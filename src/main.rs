@@ -5,4 +5,5 @@ mod evidence;
 mod hash;
 mod lens;
 mod prompt;
+mod provider;
 fn main() { println!("brk"); }
