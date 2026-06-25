@@ -6,6 +6,7 @@ mod evidence;
 mod hash;
 mod lens;
 mod orchestrate;
+mod output;
 mod prompt;
 mod provider;
 mod verdict;
