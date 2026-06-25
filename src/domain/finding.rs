@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum Severity { Low, Medium, High, Critical } // 声明顺序即 Ord：Low<Medium<High<Critical
 
+impl Severity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Severity::Low => "low",
+            Severity::Medium => "medium",
+            Severity::High => "high",
+            Severity::Critical => "critical",
+        }
+    }
+}
+
 /// 模型每次 lens 调用返回的单条 finding（codex 形状 + 可选 hard_constraint）。
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct RawFinding {

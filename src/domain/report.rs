@@ -6,6 +6,15 @@ use serde::Serialize;
 #[serde(rename_all = "kebab-case")]
 pub enum Verdict { Approve, Reject }
 
+impl Verdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Verdict::Approve => "approve",
+            Verdict::Reject => "reject",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Stats { pub critical: u32, pub high: u32, pub medium: u32, pub low: u32, pub total: u32 }
 
