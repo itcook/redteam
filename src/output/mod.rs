@@ -12,8 +12,8 @@ pub fn render(report: &ReviewReport, fmt: Format) -> String {
 
 fn render_md(r: &ReviewReport) -> String {
     let mut s = String::new();
-    s.push_str(&format!("# 对抗评审：{}\n\n", r.verdict.as_str()));
-    s.push_str(&format!("- critical {} / high {} / medium {} / low {}（共 {}）\n\n",
+    s.push_str(&format!("# Adversarial Review: {}\n\n", r.verdict.as_str()));
+    s.push_str(&format!("- critical {} / high {} / medium {} / low {} ({} total)\n\n",
         r.stats.critical, r.stats.high, r.stats.medium, r.stats.low, r.stats.total));
     for sev in [Severity::Critical, Severity::High, Severity::Medium, Severity::Low] {
         let group: Vec<_> = r.findings.iter().filter(|f| f.severity == sev).collect();
@@ -28,7 +28,7 @@ fn render_md(r: &ReviewReport) -> String {
         s.push('\n');
     }
     if !r.clusters.is_empty() {
-        s.push_str("## 关联 clusters\n");
+        s.push_str("## Correlated clusters\n");
         for c in &r.clusters {
             s.push_str(&format!("- **{}** ({}): {} — {}\n", c.theme, c.relation, c.note, c.finding_ids.join(", ")));
         }

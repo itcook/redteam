@@ -96,7 +96,7 @@ async fn main() {
                     Box::new(DirectProvider::from_config(pc, key))
                 }
                 None => {
-                    eprintln!("无可用 provider，请先配置 [providers.*]");
+                    eprintln!("no provider available, please configure [providers.*] first");
                     std::process::exit(2);
                 }
             };

@@ -3,11 +3,11 @@ pub fn collect_doc(targets: &[String]) -> anyhow::Result<String> {
     let mut out = String::new();
     for t in targets {
         let text = std::fs::read_to_string(t)
-            .map_err(|e| anyhow::anyhow!("读取文档 {t} 失败: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to read doc {t}: {e}"))?;
         out.push_str(&format!("\n===== FILE: {t} =====\n{text}\n"));
     }
     if out.is_empty() {
-        anyhow::bail!("doc 模式至少需要一个目标文档");
+        anyhow::bail!("doc mode requires at least one target document");
     }
     Ok(out)
 }

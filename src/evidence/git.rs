@@ -10,7 +10,7 @@ pub fn decide_inline(files: &[String], diff_bytes: usize, diff: &str) -> (Option
     } else {
         let list = files.join("\n  - ");
         let guidance = format!(
-            "改动较大（{} 文件 / {} 字节），未内联完整 diff。改动文件：\n  - {}\n请自己用工具读取这些文件与其改动来评审。",
+            "The diff is large ({} files / {} bytes) and has not been inlined. Changed files:\n  - {}\nPlease read these files and their changes yourself using your tools to perform the review.",
             files.len(), diff_bytes, list
         );
         (None, guidance)
@@ -34,7 +34,7 @@ pub fn dedup_files(raw: &str) -> Vec<String> {
 fn git(args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git").args(args).output()?;
     if !out.status.success() {
-        anyhow::bail!("git {:?} 失败: {}", args, String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -43,7 +43,7 @@ fn git(args: &[&str]) -> anyhow::Result<String> {
 /// 返回 (body, guidance, target_label)。
 pub fn collect_code(base: Option<&str>, branch_scope: bool) -> anyhow::Result<(String, String, String)> {
     let (diff, files, label) = if branch_scope {
-        let base = base.ok_or_else(|| anyhow::anyhow!("branch scope 需要 --base"))?;
+        let base = base.ok_or_else(|| anyhow::anyhow!("branch scope requires --base"))?;
         let merge_base = git(&["merge-base", base, "HEAD"])?.trim().to_string();
         let diff = git(&["diff", &format!("{merge_base}...HEAD")])?;
         let files = git(&["diff", "--name-only", &format!("{merge_base}...HEAD")])?;
@@ -57,7 +57,7 @@ pub fn collect_code(base: Option<&str>, branch_scope: bool) -> anyhow::Result<(S
     };
     let file_list: Vec<String> = dedup_files(&files);
     let (inline, guidance) = decide_inline(&file_list, diff.len(), &diff);
-    let body = inline.unwrap_or_else(|| format!("(diff 未内联)\n改动文件:\n{}", file_list.join("\n")));
+    let body = inline.unwrap_or_else(|| format!("(diff not inlined)\nChanged files:\n{}", file_list.join("\n")));
     Ok((body, guidance, label))
 }
 
@@ -69,7 +69,7 @@ mod tests {
         let files = vec!["a.rs".to_string(), "b.rs".into(), "c.rs".into()]; // >2 文件
         let (inline, guidance) = decide_inline(&files, 10, "DIFF");
         assert!(inline.is_none());
-        assert!(guidance.contains("a.rs") && guidance.contains("自己"));
+        assert!(guidance.contains("a.rs") && guidance.contains("yourself"));
     }
     #[test]
     fn small_diff_inlines() {

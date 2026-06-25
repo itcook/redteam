@@ -8,20 +8,20 @@ pub struct Lens {
 }
 
 static CODE: &[Lens] = &[
-    Lens { id: "L1", title: "安全与边界", focus: "鉴权/越权/租户隔离/信任边界/输入校验", max_severity: None },
-    Lens { id: "L2", title: "数据与状态", focus: "数据丢失/损坏/重复/不可逆状态/回滚安全/幂等", max_severity: None },
-    Lens { id: "L3", title: "并发与失败", focus: "竞态/顺序/重入/重试/部分失败/超时/降级依赖/空态null", max_severity: None },
-    Lens { id: "L4", title: "演进与可观测", focus: "版本漂移/schema 漂移/迁移风险/兼容回归/可观测盲区", max_severity: None },
-    Lens { id: "L0", title: "spec 一致性", focus: "实现是否偏离所给 spec 的设计意图（drift）", max_severity: None },
-    Lens { id: "L5", title: "规范遵循", focus: "编码约定/命名/结构/团队标准；非强约束时仅 low/medium", max_severity: Some(Severity::Medium) },
+    Lens { id: "L1", title: "Security & Boundaries", focus: "auth, authorization, tenant isolation, trust boundaries, input validation", max_severity: None },
+    Lens { id: "L2", title: "Data & State", focus: "data loss/corruption/duplication, irreversible state changes, rollback safety, idempotency", max_severity: None },
+    Lens { id: "L3", title: "Concurrency & Failure", focus: "race conditions, ordering assumptions, re-entrancy, retries, partial failure, timeouts, degraded dependencies, null/empty state", max_severity: None },
+    Lens { id: "L4", title: "Evolution & Observability", focus: "version skew, schema drift, migration hazards, compatibility regressions, observability gaps", max_severity: None },
+    Lens { id: "L0", title: "Spec Consistency", focus: "whether the implementation drifts from the design intent of the provided spec docs", max_severity: None },
+    Lens { id: "L5", title: "Standards Compliance", focus: "coding conventions, naming, structure, team standards; severity low/medium unless a hard project constraint", max_severity: Some(Severity::Medium) },
 ];
 
 static DOC: &[Lens] = &[
-    Lens { id: "D1", title: "内部一致性", focus: "段落矛盾、互斥需求、自相冲突约束", max_severity: None },
-    Lens { id: "D2", title: "完备性与歧义", focus: "缺失分支/未定义错误处理/欠规约/会坑实现的歧义", max_severity: None },
-    Lens { id: "D3", title: "隐藏假设与风险", focus: "未言明假设/未验证依赖；设计层是否回应安全/数据/失败/迁移", max_severity: None },
-    Lens { id: "D4", title: "可测性与成功标准", focus: "成功标准可否度量、验收条件是否定义", max_severity: None },
-    Lens { id: "D5", title: "规范遵循", focus: "是否遵循团队文档规范/模板；非强约束时仅 low/medium", max_severity: Some(Severity::Medium) },
+    Lens { id: "D1", title: "Internal Consistency", focus: "section contradictions, mutually exclusive requirements, self-conflicting constraints", max_severity: None },
+    Lens { id: "D2", title: "Completeness & Ambiguity", focus: "missing branches, undefined error handling, under-specification, ambiguity that will bite implementation", max_severity: None },
+    Lens { id: "D3", title: "Hidden Assumptions & Risk", focus: "unstated assumptions, unvalidated dependencies; whether the design addresses security/data/failure/migration", max_severity: None },
+    Lens { id: "D4", title: "Testability & Success Criteria", focus: "whether success criteria are measurable and acceptance conditions are defined", max_severity: None },
+    Lens { id: "D5", title: "Standards Compliance", focus: "whether the document follows team doc standards/templates; severity low/medium unless a hard project constraint", max_severity: Some(Severity::Medium) },
 ];
 
 pub fn all_for(mode: Mode) -> Vec<&'static Lens> {
@@ -38,7 +38,7 @@ pub fn select(mode: Mode, ids: &[String]) -> anyhow::Result<Vec<&'static Lens>> 
     }
     let mut out = Vec::new();
     for id in ids {
-        let l = by_id(id).ok_or_else(|| anyhow::anyhow!("未知 lens: {id}"))?;
+        let l = by_id(id).ok_or_else(|| anyhow::anyhow!("unknown lens: {id}"))?;
         out.push(l);
     }
     Ok(out)

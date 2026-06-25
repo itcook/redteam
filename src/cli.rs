@@ -58,8 +58,8 @@ pub fn check_multi_model(models: &Option<String>) -> anyhow::Result<()> {
         names.dedup();
         if names.len() > 1 {
             anyhow::bail!(
-                "多模型评审需 ProviderRegistry（Plan 2）；当前 MVP 仅支持单模型，\
-请用 --models <单个> 或省略 --models 走默认。收到 {} 个不同模型: {}",
+                "multi-model review needs ProviderRegistry (Plan 2); MVP supports a single model, \
+use --models <one> or omit. Got {} distinct models: {}",
                 names.len(),
                 names.join(", ")
             );
@@ -74,7 +74,7 @@ pub async fn run_review(
     cfg: &Config,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
-        anyhow::bail!("--background 在 Plan 2 实现");
+        anyhow::bail!("--background is not yet implemented (planned for Plan 2)");
     }
     // MVP 多模型保护（在 run_review 层也检查，使函数可测）
     check_multi_model(&args.models)?;

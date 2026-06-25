@@ -303,12 +303,12 @@ mod tests {
             retries: 0,
         };
         let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts).await;
-        assert!(r.findings.is_empty(), "默认路径全链失败不应有 findings");
-        assert!(r.failed_models.is_empty(), "默认路径全链失败不应写 failed_models");
-        assert!(!r.warnings.is_empty(), "默认路径全链失败应有 warning");
-        // warning 应包含两个模型的失败信息（累积）
+        assert!(r.findings.is_empty(), "default path full-chain failure must produce no findings");
+        assert!(r.failed_models.is_empty(), "default path full-chain failure must not write failed_models");
+        assert!(!r.warnings.is_empty(), "default path full-chain failure must produce a warning");
+        // warning should contain failure info for both models (accumulated)
         let warn = &r.warnings[0];
-        assert!(warn.contains("claude"), "warning 应含 claude 的失败: {warn}");
-        assert!(warn.contains("gpt"), "warning 应含 gpt 的失败: {warn}");
+        assert!(warn.contains("claude"), "warning must contain claude failure: {warn}");
+        assert!(warn.contains("gpt"), "warning must contain gpt failure: {warn}");
     }
 }
