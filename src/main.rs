@@ -8,4 +8,5 @@ mod lens;
 mod orchestrate;
 mod prompt;
 mod provider;
+mod verdict;
 fn main() { println!("brk"); }
