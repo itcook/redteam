@@ -3,6 +3,10 @@ name = "breakpoints"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "breakpoints"
+path = "src/lib.rs"
+
 [[bin]]
 name = "brk"
 path = "src/main.rs"

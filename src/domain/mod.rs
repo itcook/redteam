@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 pub mod finding;
 pub mod input;
 pub mod report;
