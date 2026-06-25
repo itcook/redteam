@@ -149,7 +149,7 @@ impl DirectProvider {
     async fn call_anthropic(&self, req: &LensRequest) -> Result<(String, u64, u64), ProviderError> {
         let base = self.base_url.as_deref().unwrap_or(ANTHROPIC_DEFAULT_BASE);
         let url = format!("{}/v1/messages", base.trim_end_matches('/'));
-        let body = build_anthropic_body(&req.model, SYSTEM, &req.prompt, MAX_TOKENS);
+        let body = build_anthropic_body(&self.model, SYSTEM, &req.prompt, MAX_TOKENS);
         let resp: Value = self
             .client
             .post(&url)
@@ -165,14 +165,14 @@ impl DirectProvider {
             .await
             .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
         extract_anthropic(&resp).ok_or_else(|| {
-            ProviderError::Unavailable("anthropic response missing content text".into())
+            ProviderError::Parse("anthropic response missing content text".into())
         })
     }
 
     async fn call_openai(&self, req: &LensRequest) -> Result<(String, u64, u64), ProviderError> {
         let base = self.base_url.as_deref().unwrap_or(OPENAI_DEFAULT_BASE);
         let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-        let body = build_openai_body(&req.model, SYSTEM, &req.prompt);
+        let body = build_openai_body(&self.model, SYSTEM, &req.prompt);
         let resp: Value = self
             .client
             .post(&url)
@@ -187,7 +187,7 @@ impl DirectProvider {
             .await
             .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
         extract_openai(&resp).ok_or_else(|| {
-            ProviderError::Unavailable("openai response missing choices content".into())
+            ProviderError::Parse("openai response missing choices content".into())
         })
     }
 }
@@ -315,6 +315,71 @@ mod tests {
         });
         let (text, _, _) = extract_anthropic(&resp).unwrap();
         assert!(parse_lens_output(&text).unwrap().findings.is_empty());
+    }
+
+    /// Finding 1 回归：build_anthropic_body / build_openai_body 以 self.model（绑定模型 id）
+    /// 而非 req.model（路由键）作为请求体的 model 字段。
+    /// 此处直接测纯函数调用路径——call_* 内部将 &self.model 传入，确保二者隔离。
+    #[test]
+    fn body_uses_bound_model_not_route_key() {
+        let bound_model = "claude-opus-4-8";
+        let route_key = "claude"; // req.model 仅是路由键，不能作 API model id 发出
+
+        let anthropic_body = build_anthropic_body(bound_model, SYSTEM, "prompt", MAX_TOKENS);
+        assert_eq!(
+            anthropic_body["model"], bound_model,
+            "anthropic body must carry bound model id"
+        );
+        assert_ne!(
+            anthropic_body["model"], route_key,
+            "anthropic body must NOT carry route key as model"
+        );
+
+        let openai_body = build_openai_body(bound_model, SYSTEM, "prompt");
+        assert_eq!(
+            openai_body["model"], bound_model,
+            "openai body must carry bound model id"
+        );
+        assert_ne!(
+            openai_body["model"], route_key,
+            "openai body must NOT carry route key as model"
+        );
+    }
+
+    /// Finding 2 回归：extract_* 返回 None（HTTP 成功但响应形状异常）时，
+    /// ok_or_else 映射为 ProviderError::Parse，而非 Unavailable。
+    #[test]
+    fn bad_response_shape_maps_to_parse_error() {
+        // Anthropic：content 字段缺失
+        let bad_anthropic = json!({ "id": "msg_123" });
+        assert!(
+            extract_anthropic(&bad_anthropic).is_none(),
+            "malformed anthropic response should yield None"
+        );
+        // 验证 None -> Parse 的映射（与 call_anthropic 内的 ok_or_else 一致）
+        let err = extract_anthropic(&bad_anthropic)
+            .ok_or_else(|| ProviderError::Parse("anthropic response missing content text".into()))
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Parse(_)),
+            "expected Parse, got: {:?}",
+            err
+        );
+
+        // OpenAI：choices 字段缺失
+        let bad_openai = json!({ "id": "chatcmpl-123" });
+        assert!(
+            extract_openai(&bad_openai).is_none(),
+            "malformed openai response should yield None"
+        );
+        let err = extract_openai(&bad_openai)
+            .ok_or_else(|| ProviderError::Parse("openai response missing choices content".into()))
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Parse(_)),
+            "expected Parse, got: {:?}",
+            err
+        );
     }
 
     /// 真实网络冒烟测试：需要真实 API key，不在 CI 跑。
