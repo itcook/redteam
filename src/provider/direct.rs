@@ -2,21 +2,33 @@ use super::{LensCall, LensRequest, ProviderError, ReviewProvider};
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::domain::LensOutput;
 use async_trait::async_trait;
+use serde_json::{json, Value};
 
-pub struct AisdkProvider {
-    pub kind: ProviderKind,
-    pub model: String,
-    pub base_url: Option<String>,
-    pub api_key: String,
+/// 固定 system 文本：prompt 本身已含 schema 契约，这里只强调"只返回 JSON"。
+const SYSTEM: &str =
+    "Return ONLY JSON matching the requested schema (an object with a \"findings\" array).";
+
+const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
+const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
+const MAX_TOKENS: u64 = 8192;
+
+/// 直连 HTTP provider：自写薄封装，按 kind 选 REST 形状，rustls-only。
+pub struct DirectProvider {
+    kind: ProviderKind,
+    model: String,
+    base_url: Option<String>,
+    api_key: String,
+    client: reqwest::Client,
 }
 
-impl AisdkProvider {
+impl DirectProvider {
     pub fn from_config(pc: &ProviderConfig, api_key: String) -> Self {
-        AisdkProvider {
+        DirectProvider {
             kind: pc.kind,
             model: pc.model.clone(),
             base_url: pc.base_url.clone(),
             api_key,
+            client: reqwest::Client::new(),
         }
     }
 }
@@ -58,36 +70,126 @@ pub fn parse_lens_output(raw: &str) -> Result<LensOutput, ProviderError> {
     )))
 }
 
+// ---- 纯函数：构造 body / 抽取 text+usage（便于 hermetic 单测，不打网络）----
+
+/// Anthropic Messages API 请求体。
+fn build_anthropic_body(model: &str, system: &str, prompt: &str, max_tokens: u64) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{ "role": "user", "content": prompt }],
+    })
+}
+
+/// OpenAI 兼容 Chat Completions 请求体。
+fn build_openai_body(model: &str, system: &str, prompt: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": prompt },
+        ],
+    })
+}
+
+/// 从 Anthropic 响应抽取 (text, input_tokens, output_tokens)；usage 取不到则 0。
+fn extract_anthropic(resp: &Value) -> Option<(String, u64, u64)> {
+    let blocks = resp.get("content")?.as_array()?;
+    let text = blocks
+        .iter()
+        .find(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .or_else(|| blocks.first())
+        .and_then(|b| b.get("text"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let input = resp["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let output = resp["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    Some((text, input, output))
+}
+
+/// 从 OpenAI 兼容响应抽取 (text, prompt_tokens, completion_tokens)；usage 取不到则 0。
+fn extract_openai(resp: &Value) -> Option<(String, u64, u64)> {
+    let text = resp
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("message")?
+        .get("content")?
+        .as_str()?
+        .to_string();
+    let input = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let output = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    Some((text, input, output))
+}
+
 #[async_trait]
-impl ReviewProvider for AisdkProvider {
+impl ReviewProvider for DirectProvider {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError> {
-        // 用 aisdk 发请求；原生 schema 优先，失败回落兜底解析。
-        // 文档 API：LanguageModelRequest::builder().model(..).system(..).prompt(..).schema::<LensOutput>().generate_text()
-        // 这里以"取回文本 → parse_lens_output"的统一兜底路径实现，保证模型无关。
-        let text = call_model_text(self, &req.prompt)
-            .await
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        // 不在 provider 内做重试（重试在 orchestrate/Task 8 包裹）。
+        let (text, input_tokens, output_tokens) = match self.kind {
+            ProviderKind::Anthropic => self.call_anthropic(&req).await?,
+            ProviderKind::Openai | ProviderKind::OpenaiCompatible => self.call_openai(&req).await?,
+            ProviderKind::Google => {
+                return Err(ProviderError::Unavailable(
+                    "google not yet supported".into(),
+                ))
+            }
+        };
         let out = parse_lens_output(&text)?;
         Ok(LensCall {
             findings: out.findings,
-            input_tokens: 0,
-            output_tokens: 0,
+            input_tokens,
+            output_tokens,
         })
     }
 }
 
-/// 用 aisdk 取回模型文本。实现期按 kind 走原生 schema/自定义 base_url/key 注入。
-async fn call_model_text(p: &AisdkProvider, prompt: &str) -> anyhow::Result<String> {
-    // 伪实现骨架（实现期用 aisdk 真实 builder 填充，按 p.kind 选 provider、p.base_url/p.api_key 注入 header）：
-    // let req = aisdk::core::LanguageModelRequest::builder()
-    //     .model(select_aisdk_model(p))
-    //     .system("Return ONLY JSON matching the schema.")
-    //     .prompt(prompt)
-    //     .schema::<crate::domain::LensOutput>()
-    //     .build();
-    // Ok(req.generate_text().await?.text().unwrap_or_default())
-    let _ = (p, prompt);
-    anyhow::bail!("aisdk call not wired in MVP test path");
+impl DirectProvider {
+    async fn call_anthropic(&self, req: &LensRequest) -> Result<(String, u64, u64), ProviderError> {
+        let base = self.base_url.as_deref().unwrap_or(ANTHROPIC_DEFAULT_BASE);
+        let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+        let body = build_anthropic_body(&req.model, SYSTEM, &req.prompt, MAX_TOKENS);
+        let resp: Value = self
+            .client
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| ProviderError::Unavailable(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        extract_anthropic(&resp).ok_or_else(|| {
+            ProviderError::Unavailable("anthropic response missing content text".into())
+        })
+    }
+
+    async fn call_openai(&self, req: &LensRequest) -> Result<(String, u64, u64), ProviderError> {
+        let base = self.base_url.as_deref().unwrap_or(OPENAI_DEFAULT_BASE);
+        let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+        let body = build_openai_body(&req.model, SYSTEM, &req.prompt);
+        let resp: Value = self
+            .client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| ProviderError::Unavailable(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        extract_openai(&resp).ok_or_else(|| {
+            ProviderError::Unavailable("openai response missing choices content".into())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -122,5 +224,120 @@ mod tests {
             "backtick in recommendation should survive: got {:?}",
             out.findings[0].recommendation
         );
+    }
+
+    // ---- 纯函数 hermetic 单测（不打网络）----
+
+    #[test]
+    fn anthropic_body_shape() {
+        let b = build_anthropic_body("claude-x", SYSTEM, "do review", 8192);
+        assert_eq!(b["model"], "claude-x");
+        assert_eq!(b["max_tokens"], 8192);
+        assert_eq!(b["system"], SYSTEM);
+        assert_eq!(b["messages"][0]["role"], "user");
+        assert_eq!(b["messages"][0]["content"], "do review");
+    }
+
+    #[test]
+    fn openai_body_shape() {
+        let b = build_openai_body("gpt-x", SYSTEM, "do review");
+        assert_eq!(b["model"], "gpt-x");
+        // system 与 user 两条消息，顺序固定
+        assert_eq!(b["messages"][0]["role"], "system");
+        assert_eq!(b["messages"][0]["content"], SYSTEM);
+        assert_eq!(b["messages"][1]["role"], "user");
+        assert_eq!(b["messages"][1]["content"], "do review");
+        // OpenAI body 不带顶层 max_tokens / system 字段
+        assert!(b.get("max_tokens").is_none());
+        assert!(b.get("system").is_none());
+    }
+
+    #[test]
+    fn extract_anthropic_text_and_usage() {
+        let resp = json!({
+            "content": [{ "type": "text", "text": "{\"findings\":[]}" }],
+            "usage": { "input_tokens": 11, "output_tokens": 22 }
+        });
+        let (text, input, output) = extract_anthropic(&resp).unwrap();
+        assert_eq!(text, "{\"findings\":[]}");
+        assert_eq!(input, 11);
+        assert_eq!(output, 22);
+    }
+
+    #[test]
+    fn extract_anthropic_missing_usage_is_zero() {
+        let resp = json!({ "content": [{ "type": "text", "text": "hi" }] });
+        let (text, input, output) = extract_anthropic(&resp).unwrap();
+        assert_eq!(text, "hi");
+        assert_eq!((input, output), (0, 0));
+    }
+
+    #[test]
+    fn extract_anthropic_no_content_is_none() {
+        let resp = json!({ "usage": { "input_tokens": 1, "output_tokens": 1 } });
+        assert!(extract_anthropic(&resp).is_none());
+    }
+
+    #[test]
+    fn extract_openai_text_and_usage() {
+        let resp = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "{\"findings\":[]}" } }],
+            "usage": { "prompt_tokens": 7, "completion_tokens": 9 }
+        });
+        let (text, input, output) = extract_openai(&resp).unwrap();
+        assert_eq!(text, "{\"findings\":[]}");
+        assert_eq!(input, 7);
+        assert_eq!(output, 9);
+    }
+
+    #[test]
+    fn extract_openai_missing_usage_is_zero() {
+        let resp = json!({
+            "choices": [{ "message": { "content": "hi" } }]
+        });
+        let (text, input, output) = extract_openai(&resp).unwrap();
+        assert_eq!(text, "hi");
+        assert_eq!((input, output), (0, 0));
+    }
+
+    #[test]
+    fn extract_openai_empty_choices_is_none() {
+        let resp = json!({ "choices": [] });
+        assert!(extract_openai(&resp).is_none());
+    }
+
+    /// 端到端：抽取出的文本喂给 parse_lens_output 能拿到 findings。
+    #[test]
+    fn extracted_text_parses_into_lens_output() {
+        let resp = json!({
+            "content": [{ "type": "text", "text": "```json\n{\"findings\":[]}\n```" }],
+            "usage": { "input_tokens": 1, "output_tokens": 2 }
+        });
+        let (text, _, _) = extract_anthropic(&resp).unwrap();
+        assert!(parse_lens_output(&text).unwrap().findings.is_empty());
+    }
+
+    /// 真实网络冒烟测试：需要真实 API key，不在 CI 跑。
+    /// 手动运行：`BRK_SMOKE_ANTHROPIC_KEY=<key> cargo test -- --ignored smoke_anthropic_run`。
+    #[tokio::test]
+    #[ignore = "requires real API key + network; run manually with --ignored"]
+    async fn smoke_anthropic_run() {
+        let key = std::env::var("BRK_SMOKE_ANTHROPIC_KEY").expect("set BRK_SMOKE_ANTHROPIC_KEY");
+        let pc = ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            model: "claude-3-5-haiku-latest".into(),
+            base_url: None,
+            api_key_env: None,
+            priority: 0,
+        };
+        let p = DirectProvider::from_config(&pc, key);
+        let call = p
+            .run(LensRequest {
+                model: "claude-3-5-haiku-latest".into(),
+                prompt: "Return JSON: {\"findings\":[]}".into(),
+            })
+            .await
+            .expect("real anthropic call");
+        assert!(call.findings.is_empty());
     }
 }

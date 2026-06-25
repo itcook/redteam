@@ -1,4 +1,4 @@
-pub mod aisdk_provider;
+pub mod direct;
 pub mod fake;
 
 use crate::domain::RawFinding;
