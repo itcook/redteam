@@ -84,14 +84,15 @@ async fn call_with_retry(
 /// 对单个 (lens, 候补链) 执行调用。
 /// 默认路径：按 priority 降序逐个候补，首个成功即止。
 /// 显式路径：只试 models[0]，失败则记录，不候补。
-/// 返回 Ok((findings, usage)) 或 Err((failed_model_name, warn_message))。
+/// 返回 Ok((findings, usage)) 或 Err(warn_message)。
+/// warn_message 包含链中所有失败模型的累积错误信息。
 async fn run_one_lens(
     provider: &dyn ReviewProvider,
     input: &ReviewInput,
     lens: &Lens,
     focus: &str,
     opts: &OrchestrateOpts,
-) -> Result<(Vec<Finding>, (u64, u64)), (String, String)> {
+) -> Result<(Vec<Finding>, (u64, u64)), String> {
     let prompt = build_prompt(input, lens, focus);
 
     // 默认路径：按 priority 降序排列，逐个候补
@@ -107,8 +108,7 @@ async fn run_one_lens(
         chain
     };
 
-    let mut last_err = String::new();
-    let first_model = opts.models.first().map(|m| m.name.clone()).unwrap_or_default();
+    let mut errs: Vec<String> = Vec::new();
 
     for pm in &chain {
         match call_with_retry(provider, &pm.name, &prompt, opts.retries).await {
@@ -121,12 +121,12 @@ async fn run_one_lens(
                 return Ok((fs, (call.input_tokens, call.output_tokens)));
             }
             Err(e) => {
-                last_err = format!("lens {} model {}: {}", lens.id, pm.name, e);
+                errs.push(format!("lens {} model {}: {}", lens.id, pm.name, e));
             }
         }
     }
 
-    Err((first_model, last_err))
+    Err(errs.join("; "))
 }
 
 /// 整个 (lens × model) 矩阵的 fan-out。
@@ -145,10 +145,10 @@ pub async fn run_fanout(
     // 不需要 Arc——直接在 async block 中使用引用即可。
     //
     // 每个 future 的类型：
-    //   impl Future<Output = (/*model_hint*/ String, Result<(Vec<Finding>, (u64,u64)), (String, String)>)>
+    //   impl Future<Output = (/*model_hint*/ String, Result<(Vec<Finding>, (u64,u64)), String>)>
 
     if opts.explicit {
-        // 显式：每个 (lens, model) 独立
+        // 显式：每个 (lens, model) 独立格子，失败记 warning + failed_models
         let futures: Vec<_> = lenses
             .iter()
             .flat_map(|lens| {
@@ -179,7 +179,7 @@ pub async fn run_fanout(
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
-                Err((_failed_model, warn)) => {
+                Err(warn) => {
                     out.warnings.push(warn);
                     if !out.failed_models.contains(&model_hint) {
                         out.failed_models.push(model_hint);
@@ -190,11 +190,11 @@ pub async fn run_fanout(
         out
     } else {
         // 默认：每个 lens 一条候补链
+        // 整条候补链失败只记 warnings，不写 failed_models（避免误导 Task 13 退出码）
         let futures: Vec<_> = lenses
             .iter()
             .map(|lens| async move {
-                let res = run_one_lens(provider, input, lens, focus, opts).await;
-                res
+                run_one_lens(provider, input, lens, focus, opts).await
             })
             .collect();
 
@@ -207,13 +207,9 @@ pub async fn run_fanout(
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
-                Err((failed_model, warn)) => {
+                Err(warn) => {
+                    // 默认路径：整条候补链失败，只记 warning，不写 failed_models
                     out.warnings.push(warn);
-                    // 默认路径失败不加 failed_models（整个候补链都没成功才算，已在 warn 里）
-                    // 但为了完整性也记录
-                    if !out.failed_models.contains(&failed_model) {
-                        out.failed_models.push(failed_model);
-                    }
                 }
             }
         }
@@ -287,5 +283,32 @@ mod tests {
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"claude".to_string()));
         assert!(!r.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_path_full_chain_failure_no_failed_models() {
+        // 回归测试（Finding #1 / Minor #3）：
+        // 默认路径，opts.models 顺序与 priority 不一致（gpt priority=20 排前，claude priority=30 排后）
+        // provider 对两个 model 都无脚本 → 整条候补链失败
+        // 期望：failed_models 为空，warnings 非空且包含两个模型的失败信息
+        let p = FakeProvider::with("nobody", vec![raw("unreachable")]);
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "gpt".into(), priority: 20 },
+                PlannedModel { name: "claude".into(), priority: 30 },
+            ],
+            explicit: false,
+            no_fallback: false,
+            max_concurrency: 4,
+            retries: 0,
+        };
+        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts).await;
+        assert!(r.findings.is_empty(), "默认路径全链失败不应有 findings");
+        assert!(r.failed_models.is_empty(), "默认路径全链失败不应写 failed_models");
+        assert!(!r.warnings.is_empty(), "默认路径全链失败应有 warning");
+        // warning 应包含两个模型的失败信息（累积）
+        let warn = &r.warnings[0];
+        assert!(warn.contains("claude"), "warning 应含 claude 的失败: {warn}");
+        assert!(warn.contains("gpt"), "warning 应含 gpt 的失败: {warn}");
     }
 }
