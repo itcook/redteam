@@ -23,4 +23,8 @@ mod tests {
         let body = collect_doc(&[p.to_string_lossy().into()]).unwrap();
         assert!(body.contains("hello") && body.contains("spec.md"));
     }
+    #[test]
+    fn empty_targets_errors() {
+        assert!(collect_doc(&[]).is_err());
+    }
 }

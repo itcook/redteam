@@ -17,6 +17,20 @@ pub fn decide_inline(files: &[String], diff_bytes: usize, diff: &str) -> (Option
     }
 }
 
+/// 将换行分隔的文件名列表去重（保留首次出现顺序），忽略空行。
+/// 供 working-tree 分支使用：staged 和 unstaged 的 --name-only 输出拼接后可能含重复文件。
+pub fn dedup_files(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut result = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if !line.is_empty() && seen.insert(line.to_string()) {
+            result.push(line.to_string());
+        }
+    }
+    result
+}
+
 fn git(args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git").args(args).output()?;
     if !out.status.success() {
@@ -41,7 +55,7 @@ pub fn collect_code(base: Option<&str>, branch_scope: bool) -> anyhow::Result<(S
         files.push_str(&git(&["diff", "--name-only"])?);
         (diff, files, "working tree".to_string())
     };
-    let file_list: Vec<String> = files.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect();
+    let file_list: Vec<String> = dedup_files(&files);
     let (inline, guidance) = decide_inline(&file_list, diff.len(), &diff);
     let body = inline.unwrap_or_else(|| format!("(diff 未内联)\n改动文件:\n{}", file_list.join("\n")));
     Ok((body, guidance, label))
@@ -62,5 +76,18 @@ mod tests {
         let files = vec!["a.rs".to_string()];
         let (inline, _) = decide_inline(&files, 10, "DIFF");
         assert_eq!(inline.as_deref(), Some("DIFF"));
+    }
+    #[test]
+    fn dedup_files_removes_duplicates_and_preserves_order() {
+        // 模拟 staged+unstaged --name-only 拼接：同一文件出现两次
+        let raw = "src/lib.rs\nsrc/main.rs\nsrc/lib.rs\n\nsrc/util.rs\n";
+        let result = dedup_files(raw);
+        assert_eq!(result, vec!["src/lib.rs", "src/main.rs", "src/util.rs"]);
+        assert_eq!(result.len(), 3); // 去重后 3 个，不是 4 个
+    }
+    #[test]
+    fn dedup_files_empty_input() {
+        assert_eq!(dedup_files(""), Vec::<String>::new());
+        assert_eq!(dedup_files("\n\n"), Vec::<String>::new());
     }
 }
