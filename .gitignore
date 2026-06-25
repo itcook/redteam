@@ -1,0 +1,19 @@
+# --- Rust ---
+/target/
+**/*.rs.bk
+# 注意：本项目是二进制 crate，Cargo.lock 应当提交（不忽略）
+
+# --- macOS ---
+.DS_Store
+**/.DS_Store
+
+# --- 密钥：永不提交 ---
+secrets.toml
+**/secrets.toml
+*.key
+
+# --- 文档：按项目偏好排除 ---
+.doc/
+
+# --- SDD 执行脚手架（进度账本，git 忽略的 scratch）---
+.superpowers/
