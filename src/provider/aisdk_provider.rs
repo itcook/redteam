@@ -110,4 +110,17 @@ mod tests {
     fn parse_garbage_errors() {
         assert!(parse_lens_output("no json here").is_err());
     }
+
+    /// 回归：recommendation 含反引号时 fence 剥离不应截断 JSON。
+    #[test]
+    fn parse_backtick_in_recommendation_survives_fence_strip() {
+        let raw = "```json\n{\"findings\":[{\"severity\":\"low\",\"title\":\"t\",\"body\":\"b\",\"file\":\"a.rs\",\"line_start\":1,\"line_end\":1,\"confidence\":0.8,\"recommendation\":\"use `foo` instead\"}]}\n```";
+        let out = parse_lens_output(raw).unwrap();
+        assert_eq!(out.findings.len(), 1);
+        assert!(
+            out.findings[0].recommendation.contains('`'),
+            "backtick in recommendation should survive: got {:?}",
+            out.findings[0].recommendation
+        );
+    }
 }
