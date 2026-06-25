@@ -1,0 +1,170 @@
+pub mod secrets;
+
+use crate::domain::Severity;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind { Anthropic, Openai, OpenaiCompatible, Google }
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProviderConfig {
+    pub kind: ProviderKind,
+    pub model: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub priority: i32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LensSets {
+    #[serde(default = "default_code_lenses")]
+    pub code: Vec<String>,
+    #[serde(default = "default_doc_lenses")]
+    pub doc: Vec<String>,
+}
+fn default_code_lenses() -> Vec<String> {
+    ["L1", "L2", "L3", "L4", "L0", "L5"].iter().map(|s| s.to_string()).collect()
+}
+fn default_doc_lenses() -> Vec<String> {
+    ["D1", "D2", "D3", "D4", "D5"].iter().map(|s| s.to_string()).collect()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReviewConfig {
+    #[serde(default)]
+    pub default_models: Vec<String>,
+    #[serde(default = "default_block")]
+    pub block_threshold: Severity,
+    #[serde(default = "default_floor")]
+    pub conf_floor: f32,
+    #[serde(default = "default_true")]
+    pub correlate: bool,
+    #[serde(default = "default_concurrency")]
+    pub max_concurrency: usize,
+    #[serde(default = "default_ttl")]
+    pub state_ttl: String,
+    #[serde(default)]
+    pub lenses: LensSets,
+}
+fn default_block() -> Severity { Severity::Medium }
+fn default_floor() -> f32 { 0.5 }
+fn default_true() -> bool { true }
+fn default_concurrency() -> usize { 8 }
+fn default_ttl() -> String { "24h".into() }
+impl Default for LensSets {
+    fn default() -> Self { LensSets { code: default_code_lenses(), doc: default_doc_lenses() } }
+}
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        ReviewConfig { default_models: vec![], block_threshold: default_block(),
+            conf_floor: default_floor(), correlate: default_true(),
+            max_concurrency: default_concurrency(), state_ttl: default_ttl(),
+            lenses: LensSets::default() }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub review: ReviewConfig,
+}
+
+impl Config {
+    /// 真实加载：内置默认（空）→ 各分层文件文本依次合并。
+    pub fn load() -> anyhow::Result<Config> {
+        let texts: Vec<String> = config_paths()
+            .into_iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        Config::from_layers(&refs)
+    }
+
+    /// 把多层 TOML 文本按 toml::Value 深合并（右侧覆盖左侧）后反序列化。
+    pub fn from_layers(layers: &[&str]) -> anyhow::Result<Config> {
+        let mut merged = toml::Value::Table(Default::default());
+        for layer in layers {
+            let v: toml::Value = toml::from_str(layer)?;
+            merge(&mut merged, v);
+        }
+        Ok(merged.try_into()?)
+    }
+
+    /// key 解析：env(api_key_env) 优先，回落 secrets.toml[provider]。
+    pub fn resolve_key(&self, provider: &str) -> Option<String> {
+        if let Some(pc) = self.providers.get(provider) {
+            if let Some(var) = &pc.api_key_env {
+                if let Ok(v) = std::env::var(var) {
+                    return Some(v);
+                }
+            }
+        }
+        secrets::load_secrets().get(provider).cloned()
+    }
+}
+
+fn merge(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(b), toml::Value::Table(o)) => {
+            for (k, v) in o {
+                merge(b.entry(k).or_insert(toml::Value::Table(Default::default())), v);
+            }
+        }
+        (b, o) => *b = o,
+    }
+}
+
+/// 分层路径（左→右优先级递增）：用户 → 项目。内置默认由 serde default 提供。
+pub fn config_paths() -> Vec<PathBuf> {
+    let mut v = vec![secrets::dirs_config().join("breakpoints").join("config.toml")];
+    v.push(PathBuf::from(".breakpoints.toml"));
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn project_overrides_user() {
+        let user = r#"[review]
+default_models=["claude"]
+block_threshold="low"
+"#;
+        let project = r#"[review]
+block_threshold="high"
+"#;
+        let cfg = Config::from_layers(&[user, project]).unwrap();
+        // 项目层覆盖用户层
+        assert_eq!(cfg.review.block_threshold, crate::domain::Severity::High);
+        // 未覆盖字段保留
+        assert_eq!(cfg.review.default_models, vec!["claude".to_string()]);
+    }
+    #[test]
+    fn defaults_apply_when_absent() {
+        let cfg = Config::from_layers(&[]).unwrap();
+        assert_eq!(cfg.review.block_threshold, crate::domain::Severity::Medium);
+        assert_eq!(cfg.review.conf_floor, 0.5);
+        assert!(cfg.review.correlate);
+    }
+    #[test]
+    fn key_resolves_env_over_secrets() {
+        std::env::set_var("BRK_TEST_KEY", "from-env");
+        let toml = r#"[providers.x]
+kind="openai"
+model="m"
+api_key_env="BRK_TEST_KEY"
+priority=10
+"#;
+        let cfg = Config::from_layers(&[toml]).unwrap();
+        assert_eq!(cfg.resolve_key("x").as_deref(), Some("from-env"));
+        std::env::remove_var("BRK_TEST_KEY");
+    }
+}
