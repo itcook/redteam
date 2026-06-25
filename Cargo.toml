@@ -18,6 +18,8 @@ futures = "0.3"
 anyhow = "1"
 thiserror = "1"
 async-trait = "0.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
+aisdk = "0.5.2"
 # 注：aisdk / reqwest(rustls) 依赖推迟到 Task 7（首次用到时）再加，避免 aisdk 版本不确定性阻塞 Tasks 1–6
 
 [dev-dependencies]
