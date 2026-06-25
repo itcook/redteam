@@ -25,6 +25,10 @@ Report only material findings. No style/naming/low-value cleanup, no evidence-fr
 Each finding answers: what breaks / why vulnerable / impact / concrete fix.
 </finding_bar>
 
+<output_language>
+Write every finding's title, body, and recommendation in the language the reviewed material explicitly requires if it states one; otherwise default to {{OUTPUT_LANGUAGE}}.
+</output_language>
+
 <output_contract>
 Return ONLY JSON matching the provided schema: an object with a "findings" array.
 Each finding: severity (low|medium|high|critical), title, body, file, line_start>=1, line_end>=1, confidence 0..1, recommendation, hard_constraint (boolean, optional — set true when severity is critical or the lens severity rule designates this finding as a hard block; omit or set false otherwise).
