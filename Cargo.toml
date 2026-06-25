@@ -18,14 +18,9 @@ futures = "0.3"
 anyhow = "1"
 thiserror = "1"
 async-trait = "0.1"
+# 直连 provider 用 reqwest（rustls-only）；0.13 的 rustls feature 名即 "rustls"。
+# 不引入 aisdk：其传递依赖会拉入 OpenSSL 且无 TLS feature 开关，违反 rustls-only 硬约束。
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
-aisdk = "0.5.2"
-# 注：aisdk / reqwest(rustls) 依赖推迟到 Task 7（首次用到时）再加，避免 aisdk 版本不确定性阻塞 Tasks 1–6
 
 [dev-dependencies]
 tempfile = "3"
-
-# Patch aisdk to force reqwest 0.12 onto rustls-tls (drop default native-tls/openssl).
-# aisdk 0.5.2 upstream does not expose a TLS-backend feature flag, so we vendor a patched copy.
-[patch.crates-io]
-aisdk = { path = "vendor/aisdk-0.5.2" }
