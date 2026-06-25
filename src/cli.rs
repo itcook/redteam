@@ -20,7 +20,8 @@ pub struct ReviewArgs {
     pub no_correlate: bool,
     pub block_threshold: Option<String>,
     pub conf_floor: Option<f32>,
-    pub wait: bool,
+    // `--wait` 是默认前台同步路径（与 `--background` 对称）。
+    // main 层处理该 CLI flag；run_review 不持有它——前台路径就是默认路径，无需单独字段。
     pub background: bool,
     pub format: String,
     pub targets: Vec<String>,
@@ -47,7 +48,26 @@ pub fn parse_format(s: &str) -> Format {
 /// → verdict → 组装 report → 退出码。
 ///
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
-/// `--background` 在 Plan 1 未实现（留 Plan 2），此处直接报错。`--wait` 是默认前台同步路径。
+/// `--background` 在 Plan 1 未实现（留 Plan 2），此处直接报错。
+/// 默认前台同步路径无需 `wait` 字段——`run_review` 本身就是同步等待模式。
+/// MVP 多模型保护：`--models` 显式传入 >1 个不同 provider 名时返回 Err。
+/// 多 provider 路由属于 Plan 2 的 ProviderRegistry；当前 MVP 只能诚实地跑单模型。
+pub fn check_multi_model(models: &Option<String>) -> anyhow::Result<()> {
+    if let Some(m) = models {
+        let mut names: Vec<&str> = m.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        names.dedup();
+        if names.len() > 1 {
+            anyhow::bail!(
+                "多模型评审需 ProviderRegistry（Plan 2）；当前 MVP 仅支持单模型，\
+请用 --models <单个> 或省略 --models 走默认。收到 {} 个不同模型: {}",
+                names.len(),
+                names.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_review(
     args: ReviewArgs,
     provider: &dyn ReviewProvider,
@@ -56,6 +76,9 @@ pub async fn run_review(
     if args.background {
         anyhow::bail!("--background 在 Plan 2 实现");
     }
+    // MVP 多模型保护（在 run_review 层也检查，使函数可测）
+    check_multi_model(&args.models)?;
+    let t0 = std::time::Instant::now();
 
     // 1. mode + 证据
     let mode = args.mode.as_deref().map(|m| match m {
@@ -150,7 +173,7 @@ pub async fn run_review(
             job_id: String::new(),
             models: model_names,
             lenses: lens_ids,
-            duration_ms: 0,
+            duration_ms: t0.elapsed().as_millis() as u64,
             usage: Usage {
                 input_tokens: raw.usage.0,
                 output_tokens: raw.usage.1,

@@ -20,4 +20,13 @@ mod tests {
         assert_eq!(fnv1a64_hex(&["a", "b"]), fnv1a64_hex(&["a", "b"]));
         assert_ne!(fnv1a64_hex(&["ab", "c"]), fnv1a64_hex(&["a", "bc"]));
     }
+
+    /// Golden 断言：钉死 FNV-1a 常量与分隔逻辑，防止未来静默破坏跨进程 finding id 稳定性。
+    /// 若此测试失败，说明哈希算法或分隔符已变更，finding id 将不再跨进程一致——需刻意迁移。
+    #[test]
+    fn golden_values() {
+        assert_eq!(fnv1a64_hex(&["a", "b"]), "d2b371819297f98a");
+        assert_eq!(fnv1a64_hex(&["ab", "c"]), "20ba9b3025a8b421");
+        assert_eq!(fnv1a64_hex(&["a", "bc"]), "a0a3542c19b900ab");
+    }
 }

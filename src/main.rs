@@ -1,4 +1,4 @@
-use breakpoints::cli::{parse_format, run_review, ReviewArgs};
+use breakpoints::cli::{check_multi_model, parse_format, run_review, ReviewArgs};
 use breakpoints::config::Config;
 use breakpoints::output::render;
 use breakpoints::provider::direct::DirectProvider;
@@ -60,12 +60,20 @@ async fn main() {
             no_correlate,
             block_threshold,
             conf_floor,
-            wait,
+            wait: _wait, // 默认前台同步路径；run_review 不持有此字段（与 --background 对称）
             background,
             format,
             targets,
         } => {
             let cfg = Config::load().unwrap_or_default();
+
+            // #1 MVP 多模型保护：显式 --models 传入 >1 个不同 provider 名时明确拒绝。
+            // run_review 层也做同样检查（可测），main 层提前 exit 避免构造无用 provider。
+            if let Err(e) = check_multi_model(&models) {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+
             // 选 lead provider 构造真实 DirectProvider。
             // 优先级：--models 首个 → review.default_models 首个 → 按 priority 降序的首个已配置 provider。
             // MVP：单实例；按 model 路由到多 provider 实例的注册表是 Plan 2 的 ProviderRegistry。
@@ -104,7 +112,6 @@ async fn main() {
                 no_correlate,
                 block_threshold,
                 conf_floor,
-                wait,
                 background,
                 format,
                 targets,

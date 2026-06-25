@@ -1,4 +1,4 @@
-use breakpoints::cli::{run_review, ReviewArgs};
+use breakpoints::cli::{check_multi_model, run_review, ReviewArgs};
 use breakpoints::config::Config;
 use breakpoints::domain::{RawFinding, Severity, Verdict};
 use breakpoints::provider::fake::FakeProvider;
@@ -39,7 +39,6 @@ default_models=["claude"]
         no_correlate: true,
         block_threshold: None,
         conf_floor: None,
-        wait: true,
         background: false,
         format: "json".into(),
         targets: vec![p.to_string_lossy().into()],
@@ -49,4 +48,20 @@ default_models=["claude"]
     assert_eq!(report.verdict, Verdict::Reject);
     assert_eq!(code, 10);
     assert_eq!(report.findings[0].models, vec!["claude".to_string()]);
+}
+
+#[test]
+fn multi_model_explicit_is_rejected() {
+    // 单个或省略 --models：通过
+    assert!(check_multi_model(&None).is_ok());
+    assert!(check_multi_model(&Some("claude".into())).is_ok());
+    assert!(check_multi_model(&Some("claude,claude".into())).is_ok()); // 去重后只有 1 个
+
+    // 两个不同 provider：拒绝
+    let err = check_multi_model(&Some("claude,gpt4".into())).unwrap_err();
+    assert!(err.to_string().contains("Plan 2"), "错误应提到 Plan 2: {err}");
+
+    // 三个不同 provider：拒绝
+    let err = check_multi_model(&Some("a,b,c".into())).unwrap_err();
+    assert!(err.to_string().contains("3"), "错误应包含数量: {err}");
 }
