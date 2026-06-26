@@ -1,9 +1,12 @@
+use crate::bundle::Bundle;
 use crate::domain::{Finding, RawFinding, ReviewInput};
 use crate::hash::fnv1a64_hex;
 use crate::lens::Lens;
-use crate::prompt::build_prompt;
+use crate::prompt::{build_bundle_prompt, build_prompt};
 use crate::provider::{LensRequest, ProviderError, ReviewProvider};
 use std::cmp::Reverse;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Clone, Debug)]
 pub struct PlannedModel {
@@ -219,6 +222,78 @@ pub async fn run_fanout(
     }
 }
 
+/// 单个文件包的评审（候补链复用 run_one_lens 的语义）。
+async fn run_one_bundle(
+    provider: &dyn ReviewProvider,
+    target_label: &str,
+    bundle: &Bundle,
+    rules: &[&Lens],
+    focus: &str,
+    opts: &OrchestrateOpts,
+) -> Result<(Vec<Finding>, (u64, u64)), String> {
+    let prompt = build_bundle_prompt(target_label, bundle, rules, focus);
+
+    let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
+    if !opts.explicit {
+        chain.sort_by_key(|m| Reverse(m.priority));
+    }
+    let chain: Vec<&PlannedModel> = if opts.explicit || opts.no_fallback {
+        chain.into_iter().take(1).collect()
+    } else {
+        chain
+    };
+
+    let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
+    let mut errs: Vec<String> = Vec::new();
+    for pm in &chain {
+        match call_with_retry(provider, &pm.name, &prompt, opts.retries).await {
+            Ok(call) => {
+                let fs = call
+                    .findings
+                    .iter()
+                    .map(|r| enrich(r, "code", &pm.name))
+                    .collect();
+                return Ok((fs, (call.input_tokens, call.output_tokens)));
+            }
+            Err(e) => errs.push(format!("bundle [{label}] model {}: {e}", pm.name)),
+        }
+    }
+    Err(errs.join("; "))
+}
+
+/// code 线扇出：bundle × model（每包一条候补链），用 Semaphore 限 max_concurrency。
+pub async fn run_code_fanout(
+    provider: &dyn ReviewProvider,
+    target_label: &str,
+    bundles: &[Bundle],
+    rules: &[&Lens],
+    focus: &str,
+    opts: &OrchestrateOpts,
+) -> RawResults {
+    let sem = Arc::new(Semaphore::new(opts.max_concurrency.max(1)));
+    let futures = bundles.iter().map(|bundle| {
+        let sem = sem.clone();
+        async move {
+            let _permit = sem.acquire().await.expect("semaphore not closed");
+            run_one_bundle(provider, target_label, bundle, rules, focus, opts).await
+        }
+    });
+    let results = futures::future::join_all(futures).await;
+
+    let mut out = RawResults::default();
+    for res in results {
+        match res {
+            Ok((fs, (it, ot))) => {
+                out.findings.extend(fs);
+                out.usage.0 += it;
+                out.usage.1 += ot;
+            }
+            Err(warn) => out.warnings.push(warn),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +362,70 @@ mod tests {
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"claude".to_string()));
         assert!(!r.warnings.is_empty());
+    }
+
+    use crate::bundle::Bundle;
+    use crate::evidence::git::FileChange;
+    use crate::lens::by_id as lens_by_id;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn raw_q(t: &str) -> RawFinding {
+        RawFinding {
+            severity: Severity::High, title: t.into(), body: "b".into(), file: "a.rs".into(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
+            hard_constraint: false, quote: "q".into(), lens: Some("L1".into()),
+        }
+    }
+
+    fn bundle(path: &str) -> Bundle {
+        Bundle { files: vec![FileChange { path: path.into(), diff: "+x".into() }] }
+    }
+
+    #[tokio::test]
+    async fn code_fanout_runs_every_bundle() {
+        let p = FakeProvider::with("m", vec![raw_q("found")]);
+        let opts = OrchestrateOpts {
+            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            explicit: true, no_fallback: false, max_concurrency: 4, retries: 0,
+        };
+        let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
+        let rules = vec![lens_by_id("L1").unwrap()];
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts).await;
+        assert_eq!(r.findings.len(), 3, "one finding per bundle");
+        // raw.lens=Some("L1") → enrich 用 L1（非 fallback）
+        assert!(r.findings.iter().all(|f| f.lenses == vec!["L1".to_string()]));
+    }
+
+    // 并发探针：断言同时在飞的 provider 调用数不超过 max_concurrency。
+    struct ConcProbe {
+        inflight: AtomicUsize,
+        max_seen: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ReviewProvider for ConcProbe {
+        async fn run(&self, _req: LensRequest) -> Result<crate::provider::LensCall, ProviderError> {
+            let cur = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_seen.fetch_max(cur, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0 })
+        }
+    }
+
+    #[tokio::test]
+    async fn code_fanout_respects_max_concurrency() {
+        let probe = Arc::new(ConcProbe { inflight: AtomicUsize::new(0), max_seen: AtomicUsize::new(0) });
+        let opts = OrchestrateOpts {
+            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            explicit: true, no_fallback: false, max_concurrency: 2, retries: 0,
+        };
+        let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
+        let rules = vec![lens_by_id("L1").unwrap()];
+        let probe_ref: &ConcProbe = &probe;
+        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", &opts).await;
+        assert!(probe.max_seen.load(Ordering::SeqCst) <= 2, "concurrency exceeded cap: {}", probe.max_seen.load(Ordering::SeqCst));
+        assert!(probe.max_seen.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]
