@@ -1,8 +1,9 @@
 use crate::provider::direct::parse_lens_output;
-use crate::provider::{LensCall, ProviderError};
+use crate::provider::{LensCall, LensRequest, ProviderError, ReviewProvider};
 use crate::tools::{tool_specs, ToolCall, ToolExecutor, ToolResult, ToolSpec};
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// provider 无关的会话消息。各 backend 自行渲染到本家协议。
@@ -78,6 +79,45 @@ pub async fn run_tool_loop(
     )))
 }
 
+const DEFAULT_MAX_ITERS: u32 = 12;
+const DEFAULT_SYSTEM: &str =
+    "You are an adversarial code reviewer. Use the provided tools to read and search the \
+     codebase as needed, then return ONLY JSON matching the requested schema (an object with a \
+     \"findings\" array).";
+
+/// 把一个 ChatBackend 与一个 ToolExecutor 组合成可直接喂给编排层的 ReviewProvider。
+pub struct ToolLoopProvider {
+    backend: Box<dyn ChatBackend>,
+    executor: ToolExecutor,
+    system: String,
+    max_iters: u32,
+}
+
+impl ToolLoopProvider {
+    pub fn new(backend: Box<dyn ChatBackend>, root: PathBuf) -> Self {
+        ToolLoopProvider {
+            backend,
+            executor: ToolExecutor::new(root),
+            system: DEFAULT_SYSTEM.to_string(),
+            max_iters: DEFAULT_MAX_ITERS,
+        }
+    }
+}
+
+#[async_trait]
+impl ReviewProvider for ToolLoopProvider {
+    async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError> {
+        run_tool_loop(
+            self.backend.as_ref(),
+            &self.executor,
+            &self.system,
+            &req.prompt,
+            self.max_iters,
+        )
+        .await
+    }
+}
+
 /// 测试替身：按序吐预置 turns，并记录每轮收到的 messages 快照。
 pub struct FakeChatBackend {
     turns: Mutex<VecDeque<AssistantTurn>>,
@@ -118,6 +158,7 @@ impl ChatBackend for FakeChatBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{LensRequest, ReviewProvider};
     use serde_json::json;
     use std::io::Write;
 
@@ -174,6 +215,32 @@ mod tests {
             m, ChatMessage::ToolResults(rs) if rs.iter().any(|r| r.content.contains("needle here"))
         ));
         assert!(fed, "tool result not fed back: {second:?}");
+    }
+
+    #[tokio::test]
+    async fn tool_loop_provider_is_drop_in_review_provider() {
+        let (_d, ex_root) = {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::File::create(dir.path().join("a.rs"))
+                .unwrap()
+                .write_all(b"needle here")
+                .unwrap();
+            let root = dir.path().to_path_buf();
+            (dir, root)
+        };
+        let backend = FakeChatBackend::new(vec![
+            toolcall_turn("read_file", json!({ "path": "a.rs" })),
+            final_turn(FINDINGS_JSON),
+        ]);
+        let provider = ToolLoopProvider::new(Box::new(backend), ex_root);
+        // 经 trait 对象调用，证明 drop-in
+        let p: &dyn ReviewProvider = &provider;
+        let call = p
+            .run(LensRequest { model: "any".into(), prompt: "review".into() })
+            .await
+            .unwrap();
+        assert_eq!(call.findings.len(), 1);
+        assert_eq!((call.input_tokens, call.output_tokens), (3, 4));
     }
 
     #[tokio::test]
