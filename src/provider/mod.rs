@@ -1,5 +1,6 @@
 pub mod direct;
 pub mod fake;
+pub mod tool_loop;
 
 use crate::domain::RawFinding;
 use async_trait::async_trait;
