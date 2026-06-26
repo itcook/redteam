@@ -17,3 +17,4 @@ secrets.toml
 
 # --- SDD 执行脚手架（进度账本，git 忽略的 scratch）---
 .superpowers/
+.gstack/
