@@ -29,6 +29,12 @@ pub struct RawFinding {
     pub recommendation: String,
     #[serde(default)]
     pub hard_constraint: bool,
+    /// 逐字引用出问题的代码原文（positioning 用；prompt 契约要求必填）。
+    #[serde(default)]
+    pub quote: String,
+    /// 模型给本条 finding 打的 rule/lens id（保住 §7.4 severity 钳制）。
+    #[serde(default)]
+    pub lens: Option<String>,
 }
 
 /// 模型每次 lens 调用的完整输出。
@@ -53,6 +59,8 @@ pub struct Finding {
     pub models: Vec<String>,
     pub agreement: u32,
     pub hard_constraint: bool,
+    /// 逐字引用（positioning 锚定依据，序列化进输出）。
+    pub quote: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
 }
@@ -80,5 +88,33 @@ mod tests {
     #[test]
     fn severity_serializes_lowercase() {
         assert_eq!(serde_json::to_string(&Severity::High).unwrap(), "\"high\"");
+    }
+
+    #[test]
+    fn raw_finding_deserializes_quote_and_lens() {
+        let j = r#"{"severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":2,"confidence":0.9,"recommendation":"r","quote":"let x = secret();","lens":"L1"}"#;
+        let r: RawFinding = serde_json::from_str(j).unwrap();
+        assert_eq!(r.quote, "let x = secret();");
+        assert_eq!(r.lens.as_deref(), Some("L1"));
+    }
+
+    #[test]
+    fn raw_finding_quote_defaults_empty_when_absent() {
+        let j = r#"{"severity":"low","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r"}"#;
+        let r: RawFinding = serde_json::from_str(j).unwrap();
+        assert_eq!(r.quote, "");
+        assert_eq!(r.lens, None);
+    }
+
+    #[test]
+    fn finding_serializes_quote() {
+        let f = Finding {
+            id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
+            file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
+            recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
+            hard_constraint: false, cluster_id: None, quote: "snippet".into(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["quote"], "snippet");
     }
 }

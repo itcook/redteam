@@ -52,6 +52,7 @@ mod tests {
             models: vec![],
             agreement: 1,
             hard_constraint: hard,
+            quote: "snippet".into(),
             cluster_id: None,
         }
     }

@@ -14,6 +14,8 @@ fn raw(sev: Severity) -> RawFinding {
         confidence: 0.9,
         recommendation: "add check".into(),
         hard_constraint: false,
+        quote: "let x = 1;".into(),
+        lens: None,
     }
 }
 

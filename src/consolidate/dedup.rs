@@ -53,7 +53,8 @@ mod tests {
     fn f(id:&str, file:&str, ls:u32, le:u32, title:&str, model:&str, sev:Severity) -> Finding {
         Finding { id:id.into(), severity:sev, title:title.into(), body:"b".into(), file:file.into(),
             line_start:ls, line_end:le, confidence:0.8, recommendation:"r".into(),
-            lenses:vec!["L1".into()], models:vec![model.into()], agreement:1, hard_constraint:false, cluster_id:None }
+            lenses:vec!["L1".into()], models:vec![model.into()], agreement:1,
+            hard_constraint:false, quote:"snippet".into(), cluster_id:None }
     }
     #[test]
     fn merges_overlapping_same_title_cross_model() {

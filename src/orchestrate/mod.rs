@@ -28,13 +28,14 @@ pub struct RawResults {
     pub usage: (u64, u64),
 }
 
-pub fn enrich(raw: &RawFinding, lens_id: &str, model: &str) -> Finding {
+pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
     let id = fnv1a64_hex(&[
         &raw.file,
         &raw.line_start.to_string(),
         &raw.line_end.to_string(),
         &raw.title.to_lowercase(),
     ]);
+    let lens = raw.lens.as_deref().unwrap_or(fallback_lens).to_string();
     Finding {
         id,
         severity: raw.severity,
@@ -45,10 +46,11 @@ pub fn enrich(raw: &RawFinding, lens_id: &str, model: &str) -> Finding {
         line_end: raw.line_end,
         confidence: raw.confidence,
         recommendation: raw.recommendation.clone(),
-        lenses: vec![lens_id.to_string()],
+        lenses: vec![lens],
         models: vec![model.to_string()],
         agreement: 1,
         hard_constraint: raw.hard_constraint,
+        quote: raw.quote.clone(),
         cluster_id: None,
     }
 }
@@ -246,6 +248,8 @@ mod tests {
             confidence: 0.9,
             recommendation: "r".into(),
             hard_constraint: false,
+            quote: "let x = 1;".into(),
+            lens: None,
         }
     }
 
