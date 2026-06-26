@@ -1,3 +1,4 @@
+use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 
@@ -71,6 +72,7 @@ pub struct ToolExecutor {
 }
 
 const READ_MAX_BYTES: usize = 64 * 1024;
+const LIST_MAX_ENTRIES: usize = 500;
 
 impl ToolExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -92,7 +94,8 @@ impl ToolExecutor {
     pub fn execute(&self, call: &ToolCall) -> ToolResult {
         let content = match call.name.as_str() {
             "read_file" => self.do_read_file(&call.args),
-            // search_repo / list_files 在 Task 3/4 接入
+            "list_files" => self.do_list_files(&call.args),
+            // search_repo 在 Task 4 接入
             other => format!("ERROR: unknown tool: {other}"),
         };
         ToolResult { id: call.id.clone(), content }
@@ -137,6 +140,50 @@ impl ToolExecutor {
         }
         if out.is_empty() {
             out.push_str("(no lines in range)\n");
+        }
+        out
+    }
+
+    /// 计算遍历起点：给了 path 则用 safe_join 后的子路径，否则 root。
+    fn scope_dir(&self, args: &Value) -> Result<PathBuf, String> {
+        match args.get("path").and_then(Value::as_str) {
+            Some(p) => self.safe_join(p).ok_or_else(|| format!("ERROR: path escapes root: {p}")),
+            None => Ok(self.root.clone()),
+        }
+    }
+
+    fn do_list_files(&self, args: &Value) -> String {
+        let scope = match self.scope_dir(args) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        // require_git(false)：即便目录非 git 仓也尊重 .gitignore（评审目标未必是 git 仓）。
+        let walk = WalkBuilder::new(&scope).require_git(false).build();
+        let mut out = String::new();
+        let mut n = 0usize;
+        for dent in walk {
+            let dent = match dent {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if !dent.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let rel = dent
+                .path()
+                .strip_prefix(&self.root)
+                .unwrap_or(dent.path())
+                .to_string_lossy();
+            out.push_str(&rel);
+            out.push('\n');
+            n += 1;
+            if n >= LIST_MAX_ENTRIES {
+                out.push_str("... [truncated]\n");
+                break;
+            }
+        }
+        if out.is_empty() {
+            out.push_str("(no files)\n");
         }
         out
     }
@@ -231,5 +278,30 @@ mod tests {
     fn executor_stores_root() {
         let ex = ToolExecutor::new("/tmp/x");
         assert_eq!(ex.root, PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn list_files_lists_tracked_excludes_gitignored() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "src/a.rs", "x");
+        write_file(dir.path(), "src/b.rs", "y");
+        write_file(dir.path(), "target/junk.o", "z");
+        write_file(dir.path(), ".gitignore", "target/\n");
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("list_files", json!({})));
+        assert!(r.content.contains("src/a.rs"), "got: {}", r.content);
+        assert!(r.content.contains("src/b.rs"), "got: {}", r.content);
+        assert!(!r.content.contains("junk.o"), "gitignored file leaked: {}", r.content);
+    }
+
+    #[test]
+    fn list_files_scopes_to_subpath() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "src/a.rs", "x");
+        write_file(dir.path(), "docs/readme.md", "y");
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("list_files", json!({ "path": "docs" })));
+        assert!(r.content.contains("docs/readme.md"), "got: {}", r.content);
+        assert!(!r.content.contains("src/a.rs"), "got: {}", r.content);
     }
 }
