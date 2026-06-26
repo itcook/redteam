@@ -288,7 +288,18 @@ pub async fn run_code_fanout(
                 out.usage.0 += it;
                 out.usage.1 += ot;
             }
-            Err(warn) => out.warnings.push(warn),
+            Err(warn) => {
+                out.warnings.push(warn);
+                // 显式模型整链失败 → 记 failed_models，守 exit-2 完整性（镜像 run_fanout 显式分支）。
+                // 默认候补路径只记 warning（与 run_fanout 默认路径一致）。
+                if opts.explicit {
+                    for pm in opts.models.iter().take(1) {
+                        if !out.failed_models.contains(&pm.name) {
+                            out.failed_models.push(pm.name.clone());
+                        }
+                    }
+                }
+            }
         }
     }
     out
@@ -426,6 +437,22 @@ mod tests {
         let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", &opts).await;
         assert!(probe.max_seen.load(Ordering::SeqCst) <= 2, "concurrency exceeded cap: {}", probe.max_seen.load(Ordering::SeqCst));
         assert!(probe.max_seen.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn code_fanout_explicit_unreachable_model_records_failed() {
+        // 显式模型完全不可用 → 整链失败 → failed_models 记该模型（守 exit-2）
+        let p = FakeProvider::with("present", vec![]);
+        let opts = OrchestrateOpts {
+            models: vec![PlannedModel { name: "absent".into(), priority: 10 }],
+            explicit: true, no_fallback: false, max_concurrency: 4, retries: 0,
+        };
+        let bundles = vec![bundle("src/a.rs")];
+        let rules = vec![lens_by_id("L1").unwrap()];
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts).await;
+        assert!(r.findings.is_empty());
+        assert!(r.failed_models.contains(&"absent".to_string()), "explicit unreachable model must be recorded");
+        assert!(!r.warnings.is_empty());
     }
 
     #[tokio::test]

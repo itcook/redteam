@@ -205,6 +205,9 @@ pub async fn run_code_review(
     changes: Vec<FileChange>,
     root: &Path,
 ) -> anyhow::Result<(ReviewReport, i32)> {
+    if args.background {
+        anyhow::bail!("--background is not yet implemented (planned for Plan 2)");
+    }
     check_multi_model(&args.models)?;
     let t0 = std::time::Instant::now();
 

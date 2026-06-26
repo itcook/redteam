@@ -14,7 +14,14 @@ fn safe_read(root: &Path, rel: &str) -> Option<String> {
     if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
         return None;
     }
-    let data = std::fs::read(root.join(p)).ok()?;
+    let full = root.join(p);
+    // 符号链接逃逸防护（镜像 ToolExecutor::do_read_file）：canonicalize 后必须仍在 root 真实路径内。
+    let real = std::fs::canonicalize(&full).ok()?;
+    let canon_root = std::fs::canonicalize(root).ok()?;
+    if !real.starts_with(&canon_root) {
+        return None;
+    }
+    let data = std::fs::read(&real).ok()?;
     let slice = if data.len() > POS_READ_MAX_BYTES { &data[..POS_READ_MAX_BYTES] } else { &data[..] };
     String::from_utf8(slice.to_vec()).ok()
 }
@@ -37,7 +44,12 @@ pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
             _ => continue, // 空 quote → 丢弃
         };
         let first = &raw_quote[first_idx];
-        match file_lines.iter().position(|fl| fl.contains(first.as_str())) {
+        // 先精确整行匹配（更准，避免短/公共子串误锚到更早的行），无则退子串包含（保召回）。
+        let hit = file_lines
+            .iter()
+            .position(|fl| fl == first)
+            .or_else(|| file_lines.iter().position(|fl| fl.contains(first.as_str())));
+        match hit {
             Some(i) => {
                 let ls = (i as u32) + 1;
                 // 真实跨度（含中间空行）：首→尾非空行的距离 + 1
@@ -131,5 +143,27 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].line_start, 2);
         assert_eq!(out[0].line_end, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drops_in_root_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "TOP SECRET").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), root.path().join("link.txt")).unwrap();
+        // quote 即便匹配 root 外文件内容，也必须因越权被丢弃
+        let out = anchor(vec![finding("link.txt", "TOP SECRET")], root.path());
+        assert!(out.is_empty(), "symlink escape must drop the finding");
+    }
+
+    #[test]
+    fn anchors_to_exact_line_not_earlier_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        // 第 1 行含 "log.info" 作子串；第 3 行恰好是 "log.info"
+        write(dir.path(), "a.rs", "log.info(x).bar();\nmid\nlog.info\n");
+        let out = anchor(vec![finding("a.rs", "log.info")], dir.path());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line_start, 3); // 精确整行优先 → 第 3 行，而非第 1 行的子串
     }
 }
