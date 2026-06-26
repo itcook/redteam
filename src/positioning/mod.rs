@@ -28,20 +28,20 @@ pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
             None => continue,
         };
         let file_lines: Vec<String> = content.lines().map(normalize_ws).collect();
-        let quote_lines: Vec<String> = f
-            .quote
-            .lines()
-            .map(normalize_ws)
-            .filter(|l| !l.is_empty())
-            .collect();
-        let first = match quote_lines.first() {
-            Some(q) => q,
-            None => continue, // 空 quote → 丢弃
+        // 保留空行的原始 quote（各行归一化）：跨度按"首个→最后一个非空行"算，含中间空行、去首尾空行
+        let raw_quote: Vec<String> = f.quote.lines().map(normalize_ws).collect();
+        let first_idx = raw_quote.iter().position(|l| !l.is_empty());
+        let last_idx = raw_quote.iter().rposition(|l| !l.is_empty());
+        let (first_idx, last_idx) = match (first_idx, last_idx) {
+            (Some(a), Some(b)) => (a, b),
+            _ => continue, // 空 quote → 丢弃
         };
+        let first = &raw_quote[first_idx];
         match file_lines.iter().position(|fl| fl.contains(first.as_str())) {
             Some(i) => {
                 let ls = (i as u32) + 1;
-                let span = quote_lines.len() as u32; // ≥1（first 存在）
+                // 真实跨度（含中间空行）：首→尾非空行的距离 + 1
+                let span = (last_idx - first_idx + 1) as u32;
                 let le = (ls + span - 1).min(file_lines.len() as u32).max(ls);
                 f.line_start = ls;
                 f.line_end = le;
@@ -120,5 +120,16 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].line_start, 2);
         assert_eq!(out[0].line_end, 4);
+    }
+
+    #[test]
+    fn multiline_quote_with_interior_blank_spans_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        // if 块含中间空行 → 占文件第 2..5 行
+        write(dir.path(), "a.rs", "x\nif y {\n\n    bad();\n}\n");
+        let out = anchor(vec![finding("a.rs", "if y {\n\n    bad();\n}")], dir.path());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line_start, 2);
+        assert_eq!(out[0].line_end, 5);
     }
 }
