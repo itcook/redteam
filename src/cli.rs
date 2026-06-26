@@ -1,12 +1,16 @@
+use crate::bundle::{group, select_files};
 use crate::config::Config;
 use crate::consolidate::{apply_clusters, correlate, dedup};
 use crate::domain::{Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::{collect, EvidenceOpts, Scope};
+use crate::evidence::git::FileChange;
 use crate::lens::select;
-use crate::orchestrate::{run_fanout, OrchestrateOpts, PlannedModel};
+use crate::orchestrate::{run_code_fanout, run_fanout, OrchestrateOpts, PlannedModel};
 use crate::output::Format;
+use crate::positioning::anchor;
 use crate::provider::ReviewProvider;
 use crate::verdict::{clamp_compliance, compute_verdict};
+use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct ReviewArgs {
@@ -190,4 +194,176 @@ pub async fn run_review(
         (Verdict::Approve, false) => 0,
     };
     Ok((report, code))
+}
+
+/// code 专属流水线（S2-2b）：bundle × model 工具循环 + positioning 尾段。
+/// 退出码同 run_review：0=approve、10=reject、2=对照集不完整。
+pub async fn run_code_review(
+    args: &ReviewArgs,
+    provider: &dyn ReviewProvider,
+    cfg: &Config,
+    changes: Vec<FileChange>,
+    root: &Path,
+) -> anyhow::Result<(ReviewReport, i32)> {
+    check_multi_model(&args.models)?;
+    let t0 = std::time::Instant::now();
+
+    // 1. 确定性筛选 + 分包
+    let bundles = group(select_files(changes));
+
+    // 2. rules = code lenses（lens → 注入 rule）
+    let lens_ids: Vec<String> = args
+        .lenses
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_else(|| cfg.review.lenses.code.clone());
+    let rules = select(Mode::Code, &lens_ids)?;
+
+    // 3. 模型集（与 run_review 同逻辑）
+    let explicit = args.models.is_some();
+    let model_names: Vec<String> = match &args.models {
+        Some(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
+        None if !cfg.review.default_models.is_empty() => cfg.review.default_models.clone(),
+        None => {
+            let mut v: Vec<_> = cfg.providers.iter().collect();
+            v.sort_by_key(|p| std::cmp::Reverse(p.1.priority));
+            v.into_iter().map(|(k, _)| k.clone()).collect()
+        }
+    };
+    let models: Vec<PlannedModel> = model_names
+        .iter()
+        .map(|n| PlannedModel {
+            name: n.clone(),
+            priority: cfg.providers.get(n).map(|p| p.priority).unwrap_or(0),
+        })
+        .collect();
+    let oopts = OrchestrateOpts {
+        models,
+        explicit,
+        no_fallback: false,
+        max_concurrency: cfg.review.max_concurrency,
+        retries: 2,
+    };
+
+    // 4. fan-out（bundle × model）
+    let focus = args.focus.clone().unwrap_or_default();
+    let target_label = if args.scope == "branch" {
+        format!("branch {}...HEAD", args.base.as_deref().unwrap_or("?"))
+    } else {
+        "working tree".to_string()
+    };
+    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts).await;
+
+    // 5. positioning（dedup 之前：准行号反哺 line-overlap 去重）
+    let anchored = anchor(raw.findings, root);
+
+    // 6. consolidate：dedup → clamp（correlate 留到 S3）
+    let mut findings = dedup(anchored);
+    clamp_compliance(&mut findings);
+
+    // 7. verdict
+    let block = args
+        .block_threshold
+        .as_deref()
+        .map(parse_sev)
+        .unwrap_or(cfg.review.block_threshold);
+    let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
+    let verdict = compute_verdict(&findings, block, floor);
+
+    // 8. 组装报告
+    let stats = Stats::from_findings(&findings);
+    let report = ReviewReport {
+        schema_version: "1".into(),
+        mode: Mode::Code,
+        verdict,
+        stats,
+        findings,
+        clusters: vec![],
+        next_steps: vec![],
+        run: RunMeta {
+            job_id: String::new(),
+            models: model_names,
+            lenses: lens_ids,
+            duration_ms: t0.elapsed().as_millis() as u64,
+            usage: Usage {
+                input_tokens: raw.usage.0,
+                output_tokens: raw.usage.1,
+            },
+            warnings: raw.warnings,
+            failed_models: raw.failed_models,
+        },
+    };
+
+    let code = match (verdict, !report.run.failed_models.is_empty()) {
+        (Verdict::Reject, _) => 10,
+        (Verdict::Approve, true) => 2,
+        (Verdict::Approve, false) => 0,
+    };
+    Ok((report, code))
+}
+
+#[cfg(test)]
+mod code_review_tests {
+    use super::*;
+    use crate::domain::{RawFinding, Verdict};
+    use crate::evidence::git::FileChange;
+    use crate::provider::fake::FakeProvider;
+    use std::io::Write;
+
+    fn write(dir: &std::path::Path, rel: &str, body: &str) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).unwrap(); }
+        std::fs::File::create(p).unwrap().write_all(body.as_bytes()).unwrap();
+    }
+
+    fn args() -> ReviewArgs {
+        ReviewArgs {
+            mode: Some("code".into()), base: None, scope: "working-tree".into(),
+            spec: vec![], focus: None, lenses: Some("L1".into()), models: Some("m".into()),
+            no_correlate: true, block_threshold: None, conf_floor: None,
+            background: false, format: "json".into(), targets: vec![],
+        }
+    }
+
+    fn raw(file: &str, quote: &str, sev: crate::domain::Severity) -> RawFinding {
+        RawFinding {
+            severity: sev, title: "issue".into(), body: "b".into(), file: file.into(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "fix".into(),
+            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn code_review_anchors_real_drops_fabricated() {
+        use crate::domain::Severity;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        let cfg = Config::from_layers(&[r#"[review]
+default_models=["m"]
+"#]).unwrap();
+        // 真 quote（锚定到第 2 行）+ 编造 quote（丢弃）
+        let provider = FakeProvider::with("m", vec![
+            raw("src/a.rs", "db.write(token);", Severity::High),
+            raw("src/a.rs", "this is fabricated", Severity::Critical),
+        ]);
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
+        let (report, code) = run_code_review(&args(), &provider, &cfg, changes, dir.path()).await.unwrap();
+        assert_eq!(report.findings.len(), 1, "fabricated dropped");
+        assert_eq!(report.findings[0].file, "src/a.rs");
+        assert_eq!(report.findings[0].line_start, 2);
+        assert_eq!(report.verdict, Verdict::Reject); // High ≥ medium block
+        assert_eq!(code, 10);
+    }
+
+    #[tokio::test]
+    async fn code_review_empty_changes_approves() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::from_layers(&[r#"[review]
+default_models=["m"]
+"#]).unwrap();
+        let provider = FakeProvider::with("m", vec![]);
+        let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path()).await.unwrap();
+        assert!(report.findings.is_empty());
+        assert_eq!(code, 0);
+    }
 }
