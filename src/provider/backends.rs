@@ -152,11 +152,17 @@ pub(crate) fn build_openai_tools_body(
                         "function": { "name": c.name, "arguments": c.args.to_string() }
                     }))
                     .collect();
-                msgs.push(json!({
-                    "role": "assistant",
-                    "content": if text.is_empty() { Value::Null } else { json!(text) },
-                    "tool_calls": calls
-                }));
+                let mut obj = serde_json::Map::new();
+                obj.insert("role".into(), json!("assistant"));
+                obj.insert(
+                    "content".into(),
+                    if text.is_empty() { Value::Null } else { json!(text) },
+                );
+                // OpenAI rejects an empty tool_calls array; omit the key entirely when there are none
+                if !calls.is_empty() {
+                    obj.insert("tool_calls".into(), json!(calls));
+                }
+                msgs.push(Value::Object(obj));
             }
             ChatMessage::ToolResults(results) => {
                 for r in results {
@@ -364,7 +370,15 @@ mod tests {
         assert!(parse_anthropic_turn(&json!({ "id": "x" })).is_none());
     }
 
-    use crate::config::{ProviderConfig, ProviderKind};
+    #[test]
+    fn openai_body_text_only_assistant_omits_tool_calls() {
+        let msgs = vec![ChatMessage::Assistant { text: "hello".into(), tool_calls: vec![] }];
+        let b = build_openai_tools_body("m", &msgs, &specs());
+        let asst = &b["messages"][0];
+        assert_eq!(asst["role"], "assistant");
+        assert_eq!(asst["content"], "hello");
+        assert!(asst.get("tool_calls").is_none(), "empty tool_calls must be omitted, got: {asst}");
+    }
 
     #[test]
     fn openai_body_has_messages_and_function_tools() {
