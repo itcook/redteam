@@ -1,8 +1,10 @@
+use crate::bundle::Bundle;
 use crate::domain::{Mode, ReviewInput};
 use crate::lens::Lens;
 
 const CODE_TPL: &str = include_str!("templates/adversarial-code.md");
 const DOC_TPL: &str = include_str!("templates/adversarial-doc.md");
+const CODE_BUNDLE_TPL: &str = include_str!("templates/adversarial-code-bundle.md");
 
 /// Detect the preferred output language from locale environment variables.
 /// Reads LC_ALL → LC_MESSAGES → LANG in order, extracts the language prefix,
@@ -45,6 +47,49 @@ pub fn build_prompt(input: &ReviewInput, lens: &Lens, user_focus: &str) -> Strin
         .replace("{{COLLECTION_GUIDANCE}}", &input.collection_guidance)
         .replace("{{TARGET_LABEL}}", &input.target_label)
         .replace("{{REVIEW_INPUT}}", &input.body)
+        .replace("{{OUTPUT_LANGUAGE}}", &output_language())
+}
+
+/// 构造一个文件包的对抗 prompt：所有适用 rule 注入为关注清单，bundle diff 内联。
+pub fn build_bundle_prompt(
+    target_label: &str,
+    bundle: &Bundle,
+    rules: &[&Lens],
+    user_focus: &str,
+) -> String {
+    let rules_block = rules
+        .iter()
+        .map(|l| {
+            let cap = if l.max_severity.is_some() {
+                " (compliance rule: severity MUST be low or medium unless an explicit hard project constraint, then set hard_constraint=true)"
+            } else {
+                ""
+            };
+            format!("- [{}] {}: {}{}", l.id, l.title, l.focus, cap)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let diffs_block = bundle
+        .files
+        .iter()
+        .map(|fc| format!("### {}\n```diff\n{}\n```", fc.path, fc.diff))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let file_list = bundle
+        .files
+        .iter()
+        .map(|fc| fc.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    CODE_BUNDLE_TPL
+        .replace("{{TARGET_LABEL}}", target_label)
+        .replace("{{RULES}}", &rules_block)
+        .replace("{{FILE_LIST}}", &file_list)
+        .replace("{{BUNDLE_DIFFS}}", &diffs_block)
+        .replace("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus })
         .replace("{{OUTPUT_LANGUAGE}}", &output_language())
 }
 
@@ -118,5 +163,25 @@ mod tests {
         assert!(!p.contains("{{"), "no residual {{}} placeholders");
         assert!(p.contains("Simplified Chinese"), "prompt must contain language name");
         unsafe { std::env::remove_var("LANG"); }
+    }
+
+    #[test]
+    fn bundle_prompt_interpolates_rules_files_and_contract() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        use crate::lens::by_id;
+        let bundle = Bundle {
+            files: vec![FileChange { path: "src/auth.rs".into(), diff: "+let t = secret();".into() }],
+        };
+        let rules = vec![by_id("L1").unwrap(), by_id("L5").unwrap()];
+        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth");
+        assert!(!p.contains("{{"), "no residual placeholders");
+        assert!(p.contains("[L1]") && p.contains("[L5]"), "rule ids injected");
+        assert!(p.contains("src/auth.rs"), "file path injected");
+        assert!(p.contains("let t = secret();"), "diff injected");
+        assert!(p.contains("quote"), "quote contract present");
+        assert!(p.contains("auth"), "user focus injected");
+        // L5 是 compliance rule → 注入 severity 封顶提示
+        assert!(p.to_lowercase().contains("compliance rule"), "compliance cap note present");
     }
 }
