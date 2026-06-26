@@ -1,3 +1,4 @@
+use crate::config::{ProviderConfig, ProviderKind};
 use crate::provider::tool_loop::{AssistantTurn, ChatBackend, ChatMessage};
 use crate::provider::ProviderError;
 use crate::tools::{ToolCall, ToolSpec};
@@ -5,6 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
+const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 const MAX_TOKENS: u64 = 8192;
 
 /// 把 provider 无关的 messages 渲染成 Anthropic Messages API 请求体。
@@ -129,6 +131,141 @@ impl ChatBackend for AnthropicBackend {
     }
 }
 
+/// 把 messages 渲染成 OpenAI 兼容 Chat Completions 请求体。
+/// system/user 直接成消息；assistant tool_calls 用 function 形状；tool 结果用 role:"tool"。
+pub(crate) fn build_openai_tools_body(
+    model: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+) -> Value {
+    let mut msgs: Vec<Value> = Vec::new();
+    for m in messages {
+        match m {
+            ChatMessage::System(s) => msgs.push(json!({ "role": "system", "content": s })),
+            ChatMessage::User(u) => msgs.push(json!({ "role": "user", "content": u })),
+            ChatMessage::Assistant { text, tool_calls } => {
+                let calls: Vec<Value> = tool_calls
+                    .iter()
+                    .map(|c| json!({
+                        "id": c.id,
+                        "type": "function",
+                        "function": { "name": c.name, "arguments": c.args.to_string() }
+                    }))
+                    .collect();
+                msgs.push(json!({
+                    "role": "assistant",
+                    "content": if text.is_empty() { Value::Null } else { json!(text) },
+                    "tool_calls": calls
+                }));
+            }
+            ChatMessage::ToolResults(results) => {
+                for r in results {
+                    msgs.push(json!({
+                        "role": "tool", "tool_call_id": r.id, "content": r.content
+                    }));
+                }
+            }
+        }
+    }
+    let tool_decls: Vec<Value> = tools
+        .iter()
+        .map(|t| json!({
+            "type": "function",
+            "function": {
+                "name": t.name, "description": t.description, "parameters": t.parameters
+            }
+        }))
+        .collect();
+    json!({ "model": model, "messages": msgs, "tools": tool_decls })
+}
+
+/// 从 OpenAI 兼容响应抽取这一轮：message.content（可空）+ tool_calls（arguments 是 JSON 字符串）。
+pub(crate) fn parse_openai_turn(resp: &Value) -> Option<AssistantTurn> {
+    let msg = resp.get("choices")?.as_array()?.first()?.get("message")?;
+    let text = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
+        for c in calls {
+            let f = match c.get("function") {
+                Some(f) => f,
+                None => continue,
+            };
+            let args_str = f.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+            let args = serde_json::from_str::<Value>(args_str).unwrap_or_else(|_| json!({}));
+            tool_calls.push(ToolCall {
+                id: c.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                name: f.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                args,
+            });
+        }
+    }
+    let input_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens })
+}
+
+/// 直连 OpenAI 兼容端点的 ChatBackend。
+pub struct OpenAiBackend {
+    model: String,
+    base_url: Option<String>,
+    api_key: String,
+    client: reqwest::Client,
+}
+
+impl OpenAiBackend {
+    pub fn new(model: String, base_url: Option<String>, api_key: String) -> Self {
+        OpenAiBackend { model, base_url, api_key, client: reqwest::Client::new() }
+    }
+}
+
+#[async_trait]
+impl ChatBackend for OpenAiBackend {
+    async fn turn(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<AssistantTurn, ProviderError> {
+        let base = self.base_url.as_deref().unwrap_or(OPENAI_DEFAULT_BASE);
+        let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+        let body = build_openai_tools_body(&self.model, messages, tools);
+        let resp: Value = self
+            .client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| ProviderError::Unavailable(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        parse_openai_turn(&resp)
+            .ok_or_else(|| ProviderError::Parse("openai response missing choices".into()))
+    }
+}
+
+/// 按 ProviderConfig.kind 造对应 backend（S2-2b 编排层入口）。Google 暂不支持。
+pub fn backend_from_config(
+    pc: &ProviderConfig,
+    api_key: String,
+) -> Result<Box<dyn ChatBackend>, ProviderError> {
+    match pc.kind {
+        ProviderKind::Anthropic => Ok(Box::new(AnthropicBackend::new(
+            pc.model.clone(),
+            pc.base_url.clone(),
+            api_key,
+        ))),
+        ProviderKind::Openai | ProviderKind::OpenaiCompatible => Ok(Box::new(OpenAiBackend::new(
+            pc.model.clone(),
+            pc.base_url.clone(),
+            api_key,
+        ))),
+        ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +362,112 @@ mod tests {
     #[test]
     fn parse_anthropic_missing_content_is_none() {
         assert!(parse_anthropic_turn(&json!({ "id": "x" })).is_none());
+    }
+
+    use crate::config::{ProviderConfig, ProviderKind};
+
+    #[test]
+    fn openai_body_has_messages_and_function_tools() {
+        let msgs = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::User("review".into()),
+        ];
+        let b = build_openai_tools_body("gpt-x", &msgs, &specs());
+        assert_eq!(b["model"], "gpt-x");
+        assert_eq!(b["messages"][0]["role"], "system");
+        assert_eq!(b["messages"][1]["role"], "user");
+        // tools 用 {type:function, function:{name, parameters}}
+        assert_eq!(b["tools"][0]["type"], "function");
+        assert_eq!(b["tools"][0]["function"]["name"], "read_file");
+        assert!(b["tools"][0]["function"]["parameters"].is_object());
+    }
+
+    #[test]
+    fn openai_body_renders_assistant_toolcall_and_tool_message() {
+        let msgs = vec![
+            ChatMessage::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    args: json!({ "path": "a.rs" }),
+                }],
+            },
+            ChatMessage::ToolResults(vec![crate::tools::ToolResult {
+                id: "call_1".into(),
+                content: "file body".into(),
+            }]),
+        ];
+        let b = build_openai_tools_body("m", &msgs, &specs());
+        let asst = &b["messages"][0];
+        assert_eq!(asst["role"], "assistant");
+        assert_eq!(asst["tool_calls"][0]["id"], "call_1");
+        assert_eq!(asst["tool_calls"][0]["type"], "function");
+        assert_eq!(asst["tool_calls"][0]["function"]["name"], "read_file");
+        // arguments 是 JSON 字符串
+        assert_eq!(asst["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
+        // tool 结果消息
+        let tr = &b["messages"][1];
+        assert_eq!(tr["role"], "tool");
+        assert_eq!(tr["tool_call_id"], "call_1");
+        assert_eq!(tr["content"], "file body");
+    }
+
+    #[test]
+    fn parse_openai_tool_call_turn() {
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_7",
+                        "type": "function",
+                        "function": { "name": "search_repo", "arguments": "{\"pattern\":\"x\"}" }
+                    }]
+                }
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 6 }
+        });
+        let t = parse_openai_turn(&resp).unwrap();
+        assert_eq!(t.text, "");
+        assert_eq!(t.tool_calls.len(), 1);
+        assert_eq!(t.tool_calls[0].id, "call_7");
+        assert_eq!(t.tool_calls[0].name, "search_repo");
+        assert_eq!(t.tool_calls[0].args["pattern"], "x");
+        assert_eq!((t.input_tokens, t.output_tokens), (5, 6));
+    }
+
+    #[test]
+    fn parse_openai_final_text_turn() {
+        let resp = json!({
+            "choices": [{ "message": { "content": "{\"findings\":[]}" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+        });
+        let t = parse_openai_turn(&resp).unwrap();
+        assert!(t.tool_calls.is_empty());
+        assert_eq!(t.text, "{\"findings\":[]}");
+    }
+
+    #[test]
+    fn parse_openai_missing_choices_is_none() {
+        assert!(parse_openai_turn(&json!({ "id": "x" })).is_none());
+    }
+
+    #[test]
+    fn from_config_maps_kind_to_backend() {
+        let anth = ProviderConfig {
+            kind: ProviderKind::Anthropic, model: "m".into(),
+            base_url: None, api_key_env: None, priority: 0,
+        };
+        assert!(backend_from_config(&anth, "k".into()).is_ok());
+        let goog = ProviderConfig {
+            kind: ProviderKind::Google, model: "m".into(),
+            base_url: None, api_key_env: None, priority: 0,
+        };
+        assert!(matches!(
+            backend_from_config(&goog, "k".into()),
+            Err(ProviderError::Unavailable(_))
+        ));
     }
 }
