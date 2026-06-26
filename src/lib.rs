@@ -8,6 +8,7 @@ pub mod hash;
 pub mod lens;
 pub mod orchestrate;
 pub mod output;
+pub mod positioning;
 pub mod prompt;
 pub mod provider;
 pub mod tools;
