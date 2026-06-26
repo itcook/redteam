@@ -91,15 +91,19 @@ pub fn changed_files(base: Option<&str>, branch_scope: bool) -> anyhow::Result<V
         let range = format!("{merge_base}...HEAD");
         let files = dedup_files(&git(&["diff", "--name-only", &range])?);
         Ok(assemble_changes(&files, |p| {
-            git(&["diff", &range, "--", p]).unwrap_or_default()
+            git(&["diff", &range, "--", p]).unwrap_or_else(|e| {
+                eprintln!("warning: failed to diff {p}: {e}");
+                String::new()
+            })
         }))
     } else {
         let mut raw = git(&["diff", "--cached", "--name-only"])?;
         raw.push_str(&git(&["diff", "--name-only"])?);
         let files = dedup_files(&raw);
         Ok(assemble_changes(&files, |p| {
-            let mut d = git(&["diff", "--cached", "--", p]).unwrap_or_default();
-            d.push_str(&git(&["diff", "--", p]).unwrap_or_default());
+            let warn = |e| { eprintln!("warning: failed to diff {p}: {e}"); String::new() };
+            let mut d = git(&["diff", "--cached", "--", p]).unwrap_or_else(&warn);
+            d.push_str(&git(&["diff", "--", p]).unwrap_or_else(&warn));
             d
         }))
     }
@@ -145,8 +149,14 @@ mod tests {
 
     #[test]
     fn assemble_changes_skips_empty_diffs() {
-        let files = vec!["a.rs".to_string(), "empty.rs".to_string()];
-        let out = assemble_changes(&files, |p| if p == "empty.rs" { String::new() } else { "x".into() });
+        let files = vec!["a.rs".to_string(), "empty.rs".to_string(), "whitespace.rs".to_string()];
+        let out = assemble_changes(&files, |p| {
+            match p {
+                "empty.rs" => String::new(),
+                "whitespace.rs" => "   \n".into(),
+                _ => "x".into(),
+            }
+        });
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, "a.rs");
     }
