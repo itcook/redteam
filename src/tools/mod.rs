@@ -1,3 +1,6 @@
+use grep_regex::RegexMatcher;
+use grep_searcher::sinks::UTF8;
+use grep_searcher::SearcherBuilder;
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
@@ -73,6 +76,7 @@ pub struct ToolExecutor {
 
 const READ_MAX_BYTES: usize = 64 * 1024;
 const LIST_MAX_ENTRIES: usize = 500;
+const SEARCH_MAX_MATCHES: usize = 100;
 
 impl ToolExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -95,7 +99,7 @@ impl ToolExecutor {
         let content = match call.name.as_str() {
             "read_file" => self.do_read_file(&call.args),
             "list_files" => self.do_list_files(&call.args),
-            // search_repo 在 Task 4 接入
+            "search_repo" => self.do_search_repo(&call.args),
             other => format!("ERROR: unknown tool: {other}"),
         };
         ToolResult { id: call.id.clone(), content }
@@ -169,11 +173,10 @@ impl ToolExecutor {
             if !dent.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                 continue;
             }
-            let rel = dent
-                .path()
-                .strip_prefix(&self.root)
-                .unwrap_or(dent.path())
-                .to_string_lossy();
+            let rel = match dent.path().strip_prefix(&self.root) {
+                Ok(r) => r.to_string_lossy().into_owned(),
+                Err(_) => continue, // scope⊆root 保证必成功；防御性跳过，绝不暴露绝对路径
+            };
             out.push_str(&rel);
             out.push('\n');
             n += 1;
@@ -184,6 +187,61 @@ impl ToolExecutor {
         }
         if out.is_empty() {
             out.push_str("(no files)\n");
+        }
+        out
+    }
+
+    fn do_search_repo(&self, args: &Value) -> String {
+        let pattern = match args.get("pattern").and_then(Value::as_str) {
+            Some(p) => p,
+            None => return "ERROR: search_repo requires a string 'pattern'".into(),
+        };
+        let scope = match self.scope_dir(args) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let matcher = match RegexMatcher::new(pattern) {
+            Ok(m) => m,
+            Err(e) => return format!("ERROR: invalid regex: {e}"),
+        };
+
+        let mut out = String::new();
+        let mut hits = 0usize;
+        let walk = WalkBuilder::new(&scope).require_git(false).build();
+        'outer: for dent in walk {
+            let dent = match dent {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if !dent.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let path = dent.path().to_path_buf();
+            let rel = match path.strip_prefix(&self.root) {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => continue, // scope⊆root 保证必成功；防御性跳过，绝不暴露绝对路径
+            };
+            let mut searcher = SearcherBuilder::new().line_number(true).build();
+            let mut local: Vec<(u64, String)> = Vec::new();
+            let _ = searcher.search_path(
+                &matcher,
+                &path,
+                UTF8(|lnum, line| {
+                    local.push((lnum, line.trim_end().to_string()));
+                    Ok(local.len() < SEARCH_MAX_MATCHES)
+                }),
+            );
+            for (lnum, line) in local {
+                out.push_str(&format!("{rel}:{lnum}:{line}\n"));
+                hits += 1;
+                if hits >= SEARCH_MAX_MATCHES {
+                    out.push_str("... [truncated]\n");
+                    break 'outer;
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push_str("(no matches)\n");
         }
         out
     }
@@ -303,5 +361,46 @@ mod tests {
         let r = ex.execute(&call("list_files", json!({ "path": "docs" })));
         assert!(r.content.contains("docs/readme.md"), "got: {}", r.content);
         assert!(!r.content.contains("src/a.rs"), "got: {}", r.content);
+    }
+
+    #[test]
+    fn search_repo_finds_matches_with_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "src/a.rs", "let token = secret();\nok\n");
+        write_file(dir.path(), "src/b.rs", "no match here\n");
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("search_repo", json!({ "pattern": "secret" })));
+        assert!(r.content.contains("src/a.rs:1:"), "got: {}", r.content);
+        assert!(r.content.contains("token = secret"), "got: {}", r.content);
+        assert!(!r.content.contains("b.rs"), "got: {}", r.content);
+    }
+
+    #[test]
+    fn search_repo_respects_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "keep.rs", "needle\n");
+        write_file(dir.path(), "build/gen.rs", "needle\n");
+        write_file(dir.path(), ".gitignore", "build/\n");
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("search_repo", json!({ "pattern": "needle" })));
+        assert!(r.content.contains("keep.rs:1:"), "got: {}", r.content);
+        assert!(!r.content.contains("gen.rs"), "gitignored hit leaked: {}", r.content);
+    }
+
+    #[test]
+    fn search_repo_no_match_is_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.rs", "nothing\n");
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("search_repo", json!({ "pattern": "zzz" })));
+        assert!(r.content.contains("(no matches)"), "got: {}", r.content);
+    }
+
+    #[test]
+    fn search_repo_bad_regex_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("search_repo", json!({ "pattern": "(" })));
+        assert!(r.content.starts_with("ERROR:"), "got: {}", r.content);
     }
 }
