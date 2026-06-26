@@ -5,6 +5,7 @@ use crate::tools::{ToolCall, ToolSpec};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+// 注意：与 src/provider/direct.rs 的同名常量保持同步
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 const MAX_TOKENS: u64 = 8192;
@@ -52,13 +53,16 @@ pub(crate) fn build_anthropic_tools_body(
         .iter()
         .map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.parameters }))
         .collect();
-    json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system,
-        "tools": tool_decls,
-        "messages": msgs,
-    })
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("max_tokens".into(), json!(max_tokens));
+    // system 为空时省略该键，与 OpenAI 的 tool_calls 省略策略保持对称。
+    if !system.is_empty() {
+        body.insert("system".into(), json!(system));
+    }
+    body.insert("tools".into(), json!(tool_decls));
+    body.insert("messages".into(), json!(msgs));
+    Value::Object(body)
 }
 
 /// 从 Anthropic 响应抽取这一轮：text 块拼接 + tool_use 块 → ToolCall；usage 取不到则 0。
@@ -296,6 +300,14 @@ mod tests {
         // system 不进 messages；user 进
         assert_eq!(b["messages"][0]["role"], "user");
         assert_eq!(b["messages"][0]["content"], "review");
+    }
+
+    // I1 回归：system 为空时 Anthropic 请求体中不应含 "system" 键。
+    #[test]
+    fn anthropic_body_omits_system_when_empty() {
+        let msgs = vec![ChatMessage::User("review".into())];
+        let b = build_anthropic_tools_body("claude-x", &msgs, &specs(), MAX_TOKENS);
+        assert!(b.get("system").is_none(), "empty system must be omitted, got: {b}");
     }
 
     #[test]

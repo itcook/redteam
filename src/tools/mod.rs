@@ -72,6 +72,8 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 /// 把工具调用落到真实文件系统上的执行器；所有访问被限制在 `root` 之内。
 pub struct ToolExecutor {
     pub(crate) root: PathBuf,
+    /// 符号链接解析后的 root 真实路径，用于 canonical 逃逸检查。
+    canonical_root: PathBuf,
 }
 
 const READ_MAX_BYTES: usize = 64 * 1024;
@@ -80,7 +82,9 @@ const SEARCH_MAX_MATCHES: usize = 100;
 
 impl ToolExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        ToolExecutor { root: root.into() }
+        let root = root.into();
+        let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        ToolExecutor { root, canonical_root }
     }
 
     /// 把模型给的相对路径安全地拼到 root 下；拒绝绝对路径与 `..`。
@@ -114,10 +118,24 @@ impl ToolExecutor {
             Some(p) => p,
             None => return format!("ERROR: path escapes root: {path}"),
         };
-        let text = match std::fs::read_to_string(&full) {
-            Ok(t) => t,
+        // 先词法 safe_join，再 canonicalize 做符号链接逃逸防护：真实路径必须仍在 root 内。
+        let real = match std::fs::canonicalize(&full) {
+            Ok(r) => r,
             Err(e) => return format!("ERROR: cannot read {path}: {e}"),
         };
+        if !real.starts_with(&self.canonical_root) {
+            return format!("ERROR: path escapes root: {path}");
+        }
+        // 有界读取：最多 READ_MAX_BYTES+1 字节进内存，避免超大/二进制文件全量读入 (I2/T2)。
+        use std::io::Read;
+        let file = match std::fs::File::open(&real) {
+            Ok(f) => f,
+            Err(e) => return format!("ERROR: cannot read {path}: {e}"),
+        };
+        let mut text = String::new();
+        if let Err(e) = file.take((READ_MAX_BYTES as u64) + 1).read_to_string(&mut text) {
+            return format!("ERROR: cannot read {path}: {e}");
+        }
         let start = args.get("start").and_then(Value::as_u64);
         let end = args.get("end").and_then(Value::as_u64);
         let mut out = String::new();
@@ -149,9 +167,20 @@ impl ToolExecutor {
     }
 
     /// 计算遍历起点：给了 path 则用 safe_join 后的子路径，否则 root。
+    /// canonicalize 成功且不在 canonical_root 内时拒绝（符号链接逃逸防护）。
     fn scope_dir(&self, args: &Value) -> Result<PathBuf, String> {
         match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.safe_join(p).ok_or_else(|| format!("ERROR: path escapes root: {p}")),
+            Some(p) => {
+                let scope = self.safe_join(p).ok_or_else(|| format!("ERROR: path escapes root: {p}"))?;
+                // 若符号链接解析成功，检查真实路径是否在 canonical_root 内。
+                if let Ok(real) = std::fs::canonicalize(&scope) {
+                    if !real.starts_with(&self.canonical_root) {
+                        return Err(format!("ERROR: path escapes root: {p}"));
+                    }
+                }
+                // canonicalize 失败（路径不存在）→ 正常返回，walk 会遍历空集。
+                Ok(scope)
+            }
             None => Ok(self.root.clone()),
         }
     }
@@ -402,5 +431,34 @@ mod tests {
         let ex = ToolExecutor::new(dir.path());
         let r = ex.execute(&call("search_repo", json!({ "pattern": "(" })));
         assert!(r.content.starts_with("ERROR:"), "got: {}", r.content);
+    }
+
+    // C1 安全回归测试：root 内的符号链接指向 root 外时，read_file 必须拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn read_file_rejects_in_root_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "TOP SECRET").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), root.path().join("escape")).unwrap();
+        let ex = ToolExecutor::new(root.path());
+        let r = ex.execute(&call("read_file", json!({ "path": "escape" })));
+        assert!(r.content.contains("ERROR: path escapes root"), "symlink escape not blocked: {}", r.content);
+        assert!(!r.content.contains("TOP SECRET"), "leaked host file: {}", r.content);
+    }
+
+    // M5 search_repo 命中数超过 100 条时应截断并输出 `... [truncated]`。
+    #[test]
+    fn search_repo_caps_at_100_matches_with_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        // 写入 200 行匹配的文件，确保超过 SEARCH_MAX_MATCHES=100。
+        let body: String = (1..=200).map(|i| format!("needle_{i}\n")).collect();
+        write_file(dir.path(), "big.rs", &body);
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("search_repo", json!({ "pattern": "needle" })));
+        assert!(r.content.contains("... [truncated]"), "expected truncated marker, got: {}", r.content);
+        // 计算 path:line: 格式行数，不超过 100。
+        let result_lines = r.content.lines().filter(|l| l.contains("big.rs:")).count();
+        assert!(result_lines <= 100, "expected ≤100 result lines, got {result_lines}");
     }
 }
