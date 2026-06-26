@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::evidence::git::FileChange;
 
 /// 噪声文件名（锁文件等，评审无价值）。
@@ -27,8 +29,6 @@ pub fn select_files(changes: Vec<FileChange>) -> Vec<FileChange> {
         .collect()
 }
 
-use std::collections::BTreeMap;
-
 #[derive(Clone, Debug)]
 pub struct Bundle {
     pub files: Vec<FileChange>,
@@ -45,9 +45,11 @@ fn parent_dir(path: &str) -> &str {
 }
 
 /// 词干：文件名去掉首个 '.' 之后部分（widget.test.ts 与 widget.ts 同词干 "widget"）。
+/// dotfile（首字符即 '.'）整名作词干，避免空词干把所有 dotfile 误并一包。
 fn stem(path: &str) -> &str {
     let f = filename(path);
     match f.find('.') {
+        Some(0) => f,
         Some(i) => &f[..i],
         None => f,
     }
@@ -85,7 +87,8 @@ pub fn group(mut changes: Vec<FileChange>) -> Vec<Bundle> {
                 let ri = uf_find(&mut parent, i);
                 let rj = uf_find(&mut parent, j);
                 if ri != rj {
-                    parent[ri] = rj;
+                    // 指向较小代表元：BTreeMap 按"组内最早文件"排序，bundle 顺序更直觉且稳定
+                    parent[ri.max(rj)] = ri.min(rj);
                 }
             }
         }
@@ -163,5 +166,16 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|b| b.files.len() <= BUNDLE_MAX_FILES));
         assert_eq!(out[0].files.len() + out[1].files.len(), 10);
+        assert_eq!(out[0].files.len(), 8);
+        assert_eq!(out[1].files.len(), 2);
+        assert!(out[0].files[0].path.ends_with("f00.rs"));
+        assert!(out[1].files[0].path.ends_with("f08.rs"));
+    }
+
+    #[test]
+    fn group_does_not_union_distinct_dotfiles() {
+        // 修复前：两个 dotfile 空词干 → 被错误并一包；修复后各自成包
+        let out = group(vec![fc("a/.gitignore", "+x"), fc("b/.eslintrc", "+y")]);
+        assert_eq!(out.len(), 2);
     }
 }
