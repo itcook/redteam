@@ -3,6 +3,12 @@ use std::process::Command;
 pub const INLINE_MAX_FILES: usize = 2;
 pub const INLINE_MAX_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileChange {
+    pub path: String,
+    pub diff: String,
+}
+
 /// 阈值决策：返回 (内联 diff 或 None, 指引文本)。
 pub fn decide_inline(files: &[String], diff_bytes: usize, diff: &str) -> (Option<String>, String) {
     if files.len() <= INLINE_MAX_FILES && diff_bytes <= INLINE_MAX_BYTES {
@@ -29,6 +35,21 @@ pub fn dedup_files(raw: &str) -> Vec<String> {
         }
     }
     result
+}
+
+/// 把文件列表与「逐文件取 diff」的闭包组装成 FileChange；跳过空 diff（纯模式变更等）。
+fn assemble_changes(files: &[String], per_file: impl Fn(&str) -> String) -> Vec<FileChange> {
+    files
+        .iter()
+        .filter_map(|p| {
+            let diff = per_file(p);
+            if diff.trim().is_empty() {
+                None
+            } else {
+                Some(FileChange { path: p.clone(), diff })
+            }
+        })
+        .collect()
 }
 
 fn git(args: &[&str]) -> anyhow::Result<String> {
@@ -61,6 +82,29 @@ pub fn collect_code(base: Option<&str>, branch_scope: bool) -> anyhow::Result<(S
     Ok((body, guidance, label))
 }
 
+/// 收集逐文件 diff：branch scope = base...HEAD；working-tree = cached + worktree。
+/// 仅 main 调用（shell git）；单测注入 FileChange，不走此函数。
+pub fn changed_files(base: Option<&str>, branch_scope: bool) -> anyhow::Result<Vec<FileChange>> {
+    if branch_scope {
+        let base = base.ok_or_else(|| anyhow::anyhow!("branch scope requires --base"))?;
+        let merge_base = git(&["merge-base", base, "HEAD"])?.trim().to_string();
+        let range = format!("{merge_base}...HEAD");
+        let files = dedup_files(&git(&["diff", "--name-only", &range])?);
+        Ok(assemble_changes(&files, |p| {
+            git(&["diff", &range, "--", p]).unwrap_or_default()
+        }))
+    } else {
+        let mut raw = git(&["diff", "--cached", "--name-only"])?;
+        raw.push_str(&git(&["diff", "--name-only"])?);
+        let files = dedup_files(&raw);
+        Ok(assemble_changes(&files, |p| {
+            let mut d = git(&["diff", "--cached", "--", p]).unwrap_or_default();
+            d.push_str(&git(&["diff", "--", p]).unwrap_or_default());
+            d
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +133,21 @@ mod tests {
     fn dedup_files_empty_input() {
         assert_eq!(dedup_files(""), Vec::<String>::new());
         assert_eq!(dedup_files("\n\n"), Vec::<String>::new());
+    }
+    #[test]
+    fn assemble_changes_pairs_files_with_diffs() {
+        let files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let out = assemble_changes(&files, |p| format!("diff for {p}"));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], FileChange { path: "a.rs".into(), diff: "diff for a.rs".into() });
+        assert_eq!(out[1].path, "b.rs");
+    }
+
+    #[test]
+    fn assemble_changes_skips_empty_diffs() {
+        let files = vec!["a.rs".to_string(), "empty.rs".to_string()];
+        let out = assemble_changes(&files, |p| if p == "empty.rs" { String::new() } else { "x".into() });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "a.rs");
     }
 }
