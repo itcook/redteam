@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolCall {
@@ -67,20 +67,147 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 
 /// 把工具调用落到真实文件系统上的执行器；所有访问被限制在 `root` 之内。
 pub struct ToolExecutor {
-    // root 在 Task 2-4 的工具执行方法中使用；此处仅骨架。
-    #[allow(dead_code)]
     pub(crate) root: PathBuf,
 }
+
+const READ_MAX_BYTES: usize = 64 * 1024;
 
 impl ToolExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         ToolExecutor { root: root.into() }
+    }
+
+    /// 把模型给的相对路径安全地拼到 root 下；拒绝绝对路径与 `..`。
+    fn safe_join(&self, rel: &str) -> Option<PathBuf> {
+        let p = Path::new(rel);
+        if p.is_absolute() {
+            return None;
+        }
+        if p.components().any(|c| matches!(c, Component::ParentDir)) {
+            return None;
+        }
+        Some(self.root.join(p))
+    }
+
+    pub fn execute(&self, call: &ToolCall) -> ToolResult {
+        let content = match call.name.as_str() {
+            "read_file" => self.do_read_file(&call.args),
+            // search_repo / list_files 在 Task 3/4 接入
+            other => format!("ERROR: unknown tool: {other}"),
+        };
+        ToolResult { id: call.id.clone(), content }
+    }
+
+    fn do_read_file(&self, args: &Value) -> String {
+        let path = match args.get("path").and_then(Value::as_str) {
+            Some(p) => p,
+            None => return "ERROR: read_file requires a string 'path'".into(),
+        };
+        let full = match self.safe_join(path) {
+            Some(p) => p,
+            None => return format!("ERROR: path escapes root: {path}"),
+        };
+        let text = match std::fs::read_to_string(&full) {
+            Ok(t) => t,
+            Err(e) => return format!("ERROR: cannot read {path}: {e}"),
+        };
+        let start = args.get("start").and_then(Value::as_u64);
+        let end = args.get("end").and_then(Value::as_u64);
+        let mut out = String::new();
+        let mut bytes = 0usize;
+        for (i, line) in text.lines().enumerate() {
+            let lnum = (i as u64) + 1;
+            if let Some(s) = start {
+                if lnum < s {
+                    continue;
+                }
+            }
+            if let Some(e) = end {
+                if lnum > e {
+                    break;
+                }
+            }
+            let row = format!("{lnum:>6}\t{line}\n");
+            bytes += row.len();
+            if bytes > READ_MAX_BYTES {
+                out.push_str("... [truncated]\n");
+                break;
+            }
+            out.push_str(&row);
+        }
+        if out.is_empty() {
+            out.push_str("(no lines in range)\n");
+        }
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn call(name: &str, args: Value) -> ToolCall {
+        ToolCall { id: "t1".into(), name: name.into(), args }
+    }
+
+    fn write_file(dir: &std::path::Path, rel: &str, body: &str) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(p).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn read_file_returns_numbered_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.rs", "fn main() {}\nlet x = 1;\n");
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("read_file", json!({ "path": "a.rs" })));
+        assert!(r.content.contains("1\tfn main() {}"), "got: {}", r.content);
+        assert!(r.content.contains("2\tlet x = 1;"), "got: {}", r.content);
+        assert_eq!(r.id, "t1");
+    }
+
+    #[test]
+    fn read_file_honors_line_range() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.rs", "l1\nl2\nl3\nl4\n");
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("read_file", json!({ "path": "a.rs", "start": 2, "end": 3 })));
+        assert!(r.content.contains("2\tl2"));
+        assert!(r.content.contains("3\tl3"));
+        assert!(!r.content.contains("l1"));
+        assert!(!r.content.contains("l4"));
+    }
+
+    #[test]
+    fn read_file_missing_is_error_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("read_file", json!({ "path": "nope.rs" })));
+        assert!(r.content.starts_with("ERROR:"), "got: {}", r.content);
+    }
+
+    #[test]
+    fn read_file_rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("read_file", json!({ "path": "../secret" })));
+        assert!(r.content.contains("ERROR: path escapes root"), "got: {}", r.content);
+        let r2 = ex.execute(&call("read_file", json!({ "path": "/etc/hosts" })));
+        assert!(r2.content.contains("ERROR: path escapes root"), "got: {}", r2.content);
+    }
+
+    #[test]
+    fn unknown_tool_is_error_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("frobnicate", json!({})));
+        assert!(r.content.contains("ERROR: unknown tool"), "got: {}", r.content);
+    }
 
     #[test]
     fn tool_specs_lists_three_named_tools() {
