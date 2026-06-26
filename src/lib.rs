@@ -9,4 +9,5 @@ pub mod orchestrate;
 pub mod output;
 pub mod prompt;
 pub mod provider;
+pub mod tools;
 pub mod verdict;

@@ -25,6 +25,10 @@ async-trait = "0.1"
 # 直连 provider 用 reqwest（rustls-only）；0.13 的 rustls feature 名即 "rustls"。
 # 不引入 aisdk：其传递依赖会拉入 OpenSSL 且无 TLS feature 开关，违反 rustls-only 硬约束。
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
+# ripgrep 内核 crate：gitignore 感知遍历(ignore) + 正则搜索(grep-*)；纯 Rust，无 OpenSSL。
+ignore = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
