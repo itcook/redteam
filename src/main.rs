@@ -1,4 +1,4 @@
-use breakpoints::cli::{check_multi_model, parse_format, run_code_review, run_review, ReviewArgs};
+use breakpoints::cli::{parse_format, run_code_review, run_review, ReviewArgs};
 use breakpoints::config::Config;
 use breakpoints::domain::Mode;
 use breakpoints::evidence::{detect_mode, EvidenceOpts, Scope};
@@ -70,11 +70,6 @@ async fn main() {
         } => {
             let cfg = Config::load().unwrap_or_default();
 
-            if let Err(e) = check_multi_model(&models) {
-                eprintln!("error: {e}");
-                std::process::exit(2);
-            }
-
             // 探测 mode 以选 provider 形态。
             let scope_enum = if scope == "branch" { Scope::Branch } else { Scope::WorkingTree };
             let mode_opt = mode.as_deref().map(|m| if m == "code" { Mode::Code } else { Mode::Doc });
@@ -118,6 +113,7 @@ async fn main() {
             let fmt = parse_format(&format);
             let args = ReviewArgs {
                 mode, base: base.clone(), scope, spec, focus, lenses, models,
+                models_all: false,
                 no_correlate, block_threshold, conf_floor, background, format, targets,
             };
 
