@@ -212,7 +212,7 @@ pub async fn run_code_review(
     let t0 = std::time::Instant::now();
 
     // 1. 确定性筛选 + 分包
-    let bundles = group(select_files(changes));
+    let bundles = group(select_files(changes), Some(root));
 
     // 2. rules = code lenses（lens → 注入 rule）
     let lens_ids: Vec<String> = args
