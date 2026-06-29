@@ -241,6 +241,9 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>) -> Vec<Bundle> {
             (0..n).map(|i| (norm_file(&changes[i].path), i)).collect();
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
+            // 安全不变量：changes[i].path 来自 git diff（仓内相对、git 跟踪、非模型可控），
+            // 故此处 root.join 直读无需 positioning::safe_read 的 canonical-root/软链防逃逸；
+            // 读失败即 continue 降级。若未来 caller 改喂不可信来源（spec/LLM 提议清单），须补该防护。
             let full = root.join(&changes[i].path);
             let content = match std::fs::read_to_string(&full) {
                 Ok(c) => c,
