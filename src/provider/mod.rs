@@ -1,6 +1,7 @@
 pub mod backends;
 pub mod direct;
 pub mod fake;
+pub mod registry;
 pub mod tool_loop;
 
 use crate::domain::RawFinding;

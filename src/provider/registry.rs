@@ -1,0 +1,74 @@
+use crate::provider::{LensCall, LensRequest, ProviderError, ReviewProvider};
+use async_trait::async_trait;
+use std::collections::BTreeMap;
+
+/// 按 model 名路由到子 provider 的注册表（通用基建）。
+/// `LensRequest.model` 即 provider 名（= 注册键，也就是 orchestrate 里 `PlannedModel.name`）；
+/// 命中则转调对应子 provider，未知名返回 `Unavailable`（让该格记入 failed_models）。
+/// code 路径填 `ToolLoopProvider` 实例、doc 路径填 `DirectProvider` 实例，二者皆 `ReviewProvider`。
+#[derive(Default)]
+pub struct ProviderRegistry {
+    providers: BTreeMap<String, Box<dyn ReviewProvider>>,
+}
+
+impl ProviderRegistry {
+    pub fn new() -> Self {
+        Self { providers: BTreeMap::new() }
+    }
+    pub fn insert(&mut self, name: impl Into<String>, provider: Box<dyn ReviewProvider>) {
+        self.providers.insert(name.into(), provider);
+    }
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+}
+
+#[async_trait]
+impl ReviewProvider for ProviderRegistry {
+    async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError> {
+        match self.providers.get(&req.model) {
+            Some(p) => p.run(req).await,
+            None => Err(ProviderError::Unavailable(format!(
+                "model not in registry: {}",
+                req.model
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{RawFinding, Severity};
+    use crate::provider::fake::FakeProvider;
+
+    fn rf(title: &str) -> RawFinding {
+        RawFinding {
+            severity: Severity::High, title: title.into(), body: "b".into(),
+            file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
+            recommendation: "r".into(), hard_constraint: false, quote: "q".into(), lens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_by_model_name() {
+        let mut reg = ProviderRegistry::new();
+        reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("from-alpha")])));
+        reg.insert("beta", Box::new(FakeProvider::with("beta", vec![rf("from-beta")])));
+        assert_eq!(reg.len(), 2);
+        let a = reg.run(LensRequest { model: "alpha".into(), prompt: "p".into() }).await.unwrap();
+        assert_eq!(a.findings[0].title, "from-alpha");
+        let b = reg.run(LensRequest { model: "beta".into(), prompt: "p".into() }).await.unwrap();
+        assert_eq!(b.findings[0].title, "from-beta");
+    }
+
+    #[tokio::test]
+    async fn unknown_model_is_unavailable() {
+        let reg = ProviderRegistry::new();
+        let e = reg.run(LensRequest { model: "ghost".into(), prompt: "p".into() }).await;
+        assert!(matches!(e, Err(ProviderError::Unavailable(_))));
+    }
+}
