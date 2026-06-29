@@ -17,7 +17,7 @@ pub struct PlannedModel {
 #[derive(Clone, Debug)]
 pub struct OrchestrateOpts {
     pub models: Vec<PlannedModel>,
-    pub explicit: bool,
+    pub replicate: bool,
     pub no_fallback: bool,
     pub max_concurrency: usize,
     pub retries: u32,
@@ -102,12 +102,12 @@ async fn run_one_lens(
 
     // 默认路径：按 priority 降序排列，逐个候补
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
-    if !opts.explicit {
+    if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
     }
 
     // 显式或 no_fallback 时只取第一个
-    let chain: Vec<&PlannedModel> = if opts.explicit || opts.no_fallback {
+    let chain: Vec<&PlannedModel> = if opts.replicate || opts.no_fallback {
         chain.into_iter().take(1).collect()
     } else {
         chain
@@ -152,7 +152,7 @@ pub async fn run_fanout(
     // 每个 future 的类型：
     //   impl Future<Output = (/*model_hint*/ String, Result<(Vec<Finding>, (u64,u64)), String>)>
 
-    if opts.explicit {
+    if opts.replicate {
         // 显式：每个 (lens, model) 独立格子，失败记 warning + failed_models
         let futures: Vec<_> = lenses
             .iter()
@@ -161,7 +161,7 @@ pub async fn run_fanout(
                     let model_name = pm.name.clone();
                     let single_opts = OrchestrateOpts {
                         models: vec![pm.clone()],
-                        explicit: true,
+                        replicate: true,
                         no_fallback: opts.no_fallback,
                         max_concurrency: opts.max_concurrency,
                         retries: opts.retries,
@@ -234,10 +234,10 @@ async fn run_one_bundle(
     let prompt = build_bundle_prompt(target_label, bundle, rules, focus);
 
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
-    if !opts.explicit {
+    if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
     }
-    let chain: Vec<&PlannedModel> = if opts.explicit || opts.no_fallback {
+    let chain: Vec<&PlannedModel> = if opts.replicate || opts.no_fallback {
         chain.into_iter().take(1).collect()
     } else {
         chain
@@ -261,7 +261,9 @@ async fn run_one_bundle(
     Err(errs.join("; "))
 }
 
-/// code 线扇出：bundle × model（每包一条候补链），用 Semaphore 限 max_concurrency。
+/// code 线扇出，用 Semaphore 限 max_concurrency：
+/// - replicate=true：每 (bundle, model) 独立格子全跑（对抗复制），失败记 failed_models（守 exit-2）。
+/// - replicate=false：每 bundle 一条候补链（容错，首个成功即止），整链失败只记 warning。
 pub async fn run_code_fanout(
     provider: &dyn ReviewProvider,
     target_label: &str,
@@ -271,38 +273,68 @@ pub async fn run_code_fanout(
     opts: &OrchestrateOpts,
 ) -> RawResults {
     let sem = Arc::new(Semaphore::new(opts.max_concurrency.max(1)));
-    let futures = bundles.iter().map(|bundle| {
-        let sem = sem.clone();
-        async move {
-            let _permit = sem.acquire().await.expect("semaphore not closed");
-            run_one_bundle(provider, target_label, bundle, rules, focus, opts).await
-        }
-    });
-    let results = futures::future::join_all(futures).await;
-
-    let mut out = RawResults::default();
-    for res in results {
-        match res {
-            Ok((fs, (it, ot))) => {
-                out.findings.extend(fs);
-                out.usage.0 += it;
-                out.usage.1 += ot;
-            }
-            Err(warn) => {
-                out.warnings.push(warn);
-                // 显式模型整链失败 → 记 failed_models，守 exit-2 完整性（镜像 run_fanout 显式分支）。
-                // 默认候补路径只记 warning（与 run_fanout 默认路径一致）。
-                if opts.explicit {
-                    for pm in opts.models.iter().take(1) {
-                        if !out.failed_models.contains(&pm.name) {
-                            out.failed_models.push(pm.name.clone());
-                        }
+    if opts.replicate {
+        // 全复制：bundle × model 笛卡尔积，每格只试该 model（不候补）
+        let futures = bundles.iter().flat_map(|bundle| {
+            let sem = sem.clone();
+            opts.models.iter().map(move |pm| {
+                let sem = sem.clone();
+                let model_name = pm.name.clone();
+                let single = OrchestrateOpts {
+                    models: vec![pm.clone()],
+                    replicate: true,
+                    no_fallback: opts.no_fallback,
+                    max_concurrency: opts.max_concurrency,
+                    retries: opts.retries,
+                };
+                async move {
+                    let _permit = sem.acquire().await.expect("semaphore not closed");
+                    let res = run_one_bundle(provider, target_label, bundle, rules, focus, &single).await;
+                    (model_name, res)
+                }
+            })
+        });
+        let results = futures::future::join_all(futures).await;
+        let mut out = RawResults::default();
+        for (model_hint, res) in results {
+            match res {
+                Ok((fs, (it, ot))) => {
+                    out.findings.extend(fs);
+                    out.usage.0 += it;
+                    out.usage.1 += ot;
+                }
+                Err(warn) => {
+                    out.warnings.push(warn);
+                    if !out.failed_models.contains(&model_hint) {
+                        out.failed_models.push(model_hint);
                     }
                 }
             }
         }
+        out
+    } else {
+        // 候补：每 bundle 一条候补链（按 priority 降序、首个成功即止）
+        let futures = bundles.iter().map(|bundle| {
+            let sem = sem.clone();
+            async move {
+                let _permit = sem.acquire().await.expect("semaphore not closed");
+                run_one_bundle(provider, target_label, bundle, rules, focus, opts).await
+            }
+        });
+        let results = futures::future::join_all(futures).await;
+        let mut out = RawResults::default();
+        for res in results {
+            match res {
+                Ok((fs, (it, ot))) => {
+                    out.findings.extend(fs);
+                    out.usage.0 += it;
+                    out.usage.1 += ot;
+                }
+                Err(warn) => out.warnings.push(warn),
+            }
+        }
+        out
     }
-    out
 }
 
 #[cfg(test)]
@@ -348,7 +380,7 @@ mod tests {
                 PlannedModel { name: "claude".into(), priority: 30 },
                 PlannedModel { name: "gpt".into(), priority: 20 },
             ],
-            explicit: false,
+            replicate: false,
             no_fallback: false,
             max_concurrency: 4,
             retries: 0,
@@ -364,7 +396,7 @@ mod tests {
         let p = FakeProvider::with("gpt", vec![raw("x")]);
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "claude".into(), priority: 30 }],
-            explicit: true,
+            replicate: true,
             no_fallback: false,
             max_concurrency: 4,
             retries: 0,
@@ -389,6 +421,14 @@ mod tests {
         }
     }
 
+    fn raw_at(file: &str, title: &str, sev: Severity) -> RawFinding {
+        RawFinding {
+            severity: sev, title: title.into(), body: "b".into(), file: file.into(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
+            hard_constraint: false, quote: "q".into(), lens: Some("L1".into()),
+        }
+    }
+
     fn bundle(path: &str) -> Bundle {
         Bundle { files: vec![FileChange { path: path.into(), diff: "+x".into() }] }
     }
@@ -398,7 +438,7 @@ mod tests {
         let p = FakeProvider::with("m", vec![raw_q("found")]);
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "m".into(), priority: 10 }],
-            explicit: true, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
@@ -429,7 +469,7 @@ mod tests {
         let probe = Arc::new(ConcProbe { inflight: AtomicUsize::new(0), max_seen: AtomicUsize::new(0) });
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "m".into(), priority: 10 }],
-            explicit: true, no_fallback: false, max_concurrency: 2, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 2, retries: 0,
         };
         let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
         let rules = vec![lens_by_id("L1").unwrap()];
@@ -445,7 +485,7 @@ mod tests {
         let p = FakeProvider::with("present", vec![]);
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "absent".into(), priority: 10 }],
-            explicit: true, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
         };
         let bundles = vec![bundle("src/a.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
@@ -453,6 +493,66 @@ mod tests {
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"absent".to_string()), "explicit unreachable model must be recorded");
         assert!(!r.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn code_fanout_replicate_runs_every_model_per_bundle() {
+        use crate::evidence::git::FileChange;
+        use std::collections::BTreeMap;
+        // 两个 model 各产 1 条 finding（不同 title），手动多 model script
+        let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
+        scripted.insert("alpha".into(), vec![raw_at("src/a.rs", "alpha-issue", Severity::High)]);
+        scripted.insert("beta".into(), vec![raw_at("src/a.rs", "beta-issue", Severity::High)]);
+        let provider = crate::provider::fake::FakeProvider { scripted };
+        let bundles = vec![
+            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] },
+            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "+y".into() }] },
+        ];
+        let l1 = by_id("L1").unwrap();
+        let rules = vec![l1];
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "alpha".into(), priority: 10 },
+                PlannedModel { name: "beta".into(), priority: 5 },
+            ],
+            replicate: true,
+            no_fallback: false,
+            max_concurrency: 8,
+            retries: 0,
+        };
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts).await;
+        // 2 bundle × 2 model = 4 格，各 1 finding → 4 条
+        assert_eq!(out.findings.len(), 4);
+        let models: std::collections::BTreeSet<&str> =
+            out.findings.iter().flat_map(|f| f.models.iter().map(|s| s.as_str())).collect();
+        assert!(models.contains("alpha") && models.contains("beta"));
+        assert!(out.failed_models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn code_fanout_replicate_records_failed_model() {
+        use crate::evidence::git::FileChange;
+        // 只有 alpha 有 script；beta 不可达 → 记 failed_models
+        let provider = crate::provider::fake::FakeProvider::with(
+            "alpha",
+            vec![raw_at("src/a.rs", "alpha-issue", Severity::High)],
+        );
+        let bundles = vec![Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] }];
+        let l1 = by_id("L1").unwrap();
+        let rules = vec![l1];
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "alpha".into(), priority: 10 },
+                PlannedModel { name: "beta".into(), priority: 5 },
+            ],
+            replicate: true,
+            no_fallback: false,
+            max_concurrency: 8,
+            retries: 0,
+        };
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts).await;
+        assert_eq!(out.findings.len(), 1); // alpha 成功
+        assert!(out.failed_models.contains(&"beta".to_string()));
     }
 
     #[tokio::test]
@@ -467,7 +567,7 @@ mod tests {
                 PlannedModel { name: "gpt".into(), priority: 20 },
                 PlannedModel { name: "claude".into(), priority: 30 },
             ],
-            explicit: false,
+            replicate: false,
             no_fallback: false,
             max_concurrency: 4,
             retries: 0,

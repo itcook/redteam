@@ -136,7 +136,7 @@ pub async fn run_review(
 
     let oopts = OrchestrateOpts {
         models,
-        explicit,
+        replicate: explicit,
         no_fallback: false,
         max_concurrency: cfg.review.max_concurrency,
         retries: 2,
@@ -242,7 +242,7 @@ pub async fn run_code_review(
         .collect();
     let oopts = OrchestrateOpts {
         models,
-        explicit,
+        replicate: explicit,
         no_fallback: false,
         max_concurrency: cfg.review.max_concurrency,
         retries: 2,
