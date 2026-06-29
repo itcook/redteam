@@ -1,4 +1,4 @@
-use breakpoints::cli::{parse_format, run_code_review, run_review, ReviewArgs};
+use breakpoints::cli::{parse_format, resolve_models, run_code_review, run_review, ReviewArgs};
 use breakpoints::config::Config;
 use breakpoints::domain::Mode;
 use breakpoints::evidence::{detect_mode, EvidenceOpts, Scope};
@@ -33,6 +33,8 @@ enum Cmd {
         #[arg(long)]
         models: Option<String>,
         #[arg(long)]
+        models_all: bool,
+        #[arg(long)]
         no_correlate: bool,
         #[arg(long)]
         block_threshold: Option<String>,
@@ -60,6 +62,7 @@ async fn main() {
             focus,
             lenses,
             models,
+            models_all,
             no_correlate,
             block_threshold,
             conf_floor,
@@ -88,61 +91,62 @@ async fn main() {
                 }
             };
 
-            // lead provider 选取（与既有逻辑一致）。
-            let lead = models
-                .as_deref()
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim().to_string())
-                .or_else(|| cfg.review.default_models.first().cloned())
-                .or_else(|| {
-                    let mut v: Vec<_> = cfg.providers.iter().collect();
-                    v.sort_by_key(|p| std::cmp::Reverse(p.1.priority));
-                    v.first().map(|(k, _)| (*k).clone())
-                });
-            let lead_pc = match lead.as_deref().and_then(|n| cfg.providers.get(n).map(|pc| (n, pc))) {
-                Some((n, pc)) => {
-                    let key = cfg.resolve_key(n).unwrap_or_default();
-                    (n.to_string(), pc.clone(), key)
-                }
-                None => {
-                    eprintln!("no provider available, please configure [providers.*] first");
-                    std::process::exit(2);
-                }
-            };
-
             let fmt = parse_format(&format);
             let args = ReviewArgs {
-                mode, base: base.clone(), scope, spec, focus, lenses, models,
-                models_all: false,
+                mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
                 no_correlate, block_threshold, conf_floor, background, format, targets,
             };
 
+            let (planned, _replicate) = resolve_models(args.models.as_deref(), args.models_all, &cfg);
+            if planned.is_empty() {
+                eprintln!("no provider available, please configure [providers.*] first");
+                std::process::exit(2);
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+            // 按 mode 构造通用 ProviderRegistry：code 填 ToolLoop 实例、doc 填 Direct 实例。
+            let mut registry = breakpoints::provider::registry::ProviderRegistry::new();
+            for pm in &planned {
+                let pc = match cfg.providers.get(&pm.name) {
+                    Some(p) => p.clone(),
+                    None => {
+                        eprintln!("error: model '{}' has no [providers.{}] config", pm.name, pm.name);
+                        std::process::exit(2);
+                    }
+                };
+                let key = cfg.resolve_key(&pm.name).unwrap_or_default();
+                match detected {
+                    Mode::Code => {
+                        let backend = match backend_from_config(&pc, key) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                std::process::exit(2);
+                            }
+                        };
+                        registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.clone())));
+                    }
+                    Mode::Doc => {
+                        registry.insert(pm.name.clone(), Box::new(DirectProvider::from_config(&pc, key)));
+                    }
+                }
+            }
+
             let result = match detected {
                 Mode::Code => {
-                    // code：工具循环 + bundle 流水线
-                    let backend = match backend_from_config(&lead_pc.1, lead_pc.2) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            std::process::exit(2);
-                        }
-                    };
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let provider = ToolLoopProvider::new(backend, cwd.clone());
-                    let changes = match breakpoints::evidence::git::changed_files(base.as_deref(), scope_enum == Scope::Branch) {
+                    let changes = match breakpoints::evidence::git::changed_files(
+                        base.as_deref(),
+                        scope_enum == Scope::Branch,
+                    ) {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("error: {e}");
                             std::process::exit(2);
                         }
                     };
-                    run_code_review(&args, &provider, &cfg, changes, &cwd).await
+                    run_code_review(&args, &registry, &cfg, changes, &cwd).await
                 }
-                Mode::Doc => {
-                    // doc：维持 Phase-1 单发 lens×model（留到 S4）
-                    let provider = DirectProvider::from_config(&lead_pc.1, lead_pc.2);
-                    run_review(args, &provider, &cfg).await
-                }
+                Mode::Doc => run_review(args, &registry, &cfg).await,
             };
 
             match result {
