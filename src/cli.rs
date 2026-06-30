@@ -12,7 +12,7 @@ use crate::provider::ReviewProvider;
 use crate::verdict::{clamp_compliance, compute_verdict};
 use std::path::Path;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReviewArgs {
     pub mode: Option<String>,
     pub base: Option<String>,

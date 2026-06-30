@@ -80,6 +80,19 @@ pub fn read_result(ws: &Path, id: &str) -> Option<String> {
     std::fs::read_to_string(job_result(ws, id)).ok()
 }
 
+pub fn job_args(ws: &Path, id: &str) -> PathBuf {
+    jobs_dir(ws).join(format!("{id}.args.json"))
+}
+
+/// 原子写 jobs/<id>.args.json（父 --background 序列化 ReviewArgs，worker 读回）。
+pub fn write_args_raw(ws: &Path, id: &str, json: &str) -> std::io::Result<()> {
+    atomic_write(&job_args(ws, id), json.as_bytes())
+}
+
+pub fn read_args_raw(ws: &Path, id: &str) -> Option<String> {
+    std::fs::read_to_string(job_args(ws, id)).ok()
+}
+
 pub fn job_result_md(ws: &Path, id: &str) -> PathBuf {
     jobs_dir(ws).join(format!("{id}.result.md"))
 }
@@ -134,6 +147,7 @@ pub fn prune(ws: &Path, ttl: Duration, now: u64) {
         let _ = std::fs::remove_file(job_result(ws, id));
         let _ = std::fs::remove_file(job_result_md(ws, id));
         let _ = std::fs::remove_file(consumed_marker(ws, id));
+        let _ = std::fs::remove_file(job_args(ws, id));
     }
 }
 
@@ -225,6 +239,29 @@ mod tests {
         st.status = status;
         write_state(ws, &st).unwrap();
         append_log(ws, id, "{}").unwrap();
+    }
+
+    #[test]
+    fn args_raw_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        assert!(read_args_raw(ws, "j").is_none());
+        write_args_raw(ws, "j", r#"{"mode":"doc"}"#).unwrap();
+        assert_eq!(read_args_raw(ws, "j").unwrap(), r#"{"mode":"doc"}"#);
+    }
+
+    #[test]
+    fn review_args_serde_round_trips() {
+        // ReviewArgs 可序列化/反序列化（worker 经 args 文件重建）
+        let json = serde_json::to_string(&crate::cli::ReviewArgs {
+            mode: Some("doc".into()), base: None, scope: "working-tree".into(),
+            spec: vec![], focus: None, lenses: None, models: None, models_all: false,
+            no_correlate: false, block_threshold: None, conf_floor: None,
+            background: true, format: "json".into(), targets: vec!["spec.md".into()],
+        }).unwrap();
+        let back: crate::cli::ReviewArgs = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.targets, vec!["spec.md".to_string()]);
+        assert_eq!(back.mode.as_deref(), Some("doc"));
     }
 
     #[test]
