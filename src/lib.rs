@@ -11,5 +11,6 @@ pub mod output;
 pub mod positioning;
 pub mod prompt;
 pub mod provider;
+pub mod state;
 pub mod tools;
 pub mod verdict;
