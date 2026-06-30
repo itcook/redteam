@@ -9,7 +9,7 @@ fn json(p: &str) -> serde_json::Value {
     serde_json::from_str(&read(p)).unwrap_or_else(|e| panic!("parse {p}: {e}"))
 }
 
-fn frontmatter<'a>(body: &'a str, key: &str) -> Option<String> {
+fn frontmatter(body: &str, key: &str) -> Option<String> {
     // 取前两个 "---" 之间、形如 "key: value" 的值
     let mut lines = body.lines();
     assert_eq!(lines.next(), Some("---"), "frontmatter must start with ---");
