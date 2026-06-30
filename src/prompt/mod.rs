@@ -5,6 +5,7 @@ use crate::lens::Lens;
 const CODE_TPL: &str = include_str!("templates/adversarial-code.md");
 const DOC_TPL: &str = include_str!("templates/adversarial-doc.md");
 const CODE_BUNDLE_TPL: &str = include_str!("templates/adversarial-code-bundle.md");
+const REFUTE_TPL: &str = include_str!("templates/adversarial-refute.md");
 
 /// Detect the preferred output language from locale environment variables.
 /// Reads LC_ALL → LC_MESSAGES → LANG in order, extracts the language prefix,
@@ -47,6 +48,19 @@ pub fn build_prompt(input: &ReviewInput, lens: &Lens, user_focus: &str) -> Strin
         .replace("{{COLLECTION_GUIDANCE}}", &input.collection_guidance)
         .replace("{{TARGET_LABEL}}", &input.target_label)
         .replace("{{REVIEW_INPUT}}", &input.body)
+        .replace("{{OUTPUT_LANGUAGE}}", &output_language())
+}
+
+/// 构造 refute prompt：给定 claimed finding，让 skeptic 对抗复审。
+/// 复用 review-as-refute——返回的 findings 空=upheld、非空=refuted（见模板 output_contract）。
+pub fn build_refute_prompt(finding: &crate::domain::Finding) -> String {
+    REFUTE_TPL
+        .replace("{{FILE}}", &finding.file)
+        .replace("{{LINE_START}}", &finding.line_start.to_string())
+        .replace("{{TITLE}}", &finding.title)
+        .replace("{{SEVERITY}}", finding.severity.as_str())
+        .replace("{{BODY}}", &finding.body)
+        .replace("{{QUOTE}}", &finding.quote)
         .replace("{{OUTPUT_LANGUAGE}}", &output_language())
 }
 
@@ -163,6 +177,24 @@ mod tests {
         assert!(!p.contains("{{"), "no residual {{}} placeholders");
         assert!(p.contains("Simplified Chinese"), "prompt must contain language name");
         unsafe { std::env::remove_var("LANG"); }
+    }
+
+    #[test]
+    fn refute_prompt_carries_finding_and_upheld_empty_contract() {
+        use crate::domain::{Finding, Severity};
+        let f = Finding {
+            id: "x".into(), severity: Severity::High, title: "missing auth".into(),
+            body: "no check before db write".into(), file: "src/a.rs".into(),
+            line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
+            lenses: vec!["L1".into()], models: vec!["claude".into()], agreement: 1,
+            hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
+        };
+        let p = build_refute_prompt(&f);
+        assert!(!p.contains("{{"), "no residual placeholders");
+        assert!(p.contains("src/a.rs") && p.contains("12"), "file:line injected");
+        assert!(p.contains("missing auth") && p.contains("db.write(token)"), "title+quote injected");
+        // upheld=空 findings 的契约必须在 prompt 中
+        assert!(p.to_lowercase().contains("findings"), "output contract present");
     }
 
     #[test]
