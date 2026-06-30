@@ -1,0 +1,10 @@
+{
+  "name": "breakpoint",
+  "description": "模型无关的对抗式代码/文档评审工具（brk）",
+  "version": "1.0.0",
+  "author": {
+    "name": "S.Kai",
+    "email": "laiwei@me.com"
+  },
+  "license": "MIT"
+}
