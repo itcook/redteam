@@ -2,7 +2,7 @@ use crate::bundle::Bundle;
 use crate::domain::{Finding, RawFinding, ReviewInput};
 use crate::hash::fnv1a64_hex;
 use crate::lens::Lens;
-use crate::prompt::{build_bundle_prompt, build_prompt};
+use crate::prompt::{build_bundle_prompt, build_doc_prompt, build_prompt};
 use crate::provider::{LensRequest, ProviderError, ReviewProvider};
 use std::cmp::Reverse;
 use std::sync::Arc;
@@ -338,6 +338,100 @@ pub async fn run_code_fanout(
     }
 }
 
+/// 单篇文档评审（整篇文档为单一单元、无 bundle；候补链语义同 run_one_bundle）。
+async fn run_one_doc(
+    provider: &dyn ReviewProvider,
+    input: &ReviewInput,
+    rules: &[&Lens],
+    focus: &str,
+    opts: &OrchestrateOpts,
+) -> Result<(Vec<Finding>, (u64, u64)), String> {
+    let prompt = build_doc_prompt(input, rules, focus);
+
+    let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
+    if !opts.replicate {
+        chain.sort_by_key(|m| Reverse(m.priority));
+    }
+    let chain: Vec<&PlannedModel> = if opts.replicate || opts.no_fallback {
+        chain.into_iter().take(1).collect()
+    } else {
+        chain
+    };
+
+    let mut errs: Vec<String> = Vec::new();
+    for pm in &chain {
+        match call_with_retry(provider, &pm.name, &prompt, opts.retries).await {
+            Ok(call) => {
+                let fs = call.findings.iter().map(|r| enrich(r, "doc", &pm.name)).collect();
+                return Ok((fs, (call.input_tokens, call.output_tokens)));
+            }
+            Err(e) => errs.push(format!("doc model {}: {e}", pm.name)),
+        }
+    }
+    Err(errs.join("; "))
+}
+
+/// doc 线扇出（整篇文档为单一单元）：
+/// - replicate=true：每 model 各跑一遍（对抗复制），失败记 failed_models（守 exit-2）；Semaphore 限并发。
+/// - replicate=false：单条候补链（按 priority 降序、首个成功即止），整链失败只记 warning。
+pub async fn run_doc_fanout(
+    provider: &dyn ReviewProvider,
+    input: &ReviewInput,
+    rules: &[&Lens],
+    focus: &str,
+    opts: &OrchestrateOpts,
+) -> RawResults {
+    if opts.replicate {
+        let sem = Arc::new(Semaphore::new(opts.max_concurrency.max(1)));
+        let futures = opts.models.iter().map(|pm| {
+            let sem = sem.clone();
+            let model_name = pm.name.clone();
+            let single = OrchestrateOpts {
+                models: vec![pm.clone()],
+                replicate: true,
+                no_fallback: opts.no_fallback,
+                max_concurrency: opts.max_concurrency,
+                retries: opts.retries,
+            };
+            async move {
+                let _permit = sem.acquire().await.expect("semaphore not closed");
+                let res = run_one_doc(provider, input, rules, focus, &single).await;
+                (model_name, res)
+            }
+        });
+        let results = futures::future::join_all(futures).await;
+        let mut out = RawResults::default();
+        for (model_hint, res) in results {
+            match res {
+                Ok((fs, (it, ot))) => {
+                    out.findings.extend(fs);
+                    out.usage.0 += it;
+                    out.usage.1 += ot;
+                }
+                Err(warn) => {
+                    out.warnings.push(warn);
+                    if !out.failed_models.contains(&model_hint) {
+                        out.failed_models.push(model_hint);
+                    }
+                }
+            }
+        }
+        out
+    } else {
+        // 单一单元候补链：仅一个任务，无需信号量。
+        let mut out = RawResults::default();
+        match run_one_doc(provider, input, rules, focus, opts).await {
+            Ok((fs, (it, ot))) => {
+                out.findings.extend(fs);
+                out.usage.0 += it;
+                out.usage.1 += ot;
+            }
+            Err(warn) => out.warnings.push(warn),
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +648,70 @@ mod tests {
         let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts).await;
         assert_eq!(out.findings.len(), 1); // alpha 成功
         assert!(out.failed_models.contains(&"beta".to_string()));
+    }
+
+    fn doc_input() -> ReviewInput {
+        ReviewInput {
+            mode: Mode::Doc, target_label: "spec.md".into(),
+            collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn doc_fanout_replicate_runs_every_model() {
+        use std::collections::BTreeMap;
+        let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
+        scripted.insert("alpha".into(), vec![raw_at("spec.md", "alpha-issue", Severity::High)]);
+        scripted.insert("beta".into(), vec![raw_at("spec.md", "beta-issue", Severity::High)]);
+        let provider = crate::provider::fake::FakeProvider { scripted };
+        let rules = vec![by_id("D1").unwrap(), by_id("D2").unwrap()];
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "alpha".into(), priority: 10 },
+                PlannedModel { name: "beta".into(), priority: 5 },
+            ],
+            replicate: true, no_fallback: false, max_concurrency: 8, retries: 0,
+        };
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts).await;
+        assert_eq!(out.findings.len(), 2, "one finding per model over the single doc");
+        let models: std::collections::BTreeSet<&str> =
+            out.findings.iter().flat_map(|f| f.models.iter().map(|s| s.as_str())).collect();
+        assert!(models.contains("alpha") && models.contains("beta"));
+        assert!(out.failed_models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn doc_fanout_replicate_records_failed_model() {
+        let provider = FakeProvider::with("alpha", vec![raw_at("spec.md", "alpha-issue", Severity::High)]);
+        let rules = vec![by_id("D1").unwrap()];
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "alpha".into(), priority: 10 },
+                PlannedModel { name: "beta".into(), priority: 5 },
+            ],
+            replicate: true, no_fallback: false, max_concurrency: 8, retries: 0,
+        };
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts).await;
+        assert_eq!(out.findings.len(), 1);
+        assert!(out.failed_models.contains(&"beta".to_string()));
+    }
+
+    #[tokio::test]
+    async fn doc_fanout_fallback_chain_first_success_wins() {
+        // 非 replicate 候补：claude 无脚本、gpt 有 → 候补命中 gpt，不记 failed_models。
+        let provider = FakeProvider::with("gpt", vec![raw_at("spec.md", "found-by-gpt", Severity::High)]);
+        let rules = vec![by_id("D1").unwrap()];
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "claude".into(), priority: 30 },
+                PlannedModel { name: "gpt".into(), priority: 20 },
+            ],
+            replicate: false, no_fallback: false, max_concurrency: 4, retries: 0,
+        };
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts).await;
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].models, vec!["gpt".to_string()]);
+        assert!(out.failed_models.is_empty());
     }
 
     #[tokio::test]
