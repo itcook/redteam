@@ -6,6 +6,7 @@ pub mod domain;
 pub mod evidence;
 pub mod hash;
 pub mod lens;
+pub mod model;
 pub mod orchestrate;
 pub mod output;
 pub mod positioning;
