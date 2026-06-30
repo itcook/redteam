@@ -24,6 +24,13 @@ fn render_md(r: &ReviewReport) -> String {
                 f.title, f.file, f.line_start,
                 f.lenses.join(", "), f.models.join(", "), f.agreement,
                 f.body, f.recommendation));
+            if let Some(v) = &f.verify {
+                let tag = match v.verdict {
+                    crate::domain::VerifyVerdict::Refuted => "refuted",
+                    crate::domain::VerifyVerdict::Upheld => "upheld",
+                };
+                s.push_str(&format!("  _[verify: {} by {}]_\n", tag, v.model));
+            }
         }
         s.push('\n');
     }
@@ -111,5 +118,13 @@ mod tests {
     fn md_next_steps_absent_when_empty() {
         let s = render(&report(), Format::Md);
         assert!(!s.contains("## next steps"), "next_steps section must not appear when empty");
+    }
+    #[test]
+    fn md_marks_refuted_verify() {
+        use crate::domain::{Verify, VerifyVerdict};
+        let mut r = report();
+        r.findings[0].verify = Some(Verify { verdict: VerifyVerdict::Refuted, model: "gpt".into(), note: "guarded".into() });
+        let s = render(&r, Format::Md);
+        assert!(s.to_lowercase().contains("refuted"), "md must mark refuted findings");
     }
 }

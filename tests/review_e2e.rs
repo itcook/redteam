@@ -203,3 +203,46 @@ default_models=["alpha","ghost"]
     assert!(report.run.failed_models.contains(&"ghost".to_string()));
     assert_eq!(code, 2);                            // approve 但对照集不完整
 }
+
+#[tokio::test]
+async fn code_replicate_lone_blocking_refuted_flips_to_approve() {
+    use breakpoints::cli::{run_code_review, ReviewArgs};
+    use breakpoints::config::Config;
+    use breakpoints::domain::{Severity, Verdict, VerifyVerdict, RawFinding};
+    use breakpoints::evidence::git::FileChange;
+    use breakpoints::provider::registry::ProviderRegistry;
+    use breakpoints::provider::fake::FakeProvider;
+
+    fn rf(file: &str, quote: &str, title: &str, sev: Severity) -> RawFinding {
+        RawFinding { severity: sev, title: title.into(), body: "b".into(), file: file.into(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "fix".into(),
+            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()) }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
+
+    // 单 model alpha 自审：review 报一条 High 孤证(agreement=1)；refute 退化自审 alpha，
+    // FakeProvider 同脚本对 refute 也返回非空 → refuted → confidence 0 → 不翻 verdict。
+    let cfg = Config::from_layers(&[r#"[review]
+default_models=["alpha"]
+"#]).unwrap();
+    let mut reg = ProviderRegistry::new();
+    reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", "missing auth", Severity::High)])));
+
+    let args = ReviewArgs {
+        mode: Some("code".into()), base: None, scope: "working-tree".into(),
+        spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
+        no_correlate: true, block_threshold: None, conf_floor: None,
+        background: false, format: "json".into(), targets: vec![],
+    };
+    let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
+    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path()).await.unwrap();
+
+    let f = report.findings.iter().find(|f| f.file == "src/a.rs").expect("finding present");
+    assert_eq!(f.verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted, "孤证被交叉 refute 证伪");
+    assert_eq!(f.confidence, 0.0, "refuted 降 confidence 下 floor");
+    assert_eq!(report.verdict, Verdict::Approve, "证伪后不翻 verdict");
+    assert!(code == 0 || code == 2, "approve → 0/2，非 10");
+}
