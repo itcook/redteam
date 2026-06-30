@@ -129,9 +129,87 @@ pub fn config_paths() -> Vec<PathBuf> {
     v
 }
 
+/// 把 [providers.<name>] 写进用户配置（config_paths()[0]），toml 深合并保留其他内容。
+/// 只写 kind/base_url/model/priority/api_key_env——**绝不写明文 key**。
+pub fn write_provider(
+    name: &str,
+    kind: &str,
+    base_url: Option<&str>,
+    model: &str,
+    priority: i32,
+    api_key_env: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = config_paths()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no config path"))?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut root: toml::Value =
+        toml::from_str(&existing).unwrap_or_else(|_| toml::Value::Table(Default::default()));
+    let root_t = root
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
+    let providers = root_t
+        .entry("providers".to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let providers_t = providers
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[providers] is not a table"))?;
+
+    let mut t = toml::value::Table::new();
+    t.insert("kind".into(), toml::Value::String(kind.to_string()));
+    t.insert("model".into(), toml::Value::String(model.to_string()));
+    if let Some(b) = base_url {
+        t.insert("base_url".into(), toml::Value::String(b.to_string()));
+    }
+    if let Some(e) = api_key_env {
+        t.insert("api_key_env".into(), toml::Value::String(e.to_string()));
+    }
+    t.insert("priority".into(), toml::Value::Integer(priority as i64));
+    providers_t.insert(name.to_string(), toml::Value::Table(t));
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, toml::to_string_pretty(&root)?)?;
+    Ok(())
+}
+
+/// 测试专用：跨 config 子模块串行化 XDG_CONFIG_HOME 环境变量写入，防并行测试污染。
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_provider_persists_block_without_key() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK 串行化
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()); }
+        // 先放一段已有 [review]，验证保留
+        let cfg_path = config_paths()[0].clone();
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(&cfg_path, "[review]\nblock_threshold=\"high\"\n").unwrap();
+
+        write_provider("local", "openai-compatible", Some("http://localhost:11434/v1"), "qwen", 10, Some("LOCAL_KEY")).unwrap();
+
+        let cfg = Config::load().unwrap();
+        let p = cfg.providers.get("local").expect("provider written");
+        assert_eq!(p.model, "qwen");
+        assert_eq!(p.priority, 10);
+        assert_eq!(p.base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(p.api_key_env.as_deref(), Some("LOCAL_KEY"));
+        // 既有 [review] 保留
+        assert_eq!(cfg.review.block_threshold, crate::domain::Severity::High);
+        // 配置文本不含明文 key（只有 api_key_env 引用）
+        let raw = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(!raw.contains("sk-"), "no plaintext key in config");
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME"); }
+    }
+
     #[test]
     fn project_overrides_user() {
         let user = r#"[review]

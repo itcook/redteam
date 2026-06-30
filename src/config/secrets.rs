@@ -42,12 +42,10 @@ pub fn write_secret(provider: &str, key: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn write_secret_persists_and_chmods_600() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = super::super::ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: ENV_LOCK 串行化 env 变更
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()); }
