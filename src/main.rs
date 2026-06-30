@@ -396,7 +396,50 @@ async fn main() {
                 }
                 breakpoints::model::check_exit_code(&avs)
             }
-            ModelCmd::Setup { .. } => { eprintln!("model setup: implemented in next task"); 2 }
+            ModelCmd::Setup { provider, kind, base_url, model, key, priority, key_store } => {
+                let k = breakpoints::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
+                let model = match model {
+                    Some(m) => m,
+                    None => { eprintln!("error: --model is required"); std::process::exit(2); }
+                };
+                let api_key_env = breakpoints::model::derive_api_key_env(&provider, &k);
+                let prio = priority.unwrap_or(0);
+                if let Err(e) = breakpoints::config::write_provider(
+                    &provider, &k, base_url.as_deref(), &model, prio, Some(&api_key_env),
+                ) {
+                    eprintln!("error: failed to write provider config: {e}");
+                    std::process::exit(2);
+                }
+                // key 去处：env(默认，打印 export) / secrets(写 secrets.toml)
+                match key_store.as_str() {
+                    "secrets" => match key {
+                        Some(k) => {
+                            if let Err(e) = breakpoints::config::secrets::write_secret(&provider, &k) {
+                                eprintln!("error: failed to write secret: {e}");
+                                std::process::exit(2);
+                            }
+                            println!("wrote key to {} (chmod 600)", breakpoints::config::secrets::secrets_path().display());
+                        }
+                        None => { eprintln!("error: --key-store secrets requires --key"); std::process::exit(2); }
+                    },
+                    _ => {
+                        // env 默认：主配置只记 api_key_env，提示用户设 env。
+                        match key {
+                            Some(k) => println!("add to your shell profile:\n  export {api_key_env}={k}"),
+                            None => println!("set the API key in your environment:\n  export {api_key_env}=<your-key>"),
+                        }
+                    }
+                }
+                println!("configured provider '{provider}' (kind={k}, model={model}, api_key_env={api_key_env})");
+                // 完成后自动跑一次 check
+                let cfg = Config::load().unwrap_or_default();
+                let prober = breakpoints::model::probe::HttpProber::new();
+                let avs = breakpoints::model::check_all(&cfg, &prober).await;
+                for a in &avs {
+                    println!("{}  {}", a.provider, a.status_str());
+                }
+                0
+            }
             ModelCmd::List { .. } => { eprintln!("model list: implemented in next task"); 2 }
         },
     };

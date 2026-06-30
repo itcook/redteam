@@ -64,6 +64,33 @@ pub fn check_exit_code(avs: &[Availability]) -> i32 {
     }
 }
 
+/// 推断 provider kind：显式 > 有 base_url(openai-compatible) > 按名推断 > 兜底 openai-compatible。
+pub fn derive_kind(provider: &str, explicit_kind: Option<&str>, base_url: Option<&str>) -> String {
+    if let Some(k) = explicit_kind {
+        return k.to_string();
+    }
+    if base_url.is_some() {
+        return "openai-compatible".to_string();
+    }
+    let p = provider.to_lowercase();
+    if p.contains("claude") || p.contains("anthropic") {
+        "anthropic".to_string()
+    } else if p.contains("gpt") || p.contains("openai") {
+        "openai".to_string()
+    } else {
+        "openai-compatible".to_string()
+    }
+}
+
+/// 推断默认 api_key_env：anthropic→ANTHROPIC_API_KEY / openai→OPENAI_API_KEY / 否则 <PROVIDER_UPPER>_API_KEY。
+pub fn derive_api_key_env(provider: &str, kind: &str) -> String {
+    match kind {
+        "anthropic" => "ANTHROPIC_API_KEY".to_string(),
+        "openai" => "OPENAI_API_KEY".to_string(),
+        _ => format!("{}_API_KEY", provider.to_uppercase().replace('-', "_")),
+    }
+}
+
 /// 测试探测替身（pub 供后续 task 复用）。
 pub struct FakeProber {
     pub reachable: bool,
@@ -119,6 +146,22 @@ mod tests {
     #[test]
     fn exit_code_empty_is_nonzero() {
         assert_eq!(check_exit_code(&[]), 1, "无 provider→非 0（预检无可用 model）");
+    }
+
+    #[test]
+    fn derive_kind_rules() {
+        assert_eq!(derive_kind("anything", Some("anthropic"), None), "anthropic"); // 显式优先
+        assert_eq!(derive_kind("x", None, Some("http://h/v1")), "openai-compatible"); // base_url
+        assert_eq!(derive_kind("claude", None, None), "anthropic"); // 名推断
+        assert_eq!(derive_kind("gpt", None, None), "openai");
+        assert_eq!(derive_kind("mystery", None, None), "openai-compatible"); // 兜底
+    }
+
+    #[test]
+    fn derive_api_key_env_rules() {
+        assert_eq!(derive_api_key_env("claude", "anthropic"), "ANTHROPIC_API_KEY");
+        assert_eq!(derive_api_key_env("gpt", "openai"), "OPENAI_API_KEY");
+        assert_eq!(derive_api_key_env("local", "openai-compatible"), "LOCAL_API_KEY");
     }
 
     #[test]
