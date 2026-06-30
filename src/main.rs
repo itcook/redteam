@@ -50,6 +50,16 @@ enum Cmd {
         format: String,
         targets: Vec<String>,
     },
+    /// 查询作业状态：无 id 列全部，有 id 打印该作业 JSON。
+    Status { job_id: Option<String> },
+    /// 取回已完成作业的评审结果（读后标记已消费）。
+    Result {
+        job_id: String,
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    /// 取消 running/pending 作业（发 SIGTERM）。
+    Cancel { job_id: String },
     /// 隐藏：后台 worker（由 `review --background` re-exec 拉起，用户不直接调）。
     #[command(hide = true)]
     Worker {
@@ -94,6 +104,26 @@ fn spawn_detached_worker(job_id: &str) -> std::io::Result<u32> {
     }
     let child = cmd.spawn()?;
     Ok(child.id())
+}
+
+/// 把作业列表渲染成每行一条的摘要（status 命令无 id 时用）。
+fn render_job_list(jobs: &[breakpoints::state::job::JobState]) -> String {
+    let mut lines: Vec<String> = jobs.iter().map(|s| {
+        let mode = s.mode.map(|m| format!("{m:?}")).unwrap_or_else(|| "?".into());
+        format!("{}  {:?}  {}  {}/{}", s.job_id, s.status, mode, s.progress.done, s.progress.total)
+    }).collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+/// 机会式 prune：加载配置，清过期作业。
+fn prune_here(ws: &std::path::Path) {
+    let cfg = Config::load().unwrap_or_default();
+    breakpoints::state::store::prune(
+        ws,
+        breakpoints::state::store::parse_ttl(&cfg.review.state_ttl),
+        now_secs(),
+    );
 }
 
 /// 探测 mode + 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
@@ -205,7 +235,8 @@ async fn main() {
                 }
             }
 
-            // 前台路径：构造 registry 后调 run_review_dispatch。
+            // 前台路径：机会式 prune + 构造 registry 后调 run_review_dispatch。
+            prune_here(&breakpoints::state::store::workspace_bucket(&cwd));
             let (_detected, registry) = build_registry(&args, &cfg, &cwd);
 
             let result = breakpoints::cli::run_review_dispatch(&args, &registry, &cfg, &cwd).await;
@@ -247,6 +278,83 @@ async fn main() {
             let code = breakpoints::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
             std::process::exit(code);
         }
+        Cmd::Status { job_id } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let ws = breakpoints::state::store::workspace_bucket(&cwd);
+            prune_here(&ws); // 机会式 prune
+            match job_id {
+                None => {
+                    let jobs = breakpoints::state::job::list_states(&ws);
+                    println!("{}", render_job_list(&jobs));
+                    0
+                }
+                Some(id) => match breakpoints::state::job::read_state(&ws, &id) {
+                    Some(st) => { println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default()); 0 }
+                    None => { eprintln!("no such job: {id}"); 2 }
+                },
+            }
+        }
+        Cmd::Result { job_id, format } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let ws = breakpoints::state::store::workspace_bucket(&cwd);
+            prune_here(&ws);
+            let st = breakpoints::state::job::read_state(&ws, &job_id);
+            match st {
+                Some(s) if matches!(s.status, breakpoints::state::job::JobStatus::Done) => {
+                    // 按 format 直读对应渲染文件（worker 已同落 json+md，无需反序列化）。
+                    let content = if format == "md" {
+                        breakpoints::state::store::read_result_md(&ws, &job_id)
+                            .or_else(|| breakpoints::state::store::read_result(&ws, &job_id))
+                    } else {
+                        breakpoints::state::store::read_result(&ws, &job_id)
+                    };
+                    match content {
+                        Some(raw) => {
+                            println!("{raw}");
+                            let _ = breakpoints::state::store::mark_consumed(&ws, &job_id);
+                            s.exit_code.unwrap_or(0)
+                        }
+                        None => { eprintln!("result expired or missing for {job_id}"); 2 }
+                    }
+                }
+                Some(s) => { eprintln!("job {job_id} not done (status: {:?})", s.status); 2 }
+                None => { eprintln!("no such job: {job_id}"); 2 }
+            }
+        }
+        Cmd::Cancel { job_id } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let ws = breakpoints::state::store::workspace_bucket(&cwd);
+            match breakpoints::state::job::read_state(&ws, &job_id) {
+                Some(mut s) if matches!(s.status, breakpoints::state::job::JobStatus::Running | breakpoints::state::job::JobStatus::Pending) => {
+                    if let Some(pid) = s.pid {
+                        // SAFETY: kill 单系统调用；pid 来自本 workspace 自己写的状态。
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                    }
+                    s.status = breakpoints::state::job::JobStatus::Cancelled;
+                    let _ = breakpoints::state::job::write_state(&ws, &s);
+                    println!("cancelled {job_id}");
+                    0
+                }
+                Some(s) => { eprintln!("job {job_id} not cancellable (status: {:?})", s.status); 2 }
+                None => { eprintln!("no such job: {job_id}"); 2 }
+            }
+        }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use breakpoints::state::job::{JobState, JobStatus};
+    #[test]
+    fn render_job_list_one_line_per_job_sorted() {
+        let mut a = JobState::new("aaa", 0); a.status = JobStatus::Done;
+        let mut b = JobState::new("bbb", 0); b.status = JobStatus::Running;
+        let out = render_job_list(&[b, a]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("aaa"), "sorted by id");
+        assert!(lines[0].contains("Done") && lines[1].contains("Running"));
+    }
 }
