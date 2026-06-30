@@ -6,6 +6,7 @@ const CODE_TPL: &str = include_str!("templates/adversarial-code.md");
 const DOC_TPL: &str = include_str!("templates/adversarial-doc.md");
 const CODE_BUNDLE_TPL: &str = include_str!("templates/adversarial-code-bundle.md");
 const REFUTE_TPL: &str = include_str!("templates/adversarial-refute.md");
+const DOC_BUNDLE_TPL: &str = include_str!("templates/adversarial-doc-bundle.md");
 
 /// Detect the preferred output language from locale environment variables.
 /// Reads LC_ALL → LC_MESSAGES → LANG in order, extracts the language prefix,
@@ -65,14 +66,9 @@ pub fn build_refute_prompt(finding: &crate::domain::Finding) -> String {
         .replace("{{OUTPUT_LANGUAGE}}", &output_language())
 }
 
-/// 构造一个文件包的对抗 prompt：所有适用 rule 注入为关注清单，bundle diff 内联。
-pub fn build_bundle_prompt(
-    target_label: &str,
-    bundle: &Bundle,
-    rules: &[&Lens],
-    user_focus: &str,
-) -> String {
-    let rules_block = rules
+/// 把 rule 集格式化为关注清单（code-bundle 与 doc-bundle 共用）。
+fn rules_block(rules: &[&Lens]) -> String {
+    rules
         .iter()
         .map(|l| {
             let cap = if l.max_severity.is_some() {
@@ -83,7 +79,33 @@ pub fn build_bundle_prompt(
             format!("- [{}] {}: {}{}", l.id, l.title, l.focus, cap)
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
+
+/// 构造 doc 对抗 prompt：全 D 系 rule 注入为一份关注清单、整篇文档内联、教模型遗漏类留空 quote。
+pub fn build_doc_prompt(input: &ReviewInput, rules: &[&Lens], user_focus: &str) -> String {
+    let spec_docs = if input.spec_docs.is_empty() {
+        "(none)".to_string()
+    } else {
+        input.spec_docs.join(", ")
+    };
+    DOC_BUNDLE_TPL
+        .replace("{{RULES}}", &rules_block(rules))
+        .replace("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus })
+        .replace("{{SPEC_DOCS}}", &spec_docs)
+        .replace("{{TARGET_LABEL}}", &input.target_label)
+        .replace("{{REVIEW_INPUT}}", &input.body)
+        .replace("{{OUTPUT_LANGUAGE}}", &output_language())
+}
+
+/// 构造一个文件包的对抗 prompt：所有适用 rule 注入为关注清单，bundle diff 内联。
+pub fn build_bundle_prompt(
+    target_label: &str,
+    bundle: &Bundle,
+    rules: &[&Lens],
+    user_focus: &str,
+) -> String {
+    let rules_str = rules_block(rules);
 
     let diffs_block = bundle
         .files
@@ -101,7 +123,7 @@ pub fn build_bundle_prompt(
 
     CODE_BUNDLE_TPL
         .replace("{{TARGET_LABEL}}", target_label)
-        .replace("{{RULES}}", &rules_block)
+        .replace("{{RULES}}", &rules_str)
         .replace("{{FILE_LIST}}", &file_list)
         .replace("{{BUNDLE_DIFFS}}", &diffs_block)
         .replace("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus })
@@ -216,5 +238,25 @@ mod tests {
         assert!(p.contains("auth"), "user focus injected");
         // L5 是 compliance rule → 注入 severity 封顶提示
         assert!(p.to_lowercase().contains("compliance rule"), "compliance cap note present");
+    }
+
+    #[test]
+    fn doc_prompt_injects_all_rules_doc_body_and_omission_contract() {
+        use crate::domain::{Mode, ReviewInput};
+        use crate::lens::by_id;
+        let input = ReviewInput {
+            mode: Mode::Doc, target_label: "spec.md".into(),
+            collection_guidance: String::new(), body: "DOCBODY".into(),
+            spec_docs: vec!["design.md".into()],
+        };
+        let rules = vec![by_id("D1").unwrap(), by_id("D2").unwrap(), by_id("D5").unwrap()];
+        let p = build_doc_prompt(&input, &rules, "auth");
+        assert!(!p.contains("{{"), "no residual placeholders");
+        assert!(p.contains("[D1]") && p.contains("[D2]") && p.contains("[D5]"), "all rules injected");
+        assert!(p.contains("DOCBODY"), "doc body inlined");
+        assert!(p.contains("design.md"), "spec docs injected");
+        assert!(p.contains("auth"), "user focus injected");
+        assert!(p.to_lowercase().contains("omission"), "omission/empty-quote contract present");
+        assert!(p.to_lowercase().contains("compliance rule"), "D5 compliance cap note present");
     }
 }
