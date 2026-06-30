@@ -2,7 +2,7 @@ use crate::bundle::{group, select_files};
 use crate::config::Config;
 use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc};
 use crate::domain::{Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
-use crate::evidence::{collect, EvidenceOpts, Scope};
+use crate::evidence::{collect, detect_mode, EvidenceOpts, Scope};
 use crate::evidence::git::FileChange;
 use crate::lens::select;
 use crate::orchestrate::{run_code_fanout, run_doc_fanout, OrchestrateOpts, PlannedModel};
@@ -298,6 +298,152 @@ pub async fn run_code_review(
 
     let code = exit_code(verdict, !report.run.failed_models.is_empty());
     Ok((report, code))
+}
+
+/// 统一 mode 探测 + 评审分发（前台 main 与后台 worker 共用）。
+/// code：git changed_files → run_code_review；doc：run_review。
+pub async fn run_review_dispatch(
+    args: &ReviewArgs,
+    provider: &dyn ReviewProvider,
+    cfg: &Config,
+    cwd: &Path,
+) -> anyhow::Result<(ReviewReport, i32)> {
+    // run_review_dispatch 永远同步执行——--background 分叉发生在 main.rs，先于此处；
+    // 故两分支都强制 background=false（否则 run_code_review/run_review 会 bail）。
+    let mut sync_args = args.clone();
+    sync_args.background = false;
+    let scope_enum = if sync_args.scope == "branch" { Scope::Branch } else { Scope::WorkingTree };
+    let mode_opt = sync_args.mode.as_deref().map(|m| if m == "code" { Mode::Code } else { Mode::Doc });
+    let eopts = EvidenceOpts {
+        mode: mode_opt,
+        base: sync_args.base.clone(),
+        scope: scope_enum,
+        spec: sync_args.spec.clone(),
+        targets: sync_args.targets.clone(),
+    };
+    let detected = detect_mode(&eopts)?;
+    match detected {
+        Mode::Code => {
+            let changes = crate::evidence::git::changed_files(sync_args.base.as_deref(), scope_enum == Scope::Branch)?;
+            run_code_review(&sync_args, provider, cfg, changes, cwd).await
+        }
+        Mode::Doc => run_review(sync_args, provider, cfg).await,
+    }
+}
+
+/// 状态机包裹评审：running → (评审) → done+result.json / failed+error。返回退出码。
+/// 已被 cancel（状态 Cancelled）时不覆盖为 Done，保留 cancelled 终态。
+pub async fn run_job(
+    ws: &Path,
+    job_id: &str,
+    args: &ReviewArgs,
+    provider: &dyn ReviewProvider,
+    cfg: &Config,
+    cwd: &Path,
+    started_at: u64,
+) -> i32 {
+    use crate::state::job::{read_state, write_state, JobState, JobStatus};
+    use crate::state::store::{job_result, write_result};
+
+    let mut st = read_state(ws, job_id).unwrap_or_else(|| JobState::new(job_id, started_at));
+    st.status = JobStatus::Running;
+    let _ = write_state(ws, &st);
+
+    match run_review_dispatch(args, provider, cfg, cwd).await {
+        Ok((report, code)) => {
+            // 同渲染 json + md 落盘（result 命令按 format 直读，避免反序列化 report 图）。
+            let json = crate::output::render(&report, crate::output::Format::Json);
+            let md = crate::output::render(&report, crate::output::Format::Md);
+            let _ = write_result(ws, job_id, &json);
+            let _ = crate::state::store::write_result_md(ws, job_id, &md);
+            // 若期间已被 cancel，保留 cancelled；否则 done。
+            let latest = read_state(ws, job_id);
+            let cancelled = matches!(latest.as_ref().map(|s| s.status), Some(JobStatus::Cancelled));
+            st.status = if cancelled { JobStatus::Cancelled } else { JobStatus::Done };
+            st.exit_code = Some(code);
+            st.mode = Some(report.mode);
+            st.models = report.run.models.clone();
+            st.lenses = report.run.lenses.clone();
+            st.result_path = Some(job_result(ws, job_id).to_string_lossy().into_owned());
+            let _ = write_state(ws, &st);
+            code
+        }
+        Err(e) => {
+            st.status = JobStatus::Failed;
+            st.error = Some(e.to_string());
+            st.exit_code = Some(2);
+            let _ = write_state(ws, &st);
+            2
+        }
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+    use crate::state::job::{read_state, JobStatus};
+    use crate::state::store::read_result;
+    use crate::provider::fake::FakeProvider;
+    use crate::domain::{RawFinding, Severity};
+    use std::collections::BTreeMap;
+
+    fn doc_args(target: &str) -> ReviewArgs {
+        ReviewArgs {
+            mode: Some("doc".into()), base: None, scope: "working-tree".into(),
+            spec: vec![], focus: None, lenses: None, models: None, models_all: false,
+            no_correlate: false, block_threshold: None, conf_floor: None,
+            background: true, format: "json".into(), targets: vec![target.into()],
+        }
+    }
+    fn cfg() -> Config {
+        Config::from_layers(&[
+            "[providers.alpha]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
+             [review]\ndefault_models=[\"alpha\"]\n",
+        ]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_job_done_writes_result_and_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("spec.md");
+        std::fs::write(&doc, "intro\nthe wrong claim here\nend\n").unwrap();
+        let dp = doc.to_string_lossy().to_string();
+        // alpha 报一条锚得到的 finding
+        let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
+        scripted.insert("alpha".into(), vec![RawFinding {
+            severity: Severity::High, title: "t".into(), body: "b".into(), file: dp.clone(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
+            hard_constraint: false, quote: "the wrong claim here".into(), lens: None,
+        }]);
+        let provider = FakeProvider { scripted };
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        crate::state::job::write_state(&ws, &crate::state::job::JobState::new("j1", 500)).unwrap();
+
+        let code = run_job(&ws, "j1", &doc_args(&dp), &provider, &cfg(), dir.path(), 500).await;
+
+        let st = read_state(&ws, "j1").unwrap();
+        assert_eq!(st.status, JobStatus::Done);
+        assert_eq!(st.exit_code, Some(code));
+        assert!(st.result_path.is_some());
+        // result.json 落盘且是合法 JSON
+        let res = read_result(&ws, "j1").unwrap();
+        assert!(res.contains("\"verdict\""));
+    }
+
+    #[tokio::test]
+    async fn run_job_failed_records_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        crate::state::job::write_state(ws, &crate::state::job::JobState::new("j2", 0)).unwrap();
+        // targets 指向不存在文件 → collect_doc 失败 → run_review_dispatch Err → failed
+        let provider = FakeProvider { scripted: BTreeMap::new() };
+        let code = run_job(ws, "j2", &doc_args("/nonexistent/zzz.md"), &provider, &cfg(), dir.path(), 0).await;
+        assert_eq!(code, 2);
+        let st = read_state(ws, "j2").unwrap();
+        assert_eq!(st.status, JobStatus::Failed);
+        assert!(st.error.is_some());
+    }
 }
 
 #[cfg(test)]
