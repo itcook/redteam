@@ -151,9 +151,21 @@ fn render_job_list(jobs: &[breakpoint::state::job::JobState]) -> String {
     lines.join("\n")
 }
 
+/// 加载配置；解析失败时打 stderr 警告（而非静默回落空配置——否则配置写错一个字段
+/// 就「无任何输出」无从诊断）后回落默认。
+fn load_config_warned() -> Config {
+    match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warning: 配置文件解析失败，回落默认/空配置：{e}");
+            Config::default()
+        }
+    }
+}
+
 /// 机会式 prune：加载配置，清过期作业。
 fn prune_here(ws: &std::path::Path) {
-    let cfg = Config::load().unwrap_or_default();
+    let cfg = load_config_warned();
     breakpoint::state::store::prune(
         ws,
         breakpoint::state::store::parse_ttl(&cfg.review.state_ttl),
@@ -227,7 +239,7 @@ async fn main() {
             format,
             targets,
         } => {
-            let cfg = Config::load().unwrap_or_default();
+            let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
             let fmt = parse_format(&format);
@@ -288,7 +300,7 @@ async fn main() {
             }
         }
         Cmd::Worker { job_id } => {
-            let cfg = Config::load().unwrap_or_default();
+            let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let ws = breakpoint::state::store::workspace_bucket(&cwd);
             let args_json = match breakpoint::state::store::read_args_raw(&ws, &job_id) {
@@ -389,7 +401,7 @@ async fn main() {
         }
         Cmd::Model { action } => match action {
             ModelCmd::Check => {
-                let cfg = Config::load().unwrap_or_default();
+                let cfg = load_config_warned();
                 let prober = breakpoint::model::probe::HttpProber::new();
                 let avs = breakpoint::model::check_all(&cfg, &prober).await;
                 for a in &avs {
@@ -399,6 +411,11 @@ async fn main() {
             }
             ModelCmd::Setup { provider, kind, base_url, model, key, priority, key_store } => {
                 let k = breakpoint::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
+                // 写入前守卫：kind/base_url 不合法则提示并拒绝写入，不污染配置。
+                if let Err(e) = breakpoint::model::validate_setup(&k, base_url.as_deref()) {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
                 let model = match model {
                     Some(m) => m,
                     None => { eprintln!("error: --model is required"); std::process::exit(2); }
@@ -433,7 +450,7 @@ async fn main() {
                 }
                 println!("configured provider '{provider}' (kind={k}, model={model}, api_key_env={api_key_env})");
                 // 完成后自动跑一次 check
-                let cfg = Config::load().unwrap_or_default();
+                let cfg = load_config_warned();
                 let prober = breakpoint::model::probe::HttpProber::new();
                 let avs = breakpoint::model::check_all(&cfg, &prober).await;
                 for a in &avs {
@@ -442,7 +459,7 @@ async fn main() {
                 0
             }
             ModelCmd::List { remote } => {
-                let cfg = Config::load().unwrap_or_default();
+                let cfg = load_config_warned();
                 let prober = breakpoint::model::probe::HttpProber::new();
                 match remote {
                     Some(prov) => {

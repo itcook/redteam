@@ -118,6 +118,25 @@ pub fn derive_api_key_env(provider: &str) -> String {
     format!("{norm}_API_KEY")
 }
 
+/// `model setup` 写入前守卫：kind 必须是合法 ProviderKind（含别名），base_url 若提供必须是
+/// http(s) URI 且有 host。任一不合法返回 Err（调用方提示并拒绝写入），避免污染配置导致后续
+/// 整份 config 解析失败（如曾经的 kind="claude" → check 无输出）。
+pub fn validate_setup(kind: &str, base_url: Option<&str>) -> Result<(), String> {
+    if ProviderKind::parse(kind).is_none() {
+        return Err(format!(
+            "非法 provider kind '{kind}'。合法值：anthropic(别名 claude) / openai(别名 gpt) / \
+             openai-compatible / google(别名 gemini)"
+        ));
+    }
+    if let Some(b) = base_url {
+        match reqwest::Url::parse(b) {
+            Ok(u) if matches!(u.scheme(), "http" | "https") && u.has_host() => {}
+            _ => return Err(format!("非法 base_url '{b}'，需形如 https://host[/path]")),
+        }
+    }
+    Ok(())
+}
+
 /// 渲染已配置 provider 列表（每行 name/kind/model/status）+ 配置文件位置。
 pub fn render_model_list(cfg: &Config, avs: &[Availability], config_paths: &[String]) -> String {
     let mut lines: Vec<String> = Vec::new();
@@ -224,6 +243,21 @@ mod tests {
         assert_eq!(derive_api_key_env("my-proxy.v2"), "MY_PROXY_V2_API_KEY");
         // 核心修复：不同 provider 名 → 不同 env（消除同 kind 共用 OPENAI_API_KEY 的冲突）
         assert_ne!(derive_api_key_env("DeepSeek"), derive_api_key_env("Kimi"));
+    }
+
+    #[test]
+    fn validate_setup_guards_kind_and_url() {
+        // 合法 kind（含别名）
+        assert!(validate_setup("anthropic", None).is_ok());
+        assert!(validate_setup("claude", None).is_ok());
+        assert!(validate_setup("openai-compatible", Some("https://h/v1")).is_ok());
+        assert!(validate_setup("claude", Some("https://team.aigocode.com/v1")).is_ok());
+        // 非法 kind → 拒绝
+        assert!(validate_setup("foobar", None).is_err());
+        // 非法 base_url → 拒绝
+        assert!(validate_setup("openai", Some("not-a-url")).is_err());
+        assert!(validate_setup("openai", Some("ftp://h")).is_err()); // 非 http(s)
+        assert!(validate_setup("openai", Some("https://")).is_err()); // 无 host
     }
 
     #[test]

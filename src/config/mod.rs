@@ -7,7 +7,24 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum ProviderKind { Anthropic, Openai, OpenaiCompatible, Google }
+pub enum ProviderKind {
+    #[serde(alias = "claude")]
+    Anthropic,
+    #[serde(alias = "gpt")]
+    Openai,
+    #[serde(alias = "openai_compatible", alias = "compatible")]
+    OpenaiCompatible,
+    #[serde(alias = "gemini")]
+    Google,
+}
+
+impl ProviderKind {
+    /// 从字符串解析（复用 serde 的 rename + 别名：claude/gpt/gemini 等）；非法返回 None。
+    /// 供 `model setup` 写入前守卫——拒绝写出后续无法反序列化的坏配置。
+    pub fn parse(s: &str) -> Option<ProviderKind> {
+        serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProviderConfig {
