@@ -57,6 +57,7 @@ pub fn build_refute_prompt(finding: &crate::domain::Finding) -> String {
     REFUTE_TPL
         .replace("{{FILE}}", &finding.file)
         .replace("{{LINE_START}}", &finding.line_start.to_string())
+        .replace("{{LINE_END}}", &finding.line_end.to_string())
         .replace("{{TITLE}}", &finding.title)
         .replace("{{SEVERITY}}", finding.severity.as_str())
         .replace("{{BODY}}", &finding.body)

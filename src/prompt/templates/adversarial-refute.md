@@ -3,7 +3,7 @@ You are a skeptical verifier. A prior adversarial review CLAIMED the problem bel
 </role>
 
 <claimed_finding>
-File: {{FILE}}:{{LINE_START}}
+Location: {{FILE}}:{{LINE_START}}-{{LINE_END}}
 Title: {{TITLE}}
 Severity: {{SEVERITY}}
 Body: {{BODY}}

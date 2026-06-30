@@ -65,6 +65,10 @@ pub async fn verify_findings(
     .await;
     for (&i, v) in targets.iter().zip(verdicts) {
         if v.verdict == VerifyVerdict::Refuted {
+            // 证伪 → 降 confidence 到 0，使 compute_verdict 的 `confidence >= conf_floor`
+            // 过滤将其判为非 blocking（默认 floor=0.5 安全）。注意退化配置 conf_floor=0 下
+            // 0.0 >= 0.0 为真，refuted 仍会 blocking——实质修复（compute_verdict 显式排除
+            // verify==Refuted，不依赖 confidence 数值）留待 S4 与 doc-verify 一并处理。
             findings[i].confidence = 0.0;
         }
         findings[i].verify = Some(v);

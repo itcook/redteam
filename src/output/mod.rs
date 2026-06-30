@@ -127,4 +127,12 @@ mod tests {
         let s = render(&r, Format::Md);
         assert!(s.to_lowercase().contains("refuted"), "md must mark refuted findings");
     }
+    #[test]
+    fn md_marks_upheld_verify() {
+        use crate::domain::{Verify, VerifyVerdict};
+        let mut r = report();
+        r.findings[0].verify = Some(Verify { verdict: VerifyVerdict::Upheld, model: "gpt".into(), note: String::new() });
+        let s = render(&r, Format::Md);
+        assert!(s.to_lowercase().contains("upheld"), "md must mark upheld findings");
+    }
 }

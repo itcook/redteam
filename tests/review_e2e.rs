@@ -205,7 +205,7 @@ default_models=["alpha","ghost"]
 }
 
 #[tokio::test]
-async fn code_replicate_lone_blocking_refuted_flips_to_approve() {
+async fn code_replicate_lone_blocking_refuted_stays_approve() {
     use breakpoints::cli::{run_code_review, ReviewArgs};
     use breakpoints::config::Config;
     use breakpoints::domain::{Severity, Verdict, VerifyVerdict, RawFinding};

@@ -73,7 +73,7 @@ pub struct Finding {
 pub enum VerifyVerdict { Upheld, Refuted }
 
 /// 一条 finding 的 verify 结果（refute pass 产出）。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Verify {
     pub verdict: VerifyVerdict,
     /// 执行 refute 的 model 名（交叉验证用哪个）。
