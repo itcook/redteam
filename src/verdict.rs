@@ -27,7 +27,7 @@ pub fn compute_verdict(
         f.severity >= block_threshold
             && f.confidence >= conf_floor
             // 实质修复（carry-to-S4 ①）：被证伪的 finding 永不 blocking，不靠 confidence 数值。
-            && f.verify.as_ref().map_or(true, |v| v.verdict != VerifyVerdict::Refuted)
+            && f.verify.as_ref().is_none_or(|v| v.verdict != VerifyVerdict::Refuted)
     });
     if blocking { Verdict::Reject } else { Verdict::Approve }
 }

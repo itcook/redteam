@@ -4,7 +4,6 @@ use breakpoints::domain::Mode;
 use breakpoints::evidence::{detect_mode, EvidenceOpts, Scope};
 use breakpoints::output::render;
 use breakpoints::provider::backends::backend_from_config;
-use breakpoints::provider::direct::DirectProvider;
 use breakpoints::provider::tool_loop::ToolLoopProvider;
 use clap::{Parser, Subcommand};
 
@@ -115,21 +114,14 @@ async fn main() {
                     }
                 };
                 let key = cfg.resolve_key(&pm.name).unwrap_or_default();
-                match detected {
-                    Mode::Code => {
-                        let backend = match backend_from_config(&pc, key) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!("error: {e}");
-                                std::process::exit(2);
-                            }
-                        };
-                        registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.clone())));
+                let backend = match backend_from_config(&pc, key) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(2);
                     }
-                    Mode::Doc => {
-                        registry.insert(pm.name.clone(), Box::new(DirectProvider::from_config(&pc, key)));
-                    }
-                }
+                };
+                registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.clone())));
             }
 
             let result = match detected {

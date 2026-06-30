@@ -44,7 +44,7 @@ mod tests {
         let p = dir.path().join("spec.md");
         std::fs::write(&p, "# Design\nhello").unwrap();
         let ps = p.to_string_lossy().to_string();
-        let files = collect_doc_files(&[ps.clone()]).unwrap();
+        let files = collect_doc_files(std::slice::from_ref(&ps)).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, ps);
         assert!(files[0].1.contains("hello"));

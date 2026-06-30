@@ -1,13 +1,13 @@
 use crate::bundle::{group, select_files};
 use crate::config::Config;
-use crate::consolidate::{apply_clusters, correlate, dedup};
+use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc};
 use crate::domain::{Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::{collect, EvidenceOpts, Scope};
 use crate::evidence::git::FileChange;
 use crate::lens::select;
-use crate::orchestrate::{run_code_fanout, run_fanout, OrchestrateOpts, PlannedModel};
+use crate::orchestrate::{run_code_fanout, run_doc_fanout, OrchestrateOpts, PlannedModel};
 use crate::output::Format;
-use crate::positioning::anchor;
+use crate::positioning::{anchor, anchor_doc};
 use crate::provider::ReviewProvider;
 use crate::verdict::{clamp_compliance, compute_verdict};
 use std::path::Path;
@@ -151,24 +151,31 @@ pub async fn run_review(
         retries: 2,
     };
 
-    // 4. fan-out
+    // 4. fan-out（doc：全 D rule 一包 × model 工具循环）
     let focus = args.focus.clone().unwrap_or_default();
-    let raw = run_fanout(provider, &input, &lenses, &focus, &oopts).await;
+    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts).await;
 
-    // 5. consolidate：dedup → clamp → correlate → apply_clusters
-    let mut findings = dedup(raw.findings);
-    clamp_compliance(&mut findings);
-    let correlate_on = cfg.review.correlate && !args.no_correlate;
-    let lead_model = model_names.first().cloned().unwrap_or_default();
-    let clusters = correlate(provider, &lead_model, &findings, correlate_on).await;
-    apply_clusters(&mut findings, &clusters);
+    // 5. positioning（doc anchor：空引用=遗漏保留、编造丢弃；按受审文档内容锚定）
+    let docs = crate::evidence::doc::collect_doc_files(&args.targets)?;
+    let anchored = anchor_doc(raw.findings, &docs);
 
-    // 6. verdict
+    // 6. consolidate：dedup_doc（非行号相似度）→ clamp → correlate(桩) → verify(三层，doc refute)
     let block = args
         .block_threshold
         .as_deref()
         .map(parse_sev)
         .unwrap_or(cfg.review.block_threshold);
+    let mut findings = dedup_doc(anchored);
+    clamp_compliance(&mut findings);
+    let correlate_on = cfg.review.correlate && !args.no_correlate;
+    let lead_model = model_names.first().cloned().unwrap_or_default();
+    let clusters = correlate(provider, &lead_model, &findings, correlate_on).await;
+    apply_clusters(&mut findings, &clusters);
+    let findings = crate::consolidate::verify_findings(
+        findings, provider, &model_names, block, cfg.review.max_concurrency, Mode::Doc,
+    ).await;
+
+    // 7. verdict
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     let verdict = compute_verdict(&findings, block, floor);
 

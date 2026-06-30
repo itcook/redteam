@@ -65,9 +65,11 @@ pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
 }
 
 /// doc 版锚定（空引用=遗漏声明 carve-out）：
+///
 /// - quote 为空/纯空白 → 遗漏类声明：原样保留（无引用可锚），透传到三层 verify 判真伪。
 /// - quote 非空且在对应受审文档中命中 → 锚定到行。
 /// - quote 非空但文档中找不到（编造）或 finding.file 不匹配任何受审文档 → 丢弃。
+///
 /// docs：受审文档的 (path, content) 对（来自 evidence::doc::collect_doc_files）。
 /// 仅按已收集内容做内存内匹配，绝不按 model 控制的任意路径读盘。
 pub fn anchor_doc(findings: Vec<Finding>, docs: &[(String, String)]) -> Vec<Finding> {
