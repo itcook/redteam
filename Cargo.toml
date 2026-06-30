@@ -1,10 +1,10 @@
 [package]
-name = "breakpoints"
+name = "breakpoint"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "breakpoints"
+name = "breakpoint"
 path = "src/lib.rs"
 
 [[bin]]

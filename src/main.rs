@@ -1,12 +1,12 @@
-use breakpoints::cli::{parse_format, resolve_models, ReviewArgs};
-use breakpoints::config::Config;
-use breakpoints::model::Prober as _;
-use breakpoints::domain::Mode;
-use breakpoints::evidence::{detect_mode, EvidenceOpts, Scope};
-use breakpoints::output::render;
-use breakpoints::provider::backends::backend_from_config;
-use breakpoints::provider::registry::ProviderRegistry;
-use breakpoints::provider::tool_loop::ToolLoopProvider;
+use breakpoint::cli::{parse_format, resolve_models, ReviewArgs};
+use breakpoint::config::Config;
+use breakpoint::model::Prober as _;
+use breakpoint::domain::Mode;
+use breakpoint::evidence::{detect_mode, EvidenceOpts, Scope};
+use breakpoint::output::render;
+use breakpoint::provider::backends::backend_from_config;
+use breakpoint::provider::registry::ProviderRegistry;
+use breakpoint::provider::tool_loop::ToolLoopProvider;
 use clap::{Parser, Subcommand};
 use std::path::Path;
 
@@ -113,7 +113,7 @@ fn now_secs() -> u64 {
 /// 生成进程内唯一 job-id（pid+secs+cwd 的 fnv 前 12 位）。
 fn gen_job_id(cwd: &std::path::Path) -> String {
     let seed = format!("{}-{}", std::process::id(), now_secs());
-    let h = breakpoints::hash::fnv1a64_hex(&[&seed, &cwd.to_string_lossy()]);
+    let h = breakpoint::hash::fnv1a64_hex(&[&seed, &cwd.to_string_lossy()]);
     h[..12].to_string()
 }
 
@@ -142,7 +142,7 @@ fn spawn_detached_worker(job_id: &str) -> std::io::Result<u32> {
 }
 
 /// 把作业列表渲染成每行一条的摘要（status 命令无 id 时用）。
-fn render_job_list(jobs: &[breakpoints::state::job::JobState]) -> String {
+fn render_job_list(jobs: &[breakpoint::state::job::JobState]) -> String {
     let mut lines: Vec<String> = jobs.iter().map(|s| {
         let mode = s.mode.map(|m| format!("{m:?}")).unwrap_or_else(|| "?".into());
         format!("{}  {:?}  {}  {}/{}", s.job_id, s.status, mode, s.progress.done, s.progress.total)
@@ -154,9 +154,9 @@ fn render_job_list(jobs: &[breakpoints::state::job::JobState]) -> String {
 /// 机会式 prune：加载配置，清过期作业。
 fn prune_here(ws: &std::path::Path) {
     let cfg = Config::load().unwrap_or_default();
-    breakpoints::state::store::prune(
+    breakpoint::state::store::prune(
         ws,
-        breakpoints::state::store::parse_ttl(&cfg.review.state_ttl),
+        breakpoint::state::store::parse_ttl(&cfg.review.state_ttl),
         now_secs(),
     );
 }
@@ -238,25 +238,25 @@ async fn main() {
 
             // 后台：写 pending + args 文件 → spawn detached worker → 打印 job-id 退出。
             if background {
-                let ws = breakpoints::state::store::workspace_bucket(&cwd);
+                let ws = breakpoint::state::store::workspace_bucket(&cwd);
                 let job_id = gen_job_id(&cwd);
                 // 机会式 prune（与前台一致，见 Task 8 也在前台跑）
-                breakpoints::state::store::prune(
+                breakpoint::state::store::prune(
                     &ws,
-                    breakpoints::state::store::parse_ttl(&cfg.review.state_ttl),
+                    breakpoint::state::store::parse_ttl(&cfg.review.state_ttl),
                     now_secs(),
                 );
                 let args_json = serde_json::to_string(&args).unwrap_or_default();
-                if breakpoints::state::store::write_args_raw(&ws, &job_id, &args_json).is_err() {
+                if breakpoint::state::store::write_args_raw(&ws, &job_id, &args_json).is_err() {
                     eprintln!("error: failed to write job args");
                     std::process::exit(2);
                 }
-                let mut st = breakpoints::state::job::JobState::new(&job_id, now_secs());
-                let _ = breakpoints::state::job::write_state(&ws, &st);
+                let mut st = breakpoint::state::job::JobState::new(&job_id, now_secs());
+                let _ = breakpoint::state::job::write_state(&ws, &st);
                 match spawn_detached_worker(&job_id) {
                     Ok(pid) => {
                         st.pid = Some(pid);
-                        let _ = breakpoints::state::job::write_state(&ws, &st);
+                        let _ = breakpoint::state::job::write_state(&ws, &st);
                         println!("{job_id}");
                         std::process::exit(0);
                     }
@@ -268,13 +268,13 @@ async fn main() {
             }
 
             // 前台路径：机会式 prune + 构造 registry 后调 run_review_dispatch。
-            prune_here(&breakpoints::state::store::workspace_bucket(&cwd));
+            prune_here(&breakpoint::state::store::workspace_bucket(&cwd));
             let (_detected, registry) = match build_registry(&args, &cfg, &cwd) {
                 Ok(x) => x,
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
             };
 
-            let result = breakpoints::cli::run_review_dispatch(&args, &registry, &cfg, &cwd).await;
+            let result = breakpoint::cli::run_review_dispatch(&args, &registry, &cfg, &cwd).await;
 
             match result {
                 Ok((report, code)) => {
@@ -290,8 +290,8 @@ async fn main() {
         Cmd::Worker { job_id } => {
             let cfg = Config::load().unwrap_or_default();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = breakpoints::state::store::workspace_bucket(&cwd);
-            let args_json = match breakpoints::state::store::read_args_raw(&ws, &job_id) {
+            let ws = breakpoint::state::store::workspace_bucket(&cwd);
+            let args_json = match breakpoint::state::store::read_args_raw(&ws, &job_id) {
                 Some(j) => j,
                 None => {
                     eprintln!("error: no args for job {job_id}");
@@ -311,32 +311,32 @@ async fn main() {
                 Err(e) => {
                     eprintln!("error: {e}");
                     // 写 Failed 终态，让 status 命令能看到错误原因。
-                    let mut st = breakpoints::state::job::read_state(&ws, &job_id)
-                        .unwrap_or_else(|| breakpoints::state::job::JobState::new(&job_id, 0));
-                    st.status = breakpoints::state::job::JobStatus::Failed;
+                    let mut st = breakpoint::state::job::read_state(&ws, &job_id)
+                        .unwrap_or_else(|| breakpoint::state::job::JobState::new(&job_id, 0));
+                    st.status = breakpoint::state::job::JobStatus::Failed;
                     st.error = Some(e);
                     st.exit_code = Some(2);
-                    let _ = breakpoints::state::job::write_state(&ws, &st);
+                    let _ = breakpoint::state::job::write_state(&ws, &st);
                     std::process::exit(2);
                 }
             };
-            let started = breakpoints::state::job::read_state(&ws, &job_id)
+            let started = breakpoint::state::job::read_state(&ws, &job_id)
                 .map(|s| s.started_at)
                 .unwrap_or_else(now_secs);
-            let code = breakpoints::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
+            let code = breakpoint::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
             std::process::exit(code);
         }
         Cmd::Status { job_id } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = breakpoints::state::store::workspace_bucket(&cwd);
+            let ws = breakpoint::state::store::workspace_bucket(&cwd);
             prune_here(&ws); // 机会式 prune
             match job_id {
                 None => {
-                    let jobs = breakpoints::state::job::list_states(&ws);
+                    let jobs = breakpoint::state::job::list_states(&ws);
                     println!("{}", render_job_list(&jobs));
                     0
                 }
-                Some(id) => match breakpoints::state::job::read_state(&ws, &id) {
+                Some(id) => match breakpoint::state::job::read_state(&ws, &id) {
                     Some(st) => { println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default()); 0 }
                     None => { eprintln!("no such job: {id}"); 2 }
                 },
@@ -344,22 +344,22 @@ async fn main() {
         }
         Cmd::Result { job_id, format } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = breakpoints::state::store::workspace_bucket(&cwd);
+            let ws = breakpoint::state::store::workspace_bucket(&cwd);
             prune_here(&ws);
-            let st = breakpoints::state::job::read_state(&ws, &job_id);
+            let st = breakpoint::state::job::read_state(&ws, &job_id);
             match st {
-                Some(s) if matches!(s.status, breakpoints::state::job::JobStatus::Done) => {
+                Some(s) if matches!(s.status, breakpoint::state::job::JobStatus::Done) => {
                     // 按 format 直读对应渲染文件（worker 已同落 json+md，无需反序列化）。
                     let content = if format == "md" {
-                        breakpoints::state::store::read_result_md(&ws, &job_id)
-                            .or_else(|| breakpoints::state::store::read_result(&ws, &job_id))
+                        breakpoint::state::store::read_result_md(&ws, &job_id)
+                            .or_else(|| breakpoint::state::store::read_result(&ws, &job_id))
                     } else {
-                        breakpoints::state::store::read_result(&ws, &job_id)
+                        breakpoint::state::store::read_result(&ws, &job_id)
                     };
                     match content {
                         Some(raw) => {
                             println!("{raw}");
-                            let _ = breakpoints::state::store::mark_consumed(&ws, &job_id);
+                            let _ = breakpoint::state::store::mark_consumed(&ws, &job_id);
                             s.exit_code.unwrap_or(0)
                         }
                         None => { eprintln!("result expired or missing for {job_id}"); 2 }
@@ -371,15 +371,15 @@ async fn main() {
         }
         Cmd::Cancel { job_id } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = breakpoints::state::store::workspace_bucket(&cwd);
-            match breakpoints::state::job::read_state(&ws, &job_id) {
-                Some(mut s) if matches!(s.status, breakpoints::state::job::JobStatus::Running | breakpoints::state::job::JobStatus::Pending) => {
+            let ws = breakpoint::state::store::workspace_bucket(&cwd);
+            match breakpoint::state::job::read_state(&ws, &job_id) {
+                Some(mut s) if matches!(s.status, breakpoint::state::job::JobStatus::Running | breakpoint::state::job::JobStatus::Pending) => {
                     if let Some(pid) = s.pid {
                         // SAFETY: kill 单系统调用；pid 来自本 workspace 自己写的状态。
                         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
                     }
-                    s.status = breakpoints::state::job::JobStatus::Cancelled;
-                    let _ = breakpoints::state::job::write_state(&ws, &s);
+                    s.status = breakpoint::state::job::JobStatus::Cancelled;
+                    let _ = breakpoint::state::job::write_state(&ws, &s);
                     println!("cancelled {job_id}");
                     0
                 }
@@ -390,22 +390,22 @@ async fn main() {
         Cmd::Model { action } => match action {
             ModelCmd::Check => {
                 let cfg = Config::load().unwrap_or_default();
-                let prober = breakpoints::model::probe::HttpProber::new();
-                let avs = breakpoints::model::check_all(&cfg, &prober).await;
+                let prober = breakpoint::model::probe::HttpProber::new();
+                let avs = breakpoint::model::check_all(&cfg, &prober).await;
                 for a in &avs {
                     println!("{}  {}", a.provider, a.status_str());
                 }
-                breakpoints::model::check_exit_code(&avs)
+                breakpoint::model::check_exit_code(&avs)
             }
             ModelCmd::Setup { provider, kind, base_url, model, key, priority, key_store } => {
-                let k = breakpoints::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
+                let k = breakpoint::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
                 let model = match model {
                     Some(m) => m,
                     None => { eprintln!("error: --model is required"); std::process::exit(2); }
                 };
-                let api_key_env = breakpoints::model::derive_api_key_env(&provider, &k);
+                let api_key_env = breakpoint::model::derive_api_key_env(&provider, &k);
                 let prio = priority.unwrap_or(0);
-                if let Err(e) = breakpoints::config::write_provider(
+                if let Err(e) = breakpoint::config::write_provider(
                     &provider, &k, base_url.as_deref(), &model, prio, Some(&api_key_env),
                 ) {
                     eprintln!("error: failed to write provider config: {e}");
@@ -415,11 +415,11 @@ async fn main() {
                 match key_store.as_str() {
                     "secrets" => match key {
                         Some(k) => {
-                            if let Err(e) = breakpoints::config::secrets::write_secret(&provider, &k) {
+                            if let Err(e) = breakpoint::config::secrets::write_secret(&provider, &k) {
                                 eprintln!("error: failed to write secret: {e}");
                                 std::process::exit(2);
                             }
-                            println!("wrote key to {} (chmod 600)", breakpoints::config::secrets::secrets_path().display());
+                            println!("wrote key to {} (chmod 600)", breakpoint::config::secrets::secrets_path().display());
                         }
                         None => { eprintln!("error: --key-store secrets requires --key"); std::process::exit(2); }
                     },
@@ -434,8 +434,8 @@ async fn main() {
                 println!("configured provider '{provider}' (kind={k}, model={model}, api_key_env={api_key_env})");
                 // 完成后自动跑一次 check
                 let cfg = Config::load().unwrap_or_default();
-                let prober = breakpoints::model::probe::HttpProber::new();
-                let avs = breakpoints::model::check_all(&cfg, &prober).await;
+                let prober = breakpoint::model::probe::HttpProber::new();
+                let avs = breakpoint::model::check_all(&cfg, &prober).await;
                 for a in &avs {
                     println!("{}  {}", a.provider, a.status_str());
                 }
@@ -443,14 +443,14 @@ async fn main() {
             }
             ModelCmd::List { remote } => {
                 let cfg = Config::load().unwrap_or_default();
-                let prober = breakpoints::model::probe::HttpProber::new();
+                let prober = breakpoint::model::probe::HttpProber::new();
                 match remote {
                     Some(prov) => {
                         let pc = match cfg.providers.get(&prov) {
                             Some(p) => p,
                             None => { eprintln!("no such provider: {prov}"); std::process::exit(2); }
                         };
-                        let base = breakpoints::model::effective_base(pc);
+                        let base = breakpoint::model::effective_base(pc);
                         let key = cfg.resolve_key(&prov);
                         match prober.list_models(&base, key.as_deref()).await {
                             Ok(models) => {
@@ -461,10 +461,10 @@ async fn main() {
                         }
                     }
                     None => {
-                        let avs = breakpoints::model::check_all(&cfg, &prober).await;
-                        let paths: Vec<String> = breakpoints::config::config_paths()
+                        let avs = breakpoint::model::check_all(&cfg, &prober).await;
+                        let paths: Vec<String> = breakpoint::config::config_paths()
                             .iter().map(|p| p.display().to_string()).collect();
-                        println!("{}", breakpoints::model::render_model_list(&cfg, &avs, &paths));
+                        println!("{}", breakpoint::model::render_model_list(&cfg, &avs, &paths));
                         0
                     }
                 }
@@ -477,7 +477,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use breakpoints::state::job::{JobState, JobStatus};
+    use breakpoint::state::job::{JobState, JobStatus};
     #[test]
     fn render_job_list_one_line_per_job_sorted() {
         let mut a = JobState::new("aaa", 0); a.status = JobStatus::Done;
@@ -492,8 +492,8 @@ mod tests {
     /// C1：无 provider 配置的 Config + doc 模式 ReviewArgs → build_registry 返回 Err。
     #[test]
     fn build_registry_no_provider_returns_err() {
-        use breakpoints::cli::ReviewArgs;
-        use breakpoints::config::Config;
+        use breakpoint::cli::ReviewArgs;
+        use breakpoint::config::Config;
 
         // 空配置：无 [providers.*]，resolve_models 会产出空列表
         let cfg = Config::default();

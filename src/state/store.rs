@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::io::Write;
 
-/// 状态根目录：$BRK_STATE_DIR → $TMPDIR/breakpoints → /tmp/breakpoints。
+/// 状态根目录：$BRK_STATE_DIR → $TMPDIR/breakpoint → /tmp/breakpoint。
 pub fn state_root() -> PathBuf {
     if let Ok(d) = std::env::var("BRK_STATE_DIR") {
         if !d.is_empty() {
@@ -12,10 +12,10 @@ pub fn state_root() -> PathBuf {
     }
     if let Ok(t) = std::env::var("TMPDIR") {
         if !t.is_empty() {
-            return PathBuf::from(t).join("breakpoints");
+            return PathBuf::from(t).join("breakpoint");
         }
     }
-    PathBuf::from("/tmp/breakpoints")
+    PathBuf::from("/tmp/breakpoint")
 }
 
 /// 按 workspace 路径 fnv1a64 分桶（canonicalize 失败则用原路径字符串）。

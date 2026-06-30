@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// 读取 ~/.config/breakpoints/secrets.toml → { provider_name: key }
+/// 读取 ~/.config/breakpoint/secrets.toml → { provider_name: key }
 pub fn load_secrets() -> BTreeMap<String, String> {
     let path = secrets_path();
     let Ok(text) = std::fs::read_to_string(&path) else { return BTreeMap::new() };
@@ -9,7 +9,7 @@ pub fn load_secrets() -> BTreeMap<String, String> {
 }
 
 pub fn secrets_path() -> PathBuf {
-    dirs_config().join("breakpoints").join("secrets.toml")
+    dirs_config().join("breakpoint").join("secrets.toml")
 }
 
 pub fn dirs_config() -> PathBuf {
