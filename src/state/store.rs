@@ -111,6 +111,32 @@ pub fn result_consumed_at(ws: &Path, id: &str) -> Option<u64> {
     std::fs::read_to_string(consumed_marker(ws, id)).ok()?.trim().parse().ok()
 }
 
+use crate::state::job::{list_states, JobStatus};
+
+/// 机会式 prune：删已终态（done/failed/cancelled）且 started_at+ttl < now 的作业全部文件。
+/// pending/running 永不删（避免误删在跑作业，靠 OS /tmp + 后续 prune 兜底）。
+pub fn prune(ws: &Path, ttl: Duration, now: u64) {
+    let ttl_secs = ttl.as_secs();
+    for st in list_states(ws) {
+        let terminal = matches!(
+            st.status,
+            JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled
+        );
+        if !terminal {
+            continue;
+        }
+        if st.started_at.saturating_add(ttl_secs) >= now {
+            continue;
+        }
+        let id = &st.job_id;
+        let _ = std::fs::remove_file(job_json(ws, id));
+        let _ = std::fs::remove_file(job_log(ws, id));
+        let _ = std::fs::remove_file(job_result(ws, id));
+        let _ = std::fs::remove_file(job_result_md(ws, id));
+        let _ = std::fs::remove_file(consumed_marker(ws, id));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +216,31 @@ mod tests {
         mark_consumed(ws, "j").unwrap();
         // grace 标记记了一个时间戳（写入用 0，断言读回 Some）
         assert!(result_consumed_at(ws, "j").is_some());
+    }
+
+    use crate::state::job::{write_state, JobState, JobStatus};
+
+    fn dated_job(ws: &Path, id: &str, status: JobStatus, started_at: u64) {
+        let mut st = JobState::new(id, started_at);
+        st.status = status;
+        write_state(ws, &st).unwrap();
+        append_log(ws, id, "{}").unwrap();
+    }
+
+    #[test]
+    fn prune_removes_expired_terminal_jobs_keeps_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let ttl = Duration::from_secs(100);
+        let now = 1000u64;
+        dated_job(ws, "old-done", JobStatus::Done, 800);        // 800+100=900 < 1000 → 删
+        dated_job(ws, "fresh-done", JobStatus::Done, 950);      // 950+100=1050 > 1000 → 留
+        dated_job(ws, "old-running", JobStatus::Running, 800);  // 活跃 → 留（即便过期）
+        prune(ws, ttl, now);
+        assert!(crate::state::job::read_state(ws, "old-done").is_none(), "expired terminal job pruned");
+        assert!(crate::state::job::read_state(ws, "fresh-done").is_some(), "fresh job kept");
+        assert!(crate::state::job::read_state(ws, "old-running").is_some(), "active job kept");
+        // old-done 的 .log 也被删
+        assert!(!job_log(ws, "old-done").exists());
     }
 }
