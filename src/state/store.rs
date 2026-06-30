@@ -126,8 +126,33 @@ pub fn result_consumed_at(ws: &Path, id: &str) -> Option<u64> {
 
 use crate::state::job::{list_states, JobStatus};
 
-/// 机会式 prune：删已终态（done/failed/cancelled）且 started_at+ttl < now 的作业全部文件。
-/// pending/running 永不删（避免误删在跑作业，靠 OS /tmp + 后续 prune 兜底）。
+/// 检测 pid 是否仍存活：kill(pid, 0) 成功或 errno==EPERM → alive；ESRCH → dead。
+pub fn pid_alive(pid: u32) -> bool {
+    // SAFETY: kill(pid, 0) 是纯查询调用，不发送任何信号，只用于探测进程是否存在。
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return true;
+    }
+    let errno = unsafe { *libc::__error() };
+    // EPERM: 进程存在但无权限发信号 → alive
+    // ESRCH: 进程不存在 → dead
+    errno == libc::EPERM
+}
+
+fn remove_job_files(ws: &Path, id: &str) {
+    let _ = std::fs::remove_file(job_json(ws, id));
+    let _ = std::fs::remove_file(job_log(ws, id));
+    let _ = std::fs::remove_file(job_result(ws, id));
+    let _ = std::fs::remove_file(job_result_md(ws, id));
+    let _ = std::fs::remove_file(consumed_marker(ws, id));
+    let _ = std::fs::remove_file(job_args(ws, id));
+}
+
+/// 机会式 prune：
+/// - 终态作业（done/failed/cancelled）：started_at+ttl < now 时删除。
+/// - 非终态作业（pending/running）：
+///   - pid 存在且进程已死 → 回收（孤儿 worker）。
+///   - pid 不存在且 started_at+ttl < now → 也回收（长期未启动的悬空 pending）。
 pub fn prune(ws: &Path, ttl: Duration, now: u64) {
     let ttl_secs = ttl.as_secs();
     for st in list_states(ws) {
@@ -135,19 +160,22 @@ pub fn prune(ws: &Path, ttl: Duration, now: u64) {
             st.status,
             JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled
         );
-        if !terminal {
-            continue;
-        }
-        if st.started_at.saturating_add(ttl_secs) >= now {
-            continue;
-        }
         let id = &st.job_id;
-        let _ = std::fs::remove_file(job_json(ws, id));
-        let _ = std::fs::remove_file(job_log(ws, id));
-        let _ = std::fs::remove_file(job_result(ws, id));
-        let _ = std::fs::remove_file(job_result_md(ws, id));
-        let _ = std::fs::remove_file(consumed_marker(ws, id));
-        let _ = std::fs::remove_file(job_args(ws, id));
+        if terminal {
+            if st.started_at.saturating_add(ttl_secs) < now {
+                remove_job_files(ws, id);
+            }
+        } else {
+            // 非终态：检查是否需要回收孤儿
+            if let Some(pid) = st.pid {
+                if !pid_alive(pid) {
+                    remove_job_files(ws, id);
+                }
+            } else if st.started_at.saturating_add(ttl_secs) < now {
+                // 无 pid 且超过 TTL：悬空 pending，回收
+                remove_job_files(ws, id);
+            }
+        }
     }
 }
 
@@ -272,12 +300,63 @@ mod tests {
         let now = 1000u64;
         dated_job(ws, "old-done", JobStatus::Done, 800);        // 800+100=900 < 1000 → 删
         dated_job(ws, "fresh-done", JobStatus::Done, 950);      // 950+100=1050 > 1000 → 留
-        dated_job(ws, "old-running", JobStatus::Running, 800);  // 活跃 → 留（即便过期）
+        dated_job(ws, "old-running", JobStatus::Running, 800);  // 无 pid，过期 → 现在也会被删（悬空 pending）
         prune(ws, ttl, now);
         assert!(crate::state::job::read_state(ws, "old-done").is_none(), "expired terminal job pruned");
         assert!(crate::state::job::read_state(ws, "fresh-done").is_some(), "fresh job kept");
-        assert!(crate::state::job::read_state(ws, "old-running").is_some(), "active job kept");
+        assert!(crate::state::job::read_state(ws, "old-running").is_none(), "no-pid expired running job pruned");
         // old-done 的 .log 也被删
         assert!(!job_log(ws, "old-done").exists());
+    }
+
+    /// I1：spawn `true`（立即退出），等待其结束（pid 已死），写 Running + pid=Some(dead)
+    /// → prune（now 未过 ttl）→ 断言被回收。
+    /// 另保留 pid=自己（alive）的 Running，断言不被回收。
+    #[test]
+    fn prune_reaps_dead_pid_non_terminal_job() {
+        use crate::state::job::{write_state, JobState};
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+
+        // 用很长的 TTL，确保时间维度不会触发回收
+        let ttl = Duration::from_secs(86400);
+        let now = 1000u64;
+
+        // spawn `true`（立即退出），等它结束确保 pid 已 dead
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let dead_pid = child.id();
+        child.wait().expect("wait child");
+
+        // 写 Running 状态 + dead pid
+        let mut st_dead = JobState::new("dead-worker", 500);
+        st_dead.status = JobStatus::Running;
+        st_dead.pid = Some(dead_pid);
+        write_state(ws, &st_dead).unwrap();
+
+        // 保留 pid=自己（alive）的 Running
+        let self_pid = std::process::id();
+        let mut st_alive = JobState::new("alive-worker", 500);
+        st_alive.status = JobStatus::Running;
+        st_alive.pid = Some(self_pid);
+        write_state(ws, &st_alive).unwrap();
+
+        prune(ws, ttl, now);
+
+        assert!(
+            crate::state::job::read_state(ws, "dead-worker").is_none(),
+            "dead-pid Running job should be reaped by prune"
+        );
+        assert!(
+            crate::state::job::read_state(ws, "alive-worker").is_some(),
+            "alive-pid Running job should NOT be reaped"
+        );
+    }
+
+    /// I1：验证 pid_alive 对自身 pid 返回 true（基础正确性）。
+    #[test]
+    fn pid_alive_self_is_alive() {
+        assert!(pid_alive(std::process::id()), "自身进程应为 alive");
     }
 }

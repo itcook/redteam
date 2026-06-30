@@ -346,6 +346,10 @@ pub async fn run_job(
     use crate::state::store::{job_result, write_result};
 
     let mut st = read_state(ws, job_id).unwrap_or_else(|| JobState::new(job_id, started_at));
+    // I2：写 Running 前检查是否已被 cancel，若是则直接返回，保留 Cancelled 终态。
+    if st.status == JobStatus::Cancelled {
+        return st.exit_code.unwrap_or(0);
+    }
     st.status = JobStatus::Running;
     let _ = write_state(ws, &st);
 
@@ -443,6 +447,32 @@ mod job_tests {
         let st = read_state(ws, "j2").unwrap();
         assert_eq!(st.status, JobStatus::Failed);
         assert!(st.error.is_some());
+    }
+
+    /// I2：pre-cancel 场景——run_job 读到 Cancelled 状态时应直接返回，不覆盖为 Running/Done，
+    /// 且不写 result.json。
+    #[tokio::test]
+    async fn run_job_honours_pre_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+
+        // 先写一个 Cancelled 状态（模拟 cancel 命令先于 worker 启动）
+        let mut pre = crate::state::job::JobState::new("j3", 0);
+        pre.status = JobStatus::Cancelled;
+        pre.exit_code = Some(0);
+        crate::state::job::write_state(ws, &pre).unwrap();
+
+        let provider = FakeProvider { scripted: BTreeMap::new() };
+        let _code = run_job(ws, "j3", &doc_args("/any.md"), &provider, &cfg(), dir.path(), 0).await;
+
+        // 状态仍应是 Cancelled
+        let st = read_state(ws, "j3").unwrap();
+        assert_eq!(st.status, JobStatus::Cancelled, "pre-cancel 状态不应被覆盖");
+        // 不应写 result.json
+        assert!(
+            crate::state::store::read_result(ws, "j3").is_none(),
+            "Cancelled 提前返回不应留下 result.json"
+        );
     }
 }
 

@@ -127,7 +127,8 @@ fn prune_here(ws: &std::path::Path) {
 }
 
 /// 探测 mode + 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
-fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> (Mode, ProviderRegistry) {
+/// 返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
+fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<(Mode, ProviderRegistry), String> {
     let scope_enum = if args.scope == "branch" { Scope::Branch } else { Scope::WorkingTree };
     let mode_opt = args.mode.as_deref().map(|m| if m == "code" { Mode::Code } else { Mode::Doc });
     let eopts = EvidenceOpts {
@@ -140,15 +141,13 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> (Mode, Provide
     let detected = match detect_mode(&eopts) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(2);
+            return Err(format!("{e}"));
         }
     };
 
     let (planned, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     if planned.is_empty() {
-        eprintln!("no provider available, please configure [providers.*] first");
-        std::process::exit(2);
+        return Err("no provider available, please configure [providers.*] first".to_string());
     }
 
     let mut registry = ProviderRegistry::new();
@@ -156,22 +155,20 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> (Mode, Provide
         let pc = match cfg.providers.get(&pm.name) {
             Some(p) => p.clone(),
             None => {
-                eprintln!("error: model '{}' has no [providers.{}] config", pm.name, pm.name);
-                std::process::exit(2);
+                return Err(format!("model '{}' has no [providers.{}] config", pm.name, pm.name));
             }
         };
         let key = cfg.resolve_key(&pm.name).unwrap_or_default();
         let backend = match backend_from_config(&pc, key) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(2);
+                return Err(format!("{e}"));
             }
         };
         registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf())));
     }
 
-    (detected, registry)
+    Ok((detected, registry))
 }
 
 #[tokio::main]
@@ -237,7 +234,10 @@ async fn main() {
 
             // 前台路径：机会式 prune + 构造 registry 后调 run_review_dispatch。
             prune_here(&breakpoints::state::store::workspace_bucket(&cwd));
-            let (_detected, registry) = build_registry(&args, &cfg, &cwd);
+            let (_detected, registry) = match build_registry(&args, &cfg, &cwd) {
+                Ok(x) => x,
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+            };
 
             let result = breakpoints::cli::run_review_dispatch(&args, &registry, &cfg, &cwd).await;
 
@@ -271,7 +271,20 @@ async fn main() {
                 }
             };
             // 建 registry（复用 build_registry：探测 mode + resolve_models + 构造 ProviderRegistry）
-            let (_detected, registry) = build_registry(&args, &cfg, &cwd);
+            let (_detected, registry) = match build_registry(&args, &cfg, &cwd) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    // 写 Failed 终态，让 status 命令能看到错误原因。
+                    let mut st = breakpoints::state::job::read_state(&ws, &job_id)
+                        .unwrap_or_else(|| breakpoints::state::job::JobState::new(&job_id, 0));
+                    st.status = breakpoints::state::job::JobStatus::Failed;
+                    st.error = Some(e);
+                    st.exit_code = Some(2);
+                    let _ = breakpoints::state::job::write_state(&ws, &st);
+                    std::process::exit(2);
+                }
+            };
             let started = breakpoints::state::job::read_state(&ws, &job_id)
                 .map(|s| s.started_at)
                 .unwrap_or_else(now_secs);
@@ -356,5 +369,39 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("aaa"), "sorted by id");
         assert!(lines[0].contains("Done") && lines[1].contains("Running"));
+    }
+
+    /// C1：无 provider 配置的 Config + doc 模式 ReviewArgs → build_registry 返回 Err。
+    #[test]
+    fn build_registry_no_provider_returns_err() {
+        use breakpoints::cli::ReviewArgs;
+        use breakpoints::config::Config;
+
+        // 空配置：无 [providers.*]，resolve_models 会产出空列表
+        let cfg = Config::default();
+        let cwd = std::path::Path::new(".");
+        let args = ReviewArgs {
+            mode: Some("doc".into()),
+            base: None,
+            scope: "working-tree".into(),
+            spec: vec![],
+            focus: None,
+            lenses: None,
+            models: None,
+            models_all: false,
+            no_correlate: false,
+            block_threshold: None,
+            conf_floor: None,
+            background: false,
+            format: "json".into(),
+            targets: vec![],
+        };
+        let result = build_registry(&args, &cfg, cwd);
+        assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");
+        let msg = result.err().unwrap();
+        assert!(
+            msg.contains("no provider"),
+            "错误消息应提示 provider 问题，实际: {msg}"
+        );
     }
 }
