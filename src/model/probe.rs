@@ -22,10 +22,6 @@ impl HttpProber {
 
 #[async_trait::async_trait]
 impl Prober for HttpProber {
-    async fn reachable(&self, base_url: &str) -> bool {
-        // 任意 HTTP 响应（含 4xx）即视为端点可达；connect/timeout/DNS 失败=不可达。
-        self.client.get(base_url).send().await.is_ok()
-    }
     async fn list_models(&self, base_url: &str, key: Option<&str>) -> anyhow::Result<Vec<String>> {
         let url = format!("{}/models", base_url.trim_end_matches('/'));
         let mut req = self.client.get(&url);

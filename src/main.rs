@@ -403,7 +403,7 @@ async fn main() {
                     Some(m) => m,
                     None => { eprintln!("error: --model is required"); std::process::exit(2); }
                 };
-                let api_key_env = breakpoint::model::derive_api_key_env(&provider, &k);
+                let api_key_env = breakpoint::model::derive_api_key_env(&provider);
                 let prio = priority.unwrap_or(0);
                 if let Err(e) = breakpoint::config::write_provider(
                     &provider, &k, base_url.as_deref(), &model, prio, Some(&api_key_env),
