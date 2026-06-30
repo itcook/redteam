@@ -29,7 +29,8 @@ Write every finding's title, body, and recommendation in the language the docume
 
 <output_contract>
 Return ONLY JSON matching the provided schema: an object with a "findings" array.
-Each finding: severity (low|medium|high|critical), title, body, file (the document path the finding is about), line_start>=1, line_end>=1, confidence 0..1, recommendation, hard_constraint (boolean, optional), quote.
+Each finding: severity (low|medium|high|critical), title, body, file (the document path the finding is about), line_start>=1, line_end>=1, confidence 0..1, recommendation, hard_constraint (boolean, optional), quote, lens.
+- lens: the id of the rule from the rules list above that this finding belongs to (e.g. "D5").
 QUOTE RULES — this determines how the finding is anchored:
 - For a CONTRADICTION / INCONSISTENCY / wrong-statement finding: set "quote" to the EXACT verbatim text from the document that is wrong or self-conflicting. A fabricated quote (text not present in the document) causes the finding to be DROPPED.
 - For an OMISSION finding (something that SHOULD be specified but is entirely ABSENT from the document): leave "quote" as an empty string "". An empty quote signals an omission claim and is NOT dropped — it is routed to independent verification.

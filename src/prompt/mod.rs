@@ -284,5 +284,6 @@ mod tests {
         assert!(p.contains("auth"), "user focus injected");
         assert!(p.to_lowercase().contains("omission"), "omission/empty-quote contract present");
         assert!(p.to_lowercase().contains("compliance rule"), "D5 compliance cap note present");
+        assert!(p.contains("lens"), "doc prompt must teach model to tag lens id per finding");
     }
 }

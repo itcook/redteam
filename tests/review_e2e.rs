@@ -317,3 +317,66 @@ default_models=["alpha"]
     assert_eq!(report.verdict, Verdict::Approve, "证伪后不翻 verdict");
     assert!(code == 0 || code == 2, "approve → 0/2，非 10");
 }
+
+/// §7.4 硬封顶在 doc 线对 D5 的 e2e 验证：
+/// FakeProvider 脚本一条 lens=Some("D5") severity=High finding，
+/// 跑 run_review 后断言报告里该 finding 被 clamp_compliance 钳到 Medium。
+#[tokio::test]
+async fn doc_d5_compliance_hard_cap_clamps_high_to_medium() {
+    use breakpoints::domain::RawFinding;
+
+    let dir = tempfile::tempdir().unwrap();
+    let doc_path = dir.path().join("spec.md");
+    std::fs::write(&doc_path, "intro line\nthe document section heading\nconclusion\n").unwrap();
+    let dp = doc_path.to_string_lossy().to_string();
+
+    // 脚本一条 D5 finding：severity=High、quote 在文档中真实存在（anchor_doc 能命中）、lens=Some("D5")
+    let finding = RawFinding {
+        severity: Severity::High,
+        title: "doc standards violation".into(),
+        body: "missing required section".into(),
+        file: dp.clone(),
+        line_start: 1,
+        line_end: 1,
+        confidence: 0.9,
+        recommendation: "add section".into(),
+        hard_constraint: false,
+        quote: "the document section heading".into(),
+        lens: Some("D5".into()),
+    };
+
+    let provider = FakeProvider::with("alpha", vec![finding]);
+
+    let cfg = Config::from_layers(&[
+        "[providers.alpha]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
+         [review]\ndefault_models=[\"alpha\"]\n",
+    ]).unwrap();
+
+    let args = ReviewArgs {
+        mode: Some("doc".into()),
+        base: None,
+        scope: "working-tree".into(),
+        spec: vec![],
+        focus: None,
+        lenses: Some("D5".into()),
+        models: None,
+        models_all: false,
+        no_correlate: true,
+        block_threshold: None,
+        conf_floor: None,
+        background: false,
+        format: "json".into(),
+        targets: vec![dp],
+    };
+
+    let (report, _code) = run_review(args, &provider, &cfg).await.unwrap();
+
+    // 必须有 finding（未被丢弃）
+    assert_eq!(report.findings.len(), 1, "D5 finding must survive anchor");
+    // §7.4 硬封顶：High → clamp_compliance → Medium
+    assert_eq!(
+        report.findings[0].severity,
+        Severity::Medium,
+        "D5 finding severity must be clamped from High to Medium by clamp_compliance (§7.4 hard cap)"
+    );
+}

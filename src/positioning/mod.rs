@@ -82,7 +82,7 @@ pub fn anchor_doc(findings: Vec<Finding>, docs: &[(String, String)]) -> Vec<Find
         }
         // 引用类：按 finding.file 找对应受审文档内容（精确或后缀匹配）。
         let content = docs.iter().find_map(|(path, content)| {
-            if path == &f.file || path.ends_with(&f.file) {
+            if path == &f.file || path.ends_with(&format!("/{}", f.file)) {
                 Some(content.as_str())
             } else {
                 None
@@ -229,5 +229,15 @@ mod tests {
         let docs = vec![("spec.md".to_string(), "content".to_string())];
         let out = anchor_doc(vec![finding("other.md", "content")], &docs);
         assert!(out.is_empty(), "quote finding whose file matches no target is dropped");
+    }
+
+    #[test]
+    fn anchor_doc_does_not_over_match_bare_suffix() {
+        // docs path = "myspec.md", finding.file = "spec.md"
+        // 纯字节后缀 "myspec.md".ends_with("spec.md") = true（过匹配）
+        // 修复后：须要求前缀为 '/'，即 "myspec.md".ends_with("/spec.md") = false → 丢弃。
+        let docs = vec![("myspec.md".to_string(), "some real content here".to_string())];
+        let out = anchor_doc(vec![finding("spec.md", "some real content here")], &docs);
+        assert!(out.is_empty(), "bare suffix over-match must be eliminated after separator-aware fix");
     }
 }
