@@ -26,7 +26,25 @@ fn safe_read(root: &Path, rel: &str) -> Option<String> {
     String::from_utf8(slice.to_vec()).ok()
 }
 
-/// 把 quote 确定性定位到真实行；定位失败即丢弃（确定性幻觉过滤）。
+/// 把 quote 在给定内容中确定性定位到行跨度；空 quote 或未命中返回 None。
+fn locate_quote(content: &str, quote: &str) -> Option<(u32, u32)> {
+    let file_lines: Vec<String> = content.lines().map(normalize_ws).collect();
+    let raw_quote: Vec<String> = quote.lines().map(normalize_ws).collect();
+    let first_idx = raw_quote.iter().position(|l| !l.is_empty())?;
+    let last_idx = raw_quote.iter().rposition(|l| !l.is_empty())?;
+    let first = &raw_quote[first_idx];
+    // 先精确整行匹配（避免短/公共子串误锚到更早行），无则退子串包含（保召回）。
+    let hit = file_lines
+        .iter()
+        .position(|fl| fl == first)
+        .or_else(|| file_lines.iter().position(|fl| fl.contains(first.as_str())))?;
+    let ls = (hit as u32) + 1;
+    let span = (last_idx - first_idx + 1) as u32;
+    let le = (ls + span - 1).min(file_lines.len() as u32).max(ls);
+    Some((ls, le))
+}
+
+/// 把 quote 确定性定位到真实行；定位失败即丢弃（确定性幻觉过滤，code 线每条 finding 须指向真实代码）。
 pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
     let mut out = Vec::new();
     for mut f in findings {
@@ -34,32 +52,47 @@ pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
             Some(c) => c,
             None => continue,
         };
-        let file_lines: Vec<String> = content.lines().map(normalize_ws).collect();
-        // 保留空行的原始 quote（各行归一化）：跨度按"首个→最后一个非空行"算，含中间空行、去首尾空行
-        let raw_quote: Vec<String> = f.quote.lines().map(normalize_ws).collect();
-        let first_idx = raw_quote.iter().position(|l| !l.is_empty());
-        let last_idx = raw_quote.iter().rposition(|l| !l.is_empty());
-        let (first_idx, last_idx) = match (first_idx, last_idx) {
-            (Some(a), Some(b)) => (a, b),
-            _ => continue, // 空 quote → 丢弃
-        };
-        let first = &raw_quote[first_idx];
-        // 先精确整行匹配（更准，避免短/公共子串误锚到更早的行），无则退子串包含（保召回）。
-        let hit = file_lines
-            .iter()
-            .position(|fl| fl == first)
-            .or_else(|| file_lines.iter().position(|fl| fl.contains(first.as_str())));
-        match hit {
-            Some(i) => {
-                let ls = (i as u32) + 1;
-                // 真实跨度（含中间空行）：首→尾非空行的距离 + 1
-                let span = (last_idx - first_idx + 1) as u32;
-                let le = (ls + span - 1).min(file_lines.len() as u32).max(ls);
+        match locate_quote(&content, &f.quote) {
+            Some((ls, le)) => {
                 f.line_start = ls;
                 f.line_end = le;
                 out.push(f);
             }
-            None => continue, // 编造 → 丢弃
+            None => continue,
+        }
+    }
+    out
+}
+
+/// doc 版锚定（空引用=遗漏声明 carve-out）：
+/// - quote 为空/纯空白 → 遗漏类声明：原样保留（无引用可锚），透传到三层 verify 判真伪。
+/// - quote 非空且在对应受审文档中命中 → 锚定到行。
+/// - quote 非空但文档中找不到（编造）或 finding.file 不匹配任何受审文档 → 丢弃。
+/// docs：受审文档的 (path, content) 对（来自 evidence::doc::collect_doc_files）。
+/// 仅按已收集内容做内存内匹配，绝不按 model 控制的任意路径读盘。
+pub fn anchor_doc(findings: Vec<Finding>, docs: &[(String, String)]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for mut f in findings {
+        if f.quote.split_whitespace().next().is_none() {
+            // 遗漏类：原样保留。
+            out.push(f);
+            continue;
+        }
+        // 引用类：按 finding.file 找对应受审文档内容（精确或后缀匹配）。
+        let content = docs.iter().find_map(|(path, content)| {
+            if path == &f.file || path.ends_with(&f.file) {
+                Some(content.as_str())
+            } else {
+                None
+            }
+        });
+        match content.and_then(|c| locate_quote(c, &f.quote)) {
+            Some((ls, le)) => {
+                f.line_start = ls;
+                f.line_end = le;
+                out.push(f);
+            }
+            None => continue, // 编造引用 / 未知文件 → 丢弃
         }
     }
     out
@@ -165,5 +198,34 @@ mod tests {
         let out = anchor(vec![finding("a.rs", "log.info")], dir.path());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].line_start, 3); // 精确整行优先 → 第 3 行，而非第 1 行的子串
+    }
+
+    #[test]
+    fn anchor_doc_anchors_contradiction_quote() {
+        let docs = vec![("spec.md".to_string(), "line one\nthe wrong claim\nline three".to_string())];
+        let out = anchor_doc(vec![finding("spec.md", "the wrong claim")], &docs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line_start, 2);
+    }
+
+    #[test]
+    fn anchor_doc_keeps_omission_empty_quote() {
+        let docs = vec![("spec.md".to_string(), "whatever".to_string())];
+        let out = anchor_doc(vec![finding("spec.md", "")], &docs);
+        assert_eq!(out.len(), 1, "omission finding (empty quote) must be kept, not dropped");
+    }
+
+    #[test]
+    fn anchor_doc_drops_fabricated_quote() {
+        let docs = vec![("spec.md".to_string(), "real content only".to_string())];
+        let out = anchor_doc(vec![finding("spec.md", "this text is not in the doc")], &docs);
+        assert!(out.is_empty(), "fabricated quote must be dropped");
+    }
+
+    #[test]
+    fn anchor_doc_drops_quote_finding_for_unknown_file() {
+        let docs = vec![("spec.md".to_string(), "content".to_string())];
+        let out = anchor_doc(vec![finding("other.md", "content")], &docs);
+        assert!(out.is_empty(), "quote finding whose file matches no target is dropped");
     }
 }
