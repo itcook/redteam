@@ -258,7 +258,7 @@ pub async fn run_code_review(
     let mut findings = dedup(anchored);
     clamp_compliance(&mut findings);
     let findings = crate::consolidate::verify_findings(
-        findings, provider, &model_names, block, cfg.review.max_concurrency,
+        findings, provider, &model_names, block, cfg.review.max_concurrency, Mode::Code,
     ).await;
 
     // 7. verdict

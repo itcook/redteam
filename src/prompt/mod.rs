@@ -6,6 +6,7 @@ const CODE_TPL: &str = include_str!("templates/adversarial-code.md");
 const DOC_TPL: &str = include_str!("templates/adversarial-doc.md");
 const CODE_BUNDLE_TPL: &str = include_str!("templates/adversarial-code-bundle.md");
 const REFUTE_TPL: &str = include_str!("templates/adversarial-refute.md");
+const REFUTE_DOC_TPL: &str = include_str!("templates/adversarial-refute-doc.md");
 const DOC_BUNDLE_TPL: &str = include_str!("templates/adversarial-doc-bundle.md");
 
 /// Detect the preferred output language from locale environment variables.
@@ -54,15 +55,24 @@ pub fn build_prompt(input: &ReviewInput, lens: &Lens, user_focus: &str) -> Strin
 
 /// 构造 refute prompt：给定 claimed finding，让 skeptic 对抗复审。
 /// 复用 review-as-refute——返回的 findings 空=upheld、非空=refuted（见模板 output_contract）。
-pub fn build_refute_prompt(finding: &crate::domain::Finding) -> String {
-    REFUTE_TPL
-        .replace("{{FILE}}", &finding.file)
+/// mode 选模板：Code→code 模板、Doc→doc 模板（空 quote 渲染为遗漏占位说明）。
+pub fn build_refute_prompt(finding: &crate::domain::Finding, mode: Mode) -> String {
+    let tpl = match mode {
+        Mode::Code => REFUTE_TPL,
+        Mode::Doc => REFUTE_DOC_TPL,
+    };
+    let quote = if finding.quote.split_whitespace().next().is_none() {
+        "(empty — the finding claims this is omitted from the document)".to_string()
+    } else {
+        finding.quote.clone()
+    };
+    tpl.replace("{{FILE}}", &finding.file)
         .replace("{{LINE_START}}", &finding.line_start.to_string())
         .replace("{{LINE_END}}", &finding.line_end.to_string())
         .replace("{{TITLE}}", &finding.title)
         .replace("{{SEVERITY}}", finding.severity.as_str())
         .replace("{{BODY}}", &finding.body)
-        .replace("{{QUOTE}}", &finding.quote)
+        .replace("{{QUOTE}}", &quote)
         .replace("{{OUTPUT_LANGUAGE}}", &output_language())
 }
 
@@ -212,12 +222,28 @@ mod tests {
             lenses: vec!["L1".into()], models: vec!["claude".into()], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
         };
-        let p = build_refute_prompt(&f);
+        let p = build_refute_prompt(&f, crate::domain::Mode::Code);
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.contains("src/a.rs") && p.contains("12"), "file:line injected");
         assert!(p.contains("missing auth") && p.contains("db.write(token)"), "title+quote injected");
         // upheld=空 findings 的契约必须在 prompt 中
         assert!(p.to_lowercase().contains("findings"), "output contract present");
+    }
+
+    #[test]
+    fn refute_prompt_doc_omission_frames_empty_quote() {
+        use crate::domain::{Finding, Mode, Severity};
+        let f = Finding {
+            id: "x".into(), severity: Severity::High, title: "missing rollback branch".into(),
+            body: "no rollback path on failure".into(), file: "spec.md".into(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "specify rollback".into(),
+            lenses: vec!["D2".into()], models: vec!["alpha".into()], agreement: 1,
+            hard_constraint: false, cluster_id: None, quote: String::new(), verify: None,
+        };
+        let p = build_refute_prompt(&f, Mode::Doc);
+        assert!(!p.contains("{{"), "no residual placeholders");
+        assert!(p.to_lowercase().contains("omit"), "doc refute frames omission");
+        assert!(!p.contains("Quoted code"), "doc template (not code template)");
     }
 
     #[test]
