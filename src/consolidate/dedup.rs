@@ -46,6 +46,26 @@ pub fn dedup(findings: Vec<Finding>) -> Vec<Finding> {
     clusters
 }
 
+/// doc 版去重（退化到非行号相似度）：同 file + 标题相似即并，不要求行重叠。
+/// 遗漏类 finding 无有意义行号，故 doc 线按主题（标题）聚类。
+pub fn dedup_doc(findings: Vec<Finding>) -> Vec<Finding> {
+    let mut clusters: Vec<Finding> = Vec::new();
+    for f in findings {
+        let mut merged = false;
+        for c in clusters.iter_mut() {
+            if c.file == f.file && title_jaccard(&c.title, &f.title) >= TITLE_SIM {
+                merge_into(c, &f);
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            clusters.push(f);
+        }
+    }
+    clusters
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +103,34 @@ mod tests {
             f("2","b.rs",10,12,"same title","claude",Severity::High),
         ];
         assert_eq!(dedup(v).len(), 2);
+    }
+
+    #[test]
+    fn dedup_doc_merges_same_title_cross_model_ignoring_lines() {
+        let v = vec![
+            f("1","spec.md",0,0,"missing error branch","claude",Severity::High),
+            f("2","spec.md",99,99,"Missing error branch","gpt",Severity::High),
+        ];
+        let out = dedup_doc(v);
+        assert_eq!(out.len(), 1, "same title merges regardless of line distance");
+        assert_eq!(out[0].agreement, 2);
+    }
+
+    #[test]
+    fn dedup_doc_keeps_distinct_titles() {
+        let v = vec![
+            f("1","spec.md",0,0,"missing error branch","claude",Severity::High),
+            f("2","spec.md",0,0,"ambiguous retry policy","claude",Severity::High),
+        ];
+        assert_eq!(dedup_doc(v).len(), 2);
+    }
+
+    #[test]
+    fn dedup_doc_different_files_never_merge() {
+        let v = vec![
+            f("1","a.md",0,0,"same title","claude",Severity::High),
+            f("2","b.md",0,0,"same title","claude",Severity::High),
+        ];
+        assert_eq!(dedup_doc(v).len(), 2);
     }
 }
