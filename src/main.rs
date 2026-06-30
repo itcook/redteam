@@ -66,6 +66,40 @@ enum Cmd {
         #[arg(long)]
         job_id: String,
     },
+    /// 配置/查询 provider 与 model。
+    Model {
+        #[command(subcommand)]
+        action: ModelCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// 配置一个 provider/model（flag 驱动）。
+    Setup {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        priority: Option<i32>,
+        /// key 去处：env(默认，打印 export) | secrets(写 secrets.toml chmod 600)
+        #[arg(long, default_value = "env")]
+        key_store: String,
+    },
+    /// 列已配置 provider + 可用性 + 配置位置。
+    List {
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// 轻量可用性预检（退出码全可用 0 / 有不可用非 0）。
+    Check,
 }
 
 fn now_secs() -> u64 {
@@ -352,6 +386,19 @@ async fn main() {
                 None => { eprintln!("no such job: {job_id}"); 2 }
             }
         }
+        Cmd::Model { action } => match action {
+            ModelCmd::Check => {
+                let cfg = Config::load().unwrap_or_default();
+                let prober = breakpoints::model::probe::HttpProber::new();
+                let avs = breakpoints::model::check_all(&cfg, &prober).await;
+                for a in &avs {
+                    println!("{}  {}", a.provider, a.status_str());
+                }
+                breakpoints::model::check_exit_code(&avs)
+            }
+            ModelCmd::Setup { .. } => { eprintln!("model setup: implemented in next task"); 2 }
+            ModelCmd::List { .. } => { eprintln!("model list: implemented in next task"); 2 }
+        },
     };
     std::process::exit(code);
 }

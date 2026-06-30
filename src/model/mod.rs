@@ -1,3 +1,5 @@
+pub mod probe;
+
 use crate::config::{Config, ProviderConfig, ProviderKind};
 
 pub const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
@@ -88,6 +90,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn check_all_truth_table_and_exit_code() {
         let _g = ENV_LOCK.lock().unwrap();
         // alpha 有 env key、beta 无 key
