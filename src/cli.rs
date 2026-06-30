@@ -49,6 +49,15 @@ pub fn parse_format(s: &str) -> Format {
     }
 }
 
+/// 退出码映射（统一 run_review/run_code_review）：reject→10、approve+对照集不完整→2、干净 approve→0。
+pub fn exit_code(verdict: Verdict, failed_models_nonempty: bool) -> i32 {
+    match (verdict, failed_models_nonempty) {
+        (Verdict::Reject, _) => 10,
+        (Verdict::Approve, true) => 2,
+        (Verdict::Approve, false) => 0,
+    }
+}
+
 /// 统一 model 选取（S3-a）。返回 (planned_models, replicate)。
 /// 显式列表（`--models-all` / `--models` / 非空 `default_models` 任一）→ replicate=true。
 /// 三者全空 → 所有已配置 provider 按 priority 降序候补，replicate=false。
@@ -188,11 +197,7 @@ pub async fn run_review(
     };
 
     // 8. 退出码：reject 优先 → 10；否则 approve 但对照集不完整 → 2；干净 approve → 0。
-    let code = match (verdict, !report.run.failed_models.is_empty()) {
-        (Verdict::Reject, _) => 10,
-        (Verdict::Approve, true) => 2,
-        (Verdict::Approve, false) => 0,
-    };
+    let code = exit_code(verdict, !report.run.failed_models.is_empty());
     Ok((report, code))
 }
 
@@ -244,16 +249,19 @@ pub async fn run_code_review(
     // 5. positioning（dedup 之前：准行号反哺 line-overlap 去重）
     let anchored = anchor(raw.findings, root);
 
-    // 6. consolidate：dedup → clamp（correlate 留到 S3）
-    let mut findings = dedup(anchored);
-    clamp_compliance(&mut findings);
-
-    // 7. verdict
+    // 6. consolidate：dedup → clamp → verify（三层 targeted-verify，孤证定向 refute）
     let block = args
         .block_threshold
         .as_deref()
         .map(parse_sev)
         .unwrap_or(cfg.review.block_threshold);
+    let mut findings = dedup(anchored);
+    clamp_compliance(&mut findings);
+    let findings = crate::consolidate::verify_findings(
+        findings, provider, &model_names, block, cfg.review.max_concurrency,
+    ).await;
+
+    // 7. verdict
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     let verdict = compute_verdict(&findings, block, floor);
 
@@ -281,11 +289,7 @@ pub async fn run_code_review(
         },
     };
 
-    let code = match (verdict, !report.run.failed_models.is_empty()) {
-        (Verdict::Reject, _) => 10,
-        (Verdict::Approve, true) => 2,
-        (Verdict::Approve, false) => 0,
-    };
+    let code = exit_code(verdict, !report.run.failed_models.is_empty());
     Ok((report, code))
 }
 
@@ -358,6 +362,45 @@ mod code_review_tests {
         std::fs::File::create(p).unwrap().write_all(body.as_bytes()).unwrap();
     }
 
+    #[test]
+    fn exit_code_maps_all_cases() {
+        use crate::domain::Verdict;
+        assert_eq!(exit_code(Verdict::Reject, false), 10);
+        assert_eq!(exit_code(Verdict::Reject, true), 10);   // reject 优先
+        assert_eq!(exit_code(Verdict::Approve, true), 2);   // approve 但对照集不完整
+        assert_eq!(exit_code(Verdict::Approve, false), 0);  // 干净 approve
+    }
+
+    #[tokio::test]
+    async fn lone_blocking_refuted_does_not_reject() {
+        use crate::domain::{Severity, Verdict, VerifyVerdict};
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        // 单 model alpha：review 报一条 High 孤证(单 model → agreement=1)；refute 退化自审 alpha。
+        // 注：FakeProvider 是 prompt-blind 的——对同一 model 的任何调用（无论 review 还是 refute
+        // prompt）都返回同一脚本，故 refute 调用返回非空 → refuted → confidence 0 → 不 reject。
+        // 交叉 model 选择本身已在 verify.rs 单测验证；本测试只验「证伪翻转 verdict」全链路。
+        let cfg = Config::from_layers(&[r#"[review]
+default_models=["alpha"]
+"#]).unwrap();
+        let provider = crate::provider::fake::FakeProvider::with(
+            "alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
+        );
+        let my_args = ReviewArgs {
+            mode: Some("code".into()), base: None, scope: "working-tree".into(),
+            spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
+            no_correlate: true, block_threshold: None, conf_floor: None,
+            background: false, format: "json".into(), targets: vec![],
+        };
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
+        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path()).await.unwrap();
+        let f = &report.findings[0];
+        assert_eq!(f.verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
+        assert_eq!(f.confidence, 0.0);
+        assert_eq!(report.verdict, Verdict::Approve, "孤证被自审 refute 证伪 → 不翻 verdict");
+        assert!(code == 0 || code == 2, "approve → 0 或 2（不 10）");
+    }
+
     fn args() -> ReviewArgs {
         ReviewArgs {
             mode: Some("code".into()), base: None, scope: "working-tree".into(),
@@ -381,20 +424,27 @@ mod code_review_tests {
         use crate::domain::Severity;
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        // 两个 model 都报真 finding → dedup 合并成 agreement=2 → 跳过层① verify，
+        // 保持本测试「anchor 砍编造 + High→Reject」的原意（不被 S3-b verify 自审误伤）。
+        // 编造 quote 只 m 报，anchor 因 quote 不在文件而丢弃。
         let cfg = Config::from_layers(&[r#"[review]
-default_models=["m"]
+default_models=["m","m2"]
 "#]).unwrap();
-        // 真 quote（锚定到第 2 行）+ 编造 quote（丢弃）
-        let provider = FakeProvider::with("m", vec![
+        let mut scripted = std::collections::BTreeMap::new();
+        scripted.insert("m".to_string(), vec![
             raw("src/a.rs", "db.write(token);", Severity::High),
             raw("src/a.rs", "this is fabricated", Severity::Critical),
         ]);
+        scripted.insert("m2".to_string(), vec![raw("src/a.rs", "db.write(token);", Severity::High)]);
+        let provider = FakeProvider { scripted };
+        let my_args = ReviewArgs { models: None, ..args() };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&args(), &provider, &cfg, changes, dir.path()).await.unwrap();
-        assert_eq!(report.findings.len(), 1, "fabricated dropped");
+        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path()).await.unwrap();
+        assert_eq!(report.findings.len(), 1, "fabricated dropped, real merged across models");
         assert_eq!(report.findings[0].file, "src/a.rs");
         assert_eq!(report.findings[0].line_start, 2);
-        assert_eq!(report.verdict, Verdict::Reject); // High ≥ medium block
+        assert_eq!(report.findings[0].agreement, 2, "two models agree → skips verify (layer ①)");
+        assert_eq!(report.verdict, Verdict::Reject); // High agreement≥2，verify 跳过 → Reject
         assert_eq!(code, 10);
     }
 
