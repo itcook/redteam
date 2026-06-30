@@ -122,3 +122,27 @@ fn codex_skills_have_name_and_no_claude_var() {
             "{name}: codex skill must invoke bundled binary");
     }
 }
+
+#[test]
+fn binary_present_and_executable() {
+    let bin = Path::new("plugins/breakpoint/bin/brk-darwin-arm64");
+    let meta = std::fs::metadata(bin)
+        .unwrap_or_else(|e| panic!("bin missing (run `make build`): {e}"));
+    assert!(meta.len() > 0, "binary is empty");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(meta.permissions().mode() & 0o111 != 0, "binary not executable");
+    }
+}
+
+// 真机执行冒烟：仅在 darwin-arm64 本机有意义，跨平台 cargo test 跳过。
+#[test]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), ignore)]
+fn binary_runs_help() {
+    let out = Command::new("plugins/breakpoint/bin/brk-darwin-arm64")
+        .arg("--help")
+        .output()
+        .expect("spawn brk");
+    assert!(out.status.success(), "brk --help failed");
+}
