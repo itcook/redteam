@@ -1,5 +1,6 @@
 use breakpoints::cli::{parse_format, resolve_models, ReviewArgs};
 use breakpoints::config::Config;
+use breakpoints::model::Prober as _;
 use breakpoints::domain::Mode;
 use breakpoints::evidence::{detect_mode, EvidenceOpts, Scope};
 use breakpoints::output::render;
@@ -440,7 +441,34 @@ async fn main() {
                 }
                 0
             }
-            ModelCmd::List { .. } => { eprintln!("model list: implemented in next task"); 2 }
+            ModelCmd::List { remote } => {
+                let cfg = Config::load().unwrap_or_default();
+                let prober = breakpoints::model::probe::HttpProber::new();
+                match remote {
+                    Some(prov) => {
+                        let pc = match cfg.providers.get(&prov) {
+                            Some(p) => p,
+                            None => { eprintln!("no such provider: {prov}"); std::process::exit(2); }
+                        };
+                        let base = breakpoints::model::effective_base(pc);
+                        let key = cfg.resolve_key(&prov);
+                        match prober.list_models(&base, key.as_deref()).await {
+                            Ok(models) => {
+                                for m in models { println!("{m}"); }
+                                0
+                            }
+                            Err(e) => { eprintln!("error querying {base}/models: {e}"); 2 }
+                        }
+                    }
+                    None => {
+                        let avs = breakpoints::model::check_all(&cfg, &prober).await;
+                        let paths: Vec<String> = breakpoints::config::config_paths()
+                            .iter().map(|p| p.display().to_string()).collect();
+                        println!("{}", breakpoints::model::render_model_list(&cfg, &avs, &paths));
+                        0
+                    }
+                }
+            }
         },
     };
     std::process::exit(code);

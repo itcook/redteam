@@ -91,6 +91,27 @@ pub fn derive_api_key_env(provider: &str, kind: &str) -> String {
     }
 }
 
+/// 渲染已配置 provider 列表（每行 name/kind/model/status）+ 配置文件位置。
+pub fn render_model_list(cfg: &Config, avs: &[Availability], config_paths: &[String]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (name, pc) in &cfg.providers {
+        let status = avs
+            .iter()
+            .find(|a| &a.provider == name)
+            .map(|a| a.status_str())
+            .unwrap_or("?");
+        let kind = format!("{:?}", pc.kind).to_lowercase();
+        lines.push(format!("{name}  [{kind}]  {}  {status}", pc.model));
+    }
+    lines.sort();
+    let mut out = lines.join("\n");
+    out.push_str("\n\nconfig files (low→high priority):");
+    for p in config_paths {
+        out.push_str(&format!("\n  {p}"));
+    }
+    out
+}
+
 /// 测试探测替身（pub 供后续 task 复用）。
 pub struct FakeProber {
     pub reachable: bool,
@@ -172,5 +193,22 @@ mod tests {
         assert_eq!(effective_base(&pc2), OPENAI_DEFAULT_BASE);
         let pc3: ProviderConfig = toml::from_str("kind=\"openai-compatible\"\nmodel=\"m\"\nbase_url=\"http://x/v1\"").unwrap();
         assert_eq!(effective_base(&pc3), "http://x/v1");
+    }
+
+    #[test]
+    fn render_model_list_one_line_per_provider_with_status() {
+        let cfg = cfg_with(
+            "[providers.alpha]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
+             [providers.beta]\nkind=\"anthropic\"\nmodel=\"b\"\npriority=5\n",
+        );
+        let avs = vec![
+            Availability { provider: "alpha".into(), key_present: true, reachable: true },
+            Availability { provider: "beta".into(), key_present: false, reachable: true },
+        ];
+        let out = render_model_list(&cfg, &avs, &["/u/config.toml".into()]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.iter().any(|l| l.contains("alpha") && l.contains("a") && l.contains("available")));
+        assert!(lines.iter().any(|l| l.contains("beta") && l.contains("missing key")));
+        assert!(out.contains("/u/config.toml"), "config 位置打印");
     }
 }
