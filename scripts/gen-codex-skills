@@ -6,6 +6,8 @@
 # 用法: scripts/gen-codex-skills [OUT_ROOT]
 #   OUT_ROOT 默认 plugins/breakpoint/codex-skills；防漂移测试传临时目录做逐字节比对。
 set -euo pipefail
+# 锁定 locale：让 glob 排序 / awk / sed 的 collation 在任意环境一致（跨 locale/CI 确定性）。
+export LC_ALL=C
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CMD_DIR="$ROOT/plugins/breakpoint/commands"
