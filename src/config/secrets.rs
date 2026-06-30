@@ -20,3 +20,51 @@ pub fn dirs_config() -> PathBuf {
             home.join(".config")
         })
 }
+
+/// 写入/更新 secrets.toml 的 provider key，并 chmod 600（密钥物理隔离主配置）。
+pub fn write_secret(provider: &str, key: &str) -> anyhow::Result<()> {
+    let path = secrets_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut map = load_secrets();
+    map.insert(provider.to_string(), key.to_string());
+    let text = toml::to_string(&map)?;
+    std::fs::write(&path, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn write_secret_persists_and_chmods_600() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK 串行化 env 变更
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()); }
+        write_secret("claude", "sk-test-123").unwrap();
+        // 读回
+        assert_eq!(load_secrets().get("claude").map(|s| s.as_str()), Some("sk-test-123"));
+        // 再写一个，保留旧的
+        write_secret("gpt", "sk-test-456").unwrap();
+        assert_eq!(load_secrets().get("claude").map(|s| s.as_str()), Some("sk-test-123"));
+        assert_eq!(load_secrets().get("gpt").map(|s| s.as_str()), Some("sk-test-456"));
+        // chmod 600
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(secrets_path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "secrets.toml must be chmod 600");
+        }
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME"); }
+    }
+}
