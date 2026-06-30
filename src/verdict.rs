@@ -54,6 +54,7 @@ mod tests {
             hard_constraint: hard,
             quote: "snippet".into(),
             cluster_id: None,
+            verify: None,
         }
     }
 

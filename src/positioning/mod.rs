@@ -76,7 +76,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
             file: file.into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec!["L1".into()], models: vec!["m".into()],
-            agreement: 1, hard_constraint: false, cluster_id: None, quote: quote.into(),
+            agreement: 1, hard_constraint: false, cluster_id: None, quote: quote.into(), verify: None,
         }
     }
 

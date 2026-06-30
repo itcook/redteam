@@ -54,7 +54,7 @@ mod tests {
         Finding { id:id.into(), severity:sev, title:title.into(), body:"b".into(), file:file.into(),
             line_start:ls, line_end:le, confidence:0.8, recommendation:"r".into(),
             lenses:vec!["L1".into()], models:vec![model.into()], agreement:1,
-            hard_constraint:false, quote:"snippet".into(), cluster_id:None }
+            hard_constraint:false, quote:"snippet".into(), cluster_id:None, verify:None }
     }
     #[test]
     fn merges_overlapping_same_title_cross_model() {

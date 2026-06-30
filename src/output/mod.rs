@@ -54,7 +54,7 @@ mod tests {
             findings:vec![Finding{ id:"1".into(),severity:Severity::High,title:"boom".into(),body:"b".into(),
                 file:"a.rs".into(),line_start:3,line_end:5,confidence:0.9,recommendation:"fix".into(),
                 lenses:vec!["L1".into()],models:vec!["claude".into()],agreement:1,hard_constraint:false,
-                quote:"snippet".into(),cluster_id:None}],
+                quote:"snippet".into(),cluster_id:None,verify:None}],
             clusters:vec![], next_steps:vec![], run:RunMeta::default() }
     }
     #[test]

@@ -55,6 +55,7 @@ pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
         hard_constraint: raw.hard_constraint,
         quote: raw.quote.clone(),
         cluster_id: None,
+        verify: None,
     }
 }
 

@@ -63,6 +63,24 @@ pub struct Finding {
     pub quote: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<Verify>,
+}
+
+/// targeted-verify（S3-b）的判定：upheld=守住反驳（finding 成立）、refuted=被证伪。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyVerdict { Upheld, Refuted }
+
+/// 一条 finding 的 verify 结果（refute pass 产出）。
+#[derive(Clone, Debug, Serialize)]
+pub struct Verify {
+    pub verdict: VerifyVerdict,
+    /// 执行 refute 的 model 名（交叉验证用哪个）。
+    pub model: String,
+    /// refute 理由（refuted 时为反驳要点；upheld 时可空）。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -112,9 +130,28 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
-            hard_constraint: false, cluster_id: None, quote: "snippet".into(),
+            hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(v["quote"], "snippet");
+    }
+
+    #[test]
+    fn finding_serializes_verify_when_present_and_skips_when_none() {
+        let mut f = Finding {
+            id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
+            file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
+            recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
+            hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
+        };
+        // None → 不出现
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert!(v.get("verify").is_none(), "verify=None must be skipped");
+        // Some(Refuted) → 出现，verdict 小写
+        f.verify = Some(Verify { verdict: VerifyVerdict::Refuted, model: "gpt".into(), note: "guarded above".into() });
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["verify"]["verdict"], "refuted");
+        assert_eq!(v["verify"]["model"], "gpt");
+        assert_eq!(v["verify"]["note"], "guarded above");
     }
 }
