@@ -1,6 +1,7 @@
 use crate::hash::fnv1a64_hex;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::io::Write;
 
 /// 状态根目录：$BRK_STATE_DIR → $TMPDIR/breakpoints → /tmp/breakpoints。
 pub fn state_root() -> PathBuf {
@@ -59,6 +60,57 @@ pub fn parse_ttl(s: &str) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// 追加一行 NDJSON 进度事件到 jobs/<id>.log。
+pub fn append_log(ws: &Path, id: &str, line: &str) -> std::io::Result<()> {
+    let p = job_log(ws, id);
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
+    writeln!(f, "{line}")
+}
+
+/// 原子写 result.json（后台作业的一次性投递缓冲）。
+pub fn write_result(ws: &Path, id: &str, json: &str) -> std::io::Result<()> {
+    atomic_write(&job_result(ws, id), json.as_bytes())
+}
+
+/// 读 result.json 原文；不存在 → None。
+pub fn read_result(ws: &Path, id: &str) -> Option<String> {
+    std::fs::read_to_string(job_result(ws, id)).ok()
+}
+
+pub fn job_result_md(ws: &Path, id: &str) -> PathBuf {
+    jobs_dir(ws).join(format!("{id}.result.md"))
+}
+
+/// 原子写 result.md（worker 完成时与 result.json 一并落，避免 result 命令反序列化 report 图）。
+pub fn write_result_md(ws: &Path, id: &str, md: &str) -> std::io::Result<()> {
+    atomic_write(&job_result_md(ws, id), md.as_bytes())
+}
+
+pub fn read_result_md(ws: &Path, id: &str) -> Option<String> {
+    std::fs::read_to_string(job_result_md(ws, id)).ok()
+}
+
+fn consumed_marker(ws: &Path, id: &str) -> PathBuf {
+    jobs_dir(ws).join(format!("{id}.consumed"))
+}
+
+/// 标记 result 已被首次取用（写当前 unix 秒，作 grace 起点）。
+pub fn mark_consumed(ws: &Path, id: &str) -> std::io::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    atomic_write(&consumed_marker(ws, id), now.to_string().as_bytes())
+}
+
+/// 读 consumed 标记时间戳；无则 None。
+pub fn result_consumed_at(ws: &Path, id: &str) -> Option<u64> {
+    std::fs::read_to_string(consumed_marker(ws, id)).ok()?.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +160,35 @@ mod tests {
         assert_eq!(parse_ttl("24h"), Duration::from_secs(86400));
         assert_eq!(parse_ttl("2d"), Duration::from_secs(172800));
         assert_eq!(parse_ttl("garbage"), Duration::from_secs(86400), "回落 24h");
+    }
+
+    #[test]
+    fn append_log_accumulates_ndjson() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        append_log(ws, "j", r#"{"event":"start"}"#).unwrap();
+        append_log(ws, "j", r#"{"event":"done"}"#).unwrap();
+        let content = std::fs::read_to_string(job_log(ws, "j")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("start") && lines[1].contains("done"));
+    }
+
+    #[test]
+    fn result_write_read_and_consume_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        assert!(read_result(ws, "j").is_none());
+        write_result(ws, "j", r#"{"verdict":"reject"}"#).unwrap();
+        assert_eq!(read_result(ws, "j").unwrap(), r#"{"verdict":"reject"}"#);
+        // md 同样往返
+        assert!(read_result_md(ws, "j").is_none());
+        write_result_md(ws, "j", "# Review\nreject").unwrap();
+        assert_eq!(read_result_md(ws, "j").unwrap(), "# Review\nreject");
+        // 未取用 → 无 consumed 标记
+        assert!(result_consumed_at(ws, "j").is_none());
+        mark_consumed(ws, "j").unwrap();
+        // grace 标记记了一个时间戳（写入用 0，断言读回 Some）
+        assert!(result_consumed_at(ws, "j").is_some());
     }
 }
