@@ -1,3 +1,6 @@
+use std::path::Path;
+use std::process::Command;
+
 fn read(p: &str) -> String {
     std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
@@ -62,5 +65,60 @@ fn commands_frontmatter_and_invocation_policy() {
         let body = read(&format!("plugins/breakpoint/commands/{name}.md"));
         assert!(frontmatter(&body, "disable-model-invocation").is_none(),
             "{name} must allow model invocation");
+    }
+}
+
+fn list_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap()
+            .map(|e| e.unwrap().path()).collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() { walk(&p, out); } else { out.push(p); }
+        }
+    }
+    walk(root, &mut out);
+    out
+}
+
+#[test]
+fn codex_skills_in_sync_with_commands() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let status = Command::new("bash")
+        .arg("scripts/gen-codex-skills")
+        .arg(tmp.path())
+        .status()
+        .expect("run gen-codex-skills");
+    assert!(status.success(), "gen-codex-skills exit non-zero");
+
+    let committed = Path::new("plugins/breakpoint/codex-skills");
+    let gen_files = list_files(tmp.path());
+    let com_files = list_files(committed);
+
+    // 文件集合（相对路径）一致
+    let rel = |base: &Path, fs: &[std::path::PathBuf]| -> Vec<String> {
+        fs.iter().map(|p| p.strip_prefix(base).unwrap().to_string_lossy().into_owned()).collect()
+    };
+    assert_eq!(rel(committed, &com_files), rel(tmp.path(), &gen_files),
+        "codex-skills 文件集合漂移：commands/ 改了未重跑 gen-codex-skills？");
+
+    // 内容逐字节一致
+    for r in rel(committed, &com_files) {
+        let a = std::fs::read(committed.join(&r)).unwrap();
+        let b = std::fs::read(tmp.path().join(&r)).unwrap();
+        assert_eq!(a, b, "codex-skills/{r} 内容漂移：commands/ 改了未重跑 gen-codex-skills");
+    }
+}
+
+#[test]
+fn codex_skills_have_name_and_no_claude_var() {
+    for name in ["review", "status", "result"] {
+        let s = read(&format!("plugins/breakpoint/codex-skills/{name}/SKILL.md"));
+        assert!(s.contains(&format!("name: {name}")), "{name}: skill must declare name");
+        assert!(!s.contains("CLAUDE_PLUGIN_ROOT"),
+            "{name}: CLAUDE_PLUGIN_ROOT must be rewritten to CODEX_PLUGIN_ROOT");
+        assert!(s.contains("${CODEX_PLUGIN_ROOT}/bin/brk-darwin-arm64"),
+            "{name}: codex skill must invoke bundled binary");
     }
 }

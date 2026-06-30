@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# gen-codex-skills — 从 Claude commands/（唯一手写真相源）确定性生成 Codex skills。
+# best-effort 镜像 codex 内置 render_command_skill（真机转换细节见设计 §18.2，作 carry）：
+#   frontmatter: 注入 name=<命令文件 stem> + 透传 description；剥离 Claude-only 的 disable-model-invocation
+#   body:        ${CLAUDE_PLUGIN_ROOT} → ${CODEX_PLUGIN_ROOT}（codex 变量名待真机验证）
+# 用法: scripts/gen-codex-skills [OUT_ROOT]
+#   OUT_ROOT 默认 plugins/breakpoint/codex-skills；防漂移测试传临时目录做逐字节比对。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CMD_DIR="$ROOT/plugins/breakpoint/commands"
+OUT_ROOT="${1:-$ROOT/plugins/breakpoint/codex-skills}"
+
+for cmd in "$CMD_DIR"/*.md; do
+  name="$(basename "$cmd" .md)"
+  desc="$(awk '/^---$/{n++; next} n==1 && /^description:/{sub(/^description:[[:space:]]*/,""); print; exit}' "$cmd")"
+  body="$(awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$cmd")"
+  out_dir="$OUT_ROOT/$name"
+  mkdir -p "$out_dir"
+  {
+    printf -- '---\n'
+    printf 'name: %s\n' "$name"
+    printf 'description: %s\n' "$desc"
+    printf -- '---\n'
+    printf '%s\n' "$body" | sed 's/\${CLAUDE_PLUGIN_ROOT}/${CODEX_PLUGIN_ROOT}/g'
+  } > "$out_dir/SKILL.md"
+done
