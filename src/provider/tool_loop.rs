@@ -32,6 +32,17 @@ pub trait ChatBackend: Send + Sync {
         messages: &[ChatMessage],
         tools: &[ToolSpec],
     ) -> Result<AssistantTurn, ProviderError>;
+
+    /// 强制收尾轮：**不**提供 tools，要求模型仅基于已收集上下文产出最终 findings JSON。
+    /// 默认实现＝不带 tools 调 `turn`（无工具可调→模型自然产出最终文本）。OpenAI 兼容
+    /// backend override 以额外带 `response_format=json_object`（探索轮不带、仅收尾带——
+    /// 中间轮带 json_object 会抑制部分 provider 的 function calling，见 dogfood 反转教训）。
+    async fn turn_final(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<AssistantTurn, ProviderError> {
+        self.turn(messages, &[]).await
+    }
 }
 
 /// 多轮工具循环：发→若 tool_calls 则执行回灌→直至最终文本→解析为 findings。
@@ -74,12 +85,25 @@ pub async fn run_tool_loop(
         messages.push(ChatMessage::ToolResults(results));
     }
 
-    Err(ProviderError::Parse(format!(
-        "tool loop exceeded {max_iters} iterations without final output"
-    )))
+    // 探索预算耗尽仍未自行收敛：发一轮强制收尾——不带 tools +（OpenAI）json_object，
+    // 要求模型基于已收集上下文仅产出最终 findings JSON。这把「function-calling 探索」与
+    // 「structured-output 收尾」分阶段，避免中间轮强制 JSON 抑制工具调用（dogfood 反转教训）。
+    messages.push(ChatMessage::User(FINALIZE_PROMPT.to_string()));
+    let turn = backend.turn_final(&messages).await?;
+    in_tok += turn.input_tokens;
+    out_tok += turn.output_tokens;
+    let out = parse_lens_output(&turn.text)?;
+    Ok(LensCall {
+        findings: out.findings,
+        input_tokens: in_tok,
+        output_tokens: out_tok,
+    })
 }
 
 const DEFAULT_MAX_ITERS: u32 = 12;
+const FINALIZE_PROMPT: &str = "You have used your tool-call budget. Based ONLY on what you have \
+     already gathered, output the final review now as a single JSON object with a \"findings\" \
+     array matching the requested schema. Do not call any more tools — respond with JSON only.";
 const DEFAULT_SYSTEM: &str =
     "You are an adversarial code reviewer. Use the provided tools to read and search the \
      codebase as needed, then return ONLY JSON matching the requested schema (an object with a \
@@ -244,15 +268,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exceeding_max_iters_errors() {
+    async fn exhausted_exploration_forces_finalize() {
         let (_d, ex) = tmp_executor_with("a.rs", "x");
-        // 永远只发 tool_call，从不收敛
+        // 探索预算 2 轮都只发 tool_call（不自行收敛）；耗尽后强制收尾轮拿到 findings。
         let backend = FakeChatBackend::new(vec![
             toolcall_turn("read_file", json!({ "path": "a.rs" })),
             toolcall_turn("read_file", json!({ "path": "a.rs" })),
-            toolcall_turn("read_file", json!({ "path": "a.rs" })),
+            final_turn(FINDINGS_JSON), // turn_final（默认实现走 turn）消费这个
         ]);
-        let err = run_tool_loop(&backend, &ex, "sys", "review", 2).await.unwrap_err();
-        assert!(matches!(err, ProviderError::Parse(_)), "got: {err:?}");
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 2).await.unwrap();
+        assert_eq!(call.findings.len(), 1, "强制收尾应产出 findings 而非报错");
+        // usage 跨探索 2 轮 + 收尾 1 轮累加：(2+2+1, 3+3+1)
+        assert_eq!((call.input_tokens, call.output_tokens), (5, 7));
+        // 收尾轮 messages 必须含 FINALIZE 指令
+        let last = backend.messages_at(backend.turn_count() - 1);
+        assert!(
+            last.iter().any(|m| matches!(m, ChatMessage::User(u) if u.contains("JSON only"))),
+            "finalize prompt not present: {last:?}"
+        );
     }
 }

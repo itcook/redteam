@@ -141,6 +141,7 @@ pub(crate) fn build_openai_tools_body(
     model: &str,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
+    json_mode: bool,
 ) -> Value {
     let mut msgs: Vec<Value> = Vec::new();
     for m in messages {
@@ -177,16 +178,28 @@ pub(crate) fn build_openai_tools_body(
             }
         }
     }
-    let tool_decls: Vec<Value> = tools
-        .iter()
-        .map(|t| json!({
-            "type": "function",
-            "function": {
-                "name": t.name, "description": t.description, "parameters": t.parameters
-            }
-        }))
-        .collect();
-    json!({ "model": model, "messages": msgs, "tools": tool_decls })
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("messages".into(), json!(msgs));
+    // 探索轮带 tools；收尾轮（tools 空）省略该键。
+    if !tools.is_empty() {
+        let tool_decls: Vec<Value> = tools
+            .iter()
+            .map(|t| json!({
+                "type": "function",
+                "function": {
+                    "name": t.name, "description": t.description, "parameters": t.parameters
+                }
+            }))
+            .collect();
+        body.insert("tools".into(), json!(tool_decls));
+    }
+    // response_format=json_object 仅在强制收尾轮加（不带 tools 时），保证最终 content 是
+    // 合法 JSON；探索轮不加，避免抑制 function calling（dogfood 反转教训）。
+    if json_mode {
+        body.insert("response_format".into(), json!({ "type": "json_object" }));
+    }
+    Value::Object(body)
 }
 
 /// 从 OpenAI 兼容响应抽取这一轮：message.content（可空）+ tool_calls（arguments 是 JSON 字符串）。
@@ -226,24 +239,17 @@ impl OpenAiBackend {
     pub fn new(model: String, base_url: Option<String>, api_key: String) -> Self {
         OpenAiBackend { model, base_url, api_key, client: reqwest::Client::new() }
     }
-}
 
-#[async_trait]
-impl ChatBackend for OpenAiBackend {
-    async fn turn(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[ToolSpec],
-    ) -> Result<AssistantTurn, ProviderError> {
+    /// 共享 HTTP 发送：POST {base}/chat/completions，解析这一轮输出。
+    async fn post(&self, body: &Value) -> Result<AssistantTurn, ProviderError> {
         let base = self.base_url.as_deref().unwrap_or(OPENAI_DEFAULT_BASE);
         let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-        let body = build_openai_tools_body(&self.model, messages, tools);
         let resp: Value = self
             .client
             .post(&url)
             .header("authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
-            .json(&body)
+            .json(body)
             .send()
             .await
             .and_then(|r| r.error_for_status())
@@ -253,6 +259,28 @@ impl ChatBackend for OpenAiBackend {
             .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
         parse_openai_turn(&resp)
             .ok_or_else(|| ProviderError::Parse("openai response missing choices".into()))
+    }
+}
+
+#[async_trait]
+impl ChatBackend for OpenAiBackend {
+    async fn turn(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<AssistantTurn, ProviderError> {
+        // 探索轮：带 tools、不强制 JSON（保留 function calling）。
+        let body = build_openai_tools_body(&self.model, messages, tools, false);
+        self.post(&body).await
+    }
+
+    async fn turn_final(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<AssistantTurn, ProviderError> {
+        // 收尾轮：不带 tools + response_format=json_object，强制产出最终 findings JSON。
+        let body = build_openai_tools_body(&self.model, messages, &[], true);
+        self.post(&body).await
     }
 }
 
@@ -385,11 +413,25 @@ mod tests {
     #[test]
     fn openai_body_text_only_assistant_omits_tool_calls() {
         let msgs = vec![ChatMessage::Assistant { text: "hello".into(), tool_calls: vec![] }];
-        let b = build_openai_tools_body("m", &msgs, &specs());
+        let b = build_openai_tools_body("m", &msgs, &specs(), false);
         let asst = &b["messages"][0];
         assert_eq!(asst["role"], "assistant");
         assert_eq!(asst["content"], "hello");
         assert!(asst.get("tool_calls").is_none(), "empty tool_calls must be omitted, got: {asst}");
+    }
+
+    // 两阶段收尾回归：收尾轮（tools 空 + json_mode）省略 tools 键并带 response_format=json_object；
+    // 探索轮（带 tools + json_mode=false）不带 response_format（避免抑制 function calling）。
+    #[test]
+    fn openai_final_body_drops_tools_and_adds_json_object() {
+        let msgs = vec![ChatMessage::User("finalize".into())];
+        let fin = build_openai_tools_body("gpt-x", &msgs, &[], true);
+        assert!(fin.get("tools").is_none(), "收尾轮不应带 tools, got: {fin}");
+        assert_eq!(fin["response_format"]["type"], "json_object");
+
+        let explore = build_openai_tools_body("gpt-x", &msgs, &specs(), false);
+        assert!(explore.get("response_format").is_none(), "探索轮不应带 response_format");
+        assert!(explore.get("tools").is_some(), "探索轮应带 tools");
     }
 
     #[test]
@@ -398,7 +440,7 @@ mod tests {
             ChatMessage::System("sys".into()),
             ChatMessage::User("review".into()),
         ];
-        let b = build_openai_tools_body("gpt-x", &msgs, &specs());
+        let b = build_openai_tools_body("gpt-x", &msgs, &specs(), false);
         assert_eq!(b["model"], "gpt-x");
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][1]["role"], "user");
@@ -424,7 +466,7 @@ mod tests {
                 content: "file body".into(),
             }]),
         ];
-        let b = build_openai_tools_body("m", &msgs, &specs());
+        let b = build_openai_tools_body("m", &msgs, &specs(), false);
         let asst = &b["messages"][0];
         assert_eq!(asst["role"], "assistant");
         assert_eq!(asst["tool_calls"][0]["id"], "call_1");
