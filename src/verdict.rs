@@ -1,4 +1,4 @@
-use crate::domain::{Finding, Severity, Verdict};
+use crate::domain::{Finding, Severity, Verdict, VerifyVerdict};
 use crate::lens::by_id;
 
 /// 规范遵循 lens 的 finding 且未标 hard_constraint → severity 钳到 ≤ medium。
@@ -23,14 +23,13 @@ pub fn compute_verdict(
     block_threshold: Severity,
     conf_floor: f32,
 ) -> Verdict {
-    let blocking = findings
-        .iter()
-        .any(|f| f.severity >= block_threshold && f.confidence >= conf_floor);
-    if blocking {
-        Verdict::Reject
-    } else {
-        Verdict::Approve
-    }
+    let blocking = findings.iter().any(|f| {
+        f.severity >= block_threshold
+            && f.confidence >= conf_floor
+            // 实质修复（carry-to-S4 ①）：被证伪的 finding 永不 blocking，不靠 confidence 数值。
+            && f.verify.as_ref().map_or(true, |v| v.verdict != VerifyVerdict::Refuted)
+    });
+    if blocking { Verdict::Reject } else { Verdict::Approve }
 }
 
 #[cfg(test)]
@@ -85,5 +84,22 @@ mod tests {
         let mut v = vec![f(Severity::High, 0.9, "L5", true)];
         clamp_compliance(&mut v);
         assert_eq!(v[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn refuted_finding_never_blocks_even_at_zero_floor() {
+        use crate::domain::{Verify, VerifyVerdict};
+        let mut hi = f(Severity::High, 0.0, "L1", false);
+        hi.verify = Some(Verify { verdict: VerifyVerdict::Refuted, model: "beta".into(), note: String::new() });
+        // conf_floor=0 退化配置：修复前 0.0>=0.0 会 blocking；修复后 refuted 被排除 → Approve。
+        assert_eq!(compute_verdict(&[hi], Severity::Medium, 0.0), Verdict::Approve);
+    }
+
+    #[test]
+    fn upheld_finding_still_blocks() {
+        use crate::domain::{Verify, VerifyVerdict};
+        let mut hi = f(Severity::High, 0.9, "L1", false);
+        hi.verify = Some(Verify { verdict: VerifyVerdict::Upheld, model: "beta".into(), note: String::new() });
+        assert_eq!(compute_verdict(&[hi], Severity::Medium, 0.5), Verdict::Reject);
     }
 }
