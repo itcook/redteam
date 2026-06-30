@@ -114,7 +114,7 @@ impl ChatBackend for AnthropicBackend {
         tools: &[ToolSpec],
     ) -> Result<AssistantTurn, ProviderError> {
         let base = self.base_url.as_deref().unwrap_or(ANTHROPIC_DEFAULT_BASE);
-        let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+        let url = super::anthropic_messages_url(base);
         let body = build_anthropic_tools_body(&self.model, messages, tools, MAX_TOKENS);
         let resp: Value = self
             .client

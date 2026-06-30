@@ -148,7 +148,7 @@ impl ReviewProvider for DirectProvider {
 impl DirectProvider {
     async fn call_anthropic(&self, req: &LensRequest) -> Result<(String, u64, u64), ProviderError> {
         let base = self.base_url.as_deref().unwrap_or(ANTHROPIC_DEFAULT_BASE);
-        let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+        let url = super::anthropic_messages_url(base);
         let body = build_anthropic_body(&self.model, SYSTEM, &req.prompt, MAX_TOKENS);
         let resp: Value = self
             .client
