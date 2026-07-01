@@ -105,7 +105,7 @@ async fn run_one_lens(
     prompt: &str,
     lens: &Lens,
     opts: &OrchestrateOpts,
-) -> Result<(Vec<Finding>, (u64, u64)), String> {
+) -> Result<(String, Vec<Finding>, (u64, u64)), String> {
     // 默认路径：按 priority 降序排列，逐个候补
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
@@ -129,7 +129,7 @@ async fn run_one_lens(
                     .iter()
                     .map(|r| enrich(r, lens.id, &pm.name))
                     .collect();
-                return Ok((fs, (call.input_tokens, call.output_tokens)));
+                return Ok((pm.name.clone(), fs, (call.input_tokens, call.output_tokens)));
             }
             Err(e) => {
                 errs.push(format!("lens {} model {}: {}", lens.id, pm.name, e));
@@ -207,7 +207,7 @@ pub async fn run_fanout(
         let mut out = RawResults::default();
         for (cell_id, model_hint, res) in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((_m, fs, (it, ot))) => {
                     if let Some(s) = sink {
                         s.on_cell(CellRecord::ok(cell_id, model_hint.clone(), fs.clone()));
                     }
@@ -265,9 +265,9 @@ pub async fn run_fanout(
         let mut out = RawResults::default();
         for (cell_id, res) in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((model, fs, (it, ot))) => {
                     if let Some(s) = sink {
-                        s.on_cell(CellRecord::ok(cell_id, cell_model(&fs), fs.clone()));
+                        s.on_cell(CellRecord::ok(cell_id, model.clone(), fs.clone()));
                     }
                     out.findings.extend(fs);
                     out.usage.0 += it;
@@ -301,21 +301,13 @@ fn top_priority_model(opts: &OrchestrateOpts) -> String {
         .unwrap_or_default()
 }
 
-/// 候补链成功后，从已 enrich 的 findings 里取实际命中的 model（enrich 写入 `models[0]`）；
-/// 无 finding 时退化为 manifest 快照的高优先候选。
-fn cell_model(fs: &[Finding]) -> String {
-    fs.first()
-        .and_then(|f| f.models.first().cloned())
-        .unwrap_or_default()
-}
-
 /// 单个文件包的评审（候补链复用 run_one_lens 的语义）。
 async fn run_one_bundle(
     provider: &dyn ReviewProvider,
     label: &str,
     prompt: &str,
     opts: &OrchestrateOpts,
-) -> Result<(Vec<Finding>, (u64, u64)), String> {
+) -> Result<(String, Vec<Finding>, (u64, u64)), String> {
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
@@ -335,7 +327,7 @@ async fn run_one_bundle(
                     .iter()
                     .map(|r| enrich(r, "code", &pm.name))
                     .collect();
-                return Ok((fs, (call.input_tokens, call.output_tokens)));
+                return Ok((pm.name.clone(), fs, (call.input_tokens, call.output_tokens)));
             }
             Err(e) => errs.push(format!("bundle [{label}] model {}: {e}", pm.name)),
         }
@@ -407,7 +399,7 @@ pub async fn run_code_fanout(
         let mut out = RawResults::default();
         for (cell_id, model_hint, res) in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((_m, fs, (it, ot))) => {
                     if let Some(s) = sink {
                         s.on_cell(CellRecord::ok(cell_id, model_hint.clone(), fs.clone()));
                     }
@@ -460,9 +452,9 @@ pub async fn run_code_fanout(
         let mut out = RawResults::default();
         for (cell_id, res) in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((model, fs, (it, ot))) => {
                     if let Some(s) = sink {
-                        s.on_cell(CellRecord::ok(cell_id, cell_model(&fs), fs.clone()));
+                        s.on_cell(CellRecord::ok(cell_id, model.clone(), fs.clone()));
                     }
                     out.findings.extend(fs);
                     out.usage.0 += it;
@@ -491,7 +483,7 @@ async fn run_one_doc(
     provider: &dyn ReviewProvider,
     prompt: &str,
     opts: &OrchestrateOpts,
-) -> Result<(Vec<Finding>, (u64, u64)), String> {
+) -> Result<(String, Vec<Finding>, (u64, u64)), String> {
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
@@ -507,7 +499,7 @@ async fn run_one_doc(
         match call_with_retry(provider, &pm.name, prompt, opts.retries).await {
             Ok(call) => {
                 let fs = call.findings.iter().map(|r| enrich(r, "doc", &pm.name)).collect();
-                return Ok((fs, (call.input_tokens, call.output_tokens)));
+                return Ok((pm.name.clone(), fs, (call.input_tokens, call.output_tokens)));
             }
             Err(e) => errs.push(format!("doc model {}: {e}", pm.name)),
         }
@@ -567,7 +559,7 @@ pub async fn run_doc_fanout(
         let mut out = RawResults::default();
         for (cell_id, model_hint, res) in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((_m, fs, (it, ot))) => {
                     if let Some(s) = sink {
                         s.on_cell(CellRecord::ok(cell_id, model_hint.clone(), fs.clone()));
                     }
@@ -606,9 +598,9 @@ pub async fn run_doc_fanout(
 
         let mut out = RawResults::default();
         match run_one_doc(provider, &prompt, opts).await {
-            Ok((fs, (it, ot))) => {
+            Ok((model, fs, (it, ot))) => {
                 if let Some(s) = sink {
-                    s.on_cell(CellRecord::ok(cell_id, cell_model(&fs), fs.clone()));
+                    s.on_cell(CellRecord::ok(cell_id, model.clone(), fs.clone()));
                 }
                 out.findings.extend(fs);
                 out.usage.0 += it;
@@ -941,16 +933,17 @@ mod tests {
     }
 
     // R2.1：记录型 sink，断言扇出前写 manifest（全集）+ 每 cell 完成各回调一次。
+    // 记完整 CellRecord（而非只记 cell id），供 T4 回归测试断言 model 字段。
     struct RecSink {
         manifest_n: std::sync::Mutex<usize>,
-        cells: std::sync::Mutex<Vec<String>>,
+        records: std::sync::Mutex<Vec<CellRecord>>,
     }
     impl CellSink for RecSink {
         fn manifest(&self, inputs: &[CellInput]) {
             *self.manifest_n.lock().unwrap() = inputs.len();
         }
         fn on_cell(&self, rec: CellRecord) {
-            self.cells.lock().unwrap().push(rec.cell);
+            self.records.lock().unwrap().push(rec);
         }
     }
 
@@ -963,9 +956,34 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let sink = RecSink { manifest_n: 0.into(), cells: Vec::new().into() };
+        let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
         let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, Some(&sink)).await;
         assert_eq!(*sink.manifest_n.lock().unwrap(), 3, "manifest 全集=3 cell");
-        assert_eq!(sink.cells.lock().unwrap().len(), 3, "每 cell 各回调一次");
+        assert_eq!(sink.records.lock().unwrap().len(), 3, "每 cell 各回调一次");
+    }
+
+    // T4 回归：候补链（replicate=false）+ provider 成功但零 findings
+    // → CellRecord.model 必须是实际命中的候选模型名，不能退化为空串。
+    #[tokio::test]
+    async fn fallback_cell_records_hit_model_even_with_zero_findings() {
+        // claude 无脚本（候补失败），gpt 有脚本但返回空 findings（成功、零发现）
+        let p = FakeProvider::with("gpt", vec![]);
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "claude".into(), priority: 30 },
+                PlannedModel { name: "gpt".into(), priority: 20 },
+            ],
+            replicate: false,
+            no_fallback: false,
+            max_concurrency: 4,
+            retries: 0,
+        };
+        let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
+        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, Some(&sink)).await;
+        assert!(r.findings.is_empty(), "gpt 命中但零 findings");
+        let recs = sink.records.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].ok, "cell 应标记成功");
+        assert_eq!(recs[0].model, "gpt", "model 必须是实际命中的候选，不能是空串");
     }
 }
