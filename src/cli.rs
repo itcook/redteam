@@ -25,8 +25,7 @@ pub struct ReviewArgs {
     pub no_correlate: bool,
     pub block_threshold: Option<String>,
     pub conf_floor: Option<f32>,
-    // `--wait` 是默认前台同步路径（与 `--background` 对称）。
-    // main 层处理该 CLI flag；run_review 不持有它——前台路径就是默认路径，无需单独字段。
+    // 前台同步路径是默认路径；`--background` 由 main 层解析并写入本字段。
     pub background: bool,
     pub format: String,
     pub targets: Vec<String>,
@@ -260,6 +259,7 @@ pub async fn run_review(
         warnings: raw.warnings,
         failed_models: raw.failed_models,
     };
+    if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
     assemble_report(raw.findings, ctx).await
 }
 
@@ -333,6 +333,7 @@ pub async fn run_code_review(
         warnings: raw.warnings,
         failed_models: raw.failed_models,
     };
+    if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
     assemble_report(raw.findings, ctx).await
 }
 
@@ -392,6 +393,7 @@ impl CellSink for JobCellSink {
         let _ = crate::state::store::write_manifest(&self.ws, &self.job_id, inputs);
         if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
             st.progress.total = inputs.len() as u32;
+            st.phase = Some(crate::state::job::Phase::Fanout);
             let _ = crate::state::job::write_state(&self.ws, &st);
         }
     }
@@ -402,6 +404,14 @@ impl CellSink for JobCellSink {
         if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
             st.last_active = now_unix();
             st.progress.done += 1;
+            let _ = crate::state::job::write_state(&self.ws, &st);
+        }
+    }
+
+    fn on_phase(&self, phase: crate::state::job::Phase) {
+        let _g = self.lock.lock().unwrap();
+        if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
+            st.phase = Some(phase);
             let _ = crate::state::job::write_state(&self.ws, &st);
         }
     }
@@ -627,6 +637,7 @@ pub async fn run_job(
         return st.exit_code.unwrap_or(0);
     }
     st.status = JobStatus::Running;
+    st.phase = Some(crate::state::job::Phase::Collecting);
     let _ = write_state(ws, &st);
 
     let sink = JobCellSink { ws: ws.to_path_buf(), job_id: job_id.to_string(), lock: std::sync::Mutex::new(()) };
@@ -1249,5 +1260,35 @@ default_models=["m"]
         let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None).await.unwrap();
         assert!(report.findings.is_empty());
         assert_eq!(code, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn jobcellsink_manifest_sets_phase_fanout() {
+        use crate::state::job::{JobState, Phase, write_state, read_state};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        write_state(&ws, &JobState::new("j", 0)).unwrap();
+        let sink = JobCellSink { ws: ws.clone(), job_id: "j".into(), lock: std::sync::Mutex::new(()) };
+        use crate::orchestrate::CellSink;
+        sink.manifest(&[crate::state::store::CellInput {
+            cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
+        assert_eq!(read_state(&ws, "j").unwrap().phase, Some(Phase::Fanout));
+    }
+
+    #[tokio::test]
+    async fn jobcellsink_on_phase_writes_phase() {
+        use crate::state::job::{JobState, Phase, write_state, read_state};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        write_state(&ws, &JobState::new("j", 0)).unwrap();
+        let sink = JobCellSink { ws: ws.clone(), job_id: "j".into(), lock: std::sync::Mutex::new(()) };
+        use crate::orchestrate::CellSink;
+        sink.on_phase(Phase::Finalizing);
+        assert_eq!(read_state(&ws, "j").unwrap().phase, Some(Phase::Finalizing));
     }
 }

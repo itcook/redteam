@@ -16,6 +16,8 @@ use tokio::sync::Semaphore;
 pub trait CellSink: Send + Sync {
     fn manifest(&self, inputs: &[CellInput]);
     fn on_cell(&self, rec: CellRecord);
+    /// 阶段转换钩子（后台 job 用；默认 no-op，前台 sink=None / 其他 sink 零影响）。
+    fn on_phase(&self, _phase: crate::state::job::Phase) {}
 }
 
 #[derive(Clone, Debug)]
