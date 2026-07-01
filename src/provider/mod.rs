@@ -99,6 +99,38 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
         .map(std::time::Duration::from_secs)
 }
 
+pub(crate) const DEFAULT_RETRY_BUDGET: u32 = 2; // 首发 + 2 重试
+const RETRY_BACKOFF_BASE_MS: u64 = 200;
+const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 通用重试：`op` 产 `Result<T, ProviderError>`；可重试错→退避后重试，不可重试→立即返回。
+/// 退避：RateLimited 有 retry_after 用之（封顶 30s），否则指数（200·2^n ms，封顶 5s）。
+pub(crate) async fn retry_classified<T, F, Fut>(budget: u32, mut op: F) -> Result<T, ProviderError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ProviderError>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt >= budget || !e.is_retryable() {
+                    return Err(e);
+                }
+                let wait = match e.retry_after() {
+                    Some(d) => d.min(RETRY_AFTER_CAP),
+                    None => std::time::Duration::from_millis(RETRY_BACKOFF_BASE_MS << (attempt + 1))
+                        .min(RETRY_BACKOFF_CAP),
+                };
+                attempt += 1;
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
 #[async_trait]
 pub trait ReviewProvider: Send + Sync {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError>;
@@ -192,5 +224,44 @@ mod tests {
         assert!(!ProviderError::Auth("x".into()).is_retryable());
         assert!(!ProviderError::BadRequest("x".into()).is_retryable());
         assert!(!ProviderError::Parse("x".into()).is_retryable());
+    }
+
+    #[tokio::test]
+    async fn retry_classified_retries_then_succeeds() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let r: Result<u32, ProviderError> = super::retry_classified(2, || {
+            let n = calls.get();
+            calls.set(n + 1);
+            async move {
+                if n < 2 { Err(ProviderError::Server("boom".into())) } else { Ok(99) }
+            }
+        }).await;
+        assert_eq!(r.unwrap(), 99);
+        assert_eq!(calls.get(), 3); // 首发 + 2 重试
+    }
+
+    #[tokio::test]
+    async fn retry_classified_non_retryable_fails_fast() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let r: Result<u32, ProviderError> = super::retry_classified(5, || {
+            calls.set(calls.get() + 1);
+            async move { Err::<u32, _>(ProviderError::Auth("401".into())) }
+        }).await;
+        assert!(matches!(r, Err(ProviderError::Auth(_))));
+        assert_eq!(calls.get(), 1, "不可重试错必须只调 1 次、不烧退避");
+    }
+
+    #[tokio::test]
+    async fn retry_classified_exhausts_budget() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let r: Result<u32, ProviderError> = super::retry_classified(2, || {
+            calls.set(calls.get() + 1);
+            async move { Err::<u32, _>(ProviderError::Network("down".into())) }
+        }).await;
+        assert!(matches!(r, Err(ProviderError::Network(_))));
+        assert_eq!(calls.get(), 3); // budget+1
     }
 }

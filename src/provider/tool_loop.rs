@@ -55,6 +55,7 @@ pub async fn run_tool_loop(
     user_prompt: &str,
     max_iters: u32,
     per_turn: std::time::Duration,
+    retry_budget: u32,
 ) -> Result<LensCall, ProviderError> {
     let tools = tool_specs();
     let mut messages = vec![
@@ -65,11 +66,13 @@ pub async fn run_tool_loop(
     let mut out_tok = 0u64;
 
     for _ in 0..max_iters {
-        let turn = match tokio::time::timeout(per_turn, backend.turn(&messages, &tools)).await {
-            Ok(r) => r?,
-            Err(_) => return Err(ProviderError::Timeout(
-                format!("turn timeout after {}s", per_turn.as_secs()))),
-        };
+        let turn = crate::provider::retry_classified(retry_budget, || async {
+            match tokio::time::timeout(per_turn, backend.turn(&messages, &tools)).await {
+                Ok(r) => r,
+                Err(_) => Err(ProviderError::Timeout(
+                    format!("turn timeout after {}s", per_turn.as_secs()))),
+            }
+        }).await?;
         in_tok += turn.input_tokens;
         out_tok += turn.output_tokens;
 
@@ -95,11 +98,13 @@ pub async fn run_tool_loop(
     // 要求模型基于已收集上下文仅产出最终 findings JSON。这把「function-calling 探索」与
     // 「structured-output 收尾」分阶段，避免中间轮强制 JSON 抑制工具调用（dogfood 反转教训）。
     messages.push(ChatMessage::User(FINALIZE_PROMPT.to_string()));
-    let turn = match tokio::time::timeout(per_turn, backend.turn_final(&messages)).await {
-        Ok(r) => r?,
-        Err(_) => return Err(ProviderError::Timeout(
-            format!("turn timeout after {}s", per_turn.as_secs()))),
-    };
+    let turn = crate::provider::retry_classified(retry_budget, || async {
+        match tokio::time::timeout(per_turn, backend.turn_final(&messages)).await {
+            Ok(r) => r,
+            Err(_) => Err(ProviderError::Timeout(
+                format!("turn timeout after {}s", per_turn.as_secs()))),
+        }
+    }).await?;
     in_tok += turn.input_tokens;
     out_tok += turn.output_tokens;
     let out = parse_lens_output(&turn.text)?;
@@ -127,6 +132,7 @@ pub struct ToolLoopProvider {
     system: String,
     max_iters: u32,
     per_turn: std::time::Duration,
+    retry_budget: u32,
 }
 
 impl ToolLoopProvider {
@@ -137,6 +143,7 @@ impl ToolLoopProvider {
             system: DEFAULT_SYSTEM.to_string(),
             max_iters: DEFAULT_MAX_ITERS,
             per_turn: PER_TURN_DEADLINE,
+            retry_budget: crate::provider::DEFAULT_RETRY_BUDGET,
         }
     }
 }
@@ -151,23 +158,27 @@ impl ReviewProvider for ToolLoopProvider {
             &req.prompt,
             self.max_iters,
             self.per_turn,
+            self.retry_budget,
         )
         .await
     }
 }
 
-/// 测试替身：按序吐预置 turns，并记录每轮收到的 messages 快照。
+/// 测试替身：按序吐预置 turns（可脚本化 Err），并记录每轮收到的 messages 快照。
 pub struct FakeChatBackend {
-    turns: Mutex<VecDeque<AssistantTurn>>,
+    turns: Mutex<VecDeque<Result<AssistantTurn, ProviderError>>>,
     seen: Mutex<Vec<Vec<ChatMessage>>>,
 }
 
 impl FakeChatBackend {
     pub fn new(turns: Vec<AssistantTurn>) -> Self {
         FakeChatBackend {
-            turns: Mutex::new(turns.into()),
+            turns: Mutex::new(turns.into_iter().map(Ok).collect()),
             seen: Mutex::new(Vec::new()),
         }
+    }
+    pub fn new_results(turns: Vec<Result<AssistantTurn, ProviderError>>) -> Self {
+        FakeChatBackend { turns: Mutex::new(turns.into()), seen: Mutex::new(Vec::new()) }
     }
     pub fn turn_count(&self) -> usize {
         self.seen.lock().unwrap().len()
@@ -189,7 +200,7 @@ impl ChatBackend for FakeChatBackend {
             .lock()
             .unwrap()
             .pop_front()
-            .ok_or_else(|| ProviderError::Unavailable("no scripted turn".into()))
+            .unwrap_or_else(|| Err(ProviderError::Unavailable("no scripted turn".into())))
     }
 }
 
@@ -227,7 +238,7 @@ mod tests {
     async fn final_only_returns_parsed_findings() {
         let (_d, ex) = tmp_executor_with("a.rs", "x");
         let backend = FakeChatBackend::new(vec![final_turn(FINDINGS_JSON)]);
-        let call = run_tool_loop(&backend, &ex, "sys", "review", 8, std::time::Duration::from_secs(60)).await.unwrap();
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 8, std::time::Duration::from_secs(60), 0).await.unwrap();
         assert_eq!(call.findings.len(), 1);
         assert_eq!(call.findings[0].title, "t");
         // 单轮 usage
@@ -243,7 +254,7 @@ mod tests {
             toolcall_turn("read_file", json!({ "path": "a.rs" })),
             final_turn(FINDINGS_JSON),
         ]);
-        let call = run_tool_loop(&backend, &ex, "sys", "review", 8, std::time::Duration::from_secs(60)).await.unwrap();
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 8, std::time::Duration::from_secs(60), 0).await.unwrap();
         assert_eq!(call.findings.len(), 1);
         // 两轮 usage 累加：(2+1, 3+1)
         assert_eq!((call.input_tokens, call.output_tokens), (3, 4));
@@ -290,7 +301,7 @@ mod tests {
             toolcall_turn("read_file", json!({ "path": "a.rs" })),
             final_turn(FINDINGS_JSON), // turn_final（默认实现走 turn）消费这个
         ]);
-        let call = run_tool_loop(&backend, &ex, "sys", "review", 2, std::time::Duration::from_secs(60)).await.unwrap();
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 2, std::time::Duration::from_secs(60), 0).await.unwrap();
         assert_eq!(call.findings.len(), 1, "强制收尾应产出 findings 而非报错");
         // usage 跨探索 2 轮 + 收尾 1 轮累加：(2+2+1, 3+3+1)
         assert_eq!((call.input_tokens, call.output_tokens), (5, 7));
@@ -315,7 +326,7 @@ mod tests {
     async fn per_turn_timeout_returns_err_not_hang() {
         let (_d, ex) = tmp_executor_with("a.rs", "x");
         let r = run_tool_loop(&HangBackend, &ex, "sys", "review", 12,
-                              std::time::Duration::from_millis(30)).await;
+                              std::time::Duration::from_millis(30), 0).await;
         assert!(matches!(r, Err(ProviderError::Timeout(_))), "got: {r:?}");
     }
 
@@ -341,7 +352,36 @@ mod tests {
         let (_d, ex) = tmp_executor_with("a.rs", "x");
         // max_iters=1：探索轮 1 次 tool_call → 进收尾轮 turn_final（挂起）→ 收尾轮 timeout 切断
         let r = run_tool_loop(&HangFinalBackend, &ex, "sys", "review", 1,
-                              std::time::Duration::from_millis(30)).await;
+                              std::time::Duration::from_millis(30), 0).await;
         assert!(matches!(r, Err(ProviderError::Timeout(_))), "finalize timeout: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn transient_turn_error_retried_keeps_accumulated_context() {
+        let (_d, ex) = tmp_executor_with("a.rs", "needle here");
+        // turn 序列：tool_call → 瞬时 Timeout（可重试）→ final_json
+        let backend = FakeChatBackend::new_results(vec![
+            Ok(toolcall_turn("read_file", json!({ "path": "a.rs" }))),
+            Err(ProviderError::Timeout("blip".into())),
+            Ok(final_turn(FINDINGS_JSON)),
+        ]);
+        // retry_budget=1 足以吞掉 1 次瞬时错
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 8,
+            std::time::Duration::from_secs(60), 1).await.unwrap();
+        assert_eq!(call.findings.len(), 1, "瞬时错应被 turn 级重试吞掉、最终产 findings");
+        // 第 3 次（重试的那一 turn）收到的 messages 必须仍含 turn 1 的 ToolResults —— 累积上下文未丢
+        let retried = backend.messages_at(2);
+        assert!(retried.iter().any(|m| matches!(m,
+            ChatMessage::ToolResults(rs) if rs.iter().any(|r| r.content.contains("needle here")))),
+            "重试轮丢了已累积上下文: {retried:?}");
+    }
+
+    #[tokio::test]
+    async fn non_retryable_turn_error_returns_immediately() {
+        let (_d, ex) = tmp_executor_with("a.rs", "x");
+        let backend = FakeChatBackend::new_results(vec![Err(ProviderError::Auth("401".into()))]);
+        let r = run_tool_loop(&backend, &ex, "sys", "review", 8,
+            std::time::Duration::from_secs(60), 3).await;
+        assert!(matches!(r, Err(ProviderError::Auth(_))), "不可重试错应立即返回: {r:?}");
     }
 }
