@@ -51,8 +51,12 @@ fn commands_frontmatter_and_invocation_policy() {
         let body = read(&format!("plugins/breakpoint/commands/{name}.md"));
         assert!(frontmatter(&body, "description").is_some(), "{name}: description required");
         assert!(
-            body.contains("${CLAUDE_PLUGIN_ROOT}/bin/brk-darwin-arm64"),
-            "{name}: must invoke bundled binary via plugin root"
+            body.contains("${CLAUDE_PLUGIN_ROOT}/bin/brk "),
+            "{name}: must invoke the bin/brk launcher via plugin root"
+        );
+        assert!(
+            !body.contains("brk-darwin-arm64"),
+            "{name}: must not reference the old flat binary name"
         );
         assert!(body.contains("$ARGUMENTS"), "{name}: must forward $ARGUMENTS");
     }
@@ -118,31 +122,63 @@ fn codex_skills_have_name_and_no_claude_var() {
         assert!(s.contains(&format!("name: {name}")), "{name}: skill must declare name");
         assert!(!s.contains("CLAUDE_PLUGIN_ROOT"),
             "{name}: CLAUDE_PLUGIN_ROOT must be rewritten to CODEX_PLUGIN_ROOT");
-        assert!(s.contains("${CODEX_PLUGIN_ROOT}/bin/brk-darwin-arm64"),
-            "{name}: codex skill must invoke bundled binary");
+        assert!(s.contains("${CODEX_PLUGIN_ROOT}/bin/brk "),
+            "{name}: codex skill must invoke the bin/brk launcher");
+        assert!(!s.contains("brk-darwin-arm64"),
+            "{name}: must not reference the old flat binary name");
     }
 }
 
 #[test]
-fn binary_present_and_executable() {
-    let bin = Path::new("plugins/breakpoint/bin/brk-darwin-arm64");
-    let meta = std::fs::metadata(bin)
-        .unwrap_or_else(|e| panic!("bin missing (run `make build`): {e}"));
-    assert!(meta.len() > 0, "binary is empty");
+fn binary_layout_and_launcher() {
+    // launcher（稳定入口）存在且可执行
+    let launcher = Path::new("plugins/breakpoint/bin/brk");
+    let lmeta = std::fs::metadata(launcher)
+        .unwrap_or_else(|e| panic!("launcher bin/brk missing: {e}"));
+    // shipped darwin/aarch64 真二进制存在且非空
+    let real = Path::new("plugins/breakpoint/bin/darwin/aarch64/brk");
+    let rmeta = std::fs::metadata(real)
+        .unwrap_or_else(|e| panic!("darwin/aarch64 binary missing (run `make build`): {e}"));
+    assert!(rmeta.len() > 0, "binary is empty");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert!(meta.permissions().mode() & 0o111 != 0, "binary not executable");
+        assert!(lmeta.permissions().mode() & 0o111 != 0, "launcher not executable");
+        assert!(rmeta.permissions().mode() & 0o111 != 0, "binary not executable");
     }
+    // 旧扁平二进制已删
+    assert!(!Path::new("plugins/breakpoint/bin/brk-darwin-arm64").exists(),
+        "old flat binary must be removed");
+    // launcher 内容：探测 os/arch + 127 报错
+    let src = read("plugins/breakpoint/bin/brk");
+    assert!(src.contains("uname -s") && src.contains("uname -m"), "launcher must probe os/arch");
+    assert!(src.contains("exit 127"), "launcher must exit 127 on resolution failure");
 }
 
-// 真机执行冒烟：仅在 darwin-arm64 本机有意义，跨平台 cargo test 跳过。
+// launcher 命中：真机透传到真二进制。仅 darwin-arm64 本机有意义，跨平台跳过。
 #[test]
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), ignore)]
-fn binary_runs_help() {
-    let out = Command::new("plugins/breakpoint/bin/brk-darwin-arm64")
-        .arg("--help")
-        .output()
-        .expect("spawn brk");
-    assert!(out.status.success(), "brk --help failed");
+fn launcher_resolves_on_this_platform() {
+    let ok = Command::new("plugins/breakpoint/bin/brk")
+        .arg("--help").output().expect("spawn launcher");
+    assert!(ok.status.success(), "launcher --help should succeed on this platform");
+}
+
+// launcher 缺失分支：拷贝 launcher 到临时目录（无平台子目录）→ 127 + 报错。
+// 不动 shipped 文件，避免与其它并行测试竞态；任意平台都能跑（sh 可用即可）。
+#[test]
+fn launcher_errors_when_binary_missing() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let launcher = tmp.path().join("brk");
+    std::fs::copy("plugins/breakpoint/bin/brk", &launcher).expect("copy launcher");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // 临时目录下没有 <os>/<arch>/brk → launcher 命中缺失分支
+    let miss = Command::new(&launcher).arg("review").output().expect("spawn launcher");
+    assert_eq!(miss.status.code(), Some(127), "missing binary → exit 127");
+    assert!(String::from_utf8_lossy(&miss.stderr).contains("no binary for"),
+        "missing binary → clear error: {}", String::from_utf8_lossy(&miss.stderr));
 }
