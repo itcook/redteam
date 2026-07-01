@@ -49,6 +49,10 @@ enum Cmd {
         background: bool,
         #[arg(long, default_value = "json")]
         format: String,
+        /// R2.3：补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
+        /// （原始 mode/targets/models 等从该作业落盘的 args.json 里重建）。
+        #[arg(long)]
+        resume: Option<String>,
         targets: Vec<String>,
     },
     /// 查询作业状态：无 id 列全部，有 id 打印该作业 JSON。
@@ -240,15 +244,44 @@ async fn main() {
             wait: _wait, // 默认前台同步路径；run_review 不持有此字段（与 --background 对称）
             background,
             format,
+            resume,
             targets,
         } => {
             let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
             let fmt = parse_format(&format);
+
+            // R2.3：--resume <job_id> 补跑差集 cell，前台同步；忽略本次调用的其余 flag——
+            // mode/targets/models 等从该作业落盘的 args.json 重建（run_resume 内部处理）。
+            if let Some(job_id) = resume {
+                let ws = breakpoint::state::store::workspace_bucket(&cwd);
+                prune_here(&ws);
+                let orig_args_json = match breakpoint::state::store::read_args_raw(&ws, &job_id) {
+                    Some(j) => j,
+                    None => {
+                        eprintln!("error: no args for job {job_id} (resume requires a job that ran via --background)");
+                        std::process::exit(2);
+                    }
+                };
+                let orig_args: ReviewArgs = match serde_json::from_str(&orig_args_json) {
+                    Ok(a) => a,
+                    Err(e) => { eprintln!("error: bad args for job {job_id}: {e}"); std::process::exit(2); }
+                };
+                let (_detected, registry) = match build_registry(&orig_args, &cfg, &cwd) {
+                    Ok(x) => x,
+                    Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                };
+                let (report, code) =
+                    breakpoint::cli::run_resume(&ws, &job_id, &registry, &cfg, &cwd).await;
+                println!("{}", render(&report, fmt));
+                std::process::exit(code);
+            }
+
             let args = ReviewArgs {
                 mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
                 no_correlate, block_threshold, conf_floor, background, format, targets,
+                resume: None,
             };
 
             // 后台：写 pending + args 文件 → spawn detached worker → 打印 job-id 退出。
@@ -541,6 +574,7 @@ mod tests {
             background: false,
             format: "json".into(),
             targets: vec![],
+            resume: None,
         };
         let result = build_registry(&args, &cfg, cwd);
         assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");

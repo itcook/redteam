@@ -1,14 +1,14 @@
 use crate::bundle::{group, select_files};
 use crate::config::Config;
-use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc};
-use crate::domain::{Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
+use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc, verify_findings};
+use crate::domain::{Finding, Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::{collect, detect_mode, EvidenceOpts, Scope};
 use crate::evidence::git::FileChange;
 use crate::lens::select;
-use crate::orchestrate::{run_code_fanout, run_doc_fanout, CellSink, OrchestrateOpts, PlannedModel};
+use crate::orchestrate::{enrich, run_code_fanout, run_doc_fanout, CellSink, OrchestrateOpts, PlannedModel};
 use crate::output::Format;
 use crate::positioning::{anchor, anchor_doc};
-use crate::provider::ReviewProvider;
+use crate::provider::{LensRequest, ReviewProvider};
 use crate::verdict::{clamp_compliance, compute_verdict};
 use std::path::Path;
 
@@ -30,6 +30,10 @@ pub struct ReviewArgs {
     pub background: bool,
     pub format: String,
     pub targets: Vec<String>,
+    /// R2.3：`--resume <job_id>`。main.rs 据此路由到 `run_resume`（前台同步，忽略 background）；
+    /// 其余字段（mode/targets/models/…）在 resume 路径下不生效——run_resume 会重新
+    /// `read_args_raw(job_id)` 取原始作业的 ReviewArgs。
+    pub resume: Option<String>,
 }
 
 fn parse_sev(s: &str) -> Severity {
@@ -95,8 +99,82 @@ pub fn resolve_models(
     (models, replicate)
 }
 
-/// 整条评审流水线：证据 → lens → fan-out → dedup → clamp → correlate → apply_clusters
-/// → verdict → 组装 report → 退出码。
+/// 扇出之后的共用尾段上下文——`run_code_review`/`run_review`/`run_resume` 三处扇出前逻辑
+/// 各不相同（bundle×model / lens×model / 直接重放 manifest prompt），但扇出后（anchor → dedup
+/// → [doc: correlate] → verify → verdict → 组报告）完全一致，抽出复用（DRY，T7 授权解冻）。
+struct TailCtx<'a> {
+    mode: Mode,
+    /// code 模式下 anchor 用的项目根；doc 模式忽略。
+    root: Option<&'a Path>,
+    /// doc 模式下 anchor_doc 用的受审文档目标；code 模式忽略。
+    targets: &'a [String],
+    provider: &'a dyn ReviewProvider,
+    model_names: Vec<String>,
+    lens_ids: Vec<String>,
+    block: Severity,
+    floor: f32,
+    correlate_on: bool,
+    max_concurrency: usize,
+    job_id: String,
+    duration_ms: u64,
+    usage: (u64, u64),
+    warnings: Vec<String>,
+    failed_models: Vec<String>,
+}
+
+/// 共用尾段：anchor → dedup → [doc: correlate/apply_clusters] → verify → verdict → 组装 report
+/// → 退出码。三处调用方（run_code_review/run_review/run_resume）行为 1:1 迁移，不改变既有语义。
+async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Result<(ReviewReport, i32)> {
+    let anchored = match ctx.mode {
+        Mode::Code => anchor(findings, ctx.root.expect("code tail requires root")),
+        Mode::Doc => {
+            let docs = crate::evidence::doc::collect_doc_files(ctx.targets)?;
+            anchor_doc(findings, &docs)
+        }
+    };
+    let mut findings = match ctx.mode {
+        Mode::Code => dedup(anchored),
+        Mode::Doc => dedup_doc(anchored),
+    };
+    clamp_compliance(&mut findings);
+    let clusters = if ctx.mode == Mode::Doc {
+        let lead_model = ctx.model_names.first().cloned().unwrap_or_default();
+        let clusters = correlate(ctx.provider, &lead_model, &findings, ctx.correlate_on).await;
+        apply_clusters(&mut findings, &clusters);
+        clusters
+    } else {
+        vec![]
+    };
+    let findings = verify_findings(
+        findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
+    ).await;
+
+    let verdict = compute_verdict(&findings, ctx.block, ctx.floor);
+    let stats = Stats::from_findings(&findings);
+    let report = ReviewReport {
+        schema_version: "1".into(),
+        mode: ctx.mode,
+        verdict,
+        stats,
+        findings,
+        clusters,
+        next_steps: vec![],
+        run: RunMeta {
+            job_id: ctx.job_id,
+            models: ctx.model_names,
+            lenses: ctx.lens_ids,
+            duration_ms: ctx.duration_ms,
+            usage: Usage { input_tokens: ctx.usage.0, output_tokens: ctx.usage.1 },
+            warnings: ctx.warnings,
+            failed_models: ctx.failed_models,
+        },
+    };
+    // 退出码：reject 优先 → 10；否则 approve 但对照集不完整 → 2；干净 approve → 0。
+    let code = exit_code(verdict, !report.run.failed_models.is_empty());
+    Ok((report, code))
+}
+
+/// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
 ///
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
 /// `--background` 在 Plan 1 未实现（留 Plan 2），此处直接报错。
@@ -158,57 +236,32 @@ pub async fn run_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink).await;
 
-    // 5. positioning（doc anchor：空引用=遗漏保留、编造丢弃；按受审文档内容锚定）
-    let docs = crate::evidence::doc::collect_doc_files(&args.targets)?;
-    let anchored = anchor_doc(raw.findings, &docs);
-
-    // 6. consolidate：dedup_doc（非行号相似度）→ clamp → correlate(桩) → verify(三层，doc refute)
+    // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
     let block = args
         .block_threshold
         .as_deref()
         .map(parse_sev)
         .unwrap_or(cfg.review.block_threshold);
-    let mut findings = dedup_doc(anchored);
-    clamp_compliance(&mut findings);
-    let correlate_on = cfg.review.correlate && !args.no_correlate;
-    let lead_model = model_names.first().cloned().unwrap_or_default();
-    let clusters = correlate(provider, &lead_model, &findings, correlate_on).await;
-    apply_clusters(&mut findings, &clusters);
-    let findings = crate::consolidate::verify_findings(
-        findings, provider, &model_names, block, cfg.review.max_concurrency, Mode::Doc,
-    ).await;
-
-    // 7. verdict
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
-    let verdict = compute_verdict(&findings, block, floor);
-
-    // 7. 组装报告
-    let stats = Stats::from_findings(&findings);
-    let report = ReviewReport {
-        schema_version: "1".into(),
+    let correlate_on = cfg.review.correlate && !args.no_correlate;
+    let ctx = TailCtx {
         mode: input.mode,
-        verdict,
-        stats,
-        findings,
-        clusters,
-        next_steps: vec![],
-        run: RunMeta {
-            job_id: String::new(),
-            models: model_names,
-            lenses: lens_ids,
-            duration_ms: t0.elapsed().as_millis() as u64,
-            usage: Usage {
-                input_tokens: raw.usage.0,
-                output_tokens: raw.usage.1,
-            },
-            warnings: raw.warnings,
-            failed_models: raw.failed_models,
-        },
+        root: None,
+        targets: &args.targets,
+        provider,
+        model_names,
+        lens_ids,
+        block,
+        floor,
+        correlate_on,
+        max_concurrency: cfg.review.max_concurrency,
+        job_id: String::new(),
+        duration_ms: t0.elapsed().as_millis() as u64,
+        usage: raw.usage,
+        warnings: raw.warnings,
+        failed_models: raw.failed_models,
     };
-
-    // 8. 退出码：reject 优先 → 10；否则 approve 但对照集不完整 → 2；干净 approve → 0。
-    let code = exit_code(verdict, !report.run.failed_models.is_empty());
-    Ok((report, code))
+    assemble_report(raw.findings, ctx).await
 }
 
 /// code 专属流水线（S2-2b）：bundle × model 工具循环 + positioning 尾段。
@@ -258,51 +311,31 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, sink).await;
 
-    // 5. positioning（dedup 之前：准行号反哺 line-overlap 去重）
-    let anchored = anchor(raw.findings, root);
-
-    // 6. consolidate：dedup → clamp → verify（三层 targeted-verify，孤证定向 refute）
+    // 5-8. 共用尾段：anchor → dedup → verify → verdict → 组报告（code 无 correlate/clusters）
     let block = args
         .block_threshold
         .as_deref()
         .map(parse_sev)
         .unwrap_or(cfg.review.block_threshold);
-    let mut findings = dedup(anchored);
-    clamp_compliance(&mut findings);
-    let findings = crate::consolidate::verify_findings(
-        findings, provider, &model_names, block, cfg.review.max_concurrency, Mode::Code,
-    ).await;
-
-    // 7. verdict
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
-    let verdict = compute_verdict(&findings, block, floor);
-
-    // 8. 组装报告
-    let stats = Stats::from_findings(&findings);
-    let report = ReviewReport {
-        schema_version: "1".into(),
+    let ctx = TailCtx {
         mode: Mode::Code,
-        verdict,
-        stats,
-        findings,
-        clusters: vec![],
-        next_steps: vec![],
-        run: RunMeta {
-            job_id: String::new(),
-            models: model_names,
-            lenses: lens_ids,
-            duration_ms: t0.elapsed().as_millis() as u64,
-            usage: Usage {
-                input_tokens: raw.usage.0,
-                output_tokens: raw.usage.1,
-            },
-            warnings: raw.warnings,
-            failed_models: raw.failed_models,
-        },
+        root: Some(root),
+        targets: &args.targets,
+        provider,
+        model_names,
+        lens_ids,
+        block,
+        floor,
+        correlate_on: false,
+        max_concurrency: cfg.review.max_concurrency,
+        job_id: String::new(),
+        duration_ms: t0.elapsed().as_millis() as u64,
+        usage: raw.usage,
+        warnings: raw.warnings,
+        failed_models: raw.failed_models,
     };
-
-    let code = exit_code(verdict, !report.run.failed_models.is_empty());
-    Ok((report, code))
+    assemble_report(raw.findings, ctx).await
 }
 
 /// 统一 mode 探测 + 评审分发（前台 main 与后台 worker 共用）。
@@ -413,6 +446,137 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
     };
     let code = exit_code(Verdict::Incomplete, false);
     (report, code)
+}
+
+/// 空壳 ReviewArgs：仅供 `run_resume` 在 `read_args_raw` 缺失时兜底构造 incomplete 报告——
+/// 正常路径不会走到（resume 只对经 `--background` 落过 args.json 的作业有意义）。
+fn empty_review_args() -> ReviewArgs {
+    ReviewArgs {
+        mode: None, base: None, scope: "working-tree".into(), spec: vec![], focus: None,
+        lenses: None, models: None, models_all: false, no_correlate: false,
+        block_threshold: None, conf_floor: None, background: false, format: "json".into(),
+        targets: vec![], resume: None,
+    }
+}
+
+/// R2.3：resume 差集补跑。读 `manifest`（全集 M）+ `partial`（已完成 ok:true 的 cell 集）→
+/// `待跑 = M − 已完成`；对待跑 cell **直接用 manifest 里渲染好的 prompt 重放**
+/// `provider.run(LensRequest{model,prompt})`——不重收集证据、不重 build prompt（确定性）；
+/// append_partial 落盘后，`read_partial` 取全部 ok:true 的 findings（已完成 + 新补）走 mode
+/// 对应的共用尾段（`assemble_report`）组出完整报告。全集补齐→verdict 正常；仍有缺失→`Incomplete`。
+///
+/// ponytail：候补链 cell（未指定 `--models`）的 `CellInput.model` 只是 manifest 写入时「最高
+/// priority 候选」的近似快照（见设计 §6.5 ⚠️）——resume 按此近似重放。若该模型正是触发 resume
+/// 的卡死模型，这次重放会再失败，该 cell 仍缺，可再次 `--resume`（渐进收敛，不会更糟）。精确解
+/// 是重放完整候补链或把 manifest.model 升级为 `Vec<String>` 快照，本 task 不做（显式/replicate
+/// cell 的 manifest.model 已是精确值，dogfood 常见场景不受影响）。
+pub async fn run_resume(
+    ws: &Path,
+    job_id: &str,
+    provider: &dyn ReviewProvider,
+    cfg: &Config,
+    cwd: &Path,
+) -> (ReviewReport, i32) {
+    let t0 = std::time::Instant::now();
+    let manifest = crate::state::store::read_manifest(ws, job_id);
+    let args: ReviewArgs = match crate::state::store::read_args_raw(ws, job_id)
+        .and_then(|j| serde_json::from_str(&j).ok())
+    {
+        Some(a) => a,
+        None => {
+            return partial_report(
+                ws, job_id, &empty_review_args(),
+                "resume: missing job args (job never ran via --background)".into(),
+            );
+        }
+    };
+    let mode = match args.mode.as_deref() {
+        Some("code") => Mode::Code,
+        _ => Mode::Doc,
+    };
+    let fallback_lens = match mode { Mode::Code => "code", Mode::Doc => "doc" };
+
+    let done: std::collections::BTreeSet<String> = crate::state::store::read_partial(ws, job_id)
+        .into_iter()
+        .filter(|r| r.ok)
+        .map(|r| r.cell)
+        .collect();
+    let pending: Vec<&crate::state::store::CellInput> =
+        manifest.iter().filter(|c| !done.contains(&c.cell)).collect();
+
+    let mut usage = (0u64, 0u64);
+    let mut warnings = Vec::new();
+    for cell in &pending {
+        let req = LensRequest { model: cell.model.clone(), prompt: cell.prompt.clone() };
+        let rec = match provider.run(req).await {
+            Ok(call) => {
+                usage.0 += call.input_tokens;
+                usage.1 += call.output_tokens;
+                let fs: Vec<Finding> =
+                    call.findings.iter().map(|r| enrich(r, fallback_lens, &cell.model)).collect();
+                crate::state::store::CellRecord::ok(cell.cell.clone(), cell.model.clone(), fs)
+            }
+            Err(e) => {
+                warnings.push(format!("resume cell [{}] model {}: {e}", cell.cell, cell.model));
+                crate::state::store::CellRecord {
+                    cell: cell.cell.clone(), model: cell.model.clone(), ok: false,
+                    findings: vec![], warn: Some(e.to_string()),
+                }
+            }
+        };
+        let _ = crate::state::store::append_partial(ws, job_id, &rec);
+    }
+
+    // 合并出报告：全部 ok:true 的 findings（已完成 + 新补）。
+    let final_records = crate::state::store::read_partial(ws, job_id);
+    let ok_cells: std::collections::BTreeSet<&str> =
+        final_records.iter().filter(|r| r.ok).map(|r| r.cell.as_str()).collect();
+    let still_missing = manifest.iter().filter(|c| !ok_cells.contains(c.cell.as_str())).count();
+    let findings: Vec<Finding> =
+        final_records.into_iter().filter(|r| r.ok).flat_map(|r| r.findings).collect();
+
+    let (models, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
+    let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
+    let lens_ids: Vec<String> = args
+        .lenses
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_else(|| match mode {
+            Mode::Code => cfg.review.lenses.code.clone(),
+            Mode::Doc => cfg.review.lenses.doc.clone(),
+        });
+    let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
+    let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
+    let correlate_on = cfg.review.correlate && !args.no_correlate;
+
+    let ctx = TailCtx {
+        mode,
+        root: if mode == Mode::Code { Some(cwd) } else { None },
+        targets: &args.targets,
+        provider,
+        model_names,
+        lens_ids,
+        block,
+        floor,
+        correlate_on,
+        max_concurrency: cfg.review.max_concurrency,
+        job_id: job_id.to_string(),
+        duration_ms: t0.elapsed().as_millis() as u64,
+        usage,
+        warnings,
+        failed_models: vec![],
+    };
+    match assemble_report(findings, ctx).await {
+        Ok((mut report, mut code)) => {
+            if still_missing > 0 {
+                report.verdict = Verdict::Incomplete;
+                report.run.warnings.push(format!("resume: {still_missing} cell(s) still missing after replay"));
+                code = exit_code(Verdict::Incomplete, false);
+            }
+            (report, code)
+        }
+        Err(e) => partial_report(ws, job_id, &args, format!("resume tail failed: {e}")),
+    }
 }
 
 /// 落终态部分报告：渲染 json+md、写 result 文件、把 state 转终态并记录错误原因。
@@ -546,6 +710,7 @@ mod job_tests {
             spec: vec![], focus: None, lenses: None, models: None, models_all: false,
             no_correlate: false, block_threshold: None, conf_floor: None,
             background: true, format: "json".into(), targets: vec![target.into()],
+            resume: None,
         }
     }
     fn cfg() -> Config {
@@ -740,6 +905,101 @@ mod job_tests {
 }
 
 #[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use crate::domain::{Finding, RawFinding, Severity};
+    use crate::state::store::CellInput;
+
+    /// 记录每次 `run` 调用的 prompt，脚本化返回一条低 severity finding（避免触发 verify 的
+    /// 二次 provider 调用，测试只关心 resume 对缺失 cell 的调用次数）。
+    #[derive(Default)]
+    struct RecordingProvider {
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::ReviewProvider for RecordingProvider {
+        async fn run(
+            &self,
+            req: crate::provider::LensRequest,
+        ) -> Result<crate::provider::LensCall, crate::provider::ProviderError> {
+            self.prompts.lock().unwrap().push(req.prompt.clone());
+            Ok(crate::provider::LensCall {
+                findings: vec![RawFinding {
+                    severity: Severity::Low,
+                    title: format!("issue-{}", req.prompt),
+                    body: "b".into(),
+                    file: "spec.md".into(),
+                    line_start: 1,
+                    line_end: 1,
+                    confidence: 0.9,
+                    recommendation: "r".into(),
+                    hard_constraint: false,
+                    quote: String::new(), // 空引用=遗漏类，anchor_doc 无条件保留
+                    lens: None,
+                }],
+                input_tokens: 1,
+                output_tokens: 1,
+            })
+        }
+    }
+
+    fn omission_finding(title: &str) -> Finding {
+        Finding {
+            id: title.into(), severity: Severity::Low, title: title.into(), body: "b".into(),
+            file: "spec.md".into(), line_start: 1, line_end: 1, confidence: 0.9,
+            recommendation: "r".into(), lenses: vec![], models: vec!["m".into()], agreement: 1,
+            hard_constraint: false, quote: String::new(), cluster_id: None, verify: None,
+        }
+    }
+
+    /// T7 核心测试：manifest 3 cell、partial 已完成 1（c1）→ resume 只应对缺失的 c2/c3 调用
+    /// provider，最终报告合并出全部 3 个 cell 的 findings。
+    #[tokio::test]
+    async fn resume_only_runs_missing_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        // doc 模式尾段需要至少一个可读的受审文档（omission finding 本身不依赖其内容）。
+        let doc = dir.path().join("spec.md");
+        std::fs::write(&doc, "whatever\n").unwrap();
+        let dp = doc.to_string_lossy().to_string();
+
+        let inputs = vec![
+            CellInput { cell: "c1".into(), model: "m".into(), prompt: "P1".into() },
+            CellInput { cell: "c2".into(), model: "m".into(), prompt: "P2".into() },
+            CellInput { cell: "c3".into(), model: "m".into(), prompt: "P3".into() },
+        ];
+        crate::state::store::write_manifest(ws, "j", &inputs).unwrap();
+        crate::state::store::append_partial(
+            ws, "j",
+            &crate::state::store::CellRecord::ok("c1", "m", vec![omission_finding("issue-c1")]),
+        ).unwrap();
+
+        let args = ReviewArgs {
+            mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
+            focus: None, lenses: None, models: Some("m".into()), models_all: false,
+            no_correlate: true, block_threshold: None, conf_floor: None, background: true,
+            format: "json".into(), targets: vec![dp], resume: None,
+        };
+        crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
+
+        let provider = RecordingProvider::default();
+        let cfg = Config::default();
+
+        let (report, _code) = run_resume(ws, "j", &provider, &cfg, dir.path()).await;
+
+        let calls = provider.prompts.lock().unwrap();
+        assert_eq!(calls.len(), 2, "只应对缺失的 2 个 cell 调用 provider");
+        assert!(calls.contains(&"P2".to_string()), "应补跑 c2");
+        assert!(calls.contains(&"P3".to_string()), "应补跑 c3");
+        assert!(!calls.contains(&"P1".to_string()), "已完成的 c1 不应重跑");
+        drop(calls);
+
+        assert_eq!(report.findings.len(), 3, "合并后应含 3 个 cell 的 findings（1 已完成 + 2 新补）");
+    }
+}
+
+#[cfg(test)]
 mod resolve_tests {
     use super::*;
 
@@ -839,6 +1099,7 @@ default_models=["alpha"]
             spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
+            resume: None,
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
         let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None).await.unwrap();
@@ -856,6 +1117,7 @@ default_models=["alpha"]
             models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
+            resume: None,
         }
     }
 
