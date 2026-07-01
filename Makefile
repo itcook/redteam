@@ -1,4 +1,4 @@
-BIN := plugins/breakpoint/bin/brk-darwin-arm64
+BIN := plugins/breakpoint/bin/darwin/aarch64/brk
 TARGET := aarch64-apple-darwin
 
 .PHONY: all gen build verify
