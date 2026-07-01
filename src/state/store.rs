@@ -210,7 +210,11 @@ pub fn result_consumed_at(ws: &Path, id: &str) -> Option<u64> {
     std::fs::read_to_string(consumed_marker(ws, id)).ok()?.trim().parse().ok()
 }
 
-use crate::state::job::{list_states, JobStatus};
+use crate::state::job::{list_states, write_state, JobStatus};
+
+/// 假死阈值：`last_active` 停滞超过此值即判「挂死」（pid 仍活也算），
+/// 对齐 19 轮手工用的「log mtime 冻结 >5min 判 HUNG」。
+const WEDGE_THRESHOLD_SECS: u64 = 300;
 
 /// 检测 pid 是否仍存活：kill(pid, 0) 成功或 errno==EPERM → alive；ESRCH → dead。
 pub fn pid_alive(pid: u32) -> bool {
@@ -235,32 +239,33 @@ fn remove_job_files(ws: &Path, id: &str) {
 }
 
 /// 机会式 prune：
-/// - 终态作业（done/failed/cancelled）：started_at+ttl < now 时删除。
+/// - 终态作业（done/failed/cancelled/timed_out）：started_at+ttl < now 时才真删文件（回收磁盘）。
 /// - 非终态作业（pending/running）：
-///   - pid 存在且进程已死 → 回收（孤儿 worker）。
-///   - pid 不存在且 started_at+ttl < now → 也回收（长期未启动的悬空 pending）。
+///   - pid 已死，或 last_active 停滞超过 `WEDGE_THRESHOLD_SECS`（即便 pid 仍活）→ 转 `Failed`
+///     留证（写 error），**不删文件**。
+///   - pid 不存在且 started_at+ttl < now：从未真正起过 worker，无证据可留，回收删除。
 pub fn prune(ws: &Path, ttl: Duration, now: u64) {
     let ttl_secs = ttl.as_secs();
-    for st in list_states(ws) {
+    for mut st in list_states(ws) {
         let terminal = matches!(
             st.status,
-            JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled
+            JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled | JobStatus::TimedOut
         );
-        let id = &st.job_id;
         if terminal {
             if st.started_at.saturating_add(ttl_secs) < now {
-                remove_job_files(ws, id);
+                remove_job_files(ws, &st.job_id);
             }
-        } else {
-            // 非终态：检查是否需要回收孤儿
-            if let Some(pid) = st.pid {
-                if !pid_alive(pid) {
-                    remove_job_files(ws, id);
-                }
-            } else if st.started_at.saturating_add(ttl_secs) < now {
-                // 无 pid 且超过 TTL：悬空 pending，回收
-                remove_job_files(ws, id);
+        } else if let Some(pid) = st.pid {
+            let dead = !pid_alive(pid);
+            let wedged = now.saturating_sub(st.last_active) > WEDGE_THRESHOLD_SECS;
+            if dead || wedged {
+                st.error = Some(if dead { "reaped: dead pid" } else { "reaped: wedged (no heartbeat)" }.to_string());
+                st.status = JobStatus::Failed;
+                let _ = write_state(ws, &st);
             }
+        } else if st.started_at.saturating_add(ttl_secs) < now {
+            // 无 pid 且超过 TTL：悬空 pending（从未起过 worker），无证据可留，回收删除
+            remove_job_files(ws, &st.job_id);
         }
     }
 }
@@ -395,9 +400,9 @@ mod tests {
         assert!(!job_log(ws, "old-done").exists());
     }
 
-    /// I1：spawn `true`（立即退出），等待其结束（pid 已死），写 Running + pid=Some(dead)
-    /// → prune（now 未过 ttl）→ 断言被回收。
-    /// 另保留 pid=自己（alive）的 Running，断言不被回收。
+    /// I1/R2.2：spawn `true`（立即退出），等待其结束（pid 已死），写 Running + pid=Some(dead)
+    /// → prune（now 未过 ttl）→ 断言转 `Failed` 留证（不再蒸发，文件仍在）。
+    /// 另保留 pid=自己（alive）+ last_active 新鲜的 Running，断言仍原样（未被回收/转态）。
     #[test]
     fn prune_reaps_dead_pid_non_terminal_job() {
         use crate::state::job::{write_state, JobState};
@@ -421,22 +426,65 @@ mod tests {
         st_dead.pid = Some(dead_pid);
         write_state(ws, &st_dead).unwrap();
 
-        // 保留 pid=自己（alive）的 Running
+        // 保留 pid=自己（alive）+ last_active 贴近 now（未挂死）的 Running
         let self_pid = std::process::id();
         let mut st_alive = JobState::new("alive-worker", 500);
         st_alive.status = JobStatus::Running;
         st_alive.pid = Some(self_pid);
+        st_alive.last_active = now;
         write_state(ws, &st_alive).unwrap();
 
         prune(ws, ttl, now);
 
-        assert!(
-            crate::state::job::read_state(ws, "dead-worker").is_none(),
-            "dead-pid Running job should be reaped by prune"
+        let dead_back = crate::state::job::read_state(ws, "dead-worker");
+        assert_eq!(
+            dead_back.as_ref().map(|s| s.status),
+            Some(JobStatus::Failed),
+            "dead-pid Running job should transition to Failed"
         );
         assert!(
-            crate::state::job::read_state(ws, "alive-worker").is_some(),
-            "alive-pid Running job should NOT be reaped"
+            dead_back.unwrap().error.is_some(),
+            "Failed transition should record error reason"
+        );
+        assert!(job_json(ws, "dead-worker").exists(), "证据保留：文件不删");
+
+        let alive_back = crate::state::job::read_state(ws, "alive-worker").unwrap();
+        assert_eq!(
+            alive_back.status,
+            JobStatus::Running,
+            "alive-pid + fresh heartbeat job should NOT be reaped/transitioned"
+        );
+    }
+
+    /// R1.2/2.2：活 pid（自身进程）但 `last_active` 远古停滞 > WEDGE_THRESHOLD → 判假死转 `Failed`，
+    /// 文件保留（留证，不蒸发）。
+    #[test]
+    fn prune_wedged_live_pid_transitions_failed_keeps_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = crate::state::job::JobState::new("j", 0);
+        st.status = crate::state::job::JobStatus::Running;
+        st.pid = Some(std::process::id()); // 活 pid（自身）
+        st.last_active = 0;                 // 远古，停滞
+        crate::state::job::write_state(ws, &st).unwrap();
+        prune(ws, parse_ttl("24h"), 99999);  // now 远超 wedge
+        let back = crate::state::job::read_state(ws, "j").unwrap();
+        assert_eq!(back.status, crate::state::job::JobStatus::Failed, "假死活 pid 应转 Failed");
+        assert!(crate::state::job::read_state(ws, "j").is_some(), "证据保留不删");
+    }
+
+    /// R2.2：终态（TimedOut，新纳入终态集合）+ 超 TTL → 真删文件，确认删除路径仍工作。
+    #[test]
+    fn prune_removes_expired_terminal_timed_out_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let ttl = Duration::from_secs(100);
+        let now = 1000u64;
+        dated_job(ws, "old-timeout", JobStatus::TimedOut, 800); // 800+100=900 < 1000 → 删
+        prune(ws, ttl, now);
+        assert!(
+            crate::state::job::read_state(ws, "old-timeout").is_none(),
+            "expired TimedOut terminal job pruned (真删)"
         );
     }
 
