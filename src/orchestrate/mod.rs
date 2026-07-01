@@ -167,11 +167,14 @@ pub async fn run_fanout(
 
     if opts.replicate {
         // 显式：每个 (lens, model) 独立格子，失败记 warning + failed_models
+        // cell-id 带上 model（`lens:<id>@<model>`）：replicate 下同一 lens 多个 model 副本
+        // 必须各自唯一，否则 resume 差集判定（join on cell）会把未完成的 model 误判为已完成
+        // （见 run_resume 设计注释——静默假阳性 bug，final-review Important）。
         let manifest: Vec<CellInput> = cells
             .iter()
             .flat_map(|(cell, prompt)| {
                 opts.models.iter().map(move |pm| CellInput {
-                    cell: cell.clone(),
+                    cell: format!("{cell}@{}", pm.name),
                     model: pm.name.clone(),
                     prompt: prompt.clone(),
                 })
@@ -187,7 +190,7 @@ pub async fn run_fanout(
             .flat_map(|(lens, (cell, prompt))| {
                 opts.models.iter().map(move |pm| {
                     let model_name = pm.name.clone();
-                    let cell_id = cell.clone();
+                    let cell_id = format!("{cell}@{}", pm.name);
                     let single_opts = OrchestrateOpts {
                         models: vec![pm.clone()],
                         replicate: true,
@@ -372,11 +375,12 @@ pub async fn run_code_fanout(
 
     if opts.replicate {
         // 全复制：bundle × model 笛卡尔积，每格只试该 model（不候补）
+        // cell-id 带上 model（`bundle[label]@<model>`）：理由同 run_fanout 的 replicate 分支注释。
         let manifest: Vec<CellInput> = cells
             .iter()
             .flat_map(|(cell, _label, prompt)| {
                 opts.models.iter().map(move |pm| CellInput {
-                    cell: cell.clone(),
+                    cell: format!("{cell}@{}", pm.name),
                     model: pm.name.clone(),
                     prompt: prompt.clone(),
                 })
@@ -391,7 +395,7 @@ pub async fn run_code_fanout(
             opts.models.iter().map(move |pm| {
                 let sem = sem.clone();
                 let model_name = pm.name.clone();
-                let cell_id = cell.clone();
+                let cell_id = format!("{cell}@{}", pm.name);
                 let single = OrchestrateOpts {
                     models: vec![pm.clone()],
                     replicate: true,
@@ -542,11 +546,12 @@ pub async fn run_doc_fanout(
     let cell_id = "doc".to_string();
 
     if opts.replicate {
+        // cell-id 带上 model（`doc@<model>`）：理由同 run_fanout 的 replicate 分支注释。
         let manifest: Vec<CellInput> = opts
             .models
             .iter()
             .map(|pm| CellInput {
-                cell: cell_id.clone(),
+                cell: format!("{cell_id}@{}", pm.name),
                 model: pm.name.clone(),
                 prompt: prompt.clone(),
             })
@@ -559,7 +564,7 @@ pub async fn run_doc_fanout(
         let futures = opts.models.iter().map(|pm| {
             let sem = sem.clone();
             let model_name = pm.name.clone();
-            let cell_id = cell_id.clone();
+            let cell_id = format!("{cell_id}@{}", pm.name);
             let prompt = &prompt;
             let single = OrchestrateOpts {
                 models: vec![pm.clone()],
@@ -887,8 +892,17 @@ mod tests {
             ],
             replicate: true, no_fallback: false, max_concurrency: 8, retries: 0,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
+        let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, Some(&sink)).await;
         assert_eq!(out.findings.len(), 2, "one finding per model over the single doc");
+        // final-review Important 回归：replicate 下同一 base cell（"doc"）的多 model 副本，
+        // manifest + on_cell 的 cell-id 必须各自带上 model 才唯一——否则 resume 的差集判定
+        // （join on cell）会把「任一 model 已完成」误判为「该 cell 全部完成」，见 cli.rs
+        // resume_replicate_missing_model_copy_is_completed。
+        let manifest_cells: std::collections::BTreeSet<String> =
+            sink.records.lock().unwrap().iter().map(|r| r.cell.clone()).collect();
+        assert_eq!(manifest_cells.len(), 2, "两个 model 副本的 cell-id 必须彼此唯一，不能坍缩成同一个 \"doc\"");
+        assert!(manifest_cells.contains("doc@alpha") && manifest_cells.contains("doc@beta"));
         let models: std::collections::BTreeSet<&str> =
             out.findings.iter().flat_map(|f| f.models.iter().map(|s| s.as_str())).collect();
         assert!(models.contains("alpha") && models.contains("beta"));

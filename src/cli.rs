@@ -1006,6 +1006,58 @@ mod resume_tests {
         assert_eq!(report.findings.len(), 3, "合并后应含 3 个 cell 的 findings（1 已完成 + 2 新补）");
     }
 
+    /// final-review Important 回归：replicate 模式（同 cell 多 model 副本）manifest 的
+    /// cell-id 必须带上 model（如 `doc@alpha`/`doc@beta`），否则 resume 的差集判定（join on
+    /// cell）会把「同 cell 任一 model 已完成」误判为「该 cell 全部完成」，缺失的 model 副本
+    /// 永不补跑，还会静默拼出一份只含部分 model 的「完整」报告。
+    /// 这里手工构造 manifest 模拟 run_doc_fanout 修复后的输出（2 行，cell 各自带 @model），
+    /// partial 只完成 doc@alpha → 断言 doc@beta 必须被补跑，且合并结果含两个 model 的 finding。
+    #[tokio::test]
+    async fn resume_replicate_missing_model_copy_is_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let doc = dir.path().join("spec.md");
+        std::fs::write(&doc, "whatever\n").unwrap();
+        let dp = doc.to_string_lossy().to_string();
+
+        let inputs = vec![
+            CellInput { cell: "doc@alpha".into(), model: "alpha".into(), prompt: "P-alpha".into() },
+            CellInput { cell: "doc@beta".into(), model: "beta".into(), prompt: "P-beta".into() },
+        ];
+        crate::state::store::write_manifest(ws, "j", &inputs).unwrap();
+        crate::state::store::append_partial(
+            ws, "j",
+            &crate::state::store::CellRecord::ok("doc@alpha", "alpha", vec![omission_finding("issue-alpha")]),
+        ).unwrap();
+
+        let args = ReviewArgs {
+            mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
+            focus: None, lenses: None, models: Some("alpha,beta".into()), models_all: false,
+            no_correlate: true, block_threshold: None, conf_floor: None, background: true,
+            format: "json".into(), targets: vec![dp], resume: None,
+        };
+        crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
+
+        let provider = RecordingProvider::default();
+        let cfg = Config::default();
+
+        let (report, _code) = run_resume(ws, "j", &provider, &cfg, dir.path()).await;
+
+        let calls = provider.prompts.lock().unwrap();
+        assert_eq!(calls.len(), 1, "只应对缺失的 doc@beta 调用 provider（doc@alpha 已完成不得重跑）");
+        assert!(calls.contains(&"P-beta".to_string()), "beta 副本必须被补跑，不能被 alpha 的完成状态静默坍缩");
+        drop(calls);
+
+        assert_eq!(
+            report.findings.len(), 2,
+            "合并后应含 alpha+beta 两个 model 副本的 findings，不能只含 alpha 就报完整"
+        );
+        assert_ne!(
+            report.verdict, crate::domain::Verdict::Incomplete,
+            "两个 model 副本都已补齐，不应再是 Incomplete"
+        );
+    }
+
     /// 假阳性防护：manifest 从未写出（job 在 fan-out 前崩溃）→ resume 不得静默出 Approve，
     /// 必须 Incomplete + 非零退出，且不调 provider。
     #[tokio::test]
