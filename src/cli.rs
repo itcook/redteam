@@ -55,6 +55,7 @@ pub fn exit_code(verdict: Verdict, failed_models_nonempty: bool) -> i32 {
         (Verdict::Reject, _) => 10,
         (Verdict::Approve, true) => 2,
         (Verdict::Approve, false) => 0,
+        (Verdict::Incomplete, _) => 2,
     }
 }
 

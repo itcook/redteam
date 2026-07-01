@@ -11,6 +11,8 @@ pub enum JobStatus {
     Done,
     Failed,
     Cancelled,
+    #[serde(rename = "timed_out")]
+    TimedOut,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -40,6 +42,10 @@ pub struct JobState {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub result_path: Option<String>,
+    #[serde(default)]
+    pub last_active: u64,
+    #[serde(default)]
+    pub deadline_at: Option<u64>,
 }
 
 impl JobState {
@@ -56,6 +62,8 @@ impl JobState {
             exit_code: None,
             error: None,
             result_path: None,
+            last_active: started_at,
+            deadline_at: None,
         }
     }
 }
@@ -106,6 +114,7 @@ mod tests {
             started_at: 1000, progress: Progress { done: 1, total: 3 },
             models: vec!["alpha".into()], lenses: vec!["D1".into()],
             pid: Some(4242), exit_code: None, error: None, result_path: None,
+            last_active: 1000, deadline_at: None,
         };
         write_state(ws, &st).unwrap();
         let back = read_state(ws, "job1").unwrap();
@@ -130,5 +139,24 @@ mod tests {
     fn read_missing_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_state(dir.path(), "nope").is_none());
+    }
+
+    #[test]
+    fn jobstate_new_fields_default_and_roundtrip() {
+        let mut s = JobState::new("j", 100);
+        s.last_active = 150;
+        s.deadline_at = Some(2500);
+        s.status = JobStatus::TimedOut;
+        let j = serde_json::to_string(&s).unwrap();
+        let back: JobState = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.last_active, 150);
+        assert_eq!(back.deadline_at, Some(2500));
+        assert_eq!(back.status, JobStatus::TimedOut);
+        // 旧文件（无新字段）可读
+        let old: JobState = serde_json::from_str(
+            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[],"lenses":[]}"#
+        ).unwrap();
+        assert_eq!(old.last_active, 0);
+        assert_eq!(old.deadline_at, None);
     }
 }
