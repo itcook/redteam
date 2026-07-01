@@ -43,8 +43,6 @@ enum Cmd {
         block_threshold: Option<String>,
         #[arg(long)]
         conf_floor: Option<f32>,
-        #[arg(long, default_value_t = true)]
-        wait: bool,
         #[arg(long)]
         background: bool,
         #[arg(long, default_value = "json")]
@@ -55,9 +53,14 @@ enum Cmd {
         resume: Option<String>,
         targets: Vec<String>,
     },
-    /// 查询作业状态：无 id 列全部，有 id 打印该作业 JSON。
-    Status { job_id: Option<String> },
-    /// 取回已完成作业的评审结果（读后标记已消费）。
+    /// 查询作业状态：无 id 列当前 workspace 全部；有 id 打印该作业 JSON。
+    /// `--workspaces` 聚合所有 workspace，`--workspaces <substr>` 按路径子串筛。
+    Status {
+        job_id: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        workspaces: Option<String>,
+    },
+    /// 取回已完成作业的评审结果（读后标记已消费）。仅作业处于终态 `done` 时可取；未终态返回退出码 2。
     Result {
         job_id: String,
         #[arg(long, default_value = "json")]
@@ -148,16 +151,6 @@ fn spawn_detached_worker(job_id: &str) -> std::io::Result<u32> {
     Ok(child.id())
 }
 
-/// 把作业列表渲染成每行一条的摘要（status 命令无 id 时用）。
-fn render_job_list(jobs: &[breakpoint::state::job::JobState]) -> String {
-    let mut lines: Vec<String> = jobs.iter().map(|s| {
-        let mode = s.mode.map(|m| format!("{m:?}")).unwrap_or_else(|| "?".into());
-        format!("{}  {:?}  {}  {}/{}", s.job_id, s.status, mode, s.progress.done, s.progress.total)
-    }).collect();
-    lines.sort();
-    lines.join("\n")
-}
-
 /// 加载配置；解析失败时打 stderr 警告（而非静默回落空配置——否则配置写错一个字段
 /// 就「无任何输出」无从诊断）后回落默认。
 fn load_config_warned() -> Config {
@@ -241,7 +234,6 @@ async fn main() {
             no_correlate,
             block_threshold,
             conf_floor,
-            wait: _wait, // 默认前台同步路径；run_review 不持有此字段（与 --background 对称）
             background,
             format,
             resume,
@@ -300,6 +292,12 @@ async fn main() {
                     std::process::exit(2);
                 }
                 let mut st = breakpoint::state::job::JobState::new(&job_id, now_secs());
+                st.workspace = Some(
+                    std::fs::canonicalize(&cwd)
+                        .unwrap_or_else(|_| cwd.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
                 let _ = breakpoint::state::job::write_state(&ws, &st);
                 match spawn_detached_worker(&job_id) {
                     Ok(pid) => {
@@ -382,14 +380,18 @@ async fn main() {
             let code = breakpoint::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
             std::process::exit(code);
         }
-        Cmd::Status { job_id } => {
+        Cmd::Status { job_id, workspaces } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let ws = breakpoint::state::store::workspace_bucket(&cwd);
-            prune_here(&ws); // 机会式 prune
+            prune_here(&ws); // 机会式 prune（仅当前 workspace，见决策⑥）
             match job_id {
                 None => {
-                    let jobs = breakpoint::state::job::list_states(&ws);
-                    println!("{}", render_job_list(&jobs));
+                    let jobs = breakpoint::state::job::select_jobs(
+                        &ws,
+                        &breakpoint::state::store::state_root(),
+                        workspaces.as_deref(),
+                    );
+                    println!("{}", serde_json::to_string_pretty(&jobs).unwrap_or_else(|_| "[]".into()));
                     0
                 }
                 Some(id) => match breakpoint::state::job::read_state(&ws, &id) {
@@ -538,17 +540,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use breakpoint::state::job::{JobState, JobStatus};
-    #[test]
-    fn render_job_list_one_line_per_job_sorted() {
-        let mut a = JobState::new("aaa", 0); a.status = JobStatus::Done;
-        let mut b = JobState::new("bbb", 0); b.status = JobStatus::Running;
-        let out = render_job_list(&[b, a]);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("aaa"), "sorted by id");
-        assert!(lines[0].contains("Done") && lines[1].contains("Running"));
-    }
 
     /// C1：无 provider 配置的 Config + doc 模式 ReviewArgs → build_registry 返回 Err。
     #[test]
