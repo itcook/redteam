@@ -103,6 +103,9 @@ enum ModelCmd {
     Check,
 }
 
+/// R1.2：worker 总时限——到点仍未完成的作业自我中止为 TimedOut（保留部分报告，见 cli::run_job）。
+const JOB_DEADLINE_SECS: u64 = 40 * 60;
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -286,7 +289,8 @@ async fn main() {
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
             };
 
-            let result = breakpoint::cli::run_review_dispatch(&args, &registry, &cfg, &cwd).await;
+            // 前台直调无 job 上下文，sink=None（与 run_review/run_code_review 直调路径一致）。
+            let result = breakpoint::cli::run_review_dispatch(&args, &registry, &cfg, &cwd, None).await;
 
             match result {
                 Ok((report, code)) => {
@@ -335,6 +339,13 @@ async fn main() {
             let started = breakpoint::state::job::read_state(&ws, &job_id)
                 .map(|s| s.started_at)
                 .unwrap_or_else(now_secs);
+            // R1.2：worker 起手设 deadline_at（若尚未设置——例如状态文件是旧格式或已被设过）。
+            if let Some(mut st) = breakpoint::state::job::read_state(&ws, &job_id) {
+                if st.deadline_at.is_none() {
+                    st.deadline_at = Some(started + JOB_DEADLINE_SECS);
+                    let _ = breakpoint::state::job::write_state(&ws, &st);
+                }
+            }
             let code = breakpoint::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
             std::process::exit(code);
         }

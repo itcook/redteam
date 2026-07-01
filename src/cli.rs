@@ -5,7 +5,7 @@ use crate::domain::{Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict
 use crate::evidence::{collect, detect_mode, EvidenceOpts, Scope};
 use crate::evidence::git::FileChange;
 use crate::lens::select;
-use crate::orchestrate::{run_code_fanout, run_doc_fanout, OrchestrateOpts, PlannedModel};
+use crate::orchestrate::{run_code_fanout, run_doc_fanout, CellSink, OrchestrateOpts, PlannedModel};
 use crate::output::Format;
 use crate::positioning::{anchor, anchor_doc};
 use crate::provider::ReviewProvider;
@@ -105,6 +105,7 @@ pub async fn run_review(
     args: ReviewArgs,
     provider: &dyn ReviewProvider,
     cfg: &Config,
+    sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
         anyhow::bail!("--background is not yet implemented (planned for Plan 2)");
@@ -154,8 +155,8 @@ pub async fn run_review(
 
     // 4. fan-out（doc：全 D rule 一包 × model 工具循环）
     let focus = args.focus.clone().unwrap_or_default();
-    // sink=None：run_review 无 job 上下文（T5 接 JobCellSink 后由 run_job 传入）。
-    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, None).await;
+    // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
+    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink).await;
 
     // 5. positioning（doc anchor：空引用=遗漏保留、编造丢弃；按受审文档内容锚定）
     let docs = crate::evidence::doc::collect_doc_files(&args.targets)?;
@@ -218,6 +219,7 @@ pub async fn run_code_review(
     cfg: &Config,
     changes: Vec<FileChange>,
     root: &Path,
+    sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
         anyhow::bail!("--background is not yet implemented (planned for Plan 2)");
@@ -253,8 +255,8 @@ pub async fn run_code_review(
     } else {
         "working tree".to_string()
     };
-    // sink=None：run_code_review 无 job 上下文（T5 接 JobCellSink 后由 run_job 传入）。
-    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, None).await;
+    // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
+    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, sink).await;
 
     // 5. positioning（dedup 之前：准行号反哺 line-overlap 去重）
     let anchored = anchor(raw.findings, root);
@@ -310,6 +312,7 @@ pub async fn run_review_dispatch(
     provider: &dyn ReviewProvider,
     cfg: &Config,
     cwd: &Path,
+    sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     // run_review_dispatch 永远同步执行——--background 分叉发生在 main.rs，先于此处；
     // 故两分支都强制 background=false（否则 run_code_review/run_review 会 bail）。
@@ -328,14 +331,109 @@ pub async fn run_review_dispatch(
     match detected {
         Mode::Code => {
             let changes = crate::evidence::git::changed_files(sync_args.base.as_deref(), scope_enum == Scope::Branch)?;
-            run_code_review(&sync_args, provider, cfg, changes, cwd).await
+            run_code_review(&sync_args, provider, cfg, changes, cwd, sink).await
         }
-        Mode::Doc => run_review(sync_args, provider, cfg).await,
+        Mode::Doc => run_review(sync_args, provider, cfg, sink).await,
     }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// R2.1 job checkpoint sink：扇出前落 manifest（+刷 progress.total），每 cell 完成落 partial
+/// （+刷 last_active/progress.done）。cell 完成是低频事件——ponytail：每次操作直接
+/// read_state+write_state，不额外加锁/缓存。
+struct JobCellSink {
+    ws: std::path::PathBuf,
+    job_id: String,
+}
+
+impl CellSink for JobCellSink {
+    fn manifest(&self, inputs: &[crate::state::store::CellInput]) {
+        let _ = crate::state::store::write_manifest(&self.ws, &self.job_id, inputs);
+        if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
+            st.progress.total = inputs.len() as u32;
+            let _ = crate::state::job::write_state(&self.ws, &st);
+        }
+    }
+
+    fn on_cell(&self, rec: crate::state::store::CellRecord) {
+        let _ = crate::state::store::append_partial(&self.ws, &self.job_id, &rec);
+        if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
+            st.last_active = now_unix();
+            st.progress.done += 1;
+            let _ = crate::state::job::write_state(&self.ws, &st);
+        }
+    }
+}
+
+/// R2.2：失败/超时时从 `<id>.partial.ndjson` 里已 checkpoint 的 findings 组一份 `incomplete`
+/// 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。M 取 manifest 行数（若尚未
+/// 写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
+fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) -> (ReviewReport, i32) {
+    let manifest = crate::state::store::read_manifest(ws, job_id);
+    let done_records: Vec<_> = crate::state::store::read_partial(ws, job_id)
+        .into_iter()
+        .filter(|r| r.ok)
+        .collect();
+    let done = done_records.len();
+    let total = manifest.len().max(done);
+    let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.findings).collect();
+    let mode = match args.mode.as_deref() {
+        Some("code") => Mode::Code,
+        _ => Mode::Doc,
+    };
+    let stats = Stats::from_findings(&findings);
+    let report = ReviewReport {
+        schema_version: "1".into(),
+        mode,
+        verdict: Verdict::Incomplete,
+        stats,
+        findings,
+        clusters: vec![],
+        next_steps: vec![],
+        run: RunMeta {
+            job_id: job_id.to_string(),
+            models: vec![],
+            lenses: vec![],
+            duration_ms: 0,
+            usage: Usage::default(),
+            warnings: vec![format!("partial: {done}/{total} cells"), reason],
+            failed_models: vec![],
+        },
+    };
+    let code = exit_code(Verdict::Incomplete, false);
+    (report, code)
+}
+
+/// 落终态部分报告：渲染 json+md、写 result 文件、把 state 转终态并记录错误原因。
+fn write_partial_result(
+    ws: &Path,
+    job_id: &str,
+    st: &mut crate::state::job::JobState,
+    status: crate::state::job::JobStatus,
+    report: &ReviewReport,
+    code: i32,
+    error: String,
+) {
+    let json = crate::output::render(report, crate::output::Format::Json);
+    let md = crate::output::render(report, crate::output::Format::Md);
+    let _ = crate::state::store::write_result(ws, job_id, &json);
+    let _ = crate::state::store::write_result_md(ws, job_id, &md);
+    st.status = status;
+    st.error = Some(error);
+    st.exit_code = Some(code);
+    st.result_path = Some(crate::state::store::job_result(ws, job_id).to_string_lossy().into_owned());
+    let _ = crate::state::job::write_state(ws, st);
 }
 
 /// 状态机包裹评审：running → (评审) → done+result.json / failed+error。返回退出码。
 /// 已被 cancel（状态 Cancelled）时不覆盖为 Done，保留 cancelled 终态。
+/// `st.deadline_at`（worker 起手设，见 main.rs）到点仍未完成 → TimedOut + 部分报告（R1.2）。
 pub async fn run_job(
     ws: &Path,
     job_id: &str,
@@ -356,8 +454,30 @@ pub async fn run_job(
     st.status = JobStatus::Running;
     let _ = write_state(ws, &st);
 
-    match run_review_dispatch(args, provider, cfg, cwd).await {
-        Ok((report, code)) => {
+    let sink = JobCellSink { ws: ws.to_path_buf(), job_id: job_id.to_string() };
+    let dispatch = run_review_dispatch(args, provider, cfg, cwd, Some(&sink));
+
+    // Outcome 只在本函数内构造/匹配一次，Box 间接层不值当——沿用 main.rs Cmd 枚举同款 allow。
+    #[allow(clippy::large_enum_variant)]
+    enum Outcome {
+        Done(anyhow::Result<(ReviewReport, i32)>),
+        TimedOut,
+    }
+
+    let outcome = match st.deadline_at {
+        Some(deadline_secs) => {
+            let remaining = deadline_secs.saturating_sub(now_unix());
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(remaining);
+            tokio::select! {
+                r = dispatch => Outcome::Done(r),
+                _ = tokio::time::sleep_until(deadline) => Outcome::TimedOut,
+            }
+        }
+        None => Outcome::Done(dispatch.await),
+    };
+
+    match outcome {
+        Outcome::Done(Ok((report, code))) => {
             // 同渲染 json + md 落盘（result 命令按 format 直读，避免反序列化 report 图）。
             let json = crate::output::render(&report, crate::output::Format::Json);
             let md = crate::output::render(&report, crate::output::Format::Md);
@@ -375,12 +495,16 @@ pub async fn run_job(
             let _ = write_state(ws, &st);
             code
         }
-        Err(e) => {
-            st.status = JobStatus::Failed;
-            st.error = Some(e.to_string());
-            st.exit_code = Some(2);
-            let _ = write_state(ws, &st);
-            2
+        Outcome::Done(Err(e)) => {
+            let (report, code) = partial_report(ws, job_id, args, e.to_string());
+            write_partial_result(ws, job_id, &mut st, JobStatus::Failed, &report, code, e.to_string());
+            code
+        }
+        Outcome::TimedOut => {
+            let reason = "timed out: deadline exceeded".to_string();
+            let (report, code) = partial_report(ws, job_id, args, reason.clone());
+            write_partial_result(ws, job_id, &mut st, JobStatus::TimedOut, &report, code, reason);
+            code
         }
     }
 }
@@ -391,8 +515,17 @@ mod job_tests {
     use crate::state::job::{read_state, JobStatus};
     use crate::state::store::read_result;
     use crate::provider::fake::FakeProvider;
-    use crate::domain::{RawFinding, Severity};
+    use crate::domain::{Finding, RawFinding, Severity};
     use std::collections::BTreeMap;
+
+    fn checkpointed_finding(title: &str) -> Finding {
+        Finding {
+            id: "f".into(), severity: Severity::Medium, title: title.into(), body: "b".into(),
+            file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
+            lenses: vec![], models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
+            quote: "q".into(), cluster_id: None, verify: None,
+        }
+    }
 
     fn doc_args(target: &str) -> ReviewArgs {
         ReviewArgs {
@@ -450,6 +583,76 @@ mod job_tests {
         let st = read_state(ws, "j2").unwrap();
         assert_eq!(st.status, JobStatus::Failed);
         assert!(st.error.is_some());
+    }
+
+    /// R2.2：dispatch 失败但已有 checkpoint（partial 里一条 ok:true 记录）→ result.json 不能
+    /// 静默丢——应写 verdict=incomplete，findings 并入已 checkpoint 的记录，warnings 含 "partial:"。
+    #[tokio::test]
+    async fn run_job_failure_writes_incomplete_partial_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        crate::state::job::write_state(ws, &crate::state::job::JobState::new("j2b", 0)).unwrap();
+        // 预置一条 partial（模拟崩溃前已完成 1 cell）
+        crate::state::store::append_partial(
+            ws, "j2b",
+            &crate::state::store::CellRecord::ok("bundle[a]", "alpha", vec![checkpointed_finding("checkpointed")]),
+        ).unwrap();
+
+        // targets 指向不存在文件 → collect 失败 → run_review_dispatch Err，但已有 partial 记录
+        let provider = FakeProvider { scripted: BTreeMap::new() };
+        let code = run_job(ws, "j2b", &doc_args("/nonexistent/zzz.md"), &provider, &cfg(), dir.path(), 0).await;
+
+        assert_eq!(code, 2);
+        let st = read_state(ws, "j2b").unwrap();
+        assert_eq!(st.status, JobStatus::Failed);
+        assert!(st.error.is_some());
+        let res = read_result(ws, "j2b").unwrap();
+        assert!(res.contains("\"incomplete\""), "verdict 应为 incomplete: {res}");
+        assert!(res.contains("partial:"), "warnings 应含 partial 标记: {res}");
+        assert!(res.contains("checkpointed"), "已 checkpoint 的 finding 不应丢失: {res}");
+    }
+
+    /// 永不完成的 provider——保证 dispatch 分支不可能赢得 deadline race（而非靠真实短
+    /// sleep+timeout 的时序假设）。用于 R1.2 deadline 超时测试，0 依赖、0 wall-clock 等待。
+    struct HangProvider;
+
+    #[async_trait::async_trait]
+    impl crate::provider::ReviewProvider for HangProvider {
+        async fn run(&self, _req: crate::provider::LensRequest) -> Result<crate::provider::LensCall, crate::provider::ProviderError> {
+            std::future::pending::<()>().await;
+            unreachable!("HangProvider never resolves")
+        }
+    }
+
+    /// R1.2：`deadline_at` 已过期 + dispatch 永不完成 → run_job 走超时分支，写 TimedOut +
+    /// 部分报告（不静默丢 deadline 前已 checkpoint 的 findings）。
+    #[tokio::test]
+    async fn run_job_timeout_writes_incomplete_partial_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let doc = dir.path().join("spec.md");
+        std::fs::write(&doc, "intro\nsome content\nend\n").unwrap();
+        let dp = doc.to_string_lossy().to_string();
+
+        let mut st = crate::state::job::JobState::new("j-to", 0);
+        st.deadline_at = Some(0); // 已过期（远小于 now）→ select 立即走超时分支
+        crate::state::job::write_state(ws, &st).unwrap();
+        // 预置一条 partial（模拟 deadline 前已完成 1 cell）
+        crate::state::store::append_partial(
+            ws, "j-to",
+            &crate::state::store::CellRecord::ok("bundle[a]", "alpha", vec![checkpointed_finding("before-deadline")]),
+        ).unwrap();
+
+        let provider = HangProvider;
+        let code = run_job(ws, "j-to", &doc_args(&dp), &provider, &cfg(), dir.path(), 0).await;
+
+        assert_eq!(code, 2);
+        let st = read_state(ws, "j-to").unwrap();
+        assert_eq!(st.status, JobStatus::TimedOut);
+        let res = read_result(ws, "j-to").unwrap();
+        assert!(res.contains("\"incomplete\""), "verdict 应为 incomplete: {res}");
+        assert!(res.contains("partial:"), "warnings 应含 partial 标记: {res}");
+        assert!(res.contains("before-deadline"), "deadline 前已 checkpoint 的 finding 不应丢失: {res}");
     }
 
     /// I2：pre-cancel 场景——run_job 读到 Cancelled 状态时应直接返回，不覆盖为 Running/Done，
@@ -581,7 +784,7 @@ default_models=["alpha"]
             background: false, format: "json".into(), targets: vec![],
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path()).await.unwrap();
+        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None).await.unwrap();
         let f = &report.findings[0];
         assert_eq!(f.verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
         assert_eq!(f.confidence, 0.0);
@@ -627,7 +830,7 @@ default_models=["m","m2"]
         let provider = FakeProvider { scripted };
         let my_args = ReviewArgs { models: None, ..args() };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path()).await.unwrap();
+        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None).await.unwrap();
         assert_eq!(report.findings.len(), 1, "fabricated dropped, real merged across models");
         assert_eq!(report.findings[0].file, "src/a.rs");
         assert_eq!(report.findings[0].line_start, 2);
@@ -643,7 +846,7 @@ default_models=["m","m2"]
 default_models=["m"]
 "#]).unwrap();
         let provider = FakeProvider::with("m", vec![]);
-        let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path()).await.unwrap();
+        let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None).await.unwrap();
         assert!(report.findings.is_empty());
         assert_eq!(code, 0);
     }
