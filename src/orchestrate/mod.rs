@@ -3,7 +3,9 @@ use crate::domain::{Finding, RawFinding, ReviewInput};
 use crate::hash::fnv1a64_hex;
 use crate::lens::Lens;
 use crate::prompt::{build_bundle_prompt, build_doc_prompt, build_prompt};
-use crate::provider::{LensRequest, ProviderError, ReviewProvider};
+use crate::provider::{LensRequest, ReviewProvider};
+#[cfg(test)]
+use crate::provider::ProviderError;
 use crate::state::store::{CellInput, CellRecord};
 use std::cmp::Reverse;
 use std::sync::Arc;
@@ -28,7 +30,6 @@ pub struct OrchestrateOpts {
     pub replicate: bool,
     pub no_fallback: bool,
     pub max_concurrency: usize,
-    pub retries: u32,
 }
 
 #[derive(Default, Debug)]
@@ -67,34 +68,6 @@ pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
     }
 }
 
-async fn call_with_retry(
-    provider: &dyn ReviewProvider,
-    model: &str,
-    prompt: &str,
-    retries: u32,
-) -> Result<crate::provider::LensCall, ProviderError> {
-    let mut attempt = 0u32;
-    loop {
-        let req = LensRequest {
-            model: model.to_string(),
-            prompt: prompt.to_string(),
-        };
-        match provider.run(req).await {
-            Ok(c) => return Ok(c),
-            Err(e) => {
-                if attempt >= retries {
-                    return Err(e);
-                }
-                attempt += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    200 * (1u64 << attempt),
-                ))
-                .await;
-            }
-        }
-    }
-}
-
 /// 对单个 (lens, 候补链) 执行调用。
 /// 默认路径：按 priority 降序逐个候补，首个成功即止。
 /// 显式路径：只试 models[0]，失败则记录，不候补。
@@ -122,7 +95,7 @@ async fn run_one_lens(
     let mut errs: Vec<String> = Vec::new();
 
     for pm in &chain {
-        match call_with_retry(provider, &pm.name, prompt, opts.retries).await {
+        match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call
                     .findings
@@ -196,7 +169,6 @@ pub async fn run_fanout(
                         replicate: true,
                         no_fallback: opts.no_fallback,
                         max_concurrency: opts.max_concurrency,
-                        retries: opts.retries,
                     };
                     async move {
                         let res = run_one_lens(provider, prompt, lens, &single_opts).await;
@@ -334,7 +306,7 @@ async fn run_one_bundle(
 
     let mut errs: Vec<String> = Vec::new();
     for pm in &chain {
-        match call_with_retry(provider, &pm.name, prompt, opts.retries).await {
+        match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call
                     .findings
@@ -401,7 +373,6 @@ pub async fn run_code_fanout(
                     replicate: true,
                     no_fallback: opts.no_fallback,
                     max_concurrency: opts.max_concurrency,
-                    retries: opts.retries,
                 };
                 async move {
                     let _permit = sem.acquire().await.expect("semaphore not closed");
@@ -519,7 +490,7 @@ async fn run_one_doc(
 
     let mut errs: Vec<String> = Vec::new();
     for pm in &chain {
-        match call_with_retry(provider, &pm.name, prompt, opts.retries).await {
+        match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call.findings.iter().map(|r| enrich(r, "doc", &pm.name)).collect();
                 return Ok((pm.name.clone(), fs, (call.input_tokens, call.output_tokens)));
@@ -571,7 +542,6 @@ pub async fn run_doc_fanout(
                 replicate: true,
                 no_fallback: opts.no_fallback,
                 max_concurrency: opts.max_concurrency,
-                retries: opts.retries,
             };
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
@@ -698,7 +668,6 @@ mod tests {
             replicate: false,
             no_fallback: false,
             max_concurrency: 4,
-            retries: 0,
         };
         let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, None).await;
         assert_eq!(r.findings.len(), 1);
@@ -714,7 +683,6 @@ mod tests {
             replicate: true,
             no_fallback: false,
             max_concurrency: 4,
-            retries: 0,
         };
         let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, None).await;
         assert!(r.findings.is_empty());
@@ -753,7 +721,7 @@ mod tests {
         let p = FakeProvider::with("m", vec![raw_q("found")]);
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "m".into(), priority: 10 }],
-            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
@@ -784,7 +752,7 @@ mod tests {
         let probe = Arc::new(ConcProbe { inflight: AtomicUsize::new(0), max_seen: AtomicUsize::new(0) });
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "m".into(), priority: 10 }],
-            replicate: true, no_fallback: false, max_concurrency: 2, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 2,
         };
         let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
         let rules = vec![lens_by_id("L1").unwrap()];
@@ -800,7 +768,7 @@ mod tests {
         let p = FakeProvider::with("present", vec![]);
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "absent".into(), priority: 10 }],
-            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
@@ -833,7 +801,6 @@ mod tests {
             replicate: true,
             no_fallback: false,
             max_concurrency: 8,
-            retries: 0,
         };
         let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts, None).await;
         // 2 bundle × 2 model = 4 格，各 1 finding → 4 条
@@ -863,7 +830,6 @@ mod tests {
             replicate: true,
             no_fallback: false,
             max_concurrency: 8,
-            retries: 0,
         };
         let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 1); // alpha 成功
@@ -890,7 +856,7 @@ mod tests {
                 PlannedModel { name: "alpha".into(), priority: 10 },
                 PlannedModel { name: "beta".into(), priority: 5 },
             ],
-            replicate: true, no_fallback: false, max_concurrency: 8, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 8,
         };
         let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
         let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, Some(&sink)).await;
@@ -918,7 +884,7 @@ mod tests {
                 PlannedModel { name: "alpha".into(), priority: 10 },
                 PlannedModel { name: "beta".into(), priority: 5 },
             ],
-            replicate: true, no_fallback: false, max_concurrency: 8, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 8,
         };
         let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 1);
@@ -935,7 +901,7 @@ mod tests {
                 PlannedModel { name: "claude".into(), priority: 30 },
                 PlannedModel { name: "gpt".into(), priority: 20 },
             ],
-            replicate: false, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: false, no_fallback: false, max_concurrency: 4,
         };
         let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 1);
@@ -958,7 +924,6 @@ mod tests {
             replicate: false,
             no_fallback: false,
             max_concurrency: 4,
-            retries: 0,
         };
         let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, None).await;
         assert!(r.findings.is_empty(), "default path full-chain failure must produce no findings");
@@ -990,7 +955,7 @@ mod tests {
         let p = FakeProvider::with("m", vec![raw_q("found")]);
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "m".into(), priority: 10 }],
-            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
@@ -1014,7 +979,6 @@ mod tests {
             replicate: false,
             no_fallback: false,
             max_concurrency: 4,
-            retries: 0,
         };
         let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
         let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, Some(&sink)).await;
@@ -1070,7 +1034,7 @@ mod tests {
         let provider = SlowFastProbe { slow_done: std::sync::atomic::AtomicBool::new(false) };
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "m".into(), priority: 10 }],
-            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/slow.rs"), bundle("src/fast.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
@@ -1087,5 +1051,58 @@ mod tests {
             Some(true),
             "快 cell 的 on_cell 必须在慢 cell 完成前触发——证明每 cell 完成即落盘（流式 checkpoint）"
         );
+    }
+
+    // R4.3 降级不变量：一个 model 在 tool loop 中途死亡（重试耗尽仍失败）
+    // → 该 cell 失败记 failed_models，run 继续，另一个 model 的 findings 存活。
+    #[tokio::test]
+    async fn mid_loop_model_death_degrades_gracefully() {
+        use crate::provider::registry::ProviderRegistry;
+        use crate::provider::tool_loop::{AssistantTurn, FakeChatBackend, ToolLoopProvider};
+        use crate::provider::ProviderError;
+        use crate::tools::ToolCall;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "x").unwrap();
+        let good_json = r#"{"findings":[{"severity":"high","title":"real","body":"b","file":"src/a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}]}"#;
+
+        // good：一轮直接产最终 findings
+        let good = ToolLoopProvider::new(
+            Box::new(FakeChatBackend::new(vec![AssistantTurn {
+                text: good_json.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1 }])),
+            dir.path().to_path_buf());
+        // bad：先 tool_call（iter1），再一路 Timeout（iter2 重试耗尽仍失败）。
+        // DEFAULT_RETRY_BUDGET=2 → iter2 需 3 次 Err（首发+2 重试）→ 备 1 Ok + 3 Err。
+        let tc = AssistantTurn { text: String::new(),
+            tool_calls: vec![ToolCall { id: "c".into(), name: "read_file".into(), args: json!({"path":"a.rs"}) }],
+            input_tokens: 1, output_tokens: 1 };
+        let bad = ToolLoopProvider::new(
+            Box::new(FakeChatBackend::new_results(vec![
+                Ok(tc),
+                Err(ProviderError::Timeout("dead".into())),
+                Err(ProviderError::Timeout("dead".into())),
+                Err(ProviderError::Timeout("dead".into())),
+            ])),
+            dir.path().to_path_buf());
+
+        let mut reg = ProviderRegistry::new();
+        reg.insert("good", Box::new(good));
+        reg.insert("bad", Box::new(bad));
+
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "good".into(), priority: 1 },
+                PlannedModel { name: "bad".into(), priority: 1 },
+            ],
+            replicate: true, no_fallback: false, max_concurrency: 4,
+        };
+        let bundles = vec![bundle("src/a.rs")];
+        let rules = vec![lens_by_id("L1").unwrap()];
+        let out = run_code_fanout(&reg, "wt", &bundles, &rules, "", &opts, None).await;
+        assert!(out.failed_models.contains(&"bad".to_string()),
+            "坏 model 应记 failed_models: {:?}", out.failed_models);
+        assert!(out.findings.iter().any(|f| f.title == "real"),
+            "好 model 的 finding 应仍在报告里");
     }
 }

@@ -19,6 +19,7 @@ pub struct DirectProvider {
     base_url: Option<String>,
     api_key: String,
     client: reqwest::Client,
+    retry_budget: u32,
 }
 
 impl DirectProvider {
@@ -29,6 +30,7 @@ impl DirectProvider {
             base_url: pc.base_url.clone(),
             api_key,
             client: crate::provider::default_http_client(),
+            retry_budget: crate::provider::DEFAULT_RETRY_BUDGET,
         }
     }
 }
@@ -126,22 +128,16 @@ fn extract_openai(resp: &Value) -> Option<(String, u64, u64)> {
 #[async_trait]
 impl ReviewProvider for DirectProvider {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError> {
-        // 不在 provider 内做重试（重试在 orchestrate/Task 8 包裹）。
-        let (text, input_tokens, output_tokens) = match self.kind {
-            ProviderKind::Anthropic => self.call_anthropic(&req).await?,
-            ProviderKind::Openai | ProviderKind::OpenaiCompatible => self.call_openai(&req).await?,
-            ProviderKind::Google => {
-                return Err(ProviderError::Unavailable(
-                    "google not yet supported".into(),
-                ))
-            }
-        };
-        let out = parse_lens_output(&text)?;
-        Ok(LensCall {
-            findings: out.findings,
-            input_tokens,
-            output_tokens,
-        })
+        let (text, input_tokens, output_tokens) =
+            crate::provider::retry_classified(self.retry_budget, || async {
+                match self.kind {
+                    ProviderKind::Anthropic => self.call_anthropic(&req).await,
+                    ProviderKind::Openai | ProviderKind::OpenaiCompatible => self.call_openai(&req).await,
+                    ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
+                }
+            }).await?;
+        let out = parse_lens_output(&text)?; // Parse 不进重试（形状问题）
+        Ok(LensCall { findings: out.findings, input_tokens, output_tokens })
     }
 }
 

@@ -228,7 +228,6 @@ pub async fn run_review(
         replicate,
         no_fallback: false,
         max_concurrency: cfg.review.max_concurrency,
-        retries: 2,
     };
 
     // 4. fan-out（doc：全 D rule 一包 × model 工具循环）
@@ -298,7 +297,6 @@ pub async fn run_code_review(
         replicate,
         no_fallback: false,
         max_concurrency: cfg.review.max_concurrency,
-        retries: 2,
     };
 
     // 4. fan-out（bundle × model）
