@@ -176,8 +176,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
 /// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
 ///
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
-/// `--background` 在 Plan 1 未实现（留 Plan 2），此处直接报错。
-/// 默认前台同步路径无需 `wait` 字段——`run_review` 本身就是同步等待模式。
+/// `--background` 在 Plan 1 未实现（留 Plan 2），此处直接报错；前台路径本身即同步执行。
 pub async fn run_review(
     args: ReviewArgs,
     provider: &dyn ReviewProvider,
