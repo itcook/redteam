@@ -154,7 +154,8 @@ pub async fn run_review(
 
     // 4. fan-out（doc：全 D rule 一包 × model 工具循环）
     let focus = args.focus.clone().unwrap_or_default();
-    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts).await;
+    // sink=None：run_review 无 job 上下文（T5 接 JobCellSink 后由 run_job 传入）。
+    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, None).await;
 
     // 5. positioning（doc anchor：空引用=遗漏保留、编造丢弃；按受审文档内容锚定）
     let docs = crate::evidence::doc::collect_doc_files(&args.targets)?;
@@ -252,7 +253,8 @@ pub async fn run_code_review(
     } else {
         "working tree".to_string()
     };
-    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts).await;
+    // sink=None：run_code_review 无 job 上下文（T5 接 JobCellSink 后由 run_job 传入）。
+    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, None).await;
 
     // 5. positioning（dedup 之前：准行号反哺 line-overlap 去重）
     let anchored = anchor(raw.findings, root);

@@ -4,9 +4,17 @@ use crate::hash::fnv1a64_hex;
 use crate::lens::Lens;
 use crate::prompt::{build_bundle_prompt, build_doc_prompt, build_prompt};
 use crate::provider::{LensRequest, ProviderError, ReviewProvider};
+use crate::state::store::{CellInput, CellRecord};
 use std::cmp::Reverse;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+
+/// 扇出持久化钩子：扇出前写输入快照（`manifest`，全集一次性），每 cell 完成即写结果（`on_cell`）。
+/// `sink=None` 时全跳过——`run_review`/`run_code_review` 无 job 上下文的直调路径行为不变。
+pub trait CellSink: Send + Sync {
+    fn manifest(&self, inputs: &[CellInput]);
+    fn on_cell(&self, rec: CellRecord);
+}
 
 #[derive(Clone, Debug)]
 pub struct PlannedModel {
@@ -94,13 +102,10 @@ async fn call_with_retry(
 /// warn_message 包含链中所有失败模型的累积错误信息。
 async fn run_one_lens(
     provider: &dyn ReviewProvider,
-    input: &ReviewInput,
+    prompt: &str,
     lens: &Lens,
-    focus: &str,
     opts: &OrchestrateOpts,
 ) -> Result<(Vec<Finding>, (u64, u64)), String> {
-    let prompt = build_prompt(input, lens, focus);
-
     // 默认路径：按 priority 降序排列，逐个候补
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
@@ -117,7 +122,7 @@ async fn run_one_lens(
     let mut errs: Vec<String> = Vec::new();
 
     for pm in &chain {
-        match call_with_retry(provider, &pm.name, &prompt, opts.retries).await {
+        match call_with_retry(provider, &pm.name, prompt, opts.retries).await {
             Ok(call) => {
                 let fs = call
                     .findings
@@ -145,6 +150,7 @@ pub async fn run_fanout(
     lenses: &[&Lens],
     focus: &str,
     opts: &OrchestrateOpts,
+    sink: Option<&dyn CellSink>,
 ) -> RawResults {
     // 收集所有任务的 future，然后用 join_all 并发执行。
     // 由于 provider、input、focus、opts 都是借用且生命周期覆盖所有 future，
@@ -153,13 +159,35 @@ pub async fn run_fanout(
     // 每个 future 的类型：
     //   impl Future<Output = (/*model_hint*/ String, Result<(Vec<Finding>, (u64,u64)), String>)>
 
+    // 每个 lens 的 prompt 只渲染一次：manifest 与执行复用同一份。
+    let cells: Vec<(String, String)> = lenses
+        .iter()
+        .map(|lens| (format!("lens:{}", lens.id), build_prompt(input, lens, focus)))
+        .collect();
+
     if opts.replicate {
         // 显式：每个 (lens, model) 独立格子，失败记 warning + failed_models
+        let manifest: Vec<CellInput> = cells
+            .iter()
+            .flat_map(|(cell, prompt)| {
+                opts.models.iter().map(move |pm| CellInput {
+                    cell: cell.clone(),
+                    model: pm.name.clone(),
+                    prompt: prompt.clone(),
+                })
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
         let futures: Vec<_> = lenses
             .iter()
-            .flat_map(|lens| {
+            .zip(cells.iter())
+            .flat_map(|(lens, (cell, prompt))| {
                 opts.models.iter().map(move |pm| {
                     let model_name = pm.name.clone();
+                    let cell_id = cell.clone();
                     let single_opts = OrchestrateOpts {
                         models: vec![pm.clone()],
                         replicate: true,
@@ -168,9 +196,8 @@ pub async fn run_fanout(
                         retries: opts.retries,
                     };
                     async move {
-                        let res =
-                            run_one_lens(provider, input, lens, focus, &single_opts).await;
-                        (model_name, res)
+                        let res = run_one_lens(provider, prompt, lens, &single_opts).await;
+                        (cell_id, model_name, res)
                     }
                 })
             })
@@ -178,14 +205,26 @@ pub async fn run_fanout(
 
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (model_hint, res) in results {
+        for (cell_id, model_hint, res) in results {
             match res {
                 Ok((fs, (it, ot))) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord::ok(cell_id, model_hint.clone(), fs.clone()));
+                    }
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
                 Err(warn) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord {
+                            cell: cell_id,
+                            model: model_hint.clone(),
+                            ok: false,
+                            findings: vec![],
+                            warn: Some(warn.clone()),
+                        });
+                    }
                     out.warnings.push(warn);
                     if !out.failed_models.contains(&model_hint) {
                         out.failed_models.push(model_hint);
@@ -197,23 +236,53 @@ pub async fn run_fanout(
     } else {
         // 默认：每个 lens 一条候补链
         // 整条候补链失败只记 warnings，不写 failed_models（避免误导 Task 13 退出码）
+        // manifest 的 model 记高优先候选（候补链本身无固定 model，此处只是快照近似值）。
+        let manifest: Vec<CellInput> = cells
+            .iter()
+            .map(|(cell, prompt)| CellInput {
+                cell: cell.clone(),
+                model: top_priority_model(opts),
+                prompt: prompt.clone(),
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
         let futures: Vec<_> = lenses
             .iter()
-            .map(|lens| async move {
-                run_one_lens(provider, input, lens, focus, opts).await
+            .zip(cells.iter())
+            .map(|(lens, (cell, prompt))| {
+                let cell_id = cell.clone();
+                async move {
+                    let res = run_one_lens(provider, prompt, lens, opts).await;
+                    (cell_id, res)
+                }
             })
             .collect();
 
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for res in results {
+        for (cell_id, res) in results {
             match res {
                 Ok((fs, (it, ot))) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord::ok(cell_id, cell_model(&fs), fs.clone()));
+                    }
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
                 Err(warn) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord {
+                            cell: cell_id,
+                            model: String::new(),
+                            ok: false,
+                            findings: vec![],
+                            warn: Some(warn.clone()),
+                        });
+                    }
                     // 默认路径：整条候补链失败，只记 warning，不写 failed_models
                     out.warnings.push(warn);
                 }
@@ -223,17 +292,30 @@ pub async fn run_fanout(
     }
 }
 
+/// 候补链场景 manifest 的 model 快照：取最高 priority 候选（无固定实际值，见 run_fanout 注释）。
+fn top_priority_model(opts: &OrchestrateOpts) -> String {
+    opts.models
+        .iter()
+        .max_by_key(|m| m.priority)
+        .map(|m| m.name.clone())
+        .unwrap_or_default()
+}
+
+/// 候补链成功后，从已 enrich 的 findings 里取实际命中的 model（enrich 写入 `models[0]`）；
+/// 无 finding 时退化为 manifest 快照的高优先候选。
+fn cell_model(fs: &[Finding]) -> String {
+    fs.first()
+        .and_then(|f| f.models.first().cloned())
+        .unwrap_or_default()
+}
+
 /// 单个文件包的评审（候补链复用 run_one_lens 的语义）。
 async fn run_one_bundle(
     provider: &dyn ReviewProvider,
-    target_label: &str,
-    bundle: &Bundle,
-    rules: &[&Lens],
-    focus: &str,
+    label: &str,
+    prompt: &str,
     opts: &OrchestrateOpts,
 ) -> Result<(Vec<Finding>, (u64, u64)), String> {
-    let prompt = build_bundle_prompt(target_label, bundle, rules, focus);
-
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
@@ -244,10 +326,9 @@ async fn run_one_bundle(
         chain
     };
 
-    let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
     let mut errs: Vec<String> = Vec::new();
     for pm in &chain {
-        match call_with_retry(provider, &pm.name, &prompt, opts.retries).await {
+        match call_with_retry(provider, &pm.name, prompt, opts.retries).await {
             Ok(call) => {
                 let fs = call
                     .findings
@@ -272,15 +353,42 @@ pub async fn run_code_fanout(
     rules: &[&Lens],
     focus: &str,
     opts: &OrchestrateOpts,
+    sink: Option<&dyn CellSink>,
 ) -> RawResults {
     let sem = Arc::new(Semaphore::new(opts.max_concurrency.max(1)));
+    // 每个 bundle 的 label/prompt 只算一次：manifest 与执行复用同一份。
+    let cells: Vec<(String, String, String)> = bundles
+        .iter()
+        .map(|bundle| {
+            let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
+            let prompt = build_bundle_prompt(target_label, bundle, rules, focus);
+            let cell_id = format!("bundle[{label}]");
+            (cell_id, label, prompt)
+        })
+        .collect();
+
     if opts.replicate {
         // 全复制：bundle × model 笛卡尔积，每格只试该 model（不候补）
-        let futures = bundles.iter().flat_map(|bundle| {
+        let manifest: Vec<CellInput> = cells
+            .iter()
+            .flat_map(|(cell, _label, prompt)| {
+                opts.models.iter().map(move |pm| CellInput {
+                    cell: cell.clone(),
+                    model: pm.name.clone(),
+                    prompt: prompt.clone(),
+                })
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
+        let futures = cells.iter().flat_map(|(cell, label, prompt)| {
             let sem = sem.clone();
             opts.models.iter().map(move |pm| {
                 let sem = sem.clone();
                 let model_name = pm.name.clone();
+                let cell_id = cell.clone();
                 let single = OrchestrateOpts {
                     models: vec![pm.clone()],
                     replicate: true,
@@ -290,21 +398,33 @@ pub async fn run_code_fanout(
                 };
                 async move {
                     let _permit = sem.acquire().await.expect("semaphore not closed");
-                    let res = run_one_bundle(provider, target_label, bundle, rules, focus, &single).await;
-                    (model_name, res)
+                    let res = run_one_bundle(provider, label, prompt, &single).await;
+                    (cell_id, model_name, res)
                 }
             })
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (model_hint, res) in results {
+        for (cell_id, model_hint, res) in results {
             match res {
                 Ok((fs, (it, ot))) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord::ok(cell_id, model_hint.clone(), fs.clone()));
+                    }
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
                 Err(warn) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord {
+                            cell: cell_id,
+                            model: model_hint.clone(),
+                            ok: false,
+                            findings: vec![],
+                            warn: Some(warn.clone()),
+                        });
+                    }
                     out.warnings.push(warn);
                     if !out.failed_models.contains(&model_hint) {
                         out.failed_models.push(model_hint);
@@ -315,23 +435,51 @@ pub async fn run_code_fanout(
         out
     } else {
         // 候补：每 bundle 一条候补链（按 priority 降序、首个成功即止）
-        let futures = bundles.iter().map(|bundle| {
+        let manifest: Vec<CellInput> = cells
+            .iter()
+            .map(|(cell, _label, prompt)| CellInput {
+                cell: cell.clone(),
+                model: top_priority_model(opts),
+                prompt: prompt.clone(),
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
+        let futures = cells.iter().map(|(cell, label, prompt)| {
             let sem = sem.clone();
+            let cell_id = cell.clone();
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
-                run_one_bundle(provider, target_label, bundle, rules, focus, opts).await
+                let res = run_one_bundle(provider, label, prompt, opts).await;
+                (cell_id, res)
             }
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for res in results {
+        for (cell_id, res) in results {
             match res {
                 Ok((fs, (it, ot))) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord::ok(cell_id, cell_model(&fs), fs.clone()));
+                    }
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
-                Err(warn) => out.warnings.push(warn),
+                Err(warn) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord {
+                            cell: cell_id,
+                            model: String::new(),
+                            ok: false,
+                            findings: vec![],
+                            warn: Some(warn.clone()),
+                        });
+                    }
+                    out.warnings.push(warn)
+                }
             }
         }
         out
@@ -341,13 +489,9 @@ pub async fn run_code_fanout(
 /// 单篇文档评审（整篇文档为单一单元、无 bundle；候补链语义同 run_one_bundle）。
 async fn run_one_doc(
     provider: &dyn ReviewProvider,
-    input: &ReviewInput,
-    rules: &[&Lens],
-    focus: &str,
+    prompt: &str,
     opts: &OrchestrateOpts,
 ) -> Result<(Vec<Finding>, (u64, u64)), String> {
-    let prompt = build_doc_prompt(input, rules, focus);
-
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
@@ -360,7 +504,7 @@ async fn run_one_doc(
 
     let mut errs: Vec<String> = Vec::new();
     for pm in &chain {
-        match call_with_retry(provider, &pm.name, &prompt, opts.retries).await {
+        match call_with_retry(provider, &pm.name, prompt, opts.retries).await {
             Ok(call) => {
                 let fs = call.findings.iter().map(|r| enrich(r, "doc", &pm.name)).collect();
                 return Ok((fs, (call.input_tokens, call.output_tokens)));
@@ -380,12 +524,32 @@ pub async fn run_doc_fanout(
     rules: &[&Lens],
     focus: &str,
     opts: &OrchestrateOpts,
+    sink: Option<&dyn CellSink>,
 ) -> RawResults {
+    // 整篇文档为单一 cell：prompt 只渲染一次，manifest 与执行复用同一份。
+    let prompt = build_doc_prompt(input, rules, focus);
+    let cell_id = "doc".to_string();
+
     if opts.replicate {
+        let manifest: Vec<CellInput> = opts
+            .models
+            .iter()
+            .map(|pm| CellInput {
+                cell: cell_id.clone(),
+                model: pm.name.clone(),
+                prompt: prompt.clone(),
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
         let sem = Arc::new(Semaphore::new(opts.max_concurrency.max(1)));
         let futures = opts.models.iter().map(|pm| {
             let sem = sem.clone();
             let model_name = pm.name.clone();
+            let cell_id = cell_id.clone();
+            let prompt = &prompt;
             let single = OrchestrateOpts {
                 models: vec![pm.clone()],
                 replicate: true,
@@ -395,20 +559,32 @@ pub async fn run_doc_fanout(
             };
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
-                let res = run_one_doc(provider, input, rules, focus, &single).await;
-                (model_name, res)
+                let res = run_one_doc(provider, prompt, &single).await;
+                (cell_id, model_name, res)
             }
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (model_hint, res) in results {
+        for (cell_id, model_hint, res) in results {
             match res {
                 Ok((fs, (it, ot))) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord::ok(cell_id, model_hint.clone(), fs.clone()));
+                    }
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
                 Err(warn) => {
+                    if let Some(s) = sink {
+                        s.on_cell(CellRecord {
+                            cell: cell_id,
+                            model: model_hint.clone(),
+                            ok: false,
+                            findings: vec![],
+                            warn: Some(warn.clone()),
+                        });
+                    }
                     out.warnings.push(warn);
                     if !out.failed_models.contains(&model_hint) {
                         out.failed_models.push(model_hint);
@@ -419,14 +595,37 @@ pub async fn run_doc_fanout(
         out
     } else {
         // 单一单元候补链：仅一个任务，无需信号量。
+        let manifest = vec![CellInput {
+            cell: cell_id.clone(),
+            model: top_priority_model(opts),
+            prompt: prompt.clone(),
+        }];
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
         let mut out = RawResults::default();
-        match run_one_doc(provider, input, rules, focus, opts).await {
+        match run_one_doc(provider, &prompt, opts).await {
             Ok((fs, (it, ot))) => {
+                if let Some(s) = sink {
+                    s.on_cell(CellRecord::ok(cell_id, cell_model(&fs), fs.clone()));
+                }
                 out.findings.extend(fs);
                 out.usage.0 += it;
                 out.usage.1 += ot;
             }
-            Err(warn) => out.warnings.push(warn),
+            Err(warn) => {
+                if let Some(s) = sink {
+                    s.on_cell(CellRecord {
+                        cell: cell_id,
+                        model: String::new(),
+                        ok: false,
+                        findings: vec![],
+                        warn: Some(warn.clone()),
+                    });
+                }
+                out.warnings.push(warn)
+            }
         }
         out
     }
@@ -480,7 +679,7 @@ mod tests {
             max_concurrency: 4,
             retries: 0,
         };
-        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts).await;
+        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, None).await;
         assert_eq!(r.findings.len(), 1);
         assert_eq!(r.findings[0].models, vec!["gpt".to_string()]);
     }
@@ -496,7 +695,7 @@ mod tests {
             max_concurrency: 4,
             retries: 0,
         };
-        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts).await;
+        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, None).await;
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"claude".to_string()));
         assert!(!r.warnings.is_empty());
@@ -537,7 +736,7 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts).await;
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, None).await;
         assert_eq!(r.findings.len(), 3, "one finding per bundle");
         // raw.lens=Some("L1") → enrich 用 L1（非 fallback）
         assert!(r.findings.iter().all(|f| f.lenses == vec!["L1".to_string()]));
@@ -569,7 +768,7 @@ mod tests {
         let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
         let rules = vec![lens_by_id("L1").unwrap()];
         let probe_ref: &ConcProbe = &probe;
-        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", &opts).await;
+        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", &opts, None).await;
         assert!(probe.max_seen.load(Ordering::SeqCst) <= 2, "concurrency exceeded cap: {}", probe.max_seen.load(Ordering::SeqCst));
         assert!(probe.max_seen.load(Ordering::SeqCst) >= 1);
     }
@@ -584,7 +783,7 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts).await;
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, None).await;
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"absent".to_string()), "explicit unreachable model must be recorded");
         assert!(!r.warnings.is_empty());
@@ -615,7 +814,7 @@ mod tests {
             max_concurrency: 8,
             retries: 0,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts, None).await;
         // 2 bundle × 2 model = 4 格，各 1 finding → 4 条
         assert_eq!(out.findings.len(), 4);
         let models: std::collections::BTreeSet<&str> =
@@ -645,7 +844,7 @@ mod tests {
             max_concurrency: 8,
             retries: 0,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 1); // alpha 成功
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -672,7 +871,7 @@ mod tests {
             ],
             replicate: true, no_fallback: false, max_concurrency: 8, retries: 0,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts).await;
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 2, "one finding per model over the single doc");
         let models: std::collections::BTreeSet<&str> =
             out.findings.iter().flat_map(|f| f.models.iter().map(|s| s.as_str())).collect();
@@ -691,7 +890,7 @@ mod tests {
             ],
             replicate: true, no_fallback: false, max_concurrency: 8, retries: 0,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts).await;
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 1);
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -708,7 +907,7 @@ mod tests {
             ],
             replicate: false, no_fallback: false, max_concurrency: 4, retries: 0,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts).await;
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].models, vec!["gpt".to_string()]);
         assert!(out.failed_models.is_empty());
@@ -731,7 +930,7 @@ mod tests {
             max_concurrency: 4,
             retries: 0,
         };
-        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts).await;
+        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, None).await;
         assert!(r.findings.is_empty(), "default path full-chain failure must produce no findings");
         assert!(r.failed_models.is_empty(), "default path full-chain failure must not write failed_models");
         assert!(!r.warnings.is_empty(), "default path full-chain failure must produce a warning");
@@ -739,5 +938,34 @@ mod tests {
         let warn = &r.warnings[0];
         assert!(warn.contains("claude"), "warning must contain claude failure: {warn}");
         assert!(warn.contains("gpt"), "warning must contain gpt failure: {warn}");
+    }
+
+    // R2.1：记录型 sink，断言扇出前写 manifest（全集）+ 每 cell 完成各回调一次。
+    struct RecSink {
+        manifest_n: std::sync::Mutex<usize>,
+        cells: std::sync::Mutex<Vec<String>>,
+    }
+    impl CellSink for RecSink {
+        fn manifest(&self, inputs: &[CellInput]) {
+            *self.manifest_n.lock().unwrap() = inputs.len();
+        }
+        fn on_cell(&self, rec: CellRecord) {
+            self.cells.lock().unwrap().push(rec.cell);
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_writes_manifest_and_each_cell() {
+        let p = FakeProvider::with("m", vec![raw_q("found")]);
+        let opts = OrchestrateOpts {
+            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
+        };
+        let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
+        let rules = vec![lens_by_id("L1").unwrap()];
+        let sink = RecSink { manifest_n: 0.into(), cells: Vec::new().into() };
+        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, Some(&sink)).await;
+        assert_eq!(*sink.manifest_n.lock().unwrap(), 3, "manifest 全集=3 cell");
+        assert_eq!(sink.cells.lock().unwrap().len(), 3, "每 cell 各回调一次");
     }
 }
