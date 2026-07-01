@@ -43,17 +43,24 @@ enum Cmd {
         block_threshold: Option<String>,
         #[arg(long)]
         conf_floor: Option<f32>,
-        #[arg(long, default_value_t = true)]
-        wait: bool,
         #[arg(long)]
         background: bool,
         #[arg(long, default_value = "json")]
         format: String,
+        /// R2.3：补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
+        /// （原始 mode/targets/models 等从该作业落盘的 args.json 里重建）。
+        #[arg(long)]
+        resume: Option<String>,
         targets: Vec<String>,
     },
-    /// 查询作业状态：无 id 列全部，有 id 打印该作业 JSON。
-    Status { job_id: Option<String> },
-    /// 取回已完成作业的评审结果（读后标记已消费）。
+    /// 查询作业状态：无 id 列当前 workspace 全部；有 id 打印该作业 JSON。
+    /// `--workspaces` 聚合所有 workspace，`--workspaces <substr>` 按路径子串筛。
+    Status {
+        job_id: Option<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        workspaces: Option<String>,
+    },
+    /// 取回已完成作业的评审结果（读后标记已消费）。仅作业处于终态 `done` 时可取；未终态返回退出码 2。
     Result {
         job_id: String,
         #[arg(long, default_value = "json")]
@@ -103,6 +110,9 @@ enum ModelCmd {
     Check,
 }
 
+/// R1.2：worker 总时限——到点仍未完成的作业自我中止为 TimedOut（保留部分报告，见 cli::run_job）。
+const JOB_DEADLINE_SECS: u64 = 40 * 60;
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -139,16 +149,6 @@ fn spawn_detached_worker(job_id: &str) -> std::io::Result<u32> {
     }
     let child = cmd.spawn()?;
     Ok(child.id())
-}
-
-/// 把作业列表渲染成每行一条的摘要（status 命令无 id 时用）。
-fn render_job_list(jobs: &[breakpoint::state::job::JobState]) -> String {
-    let mut lines: Vec<String> = jobs.iter().map(|s| {
-        let mode = s.mode.map(|m| format!("{m:?}")).unwrap_or_else(|| "?".into());
-        format!("{}  {:?}  {}  {}/{}", s.job_id, s.status, mode, s.progress.done, s.progress.total)
-    }).collect();
-    lines.sort();
-    lines.join("\n")
 }
 
 /// 加载配置；解析失败时打 stderr 警告（而非静默回落空配置——否则配置写错一个字段
@@ -234,18 +234,46 @@ async fn main() {
             no_correlate,
             block_threshold,
             conf_floor,
-            wait: _wait, // 默认前台同步路径；run_review 不持有此字段（与 --background 对称）
             background,
             format,
+            resume,
             targets,
         } => {
             let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
             let fmt = parse_format(&format);
+
+            // R2.3：--resume <job_id> 补跑差集 cell，前台同步；忽略本次调用的其余 flag——
+            // mode/targets/models 等从该作业落盘的 args.json 重建（run_resume 内部处理）。
+            if let Some(job_id) = resume {
+                let ws = breakpoint::state::store::workspace_bucket(&cwd);
+                prune_here(&ws);
+                let orig_args_json = match breakpoint::state::store::read_args_raw(&ws, &job_id) {
+                    Some(j) => j,
+                    None => {
+                        eprintln!("error: no args for job {job_id} (resume requires a job that ran via --background)");
+                        std::process::exit(2);
+                    }
+                };
+                let orig_args: ReviewArgs = match serde_json::from_str(&orig_args_json) {
+                    Ok(a) => a,
+                    Err(e) => { eprintln!("error: bad args for job {job_id}: {e}"); std::process::exit(2); }
+                };
+                let (_detected, registry) = match build_registry(&orig_args, &cfg, &cwd) {
+                    Ok(x) => x,
+                    Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                };
+                let (report, code) =
+                    breakpoint::cli::run_resume(&ws, &job_id, &registry, &cfg, &cwd).await;
+                println!("{}", render(&report, fmt));
+                std::process::exit(code);
+            }
+
             let args = ReviewArgs {
                 mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
                 no_correlate, block_threshold, conf_floor, background, format, targets,
+                resume: None,
             };
 
             // 后台：写 pending + args 文件 → spawn detached worker → 打印 job-id 退出。
@@ -264,6 +292,12 @@ async fn main() {
                     std::process::exit(2);
                 }
                 let mut st = breakpoint::state::job::JobState::new(&job_id, now_secs());
+                st.workspace = Some(
+                    std::fs::canonicalize(&cwd)
+                        .unwrap_or_else(|_| cwd.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
                 let _ = breakpoint::state::job::write_state(&ws, &st);
                 match spawn_detached_worker(&job_id) {
                     Ok(pid) => {
@@ -286,7 +320,8 @@ async fn main() {
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
             };
 
-            let result = breakpoint::cli::run_review_dispatch(&args, &registry, &cfg, &cwd).await;
+            // 前台直调无 job 上下文，sink=None（与 run_review/run_code_review 直调路径一致）。
+            let result = breakpoint::cli::run_review_dispatch(&args, &registry, &cfg, &cwd, None).await;
 
             match result {
                 Ok((report, code)) => {
@@ -335,17 +370,28 @@ async fn main() {
             let started = breakpoint::state::job::read_state(&ws, &job_id)
                 .map(|s| s.started_at)
                 .unwrap_or_else(now_secs);
+            // R1.2：worker 起手设 deadline_at（若尚未设置——例如状态文件是旧格式或已被设过）。
+            if let Some(mut st) = breakpoint::state::job::read_state(&ws, &job_id) {
+                if st.deadline_at.is_none() {
+                    st.deadline_at = Some(started + JOB_DEADLINE_SECS);
+                    let _ = breakpoint::state::job::write_state(&ws, &st);
+                }
+            }
             let code = breakpoint::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
             std::process::exit(code);
         }
-        Cmd::Status { job_id } => {
+        Cmd::Status { job_id, workspaces } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let ws = breakpoint::state::store::workspace_bucket(&cwd);
-            prune_here(&ws); // 机会式 prune
+            prune_here(&ws); // 机会式 prune（仅当前 workspace，见决策⑥）
             match job_id {
                 None => {
-                    let jobs = breakpoint::state::job::list_states(&ws);
-                    println!("{}", render_job_list(&jobs));
+                    let jobs = breakpoint::state::job::select_jobs(
+                        &ws,
+                        &breakpoint::state::store::state_root(),
+                        workspaces.as_deref(),
+                    );
+                    println!("{}", serde_json::to_string_pretty(&jobs).unwrap_or_else(|_| "[]".into()));
                     0
                 }
                 Some(id) => match breakpoint::state::job::read_state(&ws, &id) {
@@ -494,17 +540,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use breakpoint::state::job::{JobState, JobStatus};
-    #[test]
-    fn render_job_list_one_line_per_job_sorted() {
-        let mut a = JobState::new("aaa", 0); a.status = JobStatus::Done;
-        let mut b = JobState::new("bbb", 0); b.status = JobStatus::Running;
-        let out = render_job_list(&[b, a]);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("aaa"), "sorted by id");
-        assert!(lines[0].contains("Done") && lines[1].contains("Running"));
-    }
 
     /// C1：无 provider 配置的 Config + doc 模式 ReviewArgs → build_registry 返回 Err。
     #[test]
@@ -530,6 +565,7 @@ mod tests {
             background: false,
             format: "json".into(),
             targets: vec![],
+            resume: None,
         };
         let result = build_registry(&args, &cfg, cwd);
         assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");

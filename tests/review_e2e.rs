@@ -56,9 +56,10 @@ async fn doc_review_end_to_end_rejects() {
         background: false,
         format: "json".into(),
         targets: vec![ps],
+        resume: None,
     };
 
-    let (report, code) = run_review(args, &provider, &cfg).await.unwrap();
+    let (report, code) = run_review(args, &provider, &cfg, None).await.unwrap();
     assert_eq!(report.verdict, Verdict::Reject);
     assert_eq!(code, 10);
     // 两 model 合并为 agreement=2 的单条 finding
@@ -102,10 +103,11 @@ default_models=["m"]
         models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
+        resume: None,
     };
     let changes = vec![FileChange { path: "src/auth.rs".into(), diff: "+    db.write(token);".into() }];
 
-    let (report, code) = run_code_review(&args, &provider, &cfg, changes, root.path()).await.unwrap();
+    let (report, code) = run_code_review(&args, &provider, &cfg, changes, root.path(), None).await.unwrap();
 
     // 编造引用被 positioning 丢弃 → 只剩 1 条
     assert_eq!(report.findings.len(), 1, "fabricated finding must be dropped");
@@ -157,9 +159,10 @@ default_models=["alpha","beta"]
         spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
+        resume: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path()).await.unwrap();
+    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None).await.unwrap();
 
     // 两 model 同 file 同行同引用 → anchor 行2 → dedup 合并 → 1 条 agreement=2、取最高 severity
     assert_eq!(report.findings.len(), 1);
@@ -204,9 +207,10 @@ default_models=["alpha","ghost"]
         spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
+        resume: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
-    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path()).await.unwrap();
+    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None).await.unwrap();
 
     assert_eq!(report.verdict, Verdict::Approve);   // 仅 low → approve
     assert!(report.run.failed_models.contains(&"ghost".to_string()));
@@ -256,8 +260,9 @@ async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
         spec: vec![], focus: None, lenses: None, models: None, models_all: false,
         no_correlate: false, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![dp.clone()],
+        resume: None,
     };
-    let (report, code) = run_review(args, &provider, &cfg).await.unwrap();
+    let (report, code) = run_review(args, &provider, &cfg, None).await.unwrap();
 
     // 矛盾：两 model 合并 agreement=2、锚到第 2 行。
     let contra = report.findings.iter()
@@ -307,9 +312,10 @@ default_models=["alpha"]
         spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
+        resume: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path()).await.unwrap();
+    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None).await.unwrap();
 
     let f = report.findings.iter().find(|f| f.file == "src/a.rs").expect("finding present");
     assert_eq!(f.verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted, "孤证被交叉 refute 证伪");
@@ -367,9 +373,10 @@ async fn doc_d5_compliance_hard_cap_clamps_high_to_medium() {
         background: false,
         format: "json".into(),
         targets: vec![dp],
+        resume: None,
     };
 
-    let (report, _code) = run_review(args, &provider, &cfg).await.unwrap();
+    let (report, _code) = run_review(args, &provider, &cfg, None).await.unwrap();
 
     // 必须有 finding（未被丢弃）
     assert_eq!(report.findings.len(), 1, "D5 finding must survive anchor");

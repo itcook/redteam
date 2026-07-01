@@ -3,10 +3,22 @@ use crate::domain::{Finding, RawFinding, ReviewInput};
 use crate::hash::fnv1a64_hex;
 use crate::lens::Lens;
 use crate::prompt::{build_bundle_prompt, build_doc_prompt, build_prompt};
-use crate::provider::{LensRequest, ProviderError, ReviewProvider};
+use crate::provider::{LensRequest, ReviewProvider};
+#[cfg(test)]
+use crate::provider::ProviderError;
+use crate::state::store::{CellInput, CellRecord};
 use std::cmp::Reverse;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+
+/// 扇出持久化钩子：扇出前写输入快照（`manifest`，全集一次性），每 cell 完成即写结果（`on_cell`）。
+/// `sink=None` 时全跳过——`run_review`/`run_code_review` 无 job 上下文的直调路径行为不变。
+pub trait CellSink: Send + Sync {
+    fn manifest(&self, inputs: &[CellInput]);
+    fn on_cell(&self, rec: CellRecord);
+    /// 阶段转换钩子（后台 job 用；默认 no-op，前台 sink=None / 其他 sink 零影响）。
+    fn on_phase(&self, _phase: crate::state::job::Phase) {}
+}
 
 #[derive(Clone, Debug)]
 pub struct PlannedModel {
@@ -20,7 +32,6 @@ pub struct OrchestrateOpts {
     pub replicate: bool,
     pub no_fallback: bool,
     pub max_concurrency: usize,
-    pub retries: u32,
 }
 
 #[derive(Default, Debug)]
@@ -59,34 +70,6 @@ pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
     }
 }
 
-async fn call_with_retry(
-    provider: &dyn ReviewProvider,
-    model: &str,
-    prompt: &str,
-    retries: u32,
-) -> Result<crate::provider::LensCall, ProviderError> {
-    let mut attempt = 0u32;
-    loop {
-        let req = LensRequest {
-            model: model.to_string(),
-            prompt: prompt.to_string(),
-        };
-        match provider.run(req).await {
-            Ok(c) => return Ok(c),
-            Err(e) => {
-                if attempt >= retries {
-                    return Err(e);
-                }
-                attempt += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    200 * (1u64 << attempt),
-                ))
-                .await;
-            }
-        }
-    }
-}
-
 /// 对单个 (lens, 候补链) 执行调用。
 /// 默认路径：按 priority 降序逐个候补，首个成功即止。
 /// 显式路径：只试 models[0]，失败则记录，不候补。
@@ -94,13 +77,10 @@ async fn call_with_retry(
 /// warn_message 包含链中所有失败模型的累积错误信息。
 async fn run_one_lens(
     provider: &dyn ReviewProvider,
-    input: &ReviewInput,
+    prompt: &str,
     lens: &Lens,
-    focus: &str,
     opts: &OrchestrateOpts,
-) -> Result<(Vec<Finding>, (u64, u64)), String> {
-    let prompt = build_prompt(input, lens, focus);
-
+) -> Result<(String, Vec<Finding>, (u64, u64)), String> {
     // 默认路径：按 priority 降序排列，逐个候补
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
@@ -117,14 +97,14 @@ async fn run_one_lens(
     let mut errs: Vec<String> = Vec::new();
 
     for pm in &chain {
-        match call_with_retry(provider, &pm.name, &prompt, opts.retries).await {
+        match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call
                     .findings
                     .iter()
                     .map(|r| enrich(r, lens.id, &pm.name))
                     .collect();
-                return Ok((fs, (call.input_tokens, call.output_tokens)));
+                return Ok((pm.name.clone(), fs, (call.input_tokens, call.output_tokens)));
             }
             Err(e) => {
                 errs.push(format!("lens {} model {}: {}", lens.id, pm.name, e));
@@ -145,6 +125,7 @@ pub async fn run_fanout(
     lenses: &[&Lens],
     focus: &str,
     opts: &OrchestrateOpts,
+    sink: Option<&dyn CellSink>,
 ) -> RawResults {
     // 收集所有任务的 future，然后用 join_all 并发执行。
     // 由于 provider、input、focus、opts 都是借用且生命周期覆盖所有 future，
@@ -153,23 +134,64 @@ pub async fn run_fanout(
     // 每个 future 的类型：
     //   impl Future<Output = (/*model_hint*/ String, Result<(Vec<Finding>, (u64,u64)), String>)>
 
+    // 每个 lens 的 prompt 只渲染一次：manifest 与执行复用同一份。
+    let cells: Vec<(String, String)> = lenses
+        .iter()
+        .map(|lens| (format!("lens:{}", lens.id), build_prompt(input, lens, focus)))
+        .collect();
+
     if opts.replicate {
         // 显式：每个 (lens, model) 独立格子，失败记 warning + failed_models
+        // cell-id 带上 model（`lens:<id>@<model>`）：replicate 下同一 lens 多个 model 副本
+        // 必须各自唯一，否则 resume 差集判定（join on cell）会把未完成的 model 误判为已完成
+        // （见 run_resume 设计注释——静默假阳性 bug，final-review Important）。
+        let manifest: Vec<CellInput> = cells
+            .iter()
+            .flat_map(|(cell, prompt)| {
+                opts.models.iter().map(move |pm| CellInput {
+                    cell: format!("{cell}@{}", pm.name),
+                    model: pm.name.clone(),
+                    prompt: prompt.clone(),
+                })
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
         let futures: Vec<_> = lenses
             .iter()
-            .flat_map(|lens| {
+            .zip(cells.iter())
+            .flat_map(|(lens, (cell, prompt))| {
                 opts.models.iter().map(move |pm| {
                     let model_name = pm.name.clone();
+                    let cell_id = format!("{cell}@{}", pm.name);
                     let single_opts = OrchestrateOpts {
                         models: vec![pm.clone()],
                         replicate: true,
                         no_fallback: opts.no_fallback,
                         max_concurrency: opts.max_concurrency,
-                        retries: opts.retries,
                     };
                     async move {
-                        let res =
-                            run_one_lens(provider, input, lens, focus, &single_opts).await;
+                        let res = run_one_lens(provider, prompt, lens, &single_opts).await;
+                        // R2.1 修复：on_cell 在 future 内部即时调用，cell 一完成即落盘——
+                        // 崩溃只丢在飞的那个 cell（而非等 join_all 全部结束后批量落盘丢光全部）。
+                        if let Some(s) = sink {
+                            match &res {
+                                Ok((_m, fs, _)) => {
+                                    s.on_cell(CellRecord::ok(cell_id.clone(), model_name.clone(), fs.clone()));
+                                }
+                                Err(warn) => {
+                                    s.on_cell(CellRecord {
+                                        cell: cell_id.clone(),
+                                        model: model_name.clone(),
+                                        ok: false,
+                                        findings: vec![],
+                                        warn: Some(warn.clone()),
+                                    });
+                                }
+                            }
+                        }
                         (model_name, res)
                     }
                 })
@@ -180,7 +202,7 @@ pub async fn run_fanout(
         let mut out = RawResults::default();
         for (model_hint, res) in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((_m, fs, (it, ot))) => {
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
@@ -197,10 +219,45 @@ pub async fn run_fanout(
     } else {
         // 默认：每个 lens 一条候补链
         // 整条候补链失败只记 warnings，不写 failed_models（避免误导 Task 13 退出码）
+        // manifest 的 model 记高优先候选（候补链本身无固定 model，此处只是快照近似值）。
+        let manifest: Vec<CellInput> = cells
+            .iter()
+            .map(|(cell, prompt)| CellInput {
+                cell: cell.clone(),
+                model: top_priority_model(opts),
+                prompt: prompt.clone(),
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
         let futures: Vec<_> = lenses
             .iter()
-            .map(|lens| async move {
-                run_one_lens(provider, input, lens, focus, opts).await
+            .zip(cells.iter())
+            .map(|(lens, (cell, prompt))| {
+                let cell_id = cell.clone();
+                async move {
+                    let res = run_one_lens(provider, prompt, lens, opts).await;
+                    // R2.1 修复：on_cell 在 future 内部即时调用（见上一分支同款注释）。
+                    if let Some(s) = sink {
+                        match &res {
+                            Ok((model, fs, _)) => {
+                                s.on_cell(CellRecord::ok(cell_id.clone(), model.clone(), fs.clone()));
+                            }
+                            Err(warn) => {
+                                s.on_cell(CellRecord {
+                                    cell: cell_id.clone(),
+                                    model: String::new(),
+                                    ok: false,
+                                    findings: vec![],
+                                    warn: Some(warn.clone()),
+                                });
+                            }
+                        }
+                    }
+                    res
+                }
             })
             .collect();
 
@@ -208,7 +265,7 @@ pub async fn run_fanout(
         let mut out = RawResults::default();
         for res in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((_model, fs, (it, ot))) => {
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
@@ -223,17 +280,22 @@ pub async fn run_fanout(
     }
 }
 
+/// 候补链场景 manifest 的 model 快照：取最高 priority 候选（无固定实际值，见 run_fanout 注释）。
+fn top_priority_model(opts: &OrchestrateOpts) -> String {
+    opts.models
+        .iter()
+        .max_by_key(|m| m.priority)
+        .map(|m| m.name.clone())
+        .unwrap_or_default()
+}
+
 /// 单个文件包的评审（候补链复用 run_one_lens 的语义）。
 async fn run_one_bundle(
     provider: &dyn ReviewProvider,
-    target_label: &str,
-    bundle: &Bundle,
-    rules: &[&Lens],
-    focus: &str,
+    label: &str,
+    prompt: &str,
     opts: &OrchestrateOpts,
-) -> Result<(Vec<Finding>, (u64, u64)), String> {
-    let prompt = build_bundle_prompt(target_label, bundle, rules, focus);
-
+) -> Result<(String, Vec<Finding>, (u64, u64)), String> {
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
@@ -244,17 +306,16 @@ async fn run_one_bundle(
         chain
     };
 
-    let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
     let mut errs: Vec<String> = Vec::new();
     for pm in &chain {
-        match call_with_retry(provider, &pm.name, &prompt, opts.retries).await {
+        match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call
                     .findings
                     .iter()
                     .map(|r| enrich(r, "code", &pm.name))
                     .collect();
-                return Ok((fs, (call.input_tokens, call.output_tokens)));
+                return Ok((pm.name.clone(), fs, (call.input_tokens, call.output_tokens)));
             }
             Err(e) => errs.push(format!("bundle [{label}] model {}: {e}", pm.name)),
         }
@@ -272,25 +333,69 @@ pub async fn run_code_fanout(
     rules: &[&Lens],
     focus: &str,
     opts: &OrchestrateOpts,
+    sink: Option<&dyn CellSink>,
 ) -> RawResults {
     let sem = Arc::new(Semaphore::new(opts.max_concurrency.max(1)));
+    // 每个 bundle 的 label/prompt 只算一次：manifest 与执行复用同一份。
+    let cells: Vec<(String, String, String)> = bundles
+        .iter()
+        .map(|bundle| {
+            let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
+            let prompt = build_bundle_prompt(target_label, bundle, rules, focus);
+            let cell_id = format!("bundle[{label}]");
+            (cell_id, label, prompt)
+        })
+        .collect();
+
     if opts.replicate {
         // 全复制：bundle × model 笛卡尔积，每格只试该 model（不候补）
-        let futures = bundles.iter().flat_map(|bundle| {
+        // cell-id 带上 model（`bundle[label]@<model>`）：理由同 run_fanout 的 replicate 分支注释。
+        let manifest: Vec<CellInput> = cells
+            .iter()
+            .flat_map(|(cell, _label, prompt)| {
+                opts.models.iter().map(move |pm| CellInput {
+                    cell: format!("{cell}@{}", pm.name),
+                    model: pm.name.clone(),
+                    prompt: prompt.clone(),
+                })
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
+        let futures = cells.iter().flat_map(|(cell, label, prompt)| {
             let sem = sem.clone();
             opts.models.iter().map(move |pm| {
                 let sem = sem.clone();
                 let model_name = pm.name.clone();
+                let cell_id = format!("{cell}@{}", pm.name);
                 let single = OrchestrateOpts {
                     models: vec![pm.clone()],
                     replicate: true,
                     no_fallback: opts.no_fallback,
                     max_concurrency: opts.max_concurrency,
-                    retries: opts.retries,
                 };
                 async move {
                     let _permit = sem.acquire().await.expect("semaphore not closed");
-                    let res = run_one_bundle(provider, target_label, bundle, rules, focus, &single).await;
+                    let res = run_one_bundle(provider, label, prompt, &single).await;
+                    // R2.1 修复：on_cell 在 future 内部即时调用（见 run_fanout 同款注释）。
+                    if let Some(s) = sink {
+                        match &res {
+                            Ok((_m, fs, _)) => {
+                                s.on_cell(CellRecord::ok(cell_id.clone(), model_name.clone(), fs.clone()));
+                            }
+                            Err(warn) => {
+                                s.on_cell(CellRecord {
+                                    cell: cell_id.clone(),
+                                    model: model_name.clone(),
+                                    ok: false,
+                                    findings: vec![],
+                                    warn: Some(warn.clone()),
+                                });
+                            }
+                        }
+                    }
                     (model_name, res)
                 }
             })
@@ -299,7 +404,7 @@ pub async fn run_code_fanout(
         let mut out = RawResults::default();
         for (model_hint, res) in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((_m, fs, (it, ot))) => {
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
@@ -315,18 +420,49 @@ pub async fn run_code_fanout(
         out
     } else {
         // 候补：每 bundle 一条候补链（按 priority 降序、首个成功即止）
-        let futures = bundles.iter().map(|bundle| {
+        let manifest: Vec<CellInput> = cells
+            .iter()
+            .map(|(cell, _label, prompt)| CellInput {
+                cell: cell.clone(),
+                model: top_priority_model(opts),
+                prompt: prompt.clone(),
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
+        let futures = cells.iter().map(|(cell, label, prompt)| {
             let sem = sem.clone();
+            let cell_id = cell.clone();
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
-                run_one_bundle(provider, target_label, bundle, rules, focus, opts).await
+                let res = run_one_bundle(provider, label, prompt, opts).await;
+                // R2.1 修复：on_cell 在 future 内部即时调用（见 run_fanout 同款注释）。
+                if let Some(s) = sink {
+                    match &res {
+                        Ok((model, fs, _)) => {
+                            s.on_cell(CellRecord::ok(cell_id.clone(), model.clone(), fs.clone()));
+                        }
+                        Err(warn) => {
+                            s.on_cell(CellRecord {
+                                cell: cell_id.clone(),
+                                model: String::new(),
+                                ok: false,
+                                findings: vec![],
+                                warn: Some(warn.clone()),
+                            });
+                        }
+                    }
+                }
+                res
             }
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
         for res in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((_model, fs, (it, ot))) => {
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
@@ -341,13 +477,9 @@ pub async fn run_code_fanout(
 /// 单篇文档评审（整篇文档为单一单元、无 bundle；候补链语义同 run_one_bundle）。
 async fn run_one_doc(
     provider: &dyn ReviewProvider,
-    input: &ReviewInput,
-    rules: &[&Lens],
-    focus: &str,
+    prompt: &str,
     opts: &OrchestrateOpts,
-) -> Result<(Vec<Finding>, (u64, u64)), String> {
-    let prompt = build_doc_prompt(input, rules, focus);
-
+) -> Result<(String, Vec<Finding>, (u64, u64)), String> {
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
@@ -360,10 +492,10 @@ async fn run_one_doc(
 
     let mut errs: Vec<String> = Vec::new();
     for pm in &chain {
-        match call_with_retry(provider, &pm.name, &prompt, opts.retries).await {
+        match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call.findings.iter().map(|r| enrich(r, "doc", &pm.name)).collect();
-                return Ok((fs, (call.input_tokens, call.output_tokens)));
+                return Ok((pm.name.clone(), fs, (call.input_tokens, call.output_tokens)));
             }
             Err(e) => errs.push(format!("doc model {}: {e}", pm.name)),
         }
@@ -380,22 +512,59 @@ pub async fn run_doc_fanout(
     rules: &[&Lens],
     focus: &str,
     opts: &OrchestrateOpts,
+    sink: Option<&dyn CellSink>,
 ) -> RawResults {
+    // 整篇文档为单一 cell：prompt 只渲染一次，manifest 与执行复用同一份。
+    let prompt = build_doc_prompt(input, rules, focus);
+    let cell_id = "doc".to_string();
+
     if opts.replicate {
+        // cell-id 带上 model（`doc@<model>`）：理由同 run_fanout 的 replicate 分支注释。
+        let manifest: Vec<CellInput> = opts
+            .models
+            .iter()
+            .map(|pm| CellInput {
+                cell: format!("{cell_id}@{}", pm.name),
+                model: pm.name.clone(),
+                prompt: prompt.clone(),
+            })
+            .collect();
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
         let sem = Arc::new(Semaphore::new(opts.max_concurrency.max(1)));
         let futures = opts.models.iter().map(|pm| {
             let sem = sem.clone();
             let model_name = pm.name.clone();
+            let cell_id = format!("{cell_id}@{}", pm.name);
+            let prompt = &prompt;
             let single = OrchestrateOpts {
                 models: vec![pm.clone()],
                 replicate: true,
                 no_fallback: opts.no_fallback,
                 max_concurrency: opts.max_concurrency,
-                retries: opts.retries,
             };
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
-                let res = run_one_doc(provider, input, rules, focus, &single).await;
+                let res = run_one_doc(provider, prompt, &single).await;
+                // R2.1 修复：on_cell 在 future 内部即时调用（见 run_fanout 同款注释）。
+                if let Some(s) = sink {
+                    match &res {
+                        Ok((_m, fs, _)) => {
+                            s.on_cell(CellRecord::ok(cell_id.clone(), model_name.clone(), fs.clone()));
+                        }
+                        Err(warn) => {
+                            s.on_cell(CellRecord {
+                                cell: cell_id.clone(),
+                                model: model_name.clone(),
+                                ok: false,
+                                findings: vec![],
+                                warn: Some(warn.clone()),
+                            });
+                        }
+                    }
+                }
                 (model_name, res)
             }
         });
@@ -403,7 +572,7 @@ pub async fn run_doc_fanout(
         let mut out = RawResults::default();
         for (model_hint, res) in results {
             match res {
-                Ok((fs, (it, ot))) => {
+                Ok((_m, fs, (it, ot))) => {
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
@@ -419,14 +588,37 @@ pub async fn run_doc_fanout(
         out
     } else {
         // 单一单元候补链：仅一个任务，无需信号量。
+        let manifest = vec![CellInput {
+            cell: cell_id.clone(),
+            model: top_priority_model(opts),
+            prompt: prompt.clone(),
+        }];
+        if let Some(s) = sink {
+            s.manifest(&manifest);
+        }
+
         let mut out = RawResults::default();
-        match run_one_doc(provider, input, rules, focus, opts).await {
-            Ok((fs, (it, ot))) => {
+        match run_one_doc(provider, &prompt, opts).await {
+            Ok((model, fs, (it, ot))) => {
+                if let Some(s) = sink {
+                    s.on_cell(CellRecord::ok(cell_id, model.clone(), fs.clone()));
+                }
                 out.findings.extend(fs);
                 out.usage.0 += it;
                 out.usage.1 += ot;
             }
-            Err(warn) => out.warnings.push(warn),
+            Err(warn) => {
+                if let Some(s) = sink {
+                    s.on_cell(CellRecord {
+                        cell: cell_id,
+                        model: String::new(),
+                        ok: false,
+                        findings: vec![],
+                        warn: Some(warn.clone()),
+                    });
+                }
+                out.warnings.push(warn)
+            }
         }
         out
     }
@@ -478,9 +670,8 @@ mod tests {
             replicate: false,
             no_fallback: false,
             max_concurrency: 4,
-            retries: 0,
         };
-        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts).await;
+        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, None).await;
         assert_eq!(r.findings.len(), 1);
         assert_eq!(r.findings[0].models, vec!["gpt".to_string()]);
     }
@@ -494,9 +685,8 @@ mod tests {
             replicate: true,
             no_fallback: false,
             max_concurrency: 4,
-            retries: 0,
         };
-        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts).await;
+        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, None).await;
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"claude".to_string()));
         assert!(!r.warnings.is_empty());
@@ -533,11 +723,11 @@ mod tests {
         let p = FakeProvider::with("m", vec![raw_q("found")]);
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "m".into(), priority: 10 }],
-            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts).await;
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, None).await;
         assert_eq!(r.findings.len(), 3, "one finding per bundle");
         // raw.lens=Some("L1") → enrich 用 L1（非 fallback）
         assert!(r.findings.iter().all(|f| f.lenses == vec!["L1".to_string()]));
@@ -564,12 +754,12 @@ mod tests {
         let probe = Arc::new(ConcProbe { inflight: AtomicUsize::new(0), max_seen: AtomicUsize::new(0) });
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "m".into(), priority: 10 }],
-            replicate: true, no_fallback: false, max_concurrency: 2, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 2,
         };
         let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
         let rules = vec![lens_by_id("L1").unwrap()];
         let probe_ref: &ConcProbe = &probe;
-        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", &opts).await;
+        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", &opts, None).await;
         assert!(probe.max_seen.load(Ordering::SeqCst) <= 2, "concurrency exceeded cap: {}", probe.max_seen.load(Ordering::SeqCst));
         assert!(probe.max_seen.load(Ordering::SeqCst) >= 1);
     }
@@ -580,11 +770,11 @@ mod tests {
         let p = FakeProvider::with("present", vec![]);
         let opts = OrchestrateOpts {
             models: vec![PlannedModel { name: "absent".into(), priority: 10 }],
-            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts).await;
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, None).await;
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"absent".to_string()), "explicit unreachable model must be recorded");
         assert!(!r.warnings.is_empty());
@@ -613,9 +803,8 @@ mod tests {
             replicate: true,
             no_fallback: false,
             max_concurrency: 8,
-            retries: 0,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts, None).await;
         // 2 bundle × 2 model = 4 格，各 1 finding → 4 条
         assert_eq!(out.findings.len(), 4);
         let models: std::collections::BTreeSet<&str> =
@@ -643,9 +832,8 @@ mod tests {
             replicate: true,
             no_fallback: false,
             max_concurrency: 8,
-            retries: 0,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 1); // alpha 成功
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -670,10 +858,19 @@ mod tests {
                 PlannedModel { name: "alpha".into(), priority: 10 },
                 PlannedModel { name: "beta".into(), priority: 5 },
             ],
-            replicate: true, no_fallback: false, max_concurrency: 8, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 8,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts).await;
+        let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, Some(&sink)).await;
         assert_eq!(out.findings.len(), 2, "one finding per model over the single doc");
+        // final-review Important 回归：replicate 下同一 base cell（"doc"）的多 model 副本，
+        // manifest + on_cell 的 cell-id 必须各自带上 model 才唯一——否则 resume 的差集判定
+        // （join on cell）会把「任一 model 已完成」误判为「该 cell 全部完成」，见 cli.rs
+        // resume_replicate_missing_model_copy_is_completed。
+        let manifest_cells: std::collections::BTreeSet<String> =
+            sink.records.lock().unwrap().iter().map(|r| r.cell.clone()).collect();
+        assert_eq!(manifest_cells.len(), 2, "两个 model 副本的 cell-id 必须彼此唯一，不能坍缩成同一个 \"doc\"");
+        assert!(manifest_cells.contains("doc@alpha") && manifest_cells.contains("doc@beta"));
         let models: std::collections::BTreeSet<&str> =
             out.findings.iter().flat_map(|f| f.models.iter().map(|s| s.as_str())).collect();
         assert!(models.contains("alpha") && models.contains("beta"));
@@ -689,9 +886,9 @@ mod tests {
                 PlannedModel { name: "alpha".into(), priority: 10 },
                 PlannedModel { name: "beta".into(), priority: 5 },
             ],
-            replicate: true, no_fallback: false, max_concurrency: 8, retries: 0,
+            replicate: true, no_fallback: false, max_concurrency: 8,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts).await;
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 1);
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -706,9 +903,9 @@ mod tests {
                 PlannedModel { name: "claude".into(), priority: 30 },
                 PlannedModel { name: "gpt".into(), priority: 20 },
             ],
-            replicate: false, no_fallback: false, max_concurrency: 4, retries: 0,
+            replicate: false, no_fallback: false, max_concurrency: 4,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts).await;
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].models, vec!["gpt".to_string()]);
         assert!(out.failed_models.is_empty());
@@ -729,9 +926,8 @@ mod tests {
             replicate: false,
             no_fallback: false,
             max_concurrency: 4,
-            retries: 0,
         };
-        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts).await;
+        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, None).await;
         assert!(r.findings.is_empty(), "default path full-chain failure must produce no findings");
         assert!(r.failed_models.is_empty(), "default path full-chain failure must not write failed_models");
         assert!(!r.warnings.is_empty(), "default path full-chain failure must produce a warning");
@@ -739,5 +935,176 @@ mod tests {
         let warn = &r.warnings[0];
         assert!(warn.contains("claude"), "warning must contain claude failure: {warn}");
         assert!(warn.contains("gpt"), "warning must contain gpt failure: {warn}");
+    }
+
+    // R2.1：记录型 sink，断言扇出前写 manifest（全集）+ 每 cell 完成各回调一次。
+    // 记完整 CellRecord（而非只记 cell id），供 T4 回归测试断言 model 字段。
+    struct RecSink {
+        manifest_n: std::sync::Mutex<usize>,
+        records: std::sync::Mutex<Vec<CellRecord>>,
+    }
+    impl CellSink for RecSink {
+        fn manifest(&self, inputs: &[CellInput]) {
+            *self.manifest_n.lock().unwrap() = inputs.len();
+        }
+        fn on_cell(&self, rec: CellRecord) {
+            self.records.lock().unwrap().push(rec);
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_writes_manifest_and_each_cell() {
+        let p = FakeProvider::with("m", vec![raw_q("found")]);
+        let opts = OrchestrateOpts {
+            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            replicate: true, no_fallback: false, max_concurrency: 4,
+        };
+        let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
+        let rules = vec![lens_by_id("L1").unwrap()];
+        let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
+        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, Some(&sink)).await;
+        assert_eq!(*sink.manifest_n.lock().unwrap(), 3, "manifest 全集=3 cell");
+        assert_eq!(sink.records.lock().unwrap().len(), 3, "每 cell 各回调一次");
+    }
+
+    // T4 回归：候补链（replicate=false）+ provider 成功但零 findings
+    // → CellRecord.model 必须是实际命中的候选模型名，不能退化为空串。
+    #[tokio::test]
+    async fn fallback_cell_records_hit_model_even_with_zero_findings() {
+        // claude 无脚本（候补失败），gpt 有脚本但返回空 findings（成功、零发现）
+        let p = FakeProvider::with("gpt", vec![]);
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "claude".into(), priority: 30 },
+                PlannedModel { name: "gpt".into(), priority: 20 },
+            ],
+            replicate: false,
+            no_fallback: false,
+            max_concurrency: 4,
+        };
+        let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
+        let r = run_fanout(&p, &input(), &[by_id("L1").unwrap()], "", &opts, Some(&sink)).await;
+        assert!(r.findings.is_empty(), "gpt 命中但零 findings");
+        let recs = sink.records.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].ok, "cell 应标记成功");
+        assert_eq!(recs[0].model, "gpt", "model 必须是实际命中的候选，不能是空串");
+    }
+
+    // T5 Important 回归：checkpoint 现在是流式的——on_cell 必须在每个 cell 自己的 future
+    // 内部即时触发，而不是等 join_all 收齐全部结果后才批量回调（旧实现下进程中途被杀，
+    // 已完成的 cell 也会因为还没来得及回调而在 partial.ndjson 里全部丢失）。
+    //
+    // 用一慢一快两个 bundle 验证时序：慢 cell（src/slow.rs）的 provider 调用故意 sleep，
+    // 快 cell（src/fast.rs）立即返回。若 on_cell 仍是旧的「join_all 之后统一回调」，快 cell
+    // 的回调必然要等慢 cell 也跑完才会触发；改成流式后，快 cell 的回调应该在慢 cell 完成前
+    // 就已经落地。
+    struct SlowFastProbe {
+        slow_done: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl ReviewProvider for SlowFastProbe {
+        async fn run(&self, req: LensRequest) -> Result<crate::provider::LensCall, ProviderError> {
+            if req.prompt.contains("slow.rs") {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                self.slow_done.store(true, Ordering::SeqCst);
+            }
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0 })
+        }
+    }
+
+    struct StreamingProbeSink<'a> {
+        slow_done: &'a std::sync::atomic::AtomicBool,
+        // Some(true) 表示 fast cell 的 on_cell 触发时，slow cell 尚未完成（流式，符合预期）。
+        // Some(false) 表示触发时 slow 已完成（说明退化回了旧的批量回调）。
+        fast_saw_slow_incomplete: std::sync::Mutex<Option<bool>>,
+        calls: AtomicUsize,
+    }
+    impl CellSink for StreamingProbeSink<'_> {
+        fn manifest(&self, _inputs: &[CellInput]) {}
+        fn on_cell(&self, rec: CellRecord) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if rec.cell.contains("fast.rs") {
+                *self.fast_saw_slow_incomplete.lock().unwrap() =
+                    Some(!self.slow_done.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn on_cell_fires_per_cell_before_slow_sibling_completes() {
+        let provider = SlowFastProbe { slow_done: std::sync::atomic::AtomicBool::new(false) };
+        let opts = OrchestrateOpts {
+            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            replicate: true, no_fallback: false, max_concurrency: 4,
+        };
+        let bundles = vec![bundle("src/slow.rs"), bundle("src/fast.rs")];
+        let rules = vec![lens_by_id("L1").unwrap()];
+        let sink = StreamingProbeSink {
+            slow_done: &provider.slow_done,
+            fast_saw_slow_incomplete: None.into(),
+            calls: AtomicUsize::new(0),
+        };
+        let _ = run_code_fanout(&provider, "wt", &bundles, &rules, "", &opts, Some(&sink)).await;
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 2, "on_cell 调用次数=cell 数（聚合前逐个触发）");
+        let saw = *sink.fast_saw_slow_incomplete.lock().unwrap();
+        assert_eq!(
+            saw,
+            Some(true),
+            "快 cell 的 on_cell 必须在慢 cell 完成前触发——证明每 cell 完成即落盘（流式 checkpoint）"
+        );
+    }
+
+    // R4.3 降级不变量：一个 model 在 tool loop 中途死亡（重试耗尽仍失败）
+    // → 该 cell 失败记 failed_models，run 继续，另一个 model 的 findings 存活。
+    #[tokio::test]
+    async fn mid_loop_model_death_degrades_gracefully() {
+        use crate::provider::registry::ProviderRegistry;
+        use crate::provider::tool_loop::{AssistantTurn, FakeChatBackend, ToolLoopProvider};
+        use crate::provider::ProviderError;
+        use crate::tools::ToolCall;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "x").unwrap();
+        let good_json = r#"{"findings":[{"severity":"high","title":"real","body":"b","file":"src/a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}]}"#;
+
+        // good：一轮直接产最终 findings
+        let good = ToolLoopProvider::new(
+            Box::new(FakeChatBackend::new(vec![AssistantTurn {
+                text: good_json.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1 }])),
+            dir.path().to_path_buf());
+        // bad：先 tool_call（iter1），再一路 Timeout（iter2 重试耗尽仍失败）。
+        // DEFAULT_RETRY_BUDGET=2 → iter2 需 3 次 Err（首发+2 重试）→ 备 1 Ok + 3 Err。
+        let tc = AssistantTurn { text: String::new(),
+            tool_calls: vec![ToolCall { id: "c".into(), name: "read_file".into(), args: json!({"path":"a.rs"}) }],
+            input_tokens: 1, output_tokens: 1 };
+        let bad = ToolLoopProvider::new(
+            Box::new(FakeChatBackend::new_results(vec![
+                Ok(tc),
+                Err(ProviderError::Timeout("dead".into())),
+                Err(ProviderError::Timeout("dead".into())),
+                Err(ProviderError::Timeout("dead".into())),
+            ])),
+            dir.path().to_path_buf());
+
+        let mut reg = ProviderRegistry::new();
+        reg.insert("good", Box::new(good));
+        reg.insert("bad", Box::new(bad));
+
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "good".into(), priority: 1 },
+                PlannedModel { name: "bad".into(), priority: 1 },
+            ],
+            replicate: true, no_fallback: false, max_concurrency: 4,
+        };
+        let bundles = vec![bundle("src/a.rs")];
+        let rules = vec![lens_by_id("L1").unwrap()];
+        let out = run_code_fanout(&reg, "wt", &bundles, &rules, "", &opts, None).await;
+        assert!(out.failed_models.contains(&"bad".to_string()),
+            "坏 model 应记 failed_models: {:?}", out.failed_models);
+        assert!(out.findings.iter().any(|f| f.title == "real"),
+            "好 model 的 finding 应仍在报告里");
     }
 }

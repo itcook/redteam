@@ -4,13 +4,19 @@ use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Verdict { Approve, Reject }
+pub enum Verdict {
+    Approve,
+    Reject,
+    #[serde(rename = "incomplete")]
+    Incomplete,
+}
 
 impl Verdict {
     pub fn as_str(&self) -> &'static str {
         match self {
             Verdict::Approve => "approve",
             Verdict::Reject => "reject",
+            Verdict::Incomplete => "incomplete",
         }
     }
 }
@@ -78,5 +84,10 @@ mod tests {
     #[test]
     fn verdict_serializes_kebab() {
         assert_eq!(serde_json::to_string(&Verdict::Reject).unwrap(), "\"reject\"");
+    }
+
+    #[test]
+    fn verdict_incomplete_serializes() {
+        assert_eq!(serde_json::to_string(&Verdict::Incomplete).unwrap(), "\"incomplete\"");
     }
 }

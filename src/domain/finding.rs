@@ -44,7 +44,7 @@ pub struct LensOutput {
 }
 
 /// 本地在 dedup 时 enrich 后的 finding。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Finding {
     pub id: String,
     pub severity: Severity,
@@ -68,18 +68,20 @@ pub struct Finding {
 }
 
 /// targeted-verify（S3-b）的判定：upheld=守住反驳（finding 成立）、refuted=被证伪。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifyVerdict { Upheld, Refuted }
 
 /// 一条 finding 的 verify 结果（refute pass 产出）。
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Verify {
     pub verdict: VerifyVerdict,
     /// 执行 refute 的 model 名（交叉验证用哪个）。
     pub model: String,
     /// refute 理由（refuted 时为反驳要点；upheld 时可空）。
-    #[serde(skip_serializing_if = "String::is_empty")]
+    /// `default` 关键：空 note 序列化时被 skip，反序列化（read_partial）必须容忍缺键回落空，
+    /// 否则含空-note verify 的 CellRecord 会被 filter_map 静默丢弃（数据丢失）。
+    #[serde(skip_serializing_if = "String::is_empty", default)]
     pub note: String,
 }
 
@@ -153,5 +155,17 @@ mod tests {
         assert_eq!(v["verify"]["verdict"], "refuted");
         assert_eq!(v["verify"]["model"], "gpt");
         assert_eq!(v["verify"]["note"], "guarded above");
+    }
+
+    #[test]
+    fn verify_empty_note_roundtrips_after_skip() {
+        // 空 note → skip_serializing 跳键；反序列化（read_partial 路径）须 default 回 ""，
+        // 否则缺键报错 → 整条记录被 filter_map 静默丢弃（Critical 数据丢失回归防护）。
+        let v = Verify { verdict: VerifyVerdict::Upheld, model: "m".into(), note: String::new() };
+        let j = serde_json::to_string(&v).unwrap();
+        assert!(!j.contains("note"), "空 note 应被 skip: {j}");
+        let back: Verify = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.note, "", "缺 note 键须 default 回空");
+        assert_eq!(back.verdict, VerifyVerdict::Upheld);
     }
 }
