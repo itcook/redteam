@@ -553,6 +553,8 @@ mod code_review_tests {
         assert_eq!(exit_code(Verdict::Reject, true), 10);   // reject 优先
         assert_eq!(exit_code(Verdict::Approve, true), 2);   // approve 但对照集不完整
         assert_eq!(exit_code(Verdict::Approve, false), 0);  // 干净 approve
+        assert_eq!(exit_code(Verdict::Incomplete, false), 2); // 部分结果＝对照集不完整
+        assert_eq!(exit_code(Verdict::Incomplete, true), 2);
     }
 
     #[tokio::test]
