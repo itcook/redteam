@@ -318,4 +318,30 @@ mod tests {
                               std::time::Duration::from_millis(30)).await;
         assert!(matches!(r, Err(ProviderError::Unavailable(_))), "got: {r:?}");
     }
+
+    // 收尾轮 timeout 覆盖：探索轮正常返回 tool_call、耗尽 max_iters 后进收尾轮 turn_final 挂起。
+    struct HangFinalBackend;
+    #[async_trait]
+    impl ChatBackend for HangFinalBackend {
+        async fn turn(&self, _m: &[ChatMessage], _t: &[ToolSpec]) -> Result<AssistantTurn, ProviderError> {
+            Ok(AssistantTurn {
+                text: String::new(),
+                tool_calls: vec![ToolCall { id: "c1".into(), name: "read_file".into(), args: json!({"path":"a.rs"}) }],
+                input_tokens: 1, output_tokens: 1,
+            })
+        }
+        async fn turn_final(&self, _m: &[ChatMessage]) -> Result<AssistantTurn, ProviderError> {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            unreachable!("finalize turn should be cut by per-turn timeout")
+        }
+    }
+
+    #[tokio::test]
+    async fn per_turn_timeout_covers_finalize_round() {
+        let (_d, ex) = tmp_executor_with("a.rs", "x");
+        // max_iters=1：探索轮 1 次 tool_call → 进收尾轮 turn_final（挂起）→ 收尾轮 timeout 切断
+        let r = run_tool_loop(&HangFinalBackend, &ex, "sys", "review", 1,
+                              std::time::Duration::from_millis(30)).await;
+        assert!(matches!(r, Err(ProviderError::Unavailable(_))), "finalize timeout: {r:?}");
+    }
 }
