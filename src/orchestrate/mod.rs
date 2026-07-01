@@ -197,7 +197,25 @@ pub async fn run_fanout(
                     };
                     async move {
                         let res = run_one_lens(provider, prompt, lens, &single_opts).await;
-                        (cell_id, model_name, res)
+                        // R2.1 修复：on_cell 在 future 内部即时调用，cell 一完成即落盘——
+                        // 崩溃只丢在飞的那个 cell（而非等 join_all 全部结束后批量落盘丢光全部）。
+                        if let Some(s) = sink {
+                            match &res {
+                                Ok((_m, fs, _)) => {
+                                    s.on_cell(CellRecord::ok(cell_id.clone(), model_name.clone(), fs.clone()));
+                                }
+                                Err(warn) => {
+                                    s.on_cell(CellRecord {
+                                        cell: cell_id.clone(),
+                                        model: model_name.clone(),
+                                        ok: false,
+                                        findings: vec![],
+                                        warn: Some(warn.clone()),
+                                    });
+                                }
+                            }
+                        }
+                        (model_name, res)
                     }
                 })
             })
@@ -205,26 +223,14 @@ pub async fn run_fanout(
 
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (cell_id, model_hint, res) in results {
+        for (model_hint, res) in results {
             match res {
                 Ok((_m, fs, (it, ot))) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord::ok(cell_id, model_hint.clone(), fs.clone()));
-                    }
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
                 Err(warn) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord {
-                            cell: cell_id,
-                            model: model_hint.clone(),
-                            ok: false,
-                            findings: vec![],
-                            warn: Some(warn.clone()),
-                        });
-                    }
                     out.warnings.push(warn);
                     if !out.failed_models.contains(&model_hint) {
                         out.failed_models.push(model_hint);
@@ -256,33 +262,38 @@ pub async fn run_fanout(
                 let cell_id = cell.clone();
                 async move {
                     let res = run_one_lens(provider, prompt, lens, opts).await;
-                    (cell_id, res)
+                    // R2.1 修复：on_cell 在 future 内部即时调用（见上一分支同款注释）。
+                    if let Some(s) = sink {
+                        match &res {
+                            Ok((model, fs, _)) => {
+                                s.on_cell(CellRecord::ok(cell_id.clone(), model.clone(), fs.clone()));
+                            }
+                            Err(warn) => {
+                                s.on_cell(CellRecord {
+                                    cell: cell_id.clone(),
+                                    model: String::new(),
+                                    ok: false,
+                                    findings: vec![],
+                                    warn: Some(warn.clone()),
+                                });
+                            }
+                        }
+                    }
+                    res
                 }
             })
             .collect();
 
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (cell_id, res) in results {
+        for res in results {
             match res {
-                Ok((model, fs, (it, ot))) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord::ok(cell_id, model.clone(), fs.clone()));
-                    }
+                Ok((_model, fs, (it, ot))) => {
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
                 Err(warn) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord {
-                            cell: cell_id,
-                            model: String::new(),
-                            ok: false,
-                            findings: vec![],
-                            warn: Some(warn.clone()),
-                        });
-                    }
                     // 默认路径：整条候补链失败，只记 warning，不写 failed_models
                     out.warnings.push(warn);
                 }
@@ -391,32 +402,37 @@ pub async fn run_code_fanout(
                 async move {
                     let _permit = sem.acquire().await.expect("semaphore not closed");
                     let res = run_one_bundle(provider, label, prompt, &single).await;
-                    (cell_id, model_name, res)
+                    // R2.1 修复：on_cell 在 future 内部即时调用（见 run_fanout 同款注释）。
+                    if let Some(s) = sink {
+                        match &res {
+                            Ok((_m, fs, _)) => {
+                                s.on_cell(CellRecord::ok(cell_id.clone(), model_name.clone(), fs.clone()));
+                            }
+                            Err(warn) => {
+                                s.on_cell(CellRecord {
+                                    cell: cell_id.clone(),
+                                    model: model_name.clone(),
+                                    ok: false,
+                                    findings: vec![],
+                                    warn: Some(warn.clone()),
+                                });
+                            }
+                        }
+                    }
+                    (model_name, res)
                 }
             })
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (cell_id, model_hint, res) in results {
+        for (model_hint, res) in results {
             match res {
                 Ok((_m, fs, (it, ot))) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord::ok(cell_id, model_hint.clone(), fs.clone()));
-                    }
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
                 Err(warn) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord {
-                            cell: cell_id,
-                            model: model_hint.clone(),
-                            ok: false,
-                            findings: vec![],
-                            warn: Some(warn.clone()),
-                        });
-                    }
                     out.warnings.push(warn);
                     if !out.failed_models.contains(&model_hint) {
                         out.failed_models.push(model_hint);
@@ -445,33 +461,36 @@ pub async fn run_code_fanout(
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let res = run_one_bundle(provider, label, prompt, opts).await;
-                (cell_id, res)
+                // R2.1 修复：on_cell 在 future 内部即时调用（见 run_fanout 同款注释）。
+                if let Some(s) = sink {
+                    match &res {
+                        Ok((model, fs, _)) => {
+                            s.on_cell(CellRecord::ok(cell_id.clone(), model.clone(), fs.clone()));
+                        }
+                        Err(warn) => {
+                            s.on_cell(CellRecord {
+                                cell: cell_id.clone(),
+                                model: String::new(),
+                                ok: false,
+                                findings: vec![],
+                                warn: Some(warn.clone()),
+                            });
+                        }
+                    }
+                }
+                res
             }
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (cell_id, res) in results {
+        for res in results {
             match res {
-                Ok((model, fs, (it, ot))) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord::ok(cell_id, model.clone(), fs.clone()));
-                    }
+                Ok((_model, fs, (it, ot))) => {
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
-                Err(warn) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord {
-                            cell: cell_id,
-                            model: String::new(),
-                            ok: false,
-                            findings: vec![],
-                            warn: Some(warn.clone()),
-                        });
-                    }
-                    out.warnings.push(warn)
-                }
+                Err(warn) => out.warnings.push(warn),
             }
         }
         out
@@ -552,31 +571,36 @@ pub async fn run_doc_fanout(
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let res = run_one_doc(provider, prompt, &single).await;
-                (cell_id, model_name, res)
+                // R2.1 修复：on_cell 在 future 内部即时调用（见 run_fanout 同款注释）。
+                if let Some(s) = sink {
+                    match &res {
+                        Ok((_m, fs, _)) => {
+                            s.on_cell(CellRecord::ok(cell_id.clone(), model_name.clone(), fs.clone()));
+                        }
+                        Err(warn) => {
+                            s.on_cell(CellRecord {
+                                cell: cell_id.clone(),
+                                model: model_name.clone(),
+                                ok: false,
+                                findings: vec![],
+                                warn: Some(warn.clone()),
+                            });
+                        }
+                    }
+                }
+                (model_name, res)
             }
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (cell_id, model_hint, res) in results {
+        for (model_hint, res) in results {
             match res {
                 Ok((_m, fs, (it, ot))) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord::ok(cell_id, model_hint.clone(), fs.clone()));
-                    }
                     out.findings.extend(fs);
                     out.usage.0 += it;
                     out.usage.1 += ot;
                 }
                 Err(warn) => {
-                    if let Some(s) = sink {
-                        s.on_cell(CellRecord {
-                            cell: cell_id,
-                            model: model_hint.clone(),
-                            ok: false,
-                            findings: vec![],
-                            warn: Some(warn.clone()),
-                        });
-                    }
                     out.warnings.push(warn);
                     if !out.failed_models.contains(&model_hint) {
                         out.failed_models.push(model_hint);
@@ -985,5 +1009,69 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert!(recs[0].ok, "cell 应标记成功");
         assert_eq!(recs[0].model, "gpt", "model 必须是实际命中的候选，不能是空串");
+    }
+
+    // T5 Important 回归：checkpoint 现在是流式的——on_cell 必须在每个 cell 自己的 future
+    // 内部即时触发，而不是等 join_all 收齐全部结果后才批量回调（旧实现下进程中途被杀，
+    // 已完成的 cell 也会因为还没来得及回调而在 partial.ndjson 里全部丢失）。
+    //
+    // 用一慢一快两个 bundle 验证时序：慢 cell（src/slow.rs）的 provider 调用故意 sleep，
+    // 快 cell（src/fast.rs）立即返回。若 on_cell 仍是旧的「join_all 之后统一回调」，快 cell
+    // 的回调必然要等慢 cell 也跑完才会触发；改成流式后，快 cell 的回调应该在慢 cell 完成前
+    // 就已经落地。
+    struct SlowFastProbe {
+        slow_done: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl ReviewProvider for SlowFastProbe {
+        async fn run(&self, req: LensRequest) -> Result<crate::provider::LensCall, ProviderError> {
+            if req.prompt.contains("slow.rs") {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                self.slow_done.store(true, Ordering::SeqCst);
+            }
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0 })
+        }
+    }
+
+    struct StreamingProbeSink<'a> {
+        slow_done: &'a std::sync::atomic::AtomicBool,
+        // Some(true) 表示 fast cell 的 on_cell 触发时，slow cell 尚未完成（流式，符合预期）。
+        // Some(false) 表示触发时 slow 已完成（说明退化回了旧的批量回调）。
+        fast_saw_slow_incomplete: std::sync::Mutex<Option<bool>>,
+        calls: AtomicUsize,
+    }
+    impl CellSink for StreamingProbeSink<'_> {
+        fn manifest(&self, _inputs: &[CellInput]) {}
+        fn on_cell(&self, rec: CellRecord) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if rec.cell.contains("fast.rs") {
+                *self.fast_saw_slow_incomplete.lock().unwrap() =
+                    Some(!self.slow_done.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn on_cell_fires_per_cell_before_slow_sibling_completes() {
+        let provider = SlowFastProbe { slow_done: std::sync::atomic::AtomicBool::new(false) };
+        let opts = OrchestrateOpts {
+            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            replicate: true, no_fallback: false, max_concurrency: 4, retries: 0,
+        };
+        let bundles = vec![bundle("src/slow.rs"), bundle("src/fast.rs")];
+        let rules = vec![lens_by_id("L1").unwrap()];
+        let sink = StreamingProbeSink {
+            slow_done: &provider.slow_done,
+            fast_saw_slow_incomplete: None.into(),
+            calls: AtomicUsize::new(0),
+        };
+        let _ = run_code_fanout(&provider, "wt", &bundles, &rules, "", &opts, Some(&sink)).await;
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 2, "on_cell 调用次数=cell 数（聚合前逐个触发）");
+        let saw = *sink.fast_saw_slow_incomplete.lock().unwrap();
+        assert_eq!(
+            saw,
+            Some(true),
+            "快 cell 的 on_cell 必须在慢 cell 完成前触发——证明每 cell 完成即落盘（流式 checkpoint）"
+        );
     }
 }

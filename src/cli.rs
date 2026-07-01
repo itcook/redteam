@@ -345,15 +345,19 @@ fn now_unix() -> u64 {
 }
 
 /// R2.1 job checkpoint sink：扇出前落 manifest（+刷 progress.total），每 cell 完成落 partial
-/// （+刷 last_active/progress.done）。cell 完成是低频事件——ponytail：每次操作直接
-/// read_state+write_state，不额外加锁/缓存。
+/// （+刷 last_active/progress.done）。Bug B 修复：现在 on_cell 由并发 fan-out future 直接触发
+/// （见 orchestrate/mod.rs），read_state→改→write_state 的 read-modify-write 段必须串行化，
+/// 否则并发 cell 各自读到同一旧值、+1 后互相覆盖，丢更新。
+/// ponytail：全局互斥锁最省事且正确——cell 完成是低频事件，锁粒度不值当细化。
 struct JobCellSink {
     ws: std::path::PathBuf,
     job_id: String,
+    lock: std::sync::Mutex<()>,
 }
 
 impl CellSink for JobCellSink {
     fn manifest(&self, inputs: &[crate::state::store::CellInput]) {
+        let _g = self.lock.lock().unwrap();
         let _ = crate::state::store::write_manifest(&self.ws, &self.job_id, inputs);
         if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
             st.progress.total = inputs.len() as u32;
@@ -362,6 +366,7 @@ impl CellSink for JobCellSink {
     }
 
     fn on_cell(&self, rec: crate::state::store::CellRecord) {
+        let _g = self.lock.lock().unwrap();
         let _ = crate::state::store::append_partial(&self.ws, &self.job_id, &rec);
         if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
             st.last_active = now_unix();
@@ -454,7 +459,7 @@ pub async fn run_job(
     st.status = JobStatus::Running;
     let _ = write_state(ws, &st);
 
-    let sink = JobCellSink { ws: ws.to_path_buf(), job_id: job_id.to_string() };
+    let sink = JobCellSink { ws: ws.to_path_buf(), job_id: job_id.to_string(), lock: std::sync::Mutex::new(()) };
     let dispatch = run_review_dispatch(args, provider, cfg, cwd, Some(&sink));
 
     // Outcome 只在本函数内构造/匹配一次，Box 间接层不值当——沿用 main.rs Cmd 枚举同款 allow。
@@ -484,8 +489,12 @@ pub async fn run_job(
             let _ = write_result(ws, job_id, &json);
             let _ = crate::state::store::write_result_md(ws, job_id, &md);
             // 若期间已被 cancel，保留 cancelled；否则 done。
+            // Bug C 修复：以刚读到的最新状态（含 sink 在运行期写入的 progress/last_active）
+            // 为底稿叠加终态字段，而非复用函数入口处那份陈旧 st（只设过 status=Running），
+            // 否则会把 sink 写的 progress/last_active 覆盖回 0/started_at。
             let latest = read_state(ws, job_id);
             let cancelled = matches!(latest.as_ref().map(|s| s.status), Some(JobStatus::Cancelled));
+            let mut st = latest.unwrap_or(st);
             st.status = if cancelled { JobStatus::Cancelled } else { JobStatus::Done };
             st.exit_code = Some(code);
             st.mode = Some(report.mode);
@@ -497,12 +506,16 @@ pub async fn run_job(
         }
         Outcome::Done(Err(e)) => {
             let (report, code) = partial_report(ws, job_id, args, e.to_string());
+            // Bug C 修复：同上，叠加终态前先取最新状态做底稿。
+            let mut st = read_state(ws, job_id).unwrap_or(st);
             write_partial_result(ws, job_id, &mut st, JobStatus::Failed, &report, code, e.to_string());
             code
         }
         Outcome::TimedOut => {
             let reason = "timed out: deadline exceeded".to_string();
             let (report, code) = partial_report(ws, job_id, args, reason.clone());
+            // Bug C 修复：同上，叠加终态前先取最新状态做底稿。
+            let mut st = read_state(ws, job_id).unwrap_or(st);
             write_partial_result(ws, job_id, &mut st, JobStatus::TimedOut, &report, code, reason);
             code
         }
@@ -569,6 +582,10 @@ mod job_tests {
         // result.json 落盘且是合法 JSON
         let res = read_result(&ws, "j1").unwrap();
         assert!(res.contains("\"verdict\""));
+        // Bug C 回归：run_job 收尾 write_state 必须以 sink 运行期写的最新 progress 为底稿
+        // 叠加终态字段，而不是复用函数入口那份陈旧 st（否则 done/total 会被重置回 0/0）。
+        assert_eq!(st.progress.done, 1, "收尾不应吞掉 sink 写入的 progress");
+        assert_eq!(st.progress.total, 1, "收尾不应吞掉 sink 写入的 progress");
     }
 
     #[tokio::test]
@@ -678,6 +695,46 @@ mod job_tests {
         assert!(
             crate::state::store::read_result(ws, "j3").is_none(),
             "Cancelled 提前返回不应留下 result.json"
+        );
+    }
+
+    /// Bug B 回归：`JobCellSink::on_cell` 的 read_state→改→write_state 段必须串行化。
+    /// 无锁时并发 N 次调用会各自读到同一旧 progress、各自 +1、后写覆盖先写，最终
+    /// `progress.done < N`；加全局锁后必须精确等于 N。用真实 OS 线程（而非 tokio 任务，
+    /// 后者在单线程 runtime 下不会真正并发）制造竞争。
+    #[test]
+    fn job_cell_sink_on_cell_concurrent_no_lost_update() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        crate::state::job::write_state(&ws, &crate::state::job::JobState::new("jc1", 0)).unwrap();
+        let sink = Arc::new(JobCellSink {
+            ws: ws.clone(),
+            job_id: "jc1".to_string(),
+            lock: std::sync::Mutex::new(()),
+        });
+
+        let n = 20usize;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let sink = sink.clone();
+                std::thread::spawn(move || {
+                    sink.on_cell(crate::state::store::CellRecord::ok(
+                        format!("cell{i}"),
+                        "m".to_string(),
+                        vec![],
+                    ));
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let st = read_state(&ws, "jc1").unwrap();
+        assert_eq!(
+            st.progress.done, n as u32,
+            "并发 on_cell 不应丢更新（无锁会 < {n}）"
         );
     }
 }
