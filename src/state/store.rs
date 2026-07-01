@@ -212,9 +212,14 @@ pub fn result_consumed_at(ws: &Path, id: &str) -> Option<u64> {
 
 use crate::state::job::{list_states, write_state, JobStatus};
 
-/// 假死阈值：`last_active` 停滞超过此值即判「挂死」（pid 仍活也算），
-/// 对齐 19 轮手工用的「log mtime 冻结 >5min 判 HUNG」。
-const WEDGE_THRESHOLD_SECS: u64 = 300;
+/// 假死阈值：`last_active` 停滞超过此值即判「挂死」（pid 仍活也算）。
+/// **兜底语义**：`last_active` 只在**每个 cell 完成**时刷新（心跳粒度=cell），而单 cell 合法
+/// 可跑 11–34min（max_iters 12 × per_turn 150s + 候补链）。worker 有自己的 40min job deadline
+/// 会先自杀（R1.2）；wedge 只 reap 连自己 deadline 都没触发的**真·卡死**进程，故必须 **> job
+/// deadline**，否则会误杀第一个 cell 还没跑完、last_active 仍停在 started_at 的正常作业。
+/// 取 60min（> 40min deadline + 余量）。（原 5min 值源自 codex 的 per-turn log 粒度，不适配本
+/// 项目的 per-cell 心跳——一线经验推翻。）
+const WEDGE_THRESHOLD_SECS: u64 = 3600;
 
 /// 检测 pid 是否仍存活：kill(pid, 0) 成功或 errno==EPERM → alive；ESRCH → dead。
 pub fn pid_alive(pid: u32) -> bool {
@@ -471,6 +476,23 @@ mod tests {
         let back = crate::state::job::read_state(ws, "j").unwrap();
         assert_eq!(back.status, crate::state::job::JobStatus::Failed, "假死活 pid 应转 Failed");
         assert!(crate::state::job::read_state(ws, "j").is_some(), "证据保留不删");
+    }
+
+    /// R1.2 兜底语义回归：正常作业第一个 cell 未完成、last_active 停在 started_at 但仍在 wedge
+    /// 窗口内（此处 20min < 60min 阈值）→ **不**被误判假死（活 pid），保持 Running。
+    /// 防「per-cell 心跳粒度 + 过小 wedge 阈值」误杀在跑作业。
+    #[test]
+    fn prune_keeps_fresh_running_job_within_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = crate::state::job::JobState::new("j", 0);
+        st.status = crate::state::job::JobStatus::Running;
+        st.pid = Some(std::process::id()); // 活 pid
+        st.last_active = 0;
+        crate::state::job::write_state(ws, &st).unwrap();
+        prune(ws, parse_ttl("24h"), 1200); // now=20min < WEDGE(60min)：不该 reap
+        let back = crate::state::job::read_state(ws, "j").unwrap();
+        assert_eq!(back.status, crate::state::job::JobStatus::Running, "wedge 窗口内正常作业不该转 Failed");
     }
 
     /// R2.2：终态（TimedOut，新纳入终态集合）+ 超 TTL → 真删文件，确认删除路径仍工作。
