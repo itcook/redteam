@@ -47,7 +47,7 @@ pub trait ChatBackend: Send + Sync {
 
 /// 多轮工具循环：发→若 tool_calls 则执行回灌→直至最终文本→解析为 findings。
 /// usage 跨轮累加；超过 max_iters 仍未收敛则 Parse 错误。
-/// `per_turn` 为单轮最长等待时间；超时返回 `ProviderError::Unavailable`。
+/// `per_turn` 为单轮最长等待时间；超时返回 `ProviderError::Timeout`。
 pub async fn run_tool_loop(
     backend: &dyn ChatBackend,
     executor: &ToolExecutor,
@@ -67,7 +67,7 @@ pub async fn run_tool_loop(
     for _ in 0..max_iters {
         let turn = match tokio::time::timeout(per_turn, backend.turn(&messages, &tools)).await {
             Ok(r) => r?,
-            Err(_) => return Err(ProviderError::Unavailable(
+            Err(_) => return Err(ProviderError::Timeout(
                 format!("turn timeout after {}s", per_turn.as_secs()))),
         };
         in_tok += turn.input_tokens;
@@ -97,7 +97,7 @@ pub async fn run_tool_loop(
     messages.push(ChatMessage::User(FINALIZE_PROMPT.to_string()));
     let turn = match tokio::time::timeout(per_turn, backend.turn_final(&messages)).await {
         Ok(r) => r?,
-        Err(_) => return Err(ProviderError::Unavailable(
+        Err(_) => return Err(ProviderError::Timeout(
             format!("turn timeout after {}s", per_turn.as_secs()))),
     };
     in_tok += turn.input_tokens;
@@ -316,7 +316,7 @@ mod tests {
         let (_d, ex) = tmp_executor_with("a.rs", "x");
         let r = run_tool_loop(&HangBackend, &ex, "sys", "review", 12,
                               std::time::Duration::from_millis(30)).await;
-        assert!(matches!(r, Err(ProviderError::Unavailable(_))), "got: {r:?}");
+        assert!(matches!(r, Err(ProviderError::Timeout(_))), "got: {r:?}");
     }
 
     // 收尾轮 timeout 覆盖：探索轮正常返回 tool_call、耗尽 max_iters 后进收尾轮 turn_final 挂起。
@@ -342,6 +342,6 @@ mod tests {
         // max_iters=1：探索轮 1 次 tool_call → 进收尾轮 turn_final（挂起）→ 收尾轮 timeout 切断
         let r = run_tool_loop(&HangFinalBackend, &ex, "sys", "review", 1,
                               std::time::Duration::from_millis(30)).await;
-        assert!(matches!(r, Err(ProviderError::Unavailable(_))), "finalize timeout: {r:?}");
+        assert!(matches!(r, Err(ProviderError::Timeout(_))), "finalize timeout: {r:?}");
     }
 }

@@ -150,20 +150,18 @@ impl DirectProvider {
         let base = self.base_url.as_deref().unwrap_or(ANTHROPIC_DEFAULT_BASE);
         let url = super::anthropic_messages_url(base);
         let body = build_anthropic_body(&self.model, SYSTEM, &req.prompt, MAX_TOKENS);
-        let resp: Value = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        let resp: Value = super::send_classified(
+            self.client
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body),
+        )
+        .await?
+        .json()
+        .await
+        .map_err(|e| ProviderError::Parse(e.to_string()))?; // 200 但 body 非法 JSON → Parse（决策⑥）
         extract_anthropic(&resp).ok_or_else(|| {
             ProviderError::Parse("anthropic response missing content text".into())
         })
@@ -173,19 +171,17 @@ impl DirectProvider {
         let base = self.base_url.as_deref().unwrap_or(OPENAI_DEFAULT_BASE);
         let url = format!("{}/chat/completions", base.trim_end_matches('/'));
         let body = build_openai_body(&self.model, SYSTEM, &req.prompt);
-        let resp: Value = self
-            .client
-            .post(&url)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        let resp: Value = super::send_classified(
+            self.client
+                .post(&url)
+                .header("authorization", format!("Bearer {}", self.api_key))
+                .header("content-type", "application/json")
+                .json(&body),
+        )
+        .await?
+        .json()
+        .await
+        .map_err(|e| ProviderError::Parse(e.to_string()))?; // 200 但 body 非法 JSON → Parse（决策⑥）
         extract_openai(&resp).ok_or_else(|| {
             ProviderError::Parse("openai response missing choices content".into())
         })
