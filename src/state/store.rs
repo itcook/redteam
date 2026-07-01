@@ -2,6 +2,92 @@ use crate::hash::fnv1a64_hex;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::io::Write;
+use serde::{Deserialize, Serialize};
+
+// ── manifest / partial 数据结构 ────────────────────────────────────────────────
+
+/// manifest 每行：输入快照（含渲染后 prompt 全文）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CellInput {
+    pub cell: String,
+    pub model: String,
+    pub prompt: String,
+}
+
+/// partial 每行：单个 cell 的执行结果。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CellRecord {
+    pub cell: String,
+    pub model: String,
+    pub ok: bool,
+    pub findings: Vec<crate::domain::Finding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warn: Option<String>,
+}
+
+impl CellRecord {
+    /// 便捷构造：ok=true, warn=None。
+    pub fn ok(cell: impl Into<String>, model: impl Into<String>, findings: Vec<crate::domain::Finding>) -> Self {
+        Self { cell: cell.into(), model: model.into(), ok: true, findings, warn: None }
+    }
+}
+
+// ── manifest / partial 文件路径 ────────────────────────────────────────────────
+
+pub fn job_manifest(ws: &Path, id: &str) -> PathBuf {
+    jobs_dir(ws).join(format!("{id}.manifest.ndjson"))
+}
+
+pub fn job_partial(ws: &Path, id: &str) -> PathBuf {
+    jobs_dir(ws).join(format!("{id}.partial.ndjson"))
+}
+
+// ── manifest 读写 ──────────────────────────────────────────────────────────────
+
+/// 原子写全部 manifest 行（一次性覆盖）。
+pub fn write_manifest(ws: &Path, id: &str, inputs: &[CellInput]) -> std::io::Result<()> {
+    let mut buf = String::new();
+    for inp in inputs {
+        buf.push_str(&serde_json::to_string(inp).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?);
+        buf.push('\n');
+    }
+    atomic_write(&job_manifest(ws, id), buf.as_bytes())
+}
+
+/// 读 manifest；文件不存在或行解析失败均跳过，不 panic。
+pub fn read_manifest(ws: &Path, id: &str) -> Vec<CellInput> {
+    let content = match std::fs::read_to_string(job_manifest(ws, id)) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    content.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+// ── partial 读写 ───────────────────────────────────────────────────────────────
+
+/// 逐行原子 append 一条 CellRecord（仿 append_log）。
+pub fn append_partial(ws: &Path, id: &str, record: &CellRecord) -> std::io::Result<()> {
+    let p = job_partial(ws, id);
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let line = serde_json::to_string(record).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
+    writeln!(f, "{line}")
+}
+
+/// 读 partial；文件不存在或行解析失败均跳过，不 panic。
+pub fn read_partial(ws: &Path, id: &str) -> Vec<CellRecord> {
+    let content = match std::fs::read_to_string(job_partial(ws, id)) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    content.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
 
 /// 状态根目录：$BRK_STATE_DIR → $TMPDIR/breakpoint → /tmp/breakpoint。
 pub fn state_root() -> PathBuf {
@@ -358,5 +444,25 @@ mod tests {
     #[test]
     fn pid_alive_self_is_alive() {
         assert!(pid_alive(std::process::id()), "自身进程应为 alive");
+    }
+
+    #[test]
+    fn manifest_and_partial_roundtrip_and_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let inputs = vec![
+            CellInput { cell: "bundle[a]".into(), model: "m1".into(), prompt: "P1".into() },
+            CellInput { cell: "bundle[b]".into(), model: "m1".into(), prompt: "P2".into() },
+            CellInput { cell: "bundle[c]".into(), model: "m1".into(), prompt: "P3".into() },
+        ];
+        write_manifest(ws, "j", &inputs).unwrap();
+        assert_eq!(read_manifest(ws, "j").len(), 3);
+        // 完成 1 个
+        append_partial(ws, "j", &CellRecord::ok("bundle[a]", "m1", vec![])).unwrap();
+        let done: std::collections::BTreeSet<String> =
+            read_partial(ws, "j").into_iter().filter(|r| r.ok).map(|r| r.cell).collect();
+        let pending: Vec<&CellInput> =
+            inputs.iter().filter(|c| !done.contains(&c.cell)).collect();
+        assert_eq!(pending.len(), 2, "manifest − partial(done) = 待补跑");
     }
 }

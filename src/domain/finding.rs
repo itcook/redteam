@@ -44,7 +44,7 @@ pub struct LensOutput {
 }
 
 /// 本地在 dedup 时 enrich 后的 finding。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Finding {
     pub id: String,
     pub severity: Severity,
@@ -68,12 +68,12 @@ pub struct Finding {
 }
 
 /// targeted-verify（S3-b）的判定：upheld=守住反驳（finding 成立）、refuted=被证伪。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifyVerdict { Upheld, Refuted }
 
 /// 一条 finding 的 verify 结果（refute pass 产出）。
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Verify {
     pub verdict: VerifyVerdict,
     /// 执行 refute 的 model 名（交叉验证用哪个）。
