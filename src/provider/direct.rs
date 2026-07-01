@@ -28,7 +28,7 @@ impl DirectProvider {
             model: pc.model.clone(),
             base_url: pc.base_url.clone(),
             api_key,
-            client: reqwest::Client::new(),
+            client: crate::provider::default_http_client(),
         }
     }
 }

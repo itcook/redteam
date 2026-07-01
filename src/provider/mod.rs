@@ -26,6 +26,15 @@ pub trait ReviewProvider: Send + Sync {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError>;
 }
 
+/// 带超时的共享 HTTP client（connect 10s / 整请求 120s）；构建失败回落默认 client。
+pub(crate) fn default_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Anthropic Messages 端点 URL：规范化 base 的 `/v1`——无论 base 含不含 `/v1`，最终都拼成
 /// `{host}/v1/messages`。backends（工具循环）与 direct（doc 单发）**共用**，避免重复导致不同步
 /// （dogfood：网关 base 配 `.../v1` 时旧逻辑拼出 `/v1/v1/messages` 404；曾只修 backends 漏 direct）。

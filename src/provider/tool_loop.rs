@@ -47,12 +47,14 @@ pub trait ChatBackend: Send + Sync {
 
 /// 多轮工具循环：发→若 tool_calls 则执行回灌→直至最终文本→解析为 findings。
 /// usage 跨轮累加；超过 max_iters 仍未收敛则 Parse 错误。
+/// `per_turn` 为单轮最长等待时间；超时返回 `ProviderError::Unavailable`。
 pub async fn run_tool_loop(
     backend: &dyn ChatBackend,
     executor: &ToolExecutor,
     system: &str,
     user_prompt: &str,
     max_iters: u32,
+    per_turn: std::time::Duration,
 ) -> Result<LensCall, ProviderError> {
     let tools = tool_specs();
     let mut messages = vec![
@@ -63,7 +65,11 @@ pub async fn run_tool_loop(
     let mut out_tok = 0u64;
 
     for _ in 0..max_iters {
-        let turn = backend.turn(&messages, &tools).await?;
+        let turn = match tokio::time::timeout(per_turn, backend.turn(&messages, &tools)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(ProviderError::Unavailable(
+                format!("turn timeout after {}s", per_turn.as_secs()))),
+        };
         in_tok += turn.input_tokens;
         out_tok += turn.output_tokens;
 
@@ -89,7 +95,11 @@ pub async fn run_tool_loop(
     // 要求模型基于已收集上下文仅产出最终 findings JSON。这把「function-calling 探索」与
     // 「structured-output 收尾」分阶段，避免中间轮强制 JSON 抑制工具调用（dogfood 反转教训）。
     messages.push(ChatMessage::User(FINALIZE_PROMPT.to_string()));
-    let turn = backend.turn_final(&messages).await?;
+    let turn = match tokio::time::timeout(per_turn, backend.turn_final(&messages)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(ProviderError::Unavailable(
+            format!("turn timeout after {}s", per_turn.as_secs()))),
+    };
     in_tok += turn.input_tokens;
     out_tok += turn.output_tokens;
     let out = parse_lens_output(&turn.text)?;
@@ -108,6 +118,7 @@ const DEFAULT_SYSTEM: &str =
     "You are an adversarial code reviewer. Use the provided tools to read and search the \
      codebase as needed, then return ONLY JSON matching the requested schema (an object with a \
      \"findings\" array).";
+const PER_TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
 
 /// 把一个 ChatBackend 与一个 ToolExecutor 组合成可直接喂给编排层的 ReviewProvider。
 pub struct ToolLoopProvider {
@@ -115,6 +126,7 @@ pub struct ToolLoopProvider {
     executor: ToolExecutor,
     system: String,
     max_iters: u32,
+    per_turn: std::time::Duration,
 }
 
 impl ToolLoopProvider {
@@ -124,6 +136,7 @@ impl ToolLoopProvider {
             executor: ToolExecutor::new(root),
             system: DEFAULT_SYSTEM.to_string(),
             max_iters: DEFAULT_MAX_ITERS,
+            per_turn: PER_TURN_DEADLINE,
         }
     }
 }
@@ -137,6 +150,7 @@ impl ReviewProvider for ToolLoopProvider {
             &self.system,
             &req.prompt,
             self.max_iters,
+            self.per_turn,
         )
         .await
     }
@@ -182,7 +196,7 @@ impl ChatBackend for FakeChatBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{LensRequest, ReviewProvider};
+    use crate::provider::{LensRequest, ProviderError, ReviewProvider};
     use serde_json::json;
     use std::io::Write;
 
@@ -213,7 +227,7 @@ mod tests {
     async fn final_only_returns_parsed_findings() {
         let (_d, ex) = tmp_executor_with("a.rs", "x");
         let backend = FakeChatBackend::new(vec![final_turn(FINDINGS_JSON)]);
-        let call = run_tool_loop(&backend, &ex, "sys", "review", 8).await.unwrap();
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 8, std::time::Duration::from_secs(60)).await.unwrap();
         assert_eq!(call.findings.len(), 1);
         assert_eq!(call.findings[0].title, "t");
         // 单轮 usage
@@ -229,7 +243,7 @@ mod tests {
             toolcall_turn("read_file", json!({ "path": "a.rs" })),
             final_turn(FINDINGS_JSON),
         ]);
-        let call = run_tool_loop(&backend, &ex, "sys", "review", 8).await.unwrap();
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 8, std::time::Duration::from_secs(60)).await.unwrap();
         assert_eq!(call.findings.len(), 1);
         // 两轮 usage 累加：(2+1, 3+1)
         assert_eq!((call.input_tokens, call.output_tokens), (3, 4));
@@ -276,7 +290,7 @@ mod tests {
             toolcall_turn("read_file", json!({ "path": "a.rs" })),
             final_turn(FINDINGS_JSON), // turn_final（默认实现走 turn）消费这个
         ]);
-        let call = run_tool_loop(&backend, &ex, "sys", "review", 2).await.unwrap();
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 2, std::time::Duration::from_secs(60)).await.unwrap();
         assert_eq!(call.findings.len(), 1, "强制收尾应产出 findings 而非报错");
         // usage 跨探索 2 轮 + 收尾 1 轮累加：(2+2+1, 3+3+1)
         assert_eq!((call.input_tokens, call.output_tokens), (5, 7));
@@ -286,5 +300,22 @@ mod tests {
             last.iter().any(|m| matches!(m, ChatMessage::User(u) if u.contains("JSON only"))),
             "finalize prompt not present: {last:?}"
         );
+    }
+
+    struct HangBackend;
+    #[async_trait]
+    impl ChatBackend for HangBackend {
+        async fn turn(&self, _m: &[ChatMessage], _t: &[ToolSpec]) -> Result<AssistantTurn, ProviderError> {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            unreachable!("should be cut by per-turn timeout")
+        }
+    }
+
+    #[tokio::test]
+    async fn per_turn_timeout_returns_err_not_hang() {
+        let (_d, ex) = tmp_executor_with("a.rs", "x");
+        let r = run_tool_loop(&HangBackend, &ex, "sys", "review", 12,
+                              std::time::Duration::from_millis(30)).await;
+        assert!(matches!(r, Err(ProviderError::Unavailable(_))), "got: {r:?}");
     }
 }

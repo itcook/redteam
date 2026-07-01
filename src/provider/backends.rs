@@ -102,7 +102,7 @@ pub struct AnthropicBackend {
 
 impl AnthropicBackend {
     pub fn new(model: String, base_url: Option<String>, api_key: String) -> Self {
-        AnthropicBackend { model, base_url, api_key, client: reqwest::Client::new() }
+        AnthropicBackend { model, base_url, api_key, client: crate::provider::default_http_client() }
     }
 }
 
@@ -237,7 +237,7 @@ pub struct OpenAiBackend {
 
 impl OpenAiBackend {
     pub fn new(model: String, base_url: Option<String>, api_key: String) -> Self {
-        OpenAiBackend { model, base_url, api_key, client: reqwest::Client::new() }
+        OpenAiBackend { model, base_url, api_key, client: crate::provider::default_http_client() }
     }
 
     /// 共享 HTTP 发送：POST {base}/chat/completions，解析这一轮输出。
