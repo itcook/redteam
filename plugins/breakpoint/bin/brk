@@ -1,0 +1,28 @@
+#!/bin/sh
+# brk launcher — resolve <os>/<arch> and exec the matching binary.
+# 稳定入口：插件命令壳与未来 loop SKILL 都调本文件；平台探测只此一处。
+# 前瞻（roadmap M9-a）：此处的 uname 分派点，未来可扩展为「运行环境探测」
+#   （Claude Code / Codex / 裸终端），为 host-model 委派铺路——当前不实现。
+set -e
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+case "$(uname -s)" in
+    Darwin) os=darwin ;;
+    Linux)  os=linux ;;
+    MINGW*|MSYS*|CYGWIN*) os=windows ;;
+    *) echo "brk: unsupported OS $(uname -s)" >&2; exit 127 ;;
+esac
+case "$(uname -m)" in
+    arm64|aarch64) arch=aarch64 ;;
+    x86_64|amd64)  arch=x86_64 ;;
+    *) echo "brk: unsupported arch $(uname -m)" >&2; exit 127 ;;
+esac
+
+ext=""
+[ "$os" = windows ] && ext=".exe"
+target="$dir/$os/$arch/brk$ext"
+if [ ! -x "$target" ]; then
+    echo "brk: no binary for $os/$arch (shipped: darwin/aarch64; run 'make build' or fetch from release)" >&2
+    exit 127
+fi
+exec "$target" "$@"
