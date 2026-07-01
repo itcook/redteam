@@ -479,6 +479,14 @@ pub async fn run_resume(
 ) -> (ReviewReport, i32) {
     let t0 = std::time::Instant::now();
     let manifest = crate::state::store::read_manifest(ws, job_id);
+    // 空 manifest = job 在 fan-out 写 manifest 前就崩溃：没有任何 work-list，尾段会把 0 findings
+    // 组装成干净 Approve（假阳性——评审工具静默给未经审查的通过）。护栏：直接出 Incomplete。
+    if manifest.is_empty() {
+        return partial_report(
+            ws, job_id, &empty_review_args(),
+            "resume: empty manifest (job crashed before fan-out); nothing to resume".into(),
+        );
+    }
     let args: ReviewArgs = match crate::state::store::read_args_raw(ws, job_id)
         .and_then(|j| serde_json::from_str(&j).ok())
     {
@@ -996,6 +1004,29 @@ mod resume_tests {
         drop(calls);
 
         assert_eq!(report.findings.len(), 3, "合并后应含 3 个 cell 的 findings（1 已完成 + 2 新补）");
+    }
+
+    /// 假阳性防护：manifest 从未写出（job 在 fan-out 前崩溃）→ resume 不得静默出 Approve，
+    /// 必须 Incomplete + 非零退出，且不调 provider。
+    #[tokio::test]
+    async fn resume_empty_manifest_is_incomplete_not_approve() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        // 只写 args，从不 write_manifest（模拟 fan-out 前崩溃）。
+        let args = ReviewArgs {
+            mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
+            focus: None, lenses: None, models: Some("m".into()), models_all: false,
+            no_correlate: true, block_threshold: None, conf_floor: None, background: true,
+            format: "json".into(), targets: vec![], resume: None,
+        };
+        crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
+
+        let provider = RecordingProvider::default();
+        let (report, code) = run_resume(ws, "j", &provider, &Config::default(), dir.path()).await;
+
+        assert_eq!(report.verdict, crate::domain::Verdict::Incomplete, "空 manifest 不得静默 Approve");
+        assert_ne!(code, 0, "退出码非 0");
+        assert_eq!(provider.prompts.lock().unwrap().len(), 0, "无 cell 可跑，不应调 provider");
     }
 }
 
