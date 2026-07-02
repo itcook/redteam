@@ -30,9 +30,11 @@ disable-model-invocation: true
    clap 不接受重复 flag：合并顺序为用户内容在前、驳回摘要附后（用换行或分号分隔均可）；
    透传前先从 $ARGUMENTS 摘除原始 `--focus` 及其值，避免重复传参。
 2. **起评审**：`${CLAUDE_PLUGIN_ROOT}/bin/brk review --background --dismissed <dismissed-dir> [--focus <合并后内容>] <透传参数（已摘除 --focus）>`
-   → 记下 job id。轮询 `${CLAUDE_PLUGIN_ROOT}/bin/brk status <job>`（间隔约 20-30s）：
-   - `last_active` 持续前进 = 活着（慢 ≠ 死）；`phase` 走到 `finalizing` 属正常尾段。
-   - 心跳停滞超过 ~5 分钟 → `${CLAUDE_PLUGIN_ROOT}/bin/brk cancel <job>` 后重起本轮。
+   → 记下 job id。轮询 `${CLAUDE_PLUGIN_ROOT}/bin/brk status <job>`（间隔约 20-30s），只等**终态**
+     （done / failed / timed_out）。brk 后台 job 有 40 分钟 wall-clock deadline watchdog（到点自我
+     终止并出部分报告），**永不永久卡死**——因此**不要自己判卡死去 cancel**。
+   - `last_active`/`phase` 仅作进度信息（活着/慢/尾段），**不作 cancel 依据**：推理模型的超长单轮
+     turn 与 `finalizing` 尾段的 `last_active` 设计上静止，按「心跳停滞 N 分钟」判死会误杀正常慢 job。
    - **轮询期间不改动工作树**（working-tree scope 下评审正在读活文件）。
 3. **取结果**：`${CLAUDE_PLUGIN_ROOT}/bin/brk result <job>` → 存档到
    `rounds/<session>/rN.result.json`。
