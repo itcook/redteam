@@ -1,6 +1,12 @@
 #!/bin/sh
 # brk launcher — resolve <os>/<arch> and exec the matching binary.
 # 稳定入口：插件命令壳与 loop SKILL 都调本文件；平台探测只此一处。
+# 调用约定（2026-07-02 决议·方案A）：本 launcher 是 POSIX sh，自身可执行性先于 uname 探测，
+#   依赖两前提——(1) 调用方提供 sh：Claude Code / Codex 宿主的 Bash 工具主场景保证在场
+#   （Windows 用 git-bash）；(2) 执行位：git/marketplace 分发保留 mode
+#   （packaging::binary_layout_and_launcher 守此不变量）。
+#   Caveat：Windows 原生 cmd/pwsh 直调、或 npm/tar 等丢 mode 的分发，需各自 bootstrap /恢复 mode
+#   ——非插件主调用路径，待真 windows 二进制时补原生 shell launcher（M4 §4 caveat）。
 # 注：host-model 委派（M9）已搁置——宿主不给子进程回调模型的通道，且违背模型无关立场。
 #   uname 分派点若未来需按宿主适配输出，可扩展为环境探测，但与已搁置的委派无关。
 set -e
