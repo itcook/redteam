@@ -63,6 +63,30 @@ pub(crate) async fn send_classified(
     Err(classify_status(status, resp.headers()))
 }
 
+/// 把 2xx 响应体读为 JSON。**envelope 层**解码失败（空 body / 纯 keep-alive 空白 /
+/// 非 JSON 网关页——典型上游抖动或推理模型长思考后放弃）分类为 `Unavailable`（可重试），
+/// 而非 `Parse`。`Parse` 专指我方对**模型内容**的形状解析失败（不可重试）。
+/// 这是本层与 `retry_classified` 的接缝：误判为 Parse 会绕过重试，一次抖动烧掉整个 cell。
+pub(crate) async fn decode_json(resp: reqwest::Response) -> Result<serde_json::Value, ProviderError> {
+    let url = resp.url().to_string();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| ProviderError::Unavailable(format!("envelope body read failed for {url}: {e}")))?;
+    parse_envelope_json(&text, &url)
+}
+
+/// `decode_json` 的纯解析核（可测）：非法 JSON → `Unavailable` + 携带 body 前 200 字节。
+/// 证据留存：现场 body 一旦被 `.json()` 消费即灭迹，preview 让下次诊断不必活体复现。
+fn parse_envelope_json(text: &str, url: &str) -> Result<serde_json::Value, ProviderError> {
+    serde_json::from_str(text).map_err(|e| {
+        let preview: String = text.chars().take(200).collect();
+        ProviderError::Unavailable(format!(
+            "envelope decode failed for {url}: {e}; body[0..200]={preview:?}"
+        ))
+    })
+}
+
 /// reqwest 传输层错误（非 HTTP 状态）：timeout/connect/其他保守 Network。
 fn classify_transport(e: reqwest::Error) -> ProviderError {
     if e.is_timeout() {
@@ -172,9 +196,40 @@ mod tests {
         assert_eq!(anthropic_messages_url("https://h/"), "https://h/v1/messages");
     }
 
-    use super::{classify_status, parse_retry_after, ProviderError};
+    use super::{classify_status, parse_envelope_json, parse_retry_after, ProviderError};
     use reqwest::StatusCode;
     use std::time::Duration;
+
+    #[test]
+    fn envelope_empty_body_is_retryable_unavailable() {
+        // 200 + 纯空白 body（上游推理模型 keep-alive 后放弃、网关抖动）→ 可重试，
+        // 绝不能是不可重试的 Parse（那会绕过 retry_classified，一次抖动烧掉整个 cell）。
+        for body in ["", "   \n  ", "\n\n"] {
+            let err = parse_envelope_json(body, "https://api.deepseek.com/x").unwrap_err();
+            assert!(matches!(err, ProviderError::Unavailable(_)), "body {body:?} → {err:?}");
+            assert!(err.is_retryable(), "envelope 解码失败必须可重试");
+        }
+    }
+
+    #[test]
+    fn envelope_html_body_carries_preview() {
+        let err = parse_envelope_json("<html>502 Bad Gateway</html>", "u").unwrap_err();
+        let ProviderError::Unavailable(m) = err else { panic!("应为 Unavailable") };
+        assert!(m.contains("502 Bad Gateway"), "错误须携带 body 预览以便诊断: {m}");
+    }
+
+    #[test]
+    fn envelope_valid_json_decodes() {
+        let v = parse_envelope_json(r#"{"ok":true}"#, "u").unwrap();
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn envelope_leading_whitespace_before_json_is_ok() {
+        // DeepSeek 非流式在长思考期间以空行 keep-alive；有 JSON 随后仍应正常解码。
+        let v = parse_envelope_json("\n\n{\"ok\":1}", "u").unwrap();
+        assert_eq!(v["ok"], 1);
+    }
 
     #[test]
     fn classify_status_maps_http_codes() {
