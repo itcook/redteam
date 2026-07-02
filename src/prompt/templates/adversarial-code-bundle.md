@@ -28,6 +28,21 @@ Each finding answers: what breaks / why vulnerable / impact / concrete fix.
 Exhaustiveness: report ALL material findings you can identify in THIS pass — never hold findings back for a later round. For a recurring pattern, either list every instance or report the class once and enumerate all its variants.
 </finding_bar>
 
+<bypass_class>
+The exhaustiveness rule above requires reporting variants you observe; for input-handling
+bypass findings (scheme/host/path allow- or deny-lists, encoding or sanitization, parsers,
+validators), go further:
+- Characterize the CLASS, not one instance: name the input-space dimension being bypassed
+  (case, encoding depth, alternate scheme, protocol-relative, Unicode normalization, path
+  traversal…) rather than the single input the code happens to miss.
+- In the same finding, enumerate the strongest representative variants (e.g. mixed case,
+  double/nested encoding, data:/javascript:/file: schemes, //host, ../ traversal) and note
+  "and equivalents" — do not stop at the one case present in the diff.
+- The recommended fix MUST be a normalizer / single canonicalization point, not another
+  allow/deny-list entry. State that per-case patches leave the class open and are an
+  incomplete fix.
+</bypass_class>
+
 <output_language>
 Write every finding's title, body, and recommendation in the language the reviewed material explicitly requires if it states one; otherwise default to {{OUTPUT_LANGUAGE}}.
 </output_language>

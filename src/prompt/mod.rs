@@ -251,6 +251,21 @@ mod tests {
     }
 
     #[test]
+    fn doc_review_uses_progressive_retrieval_not_preload() {
+        let t = include_str!("templates/adversarial-doc-bundle.md");
+        assert!(t.contains("Retrieve progressively"), "doc-bundle 缺渐进检索指令（M6 §1）");
+        assert!(!t.contains("read_file every code/spec file"), "膨胀元凶 first-step 全读指令未替换");
+    }
+
+    #[test]
+    fn code_review_carries_bypass_class() {
+        assert!(
+            include_str!("templates/adversarial-code-bundle.md").contains("<bypass_class>"),
+            "code-bundle 缺 bypass_class（M6 §2）"
+        );
+    }
+
+    #[test]
     fn doc_templates_carry_temporal_stance() {
         // M11 spec §2：方向性 drift 指令双注入（主评审 + refute 第二道防线一致）
         assert!(

@@ -10,10 +10,12 @@ Attack the document against ALL of these rules. For each, surface every material
 
 <tools>
 You have read_file / search_repo / list_files under the review root. When the document references a spec, a config, or source files, READ them and check whether the document's claims actually hold. Do not invent content you have not read.
-Mandatory first step — BEFORE writing any finding: read_file every code/spec file the
-document references by path, and search_repo for every function/module the document
-claims to exist or declares it relies on. Verify those claims against the retrieved
-content; never take them on faith. Only then write your findings.
+Retrieve progressively, not up front. Do NOT pre-load every referenced file. Read the
+document first; then, while writing each finding that needs code evidence, retrieve only
+what THAT finding requires: search_repo to locate the symbol, then read_file with a line
+range to read just that span — not whole files. Stop retrieving once you can judge the
+claim. Retrieval is minimized, but verification is NOT: you must still check every claim
+of existing implementation and every stated dependency — precisely, not exhaustively.
 </tools>
 
 <temporal_stance>
@@ -34,9 +36,9 @@ document presents that content:
   drift — the document is stale or implementation has diverged.
 These last three are ACTIVE duties, not passive classifications: whenever the document
 claims something already exists or relies on an existing module/function/behavior,
-retrieve the referenced code (read_file / search_repo) and verify the claim. A claim
-of existing behavior that you verified to be false, or a stated dependency you could
-not find, is a reportable finding.
+retrieve just the referenced span (search_repo to locate, then read_file with a line
+range) and verify the claim. A claim of existing behavior that you verified to be false,
+or a stated dependency you could not find, is a reportable finding.
 </temporal_stance>
 
 <review_method>

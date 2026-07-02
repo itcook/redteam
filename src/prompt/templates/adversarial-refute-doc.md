@@ -11,7 +11,7 @@ Claimed evidence (empty means the claim is that this is OMITTED entirely from th
 </claimed_finding>
 
 <tools>
-You have read_file / search_repo / list_files under the review root. Read the document and any spec/config/source it references before judging. For an omission claim, search the document and referenced specs for the content alleged to be missing. Do not invent content you have not read.
+You have read_file / search_repo / list_files under the review root. Read the document and any spec/config/source it references before judging. For an omission claim, search the document and referenced specs for the content alleged to be missing. Do not invent content you have not read. Read only the span needed to judge this one claim — a line range, not whole files.
 </tools>
 
 <method>
