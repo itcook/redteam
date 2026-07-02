@@ -68,7 +68,8 @@ pub fn parse_dismissed(value: &str) -> anyhow::Result<HashSet<String>> {
     for tok in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         anyhow::ensure!(
             is_hex16(tok),
-            "--dismissed: '{tok}' is neither an existing directory nor a 16-hex finding id"
+            "--dismissed: '{tok}' is neither an existing directory nor a 16-hex finding id \
+             (for the ledger dir, run 'brk init' to create .breakpoint/dismissed/)"
         );
         out.insert(tok.to_string());
     }

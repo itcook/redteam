@@ -26,7 +26,10 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 ## 每轮 rN
 1. **组装 --focus**：读 `<dismissed-dir>/*.md`，用各文件的 title + 驳回理由生成摘要：
    「以下问题已人工裁决为误报，勿再报：…」。台账为空则不加 --focus。
-2. **起评审**：`${CODEX_PLUGIN_ROOT}/bin/brk review --background --dismissed <dismissed-dir> [--focus <摘要>] <透传参数>`
+   若用户 $ARGUMENTS 自带 `--focus <内容>`，两者**合并为一条** `--focus` 值再透传——
+   clap 不接受重复 flag：合并顺序为用户内容在前、驳回摘要附后（用换行或分号分隔均可）；
+   透传前先从 $ARGUMENTS 摘除原始 `--focus` 及其值，避免重复传参。
+2. **起评审**：`${CODEX_PLUGIN_ROOT}/bin/brk review --background --dismissed <dismissed-dir> [--focus <合并后内容>] <透传参数（已摘除 --focus）>`
    → 记下 job id。轮询 `${CODEX_PLUGIN_ROOT}/bin/brk status <job>`（间隔约 20-30s）：
    - `last_active` 持续前进 = 活着（慢 ≠ 死）；`phase` 走到 `finalizing` 属正常尾段。
    - 心跳停滞超过 ~5 分钟 → `${CODEX_PLUGIN_ROOT}/bin/brk cancel <job>` 后重起本轮。

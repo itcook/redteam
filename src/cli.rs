@@ -215,6 +215,12 @@ pub async fn run_review(
     if args.background {
         anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
     }
+    // Fix 3（final-review）：--dismissed 解析上提到证据收集/fan-out 之前 fail-fast——坏值不再
+    // 烧完 LLM 调用才报错。
+    let dismissed = match args.dismissed.as_deref() {
+        Some(v) => crate::project::parse_dismissed(v)?,
+        None => Default::default(),
+    };
     let t0 = std::time::Instant::now();
 
     // 1. mode + 证据
@@ -270,10 +276,6 @@ pub async fn run_review(
         .unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     let correlate_on = cfg.review.correlate && !args.no_correlate;
-    let dismissed = match args.dismissed.as_deref() {
-        Some(v) => crate::project::parse_dismissed(v)?,
-        None => Default::default(),
-    };
     let ctx = TailCtx {
         mode: input.mode,
         root: None,
@@ -309,6 +311,12 @@ pub async fn run_code_review(
     if args.background {
         anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
     }
+    // Fix 3（final-review）：--dismissed 解析上提到 fan-out 之前 fail-fast——坏值不再烧完 LLM
+    // 调用才报错。
+    let dismissed = match args.dismissed.as_deref() {
+        Some(v) => crate::project::parse_dismissed(v)?,
+        None => Default::default(),
+    };
     let t0 = std::time::Instant::now();
 
     // 1. 确定性筛选 + 分包
@@ -349,10 +357,6 @@ pub async fn run_code_review(
         .map(parse_sev)
         .unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
-    let dismissed = match args.dismissed.as_deref() {
-        Some(v) => crate::project::parse_dismissed(v)?,
-        None => Default::default(),
-    };
     let ctx = TailCtx {
         mode: Mode::Code,
         root: Some(root),
