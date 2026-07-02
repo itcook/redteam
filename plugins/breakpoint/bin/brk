@@ -1,8 +1,8 @@
 #!/bin/sh
 # brk launcher — resolve <os>/<arch> and exec the matching binary.
-# 稳定入口：插件命令壳与未来 loop SKILL 都调本文件；平台探测只此一处。
-# 前瞻（roadmap M9-a）：此处的 uname 分派点，未来可扩展为「运行环境探测」
-#   （Claude Code / Codex / 裸终端），为 host-model 委派铺路——当前不实现。
+# 稳定入口：插件命令壳与 loop SKILL 都调本文件；平台探测只此一处。
+# 注：host-model 委派（M9）已搁置——宿主不给子进程回调模型的通道，且违背模型无关立场。
+#   uname 分派点若未来需按宿主适配输出，可扩展为环境探测，但与已搁置的委派无关。
 set -e
 dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
