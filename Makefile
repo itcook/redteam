@@ -1,4 +1,4 @@
-BIN := plugins/breakpoint/bin/brk-darwin-arm64
+BIN := plugins/breakpoint/bin/darwin/aarch64/brk
 TARGET := aarch64-apple-darwin
 
 .PHONY: all gen build verify
@@ -14,6 +14,7 @@ build:
 	cargo build --release --target $(TARGET)
 	mkdir -p $(dir $(BIN))
 	cp target/$(TARGET)/release/brk $(BIN)
+	chmod +x plugins/breakpoint/bin/brk
 
 # 本地等价 CI 防漂移：重生成后无 git 改动
 verify: gen
