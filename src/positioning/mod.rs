@@ -75,6 +75,30 @@ fn locate_words(content: &str, quote: &str) -> Option<(u32, u32)> {
     None
 }
 
+/// doc 专用定位：去所有空白 + 去 markdown 强调标记（`* ` `` ` `` `_`）后按**字符级**连续子串匹配，
+/// 返回行跨度。中文无空格，整行/词级匹配失效；模型引用中文 markdown 常去掉 `**`/`` ` ``、跨软换行
+/// 接行、或截断——折叠后字符子串是稳健锚（M6 dogfood 实锤：真 drift 曾被逐字匹配误杀）。
+/// 仅用于 doc 路径——code quote 是代码，`*_` 在代码里有语义，勿用此归一。
+fn locate_doc(content: &str, quote: &str) -> Option<(u32, u32)> {
+    let keep = |c: &char| !c.is_whitespace() && !matches!(c, '*' | '`' | '_');
+    let mut cchars: Vec<(char, u32)> = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        for ch in line.chars().filter(keep) {
+            cchars.push((ch, (i as u32) + 1));
+        }
+    }
+    let qchars: Vec<char> = quote.chars().filter(keep).collect();
+    if qchars.is_empty() || cchars.len() < qchars.len() {
+        return None;
+    }
+    for start in 0..=(cchars.len() - qchars.len()) {
+        if cchars[start..start + qchars.len()].iter().map(|(c, _)| *c).eq(qchars.iter().copied()) {
+            return Some((cchars[start].1, cchars[start + qchars.len() - 1].1));
+        }
+    }
+    None
+}
+
 /// 把 quote 确定性定位到真实行；定位失败即丢弃（确定性幻觉过滤，code 线每条 finding 须指向真实代码）。
 pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -95,11 +119,13 @@ pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
     out
 }
 
-/// doc 版锚定（空引用=遗漏声明 carve-out）：
+/// doc 版锚定（M6-A/B：定位失败保留、不丢弃）：
 ///
-/// - quote 为空/纯空白 → 遗漏类声明：原样保留（无引用可锚），透传到三层 verify 判真伪。
-/// - quote 非空且在对应受审文档中命中 → 锚定到行。
-/// - quote 非空但文档中找不到（编造）或 finding.file 不匹配任何受审文档 → 丢弃。
+/// - quote 为空/纯空白 → 遗漏类声明：原样保留（无引用可锚）。
+/// - quote 非空且在对应受审文档中（`locate_doc` 去空白+去 markdown 字符子串）命中 → 锚定到行。
+/// - quote 非空但未命中（模型改写/截断/编造）或 file 不匹配 → **保留 + line 标 0（未锚定）**。
+///   doc finding 靠 body/recommendation 自证，不像 code 需精确行锚；幻觉过滤对 doc 中文 markdown
+///   误杀率过高（M6 dogfood：真 finding 13→2），真幻觉转由 verify/refute 尾段兜底。
 ///
 /// docs：受审文档的 (path, content) 对（来自 evidence::doc::collect_doc_files）。
 /// 仅按已收集内容做内存内匹配，绝不按 model 控制的任意路径读盘。
@@ -119,14 +145,18 @@ pub fn anchor_doc(findings: Vec<Finding>, docs: &[(String, String)]) -> Vec<Find
                 None
             }
         });
-        match content.and_then(|c| locate_quote(c, &f.quote)) {
+        match content.and_then(|c| locate_doc(c, &f.quote)) {
             Some((ls, le)) => {
                 f.line_start = ls;
                 f.line_end = le;
-                out.push(f);
             }
-            None => continue, // 编造引用 / 未知文件 → 丢弃
+            None => {
+                // M6-A：定位失败保留 + 标未锚定，不丢弃。
+                f.line_start = 0;
+                f.line_end = 0;
+            }
         }
+        out.push(f);
     }
     out
 }
@@ -268,26 +298,48 @@ mod tests {
     }
 
     #[test]
-    fn anchor_doc_drops_fabricated_quote() {
+    fn anchor_doc_keeps_unlocatable_finding_with_line_zero() {
+        // M6-A：doc finding 定位失败**保留**（非丢弃）+ 标未锚定（line 0）。doc finding 靠
+        // body/recommendation 自证，不像 code 需精确行锚；幻觉过滤对 doc 中文 markdown 误杀率
+        // 过高（M6 dogfood：真 finding 13→2）。真幻觉由 verify/refute 尾段兜底。
         let docs = vec![("spec.md".to_string(), "real content only".to_string())];
         let out = anchor_doc(vec![finding("spec.md", "this text is not in the doc")], &docs);
-        assert!(out.is_empty(), "fabricated quote must be dropped");
+        assert_eq!(out.len(), 1, "定位失败的 doc finding 必须保留");
+        assert_eq!((out[0].line_start, out[0].line_end), (0, 0), "标未锚定");
     }
 
     #[test]
-    fn anchor_doc_drops_quote_finding_for_unknown_file() {
+    fn anchor_doc_keeps_unknown_file_finding_with_line_zero() {
+        // 未知 file（模型 file 字段写法差异/写错）也保留 line 0，同 A。
         let docs = vec![("spec.md".to_string(), "content".to_string())];
-        let out = anchor_doc(vec![finding("other.md", "content")], &docs);
-        assert!(out.is_empty(), "quote finding whose file matches no target is dropped");
+        let out = anchor_doc(vec![finding("other.md", "some claim")], &docs);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].line_start, out[0].line_end), (0, 0));
+    }
+
+    #[test]
+    fn anchor_doc_locates_across_markdown_and_soft_wrap() {
+        // M6-B：模型引用中文时轻微去掉 markdown 粗体（**顺手项** → 顺手项）且跨软换行接成一行。
+        // 去空白+去 markdown 的字符级子串匹配应锚定（M6 dogfood 实锤：真 drift 被误杀）。
+        let docs = vec![(
+            "spec.md".to_string(),
+            "行一\n）**顺手项**：`cli.rs:179` 的陈旧\n注释与 bail 文案\n行尾".to_string(),
+        )];
+        let out = anchor_doc(vec![finding("spec.md", "顺手项：cli.rs:179 的陈旧注释与 bail 文案")], &docs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line_start, 2, "锚到 **顺手项** 起始行");
     }
 
     #[test]
     fn anchor_doc_does_not_over_match_bare_suffix() {
         // docs path = "myspec.md", finding.file = "spec.md"
         // 纯字节后缀 "myspec.md".ends_with("spec.md") = true（过匹配）
-        // 修复后：须要求前缀为 '/'，即 "myspec.md".ends_with("/spec.md") = false → 丢弃。
+        // 分隔符感知修复：须要求前缀为 '/'，即 "myspec.md".ends_with("/spec.md") = false → 不匹配。
+        // M6-A 后 finding 不再丢弃而保留 line 0——但绝不能锚到 myspec.md 的内容（否则 line>0=over-match）。
         let docs = vec![("myspec.md".to_string(), "some real content here".to_string())];
         let out = anchor_doc(vec![finding("spec.md", "some real content here")], &docs);
-        assert!(out.is_empty(), "bare suffix over-match must be eliminated after separator-aware fix");
+        assert_eq!(out.len(), 1, "M6-A：保留 finding");
+        assert_eq!((out[0].line_start, out[0].line_end), (0, 0),
+            "file 分隔符感知：spec.md 未匹配 myspec.md → 未锚定，绝不 over-match 到其内容");
     }
 }

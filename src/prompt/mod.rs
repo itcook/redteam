@@ -2,8 +2,6 @@ use crate::bundle::Bundle;
 use crate::domain::{Mode, ReviewInput};
 use crate::lens::Lens;
 
-const CODE_TPL: &str = include_str!("templates/adversarial-code.md");
-const DOC_TPL: &str = include_str!("templates/adversarial-doc.md");
 const CODE_BUNDLE_TPL: &str = include_str!("templates/adversarial-code-bundle.md");
 const REFUTE_TPL: &str = include_str!("templates/adversarial-refute.md");
 const REFUTE_DOC_TPL: &str = include_str!("templates/adversarial-refute-doc.md");
@@ -35,22 +33,6 @@ pub fn output_language() -> String {
         "en" => "English".to_string(),
         _ => "English".to_string(),
     }
-}
-
-pub fn build_prompt(input: &ReviewInput, lens: &Lens, user_focus: &str) -> String {
-    let tpl = match input.mode { Mode::Code => CODE_TPL, Mode::Doc => DOC_TPL };
-    let sev_rule = match lens.max_severity {
-        Some(_) => "This is a compliance lens: severity MUST be low or medium unless the violated rule is an explicit hard project constraint (then set hard_constraint=true).",
-        None => "",
-    };
-    tpl.replace("{{LENS_TITLE}}", lens.title)
-        .replace("{{LENS_FOCUS}}", lens.focus)
-        .replace("{{LENS_SEVERITY_RULE}}", sev_rule)
-        .replace("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus })
-        .replace("{{COLLECTION_GUIDANCE}}", &input.collection_guidance)
-        .replace("{{TARGET_LABEL}}", &input.target_label)
-        .replace("{{REVIEW_INPUT}}", &input.body)
-        .replace("{{OUTPUT_LANGUAGE}}", &output_language())
 }
 
 /// 构造 refute prompt：给定 claimed finding，让 skeptic 对抗复审。
@@ -143,28 +125,11 @@ pub fn build_bundle_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Mode, ReviewInput};
-    use crate::lens::by_id;
     use std::sync::Mutex;
 
     // Mutex to serialize env-var tests that mutate process-global env state.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn input() -> ReviewInput {
-        ReviewInput { mode: Mode::Code, target_label: "branch x".into(),
-            collection_guidance: "GUIDE".into(), body: "DIFF".into(), spec_docs: vec![] }
-    }
-    #[test]
-    fn interpolates_all_placeholders() {
-        let p = build_prompt(&input(), by_id("L1").unwrap(), "auth");
-        assert!(!p.contains("{{"));
-        assert!(p.contains("Security") && p.contains("DIFF") && p.contains("auth") && p.contains("GUIDE"));
-    }
-    #[test]
-    fn compliance_lens_injects_severity_cap_rule() {
-        let p = build_prompt(&input(), by_id("L5").unwrap(), "");
-        assert!(p.to_lowercase().contains("medium"));
-    }
     #[test]
     fn output_language_zh_cn() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -198,20 +163,6 @@ mod tests {
         assert_eq!(output_language(), "English");
         unsafe { std::env::remove_var("LANG"); }
     }
-    #[test]
-    fn build_prompt_contains_language_directive_and_no_residual_placeholders() {
-        let _g = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var("LC_ALL");
-            std::env::remove_var("LC_MESSAGES");
-            std::env::set_var("LANG", "zh_CN.UTF-8");
-        }
-        let p = build_prompt(&input(), by_id("L1").unwrap(), "");
-        assert!(!p.contains("{{"), "no residual {{}} placeholders");
-        assert!(p.contains("Simplified Chinese"), "prompt must contain language name");
-        unsafe { std::env::remove_var("LANG"); }
-    }
-
     #[test]
     fn refute_prompt_carries_finding_and_upheld_empty_contract() {
         use crate::domain::{Finding, Severity};
@@ -292,13 +243,26 @@ mod tests {
     #[test]
     fn all_adversarial_templates_carry_exhaustiveness_directive() {
         for t in [
-            include_str!("templates/adversarial-doc.md"),
-            include_str!("templates/adversarial-code.md"),
             include_str!("templates/adversarial-doc-bundle.md"),
             include_str!("templates/adversarial-code-bundle.md"),
         ] {
             assert!(t.contains("Exhaustiveness:"), "穷尽性指令缺失（spec §1.3 分界原则）");
         }
+    }
+
+    #[test]
+    fn doc_review_uses_progressive_retrieval_not_preload() {
+        let t = include_str!("templates/adversarial-doc-bundle.md");
+        assert!(t.contains("Retrieve progressively"), "doc-bundle 缺渐进检索指令（M6 §1）");
+        assert!(!t.contains("read_file every code/spec file"), "膨胀元凶 first-step 全读指令未替换");
+    }
+
+    #[test]
+    fn code_review_carries_bypass_class() {
+        assert!(
+            include_str!("templates/adversarial-code-bundle.md").contains("<bypass_class>"),
+            "code-bundle 缺 bypass_class（M6 §2）"
+        );
     }
 
     #[test]
