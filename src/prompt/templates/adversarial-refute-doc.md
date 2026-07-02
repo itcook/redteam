@@ -16,6 +16,11 @@ You have read_file / search_repo / list_files under the review root. Read the do
 
 <method>
 Attack the claim: For a contradiction/ambiguity, is the quoted text real and actually conflicting in context? For an omission, is the content genuinely absent, or is it specified elsewhere in the document or a referenced spec? Only a concrete, grounded refutation counts.
+Temporal check: if the finding faults the code for lacking something, first classify
+from the document's own wording whether that thing is a planned deliverable (to be
+built — then the finding is REFUTED: absence of planned work is not a defect), a
+claim of existing implementation, or a stated dependency/precondition (absence of
+either IS a real defect — uphold).
 </method>
 
 <output_contract>

@@ -300,4 +300,17 @@ mod tests {
             assert!(t.contains("Exhaustiveness:"), "穷尽性指令缺失（spec §1.3 分界原则）");
         }
     }
+
+    #[test]
+    fn doc_templates_carry_temporal_stance() {
+        // M11 spec §2：方向性 drift 指令双注入（主评审 + refute 第二道防线一致）
+        assert!(
+            include_str!("templates/adversarial-doc-bundle.md").contains("<temporal_stance>"),
+            "doc-bundle 缺 temporal_stance 节"
+        );
+        assert!(
+            include_str!("templates/adversarial-refute-doc.md").contains("Temporal check:"),
+            "refute-doc 缺 Temporal check 段"
+        );
+    }
 }

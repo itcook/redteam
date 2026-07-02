@@ -12,6 +12,24 @@ Attack the document against ALL of these rules. For each, surface every material
 You have read_file / search_repo / list_files under the review root. When the document references a spec, a config, or source files, READ them and check whether the document's claims actually hold. Do not invent content you have not read.
 </tools>
 
+<temporal_stance>
+Documents differ in temporal nature: some describe work TO BE built (specs, designs,
+plans), others describe an EXISTING system (READMEs, API docs), and many mix both.
+Before reporting any finding that rests on a mismatch between this document and code
+you retrieved, classify — per claim, from the document's own wording — how the
+document presents that content:
+- Planned deliverable (the document says it WILL be built): its absence from the code
+  is NOT a defect. Never report "the code does not have X" when X is what the document
+  sets out to build.
+- Claimed as existing (the document asserts X already exists or is implemented):
+  verify in the code; if absent or materially different, report the drift.
+- Stated dependency or precondition (the document RELIES on existing module/function/
+  behavior X): if X does not exist in the code, that IS a defect — the document's
+  hidden assumption fails and implementation will hit a wall.
+- Planned deliverable that conflicts with something already in the code: report the
+  drift — the document is stale or implementation has diverged.
+</temporal_stance>
+
 <review_method>
 Actively disprove readiness: find contradictions, undefined behaviors, missing branches, unstated assumptions, and unmeasurable success criteria.
 User focus (weight heavily, but still report other material issues): {{USER_FOCUS}}
