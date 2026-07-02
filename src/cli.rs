@@ -205,7 +205,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
 /// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
 ///
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
-/// `--background` 在 Plan 1 未实现（留 Plan 2），此处直接报错；前台路径本身即同步执行。
+/// `--background` 由 main.rs 在 dispatch 之前分叉（spawn worker）；到达这里即路由 bug。
 pub async fn run_review(
     args: ReviewArgs,
     provider: &dyn ReviewProvider,
@@ -213,7 +213,7 @@ pub async fn run_review(
     sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
-        anyhow::bail!("--background is not yet implemented (planned for Plan 2)");
+        anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
     }
     let t0 = std::time::Instant::now();
 
@@ -307,7 +307,7 @@ pub async fn run_code_review(
     sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
-        anyhow::bail!("--background is not yet implemented (planned for Plan 2)");
+        anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
     }
     let t0 = std::time::Instant::now();
 

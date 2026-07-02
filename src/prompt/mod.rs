@@ -288,4 +288,16 @@ mod tests {
         assert!(p.to_lowercase().contains("compliance rule"), "D5 compliance cap note present");
         assert!(p.contains("lens"), "doc prompt must teach model to tag lens id per finding");
     }
+
+    #[test]
+    fn all_adversarial_templates_carry_exhaustiveness_directive() {
+        for t in [
+            include_str!("templates/adversarial-doc.md"),
+            include_str!("templates/adversarial-code.md"),
+            include_str!("templates/adversarial-doc-bundle.md"),
+            include_str!("templates/adversarial-code-bundle.md"),
+        ] {
+            assert!(t.contains("Exhaustiveness:"), "穷尽性指令缺失（spec §1.3 分界原则）");
+        }
+    }
 }

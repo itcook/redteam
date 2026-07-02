@@ -23,6 +23,7 @@ User focus (weight heavily but still report other material issues in this lens):
 <finding_bar>
 Report only material findings. No style/naming/low-value cleanup, no evidence-free speculation.
 Each finding answers: what breaks / why vulnerable / impact / concrete fix.
+Exhaustiveness: report ALL material findings you can identify in THIS pass — never hold findings back for a later round. For a recurring pattern, either list every instance or report the class once and enumerate all its variants.
 </finding_bar>
 
 <output_language>

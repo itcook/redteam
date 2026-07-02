@@ -21,6 +21,7 @@ Referenced spec/code docs (read them via tools to verify claims): {{SPEC_DOCS}}
 <finding_bar>
 Report only material findings. No style/naming/low-value cleanup, no evidence-free speculation.
 Each finding answers: what is unclear / wrong / missing — why it blocks implementation — impact — concrete fix.
+Exhaustiveness: report ALL material findings you can identify in THIS pass — never hold findings back for a later round. For a recurring pattern, either list every instance or report the class once and enumerate all its variants.
 </finding_bar>
 
 <output_language>
