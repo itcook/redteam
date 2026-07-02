@@ -272,9 +272,10 @@ async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
     // 遗漏：空引用，未被 anchor 丢弃（doc carve-out 的核心）。
     assert!(report.findings.iter().any(|f| f.title.contains("rollback")),
         "omission finding must survive anchor");
-    // 编造引文：被丢弃。
-    assert!(!report.findings.iter().any(|f| f.title.contains("fabricated")),
-        "fabricated quote dropped");
+    // 编造引文：M6-A 后保留（非丢弃）但 line 标 0（未锚定）；真幻觉转由 verify/refute 尾段兜底。
+    let fab = report.findings.iter().find(|f| f.title.contains("fabricated"))
+        .expect("fabricated quote kept (M6-A: no drop)");
+    assert_eq!((fab.line_start, fab.line_end), (0, 0), "unlocatable fabricated → line 0");
     // verdict：矛盾 High agreement=2（跳过 verify）→ Reject、exit 10。
     assert_eq!(report.verdict, Verdict::Reject);
     assert_eq!(code, 10);
