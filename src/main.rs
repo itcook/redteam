@@ -79,6 +79,8 @@ enum Cmd {
         #[command(subcommand)]
         action: ModelCmd,
     },
+    /// 幂等创建项目级 .breakpoint/ 骨架（config.toml 模板、.gitignore、dismissed/、rounds/）。
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -533,6 +535,14 @@ async fn main() {
                 }
             }
         },
+        Cmd::Init => {
+            match breakpoint::project::init_project(std::path::Path::new(".")) {
+                Ok(c) if c.is_empty() => println!(".breakpoint/ already complete"),
+                Ok(c) => c.iter().for_each(|p| println!("created {p}")),
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+            }
+            0
+        }
     };
     std::process::exit(code);
 }
