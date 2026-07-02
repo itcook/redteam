@@ -33,6 +33,10 @@ pub struct ReviewArgs {
     /// 其余字段（mode/targets/models/…）在 resume 路径下不生效——run_resume 会重新
     /// `read_args_raw(job_id)` 取原始作业的 ReviewArgs。
     pub resume: Option<String>,
+    /// R8.2：`--dismissed <目录|csv>`，经 `project::parse_dismissed` 解析。`serde(default)`
+    /// 保证旧 job 落盘的 args.json（无此字段）仍可反序列化（resume 兼容）。
+    #[serde(default)]
+    pub dismissed: Option<String>,
 }
 
 fn parse_sev(s: &str) -> Severity {
@@ -98,6 +102,26 @@ pub fn resolve_models(
     (models, replicate)
 }
 
+/// R8.2：命中标记 + 派生索引（排序去重）。单点应用于共用尾段，三路径（code/doc/resume）同享。
+pub(crate) fn mark_dismissed(
+    findings: &mut [Finding],
+    dismissed: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut reappeared = Vec::new();
+    if dismissed.is_empty() {
+        return reappeared;
+    }
+    for f in findings.iter_mut() {
+        if dismissed.contains(&f.id) {
+            f.previously_dismissed = true;
+            reappeared.push(f.id.clone());
+        }
+    }
+    reappeared.sort();
+    reappeared.dedup();
+    reappeared
+}
+
 /// 扇出之后的共用尾段上下文——`run_code_review`/`run_review`/`run_resume` 三处扇出前逻辑
 /// 各不相同（bundle×model / lens×model / 直接重放 manifest prompt），但扇出后（anchor → dedup
 /// → [doc: correlate] → verify → verdict → 组报告）完全一致，抽出复用（DRY，T7 授权解冻）。
@@ -119,6 +143,7 @@ struct TailCtx<'a> {
     usage: (u64, u64),
     warnings: Vec<String>,
     failed_models: Vec<String>,
+    dismissed: &'a std::collections::HashSet<String>,
 }
 
 /// 共用尾段：anchor → dedup → [doc: correlate/apply_clusters] → verify → verdict → 组装 report
@@ -148,10 +173,13 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
         findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
     ).await;
 
+    let mut findings = findings;
+    let dismissed_reappeared = mark_dismissed(&mut findings, ctx.dismissed);
+
     let verdict = compute_verdict(&findings, ctx.block, ctx.floor);
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
-        schema_version: "1".into(),
+        schema_version: "2".into(),
         mode: ctx.mode,
         verdict,
         stats,
@@ -166,6 +194,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
             usage: Usage { input_tokens: ctx.usage.0, output_tokens: ctx.usage.1 },
             warnings: ctx.warnings,
             failed_models: ctx.failed_models,
+            dismissed_reappeared,
         },
     };
     // 退出码：reject 优先 → 10；否则 approve 但对照集不完整 → 2；干净 approve → 0。
@@ -176,7 +205,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
 /// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
 ///
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
-/// `--background` 在 Plan 1 未实现（留 Plan 2），此处直接报错；前台路径本身即同步执行。
+/// `--background` 由 main.rs 在 dispatch 之前分叉（spawn worker）；到达这里即路由 bug。
 pub async fn run_review(
     args: ReviewArgs,
     provider: &dyn ReviewProvider,
@@ -184,8 +213,14 @@ pub async fn run_review(
     sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
-        anyhow::bail!("--background is not yet implemented (planned for Plan 2)");
+        anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
     }
+    // Fix 3（final-review）：--dismissed 解析上提到证据收集/fan-out 之前 fail-fast——坏值不再
+    // 烧完 LLM 调用才报错。
+    let dismissed = match args.dismissed.as_deref() {
+        Some(v) => crate::project::parse_dismissed(v)?,
+        None => Default::default(),
+    };
     let t0 = std::time::Instant::now();
 
     // 1. mode + 证据
@@ -257,6 +292,7 @@ pub async fn run_review(
         usage: raw.usage,
         warnings: raw.warnings,
         failed_models: raw.failed_models,
+        dismissed: &dismissed,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
     assemble_report(raw.findings, ctx).await
@@ -273,8 +309,14 @@ pub async fn run_code_review(
     sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
-        anyhow::bail!("--background is not yet implemented (planned for Plan 2)");
+        anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
     }
+    // Fix 3（final-review）：--dismissed 解析上提到 fan-out 之前 fail-fast——坏值不再烧完 LLM
+    // 调用才报错。
+    let dismissed = match args.dismissed.as_deref() {
+        Some(v) => crate::project::parse_dismissed(v)?,
+        None => Default::default(),
+    };
     let t0 = std::time::Instant::now();
 
     // 1. 确定性筛选 + 分包
@@ -331,6 +373,7 @@ pub async fn run_code_review(
         usage: raw.usage,
         warnings: raw.warnings,
         failed_models: raw.failed_models,
+        dismissed: &dismissed,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
     assemble_report(raw.findings, ctx).await
@@ -434,7 +477,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
     };
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
-        schema_version: "1".into(),
+        schema_version: "2".into(),
         mode,
         verdict: Verdict::Incomplete,
         stats,
@@ -449,6 +492,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
             usage: Usage::default(),
             warnings: vec![format!("partial: {done}/{total} cells"), reason],
             failed_models: vec![],
+            dismissed_reappeared: vec![],
         },
     };
     let code = exit_code(Verdict::Incomplete, false);
@@ -462,7 +506,7 @@ fn empty_review_args() -> ReviewArgs {
         mode: None, base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         lenses: None, models: None, models_all: false, no_correlate: false,
         block_threshold: None, conf_floor: None, background: false, format: "json".into(),
-        targets: vec![], resume: None,
+        targets: vec![], resume: None, dismissed: None,
     }
 }
 
@@ -563,6 +607,15 @@ pub async fn run_resume(
     let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     let correlate_on = cfg.review.correlate && !args.no_correlate;
+    // resume 因重读 args.json 自然继承原 --dismissed；run_resume 不返回 Result（异步状态机式），
+    // 故此处不能用 `?`——解析失败按既有约定折成 partial_report（同 empty-manifest/missing-args）。
+    let dismissed = match args.dismissed.as_deref().map(crate::project::parse_dismissed) {
+        Some(Ok(d)) => d,
+        Some(Err(e)) => {
+            return partial_report(ws, job_id, &args, format!("resume: bad --dismissed: {e}"));
+        }
+        None => Default::default(),
+    };
 
     let ctx = TailCtx {
         mode,
@@ -580,6 +633,7 @@ pub async fn run_resume(
         usage,
         warnings,
         failed_models: vec![],
+        dismissed: &dismissed,
     };
     match assemble_report(findings, ctx).await {
         Ok((mut report, mut code)) => {
@@ -716,7 +770,7 @@ mod job_tests {
             id: "f".into(), severity: Severity::Medium, title: title.into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             lenses: vec![], models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
-            quote: "q".into(), cluster_id: None, verify: None,
+            quote: "q".into(), cluster_id: None, verify: None, previously_dismissed: false,
         }
     }
 
@@ -726,7 +780,7 @@ mod job_tests {
             spec: vec![], focus: None, lenses: None, models: None, models_all: false,
             no_correlate: false, block_threshold: None, conf_floor: None,
             background: true, format: "json".into(), targets: vec![target.into()],
-            resume: None,
+            resume: None, dismissed: None,
         }
     }
     fn cfg() -> Config {
@@ -966,6 +1020,7 @@ mod resume_tests {
             file: "spec.md".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec![], models: vec!["m".into()], agreement: 1,
             hard_constraint: false, quote: String::new(), cluster_id: None, verify: None,
+            previously_dismissed: false,
         }
     }
 
@@ -995,7 +1050,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1042,7 +1097,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("alpha,beta".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1077,7 +1132,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![], resume: None,
+            format: "json".into(), targets: vec![], resume: None, dismissed: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1190,7 +1245,7 @@ default_models=["alpha"]
             spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None,
+            resume: None, dismissed: None,
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
         let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None).await.unwrap();
@@ -1208,7 +1263,7 @@ default_models=["alpha"]
             models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None,
+            resume: None, dismissed: None,
         }
     }
 
@@ -1289,5 +1344,24 @@ mod tests {
         use crate::orchestrate::CellSink;
         sink.on_phase(Phase::Finalizing);
         assert_eq!(read_state(&ws, "j").unwrap().phase, Some(Phase::Finalizing));
+    }
+
+    #[test]
+    fn dismissed_survives_line_shift_and_is_marked_exempt() {
+        use crate::orchestrate::enrich;
+        use std::collections::HashSet;
+        let raw = |ls: u32, le: u32| crate::domain::RawFinding {
+            severity: Severity::High, title: "Weak hash".into(), body: "b".into(),
+            file: "src/x.rs".into(), line_start: ls, line_end: le, confidence: 0.9,
+            recommendation: "r".into(), hard_constraint: false,
+            quote: "md5(pw)".into(), lens: None,
+        };
+        let before = enrich(&raw(5, 7), "L1", "m");          // 第一轮：驳回它
+        let dismissed: HashSet<String> = [before.id.clone()].into();
+        let mut after = vec![enrich(&raw(50, 52), "L1", "m")]; // 修复位移后再现
+        let reappeared = mark_dismissed(&mut after, &dismissed);
+        assert_eq!(reappeared, vec![before.id]);
+        assert!(after[0].previously_dismissed);
+        assert_eq!(compute_verdict(&after, Severity::Medium, 0.5), Verdict::Approve);
     }
 }

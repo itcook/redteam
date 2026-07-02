@@ -10,6 +10,7 @@ pub mod model;
 pub mod orchestrate;
 pub mod output;
 pub mod positioning;
+pub mod project;
 pub mod prompt;
 pub mod provider;
 pub mod state;

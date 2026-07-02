@@ -61,11 +61,16 @@ pub struct Finding {
     pub hard_constraint: bool,
     /// 逐字引用（positioning 锚定依据，序列化进输出）。
     pub quote: String,
+    /// R8.2：命中 --dismissed 清单——verdict 豁免、保留证据（spec §1.2 三件套）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub previously_dismissed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<Verify>,
 }
+
+fn is_false(b: &bool) -> bool { !*b }
 
 /// targeted-verify（S3-b）的判定：upheld=守住反驳（finding 成立）、refuted=被证伪。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +138,7 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
+            previously_dismissed: false,
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(v["quote"], "snippet");
@@ -145,6 +151,7 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
+            previously_dismissed: false,
         };
         // None → 不出现
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();

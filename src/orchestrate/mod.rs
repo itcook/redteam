@@ -42,13 +42,25 @@ pub struct RawResults {
     pub usage: (u64, u64),
 }
 
+/// R8.1：quote 去除全部空白（保大小写）——token 序列即身份，免疫 reformat。
+fn normalize_quote(q: &str) -> String {
+    q.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// R8.1：title lowercase + 空白折叠单空格。
+fn normalize_title(t: &str) -> String {
+    t.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
-    let id = fnv1a64_hex(&[
-        &raw.file,
-        &raw.line_start.to_string(),
-        &raw.line_end.to_string(),
-        &raw.title.to_lowercase(),
-    ]);
+    let nq = normalize_quote(&raw.quote);
+    let nt = normalize_title(&raw.title);
+    // R8.1：quote 锚定、行无关；quote 缺失退化行号路径（不保证跨 fixup 稳定）。
+    let id = if nq.is_empty() {
+        fnv1a64_hex(&[&raw.file, &raw.line_start.to_string(), &raw.line_end.to_string(), &nt])
+    } else {
+        fnv1a64_hex(&[&raw.file, &nq, &nt])
+    };
     let lens = raw.lens.as_deref().unwrap_or(fallback_lens).to_string();
     Finding {
         id,
@@ -65,6 +77,7 @@ pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
         agreement: 1,
         hard_constraint: raw.hard_constraint,
         quote: raw.quote.clone(),
+        previously_dismissed: false,
         cluster_id: None,
         verify: None,
     }
@@ -1106,5 +1119,52 @@ mod tests {
             "坏 model 应记 failed_models: {:?}", out.failed_models);
         assert!(out.findings.iter().any(|f| f.title == "real"),
             "好 model 的 finding 应仍在报告里");
+    }
+
+    // R8.1：quote 锚定、行无关的 finding id。
+    // 注：命名为 raw_full（而非 raw）以避免与本模块已有的 `fn raw(t: &str)` 撞名——
+    // Rust 无重载，两者签名不同无法共用一个名字。
+    fn raw_full(file: &str, ls: u32, le: u32, title: &str, quote: &str) -> RawFinding {
+        RawFinding {
+            severity: Severity::High, title: title.into(), body: "b".into(),
+            file: file.into(), line_start: ls, line_end: le, confidence: 0.9,
+            recommendation: "r".into(), hard_constraint: false, quote: quote.into(), lens: None,
+        }
+    }
+
+    #[test]
+    fn id_ignores_line_shift_when_quote_present() {
+        let a = enrich(&raw_full("a.rs", 10, 12, "SQL injection", "let q = fmt!(sql);"), "L1", "m");
+        let b = enrich(&raw_full("a.rs", 99, 101, "SQL injection", "let q = fmt!(sql);"), "L1", "m");
+        assert_eq!(a.id, b.id, "行号位移不得改变 id");
+    }
+
+    #[test]
+    fn id_ignores_whitespace_reformat() {
+        let a = enrich(&raw_full("a.rs", 1, 2, "SQL injection", "let q =\n    fmt!( sql );"), "L1", "m");
+        let b = enrich(&raw_full("a.rs", 1, 2, "SQL injection", "letq=fmt!(sql);"), "L1", "m");
+        assert_eq!(a.id, b.id, "quote 去空白后等价 → 同 id");
+    }
+
+    #[test]
+    fn id_title_normalization_case_and_ws() {
+        let a = enrich(&raw_full("a.rs", 1, 1, "SQL  Injection", "x"), "L1", "m");
+        let b = enrich(&raw_full("a.rs", 1, 1, "sql injection", "x"), "L1", "m");
+        assert_eq!(a.id, b.id);
+    }
+
+    #[test]
+    fn id_composition_pinned() {
+        // 组成 golden：钉死组成与归一（FNV 算法本身由 hash.rs golden 钉死）。
+        let f = enrich(&raw_full("src/x.rs", 5, 7, "Weak  Hash", "md5( pw )"), "L1", "m");
+        assert_eq!(f.id, crate::hash::fnv1a64_hex(&["src/x.rs", "md5(pw)", "weak hash"]));
+    }
+
+    #[test]
+    fn id_falls_back_to_lines_without_quote() {
+        let a = enrich(&raw_full("a.rs", 1, 2, "t", ""), "L1", "m");
+        let b = enrich(&raw_full("a.rs", 3, 4, "t", ""), "L1", "m");
+        assert_ne!(a.id, b.id, "无 quote 退化回行号路径");
+        assert_eq!(a.id, crate::hash::fnv1a64_hex(&["a.rs", "1", "2", "t"]));
     }
 }

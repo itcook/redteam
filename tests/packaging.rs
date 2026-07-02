@@ -47,7 +47,7 @@ fn manifests_valid_and_named() {
 
 #[test]
 fn commands_frontmatter_and_invocation_policy() {
-    for name in ["review", "status", "result"] {
+    for name in ["review", "status", "result", "lgtm"] {
         let body = read(&format!("plugins/breakpoint/commands/{name}.md"));
         assert!(frontmatter(&body, "description").is_some(), "{name}: description required");
         assert!(
@@ -60,10 +60,12 @@ fn commands_frontmatter_and_invocation_policy() {
         );
         assert!(body.contains("$ARGUMENTS"), "{name}: must forward $ARGUMENTS");
     }
-    // review 计费重 → 禁模型自动调用
-    let review = read("plugins/breakpoint/commands/review.md");
-    assert_eq!(frontmatter(&review, "disable-model-invocation").as_deref(), Some("true"),
-        "review must disable model invocation");
+    // review/lgtm 计费重（lgtm 是烧钱长循环，同 review 政策）→ 禁模型自动调用
+    for name in ["review", "lgtm"] {
+        let body = read(&format!("plugins/breakpoint/commands/{name}.md"));
+        assert_eq!(frontmatter(&body, "disable-model-invocation").as_deref(), Some("true"),
+            "{name} must disable model invocation");
+    }
     // status/result 轻读 → 允许模型触发（不设该字段）
     for name in ["status", "result"] {
         let body = read(&format!("plugins/breakpoint/commands/{name}.md"));
@@ -117,7 +119,7 @@ fn codex_skills_in_sync_with_commands() {
 
 #[test]
 fn codex_skills_have_name_and_no_claude_var() {
-    for name in ["review", "status", "result"] {
+    for name in ["review", "status", "result", "lgtm"] {
         let s = read(&format!("plugins/breakpoint/codex-skills/{name}/SKILL.md"));
         assert!(s.contains(&format!("name: {name}")), "{name}: skill must declare name");
         assert!(!s.contains("CLAUDE_PLUGIN_ROOT"),

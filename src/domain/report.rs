@@ -52,6 +52,9 @@ pub struct RunMeta {
     pub usage: Usage,
     pub warnings: Vec<String>,
     pub failed_models: Vec<String>,
+    /// R8.2 派生索引：本次命中 dismissed 的 finding id（权威源是 findings.previously_dismissed）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_reappeared: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -74,7 +77,8 @@ mod tests {
         Finding { id: "x".into(), severity: sev, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
-            hard_constraint: false, quote: "snippet".into(), cluster_id: None, verify: None }
+            hard_constraint: false, quote: "snippet".into(), cluster_id: None, verify: None,
+            previously_dismissed: false }
     }
     #[test]
     fn stats_counts_by_severity() {

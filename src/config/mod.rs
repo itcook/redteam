@@ -97,6 +97,9 @@ pub struct Config {
 impl Config {
     /// 真实加载：内置默认（空）→ 各分层文件文本依次合并。
     pub fn load() -> anyhow::Result<Config> {
+        if std::path::Path::new(".breakpoint.toml").exists() {
+            eprintln!("breakpoint: legacy .breakpoint.toml is no longer read; move it to .breakpoint/config.toml");
+        }
         let texts: Vec<String> = config_paths()
             .into_iter()
             .filter_map(|p| std::fs::read_to_string(p).ok())
@@ -142,7 +145,7 @@ fn merge(base: &mut toml::Value, overlay: toml::Value) {
 /// 分层路径（左→右优先级递增）：用户 → 项目。内置默认由 serde default 提供。
 pub fn config_paths() -> Vec<PathBuf> {
     let mut v = vec![secrets::dirs_config().join("breakpoint").join("config.toml")];
-    v.push(PathBuf::from(".breakpoint.toml"));
+    v.push(PathBuf::from(".breakpoint").join("config.toml"));
     v
 }
 

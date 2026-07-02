@@ -51,6 +51,10 @@ enum Cmd {
         /// （原始 mode/targets/models 等从该作业落盘的 args.json 里重建）。
         #[arg(long)]
         resume: Option<String>,
+        /// R8.2：既往驳回清单——目录（内含 `<id>.md`）或 16-hex id 逗号列表；命中的 finding
+        /// 豁免 verdict blocking，报告标出 previously_dismissed + run.dismissed_reappeared。
+        #[arg(long)]
+        dismissed: Option<String>,
         targets: Vec<String>,
     },
     /// 查询作业状态：无 id 列当前 workspace 全部；有 id 打印该作业 JSON。
@@ -79,6 +83,8 @@ enum Cmd {
         #[command(subcommand)]
         action: ModelCmd,
     },
+    /// 幂等创建项目级 .breakpoint/ 骨架（config.toml 模板、.gitignore、dismissed/、rounds/）。
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -173,6 +179,40 @@ fn prune_here(ws: &std::path::Path) {
     );
 }
 
+/// Fix 1（final-review）：`brk result` 在任一终态（Done|Failed|TimedOut|Cancelled）都应放行——
+/// 失败/超时路径经 `write_partial_result` 落了带 `verdict: incomplete` 的 result.json（lgtm 协议
+/// §2.4 依赖取到它），不该被 Failed/TimedOut 一律拦成 "not done"。门槛统一为「终态 + 文件存在」；
+/// 非终态（Pending/Running）或文件缺失，行为不变（沿用既有报错文案）。
+/// 抽成纯函数便于单测，避免每条分支都要拉起子进程。
+fn resolve_result(
+    ws: &std::path::Path,
+    job_id: &str,
+    format: &str,
+    st: &breakpoint::state::job::JobState,
+) -> Result<String, (String, i32)> {
+    use breakpoint::state::job::JobStatus;
+    let terminal = matches!(
+        st.status,
+        JobStatus::Done | JobStatus::Failed | JobStatus::TimedOut | JobStatus::Cancelled
+    );
+    if !terminal {
+        return Err((format!("job {job_id} not done (status: {:?})", st.status), 2));
+    }
+    let content = if format == "md" {
+        breakpoint::state::store::read_result_md(ws, job_id)
+            .or_else(|| breakpoint::state::store::read_result(ws, job_id))
+    } else {
+        breakpoint::state::store::read_result(ws, job_id)
+    };
+    match content {
+        Some(raw) => Ok(raw),
+        None if st.status == JobStatus::Done => {
+            Err((format!("result expired or missing for {job_id}"), 2))
+        }
+        None => Err((format!("job {job_id} not done (status: {:?})", st.status), 2)),
+    }
+}
+
 /// 探测 mode + 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
 /// 返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
 fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<(Mode, ProviderRegistry), String> {
@@ -237,6 +277,7 @@ async fn main() {
             background,
             format,
             resume,
+            dismissed,
             targets,
         } => {
             let cfg = load_config_warned();
@@ -273,7 +314,7 @@ async fn main() {
             let args = ReviewArgs {
                 mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
                 no_correlate, block_threshold, conf_floor, background, format, targets,
-                resume: None,
+                resume: None, dismissed,
             };
 
             // 后台：写 pending + args 文件 → spawn detached worker → 打印 job-id 退出。
@@ -406,24 +447,14 @@ async fn main() {
             prune_here(&ws);
             let st = breakpoint::state::job::read_state(&ws, &job_id);
             match st {
-                Some(s) if matches!(s.status, breakpoint::state::job::JobStatus::Done) => {
-                    // 按 format 直读对应渲染文件（worker 已同落 json+md，无需反序列化）。
-                    let content = if format == "md" {
-                        breakpoint::state::store::read_result_md(&ws, &job_id)
-                            .or_else(|| breakpoint::state::store::read_result(&ws, &job_id))
-                    } else {
-                        breakpoint::state::store::read_result(&ws, &job_id)
-                    };
-                    match content {
-                        Some(raw) => {
-                            println!("{raw}");
-                            let _ = breakpoint::state::store::mark_consumed(&ws, &job_id);
-                            s.exit_code.unwrap_or(0)
-                        }
-                        None => { eprintln!("result expired or missing for {job_id}"); 2 }
+                Some(s) => match resolve_result(&ws, &job_id, &format, &s) {
+                    Ok(raw) => {
+                        println!("{raw}");
+                        let _ = breakpoint::state::store::mark_consumed(&ws, &job_id);
+                        s.exit_code.unwrap_or(0)
                     }
-                }
-                Some(s) => { eprintln!("job {job_id} not done (status: {:?})", s.status); 2 }
+                    Err((msg, code)) => { eprintln!("{msg}"); code }
+                },
                 None => { eprintln!("no such job: {job_id}"); 2 }
             }
         }
@@ -533,6 +564,14 @@ async fn main() {
                 }
             }
         },
+        Cmd::Init => {
+            match breakpoint::project::init_project(std::path::Path::new(".")) {
+                Ok(c) if c.is_empty() => println!(".breakpoint/ already complete"),
+                Ok(c) => c.iter().for_each(|p| println!("created {p}")),
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+            }
+            0
+        }
     };
     std::process::exit(code);
 }
@@ -566,6 +605,7 @@ mod tests {
             format: "json".into(),
             targets: vec![],
             resume: None,
+            dismissed: None,
         };
         let result = build_registry(&args, &cfg, cwd);
         assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");
@@ -574,5 +614,47 @@ mod tests {
             msg.contains("no provider"),
             "错误消息应提示 provider 问题，实际: {msg}"
         );
+    }
+
+    /// Fix 1：Failed + result.json 存在 → 取回成功（partial report，lgtm 协议 §2.4 依赖此路径）。
+    #[test]
+    fn resolve_result_failed_with_partial_report_succeeds() {
+        use breakpoint::state::job::{JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        breakpoint::state::store::write_result(ws, "j1", r#"{"verdict":"incomplete"}"#).unwrap();
+        let mut st = JobState::new("j1", 0);
+        st.status = JobStatus::Failed;
+        st.exit_code = Some(2);
+        let out = resolve_result(ws, "j1", "json", &st);
+        assert_eq!(out, Ok(r#"{"verdict":"incomplete"}"#.to_string()));
+    }
+
+    /// Fix 1：Failed + 无 result.json → 仍报错（未曾 checkpoint 过任何 cell 的早期崩溃）。
+    #[test]
+    fn resolve_result_failed_without_result_file_errs() {
+        use breakpoint::state::job::{JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = JobState::new("j2", 0);
+        st.status = JobStatus::Failed;
+        let out = resolve_result(ws, "j2", "json", &st);
+        assert!(out.is_err());
+        assert_eq!(out.unwrap_err().1, 2);
+    }
+
+    /// 非终态（Running）不受影响：即便 result.json 意外存在也不放行。
+    #[test]
+    fn resolve_result_running_stays_not_done() {
+        use breakpoint::state::job::{JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        breakpoint::state::store::write_result(ws, "j3", "{}").unwrap();
+        let mut st = JobState::new("j3", 0);
+        st.status = JobStatus::Running;
+        let out = resolve_result(ws, "j3", "json", &st);
+        let (msg, code) = out.unwrap_err();
+        assert!(msg.contains("not done"), "msg: {msg}");
+        assert_eq!(code, 2);
     }
 }
