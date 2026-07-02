@@ -382,7 +382,7 @@ mod tests {
             spec: vec![], focus: None, lenses: None, models: None, models_all: false,
             no_correlate: false, block_threshold: None, conf_floor: None,
             background: true, format: "json".into(), targets: vec!["spec.md".into()],
-            resume: None,
+            resume: None, dismissed: None,
         }).unwrap();
         let back: crate::cli::ReviewArgs = serde_json::from_str(&json).unwrap();
         assert_eq!(back.targets, vec!["spec.md".to_string()]);

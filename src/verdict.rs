@@ -28,6 +28,7 @@ pub fn compute_verdict(
             && f.confidence >= conf_floor
             // 实质修复（carry-to-S4 ①）：被证伪的 finding 永不 blocking，不靠 confidence 数值。
             && f.verify.as_ref().is_none_or(|v| v.verdict != VerifyVerdict::Refuted)
+            && !f.previously_dismissed // R8.2：人已驳回 → 不 blocking（证据保留）
     });
     if blocking { Verdict::Reject } else { Verdict::Approve }
 }
@@ -54,6 +55,7 @@ mod tests {
             quote: "snippet".into(),
             cluster_id: None,
             verify: None,
+            previously_dismissed: false,
         }
     }
 
@@ -101,5 +103,12 @@ mod tests {
         let mut hi = f(Severity::High, 0.9, "L1", false);
         hi.verify = Some(Verify { verdict: VerifyVerdict::Upheld, model: "beta".into(), note: String::new() });
         assert_eq!(compute_verdict(&[hi], Severity::Medium, 0.5), Verdict::Reject);
+    }
+
+    #[test]
+    fn dismissed_blocking_finding_is_exempt() {
+        let mut hi = f(Severity::High, 0.9, "L1", false);
+        hi.previously_dismissed = true;
+        assert_eq!(compute_verdict(&[hi], Severity::Medium, 0.5), Verdict::Approve);
     }
 }

@@ -51,6 +51,10 @@ enum Cmd {
         /// （原始 mode/targets/models 等从该作业落盘的 args.json 里重建）。
         #[arg(long)]
         resume: Option<String>,
+        /// R8.2：既往驳回清单——目录（内含 `<id>.md`）或 16-hex id 逗号列表；命中的 finding
+        /// 豁免 verdict blocking，报告标出 previously_dismissed + run.dismissed_reappeared。
+        #[arg(long)]
+        dismissed: Option<String>,
         targets: Vec<String>,
     },
     /// 查询作业状态：无 id 列当前 workspace 全部；有 id 打印该作业 JSON。
@@ -239,6 +243,7 @@ async fn main() {
             background,
             format,
             resume,
+            dismissed,
             targets,
         } => {
             let cfg = load_config_warned();
@@ -275,7 +280,7 @@ async fn main() {
             let args = ReviewArgs {
                 mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
                 no_correlate, block_threshold, conf_floor, background, format, targets,
-                resume: None,
+                resume: None, dismissed,
             };
 
             // 后台：写 pending + args 文件 → spawn detached worker → 打印 job-id 退出。
@@ -576,6 +581,7 @@ mod tests {
             format: "json".into(),
             targets: vec![],
             resume: None,
+            dismissed: None,
         };
         let result = build_registry(&args, &cfg, cwd);
         assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");

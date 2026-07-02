@@ -90,6 +90,7 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec!["L1".into()], models: vec![model.into()],
             agreement, hard_constraint: false, cluster_id: None, quote: "q".into(), verify: None,
+            previously_dismissed: false,
         }
     }
     fn rawf(title: &str) -> RawFinding {

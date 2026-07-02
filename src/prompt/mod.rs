@@ -221,6 +221,7 @@ mod tests {
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
             lenses: vec!["L1".into()], models: vec!["claude".into()], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
+            previously_dismissed: false,
         };
         let p = build_refute_prompt(&f, crate::domain::Mode::Code);
         assert!(!p.contains("{{"), "no residual placeholders");
@@ -239,6 +240,7 @@ mod tests {
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "specify rollback".into(),
             lenses: vec!["D2".into()], models: vec!["alpha".into()], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: String::new(), verify: None,
+            previously_dismissed: false,
         };
         let p = build_refute_prompt(&f, Mode::Doc);
         assert!(!p.contains("{{"), "no residual placeholders");
