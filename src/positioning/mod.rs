@@ -34,14 +34,45 @@ fn locate_quote(content: &str, quote: &str) -> Option<(u32, u32)> {
     let last_idx = raw_quote.iter().rposition(|l| !l.is_empty())?;
     let first = &raw_quote[first_idx];
     // 先精确整行匹配（避免短/公共子串误锚到更早行），无则退子串包含（保召回）。
-    let hit = file_lines
+    let hit = match file_lines
         .iter()
         .position(|fl| fl == first)
-        .or_else(|| file_lines.iter().position(|fl| fl.contains(first.as_str())))?;
+        .or_else(|| file_lines.iter().position(|fl| fl.contains(first.as_str())))
+    {
+        Some(h) => h,
+        // 软换行退路：markdown 散文 ~80 列断行，模型引用常把断行接成一行，
+        // 首行永远配不上任何单个文件行 → 按词序列匹配（换行视同空格），
+        // 不放宽内容只放宽断行。M11 dogfood 实锤：真 finding 曾被此处误杀。
+        None => return locate_words(content, quote),
+    };
     let ls = (hit as u32) + 1;
     let span = (last_idx - first_idx + 1) as u32;
     let le = (ls + span - 1).min(file_lines.len() as u32).max(ls);
     Some((ls, le))
+}
+
+/// 软换行退路：词级连续序列匹配（把换行视同空格）。词序列必须完全连续相等——
+/// 内容不放宽，只放宽断行；折叠后仍不存在的引用照样 None（幻觉过滤不放水）。
+fn locate_words(content: &str, quote: &str) -> Option<(u32, u32)> {
+    let qwords: Vec<&str> = quote.split_whitespace().collect();
+    if qwords.is_empty() {
+        return None;
+    }
+    let mut cwords: Vec<(&str, u32)> = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        for w in line.split_whitespace() {
+            cwords.push((w, (i as u32) + 1));
+        }
+    }
+    if cwords.len() < qwords.len() {
+        return None;
+    }
+    for start in 0..=(cwords.len() - qwords.len()) {
+        if cwords[start..start + qwords.len()].iter().map(|(w, _)| *w).eq(qwords.iter().copied()) {
+            return Some((cwords[start].1, cwords[start + qwords.len() - 1].1));
+        }
+    }
+    None
 }
 
 /// 把 quote 确定性定位到真实行；定位失败即丢弃（确定性幻觉过滤，code 线每条 finding 须指向真实代码）。
@@ -201,6 +232,24 @@ mod tests {
         let out = anchor(vec![finding("a.rs", "log.info")], dir.path());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].line_start, 3); // 精确整行优先 → 第 3 行，而非第 1 行的子串
+    }
+
+    #[test]
+    fn locate_survives_soft_wrap_joined_quote() {
+        // M11 dogfood 实锤：markdown 散文 ~80 列软换行，模型引用时把断行接成一行
+        // （"…function in\nsrc/store.py…" → "…function in src/store.py…"）。
+        // 首行匹配失败必须走全文折叠退路，否则真 finding 被幻觉过滤器误杀。
+        let content = "# Spec\n\nThis design RELIES on the existing `validate_record` function in\nsrc/store.py to reject malformed records before import.\n\ntail line\n";
+        let joined = "This design RELIES on the existing `validate_record` function in src/store.py to reject malformed records before import.";
+        let (ls, le) = locate_quote(content, joined).expect("soft-wrap joined quote must anchor");
+        assert_eq!((ls, le), (3, 4), "应锚回原两行跨度");
+    }
+
+    #[test]
+    fn locate_soft_wrap_fallback_rejects_fabrication() {
+        // 退路不得放水：折叠后仍不存在的引用照样丢弃。
+        let content = "alpha beta\ngamma delta\n";
+        assert!(locate_quote(content, "alpha delta epsilon").is_none());
     }
 
     #[test]

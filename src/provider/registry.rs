@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 /// 按 model 名路由到子 provider 的注册表（通用基建）。
 /// `LensRequest.model` 即 provider 名（= 注册键，也就是 orchestrate 里 `PlannedModel.name`）；
 /// 命中则转调对应子 provider，未知名返回 `Unavailable`（让该格记入 failed_models）。
-/// code 路径填 `ToolLoopProvider` 实例、doc 路径填 `DirectProvider` 实例，二者皆 `ReviewProvider`。
+/// 生产装配（main.rs）对 code/doc 两模式统一填 `ToolLoopProvider`（doc 评审同样具备
+/// read_file/search_repo 检索能力）；`DirectProvider` 是无工具单发的备选实现，当前无生产
+/// 使用方。二者皆 `ReviewProvider`。
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: BTreeMap<String, Box<dyn ReviewProvider>>,
