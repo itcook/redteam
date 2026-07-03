@@ -245,19 +245,23 @@ fn resolve_result(
     }
 }
 
-/// 探测 mode + 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
-/// 返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
-fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<(Mode, ProviderRegistry), String> {
+/// 从 review args 探测 mode（build_registry 与后台起手 stamp 共用）。
+fn detect_mode_from_args(args: &ReviewArgs) -> anyhow::Result<Mode> {
     let scope_enum = if args.scope == "branch" { Scope::Branch } else { Scope::WorkingTree };
     let mode_opt = args.mode.as_deref().map(|m| if m == "code" { Mode::Code } else { Mode::Doc });
-    let eopts = EvidenceOpts {
+    detect_mode(&EvidenceOpts {
         mode: mode_opt,
         base: args.base.clone(),
         scope: scope_enum,
         spec: args.spec.clone(),
         targets: args.targets.clone(),
-    };
-    let detected = match detect_mode(&eopts) {
+    })
+}
+
+/// 探测 mode + 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
+/// 返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
+fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<(Mode, ProviderRegistry), String> {
+    let detected = match detect_mode_from_args(args) {
         Ok(m) => m,
         Err(e) => {
             return Err(format!("{e}"));
@@ -365,6 +369,9 @@ async fn main() {
                     std::process::exit(2);
                 }
                 let mut st = redteam::state::job::JobState::new(&job_id, now_secs());
+                // 起手即 stamp mode——status 首查常落在 worker 接手前的窗口，缺 mode 时 table
+                // 显 "-" 误导（dogfood 20260702 r1）。探测失败留 None，worker 会以同样错误落 failed。
+                st.mode = detect_mode_from_args(&args).ok();
                 st.workspace = Some(
                     std::fs::canonicalize(&cwd)
                         .unwrap_or_else(|_| cwd.clone())
