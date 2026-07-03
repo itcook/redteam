@@ -21,15 +21,14 @@ const CONFIG_TEMPLATE: &str = "\
 ";
 
 /// 幂等创建 `.redteam/` 骨架，返回本次新建的条目；已存在的一律不动。
+/// dismissed/ 目录已随台账机器化退役（design 2026-07-03：台账/评审史统一 proj.db）。
 pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
     let dir = root.join(PROJECT_DIR);
     let mut created = Vec::new();
-    for sub in ["dismissed", "rounds"] {
-        let p = dir.join(sub);
-        if !p.is_dir() {
-            std::fs::create_dir_all(&p)?;
-            created.push(format!("{PROJECT_DIR}/{sub}/"));
-        }
+    let rounds = dir.join("rounds");
+    if !rounds.is_dir() {
+        std::fs::create_dir_all(&rounds)?;
+        created.push(format!("{PROJECT_DIR}/rounds/"));
     }
     for (name, body) in [(".gitignore", GITIGNORE_BODY), ("config.toml", CONFIG_TEMPLATE)] {
         let p = dir.join(name);
@@ -37,6 +36,11 @@ pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
             std::fs::write(&p, body)?;
             created.push(format!("{PROJECT_DIR}/{name}"));
         }
+    }
+    let db_path = dir.join(crate::db::DB_FILE);
+    if !db_path.exists() {
+        crate::db::ProjDb::open_at(&db_path)?;
+        created.push(format!("{PROJECT_DIR}/{}", crate::db::DB_FILE));
     }
     Ok(created)
 }
@@ -68,9 +72,10 @@ mod tests {
     fn init_creates_skeleton_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let created = init_project(tmp.path()).unwrap();
-        assert_eq!(created.len(), 4, "dismissed/ rounds/ .gitignore config.toml");
-        assert!(tmp.path().join(".redteam/dismissed").is_dir());
+        assert_eq!(created.len(), 4, "rounds/ .gitignore config.toml proj.db");
         assert!(tmp.path().join(".redteam/rounds").is_dir());
+        assert!(tmp.path().join(".redteam/proj.db").is_file(), "init 建库");
+        assert!(!tmp.path().join(".redteam/dismissed").exists(), "dismissed/ 目录已退役");
         assert_eq!(std::fs::read_to_string(tmp.path().join(".redteam/.gitignore")).unwrap(), "*\n");
         // 二跑：全部已存在 → 零创建
         assert!(init_project(tmp.path()).unwrap().is_empty());

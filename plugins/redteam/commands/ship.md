@@ -10,14 +10,13 @@ disable-model-invocation: true
 
 用户参数：$ARGUMENTS
 - `--max-rounds <N>`（本命令专属，可选）：预算护栏；未给则**无轮数上限**——目标是 approve。
-- `--dismissed-dir <path>`（本命令专属，可选）：驳回台账目录，默认 `.redteam/dismissed/`。
 - 其余参数**原样透传**给 `redteam review`（--mode/--base/--scope/--spec/--lenses/--models 等）。
-  透传前先从参数串中摘除上述两个专属参数。redteam 二进制开启 `args_override_self`
-  （同名 flag 重复时后者胜，不报错），且 ship 把自己管理的 flag 追加在用户参数**之后**——
-  因此重复本身不会崩；仍需处理的只有两类：`--resume <值>` **连值摘除**（它切同步补跑、
-  打印全报告而非 job id，破坏循环）；用户传的 `--dismissed <值>` 可不摘（会被 ship 后置的
-  台账目录覆盖），但**必须告知用户**其值未生效——如需豁免特定 finding，请把驳回记录放入
-  `--dismissed-dir` 目录（`<id>.md`）。凡摘除/覆盖都不得静默。
+  透传前先摘除上述专属参数。redteam 开启 `args_override_self`（同名 flag 重复后者胜），
+  ship 管理的 `--background` 追加在用户参数之后即权威生效；唯一需连值摘除的是
+  `--resume <值>`（它切同步补跑、打印全报告而非 job id，破坏循环）。凡摘除不得静默。
+- **台账 zero-config**：驳回判例台账在 `.redteam/proj.db`，`redteam review` 自动加载
+  （豁免 + refute 判例裁决），无需传任何 flag；报告 `run.ledger` 披露加载数。
+  用户显式传 `--dismissed`/`--no-dismissed` 时原样透传（那是合法的覆盖语义）。
 
 ## 0. 起手
 1. 运行 `${CLAUDE_PLUGIN_ROOT}/bin/redteam init`（幂等）；创建本会话目录
@@ -29,10 +28,9 @@ disable-model-invocation: true
    AskUserQuestion 一次并把答案记入 session.md；明确无测试的项目跳过测试步。
 
 ## 每轮 rN
-1. **起评审**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam review <透传参数> --background --dismissed <dismissed-dir>`
-   （ship 管理的 flag **必须放在用户透传参数之后**——`args_override_self` 语义下后者胜，
-    这是「ship 值权威生效」的机制保证，顺序不可颠倒。）
-   - `--dismissed` 自带双效：豁免既往驳回 + **台账内容自动注入评审 prompt 的「勿再报」段**——
+1. **起评审**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam review <透传参数> --background`
+   （`--background` 放在用户透传参数之后——`args_override_self` 语义下后者胜。）
+   - 台账自动生效（proj.db）：豁免既往驳回 + 疑似判例变体强制进 refute 判例裁决——
      不要自己读台账拼 --focus 摘要；用户 $ARGUMENTS 里的 `--focus` 原样透传即可。
    → 记下 job id。轮询 `${CLAUDE_PLUGIN_ROOT}/bin/redteam status <job>`（间隔约 20-30s），只等**终态**
      （done / failed / timed_out）。redteam 后台 job 有 40 分钟 wall-clock deadline watchdog（到点自我
@@ -52,16 +50,19 @@ disable-model-invocation: true
    refute note 是判例引用、或 finding body 明确反驳某条驳回理由的 → 读一眼 note 与 body：
    反驳被正面回应 → 跳过；note 答非所问（打稻草人/复述原理由）→ 该条**照常裁决**，一句话
    记简报——机器证伪不当剥夺强异议的复裁通道。`previously_dismissed`
-   按台账状态分流：`human-confirmed` 或已 `re-upheld` 的静默跳过；仅 `dismissed(rN)` 状态
-   的**首次再现**进入刹车链（每 id 至多一次）。
+   按台账状态分流（`${CLAUDE_PLUGIN_ROOT}/bin/redteam dismiss show <id>` 读 status）：
+   `human-confirmed` 或已 `re-upheld` 的静默跳过；仅 `dismissed` 状态的**首次再现**
+   进入刹车链（每 id 至多一次）。
 2. **排序**：severity 降序为主序，同级按 file 分组。
 3. **逐条**（读 quote + 文件上下文 + body 后裁决），每条属实项标注**来源：原始/衍生**——
    衍生 = quote 锚定的代码由本会话既往 `fix(ship): rN` commit 引入。**衍生标注必须附
    引入 commit 的短 sha**（`git blame` 取证，不凭记忆），写进简报——标注是停机「尾流
    守卫」的判据输入，必须留下可审计线索，防自证式标签空转：
    - **属实 → 修**：root-cause 修法——共享函数一处守卫优于逐调用点补丁。
-   - **误报 → 写 `<dismissed-dir>/<id>.md`**：内容 = finding 快照（title/file/quote/
-     severity）+ 驳回理由 + 状态行 `dismissed(rN, <日期>)`。
+   - **误报 → 建判例卡**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam dismiss add <id>
+     --reason "<驳回理由>" --from rounds/<session>/rN.result.json --round rN`
+     （快照四件套由 --from 自动抄写，勿手拼；理由写实质论据——它是未来 refute
+     判例裁决的依据文本）。
    - **存疑 → 先验证再定，禁止直接猜**：能执行就执行（微测试/复现脚本）。
      **绕过类/输入处理类强制走 fuzz 配方**：① 从 finding 提取被绕过的校验点与输入空间
      维度（编码层数/大小写/分隔符/scheme…）；② 对维度组合写 property 测试（内联枚举
@@ -90,9 +91,11 @@ disable-model-invocation: true
    `dismissed_reappeared` 中待复裁的 id 必须先走完 §3 升级刹车链，方可按本条收工**——
    尾流出口不得吞掉待复裁信号。
 3. **升级刹车链**（每 id 至多一次）：`run.dismissed_reappeared` 中处于 `dismissed` 状态
-   的 id → 对照台账里当时的驳回理由，带新 finding body **复裁一次**：改判属实 → 修 +
-   删台账文件；仍判误报 → 台账追加 `re-upheld(rM)`，**停，AskUserQuestion 交人裁决**。
-   人裁误报 → 追加 `human-confirmed(rK)`，此后该 id 永久静默；人裁属实 → 修 + 删文件，继续。
+   的 id → 对照卡上驳回理由（`dismiss show <id>`），带新 finding body **复裁一次**：
+   改判属实 → 修 + `dismiss set-status <id> withdrawn --round rM`；仍判误报 →
+   `dismiss set-status <id> re-upheld --round rM`，**停，AskUserQuestion 交人裁决**。
+   人裁误报 → `set-status <id> human-confirmed --round rK`，此后该 id 永久静默；
+   人裁属实 → 修 + `set-status <id> withdrawn --round rK`，继续。
 4. **修复受阻**：某 finding 属实但你修不了（需产品/架构决策、改动越权）→ 停，交用户。
 5. **停滞守卫**：本轮仍有未豁免 findings 但零代码改动（未修也未新驳）→ 空转，停，交用户。
 6. `--max-rounds` 达限（仅用户显式给出时）→ 停，输出未收敛摘要。

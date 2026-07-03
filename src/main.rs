@@ -111,7 +111,7 @@ enum Cmd {
         #[command(subcommand)]
         action: DismissCmd,
     },
-    /// 幂等创建项目级 .redteam/ 骨架（config.toml 模板、.gitignore、dismissed/、rounds/）。
+    /// 幂等创建项目级 .redteam/ 骨架（config.toml 模板、.gitignore、rounds/、proj.db）。
     Init,
 }
 
