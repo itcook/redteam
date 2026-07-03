@@ -21,16 +21,16 @@ pub fn output_language() -> String {
     // Extract language prefix: "zh_CN.UTF-8" → "zh_CN", "en_US" → "en_US", "C"/"POSIX" → ""
     let lang_part = raw.split('.').next().unwrap_or("").trim();
 
-    // Map to readable name by two-letter language code prefix
+    // Map to a bilingual name (English + native)——纯英文语言名对部分模型约束力弱
+    // （dogfood 20260703 r1：DeepSeek 输出全文马来语违约），母语名加固遵从。
     let lang_code = lang_part.split('_').next().unwrap_or("").to_lowercase();
     match lang_code.as_str() {
-        "zh" => "Simplified Chinese".to_string(),
-        "ja" => "Japanese".to_string(),
-        "ko" => "Korean".to_string(),
-        "fr" => "French".to_string(),
-        "de" => "German".to_string(),
-        "es" => "Spanish".to_string(),
-        "en" => "English".to_string(),
+        "zh" => "Simplified Chinese (简体中文)".to_string(),
+        "ja" => "Japanese (日本語)".to_string(),
+        "ko" => "Korean (한국어)".to_string(),
+        "fr" => "French (français)".to_string(),
+        "de" => "German (Deutsch)".to_string(),
+        "es" => "Spanish (español)".to_string(),
         _ => "English".to_string(),
     }
 }
@@ -226,7 +226,7 @@ mod tests {
             std::env::remove_var("LC_MESSAGES");
             std::env::set_var("LANG", "zh_CN.UTF-8");
         }
-        assert_eq!(output_language(), "Simplified Chinese");
+        assert_eq!(output_language(), "Simplified Chinese (简体中文)");
         unsafe { std::env::remove_var("LANG"); }
     }
     #[test]
