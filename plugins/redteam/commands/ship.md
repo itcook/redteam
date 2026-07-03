@@ -12,10 +12,11 @@ disable-model-invocation: true
 - `--max-rounds <N>`（本命令专属，可选）：预算护栏；未给则**无轮数上限**——目标是 approve。
 - `--dismissed-dir <path>`（本命令专属，可选）：驳回台账目录，默认 `.redteam/dismissed/`。
 - 其余参数**原样透传**给 `redteam review`（--mode/--base/--scope/--spec/--lenses/--models 等）。
-  透传前先从参数串中摘除上述两个专属参数；`--dismissed` 是 **ship 管理的 flag**（起评审时由
-  ship 注入台账目录，clap 拒绝重复 flag）——若用户传了 `--dismissed`，一并摘除并**明确告知用户**：
-  ship 以 `--dismissed-dir` 台账目录为准，如需豁免特定 finding，请把驳回记录放入该目录（`<id>.md`），
-  不要静默丢弃用户输入。
+  透传前先从参数串中摘除上述两个专属参数，以及 **ship 管理的模式 flag 类**（类级摘除，
+  **连同各自的值**一起摘）：`--dismissed`（ship 注入台账目录，clap 拒绝重复 flag）、
+  `--background`（ship 强制后台轮询，重复即崩）、`--resume`（会切同步补跑模式、打印全报告
+  而非 job id，破坏循环）。凡摘除**必须明确告知用户**摘了什么、为什么——如需豁免特定
+  finding，请把驳回记录放入 `--dismissed-dir` 目录（`<id>.md`）；不要静默丢弃用户输入。
 
 ## 0. 起手
 1. 运行 `${CLAUDE_PLUGIN_ROOT}/bin/redteam init`（幂等）；创建本会话目录
