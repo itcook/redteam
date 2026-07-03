@@ -47,6 +47,10 @@ pub struct Usage { pub input_tokens: u64, pub output_tokens: u64 }
 pub struct RunMeta {
     pub job_id: String,
     pub models: Vec<String>,
+    /// 与 `models`（provider 名）同序的 model id（config 的 providers.*.model）——
+    /// 人读报告显示 model 名而非 provider 名（rN.md 模板,2026-07-03）。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_ids: Vec<String>,
     pub lenses: Vec<String>,
     pub duration_ms: u64,
     pub usage: Usage,

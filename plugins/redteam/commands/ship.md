@@ -39,7 +39,8 @@ disable-model-invocation: true
      turn 与 `finalizing` 尾段的 `last_active` 设计上静止，按「心跳停滞 N 分钟」判死会误杀正常慢 job。
    - **轮询期间不改动工作树**（working-tree scope 下评审正在读活文件）。
 2. **取结果**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam result <job>` → 存档到
-   `rounds/<session>/rN.result.json`。
+   `rounds/<session>/rN.result.json`（结果已持久于 proj.db 可随时重取；此文件存档
+   仅供收工反馈的 jq 配方读取——**发布前随 feedback 仪器一并拆除本步**）。
    - job `failed/timed_out` 但有部分报告（`verdict: incomplete`）→ 用部分 findings
      照常裁决，简报注记 partial，**不算 approve**。
    - job 硬失败无产出（全 provider 挂等）→ 重试一次，再失败 → 停，报告用户。
@@ -73,8 +74,13 @@ disable-model-invocation: true
 
 ## 收轮
 修复全落 → 跑测试命令至绿 → **单次 commit（仅修复，不含 .redteam/）**，消息
-`fix(ship): rN <一句话摘要>` → 写 `rounds/<session>/rN.md` 简报（job id、verdict、
-修复/驳回/存疑清单——属实项带**原始/衍生**标、commit sha）→ 下一轮。
+`fix(ship): rN <一句话摘要>` → 生成 `rounds/<session>/rN.md` 简报：
+1. `${CLAUDE_PLUGIN_ROOT}/bin/redteam result <job> --format md > rounds/<session>/rN.md`
+   （产品化模板：Summary/severity 表/Info 表/Warnings/Finding Details 全由二进制渲染，勿手拼）；
+2. 把首行标题补上轮次后缀：`# <repo> Redteam Review #<job>` → `…#<job>-round <N>`；
+3. 文末**追加裁决段**（协议层内容，宿主写）：`## Adjudication` ——修复/驳回/存疑清单，
+   属实项带**原始/衍生**标（衍生附引入 commit 短 sha）、本轮 fix commit sha。
+→ 下一轮。
 - **工具观察（本地调试阶段 · 发布前移除）**：若本轮察觉 redteam/ship **工具级**异常（耗时反常、
   `finalizing` 卡顿、某 finding 的 quote 在文件里配不上、status/协议摩擦），往
   `rounds/<session>/observations.md` 追加**一行**——供收工反馈合成;无异常不写。

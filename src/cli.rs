@@ -191,6 +191,14 @@ pub(crate) fn mark_dismissed(
     reappeared
 }
 
+/// provider 名 → model id 映射（人读报告显示 model 名，rN.md 模板 2026-07-03）。
+fn model_ids_for(names: &[String], cfg: &Config) -> Vec<String> {
+    names
+        .iter()
+        .map(|n| cfg.providers.get(n).map(|p| p.model.clone()).unwrap_or_else(|| n.clone()))
+        .collect()
+}
+
 /// 扇出之后的共用尾段上下文——`run_code_review`/`run_review`/`run_resume` 三处扇出前逻辑
 /// 各不相同（bundle×model / lens×model / 直接重放 manifest prompt），但扇出后（anchor → dedup
 /// → [doc: correlate] → verify → verdict → 组报告）完全一致，抽出复用（DRY，T7 授权解冻）。
@@ -202,6 +210,8 @@ struct TailCtx<'a> {
     targets: &'a [String],
     provider: &'a dyn ReviewProvider,
     model_names: Vec<String>,
+    /// 与 model_names 同序的 model id（cfg.providers.*.model；查无则回退 provider 名）。
+    model_ids: Vec<String>,
     lens_ids: Vec<String>,
     block: Severity,
     floor: f32,
@@ -265,6 +275,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
         run: RunMeta {
             job_id: ctx.job_id,
             models: ctx.model_names,
+            model_ids: ctx.model_ids,
             lenses: ctx.lens_ids,
             duration_ms: ctx.duration_ms,
             usage: Usage { input_tokens: ctx.usage.0, output_tokens: ctx.usage.1 },
@@ -357,6 +368,7 @@ pub async fn run_review(
         root: None,
         targets: &args.targets,
         provider,
+        model_ids: model_ids_for(&model_names, cfg),
         model_names,
         lens_ids,
         block,
@@ -438,6 +450,7 @@ pub async fn run_code_review(
         root: Some(root),
         targets: &args.targets,
         provider,
+        model_ids: model_ids_for(&model_names, cfg),
         model_names,
         lens_ids,
         block,
@@ -563,6 +576,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
         run: RunMeta {
             job_id: job_id.to_string(),
             models: vec![],
+            model_ids: vec![],
             lenses: vec![],
             duration_ms: 0,
             usage: Usage::default(),
@@ -700,6 +714,7 @@ pub async fn run_resume(
         root: if mode == Mode::Code { Some(cwd) } else { None },
         targets: &args.targets,
         provider,
+        model_ids: model_ids_for(&model_names, cfg),
         model_names,
         lens_ids,
         block,
