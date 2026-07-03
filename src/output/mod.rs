@@ -11,11 +11,12 @@ pub fn render(report: &ReviewReport, fmt: Format) -> String {
 }
 
 /// token 数自适应缩写：≥1M → x.xxM、≥1K → x.xxK、否则原样。
+/// 结果进 markdown 表格 cell——禁用裸 `|`（会被解析成列分隔符撕裂表格），缩写用括号。
 fn human_tokens(n: u64) -> String {
     if n >= 1_000_000 {
-        format!("`{n}` | `{:.2}M`", n as f64 / 1_000_000.0)
+        format!("`{n}` ({:.2}M)", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
-        format!("`{n}` | `{:.2}K`", n as f64 / 1_000.0)
+        format!("`{n}` ({:.2}K)", n as f64 / 1_000.0)
     } else {
         format!("`{n}`")
     }
@@ -118,7 +119,8 @@ fn render_md(r: &ReviewReport) -> String {
                 if f.previously_dismissed {
                     s.push_str("| Dismissed  | previously dismissed (exempt from verdict) |\n");
                 }
-                s.push_str(&format!("\n> **Recommendation**\n>\n> {}\n", f.recommendation));
+                // rec 多行时后续行补 `> ` 前缀，防止脱出引用块。
+                s.push_str(&format!("\n> **Recommendation**\n>\n> {}\n", f.recommendation.replace('\n', "\n> ")));
             }
         }
     }
@@ -198,8 +200,8 @@ mod tests {
         assert!(s.contains("# breakpoints Redteam Review #abc123") || s.contains("Redteam Review #abc123"), "{s}");
         assert!(s.contains("deepseek-v4, kimi-k2 ❗️fail"), "model id 显示+失败标注: {s}");
         assert!(s.contains("≈ 8.8 mins"), "{s}");
-        assert!(s.contains("`2620877` | `2.62M`"), "input token 自适应缩写: {s}");
-        assert!(s.contains("`87187` | `87.19K`"), "output token 缩写: {s}");
+        assert!(s.contains("`2620877` (2.62M)"), "input token 自适应缩写(无裸管道符): {s}");
+        assert!(s.contains("`87187` (87.19K)"), "output token 缩写: {s}");
         assert!(s.contains("53 card(s) from .redteam/proj.db"), "ledger 披露: {s}");
         assert!(s.contains("- W1: w-one"), "{s}");
     }

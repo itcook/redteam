@@ -44,6 +44,9 @@ impl ProjDb {
     /// 按显式路径打开（`--dismissed <db路径>` 覆盖场景）。
     pub fn open_at(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open db {}", path.display()))?;
+        // 跨进程写并发（后台 job 写 state/results × 宿主 dismiss add）下 WAL 写锁冲突
+        // 默认立即 SQLITE_BUSY——busy_timeout 让写者排队而非报错。
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS dismissed (

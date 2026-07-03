@@ -17,6 +17,8 @@ disable-model-invocation: true
 - **台账 zero-config**：驳回判例台账在 `.redteam/proj.db`，`redteam review` 自动加载
   （豁免 + refute 判例裁决），无需传任何 flag；报告 `run.ledger` 披露加载数。
   用户显式传 `--dismissed`/`--no-dismissed` 时原样透传（那是合法的覆盖语义）。
+  **split-brain 警示**：显式 `--dismissed <文件>` 下评审豁免走该文件，而 `dismiss add`
+  写的是 proj.db——本会话新建卡对后续轮**不生效**。此场景误报不建卡，记简报交用户自决。
 
 ## 0. 起手
 1. 运行 `${CLAUDE_PLUGIN_ROOT}/bin/redteam init`（幂等）；创建本会话目录

@@ -536,7 +536,9 @@ async fn main() {
                         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
                     }
                     s.status = redteam::state::job::JobStatus::Cancelled;
-                    let _ = redteam::state::job::write_state(&ws, &s);
+                    if let Err(e) = redteam::state::job::write_state(&ws, &s) {
+                        eprintln!("warning: process killed but cancelled state not persisted (status may keep showing running): {e}");
+                    }
                     println!("cancelled {job_id}");
                     0
                 }
