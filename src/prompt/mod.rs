@@ -118,12 +118,9 @@ fn rules_block(rules: &[&Lens]) -> String {
 }
 
 /// 构造 doc 对抗 prompt：全 D 系 rule 注入为一份关注清单、整篇文档内联、教模型遗漏类留空 quote。
-pub fn build_doc_prompt(
-    input: &ReviewInput,
-    rules: &[&Lens],
-    user_focus: &str,
-    dismissed_notes: &str,
-) -> String {
+/// 台账判例不再注入 review prompt（design 2026-07-03 #2：生成侧注入两会话十连穿透实证无效，
+/// 判定后置 consolidate——机械预筛 + refute 判例裁决）。
+pub fn build_doc_prompt(input: &ReviewInput, rules: &[&Lens], user_focus: &str) -> String {
     let spec_docs = if input.spec_docs.is_empty() {
         "(none)".to_string()
     } else {
@@ -136,7 +133,6 @@ pub fn build_doc_prompt(
         ("{{OUTPUT_LANGUAGE}}", &output_language()),
         ("{{REVIEW_INPUT}}", &input.body),
         ("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus }),
-        ("{{DISMISSED_NOTES}}", if dismissed_notes.trim().is_empty() { "(none)" } else { dismissed_notes }),
     ])
 }
 
@@ -148,7 +144,6 @@ pub fn build_bundle_prompt(
     bundle: &Bundle,
     rules: &[&Lens],
     user_focus: &str,
-    dismissed_notes: &str,
     other_files: &str,
 ) -> String {
     let rules_str = rules_block(rules);
@@ -174,10 +169,44 @@ pub fn build_bundle_prompt(
         ("{{OUTPUT_LANGUAGE}}", &output_language()),
         ("{{BUNDLE_DIFFS}}", &diffs_block),
         ("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus }),
-        ("{{DISMISSED_NOTES}}", if dismissed_notes.trim().is_empty() { "(none)" } else { dismissed_notes }),
         ("{{OTHER_CHANGED_FILES}}",
             if other_files.is_empty() { "(none — this bundle covers the entire changeset)" } else { other_files }),
     ])
+}
+
+/// refute 判例注入渲染（design 2026-07-03 #7②）：按与被验 finding 的相关性排序填帽，
+/// 替代旧「16hex 文件名伪随机取前 1/4」——同 file 优先、title 相似次之；
+/// 单卡 600 / 总 4000 字符帽（帽内永远是最相关子集，台账体积与 prompt 解耦）。
+pub fn render_precedents(finding: &crate::domain::Finding, cards: &[crate::db::DismissCard]) -> String {
+    const PER_CARD_CHARS: usize = 600;
+    const TOTAL_CHARS: usize = 4000;
+    let mut ranked: Vec<(&crate::db::DismissCard, f32)> = cards
+        .iter()
+        .map(|c| {
+            let mut score = crate::consolidate::dedup::title_jaccard(&finding.title, &c.title);
+            if c.file == finding.file {
+                score += 1.0; // 同 file 整级优先
+            }
+            (c, score)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.id.cmp(&b.0.id)));
+    let mut out = String::new();
+    for (c, _) in ranked {
+        let quote_line = c.quote.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        let entry: String = format!(
+            "- [{}] {} {} | {} | quote: {} | rationale({}): {}\n",
+            c.id, c.severity, c.file, c.title, quote_line, c.status, c.reason
+        )
+        .chars()
+        .take(PER_CARD_CHARS)
+        .collect();
+        if out.chars().count() + entry.chars().count() > TOTAL_CHARS {
+            break;
+        }
+        out.push_str(&entry);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -262,6 +291,37 @@ mod tests {
     }
 
     #[test]
+    fn render_precedents_ranks_same_file_first_and_caps_total() {
+        use crate::db::DismissCard;
+        use crate::domain::{Finding, Severity};
+        let f = Finding {
+            id: "x".into(), severity: Severity::High, title: "injection via notes".into(),
+            body: "b".into(), file: "src/a.rs".into(), line_start: 1, line_end: 1,
+            confidence: 0.9, recommendation: "r".into(), lenses: vec![], models: vec![],
+            agreement: 1, hard_constraint: false, quote: "q".into(), cluster_id: None,
+            verify: None, previously_dismissed: false,
+        };
+        let card = |id: &str, file: &str, title: &str, reason: &str| DismissCard {
+            id: id.into(), status: "dismissed".into(), title: title.into(), file: file.into(),
+            quote: "qq".into(), severity: "high".into(), reason: reason.into(),
+            round: "r1".into(), updated_at: String::new(),
+        };
+        let cards = vec![
+            card("1111111111111111", "src/other.rs", "unrelated topic entirely", "别处"),
+            card("2222222222222222", "src/a.rs", "injection theme", "同文件判例"),
+        ];
+        let out = render_precedents(&f, &cards);
+        assert!(out.find("2222222222222222").unwrap() < out.find("1111111111111111").unwrap(),
+            "同 file 判例排前: {out}");
+        assert!(out.contains("同文件判例") && out.contains("rationale"), "{out}");
+        // 帽：大量长卡不超 4000 chars
+        let many: Vec<DismissCard> = (0..50)
+            .map(|i| card(&format!("{i:016x}"), "z.rs", "t", &"理".repeat(500)))
+            .collect();
+        assert!(render_precedents(&f, &many).chars().count() <= 4000, "总量帽生效");
+    }
+
+    #[test]
     fn bundle_prompt_interpolates_rules_files_and_contract() {
         use crate::bundle::Bundle;
         use crate::evidence::git::FileChange;
@@ -270,22 +330,23 @@ mod tests {
             files: vec![FileChange { path: "src/auth.rs".into(), diff: "+let t = secret();".into() }],
         };
         let rules = vec![by_id("L1").unwrap(), by_id("L5").unwrap()];
-        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "已驳回:旧误报X", "");
+        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         // 空清单 → 渲染「本包即全变更集」占位；非空 → 原样注入
         assert!(p.contains("(none — this bundle covers the entire changeset)"), "empty manifest placeholder");
-        let pm = build_bundle_prompt("wt", &bundle, &rules, "", "", "src/other.rs (+3/-1)");
+        let pm = build_bundle_prompt("wt", &bundle, &rules, "", "src/other.rs (+3/-1)");
         assert!(pm.contains("src/other.rs (+3/-1)"), "other-files manifest injected");
         // 注入对称覆盖(r4 ea30e058):bundle 侧同样不被外部占位捕获
-        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "notes {{BUNDLE_DIFFS}} 试探", "");
-        assert!(pi.contains("focus {{RULES}} 试探") && pi.contains("notes {{BUNDLE_DIFFS}} 试探"),
+        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探");
+        assert!(pi.contains("focus {{RULES}} 试探") && pi.contains("manifest {{BUNDLE_DIFFS}} 试探"),
             "bundle 外部内容占位不被捕获");
         assert!(p.contains("[L1]") && p.contains("[L5]"), "rule ids injected");
         assert!(p.contains("src/auth.rs"), "file path injected");
         assert!(p.contains("let t = secret();"), "diff injected");
         assert!(p.contains("quote"), "quote contract present");
         assert!(p.contains("auth"), "user focus injected");
-        assert!(p.contains("已驳回:旧误报X"), "dismissed ledger notes injected");
+        // 台账不再注入 review prompt(design 2026-07-03 #2)
+        assert!(!p.contains("DISMISSED"), "no ledger injection in review prompt");
         // L5 是 compliance rule → 注入 severity 封顶提示
         assert!(p.to_lowercase().contains("compliance rule"), "compliance cap note present");
     }
@@ -302,10 +363,9 @@ mod tests {
             spec_docs: vec![],
         };
         let rules = vec![by_id("D1").unwrap()];
-        let p = build_doc_prompt(&input, &rules, "focus注入 {{RULES}} 试探", "台账注入 {{REVIEW_INPUT}} 试探");
+        let p = build_doc_prompt(&input, &rules, "focus注入 {{RULES}} 试探 与 {{REVIEW_INPUT}} 试探");
         // 恶意占位串必须原样留存（模型看到无害字面），不得被替换成真实系统段内容
-        assert!(p.contains("focus注入 {{RULES}} 试探"), "focus 里的占位不被捕获");
-        assert!(p.contains("台账注入 {{REVIEW_INPUT}} 试探"), "notes 里的占位不被捕获");
+        assert!(p.contains("focus注入 {{RULES}} 试探 与 {{REVIEW_INPUT}} 试探"), "focus 里的占位不被捕获");
         // 单 pass render 下互染也消失：正文里的 {{USER_FOCUS}} 字面原样保留。
         assert!(p.contains("正文含 {{USER_FOCUS}} 字面"), "正文里的占位不被任何值填充");
         // rules 真实内容只出现一次（模板位），未被 focus 试探复制
@@ -322,13 +382,13 @@ mod tests {
             spec_docs: vec!["design.md".into()],
         };
         let rules = vec![by_id("D1").unwrap(), by_id("D2").unwrap(), by_id("D5").unwrap()];
-        let p = build_doc_prompt(&input, &rules, "auth", "已驳回:旧误报Y");
+        let p = build_doc_prompt(&input, &rules, "auth");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.contains("[D1]") && p.contains("[D2]") && p.contains("[D5]"), "all rules injected");
         assert!(p.contains("DOCBODY"), "doc body inlined");
         assert!(p.contains("design.md"), "spec docs injected");
         assert!(p.contains("auth"), "user focus injected");
-        assert!(p.contains("已驳回:旧误报Y"), "dismissed ledger notes injected");
+        assert!(!p.contains("DISMISSED"), "no ledger injection in review prompt");
         assert!(p.to_lowercase().contains("omission"), "omission/empty-quote contract present");
         assert!(p.to_lowercase().contains("compliance rule"), "D5 compliance cap note present");
         assert!(p.contains("lens"), "doc prompt must teach model to tag lens id per finding");

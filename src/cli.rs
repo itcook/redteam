@@ -33,10 +33,64 @@ pub struct ReviewArgs {
     /// 其余字段（mode/targets/models/…）在 resume 路径下不生效——run_resume 会重新
     /// `read_args_raw(job_id)` 取原始作业的 ReviewArgs。
     pub resume: Option<String>,
-    /// R8.2：`--dismissed <目录|csv>`，经 `project::parse_dismissed` 解析。`serde(default)`
-    /// 保证旧 job 落盘的 args.json（无此字段）仍可反序列化（resume 兼容）。
+    /// `--dismissed <db路径|csv>`：覆盖台账 db 路径或临时 csv 豁免（design 2026-07-03 #6；
+    /// 缺省 zero-config 自动加载 .redteam/proj.db）。`serde(default)` 保证旧 args.json 兼容。
     #[serde(default)]
     pub dismissed: Option<String>,
+    /// `--no-dismissed`：本次评审完全关闭台账（豁免/预筛/判例注入全停）。
+    #[serde(default)]
+    pub no_dismissed: bool,
+}
+
+/// 台账加载产物（design 2026-07-03 #6 zero-config）：豁免 id 集 + 活跃判例卡 + 披露 meta。
+#[derive(Default, Debug)]
+pub(crate) struct Ledger {
+    pub ids: std::collections::HashSet<String>,
+    pub cards: Vec<crate::db::DismissCard>,
+    pub meta: Option<crate::domain::LedgerMeta>,
+}
+
+/// 加载台账：--no-dismissed → 空；缺省 → `.redteam/proj.db` 存在才加载（零副作用，不建库）；
+/// `--dismissed <值>` → 文件=db 路径覆盖 / 目录=已废弃形态报错引导迁移 / 否则 csv 仅豁免。
+pub(crate) fn load_ledger(
+    dismissed: Option<&str>,
+    no_dismissed: bool,
+    cwd: &Path,
+) -> anyhow::Result<Ledger> {
+    if no_dismissed {
+        return Ok(Ledger::default());
+    }
+    let from_db = |path: &Path, source: String| -> anyhow::Result<Ledger> {
+        let db = crate::db::ProjDb::open_at(path)?;
+        let cards = db.active_cards()?;
+        let ids = db.active_ids()?;
+        let loaded = cards.len();
+        Ok(Ledger { ids, cards, meta: Some(crate::domain::LedgerMeta { loaded, source }) })
+    };
+    match dismissed {
+        None => {
+            let p = cwd.join(crate::project::PROJECT_DIR).join(crate::db::DB_FILE);
+            if !p.exists() {
+                return Ok(Ledger::default());
+            }
+            from_db(&p, format!("{}/{}", crate::project::PROJECT_DIR, crate::db::DB_FILE))
+        }
+        Some(v) => {
+            let p = Path::new(v);
+            if p.is_dir() {
+                anyhow::bail!(
+                    "--dismissed: directory ledgers are retired; migrate cards into .redteam/proj.db \
+                     via 'redteam dismiss add' (see 'redteam dismiss --help')"
+                );
+            }
+            if p.is_file() {
+                return from_db(p, v.to_string());
+            }
+            let ids = crate::project::parse_dismissed(v)?;
+            let loaded = ids.len();
+            Ok(Ledger { ids, cards: Vec::new(), meta: Some(crate::domain::LedgerMeta { loaded, source: "csv".into() }) })
+        }
+    }
 }
 
 fn parse_sev(s: &str) -> Severity {
@@ -159,8 +213,10 @@ struct TailCtx<'a> {
     warnings: Vec<String>,
     failed_models: Vec<String>,
     dismissed: &'a std::collections::HashSet<String>,
-    /// dir 形态台账全文（已截断）——refute pass 判例注入，主题变体跨轮一致抑制。
-    dismissed_notes: &'a str,
+    /// 活跃判例卡——refute 判例注入 + 机械预筛（design 2026-07-03 #3）。
+    precedents: &'a [crate::db::DismissCard],
+    /// 台账加载披露（进 RunMeta.ledger）。
+    ledger_meta: Option<crate::domain::LedgerMeta>,
 }
 
 /// 共用尾段：anchor → dedup → [doc: correlate/apply_clusters] → verify → verdict → 组装 report
@@ -188,7 +244,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
     };
     let (findings, refute_warnings) = verify_findings(
         findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
-        ctx.dismissed_notes,
+        ctx.precedents,
     ).await;
     let mut run_warnings = ctx.warnings;
     run_warnings.extend(refute_warnings);
@@ -215,6 +271,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
             warnings: run_warnings,
             failed_models: ctx.failed_models,
             dismissed_reappeared,
+            ledger: ctx.ledger_meta,
         },
     };
     // 退出码：reject 优先 → 10；否则 approve 但对照集不完整 → 2；干净 approve → 0。
@@ -235,12 +292,10 @@ pub async fn run_review(
     if args.background {
         anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
     }
-    // Fix 3（final-review）：--dismissed 解析上提到证据收集/fan-out 之前 fail-fast——坏值不再
-    // 烧完 LLM 调用才报错。
-    let dismissed = match args.dismissed.as_deref() {
-        Some(v) => crate::project::parse_dismissed(v)?,
-        None => Default::default(),
-    };
+    // Fix 3（final-review）：台账加载上提到证据收集/fan-out 之前 fail-fast——坏值不再
+    // 烧完 LLM 调用才报错。zero-config：缺省自动加载 .redteam/proj.db（存在才启用）。
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, &cwd)?;
     let t0 = std::time::Instant::now();
 
     // 1. mode + 证据
@@ -283,12 +338,11 @@ pub async fn run_review(
         max_concurrency: cfg.review.max_concurrency,
     };
 
-    // 4. fan-out（doc：全 D rule 一包 × model 工具循环）
+    // 4. fan-out（doc：全 D rule 一包 × model 工具循环）。台账不再注入 review prompt
+    //（design 2026-07-03 #2：生成侧勿再报实证无效，判定后置 consolidate）。
     let focus = args.focus.clone().unwrap_or_default();
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
-    let (dismissed_notes, notes_warnings) = args.dismissed.as_deref().map(crate::project::load_dismissed_notes).unwrap_or_default();
-    let mut raw = run_doc_fanout(provider, &input, &lenses, &focus, &dismissed_notes, &oopts, sink).await;
-    raw.warnings.extend(notes_warnings);
+    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink).await;
 
     // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
     let block = args
@@ -314,8 +368,9 @@ pub async fn run_review(
         usage: raw.usage,
         warnings: raw.warnings,
         failed_models: raw.failed_models,
-        dismissed: &dismissed,
-        dismissed_notes: &dismissed_notes,
+        dismissed: &ledger.ids,
+        precedents: &ledger.cards,
+        ledger_meta: ledger.meta.clone(),
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
     assemble_report(raw.findings, ctx).await
@@ -334,12 +389,9 @@ pub async fn run_code_review(
     if args.background {
         anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
     }
-    // Fix 3（final-review）：--dismissed 解析上提到 fan-out 之前 fail-fast——坏值不再烧完 LLM
-    // 调用才报错。
-    let dismissed = match args.dismissed.as_deref() {
-        Some(v) => crate::project::parse_dismissed(v)?,
-        None => Default::default(),
-    };
+    // Fix 3（final-review）：台账加载上提到 fan-out 之前 fail-fast——坏值不再烧完 LLM
+    // 调用才报错。zero-config：缺省自动加载 .redteam/proj.db（存在才启用）。
+    let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, root)?;
     let t0 = std::time::Instant::now();
 
     // 1. 确定性筛选 + 分包
@@ -371,9 +423,8 @@ pub async fn run_code_review(
         "working tree".to_string()
     };
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
-    let (dismissed_notes, notes_warnings) = args.dismissed.as_deref().map(crate::project::load_dismissed_notes).unwrap_or_default();
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &dismissed_notes, &oopts, sink).await;
-    raw.warnings.extend(notes_warnings);
+    // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
+    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, sink).await;
 
     // 5-8. 共用尾段：anchor → dedup → verify → verdict → 组报告（code 无 correlate/clusters）
     let block = args
@@ -398,8 +449,9 @@ pub async fn run_code_review(
         usage: raw.usage,
         warnings: raw.warnings,
         failed_models: raw.failed_models,
-        dismissed: &dismissed,
-        dismissed_notes: &dismissed_notes,
+        dismissed: &ledger.ids,
+        precedents: &ledger.cards,
+        ledger_meta: ledger.meta.clone(),
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
     assemble_report(raw.findings, ctx).await
@@ -517,6 +569,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
             warnings: vec![format!("partial: {done}/{total} cells"), reason],
             failed_models: vec![],
             dismissed_reappeared: vec![],
+            ledger: None,
         },
     };
     let code = exit_code(Verdict::Incomplete, false);
@@ -530,7 +583,7 @@ fn empty_review_args() -> ReviewArgs {
         mode: None, base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         lenses: None, models: None, models_all: false, no_correlate: false,
         block_threshold: None, conf_floor: None, background: false, format: "json".into(),
-        targets: vec![], resume: None, dismissed: None,
+        targets: vec![], resume: None, dismissed: None, no_dismissed: false,
     }
 }
 
@@ -633,18 +686,14 @@ pub async fn run_resume(
     let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     let correlate_on = cfg.review.correlate && !args.no_correlate;
-    // resume 因重读 args.json 自然继承原 --dismissed；run_resume 不返回 Result（异步状态机式），
-    // 故此处不能用 `?`——解析失败按既有约定折成 partial_report（同 empty-manifest/missing-args）。
-    let dismissed = match args.dismissed.as_deref().map(crate::project::parse_dismissed) {
-        Some(Ok(d)) => d,
-        Some(Err(e)) => {
-            return partial_report(ws, job_id, &args, format!("resume: bad --dismissed: {e}"));
+    // resume 因重读 args.json 自然继承原 --dismissed/--no-dismissed；run_resume 不返回 Result
+    //（异步状态机式），故此处不能用 `?`——加载失败按既有约定折成 partial_report。
+    let ledger = match load_ledger(args.dismissed.as_deref(), args.no_dismissed, cwd) {
+        Ok(l) => l,
+        Err(e) => {
+            return partial_report(ws, job_id, &args, format!("resume: bad ledger: {e}"));
         }
-        None => Default::default(),
     };
-    let (dismissed_notes, notes_warnings) =
-        args.dismissed.as_deref().map(crate::project::load_dismissed_notes).unwrap_or_default();
-    warnings.extend(notes_warnings);
 
     let ctx = TailCtx {
         mode,
@@ -662,8 +711,9 @@ pub async fn run_resume(
         usage,
         warnings,
         failed_models: vec![],
-        dismissed: &dismissed,
-        dismissed_notes: &dismissed_notes,
+        dismissed: &ledger.ids,
+        precedents: &ledger.cards,
+        ledger_meta: ledger.meta.clone(),
     };
     match assemble_report(findings, ctx).await {
         Ok((mut report, mut code)) => {
@@ -810,7 +860,7 @@ mod job_tests {
             spec: vec![], focus: None, lenses: None, models: None, models_all: false,
             no_correlate: false, block_threshold: None, conf_floor: None,
             background: true, format: "json".into(), targets: vec![target.into()],
-            resume: None, dismissed: None,
+            resume: None, dismissed: None, no_dismissed: false,
         }
     }
     fn cfg() -> Config {
@@ -1080,7 +1130,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1127,7 +1177,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("alpha,beta".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1162,7 +1212,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![], resume: None, dismissed: None,
+            format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1275,7 +1325,7 @@ default_models=["alpha"]
             spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None, dismissed: None,
+            resume: None, dismissed: None, no_dismissed: false,
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
         let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None).await.unwrap();
@@ -1293,7 +1343,7 @@ default_models=["alpha"]
             models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None, dismissed: None,
+            resume: None, dismissed: None, no_dismissed: false,
         }
     }
 
@@ -1350,6 +1400,54 @@ default_models=["m"]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_ledger_no_dismissed_and_missing_db_are_empty_without_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = load_ledger(None, true, tmp.path()).unwrap();
+        assert!(l.ids.is_empty() && l.cards.is_empty() && l.meta.is_none());
+        // zero-config：proj.db 不存在 → 空台账且不建库/不建目录（零副作用）
+        let l2 = load_ledger(None, false, tmp.path()).unwrap();
+        assert!(l2.ids.is_empty() && l2.meta.is_none());
+        assert!(!tmp.path().join(".redteam").exists(), "自动加载不得建 .redteam/");
+    }
+
+    #[test]
+    fn load_ledger_csv_db_and_retired_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // csv：仅豁免，meta.source=csv
+        let l = load_ledger(Some("d2b371819297f98a,20ba9b3025a8b421"), false, tmp.path()).unwrap();
+        assert_eq!(l.ids.len(), 2);
+        assert!(l.cards.is_empty());
+        assert_eq!(l.meta.as_ref().unwrap().source, "csv");
+        // db 文件路径覆盖：加载活跃卡
+        let dbp = tmp.path().join("x.db");
+        let mut db = crate::db::ProjDb::open_at(&dbp).unwrap();
+        db.dismiss_upsert(&crate::db::DismissCard {
+            id: "1111111111111111".into(), status: "dismissed".into(), title: "t".into(),
+            file: "a.rs".into(), quote: "q".into(), severity: "high".into(),
+            reason: "r".into(), round: "r1".into(), updated_at: String::new(),
+        }).unwrap();
+        drop(db);
+        let l2 = load_ledger(Some(dbp.to_str().unwrap()), false, tmp.path()).unwrap();
+        assert_eq!((l2.ids.len(), l2.cards.len()), (1, 1));
+        assert_eq!(l2.meta.as_ref().unwrap().loaded, 1);
+        // dir 形态已退役 → 明确报错引导迁移
+        let err = load_ledger(Some(tmp.path().to_str().unwrap()), false, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("retired"), "{err}");
+        // zero-config 命中：cwd 下有 .redteam/proj.db → 自动加载
+        let root = tmp.path().join("proj");
+        let mut db2 = crate::db::ProjDb::open(&root).unwrap();
+        db2.dismiss_upsert(&crate::db::DismissCard {
+            id: "2222222222222222".into(), status: "dismissed".into(), title: "t".into(),
+            file: "b.rs".into(), quote: "q".into(), severity: "low".into(),
+            reason: "r".into(), round: String::new(), updated_at: String::new(),
+        }).unwrap();
+        drop(db2);
+        let l3 = load_ledger(None, false, &root).unwrap();
+        assert_eq!(l3.cards.len(), 1);
+        assert!(l3.meta.as_ref().unwrap().source.contains("proj.db"));
+    }
 
     #[tokio::test]
     async fn jobcellsink_manifest_sets_phase_fanout() {

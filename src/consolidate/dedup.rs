@@ -19,7 +19,8 @@ pub fn title_jaccard(a: &str, b: &str) -> f32 {
 /// Jaccard）——对「一方引 1 行、一方引整块」的不等长引用鲁棒。两个模型对同一 bug 即便标题
 /// 措辞不同，引用的代码行仍高度重叠，作为 title_jaccard 之外的合并补救信号。
 /// 任一 quote 为空（如 doc 遗漏类）→ 返回 0，不作 quote 信号。
-fn quote_overlap(a: &str, b: &str) -> f32 {
+/// pub：判例机械预筛（verify::matches_precedent）复用同一相似度口径。
+pub fn quote_overlap(a: &str, b: &str) -> f32 {
     let norm = |q: &str| -> BTreeSet<String> {
         q.lines()
             .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))

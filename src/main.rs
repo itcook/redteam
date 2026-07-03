@@ -68,12 +68,13 @@ enum Cmd {
         /// （原始 mode/targets/models 等从该作业落盘的 args.json 里重建）。
         #[arg(long)]
         resume: Option<String>,
-        /// R8.2：既往驳回清单——目录（内含 `<id>.md`）或 16-hex id 逗号列表；命中的 finding
-        /// 豁免 verdict blocking，报告标出 previously_dismissed + run.dismissed_reappeared。
-        /// 注意：目录形态时台账文件内容会（截断后）注入评审 prompt 作「勿再报」上下文；
-        /// csv 形态仅豁免、无注入。
+        /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：
+        /// 项目存在 .redteam/proj.db 即自动加载（豁免 + refute 判例裁决），run.ledger 披露。
         #[arg(long)]
         dismissed: Option<String>,
+        /// 本次评审完全关闭台账（豁免/预筛/判例注入全停）。
+        #[arg(long)]
+        no_dismissed: bool,
         /// 评审目标：doc 模式为受审文档路径（可多个）；code 模式留空（评当前改动）。
         targets: Vec<String>,
     },
@@ -364,6 +365,7 @@ async fn main() {
             format,
             resume,
             dismissed,
+            no_dismissed,
             targets,
         } => {
             let cfg = load_config_warned();
@@ -400,7 +402,7 @@ async fn main() {
             let args = ReviewArgs {
                 mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
                 no_correlate, block_threshold, conf_floor, background, format, targets,
-                resume: None, dismissed,
+                resume: None, dismissed, no_dismissed,
             };
 
             // 后台：写 pending + args 文件 → spawn detached worker → 打印 job-id 退出。
@@ -938,6 +940,7 @@ mod tests {
             targets: vec![],
             resume: None,
             dismissed: None,
+            no_dismissed: false,
         };
         let result = build_registry(&args, &cfg, cwd);
         assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");

@@ -55,6 +55,17 @@ pub struct RunMeta {
     /// R8.2 派生索引：本次命中 dismissed 的 finding id（权威源是 findings.previously_dismissed）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dismissed_reappeared: Vec<String>,
+    /// 台账自动加载披露——zero-config 下 verdict 受台账影响必须可见（design 2026-07-03 #6）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<LedgerMeta>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LedgerMeta {
+    /// 加载的活跃判例卡数（withdrawn/stale 不计）。
+    pub loaded: usize,
+    /// 来源描述：db 路径或 "csv"。
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
