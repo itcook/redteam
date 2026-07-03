@@ -16,7 +16,7 @@ pub const STATUSES: &[&str] = &["dismissed", "re-upheld", "human-confirmed", "wi
 /// 活跃状态（参与豁免/预筛/注入）。
 const ACTIVE_STATUSES: &str = "('dismissed','re-upheld','human-confirmed')";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct DismissCard {
     pub id: String,
     pub status: String,

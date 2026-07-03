@@ -2,7 +2,6 @@ use redteam::cli::{parse_format, resolve_models, ReviewArgs};
 use redteam::config::Config;
 use redteam::model::Prober as _;
 use redteam::domain::Mode;
-use redteam::evidence::{detect_mode, EvidenceOpts, Scope};
 use redteam::output::render;
 use redteam::provider::backends::backend_from_config;
 use redteam::provider::registry::ProviderRegistry;
@@ -108,8 +107,70 @@ enum Cmd {
         #[command(subcommand)]
         action: ModelCmd,
     },
+    /// 驳回判例台账（.redteam/proj.db）：建卡/查卡/状态迁移/锚失效回收。
+    Dismiss {
+        #[command(subcommand)]
+        action: DismissCmd,
+    },
     /// 幂等创建项目级 .redteam/ 骨架（config.toml 模板、.gitignore、dismissed/、rounds/）。
     Init,
+}
+
+#[derive(Subcommand)]
+enum DismissCmd {
+    /// 建卡（记一条人裁驳回判例）。快照四件套优先从 --from 报告按 id 自动抄写。
+    Add {
+        /// finding id（16 位 hex，来自评审报告）。
+        id: String,
+        /// 驳回理由（判例核心，refute 判例裁决与人读都依赖它）。
+        #[arg(long)]
+        reason: String,
+        /// 评审报告 JSON 路径（redteam result 输出）——按 id 自动抄 title/file/quote/severity。
+        #[arg(long)]
+        from: Option<String>,
+        /// 驳回发生轮次（如 r2），可选。
+        #[arg(long, default_value = "")]
+        round: String,
+        /// 快照字段（无 --from 时必须全给；与 --from 并用时覆盖抄写值）。
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        quote: Option<String>,
+        #[arg(long)]
+        severity: Option<String>,
+    },
+    /// 列卡（默认全状态）。
+    List {
+        /// 按状态过滤：dismissed | re-upheld | human-confirmed | withdrawn | stale。
+        #[arg(long)]
+        status: Option<String>,
+        /// 输出格式：table（默认，人读）| json。
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// 单卡详情 + 全部历史事件。
+    Show { id: String },
+    /// 状态迁移（协议动作：re-upheld=复裁仍误报 / human-confirmed=人裁终局 /
+    /// withdrawn=改判属实 / dismissed=回滚）。历史全留痕；不做状态机硬约束。
+    SetStatus {
+        id: String,
+        #[arg(value_parser = redteam::db::STATUSES.to_vec())]
+        status: String,
+        /// 迁移发生轮次（如 r3），可选。
+        #[arg(long, default_value = "")]
+        round: String,
+        /// 新理由；缺省沿用卡上原理由。
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// 锚失效回收：quote 在当前代码中已不存在的活跃卡 → 标 stale（human-confirmed 豁免）。
+    /// 默认 dry-run 只打印清单；--apply 才落账。
+    Gc {
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -599,6 +660,7 @@ async fn main() {
                 }
             }
         },
+        Cmd::Dismiss { action } => run_dismiss(action),
         Cmd::Init => {
             match redteam::project::init_project(std::path::Path::new(".")) {
                 Ok(c) if c.is_empty() => println!(".redteam/ already complete"),
@@ -628,6 +690,151 @@ fn serde_str<T: serde::Serialize>(v: &T) -> String {
         .ok()
         .and_then(|x| x.as_str().map(String::from))
         .unwrap_or_default()
+}
+
+/// dismiss 子命令族：台账机器化（design 2026-07-03）。同步执行，直读写 proj.db。
+fn run_dismiss(action: DismissCmd) -> i32 {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut db = match redteam::db::ProjDb::open(&cwd) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("error: {e}"); return 2; }
+    };
+    let r = match action {
+        DismissCmd::Add { id, reason, from, round, title, file, quote, severity } => {
+            dismiss_add(&mut db, id, reason, from, round, title, file, quote, severity)
+        }
+        DismissCmd::List { status, format } => (|| {
+            let cards = db.dismiss_list(status.as_deref())?;
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&cards)?);
+            } else {
+                println!("{:<16}  {:<15}  {:<8}  {:<4}  {:<10}  {}", "ID", "STATUS", "SEV", "RND", "UPDATED", "FILE | TITLE");
+                for c in &cards {
+                    let title: String = c.title.chars().take(60).collect();
+                    println!("{:<16}  {:<15}  {:<8}  {:<4}  {:<10}  {} | {}", c.id, c.status, c.severity, c.round, c.updated_at, c.file, title);
+                }
+                println!("({} cards)", cards.len());
+            }
+            Ok(())
+        })(),
+        DismissCmd::Show { id } => (|| {
+            let card = db.dismiss_get(&id)?.ok_or_else(|| anyhow::anyhow!("no card with id {id}"))?;
+            println!("{}", serde_json::to_string_pretty(&card)?);
+            println!("history:");
+            for (status, round, reason, at) in db.dismiss_history(&id)? {
+                println!("  {at}  {status}({round})  {reason}");
+            }
+            Ok(())
+        })(),
+        DismissCmd::SetStatus { id, status, round, reason } => (|| {
+            let (card, warn) = db.dismiss_set_status(&id, &status, &round, reason.as_deref())?;
+            if let Some(w) = warn { eprintln!("warning: {w}"); }
+            println!("{} -> {}", card.id, card.status);
+            Ok(())
+        })(),
+        DismissCmd::Gc { apply } => dismiss_gc(&mut db, &cwd, apply),
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => { eprintln!("error: {e}"); 2 }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dismiss_add(
+    db: &mut redteam::db::ProjDb,
+    id: String, reason: String, from: Option<String>, round: String,
+    title: Option<String>, file: Option<String>, quote: Option<String>, severity: Option<String>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(redteam::project::is_hex16(&id), "id must be a 16-hex finding id, got '{id}'");
+    // --from 打底，单字段 flag 覆盖；两路都缺 → 报错拒瘦卡（无快照的卡 gc 不可判、判例残缺）
+    let snap = match &from {
+        Some(path) => Some(snapshot_from_report(path, &id)?),
+        None => None,
+    };
+    let pick = |explicit: Option<String>, from_val: Option<String>, name: &str| -> anyhow::Result<String> {
+        explicit.or(from_val).ok_or_else(|| anyhow::anyhow!(
+            "missing snapshot field '{name}': pass --from <result.json> or --{name}"))
+    };
+    let (ft, ff, fq, fs) = match snap {
+        Some((t, f, q, s)) => (Some(t), Some(f), Some(q), Some(s)),
+        None => (None, None, None, None),
+    };
+    let card = redteam::db::DismissCard {
+        id: id.clone(),
+        status: "dismissed".into(),
+        title: pick(title, ft, "title")?,
+        file: pick(file, ff, "file")?,
+        // quote 允许为空串（doc 遗漏类 finding 本就无引文），但字段必须显式来自快照或 flag
+        quote: pick(quote, fq, "quote")?,
+        severity: pick(severity, fs, "severity")?,
+        reason,
+        round,
+        updated_at: String::new(),
+    };
+    db.dismiss_upsert(&card)?;
+    println!("dismissed {id} recorded");
+    Ok(())
+}
+
+/// 从评审报告 JSON 按 id 抄快照四件套 (title, file, quote, severity)。
+fn snapshot_from_report(path: &str, id: &str) -> anyhow::Result<(String, String, String, String)> {
+    let raw = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parse {path}: {e}"))?;
+    let f = v["findings"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("{path}: no findings array"))?
+        .iter()
+        .find(|f| f["id"].as_str() == Some(id))
+        .ok_or_else(|| anyhow::anyhow!("finding {id} not in {path}"))?;
+    let s = |k: &str| f[k].as_str().unwrap_or_default().to_string();
+    Ok((s("title"), s("file"), s("quote"), s("severity")))
+}
+
+/// 锚失效回收：反转遍历（一次 walk，对未存活候选做 contains 消活）——O(files) 而非 O(cards×files)。
+/// 匹配保守（宁保卡不误杀）：整段 quote 或其最长非空行命中任一文件即视为存活。
+fn dismiss_gc(db: &mut redteam::db::ProjDb, root: &std::path::Path, apply: bool) -> anyhow::Result<()> {
+    let candidates: Vec<_> = db
+        .active_cards()?
+        .into_iter()
+        .filter(|c| c.status != "human-confirmed") // 人裁终局豁免 gc
+        .filter(|c| !c.quote.trim().is_empty())    // 无锚不可机械判，跳过
+        .collect();
+    if candidates.is_empty() {
+        println!("gc: no eligible cards (need active, non-human-confirmed, with quote)");
+        return Ok(());
+    }
+    let needle = |c: &redteam::db::DismissCard| -> (String, String) {
+        let q = c.quote.trim().to_string();
+        let longest = q.lines().map(str::trim).filter(|l| !l.is_empty())
+            .max_by_key(|l| l.len()).unwrap_or_default().to_string();
+        (q, longest)
+    };
+    let mut dead: Vec<(redteam::db::DismissCard, (String, String))> =
+        candidates.into_iter().map(|c| { let n = needle(&c); (c, n) }).collect();
+    for entry in ignore::Walk::new(root).flatten() {
+        if dead.is_empty() { break; }
+        if !entry.file_type().is_some_and(|t| t.is_file()) { continue; }
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            dead.retain(|(_, (q, l))| !(content.contains(q.as_str()) || (!l.is_empty() && content.contains(l.as_str()))));
+        }
+    }
+    if dead.is_empty() {
+        println!("gc: all quotes still anchored, nothing to collect");
+        return Ok(());
+    }
+    for (c, _) in &dead {
+        println!("stale: {}  {}  {}", c.id, c.file, c.title.chars().take(60).collect::<String>());
+    }
+    if apply {
+        for (c, _) in &dead {
+            db.dismiss_set_status(&c.id, "stale", "gc", None)?;
+        }
+        println!("gc: {} card(s) marked stale", dead.len());
+    } else {
+        println!("gc: dry-run ({} candidate(s)); pass --apply to mark stale", dead.len());
+    }
+    Ok(())
 }
 
 /// M5 批2：`status --format table` 人读视图（opt-in；默认 JSON 数组契约不动）。
