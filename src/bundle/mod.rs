@@ -88,7 +88,12 @@ pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
     let mut s = entries.join(", ");
     let extra = total - kept;
     if extra > 0 {
-        s.push_str(&format!(", … and {extra} more files"));
+        if s.is_empty() {
+            // 首条即超预算的极端截断：避免输出以 ", " 开头
+            s = format!("… and {extra} more files");
+        } else {
+            s.push_str(&format!(", … and {extra} more files"));
+        }
     }
     s
 }

@@ -53,9 +53,13 @@ fn assemble_changes(files: &[String], per_file: impl Fn(&str) -> String) -> Vec<
 }
 
 fn git(args: &[&str]) -> anyhow::Result<String> {
-    // -c color.ui=false：用户 color.diff=always 时 ANSI 码会污染管道输出
-    // （diff 内容/行数统计/prompt 注入），单点关死（dogfood 20260703 r2 b4d096e0）。
-    let out = Command::new("git").args(["-c", "color.ui=false"]).args(args).output()?;
+    // 关死 ANSI 污染（dogfood 20260703 r2 b4d096e0 / r3 661e3973 活体实证）：
+    // color.ui=false 压不住更具体的 color.diff=always（git 具体键优先），必须
+    // 同时给 color.diff=false——命令行 -c 恒优先于文件 config。
+    let out = Command::new("git")
+        .args(["-c", "color.ui=false", "-c", "color.diff=false"])
+        .args(args)
+        .output()?;
     if !out.status.success() {
         anyhow::bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     }
