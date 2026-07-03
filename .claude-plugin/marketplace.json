@@ -1,5 +1,5 @@
 {
-  "name": "breakpoint",
+  "name": "redteam",
   "owner": {
     "name": "S.Kai",
     "email": "laiwei@me.com"
@@ -7,8 +7,8 @@
   "description": "模型无关的对抗式代码/文档评审工具",
   "plugins": [
     {
-      "name": "breakpoint",
-      "source": "./plugins/breakpoint",
+      "name": "redteam",
+      "source": "./plugins/redteam",
       "description": "对抗式评审：多模型扇出 + 工具循环 + 定向核实，输出 verdict/findings"
     }
   ]

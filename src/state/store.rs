@@ -89,19 +89,19 @@ pub fn read_partial(ws: &Path, id: &str) -> Vec<CellRecord> {
         .collect()
 }
 
-/// 状态根目录：$BRK_STATE_DIR → $TMPDIR/breakpoint → /tmp/breakpoint。
+/// 状态根目录：$REDTEAM_STATE_DIR → $TMPDIR/redteam → /tmp/redteam。
 pub fn state_root() -> PathBuf {
-    if let Ok(d) = std::env::var("BRK_STATE_DIR") {
+    if let Ok(d) = std::env::var("REDTEAM_STATE_DIR") {
         if !d.is_empty() {
             return PathBuf::from(d);
         }
     }
     if let Ok(t) = std::env::var("TMPDIR") {
         if !t.is_empty() {
-            return PathBuf::from(t).join("breakpoint");
+            return PathBuf::from(t).join("redteam");
         }
     }
-    PathBuf::from("/tmp/breakpoint")
+    PathBuf::from("/tmp/redteam")
 }
 
 /// 按 workspace 路径 fnv1a64 分桶（canonicalize 失败则用原路径字符串）。
@@ -282,24 +282,24 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn state_root_prefers_brk_state_dir() {
+    fn state_root_prefers_redteam_state_dir() {
         let _g = ENV_LOCK.lock().unwrap();
         // SAFETY: ENV_LOCK 串行化 env 变更
-        unsafe { std::env::set_var("BRK_STATE_DIR", "/custom/brk"); }
-        assert_eq!(state_root(), PathBuf::from("/custom/brk"));
-        unsafe { std::env::remove_var("BRK_STATE_DIR"); }
+        unsafe { std::env::set_var("REDTEAM_STATE_DIR", "/custom/redteam"); }
+        assert_eq!(state_root(), PathBuf::from("/custom/redteam"));
+        unsafe { std::env::remove_var("REDTEAM_STATE_DIR"); }
     }
 
     #[test]
     fn workspace_bucket_is_stable_hash_under_root() {
         let _g = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("BRK_STATE_DIR", "/s"); }
+        unsafe { std::env::set_var("REDTEAM_STATE_DIR", "/s"); }
         let b1 = workspace_bucket(Path::new("/proj/a"));
         let b2 = workspace_bucket(Path::new("/proj/a"));
         assert_eq!(b1, b2, "same root → same bucket");
         assert!(b1.starts_with("/s"), "bucket under state_root");
         assert_ne!(workspace_bucket(Path::new("/proj/b")), b1, "different root → different bucket");
-        unsafe { std::env::remove_var("BRK_STATE_DIR"); }
+        unsafe { std::env::remove_var("REDTEAM_STATE_DIR"); }
     }
 
     #[test]

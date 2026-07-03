@@ -375,11 +375,11 @@ mod tests {
     }
 
     /// 真实网络冒烟测试：需要真实 API key，不在 CI 跑。
-    /// 手动运行：`BRK_SMOKE_ANTHROPIC_KEY=<key> cargo test -- --ignored smoke_anthropic_run`。
+    /// 手动运行：`REDTEAM_SMOKE_ANTHROPIC_KEY=<key> cargo test -- --ignored smoke_anthropic_run`。
     #[tokio::test]
     #[ignore = "requires real API key + network; run manually with --ignored"]
     async fn smoke_anthropic_run() {
-        let key = std::env::var("BRK_SMOKE_ANTHROPIC_KEY").expect("set BRK_SMOKE_ANTHROPIC_KEY");
+        let key = std::env::var("REDTEAM_SMOKE_ANTHROPIC_KEY").expect("set REDTEAM_SMOKE_ANTHROPIC_KEY");
         let pc = ProviderConfig {
             kind: ProviderKind::Anthropic,
             model: "claude-3-5-haiku-latest".into(),

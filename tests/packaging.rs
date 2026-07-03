@@ -26,49 +26,49 @@ fn frontmatter(body: &str, key: &str) -> Option<String> {
 fn manifests_valid_and_named() {
     // marketplace.json
     let m = json(".claude-plugin/marketplace.json");
-    assert_eq!(m["name"], "breakpoint", "marketplace name");
+    assert_eq!(m["name"], "redteam", "marketplace name");
     assert_eq!(m["owner"]["name"], "S.Kai", "owner.name");
     let plugins = m["plugins"].as_array().expect("plugins array");
-    let entry = plugins.iter().find(|p| p["name"] == "breakpoint").expect("breakpoint entry");
-    assert_eq!(entry["source"], "./plugins/breakpoint", "relative source");
+    let entry = plugins.iter().find(|p| p["name"] == "redteam").expect("redteam entry");
+    assert_eq!(entry["source"], "./plugins/redteam", "relative source");
     assert!(entry.get("version").is_none(), "version must live in plugin.json only");
 
     // plugin.json
-    let p = json("plugins/breakpoint/.claude-plugin/plugin.json");
-    assert_eq!(p["name"], "breakpoint", "plugin name → namespace");
+    let p = json("plugins/redteam/.claude-plugin/plugin.json");
+    assert_eq!(p["name"], "redteam", "plugin name → namespace");
     assert_eq!(p["version"], "1.0.0", "plugin version is authoritative");
     assert_eq!(p["author"]["email"], "laiwei@me.com");
 
     // .codex-plugin/plugin.json
-    let c = json("plugins/breakpoint/.codex-plugin/plugin.json");
-    assert_eq!(c["name"], "breakpoint");
+    let c = json("plugins/redteam/.codex-plugin/plugin.json");
+    assert_eq!(c["name"], "redteam");
     assert_eq!(c["skills"], "codex-skills", "codex skills dir → no Claude collision");
 }
 
 #[test]
 fn commands_frontmatter_and_invocation_policy() {
-    for name in ["review", "status", "result", "lgtm"] {
-        let body = read(&format!("plugins/breakpoint/commands/{name}.md"));
+    for name in ["review", "status", "result", "ship"] {
+        let body = read(&format!("plugins/redteam/commands/{name}.md"));
         assert!(frontmatter(&body, "description").is_some(), "{name}: description required");
         assert!(
-            body.contains("${CLAUDE_PLUGIN_ROOT}/bin/brk "),
-            "{name}: must invoke the bin/brk launcher via plugin root"
+            body.contains("${CLAUDE_PLUGIN_ROOT}/bin/redteam "),
+            "{name}: must invoke the bin/redteam launcher via plugin root"
         );
         assert!(
-            !body.contains("brk-darwin-arm64"),
+            !body.contains("redteam-darwin-arm64"),
             "{name}: must not reference the old flat binary name"
         );
         assert!(body.contains("$ARGUMENTS"), "{name}: must forward $ARGUMENTS");
     }
-    // review/lgtm 计费重（lgtm 是烧钱长循环，同 review 政策）→ 禁模型自动调用
-    for name in ["review", "lgtm"] {
-        let body = read(&format!("plugins/breakpoint/commands/{name}.md"));
+    // review/ship 计费重（ship 是烧钱长循环，同 review 政策）→ 禁模型自动调用
+    for name in ["review", "ship"] {
+        let body = read(&format!("plugins/redteam/commands/{name}.md"));
         assert_eq!(frontmatter(&body, "disable-model-invocation").as_deref(), Some("true"),
             "{name} must disable model invocation");
     }
     // status/result 轻读 → 允许模型触发（不设该字段）
     for name in ["status", "result"] {
-        let body = read(&format!("plugins/breakpoint/commands/{name}.md"));
+        let body = read(&format!("plugins/redteam/commands/{name}.md"));
         assert!(frontmatter(&body, "disable-model-invocation").is_none(),
             "{name} must allow model invocation");
     }
@@ -98,7 +98,7 @@ fn codex_skills_in_sync_with_commands() {
         .expect("run gen-codex-skills");
     assert!(status.success(), "gen-codex-skills exit non-zero");
 
-    let committed = Path::new("plugins/breakpoint/codex-skills");
+    let committed = Path::new("plugins/redteam/codex-skills");
     let gen_files = list_files(tmp.path());
     let com_files = list_files(committed);
 
@@ -119,14 +119,14 @@ fn codex_skills_in_sync_with_commands() {
 
 #[test]
 fn codex_skills_have_name_and_no_claude_var() {
-    for name in ["review", "status", "result", "lgtm"] {
-        let s = read(&format!("plugins/breakpoint/codex-skills/{name}/SKILL.md"));
+    for name in ["review", "status", "result", "ship"] {
+        let s = read(&format!("plugins/redteam/codex-skills/{name}/SKILL.md"));
         assert!(s.contains(&format!("name: {name}")), "{name}: skill must declare name");
         assert!(!s.contains("CLAUDE_PLUGIN_ROOT"),
             "{name}: CLAUDE_PLUGIN_ROOT must be rewritten to CODEX_PLUGIN_ROOT");
-        assert!(s.contains("${CODEX_PLUGIN_ROOT}/bin/brk "),
-            "{name}: codex skill must invoke the bin/brk launcher");
-        assert!(!s.contains("brk-darwin-arm64"),
+        assert!(s.contains("${CODEX_PLUGIN_ROOT}/bin/redteam "),
+            "{name}: codex skill must invoke the bin/redteam launcher");
+        assert!(!s.contains("redteam-darwin-arm64"),
             "{name}: must not reference the old flat binary name");
     }
 }
@@ -134,11 +134,11 @@ fn codex_skills_have_name_and_no_claude_var() {
 #[test]
 fn binary_layout_and_launcher() {
     // launcher（稳定入口）存在且可执行
-    let launcher = Path::new("plugins/breakpoint/bin/brk");
+    let launcher = Path::new("plugins/redteam/bin/redteam");
     let lmeta = std::fs::metadata(launcher)
-        .unwrap_or_else(|e| panic!("launcher bin/brk missing: {e}"));
+        .unwrap_or_else(|e| panic!("launcher bin/redteam missing: {e}"));
     // shipped darwin/aarch64 真二进制存在且非空
-    let real = Path::new("plugins/breakpoint/bin/darwin/aarch64/brk");
+    let real = Path::new("plugins/redteam/bin/darwin/aarch64/redteam");
     let rmeta = std::fs::metadata(real)
         .unwrap_or_else(|e| panic!("darwin/aarch64 binary missing (run `make build`): {e}"));
     assert!(rmeta.len() > 0, "binary is empty");
@@ -149,10 +149,10 @@ fn binary_layout_and_launcher() {
         assert!(rmeta.permissions().mode() & 0o111 != 0, "binary not executable");
     }
     // 旧扁平二进制已删
-    assert!(!Path::new("plugins/breakpoint/bin/brk-darwin-arm64").exists(),
+    assert!(!Path::new("plugins/redteam/bin/redteam-darwin-arm64").exists(),
         "old flat binary must be removed");
     // launcher 内容：探测 os/arch + 127 报错
-    let src = read("plugins/breakpoint/bin/brk");
+    let src = read("plugins/redteam/bin/redteam");
     assert!(src.contains("uname -s") && src.contains("uname -m"), "launcher must probe os/arch");
     assert!(src.contains("exit 127"), "launcher must exit 127 on resolution failure");
 }
@@ -161,7 +161,7 @@ fn binary_layout_and_launcher() {
 #[test]
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), ignore)]
 fn launcher_resolves_on_this_platform() {
-    let ok = Command::new("plugins/breakpoint/bin/brk")
+    let ok = Command::new("plugins/redteam/bin/redteam")
         .arg("--help").output().expect("spawn launcher");
     assert!(ok.status.success(), "launcher --help should succeed on this platform");
 }
@@ -171,14 +171,14 @@ fn launcher_resolves_on_this_platform() {
 #[test]
 fn launcher_errors_when_binary_missing() {
     let tmp = tempfile::tempdir().expect("tmpdir");
-    let launcher = tmp.path().join("brk");
-    std::fs::copy("plugins/breakpoint/bin/brk", &launcher).expect("copy launcher");
+    let launcher = tmp.path().join("redteam");
+    std::fs::copy("plugins/redteam/bin/redteam", &launcher).expect("copy launcher");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    // 临时目录下没有 <os>/<arch>/brk → launcher 命中缺失分支
+    // 临时目录下没有 <os>/<arch>/redteam → launcher 命中缺失分支
     let miss = Command::new(&launcher).arg("review").output().expect("spawn launcher");
     assert_eq!(miss.status.code(), Some(127), "missing binary → exit 127");
     assert!(String::from_utf8_lossy(&miss.stderr).contains("no binary for"),

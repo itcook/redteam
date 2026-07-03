@@ -1,16 +1,16 @@
-use breakpoint::cli::{run_code_review, run_review, ReviewArgs};
-use breakpoint::config::Config;
-use breakpoint::domain::{Severity, Verdict};
-use breakpoint::evidence::git::FileChange;
-use breakpoint::provider::fake::FakeProvider;
-use breakpoint::provider::tool_loop::{AssistantTurn, FakeChatBackend, ToolLoopProvider};
-use breakpoint::tools::ToolCall;
+use redteam::cli::{run_code_review, run_review, ReviewArgs};
+use redteam::config::Config;
+use redteam::domain::{Severity, Verdict};
+use redteam::evidence::git::FileChange;
+use redteam::provider::fake::FakeProvider;
+use redteam::provider::tool_loop::{AssistantTurn, FakeChatBackend, ToolLoopProvider};
+use redteam::tools::ToolCall;
 use serde_json::json;
 
 
 #[tokio::test]
 async fn doc_review_end_to_end_rejects() {
-    use breakpoint::domain::RawFinding;
+    use redteam::domain::RawFinding;
     use std::collections::BTreeMap;
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("spec.md");
@@ -126,13 +126,13 @@ default_models=["m"]
 
 #[tokio::test]
 async fn code_replicate_two_models_yield_agreement_two() {
-    use breakpoint::cli::{run_code_review, ReviewArgs};
-    use breakpoint::config::Config;
-    use breakpoint::domain::{Severity, Verdict};
-    use breakpoint::evidence::git::FileChange;
-    use breakpoint::provider::registry::ProviderRegistry;
-    use breakpoint::provider::fake::FakeProvider;
-    use breakpoint::domain::RawFinding;
+    use redteam::cli::{run_code_review, ReviewArgs};
+    use redteam::config::Config;
+    use redteam::domain::{Severity, Verdict};
+    use redteam::evidence::git::FileChange;
+    use redteam::provider::registry::ProviderRegistry;
+    use redteam::provider::fake::FakeProvider;
+    use redteam::domain::RawFinding;
 
     fn rf(file: &str, quote: &str, sev: Severity) -> RawFinding {
         RawFinding {
@@ -175,13 +175,13 @@ default_models=["alpha","beta"]
 
 #[tokio::test]
 async fn code_replicate_unreachable_model_exits_two() {
-    use breakpoint::cli::{run_code_review, ReviewArgs};
-    use breakpoint::config::Config;
-    use breakpoint::domain::{Severity, Verdict};
-    use breakpoint::evidence::git::FileChange;
-    use breakpoint::provider::registry::ProviderRegistry;
-    use breakpoint::provider::fake::FakeProvider;
-    use breakpoint::domain::RawFinding;
+    use redteam::cli::{run_code_review, ReviewArgs};
+    use redteam::config::Config;
+    use redteam::domain::{Severity, Verdict};
+    use redteam::evidence::git::FileChange;
+    use redteam::provider::registry::ProviderRegistry;
+    use redteam::provider::fake::FakeProvider;
+    use redteam::domain::RawFinding;
 
     fn rf_low(file: &str, quote: &str) -> RawFinding {
         RawFinding {
@@ -219,8 +219,8 @@ default_models=["alpha","ghost"]
 
 #[tokio::test]
 async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
-    use breakpoint::cli::{run_review, ReviewArgs};
-    use breakpoint::domain::{RawFinding, Severity, Verdict};
+    use redteam::cli::{run_review, ReviewArgs};
+    use redteam::domain::{RawFinding, Severity, Verdict};
     use std::collections::BTreeMap;
 
     let dir = tempfile::tempdir().unwrap();
@@ -247,9 +247,9 @@ async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
     scripted.insert("beta".into(), vec![
         rf(&dp, "self-contradiction on retry", "the system MUST never retry", Severity::High),
     ]);
-    let provider = breakpoint::provider::fake::FakeProvider { scripted };
+    let provider = redteam::provider::fake::FakeProvider { scripted };
 
-    let cfg = breakpoint::config::Config::from_layers(&[
+    let cfg = redteam::config::Config::from_layers(&[
         "[providers.alpha]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
          [providers.beta]\nkind=\"openai\"\nmodel=\"b\"\npriority=5\n\
          [review]\ndefault_models=[\"alpha\",\"beta\"]\n",
@@ -283,12 +283,12 @@ async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
 
 #[tokio::test]
 async fn code_replicate_lone_blocking_refuted_stays_approve() {
-    use breakpoint::cli::{run_code_review, ReviewArgs};
-    use breakpoint::config::Config;
-    use breakpoint::domain::{Severity, Verdict, VerifyVerdict, RawFinding};
-    use breakpoint::evidence::git::FileChange;
-    use breakpoint::provider::registry::ProviderRegistry;
-    use breakpoint::provider::fake::FakeProvider;
+    use redteam::cli::{run_code_review, ReviewArgs};
+    use redteam::config::Config;
+    use redteam::domain::{Severity, Verdict, VerifyVerdict, RawFinding};
+    use redteam::evidence::git::FileChange;
+    use redteam::provider::registry::ProviderRegistry;
+    use redteam::provider::fake::FakeProvider;
 
     fn rf(file: &str, quote: &str, title: &str, sev: Severity) -> RawFinding {
         RawFinding { severity: sev, title: title.into(), body: "b".into(), file: file.into(),
@@ -330,7 +330,7 @@ default_models=["alpha"]
 /// 跑 run_review 后断言报告里该 finding 被 clamp_compliance 钳到 Medium。
 #[tokio::test]
 async fn doc_d5_compliance_hard_cap_clamps_high_to_medium() {
-    use breakpoint::domain::RawFinding;
+    use redteam::domain::RawFinding;
 
     let dir = tempfile::tempdir().unwrap();
     let doc_path = dir.path().join("spec.md");

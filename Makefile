@@ -1,4 +1,4 @@
-BIN := plugins/breakpoint/bin/darwin/aarch64/brk
+BIN := plugins/redteam/bin/darwin/aarch64/redteam
 TARGET := aarch64-apple-darwin
 
 .PHONY: all gen build verify
@@ -13,10 +13,10 @@ gen:
 build:
 	cargo build --release --target $(TARGET)
 	mkdir -p $(dir $(BIN))
-	cp target/$(TARGET)/release/brk $(BIN)
-	chmod +x plugins/breakpoint/bin/brk
+	cp target/$(TARGET)/release/redteam $(BIN)
+	chmod +x plugins/redteam/bin/redteam
 
 # 本地等价 CI 防漂移：重生成后无 git 改动
 verify: gen
-	git diff --exit-code plugins/breakpoint/codex-skills/
+	git diff --exit-code plugins/redteam/codex-skills/
 	cargo test --test packaging

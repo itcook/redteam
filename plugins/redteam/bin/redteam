@@ -1,5 +1,5 @@
 #!/bin/sh
-# brk launcher — resolve <os>/<arch> and exec the matching binary.
+# redteam launcher — resolve <os>/<arch> and exec the matching binary.
 # 稳定入口：插件命令壳与 loop SKILL 都调本文件；平台探测只此一处。
 # 调用约定（2026-07-02 决议·方案A）：本 launcher 是 POSIX sh，自身可执行性先于 uname 探测，
 #   依赖两前提——(1) 调用方提供 sh：Claude Code / Codex 宿主的 Bash 工具主场景保证在场
@@ -16,19 +16,19 @@ case "$(uname -s)" in
     Darwin) os=darwin ;;
     Linux)  os=linux ;;
     MINGW*|MSYS*|CYGWIN*) os=windows ;;
-    *) echo "brk: unsupported OS $(uname -s)" >&2; exit 127 ;;
+    *) echo "redteam: unsupported OS $(uname -s)" >&2; exit 127 ;;
 esac
 case "$(uname -m)" in
     arm64|aarch64) arch=aarch64 ;;
     x86_64|amd64)  arch=x86_64 ;;
-    *) echo "brk: unsupported arch $(uname -m)" >&2; exit 127 ;;
+    *) echo "redteam: unsupported arch $(uname -m)" >&2; exit 127 ;;
 esac
 
 ext=""
 [ "$os" = windows ] && ext=".exe"
-target="$dir/$os/$arch/brk$ext"
+target="$dir/$os/$arch/redteam$ext"
 if [ ! -x "$target" ]; then
-    echo "brk: no binary for $os/$arch (shipped: darwin/aarch64; run 'make build' or fetch from release)" >&2
+    echo "redteam: no binary for $os/$arch (shipped: darwin/aarch64; run 'make build' or fetch from release)" >&2
     exit 127
 fi
 exec "$target" "$@"

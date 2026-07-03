@@ -97,9 +97,6 @@ pub struct Config {
 impl Config {
     /// 真实加载：内置默认（空）→ 各分层文件文本依次合并。
     pub fn load() -> anyhow::Result<Config> {
-        if std::path::Path::new(".breakpoint.toml").exists() {
-            eprintln!("breakpoint: legacy .breakpoint.toml is no longer read; move it to .breakpoint/config.toml");
-        }
         let texts: Vec<String> = config_paths()
             .into_iter()
             .filter_map(|p| std::fs::read_to_string(p).ok())
@@ -144,8 +141,8 @@ fn merge(base: &mut toml::Value, overlay: toml::Value) {
 
 /// 分层路径（左→右优先级递增）：用户 → 项目。内置默认由 serde default 提供。
 pub fn config_paths() -> Vec<PathBuf> {
-    let mut v = vec![secrets::dirs_config().join("breakpoint").join("config.toml")];
-    v.push(PathBuf::from(".breakpoint").join("config.toml"));
+    let mut v = vec![secrets::dirs_config().join("redteam").join("config.toml")];
+    v.push(PathBuf::from(".redteam").join("config.toml"));
     v
 }
 
@@ -254,15 +251,15 @@ block_threshold="high"
     }
     #[test]
     fn key_resolves_env_over_secrets() {
-        std::env::set_var("BRK_TEST_KEY", "from-env");
+        std::env::set_var("REDTEAM_TEST_KEY", "from-env");
         let toml = r#"[providers.x]
 kind="openai"
 model="m"
-api_key_env="BRK_TEST_KEY"
+api_key_env="REDTEAM_TEST_KEY"
 priority=10
 "#;
         let cfg = Config::from_layers(&[toml]).unwrap();
         assert_eq!(cfg.resolve_key("x").as_deref(), Some("from-env"));
-        std::env::remove_var("BRK_TEST_KEY");
+        std::env::remove_var("REDTEAM_TEST_KEY");
     }
 }

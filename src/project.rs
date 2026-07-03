@@ -1,12 +1,12 @@
-//! 项目级 `.breakpoint/` 目录：骨架初始化与 --dismissed 输入解析（spec §1.2/§1.4）。
+//! 项目级 `.redteam/` 目录：骨架初始化与 --dismissed 输入解析（spec §1.2/§1.4）。
 use std::collections::HashSet;
 use std::path::Path;
 
-pub const PROJECT_DIR: &str = ".breakpoint";
+pub const PROJECT_DIR: &str = ".redteam";
 
 const GITIGNORE_BODY: &str = "*\n";
 const CONFIG_TEMPLATE: &str = "\
-# breakpoint 项目级配置（优先级高于用户级 ~/.config/breakpoint/config.toml）。
+# redteam 项目级配置（优先级高于用户级 ~/.config/redteam/config.toml）。
 # 密钥走环境变量或用户级 secrets.toml——绝不写入本文件（本目录在仓库领地内）。
 #
 # [providers.MyProvider]
@@ -16,11 +16,11 @@ const CONFIG_TEMPLATE: &str = "\
 # api_key_env = \"MY_KEY_ENV\"
 # priority = 0
 #
-# lgtm 循环的测试命令（可选；不设则按 Cargo.toml/package.json/Makefile 推断）：
+# ship 循环的测试命令（可选；不设则按 Cargo.toml/package.json/Makefile 推断）：
 # test_command = \"cargo test\"
 ";
 
-/// 幂等创建 `.breakpoint/` 骨架，返回本次新建的条目；已存在的一律不动。
+/// 幂等创建 `.redteam/` 骨架，返回本次新建的条目；已存在的一律不动。
 pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
     let dir = root.join(PROJECT_DIR);
     let mut created = Vec::new();
@@ -37,9 +37,6 @@ pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
             std::fs::write(&p, body)?;
             created.push(format!("{PROJECT_DIR}/{name}"));
         }
-    }
-    if root.join(".breakpoint.toml").exists() {
-        eprintln!("breakpoint: legacy .breakpoint.toml is no longer read; move it into .breakpoint/config.toml");
     }
     Ok(created)
 }
@@ -69,7 +66,7 @@ pub fn parse_dismissed(value: &str) -> anyhow::Result<HashSet<String>> {
         anyhow::ensure!(
             is_hex16(tok),
             "--dismissed: '{tok}' is neither an existing directory nor a 16-hex finding id \
-             (for the ledger dir, run 'brk init' to create .breakpoint/dismissed/)"
+             (for the ledger dir, run 'redteam init' to create .redteam/dismissed/)"
         );
         out.insert(tok.to_string());
     }
@@ -86,9 +83,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let created = init_project(tmp.path()).unwrap();
         assert_eq!(created.len(), 4, "dismissed/ rounds/ .gitignore config.toml");
-        assert!(tmp.path().join(".breakpoint/dismissed").is_dir());
-        assert!(tmp.path().join(".breakpoint/rounds").is_dir());
-        assert_eq!(std::fs::read_to_string(tmp.path().join(".breakpoint/.gitignore")).unwrap(), "*\n");
+        assert!(tmp.path().join(".redteam/dismissed").is_dir());
+        assert!(tmp.path().join(".redteam/rounds").is_dir());
+        assert_eq!(std::fs::read_to_string(tmp.path().join(".redteam/.gitignore")).unwrap(), "*\n");
         // 二跑：全部已存在 → 零创建
         assert!(init_project(tmp.path()).unwrap().is_empty());
     }
@@ -96,10 +93,10 @@ mod tests {
     #[test]
     fn init_never_overwrites_existing_files() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".breakpoint")).unwrap();
-        std::fs::write(tmp.path().join(".breakpoint/.gitignore"), "custom\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".redteam")).unwrap();
+        std::fs::write(tmp.path().join(".redteam/.gitignore"), "custom\n").unwrap();
         init_project(tmp.path()).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.path().join(".breakpoint/.gitignore")).unwrap(), "custom\n");
+        assert_eq!(std::fs::read_to_string(tmp.path().join(".redteam/.gitignore")).unwrap(), "custom\n");
     }
 
     #[test]

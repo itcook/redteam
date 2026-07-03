@@ -1,14 +1,14 @@
 [package]
-name = "breakpoint"
+name = "redteam"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "breakpoint"
+name = "redteam"
 path = "src/lib.rs"
 
 [[bin]]
-name = "brk"
+name = "redteam"
 path = "src/main.rs"
 
 [dependencies]

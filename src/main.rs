@@ -1,17 +1,17 @@
-use breakpoint::cli::{parse_format, resolve_models, ReviewArgs};
-use breakpoint::config::Config;
-use breakpoint::model::Prober as _;
-use breakpoint::domain::Mode;
-use breakpoint::evidence::{detect_mode, EvidenceOpts, Scope};
-use breakpoint::output::render;
-use breakpoint::provider::backends::backend_from_config;
-use breakpoint::provider::registry::ProviderRegistry;
-use breakpoint::provider::tool_loop::ToolLoopProvider;
+use redteam::cli::{parse_format, resolve_models, ReviewArgs};
+use redteam::config::Config;
+use redteam::model::Prober as _;
+use redteam::domain::Mode;
+use redteam::evidence::{detect_mode, EvidenceOpts, Scope};
+use redteam::output::render;
+use redteam::provider::backends::backend_from_config;
+use redteam::provider::registry::ProviderRegistry;
+use redteam::provider::tool_loop::ToolLoopProvider;
 use clap::{Parser, Subcommand};
 use std::path::Path;
 
 #[derive(Parser)]
-#[command(name = "brk")]
+#[command(name = "redteam")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -83,7 +83,7 @@ enum Cmd {
         #[command(subcommand)]
         action: ModelCmd,
     },
-    /// 幂等创建项目级 .breakpoint/ 骨架（config.toml 模板、.gitignore、dismissed/、rounds/）。
+    /// 幂等创建项目级 .redteam/ 骨架（config.toml 模板、.gitignore、dismissed/、rounds/）。
     Init,
 }
 
@@ -129,7 +129,7 @@ fn now_secs() -> u64 {
 /// 生成进程内唯一 job-id（pid+secs+cwd 的 fnv 前 12 位）。
 fn gen_job_id(cwd: &std::path::Path) -> String {
     let seed = format!("{}-{}", std::process::id(), now_secs());
-    let h = breakpoint::hash::fnv1a64_hex(&[&seed, &cwd.to_string_lossy()]);
+    let h = redteam::hash::fnv1a64_hex(&[&seed, &cwd.to_string_lossy()]);
     h[..12].to_string()
 }
 
@@ -172,15 +172,15 @@ fn load_config_warned() -> Config {
 /// 机会式 prune：加载配置，清过期作业。
 fn prune_here(ws: &std::path::Path) {
     let cfg = load_config_warned();
-    breakpoint::state::store::prune(
+    redteam::state::store::prune(
         ws,
-        breakpoint::state::store::parse_ttl(&cfg.review.state_ttl),
+        redteam::state::store::parse_ttl(&cfg.review.state_ttl),
         now_secs(),
     );
 }
 
-/// Fix 1（final-review）：`brk result` 在任一终态（Done|Failed|TimedOut|Cancelled）都应放行——
-/// 失败/超时路径经 `write_partial_result` 落了带 `verdict: incomplete` 的 result.json（lgtm 协议
+/// Fix 1（final-review）：`redteam result` 在任一终态（Done|Failed|TimedOut|Cancelled）都应放行——
+/// 失败/超时路径经 `write_partial_result` 落了带 `verdict: incomplete` 的 result.json（ship 协议
 /// §2.4 依赖取到它），不该被 Failed/TimedOut 一律拦成 "not done"。门槛统一为「终态 + 文件存在」；
 /// 非终态（Pending/Running）或文件缺失，行为不变（沿用既有报错文案）。
 /// 抽成纯函数便于单测，避免每条分支都要拉起子进程。
@@ -188,9 +188,9 @@ fn resolve_result(
     ws: &std::path::Path,
     job_id: &str,
     format: &str,
-    st: &breakpoint::state::job::JobState,
+    st: &redteam::state::job::JobState,
 ) -> Result<String, (String, i32)> {
-    use breakpoint::state::job::JobStatus;
+    use redteam::state::job::JobStatus;
     let terminal = matches!(
         st.status,
         JobStatus::Done | JobStatus::Failed | JobStatus::TimedOut | JobStatus::Cancelled
@@ -199,10 +199,10 @@ fn resolve_result(
         return Err((format!("job {job_id} not done (status: {:?})", st.status), 2));
     }
     let content = if format == "md" {
-        breakpoint::state::store::read_result_md(ws, job_id)
-            .or_else(|| breakpoint::state::store::read_result(ws, job_id))
+        redteam::state::store::read_result_md(ws, job_id)
+            .or_else(|| redteam::state::store::read_result(ws, job_id))
     } else {
-        breakpoint::state::store::read_result(ws, job_id)
+        redteam::state::store::read_result(ws, job_id)
     };
     match content {
         Some(raw) => Ok(raw),
@@ -288,9 +288,9 @@ async fn main() {
             // R2.3：--resume <job_id> 补跑差集 cell，前台同步；忽略本次调用的其余 flag——
             // mode/targets/models 等从该作业落盘的 args.json 重建（run_resume 内部处理）。
             if let Some(job_id) = resume {
-                let ws = breakpoint::state::store::workspace_bucket(&cwd);
+                let ws = redteam::state::store::workspace_bucket(&cwd);
                 prune_here(&ws);
-                let orig_args_json = match breakpoint::state::store::read_args_raw(&ws, &job_id) {
+                let orig_args_json = match redteam::state::store::read_args_raw(&ws, &job_id) {
                     Some(j) => j,
                     None => {
                         eprintln!("error: no args for job {job_id} (resume requires a job that ran via --background)");
@@ -306,7 +306,7 @@ async fn main() {
                     Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
                 };
                 let (report, code) =
-                    breakpoint::cli::run_resume(&ws, &job_id, &registry, &cfg, &cwd).await;
+                    redteam::cli::run_resume(&ws, &job_id, &registry, &cfg, &cwd).await;
                 println!("{}", render(&report, fmt));
                 std::process::exit(code);
             }
@@ -319,31 +319,31 @@ async fn main() {
 
             // 后台：写 pending + args 文件 → spawn detached worker → 打印 job-id 退出。
             if background {
-                let ws = breakpoint::state::store::workspace_bucket(&cwd);
+                let ws = redteam::state::store::workspace_bucket(&cwd);
                 let job_id = gen_job_id(&cwd);
                 // 机会式 prune（与前台一致，见 Task 8 也在前台跑）
-                breakpoint::state::store::prune(
+                redteam::state::store::prune(
                     &ws,
-                    breakpoint::state::store::parse_ttl(&cfg.review.state_ttl),
+                    redteam::state::store::parse_ttl(&cfg.review.state_ttl),
                     now_secs(),
                 );
                 let args_json = serde_json::to_string(&args).unwrap_or_default();
-                if breakpoint::state::store::write_args_raw(&ws, &job_id, &args_json).is_err() {
+                if redteam::state::store::write_args_raw(&ws, &job_id, &args_json).is_err() {
                     eprintln!("error: failed to write job args");
                     std::process::exit(2);
                 }
-                let mut st = breakpoint::state::job::JobState::new(&job_id, now_secs());
+                let mut st = redteam::state::job::JobState::new(&job_id, now_secs());
                 st.workspace = Some(
                     std::fs::canonicalize(&cwd)
                         .unwrap_or_else(|_| cwd.clone())
                         .to_string_lossy()
                         .into_owned(),
                 );
-                let _ = breakpoint::state::job::write_state(&ws, &st);
+                let _ = redteam::state::job::write_state(&ws, &st);
                 match spawn_detached_worker(&job_id) {
                     Ok(pid) => {
                         st.pid = Some(pid);
-                        let _ = breakpoint::state::job::write_state(&ws, &st);
+                        let _ = redteam::state::job::write_state(&ws, &st);
                         println!("{job_id}");
                         std::process::exit(0);
                     }
@@ -355,14 +355,14 @@ async fn main() {
             }
 
             // 前台路径：机会式 prune + 构造 registry 后调 run_review_dispatch。
-            prune_here(&breakpoint::state::store::workspace_bucket(&cwd));
+            prune_here(&redteam::state::store::workspace_bucket(&cwd));
             let (_detected, registry) = match build_registry(&args, &cfg, &cwd) {
                 Ok(x) => x,
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
             };
 
             // 前台直调无 job 上下文，sink=None（与 run_review/run_code_review 直调路径一致）。
-            let result = breakpoint::cli::run_review_dispatch(&args, &registry, &cfg, &cwd, None).await;
+            let result = redteam::cli::run_review_dispatch(&args, &registry, &cfg, &cwd, None).await;
 
             match result {
                 Ok((report, code)) => {
@@ -378,8 +378,8 @@ async fn main() {
         Cmd::Worker { job_id } => {
             let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = breakpoint::state::store::workspace_bucket(&cwd);
-            let args_json = match breakpoint::state::store::read_args_raw(&ws, &job_id) {
+            let ws = redteam::state::store::workspace_bucket(&cwd);
+            let args_json = match redteam::state::store::read_args_raw(&ws, &job_id) {
                 Some(j) => j,
                 None => {
                     eprintln!("error: no args for job {job_id}");
@@ -399,43 +399,43 @@ async fn main() {
                 Err(e) => {
                     eprintln!("error: {e}");
                     // 写 Failed 终态，让 status 命令能看到错误原因。
-                    let mut st = breakpoint::state::job::read_state(&ws, &job_id)
-                        .unwrap_or_else(|| breakpoint::state::job::JobState::new(&job_id, 0));
-                    st.status = breakpoint::state::job::JobStatus::Failed;
+                    let mut st = redteam::state::job::read_state(&ws, &job_id)
+                        .unwrap_or_else(|| redteam::state::job::JobState::new(&job_id, 0));
+                    st.status = redteam::state::job::JobStatus::Failed;
                     st.error = Some(e);
                     st.exit_code = Some(2);
-                    let _ = breakpoint::state::job::write_state(&ws, &st);
+                    let _ = redteam::state::job::write_state(&ws, &st);
                     std::process::exit(2);
                 }
             };
-            let started = breakpoint::state::job::read_state(&ws, &job_id)
+            let started = redteam::state::job::read_state(&ws, &job_id)
                 .map(|s| s.started_at)
                 .unwrap_or_else(now_secs);
             // R1.2：worker 起手设 deadline_at（若尚未设置——例如状态文件是旧格式或已被设过）。
-            if let Some(mut st) = breakpoint::state::job::read_state(&ws, &job_id) {
+            if let Some(mut st) = redteam::state::job::read_state(&ws, &job_id) {
                 if st.deadline_at.is_none() {
                     st.deadline_at = Some(started + JOB_DEADLINE_SECS);
-                    let _ = breakpoint::state::job::write_state(&ws, &st);
+                    let _ = redteam::state::job::write_state(&ws, &st);
                 }
             }
-            let code = breakpoint::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
+            let code = redteam::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
             std::process::exit(code);
         }
         Cmd::Status { job_id, workspaces } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = breakpoint::state::store::workspace_bucket(&cwd);
+            let ws = redteam::state::store::workspace_bucket(&cwd);
             prune_here(&ws); // 机会式 prune（仅当前 workspace，见决策⑥）
             match job_id {
                 None => {
-                    let jobs = breakpoint::state::job::select_jobs(
+                    let jobs = redteam::state::job::select_jobs(
                         &ws,
-                        &breakpoint::state::store::state_root(),
+                        &redteam::state::store::state_root(),
                         workspaces.as_deref(),
                     );
                     println!("{}", serde_json::to_string_pretty(&jobs).unwrap_or_else(|_| "[]".into()));
                     0
                 }
-                Some(id) => match breakpoint::state::job::read_state(&ws, &id) {
+                Some(id) => match redteam::state::job::read_state(&ws, &id) {
                     Some(st) => { println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default()); 0 }
                     None => { eprintln!("no such job: {id}"); 2 }
                 },
@@ -443,14 +443,14 @@ async fn main() {
         }
         Cmd::Result { job_id, format } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = breakpoint::state::store::workspace_bucket(&cwd);
+            let ws = redteam::state::store::workspace_bucket(&cwd);
             prune_here(&ws);
-            let st = breakpoint::state::job::read_state(&ws, &job_id);
+            let st = redteam::state::job::read_state(&ws, &job_id);
             match st {
                 Some(s) => match resolve_result(&ws, &job_id, &format, &s) {
                     Ok(raw) => {
                         println!("{raw}");
-                        let _ = breakpoint::state::store::mark_consumed(&ws, &job_id);
+                        let _ = redteam::state::store::mark_consumed(&ws, &job_id);
                         s.exit_code.unwrap_or(0)
                     }
                     Err((msg, code)) => { eprintln!("{msg}"); code }
@@ -460,15 +460,15 @@ async fn main() {
         }
         Cmd::Cancel { job_id } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = breakpoint::state::store::workspace_bucket(&cwd);
-            match breakpoint::state::job::read_state(&ws, &job_id) {
-                Some(mut s) if matches!(s.status, breakpoint::state::job::JobStatus::Running | breakpoint::state::job::JobStatus::Pending) => {
+            let ws = redteam::state::store::workspace_bucket(&cwd);
+            match redteam::state::job::read_state(&ws, &job_id) {
+                Some(mut s) if matches!(s.status, redteam::state::job::JobStatus::Running | redteam::state::job::JobStatus::Pending) => {
                     if let Some(pid) = s.pid {
                         // SAFETY: kill 单系统调用；pid 来自本 workspace 自己写的状态。
                         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
                     }
-                    s.status = breakpoint::state::job::JobStatus::Cancelled;
-                    let _ = breakpoint::state::job::write_state(&ws, &s);
+                    s.status = redteam::state::job::JobStatus::Cancelled;
+                    let _ = redteam::state::job::write_state(&ws, &s);
                     println!("cancelled {job_id}");
                     0
                 }
@@ -479,17 +479,17 @@ async fn main() {
         Cmd::Model { action } => match action {
             ModelCmd::Check => {
                 let cfg = load_config_warned();
-                let prober = breakpoint::model::probe::HttpProber::new();
-                let avs = breakpoint::model::check_all(&cfg, &prober).await;
+                let prober = redteam::model::probe::HttpProber::new();
+                let avs = redteam::model::check_all(&cfg, &prober).await;
                 for a in &avs {
                     println!("{}  {}", a.provider, a.status_str());
                 }
-                breakpoint::model::check_exit_code(&avs)
+                redteam::model::check_exit_code(&avs)
             }
             ModelCmd::Setup { provider, kind, base_url, model, key, priority, key_store } => {
-                let k = breakpoint::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
+                let k = redteam::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
                 // 写入前守卫：kind/base_url 不合法则提示并拒绝写入，不污染配置。
-                if let Err(e) = breakpoint::model::validate_setup(&k, base_url.as_deref()) {
+                if let Err(e) = redteam::model::validate_setup(&k, base_url.as_deref()) {
                     eprintln!("error: {e}");
                     std::process::exit(2);
                 }
@@ -497,9 +497,9 @@ async fn main() {
                     Some(m) => m,
                     None => { eprintln!("error: --model is required"); std::process::exit(2); }
                 };
-                let api_key_env = breakpoint::model::derive_api_key_env(&provider);
+                let api_key_env = redteam::model::derive_api_key_env(&provider);
                 let prio = priority.unwrap_or(0);
-                if let Err(e) = breakpoint::config::write_provider(
+                if let Err(e) = redteam::config::write_provider(
                     &provider, &k, base_url.as_deref(), &model, prio, Some(&api_key_env),
                 ) {
                     eprintln!("error: failed to write provider config: {e}");
@@ -509,11 +509,11 @@ async fn main() {
                 match key_store.as_str() {
                     "secrets" => match key {
                         Some(k) => {
-                            if let Err(e) = breakpoint::config::secrets::write_secret(&provider, &k) {
+                            if let Err(e) = redteam::config::secrets::write_secret(&provider, &k) {
                                 eprintln!("error: failed to write secret: {e}");
                                 std::process::exit(2);
                             }
-                            println!("wrote key to {} (chmod 600)", breakpoint::config::secrets::secrets_path().display());
+                            println!("wrote key to {} (chmod 600)", redteam::config::secrets::secrets_path().display());
                         }
                         None => { eprintln!("error: --key-store secrets requires --key"); std::process::exit(2); }
                     },
@@ -528,8 +528,8 @@ async fn main() {
                 println!("configured provider '{provider}' (kind={k}, model={model}, api_key_env={api_key_env})");
                 // 完成后自动跑一次 check
                 let cfg = load_config_warned();
-                let prober = breakpoint::model::probe::HttpProber::new();
-                let avs = breakpoint::model::check_all(&cfg, &prober).await;
+                let prober = redteam::model::probe::HttpProber::new();
+                let avs = redteam::model::check_all(&cfg, &prober).await;
                 for a in &avs {
                     println!("{}  {}", a.provider, a.status_str());
                 }
@@ -537,14 +537,14 @@ async fn main() {
             }
             ModelCmd::List { remote } => {
                 let cfg = load_config_warned();
-                let prober = breakpoint::model::probe::HttpProber::new();
+                let prober = redteam::model::probe::HttpProber::new();
                 match remote {
                     Some(prov) => {
                         let pc = match cfg.providers.get(&prov) {
                             Some(p) => p,
                             None => { eprintln!("no such provider: {prov}"); std::process::exit(2); }
                         };
-                        let base = breakpoint::model::effective_base(pc);
+                        let base = redteam::model::effective_base(pc);
                         let key = cfg.resolve_key(&prov);
                         match prober.list_models(&base, key.as_deref()).await {
                             Ok(models) => {
@@ -555,18 +555,18 @@ async fn main() {
                         }
                     }
                     None => {
-                        let avs = breakpoint::model::check_all(&cfg, &prober).await;
-                        let paths: Vec<String> = breakpoint::config::config_paths()
+                        let avs = redteam::model::check_all(&cfg, &prober).await;
+                        let paths: Vec<String> = redteam::config::config_paths()
                             .iter().map(|p| p.display().to_string()).collect();
-                        println!("{}", breakpoint::model::render_model_list(&cfg, &avs, &paths));
+                        println!("{}", redteam::model::render_model_list(&cfg, &avs, &paths));
                         0
                     }
                 }
             }
         },
         Cmd::Init => {
-            match breakpoint::project::init_project(std::path::Path::new(".")) {
-                Ok(c) if c.is_empty() => println!(".breakpoint/ already complete"),
+            match redteam::project::init_project(std::path::Path::new(".")) {
+                Ok(c) if c.is_empty() => println!(".redteam/ already complete"),
                 Ok(c) => c.iter().for_each(|p| println!("created {p}")),
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
             }
@@ -583,8 +583,8 @@ mod tests {
     /// C1：无 provider 配置的 Config + doc 模式 ReviewArgs → build_registry 返回 Err。
     #[test]
     fn build_registry_no_provider_returns_err() {
-        use breakpoint::cli::ReviewArgs;
-        use breakpoint::config::Config;
+        use redteam::cli::ReviewArgs;
+        use redteam::config::Config;
 
         // 空配置：无 [providers.*]，resolve_models 会产出空列表
         let cfg = Config::default();
@@ -616,13 +616,13 @@ mod tests {
         );
     }
 
-    /// Fix 1：Failed + result.json 存在 → 取回成功（partial report，lgtm 协议 §2.4 依赖此路径）。
+    /// Fix 1：Failed + result.json 存在 → 取回成功（partial report，ship 协议 §2.4 依赖此路径）。
     #[test]
     fn resolve_result_failed_with_partial_report_succeeds() {
-        use breakpoint::state::job::{JobState, JobStatus};
+        use redteam::state::job::{JobState, JobStatus};
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
-        breakpoint::state::store::write_result(ws, "j1", r#"{"verdict":"incomplete"}"#).unwrap();
+        redteam::state::store::write_result(ws, "j1", r#"{"verdict":"incomplete"}"#).unwrap();
         let mut st = JobState::new("j1", 0);
         st.status = JobStatus::Failed;
         st.exit_code = Some(2);
@@ -633,7 +633,7 @@ mod tests {
     /// Fix 1：Failed + 无 result.json → 仍报错（未曾 checkpoint 过任何 cell 的早期崩溃）。
     #[test]
     fn resolve_result_failed_without_result_file_errs() {
-        use breakpoint::state::job::{JobState, JobStatus};
+        use redteam::state::job::{JobState, JobStatus};
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
         let mut st = JobState::new("j2", 0);
@@ -646,10 +646,10 @@ mod tests {
     /// 非终态（Running）不受影响：即便 result.json 意外存在也不放行。
     #[test]
     fn resolve_result_running_stays_not_done() {
-        use breakpoint::state::job::{JobState, JobStatus};
+        use redteam::state::job::{JobState, JobStatus};
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
-        breakpoint::state::store::write_result(ws, "j3", "{}").unwrap();
+        redteam::state::store::write_result(ws, "j3", "{}").unwrap();
         let mut st = JobState::new("j3", 0);
         st.status = JobStatus::Running;
         let out = resolve_result(ws, "j3", "json", &st);
