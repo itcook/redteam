@@ -40,6 +40,9 @@ pub struct Bundle {
 
 /// 清单条目上限——超出截断为「… and N more files」（与 dismissed notes 同思路的体积防护）。
 const MANIFEST_MAX_ENTRIES: usize = 200;
+/// 清单总字符预算——条目数之外的直接 token 防护：每 bundle prompt 注入一份清单，
+/// 大变更集下 O(bundles×manifest) 叠加，字符帽对症（dogfood 20260703 r1 6db068d2）。
+const MANIFEST_MAX_CHARS: usize = 4000;
 
 /// 全变更集清单（dogfood 20260702 #2）：`exclude` 号 bundle 之外所有变更文件的
 /// `path (+adds/-dels)`。注入单包评审 prompt，让模型知晓视野外还有哪些文件在变——
@@ -65,9 +68,20 @@ pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
             entries.push(format!("{} (+{adds}/-{dels})", fc.path));
         }
     }
-    let extra = entries.len().saturating_sub(MANIFEST_MAX_ENTRIES);
-    entries.truncate(MANIFEST_MAX_ENTRIES);
+    // 双帽：条目数 + 总字符预算（先到者截断），尾注被截条数。
+    let total = entries.len();
+    let mut kept = 0usize;
+    let mut chars = 0usize;
+    for e in &entries {
+        if kept >= MANIFEST_MAX_ENTRIES || chars + e.len() + 2 > MANIFEST_MAX_CHARS {
+            break;
+        }
+        chars += e.len() + 2; // ", " 分隔
+        kept += 1;
+    }
+    entries.truncate(kept);
     let mut s = entries.join(", ");
+    let extra = total - kept;
     if extra > 0 {
         s.push_str(&format!(", … and {extra} more files"));
     }
@@ -459,6 +473,19 @@ mod tests {
         let files: Vec<_> = (0..MANIFEST_MAX_ENTRIES + 5).map(|i| fc(&format!("f{i}.rs"), "+x")).collect();
         let bundles = vec![Bundle { files: vec![fc("self.rs", "+s")] }, Bundle { files }];
         let m = other_files_manifest(&bundles, 0);
-        assert!(m.ends_with("… and 5 more files"), "超上限截断并注记条数: {m}");
+        assert!(m.contains("more files"), "超上限截断并注记条数: {m}");
+        assert!(m.len() <= MANIFEST_MAX_CHARS + 40, "字符预算生效（截断注記在预算外富余内）: len={}", m.len());
+    }
+
+    #[test]
+    fn other_files_manifest_char_budget_truncates_long_paths() {
+        // 50 个超长路径（每条 ~120 字符）→ 字符帽先于条目帽触发
+        let files: Vec<_> = (0..50)
+            .map(|i| fc(&format!("very/deeply/nested/module/path/segment/that/keeps/going/and/going/file_number_{i:04}_with_long_name.rs"), "+x"))
+            .collect();
+        let bundles = vec![Bundle { files: vec![fc("self.rs", "+s")] }, Bundle { files }];
+        let m = other_files_manifest(&bundles, 0);
+        assert!(m.len() <= MANIFEST_MAX_CHARS + 40, "字符预算截断: len={}", m.len());
+        assert!(m.contains("more files"), "被截条数有注记: {m}");
     }
 }

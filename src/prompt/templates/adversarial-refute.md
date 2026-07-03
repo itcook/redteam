@@ -12,6 +12,7 @@ Quoted code: {{QUOTE}}
 
 <dismissal_precedents>
 Human adjudication precedents from earlier review rounds — findings already dismissed as false positives, each with its recorded rationale. If the claimed finding is substantively the same issue as a precedent — or a trivial variant re-anchored to a different file, quote, or wording — and its body offers no concrete new evidence that the recorded rationale is wrong, that is itself grounds to REFUTE: cite the matching precedent as your evidence. If the claim DOES present concrete new evidence against a recorded rationale, ignore the precedent and judge on the code alone.
+A precedent-based refutation carries audit duties: your returned finding MUST name the matching precedent and quote the rationale it relies on; and if the claim explicitly rebuts a recorded rationale, your refutation must answer that rebuttal head-on — restating the original rationale, or attacking a position the claim does not take, is NOT a refutation (return an empty array instead).
 Precedents: {{DISMISSED_NOTES}}
 </dismissal_precedents>
 

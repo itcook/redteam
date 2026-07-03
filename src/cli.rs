@@ -171,10 +171,12 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
     } else {
         vec![]
     };
-    let findings = verify_findings(
+    let (findings, refute_warnings) = verify_findings(
         findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
         ctx.dismissed_notes,
     ).await;
+    let mut run_warnings = ctx.warnings;
+    run_warnings.extend(refute_warnings);
 
     let mut findings = findings;
     let dismissed_reappeared = mark_dismissed(&mut findings, ctx.dismissed);
@@ -195,7 +197,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
             lenses: ctx.lens_ids,
             duration_ms: ctx.duration_ms,
             usage: Usage { input_tokens: ctx.usage.0, output_tokens: ctx.usage.1 },
-            warnings: ctx.warnings,
+            warnings: run_warnings,
             failed_models: ctx.failed_models,
             dismissed_reappeared,
         },

@@ -48,13 +48,17 @@ disable-model-invocation: true
      基础设施故障不消耗轮次、不触发停滞守卫。
 
 ## 内循环（逐条裁决）
-1. **分拣**：`verify == refuted` 跳过（redteam 已豁免，简报记一笔）。`previously_dismissed`
+1. **分拣**：`verify == refuted` 一般跳过（redteam 已豁免，简报记一笔）。**例外需目检**：
+   refute note 是判例引用、或 finding body 明确反驳某条驳回理由的 → 读一眼 note 与 body：
+   反驳被正面回应 → 跳过；note 答非所问（打稻草人/复述原理由）→ 该条**照常裁决**，一句话
+   记简报——机器证伪不当剥夺强异议的复裁通道。`previously_dismissed`
    按台账状态分流：`human-confirmed` 或已 `re-upheld` 的静默跳过；仅 `dismissed(rN)` 状态
    的**首次再现**进入刹车链（每 id 至多一次）。
 2. **排序**：severity 降序为主序，同级按 file 分组。
 3. **逐条**（读 quote + 文件上下文 + body 后裁决），每条属实项标注**来源：原始/衍生**——
-   衍生 = quote 锚定的代码由本会话既往 `fix(ship): rN` commit 引入（自己修的自己知道，
-   存疑用 `git blame` 验证）。此标注是停机「尾流守卫」的判据输入：
+   衍生 = quote 锚定的代码由本会话既往 `fix(ship): rN` commit 引入。**衍生标注必须附
+   引入 commit 的短 sha**（`git blame` 取证，不凭记忆），写进简报——标注是停机「尾流
+   守卫」的判据输入，必须留下可审计线索，防自证式标签空转：
    - **属实 → 修**：root-cause 修法——共享函数一处守卫优于逐调用点补丁。
    - **误报 → 写 `<dismissed-dir>/<id>.md`**：内容 = finding 快照（title/file/quote/
      severity）+ 驳回理由 + 状态行 `dismissed(rN, <日期>)`。
