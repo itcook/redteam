@@ -2,6 +2,7 @@ pub mod bundle;
 pub mod cli;
 pub mod config;
 pub mod consolidate;
+pub mod db;
 pub mod domain;
 pub mod evidence;
 pub mod hash;
