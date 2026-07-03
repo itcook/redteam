@@ -64,6 +64,9 @@ disable-model-invocation: true
 修复全落 → 跑测试命令至绿 → **单次 commit（仅修复，不含 .breakpoint/）**，消息
 `fix(lgtm): rN <一句话摘要>` → 写 `rounds/<session>/rN.md` 简报（job id、verdict、
 修复/驳回/存疑清单、commit sha）→ 下一轮。
+- **工具观察（本地调试阶段 · 发布前移除）**：若本轮察觉 brk/lgtm **工具级**异常（耗时反常、
+  `finalizing` 卡顿、某 finding 的 quote 在文件里配不上、status/协议摩擦），往
+  `rounds/<session>/observations.md` 追加**一行**——供收工反馈合成;无异常不写。
 
 ## 停机（每轮内循环完成后判定；即使 verdict=approve，待刹车 id 先走完刹车链)
 1. **verdict = approve** → 收工：写 `rounds/<session>/session.md` 总结（轮数、修复/
@@ -75,3 +78,14 @@ disable-model-invocation: true
 3. **修复受阻**：某 finding 属实但你修不了（需产品/架构决策、改动越权）→ 停，交用户。
 4. **停滞守卫**：本轮仍有未豁免 findings 但零代码改动（未修也未新驳）→ 空转，停，交用户。
 5. `--max-rounds` 达限（仅用户显式给出时）→ 停，输出未收敛摘要。
+
+## 收工反馈（本地调试阶段 · 发布前移除）
+> 开发期临时仪器,发布前连同 `${CLAUDE_PLUGIN_ROOT}/feedback.md`、本节、observations 一行约定一并删除。
+> 反馈对象是 **brk/lgtm 工具自身**（好不好用、准不准），非被审代码。
+
+会话终结时（§停机 任一路径：approve 收工 / 停交用户），**写完 `session.md` 之后**派一个反馈 subagent
+（**对被审工作树只读，仅写 home 中枢**）：
+令其读 `${CLAUDE_PLUGIN_ROOT}/feedback.md` 并按其执行——产出工具自身的**量化记分卡** + **缺陷/改进项**，
+写入 home 中枢 `${BRK_FEEDBACK_DIR:-~/.breakpoint/feedback}`。派发时把会话目录 `rounds/<session>/` 与
+dismissed 台账目录路径交给它。**本步不阻塞收工判定**：失败仅告警，不改变 approve/停机结论、不消耗轮次、
+不碰被审工作树。
