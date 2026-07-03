@@ -63,6 +63,9 @@ enum Cmd {
         job_id: Option<String>,
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         workspaces: Option<String>,
+        /// 输出格式：json（默认，机读契约）| table（人读）
+        #[arg(long, default_value = "json")]
+        format: String,
     },
     /// 取回已完成作业的评审结果（读后标记已消费）。仅作业处于终态 `done` 时可取；未终态返回退出码 2。
     Result {
@@ -421,24 +424,31 @@ async fn main() {
             let code = redteam::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
             std::process::exit(code);
         }
-        Cmd::Status { job_id, workspaces } => {
+        Cmd::Status { job_id, workspaces, format } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let ws = redteam::state::store::workspace_bucket(&cwd);
             prune_here(&ws); // 机会式 prune（仅当前 workspace，见决策⑥）
-            match job_id {
-                None => {
-                    let jobs = redteam::state::job::select_jobs(
-                        &ws,
-                        &redteam::state::store::state_root(),
-                        workspaces.as_deref(),
-                    );
-                    println!("{}", serde_json::to_string_pretty(&jobs).unwrap_or_else(|_| "[]".into()));
+            // 两分支统一收集（列表 / 单 job），再按 format 分流；json 输出形状与改动前逐字节一致。
+            let jobs: Option<Vec<redteam::state::job::JobState>> = match &job_id {
+                None => Some(redteam::state::job::select_jobs(
+                    &ws,
+                    &redteam::state::store::state_root(),
+                    workspaces.as_deref(),
+                )),
+                Some(id) => redteam::state::job::read_state(&ws, id).map(|st| vec![st]),
+            };
+            match jobs {
+                None => { eprintln!("no such job: {}", job_id.unwrap_or_default()); 2 }
+                Some(js) => {
+                    if format == "table" {
+                        println!("{}", render_status_table(&js, now_secs()));
+                    } else if job_id.is_none() {
+                        println!("{}", serde_json::to_string_pretty(&js).unwrap_or_else(|_| "[]".into()));
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&js[0]).unwrap_or_default());
+                    }
                     0
                 }
-                Some(id) => match redteam::state::job::read_state(&ws, &id) {
-                    Some(st) => { println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default()); 0 }
-                    None => { eprintln!("no such job: {id}"); 2 }
-                },
             }
         }
         Cmd::Result { job_id, format } => {
@@ -576,9 +586,99 @@ async fn main() {
     std::process::exit(code);
 }
 
+/// M5 批2：status 的人读时长（42s / 7m / 1h03m）。
+fn fmt_dur(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// serde 视角的枚举字串（与 status JSON 契约逐字一致，如 timed_out）。
+fn serde_str<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|x| x.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+/// M5 批2：`status --format table` 人读视图（opt-in；默认 JSON 数组契约不动）。
+/// 空格对齐、无框线——窄终端可 wrap、输出可 grep。now 注入以便测试。
+fn render_status_table(jobs: &[redteam::state::job::JobState], now: u64) -> String {
+    const HEADER: [&str; 8] = ["JOB", "STATUS", "PHASE", "MODE", "PROG", "AGE", "IDLE", "WORKSPACE"];
+    let rows: Vec<[String; 8]> = jobs
+        .iter()
+        .map(|j| {
+            [
+                j.job_id.clone(),
+                serde_str(&j.status),
+                j.phase.as_ref().map(serde_str).unwrap_or_else(|| "-".into()),
+                j.mode.as_ref().map(serde_str).unwrap_or_else(|| "-".into()),
+                if j.progress.total == 0 { "-".into() } else { format!("{}/{}", j.progress.done, j.progress.total) },
+                fmt_dur(now.saturating_sub(j.started_at)),
+                if j.last_active == 0 { "-".into() } else { fmt_dur(now.saturating_sub(j.last_active)) },
+                j.workspace.clone().unwrap_or_else(|| "-".into()),
+            ]
+        })
+        .collect();
+    let widths: Vec<usize> = (0..HEADER.len())
+        .map(|c| rows.iter().map(|r| r[c].len()).chain([HEADER[c].len()]).max().unwrap_or(0))
+        .collect();
+    let fmt_row = |cells: &[&str]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(c, s)| format!("{:w$}", s, w = widths[c]))
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_string()
+    };
+    let mut out = vec![fmt_row(&HEADER)];
+    out.extend(rows.iter().map(|r| fmt_row(&r.iter().map(String::as_str).collect::<Vec<_>>())));
+    out.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M5 批2：status --format table 的人读渲染（默认 json 契约不动）。
+    #[test]
+    fn render_status_table_shapes_columns() {
+        use redteam::state::job::{JobState, JobStatus, Phase, Progress};
+        let mut a = JobState::new("abc123def456", 1000);
+        a.status = JobStatus::Running;
+        a.phase = Some(Phase::Fanout);
+        a.mode = Some(redteam::domain::input::Mode::Code);
+        a.progress = Progress { done: 3, total: 10 };
+        a.last_active = 4500;
+        a.workspace = Some("/repos/sites".into());
+        let b = JobState::new("fff000fff000", 4000); // pending：phase/mode/workspace 全 None、last_active=0
+        let out = render_status_table(&[a, b], 4600);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("JOB") && lines[0].contains("STATUS") && lines[0].contains("PROG")
+            && lines[0].contains("AGE") && lines[0].contains("IDLE"), "header: {}", lines[0]);
+        assert!(lines[1].contains("abc123def456") && lines[1].contains("running")
+            && lines[1].contains("fanout") && lines[1].contains("code")
+            && lines[1].contains("3/10") && lines[1].contains("1h00m") // age 3600s
+            && !lines[1].contains("100s") && lines[1].contains("/repos/sites"), "row a: {}", lines[1]);
+        // idle 100s → "1m"（分钟粒度截断）
+        assert!(lines[1].contains("1m"), "row a idle: {}", lines[1]);
+        assert!(lines[2].contains("fff000fff000") && lines[2].contains("pending")
+            && lines[2].contains("-"), "row b folds None to '-': {}", lines[2]);
+    }
+
+    #[test]
+    fn fmt_dur_tiers() {
+        assert_eq!(fmt_dur(42), "42s");
+        assert_eq!(fmt_dur(60), "1m");
+        assert_eq!(fmt_dur(3599), "59m");
+        assert_eq!(fmt_dur(3780), "1h03m");
+    }
 
     /// C1：无 provider 配置的 Config + doc 模式 ReviewArgs → build_registry 返回 Err。
     #[test]
