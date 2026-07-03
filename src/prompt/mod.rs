@@ -64,6 +64,11 @@ pub fn build_refute_prompt(finding: &crate::domain::Finding, mode: Mode) -> Stri
 /// 结构性杜绝占位捕获与外部内容互染（r2 0b176180 / r3 eb685a65 dogfood 系列），
 /// 且替换顺序不再是防线（无排序心智负担）。
 fn render(tpl: &str, vars: &[(&str, &str)]) -> String {
+    // 键之间不得有前缀包含（如 {{FILE}} 与 {{FILE_LIST}} 同集会让短键抢占长键前缀）。
+    debug_assert!(
+        vars.iter().all(|(a, _)| vars.iter().all(|(b, _)| a == b || !b.starts_with(a))),
+        "render vars must be prefix-free"
+    );
     let mut out = String::with_capacity(tpl.len() * 2);
     let mut rest = tpl;
     loop {
@@ -251,6 +256,10 @@ mod tests {
         let rules = vec![by_id("L1").unwrap(), by_id("L5").unwrap()];
         let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "已驳回:旧误报X");
         assert!(!p.contains("{{"), "no residual placeholders");
+        // 注入对称覆盖(r4 ea30e058):bundle 侧同样不被外部占位捕获
+        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "notes {{BUNDLE_DIFFS}} 试探");
+        assert!(pi.contains("focus {{RULES}} 试探") && pi.contains("notes {{BUNDLE_DIFFS}} 试探"),
+            "bundle 外部内容占位不被捕获");
         assert!(p.contains("[L1]") && p.contains("[L5]"), "rule ids injected");
         assert!(p.contains("src/auth.rs"), "file path injected");
         assert!(p.contains("let t = secret();"), "diff injected");

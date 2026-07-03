@@ -53,7 +53,7 @@ enum Cmd {
         /// verdict 阻断阈值：low | medium（默认）| high | critical——达到即 reject。
         #[arg(long)]
         block_threshold: Option<String>,
-        /// finding 置信度下限（默认 0.5），低于即丢弃。
+        /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定，但仍保留在报告中。
         #[arg(long)]
         conf_floor: Option<f32>,
         /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。
