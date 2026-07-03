@@ -144,6 +144,8 @@ struct TailCtx<'a> {
     warnings: Vec<String>,
     failed_models: Vec<String>,
     dismissed: &'a std::collections::HashSet<String>,
+    /// dir 形态台账全文（已截断）——refute pass 判例注入，主题变体跨轮一致抑制。
+    dismissed_notes: &'a str,
 }
 
 /// 共用尾段：anchor → dedup → [doc: correlate/apply_clusters] → verify → verdict → 组装 report
@@ -171,6 +173,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
     };
     let findings = verify_findings(
         findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
+        ctx.dismissed_notes,
     ).await;
 
     let mut findings = findings;
@@ -295,6 +298,7 @@ pub async fn run_review(
         warnings: raw.warnings,
         failed_models: raw.failed_models,
         dismissed: &dismissed,
+        dismissed_notes: &dismissed_notes,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
     assemble_report(raw.findings, ctx).await
@@ -378,6 +382,7 @@ pub async fn run_code_review(
         warnings: raw.warnings,
         failed_models: raw.failed_models,
         dismissed: &dismissed,
+        dismissed_notes: &dismissed_notes,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
     assemble_report(raw.findings, ctx).await
@@ -620,6 +625,9 @@ pub async fn run_resume(
         }
         None => Default::default(),
     };
+    let (dismissed_notes, notes_warnings) =
+        args.dismissed.as_deref().map(crate::project::load_dismissed_notes).unwrap_or_default();
+    warnings.extend(notes_warnings);
 
     let ctx = TailCtx {
         mode,
@@ -638,6 +646,7 @@ pub async fn run_resume(
         warnings,
         failed_models: vec![],
         dismissed: &dismissed,
+        dismissed_notes: &dismissed_notes,
     };
     match assemble_report(findings, ctx).await {
         Ok((mut report, mut code)) => {

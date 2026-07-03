@@ -10,6 +10,11 @@ Body: {{BODY}}
 Quoted code: {{QUOTE}}
 </claimed_finding>
 
+<dismissal_precedents>
+Human adjudication precedents from earlier review rounds — findings already dismissed as false positives, each with its recorded rationale. If the claimed finding is substantively the same issue as a precedent — or a trivial variant re-anchored to a different file, quote, or wording — and its body offers no concrete new evidence that the recorded rationale is wrong, that is itself grounds to REFUTE: cite the matching precedent as your evidence. If the claim DOES present concrete new evidence against a recorded rationale, ignore the precedent and judge on the code alone.
+Precedents: {{DISMISSED_NOTES}}
+</dismissal_precedents>
+
 <tools>
 You have read_file / search_repo / list_files under the review root. Read the actual code around the claim — the surrounding function, callers, guards — before judging. Do not invent code you have not read.
 </tools>

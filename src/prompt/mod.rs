@@ -38,7 +38,12 @@ pub fn output_language() -> String {
 /// 构造 refute prompt：给定 claimed finding，让 skeptic 对抗复审。
 /// 复用 review-as-refute——返回的 findings 空=upheld、非空=refuted（见模板 output_contract）。
 /// mode 选模板：Code→code 模板、Doc→doc 模板（空 quote 渲染为遗漏占位说明）。
-pub fn build_refute_prompt(finding: &crate::domain::Finding, mode: Mode) -> String {
+/// `dismissed_notes`：驳回台账判例（可空）——skeptic 见过往人裁，主题变体一致 refute。
+pub fn build_refute_prompt(
+    finding: &crate::domain::Finding,
+    mode: Mode,
+    dismissed_notes: &str,
+) -> String {
     let tpl = match mode {
         Mode::Code => REFUTE_TPL,
         Mode::Doc => REFUTE_DOC_TPL,
@@ -48,6 +53,7 @@ pub fn build_refute_prompt(finding: &crate::domain::Finding, mode: Mode) -> Stri
     } else {
         finding.quote.clone()
     };
+    let notes = if dismissed_notes.trim().is_empty() { "(none)" } else { dismissed_notes };
     render(tpl, &[
         ("{{FILE}}", &finding.file),
         ("{{LINE_START}}", &finding.line_start.to_string()),
@@ -57,6 +63,7 @@ pub fn build_refute_prompt(finding: &crate::domain::Finding, mode: Mode) -> Stri
         ("{{TITLE}}", &finding.title),
         ("{{BODY}}", &finding.body),
         ("{{QUOTE}}", &quote),
+        ("{{DISMISSED_NOTES}}", notes),
     ])
 }
 
@@ -220,12 +227,16 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false,
         };
-        let p = build_refute_prompt(&f, crate::domain::Mode::Code);
+        let p = build_refute_prompt(&f, crate::domain::Mode::Code, "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.contains("src/a.rs") && p.contains("12"), "file:line injected");
         assert!(p.contains("missing auth") && p.contains("db.write(token)"), "title+quote injected");
         // upheld=空 findings 的契约必须在 prompt 中
         assert!(p.to_lowercase().contains("findings"), "output contract present");
+        // 空台账 → 判例段渲染 (none)；非空 → 原样注入（主题变体跨轮一致抑制）
+        assert!(p.contains("Precedents: (none)"), "empty notes render (none)");
+        let p2 = build_refute_prompt(&f, crate::domain::Mode::Code, "台账: 旧误报X 已人裁驳回");
+        assert!(p2.contains("台账: 旧误报X 已人裁驳回"), "ledger precedents injected");
     }
 
     #[test]
@@ -239,7 +250,7 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: String::new(), verify: None,
             previously_dismissed: false,
         };
-        let p = build_refute_prompt(&f, Mode::Doc);
+        let p = build_refute_prompt(&f, Mode::Doc, "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.to_lowercase().contains("omit"), "doc refute frames omission");
         assert!(!p.contains("Quoted code"), "doc template (not code template)");

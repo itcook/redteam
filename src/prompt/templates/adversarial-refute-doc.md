@@ -10,6 +10,11 @@ Body: {{BODY}}
 Claimed evidence (empty means the claim is that this is OMITTED entirely from the document): {{QUOTE}}
 </claimed_finding>
 
+<dismissal_precedents>
+Human adjudication precedents from earlier review rounds — findings already dismissed as false positives, each with its recorded rationale. If the claimed finding is substantively the same issue as a precedent — or a trivial variant re-anchored to a different file, quote, or wording — and its body offers no concrete new evidence that the recorded rationale is wrong, that is itself grounds to REFUTE: cite the matching precedent as your evidence. If the claim DOES present concrete new evidence against a recorded rationale, ignore the precedent and judge on the document alone.
+Precedents: {{DISMISSED_NOTES}}
+</dismissal_precedents>
+
 <tools>
 You have read_file / search_repo / list_files under the review root. Read the document and any spec/config/source it references before judging. For an omission claim, search the document and referenced specs for the content alleged to be missing. Do not invent content you have not read. Read only the span needed to judge this one claim — a line range, not whole files.
 </tools>
@@ -30,4 +35,3 @@ Return ONLY JSON: an object with a "findings" array.
 When in doubt, do NOT fabricate a refutation — return an empty array.
 Write every title and body in {{OUTPUT_LANGUAGE}}.
 </output_contract>
-</output>
