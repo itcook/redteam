@@ -52,7 +52,9 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
    按台账状态分流：`human-confirmed` 或已 `re-upheld` 的静默跳过；仅 `dismissed(rN)` 状态
    的**首次再现**进入刹车链（每 id 至多一次）。
 2. **排序**：severity 降序为主序，同级按 file 分组。
-3. **逐条**（读 quote + 文件上下文 + body 后裁决）：
+3. **逐条**（读 quote + 文件上下文 + body 后裁决），每条属实项标注**来源：原始/衍生**——
+   衍生 = quote 锚定的代码由本会话既往 `fix(ship): rN` commit 引入（自己修的自己知道，
+   存疑用 `git blame` 验证）。此标注是停机「尾流守卫」的判据输入：
    - **属实 → 修**：root-cause 修法——共享函数一处守卫优于逐调用点补丁。
    - **误报 → 写 `<dismissed-dir>/<id>.md`**：内容 = finding 快照（title/file/quote/
      severity）+ 驳回理由 + 状态行 `dismissed(rN, <日期>)`。
@@ -67,7 +69,7 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 ## 收轮
 修复全落 → 跑测试命令至绿 → **单次 commit（仅修复，不含 .redteam/）**，消息
 `fix(ship): rN <一句话摘要>` → 写 `rounds/<session>/rN.md` 简报（job id、verdict、
-修复/驳回/存疑清单、commit sha）→ 下一轮。
+修复/驳回/存疑清单——属实项带**原始/衍生**标、commit sha）→ 下一轮。
 - **工具观察（本地调试阶段 · 发布前移除）**：若本轮察觉 redteam/ship **工具级**异常（耗时反常、
   `finalizing` 卡顿、某 finding 的 quote 在文件里配不上、status/协议摩擦），往
   `rounds/<session>/observations.md` 追加**一行**——供收工反馈合成;无异常不写。
@@ -75,13 +77,18 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 ## 停机（每轮内循环完成后判定；即使 verdict=approve，待刹车 id 先走完刹车链)
 1. **verdict = approve** → 收工：写 `rounds/<session>/session.md` 总结（轮数、修复/
    驳回统计、遗留观察），向用户报告可 ship。
-2. **升级刹车链**（每 id 至多一次）：`run.dismissed_reappeared` 中处于 `dismissed` 状态
+2. **尾流守卫**：活跃分支上每轮修复自身会成为下轮评审对象，approve 可能结构性不可达
+   （自指尾流）。**连续 2 轮属实项全为衍生、且属实数不增**（本轮 ≤ 上轮）→ 判定
+   **原始问题面已清空**，收工（协议级视同达成目标）：session.md 如实注明「按尾流守卫
+   收工；最后一轮衍生修复未经再评审——有限停机的固有代价」。衍生数反弹（修复引入了
+   新真问题群）→ 守卫不触发，循环继续。
+3. **升级刹车链**（每 id 至多一次）：`run.dismissed_reappeared` 中处于 `dismissed` 状态
    的 id → 对照台账里当时的驳回理由，带新 finding body **复裁一次**：改判属实 → 修 +
    删台账文件；仍判误报 → 台账追加 `re-upheld(rM)`，**停，AskUserQuestion 交人裁决**。
    人裁误报 → 追加 `human-confirmed(rK)`，此后该 id 永久静默；人裁属实 → 修 + 删文件，继续。
-3. **修复受阻**：某 finding 属实但你修不了（需产品/架构决策、改动越权）→ 停，交用户。
-4. **停滞守卫**：本轮仍有未豁免 findings 但零代码改动（未修也未新驳）→ 空转，停，交用户。
-5. `--max-rounds` 达限（仅用户显式给出时）→ 停，输出未收敛摘要。
+4. **修复受阻**：某 finding 属实但你修不了（需产品/架构决策、改动越权）→ 停，交用户。
+5. **停滞守卫**：本轮仍有未豁免 findings 但零代码改动（未修也未新驳）→ 空转，停，交用户。
+6. `--max-rounds` 达限（仅用户显式给出时）→ 停，输出未收敛摘要。
 
 ## 收工反馈（本地调试阶段 · 发布前移除）
 > 开发期临时仪器,发布前连同 `${CODEX_PLUGIN_ROOT}/feedback.md`、本节、observations 一行约定一并删除。
