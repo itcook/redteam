@@ -143,9 +143,11 @@ pub async fn run_code_fanout(
     // 每个 bundle 的 label/prompt 只算一次：manifest 与执行复用同一份。
     let cells: Vec<(String, String, String)> = bundles
         .iter()
-        .map(|bundle| {
+        .enumerate()
+        .map(|(i, bundle)| {
             let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
-            let prompt = build_bundle_prompt(target_label, bundle, rules, focus, dismissed_notes);
+            let others = crate::bundle::other_files_manifest(bundles, i);
+            let prompt = build_bundle_prompt(target_label, bundle, rules, focus, dismissed_notes, &others);
             let cell_id = format!("bundle[{label}]");
             (cell_id, label, prompt)
         })
@@ -700,7 +702,8 @@ mod tests {
     #[async_trait::async_trait]
     impl ReviewProvider for SlowFastProbe {
         async fn run(&self, req: LensRequest) -> Result<crate::provider::LensCall, ProviderError> {
-            if req.prompt.contains("slow.rs") {
+            // 精确匹配「本包文件行」——清单段注入后其他包的 prompt 也含 slow.rs 路径
+            if req.prompt.contains("Files in this bundle: src/slow.rs") {
                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                 self.slow_done.store(true, Ordering::SeqCst);
             }

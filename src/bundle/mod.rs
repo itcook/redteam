@@ -38,6 +38,42 @@ pub struct Bundle {
     pub files: Vec<FileChange>,
 }
 
+/// 清单条目上限——超出截断为「… and N more files」（与 dismissed notes 同思路的体积防护）。
+const MANIFEST_MAX_ENTRIES: usize = 200;
+
+/// 全变更集清单（dogfood 20260702 #2）：`exclude` 号 bundle 之外所有变更文件的
+/// `path (+adds/-dels)`。注入单包评审 prompt，让模型知晓视野外还有哪些文件在变——
+/// 消「无证据实现/无 version」式跨 bundle 误报。空串 = 该包已覆盖全变更集。
+pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
+    let mut entries: Vec<String> = Vec::new();
+    for (i, b) in bundles.iter().enumerate() {
+        if i == exclude {
+            continue;
+        }
+        for fc in &b.files {
+            let (mut adds, mut dels) = (0usize, 0usize);
+            for l in fc.diff.lines() {
+                if l.starts_with("+++") || l.starts_with("---") {
+                    continue;
+                }
+                if l.starts_with('+') {
+                    adds += 1;
+                } else if l.starts_with('-') {
+                    dels += 1;
+                }
+            }
+            entries.push(format!("{} (+{adds}/-{dels})", fc.path));
+        }
+    }
+    let extra = entries.len().saturating_sub(MANIFEST_MAX_ENTRIES);
+    entries.truncate(MANIFEST_MAX_ENTRIES);
+    let mut s = entries.join(", ");
+    if extra > 0 {
+        s.push_str(&format!(", … and {extra} more files"));
+    }
+    s
+}
+
 /// 单个文件包的文件数上限（超出按排序切块）。
 pub const BUNDLE_MAX_FILES: usize = 8;
 
@@ -398,5 +434,31 @@ mod tests {
         // root=None：无 import 提取，退化到目录+词干（同目录并包）
         let out = group(vec![fc("src/auth/login.rs", "+a"), fc("src/auth/token.rs", "+b")], None);
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn other_files_manifest_lists_counts_and_excludes_self() {
+        let bundles = vec![
+            Bundle { files: vec![fc("a.rs", "+one\n+two\n-gone")] },
+            Bundle { files: vec![fc("b.rs", "--- a/b.rs\n+++ b/b.rs\n+x")] },
+        ];
+        let m = other_files_manifest(&bundles, 0);
+        assert_eq!(m, "b.rs (+1/-0)", "排除自身；+++/--- 头不计增删");
+        let m1 = other_files_manifest(&bundles, 1);
+        assert_eq!(m1, "a.rs (+2/-1)");
+    }
+
+    #[test]
+    fn other_files_manifest_single_bundle_is_empty() {
+        let bundles = vec![Bundle { files: vec![fc("a.rs", "+x")] }];
+        assert!(other_files_manifest(&bundles, 0).is_empty(), "单包即全变更集 → 空");
+    }
+
+    #[test]
+    fn other_files_manifest_truncates_over_cap() {
+        let files: Vec<_> = (0..MANIFEST_MAX_ENTRIES + 5).map(|i| fc(&format!("f{i}.rs"), "+x")).collect();
+        let bundles = vec![Bundle { files: vec![fc("self.rs", "+s")] }, Bundle { files }];
+        let m = other_files_manifest(&bundles, 0);
+        assert!(m.ends_with("… and 5 more files"), "超上限截断并注记条数: {m}");
     }
 }

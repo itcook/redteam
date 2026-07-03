@@ -141,12 +141,15 @@ pub fn build_doc_prompt(
 }
 
 /// 构造一个文件包的对抗 prompt：所有适用 rule 注入为关注清单，bundle diff 内联。
+/// `other_files`：本包外全变更集文件清单（`bundle::other_files_manifest` 产出，可空）——
+/// 防「无证据实现」式跨 bundle 误报。
 pub fn build_bundle_prompt(
     target_label: &str,
     bundle: &Bundle,
     rules: &[&Lens],
     user_focus: &str,
     dismissed_notes: &str,
+    other_files: &str,
 ) -> String {
     let rules_str = rules_block(rules);
 
@@ -172,6 +175,8 @@ pub fn build_bundle_prompt(
         ("{{BUNDLE_DIFFS}}", &diffs_block),
         ("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus }),
         ("{{DISMISSED_NOTES}}", if dismissed_notes.is_empty() { "(none)" } else { dismissed_notes }),
+        ("{{OTHER_CHANGED_FILES}}",
+            if other_files.is_empty() { "(none — this bundle covers the entire changeset)" } else { other_files }),
     ])
 }
 
@@ -265,10 +270,14 @@ mod tests {
             files: vec![FileChange { path: "src/auth.rs".into(), diff: "+let t = secret();".into() }],
         };
         let rules = vec![by_id("L1").unwrap(), by_id("L5").unwrap()];
-        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "已驳回:旧误报X");
+        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "已驳回:旧误报X", "");
         assert!(!p.contains("{{"), "no residual placeholders");
+        // 空清单 → 渲染「本包即全变更集」占位；非空 → 原样注入
+        assert!(p.contains("(none — this bundle covers the entire changeset)"), "empty manifest placeholder");
+        let pm = build_bundle_prompt("wt", &bundle, &rules, "", "", "src/other.rs (+3/-1)");
+        assert!(pm.contains("src/other.rs (+3/-1)"), "other-files manifest injected");
         // 注入对称覆盖(r4 ea30e058):bundle 侧同样不被外部占位捕获
-        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "notes {{BUNDLE_DIFFS}} 试探");
+        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "notes {{BUNDLE_DIFFS}} 试探", "");
         assert!(pi.contains("focus {{RULES}} 试探") && pi.contains("notes {{BUNDLE_DIFFS}} 试探"),
             "bundle 外部内容占位不被捕获");
         assert!(p.contains("[L1]") && p.contains("[L5]"), "rule ids injected");

@@ -61,6 +61,8 @@ Every finding must be grounded in code you actually read — do not invent files
 <bundle>
 Target: {{TARGET_LABEL}}
 Files in this bundle: {{FILE_LIST}}
+Files changed elsewhere in this changeset — their diffs are NOT shown here; other review passes cover them: {{OTHER_CHANGED_FILES}}
+Do NOT claim something is missing, undeclared, or unimplemented ACROSS THE CHANGESET (e.g. "no version declared", "the announced X is implemented nowhere") when it could plausibly live in one of those files — use read_file to confirm actual absence first, or drop the claim. Absence from this bundle is not absence from the changeset.
 
 Changed hunks:
 {{BUNDLE_DIFFS}}
