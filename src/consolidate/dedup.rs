@@ -44,7 +44,8 @@ fn merge_into(base: &mut Finding, other: &Finding) {
     for l in &other.lenses { if !base.lenses.contains(l) { base.lenses.push(l.clone()); } }
     for m in &other.models { if !base.models.contains(m) { base.models.push(m.clone()); } }
     base.agreement = base.models.len() as u32;
-    if other.recommendation.len() > base.recommendation.len() { base.recommendation = other.recommendation.clone(); }
+    // rec 跟随 body 同源（body 恒保留 base 的）——「更长 rec 胜」会让合并后 body 讲 A 问题、
+    // rec 讲 B 方案的串台（dogfood 20260702 r1 3cf04bba）。
     base.hard_constraint = base.hard_constraint || other.hard_constraint;
 }
 
@@ -143,6 +144,18 @@ mod tests {
         assert_eq!(out.len(), 1, "quote 行重叠应合并即便标题不相似");
         assert_eq!(out[0].agreement, 2);
         assert_eq!(out[0].severity, Severity::Critical); // 取最高
+    }
+
+    #[test]
+    fn merged_recommendation_stays_with_base_body() {
+        // 合并保留 base 的 body，rec 必须同源——即便 other 的 rec 更长（防串台回归）
+        let mut a = f("1","a.rs",10,12,"missing auth check","claude",Severity::High);
+        a.recommendation = "add guard".into();
+        let mut b = f("2","a.rs",11,13,"Missing auth check","gpt",Severity::High);
+        b.recommendation = "a much longer but unrelated recommendation about symlinks".into();
+        let out = dedup(vec![a, b]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].recommendation, "add guard", "rec 与保留的 body 同源，不取更长者");
     }
 
     #[test]
