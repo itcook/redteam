@@ -10,6 +10,13 @@
 路径对照:`.breakpoint/`→`.redteam/`、`~/.config/breakpoint/`→`~/.config/redteam/`、
 `BRK_*` 环境变量→`REDTEAM_*`、`fix(lgtm):` commit 前缀→`fix(ship):`。
 
+## 设计原则:内置命令优先(2026-07-02 定)
+
+**裸终端可用**是底线:功能尽量落进 `redteam` 二进制,而非 prompt 编排——减少宿主 prompt
+编排带来的不确定性。宿主(Claude Code/Codex)集成面 = 调命令,commands/*.md 壳层保持薄透传。
+`--help` 是裸终端用户唯一的在场文档,与代码同权重维护。判断新功能落点时:能内置就内置,
+prompt 只做裁决/编排等模型本职(例外:dev-time 临时仪器如 feedback.md,发布前拆除)。
+
 ## 常用
 
 - 挑活先读 `.doc/roadmap.md`(项目级里程碑活索引,gitignored);零散项在 `.doc/TODO.md`。

@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use std::path::Path;
 
 #[derive(Parser)]
-#[command(name = "redteam")]
+#[command(name = "redteam", version, about = "模型无关的对抗式代码/文档评审器")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -20,31 +20,46 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
+    /// 发起对抗式评审：多模型扇出 + 工具检索 + 定向核实，输出 verdict/findings。
+    /// 退出码：reject→10、approve 但有降级/不完整→2、干净 approve→0。
     Review {
+        /// 评审模式：code | doc。缺省自动推断：有 --base 或 branch scope→code；给了文档目标→doc；歧义报错。
         #[arg(long)]
         mode: Option<String>,
+        /// code 模式 diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]
         base: Option<String>,
+        /// 证据范围：working-tree（默认，未提交改动）| branch（当前分支相对基线的全部提交）。
         #[arg(long, default_value = "working-tree")]
         scope: String,
+        /// 对照的 spec/需求文档路径（可多次）——评审将检查实现与其符合度。
         #[arg(long)]
         spec: Vec<String>,
+        /// 用户聚焦提示，注入评审 prompt 引导注意力（如「重点看并发安全」）。
         #[arg(long)]
         focus: Option<String>,
+        /// 逗号分隔的 lens 集，缺省按 mode 取内置全集。
         #[arg(long)]
         lenses: Option<String>,
+        /// 逗号分隔的 model 名（依配置 priority 组候补链）；缺省用配置的 default_models。
         #[arg(long)]
         models: Option<String>,
+        /// 所有已配置 model 各评一遍（复评提升 agreement 信号），而非候补链取一。
         #[arg(long)]
         models_all: bool,
+        /// 跳过跨 finding 关联分析（不产出 clusters）。
         #[arg(long)]
         no_correlate: bool,
+        /// verdict 阻断阈值：low | medium（默认）| high | critical——达到即 reject。
         #[arg(long)]
         block_threshold: Option<String>,
+        /// finding 置信度下限（默认 0.5），低于即丢弃。
         #[arg(long)]
         conf_floor: Option<f32>,
+        /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。
         #[arg(long)]
         background: bool,
+        /// 输出格式：json（默认）| md。
         #[arg(long, default_value = "json")]
         format: String,
         /// R2.3：补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
@@ -55,6 +70,7 @@ enum Cmd {
         /// 豁免 verdict blocking，报告标出 previously_dismissed + run.dismissed_reappeared。
         #[arg(long)]
         dismissed: Option<String>,
+        /// 评审目标：doc 模式为受审文档路径（可多个）；code 模式留空（评当前改动）。
         targets: Vec<String>,
     },
     /// 查询作业状态：无 id 列当前 workspace 全部；有 id 打印该作业 JSON。
@@ -70,6 +86,7 @@ enum Cmd {
     /// 取回已完成作业的评审结果（读后标记已消费）。仅作业处于终态 `done` 时可取；未终态返回退出码 2。
     Result {
         job_id: String,
+        /// 输出格式：json（默认）| md。
         #[arg(long, default_value = "json")]
         format: String,
     },
@@ -94,16 +111,22 @@ enum Cmd {
 enum ModelCmd {
     /// 配置一个 provider/model（flag 驱动）。
     Setup {
+        /// provider 名（配置块键名，如 DeepSeek、Kimi）。
         #[arg(long)]
         provider: String,
+        /// 协议类型：openai | anthropic（含 claude/gpt/gemini 等别名）。
         #[arg(long)]
         kind: Option<String>,
+        /// API 端点 base URL（anthropic 网关须带 /v1）。
         #[arg(long)]
         base_url: Option<String>,
+        /// model id（如 deepseek-v4-pro）。
         #[arg(long)]
         model: Option<String>,
+        /// API key（配合 --key-store 决定去处；不落 config.toml）。
         #[arg(long)]
         key: Option<String>,
+        /// 候补链优先级（大者先选）。
         #[arg(long)]
         priority: Option<i32>,
         /// key 去处：env(默认，打印 export) | secrets(写 secrets.toml chmod 600)
@@ -112,6 +135,7 @@ enum ModelCmd {
     },
     /// 列已配置 provider + 可用性 + 配置位置。
     List {
+        /// 对指定 provider 实探上游 /models 列表（带 key 探测，抓 401 假阳性）。
         #[arg(long)]
         remote: Option<String>,
     },
