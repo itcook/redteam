@@ -11,7 +11,10 @@ use clap::{Parser, Subcommand};
 use std::path::Path;
 
 #[derive(Parser)]
-#[command(name = "redteam", version, about = "模型无关的对抗式代码/文档评审器")]
+// args_override_self：同名 flag 重复时后者胜（而非报错）——ship 等编排方把自己管理的
+// flag 追加在用户参数之后即权威生效，无需依赖 prompt 层把用户重复参数「摘干净」
+// （r5 dogfood 1c72b790：LLM 摘参不可靠，机制化消灭「重复即崩」类）。
+#[command(name = "redteam", version, about = "模型无关的对抗式代码/文档评审器", args_override_self = true)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
