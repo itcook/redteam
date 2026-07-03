@@ -78,17 +78,15 @@ enum Cmd {
         /// 评审目标：doc 模式为受审文档路径（可多个）；code 模式留空（评当前改动）。
         targets: Vec<String>,
     },
-    /// 查询作业状态：无 id 列当前 workspace 全部；有 id 打印该作业 JSON。
-    /// `--workspaces` 聚合所有 workspace，`--workspaces <substr>` 按路径子串筛。
+    /// 查询作业状态：无 id 列本项目全部；有 id 打印该作业 JSON。
     Status {
         job_id: Option<String>,
-        #[arg(long, num_args = 0..=1, default_missing_value = "")]
-        workspaces: Option<String>,
         /// 输出格式：json（默认，机读契约）| table（人读）
         #[arg(long, default_value = "json")]
         format: String,
     },
-    /// 取回已完成作业的评审结果（读后标记已消费）。仅作业处于终态 `done` 时可取；未终态返回退出码 2。
+    /// 取回作业的评审结果（持久存储于 .redteam/proj.db，永不过期、可重复取）。
+    /// 任一终态可取（failed/timed_out 有部分报告也放行）；未终态返回退出码 2。
     Result {
         job_id: String,
         /// 输出格式：json（默认）| md。
@@ -263,16 +261,6 @@ fn load_config_warned() -> Config {
     }
 }
 
-/// 机会式 prune：加载配置，清过期作业。
-fn prune_here(ws: &std::path::Path) {
-    let cfg = load_config_warned();
-    redteam::state::store::prune(
-        ws,
-        redteam::state::store::parse_ttl(&cfg.review.state_ttl),
-        now_secs(),
-    );
-}
-
 /// Fix 1（final-review）：`redteam result` 在任一终态（Done|Failed|TimedOut|Cancelled）都应放行——
 /// 失败/超时路径经 `write_partial_result` 落了带 `verdict: incomplete` 的 result.json（ship 协议
 /// §2.4 依赖取到它），不该被 Failed/TimedOut 一律拦成 "not done"。门槛统一为「终态 + 文件存在」；
@@ -301,7 +289,7 @@ fn resolve_result(
     match content {
         Some(raw) => Ok(raw),
         None if st.status == JobStatus::Done => {
-            Err((format!("result expired or missing for {job_id}"), 2))
+            Err((format!("result missing for {job_id}"), 2))
         }
         None => Err((format!("job {job_id} not done (status: {:?})", st.status), 2)),
     }
@@ -376,8 +364,7 @@ async fn main() {
             // R2.3：--resume <job_id> 补跑差集 cell，前台同步；忽略本次调用的其余 flag——
             // mode/targets/models 等从该作业落盘的 args.json 重建（run_resume 内部处理）。
             if let Some(job_id) = resume {
-                let ws = redteam::state::store::workspace_bucket(&cwd);
-                prune_here(&ws);
+                let ws = cwd.clone();
                 let orig_args_json = match redteam::state::store::read_args_raw(&ws, &job_id) {
                     Some(j) => j,
                     None => {
@@ -407,14 +394,8 @@ async fn main() {
 
             // 后台：写 pending + args 文件 → spawn detached worker → 打印 job-id 退出。
             if background {
-                let ws = redteam::state::store::workspace_bucket(&cwd);
+                let ws = cwd.clone();
                 let job_id = gen_job_id(&cwd);
-                // 机会式 prune（与前台一致，见 Task 8 也在前台跑）
-                redteam::state::store::prune(
-                    &ws,
-                    redteam::state::store::parse_ttl(&cfg.review.state_ttl),
-                    now_secs(),
-                );
                 let args_json = serde_json::to_string(&args).unwrap_or_default();
                 if redteam::state::store::write_args_raw(&ws, &job_id, &args_json).is_err() {
                     eprintln!("error: failed to write job args");
@@ -445,8 +426,7 @@ async fn main() {
                 }
             }
 
-            // 前台路径：机会式 prune + 构造 registry 后调 run_review_dispatch。
-            prune_here(&redteam::state::store::workspace_bucket(&cwd));
+            // 前台路径：构造 registry 后调 run_review_dispatch。
             let (_detected, registry) = match build_registry(&args, &cfg, &cwd) {
                 Ok(x) => x,
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
@@ -469,7 +449,7 @@ async fn main() {
         Cmd::Worker { job_id } => {
             let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = redteam::state::store::workspace_bucket(&cwd);
+            let ws = cwd.clone();
             let args_json = match redteam::state::store::read_args_raw(&ws, &job_id) {
                 Some(j) => j,
                 None => {
@@ -512,17 +492,11 @@ async fn main() {
             let code = redteam::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
             std::process::exit(code);
         }
-        Cmd::Status { job_id, workspaces, format } => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = redteam::state::store::workspace_bucket(&cwd);
-            prune_here(&ws); // 机会式 prune（仅当前 workspace，见决策⑥）
+        Cmd::Status { job_id, format } => {
+            let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             // 两分支统一收集（列表 / 单 job），再按 format 分流；json 输出形状与改动前逐字节一致。
             let jobs: Option<Vec<redteam::state::job::JobState>> = match &job_id {
-                None => Some(redteam::state::job::select_jobs(
-                    &ws,
-                    &redteam::state::store::state_root(),
-                    workspaces.as_deref(),
-                )),
+                None => Some(redteam::state::job::list_states(&ws)),
                 Some(id) => redteam::state::job::read_state(&ws, id).map(|st| vec![st]),
             };
             match jobs {
@@ -540,15 +514,12 @@ async fn main() {
             }
         }
         Cmd::Result { job_id, format } => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = redteam::state::store::workspace_bucket(&cwd);
-            prune_here(&ws);
+            let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let st = redteam::state::job::read_state(&ws, &job_id);
             match st {
                 Some(s) => match resolve_result(&ws, &job_id, &format, &s) {
                     Ok(raw) => {
                         println!("{raw}");
-                        let _ = redteam::state::store::mark_consumed(&ws, &job_id);
                         s.exit_code.unwrap_or(0)
                     }
                     Err((msg, code)) => { eprintln!("{msg}"); code }
@@ -557,8 +528,7 @@ async fn main() {
             }
         }
         Cmd::Cancel { job_id } => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let ws = redteam::state::store::workspace_bucket(&cwd);
+            let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             match redteam::state::job::read_state(&ws, &job_id) {
                 Some(mut s) if matches!(s.status, redteam::state::job::JobStatus::Running | redteam::state::job::JobStatus::Pending) => {
                     if let Some(pid) = s.pid {

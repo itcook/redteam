@@ -64,8 +64,6 @@ pub struct ReviewConfig {
     pub correlate: bool,
     #[serde(default = "default_concurrency")]
     pub max_concurrency: usize,
-    #[serde(default = "default_ttl")]
-    pub state_ttl: String,
     #[serde(default)]
     pub lenses: LensSets,
 }
@@ -73,7 +71,6 @@ fn default_block() -> Severity { Severity::Medium }
 fn default_floor() -> f32 { 0.5 }
 fn default_true() -> bool { true }
 fn default_concurrency() -> usize { 8 }
-fn default_ttl() -> String { "24h".into() }
 impl Default for LensSets {
     fn default() -> Self { LensSets { code: default_code_lenses(), doc: default_doc_lenses() } }
 }
@@ -81,7 +78,7 @@ impl Default for ReviewConfig {
     fn default() -> Self {
         ReviewConfig { default_models: vec![], block_threshold: default_block(),
             conf_floor: default_floor(), correlate: default_true(),
-            max_concurrency: default_concurrency(), state_ttl: default_ttl(),
+            max_concurrency: default_concurrency(),
             lenses: LensSets::default() }
     }
 }

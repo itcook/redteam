@@ -745,7 +745,7 @@ fn write_partial_result(
     st.status = status;
     st.error = Some(error);
     st.exit_code = Some(code);
-    st.result_path = Some(crate::state::store::job_result(ws, job_id).to_string_lossy().into_owned());
+    st.result_path = Some(format!("proj.db#results/{job_id}"));
     let _ = crate::state::job::write_state(ws, st);
 }
 
@@ -762,7 +762,7 @@ pub async fn run_job(
     started_at: u64,
 ) -> i32 {
     use crate::state::job::{read_state, write_state, JobState, JobStatus};
-    use crate::state::store::{job_result, write_result};
+    use crate::state::store::write_result;
 
     let mut st = read_state(ws, job_id).unwrap_or_else(|| JobState::new(job_id, started_at));
     // I2：写 Running 前检查是否已被 cancel，若是则直接返回，保留 Cancelled 终态。
@@ -814,7 +814,7 @@ pub async fn run_job(
             st.mode = Some(report.mode);
             st.models = report.run.models.clone();
             st.lenses = report.run.lenses.clone();
-            st.result_path = Some(job_result(ws, job_id).to_string_lossy().into_owned());
+            st.result_path = Some(format!("proj.db#results/{job_id}"));
             let _ = write_state(ws, &st);
             code
         }
