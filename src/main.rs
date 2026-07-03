@@ -245,18 +245,7 @@ fn resolve_result(
     }
 }
 
-/// 从 review args 探测 mode（build_registry 与后台起手 stamp 共用）。
-fn detect_mode_from_args(args: &ReviewArgs) -> anyhow::Result<Mode> {
-    let scope_enum = if args.scope == "branch" { Scope::Branch } else { Scope::WorkingTree };
-    let mode_opt = args.mode.as_deref().map(|m| if m == "code" { Mode::Code } else { Mode::Doc });
-    detect_mode(&EvidenceOpts {
-        mode: mode_opt,
-        base: args.base.clone(),
-        scope: scope_enum,
-        spec: args.spec.clone(),
-        targets: args.targets.clone(),
-    })
-}
+use redteam::cli::detect_mode_from_args;
 
 /// 探测 mode + 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
 /// 返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。

@@ -59,7 +59,10 @@ pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
         for fc in &b.files {
             let (mut adds, mut dels) = (0usize, 0usize);
             for l in fc.diff.lines() {
-                if l.starts_with("+++") || l.starts_with("---") {
+                // 文件头恒为 "--- a/…"/"+++ b/…"/"--- /dev/null"（带空格）；裸 "---"/"+++"
+                // 前缀会误跳正文增删行（如删除 "--separator" → diff 行 "---separator"，
+                // dogfood 20260703 r4 8eae1f24 agree=2）。
+                if l.starts_with("+++ ") || l.starts_with("--- ") {
                     continue;
                 }
                 if l.starts_with('+') {
@@ -470,6 +473,16 @@ mod tests {
         assert_eq!(m, "b.rs (+1/-0)", "排除自身；+++/--- 头不计增删");
         let m1 = other_files_manifest(&bundles, 1);
         assert_eq!(m1, "a.rs (+2/-1)");
+    }
+
+    #[test]
+    fn other_files_manifest_counts_body_lines_starting_with_dashes() {
+        // 正文删除行内容为 "--sep"（diff 行 "---sep"）不得被当文件头跳过；真头 "--- a/…" 仍跳
+        let bundles = vec![
+            Bundle { files: vec![fc("self.rs", "+s")] },
+            Bundle { files: vec![fc("a.rs", "--- a/a.rs\n+++ b/a.rs\n---sep\n+++x")] },
+        ];
+        assert_eq!(other_files_manifest(&bundles, 0), "a.rs (+1/-1)", "裸 ---/+++ 正文行计入增删");
     }
 
     #[test]

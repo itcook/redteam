@@ -102,6 +102,21 @@ pub fn resolve_models(
     (models, replicate)
 }
 
+/// 从 review args 探测 mode（前台 build_registry、后台起手 stamp、resume/partial 共用）。
+/// 显式值直取；None 走 detect_mode（base/scope/targets 推断）——resume 场景 args.json 里
+/// 自动探测 job 的 mode 存 None，不重探测会把 code job 错当 Doc（dogfood 20260703 r4 0474eb1e）。
+pub fn detect_mode_from_args(args: &ReviewArgs) -> anyhow::Result<Mode> {
+    let scope = if args.scope == "branch" { Scope::Branch } else { Scope::WorkingTree };
+    let mode_opt = args.mode.as_deref().map(|m| if m == "code" { Mode::Code } else { Mode::Doc });
+    crate::evidence::detect_mode(&EvidenceOpts {
+        mode: mode_opt,
+        base: args.base.clone(),
+        scope,
+        spec: args.spec.clone(),
+        targets: args.targets.clone(),
+    })
+}
+
 /// R8.2：命中标记 + 派生索引（排序去重）。单点应用于共用尾段，三路径（code/doc/resume）同享。
 pub(crate) fn mark_dismissed(
     findings: &mut [Finding],
@@ -482,10 +497,8 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
     let done = done_records.len();
     let total = manifest.len().max(done);
     let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.findings).collect();
-    let mode = match args.mode.as_deref() {
-        Some("code") => Mode::Code,
-        _ => Mode::Doc,
-    };
+    // best-effort 错误路径：探测失败（如 empty_review_args）兜 Doc，维持旧行为。
+    let mode = detect_mode_from_args(args).unwrap_or(Mode::Doc);
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
         schema_version: "2".into(),
@@ -560,9 +573,11 @@ pub async fn run_resume(
             );
         }
     };
-    let mode = match args.mode.as_deref() {
-        Some("code") => Mode::Code,
-        _ => Mode::Doc,
+    let mode = match detect_mode_from_args(&args) {
+        Ok(m) => m,
+        Err(e) => {
+            return partial_report(ws, job_id, &args, format!("resume: cannot determine mode: {e}"));
+        }
     };
     let fallback_lens = match mode { Mode::Code => "code", Mode::Doc => "doc" };
 
