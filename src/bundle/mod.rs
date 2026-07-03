@@ -43,6 +43,9 @@ const MANIFEST_MAX_ENTRIES: usize = 200;
 /// 清单总字符预算——条目数之外的直接 token 防护：每 bundle prompt 注入一份清单，
 /// 大变更集下 O(bundles×manifest) 叠加，字符帽对症（dogfood 20260703 r1 6db068d2）。
 const MANIFEST_MAX_CHARS: usize = 4000;
+/// 截断注记（"… and N more files"）的预留额——预算含注记本身，总输出不超帽
+/// （dogfood 20260703 r2 5361b545：注记后置追加曾致溢出预算）。
+const MANIFEST_SUFFIX_RESERVE: usize = 40;
 
 /// 全变更集清单（dogfood 20260702 #2）：`exclude` 号 bundle 之外所有变更文件的
 /// `path (+adds/-dels)`。注入单包评审 prompt，让模型知晓视野外还有哪些文件在变——
@@ -73,7 +76,9 @@ pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
     let mut kept = 0usize;
     let mut chars = 0usize;
     for e in &entries {
-        if kept >= MANIFEST_MAX_ENTRIES || chars + e.len() + 2 > MANIFEST_MAX_CHARS {
+        if kept >= MANIFEST_MAX_ENTRIES
+            || chars + e.len() + 2 > MANIFEST_MAX_CHARS - MANIFEST_SUFFIX_RESERVE
+        {
             break;
         }
         chars += e.len() + 2; // ", " 分隔
@@ -474,7 +479,7 @@ mod tests {
         let bundles = vec![Bundle { files: vec![fc("self.rs", "+s")] }, Bundle { files }];
         let m = other_files_manifest(&bundles, 0);
         assert!(m.contains("more files"), "超上限截断并注记条数: {m}");
-        assert!(m.len() <= MANIFEST_MAX_CHARS + 40, "字符预算生效（截断注記在预算外富余内）: len={}", m.len());
+        assert!(m.len() <= MANIFEST_MAX_CHARS, "含注记总输出不超预算: len={}", m.len());
     }
 
     #[test]
@@ -485,7 +490,7 @@ mod tests {
             .collect();
         let bundles = vec![Bundle { files: vec![fc("self.rs", "+s")] }, Bundle { files }];
         let m = other_files_manifest(&bundles, 0);
-        assert!(m.len() <= MANIFEST_MAX_CHARS + 40, "字符预算截断: len={}", m.len());
+        assert!(m.len() <= MANIFEST_MAX_CHARS, "含注记总输出不超预算: len={}", m.len());
         assert!(m.contains("more files"), "被截条数有注记: {m}");
     }
 }

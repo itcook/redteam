@@ -136,7 +136,7 @@ pub fn build_doc_prompt(
         ("{{OUTPUT_LANGUAGE}}", &output_language()),
         ("{{REVIEW_INPUT}}", &input.body),
         ("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus }),
-        ("{{DISMISSED_NOTES}}", if dismissed_notes.is_empty() { "(none)" } else { dismissed_notes }),
+        ("{{DISMISSED_NOTES}}", if dismissed_notes.trim().is_empty() { "(none)" } else { dismissed_notes }),
     ])
 }
 
@@ -174,7 +174,7 @@ pub fn build_bundle_prompt(
         ("{{OUTPUT_LANGUAGE}}", &output_language()),
         ("{{BUNDLE_DIFFS}}", &diffs_block),
         ("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus }),
-        ("{{DISMISSED_NOTES}}", if dismissed_notes.is_empty() { "(none)" } else { dismissed_notes }),
+        ("{{DISMISSED_NOTES}}", if dismissed_notes.trim().is_empty() { "(none)" } else { dismissed_notes }),
         ("{{OTHER_CHANGED_FILES}}",
             if other_files.is_empty() { "(none — this bundle covers the entire changeset)" } else { other_files }),
     ])

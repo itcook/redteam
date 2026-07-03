@@ -27,7 +27,7 @@ enum Cmd {
     /// 退出码：reject→10、approve 但有降级/不完整→2、干净 approve→0。
     Review {
         /// 评审模式：code | doc。缺省自动推断：有 --base 或 branch scope→code；给了文档目标→doc；歧义报错。
-        #[arg(long)]
+        #[arg(long, value_parser = ["code", "doc"])]
         mode: Option<String>,
         /// code 模式 diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]

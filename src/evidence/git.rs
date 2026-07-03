@@ -53,7 +53,9 @@ fn assemble_changes(files: &[String], per_file: impl Fn(&str) -> String) -> Vec<
 }
 
 fn git(args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git").args(args).output()?;
+    // -c color.ui=false：用户 color.diff=always 时 ANSI 码会污染管道输出
+    // （diff 内容/行数统计/prompt 注入），单点关死（dogfood 20260703 r2 b4d096e0）。
+    let out = Command::new("git").args(["-c", "color.ui=false"]).args(args).output()?;
     if !out.status.success() {
         anyhow::bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     }

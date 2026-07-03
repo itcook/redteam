@@ -31,7 +31,7 @@ either IS a real defect — uphold).
 
 <output_contract>
 Return ONLY JSON: an object with a "findings" array.
-- If you find concrete, grounded reasons the claim is WRONG / a false positive / actually addressed: return EXACTLY ONE finding whose title is the refutation reason and whose body cites the evidence. A non-empty array marks the claim REFUTED.
+- If you find concrete, grounded reasons the claim is WRONG / a false positive / actually addressed: return EXACTLY ONE finding — title = the refutation reason, body = the evidence. ALL schema fields are REQUIRED for the JSON to parse: fill severity, file, line_start, line_end by copying them from the claimed finding above; confidence = your certainty (0..1) that the claim is wrong; recommendation = one line on how to disposition the claim; quote may be empty. A non-empty array marks the claim REFUTED.
 - If, after reading, the claim HOLDS and you cannot refute it: return {"findings": []}. An empty array marks the claim UPHELD.
 When in doubt, do NOT fabricate a refutation — return an empty array.
 Write every title and body in {{OUTPUT_LANGUAGE}}.
