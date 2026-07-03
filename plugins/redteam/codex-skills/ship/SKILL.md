@@ -29,7 +29,9 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
    AskUserQuestion 一次并把答案记入 session.md；明确无测试的项目跳过测试步。
 
 ## 每轮 rN
-1. **起评审**：`${CODEX_PLUGIN_ROOT}/bin/redteam review --background --dismissed <dismissed-dir> <透传参数>`
+1. **起评审**：`${CODEX_PLUGIN_ROOT}/bin/redteam review <透传参数> --background --dismissed <dismissed-dir>`
+   （ship 管理的 flag **必须放在用户透传参数之后**——`args_override_self` 语义下后者胜，
+    这是「ship 值权威生效」的机制保证，顺序不可颠倒。）
    - `--dismissed` 自带双效：豁免既往驳回 + **台账内容自动注入评审 prompt 的「勿再报」段**——
      不要自己读台账拼 --focus 摘要；用户 $ARGUMENTS 里的 `--focus` 原样透传即可。
    → 记下 job id。轮询 `${CODEX_PLUGIN_ROOT}/bin/redteam status <job>`（间隔约 20-30s），只等**终态**

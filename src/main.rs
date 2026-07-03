@@ -71,6 +71,8 @@ enum Cmd {
         resume: Option<String>,
         /// R8.2：既往驳回清单——目录（内含 `<id>.md`）或 16-hex id 逗号列表；命中的 finding
         /// 豁免 verdict blocking，报告标出 previously_dismissed + run.dismissed_reappeared。
+        /// 注意：目录形态时台账文件内容会（截断后）注入评审 prompt 作「勿再报」上下文；
+        /// csv 形态仅豁免、无注入。
         #[arg(long)]
         dismissed: Option<String>,
         /// 评审目标：doc 模式为受审文档路径（可多个）；code 模式留空（评当前改动）。
