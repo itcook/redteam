@@ -12,7 +12,8 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 - `--max-rounds <N>`（本命令专属，可选）：预算护栏；未给则**无轮数上限**——目标是 approve。
 - `--dismissed-dir <path>`（本命令专属，可选）：驳回台账目录，默认 `.redteam/dismissed/`。
 - 其余参数**原样透传**给 `redteam review`（--mode/--base/--scope/--spec/--lenses/--models 等）。
-  透传前先从参数串中摘除上述两个专属参数。
+  透传前先从参数串中摘除上述两个专属参数；`--dismissed` 是 **ship 管理的 flag**（起评审时由
+  ship 注入台账目录，clap 拒绝重复 flag）——若用户误传 `--dismissed`，一并摘除，以 `--dismissed-dir` 为准。
 
 ## 0. 起手
 1. 运行 `${CODEX_PLUGIN_ROOT}/bin/redteam init`（幂等）；创建本会话目录

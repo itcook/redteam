@@ -90,12 +90,22 @@ pub fn load_dismissed_notes(value: &str) -> String {
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
             .filter(|n| n.strip_suffix(".md").is_some_and(is_hex16))
             .collect(),
-        Err(_) => return String::new(),
+        // 读失败不能静默：豁免（parse_dismissed）仍在，但「勿再报」注入丢失 → 模型重报浪费轮次。
+        Err(e) => {
+            eprintln!("redteam: --dismissed ledger dir unreadable ({e}); do-not-re-report notes NOT injected");
+            return String::new();
+        }
     };
     names.sort(); // read_dir 无序 → 排序保 prompt 确定性
     let mut out = String::new();
     for name in names {
-        let Ok(content) = std::fs::read_to_string(p.join(&name)) else { continue };
+        let content = match std::fs::read_to_string(p.join(&name)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("redteam: ledger entry {name} unreadable ({e}); skipped from notes");
+                continue;
+            }
+        };
         let snippet: String = content.trim().chars().take(PER_FILE_CHARS).collect();
         out.push_str("- ");
         out.push_str(&snippet);

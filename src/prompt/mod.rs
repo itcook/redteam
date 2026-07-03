@@ -223,7 +223,7 @@ mod tests {
         assert!(p.contains("let t = secret();"), "diff injected");
         assert!(p.contains("quote"), "quote contract present");
         assert!(p.contains("auth"), "user focus injected");
-        assert!(p.contains("已驳回:旧误报X") || p.contains("已驳回:旧误报Y"), "dismissed ledger notes injected");
+        assert!(p.contains("已驳回:旧误报X"), "dismissed ledger notes injected");
         // L5 是 compliance rule → 注入 severity 封顶提示
         assert!(p.to_lowercase().contains("compliance rule"), "compliance cap note present");
     }
@@ -244,7 +244,7 @@ mod tests {
         assert!(p.contains("DOCBODY"), "doc body inlined");
         assert!(p.contains("design.md"), "spec docs injected");
         assert!(p.contains("auth"), "user focus injected");
-        assert!(p.contains("已驳回:旧误报X") || p.contains("已驳回:旧误报Y"), "dismissed ledger notes injected");
+        assert!(p.contains("已驳回:旧误报Y"), "dismissed ledger notes injected");
         assert!(p.to_lowercase().contains("omission"), "omission/empty-quote contract present");
         assert!(p.to_lowercase().contains("compliance rule"), "D5 compliance cap note present");
         assert!(p.contains("lens"), "doc prompt must teach model to tag lens id per finding");
