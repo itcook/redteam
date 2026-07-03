@@ -48,14 +48,15 @@ pub fn build_refute_prompt(finding: &crate::domain::Finding, mode: Mode) -> Stri
     } else {
         finding.quote.clone()
     };
+    // 受控值先、外部内容（title/body/quote 来自模型输出与被审代码）后——注入防线，同 bundle 注释。
     tpl.replace("{{FILE}}", &finding.file)
         .replace("{{LINE_START}}", &finding.line_start.to_string())
         .replace("{{LINE_END}}", &finding.line_end.to_string())
-        .replace("{{TITLE}}", &finding.title)
         .replace("{{SEVERITY}}", finding.severity.as_str())
+        .replace("{{OUTPUT_LANGUAGE}}", &output_language())
+        .replace("{{TITLE}}", &finding.title)
         .replace("{{BODY}}", &finding.body)
         .replace("{{QUOTE}}", &quote)
-        .replace("{{OUTPUT_LANGUAGE}}", &output_language())
 }
 
 /// 把 rule 集格式化为关注清单（code-bundle 与 doc-bundle 共用）。
@@ -86,14 +87,18 @@ pub fn build_doc_prompt(
     } else {
         input.spec_docs.join(", ")
     };
+    // 替换顺序即注入防线：受控值（rules/spec/label/language）先替换，外部内容
+    // （文档正文/用户 focus/台账 notes）后替换——外部内容中的 `{{占位}}` 字面因此
+    // 不会被后续 replace 捕获成系统段（r2 dogfood 0b176180）。外部内容间的互染
+    // 不提升伪装等级，接受。
     DOC_BUNDLE_TPL
         .replace("{{RULES}}", &rules_block(rules))
-        .replace("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus })
-        .replace("{{DISMISSED_NOTES}}", if dismissed_notes.is_empty() { "(none)" } else { dismissed_notes })
         .replace("{{SPEC_DOCS}}", &spec_docs)
         .replace("{{TARGET_LABEL}}", &input.target_label)
-        .replace("{{REVIEW_INPUT}}", &input.body)
         .replace("{{OUTPUT_LANGUAGE}}", &output_language())
+        .replace("{{REVIEW_INPUT}}", &input.body)
+        .replace("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus })
+        .replace("{{DISMISSED_NOTES}}", if dismissed_notes.is_empty() { "(none)" } else { dismissed_notes })
 }
 
 /// 构造一个文件包的对抗 prompt：所有适用 rule 注入为关注清单，bundle diff 内联。
@@ -120,14 +125,15 @@ pub fn build_bundle_prompt(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // 受控值先、外部内容（diff/focus/notes）后——同 build_doc_prompt 的注入防线注释。
     CODE_BUNDLE_TPL
         .replace("{{TARGET_LABEL}}", target_label)
         .replace("{{RULES}}", &rules_str)
         .replace("{{FILE_LIST}}", &file_list)
+        .replace("{{OUTPUT_LANGUAGE}}", &output_language())
         .replace("{{BUNDLE_DIFFS}}", &diffs_block)
         .replace("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus })
         .replace("{{DISMISSED_NOTES}}", if dismissed_notes.is_empty() { "(none)" } else { dismissed_notes })
-        .replace("{{OUTPUT_LANGUAGE}}", &output_language())
 }
 
 #[cfg(test)]
@@ -226,6 +232,28 @@ mod tests {
         assert!(p.contains("已驳回:旧误报X"), "dismissed ledger notes injected");
         // L5 是 compliance rule → 注入 severity 封顶提示
         assert!(p.to_lowercase().contains("compliance rule"), "compliance cap note present");
+    }
+
+    /// r2 dogfood 0b176180：外部内容（notes/focus/正文）里的 `{{占位}}` 字面不得被
+    /// 后续 replace 捕获成系统段——受控值先替换、外部内容后替换的顺序防线回归测试。
+    #[test]
+    fn external_content_placeholders_are_not_captured() {
+        use crate::domain::{Mode, ReviewInput};
+        use crate::lens::by_id;
+        let input = ReviewInput {
+            mode: Mode::Doc, target_label: "spec.md".into(),
+            collection_guidance: String::new(), body: "正文含 {{USER_FOCUS}} 字面".into(),
+            spec_docs: vec![],
+        };
+        let rules = vec![by_id("D1").unwrap()];
+        let p = build_doc_prompt(&input, &rules, "focus注入 {{RULES}} 试探", "台账注入 {{REVIEW_INPUT}} 试探");
+        // 恶意占位串必须原样留存（模型看到无害字面），不得被替换成真实系统段内容
+        assert!(p.contains("focus注入 {{RULES}} 试探"), "focus 里的占位不被捕获");
+        assert!(p.contains("台账注入 {{REVIEW_INPUT}} 试探"), "notes 里的占位不被捕获");
+        // 外部内容间互染（正文里的 {{USER_FOCUS}} 被 focus 值填充）是接受的行为：
+        // focus 亦是外部内容，不构成系统段伪装——防线只保受控段不被捕获。
+        // rules 真实内容只出现一次（模板位），未被 focus 试探复制
+        assert_eq!(p.matches("[D1]").count(), 1, "rules 只渲染在模板位");
     }
 
     #[test]
