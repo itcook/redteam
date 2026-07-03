@@ -44,6 +44,7 @@ or a stated dependency you could not find, is a reportable finding.
 <review_method>
 Actively disprove readiness: find contradictions, undefined behaviors, missing branches, unstated assumptions, and unmeasurable success criteria.
 User focus (weight heavily, but still report other material issues): {{USER_FOCUS}}
+Previously dismissed by human adjudication — do NOT re-report these or trivial variants of them (ledger notes): {{DISMISSED_NOTES}}
 Referenced spec/code docs (read them via tools to verify claims): {{SPEC_DOCS}}
 </review_method>
 

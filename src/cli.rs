@@ -266,7 +266,8 @@ pub async fn run_review(
     // 4. fan-out（doc：全 D rule 一包 × model 工具循环）
     let focus = args.focus.clone().unwrap_or_default();
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
-    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink).await;
+    let dismissed_notes = args.dismissed.as_deref().map(crate::project::load_dismissed_notes).unwrap_or_default();
+    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &dismissed_notes, &oopts, sink).await;
 
     // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
     let block = args
@@ -348,7 +349,8 @@ pub async fn run_code_review(
         "working tree".to_string()
     };
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
-    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, sink).await;
+    let dismissed_notes = args.dismissed.as_deref().map(crate::project::load_dismissed_notes).unwrap_or_default();
+    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &dismissed_notes, &oopts, sink).await;
 
     // 5-8. 共用尾段：anchor → dedup → verify → verdict → 组报告（code 无 correlate/clusters）
     let block = args

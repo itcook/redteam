@@ -20,6 +20,7 @@ You have tools to inspect the repository: read_file (read any file under the rev
 <review_method>
 Actively disprove the change: violated invariants, missing guards, unhandled failure paths, assumptions that break under stress.
 User focus (weight heavily but still report other material issues): {{USER_FOCUS}}
+Previously dismissed by human adjudication — do NOT re-report these or trivial variants of them (ledger notes): {{DISMISSED_NOTES}}
 </review_method>
 
 <finding_bar>

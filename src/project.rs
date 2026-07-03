@@ -74,6 +74,40 @@ pub fn parse_dismissed(value: &str) -> anyhow::Result<HashSet<String>> {
     Ok(out)
 }
 
+/// 内置命令优先（2026-07-02）：`--dismissed <dir>` 时载入台账内容，供 prompt 注入
+/// 「勿再报」段——宿主不再自己拼 --focus 摘要。零格式解析：台账是宿主写的自由
+/// markdown，消费者是评审模型，原样注入即可。csv 形态无内容可读 → 返回空（仅豁免）。
+/// 每文件/总量截断防 prompt 爆炸（按 char 截，台账多中文）。
+pub fn load_dismissed_notes(value: &str) -> String {
+    const PER_FILE_CHARS: usize = 600;
+    const TOTAL_CHARS: usize = 4000;
+    let p = Path::new(value);
+    if !p.is_dir() {
+        return String::new();
+    }
+    let mut names: Vec<String> = match std::fs::read_dir(p) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.strip_suffix(".md").is_some_and(is_hex16))
+            .collect(),
+        Err(_) => return String::new(),
+    };
+    names.sort(); // read_dir 无序 → 排序保 prompt 确定性
+    let mut out = String::new();
+    for name in names {
+        let Ok(content) = std::fs::read_to_string(p.join(&name)) else { continue };
+        let snippet: String = content.trim().chars().take(PER_FILE_CHARS).collect();
+        out.push_str("- ");
+        out.push_str(&snippet);
+        out.push('\n');
+        if out.chars().count() >= TOTAL_CHARS {
+            out.push_str("…(more ledger entries truncated)\n");
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +150,34 @@ mod tests {
         std::fs::write(tmp.path().join("20ba9b3025a8b421.txt"), "x").unwrap();
         let s = parse_dismissed(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(s, std::collections::HashSet::from(["d2b371819297f98a".to_string()]));
+    }
+
+    #[test]
+    fn load_dismissed_notes_dir_injects_content_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bbbbbbbbbbbbbbbb.md"), "标题B\n驳回理由：证据已豁免").unwrap();
+        std::fs::write(tmp.path().join("aaaaaaaaaaaaaaaa.md"), "标题A\n驳回理由：误报").unwrap();
+        std::fs::write(tmp.path().join("README.md"), "非台账不注入").unwrap();
+        let notes = load_dismissed_notes(tmp.path().to_str().unwrap());
+        assert!(notes.contains("标题A") && notes.contains("误报"), "{notes}");
+        assert!(notes.contains("标题B") && notes.contains("证据已豁免"), "{notes}");
+        assert!(!notes.contains("非台账"), "{notes}");
+        // 排序确定性：A 在 B 前
+        assert!(notes.find("标题A").unwrap() < notes.find("标题B").unwrap());
+    }
+
+    #[test]
+    fn load_dismissed_notes_csv_or_missing_is_empty() {
+        assert_eq!(load_dismissed_notes("d2b371819297f98a,20ba9b3025a8b421"), "");
+        assert_eq!(load_dismissed_notes("/no/such/dir"), "");
+    }
+
+    #[test]
+    fn load_dismissed_notes_truncates_long_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = "长".repeat(5000);
+        std::fs::write(tmp.path().join("cccccccccccccccc.md"), &long).unwrap();
+        let notes = load_dismissed_notes(tmp.path().to_str().unwrap());
+        assert!(notes.chars().count() < 700, "per-file cap: {}", notes.chars().count());
     }
 }

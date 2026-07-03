@@ -75,7 +75,12 @@ fn rules_block(rules: &[&Lens]) -> String {
 }
 
 /// 构造 doc 对抗 prompt：全 D 系 rule 注入为一份关注清单、整篇文档内联、教模型遗漏类留空 quote。
-pub fn build_doc_prompt(input: &ReviewInput, rules: &[&Lens], user_focus: &str) -> String {
+pub fn build_doc_prompt(
+    input: &ReviewInput,
+    rules: &[&Lens],
+    user_focus: &str,
+    dismissed_notes: &str,
+) -> String {
     let spec_docs = if input.spec_docs.is_empty() {
         "(none)".to_string()
     } else {
@@ -84,6 +89,7 @@ pub fn build_doc_prompt(input: &ReviewInput, rules: &[&Lens], user_focus: &str) 
     DOC_BUNDLE_TPL
         .replace("{{RULES}}", &rules_block(rules))
         .replace("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus })
+        .replace("{{DISMISSED_NOTES}}", if dismissed_notes.is_empty() { "(none)" } else { dismissed_notes })
         .replace("{{SPEC_DOCS}}", &spec_docs)
         .replace("{{TARGET_LABEL}}", &input.target_label)
         .replace("{{REVIEW_INPUT}}", &input.body)
@@ -96,6 +102,7 @@ pub fn build_bundle_prompt(
     bundle: &Bundle,
     rules: &[&Lens],
     user_focus: &str,
+    dismissed_notes: &str,
 ) -> String {
     let rules_str = rules_block(rules);
 
@@ -119,6 +126,7 @@ pub fn build_bundle_prompt(
         .replace("{{FILE_LIST}}", &file_list)
         .replace("{{BUNDLE_DIFFS}}", &diffs_block)
         .replace("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus })
+        .replace("{{DISMISSED_NOTES}}", if dismissed_notes.is_empty() { "(none)" } else { dismissed_notes })
         .replace("{{OUTPUT_LANGUAGE}}", &output_language())
 }
 
@@ -208,13 +216,14 @@ mod tests {
             files: vec![FileChange { path: "src/auth.rs".into(), diff: "+let t = secret();".into() }],
         };
         let rules = vec![by_id("L1").unwrap(), by_id("L5").unwrap()];
-        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth");
+        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "已驳回:旧误报X");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.contains("[L1]") && p.contains("[L5]"), "rule ids injected");
         assert!(p.contains("src/auth.rs"), "file path injected");
         assert!(p.contains("let t = secret();"), "diff injected");
         assert!(p.contains("quote"), "quote contract present");
         assert!(p.contains("auth"), "user focus injected");
+        assert!(p.contains("已驳回:旧误报X") || p.contains("已驳回:旧误报Y"), "dismissed ledger notes injected");
         // L5 是 compliance rule → 注入 severity 封顶提示
         assert!(p.to_lowercase().contains("compliance rule"), "compliance cap note present");
     }
@@ -229,12 +238,13 @@ mod tests {
             spec_docs: vec!["design.md".into()],
         };
         let rules = vec![by_id("D1").unwrap(), by_id("D2").unwrap(), by_id("D5").unwrap()];
-        let p = build_doc_prompt(&input, &rules, "auth");
+        let p = build_doc_prompt(&input, &rules, "auth", "已驳回:旧误报Y");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.contains("[D1]") && p.contains("[D2]") && p.contains("[D5]"), "all rules injected");
         assert!(p.contains("DOCBODY"), "doc body inlined");
         assert!(p.contains("design.md"), "spec docs injected");
         assert!(p.contains("auth"), "user focus injected");
+        assert!(p.contains("已驳回:旧误报X") || p.contains("已驳回:旧误报Y"), "dismissed ledger notes injected");
         assert!(p.to_lowercase().contains("omission"), "omission/empty-quote contract present");
         assert!(p.to_lowercase().contains("compliance rule"), "D5 compliance cap note present");
         assert!(p.contains("lens"), "doc prompt must teach model to tag lens id per finding");
