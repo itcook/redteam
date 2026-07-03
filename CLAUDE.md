@@ -1,0 +1,18 @@
+# redteam
+
+模型无关的对抗式代码/文档评审工具。Rust 单 crate,产出 `redteam` 二进制 + Claude Code/Codex 插件。
+
+## 命名(2026-07-02 更名,勿用旧名)
+
+产品/crate/二进制/插件/斜杠空间统一为 **redteam**;循环对抗技能为 **ship**(`/redteam:ship`)。
+曾名 **breakpoint**(二进制 `brk`,循环技能 `lgtm`)——旧名已从代码与数据契约全域清除,
+历史文档(`.doc/design/`、`.doc/plans/`)与 git 历史中的旧名**保留原样**,阅读时按此对照。
+路径对照:`.breakpoint/`→`.redteam/`、`~/.config/breakpoint/`→`~/.config/redteam/`、
+`BRK_*` 环境变量→`REDTEAM_*`、`fix(lgtm):` commit 前缀→`fix(ship):`。
+
+## 常用
+
+- 挑活先读 `.doc/roadmap.md`(项目级里程碑活索引,gitignored);零散项在 `.doc/TODO.md`。
+- `make build` 编译并放置插件二进制;`make gen` 从 `plugins/redteam/commands/`(真相源)重生成
+  codex-skills;`make verify` 防漂移(commit 后跑,commit 前 diff 非零是时序问题)。
+- 密钥在 `~/.config/redteam/secrets.toml`,永不入仓、永不入主配置。
