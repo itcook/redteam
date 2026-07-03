@@ -22,5 +22,6 @@ prompt 只做裁决/编排等模型本职(例外:dev-time 临时仪器如 feedba
 - 挑活先读 `.doc/roadmap.md`(项目级里程碑活索引);零散项在 `.doc/TODO.md`。注:`.doc/` 是
   维护者私有工作区(gitignored,不随仓分发)——外部克隆者没有这些文件,以 `redteam --help` 为准。
 - `make build` 编译并放置插件二进制;`make gen` 从 `plugins/redteam/commands/`(真相源)重生成
-  codex-skills;`make verify` 防漂移(commit 后跑,commit 前 diff 非零是时序问题)。
+  codex-skills;`make verify` 防漂移——它先重新 gen 再要求零 diff,故 commands 与镜像不同步时**任何时刻**跑都会红
+  (含已入库的漂移);唯一假红:本批 commands 改动尚未 commit 时,gen 产物与 HEAD 有合法差异。
 - 密钥在 `~/.config/redteam/secrets.toml`,永不入仓、永不入主配置。

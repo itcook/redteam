@@ -12,11 +12,12 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 - `--max-rounds <N>`（本命令专属，可选）：预算护栏；未给则**无轮数上限**——目标是 approve。
 - `--dismissed-dir <path>`（本命令专属，可选）：驳回台账目录，默认 `.redteam/dismissed/`。
 - 其余参数**原样透传**给 `redteam review`（--mode/--base/--scope/--spec/--lenses/--models 等）。
-  透传前先从参数串中摘除上述两个专属参数，以及 **ship 管理的模式 flag 类**（类级摘除）：
-  `--dismissed <值>` 与 `--resume <值>` **连值一起摘**（ship 注入台账目录 / resume 会切同步
-  补跑打印全报告，均破坏循环）；`--background` 是**无值布尔 flag，只摘 flag 本身**（ship 强制
-  后台轮询，重复即崩）。凡摘除**必须明确告知用户**摘了什么、为什么——如需豁免特定
-  finding，请把驳回记录放入 `--dismissed-dir` 目录（`<id>.md`）；不要静默丢弃用户输入。
+  透传前先从参数串中摘除上述两个专属参数。redteam 二进制开启 `args_override_self`
+  （同名 flag 重复时后者胜，不报错），且 ship 把自己管理的 flag 追加在用户参数**之后**——
+  因此重复本身不会崩；仍需处理的只有两类：`--resume <值>` **连值摘除**（它切同步补跑、
+  打印全报告而非 job id，破坏循环）；用户传的 `--dismissed <值>` 可不摘（会被 ship 后置的
+  台账目录覆盖），但**必须告知用户**其值未生效——如需豁免特定 finding，请把驳回记录放入
+  `--dismissed-dir` 目录（`<id>.md`）。凡摘除/覆盖都不得静默。
 
 ## 0. 起手
 1. 运行 `${CODEX_PLUGIN_ROOT}/bin/redteam init`（幂等）；创建本会话目录

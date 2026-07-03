@@ -13,6 +13,7 @@ gen:
 build:
 	cargo build --release --target $(TARGET)
 	mkdir -p $(dir $(BIN))
+	rm -f $(BIN)
 	cp target/$(TARGET)/release/redteam $(BIN)
 	chmod +x plugins/redteam/bin/redteam
 
