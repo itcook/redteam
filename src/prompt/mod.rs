@@ -145,6 +145,7 @@ pub fn build_bundle_prompt(
     rules: &[&Lens],
     user_focus: &str,
     other_files: &str,
+    incremental: &str,
 ) -> String {
     let rules_str = rules_block(rules);
 
@@ -171,6 +172,7 @@ pub fn build_bundle_prompt(
         ("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus }),
         ("{{OTHER_CHANGED_FILES}}",
             if other_files.is_empty() { "(none — this bundle covers the entire changeset)" } else { other_files }),
+        ("{{INCREMENTAL_ROUND}}", incremental),
     ])
 }
 
@@ -207,6 +209,50 @@ pub fn render_precedents(finding: &crate::domain::Finding, cards: &[crate::db::D
         out.push_str(&entry);
     }
     out
+}
+
+/// M13 决议 4：<incremental_round> 段——仅增量轮渲染（全量路径传空串填占位）。
+/// 内容四件：delta 口径 / 双层 manifest / claimed-resolved 顺带验证清单 / 原样再报指令。
+/// 不注入 hunk→finding 映射（fix 意图不注入，防橡皮图章化）。claimed 项必须带原样
+/// title+quote **全文**——机器匹配 = 模型按原文再报 → enrich 同 id → 与 resolve 记录碰撞。
+pub fn render_incremental_section(
+    delta_base: &str,
+    two_layer_manifest: &str,
+    claimed: &[crate::db::ResolveCard],
+) -> String {
+    const CLAIMED_TOTAL_CHARS: usize = 6000;
+    let mut list = String::new();
+    let mut listed = 0usize;
+    for c in claimed {
+        let entry = format!(
+            "- [{}] {} | title: {}\n  original quote (verbatim):\n```\n{}\n```\n",
+            c.id, c.file, c.title, c.quote
+        );
+        if list.chars().count() + entry.chars().count() > CLAIMED_TOTAL_CHARS {
+            break;
+        }
+        list.push_str(&entry);
+        listed += 1;
+    }
+    if listed < claimed.len() {
+        list.push_str(&format!(
+            "… and {} more claimed-resolved items (not listed)\n",
+            claimed.len() - listed
+        ));
+    }
+    if claimed.is_empty() {
+        list = "(none)\n".into();
+    }
+    format!(
+        "<incremental_round>\n\
+         This is an INCREMENTAL round: the diffs below are a fix delta (since {delta_base}) on top of a changeset already adversarially reviewed in earlier rounds. Attack the delta itself with full force — fixes routinely introduce new problems. Unchanged files were already reviewed; do not re-litigate them unless the delta interacts with them.\n\
+         Full changeset files ([delta] = changed in THIS round; others are unchanged since the prior round):\n\
+         {two_layer_manifest}\n\
+         Claimed-resolved findings from earlier rounds — verify incidentally while reading code you already visit (this is NOT your main task):\n\
+         {list}\
+         For each claimed-resolved item: if the underlying problem is NOT actually fixed, report it again using the EXACT original title and quote verbatim (that is how it is machine-matched). If it is genuinely fixed, do not report it.\n\
+         </incremental_round>"
+    )
 }
 
 #[cfg(test)]
@@ -340,14 +386,14 @@ mod tests {
             files: vec![FileChange { path: "src/auth.rs".into(), diff: "+let t = secret();".into() }],
         };
         let rules = vec![by_id("L1").unwrap(), by_id("L5").unwrap()];
-        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "");
+        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         // 空清单 → 渲染「本包即全变更集」占位；非空 → 原样注入
         assert!(p.contains("(none — this bundle covers the entire changeset)"), "empty manifest placeholder");
-        let pm = build_bundle_prompt("wt", &bundle, &rules, "", "src/other.rs (+3/-1)");
+        let pm = build_bundle_prompt("wt", &bundle, &rules, "", "src/other.rs (+3/-1)", "");
         assert!(pm.contains("src/other.rs (+3/-1)"), "other-files manifest injected");
         // 注入对称覆盖(r4 ea30e058):bundle 侧同样不被外部占位捕获
-        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探");
+        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探", "");
         assert!(pi.contains("focus {{RULES}} 试探") && pi.contains("manifest {{BUNDLE_DIFFS}} 试探"),
             "bundle 外部内容占位不被捕获");
         assert!(p.contains("[L1]") && p.contains("[L5]"), "rule ids injected");
@@ -440,5 +486,46 @@ mod tests {
             include_str!("templates/adversarial-refute-doc.md").contains("Temporal check:"),
             "refute-doc 缺 Temporal check 段"
         );
+    }
+
+    #[test]
+    fn incremental_section_renders_only_when_given() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        use crate::lens::by_id;
+        let bundle = Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] };
+        let rules = vec![by_id("L1").unwrap()];
+        // 全量路径（空段）：模板无残留占位、无增量标记
+        let p = build_bundle_prompt("wt", &bundle, &rules, "", "", "");
+        assert!(!p.contains("{{"), "no residual placeholders");
+        assert!(!p.contains("<incremental_round>"), "全量评审不得出现增量段");
+        // 增量路径：段完整注入
+        let claimed = vec![crate::db::ResolveCard {
+            id: "a1b2c3d4e5f60718".into(), title: "weak hash".into(), file: "src/a.rs".into(),
+            quote: "let x = md5(pw);".into(), severity: "high".into(),
+            reason: String::new(), round: "r1".into(), updated_at: String::new(),
+        }];
+        let sect = render_incremental_section("abc123def456", "src/a.rs [delta], src/b.rs", &claimed);
+        let pi = build_bundle_prompt("wt", &bundle, &rules, "", "", &sect);
+        assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"));
+        assert!(pi.contains("src/a.rs [delta]"), "双层 manifest 注入");
+        assert!(pi.contains("let x = md5(pw);") && pi.contains("weak hash"), "claimed 项带原样 title+quote");
+        assert!(pi.contains("EXACT original title and quote"), "机器匹配指令在场");
+        assert!(pi.contains("[L1]"), "rules 一字不动仍在");
+    }
+
+    #[test]
+    fn incremental_section_empty_claimed_and_overflow_cap() {
+        let s = render_incremental_section("abc", "f.rs [delta]", &[]);
+        assert!(s.contains("(none)"), "{s}");
+        // 溢出：超总帽的 claimed 项截断并注记条数（静默截断=覆盖假象）
+        let big: Vec<crate::db::ResolveCard> = (0..40).map(|i| crate::db::ResolveCard {
+            id: format!("{i:016x}"), title: "t".into(), file: "f.rs".into(),
+            quote: "q".repeat(400), severity: "high".into(),
+            reason: String::new(), round: "r1".into(), updated_at: String::new(),
+        }).collect();
+        let s = render_incremental_section("abc", "", &big);
+        assert!(s.contains("more claimed-resolved items (not listed)"), "{s}");
+        assert!(s.chars().count() < 9000, "总量帽生效: {}", s.chars().count());
     }
 }

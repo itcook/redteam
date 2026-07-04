@@ -57,6 +57,8 @@ If nothing material, return {"findings": []}. Prefer one strong finding over sev
 Every finding must be grounded in code you actually read — do not invent files, lines, or behavior.
 </output_contract>
 
+{{INCREMENTAL_ROUND}}
+
 <bundle>
 Target: {{TARGET_LABEL}}
 Files in this bundle: {{FILE_LIST}}

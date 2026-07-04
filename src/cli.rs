@@ -457,7 +457,7 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, sink).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &oopts, sink).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(

@@ -74,7 +74,12 @@ pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
             entries.push(format!("{} (+{adds}/-{dels})", fc.path));
         }
     }
-    // 双帽：条目数 + 总字符预算（先到者截断），尾注被截条数。
+    cap_entries(entries)
+}
+
+/// 双帽截断（条目数 + 总字符预算，先到者截断，尾注被截条数）——
+/// other_files_manifest 与 two_layer_manifest 共用同一体积防线。
+fn cap_entries(entries: Vec<String>) -> String {
     let total = entries.len();
     let mut kept = 0usize;
     let mut chars = 0usize;
@@ -84,21 +89,31 @@ pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
         {
             break;
         }
-        chars += e.len() + 2; // ", " 分隔
+        chars += e.len() + 2;
         kept += 1;
     }
+    let mut entries = entries;
     entries.truncate(kept);
     let mut s = entries.join(", ");
     let extra = total - kept;
     if extra > 0 {
         if s.is_empty() {
-            // 首条即超预算的极端截断：避免输出以 ", " 开头
             s = format!("… and {extra} more files");
         } else {
             s.push_str(&format!(", … and {extra} more files"));
         }
     }
     s
+}
+
+/// M13 双层 manifest（决议 4）：全分支变更文件清单 + 标注哪些在本轮 delta 内——
+/// 压增量轮的视野塌缩型「无证据实现」误报。体积防线复用双帽。
+pub fn two_layer_manifest(all_files: &[String], delta: &std::collections::BTreeSet<String>) -> String {
+    let entries: Vec<String> = all_files
+        .iter()
+        .map(|p| if delta.contains(p) { format!("{p} [delta]") } else { p.clone() })
+        .collect();
+    cap_entries(entries)
 }
 
 /// 单个文件包的文件数上限（超出按排序切块）。
@@ -510,5 +525,20 @@ mod tests {
         let m = other_files_manifest(&bundles, 0);
         assert!(m.len() <= MANIFEST_MAX_CHARS, "含注记总输出不超预算: len={}", m.len());
         assert!(m.contains("more files"), "被截条数有注记: {m}");
+    }
+
+    #[test]
+    fn two_layer_manifest_marks_delta_membership_and_caps() {
+        use std::collections::BTreeSet;
+        let all = vec!["src/a.rs".to_string(), "src/b.rs".into(), "src/c.rs".into()];
+        let delta: BTreeSet<String> = ["src/b.rs".to_string()].into();
+        let s = two_layer_manifest(&all, &delta);
+        assert!(s.contains("src/b.rs [delta]"), "{s}");
+        assert!(s.contains("src/a.rs") && !s.contains("src/a.rs [delta]"), "{s}");
+        // 复用双帽：大清单截断注记
+        let many: Vec<String> = (0..500).map(|i| format!("src/file{i:04}.rs")).collect();
+        let s = two_layer_manifest(&many, &BTreeSet::new());
+        assert!(s.contains("more files"), "{s}");
+        assert!(s.chars().count() <= 4000, "{}", s.chars().count());
     }
 }
