@@ -120,7 +120,9 @@ pub fn changed_files(base: Option<&str>, branch_scope: bool) -> anyhow::Result<V
 fn git_at(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git")
         .current_dir(dir)
-        .args(["-c", "color.ui=false", "-c", "color.diff=false"])
+        // core.quotePath=false：非 ASCII 路径原样输出，不转成引号转义串——
+        // split_diff_by_file 的 strip_prefix 与 rename_map 的相等匹配都依赖裸路径。
+        .args(["-c", "color.ui=false", "-c", "color.diff=false", "-c", "core.quotePath=false"])
         .args(args)
         .output()?;
     if !out.status.success() {
@@ -171,6 +173,7 @@ pub fn worktree_dirty(dir: &std::path::Path) -> anyhow::Result<bool> {
 
 /// R1 rename 映射：base..HEAD 的旧→新路径对（-M 相似度检测，status R*）。
 /// 相似度 <50% 的 rename 不被 -M 识别 → 不进映射，carry 走 carried_dropped 降级（可审非静默）。
+// ponytail: 路径含 tab 的病态仓不在威胁模型内；quotePath 已关，中文等非 ASCII 路径原样可配。
 pub fn rename_map(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<(String, String)>> {
     let out = git_at(dir, &["diff", "--name-status", "-M", &format!("{base}..HEAD")])?;
     Ok(out
@@ -212,7 +215,6 @@ fn split_diff_by_file(full: &str) -> Vec<FileChange> {
             last.diff.push('\n');
         }
     }
-    out.retain(|fc| !fc.diff.trim().is_empty());
     out
 }
 
@@ -410,5 +412,27 @@ mod tests {
         assert_eq!(out[1].path, "x.rs");
         assert!(out[1].diff.contains("+line2"));
         assert!(split_diff_by_file("").is_empty(), "空 diff → 空 delta");
+    }
+
+    #[test]
+    fn non_ascii_filename_survives_split_and_rename_map() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("配置.rs"), "line1\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::fs::write(dir.path().join("配置.rs"), "line1\nline2\n").unwrap();
+        let c2 = commit_all(dir.path(), "c2");
+        // quotePath=false：changed_files_since 的 path 与 diff 都不应被引号转义
+        let delta = changed_files_since(dir.path(), &c1).unwrap();
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].path, "配置.rs");
+        assert!(delta[0].diff.contains("+line2"), "{}", delta[0].diff);
+        // rename：配置.rs → 配置2.rs，rename_map 靠裸路径相等匹配（转义后永不相等）
+        std::fs::rename(dir.path().join("配置.rs"), dir.path().join("配置2.rs")).unwrap();
+        commit_all(dir.path(), "rename");
+        assert_eq!(
+            rename_map(dir.path(), &c2).unwrap(),
+            vec![("配置.rs".to_string(), "配置2.rs".to_string())]
+        );
     }
 }
