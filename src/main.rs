@@ -116,6 +116,31 @@ enum Cmd {
         #[command(subcommand)]
         action: DismissCmd,
     },
+    /// 销案：把「属实→已修复」的 finding 记入 resolve 台账（proj.db 独立表，不混 dismissed
+    /// ——已修复≠误报，不进豁免/预筛）。增量轮（review --incremental-from）据此不再携带该
+    /// finding；quote 未随修复消失的会注入下轮「顺带验证」防假修复。
+    Resolve {
+        /// finding id（16 位 hex，来自评审报告）。
+        id: String,
+        /// 评审报告 JSON 路径——按 id 自动抄 title/file/quote/severity 快照。
+        #[arg(long)]
+        from: Option<String>,
+        /// 销案发生轮次（如 r2），可选。
+        #[arg(long, default_value = "")]
+        round: String,
+        /// 修法一句话（可选，进台账与 history 备审计）。
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// 快照字段（无 --from 时必须全给；与 --from 并用时覆盖抄写值）。
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        quote: Option<String>,
+        #[arg(long)]
+        severity: Option<String>,
+    },
     /// 幂等创建项目级 .redteam/ 骨架（config.toml 模板、.gitignore、rounds/、proj.db）。
     Init,
 }
@@ -655,6 +680,9 @@ async fn main() {
             }
         },
         Cmd::Dismiss { action } => run_dismiss(action),
+        Cmd::Resolve { id, from, round, reason, title, file, quote, severity } => {
+            run_resolve(id, from, round, reason, title, file, quote, severity)
+        }
         Cmd::Init => {
             match redteam::project::init_project(std::path::Path::new(".")) {
                 Ok(c) if c.is_empty() => println!(".redteam/ already complete"),
@@ -769,6 +797,47 @@ fn dismiss_add(
     db.dismiss_upsert(&card)?;
     println!("dismissed {id} recorded");
     Ok(())
+}
+
+/// resolve 子命令（M13 决议 3）：dismiss add 对称的销案入账。
+#[allow(clippy::too_many_arguments)]
+fn run_resolve(
+    id: String, from: Option<String>, round: String, reason: String,
+    title: Option<String>, file: Option<String>, quote: Option<String>, severity: Option<String>,
+) -> i32 {
+    let r = (|| -> anyhow::Result<()> {
+        anyhow::ensure!(redteam::project::is_hex16(&id), "id must be a 16-hex finding id, got '{id}'");
+        let snap = match &from {
+            Some(path) => Some(snapshot_from_report(path, &id)?),
+            None => None,
+        };
+        let pick = |explicit: Option<String>, from_val: Option<String>, name: &str| -> anyhow::Result<String> {
+            explicit.or(from_val).ok_or_else(|| anyhow::anyhow!(
+                "missing snapshot field '{name}': pass --from <result.json> or --{name}"))
+        };
+        let (ft, ff, fq, fs) = match snap {
+            Some((t, f, q, s)) => (Some(t), Some(f), Some(q), Some(s)),
+            None => (None, None, None, None),
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut db = redteam::db::ProjDb::open(&cwd)?;
+        db.resolve_upsert(&redteam::db::ResolveCard {
+            id: id.clone(),
+            title: pick(title, ft, "title")?,
+            file: pick(file, ff, "file")?,
+            quote: pick(quote, fq, "quote")?,
+            severity: pick(severity, fs, "severity")?,
+            reason,
+            round,
+            updated_at: String::new(),
+        })?;
+        println!("resolved {id} recorded");
+        Ok(())
+    })();
+    match r {
+        Ok(()) => 0,
+        Err(e) => { eprintln!("error: {e}"); 2 }
+    }
 }
 
 /// 从评审报告 JSON 按 id 抄快照四件套 (title, file, quote, severity)。

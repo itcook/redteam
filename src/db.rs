@@ -29,6 +29,21 @@ pub struct DismissCard {
     pub updated_at: String,
 }
 
+/// M13 销案卡（决议 3）：ship 裁决「属实→已修复」的判定记录。与 DismissCard 对称
+/// （快照四件套）但**无 status 状态机**——已修复≠误报，独立表、不进豁免/预筛；
+/// 增量轮据此排除携带 + 生成 claimed-resolved 顺带验证清单。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ResolveCard {
+    pub id: String,
+    pub title: String,
+    pub file: String,
+    pub quote: String,
+    pub severity: String,
+    pub reason: String,
+    pub round: String,
+    pub updated_at: String,
+}
+
 pub struct ProjDb {
     conn: Connection,
 }
@@ -64,6 +79,23 @@ impl ProjDb {
                seq INTEGER PRIMARY KEY AUTOINCREMENT,
                id TEXT NOT NULL,
                status TEXT NOT NULL,
+               round TEXT NOT NULL DEFAULT '',
+               reason TEXT NOT NULL DEFAULT '',
+               at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             );
+             CREATE TABLE IF NOT EXISTS resolved (
+               id TEXT PRIMARY KEY,
+               title TEXT NOT NULL DEFAULT '',
+               file TEXT NOT NULL DEFAULT '',
+               quote TEXT NOT NULL DEFAULT '',
+               severity TEXT NOT NULL DEFAULT '',
+               reason TEXT NOT NULL DEFAULT '',
+               round TEXT NOT NULL DEFAULT '',
+               updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d','now'))
+             );
+             CREATE TABLE IF NOT EXISTS resolved_history (
+               seq INTEGER PRIMARY KEY AUTOINCREMENT,
+               id TEXT NOT NULL,
                round TEXT NOT NULL DEFAULT '',
                reason TEXT NOT NULL DEFAULT '',
                at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
@@ -198,6 +230,47 @@ impl ProjDb {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    // ---- resolve 销案台账（M13 决议 3，dismiss 表范式对称）----
+
+    /// 销案/再销案：主表 upsert + history 追加（同一事务）。
+    pub fn resolve_upsert(&mut self, card: &ResolveCard) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO resolved (id,title,file,quote,severity,reason,round,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,strftime('%Y-%m-%d','now'))
+             ON CONFLICT(id) DO UPDATE SET title=?2,file=?3,quote=?4,severity=?5,
+               reason=?6,round=?7,updated_at=strftime('%Y-%m-%d','now')",
+            params![card.id, card.title, card.file, card.quote, card.severity, card.reason, card.round],
+        )?;
+        tx.execute(
+            "INSERT INTO resolved_history (id,round,reason) VALUES (?1,?2,?3)",
+            params![card.id, card.round, card.reason],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn resolve_get(&self, id: &str) -> Result<Option<ResolveCard>> {
+        self.conn
+            .query_row(
+                "SELECT id,title,file,quote,severity,reason,round,updated_at FROM resolved WHERE id=?1",
+                params![id],
+                row_to_resolve,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// 全量销案卡（增量轮携带排除 + claimed-resolved 清单的数据源）。
+    pub fn resolved_cards(&self) -> Result<Vec<ResolveCard>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,title,file,quote,severity,reason,round,updated_at FROM resolved
+             ORDER BY updated_at DESC, id",
+        )?;
+        let rows = stmt.query_map([], row_to_resolve)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     // ---- jobs / cells / results ----
 
     pub fn job_put_state(&self, job_id: &str, state_json: &str) -> Result<()> {
@@ -309,6 +382,13 @@ fn row_to_card(r: &rusqlite::Row<'_>) -> rusqlite::Result<DismissCard> {
     })
 }
 
+fn row_to_resolve(r: &rusqlite::Row<'_>) -> rusqlite::Result<ResolveCard> {
+    Ok(ResolveCard {
+        id: r.get(0)?, title: r.get(1)?, file: r.get(2)?, quote: r.get(3)?,
+        severity: r.get(4)?, reason: r.get(5)?, round: r.get(6)?, updated_at: r.get(7)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +477,37 @@ mod tests {
         let (j, m) = db.result_get("j1").unwrap().unwrap();
         assert_eq!((j.as_str(), m.as_str()), ("{}", "# md"));
         assert_eq!(db.job_all_states().unwrap().len(), 1);
+    }
+
+    fn rcard(id: &str) -> ResolveCard {
+        ResolveCard {
+            id: id.into(), title: "t".into(), file: "src/a.rs".into(),
+            quote: "let x = 1;".into(), severity: "high".into(),
+            reason: "加了守卫".into(), round: "r2".into(), updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_upsert_get_cards_roundtrip() {
+        let mut db = mem_db();
+        db.resolve_upsert(&rcard("a1b2c3d4e5f60718")).unwrap();
+        let got = db.resolve_get("a1b2c3d4e5f60718").unwrap().unwrap();
+        assert_eq!((got.file.as_str(), got.round.as_str()), ("src/a.rs", "r2"));
+        assert!(!got.updated_at.is_empty());
+        // 再销案（争议后重修）→ upsert 覆盖 + history 两条
+        let mut again = rcard("a1b2c3d4e5f60718");
+        again.round = "r4".into();
+        db.resolve_upsert(&again).unwrap();
+        assert_eq!(db.resolve_get("a1b2c3d4e5f60718").unwrap().unwrap().round, "r4");
+        assert_eq!(db.resolved_cards().unwrap().len(), 1, "同 id 覆盖不追加");
+    }
+
+    #[test]
+    fn resolve_is_disjoint_from_dismiss_exemption() {
+        // 已修复 ≠ 误报：resolve 卡绝不进 dismissed 豁免/预筛面（codex #10 核实项的绊线）
+        let mut db = mem_db();
+        db.resolve_upsert(&rcard("1111111111111111")).unwrap();
+        assert!(db.active_ids().unwrap().is_empty(), "resolve 不得漏进豁免 id 集");
+        assert!(db.active_cards().unwrap().is_empty(), "resolve 不得漏进判例卡集");
     }
 }
