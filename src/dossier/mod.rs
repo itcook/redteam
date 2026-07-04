@@ -5,7 +5,12 @@
 // Task 10 接线（build_dossier 进 cli）后全链可达，届时删除此 allow 并验证零警告。
 #![allow(dead_code)]
 
+use grep_regex::RegexMatcher;
+use grep_searcher::sinks::UTF8;
+use grep_searcher::SearcherBuilder;
+use ignore::WalkBuilder;
 use regex::Regex;
+use std::path::Path;
 
 struct Lang {
     exts: &'static [&'static str],
@@ -182,6 +187,86 @@ pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'s
     out
 }
 
+#[derive(Clone, Debug)]
+pub struct RefHit {
+    pub path: String,
+    pub line: usize,
+    pub context: String,
+    pub is_doc: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SymRefs {
+    pub name: String,
+    pub kind: &'static str,
+    pub defs_same_name: usize,
+    pub hits: Vec<RefHit>,
+}
+
+fn is_comment_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with('#')
+}
+
+// 一次全仓 walk 搜某名的所有词边界命中，返回 (rel_path, 1based_line)。照 do_search_repo。
+fn grep_word(name: &str, root: &Path) -> Vec<(String, usize)> {
+    let matcher = match RegexMatcher::new(&format!(r"\b{}\b", regex::escape(name))) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let mut hits = Vec::new();
+    for dent in WalkBuilder::new(root).require_git(false).build().flatten() {
+        if !dent.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = dent.path().to_path_buf();
+        let rel = match path.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+        let mut searcher = SearcherBuilder::new().line_number(true).build();
+        let _ = searcher.search_path(&matcher, &path, UTF8(|lnum, _line| {
+            hits.push((rel.clone(), lnum as usize));
+            Ok(true)
+        }));
+    }
+    hits
+}
+
+pub fn reference_points(syms: &[ChangedSym], root: &Path, defs: &[(&'static str, Regex)]) -> Vec<SymRefs> {
+    let mut file_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let read = |rel: &str, cache: &mut std::collections::HashMap<String, Vec<String>>| -> Vec<String> {
+        cache.entry(rel.to_string())
+            .or_insert_with(|| std::fs::read_to_string(root.join(rel))
+                .map(|s| s.lines().map(String::from).collect())
+                .unwrap_or_default())
+            .clone()
+    };
+    let mut out = Vec::new();
+    for sym in syms {
+        let raw = grep_word(&sym.name, root);
+        let mut defs_same_name = 0usize;
+        let mut hits = Vec::new();
+        for (path, line) in raw {
+            let lines = read(&path, &mut file_cache);
+            let hit_line = lines.get(line.saturating_sub(1)).map(String::as_str).unwrap_or("");
+            // 命中行本身是同名 def → 歧义度，不作引用点
+            if let Some((_, n)) = match_def(hit_line, defs) {
+                if n == sym.name {
+                    defs_same_name += 1;
+                    continue;
+                }
+            }
+            let lo = line.saturating_sub(4); // ±3 行（含头行）
+            let hi = (line + 3).min(lines.len());
+            let context = lines.get(lo..hi).unwrap_or(&[]).join("\n");
+            hits.push(RefHit { path, line, context, is_doc: is_comment_line(hit_line) });
+        }
+        out.push(SymRefs { name: sym.name.clone(), kind: sym.kind, defs_same_name, hits });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +356,26 @@ mod tests {
         let diff = "@@ -2,0 +3,1 @@\n+    b: u8,\n";
         let syms = symbols_in_file(diff, &file, "src/c.rs", &d);
         assert_eq!(syms, vec![ChangedSym { name: "Config".into(), kind: "struct", file: "src/c.rs".into() }]);
+    }
+
+    #[test]
+    fn reference_points_finds_callers_excludes_def_and_marks_ambiguity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"),
+            "fn helper() {}\nfn c1() { helper(); }\n").unwrap();
+        std::fs::write(root.join("src/b.rs"),
+            "fn helper() {}\n/// see helper for details\nfn c2() { helper(); }\n").unwrap();
+        let d = rust_defs();
+        let syms = vec![ChangedSym { name: "helper".into(), kind: "fn", file: "src/a.rs".into() }];
+        let refs = reference_points(&syms, root, &d);
+        assert_eq!(refs.len(), 1);
+        let r = &refs[0];
+        assert_eq!(r.defs_same_name, 2, "两处同名 def → 歧义度 2");
+        // 引用点 = c1/c2 的调用行 + doc 提及行；def 行本身被排除
+        assert!(r.hits.iter().any(|h| h.path == "src/a.rs" && h.context.contains("c1")));
+        assert!(r.hits.iter().any(|h| h.is_doc), "doc 提及命中标 is_doc");
+        assert!(!r.hits.iter().any(|h| h.line == 1 && h.path == "src/a.rs"), "def 行不作引用点");
     }
 }
