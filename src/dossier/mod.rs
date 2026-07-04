@@ -318,6 +318,37 @@ pub fn render_entries(refs: &[SymRefs]) -> String {
     out
 }
 
+/// 引擎入口：为一个 bundle 产事实卷宗块（不含 <dossier> 包裹）。空 = 无卷宗（降级）。
+pub fn build_dossier(bundle: &crate::bundle::Bundle, root: &Path) -> String {
+    let mut all_syms: Vec<ChangedSym> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for fc in &bundle.files {
+        let lang = match lang_for(&fc.path) {
+            Some(l) => l,
+            None => continue, // 非支持语言：无损降级
+        };
+        let defs = compile_defs(lang);
+        let content = std::fs::read_to_string(root.join(&fc.path)).unwrap_or_default();
+        let file_lines: Vec<&str> = content.lines().collect();
+        for s in symbols_in_file(&fc.diff, &file_lines, &fc.path, &defs) {
+            if seen.insert(s.name.clone()) {
+                all_syms.push(s);
+            }
+        }
+    }
+    if all_syms.is_empty() {
+        return String::new();
+    }
+    // 引用搜索用 Rust defs 判同名 def（跨语言歧义度是次要信号，用首文件的 lang 即可）；
+    // 简化：用改动符号所属文件的 lang 编 defs。混合 bundle 极少，取第一个支持语言的 defs。
+    let defs = bundle.files.iter()
+        .find_map(|fc| lang_for(&fc.path))
+        .map(compile_defs)
+        .unwrap_or_default();
+    let refs = reference_points(&all_syms, root, &defs);
+    render_entries(&refs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +493,31 @@ mod tests {
         // total_renderable = 4×2 = 8；渲染了 sym0 的 2 个 → dropped = 6
         assert!(out.contains("… and 6 reference points omitted for budget"),
             "丢弃计数须精确 = total_renderable - rendered，实得: {out}");
+    }
+
+    #[test]
+    fn build_dossier_end_to_end_and_graceful() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"),
+            "pub fn target() {}\nfn user() { target(); }\n").unwrap();
+        // 改动 target 的 bundle（diff 新增 target 的 def 行）
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
+        }] };
+        let out = build_dossier(&b, root);
+        assert!(out.contains("target"), "卷宗含改动符号引用点: {out}");
+        assert!(out.contains("user()"), "含 caller 上下文");
+
+        // 非支持语言 → 空（无损降级）
+        let py = Bundle { files: vec![FileChange {
+            path: "app.py".into(), diff: "@@ -1,0 +1,1 @@\n+def f(): pass\n".into(),
+        }] };
+        assert_eq!(build_dossier(&py, root), "", "非支持语言降级为空");
     }
 
     #[test]
