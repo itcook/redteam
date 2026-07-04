@@ -273,9 +273,15 @@ const DOSSIER_MAX_BYTES: usize = 28_000;
 
 /// SymRefs 列表 → 卷宗事实块（不含 <dossier> 包裹与散文，那是 prompt 层的活）。空引用 → ""。
 pub fn render_entries(refs: &[SymRefs]) -> String {
+    // 全部「可渲染」引用点（受 per-name cap 约束，不含 cap 溢出——那由 "+N more" 单独标注）。
+    let total_renderable: usize = refs
+        .iter()
+        .filter(|s| !s.hits.is_empty())
+        .map(|s| s.hits.len().min(DOSSIER_PER_NAME_CAP))
+        .sum();
     let mut out = String::new();
-    let mut dropped_for_budget = 0usize;
-    'sym: for sr in refs {
+    let mut rendered = 0usize;
+    for sr in refs {
         if sr.hits.is_empty() {
             continue;
         }
@@ -284,31 +290,30 @@ pub fn render_entries(refs: &[SymRefs]) -> String {
         } else {
             String::new()
         };
-        let header = format!("## {} ({}){}\n", sr.name, sr.kind, ambig);
-        if out.len() + header.len() > DOSSIER_MAX_BYTES {
-            dropped_for_budget += sr.hits.len();
-            continue;
-        }
-        out.push_str(&header);
+        // 组本符号整块（header + ≤cap 引用点 + 可选 cap 标注），再整体判预算——
+        // 原子：一个符号全进或全不进，杜绝悬空 header / 半截符号。
+        let mut block = format!("## {} ({}){}\n", sr.name, sr.kind, ambig);
         let shown = sr.hits.len().min(DOSSIER_PER_NAME_CAP);
         for h in &sr.hits[..shown] {
             let doc = if h.is_doc { "[doc] " } else { "" };
-            let entry = format!("{doc}{}:{}\n{}\n\n", h.path, h.line, h.context);
-            if out.len() + entry.len() > DOSSIER_MAX_BYTES {
-                dropped_for_budget += sr.hits.len(); // 本符号剩余全算丢
-                break 'sym;
-            }
-            out.push_str(&entry);
+            block.push_str(&format!("{doc}{}:{}\n{}\n\n", h.path, h.line, h.context));
         }
         if sr.hits.len() > DOSSIER_PER_NAME_CAP {
-            out.push_str(&format!(
+            block.push_str(&format!(
                 "+{} more, {} defs same name, heuristic\n\n",
-                sr.hits.len() - DOSSIER_PER_NAME_CAP, sr.defs_same_name
+                sr.hits.len() - DOSSIER_PER_NAME_CAP,
+                sr.defs_same_name
             ));
         }
+        if out.len() + block.len() > DOSSIER_MAX_BYTES {
+            break; // 预算耗尽：本符号及其后全部计入 dropped（由 total_renderable - rendered 兜底）
+        }
+        out.push_str(&block);
+        rendered += shown;
     }
-    if dropped_for_budget > 0 {
-        out.push_str(&format!("… and {dropped_for_budget} reference points omitted for budget\n"));
+    let dropped = total_renderable.saturating_sub(rendered);
+    if dropped > 0 {
+        out.push_str(&format!("… and {dropped} reference points omitted for budget\n"));
     }
     out
 }
@@ -441,6 +446,22 @@ mod tests {
         assert!(out.contains("+15 more, 3 defs same name, heuristic"), "cap 标注: {out}");
         assert!(out.contains("3 defs share this name (incl. trait dispatch), heuristic"), "歧义标注");
         assert!(out.contains("[doc]"), "doc 命中标形态");
+    }
+
+    #[test]
+    fn render_entries_budget_drop_count_is_exact() {
+        // 4 符号 × 2 引用点，每点 context 8000 字节 → 每符号块 ~16KB；预算 28KB 只容 1 个符号整块。
+        let big: Vec<SymRefs> = (0..4).map(|i| {
+            let mut s = sr(&format!("sym{i}"), 1, 2, None);
+            for h in &mut s.hits { h.context = "x".repeat(8000); }
+            s
+        }).collect();
+        let out = render_entries(&big);
+        assert!(out.contains("## sym0"), "首符号整块渲染");
+        assert!(!out.contains("## sym1"), "预算耗尽后续符号整块丢弃");
+        // total_renderable = 4×2 = 8；渲染了 sym0 的 2 个 → dropped = 6
+        assert!(out.contains("… and 6 reference points omitted for budget"),
+            "丢弃计数须精确 = total_renderable - rendered，实得: {out}");
     }
 
     #[test]
