@@ -122,7 +122,7 @@ disable-model-invocation: true
    人裁误报 → `set-status <id> human-confirmed --round rK`，此后该 id 永久静默；
    人裁属实 → 修 + `set-status <id> withdrawn --round rK`，继续。
 4. **修复受阻**：某 finding 属实但你修不了（需产品/架构决策、改动越权）→ 停，交用户。
-   doc 模式全量循环若陷自指尾流僵局（修复自身反复被重审出衍生问题、approve 不可达），
+   doc 模式或 working-tree scope 的全量循环若陷自指尾流僵局（修复自身反复被重审出衍生问题、approve 不可达），
    也按本条停机交人。
 5. **停滞守卫**：本轮仍有未豁免 findings 但零代码改动（未修也未新驳）→ 空转，停，交用户。
    增量轮的「empty delta」守卫报错同走本条（无新改动可审 = 空转）。
@@ -131,6 +131,7 @@ disable-model-invocation: true
 > 尾流守卫已随增量协议**退役**：增量轮的新 finding 定义上全是「衍生」（delta 就是上轮修复），
 > 「连续全衍生」失去判别力；自指尾流问题由「未动代码携带判决、只审 delta」结构性消解，
 > approve 经合并集天然可达。
+> （此消解仅对增量轮成立；不携带的全量循环——doc 模式或 working-tree scope——按上述 §4 出口交人。）
 
 ## 收工反馈（本地调试阶段 · 发布前移除）
 > 开发期临时仪器,发布前连同 `${CLAUDE_PLUGIN_ROOT}/feedback.md`、本节、observations 一行约定一并删除。
