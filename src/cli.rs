@@ -785,6 +785,13 @@ pub(crate) fn incremental_preflight(
         args.base.is_some(),
         "--incremental-from requires --base <branch> (the full-changeset manifest is derived from merge-base(base, HEAD))"
     );
+    // 脏树守卫（终审 Important）：carry 重锚读活文件而 delta 只含已提交改动——未提交
+    // 编辑可使携带项锚失效却不在本轮评审范围内（carried_dropped 审计语义为假，open
+    // finding 静默蒸发）。锚定不变式成立前提=评审时点树即 HEAD。硬错误保守视为脏。
+    anyhow::ensure!(
+        !crate::evidence::git::worktree_dirty(root).unwrap_or(true),
+        "--incremental-from requires a clean working tree (uncommitted tracked changes can invalidate carried findings' anchors without being part of the reviewed delta); commit or stash first, then re-run"
+    );
 
     // 载上轮 result（增量只对经 --background 持久化过 result 的作业有意义）。
     let raw = crate::state::store::read_result(root, prior_job).ok_or_else(|| anyhow::anyhow!(
@@ -1924,6 +1931,27 @@ mod incremental_tests {
         assert_eq!(base.prior_findings.len(), 1);
         assert_eq!(base.delta.len(), 1, "delta 只含 c1..HEAD 改动");
         assert!(base.renames.is_empty());
+    }
+
+    /// 脏树守卫（终审 Important）：即使其余前提全部健康，工作树有未提交 tracked 编辑
+    /// 仍必须拦下——carry 重锚读活文件而 delta 只含已提交改动，脏树使锚定不变式的
+    /// 前提（评审时点树即 HEAD）失效。独立 fixture：脏改动只留在本测试作用域内，不
+    /// commit 也不清理，不污染后续用例。
+    #[test]
+    fn preflight_rejects_dirty_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::process::Command::new("git").current_dir(dir.path())
+            .args(["branch", "dev0", &c1]).output().unwrap();
+        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m")]);
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n}\n").unwrap();
+        commit_all(dir.path(), "fix");
+        // 未提交的 tracked 编辑（不 commit）：净树守卫必须先拦下，不放行到载入上轮 result
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n    more();\n}\n").unwrap();
+        let e = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("clean working tree"), "{e}");
     }
 
     /// 五类守卫拒绝：每类断言错误文案关键词（文案即裸终端在场文档）。

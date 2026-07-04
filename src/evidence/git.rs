@@ -152,6 +152,23 @@ pub fn is_ancestor(dir: &std::path::Path, sha: &str) -> anyhow::Result<bool> {
     }
 }
 
+/// 增量守卫辅助：工作树相对 HEAD 是否有未提交改动（staged+unstaged；不看 untracked——
+/// 未跟踪文件承载不了上轮 finding 的锚）。exit 0=净 / 1=脏。
+pub fn worktree_dirty(dir: &std::path::Path) -> anyhow::Result<bool> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["diff", "HEAD", "--quiet"])
+        .output()?;
+    match out.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => anyhow::bail!(
+            "git diff HEAD --quiet failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
+}
+
 /// R1 rename 映射：base..HEAD 的旧→新路径对（-M 相似度检测，status R*）。
 /// 相似度 <50% 的 rename 不被 -M 识别 → 不进映射，carry 走 carried_dropped 降级（可审非静默）。
 pub fn rename_map(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -347,6 +364,22 @@ mod tests {
             .args(["commit", "-q", "--amend", "-m", "c2-rewritten"]).output().unwrap();
         assert!(ok.status.success());
         assert!(!is_ancestor(dir.path(), &old_head).unwrap(), "amend 后旧 HEAD 非祖先");
+    }
+
+    #[test]
+    fn worktree_dirty_detects_uncommitted_tracked_edits_but_not_untracked() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        commit_all(dir.path(), "c1");
+        assert!(!worktree_dirty(dir.path()).unwrap(), "刚提交，净树");
+        std::fs::write(dir.path().join("a.rs"), "x\ny\n").unwrap();
+        assert!(worktree_dirty(dir.path()).unwrap(), "tracked 文件未提交编辑 → 脏");
+        // 撤销改动回到净树，再加一个 untracked 新文件——不应算脏（diff HEAD 看不到 untracked）
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        assert!(!worktree_dirty(dir.path()).unwrap());
+        std::fs::write(dir.path().join("untracked.rs"), "new\n").unwrap();
+        assert!(!worktree_dirty(dir.path()).unwrap(), "untracked 新文件不算脏");
     }
 
     #[test]
