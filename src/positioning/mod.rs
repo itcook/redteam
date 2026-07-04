@@ -75,6 +75,40 @@ fn locate_words(content: &str, quote: &str) -> Option<(u32, u32)> {
     None
 }
 
+/// M13 carry 专用定位（R4）：与 locate_quote 同匹配优先级（精确整行 > 子串 > 软换行词序），
+/// 差异仅在前两层出现**多命中**时选最接近 old_line 者——carry 语义下首匹配会把 finding
+/// 错锚到同文件另一处无辜同文（幽灵 finding 阻 approve）。单一命中与 locate_quote 同结果。
+fn locate_quote_near(content: &str, quote: &str, old_line: u32) -> Option<(u32, u32)> {
+    let file_lines: Vec<String> = content.lines().map(normalize_ws).collect();
+    let raw_quote: Vec<String> = quote.lines().map(normalize_ws).collect();
+    let first_idx = raw_quote.iter().position(|l| !l.is_empty())?;
+    let last_idx = raw_quote.iter().rposition(|l| !l.is_empty())?;
+    let first = &raw_quote[first_idx];
+    let exact: Vec<usize> = file_lines.iter().enumerate()
+        .filter(|(_, fl)| *fl == first).map(|(i, _)| i).collect();
+    let hits: Vec<usize> = if exact.is_empty() {
+        file_lines.iter().enumerate()
+            .filter(|(_, fl)| fl.contains(first.as_str())).map(|(i, _)| i).collect()
+    } else {
+        exact
+    };
+    let hit = match hits.as_slice() {
+        [] => return locate_words(content, quote),
+        hs => *hs.iter().min_by_key(|&&i| (i as i64 + 1 - i64::from(old_line)).abs())?,
+    };
+    let ls = (hit as u32) + 1;
+    let span = (last_idx - first_idx + 1) as u32;
+    let le = (ls + span - 1).min(file_lines.len() as u32).max(ls);
+    Some((ls, le))
+}
+
+/// carry 重锚定入口：把 quote 定位到当前树（root 约束读取与 anchor() 同防线）。
+/// None = 定位失败（调用方收进 carried_dropped 审计，绝不静默）。
+pub fn anchor_near(root: &Path, file: &str, quote: &str, old_line: u32) -> Option<(u32, u32)> {
+    let content = safe_read(root, file)?;
+    locate_quote_near(&content, quote, old_line)
+}
+
 /// doc 专用定位：去所有空白 + 去 markdown 强调标记（`* ` `` ` `` `_`）后按**字符级**连续子串匹配，
 /// 返回行跨度。中文无空格，整行/词级匹配失效；模型引用中文 markdown 常去掉 `**`/`` ` ``、跨软换行
 /// 接行、或截断——折叠后字符子串是稳健锚（M6 dogfood 实锤：真 drift 曾被逐字匹配误杀）。
@@ -341,5 +375,39 @@ mod tests {
         assert_eq!(out.len(), 1, "M6-A：保留 finding");
         assert_eq!((out[0].line_start, out[0].line_end), (0, 0),
             "file 分隔符感知：spec.md 未匹配 myspec.md → 未锚定，绝不 over-match 到其内容");
+    }
+
+    #[test]
+    fn anchor_near_picks_hit_closest_to_old_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // 同 quote 出现在第 2 行与第 20 行
+        let mut body = String::from("head\nx.unwrap();\n");
+        for _ in 0..17 { body.push_str("filler\n"); }
+        body.push_str("x.unwrap();\ntail\n");
+        write(dir.path(), "a.rs", &body);
+        // 上轮锚在 18 行附近 → 就近选 20 行，而非首个命中的 2 行（R4 幽灵 finding 防护）
+        assert_eq!(anchor_near(dir.path(), "a.rs", "x.unwrap();", 18), Some((20, 20)));
+        // 上轮锚在 3 行附近 → 选 2 行
+        assert_eq!(anchor_near(dir.path(), "a.rs", "x.unwrap();", 3), Some((2, 2)));
+    }
+
+    #[test]
+    fn anchor_near_single_hit_ignores_old_line_and_missing_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.rs", "one\nlet t = secret();\nthree\n");
+        // 单一命中：old_line 再离谱也锚到唯一处（零影响承诺）
+        assert_eq!(anchor_near(dir.path(), "a.rs", "let t = secret();", 999), Some((2, 2)));
+        // quote 消失 → None（调用方收进 carried_dropped）
+        assert_eq!(anchor_near(dir.path(), "a.rs", "vanished();", 2), None);
+        // 文件消失 → None
+        assert_eq!(anchor_near(dir.path(), "gone.rs", "let t = secret();", 2), None);
+    }
+
+    #[test]
+    fn anchor_near_multiline_quote_spans_from_nearest_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.rs", "if x {\n    bad();\n}\nmid\nif x {\n    bad();\n}\n");
+        // 两处同型块（首行 1 与 5），old_line=6 → 就近选 5，跨度 3 行
+        assert_eq!(anchor_near(dir.path(), "a.rs", "if x {\n    bad();\n}", 6), Some((5, 7)));
     }
 }
