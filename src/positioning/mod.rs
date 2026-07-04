@@ -164,7 +164,7 @@ pub fn anchor_doc(findings: Vec<Finding>, docs: &[(String, String)]) -> Vec<Find
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Severity;
+    use crate::domain::{Origin, Severity};
     use std::io::Write;
 
     fn finding(file: &str, quote: &str) -> Finding {
@@ -173,7 +173,7 @@ mod tests {
             file: file.into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec!["L1".into()], models: vec!["m".into()],
             agreement: 1, hard_constraint: false, cluster_id: None, quote: quote.into(), verify: None,
-            previously_dismissed: false,
+            previously_dismissed: false, origin: Origin::New,
         }
     }
 

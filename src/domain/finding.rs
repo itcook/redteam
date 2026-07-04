@@ -16,6 +16,16 @@ impl Severity {
     }
 }
 
+/// M13 轮次增量：finding 出身——carried=上轮携带（重锚定成活）、new=本轮 delta 新发。
+/// v2 老 JSON 无此键，缺省 New（R6 兼容口径 `(.origin // "new")`）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    Carried,
+    #[default]
+    New,
+}
+
 /// 模型每次 lens 调用返回的单条 finding（codex 形状 + 可选 hard_constraint）。
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct RawFinding {
@@ -64,6 +74,9 @@ pub struct Finding {
     /// R8.2：命中 --dismissed 清单——verdict 豁免、保留证据（spec §1.2 三件套）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub previously_dismissed: bool,
+    /// M13：出身标记（schema v3 显式序列化；反序列化缺省 New）。
+    #[serde(default)]
+    pub origin: Origin,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,7 +103,7 @@ pub struct Verify {
     pub note: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Cluster {
     pub id: String,
     pub theme: String,
@@ -138,7 +151,7 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
-            previously_dismissed: false,
+            previously_dismissed: false, origin: Origin::New,
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(v["quote"], "snippet");
@@ -151,7 +164,7 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
-            previously_dismissed: false,
+            previously_dismissed: false, origin: Origin::New,
         };
         // None → 不出现
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
@@ -174,5 +187,20 @@ mod tests {
         let back: Verify = serde_json::from_str(&j).unwrap();
         assert_eq!(back.note, "", "缺 note 键须 default 回空");
         assert_eq!(back.verdict, VerifyVerdict::Upheld);
+    }
+
+    #[test]
+    fn origin_defaults_new_and_serializes_lowercase() {
+        // v2 老 JSON（无 origin 键）反序列化 → 默认 New（R6：缺省视 new）
+        let j = r#"{"id":"x","severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r","lenses":[],"models":[],"agreement":1,"hard_constraint":false,"quote":"q"}"#;
+        let f: Finding = serde_json::from_str(j).unwrap();
+        assert_eq!(f.origin, Origin::New);
+        // v3 序列化显式携带（契约字段不靠缺省猜）
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["origin"], "new");
+        let mut c = f.clone();
+        c.origin = Origin::Carried;
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(v["origin"], "carried");
     }
 }

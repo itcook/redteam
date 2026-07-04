@@ -40,13 +40,14 @@ pub fn apply_clusters(findings: &mut [Finding], clusters: &[Cluster]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Finding, Severity};
+    use crate::domain::{Finding, Origin, Severity};
     use crate::provider::fake::FakeProvider;
     fn f(id: &str) -> Finding {
         Finding { id: id.into(), severity: Severity::High, title: "t".into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             lenses: vec![], models: vec![], agreement: 1, hard_constraint: false,
-            quote: "snippet".into(), cluster_id: None, verify: None, previously_dismissed: false }
+            quote: "snippet".into(), cluster_id: None, verify: None, previously_dismissed: false,
+            origin: Origin::New }
     }
     #[tokio::test]
     async fn skips_when_fewer_than_two() {

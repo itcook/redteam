@@ -275,7 +275,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
     let verdict = compute_verdict(&findings, ctx.block, ctx.floor);
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
-        schema_version: "2".into(),
+        schema_version: "3".into(),
         mode: ctx.mode,
         verdict,
         stats,
@@ -292,6 +292,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
             failed_models: ctx.failed_models,
             dismissed_reappeared,
             ledger: ctx.ledger_meta,
+            ..Default::default()
         },
     };
     // 退出码：reject 优先 → 10；否则 approve 但对照集不完整 → 2；干净 approve → 0。
@@ -594,7 +595,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
     let mode = detect_mode_from_args(args).unwrap_or(Mode::Doc);
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
-        schema_version: "2".into(),
+        schema_version: "3".into(),
         mode,
         verdict: Verdict::Incomplete,
         stats,
@@ -611,6 +612,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
             failed_models: vec![],
             dismissed_reappeared: vec![],
             ledger: None,
+            ..Default::default()
         },
     };
     let code = exit_code(Verdict::Incomplete, false);
@@ -889,7 +891,7 @@ mod job_tests {
     use crate::state::job::{read_state, JobStatus};
     use crate::state::store::read_result;
     use crate::provider::fake::FakeProvider;
-    use crate::domain::{Finding, RawFinding, Severity};
+    use crate::domain::{Finding, Origin, RawFinding, Severity};
     use std::collections::BTreeMap;
 
     fn checkpointed_finding(title: &str) -> Finding {
@@ -898,6 +900,7 @@ mod job_tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             lenses: vec![], models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
             quote: "q".into(), cluster_id: None, verify: None, previously_dismissed: false,
+            origin: Origin::New,
         }
     }
 
@@ -1104,7 +1107,7 @@ mod job_tests {
 #[cfg(test)]
 mod resume_tests {
     use super::*;
-    use crate::domain::{Finding, RawFinding, Severity};
+    use crate::domain::{Finding, Origin, RawFinding, Severity};
     use crate::state::store::CellInput;
 
     /// 记录每次 `run` 调用的 prompt，脚本化返回一条低 severity finding（避免触发 verify 的
@@ -1148,7 +1151,7 @@ mod resume_tests {
             file: "spec.md".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec![], models: vec!["m".into()], agreement: 1,
             hard_constraint: false, quote: String::new(), cluster_id: None, verify: None,
-            previously_dismissed: false,
+            previously_dismissed: false, origin: Origin::New,
         }
     }
 

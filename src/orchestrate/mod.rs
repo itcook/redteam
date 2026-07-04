@@ -1,5 +1,5 @@
 use crate::bundle::Bundle;
-use crate::domain::{Finding, RawFinding, ReviewInput};
+use crate::domain::{Finding, Origin, RawFinding, ReviewInput};
 use crate::hash::fnv1a64_hex;
 use crate::lens::Lens;
 use crate::prompt::{build_bundle_prompt, build_doc_prompt};
@@ -84,6 +84,7 @@ pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
         previously_dismissed: false,
         cluster_id: None,
         verify: None,
+        origin: Origin::New,
     }
 }
 

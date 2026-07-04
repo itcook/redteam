@@ -252,14 +252,14 @@ mod tests {
     }
     #[test]
     fn refute_prompt_carries_finding_and_upheld_empty_contract() {
-        use crate::domain::{Finding, Severity};
+        use crate::domain::{Finding, Origin, Severity};
         let f = Finding {
             id: "x".into(), severity: Severity::High, title: "missing auth".into(),
             body: "no check before db write".into(), file: "src/a.rs".into(),
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
             lenses: vec!["L1".into()], models: vec!["claude".into()], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
-            previously_dismissed: false,
+            previously_dismissed: false, origin: Origin::New,
         };
         let p = build_refute_prompt(&f, crate::domain::Mode::Code, "");
         assert!(!p.contains("{{"), "no residual placeholders");
@@ -285,14 +285,14 @@ mod tests {
 
     #[test]
     fn refute_prompt_doc_omission_frames_empty_quote() {
-        use crate::domain::{Finding, Mode, Severity};
+        use crate::domain::{Finding, Mode, Origin, Severity};
         let f = Finding {
             id: "x".into(), severity: Severity::High, title: "missing rollback branch".into(),
             body: "no rollback path on failure".into(), file: "spec.md".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "specify rollback".into(),
             lenses: vec!["D2".into()], models: vec!["alpha".into()], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: String::new(), verify: None,
-            previously_dismissed: false,
+            previously_dismissed: false, origin: Origin::New,
         };
         let p = build_refute_prompt(&f, Mode::Doc, "");
         assert!(!p.contains("{{"), "no residual placeholders");
@@ -303,13 +303,13 @@ mod tests {
     #[test]
     fn render_precedents_ranks_same_file_first_and_caps_total() {
         use crate::db::DismissCard;
-        use crate::domain::{Finding, Severity};
+        use crate::domain::{Finding, Origin, Severity};
         let f = Finding {
             id: "x".into(), severity: Severity::High, title: "injection via notes".into(),
             body: "b".into(), file: "src/a.rs".into(), line_start: 1, line_end: 1,
             confidence: 0.9, recommendation: "r".into(), lenses: vec![], models: vec![],
             agreement: 1, hard_constraint: false, quote: "q".into(), cluster_id: None,
-            verify: None, previously_dismissed: false,
+            verify: None, previously_dismissed: false, origin: Origin::New,
         };
         let card = |id: &str, file: &str, title: &str, reason: &str| DismissCard {
             id: id.into(), status: "dismissed".into(), title: title.into(), file: file.into(),
