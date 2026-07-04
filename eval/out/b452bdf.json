@@ -1,0 +1,41 @@
+{
+ "commit": "b452bdf",
+ "subject": "fix(reliability): Verify.note serde default — prevent silent CellRecord drop on empty note (T3 Critical)",
+ "vanished_symbols": [],
+ "dossier_bytes_pm3": 7732,
+ "dossier_est_tokens_pm3": 2209,
+ "symbols": [
+  {
+   "name": "Verify",
+   "kind": "struct",
+   "file": "src/domain/finding.rs",
+   "line": 77,
+   "col": 11,
+   "scenario": "type_def",
+   "defs_same_name": 1,
+   "grep_ref_count": 19,
+   "gt": "ok",
+   "gt_ref_count": 18,
+   "tp": 18,
+   "gt_only": [],
+   "grep_only": [
+    "src/consolidate/verify.rs:17"
+   ]
+  },
+  {
+   "name": "verify_empty_note_roundtrips_after_skip",
+   "kind": "fn",
+   "file": "src/domain/finding.rs",
+   "line": 161,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  }
+ ]
+}

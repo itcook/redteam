@@ -1,0 +1,126 @@
+{
+ "commit": "0791793",
+ "subject": "fix(positioning): doc anchor keeps unlocatable findings + markdown/char-level locate",
+ "vanished_symbols": [
+  "anchor_doc_drops_fabricated_quote",
+  "anchor_doc_drops_quote_finding_for_unknown_file"
+ ],
+ "dossier_bytes_pm3": 5782,
+ "dossier_est_tokens_pm3": 1652,
+ "symbols": [
+  {
+   "name": "locate_doc",
+   "kind": "fn",
+   "file": "src/positioning/mod.rs",
+   "line": 82,
+   "col": 3,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 2,
+   "gt": "ok",
+   "gt_ref_count": 1,
+   "tp": 1,
+   "gt_only": [],
+   "grep_only": [
+    "src/positioning/mod.rs:125"
+   ]
+  },
+  {
+   "name": "anchor_doc",
+   "kind": "fn",
+   "file": "src/positioning/mod.rs",
+   "line": 132,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 14,
+   "gt": "ok",
+   "gt_ref_count": 8,
+   "tp": 8,
+   "gt_only": [],
+   "grep_only": [
+    "src/cli.rs:1008",
+    "src/cli.rs:132",
+    "src/cli.rs:271",
+    "src/evidence/doc.rs:1",
+    "tests/review_e2e.rs:20",
+    "tests/review_e2e.rs:340"
+   ]
+  },
+  {
+   "name": "anchor_doc_keeps_unlocatable_finding_with_line_zero",
+   "kind": "fn",
+   "file": "src/positioning/mod.rs",
+   "line": 301,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "anchor_doc_keeps_unknown_file_finding_with_line_zero",
+   "kind": "fn",
+   "file": "src/positioning/mod.rs",
+   "line": 312,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "anchor_doc_locates_across_markdown_and_soft_wrap",
+   "kind": "fn",
+   "file": "src/positioning/mod.rs",
+   "line": 321,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "anchor_doc_does_not_over_match_bare_suffix",
+   "kind": "fn",
+   "file": "src/positioning/mod.rs",
+   "line": 334,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "doc_review_keeps_omission_drops_fabricated_anchors_contradiction",
+   "kind": "fn",
+   "file": "tests/review_e2e.rs",
+   "line": 221,
+   "col": 9,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  }
+ ]
+}

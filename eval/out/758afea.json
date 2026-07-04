@@ -1,0 +1,88 @@
+{
+ "commit": "758afea",
+ "subject": "fix(provider): normalize Anthropic /v1 in base_url — shared helper for backends + direct",
+ "vanished_symbols": [],
+ "dossier_bytes_pm3": 8666,
+ "dossier_est_tokens_pm3": 2476,
+ "symbols": [
+  {
+   "name": "turn",
+   "kind": "fn",
+   "file": "src/provider/backends.rs",
+   "line": 111,
+   "col": 13,
+   "scenario": "trait_impl_method",
+   "defs_same_name": 4,
+   "grep_ref_count": 16,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": [
+    "src/provider/tool_loop.rs:178",
+    "src/provider/tool_loop.rs:277",
+    "src/provider/tool_loop.rs:37",
+    "src/provider/tool_loop.rs:44",
+    "src/provider/tool_loop.rs:66",
+    "src/provider/tool_loop.rs:67",
+    "src/provider/tool_loop.rs:68",
+    "src/provider/tool_loop.rs:70",
+    "src/provider/tool_loop.rs:71",
+    "src/provider/tool_loop.rs:80",
+    "src/provider/tool_loop.rs:82",
+    "src/provider/tool_loop.rs:83",
+    "src/provider/tool_loop.rs:92",
+    "src/provider/tool_loop.rs:93",
+    "src/provider/tool_loop.rs:94",
+    "src/provider/tool_loop.rs:95"
+   ]
+  },
+  {
+   "name": "call_anthropic",
+   "kind": "fn",
+   "file": "src/provider/direct.rs",
+   "line": 149,
+   "col": 13,
+   "scenario": "inherent_method",
+   "defs_same_name": 1,
+   "grep_ref_count": 2,
+   "gt": "ok",
+   "gt_ref_count": 1,
+   "tp": 1,
+   "gt_only": [],
+   "grep_only": [
+    "src/provider/direct.rs:359"
+   ]
+  },
+  {
+   "name": "anthropic_messages_url",
+   "kind": "fn",
+   "file": "src/provider/mod.rs",
+   "line": 32,
+   "col": 14,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 7,
+   "gt": "ok",
+   "gt_ref_count": 7,
+   "tp": 7,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "anthropic_messages_url_normalizes_v1",
+   "kind": "fn",
+   "file": "src/provider/mod.rs",
+   "line": 46,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  }
+ ]
+}

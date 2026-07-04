@@ -1,0 +1,71 @@
+{
+ "commit": "76c91c6",
+ "subject": "fix(incremental): 终审①——preflight 脏工作树守卫，防未提交编辑静默蒸发携带项",
+ "vanished_symbols": [],
+ "dossier_bytes_pm3": 9707,
+ "dossier_est_tokens_pm3": 2773,
+ "symbols": [
+  {
+   "name": "incremental_preflight",
+   "kind": "fn",
+   "file": "src/cli.rs",
+   "line": 768,
+   "col": 14,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 15,
+   "gt": "ok",
+   "gt_ref_count": 14,
+   "tp": 14,
+   "gt_only": [],
+   "grep_only": [
+    "src/cli.rs:753"
+   ]
+  },
+  {
+   "name": "preflight_rejects_dirty_working_tree",
+   "kind": "fn",
+   "file": "src/cli.rs",
+   "line": 1941,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "worktree_dirty",
+   "kind": "fn",
+   "file": "src/evidence/git.rs",
+   "line": 157,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 5,
+   "gt": "ok",
+   "gt_ref_count": 5,
+   "tp": 5,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "worktree_dirty_detects_uncommitted_tracked_edits_but_not_untracked",
+   "kind": "fn",
+   "file": "src/evidence/git.rs",
+   "line": 370,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  }
+ ]
+}
