@@ -24,12 +24,20 @@ fn is_noise(path: &str) -> bool {
     NOISE_NAMES.contains(&f) || f.ends_with(".lock")
 }
 
-/// 确定性文件筛选：丢掉空 diff 与噪声（锁文件）。代码决定，不交模型。
+/// 二进制 diff 判定：git 对二进制改动只产 "Binary files … differ" 标记行（无 hunk）。
+/// 标记行顶格无前缀；文本 hunk 正文行恒带 +/-/空格前缀，同款字样不会误伤。
+/// Task 14 回放实证：单个 build 产物开 3 cell 烧掉 36%/1.46M input——无可审文本，筛选层消灭。
+fn is_binary_diff(diff: &str) -> bool {
+    diff.lines().any(|l| l.starts_with("Binary files ") && l.ends_with(" differ"))
+}
+
+/// 确定性文件筛选：丢掉空 diff、噪声（锁文件）与二进制 diff。代码决定，不交模型。
 pub fn select_files(changes: Vec<FileChange>) -> Vec<FileChange> {
     changes
         .into_iter()
         .filter(|c| !c.diff.trim().is_empty())
         .filter(|c| !is_noise(&c.path))
+        .filter(|c| !is_binary_diff(&c.diff))
         .collect()
 }
 
@@ -377,6 +385,24 @@ mod tests {
         let out = select_files(vec![fc("src/a.rs", "+x"), fc("src/blank.rs", "   ")]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, "src/a.rs");
+    }
+
+    #[test]
+    fn select_drops_binary_diffs_but_not_lookalike_content() {
+        // Task 14 回放实证：build 产物二进制被开 3 cell 烧掉 36%/1.46M input——
+        // 二进制 diff 无可审文本，必须在筛选层消灭。
+        let bin = "diff --git a/plugins/redteam/bin/darwin/aarch64/redteam b/plugins/redteam/bin/darwin/aarch64/redteam\n\
+                   index 1111111..2222222 100755\n\
+                   Binary files a/plugins/redteam/bin/darwin/aarch64/redteam and b/plugins/redteam/bin/darwin/aarch64/redteam differ\n";
+        // 正文里出现同款字样的行带 +/-/空格前缀 → 不得误伤文本文件
+        let lookalike = "@@ -1,2 +1,3 @@\n+// Binary files a and b differ\n context\n";
+        let out = select_files(vec![
+            fc("src/a.rs", "+x"),
+            fc("plugins/redteam/bin/darwin/aarch64/redteam", bin),
+            fc("src/doc.rs", lookalike),
+        ]);
+        let paths: Vec<&str> = out.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/a.rs", "src/doc.rs"]);
     }
 
     #[test]
