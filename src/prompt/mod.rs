@@ -220,6 +220,7 @@ pub fn render_incremental_section(
     two_layer_manifest: &str,
     claimed: &[crate::db::ResolveCard],
 ) -> String {
+
     const CLAIMED_TOTAL_CHARS: usize = 6000;
     let mut list = String::new();
     let mut listed = 0usize;
@@ -252,6 +253,19 @@ pub fn render_incremental_section(
          {list}\
          For each claimed-resolved item: if the underlying problem is NOT actually fixed, report it again using the EXACT original title and quote verbatim (that is how it is machine-matched). If it is genuinely fixed, do not report it.\n\
          </incremental_round>"
+    )
+}
+
+/// 卷宗段（M14 D6/D8）：事实引用点 + 惰性保真散文。entries 空 → 空串（空渲染纪律）。
+pub fn render_dossier_section(entries: &str) -> String {
+    if entries.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "<dossier>\n\
+         The entries below are where this change's changed symbols are used elsewhere in the repo — its blast radius — found by word-boundary search (heuristic facts, not judgments; renamed or dynamic uses may be missing). Judge whether THIS change breaks these sites; do not audit them for pre-existing defects this change does not cause. The ±3-line excerpts are a starting point — read the full file at any site you must judge, and search yourself for uses you suspect are missing; your duty to verify is undiminished.\n\n\
+         {entries}\
+         </dossier>"
     )
 }
 
@@ -527,5 +541,21 @@ mod tests {
         let s = render_incremental_section("abc", "", &big);
         assert!(s.contains("more claimed-resolved items (not listed)"), "{s}");
         assert!(s.chars().count() < 9000, "总量帽生效: {}", s.chars().count());
+    }
+
+    #[test]
+    fn dossier_section_empty_renders_empty() {
+        assert_eq!(render_dossier_section(""), "");
+    }
+
+    #[test]
+    fn dossier_section_wraps_with_prose_and_scope_guard() {
+        let s = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    foo();\n");
+        assert!(s.starts_with("<dossier>"));
+        assert!(s.contains("blast radius"), "D8 措辞在场");
+        assert!(s.contains("do not audit them for pre-existing defects"), "范围划线在场");
+        assert!(s.contains("duty to verify is undiminished"));
+        assert!(s.contains("## foo (fn)"), "entries 在场");
+        assert!(s.trim_end().ends_with("</dossier>"));
     }
 }
