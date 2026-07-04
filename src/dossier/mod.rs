@@ -1,7 +1,6 @@
 //! 卷宗引擎（M14 支柱 2）：diff → 改动符号 → 仓内引用点 → 事实卷宗字符串。
 //! hermetic：喂 (bundle, root) 出字符串，零 LLM。移植自 eval/harness.py（查全 1.000）。
 use regex::Regex;
-use std::path::Path;
 
 struct Lang {
     exts: &'static [&'static str],
