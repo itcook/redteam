@@ -385,21 +385,6 @@ impl ProjDb {
             .map_err(Into::into)
     }
 
-    /// ponytail: 测试仪器——销案 history 记录数
-    #[cfg(test)]
-    pub(crate) fn resolve_history_count(&self, id: &str) -> usize {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM resolved_history WHERE id=?1", params![id], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap_or(0) as usize
-    }
-
-    /// ponytail: 测试仪器——销案 history 查询（轮、理由）
-    #[cfg(test)]
-    pub(crate) fn resolve_history_query(&self, id: &str) -> Result<Vec<(String, String)>> {
-        self.resolve_history(id)
-    }
 }
 
 fn row_to_card(r: &rusqlite::Row<'_>) -> rusqlite::Result<DismissCard> {
@@ -566,13 +551,13 @@ mod tests {
 
         // history 追加两条（两次 upsert）
         assert_eq!(
-            db.resolve_history_count("a1b2c3d4e5f60718"),
+            db.resolve_history("a1b2c3d4e5f60718").unwrap().len(),
             2,
             "history 应有两条记录"
         );
 
         // 第二条 history 记的是有效 reason（沿用值）
-        let hist = db.resolve_history_query("a1b2c3d4e5f60718").unwrap();
+        let hist = db.resolve_history("a1b2c3d4e5f60718").unwrap();
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[0].1, "加了守卫", "首次 history reason");
         assert_eq!(hist[1].1, "加了守卫", "再销案 history reason（沿用值）");
@@ -594,7 +579,7 @@ mod tests {
         let after = db.resolve_get("a1b2c3d4e5f60718").unwrap().unwrap();
         assert_eq!(after.reason, "重构 API", "新 reason 覆盖旧值");
 
-        let hist = db.resolve_history_query("a1b2c3d4e5f60718").unwrap();
+        let hist = db.resolve_history("a1b2c3d4e5f60718").unwrap();
         assert_eq!(hist[1].1, "重构 API", "再销案 history reason（新值）");
     }
 }
