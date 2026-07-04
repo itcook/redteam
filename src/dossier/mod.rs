@@ -107,6 +107,9 @@ fn block_end(lines: &[&str], i: usize) -> usize {
 /// impl/for 头非 def，天然穿透到内层 fn（照 D5 简化：只取名，不分类 impl_trait）。
 /// ponytail: 每候选行调 block_end = O(n²) 最坏；单文件几千行够用，热点再优化
 fn innermost_enclosing_def(lines: &[&str], line0: usize, defs: &[(&'static str, Regex)]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
     for i in (0..=line0.min(lines.len().saturating_sub(1))).rev() {
         if let Some((_, name)) = match_def(lines[i], defs) {
             if i == line0 || block_end(lines, i) >= line0 {
@@ -169,5 +172,11 @@ mod tests {
         // 落在两 fn 之间的空行 → 无外围
         let src2: Vec<&str> = "fn a() {}\n\nfn b() {}".lines().collect();
         assert_eq!(innermost_enclosing_def(&src2, 1, &d), None);
+    }
+
+    #[test]
+    fn innermost_enclosing_empty_lines_is_none() {
+        let d = rust_defs();
+        assert_eq!(innermost_enclosing_def(&[], 0, &d), None, "空文件不得 panic");
     }
 }
