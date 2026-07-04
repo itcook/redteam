@@ -120,6 +120,68 @@ fn innermost_enclosing_def(lines: &[&str], line0: usize, defs: &[(&'static str, 
     None
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChangedSym {
+    pub name: String,
+    pub kind: &'static str,
+    pub file: String,
+}
+
+// @@ -a,b +c,d @@ 抓新文件起始行 c 与计数 d
+fn parse_hunk_new_start(line: &str) -> Option<usize> {
+    let after_plus = line.split('+').nth(1)?; // "c,d @@ …"
+    let c = after_plus.split([',', ' ']).next()?;
+    c.parse::<usize>().ok()
+}
+
+/// diff（任意上下文级别）→ 改动符号，按 name 去重（grep 按名一次即可）。
+pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'static str, Regex)]) -> Vec<ChangedSym> {
+    let mut out: Vec<ChangedSym> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let push = |name: String, kind: &'static str, out: &mut Vec<ChangedSym>, seen: &mut std::collections::HashSet<String>| {
+        if seen.insert(name.clone()) {
+            out.push(ChangedSym { name, kind, file: file.to_string() });
+        }
+    };
+    let mut new_line = 0usize; // 当前 + / 上下文行的新文件行号（1-based）
+    let mut hunk_anchor: Option<usize> = None; // 本 hunk 首个改动行（0-based）
+    for raw in diff.lines() {
+        if raw.starts_with("+++") || raw.starts_with("---") {
+            continue;
+        }
+        if raw.starts_with("@@") {
+            // 上一 hunk 收尾：外围 def
+            if let Some(a) = hunk_anchor.take() {
+                if let Some(n) = innermost_enclosing_def(file_lines, a, defs) {
+                    push(n, "fn", &mut out, &mut seen);
+                }
+            }
+            new_line = parse_hunk_new_start(raw).unwrap_or(1);
+            continue;
+        }
+        match raw.as_bytes().first() {
+            Some(b'+') => {
+                let anchor0 = new_line.saturating_sub(1);
+                if hunk_anchor.is_none() {
+                    hunk_anchor = Some(anchor0);
+                }
+                if let Some((kind, name)) = match_def(&raw[1..], defs) {
+                    push(name, kind, &mut out, &mut seen);
+                }
+                new_line += 1;
+            }
+            Some(b'-') => { /* 删除行不推进新行号，不入卷宗 */ }
+            _ => { new_line += 1; } // 上下文行
+        }
+    }
+    if let Some(a) = hunk_anchor.take() {
+        if let Some(n) = innermost_enclosing_def(file_lines, a, defs) {
+            push(n, "fn", &mut out, &mut seen);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +240,27 @@ mod tests {
     fn innermost_enclosing_empty_lines_is_none() {
         let d = rust_defs();
         assert_eq!(innermost_enclosing_def(&[], 0, &d), None, "空文件不得 panic");
+    }
+
+    #[test]
+    fn symbols_from_diff_plus_lines_and_enclosing() {
+        let d = rust_defs();
+        // 新文件内容（root 侧真实文件）
+        let file: Vec<&str> = "fn helper() {}\n\nfn caller() {\n    helper();\n    let z = 2;\n}".lines().collect();
+        // diff：在 caller 体内改了一行（+ let z），未含 def 行 → 外围 caller
+        let diff = "@@ -4,0 +5,1 @@\n+    let z = 2;\n";
+        let syms = symbols_in_file(diff, &file, "src/x.rs", &d);
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["caller"], "改动落在 caller 体内 → 外围 caller");
+    }
+
+    #[test]
+    fn symbols_from_diff_new_def_line() {
+        let d = rust_defs();
+        let file: Vec<&str> = "fn old() {}\nfn added() {\n    work();\n}".lines().collect();
+        let diff = "@@ -1,0 +2,3 @@\n+fn added() {\n+    work();\n+}\n";
+        let syms = symbols_in_file(diff, &file, "src/y.rs", &d);
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"added"), "新增 def 行进符号集；实得 {names:?}");
     }
 }
