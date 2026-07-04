@@ -77,6 +77,12 @@ enum Cmd {
         /// 本次评审完全关闭台账（豁免/预筛/判例注入全停）。
         #[arg(long)]
         no_dismissed: bool,
+        /// 增量轮（M13）：以指定作业的评审为基线，只审其 stamped HEAD 以来已提交的 fix delta，
+        /// 未动代码的 findings 重锚定携带。仅 code 模式 + branch scope（须 --base）；上轮须干净
+        /// 全量（非 incomplete、无 failed_models、经 --background 持久化）。守卫违例显式报错，
+        /// 不静默降级全量。
+        #[arg(long)]
+        incremental_from: Option<String>,
         /// 评审目标：doc 模式为受审文档路径（可多个）；code 模式留空（评当前改动）。
         targets: Vec<String>,
     },
@@ -128,7 +134,7 @@ enum Cmd {
         /// 销案发生轮次（如 r2），可选。
         #[arg(long, default_value = "")]
         round: String,
-        /// 修法一句话（可选，进台账与 history 备审计）。
+        /// 修法一句话（可选，进台账与 history 备审计）；再销案时缺省沿用卡上原理由。
         #[arg(long, default_value = "")]
         reason: String,
         /// 快照字段（无 --from 时必须全给；与 --from 并用时覆盖抄写值）。
@@ -384,6 +390,7 @@ async fn main() {
             resume,
             dismissed,
             no_dismissed,
+            incremental_from,
             targets,
         } => {
             let cfg = load_config_warned();
@@ -430,7 +437,7 @@ async fn main() {
             let args = ReviewArgs {
                 mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
                 no_correlate, block_threshold, conf_floor, background, format, targets,
-                resume: None, dismissed, no_dismissed,
+                resume: None, dismissed, no_dismissed, incremental_from,
             };
 
             // 后台：写 pending state + args 快照（proj.db）→ spawn detached worker → 打印 job-id 退出。
@@ -1040,6 +1047,7 @@ mod tests {
             resume: None,
             dismissed: None,
             no_dismissed: false,
+            incremental_from: None,
         };
         let result = build_registry(&args, &cfg, cwd);
         assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");
