@@ -233,18 +233,25 @@ impl ProjDb {
     // ---- resolve 销案台账（M13 决议 3，dismiss 表范式对称）----
 
     /// 销案/再销案：主表 upsert + history 追加（同一事务）。
+    /// 再销案未给新 reason（空串）→ 沿用旧卡理由（对称 dismiss_set_status 的沿用语义），
+    /// 防二次销案静默清空审计理由；history 记当次生效值。
     pub fn resolve_upsert(&mut self, card: &ResolveCard) -> Result<()> {
+        let reason = if card.reason.trim().is_empty() {
+            self.resolve_get(&card.id)?.map(|old| old.reason).unwrap_or_default()
+        } else {
+            card.reason.clone()
+        };
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO resolved (id,title,file,quote,severity,reason,round,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,strftime('%Y-%m-%d','now'))
              ON CONFLICT(id) DO UPDATE SET title=?2,file=?3,quote=?4,severity=?5,
                reason=?6,round=?7,updated_at=strftime('%Y-%m-%d','now')",
-            params![card.id, card.title, card.file, card.quote, card.severity, card.reason, card.round],
+            params![card.id, card.title, card.file, card.quote, card.severity, reason, card.round],
         )?;
         tx.execute(
             "INSERT INTO resolved_history (id,round,reason) VALUES (?1,?2,?3)",
-            params![card.id, card.round, card.reason],
+            params![card.id, card.round, reason],
         )?;
         tx.commit()?;
         Ok(())
@@ -268,6 +275,17 @@ impl ProjDb {
              ORDER BY updated_at DESC, id",
         )?;
         let rows = stmt.query_map([], row_to_resolve)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// 销案卡每条 history 的轮/理由对（升序）。
+    pub fn resolve_history(&self, id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT round, reason FROM resolved_history WHERE id=?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -365,6 +383,22 @@ impl ProjDb {
             })
             .optional()
             .map_err(Into::into)
+    }
+
+    /// ponytail: 测试仪器——销案 history 记录数
+    #[cfg(test)]
+    pub(crate) fn resolve_history_count(&self, id: &str) -> usize {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM resolved_history WHERE id=?1", params![id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0) as usize
+    }
+
+    /// ponytail: 测试仪器——销案 history 查询（轮、理由）
+    #[cfg(test)]
+    pub(crate) fn resolve_history_query(&self, id: &str) -> Result<Vec<(String, String)>> {
+        self.resolve_history(id)
     }
 }
 
@@ -509,5 +543,58 @@ mod tests {
         db.resolve_upsert(&rcard("1111111111111111")).unwrap();
         assert!(db.active_ids().unwrap().is_empty(), "resolve 不得漏进豁免 id 集");
         assert!(db.active_cards().unwrap().is_empty(), "resolve 不得漏进判例卡集");
+    }
+
+    #[test]
+    fn resolve_reupset_preserves_reason_when_empty() {
+        // 再销案未给新 reason（空串）→ 沿用旧卡理由，防二次销案静默清空审计理由
+        let mut db = mem_db();
+        let mut first = rcard("a1b2c3d4e5f60718");
+        first.reason = "加了守卫".into();
+        db.resolve_upsert(&first).unwrap();
+
+        // 再销案：同 id，无新 reason（空串）
+        let mut second = rcard("a1b2c3d4e5f60718");
+        second.reason = String::new(); // 空，CLI --reason 默认值
+        second.round = "r3".into();
+        db.resolve_upsert(&second).unwrap();
+
+        // 主表 reason 沿用旧值
+        let after = db.resolve_get("a1b2c3d4e5f60718").unwrap().unwrap();
+        assert_eq!(after.reason, "加了守卫", "再销案空 reason → 沿用旧值");
+        assert_eq!(after.round, "r3", "round 该更新");
+
+        // history 追加两条（两次 upsert）
+        assert_eq!(
+            db.resolve_history_count("a1b2c3d4e5f60718"),
+            2,
+            "history 应有两条记录"
+        );
+
+        // 第二条 history 记的是有效 reason（沿用值）
+        let hist = db.resolve_history_query("a1b2c3d4e5f60718").unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].1, "加了守卫", "首次 history reason");
+        assert_eq!(hist[1].1, "加了守卫", "再销案 history reason（沿用值）");
+    }
+
+    #[test]
+    fn resolve_reupset_updates_reason_when_nonempty() {
+        // 再销案提供新 reason → 覆盖旧值
+        let mut db = mem_db();
+        let mut first = rcard("a1b2c3d4e5f60718");
+        first.reason = "加了守卫".into();
+        db.resolve_upsert(&first).unwrap();
+
+        let mut second = rcard("a1b2c3d4e5f60718");
+        second.reason = "重构 API".into();
+        second.round = "r3".into();
+        db.resolve_upsert(&second).unwrap();
+
+        let after = db.resolve_get("a1b2c3d4e5f60718").unwrap().unwrap();
+        assert_eq!(after.reason, "重构 API", "新 reason 覆盖旧值");
+
+        let hist = db.resolve_history_query("a1b2c3d4e5f60718").unwrap();
+        assert_eq!(hist[1].1, "重构 API", "再销案 history reason（新值）");
     }
 }
