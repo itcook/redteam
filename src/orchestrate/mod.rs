@@ -514,8 +514,12 @@ mod tests {
         ];
         let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &dossiers, &opts, None).await;
         let prompts = p.prompts.lock().unwrap();
-        assert!(prompts.iter().any(|s| s.contains("DOSSIER-A")), "bundle a 应收到 DOSSIER-A");
-        assert!(prompts.iter().any(|s| s.contains("DOSSIER-B")), "bundle b 应收到 DOSSIER-B");
+        let pa = prompts.iter().find(|s| s.contains("### src/a.rs")).expect("bundle a 的 prompt 应被采集");
+        let pb = prompts.iter().find(|s| s.contains("### src/b.rs")).expect("bundle b 的 prompt 应被采集");
+        assert!(pa.contains("DOSSIER-A"), "bundle a 的 prompt 应带自己的卷宗 A");
+        assert!(!pa.contains("DOSSIER-B"), "bundle a 的 prompt 不应带 bundle b 的卷宗（防反索引）");
+        assert!(pb.contains("DOSSIER-B"), "bundle b 的 prompt 应带自己的卷宗 B");
+        assert!(!pb.contains("DOSSIER-A"), "bundle b 的 prompt 不应带 bundle a 的卷宗（防反索引）");
     }
 
     // 并发探针：断言同时在飞的 provider 调用数不超过 max_concurrency。
