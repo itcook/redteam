@@ -30,17 +30,25 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
    AskUserQuestion 一次并把答案记入 session.md；明确无测试的项目跳过测试步。
 
 ## 每轮 rN
-1. **起评审**：`${CODEX_PLUGIN_ROOT}/bin/redteam review <透传参数> --background`
-   （`--background` 放在用户透传参数之后——`args_override_self` 语义下后者胜。）
-   - 台账自动生效（proj.db）：豁免既往驳回 + 疑似判例变体强制进 refute 判例裁决——
-     不要自己读台账拼 --focus 摘要；用户 $ARGUMENTS 里的 `--focus` 原样透传即可。
-   → 记下 job id。轮询 `${CODEX_PLUGIN_ROOT}/bin/redteam status <job>`（间隔约 20-30s），只等**终态**
-     （done / failed / timed_out / cancelled）。redteam 后台 job 有 40 分钟 wall-clock deadline watchdog（到点自我
-     终止并出部分报告），**永不永久卡死**——因此**不要自己判卡死去 cancel**。
-     `cancelled`（外部 `redteam cancel` 中止）→ 视为用户主动中止，停轮、报告用户，不算 approve。
+1. **起评审**：
+   - **r1（或无健康增量基线时）**：`${CODEX_PLUGIN_ROOT}/bin/redteam review <透传参数> --background`（全量）。
+   - **r2 起（code 模式且用户参数带 --base，即 branch scope）**：追加 `--incremental-from <上一轮 job id>`
+     ——只审上轮 stamped HEAD 以来已提交的 fix delta，未动代码的 findings 由 redteam 重锚定携带；
+     verdict 仍是合并集口径（携带 ∪ 新发），**不要**自己把旧 findings 复述进 --focus。
+     **前提：本轮修复已全部 commit（工作树净）**——delta 只含已提交改动。
+     doc 模式或 working-tree scope：不加该 flag，照旧全量循环。
+   - **守卫报错处置**（redteam 显式拒跑，不静默降级）：谱系（rebase/reset）/同族/健康基线/无 stamp
+     报错 → 本轮**去掉 `--incremental-from` 改跑全量**，简报注记原因与守卫名；
+     **空 delta 报错**（"empty delta"）→ 按 §停机 停滞守卫处理（空转，停，交用户）。
+   （`--background` 放在全部参数之后——`args_override_self` 语义下后者胜。）
+   → 记下 job id（**增量链条的下一环**：本轮 job id 就是下轮 `--incremental-from` 的值）。
+   轮询 `${CODEX_PLUGIN_ROOT}/bin/redteam status <job>`（间隔约 20-30s），只等**终态**
+   （done / failed / timed_out / cancelled）。redteam 后台 job 有 40 分钟 wall-clock deadline watchdog（到点自我
+   终止并出部分报告），**永不永久卡死**——因此**不要自己判卡死去 cancel**。
+   `cancelled`（外部 `redteam cancel` 中止）→ 视为用户主动中止，停轮、报告用户，不算 approve。
    - `last_active`/`phase` 仅作进度信息（活着/慢/尾段），**不作 cancel 依据**：推理模型的超长单轮
      turn 与 `finalizing` 尾段的 `last_active` 设计上静止，按「心跳停滞 N 分钟」判死会误杀正常慢 job。
-   - **轮询期间不改动工作树**（working-tree scope 下评审正在读活文件）。
+   - **轮询期间不改动工作树**（评审与携带重锚定正在读活文件）。
 2. **取结果**：`${CODEX_PLUGIN_ROOT}/bin/redteam result <job>` → 存档到
    `rounds/<session>/rN.result.json`（结果已持久于 proj.db 可随时重取；此文件存档
    仅供收工反馈的 jq 配方读取——**发布前随 feedback 仪器一并拆除本步**）。
@@ -57,12 +65,16 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
    按台账状态分流（`${CODEX_PLUGIN_ROOT}/bin/redteam dismiss show <id>` 读 status）：
    `human-confirmed` 或已 `re-upheld` 的静默跳过；仅 `dismissed` 状态的**首次再现**
    进入刹车链（每 id 至多一次）。
-2. **排序**：severity 降序为主序，同级按 file 分组。
-3. **逐条**（读 quote + 文件上下文 + body 后裁决），每条属实项标注**来源：原始/衍生**——
-   衍生 = quote 锚定的代码由本会话既往 `fix(ship): rN` commit 引入。**衍生标注必须附
-   引入 commit 的短 sha**（`git blame` 取证，不凭记忆），写进简报——标注是停机「尾流
-   守卫」的判据输入，必须留下可审计线索，防自证式标签空转：
+   增量轮报告的 `run.resolution_disputed` 非空 → 这些 id 是「已销案却再现」的假修复信号，
+   在 §3 按属实项优先处理。
+2. **排序**：severity 降序为主序，同级按 file 分组。增量轮先看 origin（rN.md 的 Origin 行 /
+   JSON 的 `.origin`）：`carried` = 上轮遗留（多为存疑未决——已裁决过的要么已 resolve 要么已
+   dismiss），不重复全量裁决，只推进其未决状态；`new` = 本轮 delta 新发，照常逐条裁决。
+3. **逐条**（读 quote + 文件上下文 + body 后裁决）：
    - **属实 → 修**：root-cause 修法——共享函数一处守卫优于逐调用点补丁。
+   - **resolution_disputed 项 → 按修复未生效处理**：重读代码确认——确实没修好 → 重修
+     （修好后收轮时重新 resolve）；模型误判（其实已修好）→ 按误报走 dismiss 建卡。
+     **同一 id 第二次出现在 resolution_disputed → 走 §停机 销案争议刹车**。
    - **误报 → 建判例卡**：`${CODEX_PLUGIN_ROOT}/bin/redteam dismiss add <id>
      --reason "<驳回理由>" --from rounds/<session>/rN.result.json --round rN`
      （快照四件套由 --from 自动抄写，勿手拼；理由写实质论据——它是未来 refute
@@ -77,28 +89,32 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 
 ## 收轮
 修复全落 → 跑测试命令至绿 → **单次 commit（仅修复，不含 .redteam/）**，消息
-`fix(ship): rN <一句话摘要>` → 生成 `rounds/<session>/rN.md` 简报：
+`fix(ship): rN <一句话摘要>`
+→ **销案**（增量链条的关键一环，紧跟 commit）：对本轮每个「属实→已修」的 finding id 逐个
+  `${CODEX_PLUGIN_ROOT}/bin/redteam resolve <id> --from rounds/<session>/rN.result.json --round rN --reason "<一句修法>"`
+  （快照四件套由 --from 自动抄写，与 dismiss add 对称；已修复≠误报，落独立表）。
+  下一轮增量据此**不再携带**该 finding；若其 quote 未随修复消失，会自动进下轮「顺带验证」
+  ——假修复会以 `resolution_disputed` 回来。**存疑未决项不 resolve**（携带到下轮继续在场）。
+→ 生成 `rounds/<session>/rN.md` 简报：
 1. `${CODEX_PLUGIN_ROOT}/bin/redteam result <job> --format md > rounds/<session>/rN.md`
    （产品化模板：Summary/severity 表/Info 表/Warnings/Finding Details 全由二进制渲染，勿手拼）；
 2. 把首行标题补上轮次后缀：`# <repo> Redteam Review #<job>` → `…#<job>-round <N>`；
 3. 文末**追加裁决段**（协议层内容，宿主写）：`## Adjudication` ——修复/驳回/存疑清单，
-   属实项带**原始/衍生**标（衍生附引入 commit 短 sha）、本轮 fix commit sha。
+   属实项带 origin 标（carried/new，报告已算好）、销案 id 清单、本轮 fix commit sha。
 → 下一轮。
 - **工具观察（本地调试阶段 · 发布前移除）**：若本轮察觉 redteam/ship **工具级**异常（耗时反常、
   `finalizing` 卡顿、某 finding 的 quote 在文件里配不上、status/协议摩擦），往
   `rounds/<session>/observations.md` 追加**一行**——供收工反馈合成;无异常不写。
 
 ## 停机（每轮内循环完成后判定；即使 verdict=approve，待刹车 id 先走完刹车链)
-1. **verdict = approve** → 收工：写 `rounds/<session>/session.md` 总结（轮数、修复/
-   驳回统计、遗留观察），向用户报告可 ship。
-2. **尾流守卫**：活跃分支上每轮修复自身会成为下轮评审对象，approve 可能结构性不可达
-   （自指尾流）。**连续 2 轮属实项全为衍生、且属实数不增**（本轮 ≤ 上轮）→ 判定
-   **原始问题面已清空**，收工（协议级视同达成目标）：session.md 如实注明「按尾流守卫
-   收工；最后一轮衍生修复未经再评审——有限停机的固有代价」。衍生数反弹（修复引入了
-   新真问题群）→ 守卫不触发，循环继续。**仅属实项 ≥1 的轮计入连续判定**——零属实轮
-   不是「全衍生」（空集真空真值不作数），走 approve/停滞守卫路径。**与 approve 同约束：
-   `dismissed_reappeared` 中待复裁的 id 必须先走完 §3 升级刹车链，方可按本条收工**——
-   尾流出口不得吞掉待复裁信号。
+1. **verdict = approve**（合并集口径：携带 ∪ 本轮新发，redteam 已算好）→ 收工：写
+   `rounds/<session>/session.md` 总结（轮数、修复/驳回/销案统计、carried 遗留清单、遗留观察），
+   向用户报告可 ship。**可选终扫**：用户需要发版级信心时，建议手动裸跑一次全量
+   `redteam review`（不带 --incremental-from）——非默认步骤，成本一整轮，收益是对
+   跨文件耦合的最后一次全量对抗。
+2. **销案争议刹车**：同一 id **第二次**出现在 `run.resolution_disputed` → 停，
+   AskUserQuestion 交人裁决（修复者与评审者死锁不该机器无限循环；对称升级刹车链的
+   「每 id 至多一次复裁」精神）。
 3. **升级刹车链**（每 id 至多一次）：`run.dismissed_reappeared` 中处于 `dismissed` 状态
    的 id → 对照卡上驳回理由（`dismiss show <id>`），带新 finding body **复裁一次**：
    改判属实 → 修 + `dismiss set-status <id> withdrawn --round rM`；仍判误报 →
@@ -106,8 +122,15 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
    人裁误报 → `set-status <id> human-confirmed --round rK`，此后该 id 永久静默；
    人裁属实 → 修 + `set-status <id> withdrawn --round rK`，继续。
 4. **修复受阻**：某 finding 属实但你修不了（需产品/架构决策、改动越权）→ 停，交用户。
+   doc 模式全量循环若陷自指尾流僵局（修复自身反复被重审出衍生问题、approve 不可达），
+   也按本条停机交人。
 5. **停滞守卫**：本轮仍有未豁免 findings 但零代码改动（未修也未新驳）→ 空转，停，交用户。
+   增量轮的「empty delta」守卫报错同走本条（无新改动可审 = 空转）。
 6. `--max-rounds` 达限（仅用户显式给出时）→ 停，输出未收敛摘要。
+
+> 尾流守卫已随增量协议**退役**：增量轮的新 finding 定义上全是「衍生」（delta 就是上轮修复），
+> 「连续全衍生」失去判别力；自指尾流问题由「未动代码携带判决、只审 delta」结构性消解，
+> approve 经合并集天然可达。
 
 ## 收工反馈（本地调试阶段 · 发布前移除）
 > 开发期临时仪器,发布前连同 `${CODEX_PLUGIN_ROOT}/feedback.md`、本节、observations 一行约定一并删除。

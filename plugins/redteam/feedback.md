@@ -24,10 +24,12 @@
   run:{ job_id, models:[], lenses:[], duration_ms, warnings:[], failed_models:[],
         usage:{ input_tokens, output_tokens, cached_input_tokens },  // 实付全价 ≈ input−cached；
         // cached=0 且 input 大 = 未命中或该 provider 缓存字段未知（L1 缓存观测）
-        dismissed_reappeared:[]  // 空时该键被省略 } }
+        dismissed_reappeared:[],  // 空时该键被省略
+        head_sha?, incremental?, delta_base?, resolved?, resolution_disputed?, carried_dropped? } }
 Finding = { id, severity:"low"|"medium"|"high"|"critical", title, body, file,
   line_start, line_end, confidence, recommendation, lenses:[], models:[], agreement,
-  hard_constraint, quote, previously_dismissed?(默认省), cluster_id?, verify? }
+  hard_constraint, quote, previously_dismissed?(默认省), cluster_id?, verify?,
+  origin?("carried"|"new"，v3;缺省视 new) }
 verify = { verdict:"upheld"|"refuted", model, note }   // 省略表示未验证
 ```
 
@@ -37,7 +39,8 @@ verify = { verdict:"upheld"|"refuted", model, note }   // 省略表示未验证
 ```bash
 jq -s '
   ([.[].findings[]] | group_by(.id) | map(.[0])) as $f
-  | { raised:        ($f | length),
+  | { raised:        ([$f[] | select((.origin // "new") == "new")] | length),
+      carried:       ([$f[] | select(.origin == "carried")] | length),
       refuted:       ([$f[] | select(.verify.verdict == "refuted")] | length),
       agreement_ge2: ([$f[] | select(.agreement >= 2)] | length),
       anchor_fail:   ([$f[] | select(.line_start == 0)] | length),
@@ -49,7 +52,8 @@ jq -s '
       partial:       any(.[]; .verdict == "incomplete")
     }' <SESSION>/r*.result.json
 ```
-- `raised` = 跨轮按 `id` 去重后的 finding 数;`refuted`/`agreement_ge2`/`anchor_fail`(定位失败痕迹)同基于去重集。
+- `raised` = 跨轮按 `id` 去重后的 **new-only** finding 数（M12 记分卡口径改增量语义：携带项
+  不重复计 raise）；`carried` = 携带项数；`refuted`/`agreement_ge2`/`anchor_fail` 同基于去重集。
 - 存下这段 JSON 备用(记 `$TIER1`)。
 
 ### 2. Tier-2 判定指标(从简报**数整数**)
