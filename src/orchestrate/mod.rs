@@ -200,7 +200,7 @@ pub async fn run_code_fanout(
         .map(|(i, bundle)| {
             let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
             let others = crate::bundle::other_files_manifest(bundles, i);
-            let prompt = build_bundle_prompt(target_label, bundle, rules, focus, &others, incremental);
+            let prompt = build_bundle_prompt(target_label, bundle, rules, focus, &others, incremental, "");
             let cell_id = format!("bundle[{label}]");
             (cell_id, label, prompt)
         })
