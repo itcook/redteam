@@ -110,6 +110,9 @@ struct CellRun {
     tokens: (u64, u64, u64), // (input, output, cached_input)
     duration_ms: u64,
     attempts: u32,
+    /// 胜出 call 的 tool-loop 迭代数（失败候补烧掉的轮数不可观测——Err 无 LensCall）；
+    /// 整链失败记 0＝未观测。
+    iterations: u32,
     warn: Option<String>,
 }
 
@@ -128,6 +131,7 @@ impl CellRun {
             output_tokens: self.tokens.1,
             cached_input_tokens: self.tokens.2,
             attempts: self.attempts,
+            iterations: self.iterations,
         }
     }
 }
@@ -162,7 +166,7 @@ async fn run_one_bundle(
                     model: pm.name.clone(), findings: fs,
                     tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                     duration_ms: t0.elapsed().as_millis() as u64,
-                    attempts: i as u32 + 1, warn: None,
+                    attempts: i as u32 + 1, iterations: call.iterations, warn: None,
                 };
             }
             Err(e) => errs.push(format!("bundle [{label}] model {}: {e}", pm.name)),
@@ -171,7 +175,7 @@ async fn run_one_bundle(
     CellRun {
         model: String::new(), findings: vec![], tokens: (0, 0, 0),
         duration_ms: t0.elapsed().as_millis() as u64,
-        attempts: chain.len() as u32, warn: Some(errs.join("; ")),
+        attempts: chain.len() as u32, iterations: 0, warn: Some(errs.join("; ")),
     }
 }
 
@@ -325,7 +329,7 @@ async fn run_one_doc(
                     model: pm.name.clone(), findings: fs,
                     tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                     duration_ms: t0.elapsed().as_millis() as u64,
-                    attempts: i as u32 + 1, warn: None,
+                    attempts: i as u32 + 1, iterations: call.iterations, warn: None,
                 };
             }
             Err(e) => errs.push(format!("doc model {}: {e}", pm.name)),
@@ -334,7 +338,7 @@ async fn run_one_doc(
     CellRun {
         model: String::new(), findings: vec![], tokens: (0, 0, 0),
         duration_ms: t0.elapsed().as_millis() as u64,
-        attempts: chain.len() as u32, warn: Some(errs.join("; ")),
+        attempts: chain.len() as u32, iterations: 0, warn: Some(errs.join("; ")),
     }
 }
 
@@ -493,7 +497,7 @@ mod tests {
             self.max_seen.fetch_max(cur, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             self.inflight.fetch_sub(1, Ordering::SeqCst);
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1 })
         }
     }
 
@@ -708,7 +712,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                 self.slow_done.store(true, Ordering::SeqCst);
             }
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1 })
         }
     }
 

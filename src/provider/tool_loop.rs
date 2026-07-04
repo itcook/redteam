@@ -70,7 +70,10 @@ pub async fn run_tool_loop(
     let mut out_tok = 0u64;
     let mut cached_tok = 0u64;
 
-    for _ in 0..max_iters {
+    // iterations 口径：逻辑迭代数——自收敛=第几轮收敛；FINALIZE 计入（带新指令的真实
+    // 往返，落 max_iters+1，>max_iters 即「触发过强制收尾」）；turn 级 retry 不计（网络
+    // 抖动非探索深度）。
+    for i in 0..max_iters {
         let turn = crate::provider::retry_classified(retry_budget, || async {
             match tokio::time::timeout(per_turn, backend.turn(&messages, &tools)).await {
                 Ok(r) => r,
@@ -89,6 +92,7 @@ pub async fn run_tool_loop(
                 input_tokens: in_tok,
                 output_tokens: out_tok,
                 cached_input_tokens: cached_tok,
+                iterations: i + 1,
             });
         }
 
@@ -121,6 +125,7 @@ pub async fn run_tool_loop(
         input_tokens: in_tok,
         output_tokens: out_tok,
         cached_input_tokens: cached_tok,
+        iterations: max_iters + 1,
     })
 }
 
@@ -253,6 +258,7 @@ mod tests {
         assert_eq!(call.findings[0].title, "t");
         // 单轮 usage
         assert_eq!((call.input_tokens, call.output_tokens), (1, 1));
+        assert_eq!(call.iterations, 1, "单发单收=1（成功恒 >=1）");
         // 没触发工具执行
         assert_eq!(backend.turn_count(), 1);
     }
@@ -268,6 +274,7 @@ mod tests {
         assert_eq!(call.findings.len(), 1);
         // 两轮 usage 累加：(2+1, 3+1)
         assert_eq!((call.input_tokens, call.output_tokens), (3, 4));
+        assert_eq!(call.iterations, 2, "1 次 tool_call + 自收敛终答 = 2 轮");
         // 第二轮收到的 messages 必须含 ToolResults，且内容是真读到的文件文本
         let second = backend.messages_at(1);
         let fed = second.iter().any(|m| matches!(
@@ -315,6 +322,7 @@ mod tests {
         assert_eq!(call.findings.len(), 1, "强制收尾应产出 findings 而非报错");
         // usage 跨探索 2 轮 + 收尾 1 轮累加：(2+2+1, 3+3+1)
         assert_eq!((call.input_tokens, call.output_tokens), (5, 7));
+        assert_eq!(call.iterations, 3, "FINALIZE 计入：max_iters(2)+1，>max_iters 即触发过强制收尾");
         // 收尾轮 messages 必须含 FINALIZE 指令
         let last = backend.messages_at(backend.turn_count() - 1);
         assert!(
