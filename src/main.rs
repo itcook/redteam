@@ -31,9 +31,10 @@ enum Cmd {
         /// code 模式 diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]
         base: Option<String>,
-        /// 证据范围：working-tree（默认，未提交改动）| branch（当前分支相对基线的全部提交）。
-        #[arg(long, default_value = "working-tree")]
-        scope: String,
+        /// 证据范围：working-tree（未提交改动）| branch（当前分支相对基线的全部提交）。
+        /// 缺省：给了 --base 用 branch，否则 working-tree。
+        #[arg(long, value_parser = ["working-tree", "branch"])]
+        scope: Option<String>,
         /// 对照的 spec/需求文档路径（可多次）——评审将检查实现与其符合度。
         #[arg(long)]
         spec: Vec<String>,
@@ -386,6 +387,17 @@ async fn main() {
                 std::process::exit(code);
             }
 
+            // scope 缺省定案（r1 20260703 事故：--base + 默认 working-tree = base 被静默
+            // 忽略 → 干净树空评审秒出 approve）：有 --base 自动 branch；显式矛盾组合报错。
+            let scope = match (scope.as_deref(), base.is_some()) {
+                (Some("working-tree"), true) => {
+                    eprintln!("error: --base only takes effect with --scope branch (working-tree reviews uncommitted changes only); drop --base or use --scope branch");
+                    std::process::exit(2);
+                }
+                (Some(s), _) => s.to_string(),
+                (None, true) => "branch".to_string(),
+                (None, false) => "working-tree".to_string(),
+            };
             let args = ReviewArgs {
                 mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
                 no_correlate, block_threshold, conf_floor, background, format, targets,

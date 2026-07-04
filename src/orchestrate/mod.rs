@@ -18,6 +18,9 @@ pub trait CellSink: Send + Sync {
     fn on_cell(&self, rec: CellRecord);
     /// 阶段转换钩子（后台 job 用；默认 no-op，前台 sink=None / 其他 sink 零影响）。
     fn on_phase(&self, _phase: crate::state::job::Phase) {}
+    /// resolve 完成即报 models/lenses（后台 job stamp 进 state，running 期 status 可见；
+    /// 此前 done 时才从 report 回填——r1 20260703 实证运行全程空数组）。默认 no-op。
+    fn on_meta(&self, _models: &[String], _lenses: &[String]) {}
 }
 
 #[derive(Clone, Debug)]

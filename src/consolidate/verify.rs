@@ -44,16 +44,43 @@ async fn refute_one(
     let notes = render_precedents(finding, precedents);
     let prompt = build_refute_prompt(finding, mode, &notes);
     match provider.run(LensRequest { model: model.clone(), prompt }).await {
-        Ok(call) if !call.findings.is_empty() => {
-            let note = call.findings.first().map(|f| f.title.clone()).unwrap_or_default();
-            (Verify { verdict: VerifyVerdict::Refuted, model, note }, None)
+        Ok(call) => {
+            let (verdict, note, contract_warn) = classify_refute(&call.findings);
+            let warn = contract_warn.map(|w| format!("refute [{}] model {model}: {w}", finding.id));
+            (Verify { verdict, model, note }, warn)
         }
-        Ok(_) => (Verify { verdict: VerifyVerdict::Upheld, model, note: String::new() }, None),
         // 保守：refute 调用失败不冤枉 finding（保留其 blocking 力），但失败必须进 warnings。
         Err(e) => {
             let warn = format!("refute [{}] model {model}: {e}", finding.id);
             (Verify { verdict: VerifyVerdict::Upheld, model, note: "refute unavailable".into() }, Some(warn))
         }
+    }
+}
+
+/// refute 输出 → verdict：语义前缀优先，非空性只是违约 fallback（附 warning）。
+/// r1 20260703 实证：六字段必填契约后，守约模型想表达 upheld 也会输出 finding
+/// （title "Claim upheld: …"），按「非空即 refuted」会静默吞掉真问题。
+fn classify_refute(
+    findings: &[crate::domain::RawFinding],
+) -> (VerifyVerdict, String, Option<&'static str>) {
+    let Some(first) = findings.first() else {
+        return (VerifyVerdict::Upheld, String::new(), None);
+    };
+    let title = first.title.trim();
+    let lower = title.to_lowercase();
+    if lower.starts_with("refuted") {
+        // 剥机器信号前缀，note 保留纯理由（"refuted" 为 ASCII，字节切片安全）。
+        let note = title["refuted".len()..].trim_start_matches([':', '：', ' ']).to_string();
+        (VerifyVerdict::Refuted, note, None)
+    } else if lower.starts_with("upheld") || lower.starts_with("claim upheld") {
+        (VerifyVerdict::Upheld, title.to_string(), None)
+    } else {
+        // 违约输出：无 verdict 前缀。沿用旧启发式（非空=refuted）保住变体压制力，但漂移必须可观测。
+        (
+            VerifyVerdict::Refuted,
+            title.to_string(),
+            Some("verdict prefix missing in refute output; non-empty treated as refuted (contract drift)"),
+        )
     }
 }
 
@@ -134,6 +161,27 @@ mod tests {
         RawFinding { severity: Severity::High, title: title.into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             hard_constraint: false, quote: "q".into(), lens: None }
+    }
+
+    #[test]
+    fn classify_refute_prefix_semantics() {
+        // 空 → upheld（原契约不变）
+        let (v, note, w) = classify_refute(&[]);
+        assert_eq!((v, note.as_str(), w), (VerifyVerdict::Upheld, "", None));
+        // REFUTED 前缀 → refuted，note 剥前缀
+        let (v, note, w) = classify_refute(&[rawf("REFUTED: guard exists at L10")]);
+        assert_eq!(v, VerifyVerdict::Refuted);
+        assert_eq!(note, "guard exists at L10");
+        assert!(w.is_none());
+        // upheld 语义前缀 → upheld（r1 12bbeb4c 型误杀不再发生）
+        let (v, _, w) = classify_refute(&[rawf("Claim upheld: body interpolated raw")]);
+        assert_eq!(v, VerifyVerdict::Upheld);
+        assert!(w.is_none());
+        // 无前缀违约 → fallback refuted + contract-drift warning
+        let (v, note, w) = classify_refute(&[rawf("actually guarded above")]);
+        assert_eq!(v, VerifyVerdict::Refuted);
+        assert_eq!(note, "actually guarded above");
+        assert!(w.unwrap().contains("contract drift"));
     }
 
     #[tokio::test]

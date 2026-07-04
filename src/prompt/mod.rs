@@ -267,6 +267,16 @@ mod tests {
         assert!(p.contains("missing auth") && p.contains("db.write(token)"), "title+quote injected");
         // upheld=空 findings 的契约必须在 prompt 中
         assert!(p.to_lowercase().contains("findings"), "output contract present");
+        // 契约同源绊线：verdict 语义前缀（verify.rs::classify_refute 解析依据）+ 必填字段指引
+        // （r2 20260702 契约不匹配、r1 20260703 upheld 误杀两案的防再漂移）。
+        assert!(p.contains("\"REFUTED: \""), "refuted 前缀信号指引在场");
+        assert!(p.contains("ONLY by the empty array"), "upheld=空数组排他表达在场");
+        for field in ["severity", "file", "line_start", "line_end", "confidence", "recommendation"] {
+            assert!(p.contains(field), "必填字段指引缺失: {field}");
+        }
+        // doc 模板同约束（双模板同源）
+        let pd = build_refute_prompt(&f, crate::domain::Mode::Doc, "");
+        assert!(pd.contains("\"REFUTED: \"") && pd.contains("ONLY by the empty array"), "doc 模板 verdict 信号同源");
         // 空台账 → 判例段渲染 (none)；非空 → 原样注入（主题变体跨轮一致抑制）
         assert!(p.contains("Precedents: (none)"), "empty notes render (none)");
         let p2 = build_refute_prompt(&f, crate::domain::Mode::Code, "台账: 旧误报X 已人裁驳回");

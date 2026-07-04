@@ -353,6 +353,7 @@ pub async fn run_review(
     //（design 2026-07-03 #2：生成侧勿再报实证无效，判定后置 consolidate）。
     let focus = args.focus.clone().unwrap_or_default();
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
+    if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
     let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink).await;
 
     // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
@@ -436,7 +437,14 @@ pub async fn run_code_review(
     };
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
-    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, sink).await;
+    if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, sink).await;
+    // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
+    if bundles.is_empty() {
+        raw.warnings.push(format!(
+            "no reviewable evidence: empty diff for {target_label} (0 cells) — the verdict reflects zero reviewed content"
+        ));
+    }
 
     // 5-8. 共用尾段：anchor → dedup → verify → verdict → 组报告（code 无 correlate/clusters）
     let block = args
@@ -545,6 +553,15 @@ impl CellSink for JobCellSink {
         let _g = self.lock.lock().unwrap();
         if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
             st.phase = Some(phase);
+            let _ = crate::state::job::write_state(&self.ws, &st);
+        }
+    }
+
+    fn on_meta(&self, models: &[String], lenses: &[String]) {
+        let _g = self.lock.lock().unwrap();
+        if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
+            st.models = models.to_vec();
+            st.lenses = lenses.to_vec();
             let _ = crate::state::job::write_state(&self.ws, &st);
         }
     }
@@ -811,7 +828,10 @@ pub async fn run_job(
     };
 
     match outcome {
-        Outcome::Done(Ok((report, code))) => {
+        Outcome::Done(Ok((mut report, code))) => {
+            // dispatch 无 job 上下文（TailCtx.job_id 恒空），此处回填——json/md 契约里
+            // run.job_id 是消费者的自证 id（r1 20260703 实证恒空串）。
+            report.run.job_id = job_id.to_string();
             // 同渲染 json + md 落盘（result 命令按 format 直读，避免反序列化 report 图）。
             let json = crate::output::render(&report, crate::output::Format::Json);
             let md = crate::output::render(&report, crate::output::Format::Md);
