@@ -534,4 +534,21 @@ mod tests {
         assert!(out.len() <= DOSSIER_MAX_BYTES + 200, "全局字节预算兜底: {}", out.len());
         assert!(out.contains("omitted for budget"), "全局丢弃标注");
     }
+
+    #[test]
+    fn build_dossier_mixed_bundle_skips_unsupported_keeps_supported() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn target() {}\nfn user() { target(); }\n").unwrap();
+        // 同一 bundle 内混：不支持(.py) + 支持(.rs)。py 跳过、rs 仍产卷宗、不中止。
+        let b = Bundle { files: vec![
+            FileChange { path: "app.py".into(), diff: "@@ -1,0 +1,1 @@\n+def f(): pass\n".into() },
+            FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into() },
+        ] };
+        let out = build_dossier(&b, root);
+        assert!(out.contains("target"), "支持语言文件仍产卷宗（不支持文件被跳过不中止）: {out}");
+    }
 }
