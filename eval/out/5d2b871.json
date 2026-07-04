@@ -1,0 +1,95 @@
+{
+ "commit": "5d2b871",
+ "subject": "fix(reliability): replicate cell-id embeds model — prevent resume silently skipping missing model copies (final-review Important)",
+ "vanished_symbols": [],
+ "dossier_bytes_pm3": 10607,
+ "dossier_est_tokens_pm3": 3030,
+ "symbols": [
+  {
+   "name": "resume_replicate_missing_model_copy_is_completed",
+   "kind": "fn",
+   "file": "src/cli.rs",
+   "line": 1016,
+   "col": 13,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 1,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": [
+    "src/orchestrate/mod.rs:901"
+   ]
+  },
+  {
+   "name": "run_fanout",
+   "kind": "fn",
+   "file": "src/orchestrate/mod.rs",
+   "line": 147,
+   "col": 13,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 10,
+   "gt": "ok",
+   "gt_ref_count": 4,
+   "tp": 4,
+   "gt_only": [],
+   "grep_only": [
+    "src/orchestrate/mod.rs:309",
+    "src/orchestrate/mod.rs:378",
+    "src/orchestrate/mod.rs:409",
+    "src/orchestrate/mod.rs:468",
+    "src/orchestrate/mod.rs:549",
+    "src/orchestrate/mod.rs:579"
+   ]
+  },
+  {
+   "name": "run_code_fanout",
+   "kind": "fn",
+   "file": "src/orchestrate/mod.rs",
+   "line": 355,
+   "col": 13,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 9,
+   "gt": "ok",
+   "gt_ref_count": 9,
+   "tp": 9,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "run_doc_fanout",
+   "kind": "fn",
+   "file": "src/orchestrate/mod.rs",
+   "line": 536,
+   "col": 13,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 6,
+   "gt": "ok",
+   "gt_ref_count": 5,
+   "tp": 5,
+   "gt_only": [],
+   "grep_only": [
+    "src/cli.rs:1013"
+   ]
+  },
+  {
+   "name": "doc_fanout_replicate_runs_every_model",
+   "kind": "fn",
+   "file": "src/orchestrate/mod.rs",
+   "line": 881,
+   "col": 13,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  }
+ ]
+}

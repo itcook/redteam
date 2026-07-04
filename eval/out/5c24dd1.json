@@ -1,0 +1,73 @@
+{
+ "commit": "5c24dd1",
+ "subject": "fix(bundle): dotfile stem (no empty-stem mis-union); min-index repr; harden tests",
+ "vanished_symbols": [],
+ "dossier_bytes_pm3": 3212,
+ "dossier_est_tokens_pm3": 917,
+ "symbols": [
+  {
+   "name": "stem",
+   "kind": "fn",
+   "file": "src/bundle/mod.rs",
+   "line": 49,
+   "col": 3,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 1,
+   "gt": "ok",
+   "gt_ref_count": 1,
+   "tp": 1,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "group",
+   "kind": "fn",
+   "file": "src/bundle/mod.rs",
+   "line": 74,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 8,
+   "gt": "ok",
+   "gt_ref_count": 5,
+   "tp": 5,
+   "gt_only": [],
+   "grep_only": [
+    "src/output/mod.rs:19",
+    "src/output/mod.rs:20",
+    "src/output/mod.rs:22"
+   ]
+  },
+  {
+   "name": "group_splits_oversized_at_cap",
+   "kind": "fn",
+   "file": "src/bundle/mod.rs",
+   "line": 160,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  },
+  {
+   "name": "group_does_not_union_distinct_dotfiles",
+   "kind": "fn",
+   "file": "src/bundle/mod.rs",
+   "line": 176,
+   "col": 7,
+   "scenario": "free_fn",
+   "defs_same_name": 1,
+   "grep_ref_count": 0,
+   "gt": "ok",
+   "gt_ref_count": 0,
+   "tp": 0,
+   "gt_only": [],
+   "grep_only": []
+  }
+ ]
+}
