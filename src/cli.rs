@@ -781,6 +781,10 @@ pub(crate) fn incremental_preflight(
         args.scope == "branch",
         "--incremental-from requires branch scope (pass --base <branch>): the delta only covers committed changes since the prior round's stamped HEAD"
     );
+    anyhow::ensure!(
+        args.base.is_some(),
+        "--incremental-from requires --base <branch> (the full-changeset manifest is derived from merge-base(base, HEAD))"
+    );
 
     // 载上轮 result（增量只对经 --background 持久化过 result 的作业有意义）。
     let raw = crate::state::store::read_result(root, prior_job).ok_or_else(|| anyhow::anyhow!(
@@ -1995,6 +1999,11 @@ mod incremental_tests {
         wt.base = None;
         let e = incremental_preflight(&wt, "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("branch scope"), "{e}");
+        // v1 范围：branch scope 但缺 --base → 显式报错（防 branch_files 处 expect panic）
+        let mut nobase = inc_args("dev0", "jprev");
+        nobase.base = None;
+        let e = incremental_preflight(&nobase, "jprev", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("requires --base"), "{e}");
         // ②同族：上轮 scope 与本轮不一致
         let mut prior_wt = ReviewArgs { scope: "working-tree".into(), base: None, ..inc_args("dev0", "x") };
         prior_wt.incremental_from = None;
