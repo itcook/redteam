@@ -267,6 +267,52 @@ pub fn reference_points(syms: &[ChangedSym], root: &Path, defs: &[(&'static str,
     out
 }
 
+const DOSSIER_PER_NAME_CAP: usize = 10;
+// ≈8K tokens @ bytes/3.5；含 CJK 注释偏保守。文档记假设，live 换真 tokenizer 校常量（D7）。
+const DOSSIER_MAX_BYTES: usize = 28_000;
+
+/// SymRefs 列表 → 卷宗事实块（不含 <dossier> 包裹与散文，那是 prompt 层的活）。空引用 → ""。
+pub fn render_entries(refs: &[SymRefs]) -> String {
+    let mut out = String::new();
+    let mut dropped_for_budget = 0usize;
+    'sym: for sr in refs {
+        if sr.hits.is_empty() {
+            continue;
+        }
+        let ambig = if sr.defs_same_name > 1 {
+            format!(" [{} defs share this name (incl. trait dispatch), heuristic]", sr.defs_same_name)
+        } else {
+            String::new()
+        };
+        let header = format!("## {} ({}){}\n", sr.name, sr.kind, ambig);
+        if out.len() + header.len() > DOSSIER_MAX_BYTES {
+            dropped_for_budget += sr.hits.len();
+            continue;
+        }
+        out.push_str(&header);
+        let shown = sr.hits.len().min(DOSSIER_PER_NAME_CAP);
+        for h in &sr.hits[..shown] {
+            let doc = if h.is_doc { "[doc] " } else { "" };
+            let entry = format!("{doc}{}:{}\n{}\n\n", h.path, h.line, h.context);
+            if out.len() + entry.len() > DOSSIER_MAX_BYTES {
+                dropped_for_budget += sr.hits.len(); // 本符号剩余全算丢
+                break 'sym;
+            }
+            out.push_str(&entry);
+        }
+        if sr.hits.len() > DOSSIER_PER_NAME_CAP {
+            out.push_str(&format!(
+                "+{} more, {} defs same name, heuristic\n\n",
+                sr.hits.len() - DOSSIER_PER_NAME_CAP, sr.defs_same_name
+            ));
+        }
+    }
+    if dropped_for_budget > 0 {
+        out.push_str(&format!("… and {dropped_for_budget} reference points omitted for budget\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +423,38 @@ mod tests {
         assert!(r.hits.iter().any(|h| h.path == "src/a.rs" && h.context.contains("c1")));
         assert!(r.hits.iter().any(|h| h.is_doc), "doc 提及命中标 is_doc");
         assert!(!r.hits.iter().any(|h| h.line == 1 && h.path == "src/a.rs"), "def 行不作引用点");
+    }
+
+    fn sr(name: &str, defs_same_name: usize, n: usize, doc_idx: Option<usize>) -> SymRefs {
+        let hits = (0..n).map(|i| RefHit {
+            path: format!("src/f{i}.rs"), line: i + 1,
+            context: format!("    {name}(); // hit {i}"),
+            is_doc: Some(i) == doc_idx,
+        }).collect();
+        SymRefs { name: name.into(), kind: "fn", defs_same_name, hits }
+    }
+
+    #[test]
+    fn render_entries_caps_per_name_and_annotates() {
+        let out = render_entries(&[sr("run", 3, 25, Some(0))]);
+        assert!(out.matches("src/f").count() <= DOSSIER_PER_NAME_CAP, "每名 ≤10 引用点");
+        assert!(out.contains("+15 more, 3 defs same name, heuristic"), "cap 标注: {out}");
+        assert!(out.contains("3 defs share this name (incl. trait dispatch), heuristic"), "歧义标注");
+        assert!(out.contains("[doc]"), "doc 命中标形态");
+    }
+
+    #[test]
+    fn render_entries_global_budget_and_empty() {
+        assert_eq!(render_entries(&[]), "", "无符号 → 空");
+        assert_eq!(render_entries(&[sr("x", 1, 0, None)]), "", "有符号但无引用点 → 空");
+        // 灌爆全局预算：多符号大上下文
+        let big: Vec<SymRefs> = (0..50).map(|i| {
+            let mut s = sr(&format!("sym{i}"), 1, 5, None);
+            for h in &mut s.hits { h.context = "x".repeat(2000); }
+            s
+        }).collect();
+        let out = render_entries(&big);
+        assert!(out.len() <= DOSSIER_MAX_BYTES + 200, "全局字节预算兜底: {}", out.len());
+        assert!(out.contains("omitted for budget"), "全局丢弃标注");
     }
 }
