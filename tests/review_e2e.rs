@@ -108,7 +108,7 @@ default_models=["m"]
     };
     let changes = vec![FileChange { path: "src/auth.rs".into(), diff: "+    db.write(token);".into() }];
 
-    let (report, code) = run_code_review(&args, &provider, &cfg, changes, root.path(), None).await.unwrap();
+    let (report, code) = run_code_review(&args, &provider, &cfg, changes, root.path(), None, None).await.unwrap();
 
     // 编造引用被 positioning 丢弃 → 只剩 1 条
     assert_eq!(report.findings.len(), 1, "fabricated finding must be dropped");
@@ -163,7 +163,7 @@ default_models=["alpha","beta"]
         resume: None, dismissed: None, no_dismissed: false,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None).await.unwrap();
+    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
 
     // 两 model 同 file 同行同引用 → anchor 行2 → dedup 合并 → 1 条 agreement=2、取最高 severity
     assert_eq!(report.findings.len(), 1);
@@ -211,7 +211,7 @@ default_models=["alpha","ghost"]
         resume: None, dismissed: None, no_dismissed: false,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
-    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None).await.unwrap();
+    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
 
     assert_eq!(report.verdict, Verdict::Approve);   // 仅 low → approve
     assert!(report.run.failed_models.contains(&"ghost".to_string()));
@@ -317,7 +317,7 @@ default_models=["alpha"]
         resume: None, dismissed: None, no_dismissed: false,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None).await.unwrap();
+    let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
 
     let f = report.findings.iter().find(|f| f.file == "src/a.rs").expect("finding present");
     assert_eq!(f.verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted, "孤证被交叉 refute 证伪");

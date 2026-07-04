@@ -115,9 +115,67 @@ pub fn changed_files(base: Option<&str>, branch_scope: bool) -> anyhow::Result<V
     }
 }
 
+/// 指定目录跑 git（M13 增量基建：hermetic 测试可用 tempdir 仓库，不依赖进程 cwd）。
+/// ANSI 关死同 `git()`（color.diff 必须显式 false，命令行 -c 恒优先于文件 config）。
+fn git_at(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "color.ui=false", "-c", "color.diff=false"])
+        .args(args)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// R3 stamp：证据 HEAD（权威时刻 = 证据收集实跑刻，调用方与 changed_files 同刻调用）。
+pub fn head_sha_at(dir: &std::path::Path) -> anyhow::Result<String> {
+    Ok(git_at(dir, &["rev-parse", "HEAD"])?.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// 测试基建：tempdir 里造真实 git 仓库（后续 rename/delta/谱系测试共用）。
+    fn git_repo(dir: &Path) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+    }
+
+    fn commit_all(dir: &Path, msg: &str) -> String {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", msg]);
+        run(&["rev-parse", "HEAD"]).trim().to_string()
+    }
+
+    #[test]
+    fn head_sha_at_returns_current_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let sha = commit_all(dir.path(), "c1");
+        assert_eq!(head_sha_at(dir.path()).unwrap(), sha);
+        // 非 git 目录 → Err（调用方 .ok() 折 None，不炸评审）
+        let plain = tempfile::tempdir().unwrap();
+        assert!(head_sha_at(plain.path()).is_err());
+    }
+
     #[test]
     fn large_diff_falls_back_to_file_list() {
         let files = vec!["a.rs".to_string(), "b.rs".into(), "c.rs".into()]; // >2 文件

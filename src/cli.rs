@@ -227,6 +227,8 @@ struct TailCtx<'a> {
     precedents: &'a [crate::db::DismissCard],
     /// 台账加载披露（进 RunMeta.ledger）。
     ledger_meta: Option<crate::domain::LedgerMeta>,
+    /// R3 stamp：证据收集刻的 HEAD（code dispatch 回填；doc/resume 为 None）。
+    head_sha: Option<String>,
     /// 后台 job 的 phase 打点通路（refute/correlate 子阶段；前台/resume 为 None）。
     sink: Option<&'a dyn CellSink>,
 }
@@ -292,6 +294,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
             failed_models: ctx.failed_models,
             dismissed_reappeared,
             ledger: ctx.ledger_meta,
+            head_sha: ctx.head_sha,
             ..Default::default()
         },
     };
@@ -394,6 +397,7 @@ pub async fn run_review(
         dismissed: &ledger.ids,
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
+        head_sha: None,
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
@@ -408,6 +412,7 @@ pub async fn run_code_review(
     cfg: &Config,
     changes: Vec<FileChange>,
     root: &Path,
+    head_sha: Option<String>,
     sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
@@ -484,6 +489,7 @@ pub async fn run_code_review(
         dismissed: &ledger.ids,
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
+        head_sha,
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
@@ -516,7 +522,10 @@ pub async fn run_review_dispatch(
     match detected {
         Mode::Code => {
             let changes = crate::evidence::git::changed_files(sync_args.base.as_deref(), scope_enum == Scope::Branch)?;
-            run_code_review(&sync_args, provider, cfg, changes, cwd, sink).await
+            // R3：stamp 权威时刻 = 证据收集实跑刻（与 changed_files 同刻同 cwd）；
+            // 非 git 目录折 None——前台裸 review 与后台 job 共用本单点，前后台天然同 sha。
+            let head_sha = crate::evidence::git::head_sha_at(cwd).ok();
+            run_code_review(&sync_args, provider, cfg, changes, cwd, head_sha, sink).await
         }
         Mode::Doc => run_review(sync_args, provider, cfg, sink).await,
     }
@@ -759,6 +768,7 @@ pub async fn run_resume(
         dismissed: &ledger.ids,
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
+        head_sha: None,
         sink: None,
     };
     match assemble_report(findings, ctx).await {
@@ -1379,7 +1389,7 @@ default_models=["alpha"]
             resume: None, dismissed: None, no_dismissed: false,
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None).await.unwrap();
+        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
         let f = &report.findings[0];
         assert_eq!(f.verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
         assert_eq!(f.confidence, 0.0);
@@ -1426,7 +1436,7 @@ default_models=["m","m2"]
         let provider = FakeProvider { scripted };
         let my_args = ReviewArgs { models: None, ..args() };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None).await.unwrap();
+        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
         assert_eq!(report.findings.len(), 1, "fabricated dropped, real merged across models");
         assert_eq!(report.findings[0].file, "src/a.rs");
         assert_eq!(report.findings[0].line_start, 2);
@@ -1442,9 +1452,23 @@ default_models=["m","m2"]
 default_models=["m"]
 "#]).unwrap();
         let provider = FakeProvider::with("m", vec![]);
-        let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None).await.unwrap();
+        let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
         assert!(report.findings.is_empty());
         assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn code_review_stamps_head_sha_into_runmeta() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::from_layers(&[r#"[review]
+default_models=["m"]
+"#]).unwrap();
+        let provider = FakeProvider::with("m", vec![]);
+        let (report, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(),
+            Some("abc123".into()), None).await.unwrap();
+        assert_eq!(report.run.head_sha.as_deref(), Some("abc123"));
+        let (report2, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
+        assert_eq!(report2.run.head_sha, None, "非 git 环境如实 None，不编造");
     }
 }
 
