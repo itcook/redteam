@@ -171,7 +171,13 @@ pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'s
                 }
                 new_line += 1;
             }
-            Some(b'-') => { /* 删除行不推进新行号，不入卷宗 */ }
+            Some(b'-') => {
+                // 纯删除 hunk 无 + 行：删除点(新文件坐标)仍在外围块内，用它锚定外围 def。
+                if hunk_anchor.is_none() {
+                    hunk_anchor = Some(new_line.saturating_sub(1));
+                }
+                // 删除行不推进 new_line，不入卷宗（旧调用点靠编译器/评审兜底）
+            }
             _ => { new_line += 1; } // 上下文行
         }
     }
@@ -415,6 +421,17 @@ mod tests {
         let syms = symbols_in_file(diff, &file, "src/x.rs", &d);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["caller"], "改动落在 caller 体内 → 外围 caller");
+    }
+
+    #[test]
+    fn symbols_from_pure_deletion_hunk_anchors_enclosing() {
+        let d = rust_defs();
+        // caller 体内纯删除一行（无 + 行）→ 外围 caller 仍应被提取为改动符号
+        let file: Vec<&str> = "fn caller() {\n    keep();\n}".lines().collect();
+        let diff = "@@ -2,1 +2,0 @@\n-    let dead = 1;\n";
+        let syms = symbols_in_file(diff, &file, "src/x.rs", &d);
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["caller"], "纯删除 hunk 应锚定外围 caller");
     }
 
     #[test]
