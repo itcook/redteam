@@ -38,6 +38,10 @@ pub struct CellRecord {
     /// 候补链实际尝试的 model 数（成功=第几家成功；整链失败=链长）。
     #[serde(default)]
     pub attempts: u32,
+    /// 胜出 call 的 tool-loop 迭代数（计 FINALIZE、不计 turn 级重试；单发单收=1）。
+    /// 0＝失败/未观测（旧记录、整链失败、resume 格）。
+    #[serde(default)]
+    pub iterations: u32,
 }
 
 impl CellRecord {
@@ -45,7 +49,7 @@ impl CellRecord {
     pub fn ok(cell: impl Into<String>, model: impl Into<String>, findings: Vec<crate::domain::Finding>) -> Self {
         Self {
             cell: cell.into(), model: model.into(), ok: true, findings, warn: None,
-            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0,
+            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0,
         }
     }
 }
@@ -129,7 +133,7 @@ mod tests {
 
     fn rec(cell: &str, ok: bool) -> CellRecord {
         CellRecord { cell: cell.into(), model: "m".into(), ok, findings: vec![], warn: None,
-            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0 }
+            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0 }
     }
 
     #[test]
@@ -175,8 +179,8 @@ mod tests {
         let old = r#"{"cell":"c","model":"m","ok":true,"findings":[]}"#;
         let rec: CellRecord = serde_json::from_str(old).unwrap();
         assert_eq!(
-            (rec.duration_ms, rec.input_tokens, rec.output_tokens, rec.attempts),
-            (0, 0, 0, 0)
+            (rec.duration_ms, rec.input_tokens, rec.output_tokens, rec.attempts, rec.iterations),
+            (0, 0, 0, 0, 0)
         );
     }
 }

@@ -138,7 +138,7 @@ impl ReviewProvider for DirectProvider {
             }).await?;
         let out = parse_lens_output(&text)?; // Parse 不进重试（形状问题）
         // DirectProvider 为无生产使用方的备选实现（registry 注释自认），call_* 不解析 cached；记 0。
-        Ok(LensCall { findings: out.findings, input_tokens, output_tokens, cached_input_tokens: 0 })
+        Ok(LensCall { findings: out.findings, input_tokens, output_tokens, cached_input_tokens: 0, iterations: 1 })
     }
 }
 
