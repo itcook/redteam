@@ -184,7 +184,8 @@ def extract_symbols(commit, tree):
 
 # ---------- 穷人版引用搜索:rg -wF ----------
 def rg_refs(tree, name):
-    r = subprocess.run(["rg", "-wF", "--json", "-t", "rust", "--", name],
+    # 显式给 '.':stdin 为管道时(heredoc 调用)rg 启发式会改搜 stdin,静默全 0
+    r = subprocess.run(["rg", "-wF", "--json", "-t", "rust", "--", name, "."],
                        cwd=tree, capture_output=True, text=True)
     hits = []
     for ln in r.stdout.splitlines():
@@ -194,7 +195,9 @@ def rg_refs(tree, name):
             continue
         if j.get("type") == "match":
             d = j["data"]
-            hits.append((d["path"]["text"], d["line_number"],
+            path = d["path"]["text"]
+            path = path[2:] if path.startswith("./") else path
+            hits.append((path, d["line_number"],
                          d["lines"]["text"].rstrip("\n")))
     return hits
 
