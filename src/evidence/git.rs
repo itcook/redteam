@@ -134,6 +134,77 @@ pub fn head_sha_at(dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(git_at(dir, &["rev-parse", "HEAD"])?.trim().to_string())
 }
 
+/// 谱系守卫（增量守卫①）：sha 是否 HEAD 祖先。rebase/reset/amend 后 false
+/// （锚定不变式失效——delta 范围不再覆盖「使锚失效的改动」）。
+/// merge-base --is-ancestor 以退出码表意（0=是/1=否），不能走 git_at 的 success 判定。
+pub fn is_ancestor(dir: &std::path::Path, sha: &str) -> anyhow::Result<bool> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+        .output()?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "git merge-base --is-ancestor {sha} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
+}
+
+/// R1 rename 映射：base..HEAD 的旧→新路径对（-M 相似度检测，status R*）。
+/// 相似度 <50% 的 rename 不被 -M 识别 → 不进映射，carry 走 carried_dropped 降级（可审非静默）。
+pub fn rename_map(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let out = git_at(dir, &["diff", "--name-status", "-M", &format!("{base}..HEAD")])?;
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split('\t');
+            let status = it.next()?;
+            if !status.starts_with('R') {
+                return None;
+            }
+            Some((it.next()?.to_string(), it.next()?.to_string()))
+        })
+        .collect())
+}
+
+/// 增量轮 delta（决议 2）：base..HEAD 的 -M diff，按文件切分。
+/// **不走既有「逐文件 pathspec 再 diff」模式**：`git diff -M <range> -- <新路径>` 的
+/// pathspec 会把旧路径滤出配对域，rename 检测失效 → 纯 rename 膨胀成整文件新增
+/// （R1 经济性被击穿）。单次全量 diff + 按 `diff --git` 边界切分则天然保留 rename 元数据。
+pub fn changed_files_since(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<FileChange>> {
+    let full = git_at(dir, &["diff", "-M", &format!("{base}..HEAD")])?;
+    Ok(split_diff_by_file(&full))
+}
+
+/// 按 "diff --git a/X b/Y" 边界切分整份 diff；path 取 b 侧（rename 挂新路径下）。
+// ponytail: 路径含 " b/" 子串或引号转义的病态仓不在本项目威胁模型内，rfind 足够；真撞见再上引号解析。
+fn split_diff_by_file(full: &str) -> Vec<FileChange> {
+    let mut out: Vec<FileChange> = Vec::new();
+    for line in full.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            let path = rest
+                .rfind(" b/")
+                .map(|i| rest[i + 3..].to_string())
+                .unwrap_or_else(|| rest.to_string());
+            out.push(FileChange { path, diff: String::new() });
+        }
+        if let Some(last) = out.last_mut() {
+            last.diff.push_str(line);
+            last.diff.push('\n');
+        }
+    }
+    out.retain(|fc| !fc.diff.trim().is_empty());
+    out
+}
+
+/// 全分支变更文件清单（双层 manifest 第一层）：merge-base(base,HEAD)...HEAD 的 name-only。
+pub fn branch_files(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<String>> {
+    let mb = git_at(dir, &["merge-base", base, "HEAD"])?.trim().to_string();
+    Ok(dedup_files(&git_at(dir, &["diff", "--name-only", &format!("{mb}...HEAD")])?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +294,88 @@ mod tests {
         });
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, "a.rs");
+    }
+
+    #[test]
+    fn rename_map_and_delta_since_pure_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("old.rs"), "fn keep() { body(); }\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::fs::rename(dir.path().join("old.rs"), dir.path().join("new.rs")).unwrap();
+        commit_all(dir.path(), "rename");
+        // R1：纯 rename → 映射一条 (old,new)
+        assert_eq!(rename_map(dir.path(), &c1).unwrap(), vec![("old.rs".to_string(), "new.rs".to_string())]);
+        // delta：-M 下纯 rename 只产 rename 元数据 diff（不炸整删整加），挂新路径名下
+        let delta = changed_files_since(dir.path(), &c1).unwrap();
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].path, "new.rs");
+        assert!(delta[0].diff.contains("rename from old.rs"), "{}", delta[0].diff);
+        assert!(!delta[0].diff.contains("-fn keep"), "纯 rename 不应展开成删加: {}", delta[0].diff);
+    }
+
+    #[test]
+    fn changed_files_since_content_change_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "line1\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        // HEAD 未动 → 空 delta（守卫④判据）
+        assert!(changed_files_since(dir.path(), &c1).unwrap().is_empty());
+        std::fs::write(dir.path().join("a.rs"), "line1\nline2\n").unwrap();
+        commit_all(dir.path(), "c2");
+        let delta = changed_files_since(dir.path(), &c1).unwrap();
+        assert_eq!(delta.len(), 1);
+        assert!(delta[0].diff.contains("+line2"));
+        assert!(rename_map(dir.path(), &c1).unwrap().is_empty(), "内容改动不产 rename 映射");
+    }
+
+    #[test]
+    fn is_ancestor_true_for_parent_false_after_amend() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::fs::write(dir.path().join("a.rs"), "x\ny\n").unwrap();
+        commit_all(dir.path(), "c2");
+        assert!(is_ancestor(dir.path(), &c1).unwrap());
+        // amend 重写 c2 → 旧 c2 不再是 HEAD 祖先（谱系守卫①判据）
+        let out = std::process::Command::new("git").current_dir(dir.path())
+            .args(["rev-parse", "HEAD"]).output().unwrap();
+        let old_head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let ok = std::process::Command::new("git").current_dir(dir.path())
+            .args(["commit", "-q", "--amend", "-m", "c2-rewritten"]).output().unwrap();
+        assert!(ok.status.success());
+        assert!(!is_ancestor(dir.path(), &old_head).unwrap(), "amend 后旧 HEAD 非祖先");
+    }
+
+    #[test]
+    fn branch_files_lists_merge_base_to_head() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("base.rs"), "x\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        // 打 base 分支引用在 c1，之后 main 前进两个 commit
+        let ok = std::process::Command::new("git").current_dir(dir.path())
+            .args(["branch", "dev0", &c1]).output().unwrap();
+        assert!(ok.status.success());
+        std::fs::write(dir.path().join("f1.rs"), "a\n").unwrap();
+        commit_all(dir.path(), "c2");
+        std::fs::write(dir.path().join("f2.rs"), "b\n").unwrap();
+        commit_all(dir.path(), "c3");
+        let files = branch_files(dir.path(), "dev0").unwrap();
+        assert_eq!(files, vec!["f1.rs".to_string(), "f2.rs".to_string()]);
+    }
+
+    #[test]
+    fn split_diff_by_file_segments_and_takes_b_side_path() {
+        let full = "diff --git a/old.rs b/new.rs\nsimilarity index 100%\nrename from old.rs\nrename to new.rs\ndiff --git a/x.rs b/x.rs\nindex 111..222 100644\n--- a/x.rs\n+++ b/x.rs\n@@ -1 +1,2 @@\n line1\n+line2\n";
+        let out = split_diff_by_file(full);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].path, "new.rs", "rename 段挂 b 侧新路径");
+        assert!(out[0].diff.contains("rename from old.rs"));
+        assert_eq!(out[1].path, "x.rs");
+        assert!(out[1].diff.contains("+line2"));
+        assert!(split_diff_by_file("").is_empty(), "空 diff → 空 delta");
     }
 }
