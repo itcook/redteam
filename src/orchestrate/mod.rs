@@ -56,15 +56,20 @@ fn normalize_title(t: &str) -> String {
     t.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
-    let nq = normalize_quote(&raw.quote);
-    let nt = normalize_title(&raw.title);
-    // R8.1：quote 锚定、行无关；quote 缺失退化行号路径（不保证跨 fixup 稳定）。
-    let id = if nq.is_empty() {
-        fnv1a64_hex(&[&raw.file, &raw.line_start.to_string(), &raw.line_end.to_string(), &nt])
+/// finding id 组成的单一真相源（R8.1 + M13 rename 迁移共用）：quote 锚定、行无关；
+/// 空 quote 退化行号路径（不保证跨 fixup 稳定）。
+pub fn finding_id(file: &str, quote: &str, title: &str, line_start: u32, line_end: u32) -> String {
+    let nq = normalize_quote(quote);
+    let nt = normalize_title(title);
+    if nq.is_empty() {
+        fnv1a64_hex(&[file, &line_start.to_string(), &line_end.to_string(), &nt])
     } else {
-        fnv1a64_hex(&[&raw.file, &nq, &nt])
-    };
+        fnv1a64_hex(&[file, &nq, &nt])
+    }
+}
+
+pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
+    let id = finding_id(&raw.file, &raw.quote, &raw.title, raw.line_start, raw.line_end);
     let lens = raw.lens.as_deref().unwrap_or(fallback_lens).to_string();
     Finding {
         id,
