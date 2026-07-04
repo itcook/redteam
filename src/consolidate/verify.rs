@@ -59,6 +59,7 @@ async fn refute_one(
 
 /// targeted refute 目标集（单一真相源：verify_findings 执行与 phase 打点的 targets 数共用，
 /// 防两处筛选逻辑漂移）。层③：孤证 blocking 或预筛命中判例变体；精确 id 在台账者除外。
+/// M13：origin=carried 不进 targets——出生轮已过孤证 refute 与判例预筛。
 pub fn refute_targets(
     findings: &[Finding],
     precedents: &[DismissCard],
@@ -68,6 +69,7 @@ pub fn refute_targets(
     findings
         .iter()
         .enumerate()
+        .filter(|(_, f)| f.origin != crate::domain::Origin::Carried)
         .filter(|(_, f)| !exact_ids.contains(f.id.as_str()))
         .filter(|(_, f)| {
             (f.agreement == 1 && f.severity >= block_threshold)
@@ -153,7 +155,7 @@ pub async fn verify_findings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Finding, Mode, Severity, VerifyVerdict};
+    use crate::domain::{Finding, Mode, Origin, Severity, VerifyVerdict};
     use crate::provider::fake::FakeProvider;
     use crate::domain::RawFinding;
     use std::collections::BTreeMap;
@@ -164,7 +166,7 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec!["L1".into()], models: vec![model.into()],
             agreement, hard_constraint: false, cluster_id: None, quote: "q".into(), verify: None,
-            previously_dismissed: false,
+            previously_dismissed: false, origin: Origin::New,
         }
     }
     fn rawf(title: &str) -> RawFinding {
@@ -294,5 +296,18 @@ mod tests {
         assert_eq!(out2[0].confidence, 0.9, "upheld 不降 confidence");
         assert_eq!(w2.len(), 1, "refute 失败必须产出 warning");
         assert!(w2[0].starts_with("refute [") && w2[0].contains("model ghost"), "warning 带 finding id 与 model: {}", w2[0]);
+    }
+
+    #[test]
+    fn carried_findings_never_enter_refute_targets() {
+        use crate::domain::Origin;
+        // 决议 5：携带项出生轮已过孤证 refute + 判例预筛，重复烧 LLM 纯浪费；
+        // 台账精确 id 豁免（mark_dismissed）每轮照常、免费，不受影响。
+        let mut carried = finding("lone blocking", Severity::High, 1, "alpha");
+        carried.origin = Origin::Carried;
+        let fresh = finding("new lone blocking", Severity::High, 1, "alpha");
+        let cards = vec![card("ffffffffffffffff", "a.rs", "lone blocking")]; // 判例变体也不打 carried
+        let targets = refute_targets(&[carried, fresh], &cards, Severity::Medium);
+        assert_eq!(targets, vec![1], "只有 origin=new 的孤证进 targets（carried 双路径均剔除）");
     }
 }

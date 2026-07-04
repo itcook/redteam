@@ -36,6 +36,7 @@ pub fn compute_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Origin;
 
     fn f(sev: Severity, conf: f32, lens: &str, hard: bool) -> Finding {
         Finding {
@@ -56,6 +57,7 @@ mod tests {
             cluster_id: None,
             verify: None,
             previously_dismissed: false,
+            origin: Origin::New,
         }
     }
 

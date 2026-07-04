@@ -94,6 +94,23 @@ fn render_md(r: &ReviewReport) -> String {
     if let Some(l) = &r.run.ledger {
         s.push_str(&format!("  | Ledger        | {} card(s) from {} |\n", l.loaded, l.source));
     }
+    // M13 增量轮注记（R5 决议：carried/new 终态语义住 result/rN.md，不进 status）。
+    if r.run.incremental {
+        let base = r.run.delta_base.as_deref().unwrap_or("?");
+        let carried = r.findings.iter().filter(|f| f.origin == crate::domain::Origin::Carried).count();
+        let fresh = r.findings.len() - carried;
+        s.push_str(&format!("  | Incremental   | delta since {} |\n", &base[..12.min(base.len())]));
+        s.push_str(&format!("  | Carried / New | {carried} / {fresh} |\n"));
+        if !r.run.carried_dropped.is_empty() {
+            s.push_str(&format!("  | Carry Dropped | {} |\n", r.run.carried_dropped.join(", ")));
+        }
+        if !r.run.resolved.is_empty() {
+            s.push_str(&format!("  | Resolved      | {} |\n", r.run.resolved.join(", ")));
+        }
+        if !r.run.resolution_disputed.is_empty() {
+            s.push_str(&format!("  | ⚠️ Disputed    | {} |\n", r.run.resolution_disputed.join(", ")));
+        }
+    }
     if !r.run.warnings.is_empty() {
         s.push_str("\n- Warnings\n\n");
         for (i, w) in r.run.warnings.iter().enumerate() {
@@ -114,6 +131,9 @@ fn render_md(r: &ReviewReport) -> String {
                 s.push_str(&format!("| Found By   | {} |\n", f.models.join(", ")));
                 s.push_str(&format!("| Lens       | {} |\n", f.lenses.join(", ")));
                 s.push_str(&format!("| Confidence | {:.2} |\n", f.confidence));
+                if f.origin == crate::domain::Origin::Carried {
+                    s.push_str("| Origin     | carried from an earlier round |\n");
+                }
                 if let Some(v) = &f.verify {
                     let tag = match v.verdict {
                         crate::domain::VerifyVerdict::Refuted => "refuted",
@@ -148,7 +168,8 @@ mod tests {
             findings:vec![Finding{ id:"1".into(),severity:Severity::High,title:"boom".into(),body:"b".into(),
                 file:"a.rs".into(),line_start:3,line_end:5,confidence:0.9,recommendation:"fix".into(),
                 lenses:vec!["L1".into()],models:vec!["claude".into()],agreement:1,hard_constraint:false,
-                quote:"snippet".into(),cluster_id:None,verify:None,previously_dismissed:false}],
+                quote:"snippet".into(),cluster_id:None,verify:None,previously_dismissed:false,
+                origin:Origin::New}],
             clusters:vec![], run:RunMeta::default() }
     }
     #[test]
@@ -243,5 +264,28 @@ mod tests {
         r.findings[0].verify = Some(Verify { verdict: VerifyVerdict::Upheld, model: "gpt".into(), note: String::new() });
         let s = render(&r, Format::Md);
         assert!(s.to_lowercase().contains("upheld"), "md must mark upheld findings");
+    }
+    #[test]
+    fn md_incremental_rows_and_carried_origin() {
+        let mut r = report();
+        r.run.incremental = true;
+        r.run.delta_base = Some("abc123def4567890".into());
+        r.run.resolved = vec!["1111111111111111".into()];
+        r.run.resolution_disputed = vec!["2222222222222222".into()];
+        r.run.carried_dropped = vec!["3333333333333333".into()];
+        r.findings[0].origin = Origin::Carried;
+        let s = render(&r, Format::Md);
+        assert!(s.contains("| Incremental") && s.contains("abc123def456"), "delta base 短 sha: {s}");
+        assert!(s.contains("| Carried / New | 1 / 0 |"), "{s}");
+        assert!(s.contains("Carry Dropped") && s.contains("3333333333333333"), "{s}");
+        assert!(s.contains("Resolved") && s.contains("1111111111111111"), "{s}");
+        assert!(s.contains("Disputed") && s.contains("2222222222222222"), "disputed 是 ship 高信号必须在场: {s}");
+        assert!(s.contains("| Origin     | carried"), "携带项标记: {s}");
+    }
+
+    #[test]
+    fn md_non_incremental_stays_clean() {
+        let s = render(&report(), Format::Md);
+        assert!(!s.contains("Incremental") && !s.contains("| Origin"), "全量报告零增量噪音: {s}");
     }
 }

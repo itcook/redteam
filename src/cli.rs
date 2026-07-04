@@ -40,6 +40,9 @@ pub struct ReviewArgs {
     /// `--no-dismissed`：本次评审完全关闭台账（豁免/预筛/判例注入全停）。
     #[serde(default)]
     pub no_dismissed: bool,
+    /// M13：`--incremental-from <job-id>`——以该作业为基线的增量轮。serde default 兼容旧 args.json。
+    #[serde(default)]
+    pub incremental_from: Option<String>,
 }
 
 /// 台账加载产物（design 2026-07-03 #6 zero-config）：豁免 id 集 + 活跃判例卡 + 披露 meta。
@@ -227,6 +230,8 @@ struct TailCtx<'a> {
     precedents: &'a [crate::db::DismissCard],
     /// 台账加载披露（进 RunMeta.ledger）。
     ledger_meta: Option<crate::domain::LedgerMeta>,
+    /// R3 stamp：证据收集刻的 HEAD（code dispatch 回填；doc/resume 为 None）。
+    head_sha: Option<String>,
     /// 后台 job 的 phase 打点通路（refute/correlate 子阶段；前台/resume 为 None）。
     sink: Option<&'a dyn CellSink>,
 }
@@ -275,7 +280,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
     let verdict = compute_verdict(&findings, ctx.block, ctx.floor);
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
-        schema_version: "2".into(),
+        schema_version: "3".into(),
         mode: ctx.mode,
         verdict,
         stats,
@@ -292,6 +297,8 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
             failed_models: ctx.failed_models,
             dismissed_reappeared,
             ledger: ctx.ledger_meta,
+            head_sha: ctx.head_sha,
+            ..Default::default()
         },
     };
     // 退出码：reject 优先 → 10；否则 approve 但对照集不完整 → 2；干净 approve → 0。
@@ -393,6 +400,7 @@ pub async fn run_review(
         dismissed: &ledger.ids,
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
+        head_sha: None,
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
@@ -407,6 +415,7 @@ pub async fn run_code_review(
     cfg: &Config,
     changes: Vec<FileChange>,
     root: &Path,
+    head_sha: Option<String>,
     sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
@@ -448,7 +457,7 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &oopts, sink).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &oopts, sink).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(
@@ -483,10 +492,165 @@ pub async fn run_code_review(
         dismissed: &ledger.ids,
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
+        head_sha,
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
     assemble_report(raw.findings, ctx).await
+}
+
+/// M13 增量轮主流水线（决议 2-5）：四守卫 → delta fan-out（<incremental_round> 注入）
+/// → carry/merge → refute(new-only) → verdict(合并集) → schema v3 报告。
+/// 只由 run_review_dispatch 路由进入（前台与后台 worker 共用）。
+pub async fn run_incremental_review(
+    args: &ReviewArgs,
+    prior_job: &str,
+    provider: &dyn ReviewProvider,
+    cfg: &Config,
+    root: &Path,
+    sink: Option<&dyn CellSink>,
+) -> anyhow::Result<(ReviewReport, i32)> {
+    let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, root)?;
+    let t0 = std::time::Instant::now();
+
+    // 1. 四守卫 + 基线（违例显式报错拒跑）。
+    let base = incremental_preflight(args, prior_job, root)?;
+    // 2. 本轮证据 HEAD stamp（R3：与 delta 收集同刻；本轮报告是下一轮的基线）。
+    let head_sha = crate::evidence::git::head_sha_at(root).ok();
+
+    // 3. resolve 台账（preflight 刚从 proj.db 读出上轮 result，库必已在；open_at 免建目录副作用）。
+    let db_path = root.join(crate::project::PROJECT_DIR).join(crate::db::DB_FILE);
+    let mut resolve_cards = if db_path.exists() {
+        crate::db::ProjDb::open_at(&db_path)?.resolved_cards()?
+    } else {
+        Vec::new()
+    };
+
+    // 4. R1 rename 迁移：上轮合并集与 resolve 卡同规则迁 file/id（碰撞域一致）。
+    let mut prior_findings = base.prior_findings;
+    crate::consolidate::migrate_renames(&mut prior_findings, &base.renames);
+    crate::consolidate::migrate_resolve_cards(&mut resolve_cards, &base.renames);
+    let prior_ids: std::collections::HashSet<String> =
+        prior_findings.iter().map(|f| f.id.clone()).collect();
+    let resolved_ids: std::collections::HashSet<String> =
+        resolve_cards.iter().map(|c| c.id.clone()).collect();
+
+    // 5. carry：resolved 排除 → 就近重锚 → 成活/消灭。
+    let outcome = crate::consolidate::carry(prior_findings, &resolved_ids, root);
+
+    // 6. claimed-resolved 清单（防假修复保险）：本谱系已销案（∩上轮合并集）且 quote 仍锚中
+    //    ——修真落地的 quote 会消失，仍在场即可疑，搭本轮评审的车顺带验证（零额外 LLM 调用）。
+    let claimed: Vec<crate::db::ResolveCard> = resolve_cards
+        .iter()
+        .filter(|c| prior_ids.contains(&c.id) && !c.quote.trim().is_empty())
+        .filter(|c| crate::positioning::anchor_near(root, &c.file, &c.quote, 0).is_some())
+        .cloned()
+        .collect();
+
+    // 7. delta → bundle + 增量 prompt 段 + fan-out（select_files/group/run_code_fanout 全复用）。
+    let bundles = group(select_files(base.delta), Some(root));
+    anyhow::ensure!(
+        !bundles.is_empty(),
+        "--incremental-from: delta since {} is all noise-filtered (nothing reviewable); run a full `redteam review` or let ship's stall guard decide",
+        base.base_sha
+    );
+    let all_files = crate::evidence::git::branch_files(
+        root,
+        args.base.as_deref().expect("branch scope enforced by preflight"),
+    )?;
+    let delta_files: std::collections::BTreeSet<String> =
+        bundles.iter().flat_map(|b| b.files.iter().map(|f| f.path.clone())).collect();
+    let manifest2 = crate::bundle::two_layer_manifest(&all_files, &delta_files);
+    let short_base = &base.base_sha[..12.min(base.base_sha.len())];
+    let inc_section = crate::prompt::render_incremental_section(short_base, &manifest2, &claimed);
+
+    let lens_ids: Vec<String> = args
+        .lenses
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_else(|| cfg.review.lenses.code.clone());
+    let rules = select(Mode::Code, &lens_ids)?;
+    let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
+    let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
+    let model_ids = model_ids_for(&model_names, cfg);
+    let oopts = OrchestrateOpts {
+        models,
+        replicate,
+        no_fallback: false,
+        max_concurrency: cfg.review.max_concurrency,
+    };
+    let focus = args.focus.clone().unwrap_or_default();
+    let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
+    if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
+    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &oopts, sink).await;
+
+    // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
+    //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。
+    let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
+    let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
+    if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
+    let anchored = anchor(raw.findings, root);
+    let mut new_findings = dedup(anchored);
+    clamp_compliance(&mut new_findings);
+    let mut resolution_disputed: Vec<String> = new_findings
+        .iter()
+        .filter(|f| resolved_ids.contains(&f.id))
+        .map(|f| f.id.clone())
+        .collect();
+    resolution_disputed.sort();
+    resolution_disputed.dedup();
+    let merged = crate::consolidate::merge_carry(outcome.carried, new_findings);
+
+    let n_targets = refute_targets(&merged, &ledger.cards, block).len();
+    if n_targets > 0 {
+        if let Some(s) = sink {
+            s.on_phase(crate::state::job::Phase::Refute, Some(format!("{n_targets} targets")));
+        }
+    }
+    let (findings, refute_warnings) = verify_findings(
+        merged, provider, &model_names, block, cfg.review.max_concurrency, Mode::Code, &ledger.cards,
+    ).await;
+    let mut warnings = raw.warnings;
+    warnings.extend(refute_warnings);
+    let mut findings = findings;
+    let dismissed_reappeared = mark_dismissed(&mut findings, &ledger.ids);
+
+    let verdict = compute_verdict(&findings, block, floor);
+    let new_only: Vec<Finding> = findings
+        .iter()
+        .filter(|f| f.origin == crate::domain::Origin::New)
+        .cloned()
+        .collect();
+    let mut stats = Stats::from_findings(&findings);
+    stats.new = Some(Box::new(Stats::from_findings(&new_only)));
+    let report = ReviewReport {
+        schema_version: "3".into(),
+        mode: Mode::Code,
+        verdict,
+        stats,
+        findings,
+        clusters: vec![],
+        run: RunMeta {
+            job_id: String::new(),
+            models: model_names,
+            model_ids,
+            lenses: lens_ids,
+            duration_ms: t0.elapsed().as_millis() as u64,
+            usage: Usage { input_tokens: raw.usage.0, output_tokens: raw.usage.1, cached_input_tokens: raw.usage.2 },
+            warnings,
+            failed_models: raw.failed_models,
+            dismissed_reappeared,
+            ledger: ledger.meta.clone(),
+            head_sha,
+            incremental: true,
+            delta_base: Some(base.base_sha),
+            resolved: outcome.resolved_applied,
+            resolution_disputed,
+            carried_dropped: outcome.carried_dropped,
+        },
+    };
+    let code = exit_code(verdict, !report.run.failed_models.is_empty());
+    Ok((report, code))
 }
 
 /// 统一 mode 探测 + 评审分发（前台 main 与后台 worker 共用）。
@@ -511,11 +675,19 @@ pub async fn run_review_dispatch(
         spec: sync_args.spec.clone(),
         targets: sync_args.targets.clone(),
     };
+    // M13：增量轮路由（前台与后台 worker 共用本单点；mode/scope 守卫在 preflight 内）。
+    if let Some(prior) = sync_args.incremental_from.clone() {
+        return run_incremental_review(&sync_args, &prior, provider, cfg, cwd, sink).await;
+    }
+
     let detected = detect_mode(&eopts)?;
     match detected {
         Mode::Code => {
             let changes = crate::evidence::git::changed_files(sync_args.base.as_deref(), scope_enum == Scope::Branch)?;
-            run_code_review(&sync_args, provider, cfg, changes, cwd, sink).await
+            // R3：stamp 权威时刻 = 证据收集实跑刻（与 changed_files 同刻同 cwd）；
+            // 非 git 目录折 None——前台裸 review 与后台 job 共用本单点，前后台天然同 sha。
+            let head_sha = crate::evidence::git::head_sha_at(cwd).ok();
+            run_code_review(&sync_args, provider, cfg, changes, cwd, head_sha, sink).await
         }
         Mode::Doc => run_review(sync_args, provider, cfg, sink).await,
     }
@@ -578,6 +750,112 @@ impl CellSink for JobCellSink {
     }
 }
 
+/// M13 增量基线（incremental_preflight 产物）。
+#[derive(Debug)]
+pub(crate) struct IncrementalBaseline {
+    /// 上轮 stamped HEAD（delta base）。
+    pub base_sha: String,
+    /// 上轮合并集（含 refuted/dismissed，原样携带候选）。
+    pub prior_findings: Vec<Finding>,
+    /// R1 旧→新路径映射。
+    pub renames: Vec<(String, String)>,
+    /// base..HEAD 逐文件 diff。
+    pub delta: Vec<crate::evidence::git::FileChange>,
+}
+
+/// 决议 7 前置守卫：违反**显式报错拒跑**（不静默降级全量——成本意外）。
+/// ①谱系 ②同族（mode/scope，含 v1 范围收窄 code+branch）③健康基线（R2 三查）④空 delta。
+pub(crate) fn incremental_preflight(
+    args: &ReviewArgs,
+    prior_job: &str,
+    root: &Path,
+) -> anyhow::Result<IncrementalBaseline> {
+    // v1 范围（决议 7）：仅 code 模式——doc id 稳定性弱，锚定携带地基不存在。
+    let mode = detect_mode_from_args(args)?;
+    anyhow::ensure!(
+        mode == Mode::Code,
+        "--incremental-from: v1 supports code mode only (doc finding ids drift across rounds); run a full `redteam review`"
+    );
+    // v1 范围：branch scope——working-tree 证据不可 stamp，轮间未提交改动会静默漏出 delta。
+    anyhow::ensure!(
+        args.scope == "branch",
+        "--incremental-from requires branch scope (pass --base <branch>): the delta only covers committed changes since the prior round's stamped HEAD"
+    );
+    anyhow::ensure!(
+        args.base.is_some(),
+        "--incremental-from requires --base <branch> (the full-changeset manifest is derived from merge-base(base, HEAD))"
+    );
+    // 脏树守卫（终审 Important）：carry 重锚读活文件而 delta 只含已提交改动——未提交
+    // 编辑可使携带项锚失效却不在本轮评审范围内（carried_dropped 审计语义为假，open
+    // finding 静默蒸发）。锚定不变式成立前提=评审时点树即 HEAD。硬错误保守视为脏。
+    anyhow::ensure!(
+        !crate::evidence::git::worktree_dirty(root).unwrap_or(true),
+        "--incremental-from requires a clean working tree (uncommitted tracked changes can invalidate carried findings' anchors without being part of the reviewed delta); commit or stash first, then re-run"
+    );
+
+    // 载上轮 result（增量只对经 --background 持久化过 result 的作业有意义）。
+    let raw = crate::state::store::read_result(root, prior_job).ok_or_else(|| anyhow::anyhow!(
+        "--incremental-from: no persisted result for job {prior_job} (prior round must have run via --background)"
+    ))?;
+    let prior: ReviewReport = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("--incremental-from: cannot parse prior result for {prior_job}: {e}"))?;
+
+    // ③健康基线守卫（R2）：锚定不变式只对「上轮全量审干净」的基线成立。
+    anyhow::ensure!(
+        prior.verdict != Verdict::Incomplete,
+        "--incremental-from: prior round {prior_job} is incomplete (unreviewed bundles have no findings to carry); run a full `redteam review` to establish a clean baseline"
+    );
+    anyhow::ensure!(
+        prior.run.failed_models.is_empty(),
+        "--incremental-from: prior round {prior_job} had failed models {:?} (adversarial coverage was incomplete); run a full `redteam review`",
+        prior.run.failed_models
+    );
+    let manifest = crate::state::store::read_manifest(root, prior_job);
+    let ok_cells: std::collections::BTreeSet<String> = crate::state::store::read_partial(root, prior_job)
+        .into_iter()
+        .filter(|r| r.ok)
+        .map(|r| r.cell)
+        .collect();
+    anyhow::ensure!(
+        manifest.iter().all(|c| ok_cells.contains(&c.cell)),
+        "--incremental-from: prior round {prior_job} has manifest cells without an ok record (partial coverage); run a full `redteam review`"
+    );
+
+    // stamp 在场（v2 老报告无 head_sha——先跑一次全量建立基线）。
+    let base_sha = prior.run.head_sha.clone().ok_or_else(|| anyhow::anyhow!(
+        "--incremental-from: prior result has no head_sha stamp (predates incremental rounds); run one full `redteam review` to establish a stamped baseline"
+    ))?;
+
+    // ②同族守卫：mode/scope 与上轮一致（读上轮 args.json）。
+    let prior_args: ReviewArgs = crate::state::store::read_args_raw(root, prior_job)
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .ok_or_else(|| anyhow::anyhow!("--incremental-from: cannot load prior job args for {prior_job}"))?;
+    anyhow::ensure!(
+        detect_mode_from_args(&prior_args).ok() == Some(Mode::Code) && prior_args.scope == args.scope,
+        "--incremental-from: mode/scope mismatch with prior round (prior scope '{}', current '{}'); incremental carry requires the same review family",
+        prior_args.scope,
+        args.scope
+    );
+
+    // ①谱系守卫：stamped HEAD 必须是当前 HEAD 祖先（rebase/reset 即锚定不变式失效）。
+    // is_ancestor 的硬错误（如 sha 不存在于对象库）同属谱系失效，折同一文案。
+    let lineage_ok = crate::evidence::git::is_ancestor(root, &base_sha).unwrap_or(false);
+    anyhow::ensure!(
+        lineage_ok,
+        "--incremental-from: prior stamped HEAD {base_sha} is not an ancestor of HEAD (rebase/reset detected — the anchoring invariant no longer holds); run a full `redteam review`"
+    );
+
+    // ④空 delta：HEAD 未动 → 显式报错（ship 按停滞守卫处理，不烧空轮）。
+    let renames = crate::evidence::git::rename_map(root, &base_sha)?;
+    let delta = crate::evidence::git::changed_files_since(root, &base_sha)?;
+    anyhow::ensure!(
+        !delta.is_empty(),
+        "--incremental-from: empty delta since {base_sha} (HEAD unchanged — nothing new to review); commit fixes first, or run a full `redteam review`"
+    );
+
+    Ok(IncrementalBaseline { base_sha, prior_findings: prior.findings, renames, delta })
+}
+
 /// R2.2：失败/超时时从 proj.db 的 cell checkpoint 里已完成的 findings 组一份 `incomplete`
 /// 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。M 取 manifest 行数（若尚未
 /// 写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
@@ -594,7 +872,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
     let mode = detect_mode_from_args(args).unwrap_or(Mode::Doc);
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
-        schema_version: "2".into(),
+        schema_version: "3".into(),
         mode,
         verdict: Verdict::Incomplete,
         stats,
@@ -611,6 +889,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
             failed_models: vec![],
             dismissed_reappeared: vec![],
             ledger: None,
+            ..Default::default()
         },
     };
     let code = exit_code(Verdict::Incomplete, false);
@@ -624,7 +903,7 @@ fn empty_review_args() -> ReviewArgs {
         mode: None, base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         lenses: None, models: None, models_all: false, no_correlate: false,
         block_threshold: None, conf_floor: None, background: false, format: "json".into(),
-        targets: vec![], resume: None, dismissed: None, no_dismissed: false,
+        targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
     }
 }
 
@@ -667,6 +946,14 @@ pub async fn run_resume(
             );
         }
     };
+    // M13：增量 job 的差集重放只补 fan-out cell，不重跑 carry/merge 尾段——直接拒绝，
+    // 引导重跑增量评审（守卫与 carry 必须整链执行）。
+    if args.incremental_from.is_some() {
+        return partial_report(
+            ws, job_id, &args,
+            "resume: incremental jobs cannot be resumed; re-run `redteam review --incremental-from <prior-job>`".into(),
+        );
+    }
     let mode = match detect_mode_from_args(&args) {
         Ok(m) => m,
         Err(e) => {
@@ -757,6 +1044,7 @@ pub async fn run_resume(
         dismissed: &ledger.ids,
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
+        head_sha: None,
         sink: None,
     };
     match assemble_report(findings, ctx).await {
@@ -889,7 +1177,7 @@ mod job_tests {
     use crate::state::job::{read_state, JobStatus};
     use crate::state::store::read_result;
     use crate::provider::fake::FakeProvider;
-    use crate::domain::{Finding, RawFinding, Severity};
+    use crate::domain::{Finding, Origin, RawFinding, Severity};
     use std::collections::BTreeMap;
 
     fn checkpointed_finding(title: &str) -> Finding {
@@ -898,6 +1186,7 @@ mod job_tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             lenses: vec![], models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
             quote: "q".into(), cluster_id: None, verify: None, previously_dismissed: false,
+            origin: Origin::New,
         }
     }
 
@@ -907,7 +1196,7 @@ mod job_tests {
             spec: vec![], focus: None, lenses: None, models: None, models_all: false,
             no_correlate: false, block_threshold: None, conf_floor: None,
             background: true, format: "json".into(), targets: vec![target.into()],
-            resume: None, dismissed: None, no_dismissed: false,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
         }
     }
     fn cfg() -> Config {
@@ -1104,7 +1393,7 @@ mod job_tests {
 #[cfg(test)]
 mod resume_tests {
     use super::*;
-    use crate::domain::{Finding, RawFinding, Severity};
+    use crate::domain::{Finding, Origin, RawFinding, Severity};
     use crate::state::store::CellInput;
 
     /// 记录每次 `run` 调用的 prompt，脚本化返回一条低 severity finding（避免触发 verify 的
@@ -1148,7 +1437,7 @@ mod resume_tests {
             file: "spec.md".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), lenses: vec![], models: vec!["m".into()], agreement: 1,
             hard_constraint: false, quote: String::new(), cluster_id: None, verify: None,
-            previously_dismissed: false,
+            previously_dismissed: false, origin: Origin::New,
         }
     }
 
@@ -1178,7 +1467,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1225,7 +1514,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("alpha,beta".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1260,7 +1549,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false,
+            format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1373,10 +1662,10 @@ default_models=["alpha"]
             spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None, dismissed: None, no_dismissed: false,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None).await.unwrap();
+        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
         let f = &report.findings[0];
         assert_eq!(f.verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
         assert_eq!(f.confidence, 0.0);
@@ -1391,7 +1680,7 @@ default_models=["alpha"]
             models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None, dismissed: None, no_dismissed: false,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
         }
     }
 
@@ -1423,7 +1712,7 @@ default_models=["m","m2"]
         let provider = FakeProvider { scripted };
         let my_args = ReviewArgs { models: None, ..args() };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None).await.unwrap();
+        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
         assert_eq!(report.findings.len(), 1, "fabricated dropped, real merged across models");
         assert_eq!(report.findings[0].file, "src/a.rs");
         assert_eq!(report.findings[0].line_start, 2);
@@ -1439,9 +1728,23 @@ default_models=["m","m2"]
 default_models=["m"]
 "#]).unwrap();
         let provider = FakeProvider::with("m", vec![]);
-        let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None).await.unwrap();
+        let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
         assert!(report.findings.is_empty());
         assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn code_review_stamps_head_sha_into_runmeta() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::from_layers(&[r#"[review]
+default_models=["m"]
+"#]).unwrap();
+        let provider = FakeProvider::with("m", vec![]);
+        let (report, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(),
+            Some("abc123".into()), None).await.unwrap();
+        assert_eq!(report.run.head_sha.as_deref(), Some("abc123"));
+        let (report2, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
+        assert_eq!(report2.run.head_sha, None, "非 git 环境如实 None，不编造");
     }
 }
 
@@ -1539,5 +1842,309 @@ mod tests {
         assert_eq!(reappeared, vec![before.id]);
         assert!(after[0].previously_dismissed);
         assert_eq!(compute_verdict(&after, Severity::Medium, 0.5), Verdict::Approve);
+    }
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+    use crate::domain::{Mode, RawFinding, Severity, Verdict};
+    use crate::orchestrate::enrich;
+    use crate::state::store::{append_partial, write_args_raw, write_manifest, CellInput, CellRecord};
+
+    pub(super) fn git_repo(dir: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        // ponytail: 镜像真实项目的 .redteam/.gitignore（project::init_project）——固件用
+        // state::store 写 proj.db 是测试副作用，不 ignore 会被后续 `git add -A` 扫进 delta，
+        // 假性膨胀 changed_files_since 的文件数（与被测逻辑无关的噪音）。
+        std::fs::write(dir.join(".gitignore"), ".redteam/\n").unwrap();
+    }
+    pub(super) fn commit_all(dir: &std::path::Path, msg: &str) -> String {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", msg]);
+        run(&["rev-parse", "HEAD"]).trim().to_string()
+    }
+
+    pub(super) fn raw(file: &str, quote: &str, title: &str) -> RawFinding {
+        RawFinding {
+            severity: Severity::High, title: title.into(), body: "b".into(), file: file.into(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
+            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()),
+        }
+    }
+
+    /// 增量 args（branch scope + code mode）。
+    pub(super) fn inc_args(base: &str, prior: &str) -> ReviewArgs {
+        ReviewArgs {
+            mode: Some("code".into()), base: Some(base.into()), scope: "branch".into(),
+            spec: vec![], focus: None, lenses: Some("L1".into()), models: Some("m".into()),
+            models_all: false, no_correlate: true, block_threshold: None, conf_floor: None,
+            background: false, format: "json".into(), targets: vec![], resume: None,
+            dismissed: None, no_dismissed: false, incremental_from: Some(prior.into()),
+        }
+    }
+
+    /// 上轮固件：result(v3, approve, head_sha=Some(sha)) + args(branch/code) + manifest/partial 全 ok。
+    pub(super) fn write_prior(root: &std::path::Path, job: &str, head_sha: &str, findings: Vec<Finding>) {
+        let stats = Stats::from_findings(&findings);
+        let report = ReviewReport {
+            schema_version: "3".into(), mode: Mode::Code, verdict: Verdict::Approve,
+            stats, findings, clusters: vec![],
+            run: RunMeta {
+                job_id: job.into(), models: vec!["m".into()], lenses: vec!["L1".into()],
+                head_sha: Some(head_sha.into()), ..Default::default()
+            },
+        };
+        crate::state::store::write_result(root, job, &serde_json::to_string(&report).unwrap()).unwrap();
+        let prior_args = ReviewArgs { incremental_from: None, background: true, ..inc_args("dev0", "unused") };
+        write_args_raw(root, job, &serde_json::to_string(&prior_args).unwrap()).unwrap();
+        write_manifest(root, job, &[CellInput { cell: "bundle[a.rs]@m".into(), model: "m".into(), prompt: "p".into() }]).unwrap();
+        append_partial(root, job, &CellRecord::ok("bundle[a.rs]@m", "m", vec![])).unwrap();
+    }
+
+    #[test]
+    fn preflight_happy_path_yields_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        let ok = std::process::Command::new("git").current_dir(dir.path())
+            .args(["branch", "dev0", &c1]).output().unwrap();
+        assert!(ok.status.success());
+        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m")]);
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n}\n").unwrap();
+        commit_all(dir.path(), "fix");
+        let base = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap();
+        assert_eq!(base.base_sha, c1);
+        assert_eq!(base.prior_findings.len(), 1);
+        assert_eq!(base.delta.len(), 1, "delta 只含 c1..HEAD 改动");
+        assert!(base.renames.is_empty());
+    }
+
+    /// 脏树守卫（终审 Important）：即使其余前提全部健康，工作树有未提交 tracked 编辑
+    /// 仍必须拦下——carry 重锚读活文件而 delta 只含已提交改动，脏树使锚定不变式的
+    /// 前提（评审时点树即 HEAD）失效。独立 fixture：脏改动只留在本测试作用域内，不
+    /// commit 也不清理，不污染后续用例。
+    #[test]
+    fn preflight_rejects_dirty_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::process::Command::new("git").current_dir(dir.path())
+            .args(["branch", "dev0", &c1]).output().unwrap();
+        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m")]);
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n}\n").unwrap();
+        commit_all(dir.path(), "fix");
+        // 未提交的 tracked 编辑（不 commit）：净树守卫必须先拦下，不放行到载入上轮 result
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n    more();\n}\n").unwrap();
+        let e = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("clean working tree"), "{e}");
+    }
+
+    /// 五类守卫拒绝：每类断言错误文案关键词（文案即裸终端在场文档）。
+    #[test]
+    fn preflight_rejects_unhealthy_and_mismatched_baselines() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
+        write_prior(dir.path(), "jok", &c1, vec![]);
+        // ④空 delta（HEAD 未动）
+        let e = incremental_preflight(&inc_args("dev0", "jok"), "jok", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("empty delta"), "{e}");
+        std::fs::write(dir.path().join("a.rs"), "x\ny\n").unwrap();
+        commit_all(dir.path(), "c2");
+        // 上轮无 result
+        let e = incremental_preflight(&inc_args("dev0", "ghost"), "ghost", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("no persisted result"), "{e}");
+        // ③R2 健康基线：incomplete
+        let mut bad: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
+        bad.verdict = Verdict::Incomplete;
+        crate::state::store::write_result(dir.path(), "jincomplete", &serde_json::to_string(&bad).unwrap()).unwrap();
+        let e = incremental_preflight(&inc_args("dev0", "jincomplete"), "jincomplete", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("incomplete"), "{e}");
+        // ③R2：failed_models 非空
+        let mut half: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
+        half.verdict = Verdict::Approve;
+        half.run.failed_models = vec!["beta".into()];
+        crate::state::store::write_result(dir.path(), "jhalf", &serde_json::to_string(&half).unwrap()).unwrap();
+        crate::state::store::write_args_raw(dir.path(), "jhalf", &crate::state::store::read_args_raw(dir.path(), "jok").unwrap()).unwrap();
+        let e = incremental_preflight(&inc_args("dev0", "jhalf"), "jhalf", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("failed models"), "{e}");
+        // ③R2：manifest 有 cell 无 ok 记录
+        let mut ok2: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
+        ok2.run.failed_models.clear();
+        crate::state::store::write_result(dir.path(), "jpartial", &serde_json::to_string(&ok2).unwrap()).unwrap();
+        crate::state::store::write_args_raw(dir.path(), "jpartial", &crate::state::store::read_args_raw(dir.path(), "jok").unwrap()).unwrap();
+        crate::state::store::write_manifest(dir.path(), "jpartial", &[
+            crate::state::store::CellInput { cell: "c-never-ran".into(), model: "m".into(), prompt: "p".into() },
+        ]).unwrap();
+        let e = incremental_preflight(&inc_args("dev0", "jpartial"), "jpartial", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("without an ok record"), "{e}");
+        // 无 stamp（v2 老报告）
+        let mut nostamp: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
+        nostamp.run.head_sha = None;
+        crate::state::store::write_result(dir.path(), "jnostamp", &serde_json::to_string(&nostamp).unwrap()).unwrap();
+        crate::state::store::write_args_raw(dir.path(), "jnostamp", &crate::state::store::read_args_raw(dir.path(), "jok").unwrap()).unwrap();
+        crate::state::store::write_manifest(dir.path(), "jnostamp", &[]).unwrap();
+        let e = incremental_preflight(&inc_args("dev0", "jnostamp"), "jnostamp", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("no head_sha stamp"), "{e}");
+    }
+
+    #[test]
+    fn preflight_rejects_scope_mode_and_lineage_violations() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
+        write_prior(dir.path(), "jprev", &c1, vec![]);
+        std::fs::write(dir.path().join("a.rs"), "x\ny\n").unwrap();
+        commit_all(dir.path(), "c2");
+        // v1 范围：doc 模式拒
+        let mut doc_args = inc_args("dev0", "jprev");
+        doc_args.mode = Some("doc".into());
+        doc_args.targets = vec!["spec.md".into()];
+        let e = incremental_preflight(&doc_args, "jprev", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("code mode only"), "{e}");
+        // v1 范围：working-tree scope 拒（不可 stamp）
+        let mut wt = inc_args("dev0", "jprev");
+        wt.scope = "working-tree".into();
+        wt.base = None;
+        let e = incremental_preflight(&wt, "jprev", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("branch scope"), "{e}");
+        // v1 范围：branch scope 但缺 --base → 显式报错（防 branch_files 处 expect panic）
+        let mut nobase = inc_args("dev0", "jprev");
+        nobase.base = None;
+        let e = incremental_preflight(&nobase, "jprev", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("requires --base"), "{e}");
+        // ②同族：上轮 scope 与本轮不一致
+        let mut prior_wt = ReviewArgs { scope: "working-tree".into(), base: None, ..inc_args("dev0", "x") };
+        prior_wt.incremental_from = None;
+        crate::state::store::write_args_raw(dir.path(), "jprev", &serde_json::to_string(&prior_wt).unwrap()).unwrap();
+        let e = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("mode/scope mismatch"), "{e}");
+        // 恢复同族后：①谱系——stamp 指向不在祖先链上的假 sha
+        let good_args = ReviewArgs { incremental_from: None, background: true, ..inc_args("dev0", "x") };
+        crate::state::store::write_args_raw(dir.path(), "jprev", &serde_json::to_string(&good_args).unwrap()).unwrap();
+        let mut rebased: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jprev").unwrap()).unwrap();
+        rebased.run.head_sha = Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into());
+        crate::state::store::write_result(dir.path(), "jprev", &serde_json::to_string(&rebased).unwrap()).unwrap();
+        let e = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
+        assert!(e.to_string().contains("not an ancestor"), "{e}");
+    }
+
+    use crate::provider::fake::FakeProvider;
+
+    fn inc_cfg() -> Config {
+        Config::from_layers(&[r#"[providers.m]
+kind="openai"
+model="m1"
+priority=10
+[review]
+default_models=["m"]
+"#]).unwrap()
+    }
+
+    /// 主链路：F1 携带（quote 存活）、F2 消灭（quote 被修掉）、新 finding 入场 → v3 报告全字段。
+    #[tokio::test]
+    async fn incremental_carries_drops_and_reports_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    md5(pw);\n}\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
+        let f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m");
+        let f2 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "L1", "m");
+        let (id1, id2) = (f1.id.clone(), f2.id.clone());
+        write_prior(dir.path(), "jprev", &c1, vec![f1, f2]);
+        // fix：修掉 md5 行，引入新问题行
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    sha256(pw);\n    leak(secret);\n}\n").unwrap();
+        commit_all(dir.path(), "fix r1");
+        // 本轮模型只报新问题
+        let provider = FakeProvider::with("m", vec![raw("a.rs", "leak(secret);", "secret leak")]);
+        let (report, code) = run_incremental_review(&inc_args("dev0", "jprev"), "jprev", &provider, &inc_cfg(), dir.path(), None).await.unwrap();
+        assert_eq!(report.schema_version, "3");
+        assert!(report.run.incremental);
+        assert_eq!(report.run.delta_base.as_deref(), Some(c1.as_str()));
+        assert!(report.run.head_sha.is_some(), "本轮同样 stamp（下轮的 base）");
+        assert_eq!(report.run.carried_dropped, vec![id2], "quote 被修掉 → 消灭进审计");
+        let carried = report.findings.iter().find(|f| f.id == id1).expect("F1 应携带");
+        assert_eq!(carried.origin, crate::domain::Origin::Carried);
+        let fresh = report.findings.iter().find(|f| f.title == "secret leak").expect("新 finding 应入场");
+        assert_eq!(fresh.origin, crate::domain::Origin::New);
+        let sn = report.stats.new.as_ref().expect("stats.new 子块");
+        assert_eq!((sn.total, report.stats.total), (1, 2), "stats 合并集口径 + new 子块");
+        assert_eq!(code, 10, "carried High(agreement=1 但携带原样) 或 new High 均 blocking → reject");
+    }
+
+    /// 假修复靶（验收 §8.2 机制层）：resolve 了但代码未动 → claimed 再现 → resolution_disputed。
+    #[tokio::test]
+    async fn fake_fix_yields_resolution_disputed() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    md5(pw);\n    other();\n}\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
+        let f1 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "L1", "m");
+        let id1 = f1.id.clone();
+        write_prior(dir.path(), "jprev", &c1, vec![f1]);
+        // 销案（谎称已修）——快照四件套与 finding 同源
+        let mut db = crate::db::ProjDb::open(dir.path()).unwrap();
+        db.resolve_upsert(&crate::db::ResolveCard {
+            id: id1.clone(), title: "weak hash".into(), file: "a.rs".into(),
+            quote: "md5(pw);".into(), severity: "high".into(),
+            reason: "假装修了".into(), round: "r1".into(), updated_at: String::new(),
+        }).unwrap();
+        drop(db);
+        // fix commit 不触 md5 行
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    md5(pw);\n    other_fixed();\n}\n").unwrap();
+        commit_all(dir.path(), "fake fix");
+        // 模型按 claimed 指令原样再报
+        let provider = FakeProvider::with("m", vec![raw("a.rs", "md5(pw);", "weak hash")]);
+        let (report, _) = run_incremental_review(&inc_args("dev0", "jprev"), "jprev", &provider, &inc_cfg(), dir.path(), None).await.unwrap();
+        assert_eq!(report.run.resolved, vec![id1.clone()], "resolve 生效：不携带");
+        assert_eq!(report.run.resolution_disputed, vec![id1.clone()], "同 id 再现 → 假修复回路");
+        let disputed = report.findings.iter().find(|f| f.id == id1).expect("disputed 项以 new 身份在场");
+        assert_eq!(disputed.origin, crate::domain::Origin::New);
+        assert!(report.run.carried_dropped.is_empty());
+    }
+
+    /// re-raise 去重：模型重报携带项 → 保 carried、agreement 不涨。
+    #[tokio::test]
+    async fn incremental_re_raise_dedups_into_carried() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
+        let mut f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m");
+        f1.agreement = 2;
+        f1.models = vec!["m".into(), "m2".into()];
+        let id1 = f1.id.clone();
+        write_prior(dir.path(), "jprev", &c1, vec![f1]);
+        std::fs::write(dir.path().join("a.rs"), "// touch\nfn f() {\n    db.write(token);\n}\n").unwrap();
+        commit_all(dir.path(), "fix");
+        let provider = FakeProvider::with("m", vec![raw("a.rs", "db.write(token);", "unvalidated write")]);
+        let (report, _) = run_incremental_review(&inc_args("dev0", "jprev"), "jprev", &provider, &inc_cfg(), dir.path(), None).await.unwrap();
+        assert_eq!(report.findings.len(), 1, "同 id 去重");
+        assert_eq!(report.findings[0].origin, crate::domain::Origin::Carried);
+        assert_eq!(report.findings[0].agreement, 2, "re-raise 不涨 agreement");
+        assert_eq!(report.findings[0].id, id1);
+        assert_eq!((report.findings[0].line_start, report.findings[0].line_end), (3, 3), "重锚随注释插入移位");
     }
 }

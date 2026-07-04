@@ -24,12 +24,20 @@ fn is_noise(path: &str) -> bool {
     NOISE_NAMES.contains(&f) || f.ends_with(".lock")
 }
 
-/// 确定性文件筛选：丢掉空 diff 与噪声（锁文件）。代码决定，不交模型。
+/// 二进制 diff 判定：git 对二进制改动只产 "Binary files … differ" 标记行（无 hunk）。
+/// 标记行顶格无前缀；文本 hunk 正文行恒带 +/-/空格前缀，同款字样不会误伤。
+/// Task 14 回放实证：单个 build 产物开 3 cell 烧掉 36%/1.46M input——无可审文本，筛选层消灭。
+fn is_binary_diff(diff: &str) -> bool {
+    diff.lines().any(|l| l.starts_with("Binary files ") && l.ends_with(" differ"))
+}
+
+/// 确定性文件筛选：丢掉空 diff、噪声（锁文件）与二进制 diff。代码决定，不交模型。
 pub fn select_files(changes: Vec<FileChange>) -> Vec<FileChange> {
     changes
         .into_iter()
         .filter(|c| !c.diff.trim().is_empty())
         .filter(|c| !is_noise(&c.path))
+        .filter(|c| !is_binary_diff(&c.diff))
         .collect()
 }
 
@@ -74,7 +82,12 @@ pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
             entries.push(format!("{} (+{adds}/-{dels})", fc.path));
         }
     }
-    // 双帽：条目数 + 总字符预算（先到者截断），尾注被截条数。
+    cap_entries(entries)
+}
+
+/// 双帽截断（条目数 + 总字符预算，先到者截断，尾注被截条数）——
+/// other_files_manifest 与 two_layer_manifest 共用同一体积防线。
+fn cap_entries(entries: Vec<String>) -> String {
     let total = entries.len();
     let mut kept = 0usize;
     let mut chars = 0usize;
@@ -84,21 +97,31 @@ pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
         {
             break;
         }
-        chars += e.len() + 2; // ", " 分隔
+        chars += e.len() + 2;
         kept += 1;
     }
+    let mut entries = entries;
     entries.truncate(kept);
     let mut s = entries.join(", ");
     let extra = total - kept;
     if extra > 0 {
         if s.is_empty() {
-            // 首条即超预算的极端截断：避免输出以 ", " 开头
             s = format!("… and {extra} more files");
         } else {
             s.push_str(&format!(", … and {extra} more files"));
         }
     }
     s
+}
+
+/// M13 双层 manifest（决议 4）：全分支变更文件清单 + 标注哪些在本轮 delta 内——
+/// 压增量轮的视野塌缩型「无证据实现」误报。体积防线复用双帽。
+pub fn two_layer_manifest(all_files: &[String], delta: &std::collections::BTreeSet<String>) -> String {
+    let entries: Vec<String> = all_files
+        .iter()
+        .map(|p| if delta.contains(p) { format!("{p} [delta]") } else { p.clone() })
+        .collect();
+    cap_entries(entries)
 }
 
 /// 单个文件包的文件数上限（超出按排序切块）。
@@ -365,6 +388,24 @@ mod tests {
     }
 
     #[test]
+    fn select_drops_binary_diffs_but_not_lookalike_content() {
+        // Task 14 回放实证：build 产物二进制被开 3 cell 烧掉 36%/1.46M input——
+        // 二进制 diff 无可审文本，必须在筛选层消灭。
+        let bin = "diff --git a/plugins/redteam/bin/darwin/aarch64/redteam b/plugins/redteam/bin/darwin/aarch64/redteam\n\
+                   index 1111111..2222222 100755\n\
+                   Binary files a/plugins/redteam/bin/darwin/aarch64/redteam and b/plugins/redteam/bin/darwin/aarch64/redteam differ\n";
+        // 正文里出现同款字样的行带 +/-/空格前缀 → 不得误伤文本文件
+        let lookalike = "@@ -1,2 +1,3 @@\n+// Binary files a and b differ\n context\n";
+        let out = select_files(vec![
+            fc("src/a.rs", "+x"),
+            fc("plugins/redteam/bin/darwin/aarch64/redteam", bin),
+            fc("src/doc.rs", lookalike),
+        ]);
+        let paths: Vec<&str> = out.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/a.rs", "src/doc.rs"]);
+    }
+
+    #[test]
     fn group_unions_same_directory() {
         let out = group(vec![fc("src/auth/login.rs", "+a"), fc("src/auth/token.rs", "+b")], None);
         assert_eq!(out.len(), 1);
@@ -510,5 +551,20 @@ mod tests {
         let m = other_files_manifest(&bundles, 0);
         assert!(m.len() <= MANIFEST_MAX_CHARS, "含注记总输出不超预算: len={}", m.len());
         assert!(m.contains("more files"), "被截条数有注记: {m}");
+    }
+
+    #[test]
+    fn two_layer_manifest_marks_delta_membership_and_caps() {
+        use std::collections::BTreeSet;
+        let all = vec!["src/a.rs".to_string(), "src/b.rs".into(), "src/c.rs".into()];
+        let delta: BTreeSet<String> = ["src/b.rs".to_string()].into();
+        let s = two_layer_manifest(&all, &delta);
+        assert!(s.contains("src/b.rs [delta]"), "{s}");
+        assert!(s.contains("src/a.rs") && !s.contains("src/a.rs [delta]"), "{s}");
+        // 复用双帽：大清单截断注记
+        let many: Vec<String> = (0..500).map(|i| format!("src/file{i:04}.rs")).collect();
+        let s = two_layer_manifest(&many, &BTreeSet::new());
+        assert!(s.contains("more files"), "{s}");
+        assert!(s.chars().count() <= 4000, "{}", s.chars().count());
     }
 }

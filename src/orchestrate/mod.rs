@@ -1,5 +1,5 @@
 use crate::bundle::Bundle;
-use crate::domain::{Finding, RawFinding, ReviewInput};
+use crate::domain::{Finding, Origin, RawFinding, ReviewInput};
 use crate::hash::fnv1a64_hex;
 use crate::lens::Lens;
 use crate::prompt::{build_bundle_prompt, build_doc_prompt};
@@ -56,15 +56,20 @@ fn normalize_title(t: &str) -> String {
     t.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
-    let nq = normalize_quote(&raw.quote);
-    let nt = normalize_title(&raw.title);
-    // R8.1：quote 锚定、行无关；quote 缺失退化行号路径（不保证跨 fixup 稳定）。
-    let id = if nq.is_empty() {
-        fnv1a64_hex(&[&raw.file, &raw.line_start.to_string(), &raw.line_end.to_string(), &nt])
+/// finding id 组成的单一真相源（R8.1 + M13 rename 迁移共用）：quote 锚定、行无关；
+/// 空 quote 退化行号路径（不保证跨 fixup 稳定）。
+pub fn finding_id(file: &str, quote: &str, title: &str, line_start: u32, line_end: u32) -> String {
+    let nq = normalize_quote(quote);
+    let nt = normalize_title(title);
+    if nq.is_empty() {
+        fnv1a64_hex(&[file, &line_start.to_string(), &line_end.to_string(), &nt])
     } else {
-        fnv1a64_hex(&[&raw.file, &nq, &nt])
-    };
+        fnv1a64_hex(&[file, &nq, &nt])
+    }
+}
+
+pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
+    let id = finding_id(&raw.file, &raw.quote, &raw.title, raw.line_start, raw.line_end);
     let lens = raw.lens.as_deref().unwrap_or(fallback_lens).to_string();
     Finding {
         id,
@@ -84,6 +89,7 @@ pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
         previously_dismissed: false,
         cluster_id: None,
         verify: None,
+        origin: Origin::New,
     }
 }
 
@@ -178,6 +184,7 @@ pub async fn run_code_fanout(
     bundles: &[Bundle],
     rules: &[&Lens],
     focus: &str,
+    incremental: &str,
     opts: &OrchestrateOpts,
     sink: Option<&dyn CellSink>,
 ) -> RawResults {
@@ -189,7 +196,7 @@ pub async fn run_code_fanout(
         .map(|(i, bundle)| {
             let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
             let others = crate::bundle::other_files_manifest(bundles, i);
-            let prompt = build_bundle_prompt(target_label, bundle, rules, focus, &others);
+            let prompt = build_bundle_prompt(target_label, bundle, rules, focus, &others, incremental);
             let cell_id = format!("bundle[{label}]");
             (cell_id, label, prompt)
         })
@@ -468,7 +475,7 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, None).await;
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &opts, None).await;
         assert_eq!(r.findings.len(), 3, "one finding per bundle");
         // raw.lens=Some("L1") → enrich 用 L1（非 fallback）
         assert!(r.findings.iter().all(|f| f.lenses == vec!["L1".to_string()]));
@@ -500,7 +507,7 @@ mod tests {
         let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
         let rules = vec![lens_by_id("L1").unwrap()];
         let probe_ref: &ConcProbe = &probe;
-        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", &opts, None).await;
+        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", "", &opts, None).await;
         assert!(probe.max_seen.load(Ordering::SeqCst) <= 2, "concurrency exceeded cap: {}", probe.max_seen.load(Ordering::SeqCst));
         assert!(probe.max_seen.load(Ordering::SeqCst) >= 1);
     }
@@ -515,7 +522,7 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, None).await;
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &opts, None).await;
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"absent".to_string()), "explicit unreachable model must be recorded");
         assert!(!r.warnings.is_empty());
@@ -545,7 +552,7 @@ mod tests {
             no_fallback: false,
             max_concurrency: 8,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts, None).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", "", &opts, None).await;
         // 2 bundle × 2 model = 4 格，各 1 finding → 4 条
         assert_eq!(out.findings.len(), 4);
         let models: std::collections::BTreeSet<&str> =
@@ -574,7 +581,7 @@ mod tests {
             no_fallback: false,
             max_concurrency: 8,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", &opts, None).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", "", &opts, None).await;
         assert_eq!(out.findings.len(), 1); // alpha 成功
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -677,7 +684,7 @@ mod tests {
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
         let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
-        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", &opts, Some(&sink)).await;
+        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &opts, Some(&sink)).await;
         assert_eq!(*sink.manifest_n.lock().unwrap(), 3, "manifest 全集=3 cell");
         assert_eq!(sink.records.lock().unwrap().len(), 3, "每 cell 各回调一次");
     }
@@ -737,7 +744,7 @@ mod tests {
             fast_saw_slow_incomplete: None.into(),
             calls: AtomicUsize::new(0),
         };
-        let _ = run_code_fanout(&provider, "wt", &bundles, &rules, "", &opts, Some(&sink)).await;
+        let _ = run_code_fanout(&provider, "wt", &bundles, &rules, "", "", &opts, Some(&sink)).await;
         assert_eq!(sink.calls.load(Ordering::SeqCst), 2, "on_cell 调用次数=cell 数（聚合前逐个触发）");
         let saw = *sink.fast_saw_slow_incomplete.lock().unwrap();
         assert_eq!(
@@ -793,7 +800,7 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let out = run_code_fanout(&reg, "wt", &bundles, &rules, "", &opts, None).await;
+        let out = run_code_fanout(&reg, "wt", &bundles, &rules, "", "", &opts, None).await;
         assert!(out.failed_models.contains(&"bad".to_string()),
             "坏 model 应记 failed_models: {:?}", out.failed_models);
         assert!(out.findings.iter().any(|f| f.title == "real"),

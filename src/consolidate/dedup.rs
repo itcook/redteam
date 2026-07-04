@@ -100,13 +100,13 @@ pub fn dedup_doc(findings: Vec<Finding>) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Severity;
+    use crate::domain::{Origin, Severity};
     fn f(id:&str, file:&str, ls:u32, le:u32, title:&str, model:&str, sev:Severity) -> Finding {
         Finding { id:id.into(), severity:sev, title:title.into(), body:"b".into(), file:file.into(),
             line_start:ls, line_end:le, confidence:0.8, recommendation:"r".into(),
             lenses:vec!["L1".into()], models:vec![model.into()], agreement:1,
             hard_constraint:false, quote:String::new(), cluster_id:None, verify:None,
-            previously_dismissed: false }
+            previously_dismissed: false, origin: Origin::New }
     }
     #[test]
     fn merges_overlapping_same_title_cross_model() {
