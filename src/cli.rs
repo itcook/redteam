@@ -219,7 +219,7 @@ struct TailCtx<'a> {
     max_concurrency: usize,
     job_id: String,
     duration_ms: u64,
-    usage: (u64, u64),
+    usage: (u64, u64, u64),
     warnings: Vec<String>,
     failed_models: Vec<String>,
     dismissed: &'a std::collections::HashSet<String>,
@@ -287,7 +287,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
             model_ids: ctx.model_ids,
             lenses: ctx.lens_ids,
             duration_ms: ctx.duration_ms,
-            usage: Usage { input_tokens: ctx.usage.0, output_tokens: ctx.usage.1 },
+            usage: Usage { input_tokens: ctx.usage.0, output_tokens: ctx.usage.1, cached_input_tokens: ctx.usage.2 },
             warnings: run_warnings,
             failed_models: ctx.failed_models,
             dismissed_reappeared,
@@ -683,14 +683,14 @@ pub async fn run_resume(
     let pending: Vec<&crate::state::store::CellInput> =
         manifest.iter().filter(|c| !done.contains(&c.cell)).collect();
 
-    let mut usage = (0u64, 0u64);
+    let mut usage = (0u64, 0u64, 0u64);
     let mut warnings = Vec::new();
     for cell in &pending {
         let req = LensRequest { model: cell.model.clone(), prompt: cell.prompt.clone() };
         let rec = match provider.run(req).await {
             Ok(call) => {
                 usage.0 += call.input_tokens;
-                usage.1 += call.output_tokens;
+                usage.1 += call.output_tokens; usage.2 += call.cached_input_tokens;
                 let fs: Vec<Finding> =
                     call.findings.iter().map(|r| enrich(r, fallback_lens, &cell.model)).collect();
                 crate::state::store::CellRecord::ok(cell.cell.clone(), cell.model.clone(), fs)
@@ -700,7 +700,7 @@ pub async fn run_resume(
                 crate::state::store::CellRecord {
                     cell: cell.cell.clone(), model: cell.model.clone(), ok: false,
                     findings: vec![], warn: Some(e.to_string()),
-                    duration_ms: 0, input_tokens: 0, output_tokens: 0, attempts: 1,
+                    duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 1,
                 }
             }
         };
@@ -1137,6 +1137,7 @@ mod resume_tests {
                 }],
                 input_tokens: 1,
                 output_tokens: 1,
+                cached_input_tokens: 0,
             })
         }
     }

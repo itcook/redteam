@@ -89,8 +89,9 @@ async fn code_bundle_tool_loop_anchors_and_drops_fabricated() {
             tool_calls: vec![ToolCall { id: "c1".into(), name: "read_file".into(), args: json!({ "path": "src/auth.rs" }) }],
             input_tokens: 2,
             output_tokens: 2,
+            cached_input_tokens: 0,
         },
-        AssistantTurn { text: findings_json.into(), tool_calls: vec![], input_tokens: 3, output_tokens: 5 },
+        AssistantTurn { text: findings_json.into(), tool_calls: vec![], input_tokens: 3, output_tokens: 5, cached_input_tokens: 0 },
     ]);
     let provider = ToolLoopProvider::new(Box::new(backend), root.path().to_path_buf());
 

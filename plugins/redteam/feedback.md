@@ -21,7 +21,9 @@
 ```
 { schema_version, mode:"code"|"doc", verdict:"approve"|"reject"|"incomplete",
   stats:{critical,high,medium,low,total}, findings:[Finding], clusters,
-  run:{ job_id, models:[], lenses:[], duration_ms, usage, warnings:[], failed_models:[],
+  run:{ job_id, models:[], lenses:[], duration_ms, warnings:[], failed_models:[],
+        usage:{ input_tokens, output_tokens, cached_input_tokens },  // 实付全价 ≈ input−cached；
+        // cached=0 且 input 大 = 未命中或该 provider 缓存字段未知（L1 缓存观测）
         dismissed_reappeared:[]  // 空时该键被省略 } }
 Finding = { id, severity:"low"|"medium"|"high"|"critical", title, body, file,
   line_start, line_end, confidence, recommendation, lenses:[], models:[], agreement,

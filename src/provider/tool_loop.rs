@@ -20,8 +20,12 @@ pub enum ChatMessage {
 pub struct AssistantTurn {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    /// 计费输入总量（各家已归一为「总输入」：OpenAI/DeepSeek 的 prompt_tokens 本含 cached，
+    /// Anthropic 侧 parse 时把 cache_read+cache_creation 加回，见 parse_anthropic_turn）。
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 命中缓存读的输入量（享折扣，是 input_tokens 的子集）。实付全价 ≈ input − cached。
+    pub cached_input_tokens: u64,
 }
 
 /// 单轮往返抽象：给定历史 + 工具声明，返回模型这一轮的输出。
@@ -64,6 +68,7 @@ pub async fn run_tool_loop(
     ];
     let mut in_tok = 0u64;
     let mut out_tok = 0u64;
+    let mut cached_tok = 0u64;
 
     for _ in 0..max_iters {
         let turn = crate::provider::retry_classified(retry_budget, || async {
@@ -75,6 +80,7 @@ pub async fn run_tool_loop(
         }).await?;
         in_tok += turn.input_tokens;
         out_tok += turn.output_tokens;
+        cached_tok += turn.cached_input_tokens;
 
         if turn.tool_calls.is_empty() {
             let out = parse_lens_output(&turn.text)?;
@@ -82,6 +88,7 @@ pub async fn run_tool_loop(
                 findings: out.findings,
                 input_tokens: in_tok,
                 output_tokens: out_tok,
+                cached_input_tokens: cached_tok,
             });
         }
 
@@ -107,11 +114,13 @@ pub async fn run_tool_loop(
     }).await?;
     in_tok += turn.input_tokens;
     out_tok += turn.output_tokens;
+    cached_tok += turn.cached_input_tokens;
     let out = parse_lens_output(&turn.text)?;
     Ok(LensCall {
         findings: out.findings,
         input_tokens: in_tok,
         output_tokens: out_tok,
+        cached_input_tokens: cached_tok,
     })
 }
 
@@ -214,7 +223,7 @@ mod tests {
     const FINDINGS_JSON: &str = r#"{"findings":[{"severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}]}"#;
 
     fn final_turn(text: &str) -> AssistantTurn {
-        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1 }
+        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 }
     }
 
     fn toolcall_turn(name: &str, args: serde_json::Value) -> AssistantTurn {
@@ -223,6 +232,7 @@ mod tests {
             tool_calls: vec![ToolCall { id: "c1".into(), name: name.into(), args }],
             input_tokens: 2,
             output_tokens: 3,
+            cached_input_tokens: 0,
         }
     }
 
@@ -338,7 +348,7 @@ mod tests {
             Ok(AssistantTurn {
                 text: String::new(),
                 tool_calls: vec![ToolCall { id: "c1".into(), name: "read_file".into(), args: json!({"path":"a.rs"}) }],
-                input_tokens: 1, output_tokens: 1,
+                input_tokens: 1, output_tokens: 1, cached_input_tokens: 0,
             })
         }
         async fn turn_final(&self, _m: &[ChatMessage]) -> Result<AssistantTurn, ProviderError> {

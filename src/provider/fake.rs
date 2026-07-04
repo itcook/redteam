@@ -16,7 +16,7 @@ impl FakeProvider {
 impl ReviewProvider for FakeProvider {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError> {
         match self.scripted.get(&req.model) {
-            Some(fs) => Ok(LensCall { findings: fs.clone(), input_tokens: 0, output_tokens: 0 }),
+            Some(fs) => Ok(LensCall { findings: fs.clone(), input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 }),
             None => Err(ProviderError::Unavailable(format!("no script for model {}", req.model))),
         }
     }

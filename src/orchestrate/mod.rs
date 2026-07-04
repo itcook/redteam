@@ -43,7 +43,7 @@ pub struct RawResults {
     pub findings: Vec<Finding>,
     pub warnings: Vec<String>,
     pub failed_models: Vec<String>,
-    pub usage: (u64, u64),
+    pub usage: (u64, u64, u64), // (input, output, cached_input)
 }
 
 /// R8.1：quote 去除全部空白（保大小写）——token 序列即身份，免疫 reformat。
@@ -101,7 +101,7 @@ fn top_priority_model(opts: &OrchestrateOpts) -> String {
 struct CellRun {
     model: String, // 胜出 model；整链失败为空
     findings: Vec<Finding>,
-    tokens: (u64, u64),
+    tokens: (u64, u64, u64), // (input, output, cached_input)
     duration_ms: u64,
     attempts: u32,
     warn: Option<String>,
@@ -120,6 +120,7 @@ impl CellRun {
             duration_ms: self.duration_ms,
             input_tokens: self.tokens.0,
             output_tokens: self.tokens.1,
+            cached_input_tokens: self.tokens.2,
             attempts: self.attempts,
         }
     }
@@ -153,7 +154,7 @@ async fn run_one_bundle(
                     .collect();
                 return CellRun {
                     model: pm.name.clone(), findings: fs,
-                    tokens: (call.input_tokens, call.output_tokens),
+                    tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                     duration_ms: t0.elapsed().as_millis() as u64,
                     attempts: i as u32 + 1, warn: None,
                 };
@@ -162,7 +163,7 @@ async fn run_one_bundle(
         }
     }
     CellRun {
-        model: String::new(), findings: vec![], tokens: (0, 0),
+        model: String::new(), findings: vec![], tokens: (0, 0, 0),
         duration_ms: t0.elapsed().as_millis() as u64,
         attempts: chain.len() as u32, warn: Some(errs.join("; ")),
     }
@@ -238,7 +239,7 @@ pub async fn run_code_fanout(
         let mut out = RawResults::default();
         for (model_hint, run) in results {
             out.usage.0 += run.tokens.0;
-            out.usage.1 += run.tokens.1;
+            out.usage.1 += run.tokens.1; out.usage.2 += run.tokens.2;
             match run.warn {
                 None => out.findings.extend(run.findings),
                 Some(warn) => {
@@ -281,7 +282,7 @@ pub async fn run_code_fanout(
         let mut out = RawResults::default();
         for run in results {
             out.usage.0 += run.tokens.0;
-            out.usage.1 += run.tokens.1;
+            out.usage.1 += run.tokens.1; out.usage.2 += run.tokens.2;
             match run.warn {
                 None => out.findings.extend(run.findings),
                 Some(warn) => out.warnings.push(warn),
@@ -315,7 +316,7 @@ async fn run_one_doc(
                 let fs = call.findings.iter().map(|r| enrich(r, "doc", &pm.name)).collect();
                 return CellRun {
                     model: pm.name.clone(), findings: fs,
-                    tokens: (call.input_tokens, call.output_tokens),
+                    tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                     duration_ms: t0.elapsed().as_millis() as u64,
                     attempts: i as u32 + 1, warn: None,
                 };
@@ -324,7 +325,7 @@ async fn run_one_doc(
         }
     }
     CellRun {
-        model: String::new(), findings: vec![], tokens: (0, 0),
+        model: String::new(), findings: vec![], tokens: (0, 0, 0),
         duration_ms: t0.elapsed().as_millis() as u64,
         attempts: chain.len() as u32, warn: Some(errs.join("; ")),
     }
@@ -386,7 +387,7 @@ pub async fn run_doc_fanout(
         let mut out = RawResults::default();
         for (model_hint, run) in results {
             out.usage.0 += run.tokens.0;
-            out.usage.1 += run.tokens.1;
+            out.usage.1 += run.tokens.1; out.usage.2 += run.tokens.2;
             match run.warn {
                 None => out.findings.extend(run.findings),
                 Some(warn) => {
@@ -415,7 +416,7 @@ pub async fn run_doc_fanout(
             s.on_cell(run.to_record(cell_id, ""));
         }
         out.usage.0 += run.tokens.0;
-        out.usage.1 += run.tokens.1;
+        out.usage.1 += run.tokens.1; out.usage.2 += run.tokens.2;
         match run.warn {
             None => out.findings.extend(run.findings),
             Some(warn) => out.warnings.push(warn),
@@ -485,7 +486,7 @@ mod tests {
             self.max_seen.fetch_max(cur, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             self.inflight.fetch_sub(1, Ordering::SeqCst);
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0 })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 })
         }
     }
 
@@ -700,7 +701,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                 self.slow_done.store(true, Ordering::SeqCst);
             }
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0 })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 })
         }
     }
 
@@ -763,13 +764,13 @@ mod tests {
         // good：一轮直接产最终 findings
         let good = ToolLoopProvider::new(
             Box::new(FakeChatBackend::new(vec![AssistantTurn {
-                text: good_json.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1 }])),
+                text: good_json.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 }])),
             dir.path().to_path_buf());
         // bad：先 tool_call（iter1），再一路 Timeout（iter2 重试耗尽仍失败）。
         // DEFAULT_RETRY_BUDGET=2 → iter2 需 3 次 Err（首发+2 重试）→ 备 1 Ok + 3 Err。
         let tc = AssistantTurn { text: String::new(),
             tool_calls: vec![ToolCall { id: "c".into(), name: "read_file".into(), args: json!({"path":"a.rs"}) }],
-            input_tokens: 1, output_tokens: 1 };
+            input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 };
         let bad = ToolLoopProvider::new(
             Box::new(FakeChatBackend::new_results(vec![
                 Ok(tc),

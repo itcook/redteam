@@ -86,6 +86,11 @@ fn render_md(r: &ReviewReport) -> String {
     s.push_str(&format!("  | Duration      | ≈ {:.1} mins |\n", r.run.duration_ms as f64 / 60_000.0));
     s.push_str(&format!("  | Input Tokens  | {} |\n", human_tokens(r.run.usage.input_tokens)));
     s.push_str(&format!("  | Output Tokens | {} |\n", human_tokens(r.run.usage.output_tokens)));
+    // L1 缓存观测：命中读量占总输入的比例（实付全价 ≈ input − cached）。cached=0 且 input 大
+    // = 未命中或该 provider 缓存字段未知，如实显示不掩盖。
+    let cached = r.run.usage.cached_input_tokens;
+    let pct = if r.run.usage.input_tokens > 0 { cached * 100 / r.run.usage.input_tokens } else { 0 };
+    s.push_str(&format!("  | Cached Input  | {} ({pct}%) |\n", human_tokens(cached)));
     if let Some(l) = &r.run.ledger {
         s.push_str(&format!("  | Ledger        | {} card(s) from {} |\n", l.loaded, l.source));
     }
@@ -193,7 +198,7 @@ mod tests {
         r.run.model_ids = vec!["deepseek-v4".into(), "kimi-k2".into()];
         r.run.failed_models = vec!["Kimi".into()];
         r.run.duration_ms = 528_000;
-        r.run.usage = Usage { input_tokens: 2_620_877, output_tokens: 87_187 };
+        r.run.usage = Usage { input_tokens: 2_620_877, output_tokens: 87_187, cached_input_tokens: 1_310_439 };
         r.run.ledger = Some(LedgerMeta { loaded: 53, source: ".redteam/proj.db".into() });
         r.run.warnings = vec!["w-one".into()];
         let s = render(&r, Format::Md);
@@ -203,6 +208,7 @@ mod tests {
         assert!(s.contains("`2620877` (2.62M)"), "input token 自适应缩写(无裸管道符): {s}");
         assert!(s.contains("`87187` (87.19K)"), "output token 缩写: {s}");
         assert!(s.contains("53 card(s) from .redteam/proj.db"), "ledger 披露: {s}");
+        assert!(s.contains("Cached Input") && s.contains("(50%)"), "缓存命中率(1310438/2620877≈50%): {s}");
         assert!(s.contains("- W1: w-one"), "{s}");
     }
     #[test]

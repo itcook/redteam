@@ -41,7 +41,14 @@ impl Stats {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
-pub struct Usage { pub input_tokens: u64, pub output_tokens: u64 }
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// 命中缓存读的输入量（input_tokens 子集）；实付全价 ≈ input − cached。跨 provider 归一，
+    /// 缺失/未知字段记 0（可观测：cached=0 且 input 大 = 未命中或字段未知）。L1 缓存观测。
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+}
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct RunMeta {

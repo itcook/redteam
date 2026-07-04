@@ -32,6 +32,9 @@ pub struct CellRecord {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// 命中缓存读的输入量（input_tokens 子集，L1 缓存观测）；缺失/未知记 0。
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     /// 候补链实际尝试的 model 数（成功=第几家成功；整链失败=链长）。
     #[serde(default)]
     pub attempts: u32,
@@ -42,7 +45,7 @@ impl CellRecord {
     pub fn ok(cell: impl Into<String>, model: impl Into<String>, findings: Vec<crate::domain::Finding>) -> Self {
         Self {
             cell: cell.into(), model: model.into(), ok: true, findings, warn: None,
-            duration_ms: 0, input_tokens: 0, output_tokens: 0, attempts: 0,
+            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0,
         }
     }
 }
@@ -126,7 +129,7 @@ mod tests {
 
     fn rec(cell: &str, ok: bool) -> CellRecord {
         CellRecord { cell: cell.into(), model: "m".into(), ok, findings: vec![], warn: None,
-            duration_ms: 0, input_tokens: 0, output_tokens: 0, attempts: 0 }
+            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0 }
     }
 
     #[test]

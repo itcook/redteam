@@ -61,6 +61,23 @@ pub(crate) fn build_anthropic_tools_body(
         body.insert("system".into(), json!(system));
     }
     body.insert("tools".into(), json!(tool_decls));
+    // L1 缓存：最后一个 message 的最后一个 content block 打 ephemeral 断点——前缀顺序
+    // tools→system→messages，断点在 messages 末尾即缓存整个前缀（tools+system+全部历史）。
+    // tool-loop append-only 确定性渲染，前缀天然稳定：每轮把断点移到新末尾，命中前一轮写的前缀、
+    // 只付增量写入，13 轮对话输入成本理论折减 ~80-90%（5min TTL 覆盖 cell 内轮间隔）。
+    // 当前三 provider 全 openai kind，此 body 走不到；为将来配 Anthropic 直连即生效而备。
+    if let Some(last) = msgs.last_mut() {
+        let is_string = last.get("content").map(Value::is_string).unwrap_or(false);
+        if is_string {
+            // User 消息 content 是裸 string → 转带 cache_control 的 text block 数组
+            let text = last["content"].as_str().unwrap_or("").to_string();
+            last["content"] = json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+        } else if let Some(Value::Array(blocks)) = last.get_mut("content") {
+            if let Some(obj) = blocks.last_mut().and_then(Value::as_object_mut) {
+                obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+            }
+        }
+    }
     body.insert("messages".into(), json!(msgs));
     Value::Object(body)
 }
@@ -87,9 +104,15 @@ pub(crate) fn parse_anthropic_turn(resp: &Value) -> Option<AssistantTurn> {
             _ => {}
         }
     }
-    let input_tokens = resp["usage"]["input_tokens"].as_u64().unwrap_or(0);
-    let output_tokens = resp["usage"]["output_tokens"].as_u64().unwrap_or(0);
-    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens })
+    // Anthropic 归一：usage.input_tokens 是「未缓存新输入」，cache_read/cache_creation 分列不含在内。
+    // 加回合成「总输入」，与 OpenAI/DeepSeek 的 prompt_tokens（本含 cached）语义对齐。
+    let u = &resp["usage"];
+    let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let cache_creation = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    let input_tokens = u["input_tokens"].as_u64().unwrap_or(0) + cache_read + cache_creation;
+    let output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
+    let cached_input_tokens = cache_read;
+    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens, cached_input_tokens })
 }
 
 /// 直连 Anthropic 的 ChatBackend（rustls-only，沿用 direct.rs 的 HTTP 形状）。
@@ -220,9 +243,17 @@ pub(crate) fn parse_openai_turn(resp: &Value) -> Option<AssistantTurn> {
             });
         }
     }
-    let input_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
-    let output_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens })
+    let u = &resp["usage"];
+    let input_tokens = u["prompt_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = u["completion_tokens"].as_u64().unwrap_or(0);
+    // 缓存命中量 fallback 链（同协议多方言）：OpenAI 嵌套 → DeepSeek top-level → Kimi/通用 top-level。
+    // 全不中记 0（可观测缺失：cached=0 且 input 大 = 未命中或字段未知，不假装省钱）。prompt_tokens
+    // 本含 cached，input_tokens 已是「总输入」，无需加法（区别于 Anthropic）。
+    let cached_input_tokens = u["prompt_tokens_details"]["cached_tokens"].as_u64()
+        .or_else(|| u["prompt_cache_hit_tokens"].as_u64())
+        .or_else(|| u["cached_tokens"].as_u64())
+        .unwrap_or(0);
+    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens, cached_input_tokens })
 }
 
 /// 直连 OpenAI 兼容端点的 ChatBackend。
@@ -321,9 +352,28 @@ mod tests {
         // tools 用 input_schema（Anthropic 协议字段名）
         assert_eq!(b["tools"][0]["name"], "read_file");
         assert!(b["tools"][0]["input_schema"].is_object());
-        // system 不进 messages；user 进
+        // system 不进 messages；user 进。L1 缓存：末条 message 的 content 转为带 ephemeral
+        // 断点的 text block 数组（裸 string User 消息形态）。
         assert_eq!(b["messages"][0]["role"], "user");
-        assert_eq!(b["messages"][0]["content"], "review");
+        assert_eq!(b["messages"][0]["content"][0]["text"], "review");
+        assert_eq!(b["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    // L1 缓存：多轮场景末条是 tool_result（block 数组）→ 其最后一个 block 打 ephemeral 断点，
+    // 非尾 message 不受影响。
+    #[test]
+    fn anthropic_body_caches_last_content_block_on_toolresult_tail() {
+        let msgs = vec![
+            ChatMessage::User("review".into()),
+            ChatMessage::ToolResults(vec![crate::tools::ToolResult { id: "tu1".into(), content: "file body".into() }]),
+        ];
+        let b = build_anthropic_tools_body("claude-x", &msgs, &specs(), MAX_TOKENS);
+        let tail = &b["messages"][1]["content"];
+        let n = tail.as_array().unwrap().len();
+        assert_eq!(tail[n - 1]["cache_control"]["type"], "ephemeral", "尾 block 打断点: {b}");
+        assert_eq!(tail[n - 1]["content"], "file body", "断点不破坏原 tool_result 内容: {b}");
+        // 非尾 message（User）不受影响，仍是裸 string
+        assert_eq!(b["messages"][0]["content"], "review", "非尾 message 不打断点: {b}");
     }
 
     // I1 回归：system 为空时 Anthropic 请求体中不应含 "system" 键。
@@ -516,6 +566,39 @@ mod tests {
     #[test]
     fn parse_openai_missing_choices_is_none() {
         assert!(parse_openai_turn(&json!({ "id": "x" })).is_none());
+    }
+
+    #[test]
+    fn parse_openai_cached_tokens_fallback_chain() {
+        // OpenAI 标准嵌套路径
+        let oa = json!({ "choices": [{ "message": { "content": "{}" } }],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 5,
+                       "prompt_tokens_details": { "cached_tokens": 40 } } });
+        assert_eq!(parse_openai_turn(&oa).unwrap().cached_input_tokens, 40);
+        // DeepSeek top-level（prompt_tokens 本含 cached，input_tokens 不加法）
+        let ds = json!({ "choices": [{ "message": { "content": "{}" } }],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 5, "prompt_cache_hit_tokens": 70 } });
+        let t = parse_openai_turn(&ds).unwrap();
+        assert_eq!((t.input_tokens, t.cached_input_tokens), (100, 70));
+        // Kimi/通用 top-level cached_tokens 兜底
+        let km = json!({ "choices": [{ "message": { "content": "{}" } }],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 5, "cached_tokens": 25 } });
+        assert_eq!(parse_openai_turn(&km).unwrap().cached_input_tokens, 25);
+        // 无缓存字段 → 记 0（可观测缺失，不假装省钱）
+        let none = json!({ "choices": [{ "message": { "content": "{}" } }],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 5 } });
+        assert_eq!(parse_openai_turn(&none).unwrap().cached_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_anthropic_cached_normalizes_total_input() {
+        // Anthropic：input_tokens 是「未缓存新输入」，cache_read/creation 分列——归一为总输入。
+        let resp = json!({ "content": [{ "type": "text", "text": "hi" }],
+            "usage": { "input_tokens": 30, "output_tokens": 20,
+                       "cache_read_input_tokens": 60, "cache_creation_input_tokens": 10 } });
+        let t = parse_anthropic_turn(&resp).unwrap();
+        // 总输入 = 30 + 60 + 10 = 100；命中读 = 60
+        assert_eq!((t.input_tokens, t.cached_input_tokens, t.output_tokens), (100, 60, 20));
     }
 
     #[test]

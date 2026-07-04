@@ -11,7 +11,7 @@ use async_trait::async_trait;
 pub struct LensRequest { pub model: String, pub prompt: String }
 
 #[derive(Clone, Debug)]
-pub struct LensCall { pub findings: Vec<RawFinding>, pub input_tokens: u64, pub output_tokens: u64 }
+pub struct LensCall { pub findings: Vec<RawFinding>, pub input_tokens: u64, pub output_tokens: u64, pub cached_input_tokens: u64 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProviderError {
