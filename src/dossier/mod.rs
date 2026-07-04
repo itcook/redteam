@@ -1,10 +1,6 @@
 //! 卷宗引擎（M14 支柱 2）：diff → 改动符号 → 仓内引用点 → 事实卷宗字符串。
 //! hermetic：喂 (bundle, root) 出字符串，零 LLM。移植自 eval/harness.py（查全 1.000）。
 
-// ponytail: 2-A 引擎自底向上构建，wiring 前内部项仅被测试引用 → dead_code 假阳。
-// Task 10 接线（build_dossier 进 cli）后全链可达，届时删除此 allow 并验证零警告。
-#![allow(dead_code)]
-
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::SearcherBuilder;
