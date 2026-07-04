@@ -106,14 +106,14 @@ fn block_end(lines: &[&str], i: usize) -> usize {
 /// line0（0-based）的最内层外围 def 名：向上首个「块覆盖 line0」的 def。
 /// impl/for 头非 def，天然穿透到内层 fn（照 D5 简化：只取名，不分类 impl_trait）。
 /// ponytail: 每候选行调 block_end = O(n²) 最坏；单文件几千行够用，热点再优化
-fn innermost_enclosing_def(lines: &[&str], line0: usize, defs: &[(&'static str, Regex)]) -> Option<String> {
+fn innermost_enclosing_def(lines: &[&str], line0: usize, defs: &[(&'static str, Regex)]) -> Option<(&'static str, String)> {
     if lines.is_empty() {
         return None;
     }
     for i in (0..=line0.min(lines.len().saturating_sub(1))).rev() {
-        if let Some((_, name)) = match_def(lines[i], defs) {
+        if let Some(kd) = match_def(lines[i], defs) {
             if i == line0 || block_end(lines, i) >= line0 {
-                return Some(name);
+                return Some(kd);
             }
         }
     }
@@ -146,14 +146,14 @@ pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'s
     let mut new_line = 0usize; // 当前 + / 上下文行的新文件行号（1-based）
     let mut hunk_anchor: Option<usize> = None; // 本 hunk 首个改动行（0-based）
     for raw in diff.lines() {
-        if raw.starts_with("+++") || raw.starts_with("---") {
+        if raw.starts_with("+++ ") || raw.starts_with("--- ") {
             continue;
         }
         if raw.starts_with("@@") {
             // 上一 hunk 收尾：外围 def
             if let Some(a) = hunk_anchor.take() {
-                if let Some(n) = innermost_enclosing_def(file_lines, a, defs) {
-                    push(n, "fn", &mut out, &mut seen);
+                if let Some((kind, n)) = innermost_enclosing_def(file_lines, a, defs) {
+                    push(n, kind, &mut out, &mut seen);
                 }
             }
             new_line = parse_hunk_new_start(raw).unwrap_or(1);
@@ -175,8 +175,8 @@ pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'s
         }
     }
     if let Some(a) = hunk_anchor.take() {
-        if let Some(n) = innermost_enclosing_def(file_lines, a, defs) {
-            push(n, "fn", &mut out, &mut seen);
+        if let Some((kind, n)) = innermost_enclosing_def(file_lines, a, defs) {
+            push(n, kind, &mut out, &mut seen);
         }
     }
     out
@@ -230,7 +230,7 @@ mod tests {
         let d = rust_defs();
         // impl 头非 def，穿透到内层 fn；改动落在 bar 体内 → 外围是 bar
         let src: Vec<&str> = "impl Foo {\n    fn bar(&self) {\n        let z = 1;\n    }\n}".lines().collect();
-        assert_eq!(innermost_enclosing_def(&src, 2, &d), Some("bar".into()));
+        assert_eq!(innermost_enclosing_def(&src, 2, &d), Some(("fn", "bar".into())));
         // 落在两 fn 之间的空行 → 无外围
         let src2: Vec<&str> = "fn a() {}\n\nfn b() {}".lines().collect();
         assert_eq!(innermost_enclosing_def(&src2, 1, &d), None);
@@ -261,6 +261,15 @@ mod tests {
         let diff = "@@ -1,0 +2,3 @@\n+fn added() {\n+    work();\n+}\n";
         let syms = symbols_in_file(diff, &file, "src/y.rs", &d);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"added"), "新增 def 行进符号集；实得 {names:?}");
+        assert_eq!(names, vec!["added"], "只此一个改动符号");
+    }
+
+    #[test]
+    fn symbols_enclosing_kind_is_real_not_always_fn() {
+        let d = rust_defs();
+        let file: Vec<&str> = "struct Config {\n    a: u8,\n    b: u8,\n}".lines().collect();
+        let diff = "@@ -2,0 +3,1 @@\n+    b: u8,\n";
+        let syms = symbols_in_file(diff, &file, "src/c.rs", &d);
+        assert_eq!(syms, vec![ChangedSym { name: "Config".into(), kind: "struct", file: "src/c.rs".into() }]);
     }
 }
