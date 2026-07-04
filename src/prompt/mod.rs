@@ -222,7 +222,6 @@ pub fn render_incremental_section(
     two_layer_manifest: &str,
     claimed: &[crate::db::ResolveCard],
 ) -> String {
-
     const CLAIMED_TOTAL_CHARS: usize = 6000;
     let mut list = String::new();
     let mut listed = 0usize;
