@@ -79,6 +79,44 @@ fn match_def(line: &str, defs: &[(&'static str, Regex)]) -> Option<(&'static str
     None
 }
 
+/// 从 0-based def 行 i 起括号配平找块尾行（0-based）；无块（; 结尾）返回 i。
+fn block_end(lines: &[&str], i: usize) -> usize {
+    let mut depth: i32 = 0;
+    let mut seen_open = false;
+    // ponytail: 上限 4000 行护栏（照 harness.py），超大函数罕见，够用
+    for j in i..(i + 4000).min(lines.len()) {
+        for ch in lines[j].chars() {
+            if ch == '{' {
+                depth += 1;
+                seen_open = true;
+            } else if ch == '}' {
+                depth -= 1;
+            }
+        }
+        if seen_open && depth <= 0 {
+            return j;
+        }
+        if !seen_open && lines[j].trim_end().ends_with(';') {
+            return j;
+        }
+    }
+    i
+}
+
+/// line0（0-based）的最内层外围 def 名：向上首个「块覆盖 line0」的 def。
+/// impl/for 头非 def，天然穿透到内层 fn（照 D5 简化：只取名，不分类 impl_trait）。
+/// ponytail: 每候选行调 block_end = O(n²) 最坏；单文件几千行够用，热点再优化
+fn innermost_enclosing_def(lines: &[&str], line0: usize, defs: &[(&'static str, Regex)]) -> Option<String> {
+    for i in (0..=line0.min(lines.len().saturating_sub(1))).rev() {
+        if let Some((_, name)) = match_def(lines[i], defs) {
+            if i == line0 || block_end(lines, i) >= line0 {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +151,23 @@ mod tests {
         assert!(lang_for("a.tsx").is_some());
         assert!(lang_for("a.js").is_some());
         assert!(lang_for("a.py").is_none(), "非支持语言降级");
+    }
+
+    #[test]
+    fn block_end_balances_braces() {
+        let src: Vec<&str> = "fn a() {\n    if x {\n        y();\n    }\n}\nfn b() {}".lines().collect();
+        assert_eq!(block_end(&src, 0), 4, "fn a 的块尾在第 5 行(0based 4)");
+        assert_eq!(block_end(&src, 5), 5, "fn b 单行块");
+    }
+
+    #[test]
+    fn innermost_enclosing_walks_up() {
+        let d = rust_defs();
+        // impl 头非 def，穿透到内层 fn；改动落在 bar 体内 → 外围是 bar
+        let src: Vec<&str> = "impl Foo {\n    fn bar(&self) {\n        let z = 1;\n    }\n}".lines().collect();
+        assert_eq!(innermost_enclosing_def(&src, 2, &d), Some("bar".into()));
+        // 落在两 fn 之间的空行 → 无外围
+        let src2: Vec<&str> = "fn a() {}\n\nfn b() {}".lines().collect();
+        assert_eq!(innermost_enclosing_def(&src2, 1, &d), None);
     }
 }
