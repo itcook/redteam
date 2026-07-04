@@ -144,7 +144,7 @@ mod tests {
                 file:"a.rs".into(),line_start:3,line_end:5,confidence:0.9,recommendation:"fix".into(),
                 lenses:vec!["L1".into()],models:vec!["claude".into()],agreement:1,hard_constraint:false,
                 quote:"snippet".into(),cluster_id:None,verify:None,previously_dismissed:false}],
-            clusters:vec![], next_steps:vec![], run:RunMeta::default() }
+            clusters:vec![], run:RunMeta::default() }
     }
     #[test]
     fn json_contains_verdict_and_provenance() {

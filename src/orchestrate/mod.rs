@@ -683,7 +683,7 @@ mod tests {
 
     // T5 Important 回归：checkpoint 现在是流式的——on_cell 必须在每个 cell 自己的 future
     // 内部即时触发，而不是等 join_all 收齐全部结果后才批量回调（旧实现下进程中途被杀，
-    // 已完成的 cell 也会因为还没来得及回调而在 partial.ndjson 里全部丢失）。
+    // 已完成的 cell 也会因为还没来得及回调而在 proj.db 的 cell checkpoint 里全部丢失）。
     //
     // 用一慢一快两个 bundle 验证时序：慢 cell（src/slow.rs）的 provider 调用故意 sleep，
     // 快 cell（src/fast.rs）立即返回。若 on_cell 仍是旧的「join_all 之后统一回调」，快 cell

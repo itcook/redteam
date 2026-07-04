@@ -80,7 +80,6 @@ pub struct ReviewReport {
     pub stats: Stats,
     pub findings: Vec<Finding>,
     pub clusters: Vec<Cluster>,
-    pub next_steps: Vec<String>,
     pub run: RunMeta,
 }
 

@@ -44,17 +44,18 @@ enum Cmd {
         /// 逗号分隔的 lens 集，缺省按 mode 取内置全集。
         #[arg(long)]
         lenses: Option<String>,
-        /// 逗号分隔的 model 名（依配置 priority 组候补链）；缺省用配置的 default_models。
+        /// 逗号分隔的 model 名，每个各评一遍（复评提升 agreement 信号，计费随模型数翻倍）；
+        /// 缺省用配置的 default_models，全空时才按 priority 组候补链取一。
         #[arg(long)]
         models: Option<String>,
         /// 所有已配置 model 各评一遍（复评提升 agreement 信号），而非候补链取一。
         #[arg(long)]
         models_all: bool,
-        /// 跳过跨 finding 关联分析（不产出 clusters）。
+        /// 跳过跨 finding 关联分析（仅 doc 模式；关联分析当前为未实现 stub，恒不产出 clusters）。
         #[arg(long)]
         no_correlate: bool,
         /// verdict 阻断阈值：low | medium（默认）| high | critical——达到即 reject。
-        #[arg(long)]
+        #[arg(long, value_parser = ["low", "medium", "high", "critical"])]
         block_threshold: Option<String>,
         /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定，但仍保留在报告中。
         #[arg(long)]
@@ -63,7 +64,7 @@ enum Cmd {
         #[arg(long)]
         background: bool,
         /// 输出格式：json（默认）| md。
-        #[arg(long, default_value = "json")]
+        #[arg(long, default_value = "json", value_parser = ["json", "md"])]
         format: String,
         /// R2.3：补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
         /// （原始 mode/targets/models 等从该作业落盘的 args.json 里重建）。
@@ -83,7 +84,7 @@ enum Cmd {
     Status {
         job_id: Option<String>,
         /// 输出格式：json（默认，机读契约）| table（人读）
-        #[arg(long, default_value = "json")]
+        #[arg(long, default_value = "json", value_parser = ["json", "table"])]
         format: String,
         /// 输出该 job 的 cell 级明细（JSON 数组：duration_ms/tokens/attempts/warn，调试用）。
         #[arg(long)]
@@ -94,7 +95,7 @@ enum Cmd {
     Result {
         job_id: String,
         /// 输出格式：json（默认）| md。
-        #[arg(long, default_value = "json")]
+        #[arg(long, default_value = "json", value_parser = ["json", "md"])]
         format: String,
     },
     /// 取消 running/pending 作业（发 SIGTERM）。
@@ -147,10 +148,10 @@ enum DismissCmd {
     /// 列卡（默认全状态）。
     List {
         /// 按状态过滤：dismissed | re-upheld | human-confirmed | withdrawn | stale。
-        #[arg(long)]
+        #[arg(long, value_parser = redteam::db::STATUSES.to_vec())]
         status: Option<String>,
         /// 输出格式：table（默认，人读）| json。
-        #[arg(long, default_value = "table")]
+        #[arg(long, default_value = "table", value_parser = ["table", "json"])]
         format: String,
     },
     /// 单卡详情 + 全部历史事件。
@@ -199,7 +200,7 @@ enum ModelCmd {
         #[arg(long)]
         priority: Option<i32>,
         /// key 去处：env(默认，打印 export) | secrets(写 secrets.toml chmod 600)
-        #[arg(long, default_value = "env")]
+        #[arg(long, default_value = "env", value_parser = ["env", "secrets"])]
         key_store: String,
     },
     /// 列已配置 provider + 可用性 + 配置位置。
@@ -266,8 +267,8 @@ fn load_config_warned() -> Config {
 }
 
 /// Fix 1（final-review）：`redteam result` 在任一终态（Done|Failed|TimedOut|Cancelled）都应放行——
-/// 失败/超时路径经 `write_partial_result` 落了带 `verdict: incomplete` 的 result.json（ship 协议
-/// §2.4 依赖取到它），不该被 Failed/TimedOut 一律拦成 "not done"。门槛统一为「终态 + 文件存在」；
+/// 失败/超时路径经 `write_partial_result` 落了带 `verdict: incomplete` 的 result 记录（ship 协议
+/// §2.4 依赖取到它），不该被 Failed/TimedOut 一律拦成 "not done"。门槛统一为「终态 + proj.db 有 result 记录」；
 /// 非终态（Pending/Running）或文件缺失，行为不变（沿用既有报错文案）。
 /// 抽成纯函数便于单测，避免每条分支都要拉起子进程。
 fn resolve_result(
@@ -407,7 +408,7 @@ async fn main() {
                 resume: None, dismissed, no_dismissed,
             };
 
-            // 后台：写 pending + args 文件 → spawn detached worker → 打印 job-id 退出。
+            // 后台：写 pending state + args 快照（proj.db）→ spawn detached worker → 打印 job-id 退出。
             if background {
                 let ws = cwd.clone();
                 let job_id = gen_job_id(&cwd);

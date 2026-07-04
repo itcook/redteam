@@ -247,9 +247,7 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
     };
     clamp_compliance(&mut findings);
     let clusters = if ctx.mode == Mode::Doc {
-        if ctx.correlate_on {
-            if let Some(s) = ctx.sink { s.on_phase(crate::state::job::Phase::Correlate, None); }
-        }
+        // correlate 当前为未实现 stub（恒空），不打 phase——待其真正接 LLM 调用时再加时间线点。
         let lead_model = ctx.model_names.first().cloned().unwrap_or_default();
         let clusters = correlate(ctx.provider, &lead_model, &findings, ctx.correlate_on).await;
         apply_clusters(&mut findings, &clusters);
@@ -283,7 +281,6 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
         stats,
         findings,
         clusters,
-        next_steps: vec![],
         run: RunMeta {
             job_id: ctx.job_id,
             models: ctx.model_names,
@@ -581,7 +578,7 @@ impl CellSink for JobCellSink {
     }
 }
 
-/// R2.2：失败/超时时从 `<id>.partial.ndjson` 里已 checkpoint 的 findings 组一份 `incomplete`
+/// R2.2：失败/超时时从 proj.db 的 cell checkpoint 里已完成的 findings 组一份 `incomplete`
 /// 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。M 取 manifest 行数（若尚未
 /// 写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
 fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) -> (ReviewReport, i32) {
@@ -603,7 +600,6 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
         stats,
         findings,
         clusters: vec![],
-        next_steps: vec![],
         run: RunMeta {
             job_id: job_id.to_string(),
             models: vec![],

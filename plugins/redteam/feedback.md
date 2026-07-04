@@ -20,7 +20,7 @@
 ### ReviewReport schema(jq 依据)
 ```
 { schema_version, mode:"code"|"doc", verdict:"approve"|"reject"|"incomplete",
-  stats:{critical,high,medium,low,total}, findings:[Finding], clusters, next_steps,
+  stats:{critical,high,medium,low,total}, findings:[Finding], clusters,
   run:{ job_id, models:[], lenses:[], duration_ms, usage, warnings:[], failed_models:[],
         dismissed_reappeared:[]  // 空时该键被省略 } }
 Finding = { id, severity:"low"|"medium"|"high"|"critical", title, body, file,

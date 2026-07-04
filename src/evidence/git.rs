@@ -89,7 +89,7 @@ pub fn collect_code(base: Option<&str>, branch_scope: bool) -> anyhow::Result<(S
 }
 
 /// 收集逐文件 diff：branch scope = base...HEAD；working-tree = cached + worktree。
-/// 仅 main 调用（shell git）；单测注入 FileChange，不走此函数。
+/// 仅 run_review_dispatch 调用（真实 shell git）；单测注入 FileChange，不走此函数。
 pub fn changed_files(base: Option<&str>, branch_scope: bool) -> anyhow::Result<Vec<FileChange>> {
     if branch_scope {
         let base = base.ok_or_else(|| anyhow::anyhow!("branch scope requires --base"))?;

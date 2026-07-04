@@ -21,7 +21,6 @@ pub enum Phase {
     Fanout,     // cell 并发执行中（progress.done 推进）
     Finalizing, // 尾段：dedup/correlate/verify/verdict（progress/last_active 静止）
     Refute,     // finalizing 子阶段：targeted refute（LLM 并发；note 带 targets 数）
-    Correlate,  // finalizing 子阶段：主题聚类（LLM；doc 线在 refute 之前）
 }
 
 /// phase 时间线一格（2026-07-03 grill 定案：finalizing 黑盒可观测）。

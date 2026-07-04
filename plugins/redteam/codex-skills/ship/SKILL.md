@@ -35,8 +35,9 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
    - 台账自动生效（proj.db）：豁免既往驳回 + 疑似判例变体强制进 refute 判例裁决——
      不要自己读台账拼 --focus 摘要；用户 $ARGUMENTS 里的 `--focus` 原样透传即可。
    → 记下 job id。轮询 `${CODEX_PLUGIN_ROOT}/bin/redteam status <job>`（间隔约 20-30s），只等**终态**
-     （done / failed / timed_out）。redteam 后台 job 有 40 分钟 wall-clock deadline watchdog（到点自我
+     （done / failed / timed_out / cancelled）。redteam 后台 job 有 40 分钟 wall-clock deadline watchdog（到点自我
      终止并出部分报告），**永不永久卡死**——因此**不要自己判卡死去 cancel**。
+     `cancelled`（外部 `redteam cancel` 中止）→ 视为用户主动中止，停轮、报告用户，不算 approve。
    - `last_active`/`phase` 仅作进度信息（活着/慢/尾段），**不作 cancel 依据**：推理模型的超长单轮
      turn 与 `finalizing` 尾段的 `last_active` 设计上静止，按「心跳停滞 N 分钟」判死会误杀正常慢 job。
    - **轮询期间不改动工作树**（working-tree scope 下评审正在读活文件）。
