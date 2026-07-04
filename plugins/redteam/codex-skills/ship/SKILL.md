@@ -37,9 +37,11 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
      verdict 仍是合并集口径（携带 ∪ 新发），**不要**自己把旧 findings 复述进 --focus。
      **前提：本轮修复已全部 commit（工作树净）**——delta 只含已提交改动。
      doc 模式或 working-tree scope：不加该 flag，照旧全量循环。
-   - **守卫报错处置**（redteam 显式拒跑，不静默降级）：谱系（rebase/reset）/同族/健康基线/无 stamp
-     报错 → 本轮**去掉 `--incremental-from` 改跑全量**，简报注记原因与守卫名；
-     **空 delta 报错**（"empty delta"）→ 按 §停机 停滞守卫处理（空转，停，交用户）。
+   - **守卫报错处置**（redteam 显式拒跑，不静默降级）：谱系（rebase/reset）/同族/健康基线/无 stamp/
+     无持久化 result 报错 → 本轮**去掉 `--incremental-from` 改跑全量**，简报注记原因与守卫名；
+     **空 delta 或 delta 全被噪声过滤报错**（"empty delta" / "all noise-filtered"）→ 按 §停机
+     停滞守卫处理（空转，停，交用户）；**脏工作树报错**（"clean working tree"）→ 停，先处置未
+     提交改动（评审前的修复必须已 commit；改全量并不消除问题）。
    （`--background` 放在全部参数之后——`args_override_self` 语义下后者胜。）
    → 记下 job id（**增量链条的下一环**：本轮 job id 就是下轮 `--incremental-from` 的值）。
    轮询 `${CODEX_PLUGIN_ROOT}/bin/redteam status <job>`（间隔约 20-30s），只等**终态**
@@ -61,9 +63,10 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 1. **分拣**：`verify == refuted` 一般跳过（redteam 已豁免，简报记一笔）。**例外需目检**：
    refute note 是判例引用、或 finding body 明确反驳某条驳回理由的 → 读一眼 note 与 body：
    反驳被正面回应 → 跳过；note 答非所问（打稻草人/复述原理由）→ 该条**照常裁决**，一句话
-   记简报——机器证伪不当剥夺强异议的复裁通道。`previously_dismissed`
-   按台账状态分流（`${CODEX_PLUGIN_ROOT}/bin/redteam dismiss show <id>` 读 status）：
-   `human-confirmed` 或已 `re-upheld` 的静默跳过；仅 `dismissed` 状态的**首次再现**
+   记简报——机器证伪不当剥夺强异议的复裁通道。`run.resolution_disputed` 中的 id 不适用
+   refuted 跳过——即使其 verify=refuted，也按 §3 争议通道处理（销案争议优先于机器证伪）。
+   `previously_dismissed` 按台账状态分流（`${CODEX_PLUGIN_ROOT}/bin/redteam dismiss show
+   <id>` 读 status）：`human-confirmed` 或已 `re-upheld` 的静默跳过；仅 `dismissed` 状态的**首次再现**
    进入刹车链（每 id 至多一次）。
    增量轮报告的 `run.resolution_disputed` 非空 → 这些 id 是「已销案却再现」的假修复信号，
    在 §3 按属实项优先处理。
