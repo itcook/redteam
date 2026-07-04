@@ -20,6 +20,17 @@ pub enum Phase {
     Collecting, // worker 起手，收集证据，fanout 前
     Fanout,     // cell 并发执行中（progress.done 推进）
     Finalizing, // 尾段：dedup/correlate/verify/verdict（progress/last_active 静止）
+    Refute,     // finalizing 子阶段：targeted refute（LLM 并发；note 带 targets 数）
+    Correlate,  // finalizing 子阶段：主题聚类（LLM；doc 线在 refute 之前）
+}
+
+/// phase 时间线一格（2026-07-03 grill 定案：finalizing 黑盒可观测）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PhaseStamp {
+    pub phase: Phase,
+    pub at: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -55,6 +66,9 @@ pub struct JobState {
     pub deadline_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub phase: Option<Phase>,
+    /// phase 转换时间线（append-only；旧 state 缺字段 default 空）。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub phase_history: Vec<PhaseStamp>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub workspace: Option<String>,
 }
@@ -76,8 +90,19 @@ impl JobState {
             last_active: started_at,
             deadline_at: None,
             phase: None,
+            phase_history: vec![],
             workspace: None,
         }
+    }
+
+    /// 设当前 phase 并 append 时间线（所有 phase 赋值点统一走这里，防漏 stamp）。
+    pub fn set_phase(&mut self, phase: Phase, note: Option<String>) {
+        self.phase = Some(phase);
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.phase_history.push(PhaseStamp { phase, at, note });
     }
 }
 
@@ -121,7 +146,7 @@ mod tests {
             started_at: 1000, progress: Progress { done: 1, total: 3 },
             models: vec!["alpha".into()], lenses: vec!["D1".into()],
             pid: Some(4242), exit_code: None, error: None, result_path: None,
-            last_active: 1000, deadline_at: None, phase: None, workspace: None,
+            last_active: 1000, deadline_at: None, phase: None, phase_history: vec![], workspace: None,
         };
         write_state(ws, &st).unwrap();
         let back = read_state(ws, "job1").unwrap();
@@ -206,4 +231,18 @@ mod tests {
         assert_eq!(back.workspace.as_deref(), Some("/Users/x/repo"));
     }
 
+    #[test]
+    fn set_phase_appends_history_with_note() {
+        let mut st = JobState::new("j", 0);
+        st.set_phase(Phase::Fanout, None);
+        st.set_phase(Phase::Refute, Some("9 targets".into()));
+        assert_eq!(st.phase, Some(Phase::Refute));
+        assert_eq!(st.phase_history.len(), 2);
+        assert_eq!(st.phase_history[1].note.as_deref(), Some("9 targets"));
+        assert!(st.phase_history[1].at >= st.phase_history[0].at);
+        // 旧 state（无 phase_history 字段）反序列化零值兼容
+        let old = r#"{"job_id":"x","status":"running","started_at":1}"#;
+        let back: JobState = serde_json::from_str(old).unwrap();
+        assert!(back.phase_history.is_empty());
+    }
 }

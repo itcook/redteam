@@ -17,6 +17,7 @@ pub struct CellInput {
 }
 
 /// partial 每 cell：单个 cell 的执行结果（db 同键覆盖：重试成功覆盖失败记录）。
+/// 运行学字段（duration/tokens/attempts，2026-07-03 grill 定案）serde default——旧记录零值兼容。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CellRecord {
     pub cell: String,
@@ -25,12 +26,24 @@ pub struct CellRecord {
     pub findings: Vec<crate::domain::Finding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warn: Option<String>,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// 候补链实际尝试的 model 数（成功=第几家成功；整链失败=链长）。
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 impl CellRecord {
-    /// 便捷构造：ok=true, warn=None。
+    /// 便捷构造：ok=true, warn=None（运行学字段由调用方按需回填）。
     pub fn ok(cell: impl Into<String>, model: impl Into<String>, findings: Vec<crate::domain::Finding>) -> Self {
-        Self { cell: cell.into(), model: model.into(), ok: true, findings, warn: None }
+        Self {
+            cell: cell.into(), model: model.into(), ok: true, findings, warn: None,
+            duration_ms: 0, input_tokens: 0, output_tokens: 0, attempts: 0,
+        }
     }
 }
 
@@ -112,7 +125,8 @@ mod tests {
     use super::*;
 
     fn rec(cell: &str, ok: bool) -> CellRecord {
-        CellRecord { cell: cell.into(), model: "m".into(), ok, findings: vec![], warn: None }
+        CellRecord { cell: cell.into(), model: "m".into(), ok, findings: vec![], warn: None,
+            duration_ms: 0, input_tokens: 0, output_tokens: 0, attempts: 0 }
     }
 
     #[test]
@@ -150,5 +164,16 @@ mod tests {
         // 结果永不过期：重复读不消费
         assert!(read_result(tmp.path(), "j1").is_some());
         assert!(read_result(tmp.path(), "nope").is_none());
+    }
+
+    #[test]
+    fn cell_record_old_json_defaults_runtime_fields() {
+        // proj.db 里的旧记录没有运行学字段——default 零值兼容,不炸反序列化。
+        let old = r#"{"cell":"c","model":"m","ok":true,"findings":[]}"#;
+        let rec: CellRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            (rec.duration_ms, rec.input_tokens, rec.output_tokens, rec.attempts),
+            (0, 0, 0, 0)
+        );
     }
 }

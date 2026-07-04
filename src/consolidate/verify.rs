@@ -57,6 +57,26 @@ async fn refute_one(
     }
 }
 
+/// targeted refute 目标集（单一真相源：verify_findings 执行与 phase 打点的 targets 数共用，
+/// 防两处筛选逻辑漂移）。层③：孤证 blocking 或预筛命中判例变体；精确 id 在台账者除外。
+pub fn refute_targets(
+    findings: &[Finding],
+    precedents: &[DismissCard],
+    block_threshold: Severity,
+) -> Vec<usize> {
+    let exact_ids: std::collections::HashSet<&str> = precedents.iter().map(|c| c.id.as_str()).collect();
+    findings
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !exact_ids.contains(f.id.as_str()))
+        .filter(|(_, f)| {
+            (f.agreement == 1 && f.severity >= block_threshold)
+                || precedents.iter().any(|c| matches_precedent(f, c))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// refute 输出 → verdict：语义前缀优先，非空性只是违约 fallback（附 warning）。
 /// r1 20260703 实证：六字段必填契约后，守约模型想表达 upheld 也会输出 finding
 /// （title "Claim upheld: …"），按「非空即 refuted」会静默吞掉真问题。
@@ -102,17 +122,7 @@ pub async fn verify_findings(
     mode: Mode,
     precedents: &[DismissCard],
 ) -> (Vec<Finding>, Vec<String>) {
-    let exact_ids: std::collections::HashSet<&str> = precedents.iter().map(|c| c.id.as_str()).collect();
-    let targets: Vec<usize> = findings
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| !exact_ids.contains(f.id.as_str()))
-        .filter(|(_, f)| {
-            (f.agreement == 1 && f.severity >= block_threshold)
-                || precedents.iter().any(|c| matches_precedent(f, c))
-        })
-        .map(|(i, _)| i)
-        .collect();
+    let targets = refute_targets(&findings, precedents, block_threshold);
     if targets.is_empty() {
         return (findings, Vec::new());
     }

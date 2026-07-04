@@ -85,6 +85,9 @@ enum Cmd {
         /// 输出格式：json（默认，机读契约）| table（人读）
         #[arg(long, default_value = "json")]
         format: String,
+        /// 输出该 job 的 cell 级明细（JSON 数组：duration_ms/tokens/attempts/warn，调试用）。
+        #[arg(long)]
+        cells: bool,
     },
     /// 取回作业的评审结果（持久存储于 .redteam/proj.db，永不过期、可重复取）。
     /// 任一终态可取（failed/timed_out 有部分报告也放行）；未终态返回退出码 2。
@@ -504,8 +507,11 @@ async fn main() {
             let code = redteam::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started).await;
             std::process::exit(code);
         }
-        Cmd::Status { job_id, format } => {
+        Cmd::Status { job_id, format, cells } => {
             let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if cells {
+                return_code_for_cells(&ws, job_id.as_deref())
+            } else {
             // 两分支统一收集（列表 / 单 job），再按 format 分流；json 输出形状与改动前逐字节一致。
             let jobs: Option<Vec<redteam::state::job::JobState>> = match &job_id {
                 None => Some(redteam::state::job::list_states(&ws)),
@@ -523,6 +529,7 @@ async fn main() {
                     }
                     0
                 }
+            }
             }
         }
         Cmd::Result { job_id, format } => {
@@ -823,6 +830,22 @@ fn dismiss_gc(db: &mut redteam::db::ProjDb, root: &std::path::Path, apply: bool)
     Ok(())
 }
 
+/// `status <job> --cells`：cell 级运行学明细（JSON 数组，2026-07-03 grill 定案）。
+fn return_code_for_cells(ws: &std::path::Path, job_id: Option<&str>) -> i32 {
+    match job_id {
+        None => { eprintln!("--cells requires a job id"); 2 }
+        Some(id) => {
+            if redteam::state::job::read_state(ws, id).is_none() {
+                eprintln!("no such job: {id}");
+                return 2;
+            }
+            let recs = redteam::state::store::read_partial(ws, id);
+            println!("{}", serde_json::to_string_pretty(&recs).unwrap_or_else(|_| "[]".into()));
+            0
+        }
+    }
+}
+
 /// M5 批2：`status --format table` 人读视图（opt-in；默认 JSON 数组契约不动）。
 /// 空格对齐、无框线——窄终端可 wrap、输出可 grep。now 注入以便测试。
 fn render_status_table(jobs: &[redteam::state::job::JobState], now: u64) -> String {
@@ -833,7 +856,18 @@ fn render_status_table(jobs: &[redteam::state::job::JobState], now: u64) -> Stri
             [
                 j.job_id.clone(),
                 serde_str(&j.status),
-                j.phase.as_ref().map(serde_str).unwrap_or_else(|| "-".into()),
+                // 运行中带当前 phase 停留时长与注记（refute[9 targets] (2m)）——
+                // 「久了不知道卡哪」的第一查询面（2026-07-03 grill 定案）。
+                {
+                    let name = j.phase.as_ref().map(serde_str).unwrap_or_else(|| "-".into());
+                    match j.phase_history.last() {
+                        Some(stamp) if j.status == redteam::state::job::JobStatus::Running && stamp.at > 0 => {
+                            let note = stamp.note.as_deref().map(|n| format!("[{n}]")).unwrap_or_default();
+                            format!("{name}{note} ({})", fmt_dur(now.saturating_sub(stamp.at)))
+                        }
+                        _ => name,
+                    }
+                },
                 j.mode.as_ref().map(serde_str).unwrap_or_else(|| "-".into()),
                 if j.progress.total == 0 { "-".into() } else { format!("{}/{}", j.progress.done, j.progress.total) },
                 fmt_dur(now.saturating_sub(j.started_at)),
@@ -865,6 +899,17 @@ mod tests {
     use super::*;
 
     /// M5 批2：status --format table 的人读渲染（默认 json 契约不动）。
+    #[test]
+    fn status_table_running_phase_shows_dwell_and_note() {
+        use redteam::state::job::{JobState, JobStatus, Phase};
+        let mut a = JobState::new("abc123def456", 1000);
+        a.status = JobStatus::Running;
+        a.set_phase(Phase::Refute, Some("9 targets".into()));
+        a.phase_history.last_mut().unwrap().at = 970; // 覆写为可控时刻（set_phase 用真实时钟）
+        let out = render_status_table(&[a], 1000);
+        assert!(out.contains("refute[9 targets] (30s)"), "phase 停留时长+注记: {out}");
+    }
+
     #[test]
     fn render_status_table_shapes_columns() {
         use redteam::state::job::{JobState, JobStatus, Phase, Progress};

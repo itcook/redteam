@@ -1,6 +1,6 @@
 use crate::bundle::{group, select_files};
 use crate::config::Config;
-use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc, verify_findings};
+use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc, refute_targets, verify_findings};
 use crate::domain::{Finding, Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::{collect, detect_mode, EvidenceOpts, Scope};
 use crate::evidence::git::FileChange;
@@ -227,6 +227,8 @@ struct TailCtx<'a> {
     precedents: &'a [crate::db::DismissCard],
     /// 台账加载披露（进 RunMeta.ledger）。
     ledger_meta: Option<crate::domain::LedgerMeta>,
+    /// 后台 job 的 phase 打点通路（refute/correlate 子阶段；前台/resume 为 None）。
+    sink: Option<&'a dyn CellSink>,
 }
 
 /// 共用尾段：anchor → dedup → [doc: correlate/apply_clusters] → verify → verdict → 组装 report
@@ -245,6 +247,9 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
     };
     clamp_compliance(&mut findings);
     let clusters = if ctx.mode == Mode::Doc {
+        if ctx.correlate_on {
+            if let Some(s) = ctx.sink { s.on_phase(crate::state::job::Phase::Correlate, None); }
+        }
         let lead_model = ctx.model_names.first().cloned().unwrap_or_default();
         let clusters = correlate(ctx.provider, &lead_model, &findings, ctx.correlate_on).await;
         apply_clusters(&mut findings, &clusters);
@@ -252,6 +257,13 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
     } else {
         vec![]
     };
+    // refute 子阶段打点（targets 数与 verify_findings 同一真相源函数，非重复实现）。
+    let n_targets = refute_targets(&findings, ctx.precedents, ctx.block).len();
+    if n_targets > 0 {
+        if let Some(s) = ctx.sink {
+            s.on_phase(crate::state::job::Phase::Refute, Some(format!("{n_targets} targets")));
+        }
+    }
     let (findings, refute_warnings) = verify_findings(
         findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
         ctx.precedents,
@@ -384,8 +396,9 @@ pub async fn run_review(
         dismissed: &ledger.ids,
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
+        sink,
     };
-    if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
+    if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
     assemble_report(raw.findings, ctx).await
 }
 
@@ -473,8 +486,9 @@ pub async fn run_code_review(
         dismissed: &ledger.ids,
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
+        sink,
     };
-    if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing); }
+    if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
     assemble_report(raw.findings, ctx).await
 }
 
@@ -534,7 +548,7 @@ impl CellSink for JobCellSink {
         let _ = crate::state::store::write_manifest(&self.ws, &self.job_id, inputs);
         if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
             st.progress.total = inputs.len() as u32;
-            st.phase = Some(crate::state::job::Phase::Fanout);
+            st.set_phase(crate::state::job::Phase::Fanout, None);
             let _ = crate::state::job::write_state(&self.ws, &st);
         }
     }
@@ -549,10 +563,10 @@ impl CellSink for JobCellSink {
         }
     }
 
-    fn on_phase(&self, phase: crate::state::job::Phase) {
+    fn on_phase(&self, phase: crate::state::job::Phase, note: Option<String>) {
         let _g = self.lock.lock().unwrap();
         if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
-            st.phase = Some(phase);
+            st.set_phase(phase, note);
             let _ = crate::state::job::write_state(&self.ws, &st);
         }
     }
@@ -690,6 +704,7 @@ pub async fn run_resume(
                 crate::state::store::CellRecord {
                     cell: cell.cell.clone(), model: cell.model.clone(), ok: false,
                     findings: vec![], warn: Some(e.to_string()),
+                    duration_ms: 0, input_tokens: 0, output_tokens: 0, attempts: 1,
                 }
             }
         };
@@ -746,6 +761,7 @@ pub async fn run_resume(
         dismissed: &ledger.ids,
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
+        sink: None,
     };
     match assemble_report(findings, ctx).await {
         Ok((mut report, mut code)) => {
@@ -802,7 +818,7 @@ pub async fn run_job(
         return st.exit_code.unwrap_or(0);
     }
     st.status = JobStatus::Running;
-    st.phase = Some(crate::state::job::Phase::Collecting);
+    st.set_phase(crate::state::job::Phase::Collecting, None);
     let _ = write_state(ws, &st);
 
     let sink = JobCellSink { ws: ws.to_path_buf(), job_id: job_id.to_string(), lock: std::sync::Mutex::new(()) };
@@ -1505,7 +1521,7 @@ mod tests {
         write_state(&ws, &JobState::new("j", 0)).unwrap();
         let sink = JobCellSink { ws: ws.clone(), job_id: "j".into(), lock: std::sync::Mutex::new(()) };
         use crate::orchestrate::CellSink;
-        sink.on_phase(Phase::Finalizing);
+        sink.on_phase(Phase::Finalizing, None);
         assert_eq!(read_state(&ws, "j").unwrap().phase, Some(Phase::Finalizing));
     }
 

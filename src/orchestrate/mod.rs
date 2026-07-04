@@ -17,7 +17,8 @@ pub trait CellSink: Send + Sync {
     fn manifest(&self, inputs: &[CellInput]);
     fn on_cell(&self, rec: CellRecord);
     /// 阶段转换钩子（后台 job 用；默认 no-op，前台 sink=None / 其他 sink 零影响）。
-    fn on_phase(&self, _phase: crate::state::job::Phase) {}
+    /// `note`：阶段注记（如 refute 的 "N targets"），进 phase_history 时间线。
+    fn on_phase(&self, _phase: crate::state::job::Phase, _note: Option<String>) {}
     /// resolve 完成即报 models/lenses（后台 job stamp 进 state，running 期 status 可见；
     /// 此前 done 时才从 report 回填——r1 20260703 实证运行全程空数组）。默认 no-op。
     fn on_meta(&self, _models: &[String], _lenses: &[String]) {}
@@ -96,12 +97,41 @@ fn top_priority_model(opts: &OrchestrateOpts) -> String {
 }
 
 /// 单个文件包的评审（候补链复用 run_one_lens 的语义）。
+/// 单 cell 执行结果（成功/失败一体：`warn=None` 即成功）。运行学字段 2026-07-03 grill 定案。
+struct CellRun {
+    model: String, // 胜出 model；整链失败为空
+    findings: Vec<Finding>,
+    tokens: (u64, u64),
+    duration_ms: u64,
+    attempts: u32,
+    warn: Option<String>,
+}
+
+impl CellRun {
+    /// 转持久化记录；`fallback_model`：胜出者为空（整链失败）时的 model 标注
+    /// （replicate 格=该格 model；候补链=空串，warn 已含逐家原因）。
+    fn to_record(&self, cell_id: String, fallback_model: &str) -> CellRecord {
+        CellRecord {
+            cell: cell_id,
+            model: if self.model.is_empty() { fallback_model.to_string() } else { self.model.clone() },
+            ok: self.warn.is_none(),
+            findings: self.findings.clone(),
+            warn: self.warn.clone(),
+            duration_ms: self.duration_ms,
+            input_tokens: self.tokens.0,
+            output_tokens: self.tokens.1,
+            attempts: self.attempts,
+        }
+    }
+}
+
 async fn run_one_bundle(
     provider: &dyn ReviewProvider,
     label: &str,
     prompt: &str,
     opts: &OrchestrateOpts,
-) -> Result<(String, Vec<Finding>, (u64, u64)), String> {
+) -> CellRun {
+    let t0 = std::time::Instant::now();
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
@@ -113,7 +143,7 @@ async fn run_one_bundle(
     };
 
     let mut errs: Vec<String> = Vec::new();
-    for pm in &chain {
+    for (i, pm) in chain.iter().enumerate() {
         match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call
@@ -121,12 +151,21 @@ async fn run_one_bundle(
                     .iter()
                     .map(|r| enrich(r, "code", &pm.name))
                     .collect();
-                return Ok((pm.name.clone(), fs, (call.input_tokens, call.output_tokens)));
+                return CellRun {
+                    model: pm.name.clone(), findings: fs,
+                    tokens: (call.input_tokens, call.output_tokens),
+                    duration_ms: t0.elapsed().as_millis() as u64,
+                    attempts: i as u32 + 1, warn: None,
+                };
             }
             Err(e) => errs.push(format!("bundle [{label}] model {}: {e}", pm.name)),
         }
     }
-    Err(errs.join("; "))
+    CellRun {
+        model: String::new(), findings: vec![], tokens: (0, 0),
+        duration_ms: t0.elapsed().as_millis() as u64,
+        attempts: chain.len() as u32, warn: Some(errs.join("; ")),
+    }
 }
 
 /// code 线扇出，用 Semaphore 限 max_concurrency：
@@ -186,38 +225,23 @@ pub async fn run_code_fanout(
                 };
                 async move {
                     let _permit = sem.acquire().await.expect("semaphore not closed");
-                    let res = run_one_bundle(provider, label, prompt, &single).await;
+                    let run = run_one_bundle(provider, label, prompt, &single).await;
                     // R2.1 修复：on_cell 在 future 内部即时调用。
                     if let Some(s) = sink {
-                        match &res {
-                            Ok((_m, fs, _)) => {
-                                s.on_cell(CellRecord::ok(cell_id.clone(), model_name.clone(), fs.clone()));
-                            }
-                            Err(warn) => {
-                                s.on_cell(CellRecord {
-                                    cell: cell_id.clone(),
-                                    model: model_name.clone(),
-                                    ok: false,
-                                    findings: vec![],
-                                    warn: Some(warn.clone()),
-                                });
-                            }
-                        }
+                        s.on_cell(run.to_record(cell_id.clone(), &model_name));
                     }
-                    (model_name, res)
+                    (model_name, run)
                 }
             })
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (model_hint, res) in results {
-            match res {
-                Ok((_m, fs, (it, ot))) => {
-                    out.findings.extend(fs);
-                    out.usage.0 += it;
-                    out.usage.1 += ot;
-                }
-                Err(warn) => {
+        for (model_hint, run) in results {
+            out.usage.0 += run.tokens.0;
+            out.usage.1 += run.tokens.1;
+            match run.warn {
+                None => out.findings.extend(run.findings),
+                Some(warn) => {
                     out.warnings.push(warn);
                     if !out.failed_models.contains(&model_hint) {
                         out.failed_models.push(model_hint);
@@ -245,37 +269,22 @@ pub async fn run_code_fanout(
             let cell_id = cell.clone();
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
-                let res = run_one_bundle(provider, label, prompt, opts).await;
+                let run = run_one_bundle(provider, label, prompt, opts).await;
                 // R2.1 修复：on_cell 在 future 内部即时调用。
                 if let Some(s) = sink {
-                    match &res {
-                        Ok((model, fs, _)) => {
-                            s.on_cell(CellRecord::ok(cell_id.clone(), model.clone(), fs.clone()));
-                        }
-                        Err(warn) => {
-                            s.on_cell(CellRecord {
-                                cell: cell_id.clone(),
-                                model: String::new(),
-                                ok: false,
-                                findings: vec![],
-                                warn: Some(warn.clone()),
-                            });
-                        }
-                    }
+                    s.on_cell(run.to_record(cell_id.clone(), ""));
                 }
-                res
+                run
             }
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for res in results {
-            match res {
-                Ok((_model, fs, (it, ot))) => {
-                    out.findings.extend(fs);
-                    out.usage.0 += it;
-                    out.usage.1 += ot;
-                }
-                Err(warn) => out.warnings.push(warn),
+        for run in results {
+            out.usage.0 += run.tokens.0;
+            out.usage.1 += run.tokens.1;
+            match run.warn {
+                None => out.findings.extend(run.findings),
+                Some(warn) => out.warnings.push(warn),
             }
         }
         out
@@ -287,7 +296,8 @@ async fn run_one_doc(
     provider: &dyn ReviewProvider,
     prompt: &str,
     opts: &OrchestrateOpts,
-) -> Result<(String, Vec<Finding>, (u64, u64)), String> {
+) -> CellRun {
+    let t0 = std::time::Instant::now();
     let mut chain: Vec<&PlannedModel> = opts.models.iter().collect();
     if !opts.replicate {
         chain.sort_by_key(|m| Reverse(m.priority));
@@ -299,16 +309,25 @@ async fn run_one_doc(
     };
 
     let mut errs: Vec<String> = Vec::new();
-    for pm in &chain {
+    for (i, pm) in chain.iter().enumerate() {
         match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call.findings.iter().map(|r| enrich(r, "doc", &pm.name)).collect();
-                return Ok((pm.name.clone(), fs, (call.input_tokens, call.output_tokens)));
+                return CellRun {
+                    model: pm.name.clone(), findings: fs,
+                    tokens: (call.input_tokens, call.output_tokens),
+                    duration_ms: t0.elapsed().as_millis() as u64,
+                    attempts: i as u32 + 1, warn: None,
+                };
             }
             Err(e) => errs.push(format!("doc model {}: {e}", pm.name)),
         }
     }
-    Err(errs.join("; "))
+    CellRun {
+        model: String::new(), findings: vec![], tokens: (0, 0),
+        duration_ms: t0.elapsed().as_millis() as u64,
+        attempts: chain.len() as u32, warn: Some(errs.join("; ")),
+    }
 }
 
 /// doc 线扇出（整篇文档为单一单元）：
@@ -355,37 +374,22 @@ pub async fn run_doc_fanout(
             };
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
-                let res = run_one_doc(provider, prompt, &single).await;
+                let run = run_one_doc(provider, prompt, &single).await;
                 // R2.1 修复：on_cell 在 future 内部即时调用。
                 if let Some(s) = sink {
-                    match &res {
-                        Ok((_m, fs, _)) => {
-                            s.on_cell(CellRecord::ok(cell_id.clone(), model_name.clone(), fs.clone()));
-                        }
-                        Err(warn) => {
-                            s.on_cell(CellRecord {
-                                cell: cell_id.clone(),
-                                model: model_name.clone(),
-                                ok: false,
-                                findings: vec![],
-                                warn: Some(warn.clone()),
-                            });
-                        }
-                    }
+                    s.on_cell(run.to_record(cell_id.clone(), &model_name));
                 }
-                (model_name, res)
+                (model_name, run)
             }
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (model_hint, res) in results {
-            match res {
-                Ok((_m, fs, (it, ot))) => {
-                    out.findings.extend(fs);
-                    out.usage.0 += it;
-                    out.usage.1 += ot;
-                }
-                Err(warn) => {
+        for (model_hint, run) in results {
+            out.usage.0 += run.tokens.0;
+            out.usage.1 += run.tokens.1;
+            match run.warn {
+                None => out.findings.extend(run.findings),
+                Some(warn) => {
                     out.warnings.push(warn);
                     if !out.failed_models.contains(&model_hint) {
                         out.failed_models.push(model_hint);
@@ -406,27 +410,15 @@ pub async fn run_doc_fanout(
         }
 
         let mut out = RawResults::default();
-        match run_one_doc(provider, &prompt, opts).await {
-            Ok((model, fs, (it, ot))) => {
-                if let Some(s) = sink {
-                    s.on_cell(CellRecord::ok(cell_id, model.clone(), fs.clone()));
-                }
-                out.findings.extend(fs);
-                out.usage.0 += it;
-                out.usage.1 += ot;
-            }
-            Err(warn) => {
-                if let Some(s) = sink {
-                    s.on_cell(CellRecord {
-                        cell: cell_id,
-                        model: String::new(),
-                        ok: false,
-                        findings: vec![],
-                        warn: Some(warn.clone()),
-                    });
-                }
-                out.warnings.push(warn)
-            }
+        let run = run_one_doc(provider, &prompt, opts).await;
+        if let Some(s) = sink {
+            s.on_cell(run.to_record(cell_id, ""));
+        }
+        out.usage.0 += run.tokens.0;
+        out.usage.1 += run.tokens.1;
+        match run.warn {
+            None => out.findings.extend(run.findings),
+            Some(warn) => out.warnings.push(warn),
         }
         out
     }
