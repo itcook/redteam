@@ -1778,7 +1778,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"),
-            "pub fn target() {}\nfn user() { target(); }\n").unwrap();
+            "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
         let bundles = vec![Bundle { files: vec![FileChange {
             path: "src/a.rs".into(),
             diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),

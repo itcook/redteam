@@ -272,6 +272,10 @@ pub fn reference_points(syms: &[ChangedSym], root: &Path, defs: &[(&'static str,
 const DOSSIER_PER_NAME_CAP: usize = 10;
 // ≈8K tokens @ bytes/3.5；含 CJK 注释偏保守。文档记假设，live 换真 tokenizer 校常量（D7）。
 const DOSSIER_MAX_BYTES: usize = 28_000;
+/// 调用密度门（live A/B 定，2026-07-05）：改动符号的仓内引用点总数低于此阈值时不产卷宗——
+/// 稀疏场景（如纯新增代码，符号尚无既有 caller）注入成本 > 收益，返空走空渲染。
+/// 阈值系 provisional，待更多 A/B 校准；调高=更保守（更少产卷宗）。
+const DOSSIER_MIN_REFS: usize = 5;
 
 /// SymRefs 列表 → 卷宗事实块（不含 <dossier> 包裹与散文，那是 prompt 层的活）。空引用 → ""。
 pub fn render_entries(refs: &[SymRefs]) -> String {
@@ -348,6 +352,10 @@ pub fn build_dossier(bundle: &crate::bundle::Bundle, root: &Path) -> String {
         .map(compile_defs)
         .unwrap_or_default();
     let refs = reference_points(&all_syms, root, &defs);
+    // 调用密度门：引用点太稀疏 → 卷宗不回本，返空（同空渲染，该 bundle 行为不变）
+    if refs.iter().map(|r| r.hits.len()).sum::<usize>() < DOSSIER_MIN_REFS {
+        return String::new();
+    }
     render_entries(&refs)
 }
 
@@ -516,7 +524,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"),
-            "pub fn target() {}\nfn user() { target(); }\n").unwrap();
+            "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
         // 改动 target 的 bundle（diff 新增 target 的 def 行）
         let b = Bundle { files: vec![FileChange {
             path: "src/a.rs".into(),
@@ -524,7 +532,7 @@ mod tests {
         }] };
         let out = build_dossier(&b, root);
         assert!(out.contains("target"), "卷宗含改动符号引用点: {out}");
-        assert!(out.contains("user()"), "含 caller 上下文");
+        assert!(out.contains("u1()"), "含 caller 上下文");
 
         // 非支持语言 → 空（无损降级）
         let py = Bundle { files: vec![FileChange {
@@ -555,7 +563,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"), "pub fn target() {}\nfn user() { target(); }\n").unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
         // 同一 bundle 内混：不支持(.py) + 支持(.rs)。py 跳过、rs 仍产卷宗、不中止。
         let b = Bundle { files: vec![
             FileChange { path: "app.py".into(), diff: "@@ -1,0 +1,1 @@\n+def f(): pass\n".into() },
@@ -563,5 +571,20 @@ mod tests {
         ] };
         let out = build_dossier(&b, root);
         assert!(out.contains("target"), "支持语言文件仍产卷宗（不支持文件被跳过不中止）: {out}");
+    }
+
+    #[test]
+    fn build_dossier_sparse_callers_are_gated_to_empty() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // target 只有 1 个 caller → 引用点 < DOSSIER_MIN_REFS → 门返空
+        std::fs::write(root.join("src/a.rs"), "pub fn target() {}\nfn only_one() { target(); }\n").unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
+        }] };
+        assert_eq!(build_dossier(&b, root), "", "引用点稀疏 → 调用密度门返空");
     }
 }
