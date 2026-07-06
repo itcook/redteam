@@ -306,6 +306,18 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
     Ok((report, code))
 }
 
+/// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）。`REDTEAM_NO_DOSSIER`
+/// 非空 → A/B off 臂，全空段（M14 D9）。
+pub(crate) fn build_dossiers(bundles: &[crate::bundle::Bundle], root: &std::path::Path) -> Vec<String> {
+    if std::env::var_os("REDTEAM_NO_DOSSIER").is_some() {
+        return vec![String::new(); bundles.len()]; // A/B off 臂：全空卷宗段
+    }
+    bundles
+        .iter()
+        .map(|b| crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)))
+        .collect()
+}
+
 /// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
 ///
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
@@ -457,7 +469,8 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &oopts, sink).await;
+    let dossiers = build_dossiers(&bundles, root);
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(
@@ -582,7 +595,8 @@ pub async fn run_incremental_review(
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &oopts, sink).await;
+    let dossiers = build_dossiers(&bundles, root);
+    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
     //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。
@@ -1752,6 +1766,36 @@ default_models=["m"]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // env-var 测试串行化锁（照 src/prompt/mod.rs 既有模式），避免与其它 env 测并发互踩。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn build_dossiers_toggle_off_arm_all_empty_on_arm_nonempty() {
+        let _g = ENV_LOCK.lock().unwrap();
+        use crate::bundle::Bundle;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"),
+            "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
+        let bundles = vec![Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
+        }] }];
+
+        // on 臂：至少一段非空（该 bundle 有引用点）
+        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
+        let on = build_dossiers(&bundles, root);
+        assert!(on.iter().any(|s| !s.is_empty()), "on 臂应有非空卷宗段: {on:?}");
+
+        // off 臂：全空
+        unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
+        let off = build_dossiers(&bundles, root);
+        assert!(off.iter().all(|s| s.is_empty()), "off 臂全空");
+        assert_eq!(off.len(), bundles.len());
+        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
+    }
 
     #[test]
     fn load_ledger_no_dismissed_and_missing_db_are_empty_without_side_effects() {

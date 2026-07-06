@@ -14,7 +14,7 @@ Give no credit for good intent, partial fixes, or likely follow-up. Happy-path-o
 </operating_stance>
 
 <tools>
-You have tools to inspect the repository: read_file (read any file under the review root, returned with line numbers), search_repo (regex search, gitignore-aware), and list_files. The diffs below show only what changed — read the surrounding files, callers, and callees yourself before judging. Do not invent code you have not read.
+You have tools to inspect the repository: read_file (read any file under the review root, returned with line numbers), search_repo (regex search, gitignore-aware), and list_files. The diffs below show only what changed — read the surrounding files, callers, and callees yourself before judging. Where a dossier of reference points is provided below, start from it and search only beyond what it lists. Do not invent code you have not read.
 </tools>
 
 <review_method>
@@ -68,3 +68,5 @@ Do NOT claim something is missing, undeclared, or unimplemented ACROSS THE CHANG
 Changed hunks:
 {{BUNDLE_DIFFS}}
 </bundle>
+
+{{DOSSIER}}

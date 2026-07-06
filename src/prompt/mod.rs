@@ -146,6 +146,7 @@ pub fn build_bundle_prompt(
     user_focus: &str,
     other_files: &str,
     incremental: &str,
+    dossier: &str,
 ) -> String {
     let rules_str = rules_block(rules);
 
@@ -173,6 +174,7 @@ pub fn build_bundle_prompt(
         ("{{OTHER_CHANGED_FILES}}",
             if other_files.is_empty() { "(none — this bundle covers the entire changeset)" } else { other_files }),
         ("{{INCREMENTAL_ROUND}}", incremental),
+        ("{{DOSSIER}}", dossier),
     ])
 }
 
@@ -252,6 +254,21 @@ pub fn render_incremental_section(
          {list}\
          For each claimed-resolved item: if the underlying problem is NOT actually fixed, report it again using the EXACT original title and quote verbatim (that is how it is machine-matched). If it is genuinely fixed, do not report it.\n\
          </incremental_round>"
+    )
+}
+
+/// 卷宗段（M14 D6/D8）：事实引用点 + 惰性保真散文。entries 空 → 空串（空渲染纪律）。
+pub fn render_dossier_section(entries: &str) -> String {
+    if entries.trim().is_empty() {
+        return String::new();
+    }
+    // 被审代码摘录可能含字面 </dossier>——中和，防破块（只装事实，不让被审内容改变结构）
+    let entries = entries.replace("</dossier>", "<\\/dossier>");
+    format!(
+        "<dossier>\n\
+         The entries below are where this change's changed symbols are used elsewhere in the repo — its blast radius — found by word-boundary search (heuristic facts, not judgments; renamed or dynamic uses may be missing). Judge whether THIS change breaks these sites; do not audit them for pre-existing defects this change does not cause. The ±3-line excerpts are a starting point — read the full file at any site you must judge, and search yourself for uses you suspect are missing; your duty to verify is undiminished.\n\n\
+         {entries}\
+         </dossier>"
     )
 }
 
@@ -386,14 +403,14 @@ mod tests {
             files: vec![FileChange { path: "src/auth.rs".into(), diff: "+let t = secret();".into() }],
         };
         let rules = vec![by_id("L1").unwrap(), by_id("L5").unwrap()];
-        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "", "");
+        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         // 空清单 → 渲染「本包即全变更集」占位；非空 → 原样注入
         assert!(p.contains("(none — this bundle covers the entire changeset)"), "empty manifest placeholder");
-        let pm = build_bundle_prompt("wt", &bundle, &rules, "", "src/other.rs (+3/-1)", "");
+        let pm = build_bundle_prompt("wt", &bundle, &rules, "", "src/other.rs (+3/-1)", "", "");
         assert!(pm.contains("src/other.rs (+3/-1)"), "other-files manifest injected");
         // 注入对称覆盖(r4 ea30e058):bundle 侧同样不被外部占位捕获
-        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探", "");
+        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探", "", "");
         assert!(pi.contains("focus {{RULES}} 试探") && pi.contains("manifest {{BUNDLE_DIFFS}} 试探"),
             "bundle 外部内容占位不被捕获");
         assert!(p.contains("[L1]") && p.contains("[L5]"), "rule ids injected");
@@ -496,7 +513,7 @@ mod tests {
         let bundle = Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] };
         let rules = vec![by_id("L1").unwrap()];
         // 全量路径（空段）：模板无残留占位、无增量标记
-        let p = build_bundle_prompt("wt", &bundle, &rules, "", "", "");
+        let p = build_bundle_prompt("wt", &bundle, &rules, "", "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(!p.contains("<incremental_round>"), "全量评审不得出现增量段");
         // 增量路径：段完整注入
@@ -506,7 +523,7 @@ mod tests {
             reason: String::new(), round: "r1".into(), updated_at: String::new(),
         }];
         let sect = render_incremental_section("abc123def456", "src/a.rs [delta], src/b.rs", &claimed);
-        let pi = build_bundle_prompt("wt", &bundle, &rules, "", "", &sect);
+        let pi = build_bundle_prompt("wt", &bundle, &rules, "", "", &sect, "");
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"));
         assert!(pi.contains("src/a.rs [delta]"), "双层 manifest 注入");
         assert!(pi.contains("let x = md5(pw);") && pi.contains("weak hash"), "claimed 项带原样 title+quote");
@@ -527,5 +544,45 @@ mod tests {
         let s = render_incremental_section("abc", "", &big);
         assert!(s.contains("more claimed-resolved items (not listed)"), "{s}");
         assert!(s.chars().count() < 9000, "总量帽生效: {}", s.chars().count());
+    }
+
+    #[test]
+    fn dossier_section_empty_renders_empty() {
+        assert_eq!(render_dossier_section(""), "");
+    }
+
+    #[test]
+    fn dossier_section_wraps_with_prose_and_scope_guard() {
+        let s = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    foo();\n");
+        assert!(s.starts_with("<dossier>"));
+        assert!(s.contains("blast radius"), "D8 措辞在场");
+        assert!(s.contains("do not audit them for pre-existing defects"), "范围划线在场");
+        assert!(s.contains("duty to verify is undiminished"));
+        assert!(s.contains("## foo (fn)"), "entries 在场");
+        assert!(s.trim_end().ends_with("</dossier>"));
+    }
+
+    #[test]
+    fn dossier_section_neutralizes_closing_delimiter_in_entries() {
+        // 被审文件的摘录里若含字面 </dossier> 不得破块
+        let s = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    let x = \"</dossier>\";\n");
+        // 结果里只应有一个真正的闭合标签（在最末尾），正文里的被中和
+        assert_eq!(s.matches("</dossier>").count(), 1, "正文里的闭合标签被中和，只剩包裹用的那个: {s}");
+        assert!(s.trim_end().ends_with("</dossier>"));
+    }
+
+    #[test]
+    fn bundle_prompt_carries_dossier_and_tools_reconciliation() {
+        let refs = vec![crate::lens::by_id("L1").unwrap()];
+        let b = crate::bundle::Bundle { files: vec![crate::evidence::git::FileChange {
+            path: "src/a.rs".into(), diff: "@@ -1 +1 @@\n-a\n+b".into(),
+        }] };
+        let dossier = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    foo();\n");
+        let p = build_bundle_prompt("wt", &b, &refs, "", "", "", &dossier);
+        assert!(p.contains("<dossier>"), "卷宗块注入");
+        assert!(p.contains("start from it and search only beyond what it lists"), "<tools> 和解句在场");
+        // 空卷宗 → 无 <dossier> 块，行为不变
+        let p2 = build_bundle_prompt("wt", &b, &refs, "", "", "", "");
+        assert!(!p2.contains("<dossier>"), "空卷宗不渲染块");
     }
 }

@@ -29,6 +29,8 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 ignore = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+# 逐行 def 正则匹配（卷宗改动符号提取）。regex 是新增直接依赖——grep-regex 只拉 regex-automata/regex-syntax，不含 regex 本体。
+regex = "1"
 libc = "0.2"
 # 台账/评审史持久层（.redteam/proj.db）。bundled：sqlite 编译进二进制,零系统依赖。
 # turso embedded 对比后因 beta 定案不用、不留期权(见 .doc/design/2026-07-03 台账机器化)。
