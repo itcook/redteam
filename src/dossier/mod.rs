@@ -160,6 +160,11 @@ pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'s
             new_line = parse_hunk_new_start(raw).unwrap_or(1);
             continue;
         }
+        // `\ No newline at end of file` 是 newline 状态标记非内容行，不得推进 new_line（T01④ 卫生守卫；
+        // 当前架构下 drift 被 hunk_anchor 首行锚定 + 每 hunk 重置掩盖，此守卫防未来 per-行锚定时暴露）。
+        if raw.starts_with('\\') {
+            continue;
+        }
         match raw.as_bytes().first() {
             Some(b'+') => {
                 let anchor0 = new_line.saturating_sub(1);
@@ -208,6 +213,20 @@ pub struct SymRefs {
 fn is_comment_line(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with('#')
+}
+
+/// 单行超长（minified/生成物单行可达 MB）时把内容截到 ≤512B（另加固定截断注记）防单个引用点
+/// 撑爆卷宗预算（T01②）。按 UTF-8 char 边界回退，绝不切在多字节字符中间。
+fn truncate_line(line: &str) -> std::borrow::Cow<'_, str> {
+    const CTX_LINE_MAX: usize = 512;
+    if line.len() <= CTX_LINE_MAX {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut end = CTX_LINE_MAX;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}… [line truncated]", &line[..end]))
 }
 
 // 一次全仓 walk 搜某名的所有词边界命中，返回 (rel_path, 1based_line)。照 do_search_repo。
@@ -261,7 +280,11 @@ pub fn reference_points(syms: &[ChangedSym], root: &Path, defs: &[(&'static str,
             }
             let lo = line.saturating_sub(4); // ±3 行（含头行）
             let hi = (line + 3).min(lines.len());
-            let context = lines.get(lo..hi).unwrap_or(&[]).join("\n");
+            let context = lines.get(lo..hi).unwrap_or(&[])
+                .iter()
+                .map(|l| truncate_line(l))
+                .collect::<Vec<_>>()
+                .join("\n");
             hits.push(RefHit { path, line, context, is_doc: is_comment_line(hit_line) });
         }
         // ponytail: 确定性排序，WalkBuilder 遍历顺序与 OS 目录顺序相关（非确定性）
@@ -509,6 +532,49 @@ mod tests {
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted, "hits 应按 (path, line) 排序: {:?}", keys);
+    }
+
+    #[test]
+    fn truncate_line_caps_long_and_is_utf8_safe() {
+        assert_eq!(truncate_line("short").as_ref(), "short", "短行原样返回（借用）");
+        let long = "x".repeat(2000);
+        let t = truncate_line(&long);
+        assert!(t.len() < 600, "超长行截断到 ~512B，实得 {}", t.len());
+        assert!(t.ends_with("… [line truncated]"), "带截断注记: {t}");
+        // 512 字节边界恰落在多字节 CJK 字符中间（每字 3 字节，边界在 3 的倍数）：必须回退到 510B，
+        // 否则 `&line[..512]` 会 panic。断言精确落点（非恒真的 from_utf8）以证明边界回退真的跑了。
+        let cjk = "字".repeat(1000);
+        let tc = truncate_line(&cjk);
+        let content = tc.strip_suffix("… [line truncated]").expect("CJK 超长行也带截断注记");
+        assert_eq!(content, "字".repeat(170), "回退到 ≤512 的最近 char 边界 = 510B = 170 个字");
+    }
+
+    #[test]
+    fn reference_points_truncates_minified_long_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // minified 风格：一行 ~15KB 里引用 target
+        let long = format!("const X = [{}]; target(); {}", "0,".repeat(5000), "z".repeat(5000));
+        std::fs::write(root.join("src/a.rs"), format!("fn target() {{}}\n{long}\n")).unwrap();
+        let d = rust_defs();
+        let syms = vec![ChangedSym { name: "target".into(), kind: "fn", file: "src/a.rs".into() }];
+        let refs = reference_points(&syms, root, &d);
+        let hit = refs[0].hits.iter().find(|h| h.line == 2).expect("超长行应命中 target");
+        assert!(hit.context.contains("[line truncated]"), "超长行被截断");
+        // 单行不再是 MB 级：整个 ±3 context 收在少数 KB（否则一个引用点即撑爆 28KB 预算）
+        assert!(hit.context.len() < 3000, "context 不再撑爆预算，实得 {}", hit.context.len());
+    }
+
+    #[test]
+    fn symbols_from_diff_ignores_no_newline_marker() {
+        let d = rust_defs();
+        let file: Vec<&str> = "fn caller() {\n    helper();\n}".lines().collect();
+        // 末行无换行：`\ No newline at end of file` 标记不得当内容行推进 new_line、不得污染符号提取
+        let diff = "@@ -1,3 +1,3 @@\n fn caller() {\n-    old();\n+    helper();\n\\ No newline at end of file\n";
+        let syms = symbols_in_file(diff, &file, "src/x.rs", &d);
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["caller"], "含 No-newline 标记仍正确锚定 caller，标记行被跳过");
     }
 
     fn sr(name: &str, defs_same_name: usize, n: usize, doc_idx: Option<usize>) -> SymRefs {
