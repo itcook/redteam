@@ -13,7 +13,7 @@ pub struct LensRequest { pub model: String, pub prompt: String }
 /// iterations：本次调用实际消耗的 tool-loop 逻辑迭代数（计 FINALIZE 强制收尾轮、
 /// 不计 turn 级 retry 重试）。成功恒 >=1（单发单收即 1）；0 保留给「失败/未观测」。
 #[derive(Clone, Debug)]
-pub struct LensCall { pub findings: Vec<RawFinding>, pub input_tokens: u64, pub output_tokens: u64, pub cached_input_tokens: u64, pub iterations: u32 }
+pub struct LensCall { pub findings: Vec<RawFinding>, pub input_tokens: u64, pub output_tokens: u64, pub cached_input_tokens: u64, pub iterations: u32, pub tool_use: crate::tools::ToolUse }
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProviderError {

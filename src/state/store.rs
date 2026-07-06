@@ -42,6 +42,10 @@ pub struct CellRecord {
     /// 0＝失败/未观测（旧记录、整链失败、resume 格）。
     #[serde(default)]
     pub iterations: u32,
+    /// 工具调用构成（延迟诊断仪器：模型有没有用 read_files 批量、每轮读多少、撞顶时新读 vs 空转）。
+    /// serde default——旧记录/单发路径/整链失败为零值。
+    #[serde(default)]
+    pub tool_use: crate::tools::ToolUse,
 }
 
 impl CellRecord {
@@ -50,6 +54,7 @@ impl CellRecord {
         Self {
             cell: cell.into(), model: model.into(), ok: true, findings, warn: None,
             duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0,
+            tool_use: Default::default(),
         }
     }
 }
@@ -133,7 +138,8 @@ mod tests {
 
     fn rec(cell: &str, ok: bool) -> CellRecord {
         CellRecord { cell: cell.into(), model: "m".into(), ok, findings: vec![], warn: None,
-            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0 }
+            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0,
+            tool_use: Default::default() }
     }
 
     #[test]

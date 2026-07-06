@@ -18,6 +18,35 @@ pub struct ToolResult {
     pub content: String,
 }
 
+/// 每 cell 的工具调用构成仪器（延迟诊断：模型有没有用 read_files 批量、每轮读多少、
+/// 撞满上限时是新读=真探索还是空转）。累计整个 tool-loop 各类型 tool_call 次数。
+/// serde default——旧记录/单发路径缺字段记零。
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolUse {
+    pub read_file: u32,
+    pub read_files: u32,
+    pub search_repo: u32,
+    pub list_files: u32,
+}
+
+impl ToolUse {
+    pub fn total(&self) -> u32 {
+        self.read_file + self.read_files + self.search_repo + self.list_files
+    }
+    /// 累加一轮的 tool_calls（按工具名归类；未知名忽略）。
+    pub fn tally(&mut self, calls: &[ToolCall]) {
+        for c in calls {
+            match c.name.as_str() {
+                "read_file" => self.read_file += 1,
+                "read_files" => self.read_files += 1,
+                "search_repo" => self.search_repo += 1,
+                "list_files" => self.list_files += 1,
+                _ => {}
+            }
+        }
+    }
+}
+
 /// 暴露给模型的工具声明（name + 描述 + JSON Schema 参数）。
 pub struct ToolSpec {
     pub name: &'static str,
@@ -430,6 +459,18 @@ mod tests {
         let r = ex.execute(&call("read_files", json!({ "paths": ["a.rs", "../secret"] })));
         assert!(r.content.contains("good"), "好文件仍读到");
         assert!(r.content.contains("ERROR: path escapes root"), "坏路径内联报错不整体失败: {}", r.content);
+    }
+
+    #[test]
+    fn tool_use_tally_counts_by_type_and_totals() {
+        let mut tu = ToolUse::default();
+        tu.tally(&[call("read_files", json!({})), call("read_file", json!({}))]);
+        tu.tally(&[call("read_files", json!({})), call("search_repo", json!({})), call("bogus", json!({}))]);
+        assert_eq!(tu.read_files, 2, "两轮各一次 read_files");
+        assert_eq!(tu.read_file, 1);
+        assert_eq!(tu.search_repo, 1);
+        assert_eq!(tu.list_files, 0);
+        assert_eq!(tu.total(), 4, "未知名 bogus 不计入");
     }
 
     #[test]

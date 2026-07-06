@@ -113,6 +113,8 @@ struct CellRun {
     /// 胜出 call 的 tool-loop 迭代数（失败候补烧掉的轮数不可观测——Err 无 LensCall）；
     /// 整链失败记 0＝未观测。
     iterations: u32,
+    /// 胜出 call 的工具调用构成（延迟诊断仪器）；整链失败/单发路径为零值。
+    tool_use: crate::tools::ToolUse,
     warn: Option<String>,
 }
 
@@ -132,6 +134,7 @@ impl CellRun {
             cached_input_tokens: self.tokens.2,
             attempts: self.attempts,
             iterations: self.iterations,
+            tool_use: self.tool_use.clone(),
         }
     }
 }
@@ -166,7 +169,7 @@ async fn run_one_bundle(
                     model: pm.name.clone(), findings: fs,
                     tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                     duration_ms: t0.elapsed().as_millis() as u64,
-                    attempts: i as u32 + 1, iterations: call.iterations, warn: None,
+                    attempts: i as u32 + 1, iterations: call.iterations, tool_use: call.tool_use, warn: None,
                 };
             }
             Err(e) => errs.push(format!("bundle [{label}] model {}: {e}", pm.name)),
@@ -175,7 +178,7 @@ async fn run_one_bundle(
     CellRun {
         model: String::new(), findings: vec![], tokens: (0, 0, 0),
         duration_ms: t0.elapsed().as_millis() as u64,
-        attempts: chain.len() as u32, iterations: 0, warn: Some(errs.join("; ")),
+        attempts: chain.len() as u32, iterations: 0, tool_use: Default::default(), warn: Some(errs.join("; ")),
     }
 }
 
@@ -331,7 +334,7 @@ async fn run_one_doc(
                     model: pm.name.clone(), findings: fs,
                     tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                     duration_ms: t0.elapsed().as_millis() as u64,
-                    attempts: i as u32 + 1, iterations: call.iterations, warn: None,
+                    attempts: i as u32 + 1, iterations: call.iterations, tool_use: call.tool_use, warn: None,
                 };
             }
             Err(e) => errs.push(format!("doc model {}: {e}", pm.name)),
@@ -340,7 +343,7 @@ async fn run_one_doc(
     CellRun {
         model: String::new(), findings: vec![], tokens: (0, 0, 0),
         duration_ms: t0.elapsed().as_millis() as u64,
-        attempts: chain.len() as u32, iterations: 0, warn: Some(errs.join("; ")),
+        attempts: chain.len() as u32, iterations: 0, tool_use: Default::default(), warn: Some(errs.join("; ")),
     }
 }
 
@@ -495,7 +498,7 @@ mod tests {
     impl ReviewProvider for PromptProbe {
         async fn run(&self, req: LensRequest) -> Result<crate::provider::LensCall, ProviderError> {
             self.prompts.lock().unwrap().push(req.prompt);
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1 })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1, tool_use: Default::default() })
         }
     }
 
@@ -534,7 +537,7 @@ mod tests {
             self.max_seen.fetch_max(cur, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             self.inflight.fetch_sub(1, Ordering::SeqCst);
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1 })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1, tool_use: Default::default() })
         }
     }
 
@@ -749,7 +752,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                 self.slow_done.store(true, Ordering::SeqCst);
             }
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1 })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1, tool_use: Default::default() })
         }
     }
 

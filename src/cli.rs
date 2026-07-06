@@ -1038,6 +1038,7 @@ pub async fn run_resume(
                     cell: cell.cell.clone(), model: cell.model.clone(), ok: false,
                     findings: vec![], warn: Some(e.to_string()),
                     duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 1, iterations: 0,
+                    tool_use: Default::default(),
                 }
             }
         };
@@ -1479,6 +1480,7 @@ mod resume_tests {
                 output_tokens: 1,
                 cached_input_tokens: 0,
                 iterations: 1,
+                tool_use: Default::default(),
             })
         }
     }

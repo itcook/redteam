@@ -72,6 +72,7 @@ pub async fn run_tool_loop(
     let mut in_tok = 0u64;
     let mut out_tok = 0u64;
     let mut cached_tok = 0u64;
+    let mut tool_use = crate::tools::ToolUse::default();
 
     // iterations 口径：逻辑迭代数——自收敛=第几轮收敛；FINALIZE 计入（带新指令的真实
     // 往返，落 max_iters+1，>max_iters 即「触发过强制收尾」）；turn 级 retry 不计（网络
@@ -87,6 +88,7 @@ pub async fn run_tool_loop(
         in_tok += turn.input_tokens;
         out_tok += turn.output_tokens;
         cached_tok += turn.cached_input_tokens;
+        tool_use.tally(&turn.tool_calls);
 
         if turn.tool_calls.is_empty() {
             let out = match parse_lens_output(&turn.text) {
@@ -99,6 +101,7 @@ pub async fn run_tool_loop(
                 output_tokens: out_tok,
                 cached_input_tokens: cached_tok,
                 iterations: i + 1,
+                tool_use: tool_use.clone(),
             });
         }
 
@@ -154,6 +157,7 @@ pub async fn run_tool_loop(
         cached_input_tokens: cached_tok,
         // 未修复=正常收尾轮 max_iters+1；修复成功=多付出一轮真实往返，计 max_iters+2。
         iterations: if repaired { max_iters + 2 } else { max_iters + 1 },
+        tool_use,
     })
 }
 
