@@ -101,4 +101,4 @@ jq -cn --argjson t1 "$TIER1" \
 只回 3 行:记分卡是否写入 + `<session>.md` 路径 + 一条最高信号的工具缺陷(若有)。**不回长文**。
 
 ## 毕业
-中枢是**原始观测池**。值得动手的缺陷/趋势由人**手工毕业**进 redteam 的 `.doc/TODO.md`/roadmap——不自动写。
+中枢是**原始观测池**。值得动手的缺陷/趋势由人**手工毕业**进 redteam 的 `.doc/TODO/`（summary+followup）/`.doc/roadmap/`——不自动写。
