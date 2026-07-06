@@ -43,6 +43,24 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "read_files",
+            description: "Read MULTIPLE files at once under the review root, each returned with line numbers. \
+                          Prefer this over repeated read_file calls: batch every file you anticipate needing \
+                          into a SINGLE call to save round-trips. Total output is bounded — an oversized batch \
+                          is truncated with a note; fetch the remainder or precise line ranges with read_file.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Paths relative to the review root."
+                    }
+                },
+                "required": ["paths"]
+            }),
+        },
+        ToolSpec {
             name: "search_repo",
             description: "Search file contents under the review root with a regular expression \
                           (gitignore-aware). Returns matching lines as path:line:text.",
@@ -77,6 +95,9 @@ pub struct ToolExecutor {
 }
 
 const READ_MAX_BYTES: usize = 64 * 1024;
+/// read_files 批量总预算（≈2× 单文件帽）：超即严格截断到 char 边界 + 注记，模型改用 read_file 取余。
+/// 硬界护 context——批量读的总输出有上限，绝不比逐个 read_file 更撑 context（可调，待 A/B 校准）。
+const READ_FILES_MAX_BYTES: usize = 128 * 1024;
 const LIST_MAX_ENTRIES: usize = 500;
 const SEARCH_MAX_MATCHES: usize = 100;
 
@@ -102,6 +123,7 @@ impl ToolExecutor {
     pub fn execute(&self, call: &ToolCall) -> ToolResult {
         let content = match call.name.as_str() {
             "read_file" => self.do_read_file(&call.args),
+            "read_files" => self.do_read_files(&call.args),
             "list_files" => self.do_list_files(&call.args),
             "search_repo" => self.do_search_repo(&call.args),
             other => format!("ERROR: unknown tool: {other}"),
@@ -114,6 +136,48 @@ impl ToolExecutor {
             Some(p) => p,
             None => return "ERROR: read_file requires a string 'path'".into(),
         };
+        let start = args.get("start").and_then(Value::as_u64);
+        let end = args.get("end").and_then(Value::as_u64);
+        self.read_one(path, start, end)
+    }
+
+    /// 批量读多个整文件（延迟主线：一轮拿全所需文件，砍 tool-loop 轮数——单数 read_file 的
+    /// affordance 把模型锁进「一轮一读」串行到撞满 max_iters）。总输出受 READ_FILES_MAX_BYTES
+    /// 严格约束（截到 char 边界 + 注记），超额让模型改用 read_file 取余，故不比逐个读更撑 context。
+    fn do_read_files(&self, args: &Value) -> String {
+        let paths = match args.get("paths").and_then(Value::as_array) {
+            Some(a) => a,
+            None => return "ERROR: read_files requires an array 'paths'".into(),
+        };
+        if paths.is_empty() {
+            return "ERROR: read_files requires a non-empty 'paths' array".into();
+        }
+        let mut out = String::new();
+        for pv in paths {
+            let rel = match pv.as_str() {
+                Some(s) => s,
+                None => continue, // 忽略非字符串项
+            };
+            out.push_str(&format!("===== {rel} =====\n"));
+            out.push_str(&self.read_one(rel, None, None));
+            out.push('\n');
+            if out.len() > READ_FILES_MAX_BYTES {
+                let mut cut = READ_FILES_MAX_BYTES;
+                while cut > 0 && !out.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                out.truncate(cut);
+                out.push_str("\n... [read_files: total budget reached; request remaining files or line ranges with read_file]\n");
+                break;
+            }
+        }
+        out
+    }
+
+    /// 读单文件为带行号字符串（词法 safe_join + canonicalize 符号链接逃逸防护 + READ_MAX_BYTES
+    /// 帽 + 可选行段）。返回值可能是 "ERROR: …" 文案（工具结果即字符串，错误内联给模型）。
+    /// read_file / read_files 共用此实现。
+    fn read_one(&self, path: &str, start: Option<u64>, end: Option<u64>) -> String {
         let full = match self.safe_join(path) {
             Some(p) => p,
             None => return format!("ERROR: path escapes root: {path}"),
@@ -136,8 +200,6 @@ impl ToolExecutor {
         if let Err(e) = file.take((READ_MAX_BYTES as u64) + 1).read_to_string(&mut text) {
             return format!("ERROR: cannot read {path}: {e}");
         }
-        let start = args.get("start").and_then(Value::as_u64);
-        let end = args.get("end").and_then(Value::as_u64);
         let mut out = String::new();
         let mut bytes = 0usize;
         for (i, line) in text.lines().enumerate() {
@@ -336,6 +398,49 @@ mod tests {
     }
 
     #[test]
+    fn read_files_batches_multiple_with_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.rs", "fn a() {}\n");
+        write_file(dir.path(), "b.rs", "fn b() {}\n");
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("read_files", json!({ "paths": ["a.rs", "b.rs"] })));
+        assert!(r.content.contains("===== a.rs ====="), "含 a 头: {}", r.content);
+        assert!(r.content.contains("===== b.rs ====="), "含 b 头");
+        assert!(r.content.contains("fn a() {}") && r.content.contains("fn b() {}"), "两文件正文都在");
+    }
+
+    #[test]
+    fn read_files_total_budget_truncates_with_note() {
+        let dir = tempfile::tempdir().unwrap();
+        // 三个 ~50KB 单长行文件 → 合计 ~150KB > READ_FILES_MAX_BYTES(128KB) → 严格截断带注记
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            write_file(dir.path(), f, &format!("{}\n", "x".repeat(50_000)));
+        }
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("read_files", json!({ "paths": ["a.rs", "b.rs", "c.rs"] })));
+        assert!(r.content.len() <= READ_FILES_MAX_BYTES + 200, "总输出受硬界约束，实得 {}", r.content.len());
+        assert!(r.content.contains("total budget reached"), "带预算截断注记");
+    }
+
+    #[test]
+    fn read_files_bad_path_is_inline_error_not_whole_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.rs", "good\n");
+        let ex = ToolExecutor::new(dir.path());
+        let r = ex.execute(&call("read_files", json!({ "paths": ["a.rs", "../secret"] })));
+        assert!(r.content.contains("good"), "好文件仍读到");
+        assert!(r.content.contains("ERROR: path escapes root"), "坏路径内联报错不整体失败: {}", r.content);
+    }
+
+    #[test]
+    fn read_files_empty_or_missing_paths_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = ToolExecutor::new(dir.path());
+        assert!(ex.execute(&call("read_files", json!({ "paths": [] }))).content.starts_with("ERROR:"), "空 paths 报错");
+        assert!(ex.execute(&call("read_files", json!({}))).content.starts_with("ERROR:"), "缺 paths 报错");
+    }
+
+    #[test]
     fn unknown_tool_is_error_result() {
         let dir = tempfile::tempdir().unwrap();
         let ex = ToolExecutor::new(dir.path());
@@ -344,10 +449,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_specs_lists_three_named_tools() {
+    fn tool_specs_lists_named_tools() {
         let specs = tool_specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["read_file", "search_repo", "list_files"]);
+        assert_eq!(names, vec!["read_file", "read_files", "search_repo", "list_files"]);
         // 每个 spec 的 parameters 是对象、含 "type":"object"
         for s in &specs {
             assert_eq!(s.parameters["type"], "object", "spec {} bad schema", s.name);
