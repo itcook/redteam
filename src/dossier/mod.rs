@@ -264,6 +264,9 @@ pub fn reference_points(syms: &[ChangedSym], root: &Path, defs: &[(&'static str,
             let context = lines.get(lo..hi).unwrap_or(&[]).join("\n");
             hits.push(RefHit { path, line, context, is_doc: is_comment_line(hit_line) });
         }
+        // ponytail: 确定性排序，WalkBuilder 遍历顺序与 OS 目录顺序相关（非确定性）
+        // 但这里 hits 数量有限 O(1000s) 且 cap 后只取前 10，sort 成本可忽略
+        hits.sort_by(|a, b| (a.path.as_str(), a.line).cmp(&(b.path.as_str(), b.line)));
         out.push(SymRefs { name: sym.name.clone(), kind: sym.kind, defs_same_name, hits });
     }
     out
@@ -480,6 +483,32 @@ mod tests {
         assert!(r.hits.iter().any(|h| h.path == "src/a.rs" && h.context.contains("c1")));
         assert!(r.hits.iter().any(|h| h.is_doc), "doc 提及命中标 is_doc");
         assert!(!r.hits.iter().any(|h| h.line == 1 && h.path == "src/a.rs"), "def 行不作引用点");
+    }
+
+    #[test]
+    fn reference_points_hits_are_sorted_by_path_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // 创建多个文件引用同一个符号，确保 walk 顺序可能不同
+        std::fs::write(root.join("src/z.rs"),
+            "fn helper() {}\nfn zc() { helper(); }\n").unwrap();
+        std::fs::write(root.join("src/a.rs"),
+            "fn ac1() { helper(); }\nfn ac2() { helper(); }\n").unwrap();
+        std::fs::write(root.join("src/m.rs"),
+            "fn mc1() { helper(); }\n/// doc helper\nfn mc2() { helper(); }\n").unwrap();
+        let d = rust_defs();
+        let syms = vec![ChangedSym { name: "helper".into(), kind: "fn", file: "src/z.rs".into() }];
+        let refs = reference_points(&syms, root, &d);
+        assert_eq!(refs.len(), 1, "应有一个符号");
+        let hits = &refs[0].hits;
+        assert!(hits.len() >= 4, "应找到至少 4 处引用点（z/a/a/m）");
+
+        // 验证按 (path, line) 排序
+        let keys: Vec<(String, usize)> = hits.iter().map(|h| (h.path.clone(), h.line)).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "hits 应按 (path, line) 排序: {:?}", keys);
     }
 
     fn sr(name: &str, defs_same_name: usize, n: usize, doc_idx: Option<usize>) -> SymRefs {
