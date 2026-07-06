@@ -219,7 +219,7 @@ mod tests {
         r.run.model_ids = vec!["deepseek-v4".into(), "kimi-k2".into()];
         r.run.failed_models = vec!["Kimi".into()];
         r.run.duration_ms = 528_000;
-        r.run.usage = Usage { input_tokens: 2_620_877, output_tokens: 87_187, cached_input_tokens: 1_310_439 };
+        r.run.usage = Usage { input_tokens: 2_620_877, output_tokens: 87_187, cached_input_tokens: 1_310_439, ..Default::default() };
         r.run.ledger = Some(LedgerMeta { loaded: 53, source: ".redteam/proj.db".into() });
         r.run.warnings = vec!["w-one".into()];
         let s = render(&r, Format::Md);

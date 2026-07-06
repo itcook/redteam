@@ -28,17 +28,19 @@ fn pick_cross_model<'a>(models: &'a [String], finding_models: &[String]) -> Opti
 }
 
 /// 对单条孤证做 refute：选交叉 model → build_refute_prompt → provider.run。
-/// 返回 (Verify, 可选 warning)：空 findings=Upheld、非空=Refuted；调用失败=保守 Upheld
+/// 返回 (Verify, 可选 warning, usage)：空 findings=Upheld、非空=Refuted；调用失败=保守 Upheld
 /// 且携带 warning——验证层静默失效必须可观测（dogfood 20260703 r1：4/6 refute 失败零告警）。
+/// usage=(input,output,cached)：无模型/调用失败时为 (0,0,0)（T03：refute 趟 token 曾被丢弃，未入任何账）。
 async fn refute_one(
     provider: &dyn ReviewProvider, finding: &Finding, models: &[String], mode: Mode,
     precedents: &[DismissCard],
-) -> (Verify, Option<String>) {
+) -> (Verify, Option<String>, (u64, u64, u64)) {
     let model = match pick_cross_model(models, &finding.models) {
         Some(m) => m.to_string(),
         None => return (
             Verify { verdict: VerifyVerdict::Upheld, model: String::new(), note: "no model".into() },
             None,
+            (0, 0, 0),
         ),
     };
     let notes = render_precedents(finding, precedents);
@@ -47,12 +49,13 @@ async fn refute_one(
         Ok(call) => {
             let (verdict, note, contract_warn) = classify_refute(&call.findings);
             let warn = contract_warn.map(|w| format!("refute [{}] model {model}: {w}", finding.id));
-            (Verify { verdict, model, note }, warn)
+            let usage = (call.input_tokens, call.output_tokens, call.cached_input_tokens);
+            (Verify { verdict, model, note }, warn, usage)
         }
         // 保守：refute 调用失败不冤枉 finding（保留其 blocking 力），但失败必须进 warnings。
         Err(e) => {
             let warn = format!("refute [{}] model {model}: {e}", finding.id);
-            (Verify { verdict: VerifyVerdict::Upheld, model, note: "refute unavailable".into() }, Some(warn))
+            (Verify { verdict: VerifyVerdict::Upheld, model, note: "refute unavailable".into() }, Some(warn), (0, 0, 0))
         }
     }
 }
@@ -115,6 +118,8 @@ fn classify_refute(
 /// Semaphore 限 max_concurrency。
 /// `precedents`：活跃判例卡——refute prompt 按相关性渲染注入，skeptic 见过往人裁，
 /// 主题变体（换文件/措辞/锚点）跨轮一致地被 refute（dogfood 20260702 最高信号缺陷）。
+/// 返回第三元素 = refute 趟累计 usage（input,output,cached）；无 targets 时为 (0,0,0)
+/// （T03：调用方须把此值折进总账，refute 趟此前从未入过任何账）。
 pub async fn verify_findings(
     mut findings: Vec<Finding>,
     provider: &dyn ReviewProvider,
@@ -123,10 +128,10 @@ pub async fn verify_findings(
     max_concurrency: usize,
     mode: Mode,
     precedents: &[DismissCard],
-) -> (Vec<Finding>, Vec<String>) {
+) -> (Vec<Finding>, Vec<String>, (u64, u64, u64)) {
     let targets = refute_targets(&findings, precedents, block_threshold);
     if targets.is_empty() {
-        return (findings, Vec::new());
+        return (findings, Vec::new(), (0, 0, 0));
     }
     let sem = Arc::new(Semaphore::new(max_concurrency.max(1)));
     let results = futures::future::join_all(targets.iter().map(|&i| {
@@ -139,7 +144,8 @@ pub async fn verify_findings(
     }))
     .await;
     let mut warnings = Vec::new();
-    for (&i, (v, warn)) in targets.iter().zip(results) {
+    let mut usage = (0u64, 0u64, 0u64);
+    for (&i, (v, warn, u)) in targets.iter().zip(results) {
         if v.verdict == VerifyVerdict::Refuted {
             // 证伪 → 降 confidence 到 0（作为信号，md 渲染/排序可用）。
             // verdict 的实质排除已落在 compute_verdict（显式 verify==Refuted 不 blocking），
@@ -148,8 +154,11 @@ pub async fn verify_findings(
         }
         findings[i].verify = Some(v);
         warnings.extend(warn);
+        usage.0 += u.0;
+        usage.1 += u.1;
+        usage.2 += u.2;
     }
-    (findings, warnings)
+    (findings, warnings, usage)
 }
 
 #[cfg(test)]
@@ -201,7 +210,7 @@ mod tests {
         // skeptic 返回非空（找到反驳）→ refuted；confidence 降 0
         let provider = FakeProvider::with("beta", vec![rawf("actually guarded above")]);
         let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, _w) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
         assert_eq!(out[0].verify.as_ref().unwrap().model, "beta", "交叉选了非 alpha 的 model");
         assert_eq!(out[0].confidence, 0.0, "refuted 降 confidence 下 floor");
@@ -212,9 +221,33 @@ mod tests {
         // skeptic 返回空（守不住反驳）→ upheld；confidence 不动
         let provider = FakeProvider::with("beta", vec![]);
         let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, _w) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld);
         assert_eq!(out[0].confidence, 0.9);
+    }
+
+    #[tokio::test]
+    async fn refute_usage_sums_across_targets() {
+        // T03：refute 趟 usage 曾被 refute_one 丢弃，run.usage 从未见过这笔账。
+        // 两条孤证都进 targets → 两次 provider.run 各记 100/20/5 → 累计应为 200/40/10。
+        let provider = FakeProvider::with_tokens("beta", vec![rawf("actually guarded")], (100, 20, 5));
+        let f1 = finding("missing auth 1", Severity::High, 1, "alpha");
+        let f2 = finding("missing auth 2", Severity::High, 1, "alpha");
+        let (_out, _w, usage) = verify_findings(
+            vec![f1, f2], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[],
+        ).await;
+        assert_eq!(usage, (200, 40, 10), "两次 refute 调用的 token 须累加，不能被丢弃");
+    }
+
+    #[tokio::test]
+    async fn no_targets_yields_zero_usage() {
+        // 无 refute target（低于 block_threshold）→ 未发生任何 provider.run 调用 → usage 为 (0,0,0)。
+        let provider = FakeProvider::with_tokens("beta", vec![rawf("x")], (100, 20, 5));
+        let f = finding("minor", Severity::Low, 1, "alpha");
+        let (_out, _w, usage) = verify_findings(
+            vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[],
+        ).await;
+        assert_eq!(usage, (0, 0, 0));
     }
 
     #[tokio::test]
@@ -222,7 +255,7 @@ mod tests {
         // agreement>=2（层①）→ 不 refute，verify 留 None
         let provider = FakeProvider::with("beta", vec![rawf("x")]);
         let f = finding("agreed bug", Severity::Critical, 2, "alpha");
-        let (out, _w) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
         assert!(out[0].verify.is_none());
         assert_eq!(out[0].confidence, 0.9);
     }
@@ -232,7 +265,7 @@ mod tests {
         // severity < block_threshold → 不 refute
         let provider = FakeProvider::with("beta", vec![rawf("x")]);
         let f = finding("minor", Severity::Low, 1, "alpha");
-        let (out, _w) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
         assert!(out[0].verify.is_none());
     }
 
@@ -243,7 +276,7 @@ mod tests {
         let provider = FakeProvider::with("beta", vec![rawf("actually specified in section 3")]);
         let mut f = finding("missing rollback branch", Severity::High, 1, "alpha");
         f.quote = String::new();
-        let (out, _w) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Doc, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Doc, &[]).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
         assert_eq!(out[0].confidence, 0.0);
     }
@@ -263,7 +296,7 @@ mod tests {
         let mut f = finding("prompt injection via ledger notes", Severity::Medium, 2, "alpha");
         f.models = vec!["alpha".into(), "gamma".into()];
         let cards = vec![card("ffffffffffffffff", "a.rs", "prompt injection via dismissed notes")];
-        let (out, _w) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::High, 4, Mode::Code, &cards).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::High, 4, Mode::Code, &cards).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted,
             "预筛命中 → 无视 agreement/severity 进 refute");
     }
@@ -274,7 +307,7 @@ mod tests {
         let provider = FakeProvider::with("beta", vec![rawf("would refute")]);
         let f = finding("missing auth", Severity::High, 1, "alpha");
         let cards = vec![card(&f.id.clone(), "a.rs", "missing auth")];
-        let (out, _w) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &cards).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &cards).await;
         assert!(out[0].verify.is_none(), "台账精确命中不烧 refute");
     }
 
@@ -284,14 +317,14 @@ mod tests {
         let provider = FakeProvider::with("alpha", vec![]); // 只有 alpha，单 model
         let f = finding("missing auth", Severity::High, 1, "alpha");
         // models 只有 alpha → 退化自审 alpha；但 FakeProvider 有 alpha script(空) → upheld
-        let (out, w) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 4, Mode::Code, &[]).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld);
         assert!(w.is_empty(), "成功 upheld 无 warning");
 
         // 真失败：所选 model 无 script → 保守 upheld + warning 上浮（验证层失效可观测）
-        let provider2 = FakeProvider { scripted: BTreeMap::new() };
+        let provider2 = FakeProvider { scripted: BTreeMap::new(), tokens: (0, 0, 0) };
         let f2 = finding("missing auth", Severity::High, 1, "ghost");
-        let (out2, w2) = verify_findings(vec![f2], &provider2, &["ghost".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out2, w2, _u2) = verify_findings(vec![f2], &provider2, &["ghost".into()], Severity::Medium, 4, Mode::Code, &[]).await;
         assert_eq!(out2[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld, "调用失败保守 upheld");
         assert_eq!(out2[0].confidence, 0.9, "upheld 不降 confidence");
         assert_eq!(w2.len(), 1, "refute 失败必须产出 warning");

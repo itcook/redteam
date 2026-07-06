@@ -2,13 +2,25 @@ use super::*;
 use crate::domain::RawFinding;
 use std::collections::BTreeMap;
 
-pub struct FakeProvider { pub scripted: BTreeMap<String, Vec<RawFinding>> }
+#[derive(Default)]
+pub struct FakeProvider {
+    pub scripted: BTreeMap<String, Vec<RawFinding>>,
+    /// (input, output, cached) 令每次 run() 都回报的固定 usage；测试 token 入账用，默认 (0,0,0)。
+    pub tokens: (u64, u64, u64),
+}
 
 impl FakeProvider {
     pub fn with(model: &str, findings: Vec<RawFinding>) -> Self {
         let mut m = BTreeMap::new();
         m.insert(model.to_string(), findings);
-        FakeProvider { scripted: m }
+        FakeProvider { scripted: m, tokens: (0, 0, 0) }
+    }
+
+    /// 同 `with`，但 run() 回报指定 usage（T03：refute usage 入账测试用）。
+    pub fn with_tokens(model: &str, findings: Vec<RawFinding>, tokens: (u64, u64, u64)) -> Self {
+        let mut p = Self::with(model, findings);
+        p.tokens = tokens;
+        p
     }
 }
 
@@ -16,7 +28,13 @@ impl FakeProvider {
 impl ReviewProvider for FakeProvider {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError> {
         match self.scripted.get(&req.model) {
-            Some(fs) => Ok(LensCall { findings: fs.clone(), input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1 }),
+            Some(fs) => Ok(LensCall {
+                findings: fs.clone(),
+                input_tokens: self.tokens.0,
+                output_tokens: self.tokens.1,
+                cached_input_tokens: self.tokens.2,
+                iterations: 1,
+            }),
             None => Err(ProviderError::Unavailable(format!("no script for model {}", req.model))),
         }
     }

@@ -53,6 +53,10 @@ pub struct Usage {
     /// 缺失/未知字段记 0（可观测：cached=0 且 input 大 = 未命中或字段未知）。L1 缓存观测。
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// refute（skeptic 复核）那趟的 token 分账（子集视角，非加法——顶层 input_tokens 已含 fan-out+refute 总量）。
+    /// None = 本次无 refute（targets 空）。镜像 stats.new 的 Option<Box<>> idiom，serde default 向后兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refute: Option<Box<Usage>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -155,6 +159,25 @@ mod tests {
         assert!(!r.run.incremental);
         assert!(r.run.resolved.is_empty() && r.run.carried_dropped.is_empty());
         assert!(r.stats.new.is_none());
+    }
+
+    #[test]
+    fn usage_refute_roundtrips_and_old_json_defaults_to_none() {
+        // T03：Usage.refute 有值 → 序列化带 refute 键；无 refute（旧 JSON）→ 反序列化为 None。
+        let u = Usage {
+            input_tokens: 100, output_tokens: 20, cached_input_tokens: 5,
+            refute: Some(Box::new(Usage { input_tokens: 30, output_tokens: 6, cached_input_tokens: 1, refute: None })),
+        };
+        let j = serde_json::to_string(&u).unwrap();
+        assert!(j.contains("\"refute\":{"), "refute 子块应出现在序列化输出: {j}");
+        let back: Usage = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.refute.unwrap().input_tokens, 30);
+
+        // 旧结果（无 refute 键）→ 向后兼容，反序列化为 None
+        let old = r#"{"input_tokens":1,"output_tokens":1}"#;
+        let r: Usage = serde_json::from_str(old).unwrap();
+        assert!(r.refute.is_none());
+        assert!(!serde_json::to_string(&Usage::default()).unwrap().contains("refute"), "默认态不产 refute 键");
     }
 
     #[test]

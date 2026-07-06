@@ -577,7 +577,7 @@ mod tests {
         let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
         scripted.insert("alpha".into(), vec![raw_at("src/a.rs", "alpha-issue", Severity::High)]);
         scripted.insert("beta".into(), vec![raw_at("src/a.rs", "beta-issue", Severity::High)]);
-        let provider = crate::provider::fake::FakeProvider { scripted };
+        let provider = crate::provider::fake::FakeProvider { scripted, ..Default::default() };
         let bundles = vec![
             Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] },
             Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "+y".into() }] },
@@ -640,7 +640,7 @@ mod tests {
         let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
         scripted.insert("alpha".into(), vec![raw_at("spec.md", "alpha-issue", Severity::High)]);
         scripted.insert("beta".into(), vec![raw_at("spec.md", "beta-issue", Severity::High)]);
-        let provider = crate::provider::fake::FakeProvider { scripted };
+        let provider = crate::provider::fake::FakeProvider { scripted, ..Default::default() };
         let rules = vec![by_id("D1").unwrap(), by_id("D2").unwrap()];
         let opts = OrchestrateOpts {
             models: vec![

@@ -238,7 +238,7 @@ struct TailCtx<'a> {
 
 /// 共用尾段：anchor → dedup → [doc: correlate/apply_clusters] → verify → verdict → 组装 report
 /// → 退出码。三处调用方（run_code_review/run_review/run_resume）行为 1:1 迁移，不改变既有语义。
-async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Result<(ReviewReport, i32)> {
+async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow::Result<(ReviewReport, i32)> {
     let anchored = match ctx.mode {
         Mode::Code => anchor(findings, ctx.root.expect("code tail requires root")),
         Mode::Doc => {
@@ -267,12 +267,16 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
             s.on_phase(crate::state::job::Phase::Refute, Some(format!("{n_targets} targets")));
         }
     }
-    let (findings, refute_warnings) = verify_findings(
+    let (findings, refute_warnings, refute_usage) = verify_findings(
         findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
         ctx.precedents,
     ).await;
     let mut run_warnings = ctx.warnings;
     run_warnings.extend(refute_warnings);
+    // T03：refute 趟 token 曾被丢弃，从未入过 run.usage 的账——折进总账，诚实反映全流程成本。
+    ctx.usage.0 += refute_usage.0;
+    ctx.usage.1 += refute_usage.1;
+    ctx.usage.2 += refute_usage.2;
 
     let mut findings = findings;
     let dismissed_reappeared = mark_dismissed(&mut findings, ctx.dismissed);
@@ -292,7 +296,15 @@ async fn assemble_report(findings: Vec<Finding>, ctx: TailCtx<'_>) -> anyhow::Re
             model_ids: ctx.model_ids,
             lenses: ctx.lens_ids,
             duration_ms: ctx.duration_ms,
-            usage: Usage { input_tokens: ctx.usage.0, output_tokens: ctx.usage.1, cached_input_tokens: ctx.usage.2 },
+            usage: Usage {
+                input_tokens: ctx.usage.0, output_tokens: ctx.usage.1, cached_input_tokens: ctx.usage.2,
+                refute: if refute_usage == (0, 0, 0) { None } else {
+                    Some(Box::new(Usage {
+                        input_tokens: refute_usage.0, output_tokens: refute_usage.1,
+                        cached_input_tokens: refute_usage.2, refute: None,
+                    }))
+                },
+            },
             warnings: run_warnings,
             failed_models: ctx.failed_models,
             dismissed_reappeared,
@@ -596,7 +608,7 @@ pub async fn run_incremental_review(
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
     let dossiers = build_dossiers(&bundles, root);
-    let raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
     //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。
@@ -621,11 +633,15 @@ pub async fn run_incremental_review(
             s.on_phase(crate::state::job::Phase::Refute, Some(format!("{n_targets} targets")));
         }
     }
-    let (findings, refute_warnings) = verify_findings(
+    let (findings, refute_warnings, refute_usage) = verify_findings(
         merged, provider, &model_names, block, cfg.review.max_concurrency, Mode::Code, &ledger.cards,
     ).await;
     let mut warnings = raw.warnings;
     warnings.extend(refute_warnings);
+    // T03：同 assemble_report——refute 趟 token 折进总账，不再是账外盈余。
+    raw.usage.0 += refute_usage.0;
+    raw.usage.1 += refute_usage.1;
+    raw.usage.2 += refute_usage.2;
     let mut findings = findings;
     let dismissed_reappeared = mark_dismissed(&mut findings, &ledger.ids);
 
@@ -650,7 +666,15 @@ pub async fn run_incremental_review(
             model_ids,
             lenses: lens_ids,
             duration_ms: t0.elapsed().as_millis() as u64,
-            usage: Usage { input_tokens: raw.usage.0, output_tokens: raw.usage.1, cached_input_tokens: raw.usage.2 },
+            usage: Usage {
+                input_tokens: raw.usage.0, output_tokens: raw.usage.1, cached_input_tokens: raw.usage.2,
+                refute: if refute_usage == (0, 0, 0) { None } else {
+                    Some(Box::new(Usage {
+                        input_tokens: refute_usage.0, output_tokens: refute_usage.1,
+                        cached_input_tokens: refute_usage.2, refute: None,
+                    }))
+                },
+            },
             warnings,
             failed_models: raw.failed_models,
             dismissed_reappeared,
@@ -1233,7 +1257,7 @@ mod job_tests {
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             hard_constraint: false, quote: "the wrong claim here".into(), lens: None,
         }]);
-        let provider = FakeProvider { scripted };
+        let provider = FakeProvider { scripted, ..Default::default() };
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         crate::state::job::write_state(&ws, &crate::state::job::JobState::new("j1", 500)).unwrap();
@@ -1259,7 +1283,7 @@ mod job_tests {
         let ws = dir.path();
         crate::state::job::write_state(ws, &crate::state::job::JobState::new("j2", 0)).unwrap();
         // targets 指向不存在文件 → collect_doc 失败 → run_review_dispatch Err → failed
-        let provider = FakeProvider { scripted: BTreeMap::new() };
+        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
         let code = run_job(ws, "j2", &doc_args("/nonexistent/zzz.md"), &provider, &cfg(), dir.path(), 0).await;
         assert_eq!(code, 2);
         let st = read_state(ws, "j2").unwrap();
@@ -1281,7 +1305,7 @@ mod job_tests {
         ).unwrap();
 
         // targets 指向不存在文件 → collect 失败 → run_review_dispatch Err，但已有 partial 记录
-        let provider = FakeProvider { scripted: BTreeMap::new() };
+        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
         let code = run_job(ws, "j2b", &doc_args("/nonexistent/zzz.md"), &provider, &cfg(), dir.path(), 0).await;
 
         assert_eq!(code, 2);
@@ -1350,7 +1374,7 @@ mod job_tests {
         pre.exit_code = Some(0);
         crate::state::job::write_state(ws, &pre).unwrap();
 
-        let provider = FakeProvider { scripted: BTreeMap::new() };
+        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
         let _code = run_job(ws, "j3", &doc_args("/any.md"), &provider, &cfg(), dir.path(), 0).await;
 
         // 状态仍应是 Cancelled
@@ -1724,7 +1748,7 @@ default_models=["m","m2"]
             raw("src/a.rs", "this is fabricated", Severity::Critical),
         ]);
         scripted.insert("m2".to_string(), vec![raw("src/a.rs", "db.write(token);", Severity::High)]);
-        let provider = FakeProvider { scripted };
+        let provider = FakeProvider { scripted, ..Default::default() };
         let my_args = ReviewArgs { models: None, ..args() };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
         let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();

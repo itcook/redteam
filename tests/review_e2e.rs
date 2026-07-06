@@ -35,7 +35,7 @@ async fn doc_review_end_to_end_rejects() {
     let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
     scripted.insert("claude".into(), vec![finding()]);
     scripted.insert("claude2".into(), vec![finding()]);
-    let provider = FakeProvider { scripted };
+    let provider = FakeProvider { scripted, ..Default::default() };
     let cfg = Config::from_layers(&[
         "[providers.claude]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
          [providers.claude2]\nkind=\"openai\"\nmodel=\"b\"\npriority=5\n\
@@ -249,7 +249,7 @@ async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
     scripted.insert("beta".into(), vec![
         rf(&dp, "self-contradiction on retry", "the system MUST never retry", Severity::High),
     ]);
-    let provider = redteam::provider::fake::FakeProvider { scripted };
+    let provider = redteam::provider::fake::FakeProvider { scripted, ..Default::default() };
 
     let cfg = redteam::config::Config::from_layers(&[
         "[providers.alpha]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
