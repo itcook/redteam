@@ -1,7 +1,7 @@
 use crate::bundle::{group, select_files};
 use crate::config::Config;
 use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc, refute_targets, verify_findings};
-use crate::domain::{Finding, Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
+use crate::domain::{DossierMeta, Finding, Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::{collect, detect_mode, EvidenceOpts, Scope};
 use crate::evidence::git::FileChange;
 use crate::lens::select;
@@ -232,6 +232,8 @@ struct TailCtx<'a> {
     ledger_meta: Option<crate::domain::LedgerMeta>,
     /// R3 stamp：证据收集刻的 HEAD（code dispatch 回填；doc/resume 为 None）。
     head_sha: Option<String>,
+    /// 卷宗覆盖 meta（T01⑥；进 RunMeta.dossier）。code fan-out 路径为 Some，doc/resume 为 None。
+    dossier_meta: Option<DossierMeta>,
     /// 后台 job 的 phase 打点通路（refute/correlate 子阶段；前台/resume 为 None）。
     sink: Option<&'a dyn CellSink>,
 }
@@ -310,6 +312,7 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
             dismissed_reappeared,
             ledger: ctx.ledger_meta,
             head_sha: ctx.head_sha,
+            dossier: ctx.dossier_meta,
             ..Default::default()
         },
     };
@@ -318,16 +321,22 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
     Ok((report, code))
 }
 
-/// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）。`REDTEAM_NO_DOSSIER`
-/// 非空 → A/B off 臂，全空段（M14 D9）。
-pub(crate) fn build_dossiers(bundles: &[crate::bundle::Bundle], root: &std::path::Path) -> Vec<String> {
-    if std::env::var_os("REDTEAM_NO_DOSSIER").is_some() {
-        return vec![String::new(); bundles.len()]; // A/B off 臂：全空卷宗段
-    }
-    bundles
-        .iter()
-        .map(|b| crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)))
-        .collect()
+/// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
+/// `REDTEAM_NO_DOSSIER` 非空 → A/B off 臂，全空段（M14 D9）。degrades 静默于：不支持语言/
+/// 无符号/调用密度门<5——meta.injected 是唯一可观测入口，供 A/B 归因与生产诊断。
+pub(crate) fn build_dossiers(bundles: &[crate::bundle::Bundle], root: &std::path::Path) -> (Vec<String>, DossierMeta) {
+    let suppressed = std::env::var_os("REDTEAM_NO_DOSSIER").is_some();
+    let sections: Vec<String> = if suppressed {
+        vec![String::new(); bundles.len()] // A/B off 臂：全空卷宗段
+    } else {
+        bundles
+            .iter()
+            .map(|b| crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)))
+            .collect()
+    };
+    let injected = sections.iter().filter(|s| !s.is_empty()).count();
+    let meta = DossierMeta { bundles: bundles.len(), injected, suppressed };
+    (sections, meta)
 }
 
 /// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
@@ -425,6 +434,7 @@ pub async fn run_review(
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
         head_sha: None,
+        dossier_meta: None,
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
@@ -481,7 +491,7 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let dossiers = build_dossiers(&bundles, root);
+    let (dossiers, dossier_meta) = build_dossiers(&bundles, root);
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
@@ -518,6 +528,7 @@ pub async fn run_code_review(
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
         head_sha,
+        dossier_meta: Some(dossier_meta),
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
@@ -607,7 +618,7 @@ pub async fn run_incremental_review(
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let dossiers = build_dossiers(&bundles, root);
+    let (dossiers, dossier_meta) = build_dossiers(&bundles, root);
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
@@ -685,6 +696,7 @@ pub async fn run_incremental_review(
             resolved: outcome.resolved_applied,
             resolution_disputed,
             carried_dropped: outcome.carried_dropped,
+            dossier: Some(dossier_meta),
         },
     };
     let code = exit_code(verdict, !report.run.failed_models.is_empty());
@@ -1083,6 +1095,7 @@ pub async fn run_resume(
         precedents: &ledger.cards,
         ledger_meta: ledger.meta.clone(),
         head_sha: None,
+        dossier_meta: None,
         sink: None,
     };
     match assemble_report(findings, ctx).await {
@@ -1803,21 +1816,31 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
-        let bundles = vec![Bundle { files: vec![FileChange {
-            path: "src/a.rs".into(),
-            diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
-        }] }];
+        // bundle 1：支持语言 + ≥5 引用点 → 应注入；bundle 2：不支持语言（.py）→ 应空（T01⑥）。
+        let bundles = vec![
+            Bundle { files: vec![FileChange {
+                path: "src/a.rs".into(),
+                diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
+            }] },
+            Bundle { files: vec![FileChange {
+                path: "src/b.py".into(),
+                diff: "@@ -1,0 +1,1 @@\n+def f(): pass\n".into(),
+            }] },
+        ];
 
-        // on 臂：至少一段非空（该 bundle 有引用点）
+        // on 臂：一段非空（有引用点）+ 一段空（不支持语言）→ meta 反映 injected:1
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
-        let on = build_dossiers(&bundles, root);
-        assert!(on.iter().any(|s| !s.is_empty()), "on 臂应有非空卷宗段: {on:?}");
+        let (on, on_meta) = build_dossiers(&bundles, root);
+        assert!(!on[0].is_empty(), "支持语言且≥5引用点应非空: {on:?}");
+        assert!(on[1].is_empty(), "不支持语言应空: {on:?}");
+        assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 1, suppressed: false });
 
-        // off 臂：全空
+        // off 臂：REDTEAM_NO_DOSSIER 生效 → 全空段 + suppressed=true + injected=0
         unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let off = build_dossiers(&bundles, root);
+        let (off, off_meta) = build_dossiers(&bundles, root);
         assert!(off.iter().all(|s| s.is_empty()), "off 臂全空");
         assert_eq!(off.len(), bundles.len());
+        assert_eq!(off_meta, DossierMeta { bundles: 2, injected: 0, suppressed: true });
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
     }
 

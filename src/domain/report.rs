@@ -59,6 +59,14 @@ pub struct Usage {
     pub refute: Option<Box<Usage>>,
 }
 
+/// 卷宗覆盖观测（T01⑥）：本次评审卷宗是否生效、多少 bundle 拿到内容——A/B 归因与生产诊断用。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct DossierMeta {
+    pub bundles: usize,       // 本次 fan-out 的 bundle 总数
+    pub injected: usize,      // 拿到非空卷宗的 bundle 数（其余=不支持语言/无符号/调用密度门<5/被抑制）
+    pub suppressed: bool,     // REDTEAM_NO_DOSSIER 生效（A/B off 臂标记）
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RunMeta {
     pub job_id: String,
@@ -97,6 +105,9 @@ pub struct RunMeta {
     /// 重锚定失败被消灭的携带候选 id（使锚失效的改动必在本轮 delta 内，审计用）。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub carried_dropped: Vec<String>,
+    /// 卷宗覆盖（code 模式且卷宗路径才有；doc/resume 为 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dossier: Option<DossierMeta>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,5 +205,28 @@ mod tests {
         for k in ["head_sha", "incremental", "delta_base", "resolved", "resolution_disputed", "carried_dropped"] {
             assert!(!d.contains(k), "默认态不应含 {k}: {d}");
         }
+    }
+
+    #[test]
+    fn runmeta_dossier_roundtrips_and_old_json_defaults_to_none() {
+        // T01⑥：dossier 有值 → 序列化带 dossier 键；旧 JSON（无 dossier 键）→ 反序列化为 None。
+        let mut m = RunMeta {
+            dossier: Some(DossierMeta { bundles: 3, injected: 1, suppressed: false }),
+            ..Default::default()
+        };
+        m.job_id = "j".into();
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains("\"dossier\":{\"bundles\":3,\"injected\":1,\"suppressed\":false}"), "{j}");
+
+        // 默认态（无 dossier）不产键——v2/v3（无卷宗字段）消费者视角零噪音
+        let d = serde_json::to_string(&RunMeta::default()).unwrap();
+        assert!(!d.contains("dossier"), "默认态不应含 dossier: {d}");
+
+        // 旧 JSON（无 dossier 键）→ 反序列化为 None（doc/resume 路径同样兼容）
+        let old = r#"{"job_id":"j1","models":["m"],"lenses":["L1"],"duration_ms":1,
+                   "usage":{"input_tokens":1,"output_tokens":1},
+                   "warnings":[],"failed_models":[]}"#;
+        let back: RunMeta = serde_json::from_str(old).unwrap();
+        assert!(back.dossier.is_none());
     }
 }
