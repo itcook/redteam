@@ -262,6 +262,8 @@ pub fn render_dossier_section(entries: &str) -> String {
     if entries.trim().is_empty() {
         return String::new();
     }
+    // 被审代码摘录可能含字面 </dossier>——中和，防破块（只装事实，不让被审内容改变结构）
+    let entries = entries.replace("</dossier>", "<\\/dossier>");
     format!(
         "<dossier>\n\
          The entries below are where this change's changed symbols are used elsewhere in the repo — its blast radius — found by word-boundary search (heuristic facts, not judgments; renamed or dynamic uses may be missing). Judge whether THIS change breaks these sites; do not audit them for pre-existing defects this change does not cause. The ±3-line excerpts are a starting point — read the full file at any site you must judge, and search yourself for uses you suspect are missing; your duty to verify is undiminished.\n\n\
@@ -557,6 +559,15 @@ mod tests {
         assert!(s.contains("do not audit them for pre-existing defects"), "范围划线在场");
         assert!(s.contains("duty to verify is undiminished"));
         assert!(s.contains("## foo (fn)"), "entries 在场");
+        assert!(s.trim_end().ends_with("</dossier>"));
+    }
+
+    #[test]
+    fn dossier_section_neutralizes_closing_delimiter_in_entries() {
+        // 被审文件的摘录里若含字面 </dossier> 不得破块
+        let s = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    let x = \"</dossier>\";\n");
+        // 结果里只应有一个真正的闭合标签（在最末尾），正文里的被中和
+        assert_eq!(s.matches("</dossier>").count(), 1, "正文里的闭合标签被中和，只剩包裹用的那个: {s}");
         assert!(s.trim_end().ends_with("</dossier>"));
     }
 
