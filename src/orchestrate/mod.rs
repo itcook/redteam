@@ -812,13 +812,13 @@ mod tests {
         // good：一轮直接产最终 findings
         let good = ToolLoopProvider::new(
             Box::new(FakeChatBackend::new(vec![AssistantTurn {
-                text: good_json.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 }])),
+                text: good_json.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None }])),
             dir.path().to_path_buf());
         // bad：先 tool_call（iter1），再一路 Timeout（iter2 重试耗尽仍失败）。
         // DEFAULT_RETRY_BUDGET=2 → iter2 需 3 次 Err（首发+2 重试）→ 备 1 Ok + 3 Err。
         let tc = AssistantTurn { text: String::new(),
             tool_calls: vec![ToolCall { id: "c".into(), name: "read_file".into(), args: json!({"path":"a.rs"}) }],
-            input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 };
+            input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None };
         let bad = ToolLoopProvider::new(
             Box::new(FakeChatBackend::new_results(vec![
                 Ok(tc),

@@ -26,6 +26,9 @@ pub struct AssistantTurn {
     pub output_tokens: u64,
     /// 命中缓存读的输入量（享折扣，是 input_tokens 的子集）。实付全价 ≈ input − cached。
     pub cached_input_tokens: u64,
+    /// 模型这一轮的结束原因（openai choices[0].finish_reason / anthropic stop_reason）——
+    /// 缺失记 None。用于把 parse 失败区分为「截断(length/max_tokens)」vs「形状违约」。
+    pub finish_reason: Option<String>,
 }
 
 /// 单轮往返抽象：给定历史 + 工具声明，返回模型这一轮的输出。
@@ -86,7 +89,10 @@ pub async fn run_tool_loop(
         cached_tok += turn.cached_input_tokens;
 
         if turn.tool_calls.is_empty() {
-            let out = parse_lens_output(&turn.text)?;
+            let out = match parse_lens_output(&turn.text) {
+                Ok(o) => o,
+                Err(_) => return Err(diagnostic_parse_error(&turn)),
+            };
             return Ok(LensCall {
                 findings: out.findings,
                 input_tokens: in_tok,
@@ -119,16 +125,51 @@ pub async fn run_tool_loop(
     in_tok += turn.input_tokens;
     out_tok += turn.output_tokens;
     cached_tok += turn.cached_input_tokens;
-    let out = parse_lens_output(&turn.text)?;
+    let (out, repaired) = match parse_lens_output(&turn.text) {
+        Ok(o) => (o, false),
+        Err(_) => {
+            // 截断/形状违约的常见根因是「篇幅超预算被 provider 截断」——不直接报废整个 cell，
+            // 补一轮纠错重发（ONE-shot，不循环；这是新请求，不碰 retry_classified 的传输重试边界）。
+            messages.push(ChatMessage::User(REPAIR_PROMPT.to_string()));
+            let repair_turn = crate::provider::retry_classified(retry_budget, || async {
+                match tokio::time::timeout(per_turn, backend.turn_final(&messages)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(ProviderError::Timeout(
+                        format!("turn timeout after {}s", per_turn.as_secs()))),
+                }
+            }).await?;
+            in_tok += repair_turn.input_tokens;
+            out_tok += repair_turn.output_tokens;
+            cached_tok += repair_turn.cached_input_tokens;
+            match parse_lens_output(&repair_turn.text) {
+                Ok(o) => (o, true),
+                Err(_) => return Err(diagnostic_parse_error(&repair_turn)),
+            }
+        }
+    };
     Ok(LensCall {
         findings: out.findings,
         input_tokens: in_tok,
         output_tokens: out_tok,
         cached_input_tokens: cached_tok,
-        iterations: max_iters + 1,
+        // 未修复=正常收尾轮 max_iters+1；修复成功=多付出一轮真实往返，计 max_iters+2。
+        iterations: if repaired { max_iters + 2 } else { max_iters + 1 },
     })
 }
 
+/// parse 失败诊断化：把 turn.finish_reason 拼进 Parse 错误，区分「截断(length/max_tokens)」
+/// vs 其它形状违约——warnings 里能直接看出根因，而不是裸的 "no schema-valid JSON in: …"。
+fn diagnostic_parse_error(turn: &AssistantTurn) -> ProviderError {
+    ProviderError::Parse(format!(
+        "final JSON parse failed (finish_reason={}): {}",
+        turn.finish_reason.as_deref().unwrap_or("unknown"),
+        turn.text.chars().take(120).collect::<String>()
+    ))
+}
+
+const REPAIR_PROMPT: &str = "Your previous response was not valid JSON (it may have been truncated). \
+Re-emit ONLY the complete findings JSON object matching the schema. If space is tight, shorten each \
+finding's body/recommendation text, but do NOT drop any finding and do NOT omit any required field.";
 const DEFAULT_MAX_ITERS: u32 = 12;
 const FINALIZE_PROMPT: &str = "You have used your tool-call budget. Based ONLY on what you have \
      already gathered, output the final review now as a single JSON object with a \"findings\" \
@@ -228,7 +269,7 @@ mod tests {
     const FINDINGS_JSON: &str = r#"{"findings":[{"severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}]}"#;
 
     fn final_turn(text: &str) -> AssistantTurn {
-        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 }
+        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None }
     }
 
     fn toolcall_turn(name: &str, args: serde_json::Value) -> AssistantTurn {
@@ -238,6 +279,7 @@ mod tests {
             input_tokens: 2,
             output_tokens: 3,
             cached_input_tokens: 0,
+            finish_reason: None,
         }
     }
 
@@ -331,6 +373,40 @@ mod tests {
         );
     }
 
+    // T24 clamp：FINALIZE 轮 parse 失败（典型根因＝篇幅超预算被截断）时补一次纠错重发，
+    // 拿到合法 JSON 就不报废整个 cell。max_iters=0 直接进 FINALIZE，跳过探索轮噪音。
+    #[tokio::test]
+    async fn finalize_parse_failure_recovers_via_one_repair_turn() {
+        let (_d, ex) = tmp_executor_with("a.rs", "x");
+        let truncated = "{\"findings\":[{\"severity\":\"high\",\"title\":\"t\",\"bo"; // 半截 JSON，模拟被截断
+        let backend = FakeChatBackend::new(vec![final_turn(truncated), final_turn(FINDINGS_JSON)]);
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 0, std::time::Duration::from_secs(60), 0)
+            .await
+            .unwrap();
+        assert_eq!(call.findings.len(), 1, "修复轮应产出 findings 而非报错");
+        assert_eq!(call.iterations, 2, "max_iters(0)+1 收尾 + 1 修复轮 = max_iters+2");
+        let repair_msgs = backend.messages_at(backend.turn_count() - 1);
+        assert!(
+            repair_msgs.iter().any(|m| matches!(m, ChatMessage::User(u) if u.contains("not valid JSON"))),
+            "repair prompt not present: {repair_msgs:?}"
+        );
+    }
+
+    // 修复轮仍解析失败 → 报错而非无限重试；错误消息带 finish_reason 诊断（区分截断 vs 形状违约）。
+    #[tokio::test]
+    async fn finalize_parse_failure_exhausted_after_one_repair_returns_diagnostic_error() {
+        let (_d, ex) = tmp_executor_with("a.rs", "x");
+        let backend = FakeChatBackend::new(vec![final_turn("not json at all"), final_turn("still not json")]);
+        let r = run_tool_loop(&backend, &ex, "sys", "review", 0, std::time::Duration::from_secs(60), 0).await;
+        let err = r.unwrap_err();
+        assert!(matches!(err, ProviderError::Parse(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("finish_reason=unknown"),
+            "diagnostic message missing finish_reason context: {err}"
+        );
+        assert_eq!(backend.turn_count(), 2, "恰好一次修复轮，不循环重试");
+    }
+
     struct HangBackend;
     #[async_trait]
     impl ChatBackend for HangBackend {
@@ -356,7 +432,7 @@ mod tests {
             Ok(AssistantTurn {
                 text: String::new(),
                 tool_calls: vec![ToolCall { id: "c1".into(), name: "read_file".into(), args: json!({"path":"a.rs"}) }],
-                input_tokens: 1, output_tokens: 1, cached_input_tokens: 0,
+                input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None,
             })
         }
         async fn turn_final(&self, _m: &[ChatMessage]) -> Result<AssistantTurn, ProviderError> {

@@ -112,7 +112,8 @@ pub(crate) fn parse_anthropic_turn(resp: &Value) -> Option<AssistantTurn> {
     let input_tokens = u["input_tokens"].as_u64().unwrap_or(0) + cache_read + cache_creation;
     let output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
     let cached_input_tokens = cache_read;
-    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens, cached_input_tokens })
+    let finish_reason = resp["stop_reason"].as_str().map(String::from);
+    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens, cached_input_tokens, finish_reason })
 }
 
 /// 直连 Anthropic 的 ChatBackend（rustls-only，沿用 direct.rs 的 HTTP 形状）。
@@ -253,7 +254,8 @@ pub(crate) fn parse_openai_turn(resp: &Value) -> Option<AssistantTurn> {
         .or_else(|| u["prompt_cache_hit_tokens"].as_u64())
         .or_else(|| u["cached_tokens"].as_u64())
         .unwrap_or(0);
-    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens, cached_input_tokens })
+    let finish_reason = resp["choices"][0]["finish_reason"].as_str().map(String::from);
+    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens, cached_input_tokens, finish_reason })
 }
 
 /// 直连 OpenAI 兼容端点的 ChatBackend。
@@ -456,6 +458,27 @@ mod tests {
         assert!(parse_anthropic_turn(&json!({ "id": "x" })).is_none());
     }
 
+    // 观测回归：stop_reason 落进 AssistantTurn.finish_reason，供上层区分截断 vs 形状违约。
+    #[test]
+    fn parse_anthropic_turn_captures_finish_reason() {
+        let resp = json!({
+            "content": [{ "type": "text", "text": "partial" }],
+            "stop_reason": "max_tokens",
+            "usage": { "input_tokens": 1, "output_tokens": 2 }
+        });
+        let t = parse_anthropic_turn(&resp).unwrap();
+        assert_eq!(t.finish_reason, Some("max_tokens".to_string()));
+    }
+
+    #[test]
+    fn parse_anthropic_turn_missing_stop_reason_is_none() {
+        let resp = json!({
+            "content": [{ "type": "text", "text": "hi" }],
+            "usage": { "input_tokens": 1, "output_tokens": 2 }
+        });
+        assert_eq!(parse_anthropic_turn(&resp).unwrap().finish_reason, None);
+    }
+
     #[test]
     fn openai_body_text_only_assistant_omits_tool_calls() {
         let msgs = vec![ChatMessage::Assistant { text: "hello".into(), tool_calls: vec![] }];
@@ -566,6 +589,26 @@ mod tests {
     #[test]
     fn parse_openai_missing_choices_is_none() {
         assert!(parse_openai_turn(&json!({ "id": "x" })).is_none());
+    }
+
+    // 观测回归：choices[0].finish_reason 落进 AssistantTurn.finish_reason（截断诊断关键信号）。
+    #[test]
+    fn parse_openai_turn_captures_finish_reason() {
+        let resp = json!({
+            "choices": [{ "message": { "content": "{\"findings\":" }, "finish_reason": "length" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+        });
+        let t = parse_openai_turn(&resp).unwrap();
+        assert_eq!(t.finish_reason, Some("length".to_string()));
+    }
+
+    #[test]
+    fn parse_openai_turn_missing_finish_reason_is_none() {
+        let resp = json!({
+            "choices": [{ "message": { "content": "hi" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+        });
+        assert_eq!(parse_openai_turn(&resp).unwrap().finish_reason, None);
     }
 
     #[test]
