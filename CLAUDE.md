@@ -19,7 +19,8 @@ prompt 只做裁决/编排等模型本职(例外:dev-time 临时仪器如 feedba
 
 ## 常用
 
-- 挑活先读 `.doc/roadmap.md`(项目级里程碑活索引);零散项在 `.doc/TODO.md`。注:`.doc/` 是
+- 挑活先读 `.doc/roadmap/summary.md`(项目级总览:五支柱账目+里程碑表;明细在同目录 done.md/followup.md);
+  零散项在 `.doc/TODO/summary.md`(编号 T01+ 总览表,明细同目录)。注:`.doc/` 是
   维护者私有工作区(gitignored,不随仓分发)——外部克隆者没有这些文件,以 `redteam --help` 为准。
 - `make build` 编译并放置插件二进制;`make gen` 从 `plugins/redteam/commands/`(真相源)重生成
   codex-skills;`make verify` 防漂移——它先重新 gen 再要求零 diff,故 commands 与镜像不同步时**任何时刻**跑都会红
