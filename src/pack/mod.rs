@@ -10,7 +10,6 @@ use crate::dossier::{symbols_in_file, reference_points, ChangedSym};
 /// 每符号正文引用点上限（相关性/多样性帽，非预算帽；沿用 dossier 惯例 10）。
 pub(crate) const PACK_PER_NAME_CAP: usize = 10;
 /// 省略清单条目上限（防大 fan-in 撑爆；超出末尾计数兜底）。
-#[allow(dead_code)]
 pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
 
 /// 0 壳段：改动 hunk 的外围 def 完整体（工作树侧全文），按 budget 字节封顶。

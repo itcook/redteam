@@ -111,12 +111,9 @@ pub(crate) fn enclosing_def_start(lines: &[&str], line0: usize, defs: &[(&'stati
     if lines.is_empty() {
         return None;
     }
-    for i in (0..=line0.min(lines.len().saturating_sub(1))).rev() {
-        if match_def(lines[i], defs).is_some() && (i == line0 || block_end(lines, i) >= line0) {
-            return Some(i);
-        }
-    }
-    None
+    (0..=line0.min(lines.len().saturating_sub(1)))
+        .rev()
+        .find(|&i| match_def(lines[i], defs).is_some() && (i == line0 || block_end(lines, i) >= line0))
 }
 
 /// line0（0-based）的最内层外围 def 名：向上首个「块覆盖 line0」的 def。
