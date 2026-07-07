@@ -4,7 +4,13 @@
 use std::path::Path;
 
 use crate::bundle::Bundle;
-use crate::dossier::{changed_def_ranges, compile_defs, lang_for};
+use crate::dossier::{changed_def_ranges, compile_defs, lang_for, SymRefs};
+
+/// 每符号正文引用点上限（相关性/多样性帽，非预算帽；沿用 dossier 惯例 10）。
+pub(crate) const PACK_PER_NAME_CAP: usize = 10;
+/// 省略清单条目上限（防大 fan-in 撑爆；超出末尾计数兜底）。
+#[allow(dead_code)]
+pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
 
 /// 0 壳段：改动 hunk 的外围 def 完整体（工作树侧全文），按 budget 字节封顶。
 /// 最近壳、优先级最高故先填；但极压下放不下的 body → omit 追加坐标（design §3/§4 兜底）。无改动符号 → ""。
@@ -37,6 +43,45 @@ pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &m
         return String::new();
     }
     format!("## 改动符号完整体（0 壳）\n{out}")
+}
+
+/// 1 壳段：每符号 ≤cap 引用点入正文、正文按 budget 字节封顶。
+/// cap 溢出（第 11+）与预算砍掉的引用点 → omit 追加 `path:line` 坐标。空 → ""。
+fn refs_section(refs: &[SymRefs], budget: usize, omit: &mut Vec<String>) -> String {
+    let mut body = String::new();
+    for sr in refs {
+        if sr.hits.is_empty() {
+            continue;
+        }
+        let ambig = if sr.defs_same_name > 1 {
+            format!(" [{} defs share this name, heuristic]", sr.defs_same_name)
+        } else {
+            String::new()
+        };
+        // 组本符号整块（header + ≤cap 引用点），整体判预算——原子进出，杜绝悬空 header。
+        let shown = sr.hits.len().min(PACK_PER_NAME_CAP);
+        let mut block = format!("### {} ({}){}\n", sr.name, sr.kind, ambig);
+        for h in &sr.hits[..shown] {
+            let doc = if h.is_doc { "[doc] " } else { "" };
+            block.push_str(&format!("{doc}{}:{}\n{}\n\n", h.path, h.line, h.context));
+        }
+        // cap 溢出的引用点（第 11+）→ 坐标进省略
+        for h in &sr.hits[shown..] {
+            omit.push(format!("{}:{} — {} 引用点", h.path, h.line, sr.name));
+        }
+        if body.len() + block.len() > budget {
+            // 预算耗尽：本符号正文进不去 → 其 shown 引用点也降级为坐标
+            for h in &sr.hits[..shown] {
+                omit.push(format!("{}:{} — {} 引用点", h.path, h.line, sr.name));
+            }
+            continue;
+        }
+        body.push_str(&block);
+    }
+    if body.is_empty() {
+        return String::new();
+    }
+    format!("## 引用点（1 壳）\n{body}")
 }
 
 #[cfg(test)]
@@ -93,5 +138,33 @@ mod tests {
         }] };
         let mut omit = Vec::new();
         assert_eq!(body_section(&b, tmp.path(), 1_000_000, &mut omit), "", "非支持语言 → 空");
+    }
+
+    fn sr(name: &str, n: usize) -> crate::dossier::SymRefs {
+        let hits = (0..n).map(|i| crate::dossier::RefHit {
+            path: format!("src/f{i}.rs"), line: i + 1,
+            context: format!("    {name}(); // hit {i}"), is_doc: false,
+        }).collect();
+        crate::dossier::SymRefs { name: name.into(), kind: "fn", defs_same_name: 1, hits }
+    }
+
+    #[test]
+    fn refs_section_caps_per_name_and_omits_overflow_as_coords() {
+        let mut omit = Vec::new();
+        // 25 引用点，per-name 帽 10 → 正文 10 个，溢出 15 个进 omit 坐标
+        let s = refs_section(&[sr("run", 25)], 1_000_000, &mut omit);
+        assert!(s.contains("## 引用点（1 壳）"), "含 1 壳标题");
+        assert_eq!(s.matches("src/f").count(), PACK_PER_NAME_CAP, "正文每名 ≤10");
+        assert_eq!(omit.len(), 15, "cap 溢出 15 个进省略坐标");
+        assert!(omit.iter().all(|o| o.contains(":")), "坐标形如 path:line: {omit:?}");
+    }
+
+    #[test]
+    fn refs_section_budget_cut_goes_to_omit() {
+        let mut omit = Vec::new();
+        // 极小预算：正文放不下 → 该符号引用点全进 omit
+        let s = refs_section(&[sr("run", 5)], 10, &mut omit);
+        assert!(!s.contains("src/f"), "预算耗尽正文无引用点: {s}");
+        assert_eq!(omit.len(), 5, "预算砍掉的 5 个引用点全进省略坐标");
     }
 }
