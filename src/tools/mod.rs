@@ -61,17 +61,26 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "read_files",
             description: "Read one or MANY files at once under the review root, each returned with line \
-                          numbers. This is your ONLY file-reading tool: pass a single path for one file, or \
-                          batch EVERY file you anticipate needing into a SINGLE call to save round-trips. \
-                          Total output is bounded — an oversized batch is truncated with a note; if truncated, \
-                          narrow via search_repo or request the remaining files in a follow-up call.",
+                          numbers. This is your ONLY file-reading tool: batch EVERY file you anticipate \
+                          needing into a SINGLE call to save round-trips. Each entry is {path} for the whole \
+                          file, or {path, start, end} to read only a 1-based inclusive line range — use a range \
+                          for large files so you get the relevant lines instead of a truncated whole file. \
+                          Total output is bounded; an oversized batch is truncated with a note.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "paths": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "One or more paths relative to the review root."
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Path relative to the review root." },
+                                "start": { "type": "integer", "description": "Optional first line (1-based, inclusive)." },
+                                "end": { "type": "integer", "description": "Optional last line (1-based, inclusive)." }
+                            },
+                            "required": ["path"]
+                        },
+                        "description": "Files to read: {path} for the whole file, or {path, start, end} for a line range."
                     }
                 },
                 "required": ["paths"]
@@ -171,12 +180,26 @@ impl ToolExecutor {
         }
         let mut out = String::new();
         for pv in paths {
-            let rel = match pv.as_str() {
-                Some(s) => s,
-                None => continue, // 忽略非字符串项
+            // 宽松解析：裸字符串=整文件；{path, start?, end?}=行段（read_one 底层已支持行段，
+            // schema 广告对象形，但容忍模型偷懒直接给字符串）。
+            let (rel, start, end) = if let Some(s) = pv.as_str() {
+                (s, None, None)
+            } else if let Some(o) = pv.as_object() {
+                match o.get("path").and_then(Value::as_str) {
+                    Some(p) => (p, o.get("start").and_then(Value::as_u64), o.get("end").and_then(Value::as_u64)),
+                    None => continue, // 缺 path 的对象跳过
+                }
+            } else {
+                continue; // 非字符串非对象项跳过
             };
-            out.push_str(&format!("===== {rel} =====\n"));
-            out.push_str(&self.read_one(rel, None, None));
+            let hdr = match (start, end) {
+                (Some(s), Some(e)) => format!("===== {rel} (lines {s}-{e}) =====\n"),
+                (Some(s), None) => format!("===== {rel} (from line {s}) =====\n"),
+                (None, Some(e)) => format!("===== {rel} (to line {e}) =====\n"),
+                (None, None) => format!("===== {rel} =====\n"),
+            };
+            out.push_str(&hdr);
+            out.push_str(&self.read_one(rel, start, end));
             out.push('\n');
             if out.len() > READ_FILES_MAX_BYTES {
                 let mut cut = READ_FILES_MAX_BYTES;
@@ -459,6 +482,23 @@ mod tests {
         assert_eq!(tu.search_repo, 1);
         assert_eq!(tu.list_files, 0);
         assert_eq!(tu.total(), 4, "未知名 bogus 不计入");
+    }
+
+    #[test]
+    fn read_files_supports_line_range_object_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.rs", "l1\nl2\nl3\nl4\nl5\n");
+        let ex = ToolExecutor::new(dir.path());
+        // 混合：裸字符串整文件 + {path,start,end} 行段（执行器宽松容两形）
+        let r = ex.execute(&call("read_files", json!({ "paths": [
+            "a.rs",
+            { "path": "a.rs", "start": 2, "end": 3 }
+        ] })));
+        assert!(r.content.contains("===== a.rs =====\n"), "整文件头");
+        assert!(r.content.contains("===== a.rs (lines 2-3) ====="), "行段头");
+        let ranged = r.content.split("(lines 2-3)").nth(1).unwrap();
+        assert!(ranged.contains("2\tl2") && ranged.contains("3\tl3"), "行段含 l2/l3");
+        assert!(!ranged.contains("l5"), "行段不含范围外的 l5");
     }
 
     #[test]
