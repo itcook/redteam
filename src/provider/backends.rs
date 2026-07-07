@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(b["model"], "claude-x");
         assert_eq!(b["system"], "sys");
         // tools 用 input_schema（Anthropic 协议字段名）
-        assert_eq!(b["tools"][0]["name"], "read_file");
+        assert_eq!(b["tools"][0]["name"], "read_files");
         assert!(b["tools"][0]["input_schema"].is_object());
         // system 不进 messages；user 进。L1 缓存：末条 message 的 content 转为带 ephemeral
         // 断点的 text block 数组（裸 string User 消息形态）。
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(b["messages"][1]["role"], "user");
         // tools 用 {type:function, function:{name, parameters}}
         assert_eq!(b["tools"][0]["type"], "function");
-        assert_eq!(b["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(b["tools"][0]["function"]["name"], "read_files");
         assert!(b["tools"][0]["function"]["parameters"].is_object());
     }
 

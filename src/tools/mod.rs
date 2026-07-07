@@ -54,36 +54,24 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
-/// 三个评审工具的固定声明集。各 adapter 自行把 parameters 映射到本家协议字段。
+/// 评审工具声明集（read_files 是唯一读文件工具——撤掉单读 read_file，逼模型批量）。
+/// 各 adapter 自行把 parameters 映射到本家协议字段。
 pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
-            name: "read_file",
-            description: "Read a file under the review root, returned with line numbers. \
-                          Optionally restrict to an inclusive 1-based line range.",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path relative to the review root." },
-                    "start": { "type": "integer", "description": "First line (1-based, inclusive)." },
-                    "end": { "type": "integer", "description": "Last line (1-based, inclusive)." }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
             name: "read_files",
-            description: "Read MULTIPLE files at once under the review root, each returned with line numbers. \
-                          Prefer this over repeated read_file calls: batch every file you anticipate needing \
-                          into a SINGLE call to save round-trips. Total output is bounded — an oversized batch \
-                          is truncated with a note; fetch the remainder or precise line ranges with read_file.",
+            description: "Read one or MANY files at once under the review root, each returned with line \
+                          numbers. This is your ONLY file-reading tool: pass a single path for one file, or \
+                          batch EVERY file you anticipate needing into a SINGLE call to save round-trips. \
+                          Total output is bounded — an oversized batch is truncated with a note; if truncated, \
+                          narrow via search_repo or request the remaining files in a follow-up call.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Paths relative to the review root."
+                        "description": "One or more paths relative to the review root."
                     }
                 },
                 "required": ["paths"]
@@ -196,7 +184,7 @@ impl ToolExecutor {
                     cut -= 1;
                 }
                 out.truncate(cut);
-                out.push_str("\n... [read_files: total budget reached; request remaining files or line ranges with read_file]\n");
+                out.push_str("\n... [read_files: total budget reached; request the remaining files in a follow-up read_files call]\n");
                 break;
             }
         }
@@ -493,7 +481,7 @@ mod tests {
     fn tool_specs_lists_named_tools() {
         let specs = tool_specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["read_file", "read_files", "search_repo", "list_files"]);
+        assert_eq!(names, vec!["read_files", "search_repo", "list_files"], "read_file 已撤，read_files 为唯一读文件工具");
         // 每个 spec 的 parameters 是对象、含 "type":"object"
         for s in &specs {
             assert_eq!(s.parameters["type"], "object", "spec {} bad schema", s.name);
@@ -501,10 +489,11 @@ mod tests {
     }
 
     #[test]
-    fn read_file_spec_requires_path() {
+    fn read_files_spec_requires_paths() {
         let specs = tool_specs();
-        let rf = specs.iter().find(|s| s.name == "read_file").unwrap();
-        assert_eq!(rf.parameters["required"][0], "path");
+        let rf = specs.iter().find(|s| s.name == "read_files").expect("read_files 为唯一读文件工具");
+        assert_eq!(rf.parameters["required"][0], "paths");
+        assert!(specs.iter().all(|s| s.name != "read_file"), "read_file 已从声明集撤除");
     }
 
     #[test]

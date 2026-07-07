@@ -580,8 +580,8 @@ mod tests {
         let dossier = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    foo();\n");
         let p = build_bundle_prompt("wt", &b, &refs, "", "", "", &dossier);
         assert!(p.contains("<dossier>"), "卷宗块注入");
-        assert!(p.contains("start from it and search only beyond what it lists"), "<tools> 和解句在场");
-        assert!(p.contains("use read_files to pull all the files"), "1a 批量读取指令在场（用 read_files 工具，code 模式专属，砍 tool-loop 轮数）");
+        assert!(p.contains("start from the files it names"), "<tools> 卷宗起点句在场");
+        assert!(p.contains("request EVERY file you can anticipate needing"), "穷尽批量读取指令在场（read_files 唯一读文件工具，code 模式专属，砍 tool-loop 轮数）");
         // 空卷宗 → 无 <dossier> 块，行为不变
         let p2 = build_bundle_prompt("wt", &b, &refs, "", "", "", "");
         assert!(!p2.contains("<dossier>"), "空卷宗不渲染块");
