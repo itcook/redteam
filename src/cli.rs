@@ -321,22 +321,33 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
     Ok((report, code))
 }
 
+/// pack flat 预算（字节，provisional）——S0 校准前初值；跨模型同值（design §2/§5）。
+/// ponytail: ~2× 旧 28KB dossier 帽以容 0 壳完整体；S0 双基线跑完换真值。
+const PACK_BUDGET_BYTES: usize = 64_000;
+
 /// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
-/// `REDTEAM_NO_DOSSIER` 非空 → A/B off 臂，全空段（M14 D9）。degrades 静默于：不支持语言/
-/// 无符号/调用密度门<5——meta.injected 是唯一可观测入口，供 A/B 归因与生产诊断。
-pub(crate) fn build_dossiers(bundles: &[crate::bundle::Bundle], root: &std::path::Path) -> (Vec<String>, DossierMeta) {
+/// 三臂：默认=pack（0 壳完整体+1 壳引用点+省略清单，M15-S1）；`REDTEAM_PACK=0`=
+/// dossier-only 基线臂（A/B 对照）；`REDTEAM_NO_DOSSIER` 非空=全空段（M14 D9 null 臂）。
+/// degrades 静默于：不支持语言/无符号/调用密度门<5——meta.injected 是唯一可观测入口，
+/// 供 A/B 归因与生产诊断。
+pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path) -> (Vec<String>, DossierMeta) {
     let suppressed = std::env::var_os("REDTEAM_NO_DOSSIER").is_some();
-    let sections: Vec<String> = if suppressed {
-        vec![String::new(); bundles.len()] // A/B off 臂：全空卷宗段
-    } else {
-        bundles
-            .iter()
-            .map(|b| crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)))
-            .collect()
-    };
-    let injected = sections.iter().filter(|s| !s.is_empty()).count();
+    let baseline = std::env::var_os("REDTEAM_PACK").map(|v| v == "0").unwrap_or(false);
+    let entries: Vec<String> = bundles
+        .iter()
+        .map(|b| {
+            if suppressed {
+                String::new()
+            } else if baseline {
+                crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root))
+            } else {
+                crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, PACK_BUDGET_BYTES))
+            }
+        })
+        .collect();
+    let injected = entries.iter().filter(|s| !s.is_empty()).count();
     let meta = DossierMeta { bundles: bundles.len(), injected, suppressed };
-    (sections, meta)
+    (entries, meta)
 }
 
 /// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
@@ -491,7 +502,7 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_dossiers(&bundles, root);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root);
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
@@ -618,7 +629,7 @@ pub async fn run_incremental_review(
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_dossiers(&bundles, root);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root);
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
@@ -1832,18 +1843,50 @@ mod tests {
 
         // on 臂：一段非空（有引用点）+ 一段空（不支持语言）→ meta 反映 injected:1
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
-        let (on, on_meta) = build_dossiers(&bundles, root);
+        let (on, on_meta) = build_packs(&bundles, root);
         assert!(!on[0].is_empty(), "支持语言且≥5引用点应非空: {on:?}");
         assert!(on[1].is_empty(), "不支持语言应空: {on:?}");
         assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 1, suppressed: false });
 
         // off 臂：REDTEAM_NO_DOSSIER 生效 → 全空段 + suppressed=true + injected=0
         unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let (off, off_meta) = build_dossiers(&bundles, root);
+        let (off, off_meta) = build_packs(&bundles, root);
         assert!(off.iter().all(|s| s.is_empty()), "off 臂全空");
         assert_eq!(off.len(), bundles.len());
         assert_eq!(off_meta, DossierMeta { bundles: 2, injected: 0, suppressed: true });
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
+    }
+
+    #[test]
+    fn build_packs_default_has_bodies_off_arm_dossier_only_null_arm_empty() {
+        let _g = ENV_LOCK.lock().unwrap();
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"),
+            "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
+        let bundles = vec![Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
+        }] }];
+
+        // 默认臂：pack（含 0 壳完整体）
+        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
+        let (on, _) = build_packs(&bundles, root);
+        assert!(on[0].contains("改动符号完整体"), "默认臂 = pack 含 0 壳: {}", on[0]);
+
+        // 基线臂：REDTEAM_PACK=0 → dossier-only（无 0 壳段、仍有引用点）
+        unsafe { std::env::set_var("REDTEAM_PACK", "0"); }
+        let (base, _) = build_packs(&bundles, root);
+        assert!(!base[0].contains("改动符号完整体"), "基线臂无 0 壳");
+        assert!(base[0].contains("target"), "基线臂仍是 dossier 引用点");
+
+        // 空臂：REDTEAM_NO_DOSSIER
+        unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
+        let (null, _) = build_packs(&bundles, root);
+        assert_eq!(null[0], "", "空臂全空段");
+        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
     }
 
     #[test]

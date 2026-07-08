@@ -8,7 +8,7 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use std::path::Path;
 
-struct Lang {
+pub(crate) struct Lang {
     exts: &'static [&'static str],
     defs: &'static [(&'static str, &'static str)],
 }
@@ -58,12 +58,12 @@ const TS_KEYWORDS: &[&str] = &[
     "function", "constructor", "await", "yield", "typeof", "new",
 ];
 
-fn lang_for(path: &str) -> Option<&'static Lang> {
+pub(crate) fn lang_for(path: &str) -> Option<&'static Lang> {
     let ext = path.rsplit('.').next()?;
     LANGS.iter().copied().find(|l| l.exts.contains(&ext))
 }
 
-fn compile_defs(lang: &Lang) -> Vec<(&'static str, Regex)> {
+pub(crate) fn compile_defs(lang: &Lang) -> Vec<(&'static str, Regex)> {
     lang.defs.iter().map(|(k, src)| (*k, Regex::new(src).expect("static def regex"))).collect()
 }
 
@@ -104,21 +104,21 @@ fn block_end(lines: &[&str], i: usize) -> usize {
     i
 }
 
-/// line0（0-based）的最内层外围 def 名：向上首个「块覆盖 line0」的 def。
+/// line0（0-based）最内层外围 def 的**起行索引**：向上首个「块覆盖 line0」的 def 行。
 /// impl/for 头非 def，天然穿透到内层 fn（照 D5 简化：只取名，不分类 impl_trait）。
 /// ponytail: 每候选行调 block_end = O(n²) 最坏；单文件几千行够用，热点再优化
-fn innermost_enclosing_def(lines: &[&str], line0: usize, defs: &[(&'static str, Regex)]) -> Option<(&'static str, String)> {
+pub(crate) fn enclosing_def_start(lines: &[&str], line0: usize, defs: &[(&'static str, Regex)]) -> Option<usize> {
     if lines.is_empty() {
         return None;
     }
-    for i in (0..=line0.min(lines.len().saturating_sub(1))).rev() {
-        if let Some(kd) = match_def(lines[i], defs) {
-            if i == line0 || block_end(lines, i) >= line0 {
-                return Some(kd);
-            }
-        }
-    }
-    None
+    (0..=line0.min(lines.len().saturating_sub(1)))
+        .rev()
+        .find(|&i| match_def(lines[i], defs).is_some() && (i == line0 || block_end(lines, i) >= line0))
+}
+
+/// line0（0-based）的最内层外围 def 名：向上首个「块覆盖 line0」的 def。
+fn innermost_enclosing_def(lines: &[&str], line0: usize, defs: &[(&'static str, Regex)]) -> Option<(&'static str, String)> {
+    enclosing_def_start(lines, line0, defs).and_then(|i| match_def(lines[i], defs))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -192,6 +192,58 @@ pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'s
         }
     }
     out
+}
+
+/// 每个 hunk 的首个改动行（0-based 新文件坐标），供 0 壳外围 def 定位。
+/// ponytail: 与 symbols_in_file 的 hunk 游走平行（drift 风险）；两者若再动一起改，热点再统一。
+pub(crate) fn hunk_anchors(diff: &str) -> Vec<usize> {
+    let mut anchors = Vec::new();
+    let mut new_line = 0usize;
+    let mut hunk_anchor: Option<usize> = None;
+    for raw in diff.lines() {
+        if raw.starts_with("+++ ") || raw.starts_with("--- ") {
+            continue;
+        }
+        if raw.starts_with("@@") {
+            if let Some(a) = hunk_anchor.take() {
+                anchors.push(a);
+            }
+            new_line = parse_hunk_new_start(raw).unwrap_or(1);
+            continue;
+        }
+        if raw.starts_with('\\') {
+            continue; // No-newline 标记非内容行
+        }
+        match raw.as_bytes().first() {
+            Some(b'+') => {
+                if hunk_anchor.is_none() {
+                    hunk_anchor = Some(new_line.saturating_sub(1));
+                }
+                new_line += 1;
+            }
+            Some(b'-') => {
+                if hunk_anchor.is_none() {
+                    hunk_anchor = Some(new_line.saturating_sub(1));
+                }
+            }
+            _ => new_line += 1,
+        }
+    }
+    if let Some(a) = hunk_anchor.take() {
+        anchors.push(a);
+    }
+    anchors
+}
+
+/// 改动 hunk 的外围 def 完整体行范围（0-based inclusive），按 def 起行去重、升序。
+pub(crate) fn changed_def_ranges(diff: &str, file_lines: &[&str], defs: &[(&'static str, Regex)]) -> Vec<(usize, usize)> {
+    let mut starts = std::collections::BTreeSet::new();
+    for a in hunk_anchors(diff) {
+        if let Some(i) = enclosing_def_start(file_lines, a, defs) {
+            starts.insert(i);
+        }
+    }
+    starts.into_iter().map(|i| (i, block_end(file_lines, i))).collect()
 }
 
 #[derive(Clone, Debug)]
@@ -681,5 +733,27 @@ mod tests {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
         }] };
         assert_eq!(build_dossier(&b, root), "", "引用点稀疏 → 调用密度门返空");
+    }
+
+    #[test]
+    fn changed_def_ranges_covers_enclosing_body() {
+        let d = rust_defs();
+        // 文件：helper 在 0-1 行，caller 在 3-6 行（含 helper() 调用改动）
+        let file: Vec<&str> = "fn helper() {}\n\nfn caller() {\n    helper();\n    let z = 2;\n}".lines().collect();
+        // diff：改 caller 体内一行（新文件第 5 行 let z）
+        let diff = "@@ -4,0 +5,1 @@\n+    let z = 2;\n";
+        let ranges = changed_def_ranges(diff, &file, &d);
+        // caller 起行 0-based = 2，块尾 = 5（`}`）
+        assert_eq!(ranges, vec![(2usize, 5usize)], "外围 caller 的完整体行范围");
+    }
+
+    #[test]
+    fn changed_def_ranges_dedups_multi_hunk_same_def() {
+        let d = rust_defs();
+        let file: Vec<&str> = "fn caller() {\n    a();\n    b();\n}".lines().collect();
+        // 同一 caller 内两个改动 hunk → 只出一个范围
+        let diff = "@@ -2,1 +2,1 @@\n-    a0();\n+    a();\n@@ -3,1 +3,1 @@\n-    b0();\n+    b();\n";
+        let ranges = changed_def_ranges(diff, &file, &d);
+        assert_eq!(ranges, vec![(0usize, 3usize)], "同 def 多 hunk 去重成一体");
     }
 }

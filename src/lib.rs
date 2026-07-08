@@ -11,6 +11,7 @@ pub mod lens;
 pub mod model;
 pub mod orchestrate;
 pub mod output;
+pub mod pack;
 pub mod positioning;
 pub mod project;
 pub mod prompt;
