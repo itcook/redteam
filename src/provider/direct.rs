@@ -46,11 +46,26 @@ pub fn parse_lens_output(raw: &str) -> Result<LensOutput, ProviderError> {
     if let Ok(v) = serde_json::from_str::<LensOutput>(trimmed) {
         return Ok(v);
     }
-    // 从首个 '{' 到匹配的 '}' 暴力扫描
+    // 从首个 '{' 到匹配的 '}' 扫描，字符串感知（跳过串内的 '{'/'}'，
+    // 正确处理 '\"' 转义）——findings.body/quote 常引用半行代码含不配平括号
+    // （如 "match x {" 未闭合），裸计数会数错深度、抠出非法 JSON。
     if let Some(start) = trimmed.find('{') {
         let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
         for (i, c) in trimmed[start..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
             match c {
+                '"' => in_string = true,
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
@@ -217,6 +232,17 @@ mod tests {
             "backtick in recommendation should survive: got {:?}",
             out.findings[0].recommendation
         );
+    }
+
+    /// 回归：finding.body 内含不配平的 `{`（模型引用半行 Rust 代码时常见，如
+    /// `match x {` 未闭合）时，裸括号深度计数会数串内的 `{`，导致抠不出合法
+    /// JSON。散文前言 + ```json 围栏模拟 DeepSeek 自收敛输出。
+    #[test]
+    fn parse_survives_unbalanced_brace_in_body_string() {
+        let raw = "Here is my analysis of the code.\n\n```json\n{\"findings\":[{\"severity\":\"low\",\"title\":\"t\",\"body\":\"code: match x { without close\",\"file\":\"a.rs\",\"line_start\":1,\"line_end\":1,\"confidence\":0.5,\"recommendation\":\"r\"}]}\n```\n\nHope that helps!";
+        let out = parse_lens_output(raw).unwrap();
+        assert_eq!(out.findings.len(), 1);
+        assert!(out.findings[0].body.contains('{'));
     }
 
     // ---- 纯函数 hermetic 单测（不打网络）----
