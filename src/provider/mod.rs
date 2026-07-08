@@ -162,11 +162,17 @@ pub trait ReviewProvider: Send + Sync {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError>;
 }
 
-/// 带超时的共享 HTTP client（connect 10s / 整请求 120s）；构建失败回落默认 client。
+/// 带超时的共享 HTTP client（connect 10s / 整请求默认 300s，`REDTEAM_HTTP_TIMEOUT_SECS` 可覆盖）；
+/// 构建失败回落默认 client。整请求超时是**校准旋钮**：思考型模型（MiniMax-M3 等）在大上下文
+/// bundle 上单轮响应可 >120s（旧值），非网络不可达（ping 通）而是慢——留 env 供按模型/网络调。
 pub(crate) fn default_http_client() -> reqwest::Client {
+    let secs = std::env::var("REDTEAM_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(secs))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
