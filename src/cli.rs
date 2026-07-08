@@ -328,7 +328,8 @@ const PACK_BUDGET_BYTES: usize = 64_000;
 /// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
 /// 三臂：默认=pack（0 壳完整体+1 壳引用点+省略清单，M15-S1）；`REDTEAM_PACK=0`=
 /// dossier-only 基线臂（A/B 对照）；`REDTEAM_NO_DOSSIER` 非空=全空段（M14 D9 null 臂）。
-/// degrades 静默于：不支持语言/无符号/调用密度门<5——meta.injected 是唯一可观测入口，
+/// degrades 静默于：不支持语言/无符号（pack 臂）；基线臂 `build_dossier` 另有调用密度门<5
+/// （pack 臂已撤，I-2：body 是 payload 与 caller 密度无关）。meta.injected 是唯一可观测入口，
 /// 供 A/B 归因与生产诊断。
 pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path) -> (Vec<String>, DossierMeta) {
     let suppressed = std::env::var_os("REDTEAM_NO_DOSSIER").is_some();
