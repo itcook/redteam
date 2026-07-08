@@ -221,6 +221,10 @@ pub(crate) fn build_openai_tools_body(
     if json_mode {
         body.insert("response_format".into(), json!({ "type": "json_object" }));
     }
+    // 流式：服务器随 token 增量发、reqwest 随到达消费 socket → 连接持续活跃，隧道/网关不当
+    // 空闲 reset（非 stream 长思考期连接静默 = 被 reset/超时的根因）。include_usage 让末块带 usage。
+    body.insert("stream".into(), json!(true));
+    body.insert("stream_options".into(), json!({ "include_usage": true }));
     Value::Object(body)
 }
 
@@ -258,6 +262,98 @@ pub(crate) fn parse_openai_turn(resp: &Value) -> Option<AssistantTurn> {
     Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens, cached_input_tokens, finish_reason })
 }
 
+/// 累积 OpenAI 流式（SSE）响应为一轮 AssistantTurn：拼 `delta.content`、按 index 合并
+/// `delta.tool_calls` 分片（id/name 首现即取、arguments 逐片拼接）、取末现 finish_reason 与 usage。
+/// 非 SSE 回退：端点忽略 `stream` 直接返完整 JSON 对象时按非流式解析。
+/// 假设 OpenAI 风格「一 `data:` 行一 JSON chunk」（多行 data 字段不支持，各家实测未用）。
+pub(crate) fn parse_openai_stream(body: &str) -> Option<AssistantTurn> {
+    // 回退：非 SSE（端点无视 stream）→ 当完整 JSON 对象解析。
+    if !body.contains("data:") {
+        if let Ok(v) = serde_json::from_str::<Value>(body) {
+            return parse_openai_turn(&v);
+        }
+    }
+    let mut text = String::new();
+    // tool_call index -> (id, name, arguments 拼接)
+    let mut frags: std::collections::BTreeMap<i64, (String, String, String)> = std::collections::BTreeMap::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage = Value::Null;
+    let mut saw_chunk = false;
+    for line in body.lines() {
+        let data = match line.trim().strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        let chunk: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue, // 心跳/空白/半行——跳过
+        };
+        saw_chunk = true;
+        if let Some(u) = chunk.get("usage") {
+            if !u.is_null() {
+                usage = u.clone(); // 末块（include_usage）带 usage
+            }
+        }
+        let choice = match chunk.get("choices").and_then(Value::as_array).and_then(|a| a.first()) {
+            Some(c) => c,
+            None => continue, // usage-only 末块无 choices
+        };
+        if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+            finish_reason = Some(fr.to_string());
+        }
+        let delta = match choice.get("delta") {
+            Some(d) => d,
+            None => continue,
+        };
+        if let Some(c) = delta.get("content").and_then(Value::as_str) {
+            text.push_str(c); // 思考型模型 native 格式的 <think> 亦在此、由 parse_lens_output 剥离
+        }
+        if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+            for tc in tcs {
+                let idx = tc.get("index").and_then(Value::as_i64).unwrap_or(0);
+                let e = frags.entry(idx).or_default();
+                if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() {
+                        e.0 = id.to_string();
+                    }
+                }
+                if let Some(f) = tc.get("function") {
+                    if let Some(n) = f.get("name").and_then(Value::as_str) {
+                        if !n.is_empty() {
+                            e.1 = n.to_string();
+                        }
+                    }
+                    if let Some(a) = f.get("arguments").and_then(Value::as_str) {
+                        e.2.push_str(a);
+                    }
+                }
+            }
+        }
+    }
+    if !saw_chunk {
+        return None; // 无一 chunk 解析成功 → 让上层判 Parse/Unavailable
+    }
+    let tool_calls: Vec<ToolCall> = frags
+        .into_values()
+        .filter(|(_, name, _)| !name.is_empty())
+        .map(|(id, name, args)| ToolCall {
+            id,
+            name,
+            args: serde_json::from_str(&args).unwrap_or_else(|_| json!({})),
+        })
+        .collect();
+    let input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
+    let cached_input_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64()
+        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
+        .or_else(|| usage["cached_tokens"].as_u64())
+        .unwrap_or(0);
+    Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens, cached_input_tokens, finish_reason })
+}
+
 /// 直连 OpenAI 兼容端点的 ChatBackend。
 pub struct OpenAiBackend {
     model: String,
@@ -271,23 +367,31 @@ impl OpenAiBackend {
         OpenAiBackend { model, base_url, api_key, client: crate::provider::default_http_client() }
     }
 
-    /// 共享 HTTP 发送：POST {base}/chat/completions，解析这一轮输出。
+    /// 共享 HTTP 发送：POST {base}/chat/completions（流式），累积 SSE 解析这一轮输出。
+    /// 流式消费的意义：reqwest 随 token 到达读 socket → 连接持续有数据流，隧道/网关不当空闲
+    /// reset（非 stream 长思考期连接静默 = 超时/reset 根因）。
     async fn post(&self, body: &Value) -> Result<AssistantTurn, ProviderError> {
         let base = self.base_url.as_deref().unwrap_or(OPENAI_DEFAULT_BASE);
         let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-        let resp: Value = super::decode_json(
-            super::send_classified(
-                self.client
-                    .post(&url)
-                    .header("authorization", format!("Bearer {}", self.api_key))
-                    .header("content-type", "application/json")
-                    .json(body),
-            )
-            .await?,
+        let resp = super::send_classified(
+            self.client
+                .post(&url)
+                .header("authorization", format!("Bearer {}", self.api_key))
+                .header("content-type", "application/json")
+                .json(body),
         )
-        .await?; // envelope 非法 JSON → Unavailable（可重试）；内容形状问题才是 Parse
-        parse_openai_turn(&resp)
-            .ok_or_else(|| ProviderError::Parse("openai response missing choices".into()))
+        .await?;
+        // 读 SSE 全文（随到达消费）。中途断流 → Unavailable（可重试），与 decode_json 一致。
+        let sse = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Unavailable(format!("stream body read failed for {url}: {e}")))?;
+        if sse.trim().is_empty() {
+            // 空体（keep-alive/上游放弃）→ 可重试，勿误判 Parse 烧格
+            return Err(ProviderError::Unavailable(format!("empty stream body for {url}")));
+        }
+        parse_openai_stream(&sse)
+            .ok_or_else(|| ProviderError::Parse("openai stream missing choices".into()))
     }
 }
 
@@ -501,6 +605,41 @@ mod tests {
         let explore = build_openai_tools_body("gpt-x", &msgs, &specs(), false);
         assert!(explore.get("response_format").is_none(), "探索轮不应带 response_format");
         assert!(explore.get("tools").is_some(), "探索轮应带 tools");
+        // 两轮都流式（保连接活跃）+ 带 include_usage
+        assert_eq!(fin["stream"], true, "收尾轮应流式");
+        assert_eq!(explore["stream"], true, "探索轮应流式");
+        assert_eq!(explore["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn parse_openai_stream_accumulates_content_toolcalls_usage() {
+        // 内容分片 + tool_call 分片（id/name 首现、arguments 逐片）+ 末块 usage + [DONE]
+        let sse = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_files\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ths\\\":[]}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\
+data: [DONE]\n";
+        let t = parse_openai_stream(sse).unwrap();
+        assert_eq!(t.text, "hello");
+        assert_eq!(t.tool_calls.len(), 1);
+        assert_eq!(t.tool_calls[0].id, "call_1");
+        assert_eq!(t.tool_calls[0].name, "read_files");
+        assert_eq!(t.tool_calls[0].args["paths"], json!([]));
+        assert_eq!(t.input_tokens, 100);
+        assert_eq!(t.output_tokens, 20);
+        assert_eq!(t.cached_input_tokens, 80);
+        assert_eq!(t.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn parse_openai_stream_falls_back_to_nonstream_json() {
+        // 端点无视 stream 直接返完整 JSON 对象 → 按非流式解析
+        let json = "{\"choices\":[{\"message\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}";
+        let t = parse_openai_stream(json).unwrap();
+        assert_eq!(t.text, "hi");
+        assert_eq!(t.finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]
