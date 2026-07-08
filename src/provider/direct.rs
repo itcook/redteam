@@ -37,6 +37,14 @@ impl DirectProvider {
 
 /// 兜底：从模型自由文本里抠出符合 schema 的 JSON。
 pub fn parse_lens_output(raw: &str) -> Result<LensOutput, ProviderError> {
+    // 思考型模型（MiniMax-M3 / DeepSeek-R1 等）即便设 response_format=json_object，仍在最终
+    // 答案前吐 <think>…</think> 推理块，其中常含裸 '{'（代码推理）会带偏下面的括号扫描 → 挂。
+    // 取最后一个 </think> 之后的内容再解析。ponytail: 极端下 finding 正文字面量含 "</think>"
+    // 会误切——评审工具输出里概率近零，够用。
+    let raw = match raw.rfind("</think>") {
+        Some(i) => &raw[i + "</think>".len()..],
+        None => raw,
+    };
     let trimmed = raw
         .trim()
         .trim_start_matches("```json")
@@ -219,6 +227,14 @@ mod tests {
     #[test]
     fn parse_garbage_errors() {
         assert!(parse_lens_output("no json here").is_err());
+    }
+
+    /// 回归：思考型模型（MiniMax-M3/DeepSeek-R1）收尾轮 <think> 块含裸 '{' → 剥到 </think> 后再解析。
+    #[test]
+    fn parse_strips_reasoning_think_block_with_braces() {
+        let raw = "<think>The diff adds fn on_meta(&self) { work(); } so I check callers { maybe }</think>\n{\"findings\":[{\"severity\":\"low\",\"title\":\"t\",\"body\":\"b\",\"file\":\"a.rs\",\"line_start\":1,\"line_end\":1,\"confidence\":0.5,\"recommendation\":\"r\"}]}";
+        let out = parse_lens_output(raw).unwrap();
+        assert_eq!(out.findings.len(), 1);
     }
 
     /// 回归：recommendation 含反引号时 fence 剥离不应截断 JSON。
