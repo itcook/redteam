@@ -62,8 +62,7 @@ fn refs_section(refs: &[SymRefs], budget: usize, omit: &mut Vec<String>) -> Stri
         let shown = sr.hits.len().min(PACK_PER_NAME_CAP);
         let mut block = format!("### {} ({}){}\n", sr.name, sr.kind, ambig);
         for h in &sr.hits[..shown] {
-            let doc = if h.is_doc { "[doc] " } else { "" };
-            block.push_str(&format!("{doc}{}:{}\n{}\n\n", h.path, h.line, h.context));
+            block.push_str(&format!("{}:{}\n{}\n\n", h.path, h.line, h.context));
         }
         // cap 溢出的引用点（第 11+）→ 坐标进省略
         for h in &sr.hits[shown..] {
@@ -201,7 +200,7 @@ mod tests {
     fn sr(name: &str, n: usize) -> crate::dossier::SymRefs {
         let hits = (0..n).map(|i| crate::dossier::RefHit {
             path: format!("src/f{i}.rs"), line: i + 1,
-            context: format!("    {name}(); // hit {i}"), is_doc: false,
+            context: format!("    {name}(); // hit {i}"),
         }).collect();
         crate::dossier::SymRefs { name: name.into(), kind: "fn", defs_same_name: 1, hits }
     }

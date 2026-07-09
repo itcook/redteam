@@ -251,7 +251,6 @@ pub struct RefHit {
     pub path: String,
     pub line: usize,
     pub context: String,
-    pub is_doc: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -260,11 +259,6 @@ pub struct SymRefs {
     pub kind: &'static str,
     pub defs_same_name: usize,
     pub hits: Vec<RefHit>,
-}
-
-fn is_comment_line(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with('#')
 }
 
 /// 单行超长（minified/生成物单行可达 MB）时把内容截到 ≤512B（另加固定截断注记）防单个引用点
@@ -279,6 +273,83 @@ fn truncate_line(line: &str) -> std::borrow::Cow<'_, str> {
         end -= 1;
     }
     std::borrow::Cow::Owned(format!("{}… [line truncated]", &line[..end]))
+}
+
+/// Rust 词法剥离：注释（`//` 行 / `/* */` 嵌套块）与字符串（`"…"` / `b"…"` / raw `r#"…"#`）
+/// 内容替成空格，保留 `\n` 与字节长度 → 行号列号对齐。用于剔「命中落在注释/字符串里」的引用假阳
+/// （S1 地板 B：redteam 代码注释/prompt 字符串满是域名词 finding/bundle，regex `\b名\b` 全命中）。
+/// 不处理 char/lifetime `'…'`（单字符几乎不撞符号名，低危；多语言各自词法 → TODO T38）。
+fn strip_rust_noncode(src: &str) -> String {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        // 行注释
+        if c == b'/' && i + 1 < n && b[i + 1] == b'/' {
+            while i < n && b[i] != b'\n' { out.push(b' '); i += 1; }
+            continue;
+        }
+        // 块注释（Rust 允许嵌套）
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            let mut depth = 1;
+            out.extend_from_slice(b"  "); i += 2;
+            while i < n && depth > 0 {
+                if b[i] == b'\n' { out.push(b'\n'); i += 1; }
+                else if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' { depth += 1; out.extend_from_slice(b"  "); i += 2; }
+                else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' { depth -= 1; out.extend_from_slice(b"  "); i += 2; }
+                else { out.push(b' '); i += 1; }
+            }
+            continue;
+        }
+        // raw 字符串 r"…" / r#"…"# / br#"…"#（区分 raw identifier r#type：# 后须是 " 或更多 #）
+        if c == b'r' || (c == b'b' && i + 1 < n && b[i + 1] == b'r') {
+            let mut j = if c == b'b' { i + 2 } else { i + 1 };
+            let mut hashes = 0;
+            while j < n && b[j] == b'#' { hashes += 1; j += 1; }
+            if j < n && b[j] == b'"' {
+                out.resize(out.len() + (j - i + 1), b' ');
+                i = j + 1;
+                while i < n {
+                    if b[i] == b'"' {
+                        let mut k = i + 1;
+                        let mut cnt = 0;
+                        while k < n && cnt < hashes && b[k] == b'#' { cnt += 1; k += 1; }
+                        if cnt == hashes {
+                            out.resize(out.len() + 1 + hashes, b' ');
+                            i = k;
+                            break;
+                        }
+                    }
+                    if b[i] == b'\n' { out.push(b'\n'); } else { out.push(b' '); }
+                    i += 1;
+                }
+                continue;
+            }
+            // 非 raw string：r/br 当普通字符落到代码区
+        }
+        // 普通/字节字符串 "…" / b"…"
+        if c == b'"' || (c == b'b' && i + 1 < n && b[i + 1] == b'"') {
+            if c == b'b' { out.push(b' '); i += 1; }
+            out.push(b' '); i += 1; // 开引号
+            while i < n && b[i] != b'"' {
+                if b[i] == b'\\' && i + 1 < n {
+                    out.push(b' ');
+                    if b[i + 1] == b'\n' { out.push(b'\n'); } else { out.push(b' '); }
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'\n' { out.push(b'\n'); } else { out.push(b' '); }
+                i += 1;
+            }
+            if i < n { out.push(b' '); i += 1; } // 闭引号
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
 }
 
 // 一次全仓 walk 搜某名的所有词边界命中，返回 (rel_path, 1based_line)。照 do_search_repo。
@@ -315,14 +386,32 @@ pub fn reference_points(syms: &[ChangedSym], root: &Path, defs: &[(&'static str,
                 .unwrap_or_default())
             .clone()
     };
+    let mut strip_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let read_stripped = |rel: &str, cache: &mut std::collections::HashMap<String, Vec<String>>| -> Vec<String> {
+        cache.entry(rel.to_string())
+            .or_insert_with(|| strip_rust_noncode(&std::fs::read_to_string(root.join(rel)).unwrap_or_default())
+                .lines().map(String::from).collect())
+            .clone()
+    };
     let mut out = Vec::new();
     for sym in syms {
+        let word = Regex::new(&format!(r"\b{}\b", regex::escape(&sym.name))).ok();
         let raw = grep_word(&sym.name, root);
         let mut defs_same_name = 0usize;
         let mut hits = Vec::new();
         for (path, line) in raw {
             let lines = read(&path, &mut file_cache);
             let hit_line = lines.get(line.saturating_sub(1)).map(String::as_str).unwrap_or("");
+            // B（S1 地板）：命中若全落在注释/字符串（剥离后该行无词边界命中）→ 假阳，剔除。
+            // 只处理 .rs（Rust 词法）；多语言词法各异 → TODO T38，非 Rust 文件不剥、原样保留。
+            if let Some(w) = &word {
+                if path.ends_with(".rs") {
+                    let sl = read_stripped(&path, &mut strip_cache);
+                    if !sl.get(line.saturating_sub(1)).map(|s| w.is_match(s)).unwrap_or(false) {
+                        continue;
+                    }
+                }
+            }
             // 命中行本身是同名 def → 歧义度，不作引用点
             if let Some((_, n)) = match_def(hit_line, defs) {
                 if n == sym.name {
@@ -337,7 +426,7 @@ pub fn reference_points(syms: &[ChangedSym], root: &Path, defs: &[(&'static str,
                 .map(|l| truncate_line(l))
                 .collect::<Vec<_>>()
                 .join("\n");
-            hits.push(RefHit { path, line, context, is_doc: is_comment_line(hit_line) });
+            hits.push(RefHit { path, line, context });
         }
         // ponytail: 确定性排序，WalkBuilder 遍历顺序与 OS 目录顺序相关（非确定性）
         // 但这里 hits 数量有限 O(1000s) 且 cap 后只取前 10，sort 成本可忽略
@@ -379,8 +468,7 @@ pub fn render_entries(refs: &[SymRefs]) -> String {
         let mut block = format!("## {} ({}){}\n", sr.name, sr.kind, ambig);
         let shown = sr.hits.len().min(DOSSIER_PER_NAME_CAP);
         for h in &sr.hits[..shown] {
-            let doc = if h.is_doc { "[doc] " } else { "" };
-            block.push_str(&format!("{doc}{}:{}\n{}\n\n", h.path, h.line, h.context));
+            block.push_str(&format!("{}:{}\n{}\n\n", h.path, h.line, h.context));
         }
         if sr.hits.len() > DOSSIER_PER_NAME_CAP {
             block.push_str(&format!(
@@ -554,9 +642,10 @@ mod tests {
         assert_eq!(refs.len(), 1);
         let r = &refs[0];
         assert_eq!(r.defs_same_name, 2, "两处同名 def → 歧义度 2");
-        // 引用点 = c1/c2 的调用行 + doc 提及行；def 行本身被排除
+        // 引用点 = c1/c2 的调用行；def 行、doc 提及行（B 剔注释）本身被排除
         assert!(r.hits.iter().any(|h| h.path == "src/a.rs" && h.context.contains("c1")));
-        assert!(r.hits.iter().any(|h| h.is_doc), "doc 提及命中标 is_doc");
+        assert!(r.hits.iter().any(|h| h.path == "src/b.rs" && h.context.contains("c2")), "c2 真调用保留");
+        assert!(!r.hits.iter().any(|h| h.path == "src/b.rs" && h.line == 2), "B: doc 注释提及行(2)被剔");
         assert!(!r.hits.iter().any(|h| h.line == 1 && h.path == "src/a.rs"), "def 行不作引用点");
     }
 
@@ -619,6 +708,42 @@ mod tests {
     }
 
     #[test]
+    fn strip_rust_noncode_blanks_comments_and_strings() {
+        let s = strip_rust_noncode(
+            "let x = finding();       // finding in comment\n\
+             let y = \"finding str\";\n\
+             /* block finding */ code_finding();\n\
+             let r = r#\"raw finding\"#;\n",
+        );
+        let l: Vec<&str> = s.lines().collect();
+        assert!(l[0].contains("finding") && !l[0].contains("comment"), "代码区 finding 留、行尾注释剥: {:?}", l[0]);
+        assert!(!l[1].contains("finding"), "字符串字面量里的 finding 剥: {:?}", l[1]);
+        assert!(l[2].contains("code_finding") && !l[2].contains("block"), "块注释后代码留、块内剥: {:?}", l[2]);
+        assert!(!l[3].contains("finding"), "raw 字符串里的 finding 剥: {:?}", l[3]);
+        assert_eq!(s.lines().count(), 4, "行数保持=行号对齐");
+    }
+
+    #[test]
+    fn reference_points_drops_comment_and_string_false_positives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // target 定义 + 真调用(2) + 行尾注释(3) + 字符串(4) + 块注释(5)
+        std::fs::write(root.join("src/a.rs"),
+            "fn target() {}\n\
+             fn real() { target(); }\n\
+             fn c() { let _x = 1; } // call target here\n\
+             fn s() { let _m = \"target not found\"; }\n\
+             /* target in block */\n\
+             fn tail() {}\n").unwrap();
+        let d = rust_defs();
+        let syms = vec![ChangedSym { name: "target".into(), kind: "fn", file: "src/a.rs".into() }];
+        let refs = reference_points(&syms, root, &d);
+        let lines: Vec<usize> = refs[0].hits.iter().map(|h| h.line).collect();
+        assert_eq!(lines, vec![2], "只留代码区真调用(行2)，剔行尾注释(3)/字符串(4)/块注释(5)");
+    }
+
+    #[test]
     fn symbols_from_diff_ignores_no_newline_marker() {
         let d = rust_defs();
         let file: Vec<&str> = "fn caller() {\n    helper();\n}".lines().collect();
@@ -629,29 +754,27 @@ mod tests {
         assert_eq!(names, vec!["caller"], "含 No-newline 标记仍正确锚定 caller，标记行被跳过");
     }
 
-    fn sr(name: &str, defs_same_name: usize, n: usize, doc_idx: Option<usize>) -> SymRefs {
+    fn sr(name: &str, defs_same_name: usize, n: usize) -> SymRefs {
         let hits = (0..n).map(|i| RefHit {
             path: format!("src/f{i}.rs"), line: i + 1,
             context: format!("    {name}(); // hit {i}"),
-            is_doc: Some(i) == doc_idx,
         }).collect();
         SymRefs { name: name.into(), kind: "fn", defs_same_name, hits }
     }
 
     #[test]
     fn render_entries_caps_per_name_and_annotates() {
-        let out = render_entries(&[sr("run", 3, 25, Some(0))]);
+        let out = render_entries(&[sr("run", 3, 25)]);
         assert!(out.matches("src/f").count() <= DOSSIER_PER_NAME_CAP, "每名 ≤10 引用点");
         assert!(out.contains("+15 more, 3 defs same name, heuristic"), "cap 标注: {out}");
         assert!(out.contains("3 defs share this name (incl. trait dispatch), heuristic"), "歧义标注");
-        assert!(out.contains("[doc]"), "doc 命中标形态");
     }
 
     #[test]
     fn render_entries_budget_drop_count_is_exact() {
         // 4 符号 × 2 引用点，每点 context 8000 字节 → 每符号块 ~16KB；预算 28KB 只容 1 个符号整块。
         let big: Vec<SymRefs> = (0..4).map(|i| {
-            let mut s = sr(&format!("sym{i}"), 1, 2, None);
+            let mut s = sr(&format!("sym{i}"), 1, 2);
             for h in &mut s.hits { h.context = "x".repeat(8000); }
             s
         }).collect();
@@ -691,10 +814,10 @@ mod tests {
     #[test]
     fn render_entries_global_budget_and_empty() {
         assert_eq!(render_entries(&[]), "", "无符号 → 空");
-        assert_eq!(render_entries(&[sr("x", 1, 0, None)]), "", "有符号但无引用点 → 空");
+        assert_eq!(render_entries(&[sr("x", 1, 0)]), "", "有符号但无引用点 → 空");
         // 灌爆全局预算：多符号大上下文
         let big: Vec<SymRefs> = (0..50).map(|i| {
-            let mut s = sr(&format!("sym{i}"), 1, 5, None);
+            let mut s = sr(&format!("sym{i}"), 1, 5);
             for h in &mut s.hits { h.context = "x".repeat(2000); }
             s
         }).collect();
