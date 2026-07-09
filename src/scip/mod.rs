@@ -88,8 +88,12 @@ impl ScipIndex {
     /// review 前置：跑 rust-analyzer scip 对工作树建索引 → 解析 → 删临时文件。
     /// RA 缺 / 失败 / 解析错 → None（调用方降级 regex-pack，绝不阻塞）。
     pub fn build(root: &Path) -> Option<ScipIndex> {
-        // 借工具链：探 rust-analyzer 在不在（D16）
-        if !Command::new("rust-analyzer").arg("--version").output().ok()?.status.success() {
+        // 借工具链：探 rust-analyzer 在不在（D16）；探针/子进程输出静默，勿脏用户终端。
+        if !Command::new("rust-analyzer")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output().ok()?.status.success() {
             return None;
         }
         let tmp = tempfile::Builder::new().prefix("redteam-scip-").suffix(".scip").tempfile().ok()?;
@@ -98,6 +102,8 @@ impl ScipIndex {
             .arg("scip").arg(root)
             .arg("--output").arg(&out_path)
             .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status().ok()?;
         if !status.success() {
             return None;
