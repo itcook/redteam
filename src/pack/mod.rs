@@ -187,8 +187,35 @@ fn scip_refs(syms: &[ChangedSym], root: &Path, index: &ScipIndex, strict: bool, 
     out
 }
 
-/// SCIP 引擎入口：0 壳复用（body_section 不变）+ SCIP 1 壳 + 省略清单。
-/// strict=true 为 scip-strict 诊断臂（关兜底）。callee 段在 Task 5 追加。
+/// callee 段：改动符号 def 区间内 callee symbol → 注入其签名（1 跳、不递归）。外部 dep 打 [dep]。
+fn callee_section(syms: &[crate::dossier::ChangedSym], root: &Path, index: &ScipIndex, budget: usize, omit: &mut Vec<String>) -> String {
+    let mut body = String::new();
+    let mut seen = std::collections::HashSet::new();
+    for s in syms {
+        let content = std::fs::read_to_string(root.join(&s.file)).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        // 位置对精确 def 行（Task 2 带的 s.def_line0）→ 区间 [def_line0, block_end]
+        let end0 = crate::dossier::block_end(&lines, s.def_line0).min(lines.len().saturating_sub(1));
+        let own = index.symbol_at(&s.file, s.def_line0).unwrap_or("");
+        for callee in index.callees_in(&s.file, s.def_line0, end0, own) {
+            let sig = match index.signature_of(&callee) { Some(sig) => sig, None => continue };
+            if !seen.insert(callee.clone()) { continue; }
+            let dep = if callee.contains(" cargo redteam ") { "" } else { " [dep]" };
+            // 展示名取 signature 本身（已含名+签名），dep 标后缀
+            let line = format!("- {sig}{dep}\n");
+            if body.len() + line.len() > budget {
+                omit.push(format!("callee 签名 {callee}"));
+            } else {
+                body.push_str(&line);
+            }
+        }
+    }
+    if body.is_empty() { return String::new(); }
+    format!("## 被调契约（callee）\n{body}")
+}
+
+/// SCIP 引擎入口：0 壳复用（body_section 不变）+ SCIP 1 壳 + callee 段 + 省略清单。
+/// strict=true 为 scip-strict 诊断臂（关兜底）。
 pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, index: &ScipIndex, strict: bool) -> String {
     let diff_bytes: usize = bundle.files.iter().map(|fc| fc.diff.len()).sum();
     let remaining = budget.saturating_sub(diff_bytes);
@@ -216,9 +243,13 @@ pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, index: &Scip
         eprintln!("redteam: scip 引擎 {fallback_count} 个符号退回 regex 兜底（位置对无 Definition occurrence）");
     }
 
+    let after_refs = after_bodies.saturating_sub(refs.len());
+    let callees = callee_section(&all_syms, root, index, after_refs, &mut omit);
+
     let mut sections: Vec<String> = Vec::new();
     if !bodies.is_empty() { sections.push(bodies); }
     if !refs.is_empty() { sections.push(refs); }
+    if !callees.is_empty() { sections.push(callees); }
     if !omit.is_empty() {
         let total = omit.len();
         omit.truncate(OMIT_MAX_ENTRIES);
@@ -419,5 +450,34 @@ mod tests {
         // B：只改体
         let b = build_pack_scip(&bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+    // touched body\n"), root, 1_000_000, &idx, false);
         assert!(!b.contains("let z = 1;"), "B 桶 caller 只给片段、不含 caller 体其余行: {b}");
+    }
+
+    #[test]
+    fn build_pack_scip_injects_callee_signatures() {
+        use crate::scip::ScipIndex;
+        // 注：signature_documentation 内层类型是 Signature（非 Document）——Task 1 已核实 scip 0.9.0 生成源，Signature 有同名 text: String。
+        use ::scip::types::{Document, Index, Occurrence, Signature, SymbolInformation};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // caller def 第0-2行，内部调 helper
+        std::fs::write(root.join("src/a.rs"),
+            "pub fn caller() {\n    helper(1);\n}\n").unwrap();
+        let occ = |l: i32, s: &str, r: i32| Occurrence { range: vec![l,0,0], symbol: s.into(), symbol_roles: r, ..Default::default() };
+        let mut helper_si = SymbolInformation { symbol: "rust-analyzer cargo redteam 0.1.0 x/helper().".into(), ..Default::default() };
+        helper_si.signature_documentation = protobuf::MessageField::some(Signature { text: "fn helper(n: i32) -> i32".into(), ..Default::default() });
+        let idx = ScipIndex::from_index(Index { documents: vec![Document {
+            relative_path: "src/a.rs".into(),
+            occurrences: vec![
+                occ(0, "rust-analyzer cargo redteam 0.1.0 x/caller().", 1),
+                occ(1, "rust-analyzer cargo redteam 0.1.0 x/helper().", 0), // caller 体内调 helper
+            ],
+            symbols: vec![helper_si],
+            ..Default::default()
+        }], ..Default::default() });
+        let b = bundle_one("src/a.rs", "@@ -1,0 +1,3 @@\n+pub fn caller() {\n+    helper(1);\n+}\n");
+        let pack = build_pack_scip(&b, root, 1_000_000, &idx, false);
+        assert!(pack.contains("## 被调契约（callee）"), "有 callee 段: {pack}");
+        assert!(pack.contains("fn helper(n: i32) -> i32"), "注入 helper 签名: {pack}");
     }
 }
