@@ -14,7 +14,7 @@ pub(crate) struct Lang {
 }
 
 // Rust def 正则：逐条照抄 eval/harness.py DEF_PATTERNS（已验证 119/119 符号锚定）。
-const RUST: Lang = Lang {
+pub(crate) const RUST: Lang = Lang {
     exts: &["rs"],
     defs: &[
         ("fn", r#"^\s*(?:pub\s*(?:\([^)]*\))?\s*)?(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_]\w*)"#),
@@ -81,7 +81,7 @@ fn match_def(line: &str, defs: &[(&'static str, Regex)]) -> Option<(&'static str
 }
 
 /// 从 0-based def 行 i 起括号配平找块尾行（0-based）；无块（; 结尾）返回 i。
-fn block_end(lines: &[&str], i: usize) -> usize {
+pub(crate) fn block_end(lines: &[&str], i: usize) -> usize {
     let mut depth: i32 = 0;
     let mut seen_open = false;
     // ponytail: 上限 4000 行护栏（照 harness.py），超大函数罕见，够用
@@ -116,9 +116,12 @@ pub(crate) fn enclosing_def_start(lines: &[&str], line0: usize, defs: &[(&'stati
         .find(|&i| match_def(lines[i], defs).is_some() && (i == line0 || block_end(lines, i) >= line0))
 }
 
-/// line0（0-based）的最内层外围 def 名：向上首个「块覆盖 line0」的 def。
-fn innermost_enclosing_def(lines: &[&str], line0: usize, defs: &[(&'static str, Regex)]) -> Option<(&'static str, String)> {
-    enclosing_def_start(lines, line0, defs).and_then(|i| match_def(lines[i], defs))
+/// 契约桶（M15-S2-b）：A=签名面变（传递展/caller 给体）、B=仅体变（caller 给片段）。
+/// C 装饰桶（注释/空白 skip）缓，见 mvp-delta-ledger #12。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Bucket {
+    A,
+    B,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,6 +129,8 @@ pub struct ChangedSym {
     pub name: String,
     pub kind: &'static str,
     pub file: String,
+    pub bucket: Bucket,
+    pub def_line0: usize, // 0-based 新树 def 行 = 位置对连接键（symbol_at 直接用）
 }
 
 // @@ -a,b +c,d @@ 抓新文件起始行 c 与计数 d
@@ -139,9 +144,9 @@ fn parse_hunk_new_start(line: &str) -> Option<usize> {
 pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'static str, Regex)]) -> Vec<ChangedSym> {
     let mut out: Vec<ChangedSym> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let push = |name: String, kind: &'static str, out: &mut Vec<ChangedSym>, seen: &mut std::collections::HashSet<String>| {
+    let push = |name: String, kind: &'static str, bucket: Bucket, def_line0: usize, out: &mut Vec<ChangedSym>, seen: &mut std::collections::HashSet<String>| {
         if seen.insert(name.clone()) {
-            out.push(ChangedSym { name, kind, file: file.to_string() });
+            out.push(ChangedSym { name, kind, file: file.to_string(), bucket, def_line0 });
         }
     };
     let mut new_line = 0usize; // 当前 + / 上下文行的新文件行号（1-based）
@@ -151,10 +156,12 @@ pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'s
             continue;
         }
         if raw.starts_with("@@") {
-            // 上一 hunk 收尾：外围 def
+            // 上一 hunk 收尾：外围 def（体变=B，def_line0=外围 def 起行）
             if let Some(a) = hunk_anchor.take() {
-                if let Some((kind, n)) = innermost_enclosing_def(file_lines, a, defs) {
-                    push(n, kind, &mut out, &mut seen);
+                if let Some(st) = enclosing_def_start(file_lines, a, defs) {
+                    if let Some((kind, n)) = match_def(file_lines[st], defs) {
+                        push(n, kind, Bucket::B, st, &mut out, &mut seen);
+                    }
                 }
             }
             new_line = parse_hunk_new_start(raw).unwrap_or(1);
@@ -172,7 +179,8 @@ pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'s
                     hunk_anchor = Some(anchor0);
                 }
                 if let Some((kind, name)) = match_def(&raw[1..], defs) {
-                    push(name, kind, &mut out, &mut seen);
+                    // + 行本身命中 def 正则=签名行进 diff → A，def_line0=该 + 行
+                    push(name, kind, Bucket::A, anchor0, &mut out, &mut seen);
                 }
                 new_line += 1;
             }
@@ -187,8 +195,10 @@ pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'s
         }
     }
     if let Some(a) = hunk_anchor.take() {
-        if let Some((kind, n)) = innermost_enclosing_def(file_lines, a, defs) {
-            push(n, kind, &mut out, &mut seen);
+        if let Some(st) = enclosing_def_start(file_lines, a, defs) {
+            if let Some((kind, n)) = match_def(file_lines[st], defs) {
+                push(n, kind, Bucket::B, st, &mut out, &mut seen);
+            }
         }
     }
     out
@@ -573,16 +583,17 @@ mod tests {
         let d = rust_defs();
         // impl 头非 def，穿透到内层 fn；改动落在 bar 体内 → 外围是 bar
         let src: Vec<&str> = "impl Foo {\n    fn bar(&self) {\n        let z = 1;\n    }\n}".lines().collect();
-        assert_eq!(innermost_enclosing_def(&src, 2, &d), Some(("fn", "bar".into())));
+        let st = enclosing_def_start(&src, 2, &d).unwrap();
+        assert_eq!(match_def(src[st], &d), Some(("fn", "bar".into())));
         // 落在两 fn 之间的空行 → 无外围
         let src2: Vec<&str> = "fn a() {}\n\nfn b() {}".lines().collect();
-        assert_eq!(innermost_enclosing_def(&src2, 1, &d), None);
+        assert_eq!(enclosing_def_start(&src2, 1, &d), None);
     }
 
     #[test]
     fn innermost_enclosing_empty_lines_is_none() {
         let d = rust_defs();
-        assert_eq!(innermost_enclosing_def(&[], 0, &d), None, "空文件不得 panic");
+        assert_eq!(enclosing_def_start(&[], 0, &d), None, "空文件不得 panic");
     }
 
     #[test]
@@ -624,7 +635,7 @@ mod tests {
         let file: Vec<&str> = "struct Config {\n    a: u8,\n    b: u8,\n}".lines().collect();
         let diff = "@@ -2,0 +3,1 @@\n+    b: u8,\n";
         let syms = symbols_in_file(diff, &file, "src/c.rs", &d);
-        assert_eq!(syms, vec![ChangedSym { name: "Config".into(), kind: "struct", file: "src/c.rs".into() }]);
+        assert_eq!(syms, vec![ChangedSym { name: "Config".into(), kind: "struct", file: "src/c.rs".into(), bucket: Bucket::B, def_line0: 0 }]);
     }
 
     #[test]
@@ -637,7 +648,7 @@ mod tests {
         std::fs::write(root.join("src/b.rs"),
             "fn helper() {}\n/// see helper for details\nfn c2() { helper(); }\n").unwrap();
         let d = rust_defs();
-        let syms = vec![ChangedSym { name: "helper".into(), kind: "fn", file: "src/a.rs".into() }];
+        let syms = vec![ChangedSym { name: "helper".into(), kind: "fn", file: "src/a.rs".into(), bucket: Bucket::A, def_line0: 0 }];
         let refs = reference_points(&syms, root, &d);
         assert_eq!(refs.len(), 1);
         let r = &refs[0];
@@ -662,7 +673,7 @@ mod tests {
         std::fs::write(root.join("src/m.rs"),
             "fn mc1() { helper(); }\n/// doc helper\nfn mc2() { helper(); }\n").unwrap();
         let d = rust_defs();
-        let syms = vec![ChangedSym { name: "helper".into(), kind: "fn", file: "src/z.rs".into() }];
+        let syms = vec![ChangedSym { name: "helper".into(), kind: "fn", file: "src/z.rs".into(), bucket: Bucket::A, def_line0: 0 }];
         let refs = reference_points(&syms, root, &d);
         assert_eq!(refs.len(), 1, "应有一个符号");
         let hits = &refs[0].hits;
@@ -699,7 +710,7 @@ mod tests {
         let long = format!("const X = [{}]; target(); {}", "0,".repeat(5000), "z".repeat(5000));
         std::fs::write(root.join("src/a.rs"), format!("fn target() {{}}\n{long}\n")).unwrap();
         let d = rust_defs();
-        let syms = vec![ChangedSym { name: "target".into(), kind: "fn", file: "src/a.rs".into() }];
+        let syms = vec![ChangedSym { name: "target".into(), kind: "fn", file: "src/a.rs".into(), bucket: Bucket::A, def_line0: 0 }];
         let refs = reference_points(&syms, root, &d);
         let hit = refs[0].hits.iter().find(|h| h.line == 2).expect("超长行应命中 target");
         assert!(hit.context.contains("[line truncated]"), "超长行被截断");
@@ -737,7 +748,7 @@ mod tests {
              /* target in block */\n\
              fn tail() {}\n").unwrap();
         let d = rust_defs();
-        let syms = vec![ChangedSym { name: "target".into(), kind: "fn", file: "src/a.rs".into() }];
+        let syms = vec![ChangedSym { name: "target".into(), kind: "fn", file: "src/a.rs".into(), bucket: Bucket::A, def_line0: 0 }];
         let refs = reference_points(&syms, root, &d);
         let lines: Vec<usize> = refs[0].hits.iter().map(|h| h.line).collect();
         assert_eq!(lines, vec![2], "只留代码区真调用(行2)，剔行尾注释(3)/字符串(4)/块注释(5)");
@@ -752,6 +763,22 @@ mod tests {
         let syms = symbols_in_file(diff, &file, "src/x.rs", &d);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["caller"], "含 No-newline 标记仍正确锚定 caller，标记行被跳过");
+    }
+
+    #[test]
+    fn symbols_in_file_tags_bucket_and_def_line() {
+        let lines: Vec<&str> = "pub fn foo(x: i32) {\n    helper();\n}\n".lines().collect();
+        let defs = compile_defs(&RUST);
+        // 改签名行（+ 行匹配 fn 正则）→ A，def_line0=0
+        let a = symbols_in_file("@@ -1,0 +1,1 @@\n+pub fn foo(x: i32) {\n", &lines, "src/a.rs", &defs);
+        let fa = a.iter().find(|s| s.name == "foo").unwrap();
+        assert_eq!(fa.bucket, Bucket::A, "签名行进 diff = A");
+        assert_eq!(fa.def_line0, 0, "A 桶 def_line0=签名行");
+        // 只改体（+ 行是 helper 调用、外围 def=foo 在第0行）→ B，def_line0=0
+        let b = symbols_in_file("@@ -2,0 +2,1 @@\n+    helper();\n", &lines, "src/a.rs", &defs);
+        let fb = b.iter().find(|s| s.name == "foo").unwrap();
+        assert_eq!(fb.bucket, Bucket::B, "仅体变 = B");
+        assert_eq!(fb.def_line0, 0, "B 桶 def_line0=外围 def 行");
     }
 
     fn sr(name: &str, defs_same_name: usize, n: usize) -> SymRefs {
