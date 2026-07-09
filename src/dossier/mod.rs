@@ -81,7 +81,7 @@ fn match_def(line: &str, defs: &[(&'static str, Regex)]) -> Option<(&'static str
 }
 
 /// 从 0-based def 行 i 起括号配平找块尾行（0-based）；无块（; 结尾）返回 i。
-fn block_end(lines: &[&str], i: usize) -> usize {
+pub(crate) fn block_end(lines: &[&str], i: usize) -> usize {
     let mut depth: i32 = 0;
     let mut seen_open = false;
     // ponytail: 上限 4000 行护栏（照 harness.py），超大函数罕见，够用

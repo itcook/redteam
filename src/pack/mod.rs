@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::bundle::Bundle;
 use crate::dossier::{changed_def_ranges, compile_defs, lang_for, SymRefs};
-use crate::dossier::{symbols_in_file, reference_points, ChangedSym};
+use crate::dossier::{symbols_in_file, reference_points, ChangedSym, Bucket};
 use crate::scip::ScipIndex;
 
 /// 单符号截断长 context（照 dossier 惯例，防 minified 行撑爆）。
@@ -156,8 +156,21 @@ fn scip_refs(syms: &[ChangedSym], root: &Path, index: &ScipIndex, strict: bool, 
             Some(symbol) => {
                 let hits: Vec<crate::dossier::RefHit> = index.callers_of(symbol).into_iter().map(|(path, line0)| {
                     let c = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
-                    let ctx: String = c.lines().nth(line0).unwrap_or("").chars().take(CONTEXT_MAX).collect();
-                    crate::dossier::RefHit { path, line: line0 + 1, context: ctx }
+                    let clines: Vec<&str> = c.lines().collect();
+                    let context = if s.bucket == Bucket::A {
+                        // A 桶：签名面变，caller 给完整外围体（enclosing def 范围切片）——方向性 D9
+                        let cdefs = compile_defs(lang_for(&path).unwrap_or(&crate::dossier::RUST));
+                        match crate::dossier::enclosing_def_start(&clines, line0, &cdefs) {
+                            Some(st) => {
+                                let en = crate::dossier::block_end(&clines, st).min(clines.len().saturating_sub(1));
+                                clines.get(st..=en).unwrap_or(&[]).join("\n")
+                            }
+                            None => clines.get(line0).unwrap_or(&"").chars().take(CONTEXT_MAX).collect(),
+                        }
+                    } else {
+                        clines.get(line0).unwrap_or(&"").chars().take(CONTEXT_MAX).collect()
+                    };
+                    crate::dossier::RefHit { path, line: line0 + 1, context }
                 }).collect();
                 out.push(SymRefs { name: s.name.clone(), kind: s.kind, defs_same_name: 1, hits });
             }
@@ -382,5 +395,29 @@ mod tests {
         // strict 臂：关兜底 → 无引用点
         let strict = build_pack_scip(&b, root, 1_000_000, &idx, true);
         assert!(!strict.contains("## 引用点"), "strict 关兜底 → 空: {strict}");
+    }
+
+    #[test]
+    fn build_pack_scip_a_bucket_gives_caller_full_body_b_gives_snippet() {
+        use crate::scip::ScipIndex;
+        use ::scip::types::{Document, Index, Occurrence};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // target def 第0行；caller u1 跨 2-4 行（多行体）
+        std::fs::write(root.join("src/a.rs"),
+            "pub fn target(x: i32) {}\nfn u1() {\n    let z = 1;\n    target(z);\n}\n").unwrap();
+        let occ = |l: i32, s: &str, r: i32| Occurrence { range: vec![l,0,0], symbol: s.into(), symbol_roles: r, ..Default::default() };
+        let idx = ScipIndex::from_index(Index { documents: vec![Document {
+            relative_path: "src/a.rs".into(),
+            occurrences: vec![occ(0,"S target().",1), occ(3,"S target().",0)],
+            ..Default::default()
+        }], ..Default::default() });
+        // A：改签名行
+        let a = build_pack_scip(&bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn target(x: i32) {}\n"), root, 1_000_000, &idx, false);
+        assert!(a.contains("fn u1() {") && a.contains("let z = 1;"), "A 桶 caller 给完整外围体: {a}");
+        // B：只改体
+        let b = build_pack_scip(&bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+    // touched body\n"), root, 1_000_000, &idx, false);
+        assert!(!b.contains("let z = 1;"), "B 桶 caller 只给片段、不含 caller 体其余行: {b}");
     }
 }
