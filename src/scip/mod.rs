@@ -1,6 +1,9 @@
 //! SCIP 语义索引（M15-S2-b）：跑 rust-analyzer scip → 解析成内存查询表 → 即弃。
 //! 行号全 0-based，与 dossier::enclosing_def_start 对齐。
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::process::Command;
+use protobuf::Message;
 use scip::types::Index;
 
 /// SCIP symbol_roles 位掩码：Definition=1（其余 Import=2/WriteAccess=4/ReadAccess=8…本 MVP 只分 def/非 def）。
@@ -81,6 +84,29 @@ impl ScipIndex {
     pub fn signature_of(&self, symbol: &str) -> Option<&str> {
         self.sig_of.get(symbol).map(String::as_str)
     }
+
+    /// review 前置：跑 rust-analyzer scip 对工作树建索引 → 解析 → 删临时文件。
+    /// RA 缺 / 失败 / 解析错 → None（调用方降级 regex-pack，绝不阻塞）。
+    pub fn build(root: &Path) -> Option<ScipIndex> {
+        // 借工具链：探 rust-analyzer 在不在（D16）
+        if !Command::new("rust-analyzer").arg("--version").output().ok()?.status.success() {
+            return None;
+        }
+        let tmp = tempfile::Builder::new().prefix("redteam-scip-").suffix(".scip").tempfile().ok()?;
+        let out_path = tmp.path().to_path_buf();
+        let status = Command::new("rust-analyzer")
+            .arg("scip").arg(root)
+            .arg("--output").arg(&out_path)
+            .current_dir(root)
+            .status().ok()?;
+        if !status.success() {
+            return None;
+        }
+        let bytes = std::fs::read(&out_path).ok()?;
+        // tmp（NamedTempFile）drop 时自动删；解析后即弃
+        let idx = Index::parse_from_bytes(&bytes).ok()?;
+        Some(ScipIndex::from_index(idx))
+    }
 }
 
 #[cfg(test)]
@@ -135,5 +161,19 @@ mod tests {
         assert_eq!(idx.callees_in("src/a.rs", 0, 0, "S bar()."), vec!["S foo().".to_string()]);
         // 签名
         assert_eq!(idx.signature_of("S foo()."), Some("pub fn foo(x: i32) -> i32"));
+    }
+
+    #[test]
+    #[ignore] // 需本机装 rust-analyzer；手动 `cargo test -p redteam scip_build -- --ignored`
+    fn scip_build_indexes_this_repo() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let idx = ScipIndex::build(root).expect("本仓应能被 rust-analyzer 索引");
+        // 本仓已知符号：dossier::reference_points 应有 def 位置对
+        // （精确行号随源码漂移，故只断言签名表非空 + 某已知函数签名可查）
+        assert!(
+            idx.signature_of("rust-analyzer cargo redteam 0.1.0 dossier/reference_points().")
+                .is_some(),
+            "reference_points 签名应在索引里"
+        );
     }
 }
