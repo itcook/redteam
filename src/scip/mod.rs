@@ -15,6 +15,7 @@ pub struct ScipIndex {
     refs_of: HashMap<String, Vec<(String, usize)>>,    // symbol -> 引用点(path,line0)，去 Definition、已排序
     by_file: HashMap<String, Vec<(usize, String, bool)>>, // path -> [(line0, symbol, is_def)]，供 callee 区间查
     sig_of: HashMap<String, String>,                   // symbol -> signature_documentation.text
+    local_defs: HashSet<String>,                        // 有 Definition occurrence 的 symbol 集合（本仓内 = local，判 [dep] 用，跑仓无关）
 }
 
 impl ScipIndex {
@@ -23,6 +24,7 @@ impl ScipIndex {
         let mut refs_of: HashMap<String, Vec<(String, usize)>> = HashMap::new();
         let mut by_file: HashMap<String, Vec<(usize, String, bool)>> = HashMap::new();
         let mut sig_of = HashMap::new();
+        let mut local_defs = HashSet::new();
         for doc in &idx.documents {
             let path = doc.relative_path.clone();
             for si in &doc.symbols {
@@ -41,6 +43,7 @@ impl ScipIndex {
                 by_file.entry(path.clone()).or_default().push((line0, occ.symbol.clone(), is_def));
                 if is_def {
                     def_at.insert((path.clone(), line0), occ.symbol.clone());
+                    local_defs.insert(occ.symbol.clone());
                 } else {
                     refs_of.entry(occ.symbol.clone()).or_default().push((path.clone(), line0));
                 }
@@ -50,7 +53,7 @@ impl ScipIndex {
             v.sort();
             v.dedup();
         }
-        Self { def_at, refs_of, by_file, sig_of }
+        Self { def_at, refs_of, by_file, sig_of, local_defs }
     }
 
     /// 位置对：某文件某 0-based 行的 Definition symbol（改动符号 ↔ SCIP 连接键）。
@@ -83,6 +86,12 @@ impl ScipIndex {
 
     pub fn signature_of(&self, symbol: &str) -> Option<&str> {
         self.sig_of.get(symbol).map(String::as_str)
+    }
+
+    /// symbol 是否本仓内定义（有 Definition occurrence）。工作区索引里外部依赖 symbol 只以 Reference
+    /// 出现、从无 Definition——故此判据与跑仓的 crate 名无关，repo-agnostic。
+    pub fn is_local(&self, symbol: &str) -> bool {
+        self.local_defs.contains(symbol)
     }
 
     /// review 前置：跑 rust-analyzer scip 对工作树建索引 → 解析 → 删临时文件。

@@ -200,7 +200,7 @@ fn callee_section(syms: &[crate::dossier::ChangedSym], root: &Path, index: &Scip
         for callee in index.callees_in(&s.file, s.def_line0, end0, own) {
             let sig = match index.signature_of(&callee) { Some(sig) => sig, None => continue };
             if !seen.insert(callee.clone()) { continue; }
-            let dep = if callee.contains(" cargo redteam ") { "" } else { " [dep]" };
+            let dep = if index.is_local(&callee) { "" } else { " [dep]" };
             // 展示名取 signature 本身（已含名+签名），dep 标后缀
             let line = format!("- {sig}{dep}\n");
             if body.len() + line.len() > budget {
@@ -479,5 +479,48 @@ mod tests {
         let pack = build_pack_scip(&b, root, 1_000_000, &idx, false);
         assert!(pack.contains("## 被调契约（callee）"), "有 callee 段: {pack}");
         assert!(pack.contains("fn helper(n: i32) -> i32"), "注入 helper 签名: {pack}");
+    }
+
+    /// 回归：[dep] 判据须与跑仓的 crate 名无关（Important finding 修复）。
+    /// 旧实现用 `callee.contains(" cargo redteam ")` 硬编码本 crate名——跑在任意别的仓上，
+    /// 本仓 local callee 的 symbol 前缀就不是 "cargo redteam"，会被误标 [dep]。
+    /// 正确判据：symbol 在索引里有 Definition occurrence（本 crate 名叫 myproj，helper 仍判 local；
+    /// bufio 只有 Reference、无 Definition，判 [dep]）。
+    #[test]
+    fn callee_section_dep_tag_is_repo_agnostic_not_crate_name_based() {
+        use crate::scip::ScipIndex;
+        use ::scip::types::{Document, Index, Occurrence, Signature, SymbolInformation};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // caller 体内调 helper（本仓内定义、非 redteam crate 名）与 read（外部依赖，索引里只有引用无定义）
+        std::fs::write(root.join("src/a.rs"),
+            "pub fn caller() {\n    helper(1);\n    read();\n}\n").unwrap();
+        let occ = |l: i32, s: &str, r: i32| Occurrence { range: vec![l, 0, 0], symbol: s.into(), symbol_roles: r, ..Default::default() };
+        let mut helper_si = SymbolInformation { symbol: "rust-analyzer cargo myproj 0.1.0 x/helper().".into(), ..Default::default() };
+        helper_si.signature_documentation = protobuf::MessageField::some(Signature { text: "fn helper(n: i32) -> i32".into(), ..Default::default() });
+        let mut read_si = SymbolInformation { symbol: "rust-analyzer cargo bufio 1.0.0 x/read().".into(), ..Default::default() };
+        read_si.signature_documentation = protobuf::MessageField::some(Signature { text: "fn read() -> usize".into(), ..Default::default() });
+        let a_doc = Document {
+            relative_path: "src/a.rs".into(),
+            occurrences: vec![
+                occ(0, "rust-analyzer cargo myproj 0.1.0 x/caller().", 1), // caller def
+                occ(1, "rust-analyzer cargo myproj 0.1.0 x/helper().", 0), // 引用 helper
+                occ(2, "rust-analyzer cargo bufio 1.0.0 x/read().", 0),    // 引用 read（外部依赖）
+            ],
+            symbols: vec![helper_si, read_si],
+            ..Default::default()
+        };
+        // helper 的 Definition occurrence 落在另一文件（同一工作区索引常见跨文件情形）
+        let b_doc = Document {
+            relative_path: "src/b.rs".into(),
+            occurrences: vec![occ(0, "rust-analyzer cargo myproj 0.1.0 x/helper().", 1)],
+            ..Default::default()
+        };
+        let idx = ScipIndex::from_index(Index { documents: vec![a_doc, b_doc], ..Default::default() });
+        let b = bundle_one("src/a.rs", "@@ -1,0 +1,4 @@\n+pub fn caller() {\n+    helper(1);\n+    read();\n+}\n");
+        let pack = build_pack_scip(&b, root, 1_000_000, &idx, false);
+        assert!(pack.contains("- fn helper(n: i32) -> i32\n"), "本仓 helper（非 redteam crate 名，有 Definition）不打 [dep]: {pack}");
+        assert!(pack.contains("- fn read() -> usize [dep]\n"), "外部依赖 read（无 Definition）打 [dep]: {pack}");
     }
 }
