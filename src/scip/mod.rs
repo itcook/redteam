@@ -28,6 +28,9 @@ impl ScipIndex {
         for doc in &idx.documents {
             let path = doc.relative_path.clone();
             for si in &doc.symbols {
+                if si.symbol.starts_with("local ") {
+                    continue;
+                }
                 if let Some(d) = si.signature_documentation.as_ref() {
                     if !d.text.is_empty() {
                         sig_of.insert(si.symbol.clone(), d.text.clone());
@@ -35,6 +38,14 @@ impl ScipIndex {
                 }
             }
             for occ in &doc.occurrences {
+                // SCIP `local N` 符号 = 函数内参数/let 绑定：文档内作用域、串跨文件重名
+                // （"local 29" 在本仓 26 个文件各指不同物），且常与所在 item 的 def **同行**。
+                // 若入表会两头坏：(1) 同行碰撞 def_at 后写覆盖，symbol_at 返回参数而非真 item；
+                // (2) 按符号串全局 key 时 refs_of 跨文件合并同名 local → callers 满仓垃圾。
+                // 全跳：我们连接/展开的连接键与引用目标永远是 item（fn/struct/field…），local 非目标。
+                if occ.symbol.starts_with("local ") {
+                    continue;
+                }
                 let line0 = match occ.range.first() {
                     Some(&l) if l >= 0 => l as usize,
                     _ => continue,
@@ -176,6 +187,34 @@ mod tests {
         assert_eq!(idx.callees_in("src/a.rs", 0, 0, "S bar()."), vec!["S foo().".to_string()]);
         // 签名
         assert_eq!(idx.signature_of("S foo()."), Some("pub fn foo(x: i32) -> i32"));
+    }
+
+    #[test]
+    fn from_index_skips_local_symbols_avoiding_def_collision_and_cross_file_merge() {
+        // 回归：真实代码里函数 def 与其参数（SCIP `local N`）同行，且同名 local 跨文件重名。
+        // 过滤前两坏：symbol_at 被后写的 local 覆盖、callers_of 跨文件合并 local。
+        let a = Document {
+            relative_path: "src/a.rs".into(),
+            occurrences: vec![
+                occ(5, "S foo().", ROLE_DEFINITION), // foo 的 def
+                occ(5, "local 1", ROLE_DEFINITION),  // foo 的参数，与 foo **同行** def
+                occ(10, "S foo().", 0),              // foo 的真 caller
+            ],
+            ..Default::default()
+        };
+        let b = Document {
+            relative_path: "src/b.rs".into(),
+            // 另一文件里同串 local 1（文档内作用域、与 a.rs 的 local 1 无关）
+            occurrences: vec![occ(3, "local 1", ROLE_DEFINITION), occ(4, "local 1", 0)],
+            ..Default::default()
+        };
+        let idx = ScipIndex::from_index(Index { documents: vec![a, b], ..Default::default() });
+        // 同行碰撞消解：symbol_at 返回 item foo，而非被后写覆盖的 local 1
+        assert_eq!(idx.symbol_at("src/a.rs", 5), Some("S foo()."));
+        // caller 干净：只 a.rs:10，绝不混入 b.rs 的 local
+        assert_eq!(idx.callers_of("S foo()."), vec![("src/a.rs".to_string(), 10)]);
+        // local 全被过滤：查 local 1 无引用（不跨文件合并）
+        assert!(idx.callers_of("local 1").is_empty());
     }
 
     #[test]
