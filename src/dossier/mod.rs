@@ -14,7 +14,7 @@ pub(crate) struct Lang {
 }
 
 // Rust def 正则：逐条照抄 eval/harness.py DEF_PATTERNS（已验证 119/119 符号锚定）。
-const RUST: Lang = Lang {
+pub(crate) const RUST: Lang = Lang {
     exts: &["rs"],
     defs: &[
         ("fn", r#"^\s*(?:pub\s*(?:\([^)]*\))?\s*)?(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_]\w*)"#),

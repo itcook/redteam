@@ -6,6 +6,10 @@ use std::path::Path;
 use crate::bundle::Bundle;
 use crate::dossier::{changed_def_ranges, compile_defs, lang_for, SymRefs};
 use crate::dossier::{symbols_in_file, reference_points, ChangedSym};
+use crate::scip::ScipIndex;
+
+/// 单符号截断长 context（照 dossier 惯例，防 minified 行撑爆）。
+const CONTEXT_MAX: usize = 200;
 
 /// 每符号正文引用点上限（相关性/多样性帽，非预算帽；沿用 dossier 惯例 10）。
 pub(crate) const PACK_PER_NAME_CAP: usize = 10;
@@ -141,6 +145,78 @@ pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize) -> String {
     sections.join("\n")
 }
 
+/// SCIP 版 1 壳：每改动符号按位置对连 SCIP symbol → callers_of 引用点；
+/// 位置对查无 → strict 跳过、否则退回单符号 regex reference_points。返回同构 Vec<SymRefs>（复用 refs_section 渲染）。
+fn scip_refs(syms: &[ChangedSym], root: &Path, index: &ScipIndex, strict: bool, fallback_count: &mut usize) -> Vec<SymRefs> {
+    let mut out = Vec::new();
+    for s in syms {
+        // 位置对：改动符号 def 行（symbols_in_file 已带 s.def_line0）→ SCIP symbol，精确无同名歧义
+        let sym = index.symbol_at(&s.file, s.def_line0);
+        match sym {
+            Some(symbol) => {
+                let hits: Vec<crate::dossier::RefHit> = index.callers_of(symbol).into_iter().map(|(path, line0)| {
+                    let c = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+                    let ctx: String = c.lines().nth(line0).unwrap_or("").chars().take(CONTEXT_MAX).collect();
+                    crate::dossier::RefHit { path, line: line0 + 1, context: ctx }
+                }).collect();
+                out.push(SymRefs { name: s.name.clone(), kind: s.kind, defs_same_name: 1, hits });
+            }
+            None if strict => { /* 诊断臂：纯 SCIP、不兜底 */ }
+            None => {
+                *fallback_count += 1;
+                // 符号级 regex 兜底：只对本符号跑 reference_points
+                let defs = compile_defs(lang_for(&s.file).unwrap_or(&crate::dossier::RUST));
+                let mut one = reference_points(std::slice::from_ref(s), root, &defs);
+                out.append(&mut one);
+            }
+        }
+    }
+    out
+}
+
+/// SCIP 引擎入口：0 壳复用（body_section 不变）+ SCIP 1 壳 + 省略清单。
+/// strict=true 为 scip-strict 诊断臂（关兜底）。callee 段在 Task 5 追加。
+pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, index: &ScipIndex, strict: bool) -> String {
+    let diff_bytes: usize = bundle.files.iter().map(|fc| fc.diff.len()).sum();
+    let remaining = budget.saturating_sub(diff_bytes);
+    let mut omit: Vec<String> = Vec::new();
+
+    let bodies = body_section(bundle, root, remaining, &mut omit);
+    let after_bodies = remaining.saturating_sub(bodies.len());
+
+    // 改动符号（复用 symbols_in_file，带 bucket）
+    let mut all_syms: Vec<ChangedSym> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for fc in &bundle.files {
+        let lang = match lang_for(&fc.path) { Some(l) => l, None => continue };
+        let defs = compile_defs(lang);
+        let content = std::fs::read_to_string(root.join(&fc.path)).unwrap_or_default();
+        let file_lines: Vec<&str> = content.lines().collect();
+        for s in symbols_in_file(&fc.diff, &file_lines, &fc.path, &defs) {
+            if seen.insert(s.name.clone()) { all_syms.push(s); }
+        }
+    }
+    let mut fallback_count = 0usize;
+    let refs = scip_refs(&all_syms, root, index, strict, &mut fallback_count);
+    let refs = refs_section(&refs, after_bodies, &mut omit);
+    if fallback_count > 0 {
+        eprintln!("redteam: scip 引擎 {fallback_count} 个符号退回 regex 兜底（位置对无 Definition occurrence）");
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    if !bodies.is_empty() { sections.push(bodies); }
+    if !refs.is_empty() { sections.push(refs); }
+    if !omit.is_empty() {
+        let total = omit.len();
+        omit.truncate(OMIT_MAX_ENTRIES);
+        let mut sec = String::from("## 已省略（可 read_files 定点读）\nread_files({paths:[{path,start,end}]})\n");
+        for line in &omit { sec.push_str(line); sec.push('\n'); }
+        if total > OMIT_MAX_ENTRIES { sec.push_str(&format!("… +{} more omitted\n", total - OMIT_MAX_ENTRIES)); }
+        sections.push(sec);
+    }
+    sections.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +342,45 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b = bundle_one("app.py", "@@ -1,0 +1,1 @@\n+def f(): pass\n");
         assert_eq!(build_pack(&b, tmp.path(), 1_000_000), "", "非支持语言 → 空 pack");
+    }
+
+    #[test]
+    fn build_pack_scip_uses_index_callers_and_falls_back_per_symbol() {
+        use crate::scip::ScipIndex;
+        use ::scip::types::{Document, Index, Occurrence};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // target def 在第0行；caller u1 在第1行调 target
+        std::fs::write(root.join("src/a.rs"),
+            "pub fn target(x: i32) {}\nfn u1() { target(1); }\n").unwrap();
+        let occ = |l: i32, s: &str, r: i32| Occurrence { range: vec![l,0,0], symbol: s.into(), symbol_roles: r, ..Default::default() };
+        let idx = ScipIndex::from_index(Index { documents: vec![Document {
+            relative_path: "src/a.rs".into(),
+            occurrences: vec![occ(0, "S target().", 1), occ(1, "S target().", 0)],
+            ..Default::default()
+        }], ..Default::default() });
+        let b = bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn target(x: i32) {}\n");
+        let pack = build_pack_scip(&b, root, 1_000_000, &idx, false);
+        assert!(pack.contains("## 引用点（1 壳）"), "有 1 壳: {pack}");
+        assert!(pack.contains("u1()") || pack.contains("target(1)"), "SCIP caller 命中 u1: {pack}");
+    }
+
+    #[test]
+    fn build_pack_scip_falls_back_when_symbol_absent_from_index() {
+        use crate::scip::ScipIndex;
+        use ::scip::types::Index;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"),
+            "pub fn ghost() {}\nfn u1() { ghost(); }\n").unwrap();
+        let idx = ScipIndex::from_index(Index::default()); // 空索引 → 位置对必查无
+        let b = bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn ghost() {}\n");
+        let pack = build_pack_scip(&b, root, 1_000_000, &idx, false);
+        assert!(pack.contains("ghost"), "空索引 → regex 兜底仍抓到 caller: {pack}");
+        // strict 臂：关兜底 → 无引用点
+        let strict = build_pack_scip(&b, root, 1_000_000, &idx, true);
+        assert!(!strict.contains("## 引用点"), "strict 关兜底 → 空: {strict}");
     }
 }
