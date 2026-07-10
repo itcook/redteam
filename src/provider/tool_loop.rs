@@ -210,6 +210,13 @@ impl ToolLoopProvider {
 #[async_trait]
 impl ReviewProvider for ToolLoopProvider {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError> {
+        // dev 诊断 marker（REDTEAM_TOOL_LOG）：以 prompt 里的 diff 文件头标记本 cell 边界，
+        // 配 max_concurrency=1 顺序跑可把后续 tool 调用归属到 cell。
+        if std::env::var_os("REDTEAM_TOOL_LOG").is_some() {
+            let files: Vec<&str> =
+                req.prompt.lines().filter_map(|l| l.strip_prefix("+++ b/")).collect();
+            crate::tools::tool_log(&serde_json::json!({ "marker": "loop_start", "bundle_files": files }));
+        }
         run_tool_loop(
             self.backend.as_ref(),
             &self.executor,
