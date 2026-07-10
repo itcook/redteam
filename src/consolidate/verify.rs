@@ -11,6 +11,10 @@ use tokio::sync::Semaphore;
 /// 全文件，解剖实测 14 调用/趟——注入声称位置的快照给它一个起点，不代替它自行验证）。
 const SNIPPET_WINDOW: usize = 60;
 const SNIPPET_BYTE_CAP: usize = 24_000;
+/// 读入帽：与本仓读路径基线对齐（tools::read_one=64KB / do_read_files=128KB /
+/// positioning::safe_read=512KB，I2/T2）——对抗式威胁模型含「恶意 PR 塞大文件」，
+/// refute 这条新读路径不得重开无界读的口子。
+const SNIPPET_READ_MAX_BYTES: usize = 512 * 1024;
 const SNIPPET_UNAVAILABLE: &str = "(source unavailable — read the file yourself)";
 
 /// finding 声称位置的工作树快照：`root.join(&f.file)` 按 `[line_start-60, line_end+60]`
@@ -18,15 +22,26 @@ const SNIPPET_UNAVAILABLE: &str = "(source unavailable — read the file yoursel
 /// 截断+注记；文件读不到 / 为空 / 窗越界（如 line_start 越过文件末尾太远）→ 统一占位——
 /// skeptic 不得被喂假装"已验证"的空内容，占位显式指示它自行用工具读。
 pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
-    let content = std::fs::read_to_string(root.join(&f.file)).unwrap_or_default();
-    if content.is_empty() {
+    // 有界读取（镜像 tools::read_one 的 I2/T2 模式）：最多 512KB+1 字节进内存，
+    // +1 用于区分「文件恰好帽长」与「命中帽被截」。非 UTF-8（含帽边界劈开多字节字符）→ 占位。
+    use std::io::Read;
+    let mut content = String::new();
+    let read_ok = std::fs::File::open(root.join(&f.file))
+        .and_then(|fh| fh.take(SNIPPET_READ_MAX_BYTES as u64 + 1).read_to_string(&mut content))
+        .is_ok();
+    if !read_ok || content.is_empty() {
         return SNIPPET_UNAVAILABLE.to_string();
     }
-    let lines: Vec<&str> = content.lines().collect();
+    let hit_cap = content.len() > SNIPPET_READ_MAX_BYTES;
+    let mut lines: Vec<&str> = content.lines().collect();
+    if hit_cap {
+        lines.pop(); // 帽处截断的尾行可能不完整，弃之
+    }
     let n = lines.len();
     let start = (f.line_start as usize).saturating_sub(SNIPPET_WINDOW).max(1);
     let end = (f.line_end as usize + SNIPPET_WINDOW).min(n);
-    if start > end {
+    // 窗越界，或命中帽且请求窗口伸进未读部分 → 安全降级占位（不喂被帽掐掉的假"现场"，模型自己读）。
+    if start > end || (hit_cap && f.line_end as usize + SNIPPET_WINDOW > n) {
         return SNIPPET_UNAVAILABLE.to_string();
     }
     let mut out = format!("{}:{}-{}（现场快照）\n{}", f.file, start, end, lines[start - 1..end].join("\n"));
@@ -245,6 +260,42 @@ mod tests {
         f2.line_start = 1;
         f2.line_end = 1;
         assert_eq!(source_snippet(root, &f2), "(source unavailable — read the file yourself)");
+    }
+
+    #[test]
+    fn source_snippet_24kb_cap_truncates_on_char_boundary() {
+        // 24KB 帽分支：多字节字符（3 字节 CJK）填满窗口，钉住 is_char_boundary 回退不 panic + 注记在场。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let line = "码".repeat(100); // 300 字节/行
+        let body: String = (0..200).map(|_| format!("{line}\n")).collect();
+        std::fs::write(root.join("big.rs"), &body).unwrap();
+        let mut f = finding("t", Severity::High, 1, "alpha");
+        f.file = "big.rs".into();
+        f.line_start = 61;
+        f.line_end = 61;
+        let s = source_snippet(root, &f); // 窗口 121 行 × ~301B ≈ 36KB > 24KB 帽
+        assert!(s.ends_with("…（截断，超 24KB 帽）"), "截断注记在场: …{}", &s[s.len().min(s.len().saturating_sub(60))..]);
+        assert!(s.len() <= SNIPPET_BYTE_CAP + "\n…（截断，超 24KB 帽）".len(), "截断到帽内: {}", s.len());
+        assert!(s.starts_with("big.rs:1-121（现场快照）"), "快照头仍在");
+    }
+
+    #[test]
+    fn source_snippet_read_cap_degrades_when_target_beyond_cap() {
+        // 512KB 读帽分支（I2/T2 对齐）：大文件 + 目标行在帽外 → 占位；帽内目标仍正常渲染。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let body: String = (1..=70_000).map(|i| format!("line{i}\n")).collect(); // ~700KB > 512KB
+        std::fs::write(root.join("huge.rs"), &body).unwrap();
+        let mut f = finding("t", Severity::High, 1, "alpha");
+        f.file = "huge.rs".into();
+        f.line_start = 65_000; // 帽外（512KB ≈ 前 ~52K 行）
+        f.line_end = 65_000;
+        assert_eq!(source_snippet(root, &f), "(source unavailable — read the file yourself)", "帽外目标安全降级");
+        f.line_start = 100; // 帽内目标不受影响
+        f.line_end = 100;
+        let s = source_snippet(root, &f);
+        assert!(s.starts_with("huge.rs:40-160（现场快照）") && s.contains("line100"), "帽内窗口正常渲染: {}", &s[..60]);
     }
 
     #[test]
