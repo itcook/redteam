@@ -383,15 +383,18 @@ mod tests {
     }
 
     #[test]
-    fn body_section_empty_when_no_supported_lang() {
+    fn body_section_empty_when_file_missing_from_worktree() {
+        // 文件不存在于工作树（如已删除的文件仍在 diff 里）→ content 空 → 静默跳过，
+        // 不进正文也不进 omit（评审修：原名 …_no_supported_lang，实测的一直是本场景）。
         use crate::bundle::Bundle;
         use crate::evidence::git::FileChange;
         let tmp = tempfile::tempdir().unwrap();
         let b = Bundle { files: vec![FileChange {
-            path: "app.py".into(), diff: "@@ -1,0 +1,1 @@\n+def f(): pass\n".into(),
+            path: "src/gone.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn f() {}\n".into(),
         }] };
         let mut omit = Vec::new();
-        assert_eq!(body_section(&b, tmp.path(), 1_000_000, &mut omit), "", "非支持语言 → 空");
+        assert_eq!(body_section(&b, tmp.path(), 1_000_000, &mut omit), "", "文件缺失 → 空");
+        assert!(omit.is_empty(), "文件缺失不进 omit: {omit:?}");
     }
 
     fn sr(name: &str, n: usize) -> crate::dossier::SymRefs {

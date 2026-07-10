@@ -266,7 +266,7 @@ pub fn render_dossier_section(entries: &str) -> String {
     let entries = entries.replace("</dossier>", "<\\/dossier>");
     format!(
         "<dossier>\n\
-         The sections below are context for this change, assembled mechanically (heuristic facts, not judgments): the full body of each changed symbol (0-shell), where those symbols are used elsewhere in the repo — its blast radius — found by word-boundary search (1-shell), and an omission list of file:line coordinates that overflowed the budget. Judge whether THIS change breaks these sites; do not audit them for pre-existing defects this change does not cause. Excerpts are a starting point — read the full file at any site you must judge, and for any omitted coordinate use read_files({{paths:[{{path,start,end}}]}}); your duty to verify is undiminished.\n\n\
+         The sections below are context for this change, assembled mechanically (heuristic facts, not judgments): the full source of each changed file (0-shell; files too large for the budget fall back to changed-symbol bodies), where the changed symbols are used elsewhere in the repo — its blast radius — found by word-boundary search (1-shell), and an omission list of file:line coordinates that overflowed the budget. Judge whether THIS change breaks these sites; do not audit them for pre-existing defects this change does not cause. Excerpts are a starting point — read the full file at any site you must judge, and for any omitted coordinate use read_files({{paths:[{{path,start,end}}]}}); your duty to verify is undiminished.\n\n\
          {entries}\
          </dossier>"
     )
@@ -575,7 +575,8 @@ mod tests {
     fn dossier_section_prose_mentions_changed_bodies_and_omission() {
         let s = render_dossier_section("## 改动源文（0 壳）\nsrc/a.rs:1-3\nfn t() {}\n");
         assert!(s.starts_with("<dossier>"));
-        assert!(s.contains("full body") || s.contains("changed symbol"), "散文提及改动源文");
+        assert!(s.contains("full source") && s.contains("changed file"), "散文提及改动源文全文");
+        assert!(s.contains("fall back to changed-symbol bodies"), "散文提及超预算回落语义");
         assert!(s.contains("read_files"), "散文提及省略项可 read_files");
         assert!(s.trim_end().ends_with("</dossier>"));
     }
