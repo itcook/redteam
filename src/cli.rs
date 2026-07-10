@@ -271,7 +271,7 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(
         findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
-        ctx.precedents,
+        ctx.root.unwrap_or(Path::new(".")), ctx.precedents,
     ).await;
     let mut run_warnings = ctx.warnings;
     run_warnings.extend(refute_warnings);
@@ -698,7 +698,7 @@ pub async fn run_incremental_review(
         }
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(
-        merged, provider, &model_names, block, cfg.review.max_concurrency, Mode::Code, &ledger.cards,
+        merged, provider, &model_names, block, cfg.review.max_concurrency, Mode::Code, root, &ledger.cards,
     ).await;
     let mut warnings = raw.warnings;
     warnings.extend(refute_warnings);

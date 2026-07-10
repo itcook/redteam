@@ -3,8 +3,43 @@ use crate::db::DismissCard;
 use crate::domain::{Finding, Mode, Severity, Verify, VerifyVerdict};
 use crate::prompt::{build_refute_prompt, render_precedents};
 use crate::provider::{LensRequest, ReviewProvider};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+
+/// refute 现场源码段窗口半径（行）与字节帽（design Task 2，E7：refute 复审零 pack 裸奔重读
+/// 全文件，解剖实测 14 调用/趟——注入声称位置的快照给它一个起点，不代替它自行验证）。
+const SNIPPET_WINDOW: usize = 60;
+const SNIPPET_BYTE_CAP: usize = 24_000;
+const SNIPPET_UNAVAILABLE: &str = "(source unavailable — read the file yourself)";
+
+/// finding 声称位置的工作树快照：`root.join(&f.file)` 按 `[line_start-60, line_end+60]`
+/// 行窗（1-based 夹紧）取内容，头带 `path:起-止（现场快照）`。超 24_000 字节按 char 边界
+/// 截断+注记；文件读不到 / 为空 / 窗越界（如 line_start 越过文件末尾太远）→ 统一占位——
+/// skeptic 不得被喂假装"已验证"的空内容，占位显式指示它自行用工具读。
+pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
+    let content = std::fs::read_to_string(root.join(&f.file)).unwrap_or_default();
+    if content.is_empty() {
+        return SNIPPET_UNAVAILABLE.to_string();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+    let start = (f.line_start as usize).saturating_sub(SNIPPET_WINDOW).max(1);
+    let end = (f.line_end as usize + SNIPPET_WINDOW).min(n);
+    if start > end {
+        return SNIPPET_UNAVAILABLE.to_string();
+    }
+    let mut out = format!("{}:{}-{}（现场快照）\n{}", f.file, start, end, lines[start - 1..end].join("\n"));
+    if out.len() > SNIPPET_BYTE_CAP {
+        let mut cut = SNIPPET_BYTE_CAP;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n…（截断，超 24KB 帽）");
+    }
+    out
+}
 
 /// 机械预筛（design 2026-07-03 #3）：finding 是否疑似某活跃判例的主题变体。
 /// 召回优先（阈值宽）、精判交 refute（判例注入的 skeptic 终审）——机械匹配对
@@ -32,7 +67,7 @@ fn pick_cross_model<'a>(models: &'a [String], finding_models: &[String]) -> Opti
 /// 且携带 warning——验证层静默失效必须可观测（dogfood 20260703 r1：4/6 refute 失败零告警）。
 /// usage=(input,output,cached)：无模型/调用失败时为 (0,0,0)（T03：refute 趟 token 曾被丢弃，未入任何账）。
 async fn refute_one(
-    provider: &dyn ReviewProvider, finding: &Finding, models: &[String], mode: Mode,
+    provider: &dyn ReviewProvider, finding: &Finding, models: &[String], mode: Mode, root: &Path,
     precedents: &[DismissCard],
 ) -> (Verify, Option<String>, (u64, u64, u64)) {
     let model = match pick_cross_model(models, &finding.models) {
@@ -44,7 +79,8 @@ async fn refute_one(
         ),
     };
     let notes = render_precedents(finding, precedents);
-    let prompt = build_refute_prompt(finding, mode, &notes);
+    let ctx = source_snippet(root, finding);
+    let prompt = build_refute_prompt(finding, mode, &notes, &ctx);
     match provider.run(LensRequest { model: model.clone(), prompt }).await {
         Ok(call) => {
             let (verdict, note, contract_warn) = classify_refute(&call.findings);
@@ -120,6 +156,9 @@ fn classify_refute(
 /// 主题变体（换文件/措辞/锚点）跨轮一致地被 refute（dogfood 20260702 最高信号缺陷）。
 /// 返回第三元素 = refute 趟累计 usage（input,output,cached）；无 targets 时为 (0,0,0)
 /// （T03：调用方须把此值折进总账，refute 趟此前从未入过任何账）。
+/// `root`：finding.file 的解析基点——喂 `source_snippet`（Task 2），非目标场景（如 doc 模式无
+/// established root）传 `Path::new(".")` 即可，读不到时 snippet 自行退化占位。
+#[allow(clippy::too_many_arguments)]
 pub async fn verify_findings(
     mut findings: Vec<Finding>,
     provider: &dyn ReviewProvider,
@@ -127,6 +166,7 @@ pub async fn verify_findings(
     block_threshold: Severity,
     max_concurrency: usize,
     mode: Mode,
+    root: &Path,
     precedents: &[DismissCard],
 ) -> (Vec<Finding>, Vec<String>, (u64, u64, u64)) {
     let targets = refute_targets(&findings, precedents, block_threshold);
@@ -139,7 +179,7 @@ pub async fn verify_findings(
         let f = &findings[i];
         async move {
             let _permit = sem.acquire().await.expect("semaphore not closed");
-            refute_one(provider, f, models, mode, precedents).await
+            refute_one(provider, f, models, mode, root, precedents).await
         }
     }))
     .await;
@@ -185,6 +225,29 @@ mod tests {
     }
 
     #[test]
+    fn source_snippet_windows_and_clamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let body: String = (1..=200).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(root.join("src/a.rs"), &body).unwrap();
+        let mut f = finding("t", Severity::High, 1, "alpha");
+        f.file = "src/a.rs".into();
+        f.line_start = 100;
+        f.line_end = 102;
+        let s = source_snippet(root, &f);
+        assert!(s.contains("line40") && s.contains("line162"), "±60 行窗: {s}");
+        assert!(!s.contains("line39\n") && !s.contains("line163"), "窗外不含");
+        assert!(s.contains("src/a.rs:40-162"), "快照头带范围");
+        // 读不到 → 占位
+        let mut f2 = finding("t", Severity::High, 1, "alpha");
+        f2.file = "no/such.rs".into();
+        f2.line_start = 1;
+        f2.line_end = 1;
+        assert_eq!(source_snippet(root, &f2), "(source unavailable — read the file yourself)");
+    }
+
+    #[test]
     fn classify_refute_prefix_semantics() {
         // 空 → upheld（原契约不变）
         let (v, note, w) = classify_refute(&[]);
@@ -210,7 +273,7 @@ mod tests {
         // skeptic 返回非空（找到反驳）→ refuted；confidence 降 0
         let provider = FakeProvider::with("beta", vec![rawf("actually guarded above")]);
         let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &[]).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
         assert_eq!(out[0].verify.as_ref().unwrap().model, "beta", "交叉选了非 alpha 的 model");
         assert_eq!(out[0].confidence, 0.0, "refuted 降 confidence 下 floor");
@@ -221,7 +284,7 @@ mod tests {
         // skeptic 返回空（守不住反驳）→ upheld；confidence 不动
         let provider = FakeProvider::with("beta", vec![]);
         let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &[]).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld);
         assert_eq!(out[0].confidence, 0.9);
     }
@@ -234,7 +297,7 @@ mod tests {
         let f1 = finding("missing auth 1", Severity::High, 1, "alpha");
         let f2 = finding("missing auth 2", Severity::High, 1, "alpha");
         let (_out, _w, usage) = verify_findings(
-            vec![f1, f2], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[],
+            vec![f1, f2], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &[],
         ).await;
         assert_eq!(usage, (200, 40, 10), "两次 refute 调用的 token 须累加，不能被丢弃");
     }
@@ -245,7 +308,7 @@ mod tests {
         let provider = FakeProvider::with_tokens("beta", vec![rawf("x")], (100, 20, 5));
         let f = finding("minor", Severity::Low, 1, "alpha");
         let (_out, _w, usage) = verify_findings(
-            vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[],
+            vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &[],
         ).await;
         assert_eq!(usage, (0, 0, 0));
     }
@@ -255,7 +318,7 @@ mod tests {
         // agreement>=2（层①）→ 不 refute，verify 留 None
         let provider = FakeProvider::with("beta", vec![rawf("x")]);
         let f = finding("agreed bug", Severity::Critical, 2, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &[]).await;
         assert!(out[0].verify.is_none());
         assert_eq!(out[0].confidence, 0.9);
     }
@@ -265,7 +328,7 @@ mod tests {
         // severity < block_threshold → 不 refute
         let provider = FakeProvider::with("beta", vec![rawf("x")]);
         let f = finding("minor", Severity::Low, 1, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &[]).await;
         assert!(out[0].verify.is_none());
     }
 
@@ -276,7 +339,7 @@ mod tests {
         let provider = FakeProvider::with("beta", vec![rawf("actually specified in section 3")]);
         let mut f = finding("missing rollback branch", Severity::High, 1, "alpha");
         f.quote = String::new();
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Doc, &[]).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Doc, Path::new("."), &[]).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
         assert_eq!(out[0].confidence, 0.0);
     }
@@ -296,7 +359,7 @@ mod tests {
         let mut f = finding("prompt injection via ledger notes", Severity::Medium, 2, "alpha");
         f.models = vec!["alpha".into(), "gamma".into()];
         let cards = vec![card("ffffffffffffffff", "a.rs", "prompt injection via dismissed notes")];
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::High, 4, Mode::Code, &cards).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::High, 4, Mode::Code, Path::new("."), &cards).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted,
             "预筛命中 → 无视 agreement/severity 进 refute");
     }
@@ -307,7 +370,7 @@ mod tests {
         let provider = FakeProvider::with("beta", vec![rawf("would refute")]);
         let f = finding("missing auth", Severity::High, 1, "alpha");
         let cards = vec![card(&f.id.clone(), "a.rs", "missing auth")];
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, &cards).await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &cards).await;
         assert!(out[0].verify.is_none(), "台账精确命中不烧 refute");
     }
 
@@ -317,14 +380,14 @@ mod tests {
         let provider = FakeProvider::with("alpha", vec![]); // 只有 alpha，单 model
         let f = finding("missing auth", Severity::High, 1, "alpha");
         // models 只有 alpha → 退化自审 alpha；但 FakeProvider 有 alpha script(空) → upheld
-        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &[]).await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld);
         assert!(w.is_empty(), "成功 upheld 无 warning");
 
         // 真失败：所选 model 无 script → 保守 upheld + warning 上浮（验证层失效可观测）
         let provider2 = FakeProvider { scripted: BTreeMap::new(), tokens: (0, 0, 0) };
         let f2 = finding("missing auth", Severity::High, 1, "ghost");
-        let (out2, w2, _u2) = verify_findings(vec![f2], &provider2, &["ghost".into()], Severity::Medium, 4, Mode::Code, &[]).await;
+        let (out2, w2, _u2) = verify_findings(vec![f2], &provider2, &["ghost".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &[]).await;
         assert_eq!(out2[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld, "调用失败保守 upheld");
         assert_eq!(out2[0].confidence, 0.9, "upheld 不降 confidence");
         assert_eq!(w2.len(), 1, "refute 失败必须产出 warning");
