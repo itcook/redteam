@@ -369,9 +369,28 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
         _ => None,
     };
     let strict = matches!(engine, PackEngine::Scip { strict: true });
+    // 实验仪器（S2-b'' 激进 A/B）：REDTEAM_PACK_SCOPE=changeset → 每格 pack 的 0 壳追加
+    // 变更集内其他 bundle 的文件全文（空 diff、排自家之后=预算优先自家），修范围错配、
+    // 供无工具臂自足。只增 pack 构建输入，不动 prompt 的 diff 段。dev 态、默认不生效。
+    let changeset_scope = std::env::var("REDTEAM_PACK_SCOPE").ok().as_deref() == Some("changeset");
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
+            let augmented;
+            let pb: &crate::bundle::Bundle = if changeset_scope {
+                let mut files = b.files.clone();
+                for ob in bundles {
+                    for fc in &ob.files {
+                        if !files.iter().any(|e| e.path == fc.path) {
+                            files.push(crate::evidence::git::FileChange { path: fc.path.clone(), diff: String::new() });
+                        }
+                    }
+                }
+                augmented = crate::bundle::Bundle { files };
+                &augmented
+            } else {
+                b
+            };
             if suppressed {
                 String::new()
             } else {
@@ -379,10 +398,10 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
                     (PackEngine::Dossier, _) =>
                         crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)),
                     (PackEngine::Scip { .. }, Some(idx)) =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(b, root, PACK_BUDGET_BYTES, idx, strict)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, PACK_BUDGET_BYTES, idx, strict)),
                     // Regex 默认，及 scip 降级（scip_index=None）都走 regex-pack。
                     _ =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, PACK_BUDGET_BYTES)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, PACK_BUDGET_BYTES)),
                 }
             }
         })
@@ -1929,6 +1948,33 @@ mod tests {
         let (null, _) = build_packs(&bundles, root);
         assert_eq!(null[0], "", "空臂全空段");
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
+    }
+
+    #[test]
+    fn build_packs_changeset_scope_augments_zero_shell_with_sibling_files() {
+        let _g = ENV_LOCK.lock().unwrap();
+        use crate::bundle::Bundle;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn beta_marker() {}\n").unwrap();
+        let bundles = vec![
+            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn beta_marker() {}\n".into() }] },
+        ];
+        unsafe {
+            std::env::remove_var("REDTEAM_NO_DOSSIER");
+            std::env::remove_var("REDTEAM_PACK");
+            std::env::set_var("REDTEAM_PACK_SCOPE", "changeset");
+        }
+        let (on, _) = build_packs(&bundles, root);
+        unsafe { std::env::remove_var("REDTEAM_PACK_SCOPE"); }
+        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 追加兄弟文件全文: {}", on[0]);
+        assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 追加兄弟文件全文");
+        // 默认（env 已除）不跨 bundle
+        let (off, _) = build_packs(&bundles, root);
+        assert!(!off[0].contains("beta_marker"), "默认不含兄弟文件: {}", off[0]);
     }
 
     #[test]
