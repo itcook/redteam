@@ -1,4 +1,4 @@
-//! pack 引擎（M15-S1）：每 bundle 的预算治理上下文块——0 壳改动符号完整体 + 1 壳引用点 + 精确省略清单。
+//! pack 引擎（M15-S1）：每 bundle 的预算治理上下文块——0 壳改动源文全文 + 1 壳引用点 + 精确省略清单。
 //! hermetic：喂 (bundle, root, budget) 出字符串，零 LLM。复用 src/dossier 的符号/引用引擎。
 
 use std::path::Path;
@@ -16,18 +16,31 @@ pub(crate) const PACK_PER_NAME_CAP: usize = 10;
 /// 省略清单条目上限（防大 fan-in 撑爆；超出末尾计数兜底）。
 pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
 
-/// 0 壳段：改动 hunk 的外围 def 完整体（工作树侧全文），按 budget 字节封顶。
-/// 最近壳、优先级最高故先填；但极压下放不下的 body → omit 追加坐标（design §3/§4 兜底）。无改动符号 → ""。
+/// 0 壳段：改动文件全文（粒度对齐模型文件级消费，E7 残余读解剖）；单文件全文超剩余预算
+/// → 回落现状 def 体（支持语言）或 omit 坐标（非支持语言）。按 budget 字节封顶。
 pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec<String>) -> String {
     let mut out = String::new();
     for fc in &bundle.files {
-        let lang = match lang_for(&fc.path) {
-            Some(l) => l,
-            None => continue, // 非支持语言：无损降级
-        };
-        let defs = compile_defs(lang);
         // 工作树直读（bundle 路径来自 git diff、非模型可控，沿用 bundle::group 安全不变量）
         let content = std::fs::read_to_string(root.join(&fc.path)).unwrap_or_default();
+        if content.is_empty() {
+            continue;
+        }
+        let n_lines = content.lines().count();
+        let block = format!("{}:1-{}（全文，{} 行）\n{}\n\n", fc.path, n_lines, n_lines, content);
+        if out.len() + block.len() <= budget {
+            out.push_str(&block);
+            continue;
+        }
+        // 全文超预算：支持语言回落 def 体（不砍语义只降粒度）；非支持语言无 def 可回落 → omit
+        let lang = match lang_for(&fc.path) {
+            Some(l) => l,
+            None => {
+                omit.push(format!("{}:1-{} — 全文超预算（非支持语言无 def 回落）", fc.path, n_lines));
+                continue;
+            }
+        };
+        let defs = compile_defs(lang);
         let lines: Vec<&str> = content.lines().collect();
         for (start, end) in changed_def_ranges(&fc.diff, &lines, &defs) {
             let end = end.min(lines.len().saturating_sub(1));
@@ -35,7 +48,7 @@ pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &m
             if body.is_empty() {
                 continue;
             }
-            let block = format!("{}:{}-{}\n{}\n\n", fc.path, start + 1, end + 1, body);
+            let block = format!("{}:{}-{}（def 体，全文超预算回落）\n{}\n\n", fc.path, start + 1, end + 1, body);
             if out.len() + block.len() > budget {
                 omit.push(format!("{}:{}-{} — 改动符号体", fc.path, start + 1, end + 1));
             } else {
@@ -46,7 +59,7 @@ pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &m
     if out.is_empty() {
         return String::new();
     }
-    format!("## 改动符号完整体（0 壳）\n{out}")
+    format!("## 改动源文（0 壳）\n{out}")
 }
 
 /// 1 壳段：每符号 ≤cap 引用点入正文、正文按 budget 字节封顶。
@@ -96,7 +109,7 @@ pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize) -> String {
 
     let mut omit: Vec<String> = Vec::new();
 
-    // 0 壳：改动符号完整体（最近壳，先填；overflow → omit）
+    // 0 壳：改动源文全文（最近壳，先填；overflow → omit）
     let bodies = body_section(bundle, root, remaining, &mut omit);
     let after_bodies = remaining.saturating_sub(bodies.len());
 
@@ -266,7 +279,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn body_section_renders_full_enclosing_body() {
+    fn body_section_renders_full_file() {
         use crate::bundle::Bundle;
         use crate::evidence::git::FileChange;
         let tmp = tempfile::tempdir().unwrap();
@@ -280,10 +293,74 @@ mod tests {
         }] };
         let mut omit = Vec::new();
         let s = body_section(&b, root, 1_000_000, &mut omit);
-        assert!(s.contains("## 改动符号完整体"), "含 0 壳标题: {s}");
+        assert!(s.contains("## 改动源文（0 壳）"), "含 0 壳标题: {s}");
         assert!(s.contains("fn caller() {") && s.contains("let z = 2;"), "含 caller 完整体");
-        assert!(!s.contains("fn helper"), "未改动的 helper 不进 0 壳");
+        assert!(s.contains("fn helper"), "全文含未改动的 helper（粒度对齐模型文件级消费，E7）");
         assert!(omit.is_empty(), "预算充足无省略");
+    }
+
+    #[test]
+    fn body_section_gives_full_file_within_budget() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"),
+            "use std::fmt;\n\nfn helper() {}\n\nfn caller() {\n    helper();\n    let z = 2;\n}\n").unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -6,0 +6,1 @@\n+    let z = 2;\n".into(),
+        }] };
+        let mut omit = Vec::new();
+        let s = body_section(&b, root, 1_000_000, &mut omit);
+        assert!(s.contains("## 改动源文（0 壳）"), "新段标题: {s}");
+        assert!(s.contains("src/a.rs:1-8（全文，8 行）"), "全文块头带行数: {s}");
+        // 粒度对齐（E7）：全文包含改动 def 之外的内容——imports 与相邻函数
+        assert!(s.contains("use std::fmt;") && s.contains("fn helper() {}"), "含 imports+相邻函数");
+        assert!(omit.is_empty(), "预算充足无省略");
+    }
+
+    #[test]
+    fn body_section_falls_back_to_def_body_when_file_exceeds_budget() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // 大文件：filler 函数撑体积 + 一个小的改动函数
+        let filler = format!("fn filler() {{\n{}}}\n", "    let x = 0;\n".repeat(200));
+        std::fs::write(root.join("src/a.rs"),
+            format!("{filler}\nfn caller() {{\n    work();\n}}\n")).unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -204,0 +204,1 @@\n+    work();\n".into(),
+        }] };
+        // 预算 500B：全文（~3.4KB）放不下 → 回落 caller def 体（~30B）放得下
+        let mut omit = Vec::new();
+        let s = body_section(&b, root, 500, &mut omit);
+        assert!(s.contains("def 体，全文超预算回落"), "回落标注: {s}");
+        assert!(s.contains("fn caller() {") && s.contains("work();"), "回落仍给改动 def 体");
+        assert!(!s.contains("fn filler"), "回落不含无关大函数");
+    }
+
+    #[test]
+    fn body_section_gives_full_file_for_unsupported_lang() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("notes.md"), "# 标题\n\n改动的文档内容。\n").unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "notes.md".into(), diff: "@@ -3,0 +3,1 @@\n+改动的文档内容。\n".into(),
+        }] };
+        let mut omit = Vec::new();
+        let s = body_section(&b, root, 1_000_000, &mut omit);
+        assert!(s.contains("改动的文档内容。"), "非支持语言也给全文（E7：templates 格整读实证）: {s}");
+        // 超预算时非支持语言无 def 可回落 → omit 坐标
+        let mut omit2 = Vec::new();
+        let s2 = body_section(&b, root, 10, &mut omit2);
+        assert!(s2.is_empty() && omit2.len() == 1 && omit2[0].contains("notes.md"), "无回落进 omit: {omit2:?}");
     }
 
     #[test]
@@ -306,15 +383,18 @@ mod tests {
     }
 
     #[test]
-    fn body_section_empty_when_no_supported_lang() {
+    fn body_section_empty_when_file_missing_from_worktree() {
+        // 文件不存在于工作树（如已删除的文件仍在 diff 里）→ content 空 → 静默跳过，
+        // 不进正文也不进 omit（评审修：原名 …_no_supported_lang，实测的一直是本场景）。
         use crate::bundle::Bundle;
         use crate::evidence::git::FileChange;
         let tmp = tempfile::tempdir().unwrap();
         let b = Bundle { files: vec![FileChange {
-            path: "app.py".into(), diff: "@@ -1,0 +1,1 @@\n+def f(): pass\n".into(),
+            path: "src/gone.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn f() {}\n".into(),
         }] };
         let mut omit = Vec::new();
-        assert_eq!(body_section(&b, tmp.path(), 1_000_000, &mut omit), "", "非支持语言 → 空");
+        assert_eq!(body_section(&b, tmp.path(), 1_000_000, &mut omit), "", "文件缺失 → 空");
+        assert!(omit.is_empty(), "文件缺失不进 omit: {omit:?}");
     }
 
     fn sr(name: &str, n: usize) -> crate::dossier::SymRefs {
@@ -360,7 +440,7 @@ mod tests {
             "pub fn target() {\n    work();\n}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\n").unwrap();
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,3 @@\n+pub fn target() {\n+    work();\n+}\n");
         let pack = build_pack(&b, root, 1_000_000);
-        assert!(pack.contains("## 改动符号完整体（0 壳）"), "有 0 壳: {pack}");
+        assert!(pack.contains("## 改动源文（0 壳）"), "有 0 壳: {pack}");
         assert!(pack.contains("pub fn target() {"), "0 壳含 target 完整体");
         assert!(pack.contains("## 引用点（1 壳）"), "有 1 壳");
         assert!(pack.contains("u1()"), "1 壳含 caller");
@@ -382,10 +462,17 @@ mod tests {
     }
 
     #[test]
-    fn build_pack_empty_for_unsupported_and_no_symbols() {
+    fn build_pack_full_file_for_unsupported_lang() {
+        // 语义翻转（E7）：非支持语言曾经全跳过、pack 空；0 壳升级整文件后即使无 def 可抽，
+        // 全文仍在预算内 → pack 非空、含改动源文全文（brief 原断言基于「app.py 未写盘故 pack 空」
+        // 的旧读法——此处补写盘以实测真实的「非支持语言给全文」行为，见 task-1 报告）。
         let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("app.py"), "def f(): pass\n").unwrap();
         let b = bundle_one("app.py", "@@ -1,0 +1,1 @@\n+def f(): pass\n");
-        assert_eq!(build_pack(&b, tmp.path(), 1_000_000), "", "非支持语言 → 空 pack");
+        let pack = build_pack(&b, root, 1_000_000);
+        assert!(pack.contains("## 改动源文（0 壳）"), "非支持语言也走 0 壳: {pack}");
+        assert!(pack.contains("def f(): pass"), "含全文: {pack}");
     }
 
     #[test]
@@ -435,15 +522,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        // target def 第0行；caller u1 跨 2-4 行（多行体）
-        std::fs::write(root.join("src/a.rs"),
-            "pub fn target(x: i32) {}\nfn u1() {\n    let z = 1;\n    target(z);\n}\n").unwrap();
+        // target def 在 a.rs（唯一改动文件——0 壳全文只含它）；caller u1 在 b.rs（未改动、跨多行体），
+        // 隔离到别的文件才能测准 1 壳 caller 粒度（否则 0 壳全文会把 caller 体也一并带进来，盖住这条断言）。
+        std::fs::write(root.join("src/a.rs"), "pub fn target(x: i32) {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn u1() {\n    let z = 1;\n    target(z);\n}\n").unwrap();
         let occ = |l: i32, s: &str, r: i32| Occurrence { range: vec![l,0,0], symbol: s.into(), symbol_roles: r, ..Default::default() };
-        let idx = ScipIndex::from_index(Index { documents: vec![Document {
-            relative_path: "src/a.rs".into(),
-            occurrences: vec![occ(0,"S target().",1), occ(3,"S target().",0)],
-            ..Default::default()
-        }], ..Default::default() });
+        let idx = ScipIndex::from_index(Index { documents: vec![
+            Document { relative_path: "src/a.rs".into(), occurrences: vec![occ(0, "S target().", 1)], ..Default::default() },
+            Document { relative_path: "src/b.rs".into(), occurrences: vec![occ(2, "S target().", 0)], ..Default::default() },
+        ], ..Default::default() });
         // A：改签名行
         let a = build_pack_scip(&bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn target(x: i32) {}\n"), root, 1_000_000, &idx, false);
         assert!(a.contains("fn u1() {") && a.contains("let z = 1;"), "A 桶 caller 给完整外围体: {a}");

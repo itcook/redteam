@@ -271,7 +271,7 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(
         findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
-        ctx.precedents,
+        ctx.root.unwrap_or(Path::new(".")), ctx.precedents,
     ).await;
     let mut run_warnings = ctx.warnings;
     run_warnings.extend(refute_warnings);
@@ -321,9 +321,9 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
     Ok((report, code))
 }
 
-/// pack flat 预算（字节，provisional）——S0 校准前初值；跨模型同值（design §2/§5）。
-/// ponytail: ~2× 旧 28KB dossier 帽以容 0 壳完整体；S0 双基线跑完换真值。
-const PACK_BUDGET_BYTES: usize = 64_000;
+/// pack flat 预算（字节）——S2-b' 提到 256K：0 壳升级整文件后 cli.rs 级大文件（~90KB）
+/// 需装入（E7）；256K ≈ 1M-context 模型的 ~6%、256K 模型的 ~25%，安全。per-model 真预算仍缓（T27）。
+const PACK_BUDGET_BYTES: usize = 256_000;
 
 /// pack 引擎四臂（M15-S2-b）：`REDTEAM_PACK` unset/其他值=Regex（默认，行为不变）；
 /// `0`=Dossier 基线臂；`scip`=Scip 语义引擎；`scip-strict`=Scip 诊断臂（关兜底）。
@@ -369,9 +369,28 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
         _ => None,
     };
     let strict = matches!(engine, PackEngine::Scip { strict: true });
+    // 实验仪器（S2-b'' 激进 A/B）：REDTEAM_PACK_SCOPE=changeset → 每格 pack 的 0 壳追加
+    // 变更集内其他 bundle 的文件全文（空 diff、排自家之后=预算优先自家），修范围错配、
+    // 供无工具臂自足。只增 pack 构建输入，不动 prompt 的 diff 段。dev 态、默认不生效。
+    let changeset_scope = std::env::var("REDTEAM_PACK_SCOPE").ok().as_deref() == Some("changeset");
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
+            let augmented;
+            let pb: &crate::bundle::Bundle = if changeset_scope {
+                let mut files = b.files.clone();
+                for ob in bundles {
+                    for fc in &ob.files {
+                        if !files.iter().any(|e| e.path == fc.path) {
+                            files.push(crate::evidence::git::FileChange { path: fc.path.clone(), diff: String::new() });
+                        }
+                    }
+                }
+                augmented = crate::bundle::Bundle { files };
+                &augmented
+            } else {
+                b
+            };
             if suppressed {
                 String::new()
             } else {
@@ -379,10 +398,10 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
                     (PackEngine::Dossier, _) =>
                         crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)),
                     (PackEngine::Scip { .. }, Some(idx)) =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(b, root, PACK_BUDGET_BYTES, idx, strict)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, PACK_BUDGET_BYTES, idx, strict)),
                     // Regex 默认，及 scip 降级（scip_index=None）都走 regex-pack。
                     _ =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, PACK_BUDGET_BYTES)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, PACK_BUDGET_BYTES)),
                 }
             }
         })
@@ -698,7 +717,7 @@ pub async fn run_incremental_review(
         }
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(
-        merged, provider, &model_names, block, cfg.review.max_concurrency, Mode::Code, &ledger.cards,
+        merged, provider, &model_names, block, cfg.review.max_concurrency, Mode::Code, root, &ledger.cards,
     ).await;
     let mut warnings = raw.warnings;
     warnings.extend(refute_warnings);
@@ -1916,12 +1935,12 @@ mod tests {
         // 默认臂：pack（含 0 壳完整体）
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
         let (on, _) = build_packs(&bundles, root);
-        assert!(on[0].contains("改动符号完整体"), "默认臂 = pack 含 0 壳: {}", on[0]);
+        assert!(on[0].contains("改动源文"), "默认臂 = pack 含 0 壳: {}", on[0]);
 
         // 基线臂：REDTEAM_PACK=0 → dossier-only（无 0 壳段、仍有引用点）
         unsafe { std::env::set_var("REDTEAM_PACK", "0"); }
         let (base, _) = build_packs(&bundles, root);
-        assert!(!base[0].contains("改动符号完整体"), "基线臂无 0 壳");
+        assert!(!base[0].contains("改动源文"), "基线臂无 0 壳");
         assert!(base[0].contains("target"), "基线臂仍是 dossier 引用点");
 
         // 空臂：REDTEAM_NO_DOSSIER
@@ -1929,6 +1948,33 @@ mod tests {
         let (null, _) = build_packs(&bundles, root);
         assert_eq!(null[0], "", "空臂全空段");
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
+    }
+
+    #[test]
+    fn build_packs_changeset_scope_augments_zero_shell_with_sibling_files() {
+        let _g = ENV_LOCK.lock().unwrap();
+        use crate::bundle::Bundle;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn beta_marker() {}\n").unwrap();
+        let bundles = vec![
+            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn beta_marker() {}\n".into() }] },
+        ];
+        unsafe {
+            std::env::remove_var("REDTEAM_NO_DOSSIER");
+            std::env::remove_var("REDTEAM_PACK");
+            std::env::set_var("REDTEAM_PACK_SCOPE", "changeset");
+        }
+        let (on, _) = build_packs(&bundles, root);
+        unsafe { std::env::remove_var("REDTEAM_PACK_SCOPE"); }
+        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 追加兄弟文件全文: {}", on[0]);
+        assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 追加兄弟文件全文");
+        // 默认（env 已除）不跨 bundle
+        let (off, _) = build_packs(&bundles, root);
+        assert!(!off[0].contains("beta_marker"), "默认不含兄弟文件: {}", off[0]);
     }
 
     #[test]
@@ -1950,7 +1996,7 @@ mod tests {
         // 默认臂不变
         unsafe { std::env::remove_var("REDTEAM_PACK"); }
         let (def, _) = build_packs(&bundles, root);
-        assert!(def[0].contains("改动符号完整体"), "默认臂仍 regex-pack");
+        assert!(def[0].contains("改动源文"), "默认臂仍 regex-pack");
         unsafe { std::env::remove_var("REDTEAM_PACK"); }
     }
 

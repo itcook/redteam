@@ -64,7 +64,12 @@ pub async fn run_tool_loop(
     per_turn: std::time::Duration,
     retry_budget: u32,
 ) -> Result<LensCall, ProviderError> {
-    let tools = tool_specs();
+    // 实验仪器（S2-b'' 激进 A/B）：REDTEAM_NO_TOOLS 非空 → 不给模型任何工具 + 换无工具
+    // system——检验「pack 上下文是否已足够评审」（对照臂=常规工具集）。backend 对空 tools
+    // 已有干净处理（不发 tools 键）。dev 态、默认不生效、发布前随 M12 拆。
+    let no_tools = std::env::var_os("REDTEAM_NO_TOOLS").is_some();
+    let tools = if no_tools { Vec::new() } else { tool_specs() };
+    let system = if no_tools { NO_TOOLS_SYSTEM } else { system };
     let mut messages = vec![
         ChatMessage::System(system.to_string()),
         ChatMessage::User(user_prompt.to_string()),
@@ -182,6 +187,13 @@ const DEFAULT_SYSTEM: &str =
     "You are an adversarial code reviewer. Use the provided tools to read and search the \
      codebase as needed, then return ONLY JSON matching the requested schema (an object with a \
      \"findings\" array).";
+/// 无工具臂 system（REDTEAM_NO_TOOLS 实验仪器）：明示无工具、只凭已给上下文裁决。
+const NO_TOOLS_SYSTEM: &str =
+    "You are an adversarial code reviewer. No tools are available in this session — base your \
+     review SOLELY on the provided context (diffs, full sources, reference points). If the \
+     evidence for a claim is not present in the provided context, weigh your confidence \
+     accordingly or drop the claim. Return ONLY JSON matching the requested schema (an object \
+     with a \"findings\" array).";
 const PER_TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
 
 /// 把一个 ChatBackend 与一个 ToolExecutor 组合成可直接喂给编排层的 ReviewProvider。
@@ -300,6 +312,26 @@ mod tests {
         std::fs::File::create(&p).unwrap().write_all(body.as_bytes()).unwrap();
         let ex = ToolExecutor::new(dir.path());
         (dir, ex)
+    }
+
+    #[tokio::test]
+    async fn no_tools_env_swaps_system_and_still_parses() {
+        // 实验仪器：REDTEAM_NO_TOOLS → system 换无工具版、工具集为空、单轮直出 JSON 照常解析。
+        let (_d, ex) = tmp_executor_with("a.rs", "x");
+        let backend = FakeChatBackend::new(vec![final_turn(FINDINGS_JSON)]);
+        unsafe { std::env::set_var("REDTEAM_NO_TOOLS", "1"); }
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 8, std::time::Duration::from_secs(60), 0).await;
+        unsafe { std::env::remove_var("REDTEAM_NO_TOOLS"); }
+        let call = call.unwrap();
+        assert_eq!(call.findings.len(), 1, "无工具单轮直出照常解析");
+        let msgs = backend.messages_at(0);
+        match &msgs[0] {
+            ChatMessage::System(s) => {
+                assert!(s.contains("No tools are available"), "system 换无工具版: {s}");
+                assert!(!s.contains("Use the provided tools"), "不残留带工具指令");
+            }
+            other => panic!("首条应为 System: {other:?}"),
+        }
     }
 
     #[tokio::test]

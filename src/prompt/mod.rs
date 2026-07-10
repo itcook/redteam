@@ -39,10 +39,13 @@ pub fn output_language() -> String {
 /// 复用 review-as-refute——返回的 findings 空=upheld、非空=refuted（见模板 output_contract）。
 /// mode 选模板：Code→code 模板、Doc→doc 模板（空 quote 渲染为遗漏占位说明）。
 /// `dismissed_notes`：驳回台账判例（可空）——skeptic 见过往人裁，主题变体一致 refute。
+/// `source_context`：finding 声称位置的工作树快照（`verify::source_snippet` 产出，可空）——
+/// 免 refute 冷启动零 pack 裸奔重读（E7：解剖实测 14 调用/趟）；空串渲染为 `(none)`。
 pub fn build_refute_prompt(
     finding: &crate::domain::Finding,
     mode: Mode,
     dismissed_notes: &str,
+    source_context: &str,
 ) -> String {
     let tpl = match mode {
         Mode::Code => REFUTE_TPL,
@@ -54,6 +57,7 @@ pub fn build_refute_prompt(
         finding.quote.clone()
     };
     let notes = if dismissed_notes.trim().is_empty() { "(none)" } else { dismissed_notes };
+    let source = if source_context.trim().is_empty() { "(none)" } else { source_context };
     render(tpl, &[
         ("{{FILE}}", &finding.file),
         ("{{LINE_START}}", &finding.line_start.to_string()),
@@ -64,6 +68,7 @@ pub fn build_refute_prompt(
         ("{{BODY}}", &finding.body),
         ("{{QUOTE}}", &quote),
         ("{{DISMISSED_NOTES}}", notes),
+        ("{{SOURCE_CONTEXT}}", source),
     ])
 }
 
@@ -266,7 +271,7 @@ pub fn render_dossier_section(entries: &str) -> String {
     let entries = entries.replace("</dossier>", "<\\/dossier>");
     format!(
         "<dossier>\n\
-         The sections below are context for this change, assembled mechanically (heuristic facts, not judgments): the full body of each changed symbol (0-shell), where those symbols are used elsewhere in the repo — its blast radius — found by word-boundary search (1-shell), and an omission list of file:line coordinates that overflowed the budget. Judge whether THIS change breaks these sites; do not audit them for pre-existing defects this change does not cause. Excerpts are a starting point — read the full file at any site you must judge, and for any omitted coordinate use read_files({{paths:[{{path,start,end}}]}}); your duty to verify is undiminished.\n\n\
+         The sections below are context for this change, assembled mechanically (heuristic facts, not judgments): the full source of each changed file (0-shell; files too large for the budget fall back to changed-symbol bodies), where the changed symbols are used elsewhere in the repo — its blast radius — found by word-boundary search (1-shell), and an omission list of file:line coordinates that overflowed the budget. Judge whether THIS change breaks these sites; do not audit them for pre-existing defects this change does not cause. The 0-shell sources are verbatim snapshots of the current working tree — re-reading those files with tools returns identical content, so spend your tool calls only on what is NOT included here. 1-shell excerpts are a starting point — read the full file at any OTHER site you must judge, and for any omitted coordinate use read_files({{paths:[{{path,start,end}}]}}); your duty to verify is undiminished.\n\n\
          {entries}\
          </dossier>"
     )
@@ -324,7 +329,7 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
-        let p = build_refute_prompt(&f, crate::domain::Mode::Code, "");
+        let p = build_refute_prompt(&f, crate::domain::Mode::Code, "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.contains("src/a.rs") && p.contains("12"), "file:line injected");
         assert!(p.contains("missing auth") && p.contains("db.write(token)"), "title+quote injected");
@@ -338,12 +343,30 @@ mod tests {
             assert!(p.contains(field), "必填字段指引缺失: {field}");
         }
         // doc 模板同约束（双模板同源）
-        let pd = build_refute_prompt(&f, crate::domain::Mode::Doc, "");
+        let pd = build_refute_prompt(&f, crate::domain::Mode::Doc, "", "");
         assert!(pd.contains("\"REFUTED: \"") && pd.contains("ONLY by the empty array"), "doc 模板 verdict 信号同源");
         // 空台账 → 判例段渲染 (none)；非空 → 原样注入（主题变体跨轮一致抑制）
         assert!(p.contains("Precedents: (none)"), "empty notes render (none)");
-        let p2 = build_refute_prompt(&f, crate::domain::Mode::Code, "台账: 旧误报X 已人裁驳回");
+        let p2 = build_refute_prompt(&f, crate::domain::Mode::Code, "台账: 旧误报X 已人裁驳回", "");
         assert!(p2.contains("台账: 旧误报X 已人裁驳回"), "ledger precedents injected");
+    }
+
+    #[test]
+    fn refute_prompt_injects_source_context() {
+        use crate::domain::{Finding, Origin, Severity};
+        let f = Finding {
+            id: "x".into(), severity: Severity::High, title: "missing auth".into(),
+            body: "no check before db write".into(), file: "src/a.rs".into(),
+            line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
+            lenses: vec!["L1".into()], models: vec!["claude".into()], agreement: 1,
+            hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
+            previously_dismissed: false, origin: Origin::New,
+        };
+        let p = build_refute_prompt(&f, crate::domain::Mode::Code, "", "src/a.rs:40-162（现场快照）\nfn x() {}");
+        assert!(p.contains("Source at the claimed location"), "段标题在场");
+        assert!(p.contains("fn x() {}"), "快照内容注入");
+        let p2 = build_refute_prompt(&f, crate::domain::Mode::Code, "", "");
+        assert!(p2.contains("(none)"), "空快照渲染占位");
     }
 
     #[test]
@@ -357,7 +380,7 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: String::new(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
-        let p = build_refute_prompt(&f, Mode::Doc, "");
+        let p = build_refute_prompt(&f, Mode::Doc, "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.to_lowercase().contains("omit"), "doc refute frames omission");
         assert!(!p.contains("Quoted code"), "doc template (not code template)");
@@ -573,9 +596,14 @@ mod tests {
 
     #[test]
     fn dossier_section_prose_mentions_changed_bodies_and_omission() {
-        let s = render_dossier_section("## 改动符号完整体（0 壳）\nsrc/a.rs:1-3\nfn t() {}\n");
+        let s = render_dossier_section("## 改动源文（0 壳）\nsrc/a.rs:1-3\nfn t() {}\n");
         assert!(s.starts_with("<dossier>"));
-        assert!(s.contains("full body") || s.contains("changed symbol"), "散文提及改动符号完整体");
+        assert!(s.contains("full source") && s.contains("changed file"), "散文提及改动源文全文");
+        assert!(s.contains("fall back to changed-symbol bodies"), "散文提及超预算回落语义");
+        // 信任声明（S2-b' 验收闭环）：0 壳=工作树逐字快照、重读同内容——没有这句，模型会
+        // 遵循旧「read the full file at any site」指令整读已在 context 里的改动文件（解剖实证）。
+        assert!(s.contains("re-reading those files with tools returns identical content"), "0 壳信任声明在场");
+        assert!(s.contains("any OTHER site"), "1 壳读指令限定在非 0 壳站点");
         assert!(s.contains("read_files"), "散文提及省略项可 read_files");
         assert!(s.trim_end().ends_with("</dossier>"));
     }

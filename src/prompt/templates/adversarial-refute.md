@@ -24,6 +24,12 @@ You have read_file / search_repo / list_files under the review root. Read the ac
 Attack the claim: Is the quoted code real and in the context described? Does the alleged failure actually occur, or is it prevented by a guard, an invariant, or a caller? Is the severity justified by real impact? Only a concrete, code-grounded refutation counts.
 </method>
 
+## Source at the claimed location (snapshot from the working tree)
+
+{{SOURCE_CONTEXT}}
+
+Use it as your starting evidence; verify beyond it with tools if needed.
+
 <output_contract>
 Return ONLY JSON: an object with a "findings" array.
 - If you find concrete, code-grounded reasons the claim is WRONG / a false positive / already handled / overstated: return EXACTLY ONE finding — title = "REFUTED: " followed by the refutation reason, body = the evidence. The "REFUTED: " title prefix is the machine-read verdict signal (keep the prefix itself in English even when writing in another language). ALL schema fields are REQUIRED for the JSON to parse: fill severity, file, line_start, line_end by copying them from the claimed finding above; confidence = your certainty (0..1) that the claim is wrong; recommendation = one line on how to disposition the claim; quote may be empty.
