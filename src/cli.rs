@@ -321,9 +321,9 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
     Ok((report, code))
 }
 
-/// pack flat 预算（字节，provisional）——S0 校准前初值；跨模型同值（design §2/§5）。
-/// ponytail: ~2× 旧 28KB dossier 帽以容 0 壳完整体；S0 双基线跑完换真值。
-const PACK_BUDGET_BYTES: usize = 64_000;
+/// pack flat 预算（字节）——S2-b' 提到 256K：0 壳升级整文件后 cli.rs 级大文件（~90KB）
+/// 需装入（E7）；256K ≈ 1M-context 模型的 ~6%、256K 模型的 ~25%，安全。per-model 真预算仍缓（T27）。
+const PACK_BUDGET_BYTES: usize = 256_000;
 
 /// pack 引擎四臂（M15-S2-b）：`REDTEAM_PACK` unset/其他值=Regex（默认，行为不变）；
 /// `0`=Dossier 基线臂；`scip`=Scip 语义引擎；`scip-strict`=Scip 诊断臂（关兜底）。
@@ -1916,12 +1916,12 @@ mod tests {
         // 默认臂：pack（含 0 壳完整体）
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
         let (on, _) = build_packs(&bundles, root);
-        assert!(on[0].contains("改动符号完整体"), "默认臂 = pack 含 0 壳: {}", on[0]);
+        assert!(on[0].contains("改动源文"), "默认臂 = pack 含 0 壳: {}", on[0]);
 
         // 基线臂：REDTEAM_PACK=0 → dossier-only（无 0 壳段、仍有引用点）
         unsafe { std::env::set_var("REDTEAM_PACK", "0"); }
         let (base, _) = build_packs(&bundles, root);
-        assert!(!base[0].contains("改动符号完整体"), "基线臂无 0 壳");
+        assert!(!base[0].contains("改动源文"), "基线臂无 0 壳");
         assert!(base[0].contains("target"), "基线臂仍是 dossier 引用点");
 
         // 空臂：REDTEAM_NO_DOSSIER
@@ -1950,7 +1950,7 @@ mod tests {
         // 默认臂不变
         unsafe { std::env::remove_var("REDTEAM_PACK"); }
         let (def, _) = build_packs(&bundles, root);
-        assert!(def[0].contains("改动符号完整体"), "默认臂仍 regex-pack");
+        assert!(def[0].contains("改动源文"), "默认臂仍 regex-pack");
         unsafe { std::env::remove_var("REDTEAM_PACK"); }
     }
 

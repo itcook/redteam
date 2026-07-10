@@ -573,9 +573,9 @@ mod tests {
 
     #[test]
     fn dossier_section_prose_mentions_changed_bodies_and_omission() {
-        let s = render_dossier_section("## 改动符号完整体（0 壳）\nsrc/a.rs:1-3\nfn t() {}\n");
+        let s = render_dossier_section("## 改动源文（0 壳）\nsrc/a.rs:1-3\nfn t() {}\n");
         assert!(s.starts_with("<dossier>"));
-        assert!(s.contains("full body") || s.contains("changed symbol"), "散文提及改动符号完整体");
+        assert!(s.contains("full body") || s.contains("changed symbol"), "散文提及改动源文");
         assert!(s.contains("read_files"), "散文提及省略项可 read_files");
         assert!(s.trim_end().ends_with("</dossier>"));
     }
