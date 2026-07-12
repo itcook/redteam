@@ -18,7 +18,13 @@ pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
 
 /// 0 壳段：改动文件全文（粒度对齐模型文件级消费，E7 残余读解剖）；单文件全文超剩余预算
 /// → 回落现状 def 体（支持语言）或 omit 坐标（非支持语言）。按 budget 字节封顶。
+/// REDTEAM_PACK_BODY=symbol：dev 实验仪器（粒度 A/B S 臂）——0 壳回到 S2-b 符号级，验后拆除。
 pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec<String>) -> String {
+    let symbol_mode = std::env::var("REDTEAM_PACK_BODY").ok().as_deref() == Some("symbol");
+    body_section_impl(bundle, root, budget, omit, symbol_mode)
+}
+
+fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec<String>, symbol_mode: bool) -> String {
     let mut out = String::new();
     for fc in &bundle.files {
         // 工作树直读（bundle 路径来自 git diff、非模型可控，沿用 bundle::group 安全不变量）
@@ -27,17 +33,21 @@ pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &m
             continue;
         }
         let n_lines = content.lines().count();
-        let block = format!("{}:1-{}（全文，{} 行）\n{}\n\n", fc.path, n_lines, n_lines, content);
-        if out.len() + block.len() <= budget {
-            out.push_str(&block);
-            continue;
+        if !symbol_mode {
+            let block = format!("{}:1-{}（全文，{} 行）\n{}\n\n", fc.path, n_lines, n_lines, content);
+            if out.len() + block.len() <= budget {
+                out.push_str(&block);
+                continue;
+            }
         }
-        // 全文超预算：支持语言回落 def 体（不砍语义只降粒度）；非支持语言无 def 可回落 → omit
+        // def 体：symbol 模式主路径 / 全文模式超预算回落（不砍语义只降粒度）
         let lang = match lang_for(&fc.path) {
             Some(l) => l,
             None => {
-                omit.push(format!("{}:1-{} — 全文超预算（非支持语言无 def 回落）", fc.path, n_lines));
-                continue;
+                if !symbol_mode {
+                    omit.push(format!("{}:1-{} — 全文超预算（非支持语言无 def 回落）", fc.path, n_lines));
+                }
+                continue; // symbol 模式沿 S2-b 旧行为：非支持语言无损降级
             }
         };
         let defs = compile_defs(lang);
@@ -48,7 +58,12 @@ pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &m
             if body.is_empty() {
                 continue;
             }
-            let block = format!("{}:{}-{}（def 体，全文超预算回落）\n{}\n\n", fc.path, start + 1, end + 1, body);
+            let head = if symbol_mode {
+                format!("{}:{}-{}", fc.path, start + 1, end + 1)
+            } else {
+                format!("{}:{}-{}（def 体，全文超预算回落）", fc.path, start + 1, end + 1)
+            };
+            let block = format!("{head}\n{body}\n\n");
             if out.len() + block.len() > budget {
                 omit.push(format!("{}:{}-{} — 改动符号体", fc.path, start + 1, end + 1));
             } else {
@@ -59,7 +74,8 @@ pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &m
     if out.is_empty() {
         return String::new();
     }
-    format!("## 改动源文（0 壳）\n{out}")
+    let title = if symbol_mode { "改动符号完整体" } else { "改动源文" };
+    format!("## {title}（0 壳）\n{out}")
 }
 
 /// 1 壳段：每符号 ≤cap 引用点入正文、正文按 budget 字节封顶。
@@ -342,6 +358,35 @@ mod tests {
         assert!(s.contains("def 体，全文超预算回落"), "回落标注: {s}");
         assert!(s.contains("fn caller() {") && s.contains("work();"), "回落仍给改动 def 体");
         assert!(!s.contains("fn filler"), "回落不含无关大函数");
+    }
+
+    #[test]
+    fn body_section_symbol_mode_restores_s2b_shape() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"),
+            "fn helper() {}\n\nfn caller() {\n    helper();\n    let z = 2;\n}\n").unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -4,0 +5,1 @@\n+    let z = 2;\n".into(),
+        }] };
+        let mut omit = Vec::new();
+        let s = body_section_impl(&b, root, 1_000_000, &mut omit, true);
+        assert!(s.contains("## 改动符号完整体（0 壳）"), "旧段标题: {s}");
+        assert!(s.contains("fn caller() {") && s.contains("let z = 2;"), "含改动 def 完整体");
+        assert!(!s.contains("fn helper"), "符号级不含未改动的相邻函数");
+        assert!(!s.contains("全文") && !s.contains("回落"), "块头无全文/回落标注: {s}");
+        // 非支持语言：S2-b 旧行为=无损降级（不产 omit、不入正文）
+        let md = Bundle { files: vec![FileChange {
+            path: "notes.md".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into(),
+        }] };
+        std::fs::write(root.join("notes.md"), "# 标题\nx\n").unwrap();
+        let mut omit2 = Vec::new();
+        let s2 = body_section_impl(&md, root, 1_000_000, &mut omit2, true);
+        assert!(s2.is_empty() && omit2.is_empty(), "非支持语言无损降级: {s2:?} {omit2:?}");
     }
 
     #[test]
