@@ -1955,17 +1955,29 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
-        std::fs::write(root.join("src/b.rs"), "pub fn beta_marker() {}\n").unwrap();
+        // 兄弟 b.rs 撑超 pack 预算：全文分支放不下 → 必走 def 锚回落，而锚定消费的是
+        // fc.diff——兄弟若被塞空 diff 占位（E8 裁决 D 回归），def 锚不到、本块静默消失。
+        let filler_line = "// 填充行：撑爆预算迫入 def 锚回落\n";
+        let sibling = format!(
+            "pub fn beta_marker() {{\n    let marker_body = 1;\n}}\n{}",
+            filler_line.repeat(PACK_BUDGET_BYTES / filler_line.len() + 10)
+        );
+        std::fs::write(root.join("src/b.rs"), &sibling).unwrap();
         let bundles = vec![
             Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn beta_marker() {}\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() }] },
         ];
         let (on, _) = build_packs(&bundles, root);
-        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 默认追加兄弟文件全景: {}", on[0]);
+        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 默认追加兄弟文件全景");
         assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 默认追加兄弟文件全景");
-        // 兄弟条目携带其原 bundle 的真 diff（非空占位）→ 全文/def 块能正常渲染，且同 path 不重复。
-        assert_eq!(on[0].matches("src/b.rs").count(), 1, "兄弟条目 src/b.rs 不重复: {}", on[0]);
-        assert_eq!(on[1].matches("src/a.rs").count(), 1, "兄弟条目 src/a.rs 不重复: {}", on[1]);
+        // 真 diff 穿透证明（集成级）：兄弟超预算迫入 def 锚回落分支（changed_def_ranges
+        // 消费兄弟真 diff）——空 diff 占位回归下无锚可寻，以下三条断言全灭。
+        assert!(on[0].contains("（def 体，全文超预算回落）"), "兄弟超预算迫入 def 回落分支");
+        assert!(on[0].contains("let marker_body = 1;"), "兄弟改动 fn 的 def 体在场（真 diff 锚定）");
+        assert!(!on[0].contains("填充行"), "回落只给改动 def 体，不带填充");
+        // 同 path 不重复
+        assert_eq!(on[0].matches("src/b.rs").count(), 1, "兄弟条目 src/b.rs 不重复");
+        assert_eq!(on[1].matches("src/a.rs").count(), 1, "兄弟条目 src/a.rs 不重复");
     }
 
     #[test]
