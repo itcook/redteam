@@ -373,28 +373,21 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
         _ => None,
     };
     let strict = matches!(engine, PackEngine::Scip { strict: true });
-    // 实验仪器（S2-b'' 激进 A/B）：REDTEAM_PACK_SCOPE=changeset → 每格 pack 的 0 壳追加
-    // 变更集内其他 bundle 的文件全文（空 diff、排自家之后=预算优先自家），修范围错配、
-    // 供无工具臂自足。只增 pack 构建输入，不动 prompt 的 diff 段。dev 态、默认不生效。
-    let changeset_scope = std::env::var("REDTEAM_PACK_SCOPE").ok().as_deref() == Some("changeset");
+    // 变更集全景 0 壳（S2-b'' 转正，design 2026-07-13 §2.1）：每格 = 自家文件（置顶）+
+    // 兄弟改动文件。兄弟带真 diff——空 diff 会让 def 降级不可达且静默消失（E8 裁决 D）。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
-            let augmented;
-            let pb: &crate::bundle::Bundle = if changeset_scope {
-                let mut files = b.files.clone();
-                for ob in bundles {
-                    for fc in &ob.files {
-                        if !files.iter().any(|e| e.path == fc.path) {
-                            files.push(crate::evidence::git::FileChange { path: fc.path.clone(), diff: String::new() });
-                        }
+            let mut files = b.files.clone();
+            for ob in bundles {
+                for fc in &ob.files {
+                    if !files.iter().any(|e| e.path == fc.path) {
+                        files.push(fc.clone());
                     }
                 }
-                augmented = crate::bundle::Bundle { files };
-                &augmented
-            } else {
-                b
-            };
+            }
+            let pb = crate::bundle::Bundle { files };
+            let pb = &pb;
             if suppressed {
                 String::new()
             } else {
@@ -1894,7 +1887,8 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
-        // bundle 1：支持语言 + ≥5 引用点 → 应注入；bundle 2：不支持语言（.py）→ 应空（T01⑥）。
+        // bundle 1：支持语言 + ≥5 引用点 → 应注入；bundle 2：自身 .py 未写盘（无贡献），但默认
+        // 变更集全景令其 pack 从兄弟 a.rs 拿到内容（非空）——T01⑥ 意图已由全景默认取代。
         let bundles = vec![
             Bundle { files: vec![FileChange {
                 path: "src/a.rs".into(),
@@ -1906,12 +1900,12 @@ mod tests {
             }] },
         ];
 
-        // on 臂：一段非空（有引用点）+ 一段空（不支持语言）→ meta 反映 injected:1
+        // on 臂：两段皆非空（bundle 2 靠全景从兄弟 a.rs 拿到引用点）→ meta 反映 injected:2
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
         let (on, on_meta) = build_packs(&bundles, root);
         assert!(!on[0].is_empty(), "支持语言且≥5引用点应非空: {on:?}");
-        assert!(on[1].is_empty(), "不支持语言应空: {on:?}");
-        assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 1, suppressed: false });
+        assert!(on[1].contains("target"), "bundle 2 自身不供内容，但全景从兄弟 a.rs 拿到 target: {on:?}");
+        assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 2, suppressed: false });
 
         // off 臂：REDTEAM_NO_DOSSIER 生效 → 全空段 + suppressed=true + injected=0
         unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
@@ -1955,8 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn build_packs_changeset_scope_augments_zero_shell_with_sibling_files() {
-        let _g = ENV_LOCK.lock().unwrap();
+    fn build_packs_default_gives_changeset_panorama_with_real_sibling_diff() {
         use crate::bundle::Bundle;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -1967,18 +1960,12 @@ mod tests {
             Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
             Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn beta_marker() {}\n".into() }] },
         ];
-        unsafe {
-            std::env::remove_var("REDTEAM_NO_DOSSIER");
-            std::env::remove_var("REDTEAM_PACK");
-            std::env::set_var("REDTEAM_PACK_SCOPE", "changeset");
-        }
         let (on, _) = build_packs(&bundles, root);
-        unsafe { std::env::remove_var("REDTEAM_PACK_SCOPE"); }
-        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 追加兄弟文件全文: {}", on[0]);
-        assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 追加兄弟文件全文");
-        // 默认（env 已除）不跨 bundle
-        let (off, _) = build_packs(&bundles, root);
-        assert!(!off[0].contains("beta_marker"), "默认不含兄弟文件: {}", off[0]);
+        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 默认追加兄弟文件全景: {}", on[0]);
+        assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 默认追加兄弟文件全景");
+        // 兄弟条目携带其原 bundle 的真 diff（非空占位）→ 全文/def 块能正常渲染，且同 path 不重复。
+        assert_eq!(on[0].matches("src/b.rs").count(), 1, "兄弟条目 src/b.rs 不重复: {}", on[0]);
+        assert_eq!(on[1].matches("src/a.rs").count(), 1, "兄弟条目 src/a.rs 不重复: {}", on[1]);
     }
 
     #[test]

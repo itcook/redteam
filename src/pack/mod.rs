@@ -52,6 +52,7 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
         };
         let defs = compile_defs(lang);
         let lines: Vec<&str> = content.lines().collect();
+        let mut contributed = false;
         for (start, end) in changed_def_ranges(&fc.diff, &lines, &defs) {
             let end = end.min(lines.len().saturating_sub(1));
             let body = lines.get(start..=end).unwrap_or(&[]).join("\n");
@@ -66,9 +67,15 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
             let block = format!("{head}\n{body}\n\n");
             if out.len() + block.len() > budget {
                 omit.push(format!("{}:{}-{} — 改动符号体", fc.path, start + 1, end + 1));
+                contributed = true;
             } else {
                 out.push_str(&block);
+                contributed = true;
             }
+        }
+        // E8 裁决 D：降级空产出禁真空——def 锚不到时必须 omit 可观测（T42 场景）。
+        if !symbol_mode && !contributed {
+            omit.push(format!("{}:1-{} — 全文超预算且 def 锚定失败（降级空产出）", fc.path, n_lines));
         }
     }
     if out.is_empty() {
@@ -161,7 +168,7 @@ pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize) -> String {
     if !omit.is_empty() {
         let total = omit.len();
         omit.truncate(OMIT_MAX_ENTRIES);
-        let mut sec = String::from("## 已省略（可 read_files 定点读）\nread_files({paths:[{path,start,end}]})\n");
+        let mut sec = String::from("## 已省略（预算裁剪；证据不足时可在补查趟点名）\n");
         for line in &omit {
             sec.push_str(line);
             sec.push('\n');
@@ -282,7 +289,7 @@ pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, index: &Scip
     if !omit.is_empty() {
         let total = omit.len();
         omit.truncate(OMIT_MAX_ENTRIES);
-        let mut sec = String::from("## 已省略（可 read_files 定点读）\nread_files({paths:[{path,start,end}]})\n");
+        let mut sec = String::from("## 已省略（预算裁剪；证据不足时可在补查趟点名）\n");
         for line in &omit { sec.push_str(line); sec.push('\n'); }
         if total > OMIT_MAX_ENTRIES { sec.push_str(&format!("… +{} more omitted\n", total - OMIT_MAX_ENTRIES)); }
         sections.push(sec);
@@ -442,6 +449,28 @@ mod tests {
         assert!(omit.is_empty(), "文件缺失不进 omit: {omit:?}");
     }
 
+    #[test]
+    fn body_section_degrade_empty_output_goes_to_omit() {
+        // E8 裁决 D：全文超预算且 def 锚不到（如 hunk 全在 mod tests，T42 场景）→ 禁真空，
+        // 必须 omit 可观测，不得静默消失。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // 大文件（超 500B 预算）+ diff 行落在无 def 可锚处（文件头注释区）
+        let filler = format!("// header\n{}", "// filler line\n".repeat(200));
+        std::fs::write(root.join("src/a.rs"), &filler).unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -1,0 +2,1 @@\n+// filler line\n".into(),
+        }] };
+        let mut omit = Vec::new();
+        let s = body_section_impl(&b, root, 500, &mut omit, false);
+        assert!(s.is_empty() || !s.contains("src/a.rs"), "无块可入");
+        assert!(omit.iter().any(|o| o.contains("src/a.rs")), "降级空产出必入 omit: {omit:?}");
+    }
+
     fn sr(name: &str, n: usize) -> crate::dossier::SymRefs {
         let hits = (0..n).map(|i| crate::dossier::RefHit {
             path: format!("src/f{i}.rs"), line: i + 1,
@@ -499,10 +528,10 @@ mod tests {
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\n").unwrap();
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn target() {}\n");
-        // 预算极小：引用点填不下 → 省略清单带坐标 + 用法提示
+        // 预算极小：引用点填不下 → 省略清单带坐标（无工具默认下不指挥不存在的工具）
         let pack = build_pack(&b, root, 60);
-        assert!(pack.contains("## 已省略（可 read_files 定点读）"), "有省略段: {pack}");
-        assert!(pack.contains("read_files({paths:"), "省略段首用法提示");
+        assert!(pack.contains("## 已省略（预算裁剪；证据不足时可在补查趟点名）"), "有省略段: {pack}");
+        assert!(!pack.contains("read_files"), "无工具默认下省略段不得指挥不存在的工具");
         assert!(pack.contains("src/a.rs:"), "省略项带 file:line 坐标");
     }
 
