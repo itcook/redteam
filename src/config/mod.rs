@@ -52,6 +52,25 @@ fn default_doc_lenses() -> Vec<String> {
     ["D1", "D2", "D3", "D4", "D5"].iter().map(|s| s.to_string()).collect()
 }
 
+/// 评审工具档位（design 2026-07-13 §2.4，E8 裁决 A）：off=纯无工具；two-stage=第一趟
+/// 无工具（needs 二阶段批 2 补全，当前行为=off 等价）；on=对话式工具（诊断/对照档）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolsMode { Off, TwoStage, On }
+
+impl ToolsMode {
+    /// CLI flag 字符串 → 档位（clap value_parser 已限值域，此处仍返回 Option 防漂移）。
+    pub fn from_flag(s: &str) -> Option<ToolsMode> {
+        match s {
+            "off" => Some(ToolsMode::Off),
+            "two-stage" => Some(ToolsMode::TwoStage),
+            "on" => Some(ToolsMode::On),
+            _ => None,
+        }
+    }
+}
+fn default_tools() -> ToolsMode { ToolsMode::TwoStage }
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReviewConfig {
     #[serde(default)]
@@ -66,6 +85,9 @@ pub struct ReviewConfig {
     pub max_concurrency: usize,
     #[serde(default)]
     pub lenses: LensSets,
+    /// 工具档位：off | two-stage（默认）| on。
+    #[serde(default = "default_tools")]
+    pub tools: ToolsMode,
 }
 fn default_block() -> Severity { Severity::Medium }
 fn default_floor() -> f32 { 0.5 }
@@ -79,7 +101,7 @@ impl Default for ReviewConfig {
         ReviewConfig { default_models: vec![], block_threshold: default_block(),
             conf_floor: default_floor(), correlate: default_true(),
             max_concurrency: default_concurrency(),
-            lenses: LensSets::default() }
+            lenses: LensSets::default(), tools: default_tools() }
     }
 }
 
@@ -246,6 +268,26 @@ block_threshold="high"
         assert_eq!(cfg.review.conf_floor, 0.5);
         assert!(cfg.review.correlate);
     }
+    #[test]
+    fn tools_mode_parses_and_defaults_to_two_stage() {
+        let c = Config::from_layers(&[r#"[review]
+tools = "off""#]).unwrap();
+        assert_eq!(c.review.tools, ToolsMode::Off);
+        let d = Config::from_layers(&[""]).unwrap();
+        assert_eq!(d.review.tools, ToolsMode::TwoStage, "默认 two-stage（E8 裁决 A）");
+        let on = Config::from_layers(&[r#"[review]
+tools = "on""#]).unwrap();
+        assert_eq!(on.review.tools, ToolsMode::On);
+    }
+
+    #[test]
+    fn tools_mode_from_flag_covers_three_values() {
+        assert_eq!(ToolsMode::from_flag("off"), Some(ToolsMode::Off));
+        assert_eq!(ToolsMode::from_flag("two-stage"), Some(ToolsMode::TwoStage));
+        assert_eq!(ToolsMode::from_flag("on"), Some(ToolsMode::On));
+        assert_eq!(ToolsMode::from_flag("bogus"), None);
+    }
+
     #[test]
     fn key_resolves_env_over_secrets() {
         std::env::set_var("REDTEAM_TEST_KEY", "from-env");

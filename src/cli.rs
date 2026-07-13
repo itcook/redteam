@@ -43,6 +43,10 @@ pub struct ReviewArgs {
     /// M13：`--incremental-from <job-id>`——以该作业为基线的增量轮。serde default 兼容旧 args.json。
     #[serde(default)]
     pub incremental_from: Option<String>,
+    /// `--tools <off|two-stage|on>`：覆盖 config 的工具档位。`serde(default)` 保旧 args.json
+    /// resume/背景 job 重建不炸（旧 job 无此字段 → None → 落 config 默认）。
+    #[serde(default)]
+    pub tools: Option<String>,
 }
 
 /// 台账加载产物（design 2026-07-03 #6 zero-config）：豁免 id 集 + 活跃判例卡 + 披露 meta。
@@ -1025,7 +1029,7 @@ fn empty_review_args() -> ReviewArgs {
         mode: None, base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         lenses: None, models: None, models_all: false, no_correlate: false,
         block_threshold: None, conf_floor: None, background: false, format: "json".into(),
-        targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+        targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     }
 }
 
@@ -1320,7 +1324,7 @@ mod job_tests {
             spec: vec![], focus: None, lenses: None, models: None, models_all: false,
             no_correlate: false, block_threshold: None, conf_floor: None,
             background: true, format: "json".into(), targets: vec![target.into()],
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         }
     }
     fn cfg() -> Config {
@@ -1593,7 +1597,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1640,7 +1644,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("alpha,beta".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1675,7 +1679,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1788,7 +1792,7 @@ default_models=["alpha"]
             spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
         let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
@@ -1806,7 +1810,7 @@ default_models=["alpha"]
             models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         }
     }
 
@@ -2141,6 +2145,7 @@ mod incremental_tests {
             models_all: false, no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![], resume: None,
             dismissed: None, no_dismissed: false, incremental_from: Some(prior.into()),
+            tools: None,
         }
     }
 

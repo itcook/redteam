@@ -60,6 +60,10 @@ enum Cmd {
         /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定，但仍保留在报告中。
         #[arg(long)]
         conf_floor: Option<f32>,
+        /// 工具档位：off（纯无工具）| two-stage（默认：无工具评审，证据不足二阶段补查）
+        /// | on（对话式工具，诊断/对照档）。缺省读 config [review].tools。
+        #[arg(long, value_parser = ["off", "two-stage", "on"])]
+        tools: Option<String>,
         /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。
         #[arg(long)]
         background: bool,
@@ -348,6 +352,15 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<(Mode, 
         return Err("no provider available, please configure [providers.*] first".to_string());
     }
 
+    // 工具档位生效值：--tools 覆盖 config [review].tools；未知/缺省字符串落 config 默认
+    // （clap 已限值域，from_flag 返回 None 仅防漂移）。build_registry 是前台/resume/worker
+    // 三条路径唯一的 registry 构造点，且已持有 args+cfg——在此就地解析，无需再加参数
+    // 穿透调用方（resume 传入的是重建后的 args，天然拿到重建值）。
+    let tools_mode = args.tools.as_deref()
+        .and_then(redteam::config::ToolsMode::from_flag)
+        .unwrap_or(cfg.review.tools);
+    let tools_enabled = matches!(tools_mode, redteam::config::ToolsMode::On);
+
     let mut registry = ProviderRegistry::new();
     for pm in &planned {
         let pc = match cfg.providers.get(&pm.name) {
@@ -363,7 +376,7 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<(Mode, 
                 return Err(format!("{e}"));
             }
         };
-        registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf(), true)));
+        registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf(), tools_enabled)));
     }
 
     Ok((detected, registry))
@@ -385,6 +398,7 @@ async fn main() {
             no_correlate,
             block_threshold,
             conf_floor,
+            tools,
             background,
             format,
             resume,
@@ -436,7 +450,7 @@ async fn main() {
             };
             let args = ReviewArgs {
                 mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
-                no_correlate, block_threshold, conf_floor, background, format, targets,
+                no_correlate, block_threshold, conf_floor, tools, background, format, targets,
                 resume: None, dismissed, no_dismissed, incremental_from,
             };
 
@@ -1048,6 +1062,7 @@ mod tests {
             dismissed: None,
             no_dismissed: false,
             incremental_from: None,
+            tools: None,
         };
         let result = build_registry(&args, &cfg, cwd);
         assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");
