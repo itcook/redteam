@@ -368,6 +368,12 @@ fn pack_engine() -> PackEngine {
     }
 }
 
+/// 验收仪器（E8 裁决 B，随 M12 拆）：REDTEAM_SINGLE_CELL 非空 → 全变更集并成单 bundle
+/// （单格全审 A/B 臂——分格在全景 pack 范式下=N 倍重复喂全景，质量对照据此判批 4 收缩）。
+fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bundle> {
+    vec![crate::bundle::Bundle { files: bundles.into_iter().flat_map(|b| b.files).collect() }]
+}
+
 /// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
 /// 四臂 + null：默认=Regex pack（0 壳完整体+1 壳引用点+省略清单，M15-S1）；`REDTEAM_PACK=0`=
 /// Dossier-only 基线臂（A/B 对照）；`REDTEAM_PACK=scip`=Scip 语义引擎（rust-analyzer 缺/索引失败
@@ -554,6 +560,13 @@ pub async fn run_code_review(
 
     // 1. 确定性筛选 + 分包
     let bundles = group(select_files(changes), Some(root));
+
+    // 验收仪器（随 M12 拆）：单格全审臂。增量轮（run_incremental）不接——验收只走全量。
+    let bundles = if std::env::var_os("REDTEAM_SINGLE_CELL").is_some() {
+        merge_bundles(bundles)
+    } else {
+        bundles
+    };
 
     // 2. rules = code lenses（lens → 注入 rule）
     let lens_ids: Vec<String> = args
@@ -2444,5 +2457,19 @@ default_models=["m"]
         assert_eq!(report.findings[0].agreement, 2, "re-raise 不涨 agreement");
         assert_eq!(report.findings[0].id, id1);
         assert_eq!((report.findings[0].line_start, report.findings[0].line_end), (3, 3), "重锚随注释插入移位");
+    }
+
+    #[test]
+    fn merge_bundles_flattens_all_files_into_one() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let fc = |p: &str| FileChange { path: p.into(), diff: format!("@@ -1,0 +1,1 @@\n+x // {p}\n") };
+        let bs = vec![
+            Bundle { files: vec![fc("src/a.rs")] },
+            Bundle { files: vec![fc("src/b.rs"), fc("src/c.rs")] },
+        ];
+        let merged = merge_bundles(bs);
+        assert_eq!(merged.len(), 1, "单格全审：全部并成一个 bundle");
+        assert_eq!(merged[0].files.len(), 3);
     }
 }

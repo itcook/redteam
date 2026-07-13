@@ -136,6 +136,10 @@ pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize) -> String {
     let bodies = body_section(bundle, root, remaining, &mut omit);
     let after_bodies = remaining.saturating_sub(bodies.len());
 
+    // 验收仪器（E8 裁决 E 第一层，随 M12 拆）：REDTEAM_PACK_SHELLS=0 → 纯 0 壳减法臂。
+    // S2-b'' 的「质量未降」属于「全景+1壳+callee」整包——1 壳/callee 的边际价值由此臂判决。
+    let zero_shell_only = std::env::var("REDTEAM_PACK_SHELLS").ok().as_deref() == Some("0");
+
     // 1 壳：引用点（用剩余预算）。改动符号 + 引用点走 dossier 引擎。
     let mut all_syms: Vec<ChangedSym> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -154,8 +158,12 @@ pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize) -> String {
         }
     }
     let defs = bundle.files.iter().find_map(|fc| lang_for(&fc.path)).map(compile_defs).unwrap_or_default();
-    let refs = reference_points(&all_syms, root, &defs);
-    let refs = refs_section(&refs, after_bodies, &mut omit);
+    let refs = if !zero_shell_only {
+        let refs = reference_points(&all_syms, root, &defs);
+        refs_section(&refs, after_bodies, &mut omit)
+    } else {
+        String::new()
+    };
 
     // 组装：非空段拼接 + 省略清单（封顶 + 计数兜底）
     let mut sections: Vec<String> = Vec::new();
@@ -260,6 +268,9 @@ pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, index: &Scip
     let bodies = body_section(bundle, root, remaining, &mut omit);
     let after_bodies = remaining.saturating_sub(bodies.len());
 
+    // 验收仪器（E8 裁决 E 第一层，随 M12 拆）：REDTEAM_PACK_SHELLS=0 → 纯 0 壳减法臂。
+    let zero_shell_only = std::env::var("REDTEAM_PACK_SHELLS").ok().as_deref() == Some("0");
+
     // 改动符号（复用 symbols_in_file，带 bucket）
     let mut all_syms: Vec<ChangedSym> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -273,14 +284,18 @@ pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, index: &Scip
         }
     }
     let mut fallback_count = 0usize;
-    let refs = scip_refs(&all_syms, root, index, strict, &mut fallback_count);
-    let refs = refs_section(&refs, after_bodies, &mut omit);
-    if fallback_count > 0 {
+    let refs = if !zero_shell_only {
+        let refs = scip_refs(&all_syms, root, index, strict, &mut fallback_count);
+        refs_section(&refs, after_bodies, &mut omit)
+    } else {
+        String::new()
+    };
+    if !zero_shell_only && fallback_count > 0 {
         eprintln!("redteam: scip 引擎 {fallback_count} 个符号退回 regex 兜底（位置对无 Definition occurrence）");
     }
 
     let after_refs = after_bodies.saturating_sub(refs.len());
-    let callees = callee_section(&all_syms, root, index, after_refs, &mut omit);
+    let callees = if !zero_shell_only { callee_section(&all_syms, root, index, after_refs, &mut omit) } else { String::new() };
 
     let mut sections: Vec<String> = Vec::new();
     if !bodies.is_empty() { sections.push(bodies); }
