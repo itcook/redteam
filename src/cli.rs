@@ -326,7 +326,8 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
 }
 
 /// pack flat 预算（字节）——S2-b' 提到 256K：0 壳升级整文件后 cli.rs 级大文件（~90KB）
-/// 需装入（E7）；256K ≈ 1M-context 模型的 ~6%、256K 模型的 ~25%，安全。per-model 真预算仍缓（T27）。
+/// 需装入（E7）；256K ≈ 1M-context 模型的 ~6%、256K 模型的 ~25%，安全。per-model 预算函数已落地
+/// （常数查表版，见下方 pack_budget_bytes）；T27 完整版（models.dev 策展表+真 tokenizer 校准）仍缓。
 const PACK_BUDGET_BYTES: usize = 256_000;
 /// 预算函数三常数（design 2026-07-13 §2.2 逐字）：输出预留（推理型模型 findings JSON +
 /// reasoning）、字节/token 保守换算（代码英文 ~3.5-4B/token，往小估防超模型墙）、prompt
@@ -338,7 +339,7 @@ const SHELL_RESERVE_BYTES: usize = 24_000;
 /// per-model pack 预算：min(字节帽, (启用模型最小窗 − 输出预留)×3 − 壳预留)。
 /// 双层墙——字节帽是策略、token limit 是硬墙；多模型取最小窗=一份 pack 全模型安全
 /// （常数查表，不复活 S2-c per-model 规划器）。未声明窗口 → 保守 128K。
-pub(crate) fn pack_budget_bytes(cfg: &crate::config::Config, model_names: &[String]) -> usize {
+pub(crate) fn pack_budget_bytes(cfg: &Config, model_names: &[String]) -> usize {
     let min_ctx = model_names
         .iter()
         .map(|m| cfg.providers.get(m).and_then(|p| p.context_window_tokens).unwrap_or(128_000))
@@ -375,6 +376,7 @@ fn pack_engine() -> PackEngine {
 /// scip 索引每次 review 前置建一次（非 per-bundle）。degrades 静默于：不支持语言/无符号（pack 臂）；
 /// 基线臂 `build_dossier` 另有调用密度门<5（pack 臂已撤，I-2：body 是 payload 与 caller 密度无关）。
 /// meta.injected 是唯一可观测入口，供 A/B 归因与生产诊断。
+/// `budget`=pack flat 预算（字节）；生产调用点由 `pack_budget_bytes` 按启用模型窗算出。
 pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
     let suppressed = std::env::var_os("REDTEAM_NO_DOSSIER").is_some();
     let engine = pack_engine();
