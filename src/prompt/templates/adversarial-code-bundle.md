@@ -13,9 +13,9 @@ Default to skepticism. Assume subtle, high-cost, user-visible failure until evid
 Give no credit for good intent, partial fixes, or likely follow-up. Happy-path-only counts as a weakness.
 </operating_stance>
 
-<tools>
-You have tools to inspect the repository: read_files (read one or many files at once, line-numbered — this is your ONLY file tool; pass every path you need), search_repo (regex search, gitignore-aware), and list_files. The diffs below show only what changed — you MUST read the full surrounding files, callers, and callees before judging; never judge from the diff alone. Where a dossier of reference points is provided below, start from the files it names. Be exhaustive but efficient: in ONE read_files call, request EVERY file you can anticipate needing — the changed files in full, plus the callers/callees the dossier lists — rather than fetching them one round at a time; only make follow-up read_files calls for references you genuinely discover afterward. For a large file, request a line range ({path, start, end}) rather than the whole file. Do not invent code you have not read.
-</tools>
+<evidence>
+No tools are available in this session — base your review solely on what is provided below: the diffs, the full source of the changed files, and (where present) a dossier of reference points for where the changed symbols are used elsewhere in the repo, plus callee signatures. The diffs alone are not enough — read the full changed-file sources and consult the dossier before judging; never judge from the diff alone. Where a dossier of reference points is provided below, start from the files it names. If the evidence a claim needs is not present in what is provided (see the dossier's omission list, if any), lower your confidence or state the gap explicitly rather than asserting something you cannot see. Do not invent code you have not been shown.
+</evidence>
 
 <review_method>
 Actively disprove the change: violated invariants, missing guards, unhandled failure paths, assumptions that break under stress.
@@ -62,8 +62,8 @@ Every finding must be grounded in code you actually read — do not invent files
 <bundle>
 Target: {{TARGET_LABEL}}
 Files in this bundle: {{FILE_LIST}}
-Files changed elsewhere in this changeset — their diffs are NOT shown here; other review passes cover them: {{OTHER_CHANGED_FILES}}
-Do NOT claim something is missing, undeclared, or unimplemented ACROSS THE CHANGESET (e.g. "no version declared", "the announced X is implemented nowhere") when it could plausibly live in one of those files — use read_file to confirm actual absence first, or drop the claim. Absence from this bundle is not absence from the changeset.
+Files changed elsewhere in this changeset — their diffs are not repeated in THIS bundle's diff block, but their full sources ARE included in the dossier below (sibling changed-file panorama): {{OTHER_CHANGED_FILES}}
+Do NOT claim something is missing, undeclared, or unimplemented ACROSS THE CHANGESET (e.g. "no version declared", "the announced X is implemented nowhere") when it could plausibly live in one of those files — verify the claim against their source in the dossier below first. If that source is omitted or unavailable (see the dossier's omission list, if any), lower your confidence or state the gap instead of asserting absence. Absence from this bundle is not absence from the changeset.
 
 Changed hunks:
 {{BUNDLE_DIFFS}}

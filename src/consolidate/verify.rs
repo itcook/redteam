@@ -15,7 +15,7 @@ const SNIPPET_BYTE_CAP: usize = 24_000;
 /// positioning::safe_read=512KB，I2/T2）——对抗式威胁模型含「恶意 PR 塞大文件」，
 /// refute 这条新读路径不得重开无界读的口子。
 const SNIPPET_READ_MAX_BYTES: usize = 512 * 1024;
-const SNIPPET_UNAVAILABLE: &str = "(source unavailable — read the file yourself)";
+const SNIPPET_UNAVAILABLE: &str = "(source unavailable — judge from the finding's quote alone and weigh confidence accordingly)";
 
 /// finding 声称位置的工作树快照：`root.join(&f.file)` 按 `[line_start-60, line_end+60]`
 /// 行窗（1-based 夹紧）取内容，头带 `path:起-止（现场快照）`。超 24_000 字节按 char 边界
@@ -123,7 +123,8 @@ async fn refute_one(
             (Verify { verdict, model, note }, warn, usage)
         }
         // 保守：refute 调用失败不冤枉 finding（保留其 blocking 力），但失败必须进 warnings。
-        // T43 层①：Parse 失败先嗅原文头部 verdict 前缀（层② repair 重试已由 tool_loop 内建）。
+        // T43 层①：Parse 失败先嗅原文头部 verdict 前缀（层② repair 重试已由 tool_loop 内建——
+        // 覆盖 FINALIZE 收尾轮与 toolless 默认路径首轮直出两条 parse 失败分支，Fix 4：final-review）。
         Err(e) => {
             let sniffed = match &e {
                 crate::provider::ProviderError::Parse(msg) => sniff_refute_verdict(msg),
@@ -291,7 +292,7 @@ mod tests {
         f2.file = "no/such.rs".into();
         f2.line_start = 1;
         f2.line_end = 1;
-        assert_eq!(source_snippet(root, &f2), "(source unavailable — read the file yourself)");
+        assert_eq!(source_snippet(root, &f2), SNIPPET_UNAVAILABLE);
     }
 
     #[test]
@@ -323,7 +324,7 @@ mod tests {
         f.file = "huge.rs".into();
         f.line_start = 65_000; // 帽外（512KB ≈ 前 ~52K 行）
         f.line_end = 65_000;
-        assert_eq!(source_snippet(root, &f), "(source unavailable — read the file yourself)", "帽外目标安全降级");
+        assert_eq!(source_snippet(root, &f), SNIPPET_UNAVAILABLE, "帽外目标安全降级");
         f.line_start = 100; // 帽内目标不受影响
         f.line_end = 100;
         let s = source_snippet(root, &f);

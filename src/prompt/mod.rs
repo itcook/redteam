@@ -618,8 +618,8 @@ mod tests {
         let dossier = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    foo();\n");
         let p = build_bundle_prompt("wt", &b, &refs, "", "", "", &dossier);
         assert!(p.contains("<dossier>"), "卷宗块注入");
-        assert!(p.contains("start from the files it names"), "<tools> 卷宗起点句在场");
-        assert!(p.contains("request EVERY file you can anticipate needing"), "穷尽批量读取指令在场（read_files 唯一读文件工具，code 模式专属，砍 tool-loop 轮数）");
+        assert!(p.contains("start from the files it names"), "<evidence> 卷宗起点句在场");
+        assert!(p.contains("No tools are available in this session"), "无工具默认转正（2026-07-13 design §2.1）——不再指挥不存在的工具");
         // 空卷宗 → 无 <dossier> 块，行为不变
         let p2 = build_bundle_prompt("wt", &b, &refs, "", "", "", "");
         assert!(!p2.contains("<dossier>"), "空卷宗不渲染块");

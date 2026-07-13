@@ -60,8 +60,8 @@ enum Cmd {
         /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定，但仍保留在报告中。
         #[arg(long)]
         conf_floor: Option<f32>,
-        /// 工具档位：off（纯无工具）| two-stage（默认：无工具评审，证据不足二阶段补查）
-        /// | on（对话式工具，诊断/对照档）。缺省读 config [review].tools。
+        /// 工具档位：off（纯无工具）| two-stage（默认：无工具评审；二阶段补查机制后续批次交付，
+        /// 当前等效 off）| on（对话式工具，诊断/对照档）。缺省读 config [review].tools。
         #[arg(long, value_parser = ["off", "two-stage", "on"])]
         tools: Option<String>,
         /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。

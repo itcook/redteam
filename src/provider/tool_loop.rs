@@ -97,18 +97,51 @@ pub async fn run_tool_loop(
         tool_use.tally(&turn.tool_calls);
 
         if turn.tool_calls.is_empty() {
-            let out = match parse_lens_output(&turn.text) {
-                Ok(o) => o,
-                Err(_) => return Err(diagnostic_parse_error(&turn)),
-            };
-            return Ok(LensCall {
-                findings: out.findings,
-                input_tokens: in_tok,
-                output_tokens: out_tok,
-                cached_input_tokens: cached_tok,
-                iterations: i + 1,
-                tool_use: tool_use.clone(),
-            });
+            match parse_lens_output(&turn.text) {
+                Ok(out) => {
+                    return Ok(LensCall {
+                        findings: out.findings,
+                        input_tokens: in_tok,
+                        output_tokens: out_tok,
+                        cached_input_tokens: cached_tok,
+                        iterations: i + 1,
+                        tool_use: tool_use.clone(),
+                    });
+                }
+                Err(_) => {
+                    // Fix 4（final-review）：无 tool_calls 的首轮直出 parse 失败——旧实现在此直接
+                    // 报错。toolless 默认路径（tools_enabled=false）每轮 tool_calls 恒空，永远走
+                    // 这条早退分支，从未触达下方「探索耗尽→FINALIZE→repair」的纠错代码，parse
+                    // 韧性在新默认路径上全灭（DeepSeek 截断常见）。镜像下方 FINALIZE 分支的 repair
+                    // 语义：补一轮 REPAIR_PROMPT + turn_final（ONE-shot，不循环），仍失败才报诊断化
+                    // Parse 错误——不再无条件报废整个 cell。
+                    messages.push(ChatMessage::User(REPAIR_PROMPT.to_string()));
+                    let repair_turn = crate::provider::retry_classified(retry_budget, || async {
+                        match tokio::time::timeout(per_turn, backend.turn_final(&messages)).await {
+                            Ok(r) => r,
+                            Err(_) => Err(ProviderError::Timeout(
+                                format!("turn timeout after {}s", per_turn.as_secs()))),
+                        }
+                    }).await?;
+                    in_tok += repair_turn.input_tokens;
+                    out_tok += repair_turn.output_tokens;
+                    cached_tok += repair_turn.cached_input_tokens;
+                    tool_use.tally(&repair_turn.tool_calls);
+                    return match parse_lens_output(&repair_turn.text) {
+                        Ok(out) => Ok(LensCall {
+                            findings: out.findings,
+                            input_tokens: in_tok,
+                            output_tokens: out_tok,
+                            cached_input_tokens: cached_tok,
+                            // 未修复分支为 i+1；此处多付出 1 次真实往返，记 i+2（同下方
+                            // FINALIZE repaired=max_iters+2 的记账惯例，"多一轮就多计一"）。
+                            iterations: i + 2,
+                            tool_use: tool_use.clone(),
+                        }),
+                        Err(_) => Err(diagnostic_parse_error(&repair_turn)),
+                    };
+                }
+            }
         }
 
         let results: Vec<ToolResult> =
@@ -452,6 +485,39 @@ mod tests {
             "diagnostic message missing finish_reason context: {err}"
         );
         assert_eq!(backend.turn_count(), 2, "恰好一次修复轮，不循环重试");
+    }
+
+    // Fix 4（final-review）：toolless 默认路径（tools_enabled=false）首轮必空 tool_calls，
+    // 旧实现 parse 失败即报废整个 cell——从未触达 FINALIZE 段的 repair 纠错。这里验证新增的
+    // 早退分支 repair：无效 JSON → 补一轮 repair → 有效 JSON 应正常出 findings 且 iterations 计入。
+    #[tokio::test]
+    async fn toolless_first_turn_parse_failure_recovers_via_one_repair_turn() {
+        let (_d, ex) = tmp_executor_with("a.rs", "x");
+        let truncated = "{\"findings\":[{\"severity\":\"high\",\"title\":\"t\",\"bo"; // 半截 JSON
+        let backend = FakeChatBackend::new(vec![final_turn(truncated), final_turn(FINDINGS_JSON)]);
+        // tools_enabled=false：不影响 FakeChatBackend 行为（忽略 tools 参数），但语义上模拟真实
+        // 无工具默认路径——首轮天然 tool_calls=[]。
+        let call = run_tool_loop(&backend, &ex, "sys", "review", 8, std::time::Duration::from_secs(60), 0, false)
+            .await
+            .unwrap();
+        assert_eq!(call.findings.len(), 1, "首轮直出 parse 失败应经 repair 拿到 findings 而非报错");
+        assert_eq!(call.iterations, 2, "首轮(i=0)+1 次 repair 往返 = i+2");
+        let repair_msgs = backend.messages_at(backend.turn_count() - 1);
+        assert!(
+            repair_msgs.iter().any(|m| matches!(m, ChatMessage::User(u) if u.contains("not valid JSON"))),
+            "repair prompt not present: {repair_msgs:?}"
+        );
+    }
+
+    // 修复轮仍解析失败 → 报诊断化 Parse 错误，不无限重试（同 FINALIZE 段既有对称测试）。
+    #[tokio::test]
+    async fn toolless_first_turn_parse_failure_exhausted_after_one_repair_returns_diagnostic_error() {
+        let (_d, ex) = tmp_executor_with("a.rs", "x");
+        let backend = FakeChatBackend::new(vec![final_turn("not json at all"), final_turn("still not json")]);
+        let r = run_tool_loop(&backend, &ex, "sys", "review", 8, std::time::Duration::from_secs(60), 0, false).await;
+        let err = r.unwrap_err();
+        assert!(matches!(err, ProviderError::Parse(_)), "got: {err:?}");
+        assert_eq!(backend.turn_count(), 2, "恰好一次 repair 往返，不循环重试");
     }
 
     struct HangBackend;

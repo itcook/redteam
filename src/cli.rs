@@ -417,6 +417,11 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
             }
             let pb = crate::bundle::Bundle { files };
             let pb = &pb;
+            // Fix 1（final-review）：预算记账只扣本 cell 自己的 diff 字节——pb 是全景增广版
+            // （混入兄弟真 diff，供 def 锚定/正文消费），但唯一真正进 prompt 的 diff 只有
+            // b 自己那份（见 orchestrate::run_code_fanout 用原 bundle 而非 pb 建 diff 块）。
+            // 用 pb.files 重新求和会把兄弟 diff 也扣进预算，大改动集下 remaining→0、0 壳塌缩。
+            let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
             if suppressed {
                 String::new()
             } else {
@@ -424,10 +429,10 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
                     (PackEngine::Dossier, _) =>
                         crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)),
                     (PackEngine::Scip { .. }, Some(idx)) =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, budget, idx, strict)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, budget, own_diff_bytes, idx, strict)),
                     // Regex 默认，及 scip 降级（scip_index=None）都走 regex-pack。
                     _ =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, budget)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, budget, own_diff_bytes)),
                 }
             }
         })
@@ -2014,6 +2019,28 @@ mod tests {
         // 同 path 不重复
         assert_eq!(on[0].matches("src/b.rs").count(), 1, "兄弟条目 src/b.rs 不重复");
         assert_eq!(on[1].matches("src/a.rs").count(), 1, "兄弟条目 src/a.rs 不重复");
+    }
+
+    #[test]
+    fn build_packs_panorama_does_not_double_reserve_sibling_diff_budget() {
+        // Fix 1 回归：全景 pb 混入兄弟真 diff，旧实现拿 pb.files 重新求和当预算扣除，
+        // 兄弟 diff 巨大时 remaining 饱和到 0、本 cell 自己那份小文件的 0 壳也塌缩——
+        // 即便实际进 prompt 的 diff 只有 own bundle 那份（orchestrate 用原 bundle 建 diff 块）。
+        use crate::bundle::Bundle;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn beta_marker() {}\n").unwrap();
+        // 兄弟 diff 本身（非文件体）巨大：撑到 >= 预算，令旧「pb.files 全体求和」饱和 remaining=0。
+        let huge_sibling_diff = format!("@@ -1,0 +1,1 @@\n+{}\n", "x".repeat(6_000));
+        let bundles = vec![
+            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: huge_sibling_diff }] },
+        ];
+        let (on, _) = build_packs(&bundles, root, 5_000);
+        assert!(on[0].contains("## 改动源文（0 壳）") && on[0].contains("alpha_marker"),
+            "格0 自身小文件应仍全文渲染，不被兄弟巨 diff 挤空: {}", on[0]);
     }
 
     #[test]
