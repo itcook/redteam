@@ -56,6 +56,25 @@ pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
     out
 }
 
+/// T43 层①：refute structured-output parse 失败（repair 重试后仍失败）的前缀嗅探。
+/// provider 的 Parse 错误携带原始输出前 120 字符（diagnostic_parse_error）——refute 契约的
+/// verdict 前缀（REFUTED/UPHELD）在头部，JSON 包装失败通常不吞语义。只嗅 strip 包装后的
+/// 头部前缀，不做全文词搜——refute 散文里 "would be REFUTED if" 会误判。嗅不出 → None，
+/// 交层③兜底（保守 Upheld 保 blocking 力：假 approve 吞真问题是 r1 20260703 老事故方向）。
+fn sniff_refute_verdict(parse_msg: &str) -> Option<VerifyVerdict> {
+    // diagnostic 格式 "…(finish_reason=…): <原文>"——固定前缀先于原文出现，取第一个 "): " 之后。
+    let raw = &parse_msg[parse_msg.find("): ")? + 3..];
+    let stripped = raw.trim_start_matches(['*', '#', '`', '"', '\'', ' ', '\n']);
+    let lower: String = stripped.chars().take(24).collect::<String>().to_lowercase();
+    if lower.starts_with("refuted") {
+        Some(VerifyVerdict::Refuted)
+    } else if lower.starts_with("upheld") || lower.starts_with("claim upheld") {
+        Some(VerifyVerdict::Upheld)
+    } else {
+        None
+    }
+}
+
 /// 机械预筛（design 2026-07-03 #3）：finding 是否疑似某活跃判例的主题变体。
 /// 召回优先（阈值宽）、精判交 refute（判例注入的 skeptic 终审）——机械匹配对
 /// 换措辞天然半盲，它只负责把候选送进 refute，不做终审。
@@ -104,9 +123,22 @@ async fn refute_one(
             (Verify { verdict, model, note }, warn, usage)
         }
         // 保守：refute 调用失败不冤枉 finding（保留其 blocking 力），但失败必须进 warnings。
+        // T43 层①：Parse 失败先嗅原文头部 verdict 前缀（层② repair 重试已由 tool_loop 内建）。
         Err(e) => {
-            let warn = format!("refute [{}] model {model}: {e}", finding.id);
-            (Verify { verdict: VerifyVerdict::Upheld, model, note: "refute unavailable".into() }, Some(warn), (0, 0, 0))
+            let sniffed = match &e {
+                crate::provider::ProviderError::Parse(msg) => sniff_refute_verdict(msg),
+                _ => None,
+            };
+            match sniffed {
+                Some(verdict) => {
+                    let warn = format!("refute [{}] model {model}: parse failed, verdict sniffed from raw prefix: {e}", finding.id);
+                    (Verify { verdict, model, note: "sniffed from unparsed refute output".into() }, Some(warn), (0, 0, 0))
+                }
+                None => {
+                    let warn = format!("refute [{}] model {model}: {e}", finding.id);
+                    (Verify { verdict: VerifyVerdict::Upheld, model, note: "refute unavailable".into() }, Some(warn), (0, 0, 0))
+                }
+            }
         }
     }
 }
@@ -456,5 +488,44 @@ mod tests {
         let cards = vec![card("ffffffffffffffff", "a.rs", "lone blocking")]; // 判例变体也不打 carried
         let targets = refute_targets(&[carried, fresh], &cards, Severity::Medium);
         assert_eq!(targets, vec![1], "只有 origin=new 的孤证进 targets（carried 双路径均剔除）");
+    }
+
+    #[test]
+    fn sniff_refute_verdict_prefix_semantics_only() {
+        // T43 层①：markdown 包装的 verdict 前缀可救回
+        let m = "structured-output parse failed: final JSON parse failed (finish_reason=stop): **REFUTED: The claim is false because…";
+        assert_eq!(sniff_refute_verdict(m), Some(VerifyVerdict::Refuted));
+        let u = "structured-output parse failed: final JSON parse failed (finish_reason=stop): Claim upheld: the guard is missing";
+        assert_eq!(sniff_refute_verdict(u), Some(VerifyVerdict::Upheld));
+        // 截断 JSON 头 → 嗅不出，交兜底
+        let j = r#"structured-output parse failed: final JSON parse failed (finish_reason=stop): {"findings": ["#;
+        assert_eq!(sniff_refute_verdict(j), None);
+        // 只嗅头部前缀：正文提及 REFUTED 不得误判（"would be REFUTED if…"）
+        let mid = "structured-output parse failed: final JSON parse failed (finish_reason=stop): The claim would be REFUTED if callers pass empty vec";
+        assert_eq!(sniff_refute_verdict(mid), None);
+    }
+
+    /// 恒返 Parse 错误的 provider——模拟 repair 后仍 parse 失败、但原文头部带 verdict 前缀。
+    struct ParseErrProvider(String);
+    #[async_trait::async_trait]
+    impl crate::provider::ReviewProvider for ParseErrProvider {
+        async fn run(&self, _req: crate::provider::LensRequest)
+            -> Result<crate::provider::LensCall, crate::provider::ProviderError> {
+            Err(crate::provider::ProviderError::Parse(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn refute_parse_failure_sniffs_refuted_prefix() {
+        // T43 实证场景（粒度 A/B 两跑）：refute 意图 REFUTED 但 JSON 包装失败 → 现状按原 conf 存活
+        // → verdict 假 reject。嗅探后应判 Refuted、confidence 归零，并留 warning 可观测。
+        let provider = ParseErrProvider(
+            "structured-output parse failed: final JSON parse failed (finish_reason=stop): **REFUTED: trailing text".into());
+        let f = finding("missing auth", Severity::High, 1, "alpha");
+        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 4, Mode::Code, Path::new("."), &[]).await;
+        assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted, "嗅探救回 REFUTED 语义");
+        assert_eq!(out[0].confidence, 0.0, "refuted 照常降 conf 下 floor");
+        assert_eq!(w.len(), 1, "嗅探路径仍必须产出 warning（可观测）");
+        assert!(w[0].contains("sniffed"), "warning 注明嗅探来源: {}", w[0]);
     }
 }
