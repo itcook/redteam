@@ -328,6 +328,27 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
 /// pack flat 预算（字节）——S2-b' 提到 256K：0 壳升级整文件后 cli.rs 级大文件（~90KB）
 /// 需装入（E7）；256K ≈ 1M-context 模型的 ~6%、256K 模型的 ~25%，安全。per-model 真预算仍缓（T27）。
 const PACK_BUDGET_BYTES: usize = 256_000;
+/// 预算函数三常数（design 2026-07-13 §2.2 逐字）：输出预留（推理型模型 findings JSON +
+/// reasoning）、字节/token 保守换算（代码英文 ~3.5-4B/token，往小估防超模型墙）、prompt
+/// 壳预留（rules/指令/信任声明，pack 预算外但占窗）。
+const OUTPUT_RESERVE_TOKENS: u32 = 16_000;
+const BYTES_PER_TOKEN: usize = 3;
+const SHELL_RESERVE_BYTES: usize = 24_000;
+
+/// per-model pack 预算：min(字节帽, (启用模型最小窗 − 输出预留)×3 − 壳预留)。
+/// 双层墙——字节帽是策略、token limit 是硬墙；多模型取最小窗=一份 pack 全模型安全
+/// （常数查表，不复活 S2-c per-model 规划器）。未声明窗口 → 保守 128K。
+pub(crate) fn pack_budget_bytes(cfg: &crate::config::Config, model_names: &[String]) -> usize {
+    let min_ctx = model_names
+        .iter()
+        .map(|m| cfg.providers.get(m).and_then(|p| p.context_window_tokens).unwrap_or(128_000))
+        .min()
+        .unwrap_or(128_000);
+    let by_window = (min_ctx.saturating_sub(OUTPUT_RESERVE_TOKENS) as usize)
+        .saturating_mul(BYTES_PER_TOKEN)
+        .saturating_sub(SHELL_RESERVE_BYTES);
+    PACK_BUDGET_BYTES.min(by_window)
+}
 
 /// pack 引擎四臂（M15-S2-b）：`REDTEAM_PACK` unset/其他值=Regex（默认，行为不变）；
 /// `0`=Dossier 基线臂；`scip`=Scip 语义引擎；`scip-strict`=Scip 诊断臂（关兜底）。
@@ -354,7 +375,7 @@ fn pack_engine() -> PackEngine {
 /// scip 索引每次 review 前置建一次（非 per-bundle）。degrades 静默于：不支持语言/无符号（pack 臂）；
 /// 基线臂 `build_dossier` 另有调用密度门<5（pack 臂已撤，I-2：body 是 payload 与 caller 密度无关）。
 /// meta.injected 是唯一可观测入口，供 A/B 归因与生产诊断。
-pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path) -> (Vec<String>, DossierMeta) {
+pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
     let suppressed = std::env::var_os("REDTEAM_NO_DOSSIER").is_some();
     let engine = pack_engine();
     // scip 引擎：前置建索引一次（非 per-bundle）；RA 缺/索引失败 → None → 降级 regex + 一行提示。
@@ -395,10 +416,10 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
                     (PackEngine::Dossier, _) =>
                         crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)),
                     (PackEngine::Scip { .. }, Some(idx)) =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, PACK_BUDGET_BYTES, idx, strict)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, budget, idx, strict)),
                     // Regex 默认，及 scip 降级（scip_index=None）都走 regex-pack。
                     _ =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, PACK_BUDGET_BYTES)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, budget)),
                 }
             }
         })
@@ -560,7 +581,7 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_packs(&bundles, root);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
@@ -687,7 +708,7 @@ pub async fn run_incremental_review(
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_packs(&bundles, root);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
@@ -1902,14 +1923,14 @@ mod tests {
 
         // on 臂：两段皆非空（bundle 2 靠全景从兄弟 a.rs 拿到引用点）→ meta 反映 injected:2
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
-        let (on, on_meta) = build_packs(&bundles, root);
+        let (on, on_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(!on[0].is_empty(), "支持语言且≥5引用点应非空: {on:?}");
         assert!(on[1].contains("target"), "bundle 2 自身不供内容，但全景从兄弟 a.rs 拿到 target: {on:?}");
         assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 2, suppressed: false });
 
         // off 臂：REDTEAM_NO_DOSSIER 生效 → 全空段 + suppressed=true + injected=0
         unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let (off, off_meta) = build_packs(&bundles, root);
+        let (off, off_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(off.iter().all(|s| s.is_empty()), "off 臂全空");
         assert_eq!(off.len(), bundles.len());
         assert_eq!(off_meta, DossierMeta { bundles: 2, injected: 0, suppressed: true });
@@ -1932,18 +1953,18 @@ mod tests {
 
         // 默认臂：pack（含 0 壳完整体）
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
-        let (on, _) = build_packs(&bundles, root);
+        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(on[0].contains("改动源文"), "默认臂 = pack 含 0 壳: {}", on[0]);
 
         // 基线臂：REDTEAM_PACK=0 → dossier-only（无 0 壳段、仍有引用点）
         unsafe { std::env::set_var("REDTEAM_PACK", "0"); }
-        let (base, _) = build_packs(&bundles, root);
+        let (base, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(!base[0].contains("改动源文"), "基线臂无 0 壳");
         assert!(base[0].contains("target"), "基线臂仍是 dossier 引用点");
 
         // 空臂：REDTEAM_NO_DOSSIER
         unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let (null, _) = build_packs(&bundles, root);
+        let (null, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert_eq!(null[0], "", "空臂全空段");
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
     }
@@ -1967,7 +1988,7 @@ mod tests {
             Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
             Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() }] },
         ];
-        let (on, _) = build_packs(&bundles, root);
+        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 默认追加兄弟文件全景");
         assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 默认追加兄弟文件全景");
         // 真 diff 穿透证明（集成级）：兄弟超预算迫入 def 锚回落分支（changed_def_ranges
@@ -1994,13 +2015,36 @@ mod tests {
         }] }];
         // scip 臂：本测试环境（tempdir 非 cargo 工程）RA 索引必失败 → 必须降级 regex（不 panic、仍出引用点）
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::set_var("REDTEAM_PACK", "scip"); }
-        let (scip, _) = build_packs(&bundles, root);
+        let (scip, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(scip[0].contains("target"), "scip 臂（或其降级）仍产 pack: {}", scip[0]);
         // 默认臂不变
         unsafe { std::env::remove_var("REDTEAM_PACK"); }
-        let (def, _) = build_packs(&bundles, root);
+        let (def, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(def[0].contains("改动源文"), "默认臂仍 regex-pack");
         unsafe { std::env::remove_var("REDTEAM_PACK"); }
+    }
+
+    #[test]
+    fn pack_budget_respects_model_token_wall() {
+        // design §2.2 预算函数：min(256K, (min_ctx − 16K 输出预留)×3 − 24K 壳预留)。
+        let cfg = crate::config::Config::from_layers(&[r#"
+[providers.Big]
+kind = "openai"
+model = "big-ctx"
+context_window_tokens = 1000000
+[providers.Small]
+kind = "openai"
+model = "small-ctx"
+context_window_tokens = 40000
+"#]).unwrap();
+        // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K → 字节帽 256K 生效
+        assert_eq!(pack_budget_bytes(&cfg, &["Unknown".into()]), 256_000);
+        // 大窗模型同样被字节帽封顶
+        assert_eq!(pack_budget_bytes(&cfg, &["Big".into()]), 256_000);
+        // 小窗模型：(40_000−16_000)*3−24_000 = 48_000
+        assert_eq!(pack_budget_bytes(&cfg, &["Small".into()]), 48_000);
+        // 多模型取最小窗（一份 pack 全模型安全）
+        assert_eq!(pack_budget_bytes(&cfg, &["Big".into(), "Small".into()]), 48_000);
     }
 
     #[test]

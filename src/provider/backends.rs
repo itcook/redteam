@@ -787,12 +787,12 @@ data: [DONE]\n";
     fn from_config_maps_kind_to_backend() {
         let anth = ProviderConfig {
             kind: ProviderKind::Anthropic, model: "m".into(),
-            base_url: None, api_key_env: None, priority: 0,
+            base_url: None, api_key_env: None, priority: 0, context_window_tokens: None,
         };
         assert!(backend_from_config(&anth, "k".into()).is_ok());
         let goog = ProviderConfig {
             kind: ProviderKind::Google, model: "m".into(),
-            base_url: None, api_key_env: None, priority: 0,
+            base_url: None, api_key_env: None, priority: 0, context_window_tokens: None,
         };
         assert!(matches!(
             backend_from_config(&goog, "k".into()),

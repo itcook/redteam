@@ -36,6 +36,10 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub priority: i32,
+    /// 模型 context window（token）。缺省按保守 128K 估——预算函数用它护 token 硬墙
+    /// （design 2026-07-13 §2.2）；确知更大窗的模型在此声明以解锁完整字节帽。
+    #[serde(default)]
+    pub context_window_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

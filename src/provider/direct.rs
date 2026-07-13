@@ -429,6 +429,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             priority: 0,
+            context_window_tokens: None,
         };
         let p = DirectProvider::from_config(&pc, key);
         let call = p
