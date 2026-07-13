@@ -816,7 +816,7 @@ mod tests {
         let good = ToolLoopProvider::new(
             Box::new(FakeChatBackend::new(vec![AssistantTurn {
                 text: good_json.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None }])),
-            dir.path().to_path_buf());
+            dir.path().to_path_buf(), true);
         // bad：先 tool_call（iter1），再一路 Timeout（iter2 重试耗尽仍失败）。
         // DEFAULT_RETRY_BUDGET=2 → iter2 需 3 次 Err（首发+2 重试）→ 备 1 Ok + 3 Err。
         let tc = AssistantTurn { text: String::new(),
@@ -829,7 +829,7 @@ mod tests {
                 Err(ProviderError::Timeout("dead".into())),
                 Err(ProviderError::Timeout("dead".into())),
             ])),
-            dir.path().to_path_buf());
+            dir.path().to_path_buf(), true);
 
         let mut reg = ProviderRegistry::new();
         reg.insert("good", Box::new(good));

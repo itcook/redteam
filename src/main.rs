@@ -363,7 +363,7 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<(Mode, 
                 return Err(format!("{e}"));
             }
         };
-        registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf())));
+        registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf(), true)));
     }
 
     Ok((detected, registry))
