@@ -498,7 +498,8 @@ fn draft_block(drafts: &[Finding]) -> String {
 /// 二阶段补查 prompt（code 线，design §2.3 置换而非追加）：整文件 needs 前插 augmented bundle
 /// （build_pack 顺序填充先进先占预算 → 最远兄弟自动让位=置换语义）；lines 行窗 needs 走
 /// `## 补查证据` 独立段置于卷宗最前；prompt 尾部追加第一趟草稿 CONFIRM-or-REVISE 段。
-/// 全部 needs 逃逸/不可读 → None（不补跑，省一次 LLM 调用）。
+/// `incremental`：增量轮的 <incremental_round> 段原样带入第二趟（claimed-resolved/dispute
+/// 契约不因补跑丢失）；全量路径传空串。全部 needs 逃逸/不可读 → None（不补跑，省一次 LLM 调用）。
 #[allow(clippy::too_many_arguments)] // 与 build_bundle_prompt 同源的参数面；收拢 struct 是过度设计
 pub(crate) fn second_pass_prompt(
     bundles: &[crate::bundle::Bundle],
@@ -510,20 +511,28 @@ pub(crate) fn second_pass_prompt(
     idx: usize,
     needs: &[crate::domain::NeedEntry],
     drafts: &[Finding],
+    incremental: &str,
 ) -> Option<String> {
     let own = bundles.get(idx)?;
     let ex = crate::tools::ToolExecutor::new(root);
-    let mut evidence = String::new();
+    // 两遍走：先收整文件条目——同 path 全文与行窗并存时全文优先（全文是超集，互斥防双重注入）。
     let mut full_paths: Vec<String> = Vec::new();
     for need in needs {
-        if parse_need_lines(need.lines.as_deref()).is_some() {
-            if let Some(sec) = need_section(&ex, need) {
-                evidence.push_str(&sec);
-            }
-        } else if !full_paths.contains(&need.path) && ex.read_capped(&need.path).is_some() {
+        if parse_need_lines(need.lines.as_deref()).is_none()
+            && !full_paths.contains(&need.path)
+            && ex.read_capped(&need.path).is_some()
+        {
             // ponytail: read_capped 在此只当路径安全验证用（内容由 build_pack 自己读）——
             // needs ≤5 条/格，多读一次成本可忽略，省一个只为验证的旁路 API。
             full_paths.push(need.path.clone());
+        }
+    }
+    let mut evidence = String::new();
+    for need in needs {
+        if parse_need_lines(need.lines.as_deref()).is_some() && !full_paths.contains(&need.path) {
+            if let Some(sec) = need_section(&ex, need) {
+                evidence.push_str(&sec);
+            }
         }
     }
     if evidence.is_empty() && full_paths.is_empty() {
@@ -551,7 +560,7 @@ pub(crate) fn second_pass_prompt(
     let pack = crate::pack::build_pack(&pb, root, budget, own_diff_bytes);
     let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
     let others = crate::bundle::other_files_manifest(bundles, idx);
-    let mut p = crate::prompt::build_bundle_prompt(target_label, own, rules, focus, &others, "", &dossier);
+    let mut p = crate::prompt::build_bundle_prompt(target_label, own, rules, focus, &others, incremental, &dossier);
     p.push_str(&draft_block(drafts));
     Some(p)
 }
@@ -746,7 +755,7 @@ pub async fn run_code_review(
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts)
+        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts, "")
     };
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink, Some(&mk)).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
@@ -877,10 +886,10 @@ pub async fn run_incremental_review(
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
     let budget = pack_budget_bytes(cfg, &model_names);
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
-    // 二阶段补查构造器。注：第二趟不带 <incremental_round> 段（构造器签名 design §2.3 定）——
-    // 增量轮触发 needs 时第二趟只保 delta diff + 补查证据 + 草稿契约。
+    // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
+    // dispute 契约不因补跑丢失。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts)
+        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts, &inc_section)
     };
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk)).await;
 
@@ -2165,13 +2174,19 @@ mod tests {
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let drafts = vec![]; // 空草稿也合法
         let rules = vec![crate::lens::by_id("L1").unwrap()];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts).unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, "").unwrap();
         assert!(p.contains("pub const LIMIT"), "needs 文件全文进包: {p}");
         assert!(p.contains("first_pass_draft"), "草稿段在场");
         assert!(p.contains("CONFIRM or REVISE"), "确认或修订语义");
+        assert!(!p.contains("<incremental_round>"), "全量路径第二趟无增量段");
+        // 增量轮：inc_section 原样带入第二趟（claimed-resolved/dispute 契约不因补跑丢失）
+        let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
+        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, &inc).unwrap();
+        assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段带入第二趟: {pi}");
+        assert!(pi.contains("pub const LIMIT"), "增量第二趟 needs 证据仍在场");
         // 路径逃逸：绝对路径 needs 被 skip、不 panic、其余照常
         let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
-        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &evil, &drafts);
+        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &evil, &drafts, "");
         if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
     }
 
@@ -2185,6 +2200,7 @@ mod tests {
         std::fs::write(root.join("src/a.rs"), "fn own() {}\n").unwrap();
         let body: String = (1..=200).map(|i| format!("line{i}\n")).collect();
         std::fs::write(root.join("src/long.rs"), &body).unwrap();
+        std::fs::write(root.join("src/other.rs"), "pub fn other_evidence() {}\n").unwrap();
         let bundles = vec![Bundle { files: vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
         }] }];
@@ -2192,7 +2208,7 @@ mod tests {
             // 合法 lines → ±30 行窗独立补查段
             NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
             // 坏格式 lines → 按整文件（前插 bundle 路径，全文进 0 壳）
-            NeedEntry { path: "src/long.rs".into(), lines: Some("abc".into()), reason: "r".into() },
+            NeedEntry { path: "src/other.rs".into(), lines: Some("abc".into()), reason: "r".into() },
         ];
         let drafts = vec![Finding {
             id: "x".into(), severity: Severity::High, title: "weak hash".into(), body: "b".into(),
@@ -2202,12 +2218,21 @@ mod tests {
             previously_dismissed: false, origin: Origin::New,
         }];
         let rules = vec![crate::lens::by_id("L1").unwrap()];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts).unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, "").unwrap();
         assert!(p.contains("## 补查证据"), "行窗补查段在场");
         assert!(p.contains("src/long.rs:70-132"), "±30 行窗头: {p}");
         assert!(p.contains("line70") && p.contains("line132"), "窗内行在场");
-        assert!(p.contains("line1\n"), "坏格式 lines 走整文件路径（line1 只在全文分支出现）");
+        assert!(p.contains("pub fn other_evidence"), "坏格式 lines 走整文件路径（全文进 0 壳）");
         assert!(p.contains("- [high] weak hash @ src/a.rs:5（md5(pw)）"), "草稿行格式: {p}");
+
+        // 互斥：同 path 既有整文件条目又有行窗条目 → 全文优先（超集），行窗段不再重复注入
+        let both = vec![
+            NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
+            NeedEntry { path: "src/long.rs".into(), lines: None, reason: "r".into() },
+        ];
+        let pb = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &both, &drafts, "").unwrap();
+        assert!(pb.contains("src/long.rs:1-200（全文"), "全文条目在场: {pb}");
+        assert!(!pb.contains("## 补查证据"), "同 path 行窗段被全文超集互斥掉: {pb}");
     }
 
     #[test]

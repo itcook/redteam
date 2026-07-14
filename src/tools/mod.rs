@@ -661,6 +661,21 @@ mod tests {
         assert!(!r.content.contains("TOP SECRET"), "leaked host file: {}", r.content);
     }
 
+    // read_capped 同享 symlink 逃逸不变量（二阶段补查读，needs 路径模型可控）。
+    #[cfg(unix)]
+    #[test]
+    fn read_capped_rejects_in_root_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "TOP SECRET").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), root.path().join("escape")).unwrap();
+        let ex = ToolExecutor::new(root.path());
+        assert_eq!(ex.read_capped("escape"), None, "symlink escape must be rejected");
+        // 对照：root 内正常文件可读（裸文本、无行号）
+        std::fs::write(root.path().join("ok.txt"), "fine\n").unwrap();
+        assert_eq!(ex.read_capped("ok.txt").as_deref(), Some("fine\n"));
+    }
+
     // M5 search_repo 命中数超过 100 条时应截断并输出 `... [truncated]`。
     #[test]
     fn search_repo_caps_at_100_matches_with_truncated() {
