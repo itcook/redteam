@@ -1,6 +1,8 @@
 use crate::consolidate::dedup::{quote_overlap, title_jaccard};
 use crate::db::DismissCard;
 use crate::domain::{Finding, Mode, Severity, Verify, VerifyVerdict};
+use crate::dossier::{compile_defs, lang_for};
+use crate::pack::skeleton_of;
 use crate::prompt::{build_refute_prompt, render_precedents};
 use crate::provider::{LensRequest, ReviewProvider};
 use std::path::Path;
@@ -49,6 +51,31 @@ pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
         lines.pop(); // 帽处截断的尾行可能不完整，弃之
     }
     let n = lines.len();
+
+    // 中档（Task 6，E8-F 补链）：全文超帽、语言受支持时先试骨架（签名行+finding 声称的
+    // 锚点行，其余折叠）——比 ±60 快照信号密度更高（骨架覆盖全文的 def 签名，快照只见局部）。
+    // 骨架复用 pack::skeleton_of（Task 5），但 refute 只有 Finding、没有 diff/hunk——合成一个
+    // 伪 hunk（`@@ -0,0 +line_start,N @@` + N 个 `+` 行）让 [line_start, line_end] 落进
+    // hunk_changed_lines 的锚点集合、折叠时存活；比传空 diff（纯签名骨架、会把 finding 声称的
+    // 现场本身折掉）更贴合 refute 的复核需求。骨架仍超 24KB 帽 → 落回下方 ±60 快照（行为不倒退）。
+    // ponytail: `hit_cap`（512KB 读帽触断）不进骨架——那条路径下 `n`/`lines` 只是被截断的
+    // 前缀，骨架会静默丢失「目标行在帽外」的安全占位语义（下方窗口分支的 hit_cap 越界检查）；
+    // hit_cap 文件本就远超骨架/窗口两级预算，走既有窗口路径的降级判断即可，升级点再拆。
+    if !hit_cap {
+        if let Some(lang) = lang_for(&f.file) {
+            let defs = compile_defs(lang);
+            let n_start = (f.line_start as usize).max(1);
+            let n_end = (f.line_end as usize).max(n_start).min(n.max(n_start));
+            let hunk_len = n_end - n_start + 1;
+            let pseudo_diff = format!("@@ -0,0 +{n_start},{hunk_len} @@\n{}", "+x\n".repeat(hunk_len));
+            let skel = skeleton_of(&lines.join("\n"), &pseudo_diff, &defs);
+            let out = format!("{}:1-{}（骨架：签名+锚点行）\n{}", f.file, n, skel);
+            if out.len() <= SNIPPET_BYTE_CAP {
+                return out;
+            }
+        }
+    }
+
     let start = (f.line_start as usize).saturating_sub(SNIPPET_WINDOW).max(1);
     let end = (f.line_end as usize + SNIPPET_WINDOW).min(n);
     // 窗越界，或命中帽且请求窗口伸进未读部分 → 安全降级占位（不喂被帽掐掉的假"现场"，模型自己读）。
@@ -295,17 +322,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        // 大于 64KB 的 fixture，以测试 ±60 行窗口逻辑（不触发全文升档）
+        // 大于 64KB 的 fixture，以测试 ±60 行窗口逻辑（不触发全文升档）；.txt 非受支持语言——
+        // 骨架中档（Task 6）只对 lang_for 命中的语言生效，此 fixture 就是走窗口路径的对照。
         let body: String = (1..=10_000).map(|i| format!("line{i}\n")).collect();
-        std::fs::write(root.join("src/a.rs"), &body).unwrap();
+        std::fs::write(root.join("src/a.txt"), &body).unwrap();
         let mut f = finding("t", Severity::High, 1, "alpha");
-        f.file = "src/a.rs".into();
+        f.file = "src/a.txt".into();
         f.line_start = 100;
         f.line_end = 102;
         let s = source_snippet(root, &f);
         assert!(s.contains("line40") && s.contains("line162"), "±60 行窗: {s}");
         assert!(!s.contains("line39\n") && !s.contains("line163"), "窗外不含");
-        assert!(s.contains("src/a.rs:40-162"), "快照头带范围");
+        assert!(s.contains("src/a.txt:40-162"), "快照头带范围");
         // 读不到 → 占位
         let mut f2 = finding("t", Severity::High, 1, "alpha");
         f2.file = "no/such.rs".into();
@@ -317,20 +345,41 @@ mod tests {
     #[test]
     fn source_snippet_24kb_cap_truncates_on_char_boundary() {
         // 24KB 帽分支：多字节字符（3 字节 CJK）填满窗口，钉住 is_char_boundary 回退不 panic + 注记在场。
+        // .txt 非受支持语言——绕开 Task 6 骨架中档，保持本测试原有窗口路径覆盖。
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let line = "码".repeat(100); // 300 字节/行
         // 500 行 × 301 字节 ≈ 150KB > 64KB，不触发全文升档，进 ±60 窗快照路径
         let body: String = (0..500).map(|_| format!("{line}\n")).collect();
-        std::fs::write(root.join("big.rs"), &body).unwrap();
+        std::fs::write(root.join("big.txt"), &body).unwrap();
         let mut f = finding("t", Severity::High, 1, "alpha");
-        f.file = "big.rs".into();
+        f.file = "big.txt".into();
         f.line_start = 61;
         f.line_end = 61;
         let s = source_snippet(root, &f); // 窗口 121 行 × ~301B ≈ 36KB > 24KB 帽
         assert!(s.ends_with("…（截断，超 24KB 帽）"), "截断注记在场: …{}", &s[s.len().min(s.len().saturating_sub(60))..]);
         assert!(s.len() <= SNIPPET_BYTE_CAP + "\n…（截断，超 24KB 帽）".len(), "截断到帽内: {}", s.len());
-        assert!(s.starts_with("big.rs:1-121（现场快照）"), "快照头仍在");
+        assert!(s.starts_with("big.txt:1-121（现场快照）"), "快照头仍在");
+    }
+
+    #[test]
+    fn source_snippet_over_64kb_rust_file_uses_skeleton_tier() {
+        // Task 6 中档：全文超 64KB 帽、.rs 受支持语言 → 应先落骨架（而非直接跳 ±60 快照）；
+        // finding 声称的锚点行（伪 hunk 合成）在骨架折叠中存活。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let body: String = (1..=10_000).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(root.join("src/a.rs"), &body).unwrap();
+        let mut f = finding("t", Severity::High, 1, "alpha");
+        f.file = "src/a.rs".into();
+        f.line_start = 100;
+        f.line_end = 102;
+        let s = source_snippet(root, &f);
+        assert!(s.contains("（骨架：签名+锚点行）"), "超帽 rust 文件应走骨架中档而非快照: {s}");
+        assert!(!s.contains("现场快照"), "骨架命中不应再落 ±60 快照");
+        assert!(s.contains("line100") && s.contains("line101") && s.contains("line102"), "finding 锚点行在骨架中存活: {s}");
+        assert!(!s.contains("line50"), "非锚点/非签名行应折叠: {s}");
     }
 
     #[test]
@@ -365,10 +414,13 @@ mod tests {
     #[test]
     fn source_snippet_falls_back_to_window_over_cap() {
         // 超 64KB 回落快照路径（Task 4, E8-F）：文件 > 64KB → ±60 行窗快照，行为不倒退。
+        // .txt 非受支持语言——绕开 Task 6 骨架中档（该级只对 lang_for 命中的语言生效），
+        // 保持本测试原有的「无骨架可选、直落窗口」覆盖；受支持语言的骨架优先级见
+        // source_snippet_over_64kb_rust_file_uses_skeleton_tier。
         let tmp = tempfile::tempdir().unwrap();
         let big = "x".repeat(70_000) + "\nfn target() {}\n";
-        std::fs::write(tmp.path().join("big.rs"), &big).unwrap();
-        let f = finding_at("big.rs", 2, 2);
+        std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
+        let f = finding_at("big.txt", 2, 2);
         let s = source_snippet(tmp.path(), &f);
         assert!(s.contains("（现场快照）"), "超帽回落 ±60 快照: {s}");
     }

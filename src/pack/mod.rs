@@ -118,7 +118,7 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
 /// ponytail: `changed_def_ranges` 命中的整个外围 def 体不整体保留（可能几百行，撑爆本就
 /// 更紧的骨架预算，且骨架仅在 def 体已超预算时触发——含 def 全文必然同样超预算、自败）——
 /// 只保信号密度最高的签名行 + 全部改动行，二者通常已覆盖诊断所需。
-fn skeleton_of(content: &str, diff: &str, defs: &[(&'static str, Regex)]) -> String {
+pub(crate) fn skeleton_of(content: &str, diff: &str, defs: &[(&'static str, Regex)]) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let anchors: std::collections::HashSet<usize> = hunk_changed_lines(diff).into_iter().collect();
     let mut body = String::new();

@@ -10,6 +10,7 @@ use crate::output::Format;
 use crate::positioning::{anchor, anchor_doc};
 use crate::provider::{LensRequest, ReviewProvider};
 use crate::verdict::{clamp_compliance, compute_verdict};
+use regex::Regex;
 use std::path::Path;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -409,17 +410,23 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     let strict = matches!(engine, PackEngine::Scip { strict: true });
     // 变更集全景 0 壳（S2-b'' 转正，design 2026-07-13 §2.1）：每格 = 自家文件（置顶）+
     // 兄弟改动文件。兄弟带真 diff——空 diff 会让 def 降级不可达且静默消失（E8 裁决 D）。
+    // Task 6（E8 岗位①）：兄弟按 dep_rank 排序后追加——直接被 own 引用的兄弟先入包，
+    // 无关兄弟排后面、预算紧张时顺序填充天然让它们最先落回落链/omit（最远先降）。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
-            let mut files = b.files.clone();
+            let own_files = &b.files;
+            let mut siblings: Vec<FileChange> = Vec::new();
             for ob in bundles {
                 for fc in &ob.files {
-                    if !files.iter().any(|e| e.path == fc.path) {
-                        files.push(fc.clone());
+                    if !own_files.iter().any(|e| e.path == fc.path) && !siblings.iter().any(|e| e.path == fc.path) {
+                        siblings.push(fc.clone());
                     }
                 }
             }
+            siblings.sort_by_key(|fc| (dep_rank(own_files, &fc.path, root), fc.path.clone()));
+            let mut files = own_files.clone();
+            files.extend(siblings);
             let pb = crate::bundle::Bundle { files };
             let pb = &pb;
             // Fix 1（final-review）：预算记账只扣本 cell 自己的 diff 字节——pb 是全景增广版
@@ -445,6 +452,34 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
     let meta = DossierMeta { bundles: bundles.len(), injected, suppressed };
     (entries, meta)
+}
+
+/// 兄弟依赖距离 MVP（Task 6，E8 岗位①）：sib 文件 stem（`b.rs`→`b`，`mod.rs`→取父目录名）是否被
+/// `own` 任一文件源码词边界引用——0=引用（近，先入包）、1=否（远，预算紧张时先降）。
+/// 两级够用，多级依赖图/传递闭包 YAGNI，痛点再升。own 文件读失败按未引用处理（贡献 1）。
+pub(crate) fn dep_rank(own: &[FileChange], sib_path: &str, root: &Path) -> u8 {
+    let p = Path::new(sib_path);
+    let stem = if p.file_name().and_then(|n| n.to_str()) == Some("mod.rs") {
+        p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str())
+    } else {
+        p.file_stem().and_then(|n| n.to_str())
+    };
+    let stem = match stem {
+        Some(s) if !s.is_empty() => s,
+        _ => return 1,
+    };
+    let re = match Regex::new(&format!(r"\b{}\b", regex::escape(stem))) {
+        Ok(r) => r,
+        Err(_) => return 1,
+    };
+    for fc in own {
+        if let Ok(content) = std::fs::read_to_string(root.join(&fc.path)) {
+            if re.is_match(&content) {
+                return 0;
+            }
+        }
+    }
+    1
 }
 
 /// 二阶段补查行窗（design §2.3）：lines 命中区间外扩 ±30 行。
@@ -2316,6 +2351,42 @@ mod tests {
         let (on, _) = build_packs(&bundles, root, 5_000);
         assert!(on[0].contains("## 改动源文（0 壳）") && on[0].contains("alpha_marker"),
             "格0 自身小文件应仍全文渲染，不被兄弟巨 diff 挤空: {}", on[0]);
+    }
+
+    #[test]
+    fn panorama_siblings_sorted_by_dep_rank() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // own 引用 zeta（词边界），不引用 alpha —— 尽管 alpha 字典序在前，zeta 应排前
+        std::fs::write(root.join("src/own.rs"), "use crate::zeta::thing;\nfn f() { zeta::go(); }\n").unwrap();
+        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/zeta.rs"), "pub fn go() {}\n").unwrap();
+        let own = vec![FileChange { path: "src/own.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }];
+        assert_eq!(dep_rank(&own, "src/zeta.rs", root), 0, "被 own 引用 → rank 0");
+        assert_eq!(dep_rank(&own, "src/alpha.rs", root), 1, "未被引用 → rank 1");
+    }
+
+    #[test]
+    fn build_packs_panorama_siblings_ordered_by_dep_rank() {
+        // 集成层排序断言：own 引用 zeta 不引用 alpha —— 尽管 alpha 字典序在前，全景注入循环
+        // 应把 zeta 块排在 alpha 块之前（最远先降，E8 岗位①）。
+        use crate::bundle::Bundle;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/own.rs"), "use crate::zeta::thing;\nfn f() { zeta::go(); }\n").unwrap();
+        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/zeta.rs"), "pub fn go() {}\n").unwrap();
+        let bundles = vec![
+            Bundle { files: vec![FileChange { path: "src/own.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/alpha.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/zeta.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
+        ];
+        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
+        let zeta_pos = on[0].find("src/zeta.rs").expect("zeta 块在场");
+        let alpha_pos = on[0].find("src/alpha.rs").expect("alpha 块在场");
+        assert!(zeta_pos < alpha_pos, "被引用兄弟 zeta 应先于未引用兄弟 alpha 出现: {}", on[0]);
     }
 
     #[test]
