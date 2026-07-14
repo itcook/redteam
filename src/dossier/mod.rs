@@ -148,6 +148,36 @@ fn parse_hunk_new_start(line: &str) -> Option<usize> {
     parse_hunk_new_range(line).map(|(c, _)| c)
 }
 
+/// diff 全部改动行（0-based 新文件坐标）：每个 + 行的行号；纯删除行取删除点坐标
+/// （同 hunk_anchors 语义——删除发生处的新文件位置，连续删除会重复、调用方去重）。
+/// 供骨架档保留 hunk 的全部改动行（hunk_anchors 只给每 hunk 首行，多行 hunk 会丢内容）。
+/// ponytail: 第三个平行 hunk 游走（见 hunk_anchors 注记的 drift 风险）；若再动一起改。
+pub(crate) fn hunk_changed_lines(diff: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut new_line = 0usize;
+    for raw in diff.lines() {
+        if raw.starts_with("+++ ") || raw.starts_with("--- ") {
+            continue;
+        }
+        if raw.starts_with("@@") {
+            new_line = parse_hunk_new_start(raw).unwrap_or(1);
+            continue;
+        }
+        if raw.starts_with('\\') {
+            continue; // No-newline 标记非内容行
+        }
+        match raw.as_bytes().first() {
+            Some(b'+') => {
+                out.push(new_line.saturating_sub(1));
+                new_line += 1;
+            }
+            Some(b'-') => out.push(new_line.saturating_sub(1)),
+            _ => new_line += 1,
+        }
+    }
+    out
+}
+
 /// diff（任意上下文级别）→ 改动符号，按 name 去重（grep 按名一次即可）。
 pub fn symbols_in_file(diff: &str, file_lines: &[&str], file: &str, defs: &[(&'static str, Regex)]) -> Vec<ChangedSym> {
     let mut out: Vec<ChangedSym> = Vec::new();
