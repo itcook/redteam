@@ -485,6 +485,15 @@ pub(crate) fn dep_rank(own: &[FileChange], sib_path: &str, root: &Path) -> u8 {
 /// 二阶段补查行窗（design §2.3）：lines 命中区间外扩 ±30 行。
 const NEED_LINES_WINDOW: usize = 30;
 
+/// 补查证据单条段字节帽（Important 修复：此前无上限——长单行文件上 ±30 行窗可逼近
+/// read_capped 的 512KB 读帽，doc 线整文件 need 直接就是整文件，均绕开预算纪律）。
+/// 量级对齐 verify.rs::SNIPPET_FULL_FILE_CAP（64KB）。
+const NEED_SECTION_BYTE_CAP: usize = 64_000;
+
+/// doc 线证据总帽（doc 无 pack/budget 可扣，需独立总量闸）：累计超此值即停止追加新段，
+/// 已收段落保留、尾部补一行裁剪注记。
+const DOC_EVIDENCE_TOTAL_CAP: usize = 256_000;
+
 /// NeedEntry.lines 解析："a-b"（1-based、a<=b）→ Some((a,b))；缺失/坏格式 → None（整文件语义）。
 fn parse_need_lines(lines: Option<&str>) -> Option<(u32, u32)> {
     let (a, b) = lines?.split_once('-')?;
@@ -510,7 +519,16 @@ fn need_section(ex: &crate::tools::ToolExecutor, need: &crate::domain::NeedEntry
         None => (1, n),
     };
     let b = b.max(a);
-    Some(format!("## 补查证据\n{}:{}-{}\n{}\n\n", need.path, a, b, lines[a - 1..b].join("\n")))
+    let mut body = lines[a - 1..b].join("\n");
+    if body.len() > NEED_SECTION_BYTE_CAP {
+        let mut cut = NEED_SECTION_BYTE_CAP;
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body.truncate(cut);
+        body.push_str("\n…（截断）");
+    }
+    Some(format!("## 补查证据\n{}:{}-{}\n{}\n\n", need.path, a, b, body))
 }
 
 /// 草稿注入段（design §2.3）：第一趟 findings 以 CONFIRM-or-REVISE 契约随第二趟 prompt 带回；
@@ -592,7 +610,10 @@ pub(crate) fn second_pass_prompt(
     let pb = crate::bundle::Bundle { files };
     // ponytail: 第二趟恒用 regex 引擎——scip 是 opt-in 实验臂且索引 per-cell 重建昂贵；
     // needs 只消费 0 壳全文分支（两引擎共用 body_section），scip 臂需要时再接。
-    let pack = crate::pack::build_pack(&pb, root, budget, own_diff_bytes);
+    // Important 修复：evidence（行窗证据段，已在上方按 NEED_SECTION_BYTE_CAP 分段封顶）先
+    // 扣出 pack 预算再传入 build_pack——否则 evidence+pack 联合越过每模型字节预算，撞墙全归零
+    // （design §2.2）。budget 耗尽时 build_pack 自身的降级链兜底，不会 panic。
+    let pack = crate::pack::build_pack(&pb, root, budget.saturating_sub(evidence.len()), own_diff_bytes);
     let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
     let others = crate::bundle::other_files_manifest(bundles, idx);
     let mut p = crate::prompt::build_bundle_prompt(target_label, own, rules, focus, &others, incremental, &dossier);
@@ -601,7 +622,10 @@ pub(crate) fn second_pass_prompt(
 }
 
 /// 二阶段补查 prompt（doc 线）：doc 无 bundle/pack——原 doc prompt + `## 补查证据` 段
-/// （整文件与行窗 need 同走 need_section）+ 草稿段。全部 needs 逃逸/不可读 → None。
+/// （整文件与行窗 need 同走 need_section，单条已按 NEED_SECTION_BYTE_CAP 封顶）+ 草稿段。
+/// doc 线没有 pack 预算可扣，Important 修复补一道独立总量闸：累计超 DOC_EVIDENCE_TOTAL_CAP
+/// 即停止追加新段（已收段落保留），尾部落一行裁剪注记——防 needs 条数多时 5×64KB 仍叠穿预算。
+/// 全部 needs 逃逸/不可读 → None。
 fn doc_second_pass_prompt(
     input: &crate::domain::ReviewInput,
     rules: &[&crate::lens::Lens],
@@ -611,9 +635,22 @@ fn doc_second_pass_prompt(
     drafts: &[Finding],
 ) -> Option<String> {
     let ex = crate::tools::ToolExecutor::new(root);
-    let evidence: String = needs.iter().filter_map(|n| need_section(&ex, n)).collect();
+    let mut evidence = String::new();
+    let mut clipped = false;
+    for need in needs {
+        if evidence.len() >= DOC_EVIDENCE_TOTAL_CAP {
+            clipped = true;
+            break;
+        }
+        if let Some(sec) = need_section(&ex, need) {
+            evidence.push_str(&sec);
+        }
+    }
     if evidence.is_empty() {
         return None;
+    }
+    if clipped {
+        evidence.push_str("（其余补查条目因预算裁剪省略）\n");
     }
     let mut p = crate::prompt::build_doc_prompt(input, rules, focus);
     p.push('\n');
@@ -2289,6 +2326,57 @@ mod tests {
         // 全部 needs 逃逸 → None（不补跑）
         let evil = vec![NeedEntry { path: "../outside.md".into(), lines: None, reason: "x".into() }];
         assert!(doc_second_pass_prompt(&input, &rules, "", root, &evil, &[]).is_none());
+    }
+
+    #[test]
+    fn second_pass_prompt_caps_huge_lines_window_evidence() {
+        // Important 修复回归：单行超长（如压缩/minified 文件）时 ±30 行窗退化成"整行"，
+        // 旧代码无字节帽——body 可逼近 read_capped 的 512KB 读帽。新帽 NEED_SECTION_BYTE_CAP
+        // 应把它摁在 64KB，且 evidence 扣减后 pack 仍正常渲染（预算纪律不因证据段被撞穿）。
+        use crate::bundle::Bundle;
+        use crate::domain::NeedEntry;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn own() {}\n").unwrap();
+        let huge_line = "x".repeat(100_000); // 无换行——lines() 只有 1 行
+        std::fs::write(root.join("src/minified.rs"), &huge_line).unwrap();
+        let bundles = vec![Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
+        }] }];
+        let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into() }];
+        let rules = vec![crate::lens::by_id("L1").unwrap()];
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &[], "").unwrap();
+        assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);
+        assert!(p.contains("fn own()"), "证据段截断后 pack 仍照常渲染自家文件");
+        assert!(p.len() < 300_000, "总 prompt 长度被证据帽拘住，未逼近原 100KB 单行体量: {}", p.len());
+    }
+
+    #[test]
+    fn doc_second_pass_prompt_total_cap_drops_later_sections() {
+        // Important 修复回归：doc 线无 pack/budget 可扣，靠独立总帽 DOC_EVIDENCE_TOTAL_CAP（256KB）
+        // 兜底——多条整文件 need 累计超帽时，后续段落应被丢弃、尾部带裁剪注记（不是逐条截断）。
+        use crate::domain::{Mode, NeedEntry, ReviewInput};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let body_60k = "y".repeat(60_000); // 单条 < 64KB 单段帽，不触发逐段截断
+        for i in 0..6 {
+            std::fs::write(root.join(format!("doc{i}.md")), &body_60k).unwrap();
+        }
+        let input = ReviewInput {
+            mode: Mode::Doc, target_label: "spec.md".into(),
+            collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
+        };
+        let rules = vec![crate::lens::by_id("D1").unwrap()];
+        let needs: Vec<NeedEntry> = (0..6)
+            .map(|i| NeedEntry { path: format!("doc{i}.md"), lines: None, reason: "r".into() })
+            .collect();
+        let p = doc_second_pass_prompt(&input, &rules, "", root, &needs, &[]).unwrap();
+        assert!(p.contains("doc4.md:1-1"), "累计未超帽前的段落在场: {p}");
+        assert!(!p.contains("doc5.md:1-1"), "累计超帽后的段落应被丢弃");
+        assert!(p.contains("（其余补查条目因预算裁剪省略）"), "总帽裁剪注记在场: {p}");
+        let sections = p.matches("## 补查证据").count();
+        assert!(sections < 6, "至少一段应被总帽挡掉，实际全部 {sections} 段在场");
     }
 
     #[test]
