@@ -15,6 +15,8 @@ const SNIPPET_BYTE_CAP: usize = 24_000;
 /// positioning::safe_read=512KB，I2/T2）——对抗式威胁模型含「恶意 PR 塞大文件」，
 /// refute 这条新读路径不得重开无界读的口子。
 const SNIPPET_READ_MAX_BYTES: usize = 512 * 1024;
+/// 锚点文件全文帽（Task 4, E8-F）：64KB 以内给整文件；超帽回落 ±60 行快照（行为不倒退）。
+const SNIPPET_FULL_FILE_CAP: usize = 64_000;
 const SNIPPET_UNAVAILABLE: &str = "(source unavailable — judge from the finding's quote alone and weigh confidence accordingly)";
 
 /// finding 声称位置的工作树快照：`root.join(&f.file)` 按 `[line_start-60, line_end+60]`
@@ -33,6 +35,15 @@ pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
         return SNIPPET_UNAVAILABLE.to_string();
     }
     let hit_cap = content.len() > SNIPPET_READ_MAX_BYTES;
+
+    // 文件成功读入且 <= 64KB → 返回整文件，头 {path}:1-{N}（锚点文件全文）；
+    // 超帽回落 ±60 行快照路径（行为不倒退）。
+    if !hit_cap && content.len() <= SNIPPET_FULL_FILE_CAP {
+        let lines: Vec<&str> = content.lines().collect();
+        let n = lines.len();
+        return format!("{}:1-{}（锚点文件全文）\n{}", f.file, n, lines.join("\n"));
+    }
+
     let mut lines: Vec<&str> = content.lines().collect();
     if hit_cap {
         lines.pop(); // 帽处截断的尾行可能不完整，弃之
@@ -266,6 +277,13 @@ mod tests {
             previously_dismissed: false, origin: Origin::New,
         }
     }
+    fn finding_at(file: &str, line_start: u32, line_end: u32) -> Finding {
+        let mut f = finding("t", Severity::High, 1, "alpha");
+        f.file = file.into();
+        f.line_start = line_start;
+        f.line_end = line_end;
+        f
+    }
     fn rawf(title: &str) -> RawFinding {
         RawFinding { severity: Severity::High, title: title.into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
@@ -277,7 +295,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        let body: String = (1..=200).map(|i| format!("line{i}\n")).collect();
+        // 大于 64KB 的 fixture，以测试 ±60 行窗口逻辑（不触发全文升档）
+        let body: String = (1..=10_000).map(|i| format!("line{i}\n")).collect();
         std::fs::write(root.join("src/a.rs"), &body).unwrap();
         let mut f = finding("t", Severity::High, 1, "alpha");
         f.file = "src/a.rs".into();
@@ -301,7 +320,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let line = "码".repeat(100); // 300 字节/行
-        let body: String = (0..200).map(|_| format!("{line}\n")).collect();
+        // 500 行 × 301 字节 ≈ 150KB > 64KB，不触发全文升档，进 ±60 窗快照路径
+        let body: String = (0..500).map(|_| format!("{line}\n")).collect();
         std::fs::write(root.join("big.rs"), &body).unwrap();
         let mut f = finding("t", Severity::High, 1, "alpha");
         f.file = "big.rs".into();
@@ -329,6 +349,28 @@ mod tests {
         f.line_end = 100;
         let s = source_snippet(root, &f);
         assert!(s.starts_with("huge.rs:40-160（现场快照）") && s.contains("line100"), "帽内窗口正常渲染: {}", &s[..60]);
+    }
+
+    #[test]
+    fn source_snippet_upgrades_to_full_file_within_cap() {
+        // 64KB 帽分支（Task 4, E8-F）：文件成功读入且 <= 64KB → 整文件，头 {path}:1-{N}（锚点文件全文）
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("small.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        let f = finding_at("small.rs", 2, 2);
+        let s = source_snippet(tmp.path(), &f);
+        assert!(s.contains("（锚点文件全文）"), "64KB 内升档全文: {s}");
+        assert!(s.contains("fn a()") && s.contains("fn c()"), "含锚点行窗之外的内容");
+    }
+
+    #[test]
+    fn source_snippet_falls_back_to_window_over_cap() {
+        // 超 64KB 回落快照路径（Task 4, E8-F）：文件 > 64KB → ±60 行窗快照，行为不倒退。
+        let tmp = tempfile::tempdir().unwrap();
+        let big = "x".repeat(70_000) + "\nfn target() {}\n";
+        std::fs::write(tmp.path().join("big.rs"), &big).unwrap();
+        let f = finding_at("big.rs", 2, 2);
+        let s = source_snippet(tmp.path(), &f);
+        assert!(s.contains("（现场快照）"), "超帽回落 ±60 快照: {s}");
     }
 
     #[test]
