@@ -67,7 +67,7 @@ pub(crate) fn compile_defs(lang: &Lang) -> Vec<(&'static str, Regex)> {
     lang.defs.iter().map(|(k, src)| (*k, Regex::new(src).expect("static def regex"))).collect()
 }
 
-fn match_def(line: &str, defs: &[(&'static str, Regex)]) -> Option<(&'static str, String)> {
+pub(crate) fn match_def(line: &str, defs: &[(&'static str, Regex)]) -> Option<(&'static str, String)> {
     for (kind, rx) in defs {
         if let Some(c) = rx.captures(line) {
             let name = c.get(1)?.as_str().to_string();
@@ -133,11 +133,19 @@ pub struct ChangedSym {
     pub def_line0: usize, // 0-based 新树 def 行 = 位置对连接键（symbol_at 直接用）
 }
 
-// @@ -a,b +c,d @@ 抓新文件起始行 c 与计数 d
+// @@ -a,b +c,d @@ 抓新文件起始行 c 与计数 d（d 缺省按 1 处理——unified diff 单行 hunk
+// 允许省略计数，本仓生成的 diff 目前总带显式计数，防御性兜底）。
+pub(crate) fn parse_hunk_new_range(line: &str) -> Option<(usize, usize)> {
+    let after_plus = line.split('+').nth(1)?; // "c,d @@ …" 或 "c @@ …"
+    let seg = after_plus.split([' ', '@']).next()?; // "c,d" 或 "c"
+    let mut parts = seg.split(',');
+    let c = parts.next()?.parse::<usize>().ok()?;
+    let d = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+    Some((c, d))
+}
+
 fn parse_hunk_new_start(line: &str) -> Option<usize> {
-    let after_plus = line.split('+').nth(1)?; // "c,d @@ …"
-    let c = after_plus.split([',', ' ']).next()?;
-    c.parse::<usize>().ok()
+    parse_hunk_new_range(line).map(|(c, _)| c)
 }
 
 /// diff（任意上下文级别）→ 改动符号，按 name 去重（grep 按名一次即可）。
