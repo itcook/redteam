@@ -43,6 +43,10 @@ pub struct ReviewArgs {
     /// M13：`--incremental-from <job-id>`——以该作业为基线的增量轮。serde default 兼容旧 args.json。
     #[serde(default)]
     pub incremental_from: Option<String>,
+    /// `--tools <off|two-stage|on>`：覆盖 config 的工具档位。`serde(default)` 保旧 args.json
+    /// resume/背景 job 重建不炸（旧 job 无此字段 → None → 落 config 默认）。
+    #[serde(default)]
+    pub tools: Option<String>,
 }
 
 /// 台账加载产物（design 2026-07-03 #6 zero-config）：豁免 id 集 + 活跃判例卡 + 披露 meta。
@@ -322,8 +326,30 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
 }
 
 /// pack flat 预算（字节）——S2-b' 提到 256K：0 壳升级整文件后 cli.rs 级大文件（~90KB）
-/// 需装入（E7）；256K ≈ 1M-context 模型的 ~6%、256K 模型的 ~25%，安全。per-model 真预算仍缓（T27）。
+/// 需装入（E7）；256K ≈ 1M-context 模型的 ~6%、256K 模型的 ~25%，安全。per-model 预算函数已落地
+/// （常数查表版，见下方 pack_budget_bytes）；T27 完整版（models.dev 策展表+真 tokenizer 校准）仍缓。
 const PACK_BUDGET_BYTES: usize = 256_000;
+/// 预算函数三常数（design 2026-07-13 §2.2 逐字）：输出预留（推理型模型 findings JSON +
+/// reasoning）、字节/token 保守换算（代码英文 ~3.5-4B/token，往小估防超模型墙）、prompt
+/// 壳预留（rules/指令/信任声明，pack 预算外但占窗）。
+const OUTPUT_RESERVE_TOKENS: u32 = 16_000;
+const BYTES_PER_TOKEN: usize = 3;
+const SHELL_RESERVE_BYTES: usize = 24_000;
+
+/// per-model pack 预算：min(字节帽, (启用模型最小窗 − 输出预留)×3 − 壳预留)。
+/// 双层墙——字节帽是策略、token limit 是硬墙；多模型取最小窗=一份 pack 全模型安全
+/// （常数查表，不复活 S2-c per-model 规划器）。未声明窗口 → 保守 128K。
+pub(crate) fn pack_budget_bytes(cfg: &Config, model_names: &[String]) -> usize {
+    let min_ctx = model_names
+        .iter()
+        .map(|m| cfg.providers.get(m).and_then(|p| p.context_window_tokens).unwrap_or(128_000))
+        .min()
+        .unwrap_or(128_000);
+    let by_window = (min_ctx.saturating_sub(OUTPUT_RESERVE_TOKENS) as usize)
+        .saturating_mul(BYTES_PER_TOKEN)
+        .saturating_sub(SHELL_RESERVE_BYTES);
+    PACK_BUDGET_BYTES.min(by_window)
+}
 
 /// pack 引擎四臂（M15-S2-b）：`REDTEAM_PACK` unset/其他值=Regex（默认，行为不变）；
 /// `0`=Dossier 基线臂；`scip`=Scip 语义引擎；`scip-strict`=Scip 诊断臂（关兜底）。
@@ -342,6 +368,12 @@ fn pack_engine() -> PackEngine {
     }
 }
 
+/// 验收仪器（E8 裁决 B，随 M12 拆）：REDTEAM_SINGLE_CELL 非空 → 全变更集并成单 bundle
+/// （单格全审 A/B 臂——分格在全景 pack 范式下=N 倍重复喂全景，质量对照据此判批 4 收缩）。
+fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bundle> {
+    vec![crate::bundle::Bundle { files: bundles.into_iter().flat_map(|b| b.files).collect() }]
+}
+
 /// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
 /// 四臂 + null：默认=Regex pack（0 壳完整体+1 壳引用点+省略清单，M15-S1）；`REDTEAM_PACK=0`=
 /// Dossier-only 基线臂（A/B 对照）；`REDTEAM_PACK=scip`=Scip 语义引擎（rust-analyzer 缺/索引失败
@@ -350,7 +382,8 @@ fn pack_engine() -> PackEngine {
 /// scip 索引每次 review 前置建一次（非 per-bundle）。degrades 静默于：不支持语言/无符号（pack 臂）；
 /// 基线臂 `build_dossier` 另有调用密度门<5（pack 臂已撤，I-2：body 是 payload 与 caller 密度无关）。
 /// meta.injected 是唯一可观测入口，供 A/B 归因与生产诊断。
-pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path) -> (Vec<String>, DossierMeta) {
+/// `budget`=pack flat 预算（字节）；生产调用点由 `pack_budget_bytes` 按启用模型窗算出。
+pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
     let suppressed = std::env::var_os("REDTEAM_NO_DOSSIER").is_some();
     let engine = pack_engine();
     // scip 引擎：前置建索引一次（非 per-bundle）；RA 缺/索引失败 → None → 降级 regex + 一行提示。
@@ -369,28 +402,26 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
         _ => None,
     };
     let strict = matches!(engine, PackEngine::Scip { strict: true });
-    // 实验仪器（S2-b'' 激进 A/B）：REDTEAM_PACK_SCOPE=changeset → 每格 pack 的 0 壳追加
-    // 变更集内其他 bundle 的文件全文（空 diff、排自家之后=预算优先自家），修范围错配、
-    // 供无工具臂自足。只增 pack 构建输入，不动 prompt 的 diff 段。dev 态、默认不生效。
-    let changeset_scope = std::env::var("REDTEAM_PACK_SCOPE").ok().as_deref() == Some("changeset");
+    // 变更集全景 0 壳（S2-b'' 转正，design 2026-07-13 §2.1）：每格 = 自家文件（置顶）+
+    // 兄弟改动文件。兄弟带真 diff——空 diff 会让 def 降级不可达且静默消失（E8 裁决 D）。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
-            let augmented;
-            let pb: &crate::bundle::Bundle = if changeset_scope {
-                let mut files = b.files.clone();
-                for ob in bundles {
-                    for fc in &ob.files {
-                        if !files.iter().any(|e| e.path == fc.path) {
-                            files.push(crate::evidence::git::FileChange { path: fc.path.clone(), diff: String::new() });
-                        }
+            let mut files = b.files.clone();
+            for ob in bundles {
+                for fc in &ob.files {
+                    if !files.iter().any(|e| e.path == fc.path) {
+                        files.push(fc.clone());
                     }
                 }
-                augmented = crate::bundle::Bundle { files };
-                &augmented
-            } else {
-                b
-            };
+            }
+            let pb = crate::bundle::Bundle { files };
+            let pb = &pb;
+            // Fix 1（final-review）：预算记账只扣本 cell 自己的 diff 字节——pb 是全景增广版
+            // （混入兄弟真 diff，供 def 锚定/正文消费），但唯一真正进 prompt 的 diff 只有
+            // b 自己那份（见 orchestrate::run_code_fanout 用原 bundle 而非 pb 建 diff 块）。
+            // 用 pb.files 重新求和会把兄弟 diff 也扣进预算，大改动集下 remaining→0、0 壳塌缩。
+            let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
             if suppressed {
                 String::new()
             } else {
@@ -398,10 +429,10 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
                     (PackEngine::Dossier, _) =>
                         crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)),
                     (PackEngine::Scip { .. }, Some(idx)) =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, PACK_BUDGET_BYTES, idx, strict)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, budget, own_diff_bytes, idx, strict)),
                     // Regex 默认，及 scip 降级（scip_index=None）都走 regex-pack。
                     _ =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, PACK_BUDGET_BYTES)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, budget, own_diff_bytes)),
                 }
             }
         })
@@ -535,6 +566,13 @@ pub async fn run_code_review(
     // 1. 确定性筛选 + 分包
     let bundles = group(select_files(changes), Some(root));
 
+    // 验收仪器（随 M12 拆）：单格全审臂。增量轮（run_incremental）不接——验收只走全量。
+    let bundles = if std::env::var_os("REDTEAM_SINGLE_CELL").is_some() {
+        merge_bundles(bundles)
+    } else {
+        bundles
+    };
+
     // 2. rules = code lenses（lens → 注入 rule）
     let lens_ids: Vec<String> = args
         .lenses
@@ -563,7 +601,7 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_packs(&bundles, root);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
@@ -690,7 +728,7 @@ pub async fn run_incremental_review(
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_packs(&bundles, root);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
@@ -1025,7 +1063,7 @@ fn empty_review_args() -> ReviewArgs {
         mode: None, base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         lenses: None, models: None, models_all: false, no_correlate: false,
         block_threshold: None, conf_floor: None, background: false, format: "json".into(),
-        targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+        targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     }
 }
 
@@ -1320,7 +1358,7 @@ mod job_tests {
             spec: vec![], focus: None, lenses: None, models: None, models_all: false,
             no_correlate: false, block_threshold: None, conf_floor: None,
             background: true, format: "json".into(), targets: vec![target.into()],
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         }
     }
     fn cfg() -> Config {
@@ -1593,7 +1631,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1640,7 +1678,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("alpha,beta".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1675,7 +1713,7 @@ mod resume_tests {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, lenses: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1788,7 +1826,7 @@ default_models=["alpha"]
             spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
         let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
@@ -1806,7 +1844,7 @@ default_models=["alpha"]
             models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         }
     }
 
@@ -1890,7 +1928,8 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
-        // bundle 1：支持语言 + ≥5 引用点 → 应注入；bundle 2：不支持语言（.py）→ 应空（T01⑥）。
+        // bundle 1：支持语言 + ≥5 引用点 → 应注入；bundle 2：自身 .py 未写盘（无贡献），但默认
+        // 变更集全景令其 pack 从兄弟 a.rs 拿到内容（非空）——T01⑥ 意图已由全景默认取代。
         let bundles = vec![
             Bundle { files: vec![FileChange {
                 path: "src/a.rs".into(),
@@ -1902,16 +1941,16 @@ mod tests {
             }] },
         ];
 
-        // on 臂：一段非空（有引用点）+ 一段空（不支持语言）→ meta 反映 injected:1
+        // on 臂：两段皆非空（bundle 2 靠全景从兄弟 a.rs 拿到引用点）→ meta 反映 injected:2
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
-        let (on, on_meta) = build_packs(&bundles, root);
+        let (on, on_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(!on[0].is_empty(), "支持语言且≥5引用点应非空: {on:?}");
-        assert!(on[1].is_empty(), "不支持语言应空: {on:?}");
-        assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 1, suppressed: false });
+        assert!(on[1].contains("target"), "bundle 2 自身不供内容，但全景从兄弟 a.rs 拿到 target: {on:?}");
+        assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 2, suppressed: false });
 
         // off 臂：REDTEAM_NO_DOSSIER 生效 → 全空段 + suppressed=true + injected=0
         unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let (off, off_meta) = build_packs(&bundles, root);
+        let (off, off_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(off.iter().all(|s| s.is_empty()), "off 臂全空");
         assert_eq!(off.len(), bundles.len());
         assert_eq!(off_meta, DossierMeta { bundles: 2, injected: 0, suppressed: true });
@@ -1934,47 +1973,74 @@ mod tests {
 
         // 默认臂：pack（含 0 壳完整体）
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
-        let (on, _) = build_packs(&bundles, root);
+        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(on[0].contains("改动源文"), "默认臂 = pack 含 0 壳: {}", on[0]);
 
         // 基线臂：REDTEAM_PACK=0 → dossier-only（无 0 壳段、仍有引用点）
         unsafe { std::env::set_var("REDTEAM_PACK", "0"); }
-        let (base, _) = build_packs(&bundles, root);
+        let (base, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(!base[0].contains("改动源文"), "基线臂无 0 壳");
         assert!(base[0].contains("target"), "基线臂仍是 dossier 引用点");
 
         // 空臂：REDTEAM_NO_DOSSIER
         unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let (null, _) = build_packs(&bundles, root);
+        let (null, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert_eq!(null[0], "", "空臂全空段");
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
     }
 
     #[test]
-    fn build_packs_changeset_scope_augments_zero_shell_with_sibling_files() {
-        let _g = ENV_LOCK.lock().unwrap();
+    fn build_packs_default_gives_changeset_panorama_with_real_sibling_diff() {
+        use crate::bundle::Bundle;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
+        // 兄弟 b.rs 撑超 pack 预算：全文分支放不下 → 必走 def 锚回落，而锚定消费的是
+        // fc.diff——兄弟若被塞空 diff 占位（E8 裁决 D 回归），def 锚不到、本块静默消失。
+        let filler_line = "// 填充行：撑爆预算迫入 def 锚回落\n";
+        let sibling = format!(
+            "pub fn beta_marker() {{\n    let marker_body = 1;\n}}\n{}",
+            filler_line.repeat(PACK_BUDGET_BYTES / filler_line.len() + 10)
+        );
+        std::fs::write(root.join("src/b.rs"), &sibling).unwrap();
+        let bundles = vec![
+            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() }] },
+        ];
+        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
+        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 默认追加兄弟文件全景");
+        assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 默认追加兄弟文件全景");
+        // 真 diff 穿透证明（集成级）：兄弟超预算迫入 def 锚回落分支（changed_def_ranges
+        // 消费兄弟真 diff）——空 diff 占位回归下无锚可寻，以下三条断言全灭。
+        assert!(on[0].contains("（def 体，全文超预算回落）"), "兄弟超预算迫入 def 回落分支");
+        assert!(on[0].contains("let marker_body = 1;"), "兄弟改动 fn 的 def 体在场（真 diff 锚定）");
+        assert!(!on[0].contains("填充行"), "回落只给改动 def 体，不带填充");
+        // 同 path 不重复
+        assert_eq!(on[0].matches("src/b.rs").count(), 1, "兄弟条目 src/b.rs 不重复");
+        assert_eq!(on[1].matches("src/a.rs").count(), 1, "兄弟条目 src/a.rs 不重复");
+    }
+
+    #[test]
+    fn build_packs_panorama_does_not_double_reserve_sibling_diff_budget() {
+        // Fix 1 回归：全景 pb 混入兄弟真 diff，旧实现拿 pb.files 重新求和当预算扣除，
+        // 兄弟 diff 巨大时 remaining 饱和到 0、本 cell 自己那份小文件的 0 壳也塌缩——
+        // 即便实际进 prompt 的 diff 只有 own bundle 那份（orchestrate 用原 bundle 建 diff 块）。
         use crate::bundle::Bundle;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
         std::fs::write(root.join("src/b.rs"), "pub fn beta_marker() {}\n").unwrap();
+        // 兄弟 diff 本身（非文件体）巨大：撑到 >= 预算，令旧「pb.files 全体求和」饱和 remaining=0。
+        let huge_sibling_diff = format!("@@ -1,0 +1,1 @@\n+{}\n", "x".repeat(6_000));
         let bundles = vec![
             Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn beta_marker() {}\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: huge_sibling_diff }] },
         ];
-        unsafe {
-            std::env::remove_var("REDTEAM_NO_DOSSIER");
-            std::env::remove_var("REDTEAM_PACK");
-            std::env::set_var("REDTEAM_PACK_SCOPE", "changeset");
-        }
-        let (on, _) = build_packs(&bundles, root);
-        unsafe { std::env::remove_var("REDTEAM_PACK_SCOPE"); }
-        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 追加兄弟文件全文: {}", on[0]);
-        assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 追加兄弟文件全文");
-        // 默认（env 已除）不跨 bundle
-        let (off, _) = build_packs(&bundles, root);
-        assert!(!off[0].contains("beta_marker"), "默认不含兄弟文件: {}", off[0]);
+        let (on, _) = build_packs(&bundles, root, 5_000);
+        assert!(on[0].contains("## 改动源文（0 壳）") && on[0].contains("alpha_marker"),
+            "格0 自身小文件应仍全文渲染，不被兄弟巨 diff 挤空: {}", on[0]);
     }
 
     #[test]
@@ -1991,13 +2057,36 @@ mod tests {
         }] }];
         // scip 臂：本测试环境（tempdir 非 cargo 工程）RA 索引必失败 → 必须降级 regex（不 panic、仍出引用点）
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::set_var("REDTEAM_PACK", "scip"); }
-        let (scip, _) = build_packs(&bundles, root);
+        let (scip, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(scip[0].contains("target"), "scip 臂（或其降级）仍产 pack: {}", scip[0]);
         // 默认臂不变
         unsafe { std::env::remove_var("REDTEAM_PACK"); }
-        let (def, _) = build_packs(&bundles, root);
+        let (def, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(def[0].contains("改动源文"), "默认臂仍 regex-pack");
         unsafe { std::env::remove_var("REDTEAM_PACK"); }
+    }
+
+    #[test]
+    fn pack_budget_respects_model_token_wall() {
+        // design §2.2 预算函数：min(256K, (min_ctx − 16K 输出预留)×3 − 24K 壳预留)。
+        let cfg = crate::config::Config::from_layers(&[r#"
+[providers.Big]
+kind = "openai"
+model = "big-ctx"
+context_window_tokens = 1000000
+[providers.Small]
+kind = "openai"
+model = "small-ctx"
+context_window_tokens = 40000
+"#]).unwrap();
+        // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K → 字节帽 256K 生效
+        assert_eq!(pack_budget_bytes(&cfg, &["Unknown".into()]), 256_000);
+        // 大窗模型同样被字节帽封顶
+        assert_eq!(pack_budget_bytes(&cfg, &["Big".into()]), 256_000);
+        // 小窗模型：(40_000−16_000)*3−24_000 = 48_000
+        assert_eq!(pack_budget_bytes(&cfg, &["Small".into()]), 48_000);
+        // 多模型取最小窗（一份 pack 全模型安全）
+        assert_eq!(pack_budget_bytes(&cfg, &["Big".into(), "Small".into()]), 48_000);
     }
 
     #[test]
@@ -2141,6 +2230,7 @@ mod incremental_tests {
             models_all: false, no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![], resume: None,
             dismissed: None, no_dismissed: false, incremental_from: Some(prior.into()),
+            tools: None,
         }
     }
 
@@ -2394,5 +2484,19 @@ default_models=["m"]
         assert_eq!(report.findings[0].agreement, 2, "re-raise 不涨 agreement");
         assert_eq!(report.findings[0].id, id1);
         assert_eq!((report.findings[0].line_start, report.findings[0].line_end), (3, 3), "重锚随注释插入移位");
+    }
+
+    #[test]
+    fn merge_bundles_flattens_all_files_into_one() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let fc = |p: &str| FileChange { path: p.into(), diff: format!("@@ -1,0 +1,1 @@\n+x // {p}\n") };
+        let bs = vec![
+            Bundle { files: vec![fc("src/a.rs")] },
+            Bundle { files: vec![fc("src/b.rs"), fc("src/c.rs")] },
+        ];
+        let merged = merge_bundles(bs);
+        assert_eq!(merged.len(), 1, "单格全审：全部并成一个 bundle");
+        assert_eq!(merged[0].files.len(), 3);
     }
 }

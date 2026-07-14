@@ -16,9 +16,9 @@ A precedent-based refutation carries audit duties: your returned finding MUST na
 Precedents: {{DISMISSED_NOTES}}
 </dismissal_precedents>
 
-<tools>
-You have read_file / search_repo / list_files under the review root. Read the document and any spec/config/source it references before judging. For an omission claim, search the document and referenced specs for the content alleged to be missing. Do not invent content you have not read. Read only the span needed to judge this one claim — a line range, not whole files.
-</tools>
+<evidence>
+No tools are available in this session. Judge from the claimed finding, the dismissal precedents, and the source snapshot below — that is the totality of what you can see. For an omission claim, check whether the content alleged to be missing is present within the snapshot; you cannot search the rest of the document or referenced specs beyond what is shown. Do not claim to have verified content you cannot see. If the snapshot does not settle the question, weigh your confidence down accordingly rather than asserting certainty.
+</evidence>
 
 <method>
 Attack the claim: For a contradiction/ambiguity, is the quoted text real and actually conflicting in context? For an omission, is the content genuinely absent, or is it specified elsewhere in the document or a referenced spec? Only a concrete, grounded refutation counts.
@@ -33,7 +33,7 @@ either IS a real defect — uphold).
 
 {{SOURCE_CONTEXT}}
 
-Use it as your starting evidence; verify beyond it with tools if needed.
+This snapshot is the entirety of your evidence for this claim — judge directly from it; do not assume unseen context resolves the question in either direction.
 
 <output_contract>
 Return ONLY JSON: an object with a "findings" array.

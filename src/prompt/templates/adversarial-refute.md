@@ -16,9 +16,9 @@ A precedent-based refutation carries audit duties: your returned finding MUST na
 Precedents: {{DISMISSED_NOTES}}
 </dismissal_precedents>
 
-<tools>
-You have read_file / search_repo / list_files under the review root. Read the actual code around the claim — the surrounding function, callers, guards — before judging. Do not invent code you have not read.
-</tools>
+<evidence>
+No tools are available in this session. Judge from the claimed finding, the dismissal precedents, and the source snapshot below — that is the totality of what you can see; you cannot read the surrounding function, callers, or guards beyond what the snapshot shows. Do not claim to have verified code you cannot see. If the snapshot does not settle whether a guard, invariant, or caller prevents the failure, weigh your confidence down accordingly rather than asserting certainty.
+</evidence>
 
 <method>
 Attack the claim: Is the quoted code real and in the context described? Does the alleged failure actually occur, or is it prevented by a guard, an invariant, or a caller? Is the severity justified by real impact? Only a concrete, code-grounded refutation counts.
@@ -28,7 +28,7 @@ Attack the claim: Is the quoted code real and in the context described? Does the
 
 {{SOURCE_CONTEXT}}
 
-Use it as your starting evidence; verify beyond it with tools if needed.
+This snapshot is the entirety of your evidence for this claim — judge directly from it; do not assume unseen context resolves the question in either direction.
 
 <output_contract>
 Return ONLY JSON: an object with a "findings" array.

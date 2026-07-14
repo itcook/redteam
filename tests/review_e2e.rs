@@ -56,7 +56,7 @@ async fn doc_review_end_to_end_rejects() {
         background: false,
         format: "json".into(),
         targets: vec![ps],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
 
     let (report, code) = run_review(args, &provider, &cfg, None).await.unwrap();
@@ -94,7 +94,7 @@ async fn code_bundle_tool_loop_anchors_and_drops_fabricated() {
         },
         AssistantTurn { text: findings_json.into(), tool_calls: vec![], input_tokens: 3, output_tokens: 5, cached_input_tokens: 0, finish_reason: None },
     ]);
-    let provider = ToolLoopProvider::new(Box::new(backend), root.path().to_path_buf());
+    let provider = ToolLoopProvider::new(Box::new(backend), root.path().to_path_buf(), true);
 
     let cfg = Config::from_layers(&[r#"[review]
 default_models=["m"]
@@ -105,7 +105,7 @@ default_models=["m"]
         models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
     let changes = vec![FileChange { path: "src/auth.rs".into(), diff: "+    db.write(token);".into() }];
 
@@ -161,7 +161,7 @@ default_models=["alpha","beta"]
         spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
     let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
@@ -209,7 +209,7 @@ default_models=["alpha","ghost"]
         spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
     let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
@@ -262,7 +262,7 @@ async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
         spec: vec![], focus: None, lenses: None, models: None, models_all: false,
         no_correlate: false, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![dp.clone()],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
     let (report, code) = run_review(args, &provider, &cfg, None).await.unwrap();
 
@@ -315,7 +315,7 @@ default_models=["alpha"]
         spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
     let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
@@ -376,7 +376,7 @@ async fn doc_d5_compliance_hard_cap_clamps_high_to_medium() {
         background: false,
         format: "json".into(),
         targets: vec![dp],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
 
     let (report, _code) = run_review(args, &provider, &cfg, None).await.unwrap();

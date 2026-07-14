@@ -52,6 +52,7 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
         };
         let defs = compile_defs(lang);
         let lines: Vec<&str> = content.lines().collect();
+        let mut contributed = false;
         for (start, end) in changed_def_ranges(&fc.diff, &lines, &defs) {
             let end = end.min(lines.len().saturating_sub(1));
             let body = lines.get(start..=end).unwrap_or(&[]).join("\n");
@@ -66,9 +67,15 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
             let block = format!("{head}\n{body}\n\n");
             if out.len() + block.len() > budget {
                 omit.push(format!("{}:{}-{} — 改动符号体", fc.path, start + 1, end + 1));
+                contributed = true;
             } else {
                 out.push_str(&block);
+                contributed = true;
             }
+        }
+        // E8 裁决 D：降级空产出禁真空——def 锚不到时必须 omit 可观测（T42 场景）。
+        if !symbol_mode && !contributed {
+            omit.push(format!("{}:1-{} — 全文超预算且 def 锚定失败（降级空产出）", fc.path, n_lines));
         }
     }
     if out.is_empty() {
@@ -118,16 +125,22 @@ fn refs_section(refs: &[SymRefs], budget: usize, omit: &mut Vec<String>) -> Stri
 
 /// 引擎入口：为一个 bundle 产 3 段 pack 正文（0 壳 + 1 壳 + 省略清单），预算近→远填。
 /// 不含 `<dossier>` 包裹（那是 prompt 层的活）。空 = 无 pack（降级）。
-pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize) -> String {
-    // diff 字节（mandate，永不砍，但占预算记账）
-    let diff_bytes: usize = bundle.files.iter().map(|fc| fc.diff.len()).sum();
-    let remaining = budget.saturating_sub(diff_bytes);
+/// `own_diff_bytes`：调用方本 cell 自身 diff 的字节数（mandate，永不砍，但占预算记账）——
+/// 传入的 `bundle` 可能是全景增广版（含兄弟真 diff，见 cli.rs::build_packs 全景循环），
+/// 但唯一真正进 prompt 的 diff 只有本 cell 自己那份；用 `bundle.files` 重新求和会把兄弟
+/// diff 也算进预算扣除，双重预留（Fix 1：final-review 报告）。
+pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: usize) -> String {
+    let remaining = budget.saturating_sub(own_diff_bytes);
 
     let mut omit: Vec<String> = Vec::new();
 
     // 0 壳：改动源文全文（最近壳，先填；overflow → omit）
     let bodies = body_section(bundle, root, remaining, &mut omit);
     let after_bodies = remaining.saturating_sub(bodies.len());
+
+    // 验收仪器（E8 裁决 E 第一层，随 M12 拆）：REDTEAM_PACK_SHELLS=0 → 纯 0 壳减法臂。
+    // S2-b'' 的「质量未降」属于「全景+1壳+callee」整包——1 壳/callee 的边际价值由此臂判决。
+    let zero_shell_only = std::env::var("REDTEAM_PACK_SHELLS").ok().as_deref() == Some("0");
 
     // 1 壳：引用点（用剩余预算）。改动符号 + 引用点走 dossier 引擎。
     let mut all_syms: Vec<ChangedSym> = Vec::new();
@@ -147,8 +160,12 @@ pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize) -> String {
         }
     }
     let defs = bundle.files.iter().find_map(|fc| lang_for(&fc.path)).map(compile_defs).unwrap_or_default();
-    let refs = reference_points(&all_syms, root, &defs);
-    let refs = refs_section(&refs, after_bodies, &mut omit);
+    let refs = if !zero_shell_only {
+        let refs = reference_points(&all_syms, root, &defs);
+        refs_section(&refs, after_bodies, &mut omit)
+    } else {
+        String::new()
+    };
 
     // 组装：非空段拼接 + 省略清单（封顶 + 计数兜底）
     let mut sections: Vec<String> = Vec::new();
@@ -161,7 +178,7 @@ pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize) -> String {
     if !omit.is_empty() {
         let total = omit.len();
         omit.truncate(OMIT_MAX_ENTRIES);
-        let mut sec = String::from("## 已省略（可 read_files 定点读）\nread_files({paths:[{path,start,end}]})\n");
+        let mut sec = String::from("## 已省略（预算裁剪）\n");
         for line in &omit {
             sec.push_str(line);
             sec.push('\n');
@@ -244,14 +261,16 @@ fn callee_section(syms: &[crate::dossier::ChangedSym], root: &Path, index: &Scip
 }
 
 /// SCIP 引擎入口：0 壳复用（body_section 不变）+ SCIP 1 壳 + callee 段 + 省略清单。
-/// strict=true 为 scip-strict 诊断臂（关兜底）。
-pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, index: &ScipIndex, strict: bool) -> String {
-    let diff_bytes: usize = bundle.files.iter().map(|fc| fc.diff.len()).sum();
-    let remaining = budget.saturating_sub(diff_bytes);
+/// strict=true 为 scip-strict 诊断臂（关兜底）。`own_diff_bytes` 语义同 build_pack（Fix 1）。
+pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: usize, index: &ScipIndex, strict: bool) -> String {
+    let remaining = budget.saturating_sub(own_diff_bytes);
     let mut omit: Vec<String> = Vec::new();
 
     let bodies = body_section(bundle, root, remaining, &mut omit);
     let after_bodies = remaining.saturating_sub(bodies.len());
+
+    // 验收仪器（E8 裁决 E 第一层，随 M12 拆）：REDTEAM_PACK_SHELLS=0 → 纯 0 壳减法臂。
+    let zero_shell_only = std::env::var("REDTEAM_PACK_SHELLS").ok().as_deref() == Some("0");
 
     // 改动符号（复用 symbols_in_file，带 bucket）
     let mut all_syms: Vec<ChangedSym> = Vec::new();
@@ -266,14 +285,18 @@ pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, index: &Scip
         }
     }
     let mut fallback_count = 0usize;
-    let refs = scip_refs(&all_syms, root, index, strict, &mut fallback_count);
-    let refs = refs_section(&refs, after_bodies, &mut omit);
-    if fallback_count > 0 {
+    let refs = if !zero_shell_only {
+        let refs = scip_refs(&all_syms, root, index, strict, &mut fallback_count);
+        refs_section(&refs, after_bodies, &mut omit)
+    } else {
+        String::new()
+    };
+    if !zero_shell_only && fallback_count > 0 {
         eprintln!("redteam: scip 引擎 {fallback_count} 个符号退回 regex 兜底（位置对无 Definition occurrence）");
     }
 
     let after_refs = after_bodies.saturating_sub(refs.len());
-    let callees = callee_section(&all_syms, root, index, after_refs, &mut omit);
+    let callees = if !zero_shell_only { callee_section(&all_syms, root, index, after_refs, &mut omit) } else { String::new() };
 
     let mut sections: Vec<String> = Vec::new();
     if !bodies.is_empty() { sections.push(bodies); }
@@ -282,7 +305,7 @@ pub fn build_pack_scip(bundle: &Bundle, root: &Path, budget: usize, index: &Scip
     if !omit.is_empty() {
         let total = omit.len();
         omit.truncate(OMIT_MAX_ENTRIES);
-        let mut sec = String::from("## 已省略（可 read_files 定点读）\nread_files({paths:[{path,start,end}]})\n");
+        let mut sec = String::from("## 已省略（预算裁剪）\n");
         for line in &omit { sec.push_str(line); sec.push('\n'); }
         if total > OMIT_MAX_ENTRIES { sec.push_str(&format!("… +{} more omitted\n", total - OMIT_MAX_ENTRIES)); }
         sections.push(sec);
@@ -442,6 +465,28 @@ mod tests {
         assert!(omit.is_empty(), "文件缺失不进 omit: {omit:?}");
     }
 
+    #[test]
+    fn body_section_degrade_empty_output_goes_to_omit() {
+        // E8 裁决 D：全文超预算且 def 锚不到（如 hunk 全在 mod tests，T42 场景）→ 禁真空，
+        // 必须 omit 可观测，不得静默消失。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // 大文件（超 500B 预算）+ diff 行落在无 def 可锚处（文件头注释区）
+        let filler = format!("// header\n{}", "// filler line\n".repeat(200));
+        std::fs::write(root.join("src/a.rs"), &filler).unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -1,0 +2,1 @@\n+// filler line\n".into(),
+        }] };
+        let mut omit = Vec::new();
+        let s = body_section_impl(&b, root, 500, &mut omit, false);
+        assert!(s.is_empty() || !s.contains("src/a.rs"), "无块可入");
+        assert!(omit.iter().any(|o| o.contains("src/a.rs")), "降级空产出必入 omit: {omit:?}");
+    }
+
     fn sr(name: &str, n: usize) -> crate::dossier::SymRefs {
         let hits = (0..n).map(|i| crate::dossier::RefHit {
             path: format!("src/f{i}.rs"), line: i + 1,
@@ -484,7 +529,8 @@ mod tests {
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {\n    work();\n}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\n").unwrap();
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,3 @@\n+pub fn target() {\n+    work();\n+}\n");
-        let pack = build_pack(&b, root, 1_000_000);
+        let own = b.files.iter().map(|fc| fc.diff.len()).sum();
+        let pack = build_pack(&b, root, 1_000_000, own);
         assert!(pack.contains("## 改动源文（0 壳）"), "有 0 壳: {pack}");
         assert!(pack.contains("pub fn target() {"), "0 壳含 target 完整体");
         assert!(pack.contains("## 引用点（1 壳）"), "有 1 壳");
@@ -499,10 +545,11 @@ mod tests {
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\n").unwrap();
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn target() {}\n");
-        // 预算极小：引用点填不下 → 省略清单带坐标 + 用法提示
-        let pack = build_pack(&b, root, 60);
-        assert!(pack.contains("## 已省略（可 read_files 定点读）"), "有省略段: {pack}");
-        assert!(pack.contains("read_files({paths:"), "省略段首用法提示");
+        // 预算极小：引用点填不下 → 省略清单带坐标（无工具默认下不指挥不存在的工具）
+        let own = b.files.iter().map(|fc| fc.diff.len()).sum();
+        let pack = build_pack(&b, root, 60, own);
+        assert!(pack.contains("## 已省略（预算裁剪）"), "有省略段: {pack}");
+        assert!(!pack.contains("read_files"), "无工具默认下省略段不得指挥不存在的工具");
         assert!(pack.contains("src/a.rs:"), "省略项带 file:line 坐标");
     }
 
@@ -515,7 +562,7 @@ mod tests {
         let root = tmp.path();
         std::fs::write(root.join("app.py"), "def f(): pass\n").unwrap();
         let b = bundle_one("app.py", "@@ -1,0 +1,1 @@\n+def f(): pass\n");
-        let pack = build_pack(&b, root, 1_000_000);
+        let pack = build_pack(&b, root, 1_000_000, 0);
         assert!(pack.contains("## 改动源文（0 壳）"), "非支持语言也走 0 壳: {pack}");
         assert!(pack.contains("def f(): pass"), "含全文: {pack}");
     }
@@ -537,7 +584,7 @@ mod tests {
             ..Default::default()
         }], ..Default::default() });
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn target(x: i32) {}\n");
-        let pack = build_pack_scip(&b, root, 1_000_000, &idx, false);
+        let pack = build_pack_scip(&b, root, 1_000_000, 0, &idx, false);
         assert!(pack.contains("## 引用点（1 壳）"), "有 1 壳: {pack}");
         assert!(pack.contains("u1()") || pack.contains("target(1)"), "SCIP caller 命中 u1: {pack}");
     }
@@ -553,10 +600,10 @@ mod tests {
             "pub fn ghost() {}\nfn u1() { ghost(); }\n").unwrap();
         let idx = ScipIndex::from_index(Index::default()); // 空索引 → 位置对必查无
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn ghost() {}\n");
-        let pack = build_pack_scip(&b, root, 1_000_000, &idx, false);
+        let pack = build_pack_scip(&b, root, 1_000_000, 0, &idx, false);
         assert!(pack.contains("ghost"), "空索引 → regex 兜底仍抓到 caller: {pack}");
         // strict 臂：关兜底 → 无引用点
-        let strict = build_pack_scip(&b, root, 1_000_000, &idx, true);
+        let strict = build_pack_scip(&b, root, 1_000_000, 0, &idx, true);
         assert!(!strict.contains("## 引用点"), "strict 关兜底 → 空: {strict}");
     }
 
@@ -577,10 +624,10 @@ mod tests {
             Document { relative_path: "src/b.rs".into(), occurrences: vec![occ(2, "S target().", 0)], ..Default::default() },
         ], ..Default::default() });
         // A：改签名行
-        let a = build_pack_scip(&bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn target(x: i32) {}\n"), root, 1_000_000, &idx, false);
+        let a = build_pack_scip(&bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn target(x: i32) {}\n"), root, 1_000_000, 0, &idx, false);
         assert!(a.contains("fn u1() {") && a.contains("let z = 1;"), "A 桶 caller 给完整外围体: {a}");
         // B：只改体
-        let b = build_pack_scip(&bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+    // touched body\n"), root, 1_000_000, &idx, false);
+        let b = build_pack_scip(&bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+    // touched body\n"), root, 1_000_000, 0, &idx, false);
         assert!(!b.contains("let z = 1;"), "B 桶 caller 只给片段、不含 caller 体其余行: {b}");
     }
 
@@ -608,7 +655,7 @@ mod tests {
             ..Default::default()
         }], ..Default::default() });
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,3 @@\n+pub fn caller() {\n+    helper(1);\n+}\n");
-        let pack = build_pack_scip(&b, root, 1_000_000, &idx, false);
+        let pack = build_pack_scip(&b, root, 1_000_000, 0, &idx, false);
         assert!(pack.contains("## 被调契约（callee）"), "有 callee 段: {pack}");
         assert!(pack.contains("fn helper(n: i32) -> i32"), "注入 helper 签名: {pack}");
     }
@@ -651,7 +698,7 @@ mod tests {
         };
         let idx = ScipIndex::from_index(Index { documents: vec![a_doc, b_doc], ..Default::default() });
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,4 @@\n+pub fn caller() {\n+    helper(1);\n+    read();\n+}\n");
-        let pack = build_pack_scip(&b, root, 1_000_000, &idx, false);
+        let pack = build_pack_scip(&b, root, 1_000_000, 0, &idx, false);
         assert!(pack.contains("- fn helper(n: i32) -> i32\n"), "本仓 helper（非 redteam crate 名，有 Definition）不打 [dep]: {pack}");
         assert!(pack.contains("- fn read() -> usize [dep]\n"), "外部依赖 read（无 Definition）打 [dep]: {pack}");
     }
