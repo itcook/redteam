@@ -506,7 +506,7 @@ pub async fn run_review(
     let focus = args.focus.clone().unwrap_or_default();
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink).await;
+    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink, None).await;
 
     // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
     let block = args
@@ -602,7 +602,7 @@ pub async fn run_code_review(
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
     let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink, None).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(
@@ -729,7 +729,7 @@ pub async fn run_incremental_review(
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
     let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink, None).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
     //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。

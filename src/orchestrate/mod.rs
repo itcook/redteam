@@ -1,5 +1,5 @@
 use crate::bundle::Bundle;
-use crate::domain::{Finding, Origin, RawFinding, ReviewInput};
+use crate::domain::{Finding, NeedEntry, Origin, RawFinding, ReviewInput};
 use crate::hash::fnv1a64_hex;
 use crate::lens::Lens;
 use crate::prompt::{build_bundle_prompt, build_doc_prompt};
@@ -44,7 +44,15 @@ pub struct RawResults {
     pub warnings: Vec<String>,
     pub failed_models: Vec<String>,
     pub usage: (u64, u64, u64), // (input, output, cached_input)
+    /// 二阶段补查触发观测（design §2.3，E8 裁决 E）：(触发格数, needs 总条数)——
+    /// 第一趟声明的 needs（cap 前），模板未列 needs 的旧模型输出恒 (0, 0)。
+    pub needs_stats: (u32, u32),
 }
+
+/// 二阶段补查 prompt 构造器（design §2.3）：`(cell_idx, cap 后的 needs, 第一趟 findings) -> Some(第二趟 prompt)`。
+/// `None`＝本格不补跑。doc fanout 单 cell，`cell_idx` 恒 0。
+pub type SecondPrompt<'a> =
+    Option<&'a (dyn Fn(usize, &[NeedEntry], &[Finding]) -> Option<String> + Sync)>;
 
 /// R8.1：quote 去除全部空白（保大小写）——token 序列即身份，免疫 reformat。
 fn normalize_quote(q: &str) -> String {
@@ -115,6 +123,8 @@ struct CellRun {
     iterations: u32,
     /// 胜出 call 的工具调用构成（延迟诊断仪器）；整链失败/单发路径为零值。
     tool_use: crate::tools::ToolUse,
+    /// 胜出 call 声明的证据缺口（design §2.3）；整链失败/二阶段已消化后为空。
+    needs: Vec<NeedEntry>,
     warn: Option<String>,
 }
 
@@ -169,7 +179,8 @@ async fn run_one_bundle(
                     model: pm.name.clone(), findings: fs,
                     tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                     duration_ms: t0.elapsed().as_millis() as u64,
-                    attempts: i as u32 + 1, iterations: call.iterations, tool_use: call.tool_use, warn: None,
+                    attempts: i as u32 + 1, iterations: call.iterations, tool_use: call.tool_use,
+                    needs: call.needs, warn: None,
                 };
             }
             Err(e) => errs.push(format!("bundle [{label}] model {}: {e}", pm.name)),
@@ -178,7 +189,62 @@ async fn run_one_bundle(
     CellRun {
         model: String::new(), findings: vec![], tokens: (0, 0, 0),
         duration_ms: t0.elapsed().as_millis() as u64,
-        attempts: chain.len() as u32, iterations: 0, tool_use: Default::default(), warn: Some(errs.join("; ")),
+        attempts: chain.len() as u32, iterations: 0, tool_use: Default::default(),
+        needs: vec![], warn: Some(errs.join("; ")),
+    }
+}
+
+/// 二阶段补查（design §2.3）：第一趟 needs 非空 → cap 5（超出 truncate + warning）→
+/// 构造器给第二趟 prompt → `rerun` 闭包重新执行一次（code/doc 各自传入自己的执行体，
+/// 免去 run_one_bundle/run_one_doc 两套重复的 cap/替换逻辑）。
+/// 第二趟成功＝整体替换（tokens/duration 累加、iterations 求和、attempts 取 max、needs 清空）；
+/// 失败＝保留第一趟全部产出 + warning。恒 ≤2 趟/格。
+/// 纯值返回（cell future 并发展开，彼此无法共享 `&mut` 状态）——warnings/stats 随返回值带出，
+/// 由调用方在 join 后的汇总循环里累加（照 usage 累加的现有模式）。
+async fn maybe_second_pass<Fut>(
+    mk: SecondPrompt<'_>,
+    idx: usize,
+    mut run: CellRun,
+    warn_label: &str,
+    rerun: impl FnOnce(String) -> Fut,
+) -> (CellRun, Vec<String>, (u32, u32))
+where
+    Fut: std::future::Future<Output = CellRun>,
+{
+    let mut warnings = Vec::new();
+    let mut stats = (0u32, 0u32);
+    let Some(mk) = mk else { return (run, warnings, stats) };
+    if run.warn.is_some() || run.needs.is_empty() {
+        return (run, warnings, stats);
+    }
+    stats.0 += 1;
+    stats.1 += run.needs.len() as u32;
+    if run.needs.len() > 5 {
+        warnings.push(format!("cell {warn_label}: {} needs declared, capped at 5", run.needs.len()));
+        run.needs.truncate(5);
+    }
+    let Some(p2) = mk(idx, &run.needs, &run.findings) else { return (run, warnings, stats) };
+    let run2 = rerun(p2).await;
+    match run2.warn {
+        None => {
+            let merged = CellRun {
+                model: run2.model,
+                findings: run2.findings, // 整体替换，非合并
+                tokens: (run.tokens.0 + run2.tokens.0, run.tokens.1 + run2.tokens.1, run.tokens.2 + run2.tokens.2),
+                duration_ms: run.duration_ms + run2.duration_ms,
+                attempts: run.attempts.max(run2.attempts),
+                iterations: run.iterations + run2.iterations,
+                tool_use: run.tool_use,
+                needs: vec![],
+                warn: None,
+            };
+            (merged, warnings, stats)
+        }
+        Some(w) => {
+            warnings.push(format!("cell {warn_label} second pass failed: {w}"));
+            run.needs.clear();
+            (run, warnings, stats)
+        }
     }
 }
 
@@ -195,6 +261,7 @@ pub async fn run_code_fanout(
     dossiers: &[String],
     opts: &OrchestrateOpts,
     sink: Option<&dyn CellSink>,
+    second_prompt: SecondPrompt<'_>,
 ) -> RawResults {
     let sem = Arc::new(Semaphore::new(opts.max_concurrency.max(1)));
     // 每个 bundle 的 label/prompt 只算一次：manifest 与执行复用同一份。
@@ -228,7 +295,7 @@ pub async fn run_code_fanout(
             s.manifest(&manifest);
         }
 
-        let futures = cells.iter().flat_map(|(cell, label, prompt)| {
+        let futures = cells.iter().enumerate().flat_map(|(idx, (cell, label, prompt))| {
             let sem = sem.clone();
             opts.models.iter().map(move |pm| {
                 let sem = sem.clone();
@@ -243,19 +310,26 @@ pub async fn run_code_fanout(
                 async move {
                     let _permit = sem.acquire().await.expect("semaphore not closed");
                     let run = run_one_bundle(provider, label, prompt, &single).await;
-                    // R2.1 修复：on_cell 在 future 内部即时调用。
+                    let warn_label = format!("bundle[{label}]");
+                    let (run, p2_warnings, p2_stats) = maybe_second_pass(
+                        second_prompt, idx, run, &warn_label,
+                        |p2| async move { run_one_bundle(provider, label, &p2, &single).await },
+                    ).await;
+                    // R2.1 修复：on_cell 在 future 内部即时调用（二阶段结束后的最终结果，仅一次）。
                     if let Some(s) = sink {
                         s.on_cell(run.to_record(cell_id.clone(), &model_name));
                     }
-                    (model_name, run)
+                    (model_name, run, p2_warnings, p2_stats)
                 }
             })
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (model_hint, run) in results {
+        for (model_hint, run, p2_warnings, p2_stats) in results {
             out.usage.0 += run.tokens.0;
             out.usage.1 += run.tokens.1; out.usage.2 += run.tokens.2;
+            out.warnings.extend(p2_warnings);
+            out.needs_stats.0 += p2_stats.0; out.needs_stats.1 += p2_stats.1;
             match run.warn {
                 None => out.findings.extend(run.findings),
                 Some(warn) => {
@@ -281,24 +355,31 @@ pub async fn run_code_fanout(
             s.manifest(&manifest);
         }
 
-        let futures = cells.iter().map(|(cell, label, prompt)| {
+        let futures = cells.iter().enumerate().map(|(idx, (cell, label, prompt))| {
             let sem = sem.clone();
             let cell_id = cell.clone();
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let run = run_one_bundle(provider, label, prompt, opts).await;
-                // R2.1 修复：on_cell 在 future 内部即时调用。
+                let warn_label = format!("bundle[{label}]");
+                let (run, p2_warnings, p2_stats) = maybe_second_pass(
+                    second_prompt, idx, run, &warn_label,
+                    |p2| async move { run_one_bundle(provider, label, &p2, opts).await },
+                ).await;
+                // R2.1 修复：on_cell 在 future 内部即时调用（二阶段结束后的最终结果，仅一次）。
                 if let Some(s) = sink {
                     s.on_cell(run.to_record(cell_id.clone(), ""));
                 }
-                run
+                (run, p2_warnings, p2_stats)
             }
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for run in results {
+        for (run, p2_warnings, p2_stats) in results {
             out.usage.0 += run.tokens.0;
             out.usage.1 += run.tokens.1; out.usage.2 += run.tokens.2;
+            out.warnings.extend(p2_warnings);
+            out.needs_stats.0 += p2_stats.0; out.needs_stats.1 += p2_stats.1;
             match run.warn {
                 None => out.findings.extend(run.findings),
                 Some(warn) => out.warnings.push(warn),
@@ -334,7 +415,8 @@ async fn run_one_doc(
                     model: pm.name.clone(), findings: fs,
                     tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                     duration_ms: t0.elapsed().as_millis() as u64,
-                    attempts: i as u32 + 1, iterations: call.iterations, tool_use: call.tool_use, warn: None,
+                    attempts: i as u32 + 1, iterations: call.iterations, tool_use: call.tool_use,
+                    needs: call.needs, warn: None,
                 };
             }
             Err(e) => errs.push(format!("doc model {}: {e}", pm.name)),
@@ -343,7 +425,8 @@ async fn run_one_doc(
     CellRun {
         model: String::new(), findings: vec![], tokens: (0, 0, 0),
         duration_ms: t0.elapsed().as_millis() as u64,
-        attempts: chain.len() as u32, iterations: 0, tool_use: Default::default(), warn: Some(errs.join("; ")),
+        attempts: chain.len() as u32, iterations: 0, tool_use: Default::default(),
+        needs: vec![], warn: Some(errs.join("; ")),
     }
 }
 
@@ -357,6 +440,7 @@ pub async fn run_doc_fanout(
     focus: &str,
     opts: &OrchestrateOpts,
     sink: Option<&dyn CellSink>,
+    second_prompt: SecondPrompt<'_>,
 ) -> RawResults {
     // 整篇文档为单一 cell：prompt 只渲染一次，manifest 与执行复用同一份。
     let prompt = build_doc_prompt(input, rules, focus);
@@ -392,18 +476,24 @@ pub async fn run_doc_fanout(
             async move {
                 let _permit = sem.acquire().await.expect("semaphore not closed");
                 let run = run_one_doc(provider, prompt, &single).await;
-                // R2.1 修复：on_cell 在 future 内部即时调用。
+                let (run, p2_warnings, p2_stats) = maybe_second_pass(
+                    second_prompt, 0, run, "doc",
+                    |p2| async move { run_one_doc(provider, &p2, &single).await },
+                ).await;
+                // R2.1 修复：on_cell 在 future 内部即时调用（二阶段结束后的最终结果，仅一次）。
                 if let Some(s) = sink {
                     s.on_cell(run.to_record(cell_id.clone(), &model_name));
                 }
-                (model_name, run)
+                (model_name, run, p2_warnings, p2_stats)
             }
         });
         let results = futures::future::join_all(futures).await;
         let mut out = RawResults::default();
-        for (model_hint, run) in results {
+        for (model_hint, run, p2_warnings, p2_stats) in results {
             out.usage.0 += run.tokens.0;
             out.usage.1 += run.tokens.1; out.usage.2 += run.tokens.2;
+            out.warnings.extend(p2_warnings);
+            out.needs_stats.0 += p2_stats.0; out.needs_stats.1 += p2_stats.1;
             match run.warn {
                 None => out.findings.extend(run.findings),
                 Some(warn) => {
@@ -428,11 +518,17 @@ pub async fn run_doc_fanout(
 
         let mut out = RawResults::default();
         let run = run_one_doc(provider, &prompt, opts).await;
+        let (run, p2_warnings, p2_stats) = maybe_second_pass(
+            second_prompt, 0, run, "doc",
+            |p2| async move { run_one_doc(provider, &p2, opts).await },
+        ).await;
         if let Some(s) = sink {
             s.on_cell(run.to_record(cell_id, ""));
         }
         out.usage.0 += run.tokens.0;
         out.usage.1 += run.tokens.1; out.usage.2 += run.tokens.2;
+        out.warnings.extend(p2_warnings);
+        out.needs_stats.0 += p2_stats.0; out.needs_stats.1 += p2_stats.1;
         match run.warn {
             None => out.findings.extend(run.findings),
             Some(warn) => out.warnings.push(warn),
@@ -475,6 +571,102 @@ mod tests {
         Bundle { files: vec![FileChange { path: path.into(), diff: "+x".into() }] }
     }
 
+    // ---- 二阶段补查测试助手（design §2.3）----
+
+    /// brief 里称 `rawf`——等价 raw_q，起个短名跟 brief 测试代码对齐。
+    fn rawf(t: &str) -> RawFinding {
+        raw_q(t)
+    }
+
+    fn rules() -> Vec<&'static Lens> {
+        vec![lens_by_id("L1").unwrap()]
+    }
+
+    fn need(path: &str, reason: &str) -> NeedEntry {
+        NeedEntry { path: path.into(), lines: None, reason: reason.into() }
+    }
+
+    fn lens_call_with(findings: Vec<RawFinding>, needs: Vec<NeedEntry>) -> crate::provider::LensCall {
+        crate::provider::LensCall {
+            findings, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0,
+            iterations: 1, tool_use: Default::default(), needs,
+        }
+    }
+
+    fn bundles_one() -> Vec<Bundle> {
+        vec![bundle("src/x.rs")]
+    }
+
+    fn dossiers_one() -> Vec<String> {
+        vec![String::new()]
+    }
+
+    fn opts_single() -> OrchestrateOpts {
+        OrchestrateOpts {
+            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            replicate: false, no_fallback: false, max_concurrency: 4,
+        }
+    }
+
+    /// 序列 provider：每次 `run` 弹出队首一个预设 LensCall（不看 model/prompt）；
+    /// 队列耗尽 → Err。用于测二阶段「同 model 两次调用返回不同结果」（现有 FakeProvider
+    /// 按 model 建表，同 model 只能回同一份脚本，撑不住序列语义）。
+    struct SeqProvider {
+        calls: std::sync::Mutex<std::collections::VecDeque<crate::provider::LensCall>>,
+    }
+    impl SeqProvider {
+        fn new(calls: Vec<crate::provider::LensCall>) -> Self {
+            SeqProvider { calls: std::sync::Mutex::new(calls.into_iter().collect()) }
+        }
+    }
+    #[async_trait::async_trait]
+    impl ReviewProvider for SeqProvider {
+        async fn run(&self, _req: LensRequest) -> Result<crate::provider::LensCall, ProviderError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| ProviderError::Unavailable("SeqProvider exhausted".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn code_fanout_second_pass_replaces_first_on_needs() {
+        // 第一趟：1 finding + 1 need；第二趟：2 findings 无 needs → 最终 2 findings（替换非合并）
+        let first = lens_call_with(vec![rawf("draft finding")], vec![need("src/x.rs", "verify")]);
+        let second = lens_call_with(vec![rawf("confirmed A"), rawf("confirmed B")], vec![]);
+        let provider = SeqProvider::new(vec![first, second]);
+        let mk = |_idx: usize, needs: &[NeedEntry], drafts: &[Finding]| {
+            assert_eq!(needs.len(), 1);
+            assert_eq!(drafts.len(), 1, "草稿传入构造器");
+            Some("second pass prompt".to_string())
+        };
+        let out = run_code_fanout(&provider, "t", &bundles_one(), &rules(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
+        assert_eq!(out.findings.len(), 2, "第二趟整体替换第一趟");
+        assert_eq!(out.needs_stats, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn code_fanout_second_pass_failure_keeps_first() {
+        let first = lens_call_with(vec![rawf("draft finding")], vec![need("src/x.rs", "verify")]);
+        let provider = SeqProvider::new(vec![first]); // 第二趟无 script → Err
+        let mk = |_i: usize, _n: &[NeedEntry], _d: &[Finding]| Some("p2".to_string());
+        let out = run_code_fanout(&provider, "t", &bundles_one(), &rules(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
+        assert_eq!(out.findings.len(), 1, "第二趟失败保留第一趟");
+        assert!(out.warnings.iter().any(|w| w.contains("second pass failed")));
+    }
+
+    #[tokio::test]
+    async fn code_fanout_needs_capped_at_five() {
+        let six: Vec<NeedEntry> = (0..6).map(|i| need(&format!("src/f{i}.rs"), "r")).collect();
+        let first = lens_call_with(vec![], six);
+        let second = lens_call_with(vec![], vec![]);
+        let provider = SeqProvider::new(vec![first, second]);
+        let mk = |_i: usize, n: &[NeedEntry], _d: &[Finding]| { assert_eq!(n.len(), 5, "cap 5"); Some("p2".into()) };
+        let out = run_code_fanout(&provider, "t", &bundles_one(), &rules(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
+        assert!(out.warnings.iter().any(|w| w.contains("capped at 5")));
+    }
+
     #[tokio::test]
     async fn code_fanout_runs_every_bundle() {
         let p = FakeProvider::with("m", vec![raw_q("found")]);
@@ -484,7 +676,7 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &[], &opts, None).await;
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &[], &opts, None, None).await;
         assert_eq!(r.findings.len(), 3, "one finding per bundle");
         // raw.lens=Some("L1") → enrich 用 L1（非 fallback）
         assert!(r.findings.iter().all(|f| f.lenses == vec!["L1".to_string()]));
@@ -515,7 +707,7 @@ mod tests {
             "<dossier>\nDOSSIER-A\n</dossier>".to_string(),
             "<dossier>\nDOSSIER-B\n</dossier>".to_string(),
         ];
-        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &dossiers, &opts, None).await;
+        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &dossiers, &opts, None, None).await;
         let prompts = p.prompts.lock().unwrap();
         let pa = prompts.iter().find(|s| s.contains("### src/a.rs")).expect("bundle a 的 prompt 应被采集");
         let pb = prompts.iter().find(|s| s.contains("### src/b.rs")).expect("bundle b 的 prompt 应被采集");
@@ -551,7 +743,7 @@ mod tests {
         let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
         let rules = vec![lens_by_id("L1").unwrap()];
         let probe_ref: &ConcProbe = &probe;
-        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", "", &[], &opts, None).await;
+        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", "", &[], &opts, None, None).await;
         assert!(probe.max_seen.load(Ordering::SeqCst) <= 2, "concurrency exceeded cap: {}", probe.max_seen.load(Ordering::SeqCst));
         assert!(probe.max_seen.load(Ordering::SeqCst) >= 1);
     }
@@ -566,7 +758,7 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &[], &opts, None).await;
+        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &[], &opts, None, None).await;
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"absent".to_string()), "explicit unreachable model must be recorded");
         assert!(!r.warnings.is_empty());
@@ -596,7 +788,7 @@ mod tests {
             no_fallback: false,
             max_concurrency: 8,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", "", &[], &opts, None).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", "", &[], &opts, None, None).await;
         // 2 bundle × 2 model = 4 格，各 1 finding → 4 条
         assert_eq!(out.findings.len(), 4);
         let models: std::collections::BTreeSet<&str> =
@@ -625,7 +817,7 @@ mod tests {
             no_fallback: false,
             max_concurrency: 8,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", "", &[], &opts, None).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", "", &[], &opts, None, None).await;
         assert_eq!(out.findings.len(), 1); // alpha 成功
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -653,7 +845,7 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 8,
         };
         let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, Some(&sink)).await;
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, Some(&sink), None).await;
         assert_eq!(out.findings.len(), 2, "one finding per model over the single doc");
         // final-review Important 回归：replicate 下同一 base cell（"doc"）的多 model 副本，
         // manifest + on_cell 的 cell-id 必须各自带上 model 才唯一——否则 resume 的差集判定
@@ -680,7 +872,7 @@ mod tests {
             ],
             replicate: true, no_fallback: false, max_concurrency: 8,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None, None).await;
         assert_eq!(out.findings.len(), 1);
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -697,7 +889,7 @@ mod tests {
             ],
             replicate: false, no_fallback: false, max_concurrency: 4,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None).await;
+        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None, None).await;
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].models, vec!["gpt".to_string()]);
         assert!(out.failed_models.is_empty());
@@ -728,7 +920,7 @@ mod tests {
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
         let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
-        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &[], &opts, Some(&sink)).await;
+        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &[], &opts, Some(&sink), None).await;
         assert_eq!(*sink.manifest_n.lock().unwrap(), 3, "manifest 全集=3 cell");
         assert_eq!(sink.records.lock().unwrap().len(), 3, "每 cell 各回调一次");
     }
@@ -788,7 +980,7 @@ mod tests {
             fast_saw_slow_incomplete: None.into(),
             calls: AtomicUsize::new(0),
         };
-        let _ = run_code_fanout(&provider, "wt", &bundles, &rules, "", "", &[], &opts, Some(&sink)).await;
+        let _ = run_code_fanout(&provider, "wt", &bundles, &rules, "", "", &[], &opts, Some(&sink), None).await;
         assert_eq!(sink.calls.load(Ordering::SeqCst), 2, "on_cell 调用次数=cell 数（聚合前逐个触发）");
         let saw = *sink.fast_saw_slow_incomplete.lock().unwrap();
         assert_eq!(
@@ -844,7 +1036,7 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs")];
         let rules = vec![lens_by_id("L1").unwrap()];
-        let out = run_code_fanout(&reg, "wt", &bundles, &rules, "", "", &[], &opts, None).await;
+        let out = run_code_fanout(&reg, "wt", &bundles, &rules, "", "", &[], &opts, None, None).await;
         assert!(out.failed_models.contains(&"bad".to_string()),
             "坏 model 应记 failed_models: {:?}", out.failed_models);
         assert!(out.findings.iter().any(|f| f.title == "real"),
