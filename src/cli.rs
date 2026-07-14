@@ -238,6 +238,8 @@ struct TailCtx<'a> {
     head_sha: Option<String>,
     /// 卷宗覆盖 meta（T01⑥；进 RunMeta.dossier）。code fan-out 路径为 Some，doc/resume 为 None。
     dossier_meta: Option<DossierMeta>,
+    /// 二阶段补查触发观测（进 RunMeta.needs，恒写）：(触发格数, 声明条数)；resume 无 fan-out 恒零。
+    needs_stats: (u32, u32),
     /// 后台 job 的 phase 打点通路（refute/correlate 子阶段；前台/resume 为 None）。
     sink: Option<&'a dyn CellSink>,
 }
@@ -317,6 +319,9 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
             ledger: ctx.ledger_meta,
             head_sha: ctx.head_sha,
             dossier: ctx.dossier_meta,
+            needs: crate::domain::NeedsMeta {
+                triggered_cells: ctx.needs_stats.0, declared: ctx.needs_stats.1,
+            },
             ..Default::default()
         },
     };
@@ -442,6 +447,137 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     (entries, meta)
 }
 
+/// 二阶段补查行窗（design §2.3）：lines 命中区间外扩 ±30 行。
+const NEED_LINES_WINDOW: usize = 30;
+
+/// NeedEntry.lines 解析："a-b"（1-based、a<=b）→ Some((a,b))；缺失/坏格式 → None（整文件语义）。
+fn parse_need_lines(lines: Option<&str>) -> Option<(u32, u32)> {
+    let (a, b) = lines?.split_once('-')?;
+    let a: u32 = a.trim().parse().ok()?;
+    let b: u32 = b.trim().parse().ok()?;
+    (a >= 1 && a <= b).then_some((a, b))
+}
+
+/// 单条 need → `## 补查证据` 段：lines 合法 → ±30 行窗；缺失/坏格式 → 整文件。
+/// 路径安全走 ToolExecutor 不变量（绝对路径/`..`/symlink 逃逸/不可读 → None、不 panic）。
+fn need_section(ex: &crate::tools::ToolExecutor, need: &crate::domain::NeedEntry) -> Option<String> {
+    let text = ex.read_capped(&need.path)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let n = lines.len();
+    if n == 0 {
+        return None;
+    }
+    let (a, b) = match parse_need_lines(need.lines.as_deref()) {
+        Some((la, lb)) => (
+            (la as usize).saturating_sub(NEED_LINES_WINDOW).max(1).min(n),
+            (lb as usize).saturating_add(NEED_LINES_WINDOW).min(n),
+        ),
+        None => (1, n),
+    };
+    let b = b.max(a);
+    Some(format!("## 补查证据\n{}:{}-{}\n{}\n\n", need.path, a, b, lines[a - 1..b].join("\n")))
+}
+
+/// 草稿注入段（design §2.3）：第一趟 findings 以 CONFIRM-or-REVISE 契约随第二趟 prompt 带回；
+/// 空草稿也渲染块（契约「不再声明 needs」对零草稿格同样生效）。
+fn draft_block(drafts: &[Finding]) -> String {
+    let mut s = String::from(
+        "\n<first_pass_draft>\nYour first pass produced these draft findings. CONFIRM or REVISE each using the\nnewly added evidence — drop a draft ONLY if the evidence refutes it, and do not\nre-declare needs.\n",
+    );
+    for d in drafts {
+        let quote_head: String = d.quote.chars().take(80).collect();
+        s.push_str(&format!(
+            "- [{}] {} @ {}:{}（{}）\n",
+            d.severity.as_str(), d.title, d.file, d.line_start, quote_head
+        ));
+    }
+    s.push_str("</first_pass_draft>\n");
+    s
+}
+
+/// 二阶段补查 prompt（code 线，design §2.3 置换而非追加）：整文件 needs 前插 augmented bundle
+/// （build_pack 顺序填充先进先占预算 → 最远兄弟自动让位=置换语义）；lines 行窗 needs 走
+/// `## 补查证据` 独立段置于卷宗最前；prompt 尾部追加第一趟草稿 CONFIRM-or-REVISE 段。
+/// 全部 needs 逃逸/不可读 → None（不补跑，省一次 LLM 调用）。
+#[allow(clippy::too_many_arguments)] // 与 build_bundle_prompt 同源的参数面；收拢 struct 是过度设计
+pub(crate) fn second_pass_prompt(
+    bundles: &[crate::bundle::Bundle],
+    root: &Path,
+    budget: usize,
+    target_label: &str,
+    rules: &[&crate::lens::Lens],
+    focus: &str,
+    idx: usize,
+    needs: &[crate::domain::NeedEntry],
+    drafts: &[Finding],
+) -> Option<String> {
+    let own = bundles.get(idx)?;
+    let ex = crate::tools::ToolExecutor::new(root);
+    let mut evidence = String::new();
+    let mut full_paths: Vec<String> = Vec::new();
+    for need in needs {
+        if parse_need_lines(need.lines.as_deref()).is_some() {
+            if let Some(sec) = need_section(&ex, need) {
+                evidence.push_str(&sec);
+            }
+        } else if !full_paths.contains(&need.path) && ex.read_capped(&need.path).is_some() {
+            // ponytail: read_capped 在此只当路径安全验证用（内容由 build_pack 自己读）——
+            // needs ≤5 条/格，多读一次成本可忽略，省一个只为验证的旁路 API。
+            full_paths.push(need.path.clone());
+        }
+    }
+    if evidence.is_empty() && full_paths.is_empty() {
+        return None;
+    }
+    // augmented bundle：needs 前插（changeset 内的 need 取真 diff，防超预算 def 回落失锚）
+    // → 自家 → 兄弟（镜像 build_packs 全景循环）；预算记账仍只扣自家原 diff（Fix 1 语义）。
+    let mut files: Vec<FileChange> = full_paths
+        .into_iter()
+        .map(|p| {
+            let diff = bundles.iter().flat_map(|b| &b.files)
+                .find(|f| f.path == p).map(|f| f.diff.clone()).unwrap_or_default();
+            FileChange { path: p, diff }
+        })
+        .collect();
+    for fc in own.files.iter().chain(bundles.iter().flat_map(|b| &b.files)) {
+        if !files.iter().any(|e| e.path == fc.path) {
+            files.push(fc.clone());
+        }
+    }
+    let own_diff_bytes: usize = own.files.iter().map(|fc| fc.diff.len()).sum();
+    let pb = crate::bundle::Bundle { files };
+    // ponytail: 第二趟恒用 regex 引擎——scip 是 opt-in 实验臂且索引 per-cell 重建昂贵；
+    // needs 只消费 0 壳全文分支（两引擎共用 body_section），scip 臂需要时再接。
+    let pack = crate::pack::build_pack(&pb, root, budget, own_diff_bytes);
+    let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
+    let others = crate::bundle::other_files_manifest(bundles, idx);
+    let mut p = crate::prompt::build_bundle_prompt(target_label, own, rules, focus, &others, "", &dossier);
+    p.push_str(&draft_block(drafts));
+    Some(p)
+}
+
+/// 二阶段补查 prompt（doc 线）：doc 无 bundle/pack——原 doc prompt + `## 补查证据` 段
+/// （整文件与行窗 need 同走 need_section）+ 草稿段。全部 needs 逃逸/不可读 → None。
+fn doc_second_pass_prompt(
+    input: &crate::domain::ReviewInput,
+    rules: &[&crate::lens::Lens],
+    focus: &str,
+    root: &Path,
+    needs: &[crate::domain::NeedEntry],
+    drafts: &[Finding],
+) -> Option<String> {
+    let ex = crate::tools::ToolExecutor::new(root);
+    let evidence: String = needs.iter().filter_map(|n| need_section(&ex, n)).collect();
+    if evidence.is_empty() {
+        return None;
+    }
+    let mut p = crate::prompt::build_doc_prompt(input, rules, focus);
+    p.push('\n');
+    p.push_str(&evidence);
+    p.push_str(&draft_block(drafts));
+    Some(p)
+}
+
 /// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
 ///
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
@@ -506,7 +642,11 @@ pub async fn run_review(
     let focus = args.focus.clone().unwrap_or_default();
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink, None).await;
+    // 二阶段补查构造器（doc 简化版）：原 doc prompt + 补查证据段 + 草稿契约。
+    let mk = |_idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
+        doc_second_pass_prompt(&input, &lenses, &focus, &cwd, needs, drafts)
+    };
+    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink, Some(&mk)).await;
 
     // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
     let block = args
@@ -538,6 +678,7 @@ pub async fn run_review(
         ledger_meta: ledger.meta.clone(),
         head_sha: None,
         dossier_meta: None,
+        needs_stats: raw.needs_stats,
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
@@ -601,8 +742,13 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink, None).await;
+    let budget = pack_budget_bytes(cfg, &model_names);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
+    let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
+        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts)
+    };
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink, Some(&mk)).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(
@@ -639,6 +785,7 @@ pub async fn run_code_review(
         ledger_meta: ledger.meta.clone(),
         head_sha,
         dossier_meta: Some(dossier_meta),
+        needs_stats: raw.needs_stats,
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
@@ -728,8 +875,14 @@ pub async fn run_incremental_review(
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink, None).await;
+    let budget = pack_budget_bytes(cfg, &model_names);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    // 二阶段补查构造器。注：第二趟不带 <incremental_round> 段（构造器签名 design §2.3 定）——
+    // 增量轮触发 needs 时第二趟只保 delta diff + 补查证据 + 草稿契约。
+    let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
+        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts)
+    };
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk)).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
     //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。
@@ -807,6 +960,9 @@ pub async fn run_incremental_review(
             resolution_disputed,
             carried_dropped: outcome.carried_dropped,
             dossier: Some(dossier_meta),
+            needs: crate::domain::NeedsMeta {
+                triggered_cells: raw.needs_stats.0, declared: raw.needs_stats.1,
+            },
         },
     };
     let code = exit_code(verdict, !report.run.failed_models.is_empty());
@@ -1207,6 +1363,7 @@ pub async fn run_resume(
         ledger_meta: ledger.meta.clone(),
         head_sha: None,
         dossier_meta: None,
+        needs_stats: (0, 0),
         sink: None,
     };
     match assemble_report(findings, ctx).await {
@@ -1988,6 +2145,98 @@ mod tests {
         let (null, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert_eq!(null[0], "", "空臂全空段");
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
+    }
+
+    #[test]
+    fn second_pass_prompt_injects_needs_evidence_and_drafts() {
+        use crate::bundle::Bundle;
+        use crate::domain::NeedEntry;
+        // fixture：两 bundle 各一文件 + 一个变更集外文件 evidence.rs
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn own() { let z = 1; }\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn sib() {}\n").unwrap();
+        std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
+        let bundles = vec![
+            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn sib() {}\n".into() }] },
+        ];
+        let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
+        let drafts = vec![]; // 空草稿也合法
+        let rules = vec![crate::lens::by_id("L1").unwrap()];
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts).unwrap();
+        assert!(p.contains("pub const LIMIT"), "needs 文件全文进包: {p}");
+        assert!(p.contains("first_pass_draft"), "草稿段在场");
+        assert!(p.contains("CONFIRM or REVISE"), "确认或修订语义");
+        // 路径逃逸：绝对路径 needs 被 skip、不 panic、其余照常
+        let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
+        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &evil, &drafts);
+        if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
+    }
+
+    #[test]
+    fn second_pass_prompt_lines_window_and_draft_format() {
+        use crate::bundle::Bundle;
+        use crate::domain::{NeedEntry, Origin};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn own() {}\n").unwrap();
+        let body: String = (1..=200).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(root.join("src/long.rs"), &body).unwrap();
+        let bundles = vec![Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
+        }] }];
+        let needs = vec![
+            // 合法 lines → ±30 行窗独立补查段
+            NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
+            // 坏格式 lines → 按整文件（前插 bundle 路径，全文进 0 壳）
+            NeedEntry { path: "src/long.rs".into(), lines: Some("abc".into()), reason: "r".into() },
+        ];
+        let drafts = vec![Finding {
+            id: "x".into(), severity: Severity::High, title: "weak hash".into(), body: "b".into(),
+            file: "src/a.rs".into(), line_start: 5, line_end: 6, confidence: 0.9,
+            recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
+            hard_constraint: false, quote: "md5(pw)".into(), cluster_id: None, verify: None,
+            previously_dismissed: false, origin: Origin::New,
+        }];
+        let rules = vec![crate::lens::by_id("L1").unwrap()];
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts).unwrap();
+        assert!(p.contains("## 补查证据"), "行窗补查段在场");
+        assert!(p.contains("src/long.rs:70-132"), "±30 行窗头: {p}");
+        assert!(p.contains("line70") && p.contains("line132"), "窗内行在场");
+        assert!(p.contains("line1\n"), "坏格式 lines 走整文件路径（line1 只在全文分支出现）");
+        assert!(p.contains("- [high] weak hash @ src/a.rs:5（md5(pw)）"), "草稿行格式: {p}");
+    }
+
+    #[test]
+    fn doc_second_pass_prompt_appends_evidence_and_drafts() {
+        use crate::domain::{Mode, NeedEntry, ReviewInput};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("spec2.md"), "background detail\n").unwrap();
+        let input = ReviewInput {
+            mode: Mode::Doc, target_label: "spec.md".into(),
+            collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
+        };
+        let rules = vec![crate::lens::by_id("D1").unwrap()];
+        let needs = vec![NeedEntry { path: "spec2.md".into(), lines: None, reason: "cross-ref".into() }];
+        let p = doc_second_pass_prompt(&input, &rules, "", root, &needs, &[]).unwrap();
+        assert!(p.contains("DOCBODY"), "原 doc prompt 在场");
+        assert!(p.contains("## 补查证据") && p.contains("background detail"), "补查段在场");
+        assert!(p.contains("first_pass_draft"), "草稿段在场");
+        // 全部 needs 逃逸 → None（不补跑）
+        let evil = vec![NeedEntry { path: "../outside.md".into(), lines: None, reason: "x".into() }];
+        assert!(doc_second_pass_prompt(&input, &rules, "", root, &evil, &[]).is_none());
+    }
+
+    #[test]
+    fn run_meta_needs_always_serialized_zeros_included() {
+        // E8-E 观测面：needs 统计恒写、零也写。
+        let v = serde_json::to_value(RunMeta::default()).unwrap();
+        assert_eq!(v["needs"]["triggered_cells"], 0);
+        assert_eq!(v["needs"]["declared"], 0);
     }
 
     #[test]

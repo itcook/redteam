@@ -59,6 +59,14 @@ pub struct Usage {
     pub refute: Option<Box<Usage>>,
 }
 
+/// 二阶段补查触发观测（design §2.3，E8 裁决 E）：triggered_cells=第一趟 needs 非空的格数、
+/// declared=第一趟声明的 needs 总条数（cap 前）。恒序列化——零也写（观测面）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct NeedsMeta {
+    pub triggered_cells: u32,
+    pub declared: u32,
+}
+
 /// 卷宗覆盖观测（T01⑥）：本次评审卷宗是否生效、多少 bundle 拿到内容——A/B 归因与生产诊断用。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct DossierMeta {
@@ -108,6 +116,9 @@ pub struct RunMeta {
     /// 卷宗覆盖（code 模式且卷宗路径才有；doc/resume 为 None）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dossier: Option<DossierMeta>,
+    /// 二阶段补查触发率（E8-E 指标）：恒写、零也写；serde default 兼容旧 JSON。
+    #[serde(default)]
+    pub needs: NeedsMeta,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -288,6 +288,25 @@ impl ToolExecutor {
         out
     }
 
+    /// 二阶段补查读（design §2.3）：复用 safe_join + canonicalize 逃逸检查的路径安全不变量，
+    /// 返回裸文本（不带行号——pack/补查段注入用原文）。绝对路径/`..`/symlink 逃逸/不可读 → None
+    /// （调用方 skip、不 panic）。读帽 512KB 镜像 consolidate/verify.rs source_snippet 的
+    /// take() 模式——行窗可能落在大文件深处，64KB 工具帽会截掉窗口。
+    // ponytail: 帽边界劈开多字节字符时 read_to_string 整体失败 → None（该条 need 跳过）；
+    // 需要精确截断时再抄 source_snippet 的 char-boundary 回退。
+    pub(crate) fn read_capped(&self, rel: &str) -> Option<String> {
+        const NEED_READ_MAX_BYTES: u64 = 512 * 1024;
+        let full = self.safe_join(rel)?;
+        let real = std::fs::canonicalize(&full).ok()?;
+        if !real.starts_with(&self.canonical_root) {
+            return None;
+        }
+        use std::io::Read;
+        let mut text = String::new();
+        std::fs::File::open(&real).ok()?.take(NEED_READ_MAX_BYTES).read_to_string(&mut text).ok()?;
+        Some(text)
+    }
+
     /// 计算遍历起点：给了 path 则用 safe_join 后的子路径，否则 root。
     /// canonicalize 成功且不在 canonical_root 内时拒绝（符号链接逃逸防护）。
     fn scope_dir(&self, args: &Value) -> Result<PathBuf, String> {
