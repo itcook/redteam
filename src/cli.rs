@@ -1591,6 +1591,7 @@ mod resume_tests {
                 cached_input_tokens: 0,
                 iterations: 1,
                 tool_use: Default::default(),
+                needs: vec![],
             })
         }
     }

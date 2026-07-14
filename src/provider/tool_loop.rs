@@ -100,6 +100,7 @@ pub async fn run_tool_loop(
             match parse_lens_output(&turn.text) {
                 Ok(out) => {
                     return Ok(LensCall {
+                        needs: out.needs,
                         findings: out.findings,
                         input_tokens: in_tok,
                         output_tokens: out_tok,
@@ -129,6 +130,7 @@ pub async fn run_tool_loop(
                     tool_use.tally(&repair_turn.tool_calls);
                     return match parse_lens_output(&repair_turn.text) {
                         Ok(out) => Ok(LensCall {
+                            needs: out.needs,
                             findings: out.findings,
                             input_tokens: in_tok,
                             output_tokens: out_tok,
@@ -190,6 +192,7 @@ pub async fn run_tool_loop(
         }
     };
     Ok(LensCall {
+        needs: out.needs,
         findings: out.findings,
         input_tokens: in_tok,
         output_tokens: out_tok,

@@ -65,6 +65,12 @@ QUOTE RULES — this determines how the finding is anchored:
 - For a CONTRADICTION / INCONSISTENCY / wrong-statement finding: set "quote" to the EXACT verbatim text from the document that is wrong or self-conflicting. A fabricated quote (text not present in the document) causes the finding to be DROPPED.
 - For an OMISSION finding (something that SHOULD be specified but is entirely ABSENT from the document): leave "quote" as an empty string "". An empty quote signals an omission claim and is NOT dropped — it is routed to independent verification.
 If nothing material, return {"findings": []}. Prefer one strong finding over several weak.
+
+Optionally include a top-level "needs" array (max 5 entries) when a claim's verdict
+hinges on evidence NOT present in the provided context: each entry is
+{"path": "<repo-relative file>", "lines": "<start-end, optional>", "reason": "<what you must verify>"}.
+Declare needs ONLY for genuinely decisive evidence — the review will be re-run once with
+those files added. Do NOT declare needs for files already shown in full above.
 </output_contract>
 
 <document_context>

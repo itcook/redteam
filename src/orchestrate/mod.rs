@@ -498,7 +498,7 @@ mod tests {
     impl ReviewProvider for PromptProbe {
         async fn run(&self, req: LensRequest) -> Result<crate::provider::LensCall, ProviderError> {
             self.prompts.lock().unwrap().push(req.prompt);
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1, tool_use: Default::default() })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1, tool_use: Default::default(), needs: vec![] })
         }
     }
 
@@ -537,7 +537,7 @@ mod tests {
             self.max_seen.fetch_max(cur, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             self.inflight.fetch_sub(1, Ordering::SeqCst);
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1, tool_use: Default::default() })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1, tool_use: Default::default(), needs: vec![] })
         }
     }
 
@@ -752,7 +752,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                 self.slow_done.store(true, Ordering::SeqCst);
             }
-            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1, tool_use: Default::default() })
+            Ok(crate::provider::LensCall { findings: vec![], input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, iterations: 1, tool_use: Default::default(), needs: vec![] })
         }
     }
 

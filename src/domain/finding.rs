@@ -47,10 +47,23 @@ pub struct RawFinding {
     pub lens: Option<String>,
 }
 
+/// 二阶段补查的证据声明（design 2026-07-13 §2.3，E8 裁决 C）：模型声明「判这个 claim
+/// 还缺哪个文件」，非对话式工具调用。lines 可选 "start-end"（超大文件只载区间±上下文）。
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct NeedEntry {
+    pub path: String,
+    #[serde(default)]
+    pub lines: Option<String>,
+    pub reason: String,
+}
+
 /// 模型每次 lens 调用的完整输出。
 #[derive(Clone, Debug, Deserialize, JsonSchema, Default)]
 pub struct LensOutput {
     pub findings: Vec<RawFinding>,
+    /// 证据缺口声明（可选；非空触发二阶段补查趟）。
+    #[serde(default)]
+    pub needs: Vec<NeedEntry>,
 }
 
 /// 本地在 dedup 时 enrich 后的 finding。
