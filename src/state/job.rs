@@ -189,6 +189,16 @@ mod tests {
     }
 
     #[test]
+    fn jobstate_ignores_legacy_lenses_key() {
+        // E8-I：旧 proj.db 记录仍带 "lenses" 键——serde 静默忽略，resume/status 不炸。
+        let old: JobState = serde_json::from_str(
+            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[],"lenses":[]}"#
+        ).unwrap();
+        assert_eq!(old.job_id, "x");
+        assert_eq!(old.status, JobStatus::Running);
+    }
+
+    #[test]
     fn phase_serializes_lowercase_and_roundtrips() {
         let mut s = JobState::new("j", 100);
         s.phase = Some(Phase::Fanout);

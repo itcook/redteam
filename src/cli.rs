@@ -2065,6 +2065,18 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn review_args_ignores_legacy_lenses_key() {
+        // E8-I：旧 args.json（--background 落盘）仍带 "lenses" 键——serde 静默忽略，resume 不炸。
+        let j = r#"{"mode":"code","base":null,"scope":"branch","spec":[],"focus":null,
+            "lenses":"L1,L2","models":null,"models_all":false,"no_correlate":false,
+            "block_threshold":null,"conf_floor":null,"background":true,"format":"json",
+            "targets":[],"resume":null}"#;
+        let a: ReviewArgs = serde_json::from_str(j).unwrap();
+        assert_eq!(a.scope, "branch");
+        assert!(a.background);
+    }
+
+    #[test]
     fn build_dossiers_toggle_off_arm_all_empty_on_arm_nonempty() {
         let _g = ENV_LOCK.lock().unwrap();
         use crate::bundle::Bundle;

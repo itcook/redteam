@@ -472,7 +472,8 @@ mod tests {
         assert!(p.contains("auth"), "user focus injected");
         assert!(!p.contains("DISMISSED"), "no ledger injection in review prompt");
         assert!(p.to_lowercase().contains("omission"), "omission/empty-quote contract present");
-        assert!(p.contains("lens"), "doc prompt must teach model to tag lens id per finding");
+        // lens 去实体化 B（E8-I 收尾）：模板不再教模型输出 lens 字段。
+        assert!(!p.contains("lens"), "doc prompt must NOT teach a lens output field: {p}");
     }
 
     #[test]
