@@ -49,7 +49,7 @@ mod tests {
     fn raw(title: &str, sev: Severity) -> RawFinding {
         RawFinding { severity: sev, title: title.into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 2, confidence: 0.9, recommendation: "fix".into(),
-            hard_constraint: false, quote: "let x = 1;".into(), lens: None }
+            hard_constraint: false, quote: "let x = 1;".into() }
     }
     #[tokio::test]
     async fn fake_returns_scripted_findings() {

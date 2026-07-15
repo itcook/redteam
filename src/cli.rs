@@ -4,13 +4,11 @@ use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc, refute_tar
 use crate::domain::{DossierMeta, Finding, Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::{collect, detect_mode, EvidenceOpts, Scope};
 use crate::evidence::git::FileChange;
-use crate::lens::select;
 use crate::orchestrate::{enrich, run_code_fanout, run_doc_fanout, CellSink, OrchestrateOpts, PlannedModel};
 use crate::output::Format;
 use crate::positioning::{anchor, anchor_doc};
 use crate::provider::{LensRequest, ReviewProvider};
-use crate::verdict::{clamp_compliance, compute_verdict};
-use regex::Regex;
+use crate::verdict::compute_verdict;
 use std::path::Path;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -20,7 +18,6 @@ pub struct ReviewArgs {
     pub scope: String,
     pub spec: Vec<String>,
     pub focus: Option<String>,
-    pub lenses: Option<String>,
     pub models: Option<String>,
     pub models_all: bool,
     pub no_correlate: bool,
@@ -208,7 +205,7 @@ fn model_ids_for(names: &[String], cfg: &Config) -> Vec<String> {
 }
 
 /// 扇出之后的共用尾段上下文——`run_code_review`/`run_review`/`run_resume` 三处扇出前逻辑
-/// 各不相同（bundle×model / lens×model / 直接重放 manifest prompt），但扇出后（anchor → dedup
+/// 各不相同（单格×model / doc 单包×model / 直接重放 manifest prompt），但扇出后（anchor → dedup
 /// → [doc: correlate] → verify → verdict → 组报告）完全一致，抽出复用（DRY，T7 授权解冻）。
 struct TailCtx<'a> {
     mode: Mode,
@@ -220,7 +217,6 @@ struct TailCtx<'a> {
     model_names: Vec<String>,
     /// 与 model_names 同序的 model id（cfg.providers.*.model；查无则回退 provider 名）。
     model_ids: Vec<String>,
-    lens_ids: Vec<String>,
     block: Severity,
     floor: f32,
     correlate_on: bool,
@@ -259,7 +255,6 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
         Mode::Code => dedup(anchored),
         Mode::Doc => dedup_doc(anchored),
     };
-    clamp_compliance(&mut findings);
     let clusters = if ctx.mode == Mode::Doc {
         // correlate 当前为未实现 stub（恒空），不打 phase——待其真正接 LLM 调用时再加时间线点。
         let lead_model = ctx.model_names.first().cloned().unwrap_or_default();
@@ -303,7 +298,6 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
             job_id: ctx.job_id,
             models: ctx.model_names,
             model_ids: ctx.model_ids,
-            lenses: ctx.lens_ids,
             duration_ms: ctx.duration_ms,
             usage: Usage {
                 input_tokens: ctx.usage.0, output_tokens: ctx.usage.1, cached_input_tokens: ctx.usage.2,
@@ -374,9 +368,15 @@ fn pack_engine() -> PackEngine {
     }
 }
 
-/// 验收仪器（E8 裁决 B，随 M12 拆）：REDTEAM_SINGLE_CELL 非空 → 全变更集并成单 bundle
-/// （单格全审 A/B 臂——分格在全景 pack 范式下=N 倍重复喂全景，质量对照据此判批 4 收缩）。
+/// 单格全审默认（E9 判决，2026-07-13 转正）：全变更集恒并成一个 bundle——分格在全景 pack
+/// 范式下=N 倍重复喂同一全景（两跑实证 input −77%、质量未见系统性下降）。空输入原样放行
+/// （不产出「一个空文件的 bundle」）——上游两处空证据守卫（`run_code_review` 的「no reviewable
+/// evidence」警告、`run_incremental_review` 的 delta 全噪声过滤报错）靠 `bundles.is_empty()`
+/// 判空，语义须保持不变。
 fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bundle> {
+    if bundles.is_empty() {
+        return bundles;
+    }
     vec![crate::bundle::Bundle { files: bundles.into_iter().flat_map(|b| b.files).collect() }]
 }
 
@@ -408,31 +408,13 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
         _ => None,
     };
     let strict = matches!(engine, PackEngine::Scip { strict: true });
-    // 变更集全景 0 壳（S2-b'' 转正，design 2026-07-13 §2.1）：每格 = 自家文件（置顶）+
-    // 兄弟改动文件。兄弟带真 diff——空 diff 会让 def 降级不可达且静默消失（E8 裁决 D）。
-    // Task 6（E8 岗位①）：兄弟按 dep_rank 排序后追加——直接被 own 引用的兄弟先入包，
-    // 无关兄弟排后面、预算紧张时顺序填充天然让它们最先落回落链/omit（最远先降）。
+    // 单格全审默认（E9）：bundles 恒为单元素（全变更集），每格即自家文件——原「兄弟改动
+    // 文件全景注入 + 依赖距离排序」随分格一并收缩（无兄弟可注入）。超预算由 build_pack/
+    // build_pack_scip 自身的降级梯子（骨架/hunk 窗/省略清单）承接，不再靠分格避让。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
-            let own_files = &b.files;
-            let mut siblings: Vec<FileChange> = Vec::new();
-            for ob in bundles {
-                for fc in &ob.files {
-                    if !own_files.iter().any(|e| e.path == fc.path) && !siblings.iter().any(|e| e.path == fc.path) {
-                        siblings.push(fc.clone());
-                    }
-                }
-            }
-            siblings.sort_by_key(|fc| (dep_rank(own_files, &fc.path, root), fc.path.clone()));
-            let mut files = own_files.clone();
-            files.extend(siblings);
-            let pb = crate::bundle::Bundle { files };
-            let pb = &pb;
-            // Fix 1（final-review）：预算记账只扣本 cell 自己的 diff 字节——pb 是全景增广版
-            // （混入兄弟真 diff，供 def 锚定/正文消费），但唯一真正进 prompt 的 diff 只有
-            // b 自己那份（见 orchestrate::run_code_fanout 用原 bundle 而非 pb 建 diff 块）。
-            // 用 pb.files 重新求和会把兄弟 diff 也扣进预算，大改动集下 remaining→0、0 壳塌缩。
+            // 预算记账扣本格自己的 diff 字节（单格默认下即全变更集真实 diff）。
             let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
             if suppressed {
                 String::new()
@@ -441,10 +423,10 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
                     (PackEngine::Dossier, _) =>
                         crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)),
                     (PackEngine::Scip { .. }, Some(idx)) =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, budget, own_diff_bytes, idx, strict)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(b, root, budget, own_diff_bytes, idx, strict)),
                     // Regex 默认，及 scip 降级（scip_index=None）都走 regex-pack。
                     _ =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, budget, own_diff_bytes)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes)),
                 }
             }
         })
@@ -452,34 +434,6 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
     let meta = DossierMeta { bundles: bundles.len(), injected, suppressed };
     (entries, meta)
-}
-
-/// 兄弟依赖距离 MVP（Task 6，E8 岗位①）：sib 文件 stem（`b.rs`→`b`，`mod.rs`→取父目录名）是否被
-/// `own` 任一文件源码词边界引用——0=引用（近，先入包）、1=否（远，预算紧张时先降）。
-/// 两级够用，多级依赖图/传递闭包 YAGNI，痛点再升。own 文件读失败按未引用处理（贡献 1）。
-pub(crate) fn dep_rank(own: &[FileChange], sib_path: &str, root: &Path) -> u8 {
-    let p = Path::new(sib_path);
-    let stem = if p.file_name().and_then(|n| n.to_str()) == Some("mod.rs") {
-        p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str())
-    } else {
-        p.file_stem().and_then(|n| n.to_str())
-    };
-    let stem = match stem {
-        Some(s) if !s.is_empty() => s,
-        _ => return 1,
-    };
-    let re = match Regex::new(&format!(r"\b{}\b", regex::escape(stem))) {
-        Ok(r) => r,
-        Err(_) => return 1,
-    };
-    for fc in own {
-        if let Ok(content) = std::fs::read_to_string(root.join(&fc.path)) {
-            if re.is_match(&content) {
-                return 0;
-            }
-        }
-    }
-    1
 }
 
 /// 二阶段补查行窗（design §2.3）：lines 命中区间外扩 ±30 行。
@@ -549,7 +503,7 @@ fn draft_block(drafts: &[Finding]) -> String {
 }
 
 /// 二阶段补查 prompt（code 线，design §2.3 置换而非追加）：整文件 needs 前插 augmented bundle
-/// （build_pack 顺序填充先进先占预算 → 最远兄弟自动让位=置换语义）；lines 行窗 needs 走
+/// （build_pack 顺序填充先进先占预算 → 自家非 needs 文件预算紧张时自动让位=置换语义）；lines 行窗 needs 走
 /// `## 补查证据` 独立段置于卷宗最前；prompt 尾部追加第一趟草稿 CONFIRM-or-REVISE 段。
 /// `incremental`：增量轮的 <incremental_round> 段原样带入第二趟（claimed-resolved/dispute
 /// 契约不因补跑丢失）；全量路径传空串。全部 needs 逃逸/不可读 → None（不补跑，省一次 LLM 调用）。
@@ -559,7 +513,6 @@ pub(crate) fn second_pass_prompt(
     root: &Path,
     budget: usize,
     target_label: &str,
-    rules: &[&crate::lens::Lens],
     focus: &str,
     idx: usize,
     needs: &[crate::domain::NeedEntry],
@@ -592,7 +545,7 @@ pub(crate) fn second_pass_prompt(
         return None;
     }
     // augmented bundle：needs 前插（changeset 内的 need 取真 diff，防超预算 def 回落失锚）
-    // → 自家 → 兄弟（镜像 build_packs 全景循环）；预算记账仍只扣自家原 diff（Fix 1 语义）。
+    // → 自家文件（单格全审默认下 own 即全变更集，无兄弟可镜像）；预算记账仍只扣自家原 diff。
     let mut files: Vec<FileChange> = full_paths
         .into_iter()
         .map(|p| {
@@ -601,7 +554,7 @@ pub(crate) fn second_pass_prompt(
             FileChange { path: p, diff }
         })
         .collect();
-    for fc in own.files.iter().chain(bundles.iter().flat_map(|b| &b.files)) {
+    for fc in own.files.iter() {
         if !files.iter().any(|e| e.path == fc.path) {
             files.push(fc.clone());
         }
@@ -616,7 +569,7 @@ pub(crate) fn second_pass_prompt(
     let pack = crate::pack::build_pack(&pb, root, budget.saturating_sub(evidence.len()), own_diff_bytes);
     let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
     let others = crate::bundle::other_files_manifest(bundles, idx);
-    let mut p = crate::prompt::build_bundle_prompt(target_label, own, rules, focus, &others, incremental, &dossier);
+    let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, &others, incremental, &dossier);
     p.push_str(&draft_block(drafts));
     Some(p)
 }
@@ -628,7 +581,6 @@ pub(crate) fn second_pass_prompt(
 /// 全部 needs 逃逸/不可读 → None。
 fn doc_second_pass_prompt(
     input: &crate::domain::ReviewInput,
-    rules: &[&crate::lens::Lens],
     focus: &str,
     root: &Path,
     needs: &[crate::domain::NeedEntry],
@@ -652,14 +604,14 @@ fn doc_second_pass_prompt(
     if clipped {
         evidence.push_str("（其余补查条目因预算裁剪省略）\n");
     }
-    let mut p = crate::prompt::build_doc_prompt(input, rules, focus);
+    let mut p = crate::prompt::build_doc_prompt(input, focus);
     p.push('\n');
     p.push_str(&evidence);
     p.push_str(&draft_block(drafts));
     Some(p)
 }
 
-/// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
+/// 整条评审流水线：证据 → 攻击面固有 prompt → fan-out → 共用尾段（assemble_report）。
 ///
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
 /// `--background` 由 main.rs 在 dispatch 之前分叉（spawn worker）；到达这里即路由 bug。
@@ -697,17 +649,6 @@ pub async fn run_review(
     };
     let input = collect(&eopts)?;
 
-    // 2. lens
-    let lens_ids: Vec<String> = args
-        .lenses
-        .as_deref()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_else(|| match input.mode {
-            Mode::Code => cfg.review.lenses.code.clone(),
-            Mode::Doc => cfg.review.lenses.doc.clone(),
-        });
-    let lenses = select(input.mode, &lens_ids)?;
-
     // 3. 模型集 + replicate 判定（统一 resolve_models）
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
@@ -722,12 +663,12 @@ pub async fn run_review(
     //（design 2026-07-03 #2：生成侧勿再报实证无效，判定后置 consolidate）。
     let focus = args.focus.clone().unwrap_or_default();
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
-    if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
+    if let Some(s) = sink { s.on_meta(&model_names); }
     // 二阶段补查构造器（doc 简化版）：原 doc prompt + 补查证据段 + 草稿契约。
     let mk = |_idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        doc_second_pass_prompt(&input, &lenses, &focus, &cwd, needs, drafts)
+        doc_second_pass_prompt(&input, &focus, &cwd, needs, drafts)
     };
-    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink, Some(&mk)).await;
+    let raw = run_doc_fanout(provider, &input, &focus, &oopts, sink, Some(&mk)).await;
 
     // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
     let block = args
@@ -744,7 +685,6 @@ pub async fn run_review(
         provider,
         model_ids: model_ids_for(&model_names, cfg),
         model_names,
-        lens_ids,
         block,
         floor,
         correlate_on,
@@ -786,22 +726,10 @@ pub async fn run_code_review(
     let t0 = std::time::Instant::now();
 
     // 1. 确定性筛选 + 分包
-    let bundles = group(select_files(changes), Some(root));
-
-    // 验收仪器（随 M12 拆）：单格全审臂。增量轮（run_incremental）不接——验收只走全量。
-    let bundles = if std::env::var_os("REDTEAM_SINGLE_CELL").is_some() {
-        merge_bundles(bundles)
-    } else {
-        bundles
-    };
-
-    // 2. rules = code lenses（lens → 注入 rule）
-    let lens_ids: Vec<String> = args
-        .lenses
-        .as_deref()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_else(|| cfg.review.lenses.code.clone());
-    let rules = select(Mode::Code, &lens_ids)?;
+    // 单格全审默认（E9，2026-07-13）：全变更集并成一个 bundle——分格在全景 pack 范式下
+    // =N 倍重复喂全景（两跑实证 input −77%、质量未见下降）。bundle::group 保留（收集与
+    // 未来 L4 拆缝用）；超预算由降级梯子（骨架/hunk 窗/省略清单）承接，不拆格。
+    let bundles = merge_bundles(group(select_files(changes), Some(root)));
 
     // 3. 模型集 + replicate 判定（统一 resolve_models）
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
@@ -822,14 +750,14 @@ pub async fn run_code_review(
     };
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
-    if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
+    if let Some(s) = sink { s.on_meta(&model_names); }
     let budget = pack_budget_bytes(cfg, &model_names);
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts, "")
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "")
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink, Some(&mk)).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk)).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(
@@ -851,7 +779,6 @@ pub async fn run_code_review(
         provider,
         model_ids: model_ids_for(&model_names, cfg),
         model_names,
-        lens_ids,
         block,
         floor,
         correlate_on: false,
@@ -922,7 +849,9 @@ pub async fn run_incremental_review(
         .collect();
 
     // 7. delta → bundle + 增量 prompt 段 + fan-out（select_files/group/run_code_fanout 全复用）。
-    let bundles = group(select_files(base.delta), Some(root));
+    // 单格全审默认（E9）：增量路径同全量一样收缩到单 bundle（merge_bundles 空输入原样放行，
+    // 下面的空判空守卫语义不变）。
+    let bundles = merge_bundles(group(select_files(base.delta), Some(root)));
     anyhow::ensure!(
         !bundles.is_empty(),
         "--incremental-from: delta since {} is all noise-filtered (nothing reviewable); run a full `redteam review` or let ship's stall guard decide",
@@ -938,12 +867,6 @@ pub async fn run_incremental_review(
     let short_base = &base.base_sha[..12.min(base.base_sha.len())];
     let inc_section = crate::prompt::render_incremental_section(short_base, &manifest2, &claimed);
 
-    let lens_ids: Vec<String> = args
-        .lenses
-        .as_deref()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_else(|| cfg.review.lenses.code.clone());
-    let rules = select(Mode::Code, &lens_ids)?;
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
     let model_ids = model_ids_for(&model_names, cfg);
@@ -955,15 +878,15 @@ pub async fn run_incremental_review(
     };
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
-    if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
+    if let Some(s) = sink { s.on_meta(&model_names); }
     let budget = pack_budget_bytes(cfg, &model_names);
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
     // dispute 契约不因补跑丢失。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts, &inc_section)
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section)
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk)).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk)).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
     //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。
@@ -971,8 +894,7 @@ pub async fn run_incremental_review(
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
     let anchored = anchor(raw.findings, root);
-    let mut new_findings = dedup(anchored);
-    clamp_compliance(&mut new_findings);
+    let new_findings = dedup(anchored);
     let mut resolution_disputed: Vec<String> = new_findings
         .iter()
         .filter(|f| resolved_ids.contains(&f.id))
@@ -1019,7 +941,6 @@ pub async fn run_incremental_review(
             job_id: String::new(),
             models: model_names,
             model_ids,
-            lenses: lens_ids,
             duration_ms: t0.elapsed().as_millis() as u64,
             usage: Usage {
                 input_tokens: raw.usage.0, output_tokens: raw.usage.1, cached_input_tokens: raw.usage.2,
@@ -1137,11 +1058,10 @@ impl CellSink for JobCellSink {
         }
     }
 
-    fn on_meta(&self, models: &[String], lenses: &[String]) {
+    fn on_meta(&self, models: &[String]) {
         let _g = self.lock.lock().unwrap();
         if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
             st.models = models.to_vec();
-            st.lenses = lenses.to_vec();
             let _ = crate::state::job::write_state(&self.ws, &st);
         }
     }
@@ -1279,7 +1199,6 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
             job_id: job_id.to_string(),
             models: vec![],
             model_ids: vec![],
-            lenses: vec![],
             duration_ms: 0,
             usage: Usage::default(),
             warnings: vec![format!("partial: {done}/{total} cells"), reason],
@@ -1298,7 +1217,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
 fn empty_review_args() -> ReviewArgs {
     ReviewArgs {
         mode: None, base: None, scope: "working-tree".into(), spec: vec![], focus: None,
-        lenses: None, models: None, models_all: false, no_correlate: false,
+        models: None, models_all: false, no_correlate: false,
         block_threshold: None, conf_floor: None, background: false, format: "json".into(),
         targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     }
@@ -1357,8 +1276,6 @@ pub async fn run_resume(
             return partial_report(ws, job_id, &args, format!("resume: cannot determine mode: {e}"));
         }
     };
-    let fallback_lens = match mode { Mode::Code => "code", Mode::Doc => "doc" };
-
     let done: std::collections::BTreeSet<String> = crate::state::store::read_partial(ws, job_id)
         .into_iter()
         .filter(|r| r.ok)
@@ -1376,7 +1293,7 @@ pub async fn run_resume(
                 usage.0 += call.input_tokens;
                 usage.1 += call.output_tokens; usage.2 += call.cached_input_tokens;
                 let fs: Vec<Finding> =
-                    call.findings.iter().map(|r| enrich(r, fallback_lens, &cell.model)).collect();
+                    call.findings.iter().map(|r| enrich(r, &cell.model)).collect();
                 crate::state::store::CellRecord::ok(cell.cell.clone(), cell.model.clone(), fs)
             }
             Err(e) => {
@@ -1402,14 +1319,6 @@ pub async fn run_resume(
 
     let (models, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
-    let lens_ids: Vec<String> = args
-        .lenses
-        .as_deref()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_else(|| match mode {
-            Mode::Code => cfg.review.lenses.code.clone(),
-            Mode::Doc => cfg.review.lenses.doc.clone(),
-        });
     let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     let correlate_on = cfg.review.correlate && !args.no_correlate;
@@ -1429,7 +1338,6 @@ pub async fn run_resume(
         provider,
         model_ids: model_ids_for(&model_names, cfg),
         model_names,
-        lens_ids,
         block,
         floor,
         correlate_on,
@@ -1548,7 +1456,6 @@ pub async fn run_job(
             st.exit_code = Some(code);
             st.mode = Some(report.mode);
             st.models = report.run.models.clone();
-            st.lenses = report.run.lenses.clone();
             st.result_path = Some(format!("proj.db#results/{job_id}"));
             let _ = write_state(ws, &st);
             code
@@ -1584,7 +1491,7 @@ mod job_tests {
         Finding {
             id: "f".into(), severity: Severity::Medium, title: title.into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            lenses: vec![], models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
+            models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
             quote: "q".into(), cluster_id: None, verify: None, previously_dismissed: false,
             origin: Origin::New,
         }
@@ -1593,7 +1500,7 @@ mod job_tests {
     fn doc_args(target: &str) -> ReviewArgs {
         ReviewArgs {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None, lenses: None, models: None, models_all: false,
+            spec: vec![], focus: None, models: None, models_all: false,
             no_correlate: false, block_threshold: None, conf_floor: None,
             background: true, format: "json".into(), targets: vec![target.into()],
             resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
@@ -1617,7 +1524,7 @@ mod job_tests {
         scripted.insert("alpha".into(), vec![RawFinding {
             severity: Severity::High, title: "t".into(), body: "b".into(), file: dp.clone(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: "the wrong claim here".into(), lens: None,
+            hard_constraint: false, quote: "the wrong claim here".into(),
         }]);
         let provider = FakeProvider { scripted, ..Default::default() };
         let ws = dir.path().join("ws");
@@ -1822,7 +1729,6 @@ mod resume_tests {
                     recommendation: "r".into(),
                     hard_constraint: false,
                     quote: String::new(), // 空引用=遗漏类，anchor_doc 无条件保留
-                    lens: None,
                 }],
                 input_tokens: 1,
                 output_tokens: 1,
@@ -1838,7 +1744,7 @@ mod resume_tests {
         Finding {
             id: title.into(), severity: Severity::Low, title: title.into(), body: "b".into(),
             file: "spec.md".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), lenses: vec![], models: vec!["m".into()], agreement: 1,
+            recommendation: "r".into(), models: vec!["m".into()], agreement: 1,
             hard_constraint: false, quote: String::new(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New,
         }
@@ -1868,7 +1774,7 @@ mod resume_tests {
 
         let args = ReviewArgs {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None, lenses: None, models: Some("m".into()), models_all: false,
+            focus: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
             format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
@@ -1915,7 +1821,7 @@ mod resume_tests {
 
         let args = ReviewArgs {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None, lenses: None, models: Some("alpha,beta".into()), models_all: false,
+            focus: None, models: Some("alpha,beta".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
             format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
@@ -1950,7 +1856,7 @@ mod resume_tests {
         // 只写 args，从不 write_manifest（模拟 fan-out 前崩溃）。
         let args = ReviewArgs {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None, lenses: None, models: Some("m".into()), models_all: false,
+            focus: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
             format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
@@ -2062,7 +1968,7 @@ default_models=["alpha"]
         );
         let my_args = ReviewArgs {
             mode: Some("code".into()), base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
+            spec: vec![], focus: None, models: None, models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
             resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
@@ -2079,7 +1985,7 @@ default_models=["alpha"]
     fn args() -> ReviewArgs {
         ReviewArgs {
             mode: Some("code".into()), base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None, lenses: Some("L1".into()), models: Some("m".into()),
+            spec: vec![], focus: None, models: Some("m".into()),
             models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
@@ -2091,7 +1997,7 @@ default_models=["alpha"]
         RawFinding {
             severity: sev, title: "issue".into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "fix".into(),
-            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: quote.into(),
         }
     }
 
@@ -2159,6 +2065,18 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn review_args_ignores_legacy_lenses_key() {
+        // E8-I：旧 args.json（--background 落盘）仍带 "lenses" 键——serde 静默忽略，resume 不炸。
+        let j = r#"{"mode":"code","base":null,"scope":"branch","spec":[],"focus":null,
+            "lenses":"L1,L2","models":null,"models_all":false,"no_correlate":false,
+            "block_threshold":null,"conf_floor":null,"background":true,"format":"json",
+            "targets":[],"resume":null}"#;
+        let a: ReviewArgs = serde_json::from_str(j).unwrap();
+        assert_eq!(a.scope, "branch");
+        assert!(a.background);
+    }
+
+    #[test]
     fn build_dossiers_toggle_off_arm_all_empty_on_arm_nonempty() {
         let _g = ENV_LOCK.lock().unwrap();
         use crate::bundle::Bundle;
@@ -2167,24 +2085,25 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
-        // bundle 1：支持语言 + ≥5 引用点 → 应注入；bundle 2：自身 .py 未写盘（无贡献），但默认
-        // 变更集全景令其 pack 从兄弟 a.rs 拿到内容（非空）——T01⑥ 意图已由全景默认取代。
+        std::fs::write(root.join("src/b.rs"), "pub fn other() {}\n").unwrap();
+        // 单格全审默认（E9）后改写：build_packs 不再做跨 bundle 兄弟注入——两 bundle 各自
+        // 以自家内容非空（DossierMeta 的多 bundle 计数仍是通用函数行为，值得独立守住）。
         let bundles = vec![
             Bundle { files: vec![FileChange {
                 path: "src/a.rs".into(),
                 diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
             }] },
             Bundle { files: vec![FileChange {
-                path: "src/b.py".into(),
-                diff: "@@ -1,0 +1,1 @@\n+def f(): pass\n".into(),
+                path: "src/b.rs".into(),
+                diff: "@@ -1,0 +1,1 @@\n+pub fn other() {}\n".into(),
             }] },
         ];
 
-        // on 臂：两段皆非空（bundle 2 靠全景从兄弟 a.rs 拿到引用点）→ meta 反映 injected:2
+        // on 臂：两段各以自家内容非空 → meta 反映 injected:2
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
         let (on, on_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(!on[0].is_empty(), "支持语言且≥5引用点应非空: {on:?}");
-        assert!(on[1].contains("target"), "bundle 2 自身不供内容，但全景从兄弟 a.rs 拿到 target: {on:?}");
+        assert!(on[0].contains("target"), "bundle 1 自家内容非空: {on:?}");
+        assert!(on[1].contains("other"), "bundle 2 自家内容非空: {on:?}");
         assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 2, suppressed: false });
 
         // off 臂：REDTEAM_NO_DOSSIER 生效 → 全空段 + suppressed=true + injected=0
@@ -2245,20 +2164,19 @@ mod tests {
         ];
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let drafts = vec![]; // 空草稿也合法
-        let rules = vec![crate::lens::by_id("L1").unwrap()];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, "").unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "").unwrap();
         assert!(p.contains("pub const LIMIT"), "needs 文件全文进包: {p}");
         assert!(p.contains("first_pass_draft"), "草稿段在场");
         assert!(p.contains("CONFIRM or REVISE"), "确认或修订语义");
         assert!(!p.contains("<incremental_round>"), "全量路径第二趟无增量段");
         // 增量轮：inc_section 原样带入第二趟（claimed-resolved/dispute 契约不因补跑丢失）
         let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
-        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, &inc).unwrap();
+        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, &inc).unwrap();
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段带入第二趟: {pi}");
         assert!(pi.contains("pub const LIMIT"), "增量第二趟 needs 证据仍在场");
         // 路径逃逸：绝对路径 needs 被 skip、不 panic、其余照常
         let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
-        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &evil, &drafts, "");
+        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "");
         if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
     }
 
@@ -2285,12 +2203,11 @@ mod tests {
         let drafts = vec![Finding {
             id: "x".into(), severity: Severity::High, title: "weak hash".into(), body: "b".into(),
             file: "src/a.rs".into(), line_start: 5, line_end: 6, confidence: 0.9,
-            recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
+            recommendation: "r".into(), models: vec![], agreement: 1,
             hard_constraint: false, quote: "md5(pw)".into(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New,
         }];
-        let rules = vec![crate::lens::by_id("L1").unwrap()];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, "").unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "").unwrap();
         assert!(p.contains("## 补查证据"), "行窗补查段在场");
         assert!(p.contains("src/long.rs:70-132"), "±30 行窗头: {p}");
         assert!(p.contains("line70") && p.contains("line132"), "窗内行在场");
@@ -2302,7 +2219,7 @@ mod tests {
             NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
             NeedEntry { path: "src/long.rs".into(), lines: None, reason: "r".into() },
         ];
-        let pb = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &both, &drafts, "").unwrap();
+        let pb = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &both, &drafts, "").unwrap();
         assert!(pb.contains("src/long.rs:1-200（全文"), "全文条目在场: {pb}");
         assert!(!pb.contains("## 补查证据"), "同 path 行窗段被全文超集互斥掉: {pb}");
     }
@@ -2317,15 +2234,14 @@ mod tests {
             mode: Mode::Doc, target_label: "spec.md".into(),
             collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
         };
-        let rules = vec![crate::lens::by_id("D1").unwrap()];
         let needs = vec![NeedEntry { path: "spec2.md".into(), lines: None, reason: "cross-ref".into() }];
-        let p = doc_second_pass_prompt(&input, &rules, "", root, &needs, &[]).unwrap();
+        let p = doc_second_pass_prompt(&input, "", root, &needs, &[]).unwrap();
         assert!(p.contains("DOCBODY"), "原 doc prompt 在场");
         assert!(p.contains("## 补查证据") && p.contains("background detail"), "补查段在场");
         assert!(p.contains("first_pass_draft"), "草稿段在场");
         // 全部 needs 逃逸 → None（不补跑）
         let evil = vec![NeedEntry { path: "../outside.md".into(), lines: None, reason: "x".into() }];
-        assert!(doc_second_pass_prompt(&input, &rules, "", root, &evil, &[]).is_none());
+        assert!(doc_second_pass_prompt(&input, "", root, &evil, &[]).is_none());
     }
 
     #[test]
@@ -2345,8 +2261,7 @@ mod tests {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
         }] }];
         let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into() }];
-        let rules = vec![crate::lens::by_id("L1").unwrap()];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &[], "").unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "").unwrap();
         assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);
         assert!(p.contains("fn own()"), "证据段截断后 pack 仍照常渲染自家文件");
         assert!(p.len() < 300_000, "总 prompt 长度被证据帽拘住，未逼近原 100KB 单行体量: {}", p.len());
@@ -2367,11 +2282,10 @@ mod tests {
             mode: Mode::Doc, target_label: "spec.md".into(),
             collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
         };
-        let rules = vec![crate::lens::by_id("D1").unwrap()];
         let needs: Vec<NeedEntry> = (0..6)
             .map(|i| NeedEntry { path: format!("doc{i}.md"), lines: None, reason: "r".into() })
             .collect();
-        let p = doc_second_pass_prompt(&input, &rules, "", root, &needs, &[]).unwrap();
+        let p = doc_second_pass_prompt(&input, "", root, &needs, &[]).unwrap();
         assert!(p.contains("doc4.md:1-1"), "累计未超帽前的段落在场: {p}");
         assert!(!p.contains("doc5.md:1-1"), "累计超帽后的段落应被丢弃");
         assert!(p.contains("（其余补查条目因预算裁剪省略）"), "总帽裁剪注记在场: {p}");
@@ -2388,93 +2302,36 @@ mod tests {
     }
 
     #[test]
-    fn build_packs_default_gives_changeset_panorama_with_real_sibling_diff() {
+    fn build_packs_single_bundle_over_budget_file_falls_back_to_def_body_with_real_diff() {
+        // E9 单格默认后改写：不再有跨 bundle 兄弟注入——E8-D 回归锚从「兄弟」换成
+        // 「同格文件超预算」：同一 bundle 内一个小文件 + 一个超预算大文件，大文件必走
+        // def 锚回落，而锚定消费的是 fc.diff——若被塞空 diff 占位（E8 裁决 D 回归），
+        // def 锚不到、本块静默消失。
         use crate::bundle::Bundle;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
-        // 兄弟 b.rs 撑超 pack 预算：全文分支放不下 → 必走 def 锚回落，而锚定消费的是
-        // fc.diff——兄弟若被塞空 diff 占位（E8 裁决 D 回归），def 锚不到、本块静默消失。
+        // 同格 b.rs 撑超 pack 预算：全文分支放不下 → 必走 def 锚回落。
         let filler_line = "// 填充行：撑爆预算迫入 def 锚回落\n";
-        let sibling = format!(
+        let big = format!(
             "pub fn beta_marker() {{\n    let marker_body = 1;\n}}\n{}",
             filler_line.repeat(PACK_BUDGET_BYTES / filler_line.len() + 10)
         );
-        std::fs::write(root.join("src/b.rs"), &sibling).unwrap();
-        let bundles = vec![
-            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() }] },
-        ];
+        std::fs::write(root.join("src/b.rs"), &big).unwrap();
+        let bundles = vec![Bundle { files: vec![
+            FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() },
+            FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() },
+        ] }];
         let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 默认追加兄弟文件全景");
-        assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 默认追加兄弟文件全景");
-        // 真 diff 穿透证明（集成级）：兄弟超预算迫入 def 锚回落分支（changed_def_ranges
-        // 消费兄弟真 diff）——空 diff 占位回归下无锚可寻，以下三条断言全灭。
-        assert!(on[0].contains("（def 体，全文超预算回落）"), "兄弟超预算迫入 def 回落分支");
-        assert!(on[0].contains("let marker_body = 1;"), "兄弟改动 fn 的 def 体在场（真 diff 锚定）");
+        assert!(on[0].contains("alpha_marker"), "小文件全文在场");
+        // 真 diff 穿透证明（集成级）：超预算文件迫入 def 锚回落分支（changed_def_ranges
+        // 消费其真 diff）——空 diff 占位回归下无锚可寻，以下两条断言全灭。
+        assert!(on[0].contains("（def 体，全文超预算回落）"), "超预算文件迫入 def 回落分支");
+        assert!(on[0].contains("let marker_body = 1;"), "超预算文件改动 def 体在场（真 diff 锚定）");
         assert!(!on[0].contains("填充行"), "回落只给改动 def 体，不带填充");
         // 同 path 不重复
-        assert_eq!(on[0].matches("src/b.rs").count(), 1, "兄弟条目 src/b.rs 不重复");
-        assert_eq!(on[1].matches("src/a.rs").count(), 1, "兄弟条目 src/a.rs 不重复");
-    }
-
-    #[test]
-    fn build_packs_panorama_does_not_double_reserve_sibling_diff_budget() {
-        // Fix 1 回归：全景 pb 混入兄弟真 diff，旧实现拿 pb.files 重新求和当预算扣除，
-        // 兄弟 diff 巨大时 remaining 饱和到 0、本 cell 自己那份小文件的 0 壳也塌缩——
-        // 即便实际进 prompt 的 diff 只有 own bundle 那份（orchestrate 用原 bundle 建 diff 块）。
-        use crate::bundle::Bundle;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
-        std::fs::write(root.join("src/b.rs"), "pub fn beta_marker() {}\n").unwrap();
-        // 兄弟 diff 本身（非文件体）巨大：撑到 >= 预算，令旧「pb.files 全体求和」饱和 remaining=0。
-        let huge_sibling_diff = format!("@@ -1,0 +1,1 @@\n+{}\n", "x".repeat(6_000));
-        let bundles = vec![
-            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: huge_sibling_diff }] },
-        ];
-        let (on, _) = build_packs(&bundles, root, 5_000);
-        assert!(on[0].contains("## 改动源文（0 壳）") && on[0].contains("alpha_marker"),
-            "格0 自身小文件应仍全文渲染，不被兄弟巨 diff 挤空: {}", on[0]);
-    }
-
-    #[test]
-    fn panorama_siblings_sorted_by_dep_rank() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        // own 引用 zeta（词边界），不引用 alpha —— 尽管 alpha 字典序在前，zeta 应排前
-        std::fs::write(root.join("src/own.rs"), "use crate::zeta::thing;\nfn f() { zeta::go(); }\n").unwrap();
-        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
-        std::fs::write(root.join("src/zeta.rs"), "pub fn go() {}\n").unwrap();
-        let own = vec![FileChange { path: "src/own.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }];
-        assert_eq!(dep_rank(&own, "src/zeta.rs", root), 0, "被 own 引用 → rank 0");
-        assert_eq!(dep_rank(&own, "src/alpha.rs", root), 1, "未被引用 → rank 1");
-    }
-
-    #[test]
-    fn build_packs_panorama_siblings_ordered_by_dep_rank() {
-        // 集成层排序断言：own 引用 zeta 不引用 alpha —— 尽管 alpha 字典序在前，全景注入循环
-        // 应把 zeta 块排在 alpha 块之前（最远先降，E8 岗位①）。
-        use crate::bundle::Bundle;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/own.rs"), "use crate::zeta::thing;\nfn f() { zeta::go(); }\n").unwrap();
-        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
-        std::fs::write(root.join("src/zeta.rs"), "pub fn go() {}\n").unwrap();
-        let bundles = vec![
-            Bundle { files: vec![FileChange { path: "src/own.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/alpha.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/zeta.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
-        ];
-        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        let zeta_pos = on[0].find("src/zeta.rs").expect("zeta 块在场");
-        let alpha_pos = on[0].find("src/alpha.rs").expect("alpha 块在场");
-        assert!(zeta_pos < alpha_pos, "被引用兄弟 zeta 应先于未引用兄弟 alpha 出现: {}", on[0]);
+        assert_eq!(on[0].matches("src/b.rs").count(), 1, "同格文件条目 src/b.rs 不重复");
     }
 
     #[test]
@@ -2604,11 +2461,11 @@ context_window_tokens = 40000
             severity: Severity::High, title: "Weak hash".into(), body: "b".into(),
             file: "src/x.rs".into(), line_start: ls, line_end: le, confidence: 0.9,
             recommendation: "r".into(), hard_constraint: false,
-            quote: "md5(pw)".into(), lens: None,
+            quote: "md5(pw)".into(),
         };
-        let before = enrich(&raw(5, 7), "L1", "m");          // 第一轮：驳回它
+        let before = enrich(&raw(5, 7), "m");          // 第一轮：驳回它
         let dismissed: HashSet<String> = [before.id.clone()].into();
-        let mut after = vec![enrich(&raw(50, 52), "L1", "m")]; // 修复位移后再现
+        let mut after = vec![enrich(&raw(50, 52), "m")]; // 修复位移后再现
         let reappeared = mark_dismissed(&mut after, &dismissed);
         assert_eq!(reappeared, vec![before.id]);
         assert!(after[0].previously_dismissed);
@@ -2652,7 +2509,7 @@ mod incremental_tests {
         RawFinding {
             severity: Severity::High, title: title.into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: quote.into(),
         }
     }
 
@@ -2660,7 +2517,7 @@ mod incremental_tests {
     pub(super) fn inc_args(base: &str, prior: &str) -> ReviewArgs {
         ReviewArgs {
             mode: Some("code".into()), base: Some(base.into()), scope: "branch".into(),
-            spec: vec![], focus: None, lenses: Some("L1".into()), models: Some("m".into()),
+            spec: vec![], focus: None, models: Some("m".into()),
             models_all: false, no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![], resume: None,
             dismissed: None, no_dismissed: false, incremental_from: Some(prior.into()),
@@ -2675,7 +2532,7 @@ mod incremental_tests {
             schema_version: "3".into(), mode: Mode::Code, verdict: Verdict::Approve,
             stats, findings, clusters: vec![],
             run: RunMeta {
-                job_id: job.into(), models: vec!["m".into()], lenses: vec!["L1".into()],
+                job_id: job.into(), models: vec!["m".into()],
                 head_sha: Some(head_sha.into()), ..Default::default()
             },
         };
@@ -2695,7 +2552,7 @@ mod incremental_tests {
         let ok = std::process::Command::new("git").current_dir(dir.path())
             .args(["branch", "dev0", &c1]).output().unwrap();
         assert!(ok.status.success());
-        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m")]);
+        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "m")]);
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n}\n").unwrap();
         commit_all(dir.path(), "fix");
         let base = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap();
@@ -2717,7 +2574,7 @@ mod incremental_tests {
         let c1 = commit_all(dir.path(), "c1");
         std::process::Command::new("git").current_dir(dir.path())
             .args(["branch", "dev0", &c1]).output().unwrap();
-        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m")]);
+        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "m")]);
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n}\n").unwrap();
         commit_all(dir.path(), "fix");
         // 未提交的 tracked 编辑（不 commit）：净树守卫必须先拦下，不放行到载入上轮 result
@@ -2840,8 +2697,8 @@ default_models=["m"]
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    md5(pw);\n}\n").unwrap();
         let c1 = commit_all(dir.path(), "c1");
         std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
-        let f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m");
-        let f2 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "L1", "m");
+        let f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "m");
+        let f2 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "m");
         let (id1, id2) = (f1.id.clone(), f2.id.clone());
         write_prior(dir.path(), "jprev", &c1, vec![f1, f2]);
         // fix：修掉 md5 行，引入新问题行
@@ -2872,7 +2729,7 @@ default_models=["m"]
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    md5(pw);\n    other();\n}\n").unwrap();
         let c1 = commit_all(dir.path(), "c1");
         std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
-        let f1 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "L1", "m");
+        let f1 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "m");
         let id1 = f1.id.clone();
         write_prior(dir.path(), "jprev", &c1, vec![f1]);
         // 销案（谎称已修）——快照四件套与 finding 同源
@@ -2904,7 +2761,7 @@ default_models=["m"]
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
         let c1 = commit_all(dir.path(), "c1");
         std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
-        let mut f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m");
+        let mut f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "m");
         f1.agreement = 2;
         f1.models = vec!["m".into(), "m2".into()];
         let id1 = f1.id.clone();
@@ -2932,5 +2789,20 @@ default_models=["m"]
         let merged = merge_bundles(bs);
         assert_eq!(merged.len(), 1, "单格全审：全部并成一个 bundle");
         assert_eq!(merged[0].files.len(), 3);
+    }
+
+    #[test]
+    fn bundles_collapse_to_single_cell_by_default() {
+        // E9：单格全审默认——group 产多 bundle 后恒并单格（无 env 门）
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let fc = |p: &str| FileChange { path: p.into(), diff: format!("@@ -1,0 +1,1 @@\n+x // {p}\n") };
+        let bs = vec![
+            Bundle { files: vec![fc("src/a.rs")] },
+            Bundle { files: vec![fc("src/b.rs")] },
+        ];
+        let merged = merge_bundles(bs);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].files.len(), 2);
     }
 }

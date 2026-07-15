@@ -51,7 +51,7 @@ mod tests {
         RawFinding {
             severity: Severity::High, title: title.into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), hard_constraint: false, quote: "q".into(), lens: None,
+            recommendation: "r".into(), hard_constraint: false, quote: "q".into(),
         }
     }
 

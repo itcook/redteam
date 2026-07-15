@@ -42,20 +42,6 @@ pub struct ProviderConfig {
     pub context_window_tokens: Option<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct LensSets {
-    #[serde(default = "default_code_lenses")]
-    pub code: Vec<String>,
-    #[serde(default = "default_doc_lenses")]
-    pub doc: Vec<String>,
-}
-fn default_code_lenses() -> Vec<String> {
-    ["L1", "L2", "L3", "L4", "L0", "L5"].iter().map(|s| s.to_string()).collect()
-}
-fn default_doc_lenses() -> Vec<String> {
-    ["D1", "D2", "D3", "D4", "D5"].iter().map(|s| s.to_string()).collect()
-}
-
 /// 评审工具档位（design 2026-07-13 §2.4，E8 裁决 A）：off=纯无工具；two-stage=第一趟
 /// 无工具（needs 二阶段批 2 补全，当前行为=off 等价）；on=对话式工具（诊断/对照档）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -87,8 +73,6 @@ pub struct ReviewConfig {
     pub correlate: bool,
     #[serde(default = "default_concurrency")]
     pub max_concurrency: usize,
-    #[serde(default)]
-    pub lenses: LensSets,
     /// 工具档位：off | two-stage（默认）| on。
     #[serde(default = "default_tools")]
     pub tools: ToolsMode,
@@ -97,15 +81,12 @@ fn default_block() -> Severity { Severity::Medium }
 fn default_floor() -> f32 { 0.5 }
 fn default_true() -> bool { true }
 fn default_concurrency() -> usize { 8 }
-impl Default for LensSets {
-    fn default() -> Self { LensSets { code: default_code_lenses(), doc: default_doc_lenses() } }
-}
 impl Default for ReviewConfig {
     fn default() -> Self {
         ReviewConfig { default_models: vec![], block_threshold: default_block(),
             conf_floor: default_floor(), correlate: default_true(),
             max_concurrency: default_concurrency(),
-            lenses: LensSets::default(), tools: default_tools() }
+            tools: default_tools() }
     }
 }
 

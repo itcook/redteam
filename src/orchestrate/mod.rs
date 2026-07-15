@@ -1,7 +1,6 @@
 use crate::bundle::Bundle;
 use crate::domain::{Finding, NeedEntry, Origin, RawFinding, ReviewInput};
 use crate::hash::fnv1a64_hex;
-use crate::lens::Lens;
 use crate::prompt::{build_bundle_prompt, build_doc_prompt};
 use crate::provider::{LensRequest, ReviewProvider};
 #[cfg(test)]
@@ -19,9 +18,9 @@ pub trait CellSink: Send + Sync {
     /// 阶段转换钩子（后台 job 用；默认 no-op，前台 sink=None / 其他 sink 零影响）。
     /// `note`：阶段注记（如 refute 的 "N targets"），进 phase_history 时间线。
     fn on_phase(&self, _phase: crate::state::job::Phase, _note: Option<String>) {}
-    /// resolve 完成即报 models/lenses（后台 job stamp 进 state，running 期 status 可见；
+    /// resolve 完成即报 models（后台 job stamp 进 state，running 期 status 可见；
     /// 此前 done 时才从 report 回填——r1 20260703 实证运行全程空数组）。默认 no-op。
-    fn on_meta(&self, _models: &[String], _lenses: &[String]) {}
+    fn on_meta(&self, _models: &[String]) {}
 }
 
 #[derive(Clone, Debug)]
@@ -76,9 +75,8 @@ pub fn finding_id(file: &str, quote: &str, title: &str, line_start: u32, line_en
     }
 }
 
-pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
+pub fn enrich(raw: &RawFinding, model: &str) -> Finding {
     let id = finding_id(&raw.file, &raw.quote, &raw.title, raw.line_start, raw.line_end);
-    let lens = raw.lens.as_deref().unwrap_or(fallback_lens).to_string();
     Finding {
         id,
         severity: raw.severity,
@@ -89,7 +87,6 @@ pub fn enrich(raw: &RawFinding, fallback_lens: &str, model: &str) -> Finding {
         line_end: raw.line_end,
         confidence: raw.confidence,
         recommendation: raw.recommendation.clone(),
-        lenses: vec![lens],
         models: vec![model.to_string()],
         agreement: 1,
         hard_constraint: raw.hard_constraint,
@@ -173,7 +170,7 @@ async fn run_one_bundle(
                 let fs = call
                     .findings
                     .iter()
-                    .map(|r| enrich(r, "code", &pm.name))
+                    .map(|r| enrich(r, &pm.name))
                     .collect();
                 return CellRun {
                     model: pm.name.clone(), findings: fs,
@@ -255,7 +252,6 @@ pub async fn run_code_fanout(
     provider: &dyn ReviewProvider,
     target_label: &str,
     bundles: &[Bundle],
-    rules: &[&Lens],
     focus: &str,
     incremental: &str,
     dossiers: &[String],
@@ -272,7 +268,7 @@ pub async fn run_code_fanout(
             let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
             let others = crate::bundle::other_files_manifest(bundles, i);
             let dossier = dossiers.get(i).map(String::as_str).unwrap_or("");
-            let prompt = build_bundle_prompt(target_label, bundle, rules, focus, &others, incremental, dossier);
+            let prompt = build_bundle_prompt(target_label, bundle, focus, &others, incremental, dossier);
             let cell_id = format!("bundle[{label}]");
             (cell_id, label, prompt)
         })
@@ -410,7 +406,7 @@ async fn run_one_doc(
     for (i, pm) in chain.iter().enumerate() {
         match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
-                let fs = call.findings.iter().map(|r| enrich(r, "doc", &pm.name)).collect();
+                let fs = call.findings.iter().map(|r| enrich(r, &pm.name)).collect();
                 return CellRun {
                     model: pm.name.clone(), findings: fs,
                     tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
@@ -436,14 +432,13 @@ async fn run_one_doc(
 pub async fn run_doc_fanout(
     provider: &dyn ReviewProvider,
     input: &ReviewInput,
-    rules: &[&Lens],
     focus: &str,
     opts: &OrchestrateOpts,
     sink: Option<&dyn CellSink>,
     second_prompt: SecondPrompt<'_>,
 ) -> RawResults {
     // 整篇文档为单一 cell：prompt 只渲染一次，manifest 与执行复用同一份。
-    let prompt = build_doc_prompt(input, rules, focus);
+    let prompt = build_doc_prompt(input, focus);
     let cell_id = "doc".to_string();
 
     if opts.replicate {
@@ -541,13 +536,11 @@ pub async fn run_doc_fanout(
 mod tests {
     use super::*;
     use crate::domain::Severity;
-    use crate::lens::by_id;
     use crate::provider::fake::FakeProvider;
     use crate::domain::{Mode, ReviewInput, RawFinding};
 
     use crate::bundle::Bundle;
     use crate::evidence::git::FileChange;
-    use crate::lens::by_id as lens_by_id;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -555,7 +548,7 @@ mod tests {
         RawFinding {
             severity: Severity::High, title: t.into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: "q".into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: "q".into(),
         }
     }
 
@@ -563,7 +556,7 @@ mod tests {
         RawFinding {
             severity: sev, title: title.into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: "q".into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: "q".into(),
         }
     }
 
@@ -576,10 +569,6 @@ mod tests {
     /// brief 里称 `rawf`——等价 raw_q，起个短名跟 brief 测试代码对齐。
     fn rawf(t: &str) -> RawFinding {
         raw_q(t)
-    }
-
-    fn rules() -> Vec<&'static Lens> {
-        vec![lens_by_id("L1").unwrap()]
     }
 
     fn need(path: &str, reason: &str) -> NeedEntry {
@@ -641,7 +630,7 @@ mod tests {
             assert_eq!(drafts.len(), 1, "草稿传入构造器");
             Some("second pass prompt".to_string())
         };
-        let out = run_code_fanout(&provider, "t", &bundles_one(), &rules(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
+        let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
         assert_eq!(out.findings.len(), 2, "第二趟整体替换第一趟");
         assert_eq!(out.needs_stats, (1, 1));
     }
@@ -651,7 +640,7 @@ mod tests {
         let first = lens_call_with(vec![rawf("draft finding")], vec![need("src/x.rs", "verify")]);
         let provider = SeqProvider::new(vec![first]); // 第二趟无 script → Err
         let mk = |_i: usize, _n: &[NeedEntry], _d: &[Finding]| Some("p2".to_string());
-        let out = run_code_fanout(&provider, "t", &bundles_one(), &rules(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
+        let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
         assert_eq!(out.findings.len(), 1, "第二趟失败保留第一趟");
         assert!(out.warnings.iter().any(|w| w.contains("second pass failed")));
     }
@@ -663,7 +652,7 @@ mod tests {
         let second = lens_call_with(vec![], vec![]);
         let provider = SeqProvider::new(vec![first, second]);
         let mk = |_i: usize, n: &[NeedEntry], _d: &[Finding]| { assert_eq!(n.len(), 5, "cap 5"); Some("p2".into()) };
-        let out = run_code_fanout(&provider, "t", &bundles_one(), &rules(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
+        let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
         assert!(out.warnings.iter().any(|w| w.contains("capped at 5")));
     }
 
@@ -675,11 +664,8 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
-        let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &[], &opts, None, None).await;
+        let r = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, None, None).await;
         assert_eq!(r.findings.len(), 3, "one finding per bundle");
-        // raw.lens=Some("L1") → enrich 用 L1（非 fallback）
-        assert!(r.findings.iter().all(|f| f.lenses == vec!["L1".to_string()]));
     }
 
     // prompt 记录探针：断言每个 bundle 收到自己（而非别的 bundle）的卷宗段。
@@ -701,13 +687,12 @@ mod tests {
             models: vec![PlannedModel { name: "m".into(), priority: 10 }],
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
-        let rules = vec![lens_by_id("L1").unwrap()];
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs")];
         let dossiers = vec![
             "<dossier>\nDOSSIER-A\n</dossier>".to_string(),
             "<dossier>\nDOSSIER-B\n</dossier>".to_string(),
         ];
-        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &dossiers, &opts, None, None).await;
+        let _ = run_code_fanout(&p, "wt", &bundles, "", "", &dossiers, &opts, None, None).await;
         let prompts = p.prompts.lock().unwrap();
         let pa = prompts.iter().find(|s| s.contains("### src/a.rs")).expect("bundle a 的 prompt 应被采集");
         let pb = prompts.iter().find(|s| s.contains("### src/b.rs")).expect("bundle b 的 prompt 应被采集");
@@ -741,9 +726,8 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 2,
         };
         let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
-        let rules = vec![lens_by_id("L1").unwrap()];
         let probe_ref: &ConcProbe = &probe;
-        let _ = run_code_fanout(probe_ref, "wt", &bundles, &rules, "", "", &[], &opts, None, None).await;
+        let _ = run_code_fanout(probe_ref, "wt", &bundles, "", "", &[], &opts, None, None).await;
         assert!(probe.max_seen.load(Ordering::SeqCst) <= 2, "concurrency exceeded cap: {}", probe.max_seen.load(Ordering::SeqCst));
         assert!(probe.max_seen.load(Ordering::SeqCst) >= 1);
     }
@@ -757,8 +741,7 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs")];
-        let rules = vec![lens_by_id("L1").unwrap()];
-        let r = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &[], &opts, None, None).await;
+        let r = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, None, None).await;
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"absent".to_string()), "explicit unreachable model must be recorded");
         assert!(!r.warnings.is_empty());
@@ -777,8 +760,6 @@ mod tests {
             Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] },
             Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "+y".into() }] },
         ];
-        let l1 = by_id("L1").unwrap();
-        let rules = vec![l1];
         let opts = OrchestrateOpts {
             models: vec![
                 PlannedModel { name: "alpha".into(), priority: 10 },
@@ -788,7 +769,7 @@ mod tests {
             no_fallback: false,
             max_concurrency: 8,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", "", &[], &opts, None, None).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, "", "", &[], &opts, None, None).await;
         // 2 bundle × 2 model = 4 格，各 1 finding → 4 条
         assert_eq!(out.findings.len(), 4);
         let models: std::collections::BTreeSet<&str> =
@@ -806,8 +787,6 @@ mod tests {
             vec![raw_at("src/a.rs", "alpha-issue", Severity::High)],
         );
         let bundles = vec![Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] }];
-        let l1 = by_id("L1").unwrap();
-        let rules = vec![l1];
         let opts = OrchestrateOpts {
             models: vec![
                 PlannedModel { name: "alpha".into(), priority: 10 },
@@ -817,7 +796,7 @@ mod tests {
             no_fallback: false,
             max_concurrency: 8,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, &rules, "", "", &[], &opts, None, None).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, "", "", &[], &opts, None, None).await;
         assert_eq!(out.findings.len(), 1); // alpha 成功
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -836,7 +815,6 @@ mod tests {
         scripted.insert("alpha".into(), vec![raw_at("spec.md", "alpha-issue", Severity::High)]);
         scripted.insert("beta".into(), vec![raw_at("spec.md", "beta-issue", Severity::High)]);
         let provider = crate::provider::fake::FakeProvider { scripted, ..Default::default() };
-        let rules = vec![by_id("D1").unwrap(), by_id("D2").unwrap()];
         let opts = OrchestrateOpts {
             models: vec![
                 PlannedModel { name: "alpha".into(), priority: 10 },
@@ -845,7 +823,7 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 8,
         };
         let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, Some(&sink), None).await;
+        let out = run_doc_fanout(&provider, &doc_input(), "", &opts, Some(&sink), None).await;
         assert_eq!(out.findings.len(), 2, "one finding per model over the single doc");
         // final-review Important 回归：replicate 下同一 base cell（"doc"）的多 model 副本，
         // manifest + on_cell 的 cell-id 必须各自带上 model 才唯一——否则 resume 的差集判定
@@ -864,7 +842,6 @@ mod tests {
     #[tokio::test]
     async fn doc_fanout_replicate_records_failed_model() {
         let provider = FakeProvider::with("alpha", vec![raw_at("spec.md", "alpha-issue", Severity::High)]);
-        let rules = vec![by_id("D1").unwrap()];
         let opts = OrchestrateOpts {
             models: vec![
                 PlannedModel { name: "alpha".into(), priority: 10 },
@@ -872,7 +849,7 @@ mod tests {
             ],
             replicate: true, no_fallback: false, max_concurrency: 8,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None, None).await;
+        let out = run_doc_fanout(&provider, &doc_input(), "", &opts, None, None).await;
         assert_eq!(out.findings.len(), 1);
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -881,7 +858,6 @@ mod tests {
     async fn doc_fanout_fallback_chain_first_success_wins() {
         // 非 replicate 候补：claude 无脚本、gpt 有 → 候补命中 gpt，不记 failed_models。
         let provider = FakeProvider::with("gpt", vec![raw_at("spec.md", "found-by-gpt", Severity::High)]);
-        let rules = vec![by_id("D1").unwrap()];
         let opts = OrchestrateOpts {
             models: vec![
                 PlannedModel { name: "claude".into(), priority: 30 },
@@ -889,7 +865,7 @@ mod tests {
             ],
             replicate: false, no_fallback: false, max_concurrency: 4,
         };
-        let out = run_doc_fanout(&provider, &doc_input(), &rules, "", &opts, None, None).await;
+        let out = run_doc_fanout(&provider, &doc_input(), "", &opts, None, None).await;
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].models, vec!["gpt".to_string()]);
         assert!(out.failed_models.is_empty());
@@ -918,9 +894,8 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
-        let rules = vec![lens_by_id("L1").unwrap()];
         let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
-        let _ = run_code_fanout(&p, "wt", &bundles, &rules, "", "", &[], &opts, Some(&sink), None).await;
+        let _ = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, Some(&sink), None).await;
         assert_eq!(*sink.manifest_n.lock().unwrap(), 3, "manifest 全集=3 cell");
         assert_eq!(sink.records.lock().unwrap().len(), 3, "每 cell 各回调一次");
     }
@@ -974,13 +949,12 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/slow.rs"), bundle("src/fast.rs")];
-        let rules = vec![lens_by_id("L1").unwrap()];
         let sink = StreamingProbeSink {
             slow_done: &provider.slow_done,
             fast_saw_slow_incomplete: None.into(),
             calls: AtomicUsize::new(0),
         };
-        let _ = run_code_fanout(&provider, "wt", &bundles, &rules, "", "", &[], &opts, Some(&sink), None).await;
+        let _ = run_code_fanout(&provider, "wt", &bundles, "", "", &[], &opts, Some(&sink), None).await;
         assert_eq!(sink.calls.load(Ordering::SeqCst), 2, "on_cell 调用次数=cell 数（聚合前逐个触发）");
         let saw = *sink.fast_saw_slow_incomplete.lock().unwrap();
         assert_eq!(
@@ -1035,8 +1009,7 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs")];
-        let rules = vec![lens_by_id("L1").unwrap()];
-        let out = run_code_fanout(&reg, "wt", &bundles, &rules, "", "", &[], &opts, None, None).await;
+        let out = run_code_fanout(&reg, "wt", &bundles, "", "", &[], &opts, None, None).await;
         assert!(out.failed_models.contains(&"bad".to_string()),
             "坏 model 应记 failed_models: {:?}", out.failed_models);
         assert!(out.findings.iter().any(|f| f.title == "real"),
@@ -1050,42 +1023,42 @@ mod tests {
         RawFinding {
             severity: Severity::High, title: title.into(), body: "b".into(),
             file: file.into(), line_start: ls, line_end: le, confidence: 0.9,
-            recommendation: "r".into(), hard_constraint: false, quote: quote.into(), lens: None,
+            recommendation: "r".into(), hard_constraint: false, quote: quote.into(),
         }
     }
 
     #[test]
     fn id_ignores_line_shift_when_quote_present() {
-        let a = enrich(&raw_full("a.rs", 10, 12, "SQL injection", "let q = fmt!(sql);"), "L1", "m");
-        let b = enrich(&raw_full("a.rs", 99, 101, "SQL injection", "let q = fmt!(sql);"), "L1", "m");
+        let a = enrich(&raw_full("a.rs", 10, 12, "SQL injection", "let q = fmt!(sql);"), "m");
+        let b = enrich(&raw_full("a.rs", 99, 101, "SQL injection", "let q = fmt!(sql);"), "m");
         assert_eq!(a.id, b.id, "行号位移不得改变 id");
     }
 
     #[test]
     fn id_ignores_whitespace_reformat() {
-        let a = enrich(&raw_full("a.rs", 1, 2, "SQL injection", "let q =\n    fmt!( sql );"), "L1", "m");
-        let b = enrich(&raw_full("a.rs", 1, 2, "SQL injection", "letq=fmt!(sql);"), "L1", "m");
+        let a = enrich(&raw_full("a.rs", 1, 2, "SQL injection", "let q =\n    fmt!( sql );"), "m");
+        let b = enrich(&raw_full("a.rs", 1, 2, "SQL injection", "letq=fmt!(sql);"), "m");
         assert_eq!(a.id, b.id, "quote 去空白后等价 → 同 id");
     }
 
     #[test]
     fn id_title_normalization_case_and_ws() {
-        let a = enrich(&raw_full("a.rs", 1, 1, "SQL  Injection", "x"), "L1", "m");
-        let b = enrich(&raw_full("a.rs", 1, 1, "sql injection", "x"), "L1", "m");
+        let a = enrich(&raw_full("a.rs", 1, 1, "SQL  Injection", "x"), "m");
+        let b = enrich(&raw_full("a.rs", 1, 1, "sql injection", "x"), "m");
         assert_eq!(a.id, b.id);
     }
 
     #[test]
     fn id_composition_pinned() {
         // 组成 golden：钉死组成与归一（FNV 算法本身由 hash.rs golden 钉死）。
-        let f = enrich(&raw_full("src/x.rs", 5, 7, "Weak  Hash", "md5( pw )"), "L1", "m");
+        let f = enrich(&raw_full("src/x.rs", 5, 7, "Weak  Hash", "md5( pw )"), "m");
         assert_eq!(f.id, crate::hash::fnv1a64_hex(&["src/x.rs", "md5(pw)", "weak hash"]));
     }
 
     #[test]
     fn id_falls_back_to_lines_without_quote() {
-        let a = enrich(&raw_full("a.rs", 1, 2, "t", ""), "L1", "m");
-        let b = enrich(&raw_full("a.rs", 3, 4, "t", ""), "L1", "m");
+        let a = enrich(&raw_full("a.rs", 1, 2, "t", ""), "m");
+        let b = enrich(&raw_full("a.rs", 3, 4, "t", ""), "m");
         assert_ne!(a.id, b.id, "无 quote 退化回行号路径");
         assert_eq!(a.id, crate::hash::fnv1a64_hex(&["a.rs", "1", "2", "t"]));
     }
