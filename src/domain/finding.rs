@@ -42,9 +42,6 @@ pub struct RawFinding {
     /// 逐字引用出问题的代码原文（positioning 用；prompt 契约要求必填）。
     #[serde(default)]
     pub quote: String,
-    /// 模型给本条 finding 打的 rule/lens id（保住 §7.4 severity 钳制）。
-    #[serde(default)]
-    pub lens: Option<String>,
 }
 
 /// 二阶段补查的证据声明（design 2026-07-13 §2.3，E8 裁决 C）：模型声明「判这个 claim
@@ -78,7 +75,6 @@ pub struct Finding {
     pub line_end: u32,
     pub confidence: f32,
     pub recommendation: String,
-    pub lenses: Vec<String>,
     pub models: Vec<String>,
     pub agreement: u32,
     pub hard_constraint: bool,
@@ -142,11 +138,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_finding_deserializes_quote_and_lens() {
-        let j = r#"{"severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":2,"confidence":0.9,"recommendation":"r","quote":"let x = secret();","lens":"L1"}"#;
+    fn raw_finding_ignores_legacy_lens_key() {
+        // E8-I：模型仍可能输出 lens 键——serde 静默忽略，不炸不存
+        let j = r#"{"severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":2,"confidence":0.9,"recommendation":"r","quote":"q","lens":"L1"}"#;
         let r: RawFinding = serde_json::from_str(j).unwrap();
-        assert_eq!(r.quote, "let x = secret();");
-        assert_eq!(r.lens.as_deref(), Some("L1"));
+        assert_eq!(r.quote, "q");
     }
 
     #[test]
@@ -154,7 +150,6 @@ mod tests {
         let j = r#"{"severity":"low","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r"}"#;
         let r: RawFinding = serde_json::from_str(j).unwrap();
         assert_eq!(r.quote, "");
-        assert_eq!(r.lens, None);
     }
 
     #[test]
@@ -162,7 +157,7 @@ mod tests {
         let f = Finding {
             id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
+            recommendation: "r".into(), models: vec![], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -175,7 +170,7 @@ mod tests {
         let mut f = Finding {
             id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
+            recommendation: "r".into(), models: vec![], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -205,7 +200,7 @@ mod tests {
     #[test]
     fn origin_defaults_new_and_serializes_lowercase() {
         // v2 老 JSON（无 origin 键）反序列化 → 默认 New（R6：缺省视 new）
-        let j = r#"{"id":"x","severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r","lenses":[],"models":[],"agreement":1,"hard_constraint":false,"quote":"q"}"#;
+        let j = r#"{"id":"x","severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r","models":[],"agreement":1,"hard_constraint":false,"quote":"q"}"#;
         let f: Finding = serde_json::from_str(j).unwrap();
         assert_eq!(f.origin, Origin::New);
         // v3 序列化显式携带（契约字段不靠缺省猜）

@@ -83,7 +83,6 @@ pub struct RunMeta {
     /// 人读报告显示 model 名而非 provider 名（rN.md 模板,2026-07-03）。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub model_ids: Vec<String>,
-    pub lenses: Vec<String>,
     pub duration_ms: u64,
     pub usage: Usage,
     pub warnings: Vec<String>,
@@ -147,7 +146,7 @@ mod tests {
     fn f(sev: Severity) -> Finding {
         Finding { id: "x".into(), severity: sev, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
+            recommendation: "r".into(), models: vec![], agreement: 1,
             hard_constraint: false, quote: "snippet".into(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New }
     }

@@ -45,7 +45,7 @@ mod tests {
     fn f(id: &str) -> Finding {
         Finding { id: id.into(), severity: Severity::High, title: "t".into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            lenses: vec![], models: vec![], agreement: 1, hard_constraint: false,
+            models: vec![], agreement: 1, hard_constraint: false,
             quote: "snippet".into(), cluster_id: None, verify: None, previously_dismissed: false,
             origin: Origin::New }
     }

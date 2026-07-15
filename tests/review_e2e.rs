@@ -30,7 +30,6 @@ async fn doc_review_end_to_end_rejects() {
         recommendation: "add check".into(),
         hard_constraint: false,
         quote: "let x = 1;".into(),
-        lens: None,
     };
     let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
     scripted.insert("claude".into(), vec![finding()]);
@@ -47,7 +46,6 @@ async fn doc_review_end_to_end_rejects() {
         scope: "working-tree".into(),
         spec: vec![],
         focus: None,
-        lenses: Some("D1".into()),
         models: None,
         models_all: false,
         no_correlate: true,
@@ -101,7 +99,7 @@ default_models=["m"]
 "#]).unwrap();
     let args = ReviewArgs {
         mode: Some("code".into()), base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, lenses: Some("L1".into()), models: Some("m".into()),
+        spec: vec![], focus: None, models: Some("m".into()),
         models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
@@ -117,8 +115,6 @@ default_models=["m"]
     assert_eq!(f.file, "src/auth.rs");
     assert_eq!(f.line_start, 3, "db.write(token); is on line 3");
     assert_eq!(f.quote, "db.write(token);");
-    // lens 去实体化 A（本 task）：enrich 不再消费 raw.lens，lenses 恒空（Task 3 删字段）。
-    assert!(f.lenses.is_empty());
     // 编造的是 critical；被丢后只剩 high → 仍 ≥ medium block → reject、exit 10
     assert_eq!(report.verdict, Verdict::Reject);
     assert_eq!(code, 10);
@@ -141,7 +137,7 @@ async fn code_replicate_two_models_yield_agreement_two() {
         RawFinding {
             severity: sev, title: "shared issue".into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "fix".into(),
-            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: quote.into(),
         }
     }
 
@@ -159,7 +155,7 @@ default_models=["alpha","beta"]
 
     let args = ReviewArgs {
         mode: Some("code".into()), base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
+        spec: vec![], focus: None, models: None, models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
         resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
@@ -190,7 +186,7 @@ async fn code_replicate_unreachable_model_exits_two() {
         RawFinding {
             severity: Severity::Low, title: "minor".into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "fix".into(),
-            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: quote.into(),
         }
     }
 
@@ -207,7 +203,7 @@ default_models=["alpha","ghost"]
 
     let args = ReviewArgs {
         mode: Some("code".into()), base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
+        spec: vec![], focus: None, models: None, models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
         resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
@@ -238,7 +234,7 @@ async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
         RawFinding {
             severity: sev, title: title.into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: quote.into(), lens: None,
+            hard_constraint: false, quote: quote.into(),
         }
     }
     let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
@@ -260,7 +256,7 @@ async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
 
     let args = ReviewArgs {
         mode: Some("doc".into()), base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, lenses: None, models: None, models_all: false,
+        spec: vec![], focus: None, models: None, models_all: false,
         no_correlate: false, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![dp.clone()],
         resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
@@ -296,7 +292,7 @@ async fn code_replicate_lone_blocking_refuted_stays_approve() {
     fn rf(file: &str, quote: &str, title: &str, sev: Severity) -> RawFinding {
         RawFinding { severity: sev, title: title.into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "fix".into(),
-            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()) }
+            hard_constraint: false, quote: quote.into() }
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -313,7 +309,7 @@ default_models=["alpha"]
 
     let args = ReviewArgs {
         mode: Some("code".into()), base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
+        spec: vec![], focus: None, models: None, models_all: false,
         no_correlate: true, block_threshold: None, conf_floor: None,
         background: false, format: "json".into(), targets: vec![],
         resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
@@ -329,8 +325,8 @@ default_models=["alpha"]
 }
 
 /// §7.4 硬封顶在 doc 线对 D5 的 e2e 验证：
-/// FakeProvider 脚本一条 lens=Some("D5") severity=High finding，
-/// 跑 run_review 后断言报告里该 finding 被 clamp_compliance 钳到 Medium。
+/// FakeProvider 脚本一条 D5 标准合规类 severity=High finding，
+/// 跑 run_review 后断言 severity 原样保留（clamp_compliance 已退场，E9）。
 #[tokio::test]
 async fn doc_d5_compliance_no_longer_mechanically_clamped() {
     use redteam::domain::RawFinding;
@@ -340,7 +336,7 @@ async fn doc_d5_compliance_no_longer_mechanically_clamped() {
     std::fs::write(&doc_path, "intro line\nthe document section heading\nconclusion\n").unwrap();
     let dp = doc_path.to_string_lossy().to_string();
 
-    // 脚本一条 D5 finding：severity=High、quote 在文档中真实存在（anchor_doc 能命中）、lens=Some("D5")
+    // 脚本一条 D5 finding：severity=High、quote 在文档中真实存在（anchor_doc 能命中）
     let finding = RawFinding {
         severity: Severity::High,
         title: "doc standards violation".into(),
@@ -352,7 +348,6 @@ async fn doc_d5_compliance_no_longer_mechanically_clamped() {
         recommendation: "add section".into(),
         hard_constraint: false,
         quote: "the document section heading".into(),
-        lens: Some("D5".into()),
     };
 
     let provider = FakeProvider::with("alpha", vec![finding]);
@@ -368,7 +363,6 @@ async fn doc_d5_compliance_no_longer_mechanically_clamped() {
         scope: "working-tree".into(),
         spec: vec![],
         focus: None,
-        lenses: Some("D5".into()),
         models: None,
         models_all: false,
         no_correlate: true,

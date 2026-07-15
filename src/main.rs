@@ -41,9 +41,6 @@ enum Cmd {
         /// 用户聚焦提示，注入评审 prompt 引导注意力（如「重点看并发安全」）。
         #[arg(long)]
         focus: Option<String>,
-        /// 逗号分隔的 lens 集，缺省按 mode 取内置全集。
-        #[arg(long)]
-        lenses: Option<String>,
         /// 逗号分隔的 model 名，每个各评一遍（复评提升 agreement 信号，计费随模型数翻倍）；
         /// 缺省用配置的 default_models，全空时才按 priority 组候补链取一。
         #[arg(long)]
@@ -392,7 +389,6 @@ async fn main() {
             scope,
             spec,
             focus,
-            lenses,
             models,
             models_all,
             no_correlate,
@@ -449,7 +445,7 @@ async fn main() {
                 (None, false) => "working-tree".to_string(),
             };
             let args = ReviewArgs {
-                mode, base: base.clone(), scope, spec, focus, lenses, models, models_all,
+                mode, base: base.clone(), scope, spec, focus, models, models_all,
                 no_correlate, block_threshold, conf_floor, tools, background, format, targets,
                 resume: None, dismissed, no_dismissed, incremental_from,
             };
@@ -1049,7 +1045,6 @@ mod tests {
             scope: "working-tree".into(),
             spec: vec![],
             focus: None,
-            lenses: None,
             models: None,
             models_all: false,
             no_correlate: false,

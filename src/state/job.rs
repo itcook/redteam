@@ -49,8 +49,6 @@ pub struct JobState {
     pub progress: Progress,
     #[serde(default)]
     pub models: Vec<String>,
-    #[serde(default)]
-    pub lenses: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -81,7 +79,6 @@ impl JobState {
             started_at,
             progress: Progress::default(),
             models: vec![],
-            lenses: vec![],
             pid: None,
             exit_code: None,
             error: None,
@@ -143,7 +140,7 @@ mod tests {
         let st = JobState {
             job_id: "job1".into(), status: JobStatus::Running, mode: Some(Mode::Doc),
             started_at: 1000, progress: Progress { done: 1, total: 3 },
-            models: vec!["alpha".into()], lenses: vec!["D1".into()],
+            models: vec!["alpha".into()],
             pid: Some(4242), exit_code: None, error: None, result_path: None,
             last_active: 1000, deadline_at: None, phase: None, phase_history: vec![], workspace: None,
         };
@@ -185,7 +182,7 @@ mod tests {
         assert_eq!(back.status, JobStatus::TimedOut);
         // 旧文件（无新字段）可读
         let old: JobState = serde_json::from_str(
-            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[],"lenses":[]}"#
+            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[]}"#
         ).unwrap();
         assert_eq!(old.last_active, 0);
         assert_eq!(old.deadline_at, None);
@@ -205,7 +202,7 @@ mod tests {
     fn phase_and_workspace_absent_default_none() {
         // 旧文件（无 phase/workspace 键）→ None
         let old: JobState = serde_json::from_str(
-            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[],"lenses":[]}"#
+            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[]}"#
         ).unwrap();
         assert_eq!(old.phase, None);
         assert_eq!(old.workspace, None);

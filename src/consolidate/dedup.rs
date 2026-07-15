@@ -42,7 +42,6 @@ fn overlaps(a: &Finding, b: &Finding) -> bool {
 fn merge_into(base: &mut Finding, other: &Finding) {
     if other.severity > base.severity { base.severity = other.severity; }
     if other.confidence > base.confidence { base.confidence = other.confidence; }
-    for l in &other.lenses { if !base.lenses.contains(l) { base.lenses.push(l.clone()); } }
     for m in &other.models { if !base.models.contains(m) { base.models.push(m.clone()); } }
     base.agreement = base.models.len() as u32;
     // rec 跟随 body 同源（body 恒保留 base 的）——「更长 rec 胜」会让合并后 body 讲 A 问题、
@@ -104,7 +103,7 @@ mod tests {
     fn f(id:&str, file:&str, ls:u32, le:u32, title:&str, model:&str, sev:Severity) -> Finding {
         Finding { id:id.into(), severity:sev, title:title.into(), body:"b".into(), file:file.into(),
             line_start:ls, line_end:le, confidence:0.8, recommendation:"r".into(),
-            lenses:vec!["L1".into()], models:vec![model.into()], agreement:1,
+            models:vec![model.into()], agreement:1,
             hard_constraint:false, quote:String::new(), cluster_id:None, verify:None,
             previously_dismissed: false, origin: Origin::New }
     }

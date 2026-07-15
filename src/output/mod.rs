@@ -129,7 +129,6 @@ fn render_md(r: &ReviewReport) -> String {
                 s.push_str("| Field      | Value |\n| ---------- | ----- |\n");
                 s.push_str(&format!("| File       | {} L{}-L{} |\n", f.file, f.line_start, f.line_end));
                 s.push_str(&format!("| Found By   | {} |\n", f.models.join(", ")));
-                s.push_str(&format!("| Lens       | {} |\n", f.lenses.join(", ")));
                 s.push_str(&format!("| Confidence | {:.2} |\n", f.confidence));
                 if f.origin == crate::domain::Origin::Carried {
                     s.push_str("| Origin     | carried from an earlier round |\n");
@@ -167,7 +166,7 @@ mod tests {
             stats:Stats{high:1,total:1,..Default::default()},
             findings:vec![Finding{ id:"1".into(),severity:Severity::High,title:"boom".into(),body:"b".into(),
                 file:"a.rs".into(),line_start:3,line_end:5,confidence:0.9,recommendation:"fix".into(),
-                lenses:vec!["L1".into()],models:vec!["claude".into()],agreement:1,hard_constraint:false,
+                models:vec!["claude".into()],agreement:1,hard_constraint:false,
                 quote:"snippet".into(),cluster_id:None,verify:None,previously_dismissed:false,
                 origin:Origin::New}],
             clusters:vec![], run:RunMeta::default() }
@@ -193,10 +192,10 @@ mod tests {
     #[test]
     fn md_no_debug_vec_rendering() {
         let s = render(&report(), Format::Md);
-        // 不含 Debug-vec 格式（如 `["L1"]`）
+        // 不含 Debug-vec 格式（如 `["claude"]`）
         assert!(!s.contains("[\""), "md output must not contain Debug-vec like [\"...\"]");
-        // 含 lens 名称（不带括号引号）
-        assert!(s.contains("L1"), "md output must contain lens name L1");
+        // 含 model 名称（不带括号引号）——Found By 字段走 join(", ") 而非 Debug
+        assert!(s.contains("claude"), "md output must contain model name claude");
         assert!(s.contains("reject"), "verdict must be lowercase 'reject'");
     }
     #[test]

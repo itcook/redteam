@@ -18,7 +18,6 @@ pub struct ReviewArgs {
     pub scope: String,
     pub spec: Vec<String>,
     pub focus: Option<String>,
-    pub lenses: Option<String>,
     pub models: Option<String>,
     pub models_all: bool,
     pub no_correlate: bool,
@@ -218,7 +217,6 @@ struct TailCtx<'a> {
     model_names: Vec<String>,
     /// 与 model_names 同序的 model id（cfg.providers.*.model；查无则回退 provider 名）。
     model_ids: Vec<String>,
-    lens_ids: Vec<String>,
     block: Severity,
     floor: f32,
     correlate_on: bool,
@@ -300,7 +298,6 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
             job_id: ctx.job_id,
             models: ctx.model_names,
             model_ids: ctx.model_ids,
-            lenses: ctx.lens_ids,
             duration_ms: ctx.duration_ms,
             usage: Usage {
                 input_tokens: ctx.usage.0, output_tokens: ctx.usage.1, cached_input_tokens: ctx.usage.2,
@@ -652,16 +649,6 @@ pub async fn run_review(
     };
     let input = collect(&eopts)?;
 
-    // 2. lens
-    let lens_ids: Vec<String> = args
-        .lenses
-        .as_deref()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_else(|| match input.mode {
-            Mode::Code => cfg.review.lenses.code.clone(),
-            Mode::Doc => cfg.review.lenses.doc.clone(),
-        });
-
     // 3. 模型集 + replicate 判定（统一 resolve_models）
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
@@ -676,7 +663,7 @@ pub async fn run_review(
     //（design 2026-07-03 #2：生成侧勿再报实证无效，判定后置 consolidate）。
     let focus = args.focus.clone().unwrap_or_default();
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
-    if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
+    if let Some(s) = sink { s.on_meta(&model_names); }
     // 二阶段补查构造器（doc 简化版）：原 doc prompt + 补查证据段 + 草稿契约。
     let mk = |_idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
         doc_second_pass_prompt(&input, &focus, &cwd, needs, drafts)
@@ -698,7 +685,6 @@ pub async fn run_review(
         provider,
         model_ids: model_ids_for(&model_names, cfg),
         model_names,
-        lens_ids,
         block,
         floor,
         correlate_on,
@@ -745,13 +731,6 @@ pub async fn run_code_review(
     // 未来 L4 拆缝用）；超预算由降级梯子（骨架/hunk 窗/省略清单）承接，不拆格。
     let bundles = merge_bundles(group(select_files(changes), Some(root)));
 
-    // 2. rules = code lenses（lens → 注入 rule）
-    let lens_ids: Vec<String> = args
-        .lenses
-        .as_deref()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_else(|| cfg.review.lenses.code.clone());
-
     // 3. 模型集 + replicate 判定（统一 resolve_models）
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
@@ -771,7 +750,7 @@ pub async fn run_code_review(
     };
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
-    if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
+    if let Some(s) = sink { s.on_meta(&model_names); }
     let budget = pack_budget_bytes(cfg, &model_names);
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
@@ -800,7 +779,6 @@ pub async fn run_code_review(
         provider,
         model_ids: model_ids_for(&model_names, cfg),
         model_names,
-        lens_ids,
         block,
         floor,
         correlate_on: false,
@@ -889,11 +867,6 @@ pub async fn run_incremental_review(
     let short_base = &base.base_sha[..12.min(base.base_sha.len())];
     let inc_section = crate::prompt::render_incremental_section(short_base, &manifest2, &claimed);
 
-    let lens_ids: Vec<String> = args
-        .lenses
-        .as_deref()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_else(|| cfg.review.lenses.code.clone());
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
     let model_ids = model_ids_for(&model_names, cfg);
@@ -905,7 +878,7 @@ pub async fn run_incremental_review(
     };
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
-    if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
+    if let Some(s) = sink { s.on_meta(&model_names); }
     let budget = pack_budget_bytes(cfg, &model_names);
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
@@ -968,7 +941,6 @@ pub async fn run_incremental_review(
             job_id: String::new(),
             models: model_names,
             model_ids,
-            lenses: lens_ids,
             duration_ms: t0.elapsed().as_millis() as u64,
             usage: Usage {
                 input_tokens: raw.usage.0, output_tokens: raw.usage.1, cached_input_tokens: raw.usage.2,
@@ -1086,11 +1058,10 @@ impl CellSink for JobCellSink {
         }
     }
 
-    fn on_meta(&self, models: &[String], lenses: &[String]) {
+    fn on_meta(&self, models: &[String]) {
         let _g = self.lock.lock().unwrap();
         if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
             st.models = models.to_vec();
-            st.lenses = lenses.to_vec();
             let _ = crate::state::job::write_state(&self.ws, &st);
         }
     }
@@ -1228,7 +1199,6 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
             job_id: job_id.to_string(),
             models: vec![],
             model_ids: vec![],
-            lenses: vec![],
             duration_ms: 0,
             usage: Usage::default(),
             warnings: vec![format!("partial: {done}/{total} cells"), reason],
@@ -1247,7 +1217,7 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
 fn empty_review_args() -> ReviewArgs {
     ReviewArgs {
         mode: None, base: None, scope: "working-tree".into(), spec: vec![], focus: None,
-        lenses: None, models: None, models_all: false, no_correlate: false,
+        models: None, models_all: false, no_correlate: false,
         block_threshold: None, conf_floor: None, background: false, format: "json".into(),
         targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     }
@@ -1349,14 +1319,6 @@ pub async fn run_resume(
 
     let (models, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
-    let lens_ids: Vec<String> = args
-        .lenses
-        .as_deref()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_else(|| match mode {
-            Mode::Code => cfg.review.lenses.code.clone(),
-            Mode::Doc => cfg.review.lenses.doc.clone(),
-        });
     let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     let correlate_on = cfg.review.correlate && !args.no_correlate;
@@ -1376,7 +1338,6 @@ pub async fn run_resume(
         provider,
         model_ids: model_ids_for(&model_names, cfg),
         model_names,
-        lens_ids,
         block,
         floor,
         correlate_on,
@@ -1495,7 +1456,6 @@ pub async fn run_job(
             st.exit_code = Some(code);
             st.mode = Some(report.mode);
             st.models = report.run.models.clone();
-            st.lenses = report.run.lenses.clone();
             st.result_path = Some(format!("proj.db#results/{job_id}"));
             let _ = write_state(ws, &st);
             code
@@ -1531,7 +1491,7 @@ mod job_tests {
         Finding {
             id: "f".into(), severity: Severity::Medium, title: title.into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            lenses: vec![], models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
+            models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
             quote: "q".into(), cluster_id: None, verify: None, previously_dismissed: false,
             origin: Origin::New,
         }
@@ -1540,7 +1500,7 @@ mod job_tests {
     fn doc_args(target: &str) -> ReviewArgs {
         ReviewArgs {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None, lenses: None, models: None, models_all: false,
+            spec: vec![], focus: None, models: None, models_all: false,
             no_correlate: false, block_threshold: None, conf_floor: None,
             background: true, format: "json".into(), targets: vec![target.into()],
             resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
@@ -1564,7 +1524,7 @@ mod job_tests {
         scripted.insert("alpha".into(), vec![RawFinding {
             severity: Severity::High, title: "t".into(), body: "b".into(), file: dp.clone(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: "the wrong claim here".into(), lens: None,
+            hard_constraint: false, quote: "the wrong claim here".into(),
         }]);
         let provider = FakeProvider { scripted, ..Default::default() };
         let ws = dir.path().join("ws");
@@ -1769,7 +1729,6 @@ mod resume_tests {
                     recommendation: "r".into(),
                     hard_constraint: false,
                     quote: String::new(), // 空引用=遗漏类，anchor_doc 无条件保留
-                    lens: None,
                 }],
                 input_tokens: 1,
                 output_tokens: 1,
@@ -1785,7 +1744,7 @@ mod resume_tests {
         Finding {
             id: title.into(), severity: Severity::Low, title: title.into(), body: "b".into(),
             file: "spec.md".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), lenses: vec![], models: vec!["m".into()], agreement: 1,
+            recommendation: "r".into(), models: vec!["m".into()], agreement: 1,
             hard_constraint: false, quote: String::new(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New,
         }
@@ -1815,7 +1774,7 @@ mod resume_tests {
 
         let args = ReviewArgs {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None, lenses: None, models: Some("m".into()), models_all: false,
+            focus: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
             format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
@@ -1862,7 +1821,7 @@ mod resume_tests {
 
         let args = ReviewArgs {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None, lenses: None, models: Some("alpha,beta".into()), models_all: false,
+            focus: None, models: Some("alpha,beta".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
             format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
@@ -1897,7 +1856,7 @@ mod resume_tests {
         // 只写 args，从不 write_manifest（模拟 fan-out 前崩溃）。
         let args = ReviewArgs {
             mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None, lenses: None, models: Some("m".into()), models_all: false,
+            focus: None, models: Some("m".into()), models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None, background: true,
             format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
@@ -2009,7 +1968,7 @@ default_models=["alpha"]
         );
         let my_args = ReviewArgs {
             mode: Some("code".into()), base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None, lenses: Some("L1".into()), models: None, models_all: false,
+            spec: vec![], focus: None, models: None, models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
             resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
@@ -2026,7 +1985,7 @@ default_models=["alpha"]
     fn args() -> ReviewArgs {
         ReviewArgs {
             mode: Some("code".into()), base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None, lenses: Some("L1".into()), models: Some("m".into()),
+            spec: vec![], focus: None, models: Some("m".into()),
             models_all: false,
             no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![],
@@ -2038,7 +1997,7 @@ default_models=["alpha"]
         RawFinding {
             severity: sev, title: "issue".into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "fix".into(),
-            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: quote.into(),
         }
     }
 
@@ -2232,7 +2191,7 @@ mod tests {
         let drafts = vec![Finding {
             id: "x".into(), severity: Severity::High, title: "weak hash".into(), body: "b".into(),
             file: "src/a.rs".into(), line_start: 5, line_end: 6, confidence: 0.9,
-            recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
+            recommendation: "r".into(), models: vec![], agreement: 1,
             hard_constraint: false, quote: "md5(pw)".into(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New,
         }];
@@ -2490,7 +2449,7 @@ context_window_tokens = 40000
             severity: Severity::High, title: "Weak hash".into(), body: "b".into(),
             file: "src/x.rs".into(), line_start: ls, line_end: le, confidence: 0.9,
             recommendation: "r".into(), hard_constraint: false,
-            quote: "md5(pw)".into(), lens: None,
+            quote: "md5(pw)".into(),
         };
         let before = enrich(&raw(5, 7), "m");          // 第一轮：驳回它
         let dismissed: HashSet<String> = [before.id.clone()].into();
@@ -2538,7 +2497,7 @@ mod incremental_tests {
         RawFinding {
             severity: Severity::High, title: title.into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: quote.into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: quote.into(),
         }
     }
 
@@ -2546,7 +2505,7 @@ mod incremental_tests {
     pub(super) fn inc_args(base: &str, prior: &str) -> ReviewArgs {
         ReviewArgs {
             mode: Some("code".into()), base: Some(base.into()), scope: "branch".into(),
-            spec: vec![], focus: None, lenses: Some("L1".into()), models: Some("m".into()),
+            spec: vec![], focus: None, models: Some("m".into()),
             models_all: false, no_correlate: true, block_threshold: None, conf_floor: None,
             background: false, format: "json".into(), targets: vec![], resume: None,
             dismissed: None, no_dismissed: false, incremental_from: Some(prior.into()),
@@ -2561,7 +2520,7 @@ mod incremental_tests {
             schema_version: "3".into(), mode: Mode::Code, verdict: Verdict::Approve,
             stats, findings, clusters: vec![],
             run: RunMeta {
-                job_id: job.into(), models: vec!["m".into()], lenses: vec!["L1".into()],
+                job_id: job.into(), models: vec!["m".into()],
                 head_sha: Some(head_sha.into()), ..Default::default()
             },
         };

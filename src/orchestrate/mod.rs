@@ -18,9 +18,9 @@ pub trait CellSink: Send + Sync {
     /// 阶段转换钩子（后台 job 用；默认 no-op，前台 sink=None / 其他 sink 零影响）。
     /// `note`：阶段注记（如 refute 的 "N targets"），进 phase_history 时间线。
     fn on_phase(&self, _phase: crate::state::job::Phase, _note: Option<String>) {}
-    /// resolve 完成即报 models/lenses（后台 job stamp 进 state，running 期 status 可见；
+    /// resolve 完成即报 models（后台 job stamp 进 state，running 期 status 可见；
     /// 此前 done 时才从 report 回填——r1 20260703 实证运行全程空数组）。默认 no-op。
-    fn on_meta(&self, _models: &[String], _lenses: &[String]) {}
+    fn on_meta(&self, _models: &[String]) {}
 }
 
 #[derive(Clone, Debug)]
@@ -75,8 +75,6 @@ pub fn finding_id(file: &str, quote: &str, title: &str, line_start: u32, line_en
     }
 }
 
-/// lens 去实体化 A（本 task）：`lenses` 恒空——`RawFinding.lens` 字段本体 Task 3 删，
-/// 届时 serde 静默忽略模型输出的 lens 键；`Finding.lenses` 字段随之在 Task 3 收尾。
 pub fn enrich(raw: &RawFinding, model: &str) -> Finding {
     let id = finding_id(&raw.file, &raw.quote, &raw.title, raw.line_start, raw.line_end);
     Finding {
@@ -89,7 +87,6 @@ pub fn enrich(raw: &RawFinding, model: &str) -> Finding {
         line_end: raw.line_end,
         confidence: raw.confidence,
         recommendation: raw.recommendation.clone(),
-        lenses: vec![],
         models: vec![model.to_string()],
         agreement: 1,
         hard_constraint: raw.hard_constraint,
@@ -551,7 +548,7 @@ mod tests {
         RawFinding {
             severity: Severity::High, title: t.into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: "q".into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: "q".into(),
         }
     }
 
@@ -559,7 +556,7 @@ mod tests {
         RawFinding {
             severity: sev, title: title.into(), body: "b".into(), file: file.into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: "q".into(), lens: Some("L1".into()),
+            hard_constraint: false, quote: "q".into(),
         }
     }
 
@@ -669,8 +666,6 @@ mod tests {
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let r = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, None, None).await;
         assert_eq!(r.findings.len(), 3, "one finding per bundle");
-        // lens 去实体化 A：enrich 不再消费 raw.lens，lenses 恒空（Task 3 删字段）。
-        assert!(r.findings.iter().all(|f| f.lenses.is_empty()));
     }
 
     // prompt 记录探针：断言每个 bundle 收到自己（而非别的 bundle）的卷宗段。
@@ -1028,7 +1023,7 @@ mod tests {
         RawFinding {
             severity: Severity::High, title: title.into(), body: "b".into(),
             file: file.into(), line_start: ls, line_end: le, confidence: 0.9,
-            recommendation: "r".into(), hard_constraint: false, quote: quote.into(), lens: None,
+            recommendation: "r".into(), hard_constraint: false, quote: quote.into(),
         }
     }
 

@@ -21,7 +21,7 @@ mod tests {
     use super::*;
     use crate::domain::Origin;
 
-    fn f(sev: Severity, conf: f32, lens: &str, hard: bool) -> Finding {
+    fn f(sev: Severity, conf: f32, hard: bool) -> Finding {
         Finding {
             id: "x".into(),
             severity: sev,
@@ -32,7 +32,6 @@ mod tests {
             line_end: 1,
             confidence: conf,
             recommendation: "r".into(),
-            lenses: vec![lens.into()],
             models: vec![],
             agreement: 1,
             hard_constraint: hard,
@@ -46,15 +45,15 @@ mod tests {
 
     #[test]
     fn reject_when_high_above_floor() {
-        let v = vec![f(Severity::High, 0.9, "L1", false)];
+        let v = vec![f(Severity::High, 0.9, false)];
         assert_eq!(compute_verdict(&v, Severity::Medium, 0.5), Verdict::Reject);
     }
 
     #[test]
     fn approve_when_only_low_or_below_floor() {
         let v = vec![
-            f(Severity::Low, 0.9, "L1", false),
-            f(Severity::High, 0.2, "L1", false),
+            f(Severity::Low, 0.9, false),
+            f(Severity::High, 0.2, false),
         ];
         assert_eq!(compute_verdict(&v, Severity::Medium, 0.5), Verdict::Approve);
     }
@@ -62,7 +61,7 @@ mod tests {
     #[test]
     fn refuted_finding_never_blocks_even_at_zero_floor() {
         use crate::domain::{Verify, VerifyVerdict};
-        let mut hi = f(Severity::High, 0.0, "L1", false);
+        let mut hi = f(Severity::High, 0.0, false);
         hi.verify = Some(Verify { verdict: VerifyVerdict::Refuted, model: "beta".into(), note: String::new() });
         // conf_floor=0 退化配置：修复前 0.0>=0.0 会 blocking；修复后 refuted 被排除 → Approve。
         assert_eq!(compute_verdict(&[hi], Severity::Medium, 0.0), Verdict::Approve);
@@ -71,14 +70,14 @@ mod tests {
     #[test]
     fn upheld_finding_still_blocks() {
         use crate::domain::{Verify, VerifyVerdict};
-        let mut hi = f(Severity::High, 0.9, "L1", false);
+        let mut hi = f(Severity::High, 0.9, false);
         hi.verify = Some(Verify { verdict: VerifyVerdict::Upheld, model: "beta".into(), note: String::new() });
         assert_eq!(compute_verdict(&[hi], Severity::Medium, 0.5), Verdict::Reject);
     }
 
     #[test]
     fn dismissed_blocking_finding_is_exempt() {
-        let mut hi = f(Severity::High, 0.9, "L1", false);
+        let mut hi = f(Severity::High, 0.9, false);
         hi.previously_dismissed = true;
         assert_eq!(compute_verdict(&[hi], Severity::Medium, 0.5), Verdict::Approve);
     }

@@ -303,7 +303,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "missing auth".into(),
             body: "no check before db write".into(), file: "src/a.rs".into(),
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
-            lenses: vec!["L1".into()], models: vec!["claude".into()], agreement: 1,
+            models: vec!["claude".into()], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -336,7 +336,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "missing auth".into(),
             body: "no check before db write".into(), file: "src/a.rs".into(),
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
-            lenses: vec!["L1".into()], models: vec!["claude".into()], agreement: 1,
+            models: vec!["claude".into()], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -354,7 +354,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "missing rollback branch".into(),
             body: "no rollback path on failure".into(), file: "spec.md".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "specify rollback".into(),
-            lenses: vec!["D2".into()], models: vec!["alpha".into()], agreement: 1,
+            models: vec!["alpha".into()], agreement: 1,
             hard_constraint: false, cluster_id: None, quote: String::new(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -371,7 +371,7 @@ mod tests {
         let f = Finding {
             id: "x".into(), severity: Severity::High, title: "injection via notes".into(),
             body: "b".into(), file: "src/a.rs".into(), line_start: 1, line_end: 1,
-            confidence: 0.9, recommendation: "r".into(), lenses: vec![], models: vec![],
+            confidence: 0.9, recommendation: "r".into(), models: vec![],
             agreement: 1, hard_constraint: false, quote: "q".into(), cluster_id: None,
             verify: None, previously_dismissed: false, origin: Origin::New,
         };
