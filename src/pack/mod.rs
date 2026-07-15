@@ -3,8 +3,10 @@
 
 use std::path::Path;
 
+use regex::Regex;
+
 use crate::bundle::Bundle;
-use crate::dossier::{changed_def_ranges, compile_defs, lang_for, SymRefs};
+use crate::dossier::{changed_def_ranges, compile_defs, hunk_changed_lines, lang_for, match_def, parse_hunk_new_range, SymRefs};
 use crate::dossier::{symbols_in_file, reference_points, ChangedSym, Bucket};
 use crate::scip::ScipIndex;
 
@@ -45,6 +47,13 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
             Some(l) => l,
             None => {
                 if !symbol_mode {
+                    // 非支持语言超预算：先试 hunk±20 行窗（禁真空升级，Task 5）→ 装不下才 omit。
+                    if let Some(block) = hunk_window_block(&fc.path, &content, &fc.diff, n_lines) {
+                        if out.len() + block.len() <= budget {
+                            out.push_str(&block);
+                            continue;
+                        }
+                    }
                     omit.push(format!("{}:1-{} — 全文超预算（非支持语言无 def 回落）", fc.path, n_lines));
                 }
                 continue; // symbol 模式沿 S2-b 旧行为：非支持语言无损降级
@@ -52,7 +61,8 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
         };
         let defs = compile_defs(lang);
         let lines: Vec<&str> = content.lines().collect();
-        let mut contributed = false;
+        let mut wrote_def = false; // 至少一个 def 体入了正文
+        let mut omitted_def = false; // 至少一个 def 体超预算进了 omit 坐标
         for (start, end) in changed_def_ranges(&fc.diff, &lines, &defs) {
             let end = end.min(lines.len().saturating_sub(1));
             let body = lines.get(start..=end).unwrap_or(&[]).join("\n");
@@ -67,14 +77,29 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
             let block = format!("{head}\n{body}\n\n");
             if out.len() + block.len() > budget {
                 omit.push(format!("{}:{}-{} — 改动符号体", fc.path, start + 1, end + 1));
-                contributed = true;
+                omitted_def = true;
             } else {
                 out.push_str(&block);
-                contributed = true;
+                wrote_def = true;
             }
         }
-        // E8 裁决 D：降级空产出禁真空——def 锚不到时必须 omit 可观测（T42 场景）。
-        if !symbol_mode && !contributed {
+        // 骨架档（回落链第 3 级插档，E8 裁决 D + Task 5，评审修 2 档位互斥）：本文件 def 体
+        // **零入正文**（全部超预算或锚定失败）才触发；部分成功保持现状——已入 def + 溢出坐标，
+        // 不叠加骨架（防同文件内容双份计预算）。溢出 def 的 omit 坐标保留——骨架只带签名+改动行，
+        // 其余 def 体确实缺席，坐标仍真。骨架也装不下 → 落回现状消息（下方）。
+        let mut wrote_skeleton = false;
+        if !symbol_mode && !wrote_def {
+            let skel = skeleton_of(&content, &fc.diff, &defs);
+            let head = format!("{}:1-{}（骨架：签名+改动行）", fc.path, n_lines);
+            let block = format!("{head}\n{skel}\n");
+            if out.len() + block.len() <= budget {
+                out.push_str(&block);
+                wrote_skeleton = true;
+            }
+        }
+        // E8 裁决 D：降级空产出禁真空——def 体没入、骨架没入、连溢出坐标都没有（锚定失败）时
+        // 必须 omit 可观测（T42 场景）。
+        if !symbol_mode && !wrote_def && !wrote_skeleton && !omitted_def {
             omit.push(format!("{}:1-{} — 全文超预算且 def 锚定失败（降级空产出）", fc.path, n_lines));
         }
     }
@@ -83,6 +108,64 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
     }
     let title = if symbol_mode { "改动符号完整体" } else { "改动源文" };
     format!("## {title}（0 壳）\n{out}")
+}
+
+/// 骨架档（回落链第 3 级，E8 裁决 D + Task 5）：全文/def 体双超预算时的降级——逐行扫描，
+/// 命中 def 正则的签名行全收（骨架地图）+ diff 全部改动行（`hunk_changed_lines`，原样保留，
+/// 让改动本身可见——评审修 1：hunk_anchors 只给每 hunk 首行，多行 hunk 会丢内容）；
+/// 其余连续行聚合折叠为 `…（N 行折叠）`。只产正文，不含块头（块头由
+/// `body_section_impl` 拼路径），故不判 budget——调用方按整块判。
+/// ponytail: `changed_def_ranges` 命中的整个外围 def 体不整体保留（可能几百行，撑爆本就
+/// 更紧的骨架预算，且骨架仅在 def 体已超预算时触发——含 def 全文必然同样超预算、自败）——
+/// 只保信号密度最高的签名行 + 全部改动行，二者通常已覆盖诊断所需。
+pub(crate) fn skeleton_of(content: &str, diff: &str, defs: &[(&'static str, Regex)]) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let anchors: std::collections::HashSet<usize> = hunk_changed_lines(diff).into_iter().collect();
+    let mut body = String::new();
+    let mut fold = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if anchors.contains(&i) || match_def(line, defs).is_some() {
+            if fold > 0 {
+                body.push_str(&format!("…（{fold} 行折叠）\n"));
+                fold = 0;
+            }
+            body.push_str(line);
+            body.push('\n');
+        } else {
+            fold += 1;
+        }
+    }
+    if fold > 0 {
+        body.push_str(&format!("…（{fold} 行折叠）\n"));
+    }
+    body
+}
+
+/// 非支持语言超预算兜底（回落链第 2 级插档，Task 5）：全文放不下、无 def 可回落时，从 diff
+/// 各 hunk 头解析新文件起止行 `(c, d)`，各取 `[c−20, c+d+20]` 窗、跨 hunk 合并成一个窗
+/// （单 cell diff 罕见多 hunk；合并窗简单可靠，偶尔多带无关行也由调用方 budget 判定兜底裁掉）。
+/// 窗内容原样保留、不折叠——非支持语言无符号结构，折叠无意义。无可解析 hunk 头 → None。
+fn hunk_window_block(path: &str, content: &str, diff: &str, n_lines: usize) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    for raw in diff.lines() {
+        if !raw.starts_with("@@") {
+            continue;
+        }
+        if let Some((c, d)) = parse_hunk_new_range(raw) {
+            lo = lo.min(c.saturating_sub(20).max(1));
+            hi = hi.max((c + d + 20).min(n_lines));
+        }
+    }
+    if hi == 0 {
+        return None;
+    }
+    let body = lines.get(lo.saturating_sub(1)..hi).unwrap_or(&[]).join("\n");
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!("{path}:{lo}-{hi}（hunk±20 窗）\n{body}\n\n"))
 }
 
 /// 1 壳段：每符号 ≤cap 引用点入正文、正文按 budget 字节封顶。
@@ -425,10 +508,108 @@ mod tests {
         let mut omit = Vec::new();
         let s = body_section(&b, root, 1_000_000, &mut omit);
         assert!(s.contains("改动的文档内容。"), "非支持语言也给全文（E7：templates 格整读实证）: {s}");
-        // 超预算时非支持语言无 def 可回落 → omit 坐标
+        // 超预算但装得下 hunk±20 窗（Task 5 骨架档兜底升级：非支持语言不再直接 omit）→ 窗内容替代 omit
         let mut omit2 = Vec::new();
-        let s2 = body_section(&b, root, 10, &mut omit2);
-        assert!(s2.is_empty() && omit2.len() == 1 && omit2[0].contains("notes.md"), "无回落进 omit: {omit2:?}");
+        let s2 = body_section(&b, root, 68, &mut omit2);
+        assert!(s2.contains("改动的文档内容。") && s2.contains("hunk±20 窗"), "窗兜底取代 omit: {s2}");
+        assert!(omit2.is_empty(), "窗已装下，无需 omit: {omit2:?}");
+        // 连窗都装不下才落回现状消息（禁真空兜底不能丢）
+        let mut omit3 = Vec::new();
+        let s3 = body_section(&b, root, 10, &mut omit3);
+        assert!(s3.is_empty() && omit3.len() == 1 && omit3[0].contains("notes.md"), "窗也装不下才进 omit: {omit3:?}");
+    }
+
+    #[test]
+    fn body_section_falls_to_skeleton_when_def_body_too_big() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // 改动 def 本身巨大（def 体回落也超预算）+ 另有若干小 fn 签名
+        let big_body = "    let x = 0;\n".repeat(300);
+        std::fs::write(root.join("src/a.rs"),
+            format!("fn tiny_one() {{}}\nfn changed_big() {{\n{big_body}}}\nfn tiny_two() {{}}\n")).unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -3,0 +3,1 @@\n+    let x = 0;\n".into(),
+        }] };
+        let mut omit = Vec::new();
+        // 预算 800B：全文（~4.5KB）超、def 体（~4.2KB）超 → 骨架（3 签名行 + 折叠标记）应放得下
+        let s = body_section_impl(&b, root, 800, &mut omit, false);
+        // 块头对齐真实语义（评审修 3）：签名+改动行（非改动 def 全文——那会自败超预算）
+        assert!(s.contains("（骨架：签名+改动行）"), "骨架档启用: {s}");
+        assert!(s.contains("fn tiny_one()") && s.contains("fn tiny_two()"), "签名行全收");
+        assert!(s.contains("折叠"), "折叠标记在场");
+    }
+
+    #[test]
+    fn skeleton_keeps_all_changed_lines_of_multiline_hunk() {
+        // 评审修 1：hunk_anchors 只给每 hunk 首个改动行，多行 hunk 其余改动行被折叠吞掉。
+        // 骨架必须保留 hunk 的全部改动行（hunk_changed_lines）。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let filler = "    let f = 0;\n".repeat(300);
+        let changed = "    let c1 = 1;\n    let c2 = 2;\n    let c3 = 3;\n    let c4 = 4;\n    let c5 = 5;\n";
+        std::fs::write(root.join("src/a.rs"),
+            format!("fn big_changed() {{\n{filler}{changed}}}\n")).unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            // 新文件 302-306 行 = c1..c5（一个 5 行 hunk）
+            diff: format!("@@ -301,0 +302,5 @@\n{}", changed.lines().map(|l| format!("+{l}\n")).collect::<String>()),
+        }] };
+        let mut omit = Vec::new();
+        // 全文/def 体（~4.6KB）双超 800B → 骨架；5 个改动行必须全在
+        let s = body_section_impl(&b, root, 800, &mut omit, false);
+        assert!(s.contains("骨架"), "骨架档启用: {s}");
+        for c in ["let c1", "let c2", "let c3", "let c4", "let c5"] {
+            assert!(s.contains(c), "多行 hunk 改动行全保留，缺 {c}: {s}");
+        }
+    }
+
+    #[test]
+    fn skeleton_not_stacked_when_some_def_bodies_fit() {
+        // 评审修 2：档位互斥——部分 def 体已入正文时不再叠加骨架（防同文件内容双份计预算）。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let big_body = "    let x = 0;\n".repeat(300);
+        std::fs::write(root.join("src/a.rs"),
+            format!("fn small_changed() {{\n    let a = 1;\n}}\nfn big_changed() {{\n{big_body}}}\n")).unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(),
+            // 两 hunk：一个落 small 体内、一个落 big 体内
+            diff: "@@ -2,0 +2,1 @@\n+    let a = 1;\n@@ -5,0 +5,1 @@\n+    let x = 0;\n".into(),
+        }] };
+        let mut omit = Vec::new();
+        // 800B：全文超、small def 体（~100B）入正文、big def 体（~4.2KB）超 → 溢出坐标，无骨架
+        let s = body_section_impl(&b, root, 800, &mut omit, false);
+        assert!(!s.contains("骨架"), "部分成功不叠加骨架: {s}");
+        assert!(s.contains("fn small_changed") && s.contains("let a = 1;"), "已入 def 体保留: {s}");
+        assert!(omit.iter().any(|o| o.contains("改动符号体")), "溢出 def 进 omit 坐标: {omit:?}");
+    }
+
+    #[test]
+    fn body_section_unsupported_lang_falls_to_hunk_window() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let body: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(root.join("notes.md"), &body).unwrap();
+        let b = Bundle { files: vec![FileChange {
+            path: "notes.md".into(),
+            diff: "@@ -100,0 +100,1 @@\n+line 100\n".into(),
+        }] };
+        let mut omit = Vec::new();
+        let s = body_section_impl(&b, root, 900, &mut omit, false);
+        assert!(s.contains("line 100") && s.contains("line 85"), "hunk±20 窗在场: {s}");
+        assert!(!s.contains("line 10\n"), "窗外内容不在");
     }
 
     #[test]
@@ -467,8 +648,9 @@ mod tests {
 
     #[test]
     fn body_section_degrade_empty_output_goes_to_omit() {
-        // E8 裁决 D：全文超预算且 def 锚不到（如 hunk 全在 mod tests，T42 场景）→ 禁真空，
-        // 必须 omit 可观测，不得静默消失。
+        // E8 裁决 D：全文超预算且 def 锚不到（如 hunk 全在 mod tests，T42 场景）→ 禁真空。
+        // Task 5 骨架档插档后：即使无签名行匹配，骨架仍能用折叠标记+diff 改动行兜底承接，
+        // 不再需要走到最终 omit 消息——骨架本身就是「禁真空」更具体的实现（比空坐标更有信号）。
         use crate::bundle::Bundle;
         use crate::evidence::git::FileChange;
         let tmp = tempfile::tempdir().unwrap();
@@ -483,8 +665,8 @@ mod tests {
         }] };
         let mut omit = Vec::new();
         let s = body_section_impl(&b, root, 500, &mut omit, false);
-        assert!(s.is_empty() || !s.contains("src/a.rs"), "无块可入");
-        assert!(omit.iter().any(|o| o.contains("src/a.rs")), "降级空产出必入 omit: {omit:?}");
+        assert!(s.contains("src/a.rs") && s.contains("骨架"), "骨架档兜底承接：无签名行也不真空: {s}");
+        assert!(omit.is_empty(), "骨架已承接，不再需要 omit 坐标: {omit:?}");
     }
 
     fn sr(name: &str, n: usize) -> crate::dossier::SymRefs {

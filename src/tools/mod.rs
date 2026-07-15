@@ -288,6 +288,25 @@ impl ToolExecutor {
         out
     }
 
+    /// 二阶段补查读（design §2.3）：复用 safe_join + canonicalize 逃逸检查的路径安全不变量，
+    /// 返回裸文本（不带行号——pack/补查段注入用原文）。绝对路径/`..`/symlink 逃逸/不可读 → None
+    /// （调用方 skip、不 panic）。读帽 512KB 镜像 consolidate/verify.rs source_snippet 的
+    /// take() 模式——行窗可能落在大文件深处，64KB 工具帽会截掉窗口。
+    // ponytail: 帽边界劈开多字节字符时 read_to_string 整体失败 → None（该条 need 跳过）；
+    // 需要精确截断时再抄 source_snippet 的 char-boundary 回退。
+    pub(crate) fn read_capped(&self, rel: &str) -> Option<String> {
+        const NEED_READ_MAX_BYTES: u64 = 512 * 1024;
+        let full = self.safe_join(rel)?;
+        let real = std::fs::canonicalize(&full).ok()?;
+        if !real.starts_with(&self.canonical_root) {
+            return None;
+        }
+        use std::io::Read;
+        let mut text = String::new();
+        std::fs::File::open(&real).ok()?.take(NEED_READ_MAX_BYTES).read_to_string(&mut text).ok()?;
+        Some(text)
+    }
+
     /// 计算遍历起点：给了 path 则用 safe_join 后的子路径，否则 root。
     /// canonicalize 成功且不在 canonical_root 内时拒绝（符号链接逃逸防护）。
     fn scope_dir(&self, args: &Value) -> Result<PathBuf, String> {
@@ -640,6 +659,21 @@ mod tests {
         let r = ex.execute(&call("read_file", json!({ "path": "escape" })));
         assert!(r.content.contains("ERROR: path escapes root"), "symlink escape not blocked: {}", r.content);
         assert!(!r.content.contains("TOP SECRET"), "leaked host file: {}", r.content);
+    }
+
+    // read_capped 同享 symlink 逃逸不变量（二阶段补查读，needs 路径模型可控）。
+    #[cfg(unix)]
+    #[test]
+    fn read_capped_rejects_in_root_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "TOP SECRET").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), root.path().join("escape")).unwrap();
+        let ex = ToolExecutor::new(root.path());
+        assert_eq!(ex.read_capped("escape"), None, "symlink escape must be rejected");
+        // 对照：root 内正常文件可读（裸文本、无行号）
+        std::fs::write(root.path().join("ok.txt"), "fine\n").unwrap();
+        assert_eq!(ex.read_capped("ok.txt").as_deref(), Some("fine\n"));
     }
 
     // M5 search_repo 命中数超过 100 条时应截断并输出 `... [truncated]`。

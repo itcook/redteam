@@ -55,6 +55,12 @@ Each finding has: severity (low|medium|high|critical), title, body, file (path r
 - hard_constraint: set true when severity is critical or a compliance rule designates a hard block; omit or set false otherwise.
 If nothing material, return {"findings": []}. Prefer one strong finding over several weak.
 Every finding must be grounded in code you actually read — do not invent files, lines, or behavior.
+
+Optionally include a top-level "needs" array (max 5 entries) when a claim's verdict
+hinges on evidence NOT present in the provided context: each entry is
+{"path": "<repo-relative file>", "lines": "<start-end, optional>", "reason": "<what you must verify>"}.
+Declare needs ONLY for genuinely decisive evidence — the review will be re-run once with
+those files added. Do NOT declare needs for files already shown in full above.
 </output_contract>
 
 {{INCREMENTAL_ROUND}}

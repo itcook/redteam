@@ -67,7 +67,7 @@ pub(crate) fn compile_defs(lang: &Lang) -> Vec<(&'static str, Regex)> {
     lang.defs.iter().map(|(k, src)| (*k, Regex::new(src).expect("static def regex"))).collect()
 }
 
-fn match_def(line: &str, defs: &[(&'static str, Regex)]) -> Option<(&'static str, String)> {
+pub(crate) fn match_def(line: &str, defs: &[(&'static str, Regex)]) -> Option<(&'static str, String)> {
     for (kind, rx) in defs {
         if let Some(c) = rx.captures(line) {
             let name = c.get(1)?.as_str().to_string();
@@ -133,11 +133,49 @@ pub struct ChangedSym {
     pub def_line0: usize, // 0-based 新树 def 行 = 位置对连接键（symbol_at 直接用）
 }
 
-// @@ -a,b +c,d @@ 抓新文件起始行 c 与计数 d
+// @@ -a,b +c,d @@ 抓新文件起始行 c 与计数 d（d 缺省按 1 处理——unified diff 单行 hunk
+// 允许省略计数，本仓生成的 diff 目前总带显式计数，防御性兜底）。
+pub(crate) fn parse_hunk_new_range(line: &str) -> Option<(usize, usize)> {
+    let after_plus = line.split('+').nth(1)?; // "c,d @@ …" 或 "c @@ …"
+    let seg = after_plus.split([' ', '@']).next()?; // "c,d" 或 "c"
+    let mut parts = seg.split(',');
+    let c = parts.next()?.parse::<usize>().ok()?;
+    let d = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+    Some((c, d))
+}
+
 fn parse_hunk_new_start(line: &str) -> Option<usize> {
-    let after_plus = line.split('+').nth(1)?; // "c,d @@ …"
-    let c = after_plus.split([',', ' ']).next()?;
-    c.parse::<usize>().ok()
+    parse_hunk_new_range(line).map(|(c, _)| c)
+}
+
+/// diff 全部改动行（0-based 新文件坐标）：每个 + 行的行号；纯删除行取删除点坐标
+/// （同 hunk_anchors 语义——删除发生处的新文件位置，连续删除会重复、调用方去重）。
+/// 供骨架档保留 hunk 的全部改动行（hunk_anchors 只给每 hunk 首行，多行 hunk 会丢内容）。
+/// ponytail: 第三个平行 hunk 游走（见 hunk_anchors 注记的 drift 风险）；若再动一起改。
+pub(crate) fn hunk_changed_lines(diff: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut new_line = 0usize;
+    for raw in diff.lines() {
+        if raw.starts_with("+++ ") || raw.starts_with("--- ") {
+            continue;
+        }
+        if raw.starts_with("@@") {
+            new_line = parse_hunk_new_start(raw).unwrap_or(1);
+            continue;
+        }
+        if raw.starts_with('\\') {
+            continue; // No-newline 标记非内容行
+        }
+        match raw.as_bytes().first() {
+            Some(b'+') => {
+                out.push(new_line.saturating_sub(1));
+                new_line += 1;
+            }
+            Some(b'-') => out.push(new_line.saturating_sub(1)),
+            _ => new_line += 1,
+        }
+    }
+    out
 }
 
 /// diff（任意上下文级别）→ 改动符号，按 name 去重（grep 按名一次即可）。

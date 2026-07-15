@@ -161,7 +161,7 @@ impl ReviewProvider for DirectProvider {
             }).await?;
         let out = parse_lens_output(&text)?; // Parse 不进重试（形状问题）
         // DirectProvider 为无生产使用方的备选实现（registry 注释自认），call_* 不解析 cached；记 0。
-        Ok(LensCall { findings: out.findings, input_tokens, output_tokens, cached_input_tokens: 0, iterations: 1, tool_use: Default::default() })
+        Ok(LensCall { findings: out.findings, needs: out.needs, input_tokens, output_tokens, cached_input_tokens: 0, iterations: 1, tool_use: Default::default() })
     }
 }
 
@@ -415,6 +415,18 @@ mod tests {
             "expected Parse, got: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn parse_lens_output_reads_optional_needs() {
+        let with = r#"{"findings": [], "needs": [{"path": "src/state/store.rs", "lines": "40-90", "reason": "verify write ordering"}]}"#;
+        let o = parse_lens_output(with).unwrap();
+        assert_eq!(o.needs.len(), 1);
+        assert_eq!(o.needs[0].path, "src/state/store.rs");
+        assert_eq!(o.needs[0].lines.as_deref(), Some("40-90"));
+        // 旧输出无 needs 字段 → 空 vec（向后兼容）
+        let without = r#"{"findings": []}"#;
+        assert!(parse_lens_output(without).unwrap().needs.is_empty());
     }
 
     /// 真实网络冒烟测试：需要真实 API key，不在 CI 跑。

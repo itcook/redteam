@@ -10,6 +10,7 @@ use crate::output::Format;
 use crate::positioning::{anchor, anchor_doc};
 use crate::provider::{LensRequest, ReviewProvider};
 use crate::verdict::{clamp_compliance, compute_verdict};
+use regex::Regex;
 use std::path::Path;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -238,6 +239,8 @@ struct TailCtx<'a> {
     head_sha: Option<String>,
     /// 卷宗覆盖 meta（T01⑥；进 RunMeta.dossier）。code fan-out 路径为 Some，doc/resume 为 None。
     dossier_meta: Option<DossierMeta>,
+    /// 二阶段补查触发观测（进 RunMeta.needs，恒写）：(触发格数, 声明条数)；resume 无 fan-out 恒零。
+    needs_stats: (u32, u32),
     /// 后台 job 的 phase 打点通路（refute/correlate 子阶段；前台/resume 为 None）。
     sink: Option<&'a dyn CellSink>,
 }
@@ -317,6 +320,9 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
             ledger: ctx.ledger_meta,
             head_sha: ctx.head_sha,
             dossier: ctx.dossier_meta,
+            needs: crate::domain::NeedsMeta {
+                triggered_cells: ctx.needs_stats.0, declared: ctx.needs_stats.1,
+            },
             ..Default::default()
         },
     };
@@ -404,17 +410,23 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     let strict = matches!(engine, PackEngine::Scip { strict: true });
     // 变更集全景 0 壳（S2-b'' 转正，design 2026-07-13 §2.1）：每格 = 自家文件（置顶）+
     // 兄弟改动文件。兄弟带真 diff——空 diff 会让 def 降级不可达且静默消失（E8 裁决 D）。
+    // Task 6（E8 岗位①）：兄弟按 dep_rank 排序后追加——直接被 own 引用的兄弟先入包，
+    // 无关兄弟排后面、预算紧张时顺序填充天然让它们最先落回落链/omit（最远先降）。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
-            let mut files = b.files.clone();
+            let own_files = &b.files;
+            let mut siblings: Vec<FileChange> = Vec::new();
             for ob in bundles {
                 for fc in &ob.files {
-                    if !files.iter().any(|e| e.path == fc.path) {
-                        files.push(fc.clone());
+                    if !own_files.iter().any(|e| e.path == fc.path) && !siblings.iter().any(|e| e.path == fc.path) {
+                        siblings.push(fc.clone());
                     }
                 }
             }
+            siblings.sort_by_key(|fc| (dep_rank(own_files, &fc.path, root), fc.path.clone()));
+            let mut files = own_files.clone();
+            files.extend(siblings);
             let pb = crate::bundle::Bundle { files };
             let pb = &pb;
             // Fix 1（final-review）：预算记账只扣本 cell 自己的 diff 字节——pb 是全景增广版
@@ -440,6 +452,211 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
     let meta = DossierMeta { bundles: bundles.len(), injected, suppressed };
     (entries, meta)
+}
+
+/// 兄弟依赖距离 MVP（Task 6，E8 岗位①）：sib 文件 stem（`b.rs`→`b`，`mod.rs`→取父目录名）是否被
+/// `own` 任一文件源码词边界引用——0=引用（近，先入包）、1=否（远，预算紧张时先降）。
+/// 两级够用，多级依赖图/传递闭包 YAGNI，痛点再升。own 文件读失败按未引用处理（贡献 1）。
+pub(crate) fn dep_rank(own: &[FileChange], sib_path: &str, root: &Path) -> u8 {
+    let p = Path::new(sib_path);
+    let stem = if p.file_name().and_then(|n| n.to_str()) == Some("mod.rs") {
+        p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str())
+    } else {
+        p.file_stem().and_then(|n| n.to_str())
+    };
+    let stem = match stem {
+        Some(s) if !s.is_empty() => s,
+        _ => return 1,
+    };
+    let re = match Regex::new(&format!(r"\b{}\b", regex::escape(stem))) {
+        Ok(r) => r,
+        Err(_) => return 1,
+    };
+    for fc in own {
+        if let Ok(content) = std::fs::read_to_string(root.join(&fc.path)) {
+            if re.is_match(&content) {
+                return 0;
+            }
+        }
+    }
+    1
+}
+
+/// 二阶段补查行窗（design §2.3）：lines 命中区间外扩 ±30 行。
+const NEED_LINES_WINDOW: usize = 30;
+
+/// 补查证据单条段字节帽（Important 修复：此前无上限——长单行文件上 ±30 行窗可逼近
+/// read_capped 的 512KB 读帽，doc 线整文件 need 直接就是整文件，均绕开预算纪律）。
+/// 量级对齐 verify.rs::SNIPPET_FULL_FILE_CAP（64KB）。
+const NEED_SECTION_BYTE_CAP: usize = 64_000;
+
+/// doc 线证据总帽（doc 无 pack/budget 可扣，需独立总量闸）：累计超此值即停止追加新段，
+/// 已收段落保留、尾部补一行裁剪注记。
+const DOC_EVIDENCE_TOTAL_CAP: usize = 256_000;
+
+/// NeedEntry.lines 解析："a-b"（1-based、a<=b）→ Some((a,b))；缺失/坏格式 → None（整文件语义）。
+fn parse_need_lines(lines: Option<&str>) -> Option<(u32, u32)> {
+    let (a, b) = lines?.split_once('-')?;
+    let a: u32 = a.trim().parse().ok()?;
+    let b: u32 = b.trim().parse().ok()?;
+    (a >= 1 && a <= b).then_some((a, b))
+}
+
+/// 单条 need → `## 补查证据` 段：lines 合法 → ±30 行窗；缺失/坏格式 → 整文件。
+/// 路径安全走 ToolExecutor 不变量（绝对路径/`..`/symlink 逃逸/不可读 → None、不 panic）。
+fn need_section(ex: &crate::tools::ToolExecutor, need: &crate::domain::NeedEntry) -> Option<String> {
+    let text = ex.read_capped(&need.path)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let n = lines.len();
+    if n == 0 {
+        return None;
+    }
+    let (a, b) = match parse_need_lines(need.lines.as_deref()) {
+        Some((la, lb)) => (
+            (la as usize).saturating_sub(NEED_LINES_WINDOW).max(1).min(n),
+            (lb as usize).saturating_add(NEED_LINES_WINDOW).min(n),
+        ),
+        None => (1, n),
+    };
+    let b = b.max(a);
+    let mut body = lines[a - 1..b].join("\n");
+    if body.len() > NEED_SECTION_BYTE_CAP {
+        let mut cut = NEED_SECTION_BYTE_CAP;
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body.truncate(cut);
+        body.push_str("\n…（截断）");
+    }
+    Some(format!("## 补查证据\n{}:{}-{}\n{}\n\n", need.path, a, b, body))
+}
+
+/// 草稿注入段（design §2.3）：第一趟 findings 以 CONFIRM-or-REVISE 契约随第二趟 prompt 带回；
+/// 空草稿也渲染块（契约「不再声明 needs」对零草稿格同样生效）。
+fn draft_block(drafts: &[Finding]) -> String {
+    let mut s = String::from(
+        "\n<first_pass_draft>\nYour first pass produced these draft findings. CONFIRM or REVISE each using the\nnewly added evidence — drop a draft ONLY if the evidence refutes it, and do not\nre-declare needs.\n",
+    );
+    for d in drafts {
+        let quote_head: String = d.quote.chars().take(80).collect();
+        s.push_str(&format!(
+            "- [{}] {} @ {}:{}（{}）\n",
+            d.severity.as_str(), d.title, d.file, d.line_start, quote_head
+        ));
+    }
+    s.push_str("</first_pass_draft>\n");
+    s
+}
+
+/// 二阶段补查 prompt（code 线，design §2.3 置换而非追加）：整文件 needs 前插 augmented bundle
+/// （build_pack 顺序填充先进先占预算 → 最远兄弟自动让位=置换语义）；lines 行窗 needs 走
+/// `## 补查证据` 独立段置于卷宗最前；prompt 尾部追加第一趟草稿 CONFIRM-or-REVISE 段。
+/// `incremental`：增量轮的 <incremental_round> 段原样带入第二趟（claimed-resolved/dispute
+/// 契约不因补跑丢失）；全量路径传空串。全部 needs 逃逸/不可读 → None（不补跑，省一次 LLM 调用）。
+#[allow(clippy::too_many_arguments)] // 与 build_bundle_prompt 同源的参数面；收拢 struct 是过度设计
+pub(crate) fn second_pass_prompt(
+    bundles: &[crate::bundle::Bundle],
+    root: &Path,
+    budget: usize,
+    target_label: &str,
+    rules: &[&crate::lens::Lens],
+    focus: &str,
+    idx: usize,
+    needs: &[crate::domain::NeedEntry],
+    drafts: &[Finding],
+    incremental: &str,
+) -> Option<String> {
+    let own = bundles.get(idx)?;
+    let ex = crate::tools::ToolExecutor::new(root);
+    // 两遍走：先收整文件条目——同 path 全文与行窗并存时全文优先（全文是超集，互斥防双重注入）。
+    let mut full_paths: Vec<String> = Vec::new();
+    for need in needs {
+        if parse_need_lines(need.lines.as_deref()).is_none()
+            && !full_paths.contains(&need.path)
+            && ex.read_capped(&need.path).is_some()
+        {
+            // ponytail: read_capped 在此只当路径安全验证用（内容由 build_pack 自己读）——
+            // needs ≤5 条/格，多读一次成本可忽略，省一个只为验证的旁路 API。
+            full_paths.push(need.path.clone());
+        }
+    }
+    let mut evidence = String::new();
+    for need in needs {
+        if parse_need_lines(need.lines.as_deref()).is_some() && !full_paths.contains(&need.path) {
+            if let Some(sec) = need_section(&ex, need) {
+                evidence.push_str(&sec);
+            }
+        }
+    }
+    if evidence.is_empty() && full_paths.is_empty() {
+        return None;
+    }
+    // augmented bundle：needs 前插（changeset 内的 need 取真 diff，防超预算 def 回落失锚）
+    // → 自家 → 兄弟（镜像 build_packs 全景循环）；预算记账仍只扣自家原 diff（Fix 1 语义）。
+    let mut files: Vec<FileChange> = full_paths
+        .into_iter()
+        .map(|p| {
+            let diff = bundles.iter().flat_map(|b| &b.files)
+                .find(|f| f.path == p).map(|f| f.diff.clone()).unwrap_or_default();
+            FileChange { path: p, diff }
+        })
+        .collect();
+    for fc in own.files.iter().chain(bundles.iter().flat_map(|b| &b.files)) {
+        if !files.iter().any(|e| e.path == fc.path) {
+            files.push(fc.clone());
+        }
+    }
+    let own_diff_bytes: usize = own.files.iter().map(|fc| fc.diff.len()).sum();
+    let pb = crate::bundle::Bundle { files };
+    // ponytail: 第二趟恒用 regex 引擎——scip 是 opt-in 实验臂且索引 per-cell 重建昂贵；
+    // needs 只消费 0 壳全文分支（两引擎共用 body_section），scip 臂需要时再接。
+    // Important 修复：evidence（行窗证据段，已在上方按 NEED_SECTION_BYTE_CAP 分段封顶）先
+    // 扣出 pack 预算再传入 build_pack——否则 evidence+pack 联合越过每模型字节预算，撞墙全归零
+    // （design §2.2）。budget 耗尽时 build_pack 自身的降级链兜底，不会 panic。
+    let pack = crate::pack::build_pack(&pb, root, budget.saturating_sub(evidence.len()), own_diff_bytes);
+    let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
+    let others = crate::bundle::other_files_manifest(bundles, idx);
+    let mut p = crate::prompt::build_bundle_prompt(target_label, own, rules, focus, &others, incremental, &dossier);
+    p.push_str(&draft_block(drafts));
+    Some(p)
+}
+
+/// 二阶段补查 prompt（doc 线）：doc 无 bundle/pack——原 doc prompt + `## 补查证据` 段
+/// （整文件与行窗 need 同走 need_section，单条已按 NEED_SECTION_BYTE_CAP 封顶）+ 草稿段。
+/// doc 线没有 pack 预算可扣，Important 修复补一道独立总量闸：累计超 DOC_EVIDENCE_TOTAL_CAP
+/// 即停止追加新段（已收段落保留），尾部落一行裁剪注记——防 needs 条数多时 5×64KB 仍叠穿预算。
+/// 全部 needs 逃逸/不可读 → None。
+fn doc_second_pass_prompt(
+    input: &crate::domain::ReviewInput,
+    rules: &[&crate::lens::Lens],
+    focus: &str,
+    root: &Path,
+    needs: &[crate::domain::NeedEntry],
+    drafts: &[Finding],
+) -> Option<String> {
+    let ex = crate::tools::ToolExecutor::new(root);
+    let mut evidence = String::new();
+    let mut clipped = false;
+    for need in needs {
+        if evidence.len() >= DOC_EVIDENCE_TOTAL_CAP {
+            clipped = true;
+            break;
+        }
+        if let Some(sec) = need_section(&ex, need) {
+            evidence.push_str(&sec);
+        }
+    }
+    if evidence.is_empty() {
+        return None;
+    }
+    if clipped {
+        evidence.push_str("（其余补查条目因预算裁剪省略）\n");
+    }
+    let mut p = crate::prompt::build_doc_prompt(input, rules, focus);
+    p.push('\n');
+    p.push_str(&evidence);
+    p.push_str(&draft_block(drafts));
+    Some(p)
 }
 
 /// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
@@ -506,7 +723,11 @@ pub async fn run_review(
     let focus = args.focus.clone().unwrap_or_default();
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink).await;
+    // 二阶段补查构造器（doc 简化版）：原 doc prompt + 补查证据段 + 草稿契约。
+    let mk = |_idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
+        doc_second_pass_prompt(&input, &lenses, &focus, &cwd, needs, drafts)
+    };
+    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink, Some(&mk)).await;
 
     // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
     let block = args
@@ -538,6 +759,7 @@ pub async fn run_review(
         ledger_meta: ledger.meta.clone(),
         head_sha: None,
         dossier_meta: None,
+        needs_stats: raw.needs_stats,
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
@@ -601,8 +823,13 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink).await;
+    let budget = pack_budget_bytes(cfg, &model_names);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
+    let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
+        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts, "")
+    };
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink, Some(&mk)).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(
@@ -639,6 +866,7 @@ pub async fn run_code_review(
         ledger_meta: ledger.meta.clone(),
         head_sha,
         dossier_meta: Some(dossier_meta),
+        needs_stats: raw.needs_stats,
         sink,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
@@ -728,8 +956,14 @@ pub async fn run_incremental_review(
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
-    let (dossiers, dossier_meta) = build_packs(&bundles, root, pack_budget_bytes(cfg, &model_names));
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink).await;
+    let budget = pack_budget_bytes(cfg, &model_names);
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
+    // dispute 契约不因补跑丢失。
+    let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
+        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts, &inc_section)
+    };
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk)).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
     //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。
@@ -807,6 +1041,9 @@ pub async fn run_incremental_review(
             resolution_disputed,
             carried_dropped: outcome.carried_dropped,
             dossier: Some(dossier_meta),
+            needs: crate::domain::NeedsMeta {
+                triggered_cells: raw.needs_stats.0, declared: raw.needs_stats.1,
+            },
         },
     };
     let code = exit_code(verdict, !report.run.failed_models.is_empty());
@@ -1207,6 +1444,7 @@ pub async fn run_resume(
         ledger_meta: ledger.meta.clone(),
         head_sha: None,
         dossier_meta: None,
+        needs_stats: (0, 0),
         sink: None,
     };
     match assemble_report(findings, ctx).await {
@@ -1591,6 +1829,7 @@ mod resume_tests {
                 cached_input_tokens: 0,
                 iterations: 1,
                 tool_use: Default::default(),
+                needs: vec![],
             })
         }
     }
@@ -1990,6 +2229,165 @@ mod tests {
     }
 
     #[test]
+    fn second_pass_prompt_injects_needs_evidence_and_drafts() {
+        use crate::bundle::Bundle;
+        use crate::domain::NeedEntry;
+        // fixture：两 bundle 各一文件 + 一个变更集外文件 evidence.rs
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn own() { let z = 1; }\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn sib() {}\n").unwrap();
+        std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
+        let bundles = vec![
+            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn sib() {}\n".into() }] },
+        ];
+        let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
+        let drafts = vec![]; // 空草稿也合法
+        let rules = vec![crate::lens::by_id("L1").unwrap()];
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, "").unwrap();
+        assert!(p.contains("pub const LIMIT"), "needs 文件全文进包: {p}");
+        assert!(p.contains("first_pass_draft"), "草稿段在场");
+        assert!(p.contains("CONFIRM or REVISE"), "确认或修订语义");
+        assert!(!p.contains("<incremental_round>"), "全量路径第二趟无增量段");
+        // 增量轮：inc_section 原样带入第二趟（claimed-resolved/dispute 契约不因补跑丢失）
+        let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
+        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, &inc).unwrap();
+        assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段带入第二趟: {pi}");
+        assert!(pi.contains("pub const LIMIT"), "增量第二趟 needs 证据仍在场");
+        // 路径逃逸：绝对路径 needs 被 skip、不 panic、其余照常
+        let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
+        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &evil, &drafts, "");
+        if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
+    }
+
+    #[test]
+    fn second_pass_prompt_lines_window_and_draft_format() {
+        use crate::bundle::Bundle;
+        use crate::domain::{NeedEntry, Origin};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn own() {}\n").unwrap();
+        let body: String = (1..=200).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(root.join("src/long.rs"), &body).unwrap();
+        std::fs::write(root.join("src/other.rs"), "pub fn other_evidence() {}\n").unwrap();
+        let bundles = vec![Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
+        }] }];
+        let needs = vec![
+            // 合法 lines → ±30 行窗独立补查段
+            NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
+            // 坏格式 lines → 按整文件（前插 bundle 路径，全文进 0 壳）
+            NeedEntry { path: "src/other.rs".into(), lines: Some("abc".into()), reason: "r".into() },
+        ];
+        let drafts = vec![Finding {
+            id: "x".into(), severity: Severity::High, title: "weak hash".into(), body: "b".into(),
+            file: "src/a.rs".into(), line_start: 5, line_end: 6, confidence: 0.9,
+            recommendation: "r".into(), lenses: vec![], models: vec![], agreement: 1,
+            hard_constraint: false, quote: "md5(pw)".into(), cluster_id: None, verify: None,
+            previously_dismissed: false, origin: Origin::New,
+        }];
+        let rules = vec![crate::lens::by_id("L1").unwrap()];
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, "").unwrap();
+        assert!(p.contains("## 补查证据"), "行窗补查段在场");
+        assert!(p.contains("src/long.rs:70-132"), "±30 行窗头: {p}");
+        assert!(p.contains("line70") && p.contains("line132"), "窗内行在场");
+        assert!(p.contains("pub fn other_evidence"), "坏格式 lines 走整文件路径（全文进 0 壳）");
+        assert!(p.contains("- [high] weak hash @ src/a.rs:5（md5(pw)）"), "草稿行格式: {p}");
+
+        // 互斥：同 path 既有整文件条目又有行窗条目 → 全文优先（超集），行窗段不再重复注入
+        let both = vec![
+            NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
+            NeedEntry { path: "src/long.rs".into(), lines: None, reason: "r".into() },
+        ];
+        let pb = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &both, &drafts, "").unwrap();
+        assert!(pb.contains("src/long.rs:1-200（全文"), "全文条目在场: {pb}");
+        assert!(!pb.contains("## 补查证据"), "同 path 行窗段被全文超集互斥掉: {pb}");
+    }
+
+    #[test]
+    fn doc_second_pass_prompt_appends_evidence_and_drafts() {
+        use crate::domain::{Mode, NeedEntry, ReviewInput};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("spec2.md"), "background detail\n").unwrap();
+        let input = ReviewInput {
+            mode: Mode::Doc, target_label: "spec.md".into(),
+            collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
+        };
+        let rules = vec![crate::lens::by_id("D1").unwrap()];
+        let needs = vec![NeedEntry { path: "spec2.md".into(), lines: None, reason: "cross-ref".into() }];
+        let p = doc_second_pass_prompt(&input, &rules, "", root, &needs, &[]).unwrap();
+        assert!(p.contains("DOCBODY"), "原 doc prompt 在场");
+        assert!(p.contains("## 补查证据") && p.contains("background detail"), "补查段在场");
+        assert!(p.contains("first_pass_draft"), "草稿段在场");
+        // 全部 needs 逃逸 → None（不补跑）
+        let evil = vec![NeedEntry { path: "../outside.md".into(), lines: None, reason: "x".into() }];
+        assert!(doc_second_pass_prompt(&input, &rules, "", root, &evil, &[]).is_none());
+    }
+
+    #[test]
+    fn second_pass_prompt_caps_huge_lines_window_evidence() {
+        // Important 修复回归：单行超长（如压缩/minified 文件）时 ±30 行窗退化成"整行"，
+        // 旧代码无字节帽——body 可逼近 read_capped 的 512KB 读帽。新帽 NEED_SECTION_BYTE_CAP
+        // 应把它摁在 64KB，且 evidence 扣减后 pack 仍正常渲染（预算纪律不因证据段被撞穿）。
+        use crate::bundle::Bundle;
+        use crate::domain::NeedEntry;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn own() {}\n").unwrap();
+        let huge_line = "x".repeat(100_000); // 无换行——lines() 只有 1 行
+        std::fs::write(root.join("src/minified.rs"), &huge_line).unwrap();
+        let bundles = vec![Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
+        }] }];
+        let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into() }];
+        let rules = vec![crate::lens::by_id("L1").unwrap()];
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &[], "").unwrap();
+        assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);
+        assert!(p.contains("fn own()"), "证据段截断后 pack 仍照常渲染自家文件");
+        assert!(p.len() < 300_000, "总 prompt 长度被证据帽拘住，未逼近原 100KB 单行体量: {}", p.len());
+    }
+
+    #[test]
+    fn doc_second_pass_prompt_total_cap_drops_later_sections() {
+        // Important 修复回归：doc 线无 pack/budget 可扣，靠独立总帽 DOC_EVIDENCE_TOTAL_CAP（256KB）
+        // 兜底——多条整文件 need 累计超帽时，后续段落应被丢弃、尾部带裁剪注记（不是逐条截断）。
+        use crate::domain::{Mode, NeedEntry, ReviewInput};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let body_60k = "y".repeat(60_000); // 单条 < 64KB 单段帽，不触发逐段截断
+        for i in 0..6 {
+            std::fs::write(root.join(format!("doc{i}.md")), &body_60k).unwrap();
+        }
+        let input = ReviewInput {
+            mode: Mode::Doc, target_label: "spec.md".into(),
+            collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
+        };
+        let rules = vec![crate::lens::by_id("D1").unwrap()];
+        let needs: Vec<NeedEntry> = (0..6)
+            .map(|i| NeedEntry { path: format!("doc{i}.md"), lines: None, reason: "r".into() })
+            .collect();
+        let p = doc_second_pass_prompt(&input, &rules, "", root, &needs, &[]).unwrap();
+        assert!(p.contains("doc4.md:1-1"), "累计未超帽前的段落在场: {p}");
+        assert!(!p.contains("doc5.md:1-1"), "累计超帽后的段落应被丢弃");
+        assert!(p.contains("（其余补查条目因预算裁剪省略）"), "总帽裁剪注记在场: {p}");
+        let sections = p.matches("## 补查证据").count();
+        assert!(sections < 6, "至少一段应被总帽挡掉，实际全部 {sections} 段在场");
+    }
+
+    #[test]
+    fn run_meta_needs_always_serialized_zeros_included() {
+        // E8-E 观测面：needs 统计恒写、零也写。
+        let v = serde_json::to_value(RunMeta::default()).unwrap();
+        assert_eq!(v["needs"]["triggered_cells"], 0);
+        assert_eq!(v["needs"]["declared"], 0);
+    }
+
+    #[test]
     fn build_packs_default_gives_changeset_panorama_with_real_sibling_diff() {
         use crate::bundle::Bundle;
         let tmp = tempfile::tempdir().unwrap();
@@ -2041,6 +2439,42 @@ mod tests {
         let (on, _) = build_packs(&bundles, root, 5_000);
         assert!(on[0].contains("## 改动源文（0 壳）") && on[0].contains("alpha_marker"),
             "格0 自身小文件应仍全文渲染，不被兄弟巨 diff 挤空: {}", on[0]);
+    }
+
+    #[test]
+    fn panorama_siblings_sorted_by_dep_rank() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // own 引用 zeta（词边界），不引用 alpha —— 尽管 alpha 字典序在前，zeta 应排前
+        std::fs::write(root.join("src/own.rs"), "use crate::zeta::thing;\nfn f() { zeta::go(); }\n").unwrap();
+        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/zeta.rs"), "pub fn go() {}\n").unwrap();
+        let own = vec![FileChange { path: "src/own.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }];
+        assert_eq!(dep_rank(&own, "src/zeta.rs", root), 0, "被 own 引用 → rank 0");
+        assert_eq!(dep_rank(&own, "src/alpha.rs", root), 1, "未被引用 → rank 1");
+    }
+
+    #[test]
+    fn build_packs_panorama_siblings_ordered_by_dep_rank() {
+        // 集成层排序断言：own 引用 zeta 不引用 alpha —— 尽管 alpha 字典序在前，全景注入循环
+        // 应把 zeta 块排在 alpha 块之前（最远先降，E8 岗位①）。
+        use crate::bundle::Bundle;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/own.rs"), "use crate::zeta::thing;\nfn f() { zeta::go(); }\n").unwrap();
+        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/zeta.rs"), "pub fn go() {}\n").unwrap();
+        let bundles = vec![
+            Bundle { files: vec![FileChange { path: "src/own.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/alpha.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
+            Bundle { files: vec![FileChange { path: "src/zeta.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
+        ];
+        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
+        let zeta_pos = on[0].find("src/zeta.rs").expect("zeta 块在场");
+        let alpha_pos = on[0].find("src/alpha.rs").expect("alpha 块在场");
+        assert!(zeta_pos < alpha_pos, "被引用兄弟 zeta 应先于未引用兄弟 alpha 出现: {}", on[0]);
     }
 
     #[test]
