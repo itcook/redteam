@@ -10,7 +10,6 @@ use crate::output::Format;
 use crate::positioning::{anchor, anchor_doc};
 use crate::provider::{LensRequest, ReviewProvider};
 use crate::verdict::{clamp_compliance, compute_verdict};
-use regex::Regex;
 use std::path::Path;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -374,9 +373,15 @@ fn pack_engine() -> PackEngine {
     }
 }
 
-/// 验收仪器（E8 裁决 B，随 M12 拆）：REDTEAM_SINGLE_CELL 非空 → 全变更集并成单 bundle
-/// （单格全审 A/B 臂——分格在全景 pack 范式下=N 倍重复喂全景，质量对照据此判批 4 收缩）。
+/// 单格全审默认（E9 判决，2026-07-13 转正）：全变更集恒并成一个 bundle——分格在全景 pack
+/// 范式下=N 倍重复喂同一全景（两跑实证 input −77%、质量未见系统性下降）。空输入原样放行
+/// （不产出「一个空文件的 bundle」）——上游两处空证据守卫（`run_code_review` 的「no reviewable
+/// evidence」警告、`run_incremental_review` 的 delta 全噪声过滤报错）靠 `bundles.is_empty()`
+/// 判空，语义须保持不变。
 fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bundle> {
+    if bundles.is_empty() {
+        return bundles;
+    }
     vec![crate::bundle::Bundle { files: bundles.into_iter().flat_map(|b| b.files).collect() }]
 }
 
@@ -408,31 +413,13 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
         _ => None,
     };
     let strict = matches!(engine, PackEngine::Scip { strict: true });
-    // 变更集全景 0 壳（S2-b'' 转正，design 2026-07-13 §2.1）：每格 = 自家文件（置顶）+
-    // 兄弟改动文件。兄弟带真 diff——空 diff 会让 def 降级不可达且静默消失（E8 裁决 D）。
-    // Task 6（E8 岗位①）：兄弟按 dep_rank 排序后追加——直接被 own 引用的兄弟先入包，
-    // 无关兄弟排后面、预算紧张时顺序填充天然让它们最先落回落链/omit（最远先降）。
+    // 单格全审默认（E9）：bundles 恒为单元素（全变更集），每格即自家文件——原「兄弟改动
+    // 文件全景注入 + 依赖距离排序」随分格一并收缩（无兄弟可注入）。超预算由 build_pack/
+    // build_pack_scip 自身的降级梯子（骨架/hunk 窗/省略清单）承接，不再靠分格避让。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
-            let own_files = &b.files;
-            let mut siblings: Vec<FileChange> = Vec::new();
-            for ob in bundles {
-                for fc in &ob.files {
-                    if !own_files.iter().any(|e| e.path == fc.path) && !siblings.iter().any(|e| e.path == fc.path) {
-                        siblings.push(fc.clone());
-                    }
-                }
-            }
-            siblings.sort_by_key(|fc| (dep_rank(own_files, &fc.path, root), fc.path.clone()));
-            let mut files = own_files.clone();
-            files.extend(siblings);
-            let pb = crate::bundle::Bundle { files };
-            let pb = &pb;
-            // Fix 1（final-review）：预算记账只扣本 cell 自己的 diff 字节——pb 是全景增广版
-            // （混入兄弟真 diff，供 def 锚定/正文消费），但唯一真正进 prompt 的 diff 只有
-            // b 自己那份（见 orchestrate::run_code_fanout 用原 bundle 而非 pb 建 diff 块）。
-            // 用 pb.files 重新求和会把兄弟 diff 也扣进预算，大改动集下 remaining→0、0 壳塌缩。
+            // 预算记账扣本格自己的 diff 字节（单格默认下即全变更集真实 diff）。
             let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
             if suppressed {
                 String::new()
@@ -441,10 +428,10 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
                     (PackEngine::Dossier, _) =>
                         crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)),
                     (PackEngine::Scip { .. }, Some(idx)) =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(pb, root, budget, own_diff_bytes, idx, strict)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(b, root, budget, own_diff_bytes, idx, strict)),
                     // Regex 默认，及 scip 降级（scip_index=None）都走 regex-pack。
                     _ =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack(pb, root, budget, own_diff_bytes)),
+                        crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes)),
                 }
             }
         })
@@ -452,34 +439,6 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
     let meta = DossierMeta { bundles: bundles.len(), injected, suppressed };
     (entries, meta)
-}
-
-/// 兄弟依赖距离 MVP（Task 6，E8 岗位①）：sib 文件 stem（`b.rs`→`b`，`mod.rs`→取父目录名）是否被
-/// `own` 任一文件源码词边界引用——0=引用（近，先入包）、1=否（远，预算紧张时先降）。
-/// 两级够用，多级依赖图/传递闭包 YAGNI，痛点再升。own 文件读失败按未引用处理（贡献 1）。
-pub(crate) fn dep_rank(own: &[FileChange], sib_path: &str, root: &Path) -> u8 {
-    let p = Path::new(sib_path);
-    let stem = if p.file_name().and_then(|n| n.to_str()) == Some("mod.rs") {
-        p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str())
-    } else {
-        p.file_stem().and_then(|n| n.to_str())
-    };
-    let stem = match stem {
-        Some(s) if !s.is_empty() => s,
-        _ => return 1,
-    };
-    let re = match Regex::new(&format!(r"\b{}\b", regex::escape(stem))) {
-        Ok(r) => r,
-        Err(_) => return 1,
-    };
-    for fc in own {
-        if let Ok(content) = std::fs::read_to_string(root.join(&fc.path)) {
-            if re.is_match(&content) {
-                return 0;
-            }
-        }
-    }
-    1
 }
 
 /// 二阶段补查行窗（design §2.3）：lines 命中区间外扩 ±30 行。
@@ -549,7 +508,7 @@ fn draft_block(drafts: &[Finding]) -> String {
 }
 
 /// 二阶段补查 prompt（code 线，design §2.3 置换而非追加）：整文件 needs 前插 augmented bundle
-/// （build_pack 顺序填充先进先占预算 → 最远兄弟自动让位=置换语义）；lines 行窗 needs 走
+/// （build_pack 顺序填充先进先占预算 → 自家非 needs 文件预算紧张时自动让位=置换语义）；lines 行窗 needs 走
 /// `## 补查证据` 独立段置于卷宗最前；prompt 尾部追加第一趟草稿 CONFIRM-or-REVISE 段。
 /// `incremental`：增量轮的 <incremental_round> 段原样带入第二趟（claimed-resolved/dispute
 /// 契约不因补跑丢失）；全量路径传空串。全部 needs 逃逸/不可读 → None（不补跑，省一次 LLM 调用）。
@@ -592,7 +551,7 @@ pub(crate) fn second_pass_prompt(
         return None;
     }
     // augmented bundle：needs 前插（changeset 内的 need 取真 diff，防超预算 def 回落失锚）
-    // → 自家 → 兄弟（镜像 build_packs 全景循环）；预算记账仍只扣自家原 diff（Fix 1 语义）。
+    // → 自家文件（单格全审默认下 own 即全变更集，无兄弟可镜像）；预算记账仍只扣自家原 diff。
     let mut files: Vec<FileChange> = full_paths
         .into_iter()
         .map(|p| {
@@ -601,7 +560,7 @@ pub(crate) fn second_pass_prompt(
             FileChange { path: p, diff }
         })
         .collect();
-    for fc in own.files.iter().chain(bundles.iter().flat_map(|b| &b.files)) {
+    for fc in own.files.iter() {
         if !files.iter().any(|e| e.path == fc.path) {
             files.push(fc.clone());
         }
@@ -786,14 +745,10 @@ pub async fn run_code_review(
     let t0 = std::time::Instant::now();
 
     // 1. 确定性筛选 + 分包
-    let bundles = group(select_files(changes), Some(root));
-
-    // 验收仪器（随 M12 拆）：单格全审臂。增量轮（run_incremental）不接——验收只走全量。
-    let bundles = if std::env::var_os("REDTEAM_SINGLE_CELL").is_some() {
-        merge_bundles(bundles)
-    } else {
-        bundles
-    };
+    // 单格全审默认（E9，2026-07-13）：全变更集并成一个 bundle——分格在全景 pack 范式下
+    // =N 倍重复喂全景（两跑实证 input −77%、质量未见下降）。bundle::group 保留（收集与
+    // 未来 L4 拆缝用）；超预算由降级梯子（骨架/hunk 窗/省略清单）承接，不拆格。
+    let bundles = merge_bundles(group(select_files(changes), Some(root)));
 
     // 2. rules = code lenses（lens → 注入 rule）
     let lens_ids: Vec<String> = args
@@ -922,7 +877,9 @@ pub async fn run_incremental_review(
         .collect();
 
     // 7. delta → bundle + 增量 prompt 段 + fan-out（select_files/group/run_code_fanout 全复用）。
-    let bundles = group(select_files(base.delta), Some(root));
+    // 单格全审默认（E9）：增量路径同全量一样收缩到单 bundle（merge_bundles 空输入原样放行，
+    // 下面的空判空守卫语义不变）。
+    let bundles = merge_bundles(group(select_files(base.delta), Some(root)));
     anyhow::ensure!(
         !bundles.is_empty(),
         "--incremental-from: delta since {} is all noise-filtered (nothing reviewable); run a full `redteam review` or let ship's stall guard decide",
@@ -2167,24 +2124,25 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
-        // bundle 1：支持语言 + ≥5 引用点 → 应注入；bundle 2：自身 .py 未写盘（无贡献），但默认
-        // 变更集全景令其 pack 从兄弟 a.rs 拿到内容（非空）——T01⑥ 意图已由全景默认取代。
+        std::fs::write(root.join("src/b.rs"), "pub fn other() {}\n").unwrap();
+        // 单格全审默认（E9）后改写：build_packs 不再做跨 bundle 兄弟注入——两 bundle 各自
+        // 以自家内容非空（DossierMeta 的多 bundle 计数仍是通用函数行为，值得独立守住）。
         let bundles = vec![
             Bundle { files: vec![FileChange {
                 path: "src/a.rs".into(),
                 diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
             }] },
             Bundle { files: vec![FileChange {
-                path: "src/b.py".into(),
-                diff: "@@ -1,0 +1,1 @@\n+def f(): pass\n".into(),
+                path: "src/b.rs".into(),
+                diff: "@@ -1,0 +1,1 @@\n+pub fn other() {}\n".into(),
             }] },
         ];
 
-        // on 臂：两段皆非空（bundle 2 靠全景从兄弟 a.rs 拿到引用点）→ meta 反映 injected:2
+        // on 臂：两段各以自家内容非空 → meta 反映 injected:2
         unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
         let (on, on_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(!on[0].is_empty(), "支持语言且≥5引用点应非空: {on:?}");
-        assert!(on[1].contains("target"), "bundle 2 自身不供内容，但全景从兄弟 a.rs 拿到 target: {on:?}");
+        assert!(on[0].contains("target"), "bundle 1 自家内容非空: {on:?}");
+        assert!(on[1].contains("other"), "bundle 2 自家内容非空: {on:?}");
         assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 2, suppressed: false });
 
         // off 臂：REDTEAM_NO_DOSSIER 生效 → 全空段 + suppressed=true + injected=0
@@ -2388,35 +2346,36 @@ mod tests {
     }
 
     #[test]
-    fn build_packs_default_gives_changeset_panorama_with_real_sibling_diff() {
+    fn build_packs_single_bundle_over_budget_file_falls_back_to_def_body_with_real_diff() {
+        // E9 单格默认后改写：不再有跨 bundle 兄弟注入——E8-D 回归锚从「兄弟」换成
+        // 「同格文件超预算」：同一 bundle 内一个小文件 + 一个超预算大文件，大文件必走
+        // def 锚回落，而锚定消费的是 fc.diff——若被塞空 diff 占位（E8 裁决 D 回归），
+        // def 锚不到、本块静默消失。
         use crate::bundle::Bundle;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
-        // 兄弟 b.rs 撑超 pack 预算：全文分支放不下 → 必走 def 锚回落，而锚定消费的是
-        // fc.diff——兄弟若被塞空 diff 占位（E8 裁决 D 回归），def 锚不到、本块静默消失。
+        // 同格 b.rs 撑超 pack 预算：全文分支放不下 → 必走 def 锚回落。
         let filler_line = "// 填充行：撑爆预算迫入 def 锚回落\n";
-        let sibling = format!(
+        let big = format!(
             "pub fn beta_marker() {{\n    let marker_body = 1;\n}}\n{}",
             filler_line.repeat(PACK_BUDGET_BYTES / filler_line.len() + 10)
         );
-        std::fs::write(root.join("src/b.rs"), &sibling).unwrap();
-        let bundles = vec![
-            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() }] },
-        ];
+        std::fs::write(root.join("src/b.rs"), &big).unwrap();
+        let bundles = vec![Bundle { files: vec![
+            FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() },
+            FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() },
+        ] }];
         let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(on[0].contains("alpha_marker") && on[0].contains("beta_marker"), "格0 默认追加兄弟文件全景");
-        assert!(on[1].contains("beta_marker") && on[1].contains("alpha_marker"), "格1 默认追加兄弟文件全景");
-        // 真 diff 穿透证明（集成级）：兄弟超预算迫入 def 锚回落分支（changed_def_ranges
-        // 消费兄弟真 diff）——空 diff 占位回归下无锚可寻，以下三条断言全灭。
-        assert!(on[0].contains("（def 体，全文超预算回落）"), "兄弟超预算迫入 def 回落分支");
-        assert!(on[0].contains("let marker_body = 1;"), "兄弟改动 fn 的 def 体在场（真 diff 锚定）");
+        assert!(on[0].contains("alpha_marker"), "小文件全文在场");
+        // 真 diff 穿透证明（集成级）：超预算文件迫入 def 锚回落分支（changed_def_ranges
+        // 消费其真 diff）——空 diff 占位回归下无锚可寻，以下两条断言全灭。
+        assert!(on[0].contains("（def 体，全文超预算回落）"), "超预算文件迫入 def 回落分支");
+        assert!(on[0].contains("let marker_body = 1;"), "超预算文件改动 def 体在场（真 diff 锚定）");
         assert!(!on[0].contains("填充行"), "回落只给改动 def 体，不带填充");
         // 同 path 不重复
-        assert_eq!(on[0].matches("src/b.rs").count(), 1, "兄弟条目 src/b.rs 不重复");
-        assert_eq!(on[1].matches("src/a.rs").count(), 1, "兄弟条目 src/a.rs 不重复");
+        assert_eq!(on[0].matches("src/b.rs").count(), 1, "同格文件条目 src/b.rs 不重复");
     }
 
     #[test]
@@ -2439,42 +2398,6 @@ mod tests {
         let (on, _) = build_packs(&bundles, root, 5_000);
         assert!(on[0].contains("## 改动源文（0 壳）") && on[0].contains("alpha_marker"),
             "格0 自身小文件应仍全文渲染，不被兄弟巨 diff 挤空: {}", on[0]);
-    }
-
-    #[test]
-    fn panorama_siblings_sorted_by_dep_rank() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        // own 引用 zeta（词边界），不引用 alpha —— 尽管 alpha 字典序在前，zeta 应排前
-        std::fs::write(root.join("src/own.rs"), "use crate::zeta::thing;\nfn f() { zeta::go(); }\n").unwrap();
-        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
-        std::fs::write(root.join("src/zeta.rs"), "pub fn go() {}\n").unwrap();
-        let own = vec![FileChange { path: "src/own.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }];
-        assert_eq!(dep_rank(&own, "src/zeta.rs", root), 0, "被 own 引用 → rank 0");
-        assert_eq!(dep_rank(&own, "src/alpha.rs", root), 1, "未被引用 → rank 1");
-    }
-
-    #[test]
-    fn build_packs_panorama_siblings_ordered_by_dep_rank() {
-        // 集成层排序断言：own 引用 zeta 不引用 alpha —— 尽管 alpha 字典序在前，全景注入循环
-        // 应把 zeta 块排在 alpha 块之前（最远先降，E8 岗位①）。
-        use crate::bundle::Bundle;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/own.rs"), "use crate::zeta::thing;\nfn f() { zeta::go(); }\n").unwrap();
-        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
-        std::fs::write(root.join("src/zeta.rs"), "pub fn go() {}\n").unwrap();
-        let bundles = vec![
-            Bundle { files: vec![FileChange { path: "src/own.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/alpha.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/zeta.rs".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into() }] },
-        ];
-        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        let zeta_pos = on[0].find("src/zeta.rs").expect("zeta 块在场");
-        let alpha_pos = on[0].find("src/alpha.rs").expect("alpha 块在场");
-        assert!(zeta_pos < alpha_pos, "被引用兄弟 zeta 应先于未引用兄弟 alpha 出现: {}", on[0]);
     }
 
     #[test]
@@ -2932,5 +2855,20 @@ default_models=["m"]
         let merged = merge_bundles(bs);
         assert_eq!(merged.len(), 1, "单格全审：全部并成一个 bundle");
         assert_eq!(merged[0].files.len(), 3);
+    }
+
+    #[test]
+    fn bundles_collapse_to_single_cell_by_default() {
+        // E9：单格全审默认——group 产多 bundle 后恒并单格（无 env 门）
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let fc = |p: &str| FileChange { path: p.into(), diff: format!("@@ -1,0 +1,1 @@\n+x // {p}\n") };
+        let bs = vec![
+            Bundle { files: vec![fc("src/a.rs")] },
+            Bundle { files: vec![fc("src/b.rs")] },
+        ];
+        let merged = merge_bundles(bs);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].files.len(), 2);
     }
 }
