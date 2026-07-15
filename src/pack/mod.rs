@@ -208,10 +208,10 @@ fn refs_section(refs: &[SymRefs], budget: usize, omit: &mut Vec<String>) -> Stri
 
 /// 引擎入口：为一个 bundle 产 3 段 pack 正文（0 壳 + 1 壳 + 省略清单），预算近→远填。
 /// 不含 `<dossier>` 包裹（那是 prompt 层的活）。空 = 无 pack（降级）。
-/// `own_diff_bytes`：调用方本 cell 自身 diff 的字节数（mandate，永不砍，但占预算记账）——
-/// 传入的 `bundle` 可能是全景增广版（含兄弟真 diff，见 cli.rs::build_packs 全景循环），
-/// 但唯一真正进 prompt 的 diff 只有本 cell 自己那份；用 `bundle.files` 重新求和会把兄弟
-/// diff 也算进预算扣除，双重预留（Fix 1：final-review 报告）。
+/// `own_diff_bytes`：本变更集 diff 的字节数（mandate——diff 是 prompt 恒渲染部分，永不砍，
+/// 但占预算记账）：先从 budget 扣出预留，pack 各段再按剩余近→远填充。由调用方传入而非在此
+/// 对 `bundle.files` 求和：二阶段补查传入的 augmented bundle 前插了 needs 文件，记账仍只按
+/// 原始变更集 diff 算。
 pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: usize) -> String {
     let remaining = budget.saturating_sub(own_diff_bytes);
 

@@ -72,8 +72,8 @@ those files added. Do NOT declare needs for files already shown in full above.
 <bundle>
 Target: {{TARGET_LABEL}}
 Files in this bundle: {{FILE_LIST}}
-Files changed elsewhere in this changeset — their diffs are not repeated in THIS bundle's diff block, but their full sources ARE included in the dossier below (sibling changed-file panorama): {{OTHER_CHANGED_FILES}}
-Do NOT claim something is missing, undeclared, or unimplemented ACROSS THE CHANGESET (e.g. "no version declared", "the announced X is implemented nowhere") when it could plausibly live in one of those files — verify the claim against their source in the dossier below first. If that source is omitted or unavailable (see the dossier's omission list, if any), lower your confidence or state the gap instead of asserting absence. Absence from this bundle is not absence from the changeset.
+Files changed elsewhere in this changeset: {{OTHER_CHANGED_FILES}}
+Do NOT claim something is missing, undeclared, or unimplemented ACROSS THE CHANGESET (e.g. "no version declared", "the announced X is implemented nowhere") without first checking the dossier below — this bundle covers the entire changeset, and the dossier's omission list (if any) is the ONLY signal that content was cut for budget rather than absent. If the deciding source appears in that list, lower your confidence or state the gap instead of asserting absence.
 
 Changed hunks:
 {{BUNDLE_DIFFS}}

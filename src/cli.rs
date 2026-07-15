@@ -205,7 +205,7 @@ fn model_ids_for(names: &[String], cfg: &Config) -> Vec<String> {
 }
 
 /// 扇出之后的共用尾段上下文——`run_code_review`/`run_review`/`run_resume` 三处扇出前逻辑
-/// 各不相同（bundle×model / lens×model / 直接重放 manifest prompt），但扇出后（anchor → dedup
+/// 各不相同（单格×model / doc 单包×model / 直接重放 manifest prompt），但扇出后（anchor → dedup
 /// → [doc: correlate] → verify → verdict → 组报告）完全一致，抽出复用（DRY，T7 授权解冻）。
 struct TailCtx<'a> {
     mode: Mode,
@@ -611,7 +611,7 @@ fn doc_second_pass_prompt(
     Some(p)
 }
 
-/// 整条评审流水线：证据 → lens → fan-out → 共用尾段（assemble_report）。
+/// 整条评审流水线：证据 → 攻击面固有 prompt → fan-out → 共用尾段（assemble_report）。
 ///
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
 /// `--background` 由 main.rs 在 dispatch 之前分叉（spawn worker）；到达这里即路由 bug。
