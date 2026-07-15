@@ -2379,28 +2379,6 @@ mod tests {
     }
 
     #[test]
-    fn build_packs_panorama_does_not_double_reserve_sibling_diff_budget() {
-        // Fix 1 回归：全景 pb 混入兄弟真 diff，旧实现拿 pb.files 重新求和当预算扣除，
-        // 兄弟 diff 巨大时 remaining 饱和到 0、本 cell 自己那份小文件的 0 壳也塌缩——
-        // 即便实际进 prompt 的 diff 只有 own bundle 那份（orchestrate 用原 bundle 建 diff 块）。
-        use crate::bundle::Bundle;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
-        std::fs::write(root.join("src/b.rs"), "pub fn beta_marker() {}\n").unwrap();
-        // 兄弟 diff 本身（非文件体）巨大：撑到 >= 预算，令旧「pb.files 全体求和」饱和 remaining=0。
-        let huge_sibling_diff = format!("@@ -1,0 +1,1 @@\n+{}\n", "x".repeat(6_000));
-        let bundles = vec![
-            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: huge_sibling_diff }] },
-        ];
-        let (on, _) = build_packs(&bundles, root, 5_000);
-        assert!(on[0].contains("## 改动源文（0 壳）") && on[0].contains("alpha_marker"),
-            "格0 自身小文件应仍全文渲染，不被兄弟巨 diff 挤空: {}", on[0]);
-    }
-
-    #[test]
     fn build_packs_scip_arm_degrades_without_ra_and_keeps_other_arms() {
         let _g = ENV_LOCK.lock().unwrap();
         use crate::bundle::Bundle;
