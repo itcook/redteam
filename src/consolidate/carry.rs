@@ -107,7 +107,7 @@ mod tests {
             hard_constraint: false, quote: quote.into(), lens: Some("L1".into()),
         }
     }
-    fn f(file: &str, quote: &str, title: &str) -> Finding { enrich(&raw(file, quote, title), "L1", "m") }
+    fn f(file: &str, quote: &str, title: &str) -> Finding { enrich(&raw(file, quote, title), "m") }
     fn write(dir: &Path, rel: &str, body: &str) {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).unwrap(); }

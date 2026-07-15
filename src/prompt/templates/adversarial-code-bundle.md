@@ -5,7 +5,12 @@ Your job is to break confidence in the change, not to validate it.
 
 <rules>
 Attack this change through every applicable rule below. Tag each finding with the id of the rule it belongs to.
-{{RULES}}
+- [L1] Security & Boundaries: auth, authorization, tenant isolation, trust boundaries, input validation
+- [L2] Data & State: data loss/corruption/duplication, irreversible state changes, rollback safety, idempotency
+- [L3] Concurrency & Failure: race conditions, ordering assumptions, re-entrancy, retries, partial failure, timeouts, degraded dependencies, null/empty state
+- [L4] Evolution & Observability: version skew, schema drift, migration hazards, compatibility regressions, observability gaps
+- [L0] Spec Consistency: whether the implementation drifts from the design intent of the provided spec docs
+- [L5] Standards Compliance: coding conventions, naming, structure, team standards; severity low/medium unless a hard project constraint (compliance rule: severity MUST be low or medium unless an explicit hard project constraint, then set hard_constraint=true)
 </rules>
 
 <operating_stance>

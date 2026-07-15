@@ -117,7 +117,8 @@ default_models=["m"]
     assert_eq!(f.file, "src/auth.rs");
     assert_eq!(f.line_start, 3, "db.write(token); is on line 3");
     assert_eq!(f.quote, "db.write(token);");
-    assert_eq!(f.lenses, vec!["L1".to_string()]);
+    // lens 去实体化 A（本 task）：enrich 不再消费 raw.lens，lenses 恒空（Task 3 删字段）。
+    assert!(f.lenses.is_empty());
     // 编造的是 critical；被丢后只剩 high → 仍 ≥ medium block → reject、exit 10
     assert_eq!(report.verdict, Verdict::Reject);
     assert_eq!(code, 10);
@@ -331,7 +332,7 @@ default_models=["alpha"]
 /// FakeProvider 脚本一条 lens=Some("D5") severity=High finding，
 /// 跑 run_review 后断言报告里该 finding 被 clamp_compliance 钳到 Medium。
 #[tokio::test]
-async fn doc_d5_compliance_hard_cap_clamps_high_to_medium() {
+async fn doc_d5_compliance_no_longer_mechanically_clamped() {
     use redteam::domain::RawFinding;
 
     let dir = tempfile::tempdir().unwrap();
@@ -383,10 +384,12 @@ async fn doc_d5_compliance_hard_cap_clamps_high_to_medium() {
 
     // 必须有 finding（未被丢弃）
     assert_eq!(report.findings.len(), 1, "D5 finding must survive anchor");
-    // §7.4 硬封顶：High → clamp_compliance → Medium
+    // E9（lens 去实体化 A）：clamp_compliance 机械钳制退场——L5/D5 cap Medium 唯一实职随之
+    // 消失，替代防线是模板固有 compliance 散文（教模型自封顶）+ refute 第二道防线；
+    // standards 假 high 记验收观察，不再是硬保证。severity 应原样保留 High（未被机械改写）。
     assert_eq!(
         report.findings[0].severity,
-        Severity::Medium,
-        "D5 finding severity must be clamped from High to Medium by clamp_compliance (§7.4 hard cap)"
+        Severity::High,
+        "clamp_compliance 退场后 severity 不再被机械钳制（E9）"
     );
 }

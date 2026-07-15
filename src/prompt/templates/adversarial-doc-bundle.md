@@ -5,7 +5,11 @@ Break confidence in the document; do not validate it. Give no credit for good in
 
 <rules>
 Attack the document against ALL of these rules. For each, surface every material issue you find:
-{{RULES}}
+- [D1] Internal Consistency: section contradictions, mutually exclusive requirements, self-conflicting constraints
+- [D2] Completeness & Ambiguity: missing branches, undefined error handling, under-specification, ambiguity that will bite implementation
+- [D3] Hidden Assumptions & Risk: unstated assumptions, unvalidated dependencies; whether the design addresses security/data/failure/migration
+- [D4] Testability & Success Criteria: whether success criteria are measurable and acceptance conditions are defined
+- [D5] Standards Compliance: whether the document follows team doc standards/templates; severity low/medium unless a hard project constraint (compliance rule: severity MUST be low or medium unless an explicit hard project constraint, then set hard_constraint=true)
 </rules>
 
 <tools>

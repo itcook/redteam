@@ -1,6 +1,5 @@
 use crate::bundle::Bundle;
 use crate::domain::{Mode, ReviewInput};
-use crate::lens::Lens;
 
 const CODE_BUNDLE_TPL: &str = include_str!("templates/adversarial-code-bundle.md");
 const REFUTE_TPL: &str = include_str!("templates/adversarial-refute.md");
@@ -106,33 +105,16 @@ fn render(tpl: &str, vars: &[(&str, &str)]) -> String {
     }
 }
 
-/// 把 rule 集格式化为关注清单（code-bundle 与 doc-bundle 共用）。
-fn rules_block(rules: &[&Lens]) -> String {
-    rules
-        .iter()
-        .map(|l| {
-            let cap = if l.max_severity.is_some() {
-                " (compliance rule: severity MUST be low or medium unless an explicit hard project constraint, then set hard_constraint=true)"
-            } else {
-                ""
-            };
-            format!("- [{}] {}: {}{}", l.id, l.title, l.focus, cap)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// 构造 doc 对抗 prompt：全 D 系 rule 注入为一份关注清单、整篇文档内联、教模型遗漏类留空 quote。
-/// 台账判例不再注入 review prompt（design 2026-07-03 #2：生成侧注入两会话十连穿透实证无效，
-/// 判定后置 consolidate——机械预筛 + refute 判例裁决）。
-pub fn build_doc_prompt(input: &ReviewInput, rules: &[&Lens], user_focus: &str) -> String {
+/// 构造 doc 对抗 prompt：D 系攻击面清单为模板固有文本（E8-I 去实体化）、整篇文档内联、
+/// 教模型遗漏类留空 quote。台账判例不再注入 review prompt（design 2026-07-03 #2：生成侧
+/// 注入两会话十连穿透实证无效，判定后置 consolidate——机械预筛 + refute 判例裁决）。
+pub fn build_doc_prompt(input: &ReviewInput, user_focus: &str) -> String {
     let spec_docs = if input.spec_docs.is_empty() {
         "(none)".to_string()
     } else {
         input.spec_docs.join(", ")
     };
     render(DOC_BUNDLE_TPL, &[
-        ("{{RULES}}", &rules_block(rules)),
         ("{{SPEC_DOCS}}", &spec_docs),
         ("{{TARGET_LABEL}}", &input.target_label),
         ("{{OUTPUT_LANGUAGE}}", &output_language()),
@@ -141,20 +123,17 @@ pub fn build_doc_prompt(input: &ReviewInput, rules: &[&Lens], user_focus: &str) 
     ])
 }
 
-/// 构造一个文件包的对抗 prompt：所有适用 rule 注入为关注清单，bundle diff 内联。
+/// 构造一个文件包的对抗 prompt：攻击面清单为模板固有文本（E8-I 去实体化），bundle diff 内联。
 /// `other_files`：本包外全变更集文件清单（`bundle::other_files_manifest` 产出，可空）——
 /// 防「无证据实现」式跨 bundle 误报。
 pub fn build_bundle_prompt(
     target_label: &str,
     bundle: &Bundle,
-    rules: &[&Lens],
     user_focus: &str,
     other_files: &str,
     incremental: &str,
     dossier: &str,
 ) -> String {
-    let rules_str = rules_block(rules);
-
     let diffs_block = bundle
         .files
         .iter()
@@ -171,7 +150,6 @@ pub fn build_bundle_prompt(
 
     render(CODE_BUNDLE_TPL, &[
         ("{{TARGET_LABEL}}", target_label),
-        ("{{RULES}}", &rules_str),
         ("{{FILE_LIST}}", &file_list),
         ("{{OUTPUT_LANGUAGE}}", &output_language()),
         ("{{BUNDLE_DIFFS}}", &diffs_block),
@@ -417,33 +395,43 @@ mod tests {
         assert!(render_precedents(&f, &many).chars().count() <= 4000, "总量帽生效");
     }
 
+    /// E8-I 去实体化：攻击面清单是模板固有文本，非渲染产物——不再构造 rules vec。
     #[test]
-    fn bundle_prompt_interpolates_rules_files_and_contract() {
-        use crate::bundle::Bundle;
+    fn bundle_prompt_carries_builtin_attack_surface() {
+        let bundle = bundle_one();
+        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "");
+        assert!(p.contains("[L1] Security & Boundaries"), "code 攻击面固有: {p}");
+        assert!(p.contains("[L5] Standards Compliance") && p.contains("hard_constraint=true"), "compliance 散文注记在场");
+        assert!(!p.contains("{{RULES}}"), "占位符已烘干");
+    }
+
+    fn bundle_one() -> Bundle {
         use crate::evidence::git::FileChange;
-        use crate::lens::by_id;
-        let bundle = Bundle {
+        Bundle {
             files: vec![FileChange { path: "src/auth.rs".into(), diff: "+let t = secret();".into() }],
-        };
-        let rules = vec![by_id("L1").unwrap(), by_id("L5").unwrap()];
-        let p = build_bundle_prompt("working tree", &bundle, &rules, "auth", "", "", "");
+        }
+    }
+
+    #[test]
+    fn bundle_prompt_interpolates_files_and_contract() {
+        let bundle = bundle_one();
+        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         // 空清单 → 渲染「本包即全变更集」占位；非空 → 原样注入
         assert!(p.contains("(none — this bundle covers the entire changeset)"), "empty manifest placeholder");
-        let pm = build_bundle_prompt("wt", &bundle, &rules, "", "src/other.rs (+3/-1)", "", "");
+        let pm = build_bundle_prompt("wt", &bundle, "", "src/other.rs (+3/-1)", "", "");
         assert!(pm.contains("src/other.rs (+3/-1)"), "other-files manifest injected");
         // 注入对称覆盖(r4 ea30e058):bundle 侧同样不被外部占位捕获
-        let pi = build_bundle_prompt("wt", &bundle, &rules, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探", "", "");
+        let pi = build_bundle_prompt("wt", &bundle, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探", "", "");
         assert!(pi.contains("focus {{RULES}} 试探") && pi.contains("manifest {{BUNDLE_DIFFS}} 试探"),
             "bundle 外部内容占位不被捕获");
-        assert!(p.contains("[L1]") && p.contains("[L5]"), "rule ids injected");
         assert!(p.contains("src/auth.rs"), "file path injected");
         assert!(p.contains("let t = secret();"), "diff injected");
         assert!(p.contains("quote"), "quote contract present");
         assert!(p.contains("auth"), "user focus injected");
         // 台账不再注入 review prompt(design 2026-07-03 #2)
         assert!(!p.contains("DISMISSED"), "no ledger injection in review prompt");
-        // L5 是 compliance rule → 注入 severity 封顶提示
+        // L5 是 compliance rule → 固有文本携带 severity 封顶提示
         assert!(p.to_lowercase().contains("compliance rule"), "compliance cap note present");
     }
 
@@ -452,41 +440,38 @@ mod tests {
     #[test]
     fn external_content_placeholders_are_not_captured() {
         use crate::domain::{Mode, ReviewInput};
-        use crate::lens::by_id;
         let input = ReviewInput {
             mode: Mode::Doc, target_label: "spec.md".into(),
             collection_guidance: String::new(), body: "正文含 {{USER_FOCUS}} 字面".into(),
             spec_docs: vec![],
         };
-        let rules = vec![by_id("D1").unwrap()];
-        let p = build_doc_prompt(&input, &rules, "focus注入 {{RULES}} 试探 与 {{REVIEW_INPUT}} 试探");
+        let p = build_doc_prompt(&input, "focus注入 {{RULES}} 试探 与 {{REVIEW_INPUT}} 试探");
         // 恶意占位串必须原样留存（模型看到无害字面），不得被替换成真实系统段内容
         assert!(p.contains("focus注入 {{RULES}} 试探 与 {{REVIEW_INPUT}} 试探"), "focus 里的占位不被捕获");
         // 单 pass render 下互染也消失：正文里的 {{USER_FOCUS}} 字面原样保留。
         assert!(p.contains("正文含 {{USER_FOCUS}} 字面"), "正文里的占位不被任何值填充");
-        // rules 真实内容只出现一次（模板位），未被 focus 试探复制
-        assert_eq!(p.matches("[D1]").count(), 1, "rules 只渲染在模板位");
+        // 攻击面固有文本只出现一次（模板位），未被 focus 试探复制
+        assert_eq!(p.matches("[D1]").count(), 1, "固有文本只渲染在模板位");
     }
 
+    /// doc 侧同型：攻击面清单模板固有文本在场。
     #[test]
-    fn doc_prompt_injects_all_rules_doc_body_and_omission_contract() {
+    fn doc_prompt_carries_builtin_attack_surface() {
         use crate::domain::{Mode, ReviewInput};
-        use crate::lens::by_id;
         let input = ReviewInput {
             mode: Mode::Doc, target_label: "spec.md".into(),
             collection_guidance: String::new(), body: "DOCBODY".into(),
             spec_docs: vec!["design.md".into()],
         };
-        let rules = vec![by_id("D1").unwrap(), by_id("D2").unwrap(), by_id("D5").unwrap()];
-        let p = build_doc_prompt(&input, &rules, "auth");
+        let p = build_doc_prompt(&input, "auth");
         assert!(!p.contains("{{"), "no residual placeholders");
-        assert!(p.contains("[D1]") && p.contains("[D2]") && p.contains("[D5]"), "all rules injected");
+        assert!(p.contains("[D1] Internal Consistency"), "doc 攻击面固有: {p}");
+        assert!(p.contains("[D5] Standards Compliance") && p.contains("hard_constraint=true"), "compliance 散文注记在场");
         assert!(p.contains("DOCBODY"), "doc body inlined");
         assert!(p.contains("design.md"), "spec docs injected");
         assert!(p.contains("auth"), "user focus injected");
         assert!(!p.contains("DISMISSED"), "no ledger injection in review prompt");
         assert!(p.to_lowercase().contains("omission"), "omission/empty-quote contract present");
-        assert!(p.to_lowercase().contains("compliance rule"), "D5 compliance cap note present");
         assert!(p.contains("lens"), "doc prompt must teach model to tag lens id per finding");
     }
 
@@ -532,11 +517,9 @@ mod tests {
     fn incremental_section_renders_only_when_given() {
         use crate::bundle::Bundle;
         use crate::evidence::git::FileChange;
-        use crate::lens::by_id;
         let bundle = Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] };
-        let rules = vec![by_id("L1").unwrap()];
         // 全量路径（空段）：模板无残留占位、无增量标记
-        let p = build_bundle_prompt("wt", &bundle, &rules, "", "", "", "");
+        let p = build_bundle_prompt("wt", &bundle, "", "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(!p.contains("<incremental_round>"), "全量评审不得出现增量段");
         // 增量路径：段完整注入
@@ -546,12 +529,12 @@ mod tests {
             reason: String::new(), round: "r1".into(), updated_at: String::new(),
         }];
         let sect = render_incremental_section("abc123def456", "src/a.rs [delta], src/b.rs", &claimed);
-        let pi = build_bundle_prompt("wt", &bundle, &rules, "", "", &sect, "");
+        let pi = build_bundle_prompt("wt", &bundle, "", "", &sect, "");
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"));
         assert!(pi.contains("src/a.rs [delta]"), "双层 manifest 注入");
         assert!(pi.contains("let x = md5(pw);") && pi.contains("weak hash"), "claimed 项带原样 title+quote");
         assert!(pi.contains("EXACT original title and quote"), "机器匹配指令在场");
-        assert!(pi.contains("[L1]"), "rules 一字不动仍在");
+        assert!(pi.contains("[L1]"), "攻击面固有文本一字不动仍在");
     }
 
     #[test]
@@ -611,17 +594,16 @@ mod tests {
 
     #[test]
     fn bundle_prompt_carries_dossier_and_tools_reconciliation() {
-        let refs = vec![crate::lens::by_id("L1").unwrap()];
         let b = crate::bundle::Bundle { files: vec![crate::evidence::git::FileChange {
             path: "src/a.rs".into(), diff: "@@ -1 +1 @@\n-a\n+b".into(),
         }] };
         let dossier = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    foo();\n");
-        let p = build_bundle_prompt("wt", &b, &refs, "", "", "", &dossier);
+        let p = build_bundle_prompt("wt", &b, "", "", "", &dossier);
         assert!(p.contains("<dossier>"), "卷宗块注入");
         assert!(p.contains("start from the files it names"), "<evidence> 卷宗起点句在场");
         assert!(p.contains("No tools are available in this session"), "无工具默认转正（2026-07-13 design §2.1）——不再指挥不存在的工具");
         // 空卷宗 → 无 <dossier> 块，行为不变
-        let p2 = build_bundle_prompt("wt", &b, &refs, "", "", "", "");
+        let p2 = build_bundle_prompt("wt", &b, "", "", "", "");
         assert!(!p2.contains("<dossier>"), "空卷宗不渲染块");
     }
 }

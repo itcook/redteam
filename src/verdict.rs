@@ -1,21 +1,4 @@
 use crate::domain::{Finding, Severity, Verdict, VerifyVerdict};
-use crate::lens::by_id;
-
-/// 规范遵循 lens 的 finding 且未标 hard_constraint → severity 钳到 ≤ medium。
-pub fn clamp_compliance(findings: &mut [Finding]) {
-    for f in findings.iter_mut() {
-        if f.hard_constraint {
-            continue;
-        }
-        let capped = f
-            .lenses
-            .iter()
-            .any(|id| by_id(id).and_then(|l| l.max_severity).is_some());
-        if capped && f.severity > Severity::Medium {
-            f.severity = Severity::Medium;
-        }
-    }
-}
 
 /// reject 当存在 finding severity ≥ block_threshold 且 confidence ≥ conf_floor。
 pub fn compute_verdict(
@@ -74,20 +57,6 @@ mod tests {
             f(Severity::High, 0.2, "L1", false),
         ];
         assert_eq!(compute_verdict(&v, Severity::Medium, 0.5), Verdict::Approve);
-    }
-
-    #[test]
-    fn clamp_compliance_lens_to_medium() {
-        let mut v = vec![f(Severity::Critical, 0.9, "L5", false)];
-        clamp_compliance(&mut v);
-        assert_eq!(v[0].severity, Severity::Medium);
-    }
-
-    #[test]
-    fn hard_constraint_not_clamped() {
-        let mut v = vec![f(Severity::High, 0.9, "L5", true)];
-        clamp_compliance(&mut v);
-        assert_eq!(v[0].severity, Severity::High);
     }
 
     #[test]

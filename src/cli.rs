@@ -4,12 +4,11 @@ use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc, refute_tar
 use crate::domain::{DossierMeta, Finding, Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::{collect, detect_mode, EvidenceOpts, Scope};
 use crate::evidence::git::FileChange;
-use crate::lens::select;
 use crate::orchestrate::{enrich, run_code_fanout, run_doc_fanout, CellSink, OrchestrateOpts, PlannedModel};
 use crate::output::Format;
 use crate::positioning::{anchor, anchor_doc};
 use crate::provider::{LensRequest, ReviewProvider};
-use crate::verdict::{clamp_compliance, compute_verdict};
+use crate::verdict::compute_verdict;
 use std::path::Path;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -258,7 +257,6 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
         Mode::Code => dedup(anchored),
         Mode::Doc => dedup_doc(anchored),
     };
-    clamp_compliance(&mut findings);
     let clusters = if ctx.mode == Mode::Doc {
         // correlate 当前为未实现 stub（恒空），不打 phase——待其真正接 LLM 调用时再加时间线点。
         let lead_model = ctx.model_names.first().cloned().unwrap_or_default();
@@ -518,7 +516,6 @@ pub(crate) fn second_pass_prompt(
     root: &Path,
     budget: usize,
     target_label: &str,
-    rules: &[&crate::lens::Lens],
     focus: &str,
     idx: usize,
     needs: &[crate::domain::NeedEntry],
@@ -575,7 +572,7 @@ pub(crate) fn second_pass_prompt(
     let pack = crate::pack::build_pack(&pb, root, budget.saturating_sub(evidence.len()), own_diff_bytes);
     let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
     let others = crate::bundle::other_files_manifest(bundles, idx);
-    let mut p = crate::prompt::build_bundle_prompt(target_label, own, rules, focus, &others, incremental, &dossier);
+    let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, &others, incremental, &dossier);
     p.push_str(&draft_block(drafts));
     Some(p)
 }
@@ -587,7 +584,6 @@ pub(crate) fn second_pass_prompt(
 /// 全部 needs 逃逸/不可读 → None。
 fn doc_second_pass_prompt(
     input: &crate::domain::ReviewInput,
-    rules: &[&crate::lens::Lens],
     focus: &str,
     root: &Path,
     needs: &[crate::domain::NeedEntry],
@@ -611,7 +607,7 @@ fn doc_second_pass_prompt(
     if clipped {
         evidence.push_str("（其余补查条目因预算裁剪省略）\n");
     }
-    let mut p = crate::prompt::build_doc_prompt(input, rules, focus);
+    let mut p = crate::prompt::build_doc_prompt(input, focus);
     p.push('\n');
     p.push_str(&evidence);
     p.push_str(&draft_block(drafts));
@@ -665,7 +661,6 @@ pub async fn run_review(
             Mode::Code => cfg.review.lenses.code.clone(),
             Mode::Doc => cfg.review.lenses.doc.clone(),
         });
-    let lenses = select(input.mode, &lens_ids)?;
 
     // 3. 模型集 + replicate 判定（统一 resolve_models）
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
@@ -684,9 +679,9 @@ pub async fn run_review(
     if let Some(s) = sink { s.on_meta(&model_names, &lens_ids); }
     // 二阶段补查构造器（doc 简化版）：原 doc prompt + 补查证据段 + 草稿契约。
     let mk = |_idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        doc_second_pass_prompt(&input, &lenses, &focus, &cwd, needs, drafts)
+        doc_second_pass_prompt(&input, &focus, &cwd, needs, drafts)
     };
-    let raw = run_doc_fanout(provider, &input, &lenses, &focus, &oopts, sink, Some(&mk)).await;
+    let raw = run_doc_fanout(provider, &input, &focus, &oopts, sink, Some(&mk)).await;
 
     // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
     let block = args
@@ -756,7 +751,6 @@ pub async fn run_code_review(
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_else(|| cfg.review.lenses.code.clone());
-    let rules = select(Mode::Code, &lens_ids)?;
 
     // 3. 模型集 + replicate 判定（统一 resolve_models）
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
@@ -782,9 +776,9 @@ pub async fn run_code_review(
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts, "")
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "")
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, "", &dossiers, &oopts, sink, Some(&mk)).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk)).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(
@@ -900,7 +894,6 @@ pub async fn run_incremental_review(
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_else(|| cfg.review.lenses.code.clone());
-    let rules = select(Mode::Code, &lens_ids)?;
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
     let model_ids = model_ids_for(&model_names, cfg);
@@ -918,9 +911,9 @@ pub async fn run_incremental_review(
     // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
     // dispute 契约不因补跑丢失。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &rules, &focus, idx, needs, drafts, &inc_section)
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section)
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &rules, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk)).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk)).await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
     //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。
@@ -928,8 +921,7 @@ pub async fn run_incremental_review(
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
     let anchored = anchor(raw.findings, root);
-    let mut new_findings = dedup(anchored);
-    clamp_compliance(&mut new_findings);
+    let new_findings = dedup(anchored);
     let mut resolution_disputed: Vec<String> = new_findings
         .iter()
         .filter(|f| resolved_ids.contains(&f.id))
@@ -1314,8 +1306,6 @@ pub async fn run_resume(
             return partial_report(ws, job_id, &args, format!("resume: cannot determine mode: {e}"));
         }
     };
-    let fallback_lens = match mode { Mode::Code => "code", Mode::Doc => "doc" };
-
     let done: std::collections::BTreeSet<String> = crate::state::store::read_partial(ws, job_id)
         .into_iter()
         .filter(|r| r.ok)
@@ -1333,7 +1323,7 @@ pub async fn run_resume(
                 usage.0 += call.input_tokens;
                 usage.1 += call.output_tokens; usage.2 += call.cached_input_tokens;
                 let fs: Vec<Finding> =
-                    call.findings.iter().map(|r| enrich(r, fallback_lens, &cell.model)).collect();
+                    call.findings.iter().map(|r| enrich(r, &cell.model)).collect();
                 crate::state::store::CellRecord::ok(cell.cell.clone(), cell.model.clone(), fs)
             }
             Err(e) => {
@@ -2203,20 +2193,19 @@ mod tests {
         ];
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let drafts = vec![]; // 空草稿也合法
-        let rules = vec![crate::lens::by_id("L1").unwrap()];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, "").unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "").unwrap();
         assert!(p.contains("pub const LIMIT"), "needs 文件全文进包: {p}");
         assert!(p.contains("first_pass_draft"), "草稿段在场");
         assert!(p.contains("CONFIRM or REVISE"), "确认或修订语义");
         assert!(!p.contains("<incremental_round>"), "全量路径第二趟无增量段");
         // 增量轮：inc_section 原样带入第二趟（claimed-resolved/dispute 契约不因补跑丢失）
         let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
-        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, &inc).unwrap();
+        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, &inc).unwrap();
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段带入第二趟: {pi}");
         assert!(pi.contains("pub const LIMIT"), "增量第二趟 needs 证据仍在场");
         // 路径逃逸：绝对路径 needs 被 skip、不 panic、其余照常
         let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
-        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &evil, &drafts, "");
+        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "");
         if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
     }
 
@@ -2247,8 +2236,7 @@ mod tests {
             hard_constraint: false, quote: "md5(pw)".into(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New,
         }];
-        let rules = vec![crate::lens::by_id("L1").unwrap()];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &drafts, "").unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "").unwrap();
         assert!(p.contains("## 补查证据"), "行窗补查段在场");
         assert!(p.contains("src/long.rs:70-132"), "±30 行窗头: {p}");
         assert!(p.contains("line70") && p.contains("line132"), "窗内行在场");
@@ -2260,7 +2248,7 @@ mod tests {
             NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
             NeedEntry { path: "src/long.rs".into(), lines: None, reason: "r".into() },
         ];
-        let pb = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &both, &drafts, "").unwrap();
+        let pb = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &both, &drafts, "").unwrap();
         assert!(pb.contains("src/long.rs:1-200（全文"), "全文条目在场: {pb}");
         assert!(!pb.contains("## 补查证据"), "同 path 行窗段被全文超集互斥掉: {pb}");
     }
@@ -2275,15 +2263,14 @@ mod tests {
             mode: Mode::Doc, target_label: "spec.md".into(),
             collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
         };
-        let rules = vec![crate::lens::by_id("D1").unwrap()];
         let needs = vec![NeedEntry { path: "spec2.md".into(), lines: None, reason: "cross-ref".into() }];
-        let p = doc_second_pass_prompt(&input, &rules, "", root, &needs, &[]).unwrap();
+        let p = doc_second_pass_prompt(&input, "", root, &needs, &[]).unwrap();
         assert!(p.contains("DOCBODY"), "原 doc prompt 在场");
         assert!(p.contains("## 补查证据") && p.contains("background detail"), "补查段在场");
         assert!(p.contains("first_pass_draft"), "草稿段在场");
         // 全部 needs 逃逸 → None（不补跑）
         let evil = vec![NeedEntry { path: "../outside.md".into(), lines: None, reason: "x".into() }];
-        assert!(doc_second_pass_prompt(&input, &rules, "", root, &evil, &[]).is_none());
+        assert!(doc_second_pass_prompt(&input, "", root, &evil, &[]).is_none());
     }
 
     #[test]
@@ -2303,8 +2290,7 @@ mod tests {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
         }] }];
         let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into() }];
-        let rules = vec![crate::lens::by_id("L1").unwrap()];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", &rules, "", 0, &needs, &[], "").unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "").unwrap();
         assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);
         assert!(p.contains("fn own()"), "证据段截断后 pack 仍照常渲染自家文件");
         assert!(p.len() < 300_000, "总 prompt 长度被证据帽拘住，未逼近原 100KB 单行体量: {}", p.len());
@@ -2325,11 +2311,10 @@ mod tests {
             mode: Mode::Doc, target_label: "spec.md".into(),
             collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
         };
-        let rules = vec![crate::lens::by_id("D1").unwrap()];
         let needs: Vec<NeedEntry> = (0..6)
             .map(|i| NeedEntry { path: format!("doc{i}.md"), lines: None, reason: "r".into() })
             .collect();
-        let p = doc_second_pass_prompt(&input, &rules, "", root, &needs, &[]).unwrap();
+        let p = doc_second_pass_prompt(&input, "", root, &needs, &[]).unwrap();
         assert!(p.contains("doc4.md:1-1"), "累计未超帽前的段落在场: {p}");
         assert!(!p.contains("doc5.md:1-1"), "累计超帽后的段落应被丢弃");
         assert!(p.contains("（其余补查条目因预算裁剪省略）"), "总帽裁剪注记在场: {p}");
@@ -2507,9 +2492,9 @@ context_window_tokens = 40000
             recommendation: "r".into(), hard_constraint: false,
             quote: "md5(pw)".into(), lens: None,
         };
-        let before = enrich(&raw(5, 7), "L1", "m");          // 第一轮：驳回它
+        let before = enrich(&raw(5, 7), "m");          // 第一轮：驳回它
         let dismissed: HashSet<String> = [before.id.clone()].into();
-        let mut after = vec![enrich(&raw(50, 52), "L1", "m")]; // 修复位移后再现
+        let mut after = vec![enrich(&raw(50, 52), "m")]; // 修复位移后再现
         let reappeared = mark_dismissed(&mut after, &dismissed);
         assert_eq!(reappeared, vec![before.id]);
         assert!(after[0].previously_dismissed);
@@ -2596,7 +2581,7 @@ mod incremental_tests {
         let ok = std::process::Command::new("git").current_dir(dir.path())
             .args(["branch", "dev0", &c1]).output().unwrap();
         assert!(ok.status.success());
-        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m")]);
+        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "m")]);
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n}\n").unwrap();
         commit_all(dir.path(), "fix");
         let base = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap();
@@ -2618,7 +2603,7 @@ mod incremental_tests {
         let c1 = commit_all(dir.path(), "c1");
         std::process::Command::new("git").current_dir(dir.path())
             .args(["branch", "dev0", &c1]).output().unwrap();
-        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m")]);
+        write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "m")]);
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n}\n").unwrap();
         commit_all(dir.path(), "fix");
         // 未提交的 tracked 编辑（不 commit）：净树守卫必须先拦下，不放行到载入上轮 result
@@ -2741,8 +2726,8 @@ default_models=["m"]
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    md5(pw);\n}\n").unwrap();
         let c1 = commit_all(dir.path(), "c1");
         std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
-        let f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m");
-        let f2 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "L1", "m");
+        let f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "m");
+        let f2 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "m");
         let (id1, id2) = (f1.id.clone(), f2.id.clone());
         write_prior(dir.path(), "jprev", &c1, vec![f1, f2]);
         // fix：修掉 md5 行，引入新问题行
@@ -2773,7 +2758,7 @@ default_models=["m"]
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    md5(pw);\n    other();\n}\n").unwrap();
         let c1 = commit_all(dir.path(), "c1");
         std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
-        let f1 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "L1", "m");
+        let f1 = enrich(&raw("a.rs", "md5(pw);", "weak hash"), "m");
         let id1 = f1.id.clone();
         write_prior(dir.path(), "jprev", &c1, vec![f1]);
         // 销案（谎称已修）——快照四件套与 finding 同源
@@ -2805,7 +2790,7 @@ default_models=["m"]
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
         let c1 = commit_all(dir.path(), "c1");
         std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
-        let mut f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "L1", "m");
+        let mut f1 = enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "m");
         f1.agreement = 2;
         f1.models = vec!["m".into(), "m2".into()];
         let id1 = f1.id.clone();
