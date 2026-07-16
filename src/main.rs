@@ -31,7 +31,8 @@ enum Cmd {
         /// 缺省：给了 --base 用 branch，否则 working-tree。
         #[arg(long, value_parser = ["working-tree", "branch"])]
         scope: Option<String>,
-        /// 对照的 spec/需求文档路径（可多次）——评审将检查实现与其符合度。
+        /// 对照的设计/规格文档路径（可多次）——注入评审上下文，供 [L0] 检查实现是否偏离设计意图
+        /// （评审对象仍是代码、spec 仅作参照；总注入 ≤64KB 超则截断；密钥/凭据类文件拒绝注入防泄漏）。
         #[arg(long)]
         spec: Vec<String>,
         /// 用户聚焦提示，注入评审 prompt 引导注意力（如「重点看并发安全」）。
