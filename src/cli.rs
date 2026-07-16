@@ -390,6 +390,78 @@ fn need_section(ex: &crate::tools::ToolExecutor, need: &crate::domain::NeedEntry
     Some(format!("## 补查证据\n{}:{}-{}\n{}\n\n", need.path, a, b, body))
 }
 
+/// --spec 参照文档总帽——超则截断+标记（D2）。
+const SPEC_BUDGET_BYTES: usize = 64_000;
+
+/// D4 守卫：拒绝把密钥/凭据类文件注入送外部模型。命中=skip+warn。
+/// 路径遍历信用户（user-arg），但内容敏感度不信任（防 secret exfil）。
+fn is_sensitive_spec_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    const DENY_EXT: &[&str] = &[".env", ".pem", ".key", ".p12", ".pfx", ".pkcs12", ".crt", ".cer"];
+    const DENY_BASE: &[&str] = &["id_rsa", "id_ed25519", "id_dsa", ".netrc", ".htpasswd"];
+    const DOC_EXT: &[&str] = &[".md", ".txt", ".rst", ".adoc"];
+    if DENY_EXT.iter().any(|e| base.ends_with(e)) {
+        return true;
+    }
+    if DENY_BASE.iter().any(|b| base == *b || base.starts_with(&format!("{b}."))) {
+        return true;
+    }
+    // 名含敏感词且非文档类 → 拒（design.md 这类文档放行）
+    let doc = DOC_EXT.iter().any(|e| base.ends_with(e));
+    if !doc && ["secret", "credential", "password", "token"].iter().any(|w| base.contains(w)) {
+        return true;
+    }
+    false
+}
+
+/// 读 --spec 文档 → 有界参照段（供 [L0] 实现-对照-设计）。返回 (段, 用掉字节)。
+/// 路径=用户 CLI 提供=可信路径遍历（D4）→ 直接有界读，允许 out-of-root；但敏感文件 denylist。
+// ponytail: 本 task 只交付纯构造器，接线（调用点注入 prompt）留给后续 task；
+// 加 allow(dead_code) 是临时的，接线落地后删掉。
+#[allow(dead_code)]
+pub(crate) fn render_spec_section(spec_paths: &[String]) -> (String, usize) {
+    if spec_paths.is_empty() {
+        return (String::new(), 0);
+    }
+    let mut body = String::new();
+    let mut used = 0usize;
+    for p in spec_paths {
+        if is_sensitive_spec_path(p) {
+            eprintln!("redteam: 拒绝把疑似密钥/凭据文件注入评审上下文（防泄漏给外部模型）：{p}");
+            continue;
+        }
+        if used >= SPEC_BUDGET_BYTES {
+            break;
+        }
+        let Ok(mut content) = std::fs::read_to_string(p) else {
+            continue;
+        };
+        let remaining = SPEC_BUDGET_BYTES - used;
+        let truncated = content.len() > remaining;
+        if truncated {
+            // 字符边界安全截断（同 need_section 的既有手法，CJK 不 panic）。
+            let mut cut = remaining;
+            while cut > 0 && !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            content.truncate(cut);
+        }
+        used += content.len();
+        body.push_str(&format!(
+            "### {p}\n```\n{content}\n```{}\n\n",
+            if truncated { "\n（…spec 截断：超参照预算）" } else { "" }
+        ));
+    }
+    if body.is_empty() {
+        return (String::new(), 0);
+    }
+    let section = format!(
+        "<spec_docs>\n关联设计/规格文档（供 [L0] 检查实现是否偏离设计意图；评审对象仍是代码、spec 仅作参照）：\n\n{body}</spec_docs>\n"
+    );
+    (section, used)
+}
+
 /// 草稿注入段（design §2.3）：第一趟 findings 以 CONFIRM-or-REVISE 契约随第二趟 prompt 带回；
 /// 空草稿也渲染块（契约「不再声明 needs」对零草稿格同样生效）。
 fn draft_block(drafts: &[Finding]) -> String {
@@ -1792,6 +1864,77 @@ default_models=["m"]
         assert_eq!(report.run.head_sha.as_deref(), Some("abc123"));
         let (report2, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
         assert_eq!(report2.run.head_sha, None, "非 git 环境如实 None，不编造");
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    #[test]
+    fn spec_section_empty_when_no_paths() {
+        assert_eq!(render_spec_section(&[]), (String::new(), 0));
+    }
+
+    #[test]
+    fn spec_section_reads_and_wraps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("design.md");
+        std::fs::write(&path, "DESIGN D8: fail-open").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        let (section, used) = render_spec_section(std::slice::from_ref(&path_str));
+        assert!(section.contains("<spec_docs>"));
+        assert!(section.contains(&path_str));
+        assert!(section.contains("DESIGN D8: fail-open"));
+        assert!(section.contains("检查实现是否偏离设计意图"));
+        assert!(used > 0);
+    }
+
+    #[test]
+    fn spec_section_caps_and_marks_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.md");
+        // CJK 多字节字符填充，确保预算切点大概率落在字符中间——验证边界安全截断不 panic。
+        let big = "设计文档超长内容测试".repeat(SPEC_BUDGET_BYTES / 10 + 1000);
+        assert!(big.len() > SPEC_BUDGET_BYTES);
+        std::fs::write(&path, &big).unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        let (section, used) = render_spec_section(&[path_str]);
+        assert!(section.contains("截断"));
+        assert!(used <= SPEC_BUDGET_BYTES);
+        // 段壳（标题/围栏/提示语）额外开销要有个合理上限，不能无界膨胀。
+        assert!(section.len() <= SPEC_BUDGET_BYTES + 1024);
+    }
+
+    #[test]
+    fn spec_section_rejects_sensitive_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("x.env");
+        let key_path = tmp.path().join("id_rsa");
+        let doc_path = tmp.path().join("design.md");
+        std::fs::write(&env_path, "SECRET_KEY=abc123").unwrap();
+        std::fs::write(&key_path, "-----BEGIN PRIVATE KEY-----").unwrap();
+        std::fs::write(&doc_path, "DESIGN: spec consistency check").unwrap();
+        let paths = vec![
+            env_path.to_string_lossy().to_string(),
+            key_path.to_string_lossy().to_string(),
+            doc_path.to_string_lossy().to_string(),
+        ];
+        let (section, used) = render_spec_section(&paths);
+        assert!(section.contains("design.md"));
+        assert!(section.contains("DESIGN: spec consistency check"));
+        assert!(!section.contains("SECRET_KEY"));
+        assert!(!section.contains("BEGIN PRIVATE KEY"));
+        assert!(used > 0);
+    }
+
+    #[test]
+    fn spec_section_all_sensitive_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pem_path = tmp.path().join("secrets.pem");
+        std::fs::write(&pem_path, "-----BEGIN CERTIFICATE-----").unwrap();
+        let (section, used) = render_spec_section(&[pem_path.to_string_lossy().to_string()]);
+        assert_eq!((section, used), (String::new(), 0));
     }
 }
 
