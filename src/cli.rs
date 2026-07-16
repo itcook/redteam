@@ -310,23 +310,6 @@ pub(crate) fn pack_budget_bytes(cfg: &Config, model_names: &[String]) -> usize {
     PACK_BUDGET_BYTES.min(by_window)
 }
 
-/// pack 引擎四臂（M15-S2-b）：`REDTEAM_PACK` unset/其他值=Regex（默认，行为不变）；
-/// `0`=Dossier 基线臂；`scip`=Scip 语义引擎；`scip-strict`=Scip 诊断臂（关兜底）。
-enum PackEngine {
-    Regex,
-    Dossier,
-    Scip { strict: bool },
-}
-
-fn pack_engine() -> PackEngine {
-    match std::env::var("REDTEAM_PACK").ok().as_deref() {
-        Some("0") => PackEngine::Dossier,
-        Some("scip") => PackEngine::Scip { strict: false },
-        Some("scip-strict") => PackEngine::Scip { strict: true },
-        _ => PackEngine::Regex,
-    }
-}
-
 /// 单格全审默认（E9 判决，2026-07-13 转正）：全变更集恒并成一个 bundle——分格在全景 pack
 /// 范式下=N 倍重复喂同一全景（两跑实证 input −77%、质量未见系统性下降）。空输入原样放行
 /// （不产出「一个空文件的 bundle」）——上游两处空证据守卫（`run_code_review` 的「no reviewable
@@ -340,36 +323,16 @@ fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bund
 }
 
 /// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
-/// 四臂 + null：默认=Regex pack（0 壳完整体+1 壳引用点+省略清单，M15-S1）；`REDTEAM_PACK=0`=
-/// Dossier-only 基线臂（A/B 对照）；`REDTEAM_PACK=scip`=Scip 语义引擎（rust-analyzer 缺/索引失败
-/// → 降级 Regex pack + 一行 stderr 提示，绝不 panic/阻塞）；`REDTEAM_PACK=scip-strict`=Scip 诊断臂
-/// （关兜底，M15-S2-b）；`REDTEAM_NO_DOSSIER` 非空=全空段（M14 D9 null 臂）。
-/// scip 索引每次 review 前置建一次（非 per-bundle）。degrades 静默于：不支持语言/无符号（pack 臂）；
-/// 基线臂 `build_dossier` 另有调用密度门<5（pack 臂已撤，I-2：body 是 payload 与 caller 密度无关）。
+/// 唯一路径（E8-E 安乐死 SCIP/Dossier 引擎后）：`build_pack`（0 壳完整体+省略清单，M15-S1）；
+/// `REDTEAM_NO_DOSSIER` 非空=全空段（M14 D9 null 臂，Task 3 territory）。
+/// degrades 静默于：不支持语言/无符号（pack 臂内部回落链承接）。
 /// meta.injected 是唯一可观测入口，供 A/B 归因与生产诊断。
 /// `budget`=pack flat 预算（字节）；生产调用点由 `pack_budget_bytes` 按启用模型窗算出。
 pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
     let suppressed = std::env::var_os("REDTEAM_NO_DOSSIER").is_some();
-    let engine = pack_engine();
-    // scip 引擎：前置建索引一次（非 per-bundle）；RA 缺/索引失败 → None → 降级 regex + 一行提示。
-    // ScipIndex::build 内部 .arg(root)+.current_dir(root) 双重解析，root 若相对会出岔——
-    // 这里先转绝对路径再传入；bundle 文件读（build_pack/build_pack_scip）仍用原 root（相对 root 的
-    // join 已能工作，不动它，避免牵连既有行为）。
-    let scip_index = match &engine {
-        PackEngine::Scip { .. } => {
-            let abs_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-            let idx = crate::scip::ScipIndex::build(&abs_root);
-            if idx.is_none() {
-                eprintln!("redteam: 未探到 rust-analyzer（或索引失败），scip 引擎降级为 regex-pack");
-            }
-            idx
-        }
-        _ => None,
-    };
-    let strict = matches!(engine, PackEngine::Scip { strict: true });
     // 单格全审默认（E9）：bundles 恒为单元素（全变更集），每格即自家文件——原「兄弟改动
-    // 文件全景注入 + 依赖距离排序」随分格一并收缩（无兄弟可注入）。超预算由 build_pack/
-    // build_pack_scip 自身的降级梯子（骨架/hunk 窗/省略清单）承接，不再靠分格避让。
+    // 文件全景注入 + 依赖距离排序」随分格一并收缩（无兄弟可注入）。超预算由 build_pack
+    // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，不再靠分格避让。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
@@ -378,15 +341,7 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
             if suppressed {
                 String::new()
             } else {
-                match (&engine, &scip_index) {
-                    (PackEngine::Dossier, _) =>
-                        crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)),
-                    (PackEngine::Scip { .. }, Some(idx)) =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(b, root, budget, own_diff_bytes, idx, strict)),
-                    // Regex 默认，及 scip 降级（scip_index=None）都走 regex-pack。
-                    _ =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes)),
-                }
+                crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes))
             }
         })
         .collect();
@@ -516,8 +471,8 @@ pub(crate) fn second_pass_prompt(
     }
     let own_diff_bytes: usize = own.files.iter().map(|fc| fc.diff.len()).sum();
     let pb = crate::bundle::Bundle { files };
-    // ponytail: 第二趟恒用 regex 引擎——scip 是 opt-in 实验臂且索引 per-cell 重建昂贵；
-    // needs 只消费 0 壳全文分支（两引擎共用 body_section），scip 臂需要时再接。
+    // 第二趟恒用 build_pack（唯一路径，E8-E 安乐死 SCIP 后无引擎可选）——needs 只消费
+    // 0 壳全文分支（body_section）。
     // Important 修复：evidence（行窗证据段，已在上方按 NEED_SECTION_BYTE_CAP 分段封顶）先
     // 扣出 pack 预算再传入 build_pack——否则 evidence+pack 联合越过每模型字节预算，撞墙全归零
     // （design §2.2）。budget 耗尽时 build_pack 自身的降级链兜底，不会 panic。
@@ -1906,7 +1861,9 @@ mod tests {
     }
 
     #[test]
-    fn build_packs_default_has_bodies_off_arm_dossier_only_null_arm_empty() {
+    fn build_packs_default_has_bodies_null_arm_empty() {
+        // E8-E 安乐死后：build_packs 只剩两臂——默认（build_pack，0 壳）与 REDTEAM_NO_DOSSIER
+        // 空臂（Task 3 territory）。PackEngine::Dossier/Scip 基线臂随引擎拆除一并消失。
         let _g = ENV_LOCK.lock().unwrap();
         use crate::bundle::Bundle;
         use crate::evidence::git::FileChange;
@@ -1920,21 +1877,15 @@ mod tests {
         }] }];
 
         // 默认臂：pack（含 0 壳完整体）
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
+        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
         let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(on[0].contains("改动源文"), "默认臂 = pack 含 0 壳: {}", on[0]);
-
-        // 基线臂：REDTEAM_PACK=0 → dossier-only（无 0 壳段、仍有引用点）
-        unsafe { std::env::set_var("REDTEAM_PACK", "0"); }
-        let (base, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(!base[0].contains("改动源文"), "基线臂无 0 壳");
-        assert!(base[0].contains("target"), "基线臂仍是 dossier 引用点");
 
         // 空臂：REDTEAM_NO_DOSSIER
         unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
         let (null, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert_eq!(null[0], "", "空臂全空段");
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
+        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
     }
 
     #[test]
@@ -2076,29 +2027,6 @@ mod tests {
         assert!(!on[0].contains("填充行"), "回落只给改动 def 体，不带填充");
         // 同 path 不重复
         assert_eq!(on[0].matches("src/b.rs").count(), 1, "同格文件条目 src/b.rs 不重复");
-    }
-
-    #[test]
-    fn build_packs_scip_arm_degrades_without_ra_and_keeps_other_arms() {
-        let _g = ENV_LOCK.lock().unwrap();
-        use crate::bundle::Bundle;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"),
-            "pub fn target() {}\nfn u1() { target(); }\n").unwrap();
-        let bundles = vec![Bundle { files: vec![FileChange {
-            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
-        }] }];
-        // scip 臂：本测试环境（tempdir 非 cargo 工程）RA 索引必失败 → 必须降级 regex（不 panic、仍出引用点）
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::set_var("REDTEAM_PACK", "scip"); }
-        let (scip, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(scip[0].contains("target"), "scip 臂（或其降级）仍产 pack: {}", scip[0]);
-        // 默认臂不变
-        unsafe { std::env::remove_var("REDTEAM_PACK"); }
-        let (def, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(def[0].contains("改动源文"), "默认臂仍 regex-pack");
-        unsafe { std::env::remove_var("REDTEAM_PACK"); }
     }
 
     #[test]
