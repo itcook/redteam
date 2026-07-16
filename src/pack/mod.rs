@@ -15,13 +15,8 @@ pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
 
 /// 0 壳段：改动文件全文（粒度对齐模型文件级消费，E7 残余读解剖）；单文件全文超剩余预算
 /// → 回落现状 def 体（支持语言）或 omit 坐标（非支持语言）。按 budget 字节封顶。
-/// REDTEAM_PACK_BODY=symbol：dev 实验仪器（粒度 A/B S 臂）——0 壳回到 S2-b 符号级，验后拆除。
+/// 唯一路径（Task 3：粒度 A/B S 臂符号级 dev 开关已判决拆除,全文恒默认）。
 pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec<String>) -> String {
-    let symbol_mode = std::env::var("REDTEAM_PACK_BODY").ok().as_deref() == Some("symbol");
-    body_section_impl(bundle, root, budget, omit, symbol_mode)
-}
-
-fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec<String>, symbol_mode: bool) -> String {
     let mut out = String::new();
     for fc in &bundle.files {
         // 工作树直读（bundle 路径来自 git diff、非模型可控，沿用 bundle::group 安全不变量）
@@ -30,28 +25,24 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
             continue;
         }
         let n_lines = content.lines().count();
-        if !symbol_mode {
-            let block = format!("{}:1-{}（全文，{} 行）\n{}\n\n", fc.path, n_lines, n_lines, content);
-            if out.len() + block.len() <= budget {
-                out.push_str(&block);
-                continue;
-            }
+        let block = format!("{}:1-{}（全文，{} 行）\n{}\n\n", fc.path, n_lines, n_lines, content);
+        if out.len() + block.len() <= budget {
+            out.push_str(&block);
+            continue;
         }
-        // def 体：symbol 模式主路径 / 全文模式超预算回落（不砍语义只降粒度）
+        // def 体：全文超预算回落（不砍语义只降粒度）
         let lang = match lang_for(&fc.path) {
             Some(l) => l,
             None => {
-                if !symbol_mode {
-                    // 非支持语言超预算：先试 hunk±20 行窗（禁真空升级，Task 5）→ 装不下才 omit。
-                    if let Some(block) = hunk_window_block(&fc.path, &content, &fc.diff, n_lines) {
-                        if out.len() + block.len() <= budget {
-                            out.push_str(&block);
-                            continue;
-                        }
+                // 非支持语言超预算：先试 hunk±20 行窗（禁真空升级，Task 5）→ 装不下才 omit。
+                if let Some(block) = hunk_window_block(&fc.path, &content, &fc.diff, n_lines) {
+                    if out.len() + block.len() <= budget {
+                        out.push_str(&block);
+                        continue;
                     }
-                    omit.push(format!("{}:1-{} — 全文超预算（非支持语言无 def 回落）", fc.path, n_lines));
                 }
-                continue; // symbol 模式沿 S2-b 旧行为：非支持语言无损降级
+                omit.push(format!("{}:1-{} — 全文超预算（非支持语言无 def 回落）", fc.path, n_lines));
+                continue;
             }
         };
         let defs = compile_defs(lang);
@@ -64,11 +55,7 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
             if body.is_empty() {
                 continue;
             }
-            let head = if symbol_mode {
-                format!("{}:{}-{}", fc.path, start + 1, end + 1)
-            } else {
-                format!("{}:{}-{}（def 体，全文超预算回落）", fc.path, start + 1, end + 1)
-            };
+            let head = format!("{}:{}-{}（def 体，全文超预算回落）", fc.path, start + 1, end + 1);
             let block = format!("{head}\n{body}\n\n");
             if out.len() + block.len() > budget {
                 omit.push(format!("{}:{}-{} — 改动符号体", fc.path, start + 1, end + 1));
@@ -83,7 +70,7 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
         // 不叠加骨架（防同文件内容双份计预算）。溢出 def 的 omit 坐标保留——骨架只带签名+改动行，
         // 其余 def 体确实缺席，坐标仍真。骨架也装不下 → 落回现状消息（下方）。
         let mut wrote_skeleton = false;
-        if !symbol_mode && !wrote_def {
+        if !wrote_def {
             let skel = skeleton_of(&content, &fc.diff, &defs);
             let head = format!("{}:1-{}（骨架：签名+改动行）", fc.path, n_lines);
             let block = format!("{head}\n{skel}\n");
@@ -94,22 +81,21 @@ fn body_section_impl(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec
         }
         // E8 裁决 D：降级空产出禁真空——def 体没入、骨架没入、连溢出坐标都没有（锚定失败）时
         // 必须 omit 可观测（T42 场景）。
-        if !symbol_mode && !wrote_def && !wrote_skeleton && !omitted_def {
+        if !wrote_def && !wrote_skeleton && !omitted_def {
             omit.push(format!("{}:1-{} — 全文超预算且 def 锚定失败（降级空产出）", fc.path, n_lines));
         }
     }
     if out.is_empty() {
         return String::new();
     }
-    let title = if symbol_mode { "改动符号完整体" } else { "改动源文" };
-    format!("## {title}（0 壳）\n{out}")
+    format!("## 改动源文（0 壳）\n{out}")
 }
 
 /// 骨架档（回落链第 3 级，E8 裁决 D + Task 5）：全文/def 体双超预算时的降级——逐行扫描，
 /// 命中 def 正则的签名行全收（骨架地图）+ diff 全部改动行（`hunk_changed_lines`，原样保留，
 /// 让改动本身可见——评审修 1：hunk_anchors 只给每 hunk 首行，多行 hunk 会丢内容）；
 /// 其余连续行聚合折叠为 `…（N 行折叠）`。只产正文，不含块头（块头由
-/// `body_section_impl` 拼路径），故不判 budget——调用方按整块判。
+/// `body_section` 拼路径），故不判 budget——调用方按整块判。
 /// ponytail: `changed_def_ranges` 命中的整个外围 def 体不整体保留（可能几百行，撑爆本就
 /// 更紧的骨架预算，且骨架仅在 def 体已超预算时触发——含 def 全文必然同样超预算、自败）——
 /// 只保信号密度最高的签名行 + 全部改动行，二者通常已覆盖诊断所需。
@@ -271,35 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn body_section_symbol_mode_restores_s2b_shape() {
-        use crate::bundle::Bundle;
-        use crate::evidence::git::FileChange;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"),
-            "fn helper() {}\n\nfn caller() {\n    helper();\n    let z = 2;\n}\n").unwrap();
-        let b = Bundle { files: vec![FileChange {
-            path: "src/a.rs".into(),
-            diff: "@@ -4,0 +5,1 @@\n+    let z = 2;\n".into(),
-        }] };
-        let mut omit = Vec::new();
-        let s = body_section_impl(&b, root, 1_000_000, &mut omit, true);
-        assert!(s.contains("## 改动符号完整体（0 壳）"), "旧段标题: {s}");
-        assert!(s.contains("fn caller() {") && s.contains("let z = 2;"), "含改动 def 完整体");
-        assert!(!s.contains("fn helper"), "符号级不含未改动的相邻函数");
-        assert!(!s.contains("全文") && !s.contains("回落"), "块头无全文/回落标注: {s}");
-        // 非支持语言：S2-b 旧行为=无损降级（不产 omit、不入正文）
-        let md = Bundle { files: vec![FileChange {
-            path: "notes.md".into(), diff: "@@ -1,0 +1,1 @@\n+x\n".into(),
-        }] };
-        std::fs::write(root.join("notes.md"), "# 标题\nx\n").unwrap();
-        let mut omit2 = Vec::new();
-        let s2 = body_section_impl(&md, root, 1_000_000, &mut omit2, true);
-        assert!(s2.is_empty() && omit2.is_empty(), "非支持语言无损降级: {s2:?} {omit2:?}");
-    }
-
-    #[test]
     fn body_section_gives_full_file_for_unsupported_lang() {
         use crate::bundle::Bundle;
         use crate::evidence::git::FileChange;
@@ -340,7 +297,7 @@ mod tests {
         }] };
         let mut omit = Vec::new();
         // 预算 800B：全文（~4.5KB）超、def 体（~4.2KB）超 → 骨架（3 签名行 + 折叠标记）应放得下
-        let s = body_section_impl(&b, root, 800, &mut omit, false);
+        let s = body_section(&b, root, 800, &mut omit);
         // 块头对齐真实语义（评审修 3）：签名+改动行（非改动 def 全文——那会自败超预算）
         assert!(s.contains("（骨架：签名+改动行）"), "骨架档启用: {s}");
         assert!(s.contains("fn tiny_one()") && s.contains("fn tiny_two()"), "签名行全收");
@@ -367,7 +324,7 @@ mod tests {
         }] };
         let mut omit = Vec::new();
         // 全文/def 体（~4.6KB）双超 800B → 骨架；5 个改动行必须全在
-        let s = body_section_impl(&b, root, 800, &mut omit, false);
+        let s = body_section(&b, root, 800, &mut omit);
         assert!(s.contains("骨架"), "骨架档启用: {s}");
         for c in ["let c1", "let c2", "let c3", "let c4", "let c5"] {
             assert!(s.contains(c), "多行 hunk 改动行全保留，缺 {c}: {s}");
@@ -392,7 +349,7 @@ mod tests {
         }] };
         let mut omit = Vec::new();
         // 800B：全文超、small def 体（~100B）入正文、big def 体（~4.2KB）超 → 溢出坐标，无骨架
-        let s = body_section_impl(&b, root, 800, &mut omit, false);
+        let s = body_section(&b, root, 800, &mut omit);
         assert!(!s.contains("骨架"), "部分成功不叠加骨架: {s}");
         assert!(s.contains("fn small_changed") && s.contains("let a = 1;"), "已入 def 体保留: {s}");
         assert!(omit.iter().any(|o| o.contains("改动符号体")), "溢出 def 进 omit 坐标: {omit:?}");
@@ -411,7 +368,7 @@ mod tests {
             diff: "@@ -100,0 +100,1 @@\n+line 100\n".into(),
         }] };
         let mut omit = Vec::new();
-        let s = body_section_impl(&b, root, 900, &mut omit, false);
+        let s = body_section(&b, root, 900, &mut omit);
         assert!(s.contains("line 100") && s.contains("line 85"), "hunk±20 窗在场: {s}");
         assert!(!s.contains("line 10\n"), "窗外内容不在");
     }
@@ -468,7 +425,7 @@ mod tests {
             diff: "@@ -1,0 +2,1 @@\n+// filler line\n".into(),
         }] };
         let mut omit = Vec::new();
-        let s = body_section_impl(&b, root, 500, &mut omit, false);
+        let s = body_section(&b, root, 500, &mut omit);
         assert!(s.contains("src/a.rs") && s.contains("骨架"), "骨架档兜底承接：无签名行也不真空: {s}");
         assert!(omit.is_empty(), "骨架已承接，不再需要 omit 坐标: {omit:?}");
     }
