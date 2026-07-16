@@ -69,8 +69,6 @@ pub struct ReviewConfig {
     pub block_threshold: Severity,
     #[serde(default = "default_floor")]
     pub conf_floor: f32,
-    #[serde(default = "default_true")]
-    pub correlate: bool,
     #[serde(default = "default_concurrency")]
     pub max_concurrency: usize,
     /// 工具档位：off | two-stage（默认）| on。
@@ -79,12 +77,11 @@ pub struct ReviewConfig {
 }
 fn default_block() -> Severity { Severity::Medium }
 fn default_floor() -> f32 { 0.5 }
-fn default_true() -> bool { true }
 fn default_concurrency() -> usize { 8 }
 impl Default for ReviewConfig {
     fn default() -> Self {
         ReviewConfig { default_models: vec![], block_threshold: default_block(),
-            conf_floor: default_floor(), correlate: default_true(),
+            conf_floor: default_floor(),
             max_concurrency: default_concurrency(),
             tools: default_tools() }
     }
@@ -251,7 +248,6 @@ block_threshold="high"
         let cfg = Config::from_layers(&[]).unwrap();
         assert_eq!(cfg.review.block_threshold, crate::domain::Severity::Medium);
         assert_eq!(cfg.review.conf_floor, 0.5);
-        assert!(cfg.review.correlate);
     }
     #[test]
     fn tools_mode_parses_and_defaults_to_two_stage() {

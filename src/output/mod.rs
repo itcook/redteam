@@ -51,7 +51,6 @@ fn render_md(r: &ReviewReport) -> String {
     } else {
         s.push_str(&format!("# {repo} Redteam Review #{}\n\n## Summary\n\n", r.run.job_id));
     }
-    s.push_str(&format!("- Mode: {}\n\n", if r.mode == crate::domain::Mode::Code { "code" } else { "doc" }));
     s.push_str(&format!("- Verdict: {verdict}\n\n"));
     s.push_str(&format!("- Findings: {}\n", r.stats.total));
     if r.stats.total > 0 {
@@ -162,7 +161,7 @@ mod tests {
     use super::*;
     use crate::domain::*;
     fn report() -> ReviewReport {
-        ReviewReport { schema_version:"2".into(), mode:Mode::Code, verdict:Verdict::Reject,
+        ReviewReport { schema_version:"2".into(), verdict:Verdict::Reject,
             stats:Stats{high:1,total:1,..Default::default()},
             findings:vec![Finding{ id:"1".into(),severity:Severity::High,title:"boom".into(),body:"b".into(),
                 file:"a.rs".into(),line_start:3,line_end:5,confidence:0.9,recommendation:"fix".into(),

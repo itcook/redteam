@@ -1,5 +1,4 @@
 use super::finding::{Cluster, Finding, Severity};
-use super::input::Mode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,7 +130,6 @@ pub struct LedgerMeta {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReviewReport {
     pub schema_version: String,
-    pub mode: Mode,
     pub verdict: Verdict,
     pub stats: Stats,
     pub findings: Vec<Finding>,

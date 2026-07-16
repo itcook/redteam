@@ -1,69 +1,10 @@
-use redteam::cli::{run_code_review, run_review, ReviewArgs};
+use redteam::cli::{run_code_review, ReviewArgs};
 use redteam::config::Config;
-use redteam::domain::{Severity, Verdict};
+use redteam::domain::Verdict;
 use redteam::evidence::git::FileChange;
-use redteam::provider::fake::FakeProvider;
 use redteam::provider::tool_loop::{AssistantTurn, FakeChatBackend, ToolLoopProvider};
 use redteam::tools::ToolCall;
 use serde_json::json;
-
-
-#[tokio::test]
-async fn doc_review_end_to_end_rejects() {
-    use redteam::domain::RawFinding;
-    use std::collections::BTreeMap;
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("spec.md");
-    std::fs::write(&p, "# design\nlet x = 1;\n").unwrap();
-    let ps = p.to_string_lossy().to_string();
-
-    // file 必须与 target 路径匹配，anchor_doc 才能在文档内容中定位 quote。
-    // 两个 model 都报同一 High finding → agreement=2 → 跳过 verify → Reject。
-    let finding = || RawFinding {
-        severity: Severity::High,
-        title: "auth missing".into(),
-        body: "b".into(),
-        file: ps.clone(),
-        line_start: 1,
-        line_end: 1,
-        confidence: 0.9,
-        recommendation: "add check".into(),
-        hard_constraint: false,
-        quote: "let x = 1;".into(),
-    };
-    let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
-    scripted.insert("claude".into(), vec![finding()]);
-    scripted.insert("claude2".into(), vec![finding()]);
-    let provider = FakeProvider { scripted, ..Default::default() };
-    let cfg = Config::from_layers(&[
-        "[providers.claude]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
-         [providers.claude2]\nkind=\"openai\"\nmodel=\"b\"\npriority=5\n\
-         [review]\ndefault_models=[\"claude\",\"claude2\"]\n",
-    ]).unwrap();
-    let args = ReviewArgs {
-        mode: Some("doc".into()),
-        base: None,
-        scope: "working-tree".into(),
-        spec: vec![],
-        focus: None,
-        models: None,
-        models_all: false,
-        no_correlate: true,
-        block_threshold: None,
-        conf_floor: None,
-        background: false,
-        format: "json".into(),
-        targets: vec![ps],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
-    };
-
-    let (report, code) = run_review(args, &provider, &cfg, None).await.unwrap();
-    assert_eq!(report.verdict, Verdict::Reject);
-    assert_eq!(code, 10);
-    // 两 model 合并为 agreement=2 的单条 finding
-    assert_eq!(report.findings.len(), 1);
-    assert_eq!(report.findings[0].agreement, 2);
-}
 
 #[tokio::test]
 async fn code_bundle_tool_loop_anchors_and_drops_fabricated() {
@@ -98,11 +39,11 @@ async fn code_bundle_tool_loop_anchors_and_drops_fabricated() {
 default_models=["m"]
 "#]).unwrap();
     let args = ReviewArgs {
-        mode: Some("code".into()), base: None, scope: "working-tree".into(),
+        base: None, scope: "working-tree".into(),
         spec: vec![], focus: None, models: Some("m".into()),
         models_all: false,
-        no_correlate: true, block_threshold: None, conf_floor: None,
-        background: false, format: "json".into(), targets: vec![],
+        block_threshold: None, conf_floor: None,
+        background: false, format: "json".into(),
         resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
     let changes = vec![FileChange { path: "src/auth.rs".into(), diff: "+    db.write(token);".into() }];
@@ -154,10 +95,10 @@ default_models=["alpha","beta"]
     reg.insert("beta", Box::new(FakeProvider::with("beta", vec![rf("src/a.rs", "db.write(token);", Severity::Critical)])));
 
     let args = ReviewArgs {
-        mode: Some("code".into()), base: None, scope: "working-tree".into(),
+        base: None, scope: "working-tree".into(),
         spec: vec![], focus: None, models: None, models_all: false,
-        no_correlate: true, block_threshold: None, conf_floor: None,
-        background: false, format: "json".into(), targets: vec![],
+        block_threshold: None, conf_floor: None,
+        background: false, format: "json".into(),
         resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
@@ -202,10 +143,10 @@ default_models=["alpha","ghost"]
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf_low("src/a.rs", "let x = 1;")])));
 
     let args = ReviewArgs {
-        mode: Some("code".into()), base: None, scope: "working-tree".into(),
+        base: None, scope: "working-tree".into(),
         spec: vec![], focus: None, models: None, models_all: false,
-        no_correlate: true, block_threshold: None, conf_floor: None,
-        background: false, format: "json".into(), targets: vec![],
+        block_threshold: None, conf_floor: None,
+        background: false, format: "json".into(),
         resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
@@ -214,70 +155,6 @@ default_models=["alpha","ghost"]
     assert_eq!(report.verdict, Verdict::Approve);   // 仅 low → approve
     assert!(report.run.failed_models.contains(&"ghost".to_string()));
     assert_eq!(code, 2);                            // approve 但对照集不完整
-}
-
-#[tokio::test]
-async fn doc_review_keeps_omission_drops_fabricated_anchors_contradiction() {
-    use redteam::cli::{run_review, ReviewArgs};
-    use redteam::domain::{RawFinding, Severity, Verdict};
-    use std::collections::BTreeMap;
-
-    let dir = tempfile::tempdir().unwrap();
-    let doc_path = dir.path().join("spec.md");
-    std::fs::write(
-        &doc_path,
-        "intro line\nthe system MUST never retry\nlater the system retries 3 times\nconclusion\n",
-    ).unwrap();
-    let dp = doc_path.to_string_lossy().to_string();
-
-    fn rf(file: &str, title: &str, quote: &str, sev: Severity) -> RawFinding {
-        RawFinding {
-            severity: sev, title: title.into(), body: "b".into(), file: file.into(),
-            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: quote.into(),
-        }
-    }
-    let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
-    scripted.insert("alpha".into(), vec![
-        rf(&dp, "self-contradiction on retry", "the system MUST never retry", Severity::High),
-        rf(&dp, "missing rollback branch", "", Severity::High),                  // 遗漏：空引用
-        rf(&dp, "fabricated claim", "this text is nowhere in the doc", Severity::High), // 编造
-    ]);
-    scripted.insert("beta".into(), vec![
-        rf(&dp, "self-contradiction on retry", "the system MUST never retry", Severity::High),
-    ]);
-    let provider = redteam::provider::fake::FakeProvider { scripted, ..Default::default() };
-
-    let cfg = redteam::config::Config::from_layers(&[
-        "[providers.alpha]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
-         [providers.beta]\nkind=\"openai\"\nmodel=\"b\"\npriority=5\n\
-         [review]\ndefault_models=[\"alpha\",\"beta\"]\n",
-    ]).unwrap();
-
-    let args = ReviewArgs {
-        mode: Some("doc".into()), base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, models: None, models_all: false,
-        no_correlate: false, block_threshold: None, conf_floor: None,
-        background: false, format: "json".into(), targets: vec![dp.clone()],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
-    };
-    let (report, code) = run_review(args, &provider, &cfg, None).await.unwrap();
-
-    // 矛盾：两 model 合并 agreement=2、锚到第 2 行。
-    let contra = report.findings.iter()
-        .find(|f| f.title.contains("contradiction")).expect("contradiction kept");
-    assert_eq!(contra.agreement, 2);
-    assert_eq!(contra.line_start, 2, "anchored to the contradicting line");
-    // 遗漏：空引用，未被 anchor 丢弃（doc carve-out 的核心）。
-    assert!(report.findings.iter().any(|f| f.title.contains("rollback")),
-        "omission finding must survive anchor");
-    // 编造引文：M6-A 后保留（非丢弃）但 line 标 0（未锚定）；真幻觉转由 verify/refute 尾段兜底。
-    let fab = report.findings.iter().find(|f| f.title.contains("fabricated"))
-        .expect("fabricated quote kept (M6-A: no drop)");
-    assert_eq!((fab.line_start, fab.line_end), (0, 0), "unlocatable fabricated → line 0");
-    // verdict：矛盾 High agreement=2（跳过 verify）→ Reject、exit 10。
-    assert_eq!(report.verdict, Verdict::Reject);
-    assert_eq!(code, 10);
 }
 
 #[tokio::test]
@@ -308,10 +185,10 @@ default_models=["alpha"]
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", "missing auth", Severity::High)])));
 
     let args = ReviewArgs {
-        mode: Some("code".into()), base: None, scope: "working-tree".into(),
+        base: None, scope: "working-tree".into(),
         spec: vec![], focus: None, models: None, models_all: false,
-        no_correlate: true, block_threshold: None, conf_floor: None,
-        background: false, format: "json".into(), targets: vec![],
+        block_threshold: None, conf_floor: None,
+        background: false, format: "json".into(),
         resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
@@ -322,68 +199,4 @@ default_models=["alpha"]
     assert_eq!(f.confidence, 0.0, "refuted 降 confidence 下 floor");
     assert_eq!(report.verdict, Verdict::Approve, "证伪后不翻 verdict");
     assert!(code == 0 || code == 2, "approve → 0/2，非 10");
-}
-
-/// §7.4 硬封顶在 doc 线对 D5 的 e2e 验证：
-/// FakeProvider 脚本一条 D5 标准合规类 severity=High finding，
-/// 跑 run_review 后断言 severity 原样保留（clamp_compliance 已退场，E9）。
-#[tokio::test]
-async fn doc_d5_compliance_no_longer_mechanically_clamped() {
-    use redteam::domain::RawFinding;
-
-    let dir = tempfile::tempdir().unwrap();
-    let doc_path = dir.path().join("spec.md");
-    std::fs::write(&doc_path, "intro line\nthe document section heading\nconclusion\n").unwrap();
-    let dp = doc_path.to_string_lossy().to_string();
-
-    // 脚本一条 D5 finding：severity=High、quote 在文档中真实存在（anchor_doc 能命中）
-    let finding = RawFinding {
-        severity: Severity::High,
-        title: "doc standards violation".into(),
-        body: "missing required section".into(),
-        file: dp.clone(),
-        line_start: 1,
-        line_end: 1,
-        confidence: 0.9,
-        recommendation: "add section".into(),
-        hard_constraint: false,
-        quote: "the document section heading".into(),
-    };
-
-    let provider = FakeProvider::with("alpha", vec![finding]);
-
-    let cfg = Config::from_layers(&[
-        "[providers.alpha]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
-         [review]\ndefault_models=[\"alpha\"]\n",
-    ]).unwrap();
-
-    let args = ReviewArgs {
-        mode: Some("doc".into()),
-        base: None,
-        scope: "working-tree".into(),
-        spec: vec![],
-        focus: None,
-        models: None,
-        models_all: false,
-        no_correlate: true,
-        block_threshold: None,
-        conf_floor: None,
-        background: false,
-        format: "json".into(),
-        targets: vec![dp],
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
-    };
-
-    let (report, _code) = run_review(args, &provider, &cfg, None).await.unwrap();
-
-    // 必须有 finding（未被丢弃）
-    assert_eq!(report.findings.len(), 1, "D5 finding must survive anchor");
-    // E9（lens 去实体化 A）：clamp_compliance 机械钳制退场——L5/D5 cap Medium 唯一实职随之
-    // 消失，替代防线是模板固有 compliance 散文（教模型自封顶）+ refute 第二道防线；
-    // standards 假 high 记验收观察，不再是硬保证。severity 应原样保留 High（未被机械改写）。
-    assert_eq!(
-        report.findings[0].severity,
-        Severity::High,
-        "clamp_compliance 退场后 severity 不再被机械钳制（E9）"
-    );
 }

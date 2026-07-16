@@ -1,4 +1,3 @@
-use crate::domain::Mode;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -19,7 +18,7 @@ pub enum JobStatus {
 pub enum Phase {
     Collecting, // worker 起手，收集证据，fanout 前
     Fanout,     // cell 并发执行中（progress.done 推进）
-    Finalizing, // 尾段：dedup/correlate/verify/verdict（progress/last_active 静止）
+    Finalizing, // 尾段：dedup/verify/verdict（progress/last_active 静止）
     Refute,     // finalizing 子阶段：targeted refute（LLM 并发；note 带 targets 数）
 }
 
@@ -42,8 +41,6 @@ pub struct Progress {
 pub struct JobState {
     pub job_id: String,
     pub status: JobStatus,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub mode: Option<Mode>,
     pub started_at: u64,
     #[serde(default)]
     pub progress: Progress,
@@ -75,7 +72,6 @@ impl JobState {
         JobState {
             job_id: job_id.to_string(),
             status: JobStatus::Pending,
-            mode: None,
             started_at,
             progress: Progress::default(),
             models: vec![],
@@ -138,7 +134,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
         let st = JobState {
-            job_id: "job1".into(), status: JobStatus::Running, mode: Some(Mode::Doc),
+            job_id: "job1".into(), status: JobStatus::Running,
             started_at: 1000, progress: Progress { done: 1, total: 3 },
             models: vec!["alpha".into()],
             pid: Some(4242), exit_code: None, error: None, result_path: None,
