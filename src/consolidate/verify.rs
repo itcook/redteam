@@ -245,6 +245,7 @@ fn classify_refute(
 /// `root`：finding.file 的解析基点——喂 `source_snippet`（Task 2），读不到时 snippet 自行退化占位。
 /// `spec_docs`：--spec 参照段（Task 4，承 hiapi F2）——透传给 refute prompt，skeptic 据设计
 /// 文档把「像 bug 实为设计明确允许」的误报驳回；空串走既有占位（refute 行为不变）。
+#[allow(clippy::too_many_arguments)] // 与 refute_one/build_refute_prompt 同源的参数面；收拢 struct 是过度设计
 pub async fn verify_findings(
     mut findings: Vec<Finding>,
     provider: &dyn ReviewProvider,
