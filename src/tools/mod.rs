@@ -127,25 +127,6 @@ const READ_FILES_MAX_BYTES: usize = 128 * 1024;
 const LIST_MAX_ENTRIES: usize = 500;
 const SEARCH_MAX_MATCHES: usize = 100;
 
-/// dev 诊断仪器（残余 tool_use 内容解剖）：`REDTEAM_TOOL_LOG=<绝对路径>` 时把工具调用
-/// 参数逐行 append 成 jsonl（只记参数不记结果）。未设 env 零成本；发布前可拆。
-pub(crate) fn tool_log(v: &serde_json::Value) {
-    let Some(path) = std::env::var_os("REDTEAM_TOOL_LOG") else { return };
-    let line = serde_json::json!({
-        "ts_ms": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
-    });
-    // 合并固定头（ts_ms）与调用方载荷
-    let mut obj = line;
-    if let (Some(dst), Some(src)) = (obj.as_object_mut(), v.as_object()) {
-        for (k, val) in src { dst.insert(k.clone(), val.clone()); }
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        use std::io::Write;
-        let _ = writeln!(f, "{obj}");
-    }
-}
-
 impl ToolExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
@@ -166,7 +147,6 @@ impl ToolExecutor {
     }
 
     pub fn execute(&self, call: &ToolCall) -> ToolResult {
-        tool_log(&serde_json::json!({ "tool": call.name, "args": call.args }));
         let content = match call.name.as_str() {
             "read_file" => self.do_read_file(&call.args),
             "read_files" => self.do_read_files(&call.args),

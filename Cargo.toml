@@ -35,13 +35,12 @@ libc = "0.2"
 # 台账/评审史持久层（.redteam/proj.db）。bundled：sqlite 编译进二进制,零系统依赖。
 # turso embedded 对比后因 beta 定案不用、不留期权(见 .doc/design/2026-07-03 台账机器化)。
 rusqlite = { version = "0.32", features = ["bundled"] }
-# SCIP 语义索引解析（M15-S2-b）。scip 0.9 bundled protobuf 绑定、免 protoc；protobuf 是 Index::parse_from_bytes 所需直接依赖。
-scip = "0.9"
-protobuf = "3"
-# 运行期 SCIP 索引临时文件（即弃、零仓库足迹）——从 dev-dependencies 升为正式依赖。
-tempfile = "3"
 
 [dev-dependencies]
+# 测试 fixture 用临时目录/文件（e2e + 单元测试大量消费）。SCIP 语义引擎曾在运行期用它建
+# 临时索引文件、因此一度升为正式依赖（M15-S2-b）；SCIP 已随 E8-E 安乐死拆除（M16 前清理
+# Task 2），production 侧已无消费者，降回测试专用。
+tempfile = "3"
 
 [profile.release]
 strip = true

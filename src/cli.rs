@@ -1,34 +1,30 @@
 use crate::bundle::{group, select_files};
 use crate::config::Config;
-use crate::consolidate::{apply_clusters, correlate, dedup, dedup_doc, refute_targets, verify_findings};
-use crate::domain::{DossierMeta, Finding, Mode, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
-use crate::evidence::{collect, detect_mode, EvidenceOpts, Scope};
+use crate::consolidate::{dedup, refute_targets, verify_findings};
+use crate::domain::{DossierMeta, Finding, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::git::FileChange;
-use crate::orchestrate::{enrich, run_code_fanout, run_doc_fanout, CellSink, OrchestrateOpts, PlannedModel};
+use crate::orchestrate::{enrich, run_code_fanout, CellSink, OrchestrateOpts, PlannedModel};
 use crate::output::Format;
-use crate::positioning::{anchor, anchor_doc};
+use crate::positioning::anchor;
 use crate::provider::{LensRequest, ReviewProvider};
 use crate::verdict::compute_verdict;
 use std::path::Path;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReviewArgs {
-    pub mode: Option<String>,
     pub base: Option<String>,
     pub scope: String,
     pub spec: Vec<String>,
     pub focus: Option<String>,
     pub models: Option<String>,
     pub models_all: bool,
-    pub no_correlate: bool,
     pub block_threshold: Option<String>,
     pub conf_floor: Option<f32>,
     // 前台同步路径是默认路径；`--background` 由 main 层解析并写入本字段。
     pub background: bool,
     pub format: String,
-    pub targets: Vec<String>,
     /// R2.3：`--resume <job_id>`。main.rs 据此路由到 `run_resume`（前台同步，忽略 background）；
-    /// 其余字段（mode/targets/models/…）在 resume 路径下不生效——run_resume 会重新
+    /// 其余字段（base/models/…）在 resume 路径下不生效——run_resume 会重新
     /// `read_args_raw(job_id)` 取原始作业的 ReviewArgs。
     pub resume: Option<String>,
     /// `--dismissed <db路径|csv>`：覆盖台账 db 路径或临时 csv 豁免（design 2026-07-03 #6；
@@ -161,22 +157,7 @@ pub fn resolve_models(
     (models, replicate)
 }
 
-/// 从 review args 探测 mode（前台 build_registry、后台起手 stamp、resume/partial 共用）。
-/// 显式值直取；None 走 detect_mode（base/scope/targets 推断）——resume 场景 args.json 里
-/// 自动探测 job 的 mode 存 None，不重探测会把 code job 错当 Doc（dogfood 20260703 r4 0474eb1e）。
-pub fn detect_mode_from_args(args: &ReviewArgs) -> anyhow::Result<Mode> {
-    let scope = if args.scope == "branch" { Scope::Branch } else { Scope::WorkingTree };
-    let mode_opt = args.mode.as_deref().map(|m| if m == "code" { Mode::Code } else { Mode::Doc });
-    crate::evidence::detect_mode(&EvidenceOpts {
-        mode: mode_opt,
-        base: args.base.clone(),
-        scope,
-        spec: args.spec.clone(),
-        targets: args.targets.clone(),
-    })
-}
-
-/// R8.2：命中标记 + 派生索引（排序去重）。单点应用于共用尾段，三路径（code/doc/resume）同享。
+/// R8.2：命中标记 + 派生索引（排序去重）。单点应用于共用尾段，两路径（code/resume）同享。
 pub(crate) fn mark_dismissed(
     findings: &mut [Finding],
     dismissed: &std::collections::HashSet<String>,
@@ -204,22 +185,18 @@ fn model_ids_for(names: &[String], cfg: &Config) -> Vec<String> {
         .collect()
 }
 
-/// 扇出之后的共用尾段上下文——`run_code_review`/`run_review`/`run_resume` 三处扇出前逻辑
-/// 各不相同（单格×model / doc 单包×model / 直接重放 manifest prompt），但扇出后（anchor → dedup
-/// → [doc: correlate] → verify → verdict → 组报告）完全一致，抽出复用（DRY，T7 授权解冻）。
+/// 扇出之后的共用尾段上下文——`run_code_review`/`run_resume` 两处扇出前逻辑各不相同
+/// （单格×model / 直接重放 manifest prompt），但扇出后（anchor → dedup → verify → verdict
+/// → 组报告）完全一致，抽出复用（DRY，T7 授权解冻）。
 struct TailCtx<'a> {
-    mode: Mode,
-    /// code 模式下 anchor 用的项目根；doc 模式忽略。
-    root: Option<&'a Path>,
-    /// doc 模式下 anchor_doc 用的受审文档目标；code 模式忽略。
-    targets: &'a [String],
+    /// anchor/verify_findings 用的项目根。
+    root: &'a Path,
     provider: &'a dyn ReviewProvider,
     model_names: Vec<String>,
     /// 与 model_names 同序的 model id（cfg.providers.*.model；查无则回退 provider 名）。
     model_ids: Vec<String>,
     block: Severity,
     floor: f32,
-    correlate_on: bool,
     max_concurrency: usize,
     job_id: String,
     duration_ms: u64,
@@ -231,39 +208,22 @@ struct TailCtx<'a> {
     precedents: &'a [crate::db::DismissCard],
     /// 台账加载披露（进 RunMeta.ledger）。
     ledger_meta: Option<crate::domain::LedgerMeta>,
-    /// R3 stamp：证据收集刻的 HEAD（code dispatch 回填；doc/resume 为 None）。
+    /// R3 stamp：证据收集刻的 HEAD（code dispatch 回填；resume 为 None）。
     head_sha: Option<String>,
-    /// 卷宗覆盖 meta（T01⑥；进 RunMeta.dossier）。code fan-out 路径为 Some，doc/resume 为 None。
+    /// 卷宗覆盖 meta（T01⑥；进 RunMeta.dossier）。code fan-out 路径为 Some，resume 为 None。
     dossier_meta: Option<DossierMeta>,
     /// 二阶段补查触发观测（进 RunMeta.needs，恒写）：(触发格数, 声明条数)；resume 无 fan-out 恒零。
     needs_stats: (u32, u32),
-    /// 后台 job 的 phase 打点通路（refute/correlate 子阶段；前台/resume 为 None）。
+    /// 后台 job 的 phase 打点通路（refute 子阶段；前台/resume 为 None）。
     sink: Option<&'a dyn CellSink>,
 }
 
-/// 共用尾段：anchor → dedup → [doc: correlate/apply_clusters] → verify → verdict → 组装 report
-/// → 退出码。三处调用方（run_code_review/run_review/run_resume）行为 1:1 迁移，不改变既有语义。
+/// 共用尾段：anchor → dedup → verify → verdict → 组装 report → 退出码。
+/// 两处调用方（run_code_review/run_resume）行为 1:1 迁移，不改变既有语义。
 async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow::Result<(ReviewReport, i32)> {
-    let anchored = match ctx.mode {
-        Mode::Code => anchor(findings, ctx.root.expect("code tail requires root")),
-        Mode::Doc => {
-            let docs = crate::evidence::doc::collect_doc_files(ctx.targets)?;
-            anchor_doc(findings, &docs)
-        }
-    };
-    let mut findings = match ctx.mode {
-        Mode::Code => dedup(anchored),
-        Mode::Doc => dedup_doc(anchored),
-    };
-    let clusters = if ctx.mode == Mode::Doc {
-        // correlate 当前为未实现 stub（恒空），不打 phase——待其真正接 LLM 调用时再加时间线点。
-        let lead_model = ctx.model_names.first().cloned().unwrap_or_default();
-        let clusters = correlate(ctx.provider, &lead_model, &findings, ctx.correlate_on).await;
-        apply_clusters(&mut findings, &clusters);
-        clusters
-    } else {
-        vec![]
-    };
+    let anchored = anchor(findings, ctx.root);
+    let findings = dedup(anchored);
+    let clusters = vec![]; // correlate 已随 doc 模式退场（E10）；clusters 字段留空保持 schema 稳定。
     // refute 子阶段打点（targets 数与 verify_findings 同一真相源函数，非重复实现）。
     let n_targets = refute_targets(&findings, ctx.precedents, ctx.block).len();
     if n_targets > 0 {
@@ -272,8 +232,8 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
         }
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(
-        findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency, ctx.mode,
-        ctx.root.unwrap_or(Path::new(".")), ctx.precedents,
+        findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency,
+        ctx.root, ctx.precedents,
     ).await;
     let mut run_warnings = ctx.warnings;
     run_warnings.extend(refute_warnings);
@@ -289,7 +249,6 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
         schema_version: "3".into(),
-        mode: ctx.mode,
         verdict,
         stats,
         findings,
@@ -351,23 +310,6 @@ pub(crate) fn pack_budget_bytes(cfg: &Config, model_names: &[String]) -> usize {
     PACK_BUDGET_BYTES.min(by_window)
 }
 
-/// pack 引擎四臂（M15-S2-b）：`REDTEAM_PACK` unset/其他值=Regex（默认，行为不变）；
-/// `0`=Dossier 基线臂；`scip`=Scip 语义引擎；`scip-strict`=Scip 诊断臂（关兜底）。
-enum PackEngine {
-    Regex,
-    Dossier,
-    Scip { strict: bool },
-}
-
-fn pack_engine() -> PackEngine {
-    match std::env::var("REDTEAM_PACK").ok().as_deref() {
-        Some("0") => PackEngine::Dossier,
-        Some("scip") => PackEngine::Scip { strict: false },
-        Some("scip-strict") => PackEngine::Scip { strict: true },
-        _ => PackEngine::Regex,
-    }
-}
-
 /// 单格全审默认（E9 判决，2026-07-13 转正）：全变更集恒并成一个 bundle——分格在全景 pack
 /// 范式下=N 倍重复喂同一全景（两跑实证 input −77%、质量未见系统性下降）。空输入原样放行
 /// （不产出「一个空文件的 bundle」）——上游两处空证据守卫（`run_code_review` 的「no reviewable
@@ -381,58 +323,25 @@ fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bund
 }
 
 /// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
-/// 四臂 + null：默认=Regex pack（0 壳完整体+1 壳引用点+省略清单，M15-S1）；`REDTEAM_PACK=0`=
-/// Dossier-only 基线臂（A/B 对照）；`REDTEAM_PACK=scip`=Scip 语义引擎（rust-analyzer 缺/索引失败
-/// → 降级 Regex pack + 一行 stderr 提示，绝不 panic/阻塞）；`REDTEAM_PACK=scip-strict`=Scip 诊断臂
-/// （关兜底，M15-S2-b）；`REDTEAM_NO_DOSSIER` 非空=全空段（M14 D9 null 臂）。
-/// scip 索引每次 review 前置建一次（非 per-bundle）。degrades 静默于：不支持语言/无符号（pack 臂）；
-/// 基线臂 `build_dossier` 另有调用密度门<5（pack 臂已撤，I-2：body 是 payload 与 caller 密度无关）。
-/// meta.injected 是唯一可观测入口，供 A/B 归因与生产诊断。
+/// 唯一路径（E8-E 安乐死 SCIP/Dossier 引擎后 + Task 3 空臂 dev 开关整拆）：
+/// `build_pack`（0 壳完整体+省略清单，M15-S1）恒执行，无空臂开关。
+/// degrades 静默于：不支持语言/无符号（pack 臂内部回落链承接）。
+/// meta.injected 是唯一可观测入口，供归因与生产诊断。
 /// `budget`=pack flat 预算（字节）；生产调用点由 `pack_budget_bytes` 按启用模型窗算出。
 pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
-    let suppressed = std::env::var_os("REDTEAM_NO_DOSSIER").is_some();
-    let engine = pack_engine();
-    // scip 引擎：前置建索引一次（非 per-bundle）；RA 缺/索引失败 → None → 降级 regex + 一行提示。
-    // ScipIndex::build 内部 .arg(root)+.current_dir(root) 双重解析，root 若相对会出岔——
-    // 这里先转绝对路径再传入；bundle 文件读（build_pack/build_pack_scip）仍用原 root（相对 root 的
-    // join 已能工作，不动它，避免牵连既有行为）。
-    let scip_index = match &engine {
-        PackEngine::Scip { .. } => {
-            let abs_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-            let idx = crate::scip::ScipIndex::build(&abs_root);
-            if idx.is_none() {
-                eprintln!("redteam: 未探到 rust-analyzer（或索引失败），scip 引擎降级为 regex-pack");
-            }
-            idx
-        }
-        _ => None,
-    };
-    let strict = matches!(engine, PackEngine::Scip { strict: true });
     // 单格全审默认（E9）：bundles 恒为单元素（全变更集），每格即自家文件——原「兄弟改动
-    // 文件全景注入 + 依赖距离排序」随分格一并收缩（无兄弟可注入）。超预算由 build_pack/
-    // build_pack_scip 自身的降级梯子（骨架/hunk 窗/省略清单）承接，不再靠分格避让。
+    // 文件全景注入 + 依赖距离排序」随分格一并收缩（无兄弟可注入）。超预算由 build_pack
+    // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，不再靠分格避让。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
             // 预算记账扣本格自己的 diff 字节（单格默认下即全变更集真实 diff）。
             let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
-            if suppressed {
-                String::new()
-            } else {
-                match (&engine, &scip_index) {
-                    (PackEngine::Dossier, _) =>
-                        crate::prompt::render_dossier_section(&crate::dossier::build_dossier(b, root)),
-                    (PackEngine::Scip { .. }, Some(idx)) =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack_scip(b, root, budget, own_diff_bytes, idx, strict)),
-                    // Regex 默认，及 scip 降级（scip_index=None）都走 regex-pack。
-                    _ =>
-                        crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes)),
-                }
-            }
+            crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes))
         })
         .collect();
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
-    let meta = DossierMeta { bundles: bundles.len(), injected, suppressed };
+    let meta = DossierMeta { bundles: bundles.len(), injected };
     (entries, meta)
 }
 
@@ -443,10 +352,6 @@ const NEED_LINES_WINDOW: usize = 30;
 /// read_capped 的 512KB 读帽，doc 线整文件 need 直接就是整文件，均绕开预算纪律）。
 /// 量级对齐 verify.rs::SNIPPET_FULL_FILE_CAP（64KB）。
 const NEED_SECTION_BYTE_CAP: usize = 64_000;
-
-/// doc 线证据总帽（doc 无 pack/budget 可扣，需独立总量闸）：累计超此值即停止追加新段，
-/// 已收段落保留、尾部补一行裁剪注记。
-const DOC_EVIDENCE_TOTAL_CAP: usize = 256_000;
 
 /// NeedEntry.lines 解析："a-b"（1-based、a<=b）→ Some((a,b))；缺失/坏格式 → None（整文件语义）。
 fn parse_need_lines(lines: Option<&str>) -> Option<(u32, u32)> {
@@ -561,8 +466,8 @@ pub(crate) fn second_pass_prompt(
     }
     let own_diff_bytes: usize = own.files.iter().map(|fc| fc.diff.len()).sum();
     let pb = crate::bundle::Bundle { files };
-    // ponytail: 第二趟恒用 regex 引擎——scip 是 opt-in 实验臂且索引 per-cell 重建昂贵；
-    // needs 只消费 0 壳全文分支（两引擎共用 body_section），scip 臂需要时再接。
+    // 第二趟恒用 build_pack（唯一路径，E8-E 安乐死 SCIP 后无引擎可选）——needs 只消费
+    // 0 壳全文分支（body_section）。
     // Important 修复：evidence（行窗证据段，已在上方按 NEED_SECTION_BYTE_CAP 分段封顶）先
     // 扣出 pack 预算再传入 build_pack——否则 evidence+pack 联合越过每模型字节预算，撞墙全归零
     // （design §2.2）。budget 耗尽时 build_pack 自身的降级链兜底，不会 panic。
@@ -574,140 +479,9 @@ pub(crate) fn second_pass_prompt(
     Some(p)
 }
 
-/// 二阶段补查 prompt（doc 线）：doc 无 bundle/pack——原 doc prompt + `## 补查证据` 段
-/// （整文件与行窗 need 同走 need_section，单条已按 NEED_SECTION_BYTE_CAP 封顶）+ 草稿段。
-/// doc 线没有 pack 预算可扣，Important 修复补一道独立总量闸：累计超 DOC_EVIDENCE_TOTAL_CAP
-/// 即停止追加新段（已收段落保留），尾部落一行裁剪注记——防 needs 条数多时 5×64KB 仍叠穿预算。
-/// 全部 needs 逃逸/不可读 → None。
-fn doc_second_pass_prompt(
-    input: &crate::domain::ReviewInput,
-    focus: &str,
-    root: &Path,
-    needs: &[crate::domain::NeedEntry],
-    drafts: &[Finding],
-) -> Option<String> {
-    let ex = crate::tools::ToolExecutor::new(root);
-    let mut evidence = String::new();
-    let mut clipped = false;
-    for need in needs {
-        if evidence.len() >= DOC_EVIDENCE_TOTAL_CAP {
-            clipped = true;
-            break;
-        }
-        if let Some(sec) = need_section(&ex, need) {
-            evidence.push_str(&sec);
-        }
-    }
-    if evidence.is_empty() {
-        return None;
-    }
-    if clipped {
-        evidence.push_str("（其余补查条目因预算裁剪省略）\n");
-    }
-    let mut p = crate::prompt::build_doc_prompt(input, focus);
-    p.push('\n');
-    p.push_str(&evidence);
-    p.push_str(&draft_block(drafts));
-    Some(p)
-}
-
-/// 整条评审流水线：证据 → 攻击面固有 prompt → fan-out → 共用尾段（assemble_report）。
-///
+/// code 专属流水线（S2-2b）：bundle × model 工具循环 + positioning 尾段。
 /// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
 /// `--background` 由 main.rs 在 dispatch 之前分叉（spawn worker）；到达这里即路由 bug。
-pub async fn run_review(
-    args: ReviewArgs,
-    provider: &dyn ReviewProvider,
-    cfg: &Config,
-    sink: Option<&dyn CellSink>,
-) -> anyhow::Result<(ReviewReport, i32)> {
-    if args.background {
-        anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
-    }
-    // Fix 3（final-review）：台账加载上提到证据收集/fan-out 之前 fail-fast——坏值不再
-    // 烧完 LLM 调用才报错。zero-config：缺省自动加载 .redteam/proj.db（存在才启用）。
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, &cwd)?;
-    let t0 = std::time::Instant::now();
-
-    // 1. mode + 证据
-    let mode = args.mode.as_deref().map(|m| match m {
-        "code" => Mode::Code,
-        _ => Mode::Doc,
-    });
-    let scope = if args.scope == "branch" {
-        Scope::Branch
-    } else {
-        Scope::WorkingTree
-    };
-    let eopts = EvidenceOpts {
-        mode,
-        base: args.base.clone(),
-        scope,
-        spec: args.spec.clone(),
-        targets: args.targets.clone(),
-    };
-    let input = collect(&eopts)?;
-
-    // 3. 模型集 + replicate 判定（统一 resolve_models）
-    let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
-    let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
-    let oopts = OrchestrateOpts {
-        models,
-        replicate,
-        no_fallback: false,
-        max_concurrency: cfg.review.max_concurrency,
-    };
-
-    // 4. fan-out（doc：全 D rule 一包 × model 工具循环）。台账不再注入 review prompt
-    //（design 2026-07-03 #2：生成侧勿再报实证无效，判定后置 consolidate）。
-    let focus = args.focus.clone().unwrap_or_default();
-    // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
-    if let Some(s) = sink { s.on_meta(&model_names); }
-    // 二阶段补查构造器（doc 简化版）：原 doc prompt + 补查证据段 + 草稿契约。
-    let mk = |_idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        doc_second_pass_prompt(&input, &focus, &cwd, needs, drafts)
-    };
-    let raw = run_doc_fanout(provider, &input, &focus, &oopts, sink, Some(&mk)).await;
-
-    // 5-8. 共用尾段：anchor_doc → dedup_doc → correlate/apply_clusters → verify → verdict → 组报告
-    let block = args
-        .block_threshold
-        .as_deref()
-        .map(parse_sev)
-        .unwrap_or(cfg.review.block_threshold);
-    let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
-    let correlate_on = cfg.review.correlate && !args.no_correlate;
-    let ctx = TailCtx {
-        mode: input.mode,
-        root: None,
-        targets: &args.targets,
-        provider,
-        model_ids: model_ids_for(&model_names, cfg),
-        model_names,
-        block,
-        floor,
-        correlate_on,
-        max_concurrency: cfg.review.max_concurrency,
-        job_id: String::new(),
-        duration_ms: t0.elapsed().as_millis() as u64,
-        usage: raw.usage,
-        warnings: raw.warnings,
-        failed_models: raw.failed_models,
-        dismissed: &ledger.ids,
-        precedents: &ledger.cards,
-        ledger_meta: ledger.meta.clone(),
-        head_sha: None,
-        dossier_meta: None,
-        needs_stats: raw.needs_stats,
-        sink,
-    };
-    if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
-    assemble_report(raw.findings, ctx).await
-}
-
-/// code 专属流水线（S2-2b）：bundle × model 工具循环 + positioning 尾段。
-/// 退出码同 run_review：0=approve、10=reject、2=对照集不完整。
 pub async fn run_code_review(
     args: &ReviewArgs,
     provider: &dyn ReviewProvider,
@@ -765,7 +539,7 @@ pub async fn run_code_review(
         ));
     }
 
-    // 5-8. 共用尾段：anchor → dedup → verify → verdict → 组报告（code 无 correlate/clusters）
+    // 5-8. 共用尾段：anchor → dedup → verify → verdict → 组报告
     let block = args
         .block_threshold
         .as_deref()
@@ -773,15 +547,12 @@ pub async fn run_code_review(
         .unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     let ctx = TailCtx {
-        mode: Mode::Code,
-        root: Some(root),
-        targets: &args.targets,
+        root,
         provider,
         model_ids: model_ids_for(&model_names, cfg),
         model_names,
         block,
         floor,
-        correlate_on: false,
         max_concurrency: cfg.review.max_concurrency,
         job_id: String::new(),
         duration_ms: t0.elapsed().as_millis() as u64,
@@ -911,7 +682,7 @@ pub async fn run_incremental_review(
         }
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(
-        merged, provider, &model_names, block, cfg.review.max_concurrency, Mode::Code, root, &ledger.cards,
+        merged, provider, &model_names, block, cfg.review.max_concurrency, root, &ledger.cards,
     ).await;
     let mut warnings = raw.warnings;
     warnings.extend(refute_warnings);
@@ -932,7 +703,6 @@ pub async fn run_incremental_review(
     stats.new = Some(Box::new(Stats::from_findings(&new_only)));
     let report = ReviewReport {
         schema_version: "3".into(),
-        mode: Mode::Code,
         verdict,
         stats,
         findings,
@@ -971,8 +741,7 @@ pub async fn run_incremental_review(
     Ok((report, code))
 }
 
-/// 统一 mode 探测 + 评审分发（前台 main 与后台 worker 共用）。
-/// code：git changed_files → run_code_review；doc：run_review。
+/// 评审分发（前台 main 与后台 worker 共用）：增量轮路由，否则 git changed_files → run_code_review。
 pub async fn run_review_dispatch(
     args: &ReviewArgs,
     provider: &dyn ReviewProvider,
@@ -981,34 +750,20 @@ pub async fn run_review_dispatch(
     sink: Option<&dyn CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     // run_review_dispatch 永远同步执行——--background 分叉发生在 main.rs，先于此处；
-    // 故两分支都强制 background=false（否则 run_code_review/run_review 会 bail）。
+    // 故强制 background=false（否则 run_code_review 会 bail）。
     let mut sync_args = args.clone();
     sync_args.background = false;
-    let scope_enum = if sync_args.scope == "branch" { Scope::Branch } else { Scope::WorkingTree };
-    let mode_opt = sync_args.mode.as_deref().map(|m| if m == "code" { Mode::Code } else { Mode::Doc });
-    let eopts = EvidenceOpts {
-        mode: mode_opt,
-        base: sync_args.base.clone(),
-        scope: scope_enum,
-        spec: sync_args.spec.clone(),
-        targets: sync_args.targets.clone(),
-    };
-    // M13：增量轮路由（前台与后台 worker 共用本单点；mode/scope 守卫在 preflight 内）。
+    let branch_scope = sync_args.scope == "branch";
+    // M13：增量轮路由（前台与后台 worker 共用本单点；scope 守卫在 preflight 内）。
     if let Some(prior) = sync_args.incremental_from.clone() {
         return run_incremental_review(&sync_args, &prior, provider, cfg, cwd, sink).await;
     }
 
-    let detected = detect_mode(&eopts)?;
-    match detected {
-        Mode::Code => {
-            let changes = crate::evidence::git::changed_files(sync_args.base.as_deref(), scope_enum == Scope::Branch)?;
-            // R3：stamp 权威时刻 = 证据收集实跑刻（与 changed_files 同刻同 cwd）；
-            // 非 git 目录折 None——前台裸 review 与后台 job 共用本单点，前后台天然同 sha。
-            let head_sha = crate::evidence::git::head_sha_at(cwd).ok();
-            run_code_review(&sync_args, provider, cfg, changes, cwd, head_sha, sink).await
-        }
-        Mode::Doc => run_review(sync_args, provider, cfg, sink).await,
-    }
+    let changes = crate::evidence::git::changed_files(cwd, sync_args.base.as_deref(), branch_scope)?;
+    // R3：stamp 权威时刻 = 证据收集实跑刻（与 changed_files 同刻同 cwd）；
+    // 非 git 目录折 None——前台裸 review 与后台 job 共用本单点，前后台天然同 sha。
+    let head_sha = crate::evidence::git::head_sha_at(cwd).ok();
+    run_code_review(&sync_args, provider, cfg, changes, cwd, head_sha, sink).await
 }
 
 fn now_unix() -> u64 {
@@ -1081,18 +836,12 @@ pub(crate) struct IncrementalBaseline {
 }
 
 /// 决议 7 前置守卫：违反**显式报错拒跑**（不静默降级全量——成本意外）。
-/// ①谱系 ②同族（mode/scope，含 v1 范围收窄 code+branch）③健康基线（R2 三查）④空 delta。
+/// ①谱系 ②同族（scope，含 v1 范围收窄 branch）③健康基线（R2 三查）④空 delta。
 pub(crate) fn incremental_preflight(
     args: &ReviewArgs,
     prior_job: &str,
     root: &Path,
 ) -> anyhow::Result<IncrementalBaseline> {
-    // v1 范围（决议 7）：仅 code 模式——doc id 稳定性弱，锚定携带地基不存在。
-    let mode = detect_mode_from_args(args)?;
-    anyhow::ensure!(
-        mode == Mode::Code,
-        "--incremental-from: v1 supports code mode only (doc finding ids drift across rounds); run a full `redteam review`"
-    );
     // v1 范围：branch scope——working-tree 证据不可 stamp，轮间未提交改动会静默漏出 delta。
     anyhow::ensure!(
         args.scope == "branch",
@@ -1143,13 +892,13 @@ pub(crate) fn incremental_preflight(
         "--incremental-from: prior result has no head_sha stamp (predates incremental rounds); run one full `redteam review` to establish a stamped baseline"
     ))?;
 
-    // ②同族守卫：mode/scope 与上轮一致（读上轮 args.json）。
+    // ②同族守卫：scope 与上轮一致（读上轮 args.json）。
     let prior_args: ReviewArgs = crate::state::store::read_args_raw(root, prior_job)
         .and_then(|j| serde_json::from_str(&j).ok())
         .ok_or_else(|| anyhow::anyhow!("--incremental-from: cannot load prior job args for {prior_job}"))?;
     anyhow::ensure!(
-        detect_mode_from_args(&prior_args).ok() == Some(Mode::Code) && prior_args.scope == args.scope,
-        "--incremental-from: mode/scope mismatch with prior round (prior scope '{}', current '{}'); incremental carry requires the same review family",
+        prior_args.scope == args.scope,
+        "--incremental-from: scope mismatch with prior round (prior scope '{}', current '{}'); incremental carry requires the same review family",
         prior_args.scope,
         args.scope
     );
@@ -1176,7 +925,7 @@ pub(crate) fn incremental_preflight(
 /// R2.2：失败/超时时从 proj.db 的 cell checkpoint 里已完成的 findings 组一份 `incomplete`
 /// 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。M 取 manifest 行数（若尚未
 /// 写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
-fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) -> (ReviewReport, i32) {
+fn partial_report(ws: &Path, job_id: &str, reason: String) -> (ReviewReport, i32) {
     let manifest = crate::state::store::read_manifest(ws, job_id);
     let done_records: Vec<_> = crate::state::store::read_partial(ws, job_id)
         .into_iter()
@@ -1185,12 +934,9 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
     let done = done_records.len();
     let total = manifest.len().max(done);
     let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.findings).collect();
-    // best-effort 错误路径：探测失败（如 empty_review_args）兜 Doc，维持旧行为。
-    let mode = detect_mode_from_args(args).unwrap_or(Mode::Doc);
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
         schema_version: "3".into(),
-        mode,
         verdict: Verdict::Incomplete,
         stats,
         findings,
@@ -1210,17 +956,6 @@ fn partial_report(ws: &Path, job_id: &str, args: &ReviewArgs, reason: String) ->
     };
     let code = exit_code(Verdict::Incomplete, false);
     (report, code)
-}
-
-/// 空壳 ReviewArgs：仅供 `run_resume` 在 `read_args_raw` 缺失时兜底构造 incomplete 报告——
-/// 正常路径不会走到（resume 只对经 `--background` 落过 args.json 的作业有意义）。
-fn empty_review_args() -> ReviewArgs {
-    ReviewArgs {
-        mode: None, base: None, scope: "working-tree".into(), spec: vec![], focus: None,
-        models: None, models_all: false, no_correlate: false,
-        block_threshold: None, conf_floor: None, background: false, format: "json".into(),
-        targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
-    }
 }
 
 /// R2.3：resume 差集补跑。读 `manifest`（全集 M）+ `partial`（已完成 ok:true 的 cell 集）→
@@ -1247,7 +982,7 @@ pub async fn run_resume(
     // 组装成干净 Approve（假阳性——评审工具静默给未经审查的通过）。护栏：直接出 Incomplete。
     if manifest.is_empty() {
         return partial_report(
-            ws, job_id, &empty_review_args(),
+            ws, job_id,
             "resume: empty manifest (job crashed before fan-out); nothing to resume".into(),
         );
     }
@@ -1257,7 +992,7 @@ pub async fn run_resume(
         Some(a) => a,
         None => {
             return partial_report(
-                ws, job_id, &empty_review_args(),
+                ws, job_id,
                 "resume: missing job args (job never ran via --background)".into(),
             );
         }
@@ -1266,16 +1001,10 @@ pub async fn run_resume(
     // 引导重跑增量评审（守卫与 carry 必须整链执行）。
     if args.incremental_from.is_some() {
         return partial_report(
-            ws, job_id, &args,
+            ws, job_id,
             "resume: incremental jobs cannot be resumed; re-run `redteam review --incremental-from <prior-job>`".into(),
         );
     }
-    let mode = match detect_mode_from_args(&args) {
-        Ok(m) => m,
-        Err(e) => {
-            return partial_report(ws, job_id, &args, format!("resume: cannot determine mode: {e}"));
-        }
-    };
     let done: std::collections::BTreeSet<String> = crate::state::store::read_partial(ws, job_id)
         .into_iter()
         .filter(|r| r.ok)
@@ -1321,26 +1050,22 @@ pub async fn run_resume(
     let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
     let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
-    let correlate_on = cfg.review.correlate && !args.no_correlate;
     // resume 因重读 args.json 自然继承原 --dismissed/--no-dismissed；run_resume 不返回 Result
     //（异步状态机式），故此处不能用 `?`——加载失败按既有约定折成 partial_report。
     let ledger = match load_ledger(args.dismissed.as_deref(), args.no_dismissed, cwd) {
         Ok(l) => l,
         Err(e) => {
-            return partial_report(ws, job_id, &args, format!("resume: bad ledger: {e}"));
+            return partial_report(ws, job_id, format!("resume: bad ledger: {e}"));
         }
     };
 
     let ctx = TailCtx {
-        mode,
-        root: if mode == Mode::Code { Some(cwd) } else { None },
-        targets: &args.targets,
+        root: cwd,
         provider,
         model_ids: model_ids_for(&model_names, cfg),
         model_names,
         block,
         floor,
-        correlate_on,
         max_concurrency: cfg.review.max_concurrency,
         job_id: job_id.to_string(),
         duration_ms: t0.elapsed().as_millis() as u64,
@@ -1364,7 +1089,7 @@ pub async fn run_resume(
             }
             (report, code)
         }
-        Err(e) => partial_report(ws, job_id, &args, format!("resume tail failed: {e}")),
+        Err(e) => partial_report(ws, job_id, format!("resume tail failed: {e}")),
     }
 }
 
@@ -1454,14 +1179,13 @@ pub async fn run_job(
             let mut st = latest.unwrap_or(st);
             st.status = if cancelled { JobStatus::Cancelled } else { JobStatus::Done };
             st.exit_code = Some(code);
-            st.mode = Some(report.mode);
             st.models = report.run.models.clone();
             st.result_path = Some(format!("proj.db#results/{job_id}"));
             let _ = write_state(ws, &st);
             code
         }
         Outcome::Done(Err(e)) => {
-            let (report, code) = partial_report(ws, job_id, args, e.to_string());
+            let (report, code) = partial_report(ws, job_id, e.to_string());
             // Bug C 修复：同上，叠加终态前先取最新状态做底稿。
             let mut st = read_state(ws, job_id).unwrap_or(st);
             write_partial_result(ws, job_id, &mut st, JobStatus::Failed, &report, code, e.to_string());
@@ -1469,7 +1193,7 @@ pub async fn run_job(
         }
         Outcome::TimedOut => {
             let reason = "timed out: deadline exceeded".to_string();
-            let (report, code) = partial_report(ws, job_id, args, reason.clone());
+            let (report, code) = partial_report(ws, job_id, reason.clone());
             // Bug C 修复：同上，叠加终态前先取最新状态做底稿。
             let mut st = read_state(ws, job_id).unwrap_or(st);
             write_partial_result(ws, job_id, &mut st, JobStatus::TimedOut, &report, code, reason);
@@ -1497,14 +1221,27 @@ mod job_tests {
         }
     }
 
-    fn doc_args(target: &str) -> ReviewArgs {
+    fn code_args() -> ReviewArgs {
         ReviewArgs {
-            mode: Some("doc".into()), base: None, scope: "working-tree".into(),
+            base: None, scope: "working-tree".into(),
             spec: vec![], focus: None, models: None, models_all: false,
-            no_correlate: false, block_threshold: None, conf_floor: None,
-            background: true, format: "json".into(), targets: vec![target.into()],
+            block_threshold: None, conf_floor: None,
+            background: true, format: "json".into(),
             resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         }
+    }
+    /// 在 dir 建 git 仓库并 stage 一个含 content 的文件——doc 模式退场后（E10）run_job 测试改走
+    /// code 路，working-tree scope 的 changed_files 把 staged 文件当作待评审改动。
+    fn git_staged(dir: &std::path::Path, file: &str, content: &str) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join(file), content).unwrap();
+        run(&["add", file]);
     }
     fn cfg() -> Config {
         Config::from_layers(&[
@@ -1516,22 +1253,20 @@ mod job_tests {
     #[tokio::test]
     async fn run_job_done_writes_result_and_state() {
         let dir = tempfile::tempdir().unwrap();
-        let doc = dir.path().join("spec.md");
-        std::fs::write(&doc, "intro\nthe wrong claim here\nend\n").unwrap();
-        let dp = doc.to_string_lossy().to_string();
-        // alpha 报一条锚得到的 finding
+        git_staged(dir.path(), "a.rs", "fn main() {\n    let x = 1;\n}\n");
+        // alpha 报一条锚得到的 low finding（不触发 refute），quote 在 a.rs 第 2 行
         let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
         scripted.insert("alpha".into(), vec![RawFinding {
-            severity: Severity::High, title: "t".into(), body: "b".into(), file: dp.clone(),
+            severity: Severity::Low, title: "t".into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: "the wrong claim here".into(),
+            hard_constraint: false, quote: "let x = 1;".into(),
         }]);
         let provider = FakeProvider { scripted, ..Default::default() };
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         crate::state::job::write_state(&ws, &crate::state::job::JobState::new("j1", 500)).unwrap();
 
-        let code = run_job(&ws, "j1", &doc_args(&dp), &provider, &cfg(), dir.path(), 500).await;
+        let code = run_job(&ws, "j1", &code_args(), &provider, &cfg(), dir.path(), 500).await;
 
         let st = read_state(&ws, "j1").unwrap();
         assert_eq!(st.status, JobStatus::Done);
@@ -1551,9 +1286,9 @@ mod job_tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
         crate::state::job::write_state(ws, &crate::state::job::JobState::new("j2", 0)).unwrap();
-        // targets 指向不存在文件 → collect_doc 失败 → run_review_dispatch Err → failed
+        // 非 git 目录 → changed_files 失败 → run_review_dispatch Err → failed
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job(ws, "j2", &doc_args("/nonexistent/zzz.md"), &provider, &cfg(), dir.path(), 0).await;
+        let code = run_job(ws, "j2", &code_args(), &provider, &cfg(), dir.path(), 0).await;
         assert_eq!(code, 2);
         let st = read_state(ws, "j2").unwrap();
         assert_eq!(st.status, JobStatus::Failed);
@@ -1573,9 +1308,9 @@ mod job_tests {
             &crate::state::store::CellRecord::ok("bundle[a]", "alpha", vec![checkpointed_finding("checkpointed")]),
         ).unwrap();
 
-        // targets 指向不存在文件 → collect 失败 → run_review_dispatch Err，但已有 partial 记录
+        // 非 git 目录 → changed_files 失败 → run_review_dispatch Err，但已有 partial 记录
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job(ws, "j2b", &doc_args("/nonexistent/zzz.md"), &provider, &cfg(), dir.path(), 0).await;
+        let code = run_job(ws, "j2b", &code_args(), &provider, &cfg(), dir.path(), 0).await;
 
         assert_eq!(code, 2);
         let st = read_state(ws, "j2b").unwrap();
@@ -1605,9 +1340,9 @@ mod job_tests {
     async fn run_job_timeout_writes_incomplete_partial_report() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
-        let doc = dir.path().join("spec.md");
-        std::fs::write(&doc, "intro\nsome content\nend\n").unwrap();
-        let dp = doc.to_string_lossy().to_string();
+        // git 仓库 + staged 改动：dispatch 得以推进到 provider（HangProvider 挂起），
+        // 让 deadline 分支赢得 select（非 git 目录会先在 changed_files 处 Err，选不到超时分支）。
+        git_staged(dir.path(), "a.rs", "fn main() {\n    let x = 1;\n}\n");
 
         let mut st = crate::state::job::JobState::new("j-to", 0);
         st.deadline_at = Some(0); // 已过期（远小于 now）→ select 立即走超时分支
@@ -1619,7 +1354,7 @@ mod job_tests {
         ).unwrap();
 
         let provider = HangProvider;
-        let code = run_job(ws, "j-to", &doc_args(&dp), &provider, &cfg(), dir.path(), 0).await;
+        let code = run_job(ws, "j-to", &code_args(), &provider, &cfg(), dir.path(), 0).await;
 
         assert_eq!(code, 2);
         let st = read_state(ws, "j-to").unwrap();
@@ -1644,7 +1379,7 @@ mod job_tests {
         crate::state::job::write_state(ws, &pre).unwrap();
 
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let _code = run_job(ws, "j3", &doc_args("/any.md"), &provider, &cfg(), dir.path(), 0).await;
+        let _code = run_job(ws, "j3", &code_args(), &provider, &cfg(), dir.path(), 0).await;
 
         // 状态仍应是 Cancelled
         let st = read_state(ws, "j3").unwrap();
@@ -1704,7 +1439,9 @@ mod resume_tests {
     use crate::state::store::CellInput;
 
     /// 记录每次 `run` 调用的 prompt，脚本化返回一条低 severity finding（避免触发 verify 的
-    /// 二次 provider 调用，测试只关心 resume 对缺失 cell 的调用次数）。
+    /// 二次 provider 调用，测试只关心 resume 对缺失 cell 的调用次数）。finding 的 file 从
+    /// prompt 派生（每 cell 独立文件），quote 恒 "marker"——各 cell 落在不同文件 → 通过 code
+    /// `anchor` 存活且互不 dedup（doc 模式退场后尾段走 code anchor，2026-07-14）。
     #[derive(Default)]
     struct RecordingProvider {
         prompts: std::sync::Mutex<Vec<String>>,
@@ -1722,13 +1459,13 @@ mod resume_tests {
                     severity: Severity::Low,
                     title: format!("issue-{}", req.prompt),
                     body: "b".into(),
-                    file: "spec.md".into(),
+                    file: format!("{}.rs", req.prompt.trim()),
                     line_start: 1,
                     line_end: 1,
                     confidence: 0.9,
                     recommendation: "r".into(),
                     hard_constraint: false,
-                    quote: String::new(), // 空引用=遗漏类，anchor_doc 无条件保留
+                    quote: "marker".into(),
                 }],
                 input_tokens: 1,
                 output_tokens: 1,
@@ -1740,12 +1477,13 @@ mod resume_tests {
         }
     }
 
-    fn omission_finding(title: &str) -> Finding {
+    /// 预置 checkpoint 用的可锚 finding：quote="marker"，file 由调用方给（须已写入根目录）。
+    fn anchorable_finding(title: &str, file: &str) -> Finding {
         Finding {
             id: title.into(), severity: Severity::Low, title: title.into(), body: "b".into(),
-            file: "spec.md".into(), line_start: 1, line_end: 1, confidence: 0.9,
+            file: file.into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), models: vec!["m".into()], agreement: 1,
-            hard_constraint: false, quote: String::new(), cluster_id: None, verify: None,
+            hard_constraint: false, quote: "marker".into(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New,
         }
     }
@@ -1756,10 +1494,10 @@ mod resume_tests {
     async fn resume_only_runs_missing_cells() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
-        // doc 模式尾段需要至少一个可读的受审文档（omission finding 本身不依赖其内容）。
-        let doc = dir.path().join("spec.md");
-        std::fs::write(&doc, "whatever\n").unwrap();
-        let dp = doc.to_string_lossy().to_string();
+        // 每 cell 一个可锚文件（code anchor 读 root.join(file) 匹配 "marker"）。
+        for f in ["c1.rs", "P2.rs", "P3.rs"] {
+            std::fs::write(dir.path().join(f), "marker\n").unwrap();
+        }
 
         let inputs = vec![
             CellInput { cell: "c1".into(), model: "m".into(), prompt: "P1".into() },
@@ -1769,14 +1507,14 @@ mod resume_tests {
         crate::state::store::write_manifest(ws, "j", &inputs).unwrap();
         crate::state::store::append_partial(
             ws, "j",
-            &crate::state::store::CellRecord::ok("c1", "m", vec![omission_finding("issue-c1")]),
+            &crate::state::store::CellRecord::ok("c1", "m", vec![anchorable_finding("issue-c1", "c1.rs")]),
         ).unwrap();
 
         let args = ReviewArgs {
-            mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
+            base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, models: Some("m".into()), models_all: false,
-            no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            block_threshold: None, conf_floor: None, background: true,
+            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1799,15 +1537,15 @@ mod resume_tests {
     /// cell-id 必须带上 model（如 `doc@alpha`/`doc@beta`），否则 resume 的差集判定（join on
     /// cell）会把「同 cell 任一 model 已完成」误判为「该 cell 全部完成」，缺失的 model 副本
     /// 永不补跑，还会静默拼出一份只含部分 model 的「完整」报告。
-    /// 这里手工构造 manifest 模拟 run_doc_fanout 修复后的输出（2 行，cell 各自带 @model），
+    /// 这里手工构造 manifest 模拟 replicate fan-out 的输出（2 行，cell 各自带 @model），
     /// partial 只完成 doc@alpha → 断言 doc@beta 必须被补跑，且合并结果含两个 model 的 finding。
     #[tokio::test]
     async fn resume_replicate_missing_model_copy_is_completed() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
-        let doc = dir.path().join("spec.md");
-        std::fs::write(&doc, "whatever\n").unwrap();
-        let dp = doc.to_string_lossy().to_string();
+        for f in ["alpha.rs", "P-beta.rs"] {
+            std::fs::write(dir.path().join(f), "marker\n").unwrap();
+        }
 
         let inputs = vec![
             CellInput { cell: "doc@alpha".into(), model: "alpha".into(), prompt: "P-alpha".into() },
@@ -1816,14 +1554,14 @@ mod resume_tests {
         crate::state::store::write_manifest(ws, "j", &inputs).unwrap();
         crate::state::store::append_partial(
             ws, "j",
-            &crate::state::store::CellRecord::ok("doc@alpha", "alpha", vec![omission_finding("issue-alpha")]),
+            &crate::state::store::CellRecord::ok("doc@alpha", "alpha", vec![anchorable_finding("issue-alpha", "alpha.rs")]),
         ).unwrap();
 
         let args = ReviewArgs {
-            mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
+            base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, models: Some("alpha,beta".into()), models_all: false,
-            no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![dp], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            block_threshold: None, conf_floor: None, background: true,
+            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1855,10 +1593,10 @@ mod resume_tests {
         let ws = dir.path();
         // 只写 args，从不 write_manifest（模拟 fan-out 前崩溃）。
         let args = ReviewArgs {
-            mode: Some("doc".into()), base: None, scope: "working-tree".into(), spec: vec![],
+            base: None, scope: "working-tree".into(), spec: vec![],
             focus: None, models: Some("m".into()), models_all: false,
-            no_correlate: true, block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), targets: vec![], resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            block_threshold: None, conf_floor: None, background: true,
+            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1967,10 +1705,10 @@ default_models=["alpha"]
             "alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
         );
         let my_args = ReviewArgs {
-            mode: Some("code".into()), base: None, scope: "working-tree".into(),
+            base: None, scope: "working-tree".into(),
             spec: vec![], focus: None, models: None, models_all: false,
-            no_correlate: true, block_threshold: None, conf_floor: None,
-            background: false, format: "json".into(), targets: vec![],
+            block_threshold: None, conf_floor: None,
+            background: false, format: "json".into(),
             resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
@@ -1984,11 +1722,11 @@ default_models=["alpha"]
 
     fn args() -> ReviewArgs {
         ReviewArgs {
-            mode: Some("code".into()), base: None, scope: "working-tree".into(),
+            base: None, scope: "working-tree".into(),
             spec: vec![], focus: None, models: Some("m".into()),
             models_all: false,
-            no_correlate: true, block_threshold: None, conf_floor: None,
-            background: false, format: "json".into(), targets: vec![],
+            block_threshold: None, conf_floor: None,
+            background: false, format: "json".into(),
             resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
         }
     }
@@ -2061,24 +1799,26 @@ default_models=["m"]
 mod tests {
     use super::*;
 
-    // env-var 测试串行化锁（照 src/prompt/mod.rs 既有模式），避免与其它 env 测并发互踩。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
-    fn review_args_ignores_legacy_lenses_key() {
-        // E8-I：旧 args.json（--background 落盘）仍带 "lenses" 键——serde 静默忽略，resume 不炸。
-        let j = r#"{"mode":"code","base":null,"scope":"branch","spec":[],"focus":null,
-            "lenses":"L1,L2","models":null,"models_all":false,"no_correlate":false,
+    fn review_args_ignores_legacy_unknown_keys() {
+        // 旧 args.json（--background 落盘）带已退役字段（E8-I 的 "lenses"、E10 移除的
+        // "mode"/"no_correlate"/"targets" 等）——serde 无 deny_unknown_fields，未知键一律静默
+        // 忽略；此处 "lenses" 代表该机制，旧 job resume 反序列化不炸。
+        let j = r#"{"base":null,"scope":"branch","spec":[],"focus":null,
+            "lenses":"L1,L2","models":null,"models_all":false,
             "block_threshold":null,"conf_floor":null,"background":true,"format":"json",
-            "targets":[],"resume":null}"#;
+            "resume":null}"#;
         let a: ReviewArgs = serde_json::from_str(j).unwrap();
         assert_eq!(a.scope, "branch");
         assert!(a.background);
     }
 
     #[test]
-    fn build_dossiers_toggle_off_arm_all_empty_on_arm_nonempty() {
-        let _g = ENV_LOCK.lock().unwrap();
+    fn build_packs_covers_multi_bundle_and_default_has_bodies() {
+        // Task 3（空臂 dev 开关整拆）后改写：build_packs 唯一路径 = build_pack（0 壳
+        // 完整体），无空臂开关。单格全审默认（E9）下 build_packs 不再做跨 bundle 兄弟注入——
+        // 两 bundle 各自以自家内容非空（DossierMeta 的多 bundle 计数仍是通用函数行为，
+        // 值得独立守住）。
         use crate::bundle::Bundle;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2086,8 +1826,6 @@ mod tests {
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
         std::fs::write(root.join("src/b.rs"), "pub fn other() {}\n").unwrap();
-        // 单格全审默认（E9）后改写：build_packs 不再做跨 bundle 兄弟注入——两 bundle 各自
-        // 以自家内容非空（DossierMeta 的多 bundle 计数仍是通用函数行为，值得独立守住）。
         let bundles = vec![
             Bundle { files: vec![FileChange {
                 path: "src/a.rs".into(),
@@ -2099,52 +1837,10 @@ mod tests {
             }] },
         ];
 
-        // on 臂：两段各以自家内容非空 → meta 反映 injected:2
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
-        let (on, on_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(on[0].contains("target"), "bundle 1 自家内容非空: {on:?}");
-        assert!(on[1].contains("other"), "bundle 2 自家内容非空: {on:?}");
-        assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 2, suppressed: false });
-
-        // off 臂：REDTEAM_NO_DOSSIER 生效 → 全空段 + suppressed=true + injected=0
-        unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let (off, off_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(off.iter().all(|s| s.is_empty()), "off 臂全空");
-        assert_eq!(off.len(), bundles.len());
-        assert_eq!(off_meta, DossierMeta { bundles: 2, injected: 0, suppressed: true });
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
-    }
-
-    #[test]
-    fn build_packs_default_has_bodies_off_arm_dossier_only_null_arm_empty() {
-        let _g = ENV_LOCK.lock().unwrap();
-        use crate::bundle::Bundle;
-        use crate::evidence::git::FileChange;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"),
-            "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
-        let bundles = vec![Bundle { files: vec![FileChange {
-            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
-        }] }];
-
-        // 默认臂：pack（含 0 壳完整体）
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
-        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(on[0].contains("改动源文"), "默认臂 = pack 含 0 壳: {}", on[0]);
-
-        // 基线臂：REDTEAM_PACK=0 → dossier-only（无 0 壳段、仍有引用点）
-        unsafe { std::env::set_var("REDTEAM_PACK", "0"); }
-        let (base, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(!base[0].contains("改动源文"), "基线臂无 0 壳");
-        assert!(base[0].contains("target"), "基线臂仍是 dossier 引用点");
-
-        // 空臂：REDTEAM_NO_DOSSIER
-        unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let (null, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert_eq!(null[0], "", "空臂全空段");
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::remove_var("REDTEAM_PACK"); }
+        let (entries, meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
+        assert!(entries[0].contains("target") && entries[0].contains("改动源文"), "bundle 1 自家内容非空含 0 壳: {entries:?}");
+        assert!(entries[1].contains("other"), "bundle 2 自家内容非空: {entries:?}");
+        assert_eq!(meta, DossierMeta { bundles: 2, injected: 2 });
     }
 
     #[test]
@@ -2225,26 +1921,6 @@ mod tests {
     }
 
     #[test]
-    fn doc_second_pass_prompt_appends_evidence_and_drafts() {
-        use crate::domain::{Mode, NeedEntry, ReviewInput};
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::write(root.join("spec2.md"), "background detail\n").unwrap();
-        let input = ReviewInput {
-            mode: Mode::Doc, target_label: "spec.md".into(),
-            collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
-        };
-        let needs = vec![NeedEntry { path: "spec2.md".into(), lines: None, reason: "cross-ref".into() }];
-        let p = doc_second_pass_prompt(&input, "", root, &needs, &[]).unwrap();
-        assert!(p.contains("DOCBODY"), "原 doc prompt 在场");
-        assert!(p.contains("## 补查证据") && p.contains("background detail"), "补查段在场");
-        assert!(p.contains("first_pass_draft"), "草稿段在场");
-        // 全部 needs 逃逸 → None（不补跑）
-        let evil = vec![NeedEntry { path: "../outside.md".into(), lines: None, reason: "x".into() }];
-        assert!(doc_second_pass_prompt(&input, "", root, &evil, &[]).is_none());
-    }
-
-    #[test]
     fn second_pass_prompt_caps_huge_lines_window_evidence() {
         // Important 修复回归：单行超长（如压缩/minified 文件）时 ±30 行窗退化成"整行"，
         // 旧代码无字节帽——body 可逼近 read_capped 的 512KB 读帽。新帽 NEED_SECTION_BYTE_CAP
@@ -2265,32 +1941,6 @@ mod tests {
         assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);
         assert!(p.contains("fn own()"), "证据段截断后 pack 仍照常渲染自家文件");
         assert!(p.len() < 300_000, "总 prompt 长度被证据帽拘住，未逼近原 100KB 单行体量: {}", p.len());
-    }
-
-    #[test]
-    fn doc_second_pass_prompt_total_cap_drops_later_sections() {
-        // Important 修复回归：doc 线无 pack/budget 可扣，靠独立总帽 DOC_EVIDENCE_TOTAL_CAP（256KB）
-        // 兜底——多条整文件 need 累计超帽时，后续段落应被丢弃、尾部带裁剪注记（不是逐条截断）。
-        use crate::domain::{Mode, NeedEntry, ReviewInput};
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let body_60k = "y".repeat(60_000); // 单条 < 64KB 单段帽，不触发逐段截断
-        for i in 0..6 {
-            std::fs::write(root.join(format!("doc{i}.md")), &body_60k).unwrap();
-        }
-        let input = ReviewInput {
-            mode: Mode::Doc, target_label: "spec.md".into(),
-            collection_guidance: String::new(), body: "DOCBODY".into(), spec_docs: vec![],
-        };
-        let needs: Vec<NeedEntry> = (0..6)
-            .map(|i| NeedEntry { path: format!("doc{i}.md"), lines: None, reason: "r".into() })
-            .collect();
-        let p = doc_second_pass_prompt(&input, "", root, &needs, &[]).unwrap();
-        assert!(p.contains("doc4.md:1-1"), "累计未超帽前的段落在场: {p}");
-        assert!(!p.contains("doc5.md:1-1"), "累计超帽后的段落应被丢弃");
-        assert!(p.contains("（其余补查条目因预算裁剪省略）"), "总帽裁剪注记在场: {p}");
-        let sections = p.matches("## 补查证据").count();
-        assert!(sections < 6, "至少一段应被总帽挡掉，实际全部 {sections} 段在场");
     }
 
     #[test]
@@ -2332,29 +1982,6 @@ mod tests {
         assert!(!on[0].contains("填充行"), "回落只给改动 def 体，不带填充");
         // 同 path 不重复
         assert_eq!(on[0].matches("src/b.rs").count(), 1, "同格文件条目 src/b.rs 不重复");
-    }
-
-    #[test]
-    fn build_packs_scip_arm_degrades_without_ra_and_keeps_other_arms() {
-        let _g = ENV_LOCK.lock().unwrap();
-        use crate::bundle::Bundle;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"),
-            "pub fn target() {}\nfn u1() { target(); }\n").unwrap();
-        let bundles = vec![Bundle { files: vec![FileChange {
-            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
-        }] }];
-        // scip 臂：本测试环境（tempdir 非 cargo 工程）RA 索引必失败 → 必须降级 regex（不 panic、仍出引用点）
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); std::env::set_var("REDTEAM_PACK", "scip"); }
-        let (scip, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(scip[0].contains("target"), "scip 臂（或其降级）仍产 pack: {}", scip[0]);
-        // 默认臂不变
-        unsafe { std::env::remove_var("REDTEAM_PACK"); }
-        let (def, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(def[0].contains("改动源文"), "默认臂仍 regex-pack");
-        unsafe { std::env::remove_var("REDTEAM_PACK"); }
     }
 
     #[test]
@@ -2476,7 +2103,7 @@ context_window_tokens = 40000
 #[cfg(test)]
 mod incremental_tests {
     use super::*;
-    use crate::domain::{Mode, RawFinding, Severity, Verdict};
+    use crate::domain::{RawFinding, Severity, Verdict};
     use crate::orchestrate::enrich;
     use crate::state::store::{append_partial, write_args_raw, write_manifest, CellInput, CellRecord};
 
@@ -2513,23 +2140,23 @@ mod incremental_tests {
         }
     }
 
-    /// 增量 args（branch scope + code mode）。
+    /// 增量 args（branch scope）。
     pub(super) fn inc_args(base: &str, prior: &str) -> ReviewArgs {
         ReviewArgs {
-            mode: Some("code".into()), base: Some(base.into()), scope: "branch".into(),
+            base: Some(base.into()), scope: "branch".into(),
             spec: vec![], focus: None, models: Some("m".into()),
-            models_all: false, no_correlate: true, block_threshold: None, conf_floor: None,
-            background: false, format: "json".into(), targets: vec![], resume: None,
+            models_all: false, block_threshold: None, conf_floor: None,
+            background: false, format: "json".into(), resume: None,
             dismissed: None, no_dismissed: false, incremental_from: Some(prior.into()),
             tools: None,
         }
     }
 
-    /// 上轮固件：result(v3, approve, head_sha=Some(sha)) + args(branch/code) + manifest/partial 全 ok。
+    /// 上轮固件：result(v3, approve, head_sha=Some(sha)) + args(branch) + manifest/partial 全 ok。
     pub(super) fn write_prior(root: &std::path::Path, job: &str, head_sha: &str, findings: Vec<Finding>) {
         let stats = Stats::from_findings(&findings);
         let report = ReviewReport {
-            schema_version: "3".into(), mode: Mode::Code, verdict: Verdict::Approve,
+            schema_version: "3".into(), verdict: Verdict::Approve,
             stats, findings, clusters: vec![],
             run: RunMeta {
                 job_id: job.into(), models: vec!["m".into()],
@@ -2644,12 +2271,6 @@ mod incremental_tests {
         write_prior(dir.path(), "jprev", &c1, vec![]);
         std::fs::write(dir.path().join("a.rs"), "x\ny\n").unwrap();
         commit_all(dir.path(), "c2");
-        // v1 范围：doc 模式拒
-        let mut doc_args = inc_args("dev0", "jprev");
-        doc_args.mode = Some("doc".into());
-        doc_args.targets = vec!["spec.md".into()];
-        let e = incremental_preflight(&doc_args, "jprev", dir.path()).unwrap_err();
-        assert!(e.to_string().contains("code mode only"), "{e}");
         // v1 范围：working-tree scope 拒（不可 stamp）
         let mut wt = inc_args("dev0", "jprev");
         wt.scope = "working-tree".into();
@@ -2666,7 +2287,7 @@ mod incremental_tests {
         prior_wt.incremental_from = None;
         crate::state::store::write_args_raw(dir.path(), "jprev", &serde_json::to_string(&prior_wt).unwrap()).unwrap();
         let e = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
-        assert!(e.to_string().contains("mode/scope mismatch"), "{e}");
+        assert!(e.to_string().contains("scope mismatch"), "{e}");
         // 恢复同族后：①谱系——stamp 指向不在祖先链上的假 sha
         let good_args = ReviewArgs { incremental_from: None, background: true, ..inc_args("dev0", "x") };
         crate::state::store::write_args_raw(dir.path(), "jprev", &serde_json::to_string(&good_args).unwrap()).unwrap();

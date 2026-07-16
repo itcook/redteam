@@ -1,7 +1,6 @@
 use redteam::cli::{parse_format, resolve_models, ReviewArgs};
 use redteam::config::Config;
 use redteam::model::Prober as _;
-use redteam::domain::Mode;
 use redteam::output::render;
 use redteam::provider::backends::backend_from_config;
 use redteam::provider::registry::ProviderRegistry;
@@ -13,7 +12,7 @@ use std::path::Path;
 // args_override_self：同名 flag 重复时后者胜（而非报错）——ship 等编排方把自己管理的
 // flag 追加在用户参数之后即权威生效，无需依赖 prompt 层把用户重复参数「摘干净」
 // （r5 dogfood 1c72b790：LLM 摘参不可靠，机制化消灭「重复即崩」类）。
-#[command(name = "redteam", version, about = "模型无关的对抗式代码/文档评审器", args_override_self = true)]
+#[command(name = "redteam", version, about = "模型无关的对抗式代码评审器", args_override_self = true)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -25,10 +24,7 @@ enum Cmd {
     /// 发起对抗式评审：多模型扇出 + 工具检索 + 定向核实，输出 verdict/findings。
     /// 退出码：reject→10、approve 但有降级/不完整→2、干净 approve→0。
     Review {
-        /// 评审模式：code | doc。缺省自动推断：有 --base 或 branch scope→code；给了文档目标→doc；歧义报错。
-        #[arg(long, value_parser = ["code", "doc"])]
-        mode: Option<String>,
-        /// code 模式 diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
+        /// diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]
         base: Option<String>,
         /// 证据范围：working-tree（未提交改动）| branch（当前分支相对基线的全部提交）。
@@ -48,9 +44,6 @@ enum Cmd {
         /// 所有已配置 model 各评一遍（复评提升 agreement 信号），而非候补链取一。
         #[arg(long)]
         models_all: bool,
-        /// 跳过跨 finding 关联分析（仅 doc 模式；关联分析当前为未实现 stub，恒不产出 clusters）。
-        #[arg(long)]
-        no_correlate: bool,
         /// verdict 阻断阈值：low | medium（默认）| high | critical——达到即 reject。
         #[arg(long, value_parser = ["low", "medium", "high", "critical"])]
         block_threshold: Option<String>,
@@ -68,7 +61,7 @@ enum Cmd {
         #[arg(long, default_value = "json", value_parser = ["json", "md"])]
         format: String,
         /// R2.3：补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
-        /// （原始 mode/targets/models 等从该作业落盘的 args.json 里重建）。
+        /// （原始 base/models 等从该作业落盘的 args.json 里重建）。
         #[arg(long)]
         resume: Option<String>,
         /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：
@@ -79,13 +72,11 @@ enum Cmd {
         #[arg(long)]
         no_dismissed: bool,
         /// 增量轮（M13）：以指定作业的评审为基线，只审其 stamped HEAD 以来已提交的 fix delta，
-        /// 未动代码的 findings 重锚定携带。仅 code 模式 + branch scope（须 --base）；上轮须干净
+        /// 未动代码的 findings 重锚定携带。仅 branch scope（须 --base）；上轮须干净
         /// 全量（非 incomplete、无 failed_models、经 --background 持久化）。守卫违例显式报错，
         /// 不静默降级全量。
         #[arg(long)]
         incremental_from: Option<String>,
-        /// 评审目标：doc 模式为受审文档路径（可多个）；code 模式留空（评当前改动）。
-        targets: Vec<String>,
     },
     /// 查询作业状态：无 id 列本项目全部；有 id 打印该作业 JSON。
     Status {
@@ -332,18 +323,9 @@ fn resolve_result(
     }
 }
 
-use redteam::cli::detect_mode_from_args;
-
-/// 探测 mode + 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
+/// 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
 /// 返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
-fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<(Mode, ProviderRegistry), String> {
-    let detected = match detect_mode_from_args(args) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(format!("{e}"));
-        }
-    };
-
+fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<ProviderRegistry, String> {
     let (planned, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     if planned.is_empty() {
         return Err("no provider available, please configure [providers.*] first".to_string());
@@ -376,7 +358,7 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<(Mode, 
         registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf(), tools_enabled)));
     }
 
-    Ok((detected, registry))
+    Ok(registry)
 }
 
 #[tokio::main]
@@ -384,14 +366,12 @@ async fn main() {
     let cli = Cli::parse();
     let code = match cli.cmd {
         Cmd::Review {
-            mode,
             base,
             scope,
             spec,
             focus,
             models,
             models_all,
-            no_correlate,
             block_threshold,
             conf_floor,
             tools,
@@ -401,7 +381,6 @@ async fn main() {
             dismissed,
             no_dismissed,
             incremental_from,
-            targets,
         } => {
             let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -409,7 +388,7 @@ async fn main() {
             let fmt = parse_format(&format);
 
             // R2.3：--resume <job_id> 补跑差集 cell，前台同步；忽略本次调用的其余 flag——
-            // mode/targets/models 等从该作业落盘的 args.json 重建（run_resume 内部处理）。
+            // base/models 等从该作业落盘的 args.json 重建（run_resume 内部处理）。
             if let Some(job_id) = resume {
                 let ws = cwd.clone();
                 let orig_args_json = match redteam::state::store::read_args_raw(&ws, &job_id) {
@@ -423,7 +402,7 @@ async fn main() {
                     Ok(a) => a,
                     Err(e) => { eprintln!("error: bad args for job {job_id}: {e}"); std::process::exit(2); }
                 };
-                let (_detected, registry) = match build_registry(&orig_args, &cfg, &cwd) {
+                let registry = match build_registry(&orig_args, &cfg, &cwd) {
                     Ok(x) => x,
                     Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
                 };
@@ -445,8 +424,8 @@ async fn main() {
                 (None, false) => "working-tree".to_string(),
             };
             let args = ReviewArgs {
-                mode, base: base.clone(), scope, spec, focus, models, models_all,
-                no_correlate, block_threshold, conf_floor, tools, background, format, targets,
+                base: base.clone(), scope, spec, focus, models, models_all,
+                block_threshold, conf_floor, tools, background, format,
                 resume: None, dismissed, no_dismissed, incremental_from,
             };
 
@@ -460,9 +439,6 @@ async fn main() {
                     std::process::exit(2);
                 }
                 let mut st = redteam::state::job::JobState::new(&job_id, now_secs());
-                // 起手即 stamp mode——status 首查常落在 worker 接手前的窗口，缺 mode 时 table
-                // 显 "-" 误导（dogfood 20260702 r1）。探测失败留 None，worker 会以同样错误落 failed。
-                st.mode = detect_mode_from_args(&args).ok();
                 st.workspace = Some(
                     std::fs::canonicalize(&cwd)
                         .unwrap_or_else(|_| cwd.clone())
@@ -485,7 +461,7 @@ async fn main() {
             }
 
             // 前台路径：构造 registry 后调 run_review_dispatch。
-            let (_detected, registry) = match build_registry(&args, &cfg, &cwd) {
+            let registry = match build_registry(&args, &cfg, &cwd) {
                 Ok(x) => x,
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
             };
@@ -522,8 +498,8 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
-            // 建 registry（复用 build_registry：探测 mode + resolve_models + 构造 ProviderRegistry）
-            let (_detected, registry) = match build_registry(&args, &cfg, &cwd) {
+            // 建 registry（复用 build_registry：resolve_models + 构造 ProviderRegistry）
+            let registry = match build_registry(&args, &cfg, &cwd) {
                 Ok(x) => x,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -936,8 +912,8 @@ fn return_code_for_cells(ws: &std::path::Path, job_id: Option<&str>) -> i32 {
 /// M5 批2：`status --format table` 人读视图（opt-in；默认 JSON 数组契约不动）。
 /// 空格对齐、无框线——窄终端可 wrap、输出可 grep。now 注入以便测试。
 fn render_status_table(jobs: &[redteam::state::job::JobState], now: u64) -> String {
-    const HEADER: [&str; 8] = ["JOB", "STATUS", "PHASE", "MODE", "PROG", "AGE", "IDLE", "WORKSPACE"];
-    let rows: Vec<[String; 8]> = jobs
+    const HEADER: [&str; 7] = ["JOB", "STATUS", "PHASE", "PROG", "AGE", "IDLE", "WORKSPACE"];
+    let rows: Vec<[String; 7]> = jobs
         .iter()
         .map(|j| {
             [
@@ -955,7 +931,6 @@ fn render_status_table(jobs: &[redteam::state::job::JobState], now: u64) -> Stri
                         _ => name,
                     }
                 },
-                j.mode.as_ref().map(serde_str).unwrap_or_else(|| "-".into()),
                 if j.progress.total == 0 { "-".into() } else { format!("{}/{}", j.progress.done, j.progress.total) },
                 fmt_dur(now.saturating_sub(j.started_at)),
                 if j.last_active == 0 { "-".into() } else { fmt_dur(now.saturating_sub(j.last_active)) },
@@ -1003,17 +978,16 @@ mod tests {
         let mut a = JobState::new("abc123def456", 1000);
         a.status = JobStatus::Running;
         a.phase = Some(Phase::Fanout);
-        a.mode = Some(redteam::domain::input::Mode::Code);
         a.progress = Progress { done: 3, total: 10 };
         a.last_active = 4500;
         a.workspace = Some("/repos/sites".into());
-        let b = JobState::new("fff000fff000", 4000); // pending：phase/mode/workspace 全 None、last_active=0
+        let b = JobState::new("fff000fff000", 4000); // pending：phase/workspace 全 None、last_active=0
         let out = render_status_table(&[a, b], 4600);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].contains("JOB") && lines[0].contains("STATUS") && lines[0].contains("PROG")
             && lines[0].contains("AGE") && lines[0].contains("IDLE"), "header: {}", lines[0]);
         assert!(lines[1].contains("abc123def456") && lines[1].contains("running")
-            && lines[1].contains("fanout") && lines[1].contains("code")
+            && lines[1].contains("fanout")
             && lines[1].contains("3/10") && lines[1].contains("1h00m") // age 3600s
             && !lines[1].contains("100s") && lines[1].contains("/repos/sites"), "row a: {}", lines[1]);
         // idle 100s → "1m"（分钟粒度截断）
@@ -1030,7 +1004,7 @@ mod tests {
         assert_eq!(fmt_dur(3780), "1h03m");
     }
 
-    /// C1：无 provider 配置的 Config + doc 模式 ReviewArgs → build_registry 返回 Err。
+    /// C1：无 provider 配置的 Config + ReviewArgs → build_registry 返回 Err。
     #[test]
     fn build_registry_no_provider_returns_err() {
         use redteam::cli::ReviewArgs;
@@ -1040,19 +1014,16 @@ mod tests {
         let cfg = Config::default();
         let cwd = std::path::Path::new(".");
         let args = ReviewArgs {
-            mode: Some("doc".into()),
             base: None,
             scope: "working-tree".into(),
             spec: vec![],
             focus: None,
             models: None,
             models_all: false,
-            no_correlate: false,
             block_threshold: None,
             conf_floor: None,
             background: false,
             format: "json".into(),
-            targets: vec![],
             resume: None,
             dismissed: None,
             no_dismissed: false,

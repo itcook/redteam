@@ -1,10 +1,7 @@
 use crate::bundle::Bundle;
-use crate::domain::{Mode, ReviewInput};
 
 const CODE_BUNDLE_TPL: &str = include_str!("templates/adversarial-code-bundle.md");
 const REFUTE_TPL: &str = include_str!("templates/adversarial-refute.md");
-const REFUTE_DOC_TPL: &str = include_str!("templates/adversarial-refute-doc.md");
-const DOC_BUNDLE_TPL: &str = include_str!("templates/adversarial-doc-bundle.md");
 
 /// Detect the preferred output language from locale environment variables.
 /// Reads LC_ALL → LC_MESSAGES → LANG in order, extracts the language prefix,
@@ -36,20 +33,14 @@ pub fn output_language() -> String {
 
 /// 构造 refute prompt：给定 claimed finding，让 skeptic 对抗复审。
 /// 复用 review-as-refute——返回的 findings 空=upheld、非空=refuted（见模板 output_contract）。
-/// mode 选模板：Code→code 模板、Doc→doc 模板（空 quote 渲染为遗漏占位说明）。
 /// `dismissed_notes`：驳回台账判例（可空）——skeptic 见过往人裁，主题变体一致 refute。
 /// `source_context`：finding 声称位置的工作树快照（`verify::source_snippet` 产出，可空）——
 /// 免 refute 冷启动零 pack 裸奔重读（E7：解剖实测 14 调用/趟）；空串渲染为 `(none)`。
 pub fn build_refute_prompt(
     finding: &crate::domain::Finding,
-    mode: Mode,
     dismissed_notes: &str,
     source_context: &str,
 ) -> String {
-    let tpl = match mode {
-        Mode::Code => REFUTE_TPL,
-        Mode::Doc => REFUTE_DOC_TPL,
-    };
     let quote = if finding.quote.split_whitespace().next().is_none() {
         "(empty — the finding claims this is omitted from the document)".to_string()
     } else {
@@ -57,7 +48,7 @@ pub fn build_refute_prompt(
     };
     let notes = if dismissed_notes.trim().is_empty() { "(none)" } else { dismissed_notes };
     let source = if source_context.trim().is_empty() { "(none)" } else { source_context };
-    render(tpl, &[
+    render(REFUTE_TPL, &[
         ("{{FILE}}", &finding.file),
         ("{{LINE_START}}", &finding.line_start.to_string()),
         ("{{LINE_END}}", &finding.line_end.to_string()),
@@ -103,24 +94,6 @@ fn render(tpl: &str, vars: &[(&str, &str)]) -> String {
             }
         }
     }
-}
-
-/// 构造 doc 对抗 prompt：D 系攻击面清单为模板固有文本（E8-I 去实体化）、整篇文档内联、
-/// 教模型遗漏类留空 quote。台账判例不再注入 review prompt（design 2026-07-03 #2：生成侧
-/// 注入两会话十连穿透实证无效，判定后置 consolidate——机械预筛 + refute 判例裁决）。
-pub fn build_doc_prompt(input: &ReviewInput, user_focus: &str) -> String {
-    let spec_docs = if input.spec_docs.is_empty() {
-        "(none)".to_string()
-    } else {
-        input.spec_docs.join(", ")
-    };
-    render(DOC_BUNDLE_TPL, &[
-        ("{{SPEC_DOCS}}", &spec_docs),
-        ("{{TARGET_LABEL}}", &input.target_label),
-        ("{{OUTPUT_LANGUAGE}}", &output_language()),
-        ("{{REVIEW_INPUT}}", &input.body),
-        ("{{USER_FOCUS}}", if user_focus.is_empty() { "(none)" } else { user_focus }),
-    ])
 }
 
 /// 构造一个文件包的对抗 prompt：攻击面清单为模板固有文本（E8-I 去实体化），bundle diff 内联。
@@ -307,7 +280,7 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
-        let p = build_refute_prompt(&f, crate::domain::Mode::Code, "", "");
+        let p = build_refute_prompt(&f, "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.contains("src/a.rs") && p.contains("12"), "file:line injected");
         assert!(p.contains("missing auth") && p.contains("db.write(token)"), "title+quote injected");
@@ -320,12 +293,9 @@ mod tests {
         for field in ["severity", "file", "line_start", "line_end", "confidence", "recommendation"] {
             assert!(p.contains(field), "必填字段指引缺失: {field}");
         }
-        // doc 模板同约束（双模板同源）
-        let pd = build_refute_prompt(&f, crate::domain::Mode::Doc, "", "");
-        assert!(pd.contains("\"REFUTED: \"") && pd.contains("ONLY by the empty array"), "doc 模板 verdict 信号同源");
         // 空台账 → 判例段渲染 (none)；非空 → 原样注入（主题变体跨轮一致抑制）
         assert!(p.contains("Precedents: (none)"), "empty notes render (none)");
-        let p2 = build_refute_prompt(&f, crate::domain::Mode::Code, "台账: 旧误报X 已人裁驳回", "");
+        let p2 = build_refute_prompt(&f, "台账: 旧误报X 已人裁驳回", "");
         assert!(p2.contains("台账: 旧误报X 已人裁驳回"), "ledger precedents injected");
     }
 
@@ -340,28 +310,11 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
-        let p = build_refute_prompt(&f, crate::domain::Mode::Code, "", "src/a.rs:40-162（现场快照）\nfn x() {}");
+        let p = build_refute_prompt(&f, "", "src/a.rs:40-162（现场快照）\nfn x() {}");
         assert!(p.contains("Source at the claimed location"), "段标题在场");
         assert!(p.contains("fn x() {}"), "快照内容注入");
-        let p2 = build_refute_prompt(&f, crate::domain::Mode::Code, "", "");
+        let p2 = build_refute_prompt(&f, "", "");
         assert!(p2.contains("(none)"), "空快照渲染占位");
-    }
-
-    #[test]
-    fn refute_prompt_doc_omission_frames_empty_quote() {
-        use crate::domain::{Finding, Mode, Origin, Severity};
-        let f = Finding {
-            id: "x".into(), severity: Severity::High, title: "missing rollback branch".into(),
-            body: "no rollback path on failure".into(), file: "spec.md".into(),
-            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "specify rollback".into(),
-            models: vec!["alpha".into()], agreement: 1,
-            hard_constraint: false, cluster_id: None, quote: String::new(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
-        };
-        let p = build_refute_prompt(&f, Mode::Doc, "", "");
-        assert!(!p.contains("{{"), "no residual placeholders");
-        assert!(p.to_lowercase().contains("omit"), "doc refute frames omission");
-        assert!(!p.contains("Quoted code"), "doc template (not code template)");
     }
 
     #[test]
@@ -435,62 +388,10 @@ mod tests {
         assert!(p.to_lowercase().contains("compliance rule"), "compliance cap note present");
     }
 
-    /// r2 dogfood 0b176180：外部内容（notes/focus/正文）里的 `{{占位}}` 字面不得被
-    /// 后续 replace 捕获成系统段——受控值先替换、外部内容后替换的顺序防线回归测试。
-    #[test]
-    fn external_content_placeholders_are_not_captured() {
-        use crate::domain::{Mode, ReviewInput};
-        let input = ReviewInput {
-            mode: Mode::Doc, target_label: "spec.md".into(),
-            collection_guidance: String::new(), body: "正文含 {{USER_FOCUS}} 字面".into(),
-            spec_docs: vec![],
-        };
-        let p = build_doc_prompt(&input, "focus注入 {{RULES}} 试探 与 {{REVIEW_INPUT}} 试探");
-        // 恶意占位串必须原样留存（模型看到无害字面），不得被替换成真实系统段内容
-        assert!(p.contains("focus注入 {{RULES}} 试探 与 {{REVIEW_INPUT}} 试探"), "focus 里的占位不被捕获");
-        // 单 pass render 下互染也消失：正文里的 {{USER_FOCUS}} 字面原样保留。
-        assert!(p.contains("正文含 {{USER_FOCUS}} 字面"), "正文里的占位不被任何值填充");
-        // 攻击面固有文本只出现一次（模板位），未被 focus 试探复制
-        assert_eq!(p.matches("[D1]").count(), 1, "固有文本只渲染在模板位");
-    }
-
-    /// doc 侧同型：攻击面清单模板固有文本在场。
-    #[test]
-    fn doc_prompt_carries_builtin_attack_surface() {
-        use crate::domain::{Mode, ReviewInput};
-        let input = ReviewInput {
-            mode: Mode::Doc, target_label: "spec.md".into(),
-            collection_guidance: String::new(), body: "DOCBODY".into(),
-            spec_docs: vec!["design.md".into()],
-        };
-        let p = build_doc_prompt(&input, "auth");
-        assert!(!p.contains("{{"), "no residual placeholders");
-        assert!(p.contains("[D1] Internal Consistency"), "doc 攻击面固有: {p}");
-        assert!(p.contains("[D5] Standards Compliance") && p.contains("hard_constraint=true"), "compliance 散文注记在场");
-        assert!(p.contains("DOCBODY"), "doc body inlined");
-        assert!(p.contains("design.md"), "spec docs injected");
-        assert!(p.contains("auth"), "user focus injected");
-        assert!(!p.contains("DISMISSED"), "no ledger injection in review prompt");
-        assert!(p.to_lowercase().contains("omission"), "omission/empty-quote contract present");
-        // lens 去实体化 B（E8-I 收尾）：模板不再教模型输出 lens 字段。
-        assert!(!p.contains("lens"), "doc prompt must NOT teach a lens output field: {p}");
-    }
-
     #[test]
     fn all_adversarial_templates_carry_exhaustiveness_directive() {
-        for t in [
-            include_str!("templates/adversarial-doc-bundle.md"),
-            include_str!("templates/adversarial-code-bundle.md"),
-        ] {
-            assert!(t.contains("Exhaustiveness:"), "穷尽性指令缺失（spec §1.3 分界原则）");
-        }
-    }
-
-    #[test]
-    fn doc_review_uses_progressive_retrieval_not_preload() {
-        let t = include_str!("templates/adversarial-doc-bundle.md");
-        assert!(t.contains("Retrieve progressively"), "doc-bundle 缺渐进检索指令（M6 §1）");
-        assert!(!t.contains("read_file every code/spec file"), "膨胀元凶 first-step 全读指令未替换");
+        let t = include_str!("templates/adversarial-code-bundle.md");
+        assert!(t.contains("Exhaustiveness:"), "穷尽性指令缺失（spec §1.3 分界原则）");
     }
 
     #[test]
@@ -498,19 +399,6 @@ mod tests {
         assert!(
             include_str!("templates/adversarial-code-bundle.md").contains("<bypass_class>"),
             "code-bundle 缺 bypass_class（M6 §2）"
-        );
-    }
-
-    #[test]
-    fn doc_templates_carry_temporal_stance() {
-        // M11 spec §2：方向性 drift 指令双注入（主评审 + refute 第二道防线一致）
-        assert!(
-            include_str!("templates/adversarial-doc-bundle.md").contains("<temporal_stance>"),
-            "doc-bundle 缺 temporal_stance 节"
-        );
-        assert!(
-            include_str!("templates/adversarial-refute-doc.md").contains("Temporal check:"),
-            "refute-doc 缺 Temporal check 段"
         );
     }
 

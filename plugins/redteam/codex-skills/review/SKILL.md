@@ -3,7 +3,7 @@ name: review
 description: 对当前改动或指定目标做模型无关的对抗式评审（计费重操作，仅用户触发）
 ---
 
-运行 redteam 对抗式评审。把用户在命令后给出的全部参数原样转发给 `redteam review`（例如目标路径、`--base <分支>`、`--mode code|doc`、`--background` 等；为空则评审当前工作树改动）：
+运行 redteam 对抗式评审。把用户在命令后给出的全部参数原样转发给 `redteam review`（例如 `--base <分支>`、`--scope`、`--spec`、`--background` 等；为空则评审当前工作树改动）：
 
 ```bash
 ${CODEX_PLUGIN_ROOT}/bin/redteam review $ARGUMENTS

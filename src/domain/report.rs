@@ -1,5 +1,4 @@
 use super::finding::{Cluster, Finding, Severity};
-use super::input::Mode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,8 +70,7 @@ pub struct NeedsMeta {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct DossierMeta {
     pub bundles: usize,       // 本次 fan-out 的 bundle 总数
-    pub injected: usize,      // 拿到非空卷宗的 bundle 数（其余=不支持语言/无符号/调用密度门<5/被抑制）
-    pub suppressed: bool,     // REDTEAM_NO_DOSSIER 生效（A/B off 臂标记）
+    pub injected: usize,      // 拿到非空卷宗的 bundle 数（其余=不支持语言/无符号/调用密度门<5）
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -131,7 +129,6 @@ pub struct LedgerMeta {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReviewReport {
     pub schema_version: String,
-    pub mode: Mode,
     pub verdict: Verdict,
     pub stats: Stats,
     pub findings: Vec<Finding>,
@@ -221,12 +218,12 @@ mod tests {
     fn runmeta_dossier_roundtrips_and_old_json_defaults_to_none() {
         // T01⑥：dossier 有值 → 序列化带 dossier 键；旧 JSON（无 dossier 键）→ 反序列化为 None。
         let mut m = RunMeta {
-            dossier: Some(DossierMeta { bundles: 3, injected: 1, suppressed: false }),
+            dossier: Some(DossierMeta { bundles: 3, injected: 1 }),
             ..Default::default()
         };
         m.job_id = "j".into();
         let j = serde_json::to_string(&m).unwrap();
-        assert!(j.contains("\"dossier\":{\"bundles\":3,\"injected\":1,\"suppressed\":false}"), "{j}");
+        assert!(j.contains("\"dossier\":{\"bundles\":3,\"injected\":1}"), "{j}");
 
         // 默认态（无 dossier）不产键——v2/v3（无卷宗字段）消费者视角零噪音
         let d = serde_json::to_string(&RunMeta::default()).unwrap();

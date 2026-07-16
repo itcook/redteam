@@ -10,7 +10,7 @@ disable-model-invocation: true
 
 用户参数：$ARGUMENTS
 - `--max-rounds <N>`（本命令专属，可选）：预算护栏；未给则**无轮数上限**——目标是 approve。
-- 其余参数**原样透传**给 `redteam review`（--mode/--base/--scope/--spec/--models 等）。
+- 其余参数**原样透传**给 `redteam review`（--base/--scope/--spec/--models 等）。
   透传前先摘除上述专属参数。redteam 开启 `args_override_self`（同名 flag 重复后者胜），
   ship 管理的 `--background` 追加在用户参数之后即权威生效；唯一需连值摘除的是
   `--resume <值>`（它切同步补跑、打印全报告而非 job id，破坏循环）。凡摘除不得静默。
@@ -23,7 +23,7 @@ disable-model-invocation: true
 ## 0. 起手
 1. 运行 `${CLAUDE_PLUGIN_ROOT}/bin/redteam init`（幂等）；创建本会话目录
    `.redteam/rounds/<YYYYMMDD-HHmmss>/`（本地时间，秒级）。
-2. code 模式：先跑项目测试命令，红树即停（先修好基线，不拿坏基线喂评审）；doc 模式跳过。
+2. 先跑项目测试命令，红树即停（先修好基线，不拿坏基线喂评审）。
    **测试命令探测**（本会话缓存结论）：`.redteam/config.toml` 的 `test_command` >
    `Cargo.toml`→`cargo test` > `package.json` 有 `scripts.test`→`npm test` >
    `Makefile` 有 test 目标→`make test` > 项目 CLAUDE.md/记忆约定 > 都推断不出 →
@@ -32,11 +32,11 @@ disable-model-invocation: true
 ## 每轮 rN
 1. **起评审**：
    - **r1（或无健康增量基线时）**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam review <透传参数> --background`（全量）。
-   - **r2 起（code 模式且用户参数带 --base，即 branch scope）**：追加 `--incremental-from <上一轮 job id>`
+   - **r2 起（用户参数带 --base，即 branch scope）**：追加 `--incremental-from <上一轮 job id>`
      ——只审上轮 stamped HEAD 以来已提交的 fix delta，未动代码的 findings 由 redteam 重锚定携带；
      verdict 仍是合并集口径（携带 ∪ 新发），**不要**自己把旧 findings 复述进 --focus。
      **前提：本轮修复已全部 commit（工作树净）**——delta 只含已提交改动。
-     doc 模式或 working-tree scope：不加该 flag，照旧全量循环。
+     working-tree scope：不加该 flag，照旧全量循环。
    - **守卫报错处置**（redteam 显式拒跑，不静默降级）：谱系（rebase/reset）/同族/健康基线/无 stamp/
      无持久化 result 报错 → 本轮**去掉 `--incremental-from` 改跑全量**，简报注记原因与守卫名；
      **空 delta 或 delta 全被噪声过滤报错**（"empty delta" / "all noise-filtered"）→ 按 §停机
@@ -53,7 +53,7 @@ disable-model-invocation: true
    - **轮询期间不改动工作树**（评审与携带重锚定正在读活文件）。
 2. **取结果**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam result <job>` → 存档到
    `rounds/<session>/rN.result.json`（结果已持久于 proj.db 可随时重取；此文件存档
-   仅供收工反馈的 jq 配方读取——**发布前随 feedback 仪器一并拆除本步**）。
+   供内循环 `dismiss add --from` 与收轮 `resolve --from` 读取快照四件套）。
    - job `failed/timed_out` 但有部分报告（`verdict: incomplete`）→ 用部分 findings
      照常裁决，简报注记 partial，**不算 approve**。
    - job 硬失败无产出（全 provider 挂等）→ 重试一次，再失败 → 停，报告用户。
@@ -105,9 +105,6 @@ disable-model-invocation: true
 3. 文末**追加裁决段**（协议层内容，宿主写）：`## Adjudication` ——修复/驳回/存疑清单，
    属实项带 origin 标（carried/new，报告已算好）、销案 id 清单、本轮 fix commit sha。
 → 下一轮。
-- **工具观察（本地调试阶段 · 发布前移除）**：若本轮察觉 redteam/ship **工具级**异常（耗时反常、
-  `finalizing` 卡顿、某 finding 的 quote 在文件里配不上、status/协议摩擦），往
-  `rounds/<session>/observations.md` 追加**一行**——供收工反馈合成;无异常不写。
 
 ## 停机（每轮内循环完成后判定；即使 verdict=approve，待刹车 id 先走完刹车链)
 1. **verdict = approve**（合并集口径：携带 ∪ 本轮新发，redteam 已算好）→ 收工：写
@@ -125,7 +122,7 @@ disable-model-invocation: true
    人裁误报 → `set-status <id> human-confirmed --round rK`，此后该 id 永久静默；
    人裁属实 → 修 + `set-status <id> withdrawn --round rK`，继续。
 4. **修复受阻**：某 finding 属实但你修不了（需产品/架构决策、改动越权）→ 停，交用户。
-   doc 模式或 working-tree scope 的全量循环若陷自指尾流僵局（修复自身反复被重审出衍生问题、approve 不可达），
+   working-tree scope 的全量循环若陷自指尾流僵局（修复自身反复被重审出衍生问题、approve 不可达），
    也按本条停机交人。
 5. **停滞守卫**：本轮仍有未豁免 findings 但零代码改动（未修也未新驳）→ 空转，停，交用户。
    增量轮的「empty delta」守卫报错同走本条（无新改动可审 = 空转）。
@@ -134,15 +131,4 @@ disable-model-invocation: true
 > 尾流守卫已随增量协议**退役**：增量轮的新 finding 定义上全是「衍生」（delta 就是上轮修复），
 > 「连续全衍生」失去判别力；自指尾流问题由「未动代码携带判决、只审 delta」结构性消解，
 > approve 经合并集天然可达。
-> （此消解仅对增量轮成立；不携带的全量循环——doc 模式或 working-tree scope——按上述 §4 出口交人。）
-
-## 收工反馈（本地调试阶段 · 发布前移除）
-> 开发期临时仪器,发布前连同 `${CLAUDE_PLUGIN_ROOT}/feedback.md`、本节、observations 一行约定一并删除。
-> 反馈对象是 **redteam/ship 工具自身**（好不好用、准不准），非被审代码。
-
-会话终结时（§停机 任一路径：approve 收工 / 停交用户），**写完 `session.md` 之后**派一个反馈 subagent
-（**对被审工作树只读，仅写 home 中枢**）：
-令其读 `${CLAUDE_PLUGIN_ROOT}/feedback.md` 并按其执行——产出工具自身的**量化记分卡** + **缺陷/改进项**，
-写入 home 中枢 `${REDTEAM_FEEDBACK_DIR:-~/.redteam/feedback}`。派发时把会话目录 `rounds/<session>/` 与
-dismissed 台账目录路径交给它。**本步不阻塞收工判定**：失败仅告警，不改变 approve/停机结论、不消耗轮次、
-不碰被审工作树。
+> （此消解仅对增量轮成立；不携带的全量循环——working-tree scope——按上述 §4 出口交人。）

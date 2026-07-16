@@ -1,26 +1,9 @@
 use std::process::Command;
 
-pub const INLINE_MAX_FILES: usize = 2;
-pub const INLINE_MAX_BYTES: usize = 256 * 1024;
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileChange {
     pub path: String,
     pub diff: String,
-}
-
-/// 阈值决策：返回 (内联 diff 或 None, 指引文本)。
-pub fn decide_inline(files: &[String], diff_bytes: usize, diff: &str) -> (Option<String>, String) {
-    if files.len() <= INLINE_MAX_FILES && diff_bytes <= INLINE_MAX_BYTES {
-        (Some(diff.to_string()), String::new())
-    } else {
-        let list = files.join("\n  - ");
-        let guidance = format!(
-            "The diff is large ({} files / {} bytes) and has not been inlined. Changed files:\n  - {}\nPlease read these files and their changes yourself using your tools to perform the review.",
-            files.len(), diff_bytes, list
-        );
-        (None, guidance)
-    }
 }
 
 /// 将换行分隔的文件名列表去重（保留首次出现顺序），忽略空行。
@@ -52,64 +35,30 @@ fn assemble_changes(files: &[String], per_file: impl Fn(&str) -> String) -> Vec<
         .collect()
 }
 
-fn git(args: &[&str]) -> anyhow::Result<String> {
-    // 关死 ANSI 污染（dogfood 20260703 r2 b4d096e0 / r3 661e3973 活体实证）：
-    // color.ui=false 压不住更具体的 color.diff=always（git 具体键优先），必须
-    // 同时给 color.diff=false——命令行 -c 恒优先于文件 config。
-    let out = Command::new("git")
-        .args(["-c", "color.ui=false", "-c", "color.diff=false"])
-        .args(args)
-        .output()?;
-    if !out.status.success() {
-        anyhow::bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// 收集 code 证据：branch scope = base...HEAD；working-tree = cached+worktree。
-/// 返回 (body, guidance, target_label)。
-pub fn collect_code(base: Option<&str>, branch_scope: bool) -> anyhow::Result<(String, String, String)> {
-    let (diff, files, label) = if branch_scope {
-        let base = base.ok_or_else(|| anyhow::anyhow!("branch scope requires --base"))?;
-        let merge_base = git(&["merge-base", base, "HEAD"])?.trim().to_string();
-        let diff = git(&["diff", &format!("{merge_base}...HEAD")])?;
-        let files = git(&["diff", "--name-only", &format!("{merge_base}...HEAD")])?;
-        (diff, files, format!("branch {base}...HEAD"))
-    } else {
-        let mut diff = git(&["diff", "--cached"])?;
-        diff.push_str(&git(&["diff"])?);
-        let mut files = git(&["diff", "--cached", "--name-only"])?;
-        files.push_str(&git(&["diff", "--name-only"])?);
-        (diff, files, "working tree".to_string())
-    };
-    let file_list: Vec<String> = dedup_files(&files);
-    let (inline, guidance) = decide_inline(&file_list, diff.len(), &diff);
-    let body = inline.unwrap_or_else(|| format!("(diff not inlined)\nChanged files:\n{}", file_list.join("\n")));
-    Ok((body, guidance, label))
-}
-
 /// 收集逐文件 diff：branch scope = base...HEAD；working-tree = cached + worktree。
+/// `dir`：git 仓库根（hermetic，走 `git_at`，不依赖进程 cwd——镜像 `changed_files_since` 等
+/// M13 helper；doc 模式退场后 job 测试改走此路，需要可注入的 tempdir 仓库，2026-07-14）。
 /// 仅 run_review_dispatch 调用（真实 shell git）；单测注入 FileChange，不走此函数。
-pub fn changed_files(base: Option<&str>, branch_scope: bool) -> anyhow::Result<Vec<FileChange>> {
+pub fn changed_files(dir: &std::path::Path, base: Option<&str>, branch_scope: bool) -> anyhow::Result<Vec<FileChange>> {
     if branch_scope {
         let base = base.ok_or_else(|| anyhow::anyhow!("branch scope requires --base"))?;
-        let merge_base = git(&["merge-base", base, "HEAD"])?.trim().to_string();
+        let merge_base = git_at(dir, &["merge-base", base, "HEAD"])?.trim().to_string();
         let range = format!("{merge_base}...HEAD");
-        let files = dedup_files(&git(&["diff", "--name-only", &range])?);
+        let files = dedup_files(&git_at(dir, &["diff", "--name-only", &range])?);
         Ok(assemble_changes(&files, |p| {
-            git(&["diff", &range, "--", p]).unwrap_or_else(|e| {
+            git_at(dir, &["diff", &range, "--", p]).unwrap_or_else(|e| {
                 eprintln!("warning: failed to diff {p}: {e}");
                 String::new()
             })
         }))
     } else {
-        let mut raw = git(&["diff", "--cached", "--name-only"])?;
-        raw.push_str(&git(&["diff", "--name-only"])?);
+        let mut raw = git_at(dir, &["diff", "--cached", "--name-only"])?;
+        raw.push_str(&git_at(dir, &["diff", "--name-only"])?);
         let files = dedup_files(&raw);
         Ok(assemble_changes(&files, |p| {
             let warn = |e| { eprintln!("warning: failed to diff {p}: {e}"); String::new() };
-            let mut d = git(&["diff", "--cached", "--", p]).unwrap_or_else(&warn);
-            d.push_str(&git(&["diff", "--", p]).unwrap_or_else(&warn));
+            let mut d = git_at(dir, &["diff", "--cached", "--", p]).unwrap_or_else(&warn);
+            d.push_str(&git_at(dir, &["diff", "--", p]).unwrap_or_else(&warn));
             d
         }))
     }
@@ -266,19 +215,6 @@ mod tests {
         assert!(head_sha_at(plain.path()).is_err());
     }
 
-    #[test]
-    fn large_diff_falls_back_to_file_list() {
-        let files = vec!["a.rs".to_string(), "b.rs".into(), "c.rs".into()]; // >2 文件
-        let (inline, guidance) = decide_inline(&files, 10, "DIFF");
-        assert!(inline.is_none());
-        assert!(guidance.contains("a.rs") && guidance.contains("yourself"));
-    }
-    #[test]
-    fn small_diff_inlines() {
-        let files = vec!["a.rs".to_string()];
-        let (inline, _) = decide_inline(&files, 10, "DIFF");
-        assert_eq!(inline.as_deref(), Some("DIFF"));
-    }
     #[test]
     fn dedup_files_removes_duplicates_and_preserves_order() {
         // 模拟 staged+unstaged --name-only 拼接：同一文件出现两次
