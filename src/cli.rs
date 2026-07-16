@@ -505,6 +505,8 @@ fn draft_block(drafts: &[Finding]) -> String {
 /// `## 补查证据` 独立段置于卷宗最前；prompt 尾部追加第一趟草稿 CONFIRM-or-REVISE 段。
 /// `incremental`：增量轮的 <incremental_round> 段原样带入第二趟（claimed-resolved/dispute
 /// 契约不因补跑丢失）；全量路径传空串。全部 needs 逃逸/不可读 → None（不补跑，省一次 LLM 调用）。
+/// `spec_docs`：--spec 参照段（D2），透传给 `build_bundle_prompt` 的 `{{SPEC_DOCS}}` 槽——
+/// 第一趟算好的同一份 spec_section 原样复用，不重读；空串走既有占位散文（回归零漂移）。
 #[allow(clippy::too_many_arguments)] // 与 build_bundle_prompt 同源的参数面；收拢 struct 是过度设计
 pub(crate) fn second_pass_prompt(
     bundles: &[crate::bundle::Bundle],
@@ -516,6 +518,7 @@ pub(crate) fn second_pass_prompt(
     needs: &[crate::domain::NeedEntry],
     drafts: &[Finding],
     incremental: &str,
+    spec_docs: &str,
 ) -> Option<String> {
     let own = bundles.get(idx)?;
     let ex = crate::tools::ToolExecutor::new(root);
@@ -567,8 +570,7 @@ pub(crate) fn second_pass_prompt(
     let pack = crate::pack::build_pack(&pb, root, budget.saturating_sub(evidence.len()), own_diff_bytes);
     let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
     let others = crate::bundle::other_files_manifest(bundles, idx);
-    // TODO(Task 3)：第二趟补查 prompt 尚未接 --spec 参照段——占位 ""，接线时换真 spec_docs。
-    let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, &others, incremental, &dossier, "");
+    let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, &others, incremental, &dossier, spec_docs);
     p.push_str(&draft_block(drafts));
     Some(p)
 }
@@ -627,7 +629,7 @@ pub async fn run_code_review(
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "")
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "", &spec_section)
     };
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk), &spec_section).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
@@ -752,11 +754,12 @@ pub async fn run_incremental_review(
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
     // dispute 契约不因补跑丢失。
+    // ponytail: 增量轮暂不接 --spec（第一/二趟均占位 ""）——T44 债：`--incremental-from` +
+    // --spec 组合现静默忽略 --spec；补法=复用 args.spec + render_spec_section + budget 扣减，
+    // 同 run_code_review 手法透传进 mk 与 run_code_fanout。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section)
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section, "")
     };
-    // ponytail: 增量轮暂不接 --spec（Task 2 需求单只界定 run_code_review 的第一趟）——占位 ""；
-    // 若产品要增量轮也带 spec 参照，后续任务在此复用 args.spec + render_spec_section。
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk), "").await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
@@ -2198,20 +2201,45 @@ mod tests {
         ];
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let drafts = vec![]; // 空草稿也合法
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "").unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "").unwrap();
         assert!(p.contains("pub const LIMIT"), "needs 文件全文进包: {p}");
         assert!(p.contains("first_pass_draft"), "草稿段在场");
         assert!(p.contains("CONFIRM or REVISE"), "确认或修订语义");
         assert!(!p.contains("<incremental_round>"), "全量路径第二趟无增量段");
         // 增量轮：inc_section 原样带入第二趟（claimed-resolved/dispute 契约不因补跑丢失）
         let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
-        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, &inc).unwrap();
+        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, &inc, "").unwrap();
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段带入第二趟: {pi}");
         assert!(pi.contains("pub const LIMIT"), "增量第二趟 needs 证据仍在场");
         // 路径逃逸：绝对路径 needs 被 skip、不 panic、其余照常
         let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
-        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "");
+        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "", "");
         if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
+    }
+
+    #[test]
+    fn second_pass_injects_spec() {
+        // spec 参照段接入第二趟补查（Task 3）：非空 spec_docs 与 needs 证据段各自独立并存；
+        // 空 spec_docs 回归到既有占位散文，不泄漏内容。
+        use crate::bundle::Bundle;
+        use crate::domain::NeedEntry;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn own() { let z = 1; }\n").unwrap();
+        std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
+        let bundles = vec![Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into(),
+        }] }];
+        let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
+        let spec = "<spec_docs>\nDESIGN D8: fail-open\n</spec_docs>\n";
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", spec).unwrap();
+        assert!(p.contains("DESIGN D8: fail-open"), "spec 段在第二趟原样注入: {p}");
+        assert!(p.contains("pub const LIMIT"), "needs 证据段独立并存、不被 spec 段挤占: {p}");
+
+        let p_empty = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "").unwrap();
+        assert!(p_empty.contains("(none — no spec docs provided)"), "空 spec 走既有占位: {p_empty}");
+        assert!(!p_empty.contains("DESIGN D8"), "空 spec 不泄漏内容: {p_empty}");
     }
 
     #[test]
@@ -2241,7 +2269,7 @@ mod tests {
             hard_constraint: false, quote: "md5(pw)".into(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New,
         }];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "").unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "").unwrap();
         assert!(p.contains("## 补查证据"), "行窗补查段在场");
         assert!(p.contains("src/long.rs:70-132"), "±30 行窗头: {p}");
         assert!(p.contains("line70") && p.contains("line132"), "窗内行在场");
@@ -2253,7 +2281,7 @@ mod tests {
             NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
             NeedEntry { path: "src/long.rs".into(), lines: None, reason: "r".into() },
         ];
-        let pb = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &both, &drafts, "").unwrap();
+        let pb = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &both, &drafts, "", "").unwrap();
         assert!(pb.contains("src/long.rs:1-200（全文"), "全文条目在场: {pb}");
         assert!(!pb.contains("## 补查证据"), "同 path 行窗段被全文超集互斥掉: {pb}");
     }
@@ -2275,7 +2303,7 @@ mod tests {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
         }] }];
         let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into() }];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "").unwrap();
+        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "").unwrap();
         assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);
         assert!(p.contains("fn own()"), "证据段截断后 pack 仍照常渲染自家文件");
         assert!(p.len() < 300_000, "总 prompt 长度被证据帽拘住，未逼近原 100KB 单行体量: {}", p.len());
