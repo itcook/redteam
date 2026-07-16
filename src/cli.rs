@@ -323,13 +323,12 @@ fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bund
 }
 
 /// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
-/// 唯一路径（E8-E 安乐死 SCIP/Dossier 引擎后）：`build_pack`（0 壳完整体+省略清单，M15-S1）；
-/// `REDTEAM_NO_DOSSIER` 非空=全空段（M14 D9 null 臂，Task 3 territory）。
+/// 唯一路径（E8-E 安乐死 SCIP/Dossier 引擎后 + Task 3 空臂 dev 开关整拆）：
+/// `build_pack`（0 壳完整体+省略清单，M15-S1）恒执行，无空臂开关。
 /// degrades 静默于：不支持语言/无符号（pack 臂内部回落链承接）。
-/// meta.injected 是唯一可观测入口，供 A/B 归因与生产诊断。
+/// meta.injected 是唯一可观测入口，供归因与生产诊断。
 /// `budget`=pack flat 预算（字节）；生产调用点由 `pack_budget_bytes` 按启用模型窗算出。
 pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
-    let suppressed = std::env::var_os("REDTEAM_NO_DOSSIER").is_some();
     // 单格全审默认（E9）：bundles 恒为单元素（全变更集），每格即自家文件——原「兄弟改动
     // 文件全景注入 + 依赖距离排序」随分格一并收缩（无兄弟可注入）。超预算由 build_pack
     // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，不再靠分格避让。
@@ -338,15 +337,11 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
         .map(|b| {
             // 预算记账扣本格自己的 diff 字节（单格默认下即全变更集真实 diff）。
             let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
-            if suppressed {
-                String::new()
-            } else {
-                crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes))
-            }
+            crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes))
         })
         .collect();
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
-    let meta = DossierMeta { bundles: bundles.len(), injected, suppressed };
+    let meta = DossierMeta { bundles: bundles.len(), injected };
     (entries, meta)
 }
 
@@ -1804,9 +1799,6 @@ default_models=["m"]
 mod tests {
     use super::*;
 
-    // env-var 测试串行化锁（照 src/prompt/mod.rs 既有模式），避免与其它 env 测并发互踩。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn review_args_ignores_legacy_unknown_keys() {
         // 旧 args.json（--background 落盘）带已退役字段（E8-I 的 "lenses"、E10 移除的
@@ -1822,8 +1814,11 @@ mod tests {
     }
 
     #[test]
-    fn build_dossiers_toggle_off_arm_all_empty_on_arm_nonempty() {
-        let _g = ENV_LOCK.lock().unwrap();
+    fn build_packs_covers_multi_bundle_and_default_has_bodies() {
+        // Task 3（空臂 dev 开关整拆）后改写：build_packs 唯一路径 = build_pack（0 壳
+        // 完整体），无空臂开关。单格全审默认（E9）下 build_packs 不再做跨 bundle 兄弟注入——
+        // 两 bundle 各自以自家内容非空（DossierMeta 的多 bundle 计数仍是通用函数行为，
+        // 值得独立守住）。
         use crate::bundle::Bundle;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -1831,8 +1826,6 @@ mod tests {
         std::fs::write(root.join("src/a.rs"),
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
         std::fs::write(root.join("src/b.rs"), "pub fn other() {}\n").unwrap();
-        // 单格全审默认（E9）后改写：build_packs 不再做跨 bundle 兄弟注入——两 bundle 各自
-        // 以自家内容非空（DossierMeta 的多 bundle 计数仍是通用函数行为，值得独立守住）。
         let bundles = vec![
             Bundle { files: vec![FileChange {
                 path: "src/a.rs".into(),
@@ -1844,48 +1837,10 @@ mod tests {
             }] },
         ];
 
-        // on 臂：两段各以自家内容非空 → meta 反映 injected:2
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
-        let (on, on_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(on[0].contains("target"), "bundle 1 自家内容非空: {on:?}");
-        assert!(on[1].contains("other"), "bundle 2 自家内容非空: {on:?}");
-        assert_eq!(on_meta, DossierMeta { bundles: 2, injected: 2, suppressed: false });
-
-        // off 臂：REDTEAM_NO_DOSSIER 生效 → 全空段 + suppressed=true + injected=0
-        unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let (off, off_meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(off.iter().all(|s| s.is_empty()), "off 臂全空");
-        assert_eq!(off.len(), bundles.len());
-        assert_eq!(off_meta, DossierMeta { bundles: 2, injected: 0, suppressed: true });
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
-    }
-
-    #[test]
-    fn build_packs_default_has_bodies_null_arm_empty() {
-        // E8-E 安乐死后：build_packs 只剩两臂——默认（build_pack，0 壳）与 REDTEAM_NO_DOSSIER
-        // 空臂（Task 3 territory）。PackEngine::Dossier/Scip 基线臂随引擎拆除一并消失。
-        let _g = ENV_LOCK.lock().unwrap();
-        use crate::bundle::Bundle;
-        use crate::evidence::git::FileChange;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"),
-            "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
-        let bundles = vec![Bundle { files: vec![FileChange {
-            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
-        }] }];
-
-        // 默认臂：pack（含 0 壳完整体）
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
-        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert!(on[0].contains("改动源文"), "默认臂 = pack 含 0 壳: {}", on[0]);
-
-        // 空臂：REDTEAM_NO_DOSSIER
-        unsafe { std::env::set_var("REDTEAM_NO_DOSSIER", "1"); }
-        let (null, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
-        assert_eq!(null[0], "", "空臂全空段");
-        unsafe { std::env::remove_var("REDTEAM_NO_DOSSIER"); }
+        let (entries, meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
+        assert!(entries[0].contains("target") && entries[0].contains("改动源文"), "bundle 1 自家内容非空含 0 壳: {entries:?}");
+        assert!(entries[1].contains("other"), "bundle 2 自家内容非空: {entries:?}");
+        assert_eq!(meta, DossierMeta { bundles: 2, injected: 2 });
     }
 
     #[test]
