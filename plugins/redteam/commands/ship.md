@@ -53,7 +53,7 @@ disable-model-invocation: true
    - **轮询期间不改动工作树**（评审与携带重锚定正在读活文件）。
 2. **取结果**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam result <job>` → 存档到
    `rounds/<session>/rN.result.json`（结果已持久于 proj.db 可随时重取；此文件存档
-   仅供收工反馈的 jq 配方读取——**发布前随 feedback 仪器一并拆除本步**）。
+   供内循环 `dismiss add --from` 与收轮 `resolve --from` 读取快照四件套）。
    - job `failed/timed_out` 但有部分报告（`verdict: incomplete`）→ 用部分 findings
      照常裁决，简报注记 partial，**不算 approve**。
    - job 硬失败无产出（全 provider 挂等）→ 重试一次，再失败 → 停，报告用户。
@@ -105,9 +105,6 @@ disable-model-invocation: true
 3. 文末**追加裁决段**（协议层内容，宿主写）：`## Adjudication` ——修复/驳回/存疑清单，
    属实项带 origin 标（carried/new，报告已算好）、销案 id 清单、本轮 fix commit sha。
 → 下一轮。
-- **工具观察（本地调试阶段 · 发布前移除）**：若本轮察觉 redteam/ship **工具级**异常（耗时反常、
-  `finalizing` 卡顿、某 finding 的 quote 在文件里配不上、status/协议摩擦），往
-  `rounds/<session>/observations.md` 追加**一行**——供收工反馈合成;无异常不写。
 
 ## 停机（每轮内循环完成后判定；即使 verdict=approve，待刹车 id 先走完刹车链)
 1. **verdict = approve**（合并集口径：携带 ∪ 本轮新发，redteam 已算好）→ 收工：写
@@ -135,14 +132,3 @@ disable-model-invocation: true
 > 「连续全衍生」失去判别力；自指尾流问题由「未动代码携带判决、只审 delta」结构性消解，
 > approve 经合并集天然可达。
 > （此消解仅对增量轮成立；不携带的全量循环——working-tree scope——按上述 §4 出口交人。）
-
-## 收工反馈（本地调试阶段 · 发布前移除）
-> 开发期临时仪器,发布前连同 `${CLAUDE_PLUGIN_ROOT}/feedback.md`、本节、observations 一行约定一并删除。
-> 反馈对象是 **redteam/ship 工具自身**（好不好用、准不准），非被审代码。
-
-会话终结时（§停机 任一路径：approve 收工 / 停交用户），**写完 `session.md` 之后**派一个反馈 subagent
-（**对被审工作树只读，仅写 home 中枢**）：
-令其读 `${CLAUDE_PLUGIN_ROOT}/feedback.md` 并按其执行——产出工具自身的**量化记分卡** + **缺陷/改进项**，
-写入 home 中枢 `${REDTEAM_FEEDBACK_DIR:-~/.redteam/feedback}`。派发时把会话目录 `rounds/<session>/` 与
-dismissed 台账目录路径交给它。**本步不阻塞收工判定**：失败仅告警，不改变 approve/停机结论、不消耗轮次、
-不碰被审工作树。
