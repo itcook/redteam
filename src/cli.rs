@@ -427,9 +427,8 @@ fn contains_pem_private_key(content: &str) -> bool {
 /// 读 --spec 文档 → 有界参照段（供 [L0] 实现-对照-设计）。返回 (段, 用掉字节)。
 /// 路径=用户 CLI 提供=可信路径遍历（D4）→ 直接有界读，允许 out-of-root；但敏感文件 denylist +
 /// 读到内容后的 PEM 私钥内容嗅探（防改名绕过文件名 denylist）双重把关。
-// ponytail: 本 task 只交付纯构造器，接线（调用点注入 prompt）留给后续 task；
-// 加 allow(dead_code) 是临时的，接线落地后删掉。
-#[allow(dead_code)]
+/// 接线（Task 2）：`run_code_review` 第一趟主评审读 `args.spec` 调用本函数，段注入
+/// `build_bundle_prompt` 的 `{{SPEC_DOCS}}` 槽，`used` 字节从 pack 预算里扣减（D2）。
 pub(crate) fn render_spec_section(spec_paths: &[String]) -> (String, usize) {
     if spec_paths.is_empty() {
         return (String::new(), 0);
@@ -568,7 +567,8 @@ pub(crate) fn second_pass_prompt(
     let pack = crate::pack::build_pack(&pb, root, budget.saturating_sub(evidence.len()), own_diff_bytes);
     let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
     let others = crate::bundle::other_files_manifest(bundles, idx);
-    let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, &others, incremental, &dossier);
+    // TODO(Task 3)：第二趟补查 prompt 尚未接 --spec 参照段——占位 ""，接线时换真 spec_docs。
+    let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, &others, incremental, &dossier, "");
     p.push_str(&draft_block(drafts));
     Some(p)
 }
@@ -619,13 +619,17 @@ pub async fn run_code_review(
     // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
     // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names); }
-    let budget = pack_budget_bytes(cfg, &model_names);
+    // --spec 参照段（D2）：读 spec_docs → 从 pack 预算里扣掉它占用的字节，让 build_packs +
+    // 第二趟补查都用缩后预算——总上下文守界，spec 与 pack 不叠加超模型墙。空 --spec →
+    // (String::new(), 0) → budget 原样不变（既有回归行为零漂移）。
+    let (spec_section, spec_used) = render_spec_section(&args.spec);
+    let budget = pack_budget_bytes(cfg, &model_names).saturating_sub(spec_used);
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
         second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "")
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk)).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk), &spec_section).await;
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(
@@ -751,7 +755,9 @@ pub async fn run_incremental_review(
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
         second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section)
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk)).await;
+    // ponytail: 增量轮暂不接 --spec（Task 2 需求单只界定 run_code_review 的第一趟）——占位 ""；
+    // 若产品要增量轮也带 spec 参照，后续任务在此复用 args.spec + render_spec_section。
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk), "").await;
 
     // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
     //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。
@@ -2034,6 +2040,96 @@ mod spec_tests {
         assert!(section.contains("DESIGN: still readable"));
         assert!(!section.contains("does-not-exist"));
         assert!(used > 0);
+    }
+
+    // ---- Task 2：--spec 接入第一趟主评审的接线级回归（集成测试，非纯构造器单测）----
+
+    /// 记录每次 `run` 调用的 prompt；空脚本化返回（0 findings）——本组测试只关心 prompt 内容，
+    /// 不关心 findings/verify 链路（同 resume_tests::RecordingProvider 手法）。
+    #[derive(Default)]
+    struct SpecPromptRecorder {
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::ReviewProvider for SpecPromptRecorder {
+        async fn run(
+            &self,
+            req: crate::provider::LensRequest,
+        ) -> Result<crate::provider::LensCall, crate::provider::ProviderError> {
+            self.prompts.lock().unwrap().push(req.prompt.clone());
+            Ok(crate::provider::LensCall {
+                findings: vec![],
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                iterations: 1,
+                tool_use: Default::default(),
+                needs: vec![],
+            })
+        }
+    }
+
+    fn spec_test_args(spec: Vec<String>) -> ReviewArgs {
+        ReviewArgs {
+            base: None, scope: "working-tree".into(), spec, focus: None,
+            models: Some("m".into()), models_all: false,
+            block_threshold: None, conf_floor: None,
+            background: false, format: "json".into(),
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn code_review_with_spec_injects_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
+        let spec_path = root.join("design.md");
+        std::fs::write(&spec_path, "DESIGN D8: fail-open").unwrap();
+
+        let cfg = Config::from_layers(&[r#"[review]
+default_models=["m"]
+"#]).unwrap();
+        let provider = SpecPromptRecorder::default();
+        let args = spec_test_args(vec![spec_path.to_string_lossy().to_string()]);
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
+
+        run_code_review(&args, &provider, &cfg, changes, root, None, None).await.unwrap();
+
+        let prompts = provider.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "单格全审默认下第一趟只应有一次 provider 调用");
+        assert!(prompts[0].contains("<spec_docs>"), "第一趟 prompt 须含 spec_docs 段: {}", prompts[0]);
+        assert!(prompts[0].contains("DESIGN D8: fail-open"), "spec 内容须原样注入: {}", prompts[0]);
+        assert!(!prompts[0].contains("{{SPEC_DOCS}}"), "no residual placeholder");
+    }
+
+    #[tokio::test]
+    async fn code_review_without_spec_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
+
+        let cfg = Config::from_layers(&[r#"[review]
+default_models=["m"]
+"#]).unwrap();
+        let provider = SpecPromptRecorder::default();
+        let args = spec_test_args(vec![]); // 不带 --spec
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
+
+        run_code_review(&args, &provider, &cfg, changes, root, None, None).await.unwrap();
+
+        let prompts = provider.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        // 无 --spec → prompt 无 spec 段内容，仅占位散文（既有评审 prompt 零变化）。
+        assert!(prompts[0].contains("(none — no spec docs provided)"), "空 spec 渲染占位: {}", prompts[0]);
+        assert!(!prompts[0].contains("DESIGN"), "不应有任何 spec 内容泄漏: {}", prompts[0]);
+        // budget 未扣（D2）：空 --spec → render_spec_section 用掉 0 字节 → saturating_sub(0)
+        // 是恒等运算，pack 预算与不带本 feature 时完全一致。
+        let (_, spec_used) = render_spec_section(&args.spec);
+        assert_eq!(spec_used, 0, "空 spec 不得占用任何预算字节");
     }
 }
 

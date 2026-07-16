@@ -106,6 +106,7 @@ pub fn build_bundle_prompt(
     other_files: &str,
     incremental: &str,
     dossier: &str,
+    spec_docs: &str,
 ) -> String {
     let diffs_block = bundle
         .files
@@ -131,6 +132,7 @@ pub fn build_bundle_prompt(
             if other_files.is_empty() { "(none — this bundle covers the entire changeset)" } else { other_files }),
         ("{{INCREMENTAL_ROUND}}", incremental),
         ("{{DOSSIER}}", dossier),
+        ("{{SPEC_DOCS}}", if spec_docs.is_empty() { "(none — no spec docs provided)" } else { spec_docs }),
     ])
 }
 
@@ -352,7 +354,7 @@ mod tests {
     #[test]
     fn bundle_prompt_carries_builtin_attack_surface() {
         let bundle = bundle_one();
-        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "");
+        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "", "");
         assert!(p.contains("[L1] Security & Boundaries"), "code 攻击面固有: {p}");
         assert!(p.contains("[L5] Standards Compliance") && p.contains("hard_constraint=true"), "compliance 散文注记在场");
         assert!(!p.contains("{{RULES}}"), "占位符已烘干");
@@ -368,14 +370,14 @@ mod tests {
     #[test]
     fn bundle_prompt_interpolates_files_and_contract() {
         let bundle = bundle_one();
-        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "");
+        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         // 空清单 → 渲染「本包即全变更集」占位；非空 → 原样注入
         assert!(p.contains("(none — this bundle covers the entire changeset)"), "empty manifest placeholder");
-        let pm = build_bundle_prompt("wt", &bundle, "", "src/other.rs (+3/-1)", "", "");
+        let pm = build_bundle_prompt("wt", &bundle, "", "src/other.rs (+3/-1)", "", "", "");
         assert!(pm.contains("src/other.rs (+3/-1)"), "other-files manifest injected");
         // 注入对称覆盖(r4 ea30e058):bundle 侧同样不被外部占位捕获
-        let pi = build_bundle_prompt("wt", &bundle, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探", "", "");
+        let pi = build_bundle_prompt("wt", &bundle, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探", "", "", "");
         assert!(pi.contains("focus {{RULES}} 试探") && pi.contains("manifest {{BUNDLE_DIFFS}} 试探"),
             "bundle 外部内容占位不被捕获");
         assert!(p.contains("src/auth.rs"), "file path injected");
@@ -408,7 +410,7 @@ mod tests {
         use crate::evidence::git::FileChange;
         let bundle = Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] };
         // 全量路径（空段）：模板无残留占位、无增量标记
-        let p = build_bundle_prompt("wt", &bundle, "", "", "", "");
+        let p = build_bundle_prompt("wt", &bundle, "", "", "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(!p.contains("<incremental_round>"), "全量评审不得出现增量段");
         // 增量路径：段完整注入
@@ -418,7 +420,7 @@ mod tests {
             reason: String::new(), round: "r1".into(), updated_at: String::new(),
         }];
         let sect = render_incremental_section("abc123def456", "src/a.rs [delta], src/b.rs", &claimed);
-        let pi = build_bundle_prompt("wt", &bundle, "", "", &sect, "");
+        let pi = build_bundle_prompt("wt", &bundle, "", "", &sect, "", "");
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"));
         assert!(pi.contains("src/a.rs [delta]"), "双层 manifest 注入");
         assert!(pi.contains("let x = md5(pw);") && pi.contains("weak hash"), "claimed 项带原样 title+quote");
@@ -487,12 +489,28 @@ mod tests {
             path: "src/a.rs".into(), diff: "@@ -1 +1 @@\n-a\n+b".into(),
         }] };
         let dossier = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    foo();\n");
-        let p = build_bundle_prompt("wt", &b, "", "", "", &dossier);
+        let p = build_bundle_prompt("wt", &b, "", "", "", &dossier, "");
         assert!(p.contains("<dossier>"), "卷宗块注入");
         assert!(p.contains("start from the files it names"), "<evidence> 卷宗起点句在场");
         assert!(p.contains("No tools are available in this session"), "无工具默认转正（2026-07-13 design §2.1）——不再指挥不存在的工具");
         // 空卷宗 → 无 <dossier> 块，行为不变
-        let p2 = build_bundle_prompt("wt", &b, "", "", "", "");
+        let p2 = build_bundle_prompt("wt", &b, "", "", "", "", "");
         assert!(!p2.contains("<dossier>"), "空卷宗不渲染块");
+    }
+
+    /// Task 2：`--spec` 参照段接入第一趟主评审 prompt（模板 `[L0] Spec Consistency` 早有的空槽）。
+    #[test]
+    fn bundle_prompt_injects_spec_docs() {
+        let p = build_bundle_prompt("wt", &bundle_one(), "", "", "", "", "<spec_docs>…DESIGN D8…</spec_docs>\n");
+        assert!(p.contains("<spec_docs>…DESIGN D8…</spec_docs>"), "spec 段原样注入: {p}");
+        assert!(!p.contains("{{SPEC_DOCS}}"), "占位符已烘干");
+    }
+
+    /// 空 spec（未带 --spec 的既有评审）→ 占位散文，且不残留裸占位符（回归钉：行为完全不变）。
+    #[test]
+    fn bundle_prompt_spec_none_renders_placeholder() {
+        let p = build_bundle_prompt("wt", &bundle_one(), "", "", "", "", "");
+        assert!(p.contains("(none — no spec docs provided)"), "空 spec 渲染占位: {p}");
+        assert!(!p.contains("{{SPEC_DOCS}}"), "no residual placeholder");
     }
 }
