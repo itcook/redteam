@@ -10,7 +10,7 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 
 用户参数：$ARGUMENTS
 - `--max-rounds <N>`（本命令专属，可选）：预算护栏；未给则**无轮数上限**——目标是 approve。
-- 其余参数**原样透传**给 `redteam review`（--mode/--base/--scope/--spec/--models 等）。
+- 其余参数**原样透传**给 `redteam review`（--base/--scope/--spec/--models 等）。
   透传前先摘除上述专属参数。redteam 开启 `args_override_self`（同名 flag 重复后者胜），
   ship 管理的 `--background` 追加在用户参数之后即权威生效；唯一需连值摘除的是
   `--resume <值>`（它切同步补跑、打印全报告而非 job id，破坏循环）。凡摘除不得静默。
@@ -23,7 +23,7 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 ## 0. 起手
 1. 运行 `${CODEX_PLUGIN_ROOT}/bin/redteam init`（幂等）；创建本会话目录
    `.redteam/rounds/<YYYYMMDD-HHmmss>/`（本地时间，秒级）。
-2. code 模式：先跑项目测试命令，红树即停（先修好基线，不拿坏基线喂评审）；doc 模式跳过。
+2. 先跑项目测试命令，红树即停（先修好基线，不拿坏基线喂评审）。
    **测试命令探测**（本会话缓存结论）：`.redteam/config.toml` 的 `test_command` >
    `Cargo.toml`→`cargo test` > `package.json` 有 `scripts.test`→`npm test` >
    `Makefile` 有 test 目标→`make test` > 项目 CLAUDE.md/记忆约定 > 都推断不出 →
@@ -32,11 +32,11 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 ## 每轮 rN
 1. **起评审**：
    - **r1（或无健康增量基线时）**：`${CODEX_PLUGIN_ROOT}/bin/redteam review <透传参数> --background`（全量）。
-   - **r2 起（code 模式且用户参数带 --base，即 branch scope）**：追加 `--incremental-from <上一轮 job id>`
+   - **r2 起（用户参数带 --base，即 branch scope）**：追加 `--incremental-from <上一轮 job id>`
      ——只审上轮 stamped HEAD 以来已提交的 fix delta，未动代码的 findings 由 redteam 重锚定携带；
      verdict 仍是合并集口径（携带 ∪ 新发），**不要**自己把旧 findings 复述进 --focus。
      **前提：本轮修复已全部 commit（工作树净）**——delta 只含已提交改动。
-     doc 模式或 working-tree scope：不加该 flag，照旧全量循环。
+     working-tree scope：不加该 flag，照旧全量循环。
    - **守卫报错处置**（redteam 显式拒跑，不静默降级）：谱系（rebase/reset）/同族/健康基线/无 stamp/
      无持久化 result 报错 → 本轮**去掉 `--incremental-from` 改跑全量**，简报注记原因与守卫名；
      **空 delta 或 delta 全被噪声过滤报错**（"empty delta" / "all noise-filtered"）→ 按 §停机
@@ -125,7 +125,7 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
    人裁误报 → `set-status <id> human-confirmed --round rK`，此后该 id 永久静默；
    人裁属实 → 修 + `set-status <id> withdrawn --round rK`，继续。
 4. **修复受阻**：某 finding 属实但你修不了（需产品/架构决策、改动越权）→ 停，交用户。
-   doc 模式或 working-tree scope 的全量循环若陷自指尾流僵局（修复自身反复被重审出衍生问题、approve 不可达），
+   working-tree scope 的全量循环若陷自指尾流僵局（修复自身反复被重审出衍生问题、approve 不可达），
    也按本条停机交人。
 5. **停滞守卫**：本轮仍有未豁免 findings 但零代码改动（未修也未新驳）→ 空转，停，交用户。
    增量轮的「empty delta」守卫报错同走本条（无新改动可审 = 空转）。
@@ -134,7 +134,7 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 > 尾流守卫已随增量协议**退役**：增量轮的新 finding 定义上全是「衍生」（delta 就是上轮修复），
 > 「连续全衍生」失去判别力；自指尾流问题由「未动代码携带判决、只审 delta」结构性消解，
 > approve 经合并集天然可达。
-> （此消解仅对增量轮成立；不携带的全量循环——doc 模式或 working-tree scope——按上述 §4 出口交人。）
+> （此消解仅对增量轮成立；不携带的全量循环——working-tree scope——按上述 §4 出口交人。）
 
 ## 收工反馈（本地调试阶段 · 发布前移除）
 > 开发期临时仪器,发布前连同 `${CODEX_PLUGIN_ROOT}/feedback.md`、本节、observations 一行约定一并删除。
