@@ -400,10 +400,15 @@ const SPEC_BUDGET_BYTES: usize = 64_000;
 fn is_sensitive_spec_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
-    const DENY_EXT: &[&str] = &[".env", ".pem", ".key", ".p12", ".pfx", ".pkcs12", ".crt", ".cer"];
+    const DENY_EXT: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".pkcs12", ".p8", ".crt", ".cer"];
     const DENY_BASE: &[&str] = &["id_rsa", "id_ed25519", "id_dsa", "id_ecdsa", ".netrc", ".htpasswd"];
     const DOC_EXT: &[&str] = &[".md", ".txt", ".rst", ".adoc"];
     if DENY_EXT.iter().any(|e| base.ends_with(e)) {
+        return true;
+    }
+    // .env 家族：.env / .env.local / .env.production / config.env / app.env.local 全拒
+    // （`base.ends_with(".env")` 单独漏 .env.* 变体，是最常见密钥文件形状——终审 Important）。
+    if base == ".env" || base.ends_with(".env") || base.starts_with(".env.") || base.contains(".env.") {
         return true;
     }
     if DENY_BASE.iter().any(|b| base == *b || base.starts_with(&format!("{b}."))) {
@@ -1995,6 +2000,23 @@ mod spec_tests {
         ];
         let (section, used) = render_spec_section(&paths);
         assert_eq!((section, used), (String::new(), 0), "denylist 补的 key/id_ecdsa 三类均须被拒");
+    }
+
+    #[test]
+    fn spec_section_rejects_env_variants_and_p8() {
+        let tmp = tempfile::tempdir().unwrap();
+        // .env.* 变体（终审 Important：base.ends_with(".env") 单独漏这些）+ .p8（Apple AuthKey）
+        for name in ["e.env.local", ".env.production", "config.env", "AuthKey_ABC.p8"] {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, "AWS_SECRET_ACCESS_KEY=leak").unwrap();
+            let (section, used) = render_spec_section(&[p.to_string_lossy().to_string()]);
+            assert_eq!((section, used), (String::new(), 0), "{name} 应被守卫拒绝");
+        }
+        // environment.md（含 env 子串的正当文档）须放行——不误伤
+        let doc = tmp.path().join("environment.md");
+        std::fs::write(&doc, "设计：环境变量约定").unwrap();
+        let (section, _) = render_spec_section(&[doc.to_string_lossy().to_string()]);
+        assert!(section.contains("environment.md"), "environment.md 是正当文档、须放行");
     }
 
     #[test]
