@@ -216,6 +216,8 @@ struct TailCtx<'a> {
     needs_stats: (u32, u32),
     /// 后台 job 的 phase 打点通路（refute 子阶段；前台/resume 为 None）。
     sink: Option<&'a dyn CellSink>,
+    /// --spec 参照段（Task 4，承 hiapi F2）——透传给 refute 趟；空 --spec=""（行为不变）。
+    spec_docs: &'a str,
 }
 
 /// 共用尾段：anchor → dedup → verify → verdict → 组装 report → 退出码。
@@ -233,7 +235,7 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(
         findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency,
-        ctx.root, ctx.precedents,
+        ctx.root, ctx.precedents, ctx.spec_docs,
     ).await;
     let mut run_warnings = ctx.warnings;
     run_warnings.extend(refute_warnings);
@@ -666,6 +668,7 @@ pub async fn run_code_review(
         dossier_meta: Some(dossier_meta),
         needs_stats: raw.needs_stats,
         sink,
+        spec_docs: &spec_section,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
     assemble_report(raw.findings, ctx).await
@@ -784,8 +787,11 @@ pub async fn run_incremental_review(
             s.on_phase(crate::state::job::Phase::Refute, Some(format!("{n_targets} targets")));
         }
     }
+    // ponytail: 增量轮 refute 暂不接 --spec（同第一/二趟传 ""）——T44 债：`--incremental-from` +
+    // --spec 组合现静默忽略 spec 参照段；补法=复用 args.spec + render_spec_section + budget 扣减，
+    // 同 run_code_review 手法把 spec_section 透传进 fan-out 与此处 refute。
     let (findings, refute_warnings, refute_usage) = verify_findings(
-        merged, provider, &model_names, block, cfg.review.max_concurrency, root, &ledger.cards,
+        merged, provider, &model_names, block, cfg.review.max_concurrency, root, &ledger.cards, "",
     ).await;
     let mut warnings = raw.warnings;
     warnings.extend(refute_warnings);
@@ -1162,6 +1168,9 @@ pub async fn run_resume(
         }
     };
 
+    // Task 4：resume 的 refute 趟同原运行拿 --spec 参照段——从 args.spec 重渲（resume 已按同法
+    // 重导 models/block/floor/ledger），与首趟缓存 prompt 里烘干的 spec 保持一致；空 --spec→""。
+    let (spec_section, _spec_used) = render_spec_section(&args.spec);
     let ctx = TailCtx {
         root: cwd,
         provider,
@@ -1182,6 +1191,7 @@ pub async fn run_resume(
         dossier_meta: None,
         needs_stats: (0, 0),
         sink: None,
+        spec_docs: &spec_section,
     };
     match assemble_report(findings, ctx).await {
         Ok((mut report, mut code)) => {

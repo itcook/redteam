@@ -16,6 +16,11 @@ A precedent-based refutation carries audit duties: your returned finding MUST na
 Precedents: {{DISMISSED_NOTES}}
 </dismissal_precedents>
 
+<spec_reference>
+Referenced design/spec docs for this project (may be empty). If the behavior the claimed finding accuses is explicitly permitted, intended, or documented as a deliberate tradeoff by these docs, that is itself grounds to REFUTE — cite the specific doc passage as your evidence. A finding that looks like a bug in isolation is not one if the spec says it is the designed behavior.
+{{SPEC_DOCS}}
+</spec_reference>
+
 <evidence>
 No tools are available in this session. Judge from the claimed finding, the dismissal precedents, and the source snapshot below — that is the totality of what you can see; you cannot read the surrounding function, callers, or guards beyond what the snapshot shows. Do not claim to have verified code you cannot see. If the snapshot does not settle whether a guard, invariant, or caller prevents the failure, weigh your confidence down accordingly rather than asserting certainty.
 </evidence>

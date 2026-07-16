@@ -36,10 +36,13 @@ pub fn output_language() -> String {
 /// `dismissed_notes`：驳回台账判例（可空）——skeptic 见过往人裁，主题变体一致 refute。
 /// `source_context`：finding 声称位置的工作树快照（`verify::source_snippet` 产出，可空）——
 /// 免 refute 冷启动零 pack 裸奔重读（E7：解剖实测 14 调用/趟）；空串渲染为 `(none)`。
+/// `spec_docs`：--spec 参照段（Task 4，承 hiapi F2）——skeptic 拿到设计文档，就能把「像 bug
+/// 实为设计明确允许」的误报据 spec 驳回；空串渲染为 `(none)`（既有 refute 行为不变）。
 pub fn build_refute_prompt(
     finding: &crate::domain::Finding,
     dismissed_notes: &str,
     source_context: &str,
+    spec_docs: &str,
 ) -> String {
     let quote = if finding.quote.split_whitespace().next().is_none() {
         "(empty — the finding claims this is omitted from the document)".to_string()
@@ -59,6 +62,7 @@ pub fn build_refute_prompt(
         ("{{QUOTE}}", &quote),
         ("{{DISMISSED_NOTES}}", notes),
         ("{{SOURCE_CONTEXT}}", source),
+        ("{{SPEC_DOCS}}", if spec_docs.trim().is_empty() { "(none)" } else { spec_docs }),
     ])
 }
 
@@ -282,7 +286,7 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
-        let p = build_refute_prompt(&f, "", "");
+        let p = build_refute_prompt(&f, "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.contains("src/a.rs") && p.contains("12"), "file:line injected");
         assert!(p.contains("missing auth") && p.contains("db.write(token)"), "title+quote injected");
@@ -297,7 +301,7 @@ mod tests {
         }
         // 空台账 → 判例段渲染 (none)；非空 → 原样注入（主题变体跨轮一致抑制）
         assert!(p.contains("Precedents: (none)"), "empty notes render (none)");
-        let p2 = build_refute_prompt(&f, "台账: 旧误报X 已人裁驳回", "");
+        let p2 = build_refute_prompt(&f, "台账: 旧误报X 已人裁驳回", "", "");
         assert!(p2.contains("台账: 旧误报X 已人裁驳回"), "ledger precedents injected");
     }
 
@@ -312,11 +316,48 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
-        let p = build_refute_prompt(&f, "", "src/a.rs:40-162（现场快照）\nfn x() {}");
+        let p = build_refute_prompt(&f, "", "src/a.rs:40-162（现场快照）\nfn x() {}", "");
         assert!(p.contains("Source at the claimed location"), "段标题在场");
         assert!(p.contains("fn x() {}"), "快照内容注入");
-        let p2 = build_refute_prompt(&f, "", "");
+        let p2 = build_refute_prompt(&f, "", "", "");
         assert!(p2.contains("(none)"), "空快照渲染占位");
+    }
+
+    /// Task 4：refute prompt 接入 --spec 参照段（承 hiapi F2「结合设计判定为设计允许行为、驳回」）。
+    #[test]
+    fn refute_prompt_carries_spec() {
+        use crate::domain::{Finding, Origin, Severity};
+        let f = Finding {
+            id: "x".into(), severity: Severity::Medium, title: "fail-open on timeout".into(),
+            body: "on timeout the guard falls through instead of denying".into(), file: "src/a.rs".into(),
+            line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
+            models: vec!["claude".into()], agreement: 1,
+            hard_constraint: false, cluster_id: None, quote: "if timeout { return Ok(()); }".into(), verify: None,
+            previously_dismissed: false, origin: Origin::New,
+        };
+        let p = build_refute_prompt(&f, "", "", "<spec_docs>…DESIGN D8: fail-open is intentional on timeout…</spec_docs>");
+        assert!(p.contains("<spec_docs>…DESIGN D8: fail-open is intentional on timeout…</spec_docs>"), "spec 段原样注入: {p}");
+        assert!(!p.contains("{{SPEC_DOCS}}"), "占位符已烘干");
+        // 框架语：驳回依据须指向「设计允许行为」
+        assert!(p.to_lowercase().contains("designed behavior") || p.to_lowercase().contains("explicitly permitted"),
+            "spec 驳回框架语在场: {p}");
+    }
+
+    /// 空 spec 回归：未带 --spec 的既有 refute 行为完全不变——占位 `(none)`，不残留裸占位符。
+    #[test]
+    fn refute_prompt_spec_none_renders_placeholder() {
+        use crate::domain::{Finding, Origin, Severity};
+        let f = Finding {
+            id: "x".into(), severity: Severity::High, title: "missing auth".into(),
+            body: "no check before db write".into(), file: "src/a.rs".into(),
+            line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
+            models: vec!["claude".into()], agreement: 1,
+            hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
+            previously_dismissed: false, origin: Origin::New,
+        };
+        let p = build_refute_prompt(&f, "", "", "");
+        assert!(p.contains("(none)"), "空 spec 渲染占位: {p}");
+        assert!(!p.contains("{{SPEC_DOCS}}"), "no residual placeholder");
     }
 
     #[test]
