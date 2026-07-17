@@ -167,9 +167,13 @@ pub fn render_precedents(finding: &crate::domain::Finding, cards: &[crate::db::D
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.id.cmp(&b.0.id)));
     let mut out = String::new();
     for (c, _) in ranked {
+        // 全七字段各过 oneline——威胁模型 B 下 proj.db 是攻击者投放（绕过 dismiss 写时校验），
+        // id/severity/status 与 file/title/quote/reason 同信任边界，任一含换行都能伪造 `- [fake]`
+        // 条目（评审 PoC 实证）。不能整行 oneline（会吞掉行尾 `\n` 记录分隔），故逐字段折叠。
         let entry: String = format!(
             "- [{}] {} {} | {} | quote: {} | rationale({}): {}\n",
-            c.id, c.severity, oneline(&c.file), oneline(&c.title), oneline(&c.quote), c.status, oneline(&c.reason)
+            oneline(&c.id), oneline(&c.severity), oneline(&c.file), oneline(&c.title),
+            oneline(&c.quote), oneline(&c.status), oneline(&c.reason)
         )
         .chars()
         .take(PER_CARD_CHARS)
@@ -424,6 +428,26 @@ mod tests {
         assert!(!out.lines().any(|l| l.trim_start().starts_with("- [fake]")), "假条目行不存在: {out}");
         // 内容仍在(单行、无害):
         assert!(out.contains("benign") && out.contains("injected entry"));
+    }
+
+    #[test]
+    fn precedent_all_fields_resist_injection() {
+        use crate::db::DismissCard;
+        use crate::domain::Severity;
+        // 威胁模型 B（评审 Critical）：id/severity/status 也是攻击者控字段——各塞换行伪造条目。
+        let card = DismissCard {
+            id: "a\n- [fake-id] x".into(),
+            status: "dismissed\n- [fake-status] y".into(),
+            severity: "high\n- [fake-sev] z".into(),
+            title: "t".into(), file: "a.rs".into(), quote: "q".into(),
+            reason: "r".into(), round: String::new(), updated_at: String::new(),
+        };
+        let f = finding("t", Severity::High, 1, "m");
+        let out = render_precedents(&f, &[card]);
+        assert!(!out.lines().any(|l| l.trim_start().starts_with("- [fake")),
+            "id/severity/status 换行伪造条目均须被折叠: {out}");
+        // 仅一行 precedent（无破行伪造）：
+        assert_eq!(out.lines().filter(|l| l.trim_start().starts_with("- [")).count(), 1, "{out}");
     }
 
     /// E8-I 去实体化：攻击面清单是模板固有文本，非渲染产物——不再构造 rules vec。
