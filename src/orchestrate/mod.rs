@@ -248,6 +248,10 @@ where
 /// code 线扇出，用 Semaphore 限 max_concurrency：
 /// - replicate=true：每 (bundle, model) 独立格子全跑（对抗复制），失败记 failed_models（守 exit-2）。
 /// - replicate=false：每 bundle 一条候补链（容错，首个成功即止），整链失败只记 warning。
+///
+/// `spec_docs`：`--spec` 参照段（Task 2），原样透传给每个 bundle 的 prompt（`build_bundle_prompt`
+/// 的 `{{SPEC_DOCS}}` 槽，供 `[L0] Spec Consistency` 实现-对照-设计）；空串渲染为占位文案。
+#[allow(clippy::too_many_arguments)] // 与 second_pass_prompt 同源的参数面；收拢 struct 是过度设计
 pub async fn run_code_fanout(
     provider: &dyn ReviewProvider,
     target_label: &str,
@@ -258,6 +262,7 @@ pub async fn run_code_fanout(
     opts: &OrchestrateOpts,
     sink: Option<&dyn CellSink>,
     second_prompt: SecondPrompt<'_>,
+    spec_docs: &str,
 ) -> RawResults {
     let sem = Arc::new(Semaphore::new(opts.max_concurrency.max(1)));
     // 每个 bundle 的 label/prompt 只算一次：manifest 与执行复用同一份。
@@ -268,7 +273,7 @@ pub async fn run_code_fanout(
             let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
             let others = crate::bundle::other_files_manifest(bundles, i);
             let dossier = dossiers.get(i).map(String::as_str).unwrap_or("");
-            let prompt = build_bundle_prompt(target_label, bundle, focus, &others, incremental, dossier);
+            let prompt = build_bundle_prompt(target_label, bundle, focus, &others, incremental, dossier, spec_docs);
             let cell_id = format!("bundle[{label}]");
             (cell_id, label, prompt)
         })
@@ -483,7 +488,7 @@ mod tests {
             assert_eq!(drafts.len(), 1, "草稿传入构造器");
             Some("second pass prompt".to_string())
         };
-        let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
+        let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk), "").await;
         assert_eq!(out.findings.len(), 2, "第二趟整体替换第一趟");
         assert_eq!(out.needs_stats, (1, 1));
     }
@@ -493,7 +498,7 @@ mod tests {
         let first = lens_call_with(vec![rawf("draft finding")], vec![need("src/x.rs", "verify")]);
         let provider = SeqProvider::new(vec![first]); // 第二趟无 script → Err
         let mk = |_i: usize, _n: &[NeedEntry], _d: &[Finding]| Some("p2".to_string());
-        let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
+        let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk), "").await;
         assert_eq!(out.findings.len(), 1, "第二趟失败保留第一趟");
         assert!(out.warnings.iter().any(|w| w.contains("second pass failed")));
     }
@@ -505,7 +510,7 @@ mod tests {
         let second = lens_call_with(vec![], vec![]);
         let provider = SeqProvider::new(vec![first, second]);
         let mk = |_i: usize, n: &[NeedEntry], _d: &[Finding]| { assert_eq!(n.len(), 5, "cap 5"); Some("p2".into()) };
-        let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk)).await;
+        let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk), "").await;
         assert!(out.warnings.iter().any(|w| w.contains("capped at 5")));
     }
 
@@ -517,7 +522,7 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
-        let r = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, None, None).await;
+        let r = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, None, None, "").await;
         assert_eq!(r.findings.len(), 3, "one finding per bundle");
     }
 
@@ -545,7 +550,7 @@ mod tests {
             "<dossier>\nDOSSIER-A\n</dossier>".to_string(),
             "<dossier>\nDOSSIER-B\n</dossier>".to_string(),
         ];
-        let _ = run_code_fanout(&p, "wt", &bundles, "", "", &dossiers, &opts, None, None).await;
+        let _ = run_code_fanout(&p, "wt", &bundles, "", "", &dossiers, &opts, None, None, "").await;
         let prompts = p.prompts.lock().unwrap();
         let pa = prompts.iter().find(|s| s.contains("### src/a.rs")).expect("bundle a 的 prompt 应被采集");
         let pb = prompts.iter().find(|s| s.contains("### src/b.rs")).expect("bundle b 的 prompt 应被采集");
@@ -580,7 +585,7 @@ mod tests {
         };
         let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
         let probe_ref: &ConcProbe = &probe;
-        let _ = run_code_fanout(probe_ref, "wt", &bundles, "", "", &[], &opts, None, None).await;
+        let _ = run_code_fanout(probe_ref, "wt", &bundles, "", "", &[], &opts, None, None, "").await;
         assert!(probe.max_seen.load(Ordering::SeqCst) <= 2, "concurrency exceeded cap: {}", probe.max_seen.load(Ordering::SeqCst));
         assert!(probe.max_seen.load(Ordering::SeqCst) >= 1);
     }
@@ -594,7 +599,7 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs")];
-        let r = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, None, None).await;
+        let r = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, None, None, "").await;
         assert!(r.findings.is_empty());
         assert!(r.failed_models.contains(&"absent".to_string()), "explicit unreachable model must be recorded");
         assert!(!r.warnings.is_empty());
@@ -622,7 +627,7 @@ mod tests {
             no_fallback: false,
             max_concurrency: 8,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, "", "", &[], &opts, None, None).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, "", "", &[], &opts, None, None, "").await;
         // 2 bundle × 2 model = 4 格，各 1 finding → 4 条
         assert_eq!(out.findings.len(), 4);
         let models: std::collections::BTreeSet<&str> =
@@ -649,7 +654,7 @@ mod tests {
             no_fallback: false,
             max_concurrency: 8,
         };
-        let out = run_code_fanout(&provider, "working tree", &bundles, "", "", &[], &opts, None, None).await;
+        let out = run_code_fanout(&provider, "working tree", &bundles, "", "", &[], &opts, None, None, "").await;
         assert_eq!(out.findings.len(), 1); // alpha 成功
         assert!(out.failed_models.contains(&"beta".to_string()));
     }
@@ -678,7 +683,7 @@ mod tests {
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
         let sink = RecSink { manifest_n: 0.into(), records: Vec::new().into() };
-        let _ = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, Some(&sink), None).await;
+        let _ = run_code_fanout(&p, "wt", &bundles, "", "", &[], &opts, Some(&sink), None, "").await;
         assert_eq!(*sink.manifest_n.lock().unwrap(), 3, "manifest 全集=3 cell");
         assert_eq!(sink.records.lock().unwrap().len(), 3, "每 cell 各回调一次");
     }
@@ -737,7 +742,7 @@ mod tests {
             fast_saw_slow_incomplete: None.into(),
             calls: AtomicUsize::new(0),
         };
-        let _ = run_code_fanout(&provider, "wt", &bundles, "", "", &[], &opts, Some(&sink), None).await;
+        let _ = run_code_fanout(&provider, "wt", &bundles, "", "", &[], &opts, Some(&sink), None, "").await;
         assert_eq!(sink.calls.load(Ordering::SeqCst), 2, "on_cell 调用次数=cell 数（聚合前逐个触发）");
         let saw = *sink.fast_saw_slow_incomplete.lock().unwrap();
         assert_eq!(
@@ -792,7 +797,7 @@ mod tests {
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs")];
-        let out = run_code_fanout(&reg, "wt", &bundles, "", "", &[], &opts, None, None).await;
+        let out = run_code_fanout(&reg, "wt", &bundles, "", "", &[], &opts, None, None, "").await;
         assert!(out.failed_models.contains(&"bad".to_string()),
             "坏 model 应记 failed_models: {:?}", out.failed_models);
         assert!(out.findings.iter().any(|f| f.title == "real"),

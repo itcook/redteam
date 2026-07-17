@@ -19,8 +19,12 @@ Give no credit for good intent, partial fixes, or likely follow-up. Happy-path-o
 </operating_stance>
 
 <evidence>
-No tools are available in this session — base your review solely on what is provided below: the diffs, the full source of the changed files, and (where present) a dossier of reference points for where the changed symbols are used elsewhere in the repo, plus callee signatures. The diffs alone are not enough — read the full changed-file sources and consult the dossier before judging; never judge from the diff alone. Where a dossier of reference points is provided below, start from the files it names. If the evidence a claim needs is not present in what is provided (see the dossier's omission list, if any), lower your confidence or state the gap explicitly rather than asserting something you cannot see. Do not invent code you have not been shown.
+No tools are available in this session — base your review solely on what is provided below: the diffs, the full source of the changed files, any provided spec docs, and (where present) a dossier of reference points for where the changed symbols are used elsewhere in the repo, plus callee signatures. The diffs alone are not enough — read the full changed-file sources and consult the dossier before judging; never judge from the diff alone. Where a dossier of reference points is provided below, start from the files it names. If the evidence a claim needs is not present in what is provided (see the dossier's omission list, if any), lower your confidence or state the gap explicitly rather than asserting something you cannot see. Do not invent code you have not been shown.
 </evidence>
+
+<spec_docs>
+{{SPEC_DOCS}}
+</spec_docs>
 
 <review_method>
 Actively disprove the change: violated invariants, missing guards, unhandled failure paths, assumptions that break under stress.

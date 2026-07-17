@@ -188,6 +188,9 @@ pub(crate) fn anthropic_messages_url(base: &str) -> String {
         format!("{base}/v1/messages")
     }
 }
+// 注：openai 侧**有意不做** anthropic 同款 /v1 规范化——openai 兼容生态无统一规范
+// （DeepSeek 官方 base 裸路径正统、部分网关必须带 /v1、部分必须不带），自动补写对
+// 「必须不带」的端点是破坏性的。base_url = 完整前缀，由配置负责（用户 2026-07-16 定）。
 
 #[cfg(test)]
 mod tests {

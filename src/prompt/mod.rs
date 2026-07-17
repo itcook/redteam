@@ -36,10 +36,13 @@ pub fn output_language() -> String {
 /// `dismissed_notes`：驳回台账判例（可空）——skeptic 见过往人裁，主题变体一致 refute。
 /// `source_context`：finding 声称位置的工作树快照（`verify::source_snippet` 产出，可空）——
 /// 免 refute 冷启动零 pack 裸奔重读（E7：解剖实测 14 调用/趟）；空串渲染为 `(none)`。
+/// `spec_docs`：--spec 参照段（Task 4，承 hiapi F2）——skeptic 拿到设计文档，就能把「像 bug
+/// 实为设计明确允许」的误报据 spec 驳回；空串渲染为 `(none)`（既有 refute 行为不变）。
 pub fn build_refute_prompt(
     finding: &crate::domain::Finding,
     dismissed_notes: &str,
     source_context: &str,
+    spec_docs: &str,
 ) -> String {
     let quote = if finding.quote.split_whitespace().next().is_none() {
         "(empty — the finding claims this is omitted from the document)".to_string()
@@ -59,6 +62,7 @@ pub fn build_refute_prompt(
         ("{{QUOTE}}", &quote),
         ("{{DISMISSED_NOTES}}", notes),
         ("{{SOURCE_CONTEXT}}", source),
+        ("{{SPEC_DOCS}}", if spec_docs.trim().is_empty() { "(none)" } else { spec_docs }),
     ])
 }
 
@@ -106,6 +110,7 @@ pub fn build_bundle_prompt(
     other_files: &str,
     incremental: &str,
     dossier: &str,
+    spec_docs: &str,
 ) -> String {
     let diffs_block = bundle
         .files
@@ -131,6 +136,7 @@ pub fn build_bundle_prompt(
             if other_files.is_empty() { "(none — this bundle covers the entire changeset)" } else { other_files }),
         ("{{INCREMENTAL_ROUND}}", incremental),
         ("{{DOSSIER}}", dossier),
+        ("{{SPEC_DOCS}}", if spec_docs.is_empty() { "(none — no spec docs provided)" } else { spec_docs }),
     ])
 }
 
@@ -280,7 +286,7 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
-        let p = build_refute_prompt(&f, "", "");
+        let p = build_refute_prompt(&f, "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(p.contains("src/a.rs") && p.contains("12"), "file:line injected");
         assert!(p.contains("missing auth") && p.contains("db.write(token)"), "title+quote injected");
@@ -295,7 +301,7 @@ mod tests {
         }
         // 空台账 → 判例段渲染 (none)；非空 → 原样注入（主题变体跨轮一致抑制）
         assert!(p.contains("Precedents: (none)"), "empty notes render (none)");
-        let p2 = build_refute_prompt(&f, "台账: 旧误报X 已人裁驳回", "");
+        let p2 = build_refute_prompt(&f, "台账: 旧误报X 已人裁驳回", "", "");
         assert!(p2.contains("台账: 旧误报X 已人裁驳回"), "ledger precedents injected");
     }
 
@@ -310,11 +316,48 @@ mod tests {
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
-        let p = build_refute_prompt(&f, "", "src/a.rs:40-162（现场快照）\nfn x() {}");
+        let p = build_refute_prompt(&f, "", "src/a.rs:40-162（现场快照）\nfn x() {}", "");
         assert!(p.contains("Source at the claimed location"), "段标题在场");
         assert!(p.contains("fn x() {}"), "快照内容注入");
-        let p2 = build_refute_prompt(&f, "", "");
+        let p2 = build_refute_prompt(&f, "", "", "");
         assert!(p2.contains("(none)"), "空快照渲染占位");
+    }
+
+    /// Task 4：refute prompt 接入 --spec 参照段（承 hiapi F2「结合设计判定为设计允许行为、驳回」）。
+    #[test]
+    fn refute_prompt_carries_spec() {
+        use crate::domain::{Finding, Origin, Severity};
+        let f = Finding {
+            id: "x".into(), severity: Severity::Medium, title: "fail-open on timeout".into(),
+            body: "on timeout the guard falls through instead of denying".into(), file: "src/a.rs".into(),
+            line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
+            models: vec!["claude".into()], agreement: 1,
+            hard_constraint: false, cluster_id: None, quote: "if timeout { return Ok(()); }".into(), verify: None,
+            previously_dismissed: false, origin: Origin::New,
+        };
+        let p = build_refute_prompt(&f, "", "", "<spec_docs>…DESIGN D8: fail-open is intentional on timeout…</spec_docs>");
+        assert!(p.contains("<spec_docs>…DESIGN D8: fail-open is intentional on timeout…</spec_docs>"), "spec 段原样注入: {p}");
+        assert!(!p.contains("{{SPEC_DOCS}}"), "占位符已烘干");
+        // 框架语：驳回依据须指向「设计允许行为」
+        assert!(p.to_lowercase().contains("designed behavior") || p.to_lowercase().contains("explicitly permitted"),
+            "spec 驳回框架语在场: {p}");
+    }
+
+    /// 空 spec 回归：未带 --spec 的既有 refute 行为完全不变——占位 `(none)`，不残留裸占位符。
+    #[test]
+    fn refute_prompt_spec_none_renders_placeholder() {
+        use crate::domain::{Finding, Origin, Severity};
+        let f = Finding {
+            id: "x".into(), severity: Severity::High, title: "missing auth".into(),
+            body: "no check before db write".into(), file: "src/a.rs".into(),
+            line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
+            models: vec!["claude".into()], agreement: 1,
+            hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
+            previously_dismissed: false, origin: Origin::New,
+        };
+        let p = build_refute_prompt(&f, "", "", "");
+        assert!(p.contains("(none)"), "空 spec 渲染占位: {p}");
+        assert!(!p.contains("{{SPEC_DOCS}}"), "no residual placeholder");
     }
 
     #[test]
@@ -352,7 +395,7 @@ mod tests {
     #[test]
     fn bundle_prompt_carries_builtin_attack_surface() {
         let bundle = bundle_one();
-        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "");
+        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "", "");
         assert!(p.contains("[L1] Security & Boundaries"), "code 攻击面固有: {p}");
         assert!(p.contains("[L5] Standards Compliance") && p.contains("hard_constraint=true"), "compliance 散文注记在场");
         assert!(!p.contains("{{RULES}}"), "占位符已烘干");
@@ -368,14 +411,14 @@ mod tests {
     #[test]
     fn bundle_prompt_interpolates_files_and_contract() {
         let bundle = bundle_one();
-        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "");
+        let p = build_bundle_prompt("working tree", &bundle, "auth", "", "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         // 空清单 → 渲染「本包即全变更集」占位；非空 → 原样注入
         assert!(p.contains("(none — this bundle covers the entire changeset)"), "empty manifest placeholder");
-        let pm = build_bundle_prompt("wt", &bundle, "", "src/other.rs (+3/-1)", "", "");
+        let pm = build_bundle_prompt("wt", &bundle, "", "src/other.rs (+3/-1)", "", "", "");
         assert!(pm.contains("src/other.rs (+3/-1)"), "other-files manifest injected");
         // 注入对称覆盖(r4 ea30e058):bundle 侧同样不被外部占位捕获
-        let pi = build_bundle_prompt("wt", &bundle, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探", "", "");
+        let pi = build_bundle_prompt("wt", &bundle, "focus {{RULES}} 试探", "manifest {{BUNDLE_DIFFS}} 试探", "", "", "");
         assert!(pi.contains("focus {{RULES}} 试探") && pi.contains("manifest {{BUNDLE_DIFFS}} 试探"),
             "bundle 外部内容占位不被捕获");
         assert!(p.contains("src/auth.rs"), "file path injected");
@@ -408,7 +451,7 @@ mod tests {
         use crate::evidence::git::FileChange;
         let bundle = Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] };
         // 全量路径（空段）：模板无残留占位、无增量标记
-        let p = build_bundle_prompt("wt", &bundle, "", "", "", "");
+        let p = build_bundle_prompt("wt", &bundle, "", "", "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
         assert!(!p.contains("<incremental_round>"), "全量评审不得出现增量段");
         // 增量路径：段完整注入
@@ -418,7 +461,7 @@ mod tests {
             reason: String::new(), round: "r1".into(), updated_at: String::new(),
         }];
         let sect = render_incremental_section("abc123def456", "src/a.rs [delta], src/b.rs", &claimed);
-        let pi = build_bundle_prompt("wt", &bundle, "", "", &sect, "");
+        let pi = build_bundle_prompt("wt", &bundle, "", "", &sect, "", "");
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"));
         assert!(pi.contains("src/a.rs [delta]"), "双层 manifest 注入");
         assert!(pi.contains("let x = md5(pw);") && pi.contains("weak hash"), "claimed 项带原样 title+quote");
@@ -487,12 +530,28 @@ mod tests {
             path: "src/a.rs".into(), diff: "@@ -1 +1 @@\n-a\n+b".into(),
         }] };
         let dossier = render_dossier_section("## foo (fn)\nsrc/a.rs:3\n    foo();\n");
-        let p = build_bundle_prompt("wt", &b, "", "", "", &dossier);
+        let p = build_bundle_prompt("wt", &b, "", "", "", &dossier, "");
         assert!(p.contains("<dossier>"), "卷宗块注入");
         assert!(p.contains("start from the files it names"), "<evidence> 卷宗起点句在场");
         assert!(p.contains("No tools are available in this session"), "无工具默认转正（2026-07-13 design §2.1）——不再指挥不存在的工具");
         // 空卷宗 → 无 <dossier> 块，行为不变
-        let p2 = build_bundle_prompt("wt", &b, "", "", "", "");
+        let p2 = build_bundle_prompt("wt", &b, "", "", "", "", "");
         assert!(!p2.contains("<dossier>"), "空卷宗不渲染块");
+    }
+
+    /// Task 2：`--spec` 参照段接入第一趟主评审 prompt（模板 `[L0] Spec Consistency` 早有的空槽）。
+    #[test]
+    fn bundle_prompt_injects_spec_docs() {
+        let p = build_bundle_prompt("wt", &bundle_one(), "", "", "", "", "<spec_docs>…DESIGN D8…</spec_docs>\n");
+        assert!(p.contains("<spec_docs>…DESIGN D8…</spec_docs>"), "spec 段原样注入: {p}");
+        assert!(!p.contains("{{SPEC_DOCS}}"), "占位符已烘干");
+    }
+
+    /// 空 spec（未带 --spec 的既有评审）→ 占位散文，且不残留裸占位符（回归钉：行为完全不变）。
+    #[test]
+    fn bundle_prompt_spec_none_renders_placeholder() {
+        let p = build_bundle_prompt("wt", &bundle_one(), "", "", "", "", "");
+        assert!(p.contains("(none — no spec docs provided)"), "空 spec 渲染占位: {p}");
+        assert!(!p.contains("{{SPEC_DOCS}}"), "no residual placeholder");
     }
 }
