@@ -235,14 +235,13 @@ pub fn render_incremental_section(
 
 /// 结构定界符中和（E11-Q6，威胁模型 B：被审内容不可信）：被审内容里若含字面模板闭合标签，
 /// 攻击者可伪造"块已提前闭合"，把之后的文本伪装成模板真实指令段(如假 `</output_contract>`
-/// 骗模型以为契约段重开)。大小写不敏感中和给定标签名的闭合形式(`</name>`)，代码围栏 ``` 一并
-/// 中和(防伪造代码块打断/续接结构)。只中和"闭合"标签——真正危险的是让后续内容看起来已跳出
-/// 当前块，开标签本身不构成破块。**只中和 XML 结构标签、不动 ``` 代码围栏**：本系统的真结构
-/// 定界符是 XML 标签(模型据此认段)，``` 只是 markdown 排版、非安全边界(伪造 ``` 仍困在
-/// <dossier>/<bundle> 内)；而中和 ``` 会污染被审代码——finding.quote 若含 ``` 会与磁盘真文本
-/// 失配、被 locate_quote 当幻觉静默丢弃(评审 Important 实证的 quote 假阴性回归)。散文级注入由
-/// system 免疫段兜底。（--spec 路径 neutralize_spec_delimiters 仍中和 ```：设计文档不被 quote
-/// 匹配、无此回归。）
+/// 骗模型以为契约段重开)。大小写不敏感中和给定标签名的闭合形式(`</name>`)。只中和"闭合"标签
+/// ——真正危险的是让后续内容看起来已跳出当前块，开标签本身不构成破块。
+/// **只中和 XML 结构标签、不动 markdown 代码围栏**：本系统真结构定界符是 XML 标签(模型据此认段)，
+/// 代码围栏只是排版、非安全边界(伪造它仍困在 <dossier>/<bundle> 内)；而中和它会污染被审代码
+/// ——finding.quote 若含代码围栏会与磁盘真文本失配、被 locate_quote 当幻觉静默丢弃(评审
+/// Important 实证的 quote 假阴性回归)。散文级注入由 system 免疫段兜底。dossier/diff 与 --spec
+/// 三条路径共用本 helper、行为一致（均只中和 XML 标签、代码围栏原样保留）。
 pub(crate) fn neutralize_structure(content: &str, tag_names: &[&str]) -> String {
     let mut out = content.to_string();
     for name in tag_names {
@@ -286,7 +285,8 @@ pub fn render_dossier_section(entries: &str) -> String {
     if entries.trim().is_empty() {
         return String::new();
     }
-    // 被审代码摘录可能含字面结构标签/代码围栏——中和，防破块（只装事实，不让被审内容改变结构）
+    // 被审代码摘录可能含字面 XML 结构标签——中和，防破块（只装事实，不让被审内容改变结构；
+    // 代码围栏原样保留，非安全边界，见 neutralize_structure）
     let entries = neutralize_structure(entries, DOSSIER_STRUCTURAL_TAGS);
     format!(
         "<dossier>\n\

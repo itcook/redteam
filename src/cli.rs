@@ -475,8 +475,9 @@ fn contains_pem_private_key(content: &str) -> bool {
     content.lines().any(|line| line.contains("-----BEGIN") && line.contains("PRIVATE KEY"))
 }
 
-/// spec 内容结构定界符中和（dogfood #1 防御纵深）：``` 代码围栏 + `</spec_docs>` 段闭合标签
-/// （大小写不敏感）转义，防内容跳出参照块。散文级注入挡不住（LLM 固有），归安全组 T45。
+/// spec 内容结构定界符中和（防御纵深）：中和 `</spec_docs>` 段闭合标签（大小写不敏感），
+/// 防内容跳出参照块伪造评审指令（`<spec_docs>` XML 是唯一真出口）。代码围栏不中和（非安全
+/// 边界，与 dossier/diff 一致）。散文级注入挡不住（LLM 固有），归安全组 T45。
 /// 实现收敛到 `prompt::neutralize_structure`（Task 4，dossier entries 同类风险共用一套）。
 fn neutralize_spec_delimiters(content: &str) -> String {
     crate::prompt::neutralize_structure(content, &["spec_docs"])
@@ -564,8 +565,8 @@ pub(crate) fn render_spec_section_capped(spec_paths: &[String], cap: usize) -> (
             }
             content.truncate(cut);
         }
-        // 结构定界符中和（dogfood fence 逃逸，防御纵深）：中和 spec 内容里的 ``` 代码围栏
-        // 与 </spec_docs> 段闭合标签（大小写不敏感），使内容无法跳出参照块伪造评审指令。
+        // 结构定界符中和（防御纵深）：中和 spec 内容里的 </spec_docs> 段闭合标签（大小写
+        // 不敏感），使内容无法跳出参照块伪造评审指令。（代码围栏不中和，非安全边界。）
         // ⚠️ 已知天花板：这挡结构逃逸，挡不住散文级 prompt 注入（"忽略以上规则…"明文）——
         // 那是 LLM 读自然语言的固有问题，与 render_dossier_section 包裹被审代码同款暴露面；
         // 不可信 spec 的内容注入归 M16 安全组的「不可信内容处置」统一治理（见 T45）。
