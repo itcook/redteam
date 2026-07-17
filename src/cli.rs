@@ -363,9 +363,53 @@ fn parse_need_lines(lines: Option<&str>) -> Option<(u32, u32)> {
     (a >= 1 && a <= b).then_some((a, b))
 }
 
+/// needs 读 denylist（E11-Q4）：即便 git-tracked 也拒——凭据类文件 + 工具自建/VCS 内部目录。
+/// 与 `is_sensitive_spec_path`（--spec 路径，用户提供、信任模型不同）同族但独立：路径前缀/
+/// 后缀匹配，不判内容（needs 读点无 PEM 嗅探，路径已够收窄威胁面）。
+fn is_needs_denylisted(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    // .env 家族：.env / .env.local / .env.production 等变体全拒。
+    if base == ".env" || base.ends_with(".env") || base.starts_with(".env.") || base.contains(".env.") {
+        return true;
+    }
+    if base.ends_with(".pem") || base.ends_with(".key") {
+        return true;
+    }
+    if base == "id_rsa" || base == "id_ed25519" {
+        return true;
+    }
+    // 工具自建目录（.redteam/）与 VCS 内部目录（.git/）——任意路径深度，逐段匹配。
+    lower.split(['/', '\\']).any(|seg| seg == ".redteam" || seg == ".git")
+}
+
+/// 二阶段补查 needs 读守卫（E11-Q4，dogfood 抓）：needs 是模型声明的路径（"我要读 X 文件"）——
+/// 威胁模型 B（本地审不可信仓）下若不设限即为任意文件读。仅放行「git-tracked ∧ 非 denylist」。
+/// git 判定失败（非 git 仓/git 缺失/命令报错）→ 保守拒（fail-closed，安全侧优先于可用性）。
+/// worktree 下必须用 `root`（`current_dir`），不能信进程 cwd——镜像 evidence/git.rs 的 git_at 手法。
+fn need_read_allowed(root: &Path, rel: &str) -> Result<(), &'static str> {
+    if is_needs_denylisted(rel) {
+        return Err("敏感路径（denylist 命中）");
+    }
+    match std::process::Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--error-unmatch", rel])
+        .output()
+    {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(_) => Err("非 git-tracked"),
+        Err(_) => Err("git 不可用（fail-closed）"),
+    }
+}
+
 /// 单条 need → `## 补查证据` 段：lines 合法 → ±30 行窗；缺失/坏格式 → 整文件。
-/// 路径安全走 ToolExecutor 不变量（绝对路径/`..`/symlink 逃逸/不可读 → None、不 panic）。
-fn need_section(ex: &crate::tools::ToolExecutor, need: &crate::domain::NeedEntry) -> Option<String> {
+/// 路径安全走 ToolExecutor 不变量（绝对路径/`..`/symlink 逃逸/不可读 → None、不 panic）+
+/// `need_read_allowed` 守卫（git-tracked ∧ 非 denylist，E11-Q4）；守卫拒则 skip + eprintln 披露。
+fn need_section(ex: &crate::tools::ToolExecutor, root: &Path, need: &crate::domain::NeedEntry) -> Option<String> {
+    if let Err(reason) = need_read_allowed(root, &need.path) {
+        eprintln!("redteam: needs 读被拒（{reason}）：{}", need.path);
+        return None;
+    }
     let text = ex.read_capped(&need.path)?;
     let lines: Vec<&str> = text.lines().collect();
     let n = lines.len();
@@ -602,22 +646,37 @@ pub(crate) fn second_pass_prompt(
 ) -> Option<String> {
     let own = bundles.get(idx)?;
     let ex = crate::tools::ToolExecutor::new(root);
+    // 变更集文件路径集合（披露用，E11-Q4）：needs 读的文件若不在其中即「变更集外」——
+    // 即便 git-tracked 守卫放行，人（威胁模型 B 在场）也该知道读出了 diff 之外的内容。
+    let changeset: std::collections::HashSet<&str> =
+        bundles.iter().flat_map(|b| &b.files).map(|fc| fc.path.as_str()).collect();
+    let disclose_scope = |path: &str| {
+        if !changeset.contains(path) {
+            eprintln!("redteam: needs 读取变更集外文件：{path}");
+        }
+    };
     // 两遍走：先收整文件条目——同 path 全文与行窗并存时全文优先（全文是超集，互斥防双重注入）。
     let mut full_paths: Vec<String> = Vec::new();
     for need in needs {
-        if parse_need_lines(need.lines.as_deref()).is_none()
-            && !full_paths.contains(&need.path)
-            && ex.read_capped(&need.path).is_some()
-        {
-            // ponytail: read_capped 在此只当路径安全验证用（内容由 build_pack 自己读）——
-            // needs ≤5 条/格，多读一次成本可忽略，省一个只为验证的旁路 API。
-            full_paths.push(need.path.clone());
+        if parse_need_lines(need.lines.as_deref()).is_none() && !full_paths.contains(&need.path) {
+            match need_read_allowed(root, &need.path) {
+                Ok(()) => {
+                    // ponytail: read_capped 在此只当路径安全验证用（内容由 build_pack 自己读）——
+                    // needs ≤5 条/格，多读一次成本可忽略，省一个只为验证的旁路 API。
+                    if ex.read_capped(&need.path).is_some() {
+                        disclose_scope(&need.path);
+                        full_paths.push(need.path.clone());
+                    }
+                }
+                Err(reason) => eprintln!("redteam: needs 读被拒（{reason}）：{}", need.path),
+            }
         }
     }
     let mut evidence = String::new();
     for need in needs {
         if parse_need_lines(need.lines.as_deref()).is_some() && !full_paths.contains(&need.path) {
-            if let Some(sec) = need_section(&ex, need) {
+            if let Some(sec) = need_section(&ex, root, need) {
+                disclose_scope(&need.path);
                 evidence.push_str(&sec);
             }
         }
@@ -2360,6 +2419,9 @@ mod tests {
         std::fs::write(root.join("src/a.rs"), "fn own() { let z = 1; }\n").unwrap();
         std::fs::write(root.join("src/b.rs"), "fn sib() {}\n").unwrap();
         std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
+        // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
+        super::incremental_tests::git_repo(root);
+        super::incremental_tests::commit_all(root, "init");
         let bundles = vec![
             Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into() }] },
             Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn sib() {}\n".into() }] },
@@ -2393,6 +2455,9 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "fn own() { let z = 1; }\n").unwrap();
         std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
+        // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
+        super::incremental_tests::git_repo(root);
+        super::incremental_tests::commit_all(root, "init");
         let bundles = vec![Bundle { files: vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into(),
         }] }];
@@ -2418,6 +2483,9 @@ mod tests {
         let body: String = (1..=200).map(|i| format!("line{i}\n")).collect();
         std::fs::write(root.join("src/long.rs"), &body).unwrap();
         std::fs::write(root.join("src/other.rs"), "pub fn other_evidence() {}\n").unwrap();
+        // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
+        super::incremental_tests::git_repo(root);
+        super::incremental_tests::commit_all(root, "init");
         let bundles = vec![Bundle { files: vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
         }] }];
@@ -2464,6 +2532,9 @@ mod tests {
         std::fs::write(root.join("src/a.rs"), "fn own() {}\n").unwrap();
         let huge_line = "x".repeat(100_000); // 无换行——lines() 只有 1 行
         std::fs::write(root.join("src/minified.rs"), &huge_line).unwrap();
+        // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
+        super::incremental_tests::git_repo(root);
+        super::incremental_tests::commit_all(root, "init");
         let bundles = vec![Bundle { files: vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
         }] }];
@@ -2472,6 +2543,28 @@ mod tests {
         assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);
         assert!(p.contains("fn own()"), "证据段截断后 pack 仍照常渲染自家文件");
         assert!(p.len() < 300_000, "总 prompt 长度被证据帽拘住，未逼近原 100KB 单行体量: {}", p.len());
+    }
+
+    #[test]
+    fn needs_rejects_untracked_and_sensitive_paths() {
+        // E11-Q4 dogfood 抓：二阶段补查 needs 是模型声明路径——威胁模型 B 下不设限即任意文件读。
+        // git repo fixture：tracked src/foo.rs 提交后放行；untracked .env / 工具自建
+        // .redteam/proj.db 命中 denylist 拒（即便后者恰好也 untracked，denylist 独立于 git 判定）。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/foo.rs"), "fn a(){}\n").unwrap();
+        super::incremental_tests::git_repo(root);
+        super::incremental_tests::commit_all(root, "init");
+        std::fs::write(root.join(".env"), "SECRET=x\n").unwrap(); // 提交后再写，保证真 untracked
+        assert!(need_read_allowed(root, "src/foo.rs").is_ok(), "tracked 源文件放行");
+        assert!(need_read_allowed(root, ".env").is_err(), "untracked 敏感文件拒");
+        assert!(need_read_allowed(root, ".redteam/proj.db").is_err(), "工具自建 untracked 拒（denylist）");
+
+        // fail-closed：非 git 仓（或 git 判定失败）时即便文件存在也保守拒，不放行。
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::write(tmp2.path().join("bare.rs"), "fn b(){}\n").unwrap();
+        assert!(need_read_allowed(tmp2.path(), "bare.rs").is_err(), "非 git 仓 fail-closed 拒");
     }
 
     #[test]
