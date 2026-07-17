@@ -391,9 +391,13 @@ fn need_read_allowed(root: &Path, rel: &str) -> Result<(), &'static str> {
     if is_needs_denylisted(rel) {
         return Err("敏感路径（denylist 命中）");
     }
+    // rel 是模型控制路径（dogfood 2026-07-17 抓）——`--` 停止选项解析（防 `-x`/`--cached` 式
+    // 参数注入），`GIT_LITERAL_PATHSPECS=1` 禁 pathspec 魔法（防 `:(glob)`/`:!` 式让未跟踪文件
+    // 蒙混过 --error-unmatch）。两道叠加使 rel 恒被当字面路径校验。
     match std::process::Command::new("git")
         .current_dir(root)
-        .args(["ls-files", "--error-unmatch", rel])
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .args(["ls-files", "--error-unmatch", "--", rel])
         .output()
     {
         Ok(out) if out.status.success() => Ok(()),
@@ -2550,6 +2554,12 @@ mod tests {
         let tmp2 = tempfile::tempdir().unwrap();
         std::fs::write(tmp2.path().join("bare.rs"), "fn b(){}\n").unwrap();
         assert!(need_read_allowed(tmp2.path(), "bare.rs").is_err(), "非 git 仓 fail-closed 拒");
+
+        // dogfood 2026-07-17：git 参数/pathspec 注入——`--` + GIT_LITERAL_PATHSPECS 后，
+        // 选项样式路径与 pathspec 魔法均不能让未跟踪内容蒙混放行。
+        assert!(need_read_allowed(root, "--cached").is_err(), "选项样式路径须拒（-- 停止选项解析）");
+        assert!(need_read_allowed(root, ":(glob)**/*.env").is_err(), "pathspec 魔法须拒（字面路径校验）");
+        assert!(need_read_allowed(root, ":!src").is_err(), "pathspec 排除魔法须拒");
     }
 
     #[test]
