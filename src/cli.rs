@@ -477,27 +477,9 @@ fn contains_pem_private_key(content: &str) -> bool {
 
 /// spec 内容结构定界符中和（dogfood #1 防御纵深）：``` 代码围栏 + `</spec_docs>` 段闭合标签
 /// （大小写不敏感）转义，防内容跳出参照块。散文级注入挡不住（LLM 固有），归安全组 T45。
+/// 实现收敛到 `prompt::neutralize_structure`（Task 4，dossier entries 同类风险共用一套）。
 fn neutralize_spec_delimiters(content: &str) -> String {
-    let mut out = content.replace("```", "ˋˋˋ"); // 代码围栏 → 视觉等价的 modifier grave（非 markdown 围栏）
-    // </spec_docs> 大小写不敏感中和（保留可读性，只破其定界作用）。
-    let lower = out.to_ascii_lowercase();
-    if lower.contains("</spec_docs>") {
-        let mut result = String::with_capacity(out.len());
-        let (mut i, tag) = (0usize, "</spec_docs>");
-        while i < out.len() {
-            if lower[i..].starts_with(tag) {
-                result.push_str("<\\/spec_docs>");
-                i += tag.len();
-            } else {
-                // 逐字符推进（UTF-8 安全）
-                let ch_len = out[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-                result.push_str(&out[i..i + ch_len]);
-                i += ch_len;
-            }
-        }
-        out = result;
-    }
-    out
+    crate::prompt::neutralize_structure(content, &["spec_docs"])
 }
 
 /// 读 --spec 文档 → 有界参照段（供 [L0] 实现-对照-设计）。返回 (段, 用掉字节)。
