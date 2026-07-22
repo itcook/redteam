@@ -13,6 +13,16 @@ pub enum JobStatus {
     TimedOut,
 }
 
+impl JobStatus {
+    /// 终态：不可再转移，落定后永不被覆盖（E12 首个终态封盘）。
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled | JobStatus::TimedOut
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -122,6 +132,33 @@ pub fn list_states(ws: &Path) -> Vec<JobState> {
         .and_then(|d| d.job_all_states().ok())
         .map(|rows| rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
         .unwrap_or_default()
+}
+
+/// 守卫式状态更新（E12 并发组核心）：db 事务内取现状 → 反序列化 → **若已终态则整个更新放弃**
+/// （首个终态封盘：任一终态落定后，progress/终态/任何字段都不再被写）→ 否则 `mutate` 改后写回。
+/// 返回是否实际写入（`false`=被终态封盘拦下 / job 不存在 / 反序列化失败）。
+/// 所有 job 状态写点（进度、phase、终态、cancel、收尸、panic 兜底）统一走这里，杜绝非原子 RMW。
+pub fn update_state_if_active(
+    ws: &Path,
+    id: &str,
+    mutate: impl FnOnce(&mut JobState),
+) -> std::io::Result<bool> {
+    let mut db = crate::db::ProjDb::open(ws).map_err(std::io::Error::other)?;
+    let mut wrote = false;
+    let mut mutate = Some(mutate);
+    db.job_update_guarded(id, |cur| {
+        let json = cur?;
+        let mut st: JobState = serde_json::from_str(&json).ok()?;
+        if st.status.is_terminal() {
+            return None; // 首个终态封盘
+        }
+        (mutate.take().unwrap())(&mut st);
+        let out = serde_json::to_string(&st).ok()?;
+        wrote = true;
+        Some(out)
+    })
+    .map_err(std::io::Error::other)?;
+    Ok(wrote)
 }
 
 
@@ -246,5 +283,58 @@ mod tests {
         let old = r#"{"job_id":"x","status":"running","started_at":1}"#;
         let back: JobState = serde_json::from_str(old).unwrap();
         assert!(back.phase_history.is_empty());
+    }
+
+    #[test]
+    fn is_terminal_covers_four() {
+        assert!(!JobStatus::Pending.is_terminal());
+        assert!(!JobStatus::Running.is_terminal());
+        assert!(JobStatus::Done.is_terminal());
+        assert!(JobStatus::Failed.is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
+        assert!(JobStatus::TimedOut.is_terminal());
+    }
+
+    #[test]
+    fn update_active_applies_and_freezes_on_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Running;
+        write_state(ws, &st).unwrap();
+        // 非终态 → 应用
+        let wrote = update_state_if_active(ws, "j", |s| s.status = JobStatus::Done).unwrap();
+        assert!(wrote);
+        assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done);
+        // 已终态 → 拒写（首个终态封盘），status 不动
+        let wrote2 = update_state_if_active(ws, "j", |s| s.status = JobStatus::Cancelled).unwrap();
+        assert!(!wrote2);
+        assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done);
+    }
+
+    #[test]
+    fn update_active_missing_job_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!update_state_if_active(dir.path(), "nope", |_s| {}).unwrap());
+    }
+
+    #[test]
+    fn concurrent_progress_no_lost_update() {
+        // 10 线程各 +1，跨独立连接靠守卫串行化 → done 精确 10（无 RMW 丢更新）
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let ws: Arc<std::path::PathBuf> = Arc::new(dir.path().to_path_buf());
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Running;
+        write_state(&ws, &st).unwrap();
+        let mut hs = vec![];
+        for _ in 0..10 {
+            let ws = Arc::clone(&ws);
+            hs.push(std::thread::spawn(move || {
+                update_state_if_active(&ws, "j", |s| s.progress.done += 1).unwrap();
+            }));
+        }
+        for h in hs { h.join().unwrap(); }
+        assert_eq!(read_state(&ws, "j").unwrap().progress.done, 10);
     }
 }

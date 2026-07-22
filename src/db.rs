@@ -385,6 +385,33 @@ impl ProjDb {
             .map_err(Into::into)
     }
 
+    /// 守卫式读改写：`BEGIN IMMEDIATE` 事务内取现 `state_json` → 交调用方闭包 → 闭包返
+    /// `Some(新json)` 才 UPDATE、返 `None` 放弃写。空串（args/manifest 先建行、state 未写）
+    /// 视同不存在→传 `None`。跨进程原子性靠 SQLite 写锁：`Immediate` 在 BEGIN 即取写锁，
+    /// 配合已设的 `busy_timeout(5s)` 让并发写者排队而非丢更新（后台 worker 收尾 × 宿主 cancel
+    /// 同刻竞争终态的关键序列化点）。db 层不识 `JobState`——只搬 JSON 字符串。
+    pub fn job_update_guarded<F>(&mut self, job_id: &str, f: F) -> Result<()>
+    where
+        F: FnOnce(Option<String>) -> Option<String>,
+    {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .query_row("SELECT state_json FROM jobs WHERE job_id=?1", params![job_id], |r| r.get(0))
+            .optional()?;
+        let current = current.filter(|s| !s.is_empty());
+        if let Some(new_json) = f(current) {
+            tx.execute(
+                "INSERT INTO jobs (job_id, state_json) VALUES (?1,?2)
+                 ON CONFLICT(job_id) DO UPDATE SET state_json=?2",
+                params![job_id, new_json],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
 }
 
 fn row_to_card(r: &rusqlite::Row<'_>) -> rusqlite::Result<DismissCard> {
@@ -581,5 +608,43 @@ mod tests {
 
         let hist = db.resolve_history("a1b2c3d4e5f60718").unwrap();
         assert_eq!(hist[1].1, "重构 API", "再销案 history reason（新值）");
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn guarded_none_aborts_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ProjDb::open(dir.path()).unwrap();
+        db.job_put_state("j", r#"{"v":1}"#).unwrap();
+        // 闭包返 None → 不写
+        db.job_update_guarded("j", |_cur| None).unwrap();
+        assert_eq!(db.job_get_state("j").unwrap().as_deref(), Some(r#"{"v":1}"#));
+    }
+
+    #[test]
+    fn guarded_some_writes_and_sees_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ProjDb::open(dir.path()).unwrap();
+        db.job_put_state("j", r#"{"v":1}"#).unwrap();
+        db.job_update_guarded("j", |cur| {
+            assert_eq!(cur.as_deref(), Some(r#"{"v":1}"#)); // 事务内见现值
+            Some(r#"{"v":2}"#.to_string())
+        }).unwrap();
+        assert_eq!(db.job_get_state("j").unwrap().as_deref(), Some(r#"{"v":2}"#));
+    }
+
+    #[test]
+    fn guarded_empty_state_is_none() {
+        // args/manifest 先建行、state 空串 → 闭包收 None
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ProjDb::open(dir.path()).unwrap();
+        db.job_put_args("j", r#"{"a":1}"#).unwrap(); // state_json=''
+        let mut seen = Some("x".to_string());
+        db.job_update_guarded("j", |cur| { seen = cur.clone(); None }).unwrap();
+        assert_eq!(seen, None);
     }
 }
