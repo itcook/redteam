@@ -576,17 +576,29 @@ async fn main() {
         Cmd::Cancel { job_id } => {
             let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             match redteam::state::job::read_state(&ws, &job_id) {
-                Some(mut s) if matches!(s.status, redteam::state::job::JobStatus::Running | redteam::state::job::JobStatus::Pending) => {
+                Some(s) if matches!(s.status, redteam::state::job::JobStatus::Running | redteam::state::job::JobStatus::Pending) => {
+                    // 仅当 worker 进程确活（pid 存活 且 身份锚吻合）才发信号——否则 pid 可能已被
+                    // OS 复用给无辜进程，盲发 SIGTERM 会误杀（E12-Q3/bug③）。
                     if let Some(pid) = s.pid {
-                        // SAFETY: kill 单系统调用；pid 来自本 workspace 自己写的状态。
-                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                        if redteam::procinfo::is_worker_alive(pid, s.pid_start) {
+                            // SAFETY: kill 单系统调用；已确认 pid 属本 job 原进程。
+                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                        }
                     }
-                    s.status = redteam::state::job::JobStatus::Cancelled;
-                    if let Err(e) = redteam::state::job::write_state(&ws, &s) {
-                        eprintln!("warning: process killed but cancelled state not persisted (status may keep showing running): {e}");
+                    // 守卫写 Cancelled：若 worker 已抢先落终态（Done/Failed/TimedOut），守卫拒写、
+                    // 保留其终态（首个终态封盘/bug①）。wrote=false 即被封盘。
+                    let wrote = redteam::state::job::update_state_if_active(&ws, &job_id, |st| {
+                        st.status = redteam::state::job::JobStatus::Cancelled;
+                    })
+                    .unwrap_or(false);
+                    if wrote {
+                        println!("cancelled {job_id}");
+                        0
+                    } else {
+                        let now = redteam::state::job::read_state(&ws, &job_id).map(|s| s.status);
+                        eprintln!("job {job_id} already finished ({now:?}), not cancelled");
+                        2
                     }
-                    println!("cancelled {job_id}");
-                    0
                 }
                 Some(s) => { eprintln!("job {job_id} not cancellable (status: {:?})", s.status); 2 }
                 None => { eprintln!("no such job: {job_id}"); 2 }
