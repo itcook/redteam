@@ -486,6 +486,24 @@ async fn main() {
             let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let ws = cwd.clone();
+            // 进程级 panic 兜底（E12-Q4，真·顶层）：worker 评审体若 panic，落 Failed 终态再正常
+            // 展开——否则状态永停 Running（惰性收尸只治「进程已死」，panic 与退出间有窗口）。
+            // hook 是 'static Fn，捕获 ws/job_id 的 clone；只取 payload message，不带 backtrace。
+            {
+                let ws_h = ws.clone();
+                let jid_h = job_id.clone();
+                let default_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    let msg = info
+                        .payload()
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    redteam::cli::mark_failed_panic(&ws_h, &jid_h, &msg);
+                    default_hook(info);
+                }));
+            }
             let args_json = match redteam::state::store::read_args_raw(&ws, &job_id) {
                 Some(j) => j,
                 None => {

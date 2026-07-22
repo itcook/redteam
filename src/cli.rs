@@ -1476,6 +1476,18 @@ pub fn reap_if_dead(ws: &Path, st: crate::state::job::JobState) -> crate::state:
     }
 }
 
+/// panic 兜底落终态（E12-Q4）：worker 评审体 panic 时由 panic hook 调用，守卫式把 Running
+/// 落 Failed（error 只带 message、不带 backtrace/location——B 下报告要干净）。若 panic 发生在
+/// 真完成之后，守卫拒写、保留真终态。
+pub fn mark_failed_panic(ws: &Path, job_id: &str, msg: &str) {
+    let msg = msg.to_string();
+    let _ = crate::state::job::update_state_if_active(ws, job_id, |st| {
+        st.status = crate::state::job::JobStatus::Failed;
+        st.error = Some(format!("panic: {msg}"));
+        st.exit_code = Some(2);
+    });
+}
+
 #[cfg(test)]
 mod job_tests {
     use super::*;
@@ -1783,6 +1795,35 @@ mod job_tests {
         let out = reap_if_dead(ws, stale);
         assert_eq!(out.status, JobStatus::Done, "必须重读拿到真 Done，而非陈旧 Running 快照或误杀 Failed");
         assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done, "db 现状不应被 reap 覆盖");
+    }
+
+    #[test]
+    fn mark_failed_panic_sets_failed_with_message_only() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Running;
+        write_state(ws, &st).unwrap();
+        mark_failed_panic(ws, "j", "index out of bounds");
+        let back = read_state(ws, "j").unwrap();
+        assert_eq!(back.status, JobStatus::Failed);
+        let err = back.error.unwrap_or_default();
+        assert!(err.contains("panic"), "error 应标 panic: {err}");
+        assert!(err.contains("index out of bounds"));
+    }
+
+    #[test]
+    fn mark_failed_panic_respects_terminal_freeze() {
+        // panic 发生在真完成之后 → 守卫拒写、保留 Done
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Done;
+        write_state(ws, &st).unwrap();
+        mark_failed_panic(ws, "j", "late panic");
+        assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done);
     }
 }
 
