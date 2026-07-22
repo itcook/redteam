@@ -1433,6 +1433,49 @@ pub async fn run_job(
     }
 }
 
+/// 惰性收尸（E12-Q2）：`status`/`list` 读状态时，对 Running 但 worker 进程已死（或 pid 被复用）
+/// 的 job，就地落 **Failed** 终态并返回更新后状态（无常驻守护进程——裸终端工具无 daemon，YAGNI）。
+/// 走守卫写：若此刻 worker 恰好真完成写了 Done，守卫拒写；无论写成功与否都重读 db 真相返回——
+/// 绝不落回调用方传入的陈旧 Running 快照 `st`（那会把已完成/已消失的 job 谎报成仍在 Running）。
+pub fn reap_if_dead(ws: &Path, st: crate::state::job::JobState) -> crate::state::job::JobState {
+    use crate::state::job::{read_state, JobStatus};
+    if st.status != JobStatus::Running {
+        return st;
+    }
+    let pid = match st.pid {
+        Some(p) => p,
+        None => return st, // 无 pid 无从判定，保守放过
+    };
+    if crate::procinfo::is_worker_alive(pid, st.pid_start) {
+        return st;
+    }
+    let job_id = st.job_id.clone();
+    let wrote = crate::state::job::update_state_if_active(ws, &job_id, |s| {
+        s.status = JobStatus::Failed;
+        s.error = Some("worker process died (reaped)".to_string());
+        s.exit_code = Some(2);
+    })
+    .unwrap_or(false);
+    // 成功：拿到刚写的 Failed；被拒（终态封盘生效，说明 worker 在探活与落笔间的极小窗口内
+    // 已真完成/被 cancel）：重读拿到真终态，而非误判为 Running 或误写为 Failed。
+    match read_state(ws, &job_id) {
+        Some(fresh) => fresh,
+        None => {
+            // 重读也扑空（job 状态被并发移除等极端情况）：明确降级返回 Failed，绝不复用
+            // 调用方传入的陈旧 Running 快照——那同样会谎报「已消失」的 job 仍在 Running。
+            let mut degraded = st;
+            degraded.status = JobStatus::Failed;
+            degraded.error = Some(if wrote {
+                "worker process died (reaped)".to_string()
+            } else {
+                "job state vanished during reap (degraded)".to_string()
+            });
+            degraded.exit_code = Some(2);
+            degraded
+        }
+    }
+}
+
 #[cfg(test)]
 mod job_tests {
     use super::*;
@@ -1659,6 +1702,87 @@ mod job_tests {
             st.progress.done, n as u32,
             "并发 on_cell 不应丢更新（无锁会 < {n}）"
         );
+    }
+
+    #[test]
+    fn reap_dead_running_job_to_failed() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        // 起一个立即退出的子进程做「死 worker」
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let mut child = child; child.wait().unwrap();
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Running;
+        st.pid = Some(pid);
+        st.pid_start = None; // 降级纯存活探测；pid 已回收 → 死
+        write_state(ws, &st).unwrap();
+        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        assert_eq!(out.status, JobStatus::Failed);
+        assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Failed);
+        assert!(out.error.as_deref().unwrap_or("").contains("reaped"));
+    }
+
+    #[test]
+    fn reap_leaves_alive_running_untouched() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let me = std::process::id(); // 本进程恒活
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Running;
+        st.pid = Some(me);
+        st.pid_start = crate::procinfo::start_time(me);
+        write_state(ws, &st).unwrap();
+        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        assert_eq!(out.status, JobStatus::Running); // 活着 → 不动
+    }
+
+    #[test]
+    fn reap_ignores_terminal_jobs() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Done;
+        st.pid = Some(999_999); // 不存在的 pid，但已终态 → 不该被碰
+        write_state(ws, &st).unwrap();
+        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        assert_eq!(out.status, JobStatus::Done);
+    }
+
+    /// 回归（并发完成竞态）：`reap_if_dead` 拿到的 `st` 是调用方早先读到的陈旧 Running 快照；
+    /// 在探活与守卫落笔之间的极小窗口内，worker 已经真完成并把 db 现状推进到 Done（首个终态
+    /// 封盘生效）。此时守卫写必被拒——绝不能因此把 stale 快照直接吐回去（会谎报「已完成」的
+    /// job 仍是 Running），也绝不能强行把它冲成 Failed（会误杀真完成的 job）。必须重读 db 拿到
+    /// 真 Done。
+    #[test]
+    fn reap_concurrent_completion_not_clobbered() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let mut child = child; child.wait().unwrap();
+        // 调用方（如 status 的 list 分支）早先读到的快照：Running + 死 pid。
+        let mut stale = JobState::new("j", 0);
+        stale.status = JobStatus::Running;
+        stale.pid = Some(pid);
+        stale.pid_start = None;
+        write_state(ws, &stale).unwrap();
+        // 模拟窗口期内 worker 真完成：db 现状推进到 Done（守卫写，此时尚未终态封盘）。
+        let wrote = crate::state::job::update_state_if_active(ws, "j", |s| {
+            s.status = JobStatus::Done;
+            s.exit_code = Some(0);
+        })
+        .unwrap();
+        assert!(wrote, "模拟的「worker 真完成」写应成功（此时仍是 Running，未终态封盘）");
+        // reap_if_dead 拿到的仍是旧的 stale 快照，但 db 里已是 Done：
+        // 守卫写应被终态封盘拒绝，必须重读拿到真 Done——不可被冲成 Failed，也不可原样报告 Running。
+        let out = reap_if_dead(ws, stale);
+        assert_eq!(out.status, JobStatus::Done, "必须重读拿到真 Done，而非陈旧 Running 快照或误杀 Failed");
+        assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done, "db 现状不应被 reap 覆盖");
     }
 }
 

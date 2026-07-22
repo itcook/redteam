@@ -535,8 +535,14 @@ async fn main() {
             } else {
             // 两分支统一收集（列表 / 单 job），再按 format 分流；json 输出形状与改动前逐字节一致。
             let jobs: Option<Vec<redteam::state::job::JobState>> = match &job_id {
-                None => Some(redteam::state::job::list_states(&ws)),
-                Some(id) => redteam::state::job::read_state(&ws, id).map(|st| vec![st]),
+                None => Some(
+                    redteam::state::job::list_states(&ws)
+                        .into_iter()
+                        .map(|st| redteam::cli::reap_if_dead(&ws, st))
+                        .collect(),
+                ),
+                Some(id) => redteam::state::job::read_state(&ws, id)
+                    .map(|st| vec![redteam::cli::reap_if_dead(&ws, st)]),
             };
             match jobs {
                 None => { eprintln!("no such job: {}", job_id.unwrap_or_default()); 2 }
