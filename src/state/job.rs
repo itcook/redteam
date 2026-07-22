@@ -152,10 +152,18 @@ pub fn update_state_if_active(
     let mut wrote = false;
     let mut mutate = Some(mutate);
     db.job_update_guarded(id, |cur| {
-        let json = cur?;
-        let mut st: JobState = serde_json::from_str(&json).ok()?;
+        let json = cur?; // job 不存在/state 未写：正常静默放弃，非异常
+        let mut st: JobState = match serde_json::from_str(&json) {
+            Ok(st) => st,
+            Err(e) => {
+                // schema 演进导致的反序列化失败与「终态封盘」同为放弃写，但语义不同——
+                // 前者是数据/代码不一致的异常信号，不打印会与正常封盘混淆、难以排查。
+                eprintln!("warn: job {id} state_json 反序列化失败，更新被跳过: {e}");
+                return None;
+            }
+        };
         if st.status.is_terminal() {
-            return None; // 首个终态封盘
+            return None; // 首个终态封盘（正常分支，不告警）
         }
         (mutate.take().unwrap())(&mut st);
         let out = serde_json::to_string(&st).ok()?;

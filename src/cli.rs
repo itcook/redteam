@@ -1010,51 +1010,44 @@ fn now_unix() -> u64 {
 }
 
 /// R2.1 job checkpoint sink：扇出前落 manifest（+刷 progress.total），每 cell 完成落 partial
-/// （+刷 last_active/progress.done）。Bug B 修复：现在 on_cell 由并发 fan-out future 直接触发
-/// （见 orchestrate/mod.rs），read_state→改→write_state 的 read-modify-write 段必须串行化，
-/// 否则并发 cell 各自读到同一旧值、+1 后互相覆盖，丢更新。
-/// ponytail：全局互斥锁最省事且正确——cell 完成是低频事件，锁粒度不值当细化。
+/// （+刷 last_active/progress.done）。所有 JobState 写走 `update_state_if_active`（守卫式
+/// 读改写）——事务内 `progress.done += 1` 消除并发 cell 的 RMW 丢更新（原进程内 Mutex 只护
+/// worker 自身、跨不进 cancel 进程；守卫靠 SQLite 写锁跨进程串行化，故 Mutex 退役）。
+/// 终态封盘：job 已终态（如被 cancel）时守卫拒写，sink 的迟到进度不复活状态。
 struct JobCellSink {
     ws: std::path::PathBuf,
     job_id: String,
-    lock: std::sync::Mutex<()>,
 }
 
 impl CellSink for JobCellSink {
     fn manifest(&self, inputs: &[crate::state::store::CellInput]) {
-        let _g = self.lock.lock().unwrap();
         let _ = crate::state::store::write_manifest(&self.ws, &self.job_id, inputs);
-        if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
-            st.progress.total = inputs.len() as u32;
+        let total = inputs.len() as u32;
+        let _ = crate::state::job::update_state_if_active(&self.ws, &self.job_id, |st| {
+            st.progress.total = total;
             st.set_phase(crate::state::job::Phase::Fanout, None);
-            let _ = crate::state::job::write_state(&self.ws, &st);
-        }
+        });
     }
 
     fn on_cell(&self, rec: crate::state::store::CellRecord) {
-        let _g = self.lock.lock().unwrap();
         let _ = crate::state::store::append_partial(&self.ws, &self.job_id, &rec);
-        if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
+        let _ = crate::state::job::update_state_if_active(&self.ws, &self.job_id, |st| {
             st.last_active = now_unix();
             st.progress.done += 1;
-            let _ = crate::state::job::write_state(&self.ws, &st);
-        }
+        });
     }
 
     fn on_phase(&self, phase: crate::state::job::Phase, note: Option<String>) {
-        let _g = self.lock.lock().unwrap();
-        if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
+        let _ = crate::state::job::update_state_if_active(&self.ws, &self.job_id, |st| {
             st.set_phase(phase, note);
-            let _ = crate::state::job::write_state(&self.ws, &st);
-        }
+        });
     }
 
     fn on_meta(&self, models: &[String]) {
-        let _g = self.lock.lock().unwrap();
-        if let Some(mut st) = crate::state::job::read_state(&self.ws, &self.job_id) {
-            st.models = models.to_vec();
-            let _ = crate::state::job::write_state(&self.ws, &st);
-        }
+        let models = models.to_vec();
+        let _ = crate::state::job::update_state_if_active(&self.ws, &self.job_id, |st| {
+            st.models = models;
+        });
     }
 }
 
@@ -1337,11 +1330,11 @@ pub async fn run_resume(
     }
 }
 
-/// 落终态部分报告：渲染 json+md、写 result 文件、把 state 转终态并记录错误原因。
+/// 落终态部分报告：渲染 json+md、写 result 文件、守卫式把 state 转终态并记录错误原因。
+/// 走 `update_state_if_active`：若期间已被 cancel（终态），守卫拒写、保留 Cancelled（首个终态封盘）。
 fn write_partial_result(
     ws: &Path,
     job_id: &str,
-    st: &mut crate::state::job::JobState,
     status: crate::state::job::JobStatus,
     report: &ReviewReport,
     code: i32,
@@ -1351,11 +1344,12 @@ fn write_partial_result(
     let md = crate::output::render(report, crate::output::Format::Md);
     let _ = crate::state::store::write_result(ws, job_id, &json);
     let _ = crate::state::store::write_result_md(ws, job_id, &md);
-    st.status = status;
-    st.error = Some(error);
-    st.exit_code = Some(code);
-    st.result_path = Some(format!("proj.db#results/{job_id}"));
-    let _ = crate::state::job::write_state(ws, st);
+    let _ = crate::state::job::update_state_if_active(ws, job_id, |st| {
+        st.status = status;
+        st.error = Some(error);
+        st.exit_code = Some(code);
+        st.result_path = Some(format!("proj.db#results/{job_id}"));
+    });
 }
 
 /// 状态机包裹评审：running → (评审) → done+result.json / failed+error。返回退出码。
@@ -1382,7 +1376,7 @@ pub async fn run_job(
     st.set_phase(crate::state::job::Phase::Collecting, None);
     let _ = write_state(ws, &st);
 
-    let sink = JobCellSink { ws: ws.to_path_buf(), job_id: job_id.to_string(), lock: std::sync::Mutex::new(()) };
+    let sink = JobCellSink { ws: ws.to_path_buf(), job_id: job_id.to_string() };
     let dispatch = run_review_dispatch(args, provider, cfg, cwd, Some(&sink));
 
     // Outcome 只在本函数内构造/匹配一次，Box 间接层不值当——沿用 main.rs Cmd 枚举同款 allow。
@@ -1414,33 +1408,26 @@ pub async fn run_job(
             let md = crate::output::render(&report, crate::output::Format::Md);
             let _ = write_result(ws, job_id, &json);
             let _ = crate::state::store::write_result_md(ws, job_id, &md);
-            // 若期间已被 cancel，保留 cancelled；否则 done。
-            // Bug C 修复：以刚读到的最新状态（含 sink 在运行期写入的 progress/last_active）
-            // 为底稿叠加终态字段，而非复用函数入口处那份陈旧 st（只设过 status=Running），
-            // 否则会把 sink 写的 progress/last_active 覆盖回 0/started_at。
-            let latest = read_state(ws, job_id);
-            let cancelled = matches!(latest.as_ref().map(|s| s.status), Some(JobStatus::Cancelled));
-            let mut st = latest.unwrap_or(st);
-            st.status = if cancelled { JobStatus::Cancelled } else { JobStatus::Done };
-            st.exit_code = Some(code);
-            st.models = report.run.models.clone();
-            st.result_path = Some(format!("proj.db#results/{job_id}"));
-            let _ = write_state(ws, &st);
+            let models = report.run.models.clone();
+            // 守卫写 Done：若期间已被 cancel（Cancelled 终态），守卫拒写、保留 Cancelled
+            // （首个终态封盘）。progress/last_active 由 sink 运行期已写，这里只叠终态字段。
+            let _ = crate::state::job::update_state_if_active(ws, job_id, |st| {
+                st.status = JobStatus::Done;
+                st.exit_code = Some(code);
+                st.models = models;
+                st.result_path = Some(format!("proj.db#results/{job_id}"));
+            });
             code
         }
         Outcome::Done(Err(e)) => {
             let (report, code) = partial_report(ws, job_id, e.to_string());
-            // Bug C 修复：同上，叠加终态前先取最新状态做底稿。
-            let mut st = read_state(ws, job_id).unwrap_or(st);
-            write_partial_result(ws, job_id, &mut st, JobStatus::Failed, &report, code, e.to_string());
+            write_partial_result(ws, job_id, JobStatus::Failed, &report, code, e.to_string());
             code
         }
         Outcome::TimedOut => {
             let reason = "timed out: deadline exceeded".to_string();
             let (report, code) = partial_report(ws, job_id, reason.clone());
-            // Bug C 修复：同上，叠加终态前先取最新状态做底稿。
-            let mut st = read_state(ws, job_id).unwrap_or(st);
-            write_partial_result(ws, job_id, &mut st, JobStatus::TimedOut, &report, code, reason);
+            write_partial_result(ws, job_id, JobStatus::TimedOut, &report, code, reason);
             code
         }
     }
@@ -1648,7 +1635,6 @@ mod job_tests {
         let sink = Arc::new(JobCellSink {
             ws: ws.clone(),
             job_id: "jc1".to_string(),
-            lock: std::sync::Mutex::new(()),
         });
 
         let n = 20usize;
@@ -2680,7 +2666,7 @@ context_window_tokens = 40000
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
         write_state(&ws, &JobState::new("j", 0)).unwrap();
-        let sink = JobCellSink { ws: ws.clone(), job_id: "j".into(), lock: std::sync::Mutex::new(()) };
+        let sink = JobCellSink { ws: ws.clone(), job_id: "j".into() };
         use crate::orchestrate::CellSink;
         sink.manifest(&[crate::state::store::CellInput {
             cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
@@ -2693,7 +2679,7 @@ context_window_tokens = 40000
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
         write_state(&ws, &JobState::new("j", 0)).unwrap();
-        let sink = JobCellSink { ws: ws.clone(), job_id: "j".into(), lock: std::sync::Mutex::new(()) };
+        let sink = JobCellSink { ws: ws.clone(), job_id: "j".into() };
         use crate::orchestrate::CellSink;
         sink.on_phase(Phase::Finalizing, None);
         assert_eq!(read_state(&ws, "j").unwrap().phase, Some(Phase::Finalizing));
