@@ -450,6 +450,7 @@ async fn main() {
                 match spawn_detached_worker(&job_id) {
                     Ok(pid) => {
                         st.pid = Some(pid);
+                        st.pid_start = redteam::procinfo::start_time(pid);
                         let _ = redteam::state::job::write_state(&ws, &st);
                         println!("{job_id}");
                         std::process::exit(0);

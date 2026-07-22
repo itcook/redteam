@@ -58,6 +58,10 @@ pub struct JobState {
     pub models: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pid: Option<u32>,
+    /// pid 身份锚：`pid` 对应进程的启动时刻（Unix 秒），防 pid 复用误判（E12-Q3）。
+    /// 父进程 spawn worker 后记录；旧状态缺字段 default None → 降级纯存活探测。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pid_start: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -86,6 +90,7 @@ impl JobState {
             progress: Progress::default(),
             models: vec![],
             pid: None,
+            pid_start: None,
             exit_code: None,
             error: None,
             result_path: None,
@@ -174,7 +179,7 @@ mod tests {
             job_id: "job1".into(), status: JobStatus::Running,
             started_at: 1000, progress: Progress { done: 1, total: 3 },
             models: vec!["alpha".into()],
-            pid: Some(4242), exit_code: None, error: None, result_path: None,
+            pid: Some(4242), pid_start: None, exit_code: None, error: None, result_path: None,
             last_active: 1000, deadline_at: None, phase: None, phase_history: vec![], workspace: None,
         };
         write_state(ws, &st).unwrap();
@@ -283,6 +288,21 @@ mod tests {
         let old = r#"{"job_id":"x","status":"running","started_at":1}"#;
         let back: JobState = serde_json::from_str(old).unwrap();
         assert!(back.phase_history.is_empty());
+    }
+
+    #[test]
+    fn pid_start_roundtrips_and_legacy_defaults_none() {
+        let mut s = JobState::new("j", 0);
+        s.pid_start = Some(1_700_000_000);
+        let back: JobState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.pid_start, Some(1_700_000_000));
+        // 旧状态（无 pid_start 键）→ None
+        let old: JobState = serde_json::from_str(
+            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[]}"#
+        ).unwrap();
+        assert_eq!(old.pid_start, None);
+        // pid_start=None 省略键
+        assert!(!serde_json::to_string(&JobState::new("j", 0)).unwrap().contains("pid_start"));
     }
 
     #[test]
