@@ -1353,7 +1353,7 @@ fn write_partial_result(
 }
 
 /// 状态机包裹评审：running → (评审) → done+result.json / failed+error。返回退出码。
-/// 已被 cancel（状态 Cancelled）时不覆盖为 Done，保留 cancelled 终态。
+/// 起手若已是任意终态（Cancelled/Done/Failed/TimedOut）则早退不覆盖，保留首个终态。
 /// `st.deadline_at`（worker 起手设，见 main.rs）到点仍未完成 → TimedOut + 部分报告（R1.2）。
 pub async fn run_job(
     ws: &Path,
@@ -1364,17 +1364,27 @@ pub async fn run_job(
     cwd: &Path,
     started_at: u64,
 ) -> i32 {
-    use crate::state::job::{read_state, write_state, JobState, JobStatus};
+    use crate::state::job::{read_state, JobState, JobStatus};
     use crate::state::store::write_result;
 
-    let mut st = read_state(ws, job_id).unwrap_or_else(|| JobState::new(job_id, started_at));
-    // I2：写 Running 前检查是否已被 cancel，若是则直接返回，保留 Cancelled 终态。
-    if st.status == JobStatus::Cancelled {
+    let st = read_state(ws, job_id).unwrap_or_else(|| JobState::new(job_id, started_at));
+    // 终态封盘：写 Running 前检查是否已落任意终态（不止 Cancelled），若是则直接返回，
+    // 不再走下面的守卫写（避免用一次注定被拒的写掩盖真实早退语义）。
+    if st.status.is_terminal() {
         return st.exit_code.unwrap_or(0);
     }
-    st.status = JobStatus::Running;
-    st.set_phase(crate::state::job::Phase::Collecting, None);
-    let _ = write_state(ws, &st);
+    // 守卫写 Pending→Running：与上面的检查之间存在窗口——cancel 进程可能在此期间
+    // 抢先落 Cancelled 并提交，若仍走裸 write_state 会把 Cancelled 覆回 Running
+    // （违反首个终态封盘）。改走 update_state_if_active，事务内 CAS，拒写不覆盖。
+    let wrote = crate::state::job::update_state_if_active(ws, job_id, |s| {
+        s.status = JobStatus::Running;
+        s.set_phase(crate::state::job::Phase::Collecting, None);
+    })
+    .unwrap_or(false);
+    if !wrote {
+        // 期间已被别的进程落了终态：重读真终态、返回其 exit_code（与上面早退同款语义）。
+        return read_state(ws, job_id).and_then(|s| s.exit_code).unwrap_or(0);
+    }
 
     let sink = JobCellSink { ws: ws.to_path_buf(), job_id: job_id.to_string() };
     let dispatch = run_review_dispatch(args, provider, cfg, cwd, Some(&sink));
@@ -1675,6 +1685,51 @@ mod job_tests {
             crate::state::store::read_result(ws, "j3").is_none(),
             "Cancelled 提前返回不应留下 result.json"
         );
+    }
+
+    /// 终审 Important 回归：修复前 run_job 的 `== Cancelled` 早退与裸 `write_state` 写
+    /// Running 之间存在窗口——本测试钉住修复后的行为：读到 Cancelled（带 exit_code=7）时，
+    /// (a) run_job 必须原样返回该 exit_code；(b) 调用后状态仍是 Cancelled，未被覆写为
+    /// Running（首个终态封盘）。早退发生在建 sink/dispatch 之前，故不需要真 provider 跑完。
+    #[tokio::test]
+    async fn run_job_pre_cancel_returns_its_exit_code_and_does_not_overwrite_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+
+        // 先写一个 Cancelled 状态、带具体 exit_code=7（模拟 cancel 命令先于 worker 启动）
+        let mut pre = crate::state::job::JobState::new("j-precancel-7", 0);
+        pre.status = JobStatus::Cancelled;
+        pre.exit_code = Some(7);
+        crate::state::job::write_state(ws, &pre).unwrap();
+
+        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
+        let code = run_job(ws, "j-precancel-7", &code_args(), &provider, &cfg(), dir.path(), 0).await;
+
+        // (a) 返回值必须是 Cancelled 快照里的 exit_code，而非重新跑出的别的码
+        assert_eq!(code, 7, "run_job 应原样返回 pre-cancel 的 exit_code");
+
+        // (b) 状态仍应是 Cancelled，未被裸写覆盖为 Running
+        let st = read_state(ws, "j-precancel-7").unwrap();
+        assert_eq!(st.status, JobStatus::Cancelled, "pre-cancel 状态不应被覆写为 Running");
+    }
+
+    /// 同一窄洞的 Done 终态变体：非 Cancelled 的终态也应早退，不被覆写为 Running。
+    #[tokio::test]
+    async fn run_job_pre_done_does_not_overwrite_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+
+        let mut pre = crate::state::job::JobState::new("j-predone", 0);
+        pre.status = JobStatus::Done;
+        pre.exit_code = Some(0);
+        crate::state::job::write_state(ws, &pre).unwrap();
+
+        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
+        let code = run_job(ws, "j-predone", &code_args(), &provider, &cfg(), dir.path(), 0).await;
+
+        assert_eq!(code, 0);
+        let st = read_state(ws, "j-predone").unwrap();
+        assert_eq!(st.status, JobStatus::Done, "pre-done 状态不应被覆写为 Running");
     }
 
     /// Bug B 回归：`JobCellSink::on_cell` 的 read_state→改→write_state 段必须串行化。

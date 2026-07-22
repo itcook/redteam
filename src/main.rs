@@ -523,13 +523,13 @@ async fn main() {
                 Ok(x) => x,
                 Err(e) => {
                     eprintln!("error: {e}");
-                    // 写 Failed 终态，让 status 命令能看到错误原因。
-                    let mut st = redteam::state::job::read_state(&ws, &job_id)
-                        .unwrap_or_else(|| redteam::state::job::JobState::new(&job_id, 0));
-                    st.status = redteam::state::job::JobStatus::Failed;
-                    st.error = Some(e);
-                    st.exit_code = Some(2);
-                    let _ = redteam::state::job::write_state(&ws, &st);
+                    // 写 Failed 终态，让 status 命令能看到错误原因。改走守卫：裸 write_state
+                    // 会覆写掉 pre-worker 阶段已落定的 Cancelled 终态（首个终态封盘）。
+                    let _ = redteam::state::job::update_state_if_active(&ws, &job_id, |st| {
+                        st.status = redteam::state::job::JobStatus::Failed;
+                        st.error = Some(e);
+                        st.exit_code = Some(2);
+                    });
                     std::process::exit(2);
                 }
             };
