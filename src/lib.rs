@@ -12,6 +12,7 @@ pub mod orchestrate;
 pub mod output;
 pub mod pack;
 pub mod positioning;
+pub mod procinfo;
 pub mod project;
 pub mod prompt;
 pub mod provider;

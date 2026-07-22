@@ -13,6 +13,16 @@ pub enum JobStatus {
     TimedOut,
 }
 
+impl JobStatus {
+    /// 终态：不可再转移，落定后永不被覆盖（E12 首个终态封盘）。
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled | JobStatus::TimedOut
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -48,6 +58,10 @@ pub struct JobState {
     pub models: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pid: Option<u32>,
+    /// pid 身份锚：`pid` 对应进程的启动时刻（Unix 秒），防 pid 复用误判（E12-Q3）。
+    /// 父进程 spawn worker 后记录；旧状态缺字段 default None → 降级纯存活探测。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pid_start: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -76,6 +90,7 @@ impl JobState {
             progress: Progress::default(),
             models: vec![],
             pid: None,
+            pid_start: None,
             exit_code: None,
             error: None,
             result_path: None,
@@ -124,6 +139,41 @@ pub fn list_states(ws: &Path) -> Vec<JobState> {
         .unwrap_or_default()
 }
 
+/// 守卫式状态更新（E12 并发组核心）：db 事务内取现状 → 反序列化 → **若已终态则整个更新放弃**
+/// （首个终态封盘：任一终态落定后，progress/终态/任何字段都不再被写）→ 否则 `mutate` 改后写回。
+/// 返回是否实际写入（`false`=被终态封盘拦下 / job 不存在 / 反序列化失败）。
+/// 所有 job 状态写点（进度、phase、终态、cancel、收尸、panic 兜底）统一走这里，杜绝非原子 RMW。
+pub fn update_state_if_active(
+    ws: &Path,
+    id: &str,
+    mutate: impl FnOnce(&mut JobState),
+) -> std::io::Result<bool> {
+    let mut db = crate::db::ProjDb::open(ws).map_err(std::io::Error::other)?;
+    let mut wrote = false;
+    let mut mutate = Some(mutate);
+    db.job_update_guarded(id, |cur| {
+        let json = cur?; // job 不存在/state 未写：正常静默放弃，非异常
+        let mut st: JobState = match serde_json::from_str(&json) {
+            Ok(st) => st,
+            Err(e) => {
+                // schema 演进导致的反序列化失败与「终态封盘」同为放弃写，但语义不同——
+                // 前者是数据/代码不一致的异常信号，不打印会与正常封盘混淆、难以排查。
+                eprintln!("warn: job {id} state_json 反序列化失败，更新被跳过: {e}");
+                return None;
+            }
+        };
+        if st.status.is_terminal() {
+            return None; // 首个终态封盘（正常分支，不告警）
+        }
+        (mutate.take().unwrap())(&mut st);
+        let out = serde_json::to_string(&st).ok()?;
+        wrote = true;
+        Some(out)
+    })
+    .map_err(std::io::Error::other)?;
+    Ok(wrote)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -137,7 +187,7 @@ mod tests {
             job_id: "job1".into(), status: JobStatus::Running,
             started_at: 1000, progress: Progress { done: 1, total: 3 },
             models: vec!["alpha".into()],
-            pid: Some(4242), exit_code: None, error: None, result_path: None,
+            pid: Some(4242), pid_start: None, exit_code: None, error: None, result_path: None,
             last_active: 1000, deadline_at: None, phase: None, phase_history: vec![], workspace: None,
         };
         write_state(ws, &st).unwrap();
@@ -246,5 +296,73 @@ mod tests {
         let old = r#"{"job_id":"x","status":"running","started_at":1}"#;
         let back: JobState = serde_json::from_str(old).unwrap();
         assert!(back.phase_history.is_empty());
+    }
+
+    #[test]
+    fn pid_start_roundtrips_and_legacy_defaults_none() {
+        let mut s = JobState::new("j", 0);
+        s.pid_start = Some(1_700_000_000);
+        let back: JobState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.pid_start, Some(1_700_000_000));
+        // 旧状态（无 pid_start 键）→ None
+        let old: JobState = serde_json::from_str(
+            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[]}"#
+        ).unwrap();
+        assert_eq!(old.pid_start, None);
+        // pid_start=None 省略键
+        assert!(!serde_json::to_string(&JobState::new("j", 0)).unwrap().contains("pid_start"));
+    }
+
+    #[test]
+    fn is_terminal_covers_four() {
+        assert!(!JobStatus::Pending.is_terminal());
+        assert!(!JobStatus::Running.is_terminal());
+        assert!(JobStatus::Done.is_terminal());
+        assert!(JobStatus::Failed.is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
+        assert!(JobStatus::TimedOut.is_terminal());
+    }
+
+    #[test]
+    fn update_active_applies_and_freezes_on_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Running;
+        write_state(ws, &st).unwrap();
+        // 非终态 → 应用
+        let wrote = update_state_if_active(ws, "j", |s| s.status = JobStatus::Done).unwrap();
+        assert!(wrote);
+        assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done);
+        // 已终态 → 拒写（首个终态封盘），status 不动
+        let wrote2 = update_state_if_active(ws, "j", |s| s.status = JobStatus::Cancelled).unwrap();
+        assert!(!wrote2);
+        assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done);
+    }
+
+    #[test]
+    fn update_active_missing_job_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!update_state_if_active(dir.path(), "nope", |_s| {}).unwrap());
+    }
+
+    #[test]
+    fn concurrent_progress_no_lost_update() {
+        // 10 线程各 +1，跨独立连接靠守卫串行化 → done 精确 10（无 RMW 丢更新）
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let ws: Arc<std::path::PathBuf> = Arc::new(dir.path().to_path_buf());
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Running;
+        write_state(&ws, &st).unwrap();
+        let mut hs = vec![];
+        for _ in 0..10 {
+            let ws = Arc::clone(&ws);
+            hs.push(std::thread::spawn(move || {
+                update_state_if_active(&ws, "j", |s| s.progress.done += 1).unwrap();
+            }));
+        }
+        for h in hs { h.join().unwrap(); }
+        assert_eq!(read_state(&ws, "j").unwrap().progress.done, 10);
     }
 }

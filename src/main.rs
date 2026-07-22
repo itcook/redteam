@@ -450,6 +450,7 @@ async fn main() {
                 match spawn_detached_worker(&job_id) {
                     Ok(pid) => {
                         st.pid = Some(pid);
+                        st.pid_start = redteam::procinfo::start_time(pid);
                         let _ = redteam::state::job::write_state(&ws, &st);
                         println!("{job_id}");
                         std::process::exit(0);
@@ -485,6 +486,24 @@ async fn main() {
             let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let ws = cwd.clone();
+            // 进程级 panic 兜底（E12-Q4，真·顶层）：worker 评审体若 panic，落 Failed 终态再正常
+            // 展开——否则状态永停 Running（惰性收尸只治「进程已死」，panic 与退出间有窗口）。
+            // hook 是 'static Fn，捕获 ws/job_id 的 clone；只取 payload message，不带 backtrace。
+            {
+                let ws_h = ws.clone();
+                let jid_h = job_id.clone();
+                let default_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    let msg = info
+                        .payload()
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    redteam::cli::mark_failed_panic(&ws_h, &jid_h, &msg);
+                    default_hook(info);
+                }));
+            }
             let args_json = match redteam::state::store::read_args_raw(&ws, &job_id) {
                 Some(j) => j,
                 None => {
@@ -504,13 +523,13 @@ async fn main() {
                 Ok(x) => x,
                 Err(e) => {
                     eprintln!("error: {e}");
-                    // 写 Failed 终态，让 status 命令能看到错误原因。
-                    let mut st = redteam::state::job::read_state(&ws, &job_id)
-                        .unwrap_or_else(|| redteam::state::job::JobState::new(&job_id, 0));
-                    st.status = redteam::state::job::JobStatus::Failed;
-                    st.error = Some(e);
-                    st.exit_code = Some(2);
-                    let _ = redteam::state::job::write_state(&ws, &st);
+                    // 写 Failed 终态，让 status 命令能看到错误原因。改走守卫：裸 write_state
+                    // 会覆写掉 pre-worker 阶段已落定的 Cancelled 终态（首个终态封盘）。
+                    let _ = redteam::state::job::update_state_if_active(&ws, &job_id, |st| {
+                        st.status = redteam::state::job::JobStatus::Failed;
+                        st.error = Some(e);
+                        st.exit_code = Some(2);
+                    });
                     std::process::exit(2);
                 }
             };
@@ -534,8 +553,14 @@ async fn main() {
             } else {
             // 两分支统一收集（列表 / 单 job），再按 format 分流；json 输出形状与改动前逐字节一致。
             let jobs: Option<Vec<redteam::state::job::JobState>> = match &job_id {
-                None => Some(redteam::state::job::list_states(&ws)),
-                Some(id) => redteam::state::job::read_state(&ws, id).map(|st| vec![st]),
+                None => Some(
+                    redteam::state::job::list_states(&ws)
+                        .into_iter()
+                        .map(|st| redteam::cli::reap_if_dead(&ws, st))
+                        .collect(),
+                ),
+                Some(id) => redteam::state::job::read_state(&ws, id)
+                    .map(|st| vec![redteam::cli::reap_if_dead(&ws, st)]),
             };
             match jobs {
                 None => { eprintln!("no such job: {}", job_id.unwrap_or_default()); 2 }
@@ -569,17 +594,29 @@ async fn main() {
         Cmd::Cancel { job_id } => {
             let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             match redteam::state::job::read_state(&ws, &job_id) {
-                Some(mut s) if matches!(s.status, redteam::state::job::JobStatus::Running | redteam::state::job::JobStatus::Pending) => {
+                Some(s) if matches!(s.status, redteam::state::job::JobStatus::Running | redteam::state::job::JobStatus::Pending) => {
+                    // 仅当 worker 进程确活（pid 存活 且 身份锚吻合）才发信号——否则 pid 可能已被
+                    // OS 复用给无辜进程，盲发 SIGTERM 会误杀（E12-Q3/bug③）。
                     if let Some(pid) = s.pid {
-                        // SAFETY: kill 单系统调用；pid 来自本 workspace 自己写的状态。
-                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                        if redteam::procinfo::is_worker_alive(pid, s.pid_start) {
+                            // SAFETY: kill 单系统调用；已确认 pid 属本 job 原进程。
+                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                        }
                     }
-                    s.status = redteam::state::job::JobStatus::Cancelled;
-                    if let Err(e) = redteam::state::job::write_state(&ws, &s) {
-                        eprintln!("warning: process killed but cancelled state not persisted (status may keep showing running): {e}");
+                    // 守卫写 Cancelled：若 worker 已抢先落终态（Done/Failed/TimedOut），守卫拒写、
+                    // 保留其终态（首个终态封盘/bug①）。wrote=false 即被封盘。
+                    let wrote = redteam::state::job::update_state_if_active(&ws, &job_id, |st| {
+                        st.status = redteam::state::job::JobStatus::Cancelled;
+                    })
+                    .unwrap_or(false);
+                    if wrote {
+                        println!("cancelled {job_id}");
+                        0
+                    } else {
+                        let now = redteam::state::job::read_state(&ws, &job_id).map(|s| s.status);
+                        eprintln!("job {job_id} already finished ({now:?}), not cancelled");
+                        2
                     }
-                    println!("cancelled {job_id}");
-                    0
                 }
                 Some(s) => { eprintln!("job {job_id} not cancellable (status: {:?})", s.status); 2 }
                 None => { eprintln!("no such job: {job_id}"); 2 }
