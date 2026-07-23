@@ -1443,13 +1443,16 @@ pub async fn run_job(
     }
 }
 
-/// 惰性收尸（E12-Q2）：`status`/`list` 读状态时，对 Running 但 worker 进程已死（或 pid 被复用）
-/// 的 job，就地落 **Failed** 终态并返回更新后状态（无常驻守护进程——裸终端工具无 daemon，YAGNI）。
+/// 惰性收尸（E12-Q2）：`status`/`list` 读状态时，对 Running/Pending 且已登记 pid 但 worker
+/// 进程已死（或 pid 被复用）的 job，就地落 **Failed** 终态并返回更新后状态（无常驻守护进程——
+/// 裸终端工具无 daemon，YAGNI）。Pending 一并收（dogfood F4 抓漏）：worker 在写 Running 前
+/// 早夭（启动期被杀/args 读失败 exit）会留下 Pending+死 pid 永久悬置；pid 尚未登记的创建
+/// 窗口由「无 pid 放过」天然挡住，不会误收。
 /// 走守卫写：若此刻 worker 恰好真完成写了 Done，守卫拒写；无论写成功与否都重读 db 真相返回——
 /// 绝不落回调用方传入的陈旧 Running 快照 `st`（那会把已完成/已消失的 job 谎报成仍在 Running）。
 pub fn reap_if_dead(ws: &Path, st: crate::state::job::JobState) -> crate::state::job::JobState {
     use crate::state::job::{read_state, JobStatus};
-    if st.status != JobStatus::Running {
+    if st.status != JobStatus::Running && st.status != JobStatus::Pending {
         return st;
     }
     let pid = match st.pid {
@@ -1817,6 +1820,76 @@ mod job_tests {
         write_state(ws, &st).unwrap();
         let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
         assert_eq!(out.status, JobStatus::Done);
+    }
+
+    /// dogfood F4 回归：worker 在写 Running 前早夭（启动期被杀/args 读失败 exit(2) 不落终态）
+    /// 会留下 Pending + 死 pid——reap 必须一并收掉，否则永久悬置、status/list 永不修复。
+    #[test]
+    fn reap_dead_pending_job_to_failed() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let mut child = child; child.wait().unwrap();
+        let mut st = JobState::new("j", 0); // JobState::new 即 Pending
+        st.pid = Some(pid);
+        st.pid_start = None;
+        write_state(ws, &st).unwrap();
+        assert_eq!(st.status, JobStatus::Pending, "前提：新建态是 Pending");
+        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        assert_eq!(out.status, JobStatus::Failed);
+        assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Failed);
+    }
+
+    /// dogfood F4 边界：pid 尚未登记的创建窗口（父进程两次写之间）——无 pid 无从判定，
+    /// 保守放过、原样吐回，不误收刚创建的 job。
+    #[test]
+    fn reap_leaves_pending_without_pid_untouched() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let st = JobState::new("j", 0); // Pending，pid=None
+        write_state(ws, &st).unwrap();
+        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        assert_eq!(out.status, JobStatus::Pending);
+        assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Pending);
+    }
+
+    /// dogfood F2 回归（语义级）：父进程 spawn 后的 pid 登记必须走守卫、只补 pid/pid_start
+    /// 不动 status——子进程抢先推进到 Running 时不得覆回 Pending；抢先落终态时拒写。
+    #[test]
+    fn guarded_pid_registration_preserves_status_and_respects_terminal() {
+        use crate::state::job::{update_state_if_active, write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        // 场景 A：子进程已抢先 Running → 登记只补 pid，status 保持 Running。
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Running;
+        write_state(ws, &st).unwrap();
+        let wrote = update_state_if_active(ws, "j", |s| {
+            s.pid = Some(12345);
+            s.pid_start = Some(67890);
+        })
+        .unwrap();
+        assert!(wrote);
+        let fresh = read_state(ws, "j").unwrap();
+        assert_eq!(fresh.status, JobStatus::Running, "登记不得把 Running 覆回 Pending");
+        assert_eq!(fresh.pid, Some(12345));
+        // 场景 B：子进程已极快失败落终态 → 登记被守卫拒绝，终态与字段原封不动。
+        let mut st2 = JobState::new("j2", 0);
+        st2.status = JobStatus::Failed;
+        st2.exit_code = Some(2);
+        write_state(ws, &st2).unwrap();
+        let wrote2 = update_state_if_active(ws, "j2", |s| {
+            s.pid = Some(12345);
+            s.pid_start = Some(67890);
+        })
+        .unwrap();
+        assert!(!wrote2, "已终态 → 登记拒写（首个终态封盘）");
+        let fresh2 = read_state(ws, "j2").unwrap();
+        assert_eq!(fresh2.status, JobStatus::Failed);
+        assert_eq!(fresh2.pid, None, "拒写后不得留下部分字段");
     }
 
     /// 回归（并发完成竞态）：`reap_if_dead` 拿到的 `st` 是调用方早先读到的陈旧 Running 快照；

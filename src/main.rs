@@ -449,9 +449,15 @@ async fn main() {
                 let _ = redteam::state::job::write_state(&ws, &st);
                 match spawn_detached_worker(&job_id) {
                     Ok(pid) => {
-                        st.pid = Some(pid);
-                        st.pid_start = redteam::procinfo::start_time(pid);
-                        let _ = redteam::state::job::write_state(&ws, &st);
+                        // pid 登记走守卫（dogfood F2 抓漏）：子进程可能已抢先把状态推进到
+                        // Running 甚至终态（极快失败），用 spawn 前的 Pending 快照裸写会把
+                        // 它覆回去。守卫在新鲜快照上只补 pid/pid_start、不动 status；
+                        // 已终态则拒写（worker 已结束，pid 无登记意义）。
+                        let pid_start = redteam::procinfo::start_time(pid);
+                        let _ = redteam::state::job::update_state_if_active(&ws, &job_id, |s| {
+                            s.pid = Some(pid);
+                            s.pid_start = pid_start;
+                        });
                         println!("{job_id}");
                         std::process::exit(0);
                     }

@@ -56,6 +56,8 @@ pub fn is_worker_alive(pid: u32, recorded_start: Option<u64>) -> bool {
 mod tests {
     use super::*;
 
+    /// 锚依赖：非 macOS 无 start_time 实现（恒 None），此测必挂——门控（dogfood F1 抓漏）。
+    #[cfg(target_os = "macos")]
     #[test]
     fn start_time_self_is_stable() {
         let me = std::process::id();
@@ -72,6 +74,8 @@ mod tests {
         assert!(is_worker_alive(me, anchor), "本进程 + 吻合锚 → 活");
     }
 
+    /// 锚依赖：非 macOS 下伪造锚塌缩成 None → 降级判活 → 断言反转，此测必挂——门控（dogfood F1）。
+    #[cfg(target_os = "macos")]
     #[test]
     fn alive_self_reused_anchor_is_dead() {
         let me = std::process::id();
