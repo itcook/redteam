@@ -4,7 +4,7 @@ pub mod config;
 pub mod consolidate;
 pub mod db;
 pub mod domain;
-pub mod dossier;
+pub mod diffsym;
 pub mod evidence;
 pub mod hash;
 pub mod model;

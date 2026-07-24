@@ -1,7 +1,7 @@
 use crate::consolidate::dedup::{quote_overlap, title_jaccard};
 use crate::db::DismissCard;
 use crate::domain::{Finding, Severity, Verify, VerifyVerdict};
-use crate::dossier::{compile_defs, lang_for};
+use crate::diffsym::{compile_defs, lang_for};
 use crate::pack::skeleton_of;
 use crate::prompt::{build_refute_prompt, render_precedents};
 use crate::provider::{LensRequest, ReviewProvider};
