@@ -200,3 +200,132 @@ default_models=["alpha"]
     assert_eq!(report.verdict, Verdict::Approve, "证伪后不翻 verdict");
     assert!(code == 0 || code == 2, "approve → 0/2，非 10");
 }
+
+/// M17-a Task 4：增量轮冒烟锚（进程外 e2e，走 `run_review_dispatch` 真路由，非 lib 内部单测）。
+/// ①临时仓 commit A → 全量 review（branch scope）产出 1 条 finding，落库为 prior job
+///  （模拟 `--background` 持久化：`incremental_preflight` 只信已入库的作业）；
+/// ②commit B 造 delta：旧问题行原样保留（验携带存活）+ 新增一处问题行；
+/// ③`--incremental-from <prior>` 跑增量轮：fake provider 只报新问题，携带项由 carry 机制
+///  就近重锚补入 → 断言携带(origin=Carried)+新(origin=New)两条在场、`run.incremental`、
+///  `run.delta_base`、verdict/exit code 映射。完整矩阵（drop/dispute/re-raise 等）已在
+///  cli.rs 的 `run_incremental_review` 单测覆盖，本锚只证「端到端走得通」。
+#[tokio::test]
+async fn incremental_round_smoke() {
+    use redteam::cli::{exit_code, run_review_dispatch};
+    use redteam::domain::{Origin, RawFinding, Severity, Verdict};
+    use redteam::provider::fake::FakeProvider;
+    use redteam::state::store::{append_partial, write_args_raw, write_manifest, write_result, CellInput, CellRecord};
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+    fn commit_all(dir: &std::path::Path, msg: &str) -> String {
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", msg]);
+        git(dir, &["rev-parse", "HEAD"]).trim().to_string()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    // .redteam/ 是测试副作用（proj.db 落库 prior job）——ignore 掉，防止污染后续 commit 的 delta 统计。
+    std::fs::write(dir.path().join(".gitignore"), ".redteam/\n").unwrap();
+    let c0 = commit_all(dir.path(), "c0: empty baseline");
+    git(dir.path(), &["branch", "dev0", &c0]);
+
+    // commit A：引入一处真实问题（unvalidated write）。
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
+    let c1 = commit_all(dir.path(), "commit A: introduce finding");
+
+    // 两 model（m + m2）：refute 挑交叉 model 时需要一个真实的「非自审」对象——单 model 场景下
+    // pick_cross_model 会退化自审，FakeProvider 对 review/refute 两种调用回同一份脚本，自审趟
+    // 会把刚报出的孤证当「非空回复」误判 refuted（title 无 upheld/refuted 前缀走违约兜底），
+    // confidence 归零、静默吞掉 blocking 力——这不是本锚要测的东西（cross-refute 契约已有专门
+    // 单测覆盖），m2 恒空脚本 = 交叉 refute 稳定判 Upheld，让 verdict 走真实、可预期的路径。
+    let cfg = Config::from_layers(&[r#"[providers.m]
+kind="openai"
+model="m1"
+priority=10
+[providers.m2]
+kind="openai"
+model="m2model"
+priority=5
+[review]
+default_models=["m","m2"]
+"#]).unwrap();
+
+    // ① 全量评审（branch scope，base=dev0=c0）：fake provider 出 1 条 finding（m2 恒空）。
+    let full_args = ReviewArgs {
+        base: Some("dev0".into()), scope: "branch".into(),
+        spec: vec![], focus: None, models: None, models_all: false,
+        block_threshold: None, conf_floor: None, background: false, format: "json".into(),
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+    };
+    let mut full_scripted: std::collections::BTreeMap<String, Vec<RawFinding>> = std::collections::BTreeMap::new();
+    full_scripted.insert("m".into(), vec![RawFinding {
+        severity: Severity::High, title: "unvalidated write".into(), body: "b".into(),
+        file: "src/a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
+        recommendation: "validate".into(), hard_constraint: false, quote: "db.write(token);".into(),
+    }]);
+    full_scripted.insert("m2".into(), vec![]);
+    let full_provider = FakeProvider { scripted: full_scripted, tokens: (0, 0, 0) };
+    let (prior_report, _prior_code) =
+        run_review_dispatch(&full_args, &full_provider, &cfg, dir.path(), None).await.unwrap();
+    assert_eq!(prior_report.findings.len(), 1, "全量轮应锚定出 1 条 finding");
+    assert_eq!(prior_report.run.head_sha.as_deref(), Some(c1.as_str()), "R3 stamp = 全量证据收集刻 HEAD");
+
+    // 落库为 prior job（模拟 --background 持久化——incremental_preflight 只信「已入库」的作业）。
+    let job_id = "prior1";
+    write_args_raw(dir.path(), job_id, &serde_json::to_string(&full_args).unwrap()).unwrap();
+    write_result(dir.path(), job_id, &serde_json::to_string(&prior_report).unwrap()).unwrap();
+    write_manifest(dir.path(), job_id, &[CellInput {
+        cell: "bundle[src/a.rs]".into(), model: "m".into(), prompt: "p".into(),
+    }]).unwrap();
+    append_partial(dir.path(), job_id, &CellRecord::ok(
+        "bundle[src/a.rs]", "m", prior_report.findings.clone(),
+    )).unwrap();
+
+    // ② commit B 造 delta：旧问题行原样保留（验携带存活），新增一处问题行。
+    std::fs::write(
+        dir.path().join("src/a.rs"),
+        "fn f() {\n    db.write(token);\n    leak(secret);\n}\n",
+    ).unwrap();
+    let _c2 = commit_all(dir.path(), "commit B: new leak");
+
+    // ③ 增量轮：fake provider 只报新问题（m2 仍恒空——同一原因，供 refute 挑交叉 model）。
+    let inc_args = ReviewArgs { incremental_from: Some(job_id.into()), ..full_args.clone() };
+    let mut inc_scripted: std::collections::BTreeMap<String, Vec<RawFinding>> = std::collections::BTreeMap::new();
+    inc_scripted.insert("m".into(), vec![RawFinding {
+        severity: Severity::High, title: "secret leak".into(), body: "b".into(),
+        file: "src/a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
+        recommendation: "fix".into(), hard_constraint: false, quote: "leak(secret);".into(),
+    }]);
+    inc_scripted.insert("m2".into(), vec![]);
+    let inc_provider = FakeProvider { scripted: inc_scripted, tokens: (0, 0, 0) };
+    let (report, code) =
+        run_review_dispatch(&inc_args, &inc_provider, &cfg, dir.path(), None).await.unwrap();
+
+    assert!(report.run.incremental, "增量轮标记应为 true");
+    assert_eq!(report.run.delta_base.as_deref(), Some(c1.as_str()), "delta_base = 上轮完整 stamped sha");
+
+    let carried = report.findings.iter().find(|f| f.origin == Origin::Carried)
+        .expect("携带项（origin=Carried）应在场");
+    assert_eq!(carried.title, "unvalidated write");
+    let fresh = report.findings.iter().find(|f| f.origin == Origin::New)
+        .expect("新 finding（origin=New）应在场");
+    assert_eq!(fresh.title, "secret leak");
+    assert_eq!(report.findings.len(), 2, "携带 + 新 各一条，恰好两条");
+
+    // 携带项（High、confidence 0.9、verify=None）恒 blocking，与新 finding 的 refute 结果无关
+    // →本场景 verdict 确定性为 Reject（非泛泛的「合法枚举」断言，锚住实际计算路径）。
+    assert_eq!(report.verdict, Verdict::Reject, "携带的 High finding 应 blocking");
+    assert!(report.run.failed_models.is_empty(), "唯一 model 全程可达");
+    let expected_code = exit_code(report.verdict, !report.run.failed_models.is_empty());
+    assert_eq!(code, 10, "reject → exit 10");
+    assert_eq!(code, expected_code, "exit code 必须与 verdict 映射一致（非硬编码脱钩）");
+}
