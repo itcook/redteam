@@ -932,101 +932,59 @@ pub async fn run_incremental_review(
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = format!("fix delta {short_base}..HEAD (incremental round)");
     if let Some(s) = sink { s.on_meta(&model_names); }
-    let budget = pack_budget_bytes(cfg, &model_names);
+    // T44：--spec 参照段透传（此前两处占位 ""——增量路径静默忽略 --spec）。逐字复制
+    // run_code_review 手法（cli.rs:801-808）：budget_raw → spec 帽夹紧到 pack 预算一半 →
+    // 扣减出 budget → build_packs/mk/fan-out 与 TailCtx.spec_docs（喂 refute 趟）全用
+    // 缩后预算 + 真值。空 --spec → (String::new(), 0) → budget 原样不变（回归零漂移）。
+    let budget_raw = pack_budget_bytes(cfg, &model_names);
+    let (spec_section, spec_used) =
+        render_spec_section_capped(&args.spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
+    let budget = budget_raw.saturating_sub(spec_used);
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
     // dispute 契约不因补跑丢失。
-    // ponytail: 增量轮暂不接 --spec（第一/二趟均占位 ""）——T44 债：`--incremental-from` +
-    // --spec 组合现静默忽略 --spec；补法=复用 args.spec + render_spec_section + budget 扣减，
-    // 同 run_code_review 手法透传进 mk 与 run_code_fanout。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section, "")
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section, &spec_section)
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk), "").await;
+    let raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk), &spec_section).await;
 
-    // 8. 尾段：anchor→dedup→clamp（仅 new）→ dispute 检测 → merge(carry∪new)
-    //    → refute(new-only) → mark_dismissed → verdict(合并集) → v3 报告。
+    // 尾段（Task 3，M17-a 尾段统一）：接入 assemble_report 共用引擎——carry=Some 时其内部
+    // 完成 anchor→dedup→dispute 检测→merge_carry→refute(合并集)→mark_dismissed→verdict→
+    // v3 报告 + Stats.new/RunMeta 五字段回填，与本函数之前的手抄尾段逐字等价（Task 2 已就
+    // assemble_report 的 carry=Some 分支隔离评审确认）。
     let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
-    let anchored = anchor(raw.findings, root);
-    let new_findings = dedup(anchored);
-    let mut resolution_disputed: Vec<String> = new_findings
-        .iter()
-        .filter(|f| resolved_ids.contains(&f.id))
-        .map(|f| f.id.clone())
-        .collect();
-    resolution_disputed.sort();
-    resolution_disputed.dedup();
-    let merged = crate::consolidate::merge_carry(outcome.carried, new_findings);
-
-    let n_targets = refute_targets(&merged, &ledger.cards, block).len();
-    if n_targets > 0 {
-        if let Some(s) = sink {
-            s.on_phase(crate::state::job::Phase::Refute, Some(format!("{n_targets} targets")));
-        }
-    }
-    // ponytail: 增量轮 refute 暂不接 --spec（同第一/二趟传 ""）——T44 债：`--incremental-from` +
-    // --spec 组合现静默忽略 spec 参照段；补法=复用 args.spec + render_spec_section + budget 扣减，
-    // 同 run_code_review 手法把 spec_section 透传进 fan-out 与此处 refute。
-    let (findings, refute_warnings, refute_usage) = verify_findings(
-        merged, provider, &model_names, block, cfg.review.max_concurrency, root, &ledger.cards, "",
-    ).await;
-    let mut warnings = raw.warnings;
-    warnings.extend(refute_warnings);
-    // T03：同 assemble_report——refute 趟 token 折进总账，不再是账外盈余。
-    raw.usage.0 += refute_usage.0;
-    raw.usage.1 += refute_usage.1;
-    raw.usage.2 += refute_usage.2;
-    let mut findings = findings;
-    let dismissed_reappeared = mark_dismissed(&mut findings, &ledger.ids);
-
-    let verdict = compute_verdict(&findings, block, floor);
-    let new_only: Vec<Finding> = findings
-        .iter()
-        .filter(|f| f.origin == crate::domain::Origin::New)
-        .cloned()
-        .collect();
-    let mut stats = Stats::from_findings(&findings);
-    stats.new = Some(Box::new(Stats::from_findings(&new_only)));
-    let report = ReviewReport {
-        schema_version: "3".into(),
-        verdict,
-        stats,
-        findings,
-        clusters: vec![],
-        run: RunMeta {
-            job_id: String::new(),
-            models: model_names,
-            model_ids,
-            duration_ms: t0.elapsed().as_millis() as u64,
-            usage: Usage {
-                input_tokens: raw.usage.0, output_tokens: raw.usage.1, cached_input_tokens: raw.usage.2,
-                refute: if refute_usage == (0, 0, 0) { None } else {
-                    Some(Box::new(Usage {
-                        input_tokens: refute_usage.0, output_tokens: refute_usage.1,
-                        cached_input_tokens: refute_usage.2, refute: None,
-                    }))
-                },
-            },
-            warnings,
-            failed_models: raw.failed_models,
-            dismissed_reappeared,
-            ledger: ledger.meta.clone(),
-            head_sha,
-            incremental: true,
-            delta_base: Some(base.base_sha),
-            resolved: outcome.resolved_applied,
-            resolution_disputed,
+    let ctx = TailCtx {
+        root,
+        provider,
+        model_ids,
+        model_names,
+        block,
+        floor,
+        max_concurrency: cfg.review.max_concurrency,
+        job_id: String::new(),
+        duration_ms: t0.elapsed().as_millis() as u64,
+        usage: raw.usage,
+        warnings: raw.warnings,
+        failed_models: raw.failed_models,
+        dismissed: &ledger.ids,
+        precedents: &ledger.cards,
+        ledger_meta: ledger.meta.clone(),
+        head_sha,
+        dossier_meta: Some(dossier_meta),
+        needs_stats: raw.needs_stats,
+        sink,
+        spec_docs: &spec_section,
+        carry: Some(CarryCtx {
+            carried: outcome.carried,
+            resolved_ids,
+            resolved_applied: outcome.resolved_applied,
             carried_dropped: outcome.carried_dropped,
-            dossier: Some(dossier_meta),
-            needs: crate::domain::NeedsMeta {
-                triggered_cells: raw.needs_stats.0, declared: raw.needs_stats.1,
-            },
-        },
+            delta_base: base.base_sha,
+        }),
     };
-    let code = exit_code(verdict, !report.run.failed_models.is_empty());
-    Ok((report, code))
+    assemble_report(raw.findings, ctx).await
 }
 
 /// 评审分发（前台 main 与后台 worker 共用）：增量轮路由，否则 git changed_files → run_code_review。
@@ -2793,6 +2751,13 @@ mod tests {
         let p_empty = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "").unwrap();
         assert!(p_empty.contains("(none — no spec docs provided)"), "空 spec 走既有占位: {p_empty}");
         assert!(!p_empty.contains("DESIGN D8"), "空 spec 不泄漏内容: {p_empty}");
+
+        // T44：增量分支——inc_section 与 spec 同时非空须共存不互相挤占（run_incremental_review
+        // 的 mk 闭包现同时透传两者，此前 spec 处恒占位 ""）。
+        let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
+        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], &inc, spec).unwrap();
+        assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段在场: {pi}");
+        assert!(pi.contains("<spec_docs>") && pi.contains("DESIGN D8: fail-open"), "spec 段与增量段共存: {pi}");
     }
 
     #[test]
@@ -3463,6 +3428,51 @@ default_models=["m"]
         assert_eq!(report.findings[0].agreement, 2, "re-raise 不涨 agreement");
         assert_eq!(report.findings[0].id, id1);
         assert_eq!((report.findings[0].line_start, report.findings[0].line_end), (3, 3), "重锚随注释插入移位");
+    }
+
+    /// T44：`--spec` 透传增量路径——第一趟主评审 prompt 须含 `<spec_docs>` 段（此前三处占位
+    /// ""，静默丢弃 --spec）。用记录型 provider 而非 FakeProvider（后者不留存 prompt 内容）。
+    #[derive(Default)]
+    struct SpecRecordingProvider {
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::provider::ReviewProvider for SpecRecordingProvider {
+        async fn run(
+            &self,
+            req: crate::provider::LensRequest,
+        ) -> Result<crate::provider::LensCall, crate::provider::ProviderError> {
+            self.prompts.lock().unwrap().push(req.prompt.clone());
+            Ok(crate::provider::LensCall {
+                findings: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0,
+                iterations: 1, tool_use: Default::default(), needs: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_review_injects_spec_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
+        let c1 = commit_all(dir.path(), "c1");
+        std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
+        write_prior(dir.path(), "jprev", &c1, vec![]);
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n}\n").unwrap();
+        commit_all(dir.path(), "fix");
+
+        let spec_path = dir.path().join("design.md");
+        std::fs::write(&spec_path, "DESIGN D8: fail-open").unwrap();
+        let mut args = inc_args("dev0", "jprev");
+        args.spec = vec![spec_path.to_string_lossy().to_string()];
+
+        let provider = SpecRecordingProvider::default();
+        run_incremental_review(&args, "jprev", &provider, &inc_cfg(), dir.path(), None).await.unwrap();
+
+        let prompts = provider.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "单格全审默认下第一趟只应有一次 provider 调用");
+        assert!(prompts[0].contains("<spec_docs>"), "增量第一趟 prompt 须含 spec_docs 段: {}", prompts[0]);
+        assert!(prompts[0].contains("DESIGN D8: fail-open"), "spec 内容须原样注入: {}", prompts[0]);
     }
 
     #[test]
