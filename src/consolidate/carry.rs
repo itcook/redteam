@@ -74,12 +74,19 @@ pub fn carry(prior: Vec<Finding>, resolved_ids: &HashSet<String>, root: &Path) -
     out
 }
 
-/// 决议 5 合并去重：同 id 保 carried、丢 new 副本、models 并集、**agreement 不变**
-/// （跨轮重看非独立证据；顽固性由「仍在携带集」这一事实表达）。new 独有项原样进合并集。
+/// 决议 5 合并去重：同 id（或相似回落，D4）保 carried、丢 new 副本、models 并集、**agreement
+/// 不变**（跨轮重看非独立证据；顽固性由「仍在携带集」这一事实表达）。相似回落=quote 漂移
+/// 导致 id 不同但实为同一 bug 的补丁（is_same_bug 单一真相源，与 dedup 主循环同阈值），
+/// 仅对 out 中 origin==Carried 的项生效——new-vs-new 相似命中不在此处理（上游 dedup 已处理）。
+/// new 独有项原样进合并集。
 pub fn merge_carry(carried: Vec<Finding>, new: Vec<Finding>) -> Vec<Finding> {
     let mut out = carried;
     for n in new {
-        if let Some(c) = out.iter_mut().find(|c| c.id == n.id) {
+        let hit = out.iter_mut().find(|c| {
+            c.id == n.id
+                || (c.origin == Origin::Carried && crate::consolidate::dedup::is_same_bug(c, &n))
+        });
+        if let Some(c) = hit {
             for m in &n.models {
                 if !c.models.contains(m) {
                     c.models.push(m.clone());
@@ -182,5 +189,62 @@ mod tests {
         assert!(kept.models.contains(&"gamma".to_string()), "models 并集记录");
         let fresh = merged.iter().find(|x| x.id == new_id).unwrap();
         assert_eq!(fresh.origin, Origin::New);
+    }
+
+    #[test]
+    fn merge_carry_absorbs_quote_drifted_new_into_carried() {
+        // D4：quote 漂移致 id 不同，但 file/行重叠 + 标题高 Jaccard → 相似回落仍吸收进 carried，
+        // 不该被当成独立新 bug 双条入报告。severity/confidence/body/rec 保 carried 原值,
+        // agreement 不变（相似回落=id 漂移补丁,语义同构于精确 id 命中,非独立证据）。
+        let mut carried = f("a.rs", "Q1", "missing auth check");
+        carried.line_start = 10;
+        carried.line_end = 12;
+        carried.origin = Origin::Carried;
+        carried.agreement = 2;
+        carried.models = vec!["claude".into()];
+        let mut drifted = f("a.rs", "Q2", "missing auth check"); // 同义高 Jaccard、quote 不同 → id 不同
+        drifted.line_start = 11;
+        drifted.line_end = 13;
+        drifted.models = vec!["gpt".into()];
+        assert_ne!(carried.id, drifted.id, "quote 漂移前提：两条 id 必须不同");
+
+        let carried_severity = carried.severity;
+        let carried_confidence = carried.confidence;
+        let carried_body = carried.body.clone();
+        let carried_rec = carried.recommendation.clone();
+
+        let merged = merge_carry(vec![carried], vec![drifted]);
+        assert_eq!(merged.len(), 1, "相似回落吸收，不应双条入报告");
+        let kept = &merged[0];
+        assert_eq!(kept.origin, Origin::Carried);
+        assert_eq!(kept.agreement, 2, "agreement 不变——相似回落语义同构于精确 id 命中");
+        assert!(kept.models.contains(&"claude".to_string()) && kept.models.contains(&"gpt".to_string()), "models 并集");
+        assert_eq!(kept.severity, carried_severity, "severity 保 carried 原值");
+        assert_eq!(kept.confidence, carried_confidence, "confidence 保 carried 原值");
+        assert_eq!(kept.body, carried_body, "body 保 carried 原值");
+        assert_eq!(kept.recommendation, carried_rec, "recommendation 保 carried 原值");
+    }
+
+    #[test]
+    fn merge_carry_similarity_only_absorbs_into_carried() {
+        // 相似回落仅对 origin==Carried 的 out 项生效；new-vs-new 相似命中不在 merge_carry
+        // 职责内（上游 dedup 处理），故两条相似 new 各自独立入 out。
+        let mut unrelated_carried = f("z.rs", "Zq", "unrelated issue");
+        unrelated_carried.line_start = 1;
+        unrelated_carried.line_end = 1;
+        unrelated_carried.origin = Origin::Carried;
+
+        let mut new1 = f("a.rs", "Q1", "missing auth check");
+        new1.line_start = 10;
+        new1.line_end = 12;
+        new1.models = vec!["claude".into()];
+        let mut new2 = f("a.rs", "Q2", "missing auth check");
+        new2.line_start = 11;
+        new2.line_end = 13;
+        new2.models = vec!["gpt".into()];
+        assert_ne!(new1.id, new2.id);
+
+        let merged = merge_carry(vec![unrelated_carried], vec![new1, new2]);
+        assert_eq!(merged.len(), 3, "new-vs-new 不在 merge_carry 合并——各自独立入合并集");
     }
 }

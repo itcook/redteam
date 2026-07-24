@@ -39,6 +39,13 @@ fn overlaps(a: &Finding, b: &Finding) -> bool {
         && b.line_start <= a.line_end.saturating_add(LINE_GAP)
 }
 
+/// dedup 与 merge_carry 共用的「同一 bug」谓词（D4：单一真相源，不另立第二套阈值）。
+pub(crate) fn is_same_bug(a: &Finding, b: &Finding) -> bool {
+    overlaps(a, b)
+        && (title_jaccard(&a.title, &b.title) >= TITLE_SIM
+            || quote_overlap(&a.quote, &b.quote) >= QUOTE_SIM)
+}
+
 fn merge_into(base: &mut Finding, other: &Finding) {
     if other.severity > base.severity { base.severity = other.severity; }
     if other.confidence > base.confidence { base.confidence = other.confidence; }
@@ -62,10 +69,7 @@ pub fn dedup(findings: Vec<Finding>) -> Vec<Finding> {
             // 同 file + 行重叠（positioning 锚定的真实行号）+（标题相似 OR quote 行重叠）。
             // quote 信号补救 title_jaccard 的同义表述盲点：不同模型对同一 bug 措辞不同（标题
             // Jaccard 低）但引用同段代码 → 仍合并 + agreement 加成（dogfood#4）。
-            if overlaps(c, &f)
-                && (title_jaccard(&c.title, &f.title) >= TITLE_SIM
-                    || quote_overlap(&c.quote, &f.quote) >= QUOTE_SIM)
-            {
+            if is_same_bug(c, &f) {
                 merge_into(c, &f);
                 merged = true;
                 break;
@@ -162,5 +166,23 @@ mod tests {
         let mut b = f("2","s.rs",60,62,"silent removal error swallowed","kimi",Severity::Low);
         b.quote = "let _ = std::fs::remove_file(path);".into();
         assert_eq!(dedup(vec![a, b]).len(), 2, "quote 引不同行 + 标题不同 → 不合并");
+    }
+
+    #[test]
+    fn is_same_bug_false_when_lines_dont_overlap() {
+        // 行不重叠 → 即便标题完全相同也不是同一 bug（D4：merge_carry 复用同一谓词）
+        let a = f("1","a.rs",10,12,"missing auth check","claude",Severity::High);
+        let b = f("2","a.rs",100,102,"missing auth check","gpt",Severity::High);
+        assert!(!is_same_bug(&a, &b));
+    }
+
+    #[test]
+    fn is_same_bug_false_when_title_and_quote_both_low_similarity() {
+        // under-merge 守卫：行重叠但 title Jaccard 与 quote overlap 双低 → false
+        let mut a = f("1","a.rs",10,12,"missing auth check","claude",Severity::High);
+        a.quote = "entries.iter().take(entries.len() - keep)".into();
+        let mut b = f("2","a.rs",10,12,"unvalidated write to db","gpt",Severity::High);
+        b.quote = "let _ = std::fs::remove_file(path);".into();
+        assert!(!is_same_bug(&a, &b));
     }
 }
