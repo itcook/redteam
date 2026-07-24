@@ -1,6 +1,6 @@
 //! pack 引擎（M15-S1，E8-E 安乐死 SCIP/1 壳引用点后收窄）：每 bundle 的预算治理上下文块——
 //! 0 壳改动源文全文（回落链：def 体→骨架→hunk 窗）+ 精确省略清单。唯一路径，无引擎分派。
-//! hermetic：喂 (bundle, root, budget) 出字符串，零 LLM。复用 src/dossier 的 diff/符号解析核心
+//! hermetic：喂 (bundle, root, budget) 出字符串，零 LLM。复用 src/diffsym 的 diff/符号解析核心
 //! （梯子降级用），不再消费其引用点搜索（该引擎已随 SCIP 一并拆除）。
 
 use std::path::Path;
@@ -8,7 +8,7 @@ use std::path::Path;
 use regex::Regex;
 
 use crate::bundle::Bundle;
-use crate::dossier::{changed_def_ranges, compile_defs, hunk_changed_lines, lang_for, match_def, parse_hunk_new_range};
+use crate::diffsym::{changed_def_ranges, compile_defs, hunk_changed_lines, lang_for, match_def, parse_hunk_new_range};
 
 /// 省略清单条目上限（防大 fan-in 撑爆；超出末尾计数兜底）。
 pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
