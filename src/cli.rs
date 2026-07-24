@@ -185,6 +185,23 @@ fn model_ids_for(names: &[String], cfg: &Config) -> Vec<String> {
         .collect()
 }
 
+/// Task 3 消费：增量轮携带态——上轮合并集（carry() 已重锚/排除 resolved）+ resolved 台账
+/// id 集（dispute 检测用）+ 审计三件套（resolved_applied/carried_dropped/delta_base）。
+/// `carry=None`（`TailCtx.carry`）时 assemble_report 行为与本任务之前逐字一致；`Some` 时
+/// 在 dedup 后插入合并/dispute 检测，组装期回填 Stats.new + RunMeta 五字段。
+struct CarryCtx {
+    /// 上轮携带集（已含 origin=Carried、行号已就近重锚）。
+    carried: Vec<Finding>,
+    /// resolve 台账 id 集——本轮新 finding 精确命中即 resolution_disputed（假修复回路）。
+    resolved_ids: std::collections::HashSet<String>,
+    /// 命中 resolved_ids 被排除携带的 id（进 RunMeta.resolved，审计用）。
+    resolved_applied: Vec<String>,
+    /// 重锚失败被消灭的携带 id（进 RunMeta.carried_dropped，审计用）。
+    carried_dropped: Vec<String>,
+    /// R3 基线 HEAD（进 RunMeta.delta_base）。
+    delta_base: String,
+}
+
 /// 扇出之后的共用尾段上下文——`run_code_review`/`run_resume` 两处扇出前逻辑各不相同
 /// （单格×model / 直接重放 manifest prompt），但扇出后（anchor → dedup → verify → verdict
 /// → 组报告）完全一致，抽出复用（DRY，T7 授权解冻）。
@@ -218,6 +235,9 @@ struct TailCtx<'a> {
     sink: Option<&'a dyn CellSink>,
     /// --spec 参照段（Task 4，承 hiapi F2）——透传给 refute 趟；空 --spec=""（行为不变）。
     spec_docs: &'a str,
+    /// Task 2（尾段引擎泛化）：增量携带态。None=既有全量/resume 路径逐字不变；
+    /// Some=Task 3 消费，assemble_report 内 merge_carry + 回填 RunMeta 五字段。
+    carry: Option<CarryCtx>,
 }
 
 /// 共用尾段：anchor → dedup → verify → verdict → 组装 report → 退出码。
@@ -225,6 +245,21 @@ struct TailCtx<'a> {
 async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow::Result<(ReviewReport, i32)> {
     let anchored = anchor(findings, ctx.root);
     let findings = dedup(anchored);
+    // Task 2 插入点（brief 2.3 逐字）：carry=None → 现状路径逐字不变；carry=Some → dispute
+    // 检测（精确 id 命中 resolved 台账，须在 merge 前对纯 new 集合判，避免携带项误判）→
+    // merge_carry 吸收携带集，refute/mark_dismissed/verdict 作用于合并后的 findings。
+    let carry = ctx.carry.take();
+    let (findings, resolution_disputed, carry_meta) = match carry {
+        Some(c) => {
+            let mut disputed: Vec<String> = findings.iter()
+                .filter(|f| c.resolved_ids.contains(&f.id))
+                .map(|f| f.id.clone()).collect();
+            disputed.sort(); disputed.dedup();
+            let merged = crate::consolidate::merge_carry(c.carried, findings);
+            (merged, disputed, Some((c.resolved_applied, c.carried_dropped, c.delta_base)))
+        }
+        None => (findings, vec![], None),
+    };
     let clusters = vec![]; // correlate 已随 doc 模式退场（E10）；clusters 字段留空保持 schema 稳定。
     // refute 子阶段打点（targets 数与 verify_findings 同一真相源函数，非重复实现）。
     let n_targets = refute_targets(&findings, ctx.precedents, ctx.block).len();
@@ -248,7 +283,19 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
     let dismissed_reappeared = mark_dismissed(&mut findings, ctx.dismissed);
 
     let verdict = compute_verdict(&findings, ctx.block, ctx.floor);
-    let stats = Stats::from_findings(&findings);
+    let mut stats = Stats::from_findings(&findings);
+    // carry_meta 为 Some 时填 Stats.new（origin==New 子账，手法参照 run_incremental_review
+    // 手抄段 cli.rs:938-939）；None 时沿用现状（无 stats.new 子块）。
+    if carry_meta.is_some() {
+        let new_only: Vec<Finding> = findings.iter()
+            .filter(|f| f.origin == crate::domain::Origin::New)
+            .cloned().collect();
+        stats.new = Some(Box::new(Stats::from_findings(&new_only)));
+    }
+    let (incremental, delta_base, resolved, carried_dropped) = match carry_meta {
+        Some((resolved_applied, dropped, base)) => (true, Some(base), resolved_applied, dropped),
+        None => (false, None, vec![], vec![]),
+    };
     let report = ReviewReport {
         schema_version: "3".into(),
         verdict,
@@ -278,7 +325,11 @@ async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>) -> anyhow
             needs: crate::domain::NeedsMeta {
                 triggered_cells: ctx.needs_stats.0, declared: ctx.needs_stats.1,
             },
-            ..Default::default()
+            incremental,
+            delta_base,
+            resolved,
+            resolution_disputed,
+            carried_dropped,
         },
     };
     // 退出码：reject 优先 → 10；否则 approve 但对照集不完整 → 2；干净 approve → 0。
@@ -796,6 +847,7 @@ pub async fn run_code_review(
         needs_stats: raw.needs_stats,
         sink,
         spec_docs: &spec_section,
+        carry: None,
     };
     if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
     assemble_report(raw.findings, ctx).await
@@ -1316,6 +1368,7 @@ pub async fn run_resume(
         needs_stats: (0, 0),
         sink: None,
         spec_docs: &spec_section,
+        carry: None,
     };
     match assemble_report(findings, ctx).await {
         Ok((mut report, mut code)) => {
@@ -2631,6 +2684,8 @@ default_models=["m"]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Origin;
+    use crate::provider::fake::FakeProvider;
 
     #[test]
     fn review_args_ignores_legacy_unknown_keys() {
@@ -2995,6 +3050,120 @@ context_window_tokens = 40000
         assert_eq!(reappeared, vec![before.id]);
         assert!(after[0].previously_dismissed);
         assert_eq!(compute_verdict(&after, Severity::Medium, 0.5), Verdict::Approve);
+    }
+
+    // Task 2（尾段引擎泛化）：CarryCtx 数据扩展 + assemble_report 插入点。
+    // 下面两条直构 TailCtx，FakeProvider 空脚本——findings 严格低于 block 阈值，
+    // refute_targets 恒空，verify_findings 短路不发起 provider 调用。
+
+    fn tailctx_fixture<'a>(
+        root: &'a Path,
+        provider: &'a dyn ReviewProvider,
+        dismissed: &'a std::collections::HashSet<String>,
+        carry: Option<CarryCtx>,
+    ) -> TailCtx<'a> {
+        TailCtx {
+            root,
+            provider,
+            model_names: vec!["m".into()],
+            model_ids: vec!["m1".into()],
+            block: Severity::High,
+            floor: 0.5,
+            max_concurrency: 1,
+            job_id: String::new(),
+            duration_ms: 0,
+            usage: (0, 0, 0),
+            warnings: vec![],
+            failed_models: vec![],
+            dismissed,
+            precedents: &[],
+            ledger_meta: None,
+            head_sha: None,
+            dossier_meta: None,
+            needs_stats: (0, 0),
+            sink: None,
+            spec_docs: "",
+            carry,
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_report_carry_none_unchanged() {
+        // 现状锚：carry=None 时 assemble_report 行为必须与本任务之前逐字一致——
+        // 报告无 stats.new 子块、RunMeta.incremental=false、delta_base=None。
+        use crate::orchestrate::enrich;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    minor_issue();\n}\n").unwrap();
+        let finding = enrich(&crate::domain::RawFinding {
+            severity: Severity::Low, title: "minor".into(), body: "b".into(), file: "a.rs".into(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
+            hard_constraint: false, quote: "minor_issue();".into(),
+        }, "m");
+        let dismissed = std::collections::HashSet::new();
+        let provider = FakeProvider { scripted: Default::default(), ..Default::default() };
+        let ctx = tailctx_fixture(dir.path(), &provider, &dismissed, None);
+        let (report, _code) = assemble_report(vec![finding], ctx).await.unwrap();
+        assert!(report.stats.new.is_none(), "carry=None 不应产出 stats.new 子块");
+        assert!(!report.run.incremental, "carry=None → incremental 恒 false");
+        assert_eq!(report.run.delta_base, None, "carry=None → delta_base 恒 None");
+        assert_eq!(report.run.resolved, Vec::<String>::new());
+        assert_eq!(report.run.resolution_disputed, Vec::<String>::new());
+        assert_eq!(report.run.carried_dropped, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn assemble_report_carry_some_merges_and_fills_meta() {
+        // carry=Some：carried 1 条（origin=Carried，不经 anchor）+ resolved_ids 命中本轮一条
+        // 再现的 new id → 合并集含 carried、resolution_disputed 命中、Stats.new 只计 New，
+        // RunMeta 五字段逐一断言。
+        use crate::orchestrate::enrich;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn f() {\n    reraised_bug();\n    brand_new_bug();\n}\n",
+        ).unwrap();
+        let raw = |quote: &str, title: &str| crate::domain::RawFinding {
+            severity: Severity::Low, title: title.into(), body: "b".into(), file: "a.rs".into(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
+            hard_constraint: false, quote: quote.into(),
+        };
+        // 本轮再报一条已"销案"的 id（假修复回路）+ 一条真新 finding。
+        let reraised = enrich(&raw("reraised_bug();", "weak hash"), "m");
+        let fresh = enrich(&raw("brand_new_bug();", "secret leak"), "m");
+        let disputed_id = reraised.id.clone();
+
+        let mut carried_finding = enrich(&crate::domain::RawFinding {
+            severity: Severity::Medium, title: "carried issue".into(), body: "b".into(),
+            file: "carried.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
+            recommendation: "r".into(), hard_constraint: false, quote: "old_bug();".into(),
+        }, "m");
+        carried_finding.origin = Origin::Carried;
+
+        let mut resolved_ids = std::collections::HashSet::new();
+        resolved_ids.insert(disputed_id.clone());
+        let carry = CarryCtx {
+            carried: vec![carried_finding],
+            resolved_ids,
+            resolved_applied: vec!["resolved-x".into()],
+            carried_dropped: vec!["dropped-y".into()],
+            delta_base: "deadbeef".into(),
+        };
+
+        let dismissed = std::collections::HashSet::new();
+        let provider = FakeProvider { scripted: Default::default(), ..Default::default() };
+        let ctx = tailctx_fixture(dir.path(), &provider, &dismissed, Some(carry));
+        let (report, _code) = assemble_report(vec![reraised, fresh], ctx).await.unwrap();
+
+        assert_eq!(report.findings.len(), 3, "合并集 = carried(1) + new(2)");
+        assert!(report.findings.iter().any(|f| f.origin == Origin::Carried), "carried 项在场");
+        assert_eq!(report.run.resolution_disputed, vec![disputed_id], "精确 id 命中已销案 → dispute");
+        let sn = report.stats.new.as_ref().expect("carry=Some 应产出 stats.new 子块");
+        assert_eq!(sn.total, 2, "stats.new 只计 origin==New（2 条）");
+        assert_eq!(report.stats.total, 3, "主 stats 维持合并集口径（3 条）");
+        assert!(report.run.incremental, "carry=Some → incremental=true");
+        assert_eq!(report.run.delta_base.as_deref(), Some("deadbeef"));
+        assert_eq!(report.run.resolved, vec!["resolved-x".to_string()]);
+        assert_eq!(report.run.carried_dropped, vec!["dropped-y".to_string()]);
     }
 }
 
