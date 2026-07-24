@@ -321,10 +321,10 @@ default_models=["m","m2"]
     assert_eq!(fresh.title, "secret leak");
     assert_eq!(report.findings.len(), 2, "携带 + 新 各一条，恰好两条");
 
-    // 携带项（High、confidence 0.9、verify=None）恒 blocking，与新 finding 的 refute 结果无关
+    // 携带项（High、confidence 0.9、verify=Upheld（第一轮交叉 refute 继承））恒 blocking，与新 finding 的 refute 结果无关
     // →本场景 verdict 确定性为 Reject（非泛泛的「合法枚举」断言，锚住实际计算路径）。
     assert_eq!(report.verdict, Verdict::Reject, "携带的 High finding 应 blocking");
-    assert!(report.run.failed_models.is_empty(), "唯一 model 全程可达");
+    assert!(report.run.failed_models.is_empty(), "双 model 全程可达");
     let expected_code = exit_code(report.verdict, !report.run.failed_models.is_empty());
     assert_eq!(code, 10, "reject → exit 10");
     assert_eq!(code, expected_code, "exit code 必须与 verdict 映射一致（非硬编码脱钩）");
