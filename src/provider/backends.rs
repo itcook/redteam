@@ -1,4 +1,5 @@
 use crate::config::{ProviderConfig, ProviderKind};
+use crate::provider::parse::error_body_to_provider_error;
 use crate::provider::tool_loop::{AssistantTurn, ChatBackend, ChatMessage};
 use crate::provider::ProviderError;
 use crate::tools::{ToolCall, ToolSpec};
@@ -151,6 +152,11 @@ impl ChatBackend for AnthropicBackend {
             .await?,
         )
         .await?; // envelope 非法 JSON → Unavailable（可重试）；内容形状问题才是 Parse
+        // D1：网关有时在 HTTP 200 里塞 error 体（`{"type":"error","error":{...}}`）——parse 前先探，
+        // 按语义分类而非一律 Parse 烧格。
+        if let Some(e) = error_body_to_provider_error(&resp) {
+            return Err(e);
+        }
         parse_anthropic_turn(&resp)
             .ok_or_else(|| ProviderError::Parse("anthropic response missing content".into()))
     }
@@ -388,6 +394,18 @@ impl OpenAiBackend {
         if sse.trim().is_empty() {
             // 空体（keep-alive/上游放弃）→ 可重试，勿误判 Parse 烧格
             return Err(ProviderError::Unavailable(format!("empty stream body for {url}")));
+        }
+        // D1：网关把错误塞进 HTTP 200 body 时走的正是这条「非 SSE、整体纯 JSON」路径——
+        // `parse_openai_stream` 内部回落分支（`!body.contains("data:")`）与此处判定同一条件，
+        // 在其解析前先探 error 形状，避免回落分支拿到 error 体、`parse_openai_turn` 因无
+        // `choices` 返回 `None`、最终误判 `Parse`（不可重试烧格）。SSE 帧内 error 事件不做
+        // （design 明确不强求）。
+        if !sse.contains("data:") {
+            if let Ok(v) = serde_json::from_str::<Value>(&sse) {
+                if let Some(e) = error_body_to_provider_error(&v) {
+                    return Err(e);
+                }
+            }
         }
         parse_openai_stream(&sse)
             .ok_or_else(|| ProviderError::Parse("openai stream missing choices".into()))

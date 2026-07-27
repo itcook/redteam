@@ -4,6 +4,7 @@
 use super::tool_loop::AssistantTurn;
 use super::ProviderError;
 use crate::domain::LensOutput;
+use serde_json::Value;
 
 /// 兜底：从模型自由文本里抠出符合 schema 的 JSON。
 pub fn parse_lens_output(raw: &str) -> Result<LensOutput, ProviderError> {
@@ -65,6 +66,36 @@ pub fn parse_lens_output(raw: &str) -> Result<LensOutput, ProviderError> {
     )))
 }
 
+/// D1：兼容网关有时把错误塞进 HTTP 200 响应体（不触发 4xx/5xx，`send_classified` 判"成功"）——
+/// `parse_anthropic_turn`/`parse_openai_turn`/`parse_openai_stream` 拿不到期望字段 → `None` →
+/// 上层误判 `Parse`（不可重试，一次网关异常烧掉整个 cell）。此函数在 parse 之前先探这层：
+/// 两种已知形状——OpenAI `{"error":{"type","code","message"}}`；
+/// Anthropic `{"type":"error","error":{"type","message"}}`——两者共同点是都有顶层 `error`
+/// 对象，故只认这一个键即可覆盖双形状，不必额外判断外层 `type` 字段。
+/// 找不到 `error` 键（即正常 findings/choices/content 体）→ `None`，不干预。
+pub(crate) fn error_body_to_provider_error(v: &Value) -> Option<ProviderError> {
+    let err_obj = v.get("error")?;
+    let etype = err_obj.get("type").and_then(Value::as_str).unwrap_or("");
+    let message = err_obj.get("message").and_then(Value::as_str).unwrap_or("");
+    let detail = format!("{etype}: {message}");
+    // 子串匹配（而非精确枚举）：OpenAI/Anthropic/网关三方言的 error.type 用词不完全一致
+    // （如 "rate_limit_error" vs "rate_limit_exceeded"），子串覆盖两家现有值且对未来变体宽容。
+    Some(if etype.contains("rate_limit") || etype.contains("overloaded") {
+        ProviderError::RateLimited { retry_after: None }
+    } else if etype.contains("timeout") {
+        ProviderError::Timeout(detail)
+    } else if etype.contains("server_error") || etype.contains("api_error") {
+        ProviderError::Server(detail)
+    } else if etype.contains("authentication") || etype.contains("permission") {
+        ProviderError::Auth(detail)
+    } else if etype.contains("invalid_request") || etype.contains("context_length") {
+        ProviderError::BadRequest(detail)
+    } else {
+        // 未知 error 类型：保守可重试——宁可多试一次，不可误把陌生错误当不可重试永久失败。
+        ProviderError::Unavailable(detail)
+    })
+}
+
 pub(crate) const REPAIR_PROMPT: &str = "Your previous response was not valid JSON (it may have been truncated). \
 Re-emit ONLY the complete findings JSON object matching the schema. If space is tight, shorten each \
 finding's body/recommendation text, but do NOT drop any finding and do NOT omit any required field.";
@@ -82,6 +113,7 @@ pub(crate) fn diagnostic_parse_error(turn: &AssistantTurn) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parse_strips_code_fence() {
@@ -130,6 +162,78 @@ mod tests {
         let out = parse_lens_output(raw).unwrap();
         assert_eq!(out.findings.len(), 1);
         assert!(out.findings[0].body.contains('{'));
+    }
+
+    // D1 四锚：200+error 体误分类修复。兼容网关把错误塞进 HTTP 200 body，
+    // send_classified 判"成功"、旧逻辑 parse_*_turn 拿不到 content/choices → None → Parse
+    // （不可重试，烧格）。error_body_to_provider_error 在 parse 之前先探这层。
+    #[test]
+    fn error_body_openai_rate_limit_is_retryable() {
+        let v = json!({"error": {"type": "rate_limit_error", "message": "slow down"}});
+        let e = error_body_to_provider_error(&v).unwrap();
+        assert!(matches!(e, ProviderError::RateLimited { .. }));
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn error_body_anthropic_overloaded_is_retryable() {
+        let v = json!({"type": "error", "error": {"type": "overloaded_error", "message": "capacity"}});
+        let e = error_body_to_provider_error(&v).unwrap();
+        assert!(matches!(e, ProviderError::RateLimited { .. }));
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn error_body_auth_is_not_retryable() {
+        let v = json!({"error": {"type": "authentication_error", "message": "invalid key"}});
+        let e = error_body_to_provider_error(&v).unwrap();
+        assert!(matches!(e, ProviderError::Auth(_)));
+        assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn error_body_normal_findings_body_is_none() {
+        let v = json!({"findings": []});
+        assert!(error_body_to_provider_error(&v).is_none());
+    }
+
+    // 覆盖映射表其余档：server_error/api_error→Server、invalid_request/context_length→
+    // BadRequest（不可重试）、未知类型→Unavailable（保守可重试）。
+    #[test]
+    fn error_body_maps_remaining_types() {
+        let server = json!({"error": {"type": "server_error", "message": "boom"}});
+        assert!(matches!(error_body_to_provider_error(&server).unwrap(), ProviderError::Server(_)));
+
+        let api_err = json!({"error": {"type": "api_error", "message": "boom"}});
+        assert!(matches!(error_body_to_provider_error(&api_err).unwrap(), ProviderError::Server(_)));
+
+        let timeout = json!({"error": {"type": "timeout_error", "message": "slow"}});
+        let t = error_body_to_provider_error(&timeout).unwrap();
+        assert!(matches!(t, ProviderError::Timeout(_)));
+        assert!(t.is_retryable());
+
+        let bad_req = json!({"error": {"type": "invalid_request_error", "message": "bad shape"}});
+        let b = error_body_to_provider_error(&bad_req).unwrap();
+        assert!(matches!(b, ProviderError::BadRequest(_)));
+        assert!(!b.is_retryable());
+
+        let ctx = json!({"error": {"type": "context_length_exceeded", "message": "too long"}});
+        assert!(matches!(error_body_to_provider_error(&ctx).unwrap(), ProviderError::BadRequest(_)));
+
+        let unknown = json!({"error": {"type": "some_new_error_type", "message": "???"}});
+        let u = error_body_to_provider_error(&unknown).unwrap();
+        assert!(matches!(u, ProviderError::Unavailable(_)));
+        assert!(u.is_retryable(), "未知 error 类型必须保守可重试");
+    }
+
+    // error.message/type 须体现在 Display 里，便于诊断（不可只留一句 "Unavailable"）。
+    #[test]
+    fn error_body_message_carried_in_display() {
+        let v = json!({"error": {"type": "server_error", "message": "upstream exploded"}});
+        let e = error_body_to_provider_error(&v).unwrap();
+        let s = e.to_string();
+        assert!(s.contains("upstream exploded"), "错误消息应携带，got: {s}");
+        assert!(s.contains("server_error"), "错误类型应携带，got: {s}");
     }
 
     #[test]
