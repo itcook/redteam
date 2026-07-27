@@ -1,14 +1,15 @@
 pub mod backends;
-pub mod direct;
 pub mod fake;
+pub mod parse;
 pub mod registry;
+pub mod single_shot;
 pub mod tool_loop;
 
 use crate::domain::RawFinding;
 use async_trait::async_trait;
 
 #[derive(Clone, Debug)]
-pub struct LensRequest { pub model: String, pub prompt: String }
+pub struct LensRequest { pub route_key: String, pub prompt: String }
 
 /// iterations：本次调用实际消耗的 tool-loop 逻辑迭代数（计 FINALIZE 强制收尾轮、
 /// 不计 turn 级 retry 重试）。成功恒 >=1（单发单收即 1）；0 保留给「失败/未观测」。
@@ -126,12 +127,15 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
 }
 
 pub(crate) const DEFAULT_RETRY_BUDGET: u32 = 2; // 首发 + 2 重试
+/// 单轮最长等待时间；tool_loop 与 single_shot 共用同一常量（原各私有一份，Task 2 评审 Minor 收敛）。
+pub(crate) const PER_TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
 const RETRY_BACKOFF_BASE_MS: u64 = 200;
 const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
 const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 通用重试：`op` 产 `Result<T, ProviderError>`；可重试错→退避后重试，不可重试→立即返回。
-/// 退避：RateLimited 有 retry_after 用之（封顶 30s），否则指数（200·2^n ms，封顶 5s）。
+/// 退避：RateLimited 有 retry_after 用之（封顶 30s），否则指数（200·2^(n+1) ms，
+/// 首试 400ms，封顶 5s；n=attempt 从 0 计，故首次退避即左移一位而非 200ms）。
 pub(crate) async fn retry_classified<T, F, Fut>(budget: u32, mut op: F) -> Result<T, ProviderError>
 where
     F: FnMut() -> Fut,
@@ -162,6 +166,40 @@ pub trait ReviewProvider: Send + Sync {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError>;
 }
 
+/// 单轮 timeout+retry 包装（带 tools，对应 `ChatBackend::turn`）：超时归 `ProviderError::Timeout`，
+/// 外层套 `retry_classified`。tool_loop 与 single_shot 共享，避免各自手写同一手写块（B2 抽取）。
+pub(crate) async fn timed_turn(
+    backend: &dyn crate::provider::tool_loop::ChatBackend,
+    messages: &[crate::provider::tool_loop::ChatMessage],
+    tools: &[crate::tools::ToolSpec],
+    per_turn: std::time::Duration,
+    retry_budget: u32,
+) -> Result<crate::provider::tool_loop::AssistantTurn, ProviderError> {
+    retry_classified(retry_budget, || async {
+        match tokio::time::timeout(per_turn, backend.turn(messages, tools)).await {
+            Ok(r) => r,
+            Err(_) => Err(ProviderError::Timeout(
+                format!("turn timeout after {}s", per_turn.as_secs()))),
+        }
+    }).await
+}
+
+/// 同上，收尾轮版本（对应 `ChatBackend::turn_final`，不带 tools）。
+pub(crate) async fn timed_turn_final(
+    backend: &dyn crate::provider::tool_loop::ChatBackend,
+    messages: &[crate::provider::tool_loop::ChatMessage],
+    per_turn: std::time::Duration,
+    retry_budget: u32,
+) -> Result<crate::provider::tool_loop::AssistantTurn, ProviderError> {
+    retry_classified(retry_budget, || async {
+        match tokio::time::timeout(per_turn, backend.turn_final(messages)).await {
+            Ok(r) => r,
+            Err(_) => Err(ProviderError::Timeout(
+                format!("turn timeout after {}s", per_turn.as_secs()))),
+        }
+    }).await
+}
+
 /// 带超时的共享 HTTP client（connect 10s / 整请求默认 300s，`REDTEAM_HTTP_TIMEOUT_SECS` 可覆盖）；
 /// 构建失败回落默认 client。整请求超时是**校准旋钮**：思考型模型（MiniMax-M3 等）在大上下文
 /// bundle 上单轮响应可 >120s（旧值），非网络不可达（ping 通）而是慢——留 env 供按模型/网络调。
@@ -178,8 +216,7 @@ pub(crate) fn default_http_client() -> reqwest::Client {
 }
 
 /// Anthropic Messages 端点 URL：规范化 base 的 `/v1`——无论 base 含不含 `/v1`，最终都拼成
-/// `{host}/v1/messages`。backends（工具循环）与 direct（doc 单发）**共用**，避免重复导致不同步
-/// （dogfood：网关 base 配 `.../v1` 时旧逻辑拼出 `/v1/v1/messages` 404；曾只修 backends 漏 direct）。
+/// `{host}/v1/messages`（dogfood：网关 base 配 `.../v1` 时旧逻辑拼出 `/v1/v1/messages` 404）。
 pub(crate) fn anthropic_messages_url(base: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/v1") {

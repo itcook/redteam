@@ -4,6 +4,7 @@ use redteam::model::Prober as _;
 use redteam::output::render;
 use redteam::provider::backends::backend_from_config;
 use redteam::provider::registry::ProviderRegistry;
+use redteam::provider::single_shot::SingleShotProvider;
 use redteam::provider::tool_loop::ToolLoopProvider;
 use clap::{Parser, Subcommand};
 use std::path::Path;
@@ -339,7 +340,6 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
     let tools_mode = args.tools.as_deref()
         .and_then(redteam::config::ToolsMode::from_flag)
         .unwrap_or(cfg.review.tools);
-    let tools_enabled = matches!(tools_mode, redteam::config::ToolsMode::On);
 
     let mut registry = ProviderRegistry::new();
     for pm in &planned {
@@ -356,7 +356,11 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
                 return Err(format!("{e}"));
             }
         };
-        registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf(), tools_enabled)));
+        let provider: Box<dyn redteam::provider::ReviewProvider> = match tools_mode {
+            redteam::config::ToolsMode::On => Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf())),
+            _ => Box::new(SingleShotProvider::new(backend)),
+        };
+        registry.insert(pm.name.clone(), provider);
     }
 
     Ok(registry)
@@ -641,7 +645,11 @@ async fn main() {
             ModelCmd::Setup { provider, kind, base_url, model, key, priority, key_store } => {
                 let k = redteam::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
                 // 写入前守卫：kind/base_url 不合法则提示并拒绝写入，不污染配置。
-                if let Err(e) = redteam::model::validate_setup(&k, base_url.as_deref()) {
+                // kind 检查用原始 --kind 字符串（若显式给出，哪怕非法）而非 `k`——`derive_kind`
+                // 现返回强类型 ProviderKind，非法显式值在其内部已落回推断链、不会原样带出来，
+                // 若改用 k 校验会让非法 --kind 悄悄通过；未显式给 kind 时 k 恒合法，直接借它占位。
+                let kind_for_validate = kind.as_deref().unwrap_or_else(|| k.as_str());
+                if let Err(e) = redteam::model::validate_setup(kind_for_validate, base_url.as_deref()) {
                     eprintln!("error: {e}");
                     std::process::exit(2);
                 }
@@ -652,7 +660,7 @@ async fn main() {
                 let api_key_env = redteam::model::derive_api_key_env(&provider);
                 let prio = priority.unwrap_or(0);
                 if let Err(e) = redteam::config::write_provider(
-                    &provider, &k, base_url.as_deref(), &model, prio, Some(&api_key_env),
+                    &provider, k.as_str(), base_url.as_deref(), &model, prio, Some(&api_key_env),
                 ) {
                     eprintln!("error: failed to write provider config: {e}");
                     std::process::exit(2);
@@ -677,7 +685,7 @@ async fn main() {
                         }
                     }
                 }
-                println!("configured provider '{provider}' (kind={k}, model={model}, api_key_env={api_key_env})");
+                println!("configured provider '{provider}' (kind={}, model={model}, api_key_env={api_key_env})", k.as_str());
                 // 完成后自动跑一次 check
                 let cfg = load_config_warned();
                 let prober = redteam::model::probe::HttpProber::new();
@@ -698,7 +706,7 @@ async fn main() {
                         };
                         let base = redteam::model::effective_base(pc);
                         let key = cfg.resolve_key(&prov);
-                        match prober.list_models(&base, key.as_deref()).await {
+                        match prober.list_models(&base, key.as_deref(), pc.kind).await {
                             Ok(models) => {
                                 for m in models { println!("{m}"); }
                                 0

@@ -18,11 +18,11 @@ pub fn effective_base(pc: &ProviderConfig) -> String {
 
 /// 端点探测（可注入）：`list_models` 带 key 查 `{base}/models`——
 /// 成功(2xx)即认证通过 + 端点正确，返回模型 id 列表；失败(401/404/连不上)→Err。
-/// （注：用 bearer auth，适配 openai 兼容端点；Anthropic 的 /models 用 x-api-key 头，
-///  其 check 认证差异作 carry，配 Anthropic provider 时再处理。）
+/// 认证头随 `kind` 分派（Anthropic 用 `x-api-key`+`anthropic-version`，其余 bearer；
+/// 见 `probe::auth_headers`），故调用方须传入 provider 的 `ProviderKind`。
 #[async_trait::async_trait]
 pub trait Prober: Send + Sync {
-    async fn list_models(&self, base_url: &str, key: Option<&str>) -> anyhow::Result<Vec<String>>;
+    async fn list_models(&self, base_url: &str, key: Option<&str>, kind: ProviderKind) -> anyhow::Result<Vec<String>>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,7 +62,7 @@ pub async fn check_all(cfg: &Config, prober: &dyn Prober) -> Vec<Availability> {
         let key = cfg.resolve_key(name);
         let key_present = key.is_some();
         let (reachable, model_listed) =
-            match prober.list_models(&effective_base(pc), key.as_deref()).await {
+            match prober.list_models(&effective_base(pc), key.as_deref(), pc.kind).await {
                 Ok(ids) => {
                     let listed = if ids.is_empty() {
                         None
@@ -88,20 +88,23 @@ pub fn check_exit_code(avs: &[Availability]) -> i32 {
 }
 
 /// 推断 provider kind：显式 > 有 base_url(openai-compatible) > 按名推断 > 兜底 openai-compatible。
-pub fn derive_kind(provider: &str, explicit_kind: Option<&str>, base_url: Option<&str>) -> String {
-    if let Some(k) = explicit_kind {
-        return k.to_string();
+/// 显式 kind 若非法（`ProviderKind::parse` 失败）视同未提供、落回后续推断——CLI 层
+/// （`model setup`）在调用本函数前已用 `validate_setup` 对显式输入把关，故此处到达
+/// 「非法显式值」分支时调用方本已提前拒绝；本函数独立单测时对此保守兜底、不 panic。
+pub fn derive_kind(provider: &str, explicit_kind: Option<&str>, base_url: Option<&str>) -> ProviderKind {
+    if let Some(k) = explicit_kind.and_then(ProviderKind::parse) {
+        return k;
     }
     if base_url.is_some() {
-        return "openai-compatible".to_string();
+        return ProviderKind::OpenaiCompatible;
     }
     let p = provider.to_lowercase();
     if p.contains("claude") || p.contains("anthropic") {
-        "anthropic".to_string()
+        ProviderKind::Anthropic
     } else if p.contains("gpt") || p.contains("openai") {
-        "openai".to_string()
+        ProviderKind::Openai
     } else {
-        "openai-compatible".to_string()
+        ProviderKind::OpenaiCompatible
     }
 }
 
@@ -164,7 +167,7 @@ pub struct FakeProber {
 }
 #[async_trait::async_trait]
 impl Prober for FakeProber {
-    async fn list_models(&self, _base_url: &str, _key: Option<&str>) -> anyhow::Result<Vec<String>> {
+    async fn list_models(&self, _base_url: &str, _key: Option<&str>, _kind: ProviderKind) -> anyhow::Result<Vec<String>> {
         match &self.models {
             Some(m) => Ok(m.clone()),
             None => Err(anyhow::anyhow!("simulated auth/connection failure")),
@@ -227,11 +230,14 @@ mod tests {
 
     #[test]
     fn derive_kind_rules() {
-        assert_eq!(derive_kind("anything", Some("anthropic"), None), "anthropic"); // 显式优先
-        assert_eq!(derive_kind("x", None, Some("http://h/v1")), "openai-compatible"); // base_url
-        assert_eq!(derive_kind("claude", None, None), "anthropic"); // 名推断
-        assert_eq!(derive_kind("gpt", None, None), "openai");
-        assert_eq!(derive_kind("mystery", None, None), "openai-compatible"); // 兜底
+        assert_eq!(derive_kind("anything", Some("anthropic"), None), ProviderKind::Anthropic); // 显式优先
+        assert_eq!(derive_kind("x", None, Some("http://h/v1")), ProviderKind::OpenaiCompatible); // base_url
+        assert_eq!(derive_kind("claude", None, None), ProviderKind::Anthropic); // 名推断
+        assert_eq!(derive_kind("gpt", None, None), ProviderKind::Openai);
+        assert_eq!(derive_kind("mystery", None, None), ProviderKind::OpenaiCompatible); // 兜底
+        // 显式别名按 ProviderKind::parse 规范化；非法显式值落回推断链（不 panic）
+        assert_eq!(derive_kind("anything", Some("claude"), None), ProviderKind::Anthropic);
+        assert_eq!(derive_kind("mystery", Some("bogus"), None), ProviderKind::OpenaiCompatible);
     }
 
     #[test]
