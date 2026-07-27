@@ -206,9 +206,11 @@ pub fn render_precedents(finding: &crate::domain::Finding, cards: &[crate::db::D
 /// （恶意文件名），过 `neutralize_structure` 防伪造闭合标签越权改契约（对齐 build_bundle_prompt
 /// 对 diff/路径的手法）。claimed 卡（ResolveCard）来自不可信仓 `.redteam/proj.db` 的
 /// resolve 记录，id/file/title/quote 与 render_precedents 的 DismissCard 同信任边界——
-/// 逐字段 `oneline`（不能整行 oneline，会吞掉记录分隔与 quote 内部换行，quote 需保留原始
-/// 换行供 markdown 代码块内多行原样再报；quote 改走 neutralize_structure 防标签逃逸、
-/// 不 oneline 防原文失真致机器匹配失败）。
+/// id/file/title 逐字段 `oneline`（含换行会伪造清单假条目）。quote 单独走
+/// neutralize_structure 防标签逃逸、但**不** oneline——保留原始换行供 markdown 代码块内
+/// 多行原样再报（利于模型复现引用块）；机器匹配走 normalize_quote 剥全部空白、天然对
+/// 换行不敏感，故不 oneline 无损匹配。quote 换行至多在 claimed 清单内造视觉伪条目，但
+/// 清单本就攻击者可控（proj.db），弱于直接 INSERT 合法卡、不逃逸段外（opus 批 1 终审实证）。
 pub fn render_incremental_section(
     delta_base: &str,
     two_layer_manifest: &str,
