@@ -1,4 +1,4 @@
-use crate::provider::direct::parse_lens_output;
+use crate::provider::parse::{diagnostic_parse_error, parse_lens_output, REPAIR_PROMPT};
 use crate::provider::{LensCall, LensRequest, ProviderError, ReviewProvider};
 use crate::tools::{tool_specs, ToolCall, ToolExecutor, ToolResult, ToolSpec};
 use async_trait::async_trait;
@@ -203,19 +203,6 @@ pub async fn run_tool_loop(
     })
 }
 
-/// parse 失败诊断化：把 turn.finish_reason 拼进 Parse 错误，区分「截断(length/max_tokens)」
-/// vs 其它形状违约——warnings 里能直接看出根因，而不是裸的 "no schema-valid JSON in: …"。
-fn diagnostic_parse_error(turn: &AssistantTurn) -> ProviderError {
-    ProviderError::Parse(format!(
-        "final JSON parse failed (finish_reason={}): {}",
-        turn.finish_reason.as_deref().unwrap_or("unknown"),
-        turn.text.chars().take(120).collect::<String>()
-    ))
-}
-
-const REPAIR_PROMPT: &str = "Your previous response was not valid JSON (it may have been truncated). \
-Re-emit ONLY the complete findings JSON object matching the schema. If space is tight, shorten each \
-finding's body/recommendation text, but do NOT drop any finding and do NOT omit any required field.";
 const DEFAULT_MAX_ITERS: u32 = 12;
 const FINALIZE_PROMPT: &str = "You have used your tool-call budget. Based ONLY on what you have \
      already gathered, output the final review now as a single JSON object with a \"findings\" \

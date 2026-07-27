@@ -1,6 +1,6 @@
 pub mod backends;
-pub mod direct;
 pub mod fake;
+pub mod parse;
 pub mod registry;
 pub mod tool_loop;
 
@@ -178,8 +178,7 @@ pub(crate) fn default_http_client() -> reqwest::Client {
 }
 
 /// Anthropic Messages 端点 URL：规范化 base 的 `/v1`——无论 base 含不含 `/v1`，最终都拼成
-/// `{host}/v1/messages`。backends（工具循环）与 direct（doc 单发）**共用**，避免重复导致不同步
-/// （dogfood：网关 base 配 `.../v1` 时旧逻辑拼出 `/v1/v1/messages` 404；曾只修 backends 漏 direct）。
+/// `{host}/v1/messages`（dogfood：网关 base 配 `.../v1` 时旧逻辑拼出 `/v1/v1/messages` 404）。
 pub(crate) fn anthropic_messages_url(base: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/v1") {
