@@ -127,6 +127,8 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
 }
 
 pub(crate) const DEFAULT_RETRY_BUDGET: u32 = 2; // 首发 + 2 重试
+/// 单轮最长等待时间；tool_loop 与 single_shot 共用同一常量（原各私有一份，Task 2 评审 Minor 收敛）。
+pub(crate) const PER_TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
 const RETRY_BACKOFF_BASE_MS: u64 = 200;
 const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
 const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);
