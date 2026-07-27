@@ -2,6 +2,7 @@ pub mod backends;
 pub mod fake;
 pub mod parse;
 pub mod registry;
+pub mod single_shot;
 pub mod tool_loop;
 
 use crate::domain::RawFinding;
@@ -160,6 +161,40 @@ where
 #[async_trait]
 pub trait ReviewProvider: Send + Sync {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError>;
+}
+
+/// 单轮 timeout+retry 包装（带 tools，对应 `ChatBackend::turn`）：超时归 `ProviderError::Timeout`，
+/// 外层套 `retry_classified`。tool_loop 与 single_shot 共享，避免各自手写同一手写块（B2 抽取）。
+pub(crate) async fn timed_turn(
+    backend: &dyn crate::provider::tool_loop::ChatBackend,
+    messages: &[crate::provider::tool_loop::ChatMessage],
+    tools: &[crate::tools::ToolSpec],
+    per_turn: std::time::Duration,
+    retry_budget: u32,
+) -> Result<crate::provider::tool_loop::AssistantTurn, ProviderError> {
+    retry_classified(retry_budget, || async {
+        match tokio::time::timeout(per_turn, backend.turn(messages, tools)).await {
+            Ok(r) => r,
+            Err(_) => Err(ProviderError::Timeout(
+                format!("turn timeout after {}s", per_turn.as_secs()))),
+        }
+    }).await
+}
+
+/// 同上，收尾轮版本（对应 `ChatBackend::turn_final`，不带 tools）。
+pub(crate) async fn timed_turn_final(
+    backend: &dyn crate::provider::tool_loop::ChatBackend,
+    messages: &[crate::provider::tool_loop::ChatMessage],
+    per_turn: std::time::Duration,
+    retry_budget: u32,
+) -> Result<crate::provider::tool_loop::AssistantTurn, ProviderError> {
+    retry_classified(retry_budget, || async {
+        match tokio::time::timeout(per_turn, backend.turn_final(messages)).await {
+            Ok(r) => r,
+            Err(_) => Err(ProviderError::Timeout(
+                format!("turn timeout after {}s", per_turn.as_secs()))),
+        }
+    }).await
 }
 
 /// 带超时的共享 HTTP client（connect 10s / 整请求默认 300s，`REDTEAM_HTTP_TIMEOUT_SECS` 可覆盖）；

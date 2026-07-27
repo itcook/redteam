@@ -5,7 +5,6 @@ use crate::tools::{ToolCall, ToolSpec};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-// 注意：与 src/provider/direct.rs 的同名常量保持同步
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 const MAX_TOKENS: u64 = 8192;
@@ -116,7 +115,7 @@ pub(crate) fn parse_anthropic_turn(resp: &Value) -> Option<AssistantTurn> {
     Some(AssistantTurn { text, tool_calls, input_tokens, output_tokens, cached_input_tokens, finish_reason })
 }
 
-/// 直连 Anthropic 的 ChatBackend（rustls-only，沿用 direct.rs 的 HTTP 形状）。
+/// 直连 Anthropic 的 ChatBackend（rustls-only）。
 pub struct AnthropicBackend {
     model: String,
     base_url: Option<String>,
