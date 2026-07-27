@@ -165,7 +165,7 @@ async fn run_one_bundle(
 
     let mut errs: Vec<String> = Vec::new();
     for (i, pm) in chain.iter().enumerate() {
-        match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
+        match provider.run(LensRequest { route_key: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call
                     .findings
@@ -770,7 +770,7 @@ mod tests {
         let good = ToolLoopProvider::new(
             Box::new(FakeChatBackend::new(vec![AssistantTurn {
                 text: good_json.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None }])),
-            dir.path().to_path_buf(), true);
+            dir.path().to_path_buf());
         // bad：先 tool_call（iter1），再一路 Timeout（iter2 重试耗尽仍失败）。
         // DEFAULT_RETRY_BUDGET=2 → iter2 需 3 次 Err（首发+2 重试）→ 备 1 Ok + 3 Err。
         let tc = AssistantTurn { text: String::new(),
@@ -783,7 +783,7 @@ mod tests {
                 Err(ProviderError::Timeout("dead".into())),
                 Err(ProviderError::Timeout("dead".into())),
             ])),
-            dir.path().to_path_buf(), true);
+            dir.path().to_path_buf());
 
         let mut reg = ProviderRegistry::new();
         reg.insert("good", Box::new(good));

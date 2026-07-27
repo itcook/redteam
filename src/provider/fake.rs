@@ -27,7 +27,7 @@ impl FakeProvider {
 #[async_trait::async_trait]
 impl ReviewProvider for FakeProvider {
     async fn run(&self, req: LensRequest) -> Result<LensCall, ProviderError> {
-        match self.scripted.get(&req.model) {
+        match self.scripted.get(&req.route_key) {
             Some(fs) => Ok(LensCall {
                 findings: fs.clone(),
                 input_tokens: self.tokens.0,
@@ -37,7 +37,7 @@ impl ReviewProvider for FakeProvider {
                 tool_use: Default::default(),
                 needs: vec![],
             }),
-            None => Err(ProviderError::Unavailable(format!("no script for model {}", req.model))),
+            None => Err(ProviderError::Unavailable(format!("no script for model {}", req.route_key))),
         }
     }
 }
@@ -54,14 +54,14 @@ mod tests {
     #[tokio::test]
     async fn fake_returns_scripted_findings() {
         let p = FakeProvider::with("claude", vec![raw("boom", Severity::High)]);
-        let call = p.run(LensRequest { model: "claude".into(), prompt: "x".into() }).await.unwrap();
+        let call = p.run(LensRequest { route_key: "claude".into(), prompt: "x".into() }).await.unwrap();
         assert_eq!(call.findings.len(), 1);
         assert_eq!(call.findings[0].title, "boom");
     }
     #[tokio::test]
     async fn fake_unknown_model_is_unavailable() {
         let p = FakeProvider::with("claude", vec![]);
-        let err = p.run(LensRequest { model: "gpt".into(), prompt: "x".into() }).await.unwrap_err();
+        let err = p.run(LensRequest { route_key: "gpt".into(), prompt: "x".into() }).await.unwrap_err();
         assert!(matches!(err, ProviderError::Unavailable(_)));
     }
 }

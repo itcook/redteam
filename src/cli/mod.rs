@@ -469,7 +469,7 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
 
 /// R2.3：resume 差集补跑。读 `manifest`（全集 M）+ `partial`（已完成 ok:true 的 cell 集）→
 /// `待跑 = M − 已完成`；对待跑 cell **直接用 manifest 里渲染好的 prompt 重放**
-/// `provider.run(LensRequest{model,prompt})`——不重收集证据、不重 build prompt（确定性）；
+/// `provider.run(LensRequest{route_key,prompt})`——不重收集证据、不重 build prompt（确定性）；
 /// append_partial 落盘后，`read_partial` 取全部 ok:true 的 findings（已完成 + 新补）走 mode
 /// 对应的共用尾段（`assemble_report`）组出完整报告。全集补齐→verdict 正常；仍有缺失→`Incomplete`。
 ///
@@ -525,7 +525,7 @@ pub async fn run_resume(
     let mut usage = (0u64, 0u64, 0u64);
     let mut warnings = Vec::new();
     for cell in &pending {
-        let req = LensRequest { model: cell.model.clone(), prompt: cell.prompt.clone() };
+        let req = LensRequest { route_key: cell.model.clone(), prompt: cell.prompt.clone() };
         let rec = match provider.run(req).await {
             Ok(call) => {
                 usage.0 += call.input_tokens;

@@ -24,6 +24,17 @@ impl ProviderKind {
     pub fn parse(s: &str) -> Option<ProviderKind> {
         serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
     }
+
+    /// 规范 kebab-case 名（与 serde `rename_all` 一致，恒返别名的标准形）；
+    /// 供需要把枚举写回文本的场合用（TOML 落盘、日志），避免手写字符串表与枚举定义各说各话。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::Openai => "openai",
+            ProviderKind::OpenaiCompatible => "openai-compatible",
+            ProviderKind::Google => "google",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -33,7 +33,7 @@ async fn code_bundle_tool_loop_anchors_and_drops_fabricated() {
         },
         AssistantTurn { text: findings_json.into(), tool_calls: vec![], input_tokens: 3, output_tokens: 5, cached_input_tokens: 0, finish_reason: None },
     ]);
-    let provider = ToolLoopProvider::new(Box::new(backend), root.path().to_path_buf(), true);
+    let provider = ToolLoopProvider::new(Box::new(backend), root.path().to_path_buf());
 
     let cfg = Config::from_layers(&[r#"[review]
 default_models=["m"]
