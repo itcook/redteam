@@ -330,3 +330,116 @@ default_models=["m","m2"]
     assert_eq!(code, 10, "reject → exit 10");
     assert_eq!(code, expected_code, "exit code 必须与 verdict 映射一致（非硬编码脱钩）");
 }
+
+/// M17-c Task 6：背景 job 冒烟 e2e——真 worker 落盘链路首条端到端锚（C-Q5）。
+///
+/// 方案①（真 spawn `redteam review --background` 二进制 + fake provider 经 config 注入）
+/// 已判死：`[providers.*].kind` 只收 anthropic/openai/openai_compatible/google 四种真实网络
+/// backend（`backend_from_config`/`ProviderKind` 收口），`FakeProvider` 是纯 Rust 代码内桩，
+/// 无法经配置文件被选中——真 spawn 意味着必须打真实模型 API，不可行也不该为此引入网络依赖/
+/// 密钥。改走方案②：进程内驱动 `run_job`（pub API，main.rs Worker 命令的真实调用点）跑全
+/// 链路——这正是本批（M17-c）要锚的「worker 全生命周期单连接贯穿」的可观测面：manifest/
+/// partial/state/result 四张表全部经同一个 `Arc<JobStore>` 写入与读回。
+#[tokio::test]
+async fn background_job_smoke_full_lifecycle_single_store() {
+    use redteam::cli::{exit_code, run_job, ReviewArgs};
+    use redteam::config::Config;
+    use redteam::domain::{RawFinding, ReviewReport, Severity, Verdict};
+    use redteam::provider::fake::FakeProvider;
+    use redteam::state::{JobStatus, JobStore, Phase};
+    use std::sync::Arc;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
+    git(dir.path(), &["add", "src/a.rs"]); // working-tree scope 读 staged 改动
+
+    let cfg = Config::from_layers(&[r#"[providers.alpha]
+kind="openai"
+model="a"
+priority=10
+[review]
+default_models=["alpha"]
+"#])
+    .unwrap();
+
+    // 单 model 报一条 High（孤证 blocking）——既锚 Fanout 又必然触发 Refute 子阶段打点
+    // （agreement==1 且 severity>=block_threshold）；单 model 交叉 refute 退化自审，
+    // FakeProvider 对 review/refute 两种调用回同一份脚本，无 upheld/refuted 前缀走违约
+    // 兜底判 Refuted（既有 `code_replicate_lone_blocking_refuted_stays_approve` 已证此
+    // 契约）→ confidence 归零、不 blocking → 全链路应稳定收敛到 Approve/exit 0（非 flake）。
+    let mut scripted = std::collections::BTreeMap::new();
+    scripted.insert(
+        "alpha".to_string(),
+        vec![RawFinding {
+            severity: Severity::High,
+            title: "unvalidated write".into(),
+            body: "b".into(),
+            file: "src/a.rs".into(),
+            line_start: 1,
+            line_end: 1,
+            confidence: 0.9,
+            recommendation: "validate".into(),
+            hard_constraint: false,
+            quote: "db.write(token);".into(),
+        }],
+    );
+    let provider = FakeProvider { scripted, tokens: (0, 0, 0) };
+
+    let args = ReviewArgs {
+        base: None, scope: "working-tree".into(), spec: vec![], focus: None,
+        models: None, models_all: false, block_threshold: None, conf_floor: None,
+        background: true, format: "json".into(), resume: None, dismissed: None,
+        no_dismissed: false, incremental_from: None, tools: None,
+    };
+
+    // 模拟 main.rs 后台派发起手态（写 args 快照 + 起手 Pending）：单一 `JobStore::open`
+    // 此后全程复用（Arc 化），与真实 worker 进程「main 建 store → run_job/sink 全生命周期
+    // 共享同一连接」的落点等价——这条 store 之后不再重开，manifest/partial/状态/result
+    // 全部经它写、也经它读回，直接锚「一条连接跑完整 job 生命周期」。
+    let job_id = "smoke1";
+    let store = Arc::new(JobStore::open(dir.path()).unwrap());
+    store.write_args_raw(job_id, &serde_json::to_string(&args).unwrap()).unwrap();
+    store.create_job(job_id, 1_000).unwrap();
+
+    let code = run_job(job_id, &args, &provider, &cfg, dir.path(), 1_000, Arc::clone(&store)).await;
+
+    // ── 终态：Done，非 Failed/TimedOut ──────────────────────────────────
+    let st = store.read_state(job_id).expect("job state 应在场");
+    assert_eq!(st.status, JobStatus::Done, "全链路应正常收敛到 Done");
+    assert_eq!(st.exit_code, Some(code), "落盘 exit_code 应与 run_job 返回值一致");
+    assert!(st.result_path.is_some(), "result_path 应回填");
+
+    // ── progress/phase_history 有痕（worker 单连接贯穿要锚的可观测面）───────────
+    assert_eq!(st.progress.total, 1, "manifest 应写 1 个 cell");
+    assert_eq!(st.progress.done, 1, "sink 应推进 1 个 cell 完成");
+    let phases: Vec<Phase> = st.phase_history.iter().map(|p| p.phase).collect();
+    assert!(phases.contains(&Phase::Collecting), "起手应打 Collecting");
+    assert!(phases.contains(&Phase::Fanout), "manifest 写出后应打 Fanout");
+    assert!(phases.contains(&Phase::Finalizing), "尾段前应打 Finalizing");
+    assert!(phases.contains(&Phase::Refute), "孤证 blocking 应触发 refute 子阶段打点");
+
+    // ── result 落库可读、verdict 合法、exit code 与 verdict 映射一致 ─────────────
+    let raw = store.read_result(job_id).expect("result 应可读");
+    let report: ReviewReport = serde_json::from_str(&raw).expect("result 应是合法 JSON");
+    assert_eq!(report.verdict, Verdict::Approve, "孤证被自审 refute 证伪后不应 blocking");
+    assert_eq!(report.run.job_id, job_id, "run.job_id 应由 run_job 回填（dispatch 内恒空串）");
+    assert!(report.run.failed_models.is_empty(), "单 model 全程可达");
+    let expected_code = exit_code(report.verdict, !report.run.failed_models.is_empty());
+    assert_eq!(code, 0, "approve 且对照集完整 → exit 0");
+    assert_eq!(code, expected_code, "exit code 必须与 verdict 映射一致（非硬编码脱钩）");
+
+    // ── 全程单一 store：同一 Arc<JobStore> 既是 run_job 的落盘方，也是本处的校验读方——
+    // manifest/partial 两张表经它可读，证明写读全在一条连接上，未散落到别的打开实例。
+    assert_eq!(store.read_manifest(job_id).len(), 1, "manifest 应可经同一 store 读回");
+    assert_eq!(store.read_partial(job_id).len(), 1, "partial checkpoint 应可经同一 store 读回");
+}
