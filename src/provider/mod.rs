@@ -9,7 +9,7 @@ use crate::domain::RawFinding;
 use async_trait::async_trait;
 
 #[derive(Clone, Debug)]
-pub struct LensRequest { pub model: String, pub prompt: String }
+pub struct LensRequest { pub route_key: String, pub prompt: String }
 
 /// iterations：本次调用实际消耗的 tool-loop 逻辑迭代数（计 FINALIZE 强制收尾轮、
 /// 不计 turn 级 retry 重试）。成功恒 >=1（单发单收即 1）；0 保留给「失败/未观测」。
@@ -134,7 +134,8 @@ const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5)
 const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 通用重试：`op` 产 `Result<T, ProviderError>`；可重试错→退避后重试，不可重试→立即返回。
-/// 退避：RateLimited 有 retry_after 用之（封顶 30s），否则指数（200·2^n ms，封顶 5s）。
+/// 退避：RateLimited 有 retry_after 用之（封顶 30s），否则指数（200·2^(n+1) ms，
+/// 首试 400ms，封顶 5s；n=attempt 从 0 计，故首次退避即左移一位而非 200ms）。
 pub(crate) async fn retry_classified<T, F, Fut>(budget: u32, mut op: F) -> Result<T, ProviderError>
 where
     F: FnMut() -> Fut,

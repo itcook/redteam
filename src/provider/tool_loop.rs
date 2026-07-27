@@ -397,7 +397,7 @@ mod tests {
         // 经 trait 对象调用，证明 drop-in
         let p: &dyn ReviewProvider = &provider;
         let call = p
-            .run(LensRequest { model: "any".into(), prompt: "review".into() })
+            .run(LensRequest { route_key: "any".into(), prompt: "review".into() })
             .await
             .unwrap();
         assert_eq!(call.findings.len(), 1);

@@ -153,7 +153,7 @@ async fn refute_one(
     let notes = render_precedents(finding, precedents);
     let ctx = source_snippet(root, finding);
     let prompt = build_refute_prompt(finding, &notes, &ctx, spec_docs);
-    match provider.run(LensRequest { model: model.clone(), prompt }).await {
+    match provider.run(LensRequest { route_key: model.clone(), prompt }).await {
         Ok(call) => {
             let (verdict, note, contract_warn) = classify_refute(&call.findings);
             let warn = contract_warn.map(|w| format!("refute [{}] model {model}: {w}", finding.id));

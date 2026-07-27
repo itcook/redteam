@@ -165,7 +165,7 @@ async fn run_one_bundle(
 
     let mut errs: Vec<String> = Vec::new();
     for (i, pm) in chain.iter().enumerate() {
-        match provider.run(LensRequest { model: pm.name.clone(), prompt: prompt.to_string() }).await {
+        match provider.run(LensRequest { route_key: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
                 let fs = call
                     .findings
