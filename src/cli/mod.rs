@@ -940,7 +940,7 @@ mod job_tests {
         // 非 git 目录 → changed_files 失败 → run_review_dispatch Err → failed
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
         let code = run_job("j2", &code_args(), &provider, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
-        assert_eq!(code, 2);
+        assert_eq!(code, 3); // 五档：dispatch 失败落 partial_report → Verdict::Incomplete → 3
         let st = store.read_state("j2").unwrap();
         assert_eq!(st.status, JobStatus::Failed);
         assert!(st.error.is_some());
@@ -964,7 +964,7 @@ mod job_tests {
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
         let code = run_job("j2b", &code_args(), &provider, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
 
-        assert_eq!(code, 2);
+        assert_eq!(code, 3); // 五档：partial 报告 verdict=incomplete → 3
         let st = store.read_state("j2b").unwrap();
         assert_eq!(st.status, JobStatus::Failed);
         assert!(st.error.is_some());
@@ -1009,7 +1009,7 @@ mod job_tests {
         let provider = HangProvider;
         let code = run_job("j-to", &code_args(), &provider, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
 
-        assert_eq!(code, 2);
+        assert_eq!(code, 3); // 五档：超时 partial 报告 verdict=incomplete → 3
         let st = store.read_state("j-to").unwrap();
         assert_eq!(st.status, JobStatus::TimedOut);
         let res = store.read_result("j-to").unwrap();
