@@ -48,10 +48,12 @@ pub struct RawResults {
     pub needs_stats: (u32, u32),
 }
 
-/// 二阶段补查 prompt 构造器（design §2.3）：`(cell_idx, cap 后的 needs, 第一趟 findings) -> Some(第二趟 prompt)`。
-/// `None`＝本格不补跑。doc fanout 单 cell，`cell_idx` 恒 0。
+/// 二阶段补查 prompt 构造器（design §2.3）：`(cell_idx, cap 后的 needs, 第一趟 findings) ->
+/// (Some(第二趟 prompt) 或 None＝本格不补跑, 拒读 warnings)`。第二元恒返回（T46①：needs 读守卫
+/// 拒读事件即便最终判定不补跑——evidence 为空——也须把拒读理由带出去落 `run.warnings`，不能
+/// 随 None 分支一起被默默吞掉）。doc fanout 单 cell，`cell_idx` 恒 0。
 pub type SecondPrompt<'a> =
-    Option<&'a (dyn Fn(usize, &[NeedEntry], &[Finding]) -> Option<String> + Sync)>;
+    Option<&'a (dyn Fn(usize, &[NeedEntry], &[Finding]) -> (Option<String>, Vec<String>) + Sync)>;
 
 /// R8.1：quote 去除全部空白（保大小写）——token 序列即身份，免疫 reformat。
 fn normalize_quote(q: &str) -> String {
@@ -220,7 +222,9 @@ where
         warnings.push(format!("cell {warn_label}: {} needs declared, capped at 5", run.needs.len()));
         run.needs.truncate(5);
     }
-    let Some(p2) = mk(idx, &run.needs, &run.findings) else { return (run, warnings, stats) };
+    let (p2, deny_warnings) = mk(idx, &run.needs, &run.findings);
+    warnings.extend(deny_warnings); // T46①：拒读 warnings 无条件带出（即便 p2 随后是 None）
+    let Some(p2) = p2 else { return (run, warnings, stats) };
     let run2 = rerun(p2).await;
     match run2.warn {
         None => {
@@ -486,7 +490,7 @@ mod tests {
         let mk = |_idx: usize, needs: &[NeedEntry], drafts: &[Finding]| {
             assert_eq!(needs.len(), 1);
             assert_eq!(drafts.len(), 1, "草稿传入构造器");
-            Some("second pass prompt".to_string())
+            (Some("second pass prompt".to_string()), vec![])
         };
         let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk), "").await;
         assert_eq!(out.findings.len(), 2, "第二趟整体替换第一趟");
@@ -497,7 +501,7 @@ mod tests {
     async fn code_fanout_second_pass_failure_keeps_first() {
         let first = lens_call_with(vec![rawf("draft finding")], vec![need("src/x.rs", "verify")]);
         let provider = SeqProvider::new(vec![first]); // 第二趟无 script → Err
-        let mk = |_i: usize, _n: &[NeedEntry], _d: &[Finding]| Some("p2".to_string());
+        let mk = |_i: usize, _n: &[NeedEntry], _d: &[Finding]| (Some("p2".to_string()), vec![]);
         let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk), "").await;
         assert_eq!(out.findings.len(), 1, "第二趟失败保留第一趟");
         assert!(out.warnings.iter().any(|w| w.contains("second pass failed")));
@@ -509,7 +513,7 @@ mod tests {
         let first = lens_call_with(vec![], six);
         let second = lens_call_with(vec![], vec![]);
         let provider = SeqProvider::new(vec![first, second]);
-        let mk = |_i: usize, n: &[NeedEntry], _d: &[Finding]| { assert_eq!(n.len(), 5, "cap 5"); Some("p2".into()) };
+        let mk = |_i: usize, n: &[NeedEntry], _d: &[Finding]| { assert_eq!(n.len(), 5, "cap 5"); (Some("p2".into()), vec![]) };
         let out = run_code_fanout(&provider, "t", &bundles_one(), "", "", &dossiers_one(), &opts_single(), None, Some(&mk), "").await;
         assert!(out.warnings.iter().any(|w| w.contains("capped at 5")));
     }

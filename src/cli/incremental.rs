@@ -101,7 +101,7 @@ pub async fn run_incremental_review(
     // 扣减出 budget → build_packs/mk/fan-out 与 TailCtx.spec_docs（喂 refute 趟）全用
     // 缩后预算 + 真值。空 --spec → (String::new(), 0) → budget 原样不变（回归零漂移）。
     let budget_raw = pack_budget_bytes(cfg, &model_names);
-    let (spec_section, spec_used) =
+    let (spec_section, spec_used, spec_warnings) =
         render_spec_section_capped(&args.spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
     let budget = budget_raw.saturating_sub(spec_used);
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
@@ -110,7 +110,9 @@ pub async fn run_incremental_review(
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
         second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section, &spec_section)
     };
-    let raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk), &spec_section).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk), &spec_section).await;
+    // T46①：--spec denylist/PEM 拒读 warnings 并入 run.warnings（与 run_code_review 一致）。
+    raw.warnings.extend(spec_warnings);
 
     // 尾段（Task 3，M17-a 尾段统一）：接入 assemble_report 共用引擎——carry=Some 时其内部
     // 完成 anchor→dedup→dispute 检测→merge_carry→refute(合并集)→mark_dismissed→verdict→

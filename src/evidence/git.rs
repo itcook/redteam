@@ -42,11 +42,15 @@ fn assemble_changes(files: &[String], per_file: impl Fn(&str) -> String) -> Vec<
 pub fn changed_files(dir: &std::path::Path, base: Option<&str>, branch_scope: bool) -> anyhow::Result<Vec<FileChange>> {
     if branch_scope {
         let base = base.ok_or_else(|| anyhow::anyhow!("branch scope requires --base"))?;
-        let merge_base = git_at(dir, &["merge-base", base, "HEAD"])?.trim().to_string();
+        // `--end-of-options`：base 是 --base 传入的 user-arg（威胁模型 B：本身可信，但仍以
+        // 攻击者摆布的分支名/字符串形态出现——如 "--output=/tmp/x"）。挡在 base 前，保证它
+        // 恒被当 rev 解析、绝不会被 git 当选项吃掉（既往 plain `--` 会把 range 误判成
+        // pathspec、静默空输出；`--end-of-options` 无此副作用，见 evidence/git.rs 顶注）。
+        let merge_base = git_at(dir, &["merge-base", "--end-of-options", base, "HEAD"])?.trim().to_string();
         let range = format!("{merge_base}...HEAD");
-        let files = dedup_files(&git_at(dir, &["diff", "--name-only", &range])?);
+        let files = dedup_files(&git_at(dir, &["diff", "--name-only", "--end-of-options", &range])?);
         Ok(assemble_changes(&files, |p| {
-            git_at(dir, &["diff", &range, "--", p]).unwrap_or_else(|e| {
+            git_at(dir, &["diff", "--end-of-options", &range, "--", p]).unwrap_or_else(|e| {
                 eprintln!("warning: failed to diff {p}: {e}");
                 String::new()
             })
@@ -89,9 +93,11 @@ pub fn head_sha_at(dir: &std::path::Path) -> anyhow::Result<String> {
 /// （锚定不变式失效——delta 范围不再覆盖「使锚失效的改动」）。
 /// merge-base --is-ancestor 以退出码表意（0=是/1=否），不能走 git_at 的 success 判定。
 pub fn is_ancestor(dir: &std::path::Path, sha: &str) -> anyhow::Result<bool> {
+    // `--end-of-options`：sha 是位置参数（虽是内部产出的 SHA，非直接 user-arg，但作为纵深
+    // 防御同族补齐——理由与 changed_files 顶注一致）。
     let out = Command::new("git")
         .current_dir(dir)
-        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+        .args(["merge-base", "--is-ancestor", "--end-of-options", sha, "HEAD"])
         .output()?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -124,7 +130,8 @@ pub fn worktree_dirty(dir: &std::path::Path) -> anyhow::Result<bool> {
 /// 相似度 <50% 的 rename 不被 -M 识别 → 不进映射，carry 走 carried_dropped 降级（可审非静默）。
 // ponytail: 路径含 tab 的病态仓不在威胁模型内；quotePath 已关，中文等非 ASCII 路径原样可配。
 pub fn rename_map(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let out = git_at(dir, &["diff", "--name-status", "-M", &format!("{base}..HEAD")])?;
+    // `--end-of-options`：base 拼进 range 字符串里的位置参数，同 changed_files 顶注防注入。
+    let out = git_at(dir, &["diff", "--name-status", "-M", "--end-of-options", &format!("{base}..HEAD")])?;
     Ok(out
         .lines()
         .filter_map(|l| {
@@ -143,7 +150,8 @@ pub fn rename_map(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<(Stri
 /// pathspec 会把旧路径滤出配对域，rename 检测失效 → 纯 rename 膨胀成整文件新增
 /// （R1 经济性被击穿）。单次全量 diff + 按 `diff --git` 边界切分则天然保留 rename 元数据。
 pub fn changed_files_since(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<FileChange>> {
-    let full = git_at(dir, &["diff", "-M", &format!("{base}..HEAD")])?;
+    // `--end-of-options`：同 rename_map，base 拼进 range 字符串的位置参数防注入。
+    let full = git_at(dir, &["diff", "-M", "--end-of-options", &format!("{base}..HEAD")])?;
     Ok(split_diff_by_file(&full))
 }
 
@@ -169,8 +177,10 @@ fn split_diff_by_file(full: &str) -> Vec<FileChange> {
 
 /// 全分支变更文件清单（双层 manifest 第一层）：merge-base(base,HEAD)...HEAD 的 name-only。
 pub fn branch_files(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<String>> {
-    let mb = git_at(dir, &["merge-base", base, "HEAD"])?.trim().to_string();
-    Ok(dedup_files(&git_at(dir, &["diff", "--name-only", &format!("{mb}...HEAD")])?))
+    // `--end-of-options`：base 是位置参数，同 changed_files 顶注防注入；mb 是 merge-base 的
+    // 输出（已由 git 自身校验落回合法 SHA），但仍一并加固——不假设下游拼接恒安全。
+    let mb = git_at(dir, &["merge-base", "--end-of-options", base, "HEAD"])?.trim().to_string();
+    Ok(dedup_files(&git_at(dir, &["diff", "--name-only", "--end-of-options", &format!("{mb}...HEAD")])?))
 }
 
 #[cfg(test)]
@@ -336,6 +346,64 @@ mod tests {
         commit_all(dir.path(), "c3");
         let files = branch_files(dir.path(), "dev0").unwrap();
         assert_eq!(files, vec!["f1.rs".to_string(), "f2.rs".to_string()]);
+    }
+
+    /// 1-5：git 参数注入回归锚——`--base` 若长成 `--output=<file>` 这种形态（威胁模型 B：
+    /// 攻击者摆布 CLI 参数字符串），此前会被当选项吃掉，git diff/merge-base 借 `--output`
+    /// 把 diff 内容任意写到攻击者选择的路径（真实验证过的漏洞，见 2026-07-14 dogfood）。
+    /// `--end-of-options` 令这类字符串恒被当 rev 解析失败（fail-closed：函数返回 Err），
+    /// 而不是被当选项静默执行——本测试断言两件事：调用失败 + 目标文件确实没被写出。
+    #[test]
+    fn changed_files_branch_scope_rejects_option_shaped_base_without_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        commit_all(dir.path(), "c1");
+        std::fs::write(dir.path().join("a.rs"), "x\ny\n").unwrap();
+        commit_all(dir.path(), "c2");
+
+        let target = dir.path().join("pwned_by_base");
+        let malicious_base = format!("--output={}", target.display());
+        let result = changed_files(dir.path(), Some(&malicious_base), true);
+        assert!(result.is_err(), "option 形态的 base 须 fail-closed（Err），而非被当选项静默执行");
+        assert!(!target.exists(), "--output 注入不应能任意写文件：{target:?}");
+    }
+
+    #[test]
+    fn branch_files_rejects_option_shaped_base_without_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        commit_all(dir.path(), "c1");
+
+        let target = dir.path().join("pwned_by_branch_files");
+        let malicious_base = format!("--output={}", target.display());
+        let result = branch_files(dir.path(), &malicious_base);
+        assert!(result.is_err(), "option 形态的 base 须 fail-closed（Err）");
+        assert!(!target.exists(), "--output 注入不应能任意写文件：{target:?}");
+    }
+
+    /// rename_map/changed_files_since 把 base 直接拼进 range 字符串（`{base}..HEAD`）——
+    /// 与 changed_files 的独立 merge-base 调用是不同的注入面（这里连 merge-base 校验都没有，
+    /// base 直接进 git diff 的位置参数），同样须被 `--end-of-options` 挡住。
+    #[test]
+    fn changed_files_since_and_rename_map_reject_option_shaped_base_without_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        commit_all(dir.path(), "c1");
+        std::fs::write(dir.path().join("a.rs"), "x\ny\n").unwrap();
+        commit_all(dir.path(), "c2");
+
+        let target1 = dir.path().join("pwned_by_delta");
+        let malicious_base = format!("--output={}", target1.display());
+        assert!(changed_files_since(dir.path(), &malicious_base).is_err());
+        assert!(!target1.exists(), "changed_files_since 不应被注入写文件：{target1:?}");
+
+        let target2 = dir.path().join("pwned_by_rename_map");
+        let malicious_base2 = format!("--output={}", target2.display());
+        assert!(rename_map(dir.path(), &malicious_base2).is_err());
+        assert!(!target2.exists(), "rename_map 不应被注入写文件：{target2:?}");
     }
 
     #[test]
