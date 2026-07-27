@@ -366,12 +366,24 @@ impl ProjDb {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// 评审史：结果持久存储，永不过期（设计定案 #8）。
-    pub fn result_put(&self, job_id: &str, json: &str, md: &str) -> Result<()> {
+    /// 评审史 json 列单独原子写（M17-c C-Q4：消除「读另一列再写两列」的双事务窗口——
+    /// 旧 result_put 整行覆盖已删，json/md 各自单列 upsert，互不读取对方现值）。
+    pub fn result_put_json(&self, job_id: &str, json: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO results (job_id, json, md) VALUES (?1,?2,?3)
-             ON CONFLICT(job_id) DO UPDATE SET json=?2, md=?3",
-            params![job_id, json, md],
+            "INSERT INTO results (job_id, json) VALUES (?1,?2)
+             ON CONFLICT(job_id) DO UPDATE SET json=excluded.json",
+            params![job_id, json],
+        )?;
+        Ok(())
+    }
+
+    /// 评审史 md 列单独原子写（同上，对称）。首建行需显式给 json=''——
+    /// json 列 NOT NULL 无 DEFAULT，省略会报约束错。
+    pub fn result_put_md(&self, job_id: &str, md: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO results (job_id, json, md) VALUES (?1,'',?2)
+             ON CONFLICT(job_id) DO UPDATE SET md=excluded.md",
+            params![job_id, md],
         )?;
         Ok(())
     }
@@ -519,10 +531,34 @@ mod tests {
         assert_eq!(cells.len(), 1, "同 cell 覆盖（重试成功覆盖失败）");
         assert_eq!(cells[0], r#"{"ok":true}"#);
 
-        db.result_put("j1", "{}", "# md").unwrap();
+        db.result_put_json("j1", "{}").unwrap();
+        db.result_put_md("j1", "# md").unwrap();
         let (j, m) = db.result_get("j1").unwrap().unwrap();
         assert_eq!((j.as_str(), m.as_str()), ("{}", "# md"));
         assert_eq!(db.job_all_states().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn result_put_json_and_md_upsert_independently_without_clobbering() {
+        // M17-c C-Q4：单列 upsert 不读另一列现值，先后各写一次互不覆盖。
+        let db = mem_db();
+        db.result_put_json("j1", r#"{"v":1}"#).unwrap();
+        // md 尚未写入 → DEFAULT '' 占位
+        assert_eq!(db.result_get("j1").unwrap().unwrap(), (r#"{"v":1}"#.to_string(), String::new()));
+        db.result_put_md("j1", "# md").unwrap();
+        // 写 md 不覆盖已落的 json
+        assert_eq!(db.result_get("j1").unwrap().unwrap(), (r#"{"v":1}"#.to_string(), "# md".to_string()));
+        // 再写一次 json，md 不受影响
+        db.result_put_json("j1", r#"{"v":2}"#).unwrap();
+        assert_eq!(db.result_get("j1").unwrap().unwrap(), (r#"{"v":2}"#.to_string(), "# md".to_string()));
+    }
+
+    #[test]
+    fn result_put_md_first_defaults_json_to_empty_string() {
+        // md 先到场景（json 尚未产出）：首建行 json 显式占位 ''，不报 NOT NULL 约束错。
+        let db = mem_db();
+        db.result_put_md("j1", "# early md").unwrap();
+        assert_eq!(db.result_get("j1").unwrap().unwrap(), (String::new(), "# early md".to_string()));
     }
 
     fn rcard(id: &str) -> ResolveCard {

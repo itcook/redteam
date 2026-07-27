@@ -5,7 +5,7 @@ use crate::prompt::build_bundle_prompt;
 use crate::provider::{LensRequest, ReviewProvider};
 #[cfg(test)]
 use crate::provider::ProviderError;
-use crate::state::store::{CellInput, CellRecord};
+use crate::state::{CellInput, CellRecord};
 use std::cmp::Reverse;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -17,7 +17,7 @@ pub trait CellSink: Send + Sync {
     fn on_cell(&self, rec: CellRecord);
     /// 阶段转换钩子（后台 job 用；默认 no-op，前台 sink=None / 其他 sink 零影响）。
     /// `note`：阶段注记（如 refute 的 "N targets"），进 phase_history 时间线。
-    fn on_phase(&self, _phase: crate::state::job::Phase, _note: Option<String>) {}
+    fn on_phase(&self, _phase: crate::state::Phase, _note: Option<String>) {}
     /// resolve 完成即报 models（后台 job stamp 进 state，running 期 status 可见；
     /// 此前 done 时才从 report 回填——r1 20260703 实证运行全程空数组）。默认 no-op。
     fn on_meta(&self, _models: &[String]) {}
