@@ -72,9 +72,9 @@ pub fn parse_lens_output(raw: &str) -> Result<LensOutput, ProviderError> {
 /// 两种已知形状——OpenAI `{"error":{"type","code","message"}}`；
 /// Anthropic `{"type":"error","error":{"type","message"}}`——两者共同点是都有顶层 `error`
 /// 对象，故只认这一个键即可覆盖双形状，不必额外判断外层 `type` 字段。
-/// 找不到 `error` 键或其值为 null（兼容网关占位、即正常 findings/choices/content 体）→ `None`，不干预。
+/// 找不到 `error` 键或其值非对象（`error:""` / `error:[]` 等占位、兼容网关、即正常 findings/choices/content 体）→ `None`，不干预。
 pub(crate) fn error_body_to_provider_error(v: &Value) -> Option<ProviderError> {
-    let err_obj = v.get("error").filter(|e| !e.is_null())?;
+    let err_obj = v.get("error").filter(|e| e.is_object())?;
     let etype = err_obj.get("type").and_then(Value::as_str).unwrap_or("");
     let message = err_obj.get("message").and_then(Value::as_str).unwrap_or("");
     let detail = format!("{etype}: {message}");
@@ -202,6 +202,14 @@ mod tests {
     #[test]
     fn error_body_null_field_is_none() {
         let v = json!({"error": null, "choices": [{"message": {"content": "ok"}}]});
+        assert!(error_body_to_provider_error(&v).is_none());
+    }
+
+    /// D1 回归：兼容网关用非对象占位符（error:""、error:[] 等）在成功响应里
+    /// 应短路返回 None，不误判为错误体。
+    #[test]
+    fn error_body_non_object_placeholder_is_none() {
+        let v = json!({"error": "", "choices": [{"message": {"content": "ok"}}]});
         assert!(error_body_to_provider_error(&v).is_none());
     }
 
