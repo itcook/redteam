@@ -23,7 +23,8 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// 发起对抗式评审：多模型扇出 + 工具检索 + 定向核实，输出 verdict/findings。
-    /// 退出码：reject→10、approve 但有降级/不完整→2、干净 approve→0。
+    /// 退出码（五档）：0=干净 approve、1=命令自身失败（参数/IO/配置错误）、
+    /// 2=降级 approve（部分模型未参与）、3=incomplete（不完整报告）、10=reject。
     Review {
         /// diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]
@@ -52,8 +53,10 @@ enum Cmd {
         /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定，但仍保留在报告中。
         #[arg(long)]
         conf_floor: Option<f32>,
-        /// 工具档位：off（纯无工具）| two-stage（默认：无工具评审；二阶段补查机制后续批次交付，
-        /// 当前等效 off）| on（对话式工具，诊断/对照档）。缺省读 config [review].tools。
+        /// 工具档位：off（单发单轮，无工具）| two-stage（默认：单发 + needs 声明触发的二阶段补查，
+        /// 已交付——注：当前实现里 off 与 two-stage 走同一 SingleShotProvider 且补查逻辑不看此
+        /// flag，故两档管线行为暂等价，仅 on 真正分叉）| on（对话式工具，诊断/对照档）。
+        /// 缺省读 config [review].tools。
         #[arg(long, value_parser = ["off", "two-stage", "on"])]
         tools: Option<String>,
         /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。
@@ -91,7 +94,7 @@ enum Cmd {
         cells: bool,
     },
     /// 取回作业的评审结果（持久存储于 .redteam/proj.db，永不过期、可重复取）。
-    /// 任一终态可取（failed/timed_out 有部分报告也放行）；未终态返回退出码 2。
+    /// 任一终态可取（failed/timed_out 有部分报告也放行）；未终态是命令自身失败，退出码 1。
     Result {
         job_id: String,
         /// 输出格式：json（默认）| md。
@@ -162,7 +165,10 @@ enum DismissCmd {
         format: String,
     },
     /// 单卡详情 + 全部历史事件。
-    Show { id: String },
+    Show {
+        /// finding id（16 位 hex，来自评审报告；查无此卡报错退非零）。
+        id: String,
+    },
     /// 状态迁移（协议动作：re-upheld=复裁仍误报 / human-confirmed=人裁终局 /
     /// withdrawn=改判属实 / dismissed=回滚）。历史全留痕；不做状态机硬约束。
     SetStatus {
@@ -212,7 +218,10 @@ enum ResolveCmd {
     },
     /// 单卡详情 + 全部修复历史（跨轮状态重建读口，D-QC1：ship.md 用 history 条数判断
     /// 复裁资格，不信会话记忆）。查无此卡报错退非零。
-    Show { id: String },
+    Show {
+        /// finding id（16 位 hex，来自评审报告；查无此卡报错退非零）。
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -318,19 +327,31 @@ fn resolve_result(
         JobStatus::Done | JobStatus::Failed | JobStatus::TimedOut | JobStatus::Cancelled
     );
     if !terminal {
-        return Err((format!("job {job_id} not done (status: {:?})", st.status), 2));
+        // 五档：未终态是命令自身失败（参数/时序错误），退出码 1，不与降级 approve 的 2 混淆。
+        return Err((format!("job {job_id} not done (status: {:?})", st.status), 1));
     }
-    let content = if format == "md" {
-        store.read_result_md(job_id).or_else(|| store.read_result(job_id))
-    } else {
-        store.read_result(job_id)
-    };
-    match content {
+    if format == "md" {
+        // D3（表2-2，M18批2）：md 列缺失不再静默回落出 JSON（ship rN.md 依赖这条命令产出
+        // 的是 markdown，静默回落=谎报格式）。md 缺但 json 在库 → 反序列化 ReviewReport
+        // 现算 render_md；两者皆缺才报错退 1。
+        if let Some(md) = store.read_result_md(job_id) {
+            return Ok(md);
+        }
+        return match store.read_result(job_id) {
+            Some(json) => match serde_json::from_str::<redteam::domain::ReviewReport>(&json) {
+                Ok(report) => Ok(render(&report, redteam::output::Format::Md)),
+                Err(e) => Err((format!("result for {job_id} 解析失败，无法渲染 md: {e}"), 1)),
+            },
+            None if st.status == JobStatus::Done => Err((format!("result missing for {job_id}"), 1)),
+            None => Err((format!("job {job_id} not done (status: {:?})", st.status), 1)),
+        };
+    }
+    match store.read_result(job_id) {
         Some(raw) => Ok(raw),
         None if st.status == JobStatus::Done => {
-            Err((format!("result missing for {job_id}"), 2))
+            Err((format!("result missing for {job_id}"), 1))
         }
-        None => Err((format!("job {job_id} not done (status: {:?})", st.status), 2)),
+        None => Err((format!("job {job_id} not done (status: {:?})", st.status), 1)),
     }
 }
 
@@ -406,25 +427,26 @@ async fn main() {
             if let Some(job_id) = resume {
                 let ws = cwd.clone();
                 // ④级：JobStore 打不开是硬错误，直冒（main() 非 Result 返回，沿用本仓
-                // match/exit(2) 惯用法做「?的等价物」，而非静默 let _=）。
+                // match/exit(1) 惯用法做「?的等价物」，而非静默 let _=；五档下命令自身
+                // 失败退出码为 1）。
                 let store = match redteam::state::JobStore::open(&ws) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                    Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 };
                 let orig_args_json = match store.read_args_raw(&job_id) {
                     Some(j) => j,
                     None => {
                         eprintln!("error: no args for job {job_id} (resume requires a job that ran via --background)");
-                        std::process::exit(2);
+                        std::process::exit(1);
                     }
                 };
                 let orig_args: ReviewArgs = match serde_json::from_str(&orig_args_json) {
                     Ok(a) => a,
-                    Err(e) => { eprintln!("error: bad args for job {job_id}: {e}"); std::process::exit(2); }
+                    Err(e) => { eprintln!("error: bad args for job {job_id}: {e}"); std::process::exit(1); }
                 };
                 let registry = match build_registry(&orig_args, &cfg, &cwd) {
                     Ok(x) => x,
-                    Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                    Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 };
                 let (report, code) =
                     redteam::cli::run_resume(&job_id, &registry, &cfg, &cwd, &store).await;
@@ -432,12 +454,22 @@ async fn main() {
                 std::process::exit(code);
             }
 
+            // 值域校验（表2-5，M18批2）：conf_floor 越界（如 --conf-floor 5.0）会让
+            // compute_verdict/refute 的 floor 门产生诡异行为（永久豁免/永久 blocking）——
+            // 命令层直接拒收，退出码 1（命令自身失败，五档契约），不放行到评审流程里静默跑歪。
+            if let Some(f) = conf_floor {
+                if !(0.0..=1.0).contains(&f) {
+                    eprintln!("error: --conf-floor must be within 0.0..=1.0, got {f}");
+                    std::process::exit(1);
+                }
+            }
+
             // scope 缺省定案（r1 20260703 事故：--base + 默认 working-tree = base 被静默
             // 忽略 → 干净树空评审秒出 approve）：有 --base 自动 branch；显式矛盾组合报错。
             let scope = match (scope.as_deref(), base.is_some()) {
                 (Some("working-tree"), true) => {
                     eprintln!("error: --base only takes effect with --scope branch (working-tree reviews uncommitted changes only); drop --base or use --scope branch");
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
                 (Some(s), _) => s.to_string(),
                 (None, true) => "branch".to_string(),
@@ -456,17 +488,17 @@ async fn main() {
                 // ④级：store 打不开是硬错误，直冒。
                 let store = match redteam::state::JobStore::open(&ws) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                    Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 };
                 let args_json = serde_json::to_string(&args).unwrap_or_default();
                 if store.write_args_raw(&job_id, &args_json).is_err() {
                     eprintln!("error: failed to write job args");
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
                 // ④级：起手建 job 是 gating 写——失败则整条后台派发都不成立，直接报错退出。
                 if let Err(e) = store.create_job(&job_id, now_secs()) {
                     eprintln!("error: failed to create job: {e}");
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
                 // JobStore::create_job 没有 workspace 形参（起手态只收 id+started_at）——
                 // 这里补一次守卫式更新回填 workspace。二写之间存在极短窗口（workspace 短暂
@@ -497,7 +529,7 @@ async fn main() {
                     }
                     Err(e) => {
                         eprintln!("error: failed to spawn worker: {e}");
-                        std::process::exit(2);
+                        std::process::exit(1);
                     }
                 }
             }
@@ -505,7 +537,7 @@ async fn main() {
             // 前台路径：构造 registry 后调 run_review_dispatch。
             let registry = match build_registry(&args, &cfg, &cwd) {
                 Ok(x) => x,
-                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             };
 
             // 前台直调无 job 上下文，sink=None（与 run_review/run_code_review 直调路径一致）。
@@ -517,8 +549,9 @@ async fn main() {
                     code
                 }
                 Err(e) => {
+                    // dispatch 基础设施错误（非评审结论）→ 命令自身失败，五档 1。
                     eprintln!("error: {e}");
-                    2
+                    1
                 }
             }
         }
@@ -531,7 +564,7 @@ async fn main() {
             // 共享同一个 JobStore（同一个底层 rusqlite::Connection），不再各自现开连接。
             let store = match redteam::state::JobStore::open(&ws) {
                 Ok(s) => std::sync::Arc::new(s),
-                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             };
             // 进程级 panic 兜底（E12-Q4，真·顶层）：worker 评审体若 panic，落 Failed 终态再正常
             // 展开——否则状态永停 Running（惰性收尸只治「进程已死」，panic 与退出间有窗口）。
@@ -565,14 +598,14 @@ async fn main() {
                 Some(j) => j,
                 None => {
                     eprintln!("error: no args for job {job_id}");
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
             };
             let args: ReviewArgs = match serde_json::from_str(&args_json) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("error: bad args: {e}");
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
             };
             // 建 registry（复用 build_registry：resolve_models + 构造 ProviderRegistry）
@@ -582,16 +615,18 @@ async fn main() {
                     eprintln!("error: {e}");
                     // 写 Failed 终态，让 status 命令能看到错误原因。走守卫：裸覆写
                     // 会盖掉 pre-worker 阶段已落定的 Cancelled 终态（首个终态封盘）。
+                    // 五档：配置/provider 构造失败是命令自身失败，exit_code 落 1（不与
+                    // 降级 approve 的 2 混淆）。
                     match store.update_if_active(&job_id, |st| {
                         st.status = redteam::state::JobStatus::Failed;
                         st.error = Some(e);
-                        st.exit_code = Some(2);
+                        st.exit_code = Some(1);
                     }) {
                         Ok(false) => eprintln!("warn: job {job_id} 终态写被终态封盘拒绝"),
                         Err(e) => eprintln!("warn: job {job_id} 终态写失败: {e}"),
                         Ok(true) => {}
                     }
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
             };
             let started = store
@@ -612,7 +647,7 @@ async fn main() {
             // ④级：store 打不开是硬错误，直冒。
             let store = match redteam::state::JobStore::open(&ws) {
                 Ok(s) => s,
-                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             };
             if cells {
                 return_code_for_cells(&store, job_id.as_deref())
@@ -631,7 +666,7 @@ async fn main() {
                     .map(|st| vec![redteam::cli::reap_if_dead(&store, st)]),
             };
             match jobs {
-                None => { eprintln!("no such job: {}", job_id.unwrap_or_default()); 2 }
+                None => { eprintln!("no such job: {}", job_id.unwrap_or_default()); 1 }
                 Some(js) => {
                     if format == "table" {
                         println!("{}", render_status_table(&js, now_secs()));
@@ -650,7 +685,7 @@ async fn main() {
             // ④级：store 打不开是硬错误，直冒。
             let store = match redteam::state::JobStore::open(&ws) {
                 Ok(s) => s,
-                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             };
             let st = store.read_state(&job_id);
             match st {
@@ -661,7 +696,7 @@ async fn main() {
                     }
                     Err((msg, code)) => { eprintln!("{msg}"); code }
                 },
-                None => { eprintln!("no such job: {job_id}"); 2 }
+                None => { eprintln!("no such job: {job_id}"); 1 }
             }
         }
         Cmd::Cancel { job_id } => {
@@ -669,7 +704,7 @@ async fn main() {
             // ④级：store 打不开是硬错误，直冒。
             let store = match redteam::state::JobStore::open(&ws) {
                 Ok(s) => s,
-                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             };
             match store.read_state(&job_id) {
                 Some(s) if matches!(s.status, redteam::state::JobStatus::Running | redteam::state::JobStatus::Pending) => {
@@ -695,16 +730,16 @@ async fn main() {
                         Ok(false) => {
                             let now = store.read_state(&job_id).map(|s| s.status);
                             eprintln!("job {job_id} already finished ({now:?}), not cancelled");
-                            2
+                            1
                         }
                         Err(e) => {
                             eprintln!("error: job {job_id} cancel 写失败（非拒写，db 层异常）: {e}");
-                            2
+                            1
                         }
                     }
                 }
-                Some(s) => { eprintln!("job {job_id} not cancellable (status: {:?})", s.status); 2 }
-                None => { eprintln!("no such job: {job_id}"); 2 }
+                Some(s) => { eprintln!("job {job_id} not cancellable (status: {:?})", s.status); 1 }
+                None => { eprintln!("no such job: {job_id}"); 1 }
             }
         }
         Cmd::Model { action } => match action {
@@ -726,11 +761,11 @@ async fn main() {
                 let kind_for_validate = kind.as_deref().unwrap_or_else(|| k.as_str());
                 if let Err(e) = redteam::model::validate_setup(kind_for_validate, base_url.as_deref()) {
                     eprintln!("error: {e}");
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
                 let model = match model {
                     Some(m) => m,
-                    None => { eprintln!("error: --model is required"); std::process::exit(2); }
+                    None => { eprintln!("error: --model is required"); std::process::exit(1); }
                 };
                 let api_key_env = redteam::model::derive_api_key_env(&provider);
                 let prio = priority.unwrap_or(0);
@@ -738,7 +773,7 @@ async fn main() {
                     &provider, k.as_str(), base_url.as_deref(), &model, prio, Some(&api_key_env),
                 ) {
                     eprintln!("error: failed to write provider config: {e}");
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
                 // key 去处：env(默认，打印 export) / secrets(写 secrets.toml)
                 match key_store.as_str() {
@@ -746,11 +781,11 @@ async fn main() {
                         Some(k) => {
                             if let Err(e) = redteam::config::secrets::write_secret(&provider, &k) {
                                 eprintln!("error: failed to write secret: {e}");
-                                std::process::exit(2);
+                                std::process::exit(1);
                             }
                             println!("wrote key to {} (chmod 600)", redteam::config::secrets::secrets_path().display());
                         }
-                        None => { eprintln!("error: --key-store secrets requires --key"); std::process::exit(2); }
+                        None => { eprintln!("error: --key-store secrets requires --key"); std::process::exit(1); }
                     },
                     _ => {
                         // env 默认：主配置只记 api_key_env，提示用户设 env。
@@ -761,13 +796,24 @@ async fn main() {
                     }
                 }
                 println!("configured provider '{provider}' (kind={}, model={model}, api_key_env={api_key_env})", k.as_str());
-                // 完成后自动跑一次 check
+                // 落盘后自动 probe 刚配置的这个 provider（只探它、不是全部 provider——
+                // 复用 probe.rs 按 kind 认证的 list_models）。probe 失败只警告、不回滚已
+                // 落盘的配置：离线环境先 setup、后续再联网核实是合理场景，不该因一次探测
+                // 失败被拒绝写入（T26，M18 decisions Q6 明确否掉「probe 失败拒绝落盘」的
+                // 旧 TODO 框架）。展示文案抽成纯函数 format_probe_outcome 以便单测覆盖。
                 let cfg = load_config_warned();
                 let prober = redteam::model::probe::HttpProber::new();
-                let avs = redteam::model::check_all(&cfg, &prober).await;
-                for a in &avs {
-                    println!("{}  {}", a.provider, a.status_str());
-                }
+                let probe_result = match cfg.providers.get(&provider) {
+                    Some(pc) => {
+                        let key = cfg.resolve_key(&provider);
+                        prober
+                            .list_models(&redteam::model::effective_base(pc), key.as_deref(), pc.kind)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    None => Err("provider missing from just-written config (unexpected)".into()),
+                };
+                println!("{}", format_probe_outcome(&provider, &model, &probe_result));
                 0
             }
             ModelCmd::List { remote } => {
@@ -777,7 +823,7 @@ async fn main() {
                     Some(prov) => {
                         let pc = match cfg.providers.get(&prov) {
                             Some(p) => p,
-                            None => { eprintln!("no such provider: {prov}"); std::process::exit(2); }
+                            None => { eprintln!("no such provider: {prov}"); std::process::exit(1); }
                         };
                         let base = redteam::model::effective_base(pc);
                         let key = cfg.resolve_key(&prov);
@@ -786,7 +832,7 @@ async fn main() {
                                 for m in models { println!("{m}"); }
                                 0
                             }
-                            Err(e) => { eprintln!("error querying {base}/models: {e}"); 2 }
+                            Err(e) => { eprintln!("error querying {base}/models: {e}"); 1 }
                         }
                     }
                     None => {
@@ -805,12 +851,27 @@ async fn main() {
             match redteam::project::init_project(std::path::Path::new(".")) {
                 Ok(c) if c.is_empty() => println!(".redteam/ already complete"),
                 Ok(c) => c.iter().for_each(|p| println!("created {p}")),
-                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             }
             0
         }
     };
     std::process::exit(code);
+}
+
+/// T26：`model setup` 落盘后自动 probe 该 provider 的结果文案——纯函数，网络调用
+/// 已在调用方完成，这里只管把 `Result<Vec<String>, String>` 渲成人读行，便于单测覆盖
+/// 「probe 失败仍要给出警告 + 复核提示」这条语义，不必真打网络。
+fn format_probe_outcome(provider: &str, model: &str, probe: &Result<Vec<String>, String>) -> String {
+    match probe {
+        Ok(ids) if ids.is_empty() || ids.iter().any(|m| m == model) => {
+            format!("{provider}  ✓ available")
+        }
+        Ok(_) => format!("{provider}  ⚠ reachable, model not in /models"),
+        Err(e) => format!(
+            "{provider}  ⚠ probe failed（{e}）——配置已保存，联网恢复后可用 `redteam model check` 复核"
+        ),
+    }
 }
 
 /// M5 批2：status 的人读时长（42s / 7m / 1h03m）。
@@ -837,7 +898,7 @@ fn run_dismiss(action: DismissCmd) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut db = match redteam::db::ProjDb::open(&cwd) {
         Ok(d) => d,
-        Err(e) => { eprintln!("error: {e}"); return 2; }
+        Err(e) => { eprintln!("error: {e}"); return 1; }
     };
     let r = match action {
         DismissCmd::Add { id, reason, from, round, title, file, quote, severity } => {
@@ -876,7 +937,7 @@ fn run_dismiss(action: DismissCmd) -> i32 {
     };
     match r {
         Ok(()) => 0,
-        Err(e) => { eprintln!("error: {e}"); 2 }
+        Err(e) => { eprintln!("error: {e}"); 1 }
     }
 }
 
@@ -922,7 +983,7 @@ fn run_resolve(action: ResolveCmd) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut db = match redteam::db::ProjDb::open(&cwd) {
         Ok(d) => d,
-        Err(e) => { eprintln!("error: {e}"); return 2; }
+        Err(e) => { eprintln!("error: {e}"); return 1; }
     };
     let r = match action {
         ResolveCmd::Add { id, from, round, reason, title, file, quote, severity } => {
@@ -932,7 +993,7 @@ fn run_resolve(action: ResolveCmd) -> i32 {
     };
     match r {
         Ok(()) => 0,
-        Err(e) => { eprintln!("error: {e}"); 2 }
+        Err(e) => { eprintln!("error: {e}"); 1 }
     }
 }
 
@@ -1045,11 +1106,11 @@ fn dismiss_gc(db: &mut redteam::db::ProjDb, root: &std::path::Path, apply: bool)
 /// `status <job> --cells`：cell 级运行学明细（JSON 数组，2026-07-03 grill 定案）。
 fn return_code_for_cells(store: &redteam::state::JobStore, job_id: Option<&str>) -> i32 {
     match job_id {
-        None => { eprintln!("--cells requires a job id"); 2 }
+        None => { eprintln!("--cells requires a job id"); 1 }
         Some(id) => {
             if store.read_state(id).is_none() {
                 eprintln!("no such job: {id}");
-                return 2;
+                return 1;
             }
             let recs = store.read_partial(id);
             println!("{}", serde_json::to_string_pretty(&recs).unwrap_or_else(|_| "[]".into()));
@@ -1119,6 +1180,31 @@ mod tests {
         a.phase_history.last_mut().unwrap().at = 970; // 覆写为可控时刻（set_phase 用真实时钟）
         let out = render_status_table(&[a], 1000);
         assert!(out.contains("refute[9 targets] (30s)"), "phase 停留时长+注记: {out}");
+    }
+
+    /// T26：probe 成功且 model 在列表中 → available。
+    #[test]
+    fn format_probe_outcome_success_lists_model() {
+        let out = format_probe_outcome("alpha", "m1", &Ok(vec!["m1".into(), "m2".into()]));
+        assert_eq!(out, "alpha  ✓ available");
+    }
+
+    /// T26：probe 成功但配置的 model 不在返回列表里 → 软提示，非报错。
+    #[test]
+    fn format_probe_outcome_success_model_missing() {
+        let out = format_probe_outcome("alpha", "m1", &Ok(vec!["other".into()]));
+        assert_eq!(out, "alpha  ⚠ reachable, model not in /models");
+    }
+
+    /// T26 核心：probe 失败只警告 + 给复核提示，措辞里不出现「拒绝/回滚/失败退出」类字眼——
+    /// 已落盘的配置不受 probe 结果影响（离线 setup 场景）。
+    #[test]
+    fn format_probe_outcome_failure_warns_without_rollback_language() {
+        let out = format_probe_outcome("alpha", "m1", &Err("connection refused".into()));
+        assert!(out.contains("⚠ probe failed"), "应是警告而非错误: {out}");
+        assert!(out.contains("connection refused"), "应带上原始错误: {out}");
+        assert!(out.contains("redteam model check"), "应提示复核命令: {out}");
+        assert!(!out.contains("回滚") && !out.contains("rollback"), "不应暗示回滚: {out}");
     }
 
     #[test]
@@ -1198,7 +1284,7 @@ mod tests {
         store.write_result("j1", r#"{"verdict":"incomplete"}"#).unwrap();
         let mut st = JobState::new("j1", 0);
         st.status = JobStatus::Failed;
-        st.exit_code = Some(2);
+        st.exit_code = Some(3); // 五档：verdict=incomplete 对应的落盘 exit_code（此测不读该字段，仅保持语义一致）
         let out = resolve_result(&store, "j1", "json", &st);
         assert_eq!(out, Ok(r#"{"verdict":"incomplete"}"#.to_string()));
     }
@@ -1214,7 +1300,7 @@ mod tests {
         st.status = JobStatus::Failed;
         let out = resolve_result(&store, "j2", "json", &st);
         assert!(out.is_err());
-        assert_eq!(out.unwrap_err().1, 2);
+        assert_eq!(out.unwrap_err().1, 1); // 五档：命令自身失败（结果缺失）→ 1
     }
 
     /// 非终态（Running）不受影响：即便 result.json 意外存在也不放行。
@@ -1230,7 +1316,7 @@ mod tests {
         let out = resolve_result(&store, "j3", "json", &st);
         let (msg, code) = out.unwrap_err();
         assert!(msg.contains("not done"), "msg: {msg}");
-        assert_eq!(code, 2);
+        assert_eq!(code, 1); // 五档：命令自身失败（未终态）→ 1
     }
 
     // ---- resolve add|show 子命令空间化（M17-d Task 1，D-QC1）----

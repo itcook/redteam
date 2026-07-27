@@ -166,6 +166,9 @@ async fn run_one_bundle(
     };
 
     let mut errs: Vec<String> = Vec::new();
+    // T25：候补链逐个失败时，每次失败携带的已烧 usage（`ProviderError::attach_usage` 挂的）
+    // 累加进这里——链条全灭时不再谎报 (0,0,0)，真实入账各次尝试烧掉的 token。
+    let mut burned = (0u64, 0u64, 0u64);
     for (i, pm) in chain.iter().enumerate() {
         match provider.run(LensRequest { route_key: pm.name.clone(), prompt: prompt.to_string() }).await {
             Ok(call) => {
@@ -182,11 +185,15 @@ async fn run_one_bundle(
                     needs: call.needs, warn: None,
                 };
             }
-            Err(e) => errs.push(format!("bundle [{label}] model {}: {e}", pm.name)),
+            Err(e) => {
+                let u = e.burned_usage();
+                burned = (burned.0 + u.0, burned.1 + u.1, burned.2 + u.2);
+                errs.push(format!("bundle [{label}] model {}: {e}", pm.name));
+            }
         }
     }
     CellRun {
-        model: String::new(), findings: vec![], tokens: (0, 0, 0),
+        model: String::new(), findings: vec![], tokens: burned,
         duration_ms: t0.elapsed().as_millis() as u64,
         attempts: chain.len() as u32, iterations: 0, tool_use: Default::default(),
         needs: vec![], warn: Some(errs.join("; ")),
@@ -806,6 +813,48 @@ mod tests {
             "坏 model 应记 failed_models: {:?}", out.failed_models);
         assert!(out.findings.iter().any(|f| f.title == "real"),
             "好 model 的 finding 应仍在报告里");
+    }
+
+    /// T25 测试助手：按 route_key 查表返回一个携带非零 usage 的失败——模拟「本次尝试真烧了
+    /// token，但最终仍报错」（如 tool_loop 内多轮后 FINALIZE 超时）。查表 miss 时兜底一个零
+    /// usage 的 Unavailable（不影响本测试，仅防越界 panic）。
+    struct FailingWithUsage {
+        usage_by_model: std::collections::BTreeMap<String, (u64, u64, u64)>,
+    }
+    #[async_trait::async_trait]
+    impl ReviewProvider for FailingWithUsage {
+        async fn run(&self, req: LensRequest) -> Result<crate::provider::LensCall, ProviderError> {
+            let usage = self.usage_by_model.get(&req.route_key).copied().unwrap_or((0, 0, 0));
+            Err(ProviderError::Timeout(format!("dead: {}", req.route_key)).attach_usage(usage))
+        }
+    }
+
+    // T25：候补链全灭时，各次失败尝试已烧的 usage 必须累计回填进失败 CellRecord——
+    // 不能像修复前那样恒记 (0,0,0)（design 表 2-6）。
+    #[tokio::test]
+    async fn full_chain_failure_backfills_accumulated_usage() {
+        let mut usage_by_model = std::collections::BTreeMap::new();
+        usage_by_model.insert("first".to_string(), (100, 20, 5));
+        usage_by_model.insert("second".to_string(), (50, 10, 0));
+        let provider = FailingWithUsage { usage_by_model };
+
+        let opts = OrchestrateOpts {
+            models: vec![
+                PlannedModel { name: "first".into(), priority: 2 },
+                PlannedModel { name: "second".into(), priority: 1 },
+            ],
+            replicate: false, no_fallback: false, max_concurrency: 4,
+        };
+        let run = run_one_bundle(&provider, "wt", "prompt", &opts).await;
+        assert!(run.warn.is_some(), "候补链全灭必须落 warn");
+        assert_eq!(run.tokens, (150, 30, 5), "两次失败尝试的 usage 应累加，而非恒零");
+
+        let rec = run.to_record("cell-1".into(), "");
+        assert!(rec.input_tokens > 0, "失败 CellRecord.input_tokens 必须非零: {}", rec.input_tokens);
+        assert_eq!(rec.input_tokens, 150);
+        assert_eq!(rec.output_tokens, 30);
+        assert_eq!(rec.cached_input_tokens, 5);
+        assert!(!rec.ok, "候补链全灭应记为失败");
     }
 
     // R8.1：quote 锚定、行无关的 finding id。

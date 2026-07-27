@@ -23,7 +23,12 @@ pub struct ToolResult {
 /// serde default——旧记录/单发路径缺字段记零。
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolUse {
+    /// 单文件读工具调用次数——`tool_specs()` 已不再向模型广播 `read_file`（只留
+    /// `read_files` 逼批量），故活跳道上此字段恒 0；保留字段只为兼容旧 `CellRecord`
+    /// JSON 反序列化（`Executor::execute` 仍认得 "read_file" 这个 dispatch 名，
+    /// 不广播≠彻底撤掉，故人手构造/回放场景仍可能计入)。
     pub read_file: u32,
+    /// 批量读工具调用次数——当前对模型广播的唯一读文件工具，正常评审流量都计这里。
     pub read_files: u32,
     pub search_repo: u32,
     pub list_files: u32,

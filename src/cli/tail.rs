@@ -10,13 +10,17 @@ use crate::provider::ReviewProvider;
 use crate::verdict::compute_verdict;
 use std::path::Path;
 
-/// 退出码映射（统一 run_review/run_code_review）：reject→10、approve+对照集不完整→2、干净 approve→0。
+/// 退出码映射（统一 run_review/run_code_review，五档契约·2026-07-27 定稿）：
+/// reject→10、Verdict::Incomplete（部分结果，见 partial_report/run_resume 的 still_missing
+/// 分支——真实判定来源是 domain::Verdict 本身而非另一标志位）→3、approve 但对照集不完整
+/// （failed_models 非空，模型半失败降级）→2、干净 approve→0。命令自身失败（参数/IO/配置错误）
+/// 不经此函数，走 main.rs 的 exit(1)。
 pub fn exit_code(verdict: Verdict, failed_models_nonempty: bool) -> i32 {
     match (verdict, failed_models_nonempty) {
         (Verdict::Reject, _) => 10,
         (Verdict::Approve, true) => 2,
         (Verdict::Approve, false) => 0,
-        (Verdict::Incomplete, _) => 2,
+        (Verdict::Incomplete, _) => 3,
     }
 }
 
@@ -125,14 +129,14 @@ pub(crate) async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>
     };
     let clusters = vec![]; // correlate 已随 doc 模式退场（E10）；clusters 字段留空保持 schema 稳定。
     // refute 子阶段打点（targets 数与 verify_findings 同一真相源函数，非重复实现）。
-    let n_targets = refute_targets(&findings, ctx.precedents, ctx.block).len();
+    let n_targets = refute_targets(&findings, ctx.precedents, ctx.block, ctx.floor).len();
     if n_targets > 0 {
         if let Some(s) = ctx.sink {
             s.on_phase(crate::state::Phase::Refute, Some(format!("{n_targets} targets")));
         }
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(
-        findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency,
+        findings, ctx.provider, &ctx.model_names, ctx.block, ctx.floor, ctx.max_concurrency,
         ctx.root, ctx.precedents, ctx.spec_docs,
     ).await;
     let mut run_warnings = ctx.warnings;
@@ -211,10 +215,10 @@ mod tests {
         use crate::domain::Verdict;
         assert_eq!(exit_code(Verdict::Reject, false), 10);
         assert_eq!(exit_code(Verdict::Reject, true), 10);   // reject 优先
-        assert_eq!(exit_code(Verdict::Approve, true), 2);   // approve 但对照集不完整
+        assert_eq!(exit_code(Verdict::Approve, true), 2);   // approve 但对照集不完整（降级 approve）
         assert_eq!(exit_code(Verdict::Approve, false), 0);  // 干净 approve
-        assert_eq!(exit_code(Verdict::Incomplete, false), 2); // 部分结果＝对照集不完整
-        assert_eq!(exit_code(Verdict::Incomplete, true), 2);
+        assert_eq!(exit_code(Verdict::Incomplete, false), 3); // 不完整报告，与降级 approve 分离
+        assert_eq!(exit_code(Verdict::Incomplete, true), 3);  // failed_models 与否不改变不完整判定
     }
 
     #[test]

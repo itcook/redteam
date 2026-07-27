@@ -5,6 +5,9 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// 各变体的 `#[serde(alias = ...)]` 是别名的唯一真相源；`model::validate_setup` 的报错文案
+/// 手工抄了一份人读版本（serde alias 列表运行时不可反射，无法程序化生成）——改这里的别名
+/// 记得同步改那边的文案（batch4 polish 交叉引用，2026-07-27）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
@@ -53,8 +56,10 @@ pub struct ProviderConfig {
     pub context_window_tokens: Option<u32>,
 }
 
-/// 评审工具档位（design 2026-07-13 §2.4，E8 裁决 A）：off=纯无工具；two-stage=第一趟
-/// 无工具（needs 二阶段批 2 补全，当前行为=off 等价）；on=对话式工具（诊断/对照档）。
+/// 评审工具档位（design 2026-07-13 §2.4，E8 裁决 A）：off=单发单轮无工具；two-stage
+/// （默认）=单发 + needs 声明触发的二阶段补查（批 2/3/4 已交付，非"后续批次"）；
+/// on=对话式工具（诊断/对照档）。注：二阶段补查逻辑目前不读此 flag、对 off/two-stage
+/// 一视同仁（见 `cli::mod` 里 `mk` 闭包无条件传入），两档暂管线等价，仅 on 真正分叉。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolsMode { Off, TwoStage, On }

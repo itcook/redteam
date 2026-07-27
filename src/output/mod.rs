@@ -22,6 +22,16 @@ fn human_tokens(n: u64) -> String {
     }
 }
 
+/// Duration 展示：<1min 显整数秒（如 `≈ 45 s`），否则回落原有分钟粒度（`≈ X.X mins`）——
+/// 批 4 polish：秒级任务此前恒显 `≈ 0.0 mins`/`≈ 0.8 mins`，对用户无意义（design §5）。
+fn fmt_duration(ms: u64) -> String {
+    if ms < 60_000 {
+        format!("≈ {} s", (ms as f64 / 1000.0).round() as u64)
+    } else {
+        format!("≈ {:.1} mins", ms as f64 / 60_000.0)
+    }
+}
+
 fn sev_emoji(sev: Severity) -> &'static str {
     match sev {
         Severity::Critical => "🔴",
@@ -82,7 +92,7 @@ fn render_md(r: &ReviewReport) -> String {
         .collect();
     s.push_str("\n- Info\n\n  | Field         | Value |\n  | ------------- | ----- |\n");
     s.push_str(&format!("  | Models        | {} |\n", models.join(", ")));
-    s.push_str(&format!("  | Duration      | ≈ {:.1} mins |\n", r.run.duration_ms as f64 / 60_000.0));
+    s.push_str(&format!("  | Duration      | {} |\n", fmt_duration(r.run.duration_ms)));
     s.push_str(&format!("  | Input Tokens  | {} |\n", human_tokens(r.run.usage.input_tokens)));
     s.push_str(&format!("  | Output Tokens | {} |\n", human_tokens(r.run.usage.output_tokens)));
     // L1 缓存观测：命中读量占总输入的比例（实付全价 ≈ input − cached）。cached=0 且 input 大
@@ -169,6 +179,18 @@ mod tests {
                 quote:"snippet".into(),cluster_id:None,verify:None,previously_dismissed:false,
                 origin:Origin::New}],
             clusters:vec![], run:RunMeta::default() }
+    }
+    // 批 4 polish：Duration <1min 应显整数秒，而非恒 "0.0 mins"/"0.8 mins" 之类无意义粒度。
+    #[test]
+    fn fmt_duration_sub_minute_shows_seconds() {
+        assert_eq!(fmt_duration(45_000), "≈ 45 s");
+        assert_eq!(fmt_duration(0), "≈ 0 s");
+        assert_eq!(fmt_duration(59_999), "≈ 60 s", "四舍五入到整秒，边界值容忍显 60 s");
+    }
+    #[test]
+    fn fmt_duration_minute_and_above_keeps_mins_grain() {
+        assert_eq!(fmt_duration(60_000), "≈ 1.0 mins");
+        assert_eq!(fmt_duration(528_000), "≈ 8.8 mins");
     }
     #[test]
     fn json_contains_verdict_and_provenance() {
