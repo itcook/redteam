@@ -11,6 +11,7 @@ use crate::output::Format;
 use crate::provider::{LensRequest, ReviewProvider};
 use std::path::Path;
 
+mod deny;
 mod incremental;
 mod second_pass;
 mod spec;
@@ -272,7 +273,7 @@ pub async fn run_code_review(
     // (String::new(), 0) → budget 原样不变（既有回归行为零漂移）。
     let budget_raw = pack_budget_bytes(cfg, &model_names);
     // spec 帽夹紧到 pack 预算一半（dogfood #2：64K 固定帽会吃穿小窗模型的整个输入窗）。
-    let (spec_section, spec_used) =
+    let (spec_section, spec_used, spec_warnings) =
         render_spec_section_capped(&args.spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
     let budget = budget_raw.saturating_sub(spec_used);
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
@@ -281,6 +282,8 @@ pub async fn run_code_review(
         second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "", &spec_section)
     };
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk), &spec_section).await;
+    // T46①：--spec denylist/PEM 拒读 warnings 并入 run.warnings（CI/bot 可见，不仅 eprintln）。
+    raw.warnings.extend(spec_warnings);
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         raw.warnings.push(format!(
@@ -571,10 +574,12 @@ pub async fn run_resume(
     // Task 4：resume 的 refute 趟同原运行拿 --spec 参照段——从 args.spec 重渲（resume 已按同法
     // 重导 models/block/floor/ledger），与首趟缓存 prompt 里烘干的 spec 保持一致；空 --spec→""。
     // 帽用与首趟同一夹紧公式（cap 不同会导致重渲截断点漂移、与首趟 spec 段不一致）。
-    let (spec_section, _spec_used) = render_spec_section_capped(
+    let (spec_section, _spec_used, spec_warnings) = render_spec_section_capped(
         &args.spec,
         SPEC_BUDGET_BYTES.min(pack_budget_bytes(cfg, &model_names) / 2),
     );
+    // T46①：resume 重渲 --spec 段时若命中 denylist/PEM 拒读，同样并入 warnings（与首趟一致）。
+    warnings.extend(spec_warnings);
     let ctx = TailCtx {
         root: cwd,
         provider,
@@ -1801,7 +1806,7 @@ default_models=["m"]
         assert!(!prompts[0].contains("DESIGN"), "不应有任何 spec 内容泄漏: {}", prompts[0]);
         // budget 未扣（D2）：空 --spec → render_spec_section 用掉 0 字节 → saturating_sub(0)
         // 是恒等运算，pack 预算与不带本 feature 时完全一致。
-        let (_, spec_used) = render_spec_section(&args.spec);
+        let (_, spec_used, _spec_warnings) = render_spec_section(&args.spec);
         assert_eq!(spec_used, 0, "空 spec 不得占用任何预算字节");
     }
 }

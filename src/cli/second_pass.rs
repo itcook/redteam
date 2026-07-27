@@ -22,23 +22,20 @@ fn parse_need_lines(lines: Option<&str>) -> Option<(u32, u32)> {
 }
 
 /// needs 读 denylist（E11-Q4）：即便 git-tracked 也拒——凭据类文件 + 工具自建/VCS 内部目录。
-/// 与 `is_sensitive_spec_path`（--spec 路径，用户提供、信任模型不同）同族但独立：路径前缀/
-/// 后缀匹配，不判内容（needs 读点无 PEM 嗅探，路径已够收窄威胁面）。
+/// M18 批 1·1-2：判据本身已抽到 `deny::is_denylisted_path`（与 spec.rs 的 `is_sensitive_spec_path`
+/// 共用单一真相源、语义=两清单并集——原本各自独有的判据互补齐），本函数只剩薄委托。
+/// needs 读点仍不做内容级 PEM 嗅探（E11-Q4 已裁：路径已够收窄威胁面，与 spec 侧信任模型不同）。
 fn is_needs_denylisted(rel: &str) -> bool {
-    let lower = rel.to_ascii_lowercase();
-    let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
-    // .env 家族：.env / .env.local / .env.production 等变体全拒。
-    if base == ".env" || base.ends_with(".env") || base.starts_with(".env.") || base.contains(".env.") {
-        return true;
-    }
-    if base.ends_with(".pem") || base.ends_with(".key") {
-        return true;
-    }
-    if base == "id_rsa" || base == "id_ed25519" {
-        return true;
-    }
-    // 工具自建目录（.redteam/）与 VCS 内部目录（.git/）——任意路径深度，逐段匹配。
-    lower.split(['/', '\\']).any(|seg| seg == ".redteam" || seg == ".git")
+    super::deny::is_denylisted_path(rel)
+}
+
+/// 拒读事件统一披露（T46②DRY + T46①入账，M18 批 1）：needs 读守卫拒读原分散两处 eprintln
+/// 重复段——本函数收敛为单点：eprintln 供本地终端可见（既有行为不变）+ push 进 warnings
+/// 供上游并入 `run.warnings`（CI/bot 可见，复用 M17-c 披露通道手法）。
+fn deny_need_read(reason: &str, path: &str, warnings: &mut Vec<String>) {
+    let msg = format!("needs 读被拒（{reason}）：{path}");
+    eprintln!("redteam: {msg}");
+    warnings.push(msg);
 }
 
 /// 二阶段补查 needs 读守卫（E11-Q4，dogfood 抓）：needs 是模型声明的路径（"我要读 X 文件"）——
@@ -66,10 +63,16 @@ pub(crate) fn need_read_allowed(root: &Path, rel: &str) -> Result<(), &'static s
 
 /// 单条 need → `## 补查证据` 段：lines 合法 → ±30 行窗；缺失/坏格式 → 整文件。
 /// 路径安全走 ToolExecutor 不变量（绝对路径/`..`/symlink 逃逸/不可读 → None、不 panic）+
-/// `need_read_allowed` 守卫（git-tracked ∧ 非 denylist，E11-Q4）；守卫拒则 skip + eprintln 披露。
-fn need_section(ex: &crate::tools::ToolExecutor, root: &Path, need: &crate::domain::NeedEntry) -> Option<String> {
+/// `need_read_allowed` 守卫（git-tracked ∧ 非 denylist，E11-Q4）；守卫拒则 skip + 披露
+/// （`deny_need_read`：eprintln + 入 `warnings`，T46①②）。
+fn need_section(
+    ex: &crate::tools::ToolExecutor,
+    root: &Path,
+    need: &crate::domain::NeedEntry,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
     if let Err(reason) = need_read_allowed(root, &need.path) {
-        eprintln!("redteam: needs 读被拒（{reason}）：{}", need.path);
+        deny_need_read(reason, &need.path, warnings);
         return None;
     }
     let text = ex.read_capped(&need.path)?;
@@ -122,6 +125,9 @@ fn draft_block(drafts: &[Finding]) -> String {
 /// 契约不因补跑丢失）；全量路径传空串。全部 needs 逃逸/不可读 → None（不补跑，省一次 LLM 调用）。
 /// `spec_docs`：--spec 参照段（D2），透传给 `build_bundle_prompt` 的 `{{SPEC_DOCS}}` 槽——
 /// 第一趟算好的同一份 spec_section 原样复用，不重读；空串走既有占位散文（回归零漂移）。
+/// 返回 `(Some(第二趟 prompt) 或 None＝不补跑, 拒读 warnings)`：第二元恒返回（T46①，M18 批 1）——
+/// needs 读守卫的拒读理由即便最终判定不补跑（evidence 全空）也不能随 None 分支被默默吞掉，
+/// 上游 `maybe_second_pass` 无条件把它并入 `run.warnings`（CI/bot 可见）。
 #[allow(clippy::too_many_arguments)] // 与 build_bundle_prompt 同源的参数面；收拢 struct 是过度设计
 pub(crate) fn second_pass_prompt(
     bundles: &[crate::bundle::Bundle],
@@ -134,11 +140,13 @@ pub(crate) fn second_pass_prompt(
     drafts: &[Finding],
     incremental: &str,
     spec_docs: &str,
-) -> Option<String> {
-    let own = bundles.get(idx)?;
+) -> (Option<String>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let Some(own) = bundles.get(idx) else { return (None, warnings) };
     let ex = crate::tools::ToolExecutor::new(root);
     // 变更集文件路径集合（披露用，E11-Q4）：needs 读的文件若不在其中即「变更集外」——
     // 即便 git-tracked 守卫放行，人（威胁模型 B 在场）也该知道读出了 diff 之外的内容。
+    // 注：这不是 denylist 拒读（读被允许了，只是范围外），不入 warnings——维持既有 eprintln-only。
     let changeset: std::collections::HashSet<&str> =
         bundles.iter().flat_map(|b| &b.files).map(|fc| fc.path.as_str()).collect();
     let disclose_scope = |path: &str| {
@@ -159,21 +167,21 @@ pub(crate) fn second_pass_prompt(
                         full_paths.push(need.path.clone());
                     }
                 }
-                Err(reason) => eprintln!("redteam: needs 读被拒（{reason}）：{}", need.path),
+                Err(reason) => deny_need_read(reason, &need.path, &mut warnings),
             }
         }
     }
     let mut evidence = String::new();
     for need in needs {
         if parse_need_lines(need.lines.as_deref()).is_some() && !full_paths.contains(&need.path) {
-            if let Some(sec) = need_section(&ex, root, need) {
+            if let Some(sec) = need_section(&ex, root, need, &mut warnings) {
                 disclose_scope(&need.path);
                 evidence.push_str(&sec);
             }
         }
     }
     if evidence.is_empty() && full_paths.is_empty() {
-        return None;
+        return (None, warnings);
     }
     // augmented bundle：needs 前插（changeset 内的 need 取真 diff，防超预算 def 回落失锚）
     // → 自家文件（单格全审默认下 own 即全变更集，无兄弟可镜像）；预算记账仍只扣自家原 diff。
@@ -202,7 +210,7 @@ pub(crate) fn second_pass_prompt(
     let others = crate::bundle::other_files_manifest(bundles, idx);
     let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, &others, incremental, &dossier, spec_docs);
     p.push_str(&draft_block(drafts));
-    Some(p)
+    (Some(p), warnings)
 }
 
 #[cfg(test)]
@@ -230,20 +238,57 @@ mod tests {
         ];
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let drafts = vec![]; // 空草稿也合法
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "").unwrap();
+        let (p, warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "");
+        let p = p.unwrap();
         assert!(p.contains("pub const LIMIT"), "needs 文件全文进包: {p}");
         assert!(p.contains("first_pass_draft"), "草稿段在场");
         assert!(p.contains("CONFIRM or REVISE"), "确认或修订语义");
         assert!(!p.contains("<incremental_round>"), "全量路径第二趟无增量段");
+        assert!(warnings.is_empty(), "放行的 needs 不应产生拒读 warning: {warnings:?}");
         // 增量轮：inc_section 原样带入第二趟（claimed-resolved/dispute 契约不因补跑丢失）
         let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
-        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, &inc, "").unwrap();
+        let (pi, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, &inc, "");
+        let pi = pi.unwrap();
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段带入第二趟: {pi}");
         assert!(pi.contains("pub const LIMIT"), "增量第二趟 needs 证据仍在场");
         // 路径逃逸：绝对路径 needs 被 skip、不 panic、其余照常
         let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
-        let p2 = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "", "");
+        let (p2, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "", "");
         if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
+    }
+
+    #[test]
+    fn second_pass_prompt_denylist_hit_surfaces_warning() {
+        // T46①（M18 批 1）：needs 命中 denylist 的拒读理由须随返回值带出——即便本例仍有其余
+        // 合法 needs 令补跑照常进行（Some(prompt)），拒读条目也不能被默默吞掉。
+        use crate::bundle::Bundle;
+        use crate::domain::NeedEntry;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn own() { let z = 1; }\n").unwrap();
+        std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
+        crate::cli::incremental::incremental_tests::git_repo(root);
+        crate::cli::incremental::incremental_tests::commit_all(root, "init");
+        let bundles = vec![Bundle { files: vec![FileChange {
+            path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into(),
+        }] }];
+        let needs = vec![
+            NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() },
+            NeedEntry { path: ".redteam/proj.db".into(), lines: None, reason: "peek ledger".into() },
+        ];
+        let (p, warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "");
+        assert!(p.is_some(), "其余合法 needs 仍让补跑照常进行");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(".redteam/proj.db"), "{warnings:?}");
+        assert!(warnings[0].contains("denylist") || warnings[0].contains("敏感路径"), "{warnings:?}");
+
+        // 全体 needs 都被拒 → prompt 为 None，但 warnings 仍须带出（此前会随 None 分支被吞掉）。
+        let all_denied = vec![NeedEntry { path: ".redteam/proj.db".into(), lines: None, reason: "x".into() }];
+        let (p_none, warnings_none) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &all_denied, &[], "", "");
+        assert!(p_none.is_none(), "全体 needs 被拒 → 不补跑");
+        assert_eq!(warnings_none.len(), 1, "{warnings_none:?}");
+        assert!(warnings_none[0].contains(".redteam/proj.db"), "{warnings_none:?}");
     }
 
     #[test]
@@ -265,18 +310,21 @@ mod tests {
         }] }];
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let spec = "<spec_docs>\nDESIGN D8: fail-open\n</spec_docs>\n";
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", spec).unwrap();
+        let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", spec);
+        let p = p.unwrap();
         assert!(p.contains("DESIGN D8: fail-open"), "spec 段在第二趟原样注入: {p}");
         assert!(p.contains("pub const LIMIT"), "needs 证据段独立并存、不被 spec 段挤占: {p}");
 
-        let p_empty = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "").unwrap();
+        let (p_empty, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "");
+        let p_empty = p_empty.unwrap();
         assert!(p_empty.contains("(none — no spec docs provided)"), "空 spec 走既有占位: {p_empty}");
         assert!(!p_empty.contains("DESIGN D8"), "空 spec 不泄漏内容: {p_empty}");
 
         // T44：增量分支——inc_section 与 spec 同时非空须共存不互相挤占（run_incremental_review
         // 的 mk 闭包现同时透传两者，此前 spec 处恒占位 ""）。
         let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
-        let pi = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], &inc, spec).unwrap();
+        let (pi, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], &inc, spec);
+        let pi = pi.unwrap();
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段在场: {pi}");
         assert!(pi.contains("<spec_docs>") && pi.contains("DESIGN D8: fail-open"), "spec 段与增量段共存: {pi}");
     }
@@ -311,7 +359,8 @@ mod tests {
             hard_constraint: false, quote: "md5(pw)".into(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New,
         }];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "").unwrap();
+        let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "");
+        let p = p.unwrap();
         assert!(p.contains("## 补查证据"), "行窗补查段在场");
         assert!(p.contains("src/long.rs:70-132"), "±30 行窗头: {p}");
         assert!(p.contains("line70") && p.contains("line132"), "窗内行在场");
@@ -323,7 +372,8 @@ mod tests {
             NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
             NeedEntry { path: "src/long.rs".into(), lines: None, reason: "r".into() },
         ];
-        let pb = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &both, &drafts, "", "").unwrap();
+        let (pb, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &both, &drafts, "", "");
+        let pb = pb.unwrap();
         assert!(pb.contains("src/long.rs:1-200（全文"), "全文条目在场: {pb}");
         assert!(!pb.contains("## 补查证据"), "同 path 行窗段被全文超集互斥掉: {pb}");
     }
@@ -348,7 +398,8 @@ mod tests {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
         }] }];
         let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into() }];
-        let p = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "").unwrap();
+        let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "");
+        let p = p.unwrap();
         assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);
         assert!(p.contains("fn own()"), "证据段截断后 pack 仍照常渲染自家文件");
         assert!(p.len() < 300_000, "总 prompt 长度被证据帽拘住，未逼近原 100KB 单行体量: {}", p.len());
