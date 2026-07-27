@@ -129,14 +129,14 @@ pub(crate) async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>
     };
     let clusters = vec![]; // correlate 已随 doc 模式退场（E10）；clusters 字段留空保持 schema 稳定。
     // refute 子阶段打点（targets 数与 verify_findings 同一真相源函数，非重复实现）。
-    let n_targets = refute_targets(&findings, ctx.precedents, ctx.block).len();
+    let n_targets = refute_targets(&findings, ctx.precedents, ctx.block, ctx.floor).len();
     if n_targets > 0 {
         if let Some(s) = ctx.sink {
             s.on_phase(crate::state::Phase::Refute, Some(format!("{n_targets} targets")));
         }
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(
-        findings, ctx.provider, &ctx.model_names, ctx.block, ctx.max_concurrency,
+        findings, ctx.provider, &ctx.model_names, ctx.block, ctx.floor, ctx.max_concurrency,
         ctx.root, ctx.precedents, ctx.spec_docs,
     ).await;
     let mut run_warnings = ctx.warnings;

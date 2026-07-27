@@ -17,14 +17,19 @@ const SNIPPET_BYTE_CAP: usize = 24_000;
 /// positioning::safe_read=512KB，I2/T2）——对抗式威胁模型含「恶意 PR 塞大文件」，
 /// refute 这条新读路径不得重开无界读的口子。
 const SNIPPET_READ_MAX_BYTES: usize = 512 * 1024;
-/// 锚点文件全文帽（Task 4, E8-F）：64KB 以内给整文件；超帽回落 ±60 行快照（行为不倒退）。
+/// 骨架中档触发帽（Task 6, E8-F；T48 后语义变化——表2-4，M18批2）：内容 > 64KB 且语言
+/// 受支持时先试骨架；64KB 帽以下与骨架未命中/超帽的情形统一走下方 ±60 行窗（不再对
+/// ≤64KB 文件整篇回退，line_start/end 全路径都被用上）。
 const SNIPPET_FULL_FILE_CAP: usize = 64_000;
 const SNIPPET_UNAVAILABLE: &str = "(source unavailable — judge from the finding's quote alone and weigh confidence accordingly)";
 
-/// finding 声称位置的工作树快照：`root.join(&f.file)` 按 `[line_start-60, line_end+60]`
-/// 行窗（1-based 夹紧）取内容，头带 `path:起-止（现场快照）`。超 24_000 字节按 char 边界
-/// 截断+注记；文件读不到 / 为空 / 窗越界（如 line_start 越过文件末尾太远）→ 统一占位——
-/// skeptic 不得被喂假装"已验证"的空内容，占位显式指示它自行用工具读。
+/// finding 声称位置的工作树快照：内容 ≤64KB、或受支持语言的骨架未命中/超帽，统一走
+/// `[line_start-60, line_end+60]` 行窗（1-based 夹紧）取内容，头带 `path:起-止（现场快照）`；
+/// 受支持语言且原文 >64KB 时先试骨架中档（签名+锚点行，Task 6）。超 24_000 字节按 char
+/// 边界截断+注记。声称行号超出文件实际范围（模型谎报 / carried 陈旧行号，T48 行契约，
+/// M18 表2-4）→ clamp 到 `[1,n]` 且头部注记，不再占位吞证据；文件读不到 / 为空 / 命中读帽
+/// 且窗口伸进未读部分 → 仍统一占位——skeptic 不得被喂假装"已验证"的空内容，占位显式
+/// 指示它自行用工具读。
 pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
     // 有界读取（镜像 tools::read_one 的 I2/T2 模式）：最多 512KB+1 字节进内存，
     // +1 用于区分「文件恰好帽长」与「命中帽被截」。非 UTF-8（含帽边界劈开多字节字符）→ 占位。
@@ -38,21 +43,16 @@ pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
     }
     let hit_cap = content.len() > SNIPPET_READ_MAX_BYTES;
 
-    // 文件成功读入且 <= 64KB → 返回整文件，头 {path}:1-{N}（锚点文件全文）；
-    // 超帽回落 ±60 行快照路径（行为不倒退）。
-    if !hit_cap && content.len() <= SNIPPET_FULL_FILE_CAP {
-        let lines: Vec<&str> = content.lines().collect();
-        let n = lines.len();
-        return format!("{}:1-{}（锚点文件全文）\n{}", f.file, n, lines.join("\n"));
-    }
-
     let mut lines: Vec<&str> = content.lines().collect();
     if hit_cap {
         lines.pop(); // 帽处截断的尾行可能不完整，弃之
     }
     let n = lines.len();
+    if n == 0 {
+        return SNIPPET_UNAVAILABLE.to_string();
+    }
 
-    // 中档（Task 6，E8-F 补链）：全文超帽、语言受支持时先试骨架（签名行+finding 声称的
+    // 中档（Task 6，E8-F 补链）：全文超 64KB 帽、语言受支持时先试骨架（签名行+finding 声称的
     // 锚点行，其余折叠）——比 ±60 快照信号密度更高（骨架覆盖全文的 def 签名，快照只见局部）。
     // 骨架复用 pack::skeleton_of（Task 5），但 refute 只有 Finding、没有 diff/hunk——合成一个
     // 伪 hunk（`@@ -0,0 +line_start,N @@` + N 个 `+` 行）让 [line_start, line_end] 落进
@@ -61,7 +61,7 @@ pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
     // ponytail: `hit_cap`（512KB 读帽触断）不进骨架——那条路径下 `n`/`lines` 只是被截断的
     // 前缀，骨架会静默丢失「目标行在帽外」的安全占位语义（下方窗口分支的 hit_cap 越界检查）；
     // hit_cap 文件本就远超骨架/窗口两级预算，走既有窗口路径的降级判断即可，升级点再拆。
-    if !hit_cap {
+    if !hit_cap && content.len() > SNIPPET_FULL_FILE_CAP {
         if let Some(lang) = lang_for(&f.file) {
             let defs = compile_defs(lang);
             let n_start = (f.line_start as usize).max(1);
@@ -76,13 +76,33 @@ pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
         }
     }
 
-    let start = (f.line_start as usize).saturating_sub(SNIPPET_WINDOW).max(1);
-    let end = (f.line_end as usize + SNIPPET_WINDOW).min(n);
-    // 窗越界，或命中帽且请求窗口伸进未读部分 → 安全降级占位（不喂被帽掐掉的假"现场"，模型自己读）。
-    if start > end || (hit_cap && f.line_end as usize + SNIPPET_WINDOW > n) {
+    // 行窗（T48 行契约，M18 表2-4）：finding 声称的 line_start/end ± SNIPPET_WINDOW，clamp 到
+    // [1,n]（不再对 ≤64KB 文件整篇回退——line_start/end 全路径统一被用上）。
+    let claimed_start = (f.line_start as usize).max(1);
+    let claimed_end = (f.line_end as usize).max(claimed_start);
+    // 命中读帽（非行号谎报，是「还没读到那么远」）且请求窗口伸进未读部分 → 安全降级占位，
+    // 不喂被帽掐掉的假"现场"，模型自己读。
+    if hit_cap && claimed_end + SNIPPET_WINDOW > n {
         return SNIPPET_UNAVAILABLE.to_string();
     }
-    let mut out = format!("{}:{}-{}（现场快照）\n{}", f.file, start, end, lines[start - 1..end].join("\n"));
+    // 声称行号超出文件实际行数（模型谎报 / carried 陈旧锚点）→ clamp 到实际范围 + 头部注记，
+    // 不再占位吞掉证据（旧行为：start>end 即整体判死，见 T48 前 revision）；越界时给整个可读
+    // 范围（而非把窗口硬夹到末尾一行——那样等于二次吞证据）。
+    let out_of_range = claimed_start > n || claimed_end > n;
+    let (start, end) = if out_of_range {
+        (1, n)
+    } else {
+        (claimed_start.saturating_sub(SNIPPET_WINDOW).max(1), (claimed_end + SNIPPET_WINDOW).min(n))
+    };
+    let header = if out_of_range {
+        format!(
+            "{}:{}-{}（声称行号 {}-{} 超出文件范围 1-{}，已收窄为现场快照）",
+            f.file, start, end, claimed_start, claimed_end, n
+        )
+    } else {
+        format!("{}:{}-{}（现场快照）", f.file, start, end)
+    };
+    let mut out = format!("{header}\n{}", lines[start - 1..end].join("\n"));
     if out.len() > SNIPPET_BYTE_CAP {
         let mut cut = SNIPPET_BYTE_CAP;
         while cut > 0 && !out.is_char_boundary(cut) {
@@ -185,10 +205,15 @@ async fn refute_one(
 /// targeted refute 目标集（单一真相源：verify_findings 执行与 phase 打点的 targets 数共用，
 /// 防两处筛选逻辑漂移）。层③：孤证 blocking 或预筛命中判例变体；精确 id 在台账者除外。
 /// M13：origin=carried 不进 targets——出生轮已过孤证 refute 与判例预筛。
+/// `floor`（表2-3，M18批2/decisions Q4）：仅孤证 blocking 分支加 `confidence >= floor`——
+/// 低于 floor 的孤证在 verdict 层本就永不 blocking（`verdict::compute_verdict` 的 conf_floor
+/// 语义），refute 复核它纯烧 LLM 无裁决增益。判例预筛分支**有意不门**：变体压制语义（跨轮
+/// 一致驳回）+ refuted 标记披露价值 + 命中率低成本可控。floor=0 时与现状全等（零默认行为变化）。
 pub fn refute_targets(
     findings: &[Finding],
     precedents: &[DismissCard],
     block_threshold: Severity,
+    floor: f32,
 ) -> Vec<usize> {
     let exact_ids: std::collections::HashSet<&str> = precedents.iter().map(|c| c.id.as_str()).collect();
     findings
@@ -197,7 +222,7 @@ pub fn refute_targets(
         .filter(|(_, f)| f.origin != crate::domain::Origin::Carried)
         .filter(|(_, f)| !exact_ids.contains(f.id.as_str()))
         .filter(|(_, f)| {
-            (f.agreement == 1 && f.severity >= block_threshold)
+            (f.agreement == 1 && f.severity >= block_threshold && f.confidence >= floor)
                 || precedents.iter().any(|c| matches_precedent(f, c))
         })
         .map(|(i, _)| i)
@@ -233,8 +258,9 @@ fn classify_refute(
 
 /// 三层 targeted-verify（S3-b）+ 判例预筛扩面（design 2026-07-03 #3）。
 /// 层①：agreement>=2 跳过（多模型已互证）。层②：引用存在性由 positioning 已砍编造。
-/// 层③：孤证 blocking（agreement==1 && severity>=block_threshold）**或预筛命中判例变体**
-/// （后者无视 agreement/severity——review 不再注入勿再报后，变体可能多模型同报/低严出现）。
+/// 层③：孤证 blocking（agreement==1 && severity>=block_threshold && confidence>=floor）
+/// **或预筛命中判例变体**（后者无视 agreement/severity/floor——review 不再注入勿再报后，
+/// 变体可能多模型同报/低严出现；decisions Q4）。目标集委托 `refute_targets`（单一真相源）。
 /// 精确 id 已在台账者不 refute（mark_dismissed 将豁免，烧 LLM 纯浪费）。
 /// refuted → verify=Refuted 且 confidence=0.0（降下 floor，不翻 verdict）；upheld → verify=Upheld。
 /// Semaphore 限 max_concurrency。
@@ -251,12 +277,13 @@ pub async fn verify_findings(
     provider: &dyn ReviewProvider,
     models: &[String],
     block_threshold: Severity,
+    floor: f32,
     max_concurrency: usize,
     root: &Path,
     precedents: &[DismissCard],
     spec_docs: &str,
 ) -> (Vec<Finding>, Vec<String>, (u64, u64, u64)) {
-    let targets = refute_targets(&findings, precedents, block_threshold);
+    let targets = refute_targets(&findings, precedents, block_threshold, floor);
     if targets.is_empty() {
         return (findings, Vec::new(), (0, 0, 0));
     }
@@ -402,14 +429,30 @@ mod tests {
     }
 
     #[test]
-    fn source_snippet_upgrades_to_full_file_within_cap() {
-        // 64KB 帽分支（Task 4, E8-F）：文件成功读入且 <= 64KB → 整文件，头 {path}:1-{N}（锚点文件全文）
+    fn source_snippet_small_file_uses_line_window_not_full_file(){
+        // T48 行契约（表2-4，M18批2）：≤64KB 文件不再整篇回退——line_start/end 全路径统一
+        // 走行窗；窗口（±60）覆盖了这个 3 行小文件的全部内容，故实际渲染范围恰好是全文，
+        // 但契约上走的是「现场快照」窗口分支，不是旧的「锚点文件全文」分支。
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("small.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
         let f = finding_at("small.rs", 2, 2);
         let s = source_snippet(tmp.path(), &f);
-        assert!(s.contains("（锚点文件全文）"), "64KB 内升档全文: {s}");
-        assert!(s.contains("fn a()") && s.contains("fn c()"), "含锚点行窗之外的内容");
+        assert!(s.contains("（现场快照）"), "小文件也走行窗契约，非整篇回退: {s}");
+        assert!(!s.contains("锚点文件全文"), "旧的整篇回退分支已移除: {s}");
+        assert!(s.contains("fn a()") && s.contains("fn c()"), "窗口覆盖了小文件的全部内容");
+    }
+
+    #[test]
+    fn source_snippet_out_of_range_line_clamps_with_note() {
+        // T48 行契约：finding 声称的行号超出文件实际范围（模型谎报/carried 陈旧锚点）→
+        // clamp 到文件实际范围 + 头部注记，不再像旧行为一样整体判死成占位（吞掉证据）。
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("tiny.rs"), "fn a() {}\nfn b() {}\n").unwrap(); // 只有 2 行
+        let f = finding_at("tiny.rs", 1000, 1005); // 远超文件实际行数
+        let s = source_snippet(tmp.path(), &f);
+        assert_ne!(s, SNIPPET_UNAVAILABLE, "越界不该占位吞掉证据");
+        assert!(s.contains("超出文件范围"), "头部须注记谎报: {s}");
+        assert!(s.contains("fn a()") && s.contains("fn b()"), "clamp 后仍给出文件实际内容: {s}");
     }
 
     #[test]
@@ -452,7 +495,7 @@ mod tests {
         // skeptic 返回非空（找到反驳）→ refuted；confidence 降 0
         let provider = FakeProvider::with("beta", vec![rawf("actually guarded above")]);
         let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Path::new("."), &[], "").await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
         assert_eq!(out[0].verify.as_ref().unwrap().model, "beta", "交叉选了非 alpha 的 model");
         assert_eq!(out[0].confidence, 0.0, "refuted 降 confidence 下 floor");
@@ -463,7 +506,7 @@ mod tests {
         // skeptic 返回空（守不住反驳）→ upheld；confidence 不动
         let provider = FakeProvider::with("beta", vec![]);
         let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Path::new("."), &[], "").await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld);
         assert_eq!(out[0].confidence, 0.9);
     }
@@ -476,7 +519,7 @@ mod tests {
         let f1 = finding("missing auth 1", Severity::High, 1, "alpha");
         let f2 = finding("missing auth 2", Severity::High, 1, "alpha");
         let (_out, _w, usage) = verify_findings(
-            vec![f1, f2], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Path::new("."), &[], "",
+            vec![f1, f2], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "",
         ).await;
         assert_eq!(usage, (200, 40, 10), "两次 refute 调用的 token 须累加，不能被丢弃");
     }
@@ -487,7 +530,7 @@ mod tests {
         let provider = FakeProvider::with_tokens("beta", vec![rawf("x")], (100, 20, 5));
         let f = finding("minor", Severity::Low, 1, "alpha");
         let (_out, _w, usage) = verify_findings(
-            vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Path::new("."), &[], "",
+            vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "",
         ).await;
         assert_eq!(usage, (0, 0, 0));
     }
@@ -497,7 +540,7 @@ mod tests {
         // agreement>=2（层①）→ 不 refute，verify 留 None
         let provider = FakeProvider::with("beta", vec![rawf("x")]);
         let f = finding("agreed bug", Severity::Critical, 2, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Path::new("."), &[], "").await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
         assert!(out[0].verify.is_none());
         assert_eq!(out[0].confidence, 0.9);
     }
@@ -507,7 +550,7 @@ mod tests {
         // severity < block_threshold → 不 refute
         let provider = FakeProvider::with("beta", vec![rawf("x")]);
         let f = finding("minor", Severity::Low, 1, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Path::new("."), &[], "").await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
         assert!(out[0].verify.is_none());
     }
 
@@ -526,7 +569,7 @@ mod tests {
         let mut f = finding("prompt injection via ledger notes", Severity::Medium, 2, "alpha");
         f.models = vec!["alpha".into(), "gamma".into()];
         let cards = vec![card("ffffffffffffffff", "a.rs", "prompt injection via dismissed notes")];
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::High, 4, Path::new("."), &cards, "").await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::High, 0.0, 4, Path::new("."), &cards, "").await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted,
             "预筛命中 → 无视 agreement/severity 进 refute");
     }
@@ -537,7 +580,7 @@ mod tests {
         let provider = FakeProvider::with("beta", vec![rawf("would refute")]);
         let f = finding("missing auth", Severity::High, 1, "alpha");
         let cards = vec![card(&f.id.clone(), "a.rs", "missing auth")];
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 4, Path::new("."), &cards, "").await;
+        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &cards, "").await;
         assert!(out[0].verify.is_none(), "台账精确命中不烧 refute");
     }
 
@@ -547,14 +590,14 @@ mod tests {
         let provider = FakeProvider::with("alpha", vec![]); // 只有 alpha，单 model
         let f = finding("missing auth", Severity::High, 1, "alpha");
         // models 只有 alpha → 退化自审 alpha；但 FakeProvider 有 alpha script(空) → upheld
-        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 4, Path::new("."), &[], "").await;
+        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld);
         assert!(w.is_empty(), "成功 upheld 无 warning");
 
         // 真失败：所选 model 无 script → 保守 upheld + warning 上浮（验证层失效可观测）
         let provider2 = FakeProvider { scripted: BTreeMap::new(), tokens: (0, 0, 0) };
         let f2 = finding("missing auth", Severity::High, 1, "ghost");
-        let (out2, w2, _u2) = verify_findings(vec![f2], &provider2, &["ghost".into()], Severity::Medium, 4, Path::new("."), &[], "").await;
+        let (out2, w2, _u2) = verify_findings(vec![f2], &provider2, &["ghost".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
         assert_eq!(out2[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld, "调用失败保守 upheld");
         assert_eq!(out2[0].confidence, 0.9, "upheld 不降 confidence");
         assert_eq!(w2.len(), 1, "refute 失败必须产出 warning");
@@ -570,8 +613,40 @@ mod tests {
         carried.origin = Origin::Carried;
         let fresh = finding("new lone blocking", Severity::High, 1, "alpha");
         let cards = vec![card("ffffffffffffffff", "a.rs", "lone blocking")]; // 判例变体也不打 carried
-        let targets = refute_targets(&[carried, fresh], &cards, Severity::Medium);
+        let targets = refute_targets(&[carried, fresh], &cards, Severity::Medium, 0.0);
         assert_eq!(targets, vec![1], "只有 origin=new 的孤证进 targets（carried 双路径均剔除）");
+    }
+
+    // ---- refute conf_floor 门（表2-3，M18批2/decisions Q4）----
+
+    #[test]
+    fn refute_targets_conf_floor_excludes_low_confidence_lone_blocking() {
+        // 高 severity 但低于 floor 的孤证：verdict 层本就永不 blocking，refute 复核纯烧 LLM。
+        let mut low = finding("lone blocking low conf", Severity::High, 1, "alpha");
+        low.confidence = 0.2;
+        let targets = refute_targets(&[low], &[], Severity::Medium, 0.5);
+        assert!(targets.is_empty(), "低于 floor 的孤证 blocking 不应进 refute targets");
+    }
+
+    #[test]
+    fn refute_targets_conf_floor_admits_high_confidence_lone_blocking() {
+        // 高 severity 且不低于 floor 的孤证：照常进 targets（floor 门不误伤正常孤证）。
+        let mut high = finding("lone blocking high conf", Severity::High, 1, "alpha");
+        high.confidence = 0.9;
+        let targets = refute_targets(&[high], &[], Severity::Medium, 0.5);
+        assert_eq!(targets, vec![0], "不低于 floor 的孤证 blocking 正常进 refute targets");
+    }
+
+    #[test]
+    fn refute_targets_precedent_prescreen_ignores_conf_floor() {
+        // 判例预筛分支有意不门 floor（decisions Q4）：即便置信度低于 floor，命中判例变体
+        // 仍强制进 refute——变体压制语义（跨轮一致驳回）+ refuted 标记披露价值。
+        let mut f = finding("prompt injection via ledger notes", Severity::Medium, 2, "alpha");
+        f.confidence = 0.1;
+        f.models = vec!["alpha".into(), "gamma".into()];
+        let cards = vec![card("ffffffffffffffff", "a.rs", "prompt injection via dismissed notes")];
+        let targets = refute_targets(&[f], &cards, Severity::High, 0.5);
+        assert_eq!(targets, vec![0], "判例预筛命中不受 conf_floor 门控，无视低置信度");
     }
 
     #[test]
@@ -606,7 +681,7 @@ mod tests {
         let provider = ParseErrProvider(
             "structured-output parse failed: final JSON parse failed (finish_reason=stop): **REFUTED: trailing text".into());
         let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 4, Path::new("."), &[], "").await;
+        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
         assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted, "嗅探救回 REFUTED 语义");
         assert_eq!(out[0].confidence, 0.0, "refuted 照常降 conf 下 floor");
         assert_eq!(w.len(), 1, "嗅探路径仍必须产出 warning（可观测）");

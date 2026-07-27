@@ -322,12 +322,23 @@ fn resolve_result(
         // 五档：未终态是命令自身失败（参数/时序错误），退出码 1，不与降级 approve 的 2 混淆。
         return Err((format!("job {job_id} not done (status: {:?})", st.status), 1));
     }
-    let content = if format == "md" {
-        store.read_result_md(job_id).or_else(|| store.read_result(job_id))
-    } else {
-        store.read_result(job_id)
-    };
-    match content {
+    if format == "md" {
+        // D3（表2-2，M18批2）：md 列缺失不再静默回落出 JSON（ship rN.md 依赖这条命令产出
+        // 的是 markdown，静默回落=谎报格式）。md 缺但 json 在库 → 反序列化 ReviewReport
+        // 现算 render_md；两者皆缺才报错退 1。
+        if let Some(md) = store.read_result_md(job_id) {
+            return Ok(md);
+        }
+        return match store.read_result(job_id) {
+            Some(json) => match serde_json::from_str::<redteam::domain::ReviewReport>(&json) {
+                Ok(report) => Ok(render(&report, redteam::output::Format::Md)),
+                Err(e) => Err((format!("result for {job_id} 解析失败，无法渲染 md: {e}"), 1)),
+            },
+            None if st.status == JobStatus::Done => Err((format!("result missing for {job_id}"), 1)),
+            None => Err((format!("job {job_id} not done (status: {:?})", st.status), 1)),
+        };
+    }
+    match store.read_result(job_id) {
         Some(raw) => Ok(raw),
         None if st.status == JobStatus::Done => {
             Err((format!("result missing for {job_id}"), 1))
@@ -433,6 +444,16 @@ async fn main() {
                     redteam::cli::run_resume(&job_id, &registry, &cfg, &cwd, &store).await;
                 println!("{}", render(&report, fmt));
                 std::process::exit(code);
+            }
+
+            // 值域校验（表2-5，M18批2）：conf_floor 越界（如 --conf-floor 5.0）会让
+            // compute_verdict/refute 的 floor 门产生诡异行为（永久豁免/永久 blocking）——
+            // 命令层直接拒收，退出码 1（命令自身失败，五档契约），不放行到评审流程里静默跑歪。
+            if let Some(f) = conf_floor {
+                if !(0.0..=1.0).contains(&f) {
+                    eprintln!("error: --conf-floor must be within 0.0..=1.0, got {f}");
+                    std::process::exit(1);
+                }
             }
 
             // scope 缺省定案（r1 20260703 事故：--base + 默认 working-tree = base 被静默
