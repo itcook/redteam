@@ -214,7 +214,7 @@ async fn incremental_round_smoke() {
     use redteam::cli::{exit_code, run_review_dispatch};
     use redteam::domain::{Origin, RawFinding, Severity, Verdict};
     use redteam::provider::fake::FakeProvider;
-    use redteam::state::store::{append_partial, write_args_raw, write_manifest, write_result, CellInput, CellRecord};
+    use redteam::state::{CellInput, CellRecord};
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
@@ -281,12 +281,13 @@ default_models=["m","m2"]
 
     // 落库为 prior job（模拟 --background 持久化——incremental_preflight 只信「已入库」的作业）。
     let job_id = "prior1";
-    write_args_raw(dir.path(), job_id, &serde_json::to_string(&full_args).unwrap()).unwrap();
-    write_result(dir.path(), job_id, &serde_json::to_string(&prior_report).unwrap()).unwrap();
-    write_manifest(dir.path(), job_id, &[CellInput {
+    let store = redteam::state::JobStore::open(dir.path()).unwrap();
+    store.write_args_raw(job_id, &serde_json::to_string(&full_args).unwrap()).unwrap();
+    store.write_result(job_id, &serde_json::to_string(&prior_report).unwrap()).unwrap();
+    store.write_manifest(job_id, &[CellInput {
         cell: "bundle[src/a.rs]".into(), model: "m".into(), prompt: "p".into(),
     }]).unwrap();
-    append_partial(dir.path(), job_id, &CellRecord::ok(
+    store.append_partial(job_id, &CellRecord::ok(
         "bundle[src/a.rs]", "m", prior_report.findings.clone(),
     )).unwrap();
 

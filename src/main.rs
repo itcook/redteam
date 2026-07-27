@@ -296,9 +296,9 @@ fn resolve_result(
     store: &redteam::state::JobStore,
     job_id: &str,
     format: &str,
-    st: &redteam::state::job::JobState,
+    st: &redteam::state::JobState,
 ) -> Result<String, (String, i32)> {
-    use redteam::state::job::JobStatus;
+    use redteam::state::JobStatus;
     let terminal = matches!(
         st.status,
         JobStatus::Done | JobStatus::Failed | JobStatus::TimedOut | JobStatus::Cancelled
@@ -510,17 +510,20 @@ async fn main() {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let ws = cwd.clone();
             // ④级：worker 主进程打不开 store 是硬错误，直接报错退出。
+            // M17-c Task 3：单连接贯穿 worker 全生命周期——Arc 化后 run_job/panic hook/收尾
+            // 共享同一个 JobStore（同一个底层 rusqlite::Connection），不再各自现开连接。
             let store = match redteam::state::JobStore::open(&ws) {
-                Ok(s) => s,
+                Ok(s) => std::sync::Arc::new(s),
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
             };
             // 进程级 panic 兜底（E12-Q4，真·顶层）：worker 评审体若 panic，落 Failed 终态再正常
             // 展开——否则状态永停 Running（惰性收尸只治「进程已死」，panic 与退出间有窗口）。
-            // hook 是 'static Fn，捕获 ws/job_id 的 clone；只取 payload message，不带 backtrace。
-            // panic hook 要求 'static 闭包，无法捕获局部 &JobStore 借用——触发时现开一个临时
-            // store 仅供这一次落终态用（Arc 化跨闭包共享是 Task 3 的事）。
+            // hook 是 'static Fn：M17-c Task 3 前受限于闭包无法借用局部 &JobStore，只能在触发时
+            // 现开一个临时 store；现在 store 已是 Arc<JobStore>（Send+Sync，见 db.rs 的
+            // Mutex<ProjDb> 内部可变性），克隆进闭包即满足 'static，遂改为与主流程共享同一连接——
+            // 少一次 panic 时的临时连接开销，且不再需要 ws_h 这份路径 clone。
             {
-                let ws_h = ws.clone();
+                let store_h = std::sync::Arc::clone(&store);
                 let jid_h = job_id.clone();
                 let default_hook = std::panic::take_hook();
                 std::panic::set_hook(Box::new(move |info| {
@@ -530,12 +533,7 @@ async fn main() {
                         .map(|s| s.to_string())
                         .or_else(|| info.payload().downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "unknown".to_string());
-                    match redteam::state::JobStore::open(&ws_h) {
-                        Ok(s) => redteam::cli::mark_failed_panic(&s, &jid_h, &msg),
-                        Err(e) => eprintln!(
-                            "warn: panic hook 无法打开 proj.db，job {jid_h} 状态未落 Failed（需人工处理）: {e}"
-                        ),
-                    }
+                    redteam::cli::mark_failed_panic(&store_h, &jid_h, &msg);
                     default_hook(info);
                 }));
             }
@@ -561,7 +559,7 @@ async fn main() {
                     // 写 Failed 终态，让 status 命令能看到错误原因。走守卫：裸覆写
                     // 会盖掉 pre-worker 阶段已落定的 Cancelled 终态（首个终态封盘）。
                     match store.update_if_active(&job_id, |st| {
-                        st.status = redteam::state::job::JobStatus::Failed;
+                        st.status = redteam::state::JobStatus::Failed;
                         st.error = Some(e);
                         st.exit_code = Some(2);
                     }) {
@@ -581,7 +579,7 @@ async fn main() {
             // 便于单测锚住守卫语义（见 cli/mod.rs stamp_deadline_tests）。
             redteam::cli::stamp_deadline(&store, &job_id, started);
             let code =
-                redteam::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started, &store)
+                redteam::cli::run_job(&job_id, &args, &registry, &cfg, &cwd, started, store)
                     .await;
             std::process::exit(code);
         }
@@ -596,7 +594,7 @@ async fn main() {
                 return_code_for_cells(&store, job_id.as_deref())
             } else {
             // 两分支统一收集（列表 / 单 job），再按 format 分流；json 输出形状与改动前逐字节一致。
-            let jobs: Option<Vec<redteam::state::job::JobState>> = match &job_id {
+            let jobs: Option<Vec<redteam::state::JobState>> = match &job_id {
                 None => Some(
                     store
                         .list_states()
@@ -650,7 +648,7 @@ async fn main() {
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
             };
             match store.read_state(&job_id) {
-                Some(s) if matches!(s.status, redteam::state::job::JobStatus::Running | redteam::state::job::JobStatus::Pending) => {
+                Some(s) if matches!(s.status, redteam::state::JobStatus::Running | redteam::state::JobStatus::Pending) => {
                     // 仅当 worker 进程确活（pid 存活 且 身份锚吻合）才发信号——否则 pid 可能已被
                     // OS 复用给无辜进程，盲发 SIGTERM 会误杀（E12-Q3/bug③）。
                     if let Some(pid) = s.pid {
@@ -664,7 +662,7 @@ async fn main() {
                     // 曾把「守卫拒写 Ok(false)」与「db 真错误 Err(e)」折成同一路径，掩盖真实故障；
                     // 对照 cli/mod.rs 同批四处终态写的既有三分支模式拆开。
                     match store.update_if_active(&job_id, |st| {
-                        st.status = redteam::state::job::JobStatus::Cancelled;
+                        st.status = redteam::state::JobStatus::Cancelled;
                     }) {
                         Ok(true) => {
                             println!("cancelled {job_id}");
@@ -1012,7 +1010,7 @@ fn return_code_for_cells(store: &redteam::state::JobStore, job_id: Option<&str>)
 
 /// M5 批2：`status --format table` 人读视图（opt-in；默认 JSON 数组契约不动）。
 /// 空格对齐、无框线——窄终端可 wrap、输出可 grep。now 注入以便测试。
-fn render_status_table(jobs: &[redteam::state::job::JobState], now: u64) -> String {
+fn render_status_table(jobs: &[redteam::state::JobState], now: u64) -> String {
     const HEADER: [&str; 7] = ["JOB", "STATUS", "PHASE", "PROG", "AGE", "IDLE", "WORKSPACE"];
     let rows: Vec<[String; 7]> = jobs
         .iter()
@@ -1025,7 +1023,7 @@ fn render_status_table(jobs: &[redteam::state::job::JobState], now: u64) -> Stri
                 {
                     let name = j.phase.as_ref().map(serde_str).unwrap_or_else(|| "-".into());
                     match j.phase_history.last() {
-                        Some(stamp) if j.status == redteam::state::job::JobStatus::Running && stamp.at > 0 => {
+                        Some(stamp) if j.status == redteam::state::JobStatus::Running && stamp.at > 0 => {
                             let note = stamp.note.as_deref().map(|n| format!("[{n}]")).unwrap_or_default();
                             format!("{name}{note} ({})", fmt_dur(now.saturating_sub(stamp.at)))
                         }
@@ -1064,7 +1062,7 @@ mod tests {
     /// M5 批2：status --format table 的人读渲染（默认 json 契约不动）。
     #[test]
     fn status_table_running_phase_shows_dwell_and_note() {
-        use redteam::state::job::{JobState, JobStatus, Phase};
+        use redteam::state::{JobState, JobStatus, Phase};
         let mut a = JobState::new("abc123def456", 1000);
         a.status = JobStatus::Running;
         a.set_phase(Phase::Refute, Some("9 targets".into()));
@@ -1075,7 +1073,7 @@ mod tests {
 
     #[test]
     fn render_status_table_shapes_columns() {
-        use redteam::state::job::{JobState, JobStatus, Phase, Progress};
+        use redteam::state::{JobState, JobStatus, Phase, Progress};
         let mut a = JobState::new("abc123def456", 1000);
         a.status = JobStatus::Running;
         a.phase = Some(Phase::Fanout);
@@ -1143,7 +1141,7 @@ mod tests {
     /// Fix 1：Failed + result.json 存在 → 取回成功（partial report，ship 协议 §2.4 依赖此路径）。
     #[test]
     fn resolve_result_failed_with_partial_report_succeeds() {
-        use redteam::state::job::{JobState, JobStatus};
+        use redteam::state::{JobState, JobStatus};
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
         let store = redteam::state::JobStore::open(ws).unwrap();
@@ -1158,7 +1156,7 @@ mod tests {
     /// Fix 1：Failed + 无 result.json → 仍报错（未曾 checkpoint 过任何 cell 的早期崩溃）。
     #[test]
     fn resolve_result_failed_without_result_file_errs() {
-        use redteam::state::job::{JobState, JobStatus};
+        use redteam::state::{JobState, JobStatus};
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
         let store = redteam::state::JobStore::open(ws).unwrap();
@@ -1172,7 +1170,7 @@ mod tests {
     /// 非终态（Running）不受影响：即便 result.json 意外存在也不放行。
     #[test]
     fn resolve_result_running_stays_not_done() {
-        use redteam::state::job::{JobState, JobStatus};
+        use redteam::state::{JobState, JobStatus};
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
         let store = redteam::state::JobStore::open(ws).unwrap();

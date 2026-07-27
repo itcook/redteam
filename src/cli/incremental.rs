@@ -259,7 +259,7 @@ pub(crate) mod incremental_tests {
     use crate::domain::{RawFinding, RunMeta, Severity, Stats, Verdict};
     use crate::evidence::git::FileChange;
     use crate::orchestrate::enrich;
-    use crate::state::store::{append_partial, write_args_raw, write_manifest, CellInput, CellRecord};
+    use crate::state::{CellInput, CellRecord};
 
     pub(crate) fn git_repo(dir: &std::path::Path) {
         let run = |args: &[&str]| {
@@ -317,11 +317,12 @@ pub(crate) mod incremental_tests {
                 head_sha: Some(head_sha.into()), ..Default::default()
             },
         };
-        crate::state::store::write_result(root, job, &serde_json::to_string(&report).unwrap()).unwrap();
+        let store = crate::state::JobStore::open(root).unwrap();
+        store.write_result(job, &serde_json::to_string(&report).unwrap()).unwrap();
         let prior_args = ReviewArgs { incremental_from: None, background: true, ..inc_args("dev0", "unused") };
-        write_args_raw(root, job, &serde_json::to_string(&prior_args).unwrap()).unwrap();
-        write_manifest(root, job, &[CellInput { cell: "bundle[a.rs]@m".into(), model: "m".into(), prompt: "p".into() }]).unwrap();
-        append_partial(root, job, &CellRecord::ok("bundle[a.rs]@m", "m", vec![])).unwrap();
+        store.write_args_raw(job, &serde_json::to_string(&prior_args).unwrap()).unwrap();
+        store.write_manifest(job, &[CellInput { cell: "bundle[a.rs]@m".into(), model: "m".into(), prompt: "p".into() }]).unwrap();
+        store.append_partial(job, &CellRecord::ok("bundle[a.rs]@m", "m", vec![])).unwrap();
     }
 
     #[test]
@@ -385,35 +386,35 @@ pub(crate) mod incremental_tests {
         let e = incremental_preflight(&store, &inc_args("dev0", "ghost"), "ghost", dir.path()).unwrap_err();
         assert!(e.to_string().contains("no persisted result"), "{e}");
         // ③R2 健康基线：incomplete
-        let mut bad: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
+        let mut bad: ReviewReport = serde_json::from_str(&store.read_result("jok").unwrap()).unwrap();
         bad.verdict = Verdict::Incomplete;
-        crate::state::store::write_result(dir.path(), "jincomplete", &serde_json::to_string(&bad).unwrap()).unwrap();
+        store.write_result("jincomplete", &serde_json::to_string(&bad).unwrap()).unwrap();
         let e = incremental_preflight(&store, &inc_args("dev0", "jincomplete"), "jincomplete", dir.path()).unwrap_err();
         assert!(e.to_string().contains("incomplete"), "{e}");
         // ③R2：failed_models 非空
-        let mut half: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
+        let mut half: ReviewReport = serde_json::from_str(&store.read_result("jok").unwrap()).unwrap();
         half.verdict = Verdict::Approve;
         half.run.failed_models = vec!["beta".into()];
-        crate::state::store::write_result(dir.path(), "jhalf", &serde_json::to_string(&half).unwrap()).unwrap();
-        crate::state::store::write_args_raw(dir.path(), "jhalf", &crate::state::store::read_args_raw(dir.path(), "jok").unwrap()).unwrap();
+        store.write_result("jhalf", &serde_json::to_string(&half).unwrap()).unwrap();
+        store.write_args_raw("jhalf", &store.read_args_raw("jok").unwrap()).unwrap();
         let e = incremental_preflight(&store, &inc_args("dev0", "jhalf"), "jhalf", dir.path()).unwrap_err();
         assert!(e.to_string().contains("failed models"), "{e}");
         // ③R2：manifest 有 cell 无 ok 记录
-        let mut ok2: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
+        let mut ok2: ReviewReport = serde_json::from_str(&store.read_result("jok").unwrap()).unwrap();
         ok2.run.failed_models.clear();
-        crate::state::store::write_result(dir.path(), "jpartial", &serde_json::to_string(&ok2).unwrap()).unwrap();
-        crate::state::store::write_args_raw(dir.path(), "jpartial", &crate::state::store::read_args_raw(dir.path(), "jok").unwrap()).unwrap();
-        crate::state::store::write_manifest(dir.path(), "jpartial", &[
-            crate::state::store::CellInput { cell: "c-never-ran".into(), model: "m".into(), prompt: "p".into() },
+        store.write_result("jpartial", &serde_json::to_string(&ok2).unwrap()).unwrap();
+        store.write_args_raw("jpartial", &store.read_args_raw("jok").unwrap()).unwrap();
+        store.write_manifest("jpartial", &[
+            crate::state::CellInput { cell: "c-never-ran".into(), model: "m".into(), prompt: "p".into() },
         ]).unwrap();
         let e = incremental_preflight(&store, &inc_args("dev0", "jpartial"), "jpartial", dir.path()).unwrap_err();
         assert!(e.to_string().contains("without an ok record"), "{e}");
         // 无 stamp（v2 老报告）
-        let mut nostamp: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
+        let mut nostamp: ReviewReport = serde_json::from_str(&store.read_result("jok").unwrap()).unwrap();
         nostamp.run.head_sha = None;
-        crate::state::store::write_result(dir.path(), "jnostamp", &serde_json::to_string(&nostamp).unwrap()).unwrap();
-        crate::state::store::write_args_raw(dir.path(), "jnostamp", &crate::state::store::read_args_raw(dir.path(), "jok").unwrap()).unwrap();
-        crate::state::store::write_manifest(dir.path(), "jnostamp", &[]).unwrap();
+        store.write_result("jnostamp", &serde_json::to_string(&nostamp).unwrap()).unwrap();
+        store.write_args_raw("jnostamp", &store.read_args_raw("jok").unwrap()).unwrap();
+        store.write_manifest("jnostamp", &[]).unwrap();
         let e = incremental_preflight(&store, &inc_args("dev0", "jnostamp"), "jnostamp", dir.path()).unwrap_err();
         assert!(e.to_string().contains("no head_sha stamp"), "{e}");
     }
@@ -443,15 +444,15 @@ pub(crate) mod incremental_tests {
         // ②同族：上轮 scope 与本轮不一致
         let mut prior_wt = ReviewArgs { scope: "working-tree".into(), base: None, ..inc_args("dev0", "x") };
         prior_wt.incremental_from = None;
-        crate::state::store::write_args_raw(dir.path(), "jprev", &serde_json::to_string(&prior_wt).unwrap()).unwrap();
+        store.write_args_raw("jprev", &serde_json::to_string(&prior_wt).unwrap()).unwrap();
         let e = incremental_preflight(&store, &inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("scope mismatch"), "{e}");
         // 恢复同族后：①谱系——stamp 指向不在祖先链上的假 sha
         let good_args = ReviewArgs { incremental_from: None, background: true, ..inc_args("dev0", "x") };
-        crate::state::store::write_args_raw(dir.path(), "jprev", &serde_json::to_string(&good_args).unwrap()).unwrap();
-        let mut rebased: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jprev").unwrap()).unwrap();
+        store.write_args_raw("jprev", &serde_json::to_string(&good_args).unwrap()).unwrap();
+        let mut rebased: ReviewReport = serde_json::from_str(&store.read_result("jprev").unwrap()).unwrap();
         rebased.run.head_sha = Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into());
-        crate::state::store::write_result(dir.path(), "jprev", &serde_json::to_string(&rebased).unwrap()).unwrap();
+        store.write_result("jprev", &serde_json::to_string(&rebased).unwrap()).unwrap();
         let e = incremental_preflight(&store, &inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("not an ancestor"), "{e}");
     }
