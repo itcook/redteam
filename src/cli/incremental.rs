@@ -27,8 +27,12 @@ pub async fn run_incremental_review(
     let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, root)?;
     let t0 = std::time::Instant::now();
 
+    // C-Q4：本函数只在真有 prior_job 的增量轮才会被调用（db 必已存在，见 run_review_dispatch
+    // 路由），故在此就地开一次 store 供 preflight 消费——不往上抬到 run_review_dispatch/main.rs，
+    // 避免非增量的普通前台评审也被迫触碰 proj.db（零副作用不变式，见 load_ledger 同款约定）。
+    let store = crate::state::JobStore::open(root)?;
     // 1. 四守卫 + 基线（违例显式报错拒跑）。
-    let base = incremental_preflight(args, prior_job, root)?;
+    let base = incremental_preflight(&store, args, prior_job, root)?;
     // 2. 本轮证据 HEAD stamp（R3：与 delta 收集同刻；本轮报告是下一轮的基线）。
     let head_sha = crate::evidence::git::head_sha_at(root).ok();
 
@@ -114,7 +118,7 @@ pub async fn run_incremental_review(
     // assemble_report 的 carry=Some 分支隔离评审确认）。
     let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
-    if let Some(s) = sink { s.on_phase(crate::state::job::Phase::Finalizing, None); }
+    if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
     let ctx = TailCtx {
         root,
         provider,
@@ -163,6 +167,7 @@ pub(crate) struct IncrementalBaseline {
 /// 决议 7 前置守卫：违反**显式报错拒跑**（不静默降级全量——成本意外）。
 /// ①谱系 ②同族（scope，含 v1 范围收窄 branch）③健康基线（R2 三查）④空 delta。
 pub(crate) fn incremental_preflight(
+    store: &crate::state::JobStore,
     args: &ReviewArgs,
     prior_job: &str,
     root: &Path,
@@ -185,7 +190,7 @@ pub(crate) fn incremental_preflight(
     );
 
     // 载上轮 result（增量只对经 --background 持久化过 result 的作业有意义）。
-    let raw = crate::state::store::read_result(root, prior_job).ok_or_else(|| anyhow::anyhow!(
+    let raw = store.read_result(prior_job).ok_or_else(|| anyhow::anyhow!(
         "--incremental-from: no persisted result for job {prior_job} (prior round must have run via --background)"
     ))?;
     let prior: ReviewReport = serde_json::from_str(&raw)
@@ -201,8 +206,8 @@ pub(crate) fn incremental_preflight(
         "--incremental-from: prior round {prior_job} had failed models {:?} (adversarial coverage was incomplete); run a full `redteam review`",
         prior.run.failed_models
     );
-    let manifest = crate::state::store::read_manifest(root, prior_job);
-    let ok_cells: std::collections::BTreeSet<String> = crate::state::store::read_partial(root, prior_job)
+    let manifest = store.read_manifest(prior_job);
+    let ok_cells: std::collections::BTreeSet<String> = store.read_partial(prior_job)
         .into_iter()
         .filter(|r| r.ok)
         .map(|r| r.cell)
@@ -218,7 +223,7 @@ pub(crate) fn incremental_preflight(
     ))?;
 
     // ②同族守卫：scope 与上轮一致（读上轮 args.json）。
-    let prior_args: ReviewArgs = crate::state::store::read_args_raw(root, prior_job)
+    let prior_args: ReviewArgs = store.read_args_raw(prior_job)
         .and_then(|j| serde_json::from_str(&j).ok())
         .ok_or_else(|| anyhow::anyhow!("--incremental-from: cannot load prior job args for {prior_job}"))?;
     anyhow::ensure!(
@@ -331,7 +336,8 @@ pub(crate) mod incremental_tests {
         write_prior(dir.path(), "jprev", &c1, vec![enrich(&raw("a.rs", "db.write(token);", "unvalidated write"), "m")]);
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n}\n").unwrap();
         commit_all(dir.path(), "fix");
-        let base = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap();
+        let store = crate::state::JobStore::open(dir.path()).unwrap();
+        let base = incremental_preflight(&store, &inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap();
         assert_eq!(base.base_sha, c1);
         assert_eq!(base.prior_findings.len(), 1);
         assert_eq!(base.delta.len(), 1, "delta 只含 c1..HEAD 改动");
@@ -355,7 +361,8 @@ pub(crate) mod incremental_tests {
         commit_all(dir.path(), "fix");
         // 未提交的 tracked 编辑（不 commit）：净树守卫必须先拦下，不放行到载入上轮 result
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    extra();\n    more();\n}\n").unwrap();
-        let e = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
+        let store = crate::state::JobStore::open(dir.path()).unwrap();
+        let e = incremental_preflight(&store, &inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("clean working tree"), "{e}");
     }
 
@@ -368,19 +375,20 @@ pub(crate) mod incremental_tests {
         let c1 = commit_all(dir.path(), "c1");
         std::process::Command::new("git").current_dir(dir.path()).args(["branch", "dev0", &c1]).output().unwrap();
         write_prior(dir.path(), "jok", &c1, vec![]);
+        let store = crate::state::JobStore::open(dir.path()).unwrap();
         // ④空 delta（HEAD 未动）
-        let e = incremental_preflight(&inc_args("dev0", "jok"), "jok", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &inc_args("dev0", "jok"), "jok", dir.path()).unwrap_err();
         assert!(e.to_string().contains("empty delta"), "{e}");
         std::fs::write(dir.path().join("a.rs"), "x\ny\n").unwrap();
         commit_all(dir.path(), "c2");
         // 上轮无 result
-        let e = incremental_preflight(&inc_args("dev0", "ghost"), "ghost", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &inc_args("dev0", "ghost"), "ghost", dir.path()).unwrap_err();
         assert!(e.to_string().contains("no persisted result"), "{e}");
         // ③R2 健康基线：incomplete
         let mut bad: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
         bad.verdict = Verdict::Incomplete;
         crate::state::store::write_result(dir.path(), "jincomplete", &serde_json::to_string(&bad).unwrap()).unwrap();
-        let e = incremental_preflight(&inc_args("dev0", "jincomplete"), "jincomplete", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &inc_args("dev0", "jincomplete"), "jincomplete", dir.path()).unwrap_err();
         assert!(e.to_string().contains("incomplete"), "{e}");
         // ③R2：failed_models 非空
         let mut half: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
@@ -388,7 +396,7 @@ pub(crate) mod incremental_tests {
         half.run.failed_models = vec!["beta".into()];
         crate::state::store::write_result(dir.path(), "jhalf", &serde_json::to_string(&half).unwrap()).unwrap();
         crate::state::store::write_args_raw(dir.path(), "jhalf", &crate::state::store::read_args_raw(dir.path(), "jok").unwrap()).unwrap();
-        let e = incremental_preflight(&inc_args("dev0", "jhalf"), "jhalf", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &inc_args("dev0", "jhalf"), "jhalf", dir.path()).unwrap_err();
         assert!(e.to_string().contains("failed models"), "{e}");
         // ③R2：manifest 有 cell 无 ok 记录
         let mut ok2: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
@@ -398,7 +406,7 @@ pub(crate) mod incremental_tests {
         crate::state::store::write_manifest(dir.path(), "jpartial", &[
             crate::state::store::CellInput { cell: "c-never-ran".into(), model: "m".into(), prompt: "p".into() },
         ]).unwrap();
-        let e = incremental_preflight(&inc_args("dev0", "jpartial"), "jpartial", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &inc_args("dev0", "jpartial"), "jpartial", dir.path()).unwrap_err();
         assert!(e.to_string().contains("without an ok record"), "{e}");
         // 无 stamp（v2 老报告）
         let mut nostamp: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jok").unwrap()).unwrap();
@@ -406,7 +414,7 @@ pub(crate) mod incremental_tests {
         crate::state::store::write_result(dir.path(), "jnostamp", &serde_json::to_string(&nostamp).unwrap()).unwrap();
         crate::state::store::write_args_raw(dir.path(), "jnostamp", &crate::state::store::read_args_raw(dir.path(), "jok").unwrap()).unwrap();
         crate::state::store::write_manifest(dir.path(), "jnostamp", &[]).unwrap();
-        let e = incremental_preflight(&inc_args("dev0", "jnostamp"), "jnostamp", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &inc_args("dev0", "jnostamp"), "jnostamp", dir.path()).unwrap_err();
         assert!(e.to_string().contains("no head_sha stamp"), "{e}");
     }
 
@@ -420,22 +428,23 @@ pub(crate) mod incremental_tests {
         write_prior(dir.path(), "jprev", &c1, vec![]);
         std::fs::write(dir.path().join("a.rs"), "x\ny\n").unwrap();
         commit_all(dir.path(), "c2");
+        let store = crate::state::JobStore::open(dir.path()).unwrap();
         // v1 范围：working-tree scope 拒（不可 stamp）
         let mut wt = inc_args("dev0", "jprev");
         wt.scope = "working-tree".into();
         wt.base = None;
-        let e = incremental_preflight(&wt, "jprev", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &wt, "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("branch scope"), "{e}");
         // v1 范围：branch scope 但缺 --base → 显式报错（防 branch_files 处 expect panic）
         let mut nobase = inc_args("dev0", "jprev");
         nobase.base = None;
-        let e = incremental_preflight(&nobase, "jprev", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &nobase, "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("requires --base"), "{e}");
         // ②同族：上轮 scope 与本轮不一致
         let mut prior_wt = ReviewArgs { scope: "working-tree".into(), base: None, ..inc_args("dev0", "x") };
         prior_wt.incremental_from = None;
         crate::state::store::write_args_raw(dir.path(), "jprev", &serde_json::to_string(&prior_wt).unwrap()).unwrap();
-        let e = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("scope mismatch"), "{e}");
         // 恢复同族后：①谱系——stamp 指向不在祖先链上的假 sha
         let good_args = ReviewArgs { incremental_from: None, background: true, ..inc_args("dev0", "x") };
@@ -443,7 +452,7 @@ pub(crate) mod incremental_tests {
         let mut rebased: ReviewReport = serde_json::from_str(&crate::state::store::read_result(dir.path(), "jprev").unwrap()).unwrap();
         rebased.run.head_sha = Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into());
         crate::state::store::write_result(dir.path(), "jprev", &serde_json::to_string(&rebased).unwrap()).unwrap();
-        let e = incremental_preflight(&inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
+        let e = incremental_preflight(&store, &inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("not an ancestor"), "{e}");
     }
 

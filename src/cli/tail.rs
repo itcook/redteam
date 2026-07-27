@@ -128,7 +128,7 @@ pub(crate) async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>
     let n_targets = refute_targets(&findings, ctx.precedents, ctx.block).len();
     if n_targets > 0 {
         if let Some(s) = ctx.sink {
-            s.on_phase(crate::state::job::Phase::Refute, Some(format!("{n_targets} targets")));
+            s.on_phase(crate::state::Phase::Refute, Some(format!("{n_targets} targets")));
         }
     }
     let (findings, refute_warnings, refute_usage) = verify_findings(

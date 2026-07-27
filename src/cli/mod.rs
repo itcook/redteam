@@ -399,9 +399,9 @@ impl CellSink for JobCellSink {
 /// R2.2：失败/超时时从 proj.db 的 cell checkpoint 里已完成的 findings 组一份 `incomplete`
 /// 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。M 取 manifest 行数（若尚未
 /// 写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
-fn partial_report(ws: &Path, job_id: &str, reason: String) -> (ReviewReport, i32) {
-    let manifest = crate::state::store::read_manifest(ws, job_id);
-    let done_records: Vec<_> = crate::state::store::read_partial(ws, job_id)
+fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) -> (ReviewReport, i32) {
+    let manifest = store.read_manifest(job_id);
+    let done_records: Vec<_> = store.read_partial(job_id)
         .into_iter()
         .filter(|r| r.ok)
         .collect();
@@ -444,29 +444,29 @@ fn partial_report(ws: &Path, job_id: &str, reason: String) -> (ReviewReport, i32
 /// 是重放完整候补链或把 manifest.model 升级为 `Vec<String>` 快照，本 task 不做（显式/replicate
 /// cell 的 manifest.model 已是精确值，dogfood 常见场景不受影响）。
 pub async fn run_resume(
-    ws: &Path,
     job_id: &str,
     provider: &dyn ReviewProvider,
     cfg: &Config,
     cwd: &Path,
+    store: &crate::state::JobStore,
 ) -> (ReviewReport, i32) {
     let t0 = std::time::Instant::now();
-    let manifest = crate::state::store::read_manifest(ws, job_id);
+    let manifest = store.read_manifest(job_id);
     // 空 manifest = job 在 fan-out 写 manifest 前就崩溃：没有任何 work-list，尾段会把 0 findings
     // 组装成干净 Approve（假阳性——评审工具静默给未经审查的通过）。护栏：直接出 Incomplete。
     if manifest.is_empty() {
         return partial_report(
-            ws, job_id,
+            store, job_id,
             "resume: empty manifest (job crashed before fan-out); nothing to resume".into(),
         );
     }
-    let args: ReviewArgs = match crate::state::store::read_args_raw(ws, job_id)
+    let args: ReviewArgs = match store.read_args_raw(job_id)
         .and_then(|j| serde_json::from_str(&j).ok())
     {
         Some(a) => a,
         None => {
             return partial_report(
-                ws, job_id,
+                store, job_id,
                 "resume: missing job args (job never ran via --background)".into(),
             );
         }
@@ -475,11 +475,11 @@ pub async fn run_resume(
     // 引导重跑增量评审（守卫与 carry 必须整链执行）。
     if args.incremental_from.is_some() {
         return partial_report(
-            ws, job_id,
+            store, job_id,
             "resume: incremental jobs cannot be resumed; re-run `redteam review --incremental-from <prior-job>`".into(),
         );
     }
-    let done: std::collections::BTreeSet<String> = crate::state::store::read_partial(ws, job_id)
+    let done: std::collections::BTreeSet<String> = store.read_partial(job_id)
         .into_iter()
         .filter(|r| r.ok)
         .map(|r| r.cell)
@@ -509,11 +509,11 @@ pub async fn run_resume(
                 }
             }
         };
-        let _ = crate::state::store::append_partial(ws, job_id, &rec);
+        let _ = store.append_partial(job_id, &rec);
     }
 
     // 合并出报告：全部 ok:true 的 findings（已完成 + 新补）。
-    let final_records = crate::state::store::read_partial(ws, job_id);
+    let final_records = store.read_partial(job_id);
     let ok_cells: std::collections::BTreeSet<&str> =
         final_records.iter().filter(|r| r.ok).map(|r| r.cell.as_str()).collect();
     let still_missing = manifest.iter().filter(|c| !ok_cells.contains(c.cell.as_str())).count();
@@ -529,7 +529,7 @@ pub async fn run_resume(
     let ledger = match load_ledger(args.dismissed.as_deref(), args.no_dismissed, cwd) {
         Ok(l) => l,
         Err(e) => {
-            return partial_report(ws, job_id, format!("resume: bad ledger: {e}"));
+            return partial_report(store, job_id, format!("resume: bad ledger: {e}"));
         }
     };
 
@@ -572,14 +572,14 @@ pub async fn run_resume(
             }
             (report, code)
         }
-        Err(e) => partial_report(ws, job_id, format!("resume tail failed: {e}")),
+        Err(e) => partial_report(store, job_id, format!("resume tail failed: {e}")),
     }
 }
 
 /// 落终态部分报告：渲染 json+md、写 result 文件、守卫式把 state 转终态并记录错误原因。
 /// 走 `update_state_if_active`：若期间已被 cancel（终态），守卫拒写、保留 Cancelled（首个终态封盘）。
 fn write_partial_result(
-    ws: &Path,
+    store: &crate::state::JobStore,
     job_id: &str,
     status: crate::state::job::JobStatus,
     report: &ReviewReport,
@@ -588,19 +588,30 @@ fn write_partial_result(
 ) {
     let json = crate::output::render(report, crate::output::Format::Json);
     let md = crate::output::render(report, crate::output::Format::Md);
-    let _ = crate::state::store::write_result(ws, job_id, &json);
-    let _ = crate::state::store::write_result_md(ws, job_id, &md);
-    let _ = crate::state::job::update_state_if_active(ws, job_id, |st| {
+    // ③级终态写：失败必响（design §4）——result/result_md/终态任一落盘失败都不该被静默吞掉，
+    // 否则 status/result 命令会永远看不到这份部分报告，且查无踪迹。
+    if let Err(e) = store.write_result(job_id, &json) {
+        eprintln!("warn: job {job_id} write_result 失败: {e}");
+    }
+    if let Err(e) = store.write_result_md(job_id, &md) {
+        eprintln!("warn: job {job_id} write_result_md 失败: {e}");
+    }
+    match store.update_if_active(job_id, |st| {
         st.status = status;
         st.error = Some(error);
         st.exit_code = Some(code);
         st.result_path = Some(format!("proj.db#results/{job_id}"));
-    });
+    }) {
+        Ok(false) => eprintln!("warn: job {job_id} 终态写被终态封盘拒绝（可能已被 cancel/收尸）"),
+        Err(e) => eprintln!("warn: job {job_id} 终态写失败: {e}"),
+        Ok(true) => {}
+    }
 }
 
 /// 状态机包裹评审：running → (评审) → done+result.json / failed+error。返回退出码。
 /// 起手若已是任意终态（Cancelled/Done/Failed/TimedOut）则早退不覆盖，保留首个终态。
 /// `st.deadline_at`（worker 起手设，见 main.rs）到点仍未完成 → TimedOut + 部分报告（R1.2）。
+#[allow(clippy::too_many_arguments)] // C-Q4 新增 store 参致第 8 参；收拢 struct 是过度设计
 pub async fn run_job(
     ws: &Path,
     job_id: &str,
@@ -609,11 +620,12 @@ pub async fn run_job(
     cfg: &Config,
     cwd: &Path,
     started_at: u64,
+    store: &crate::state::JobStore,
 ) -> i32 {
-    use crate::state::job::{read_state, JobState, JobStatus};
-    use crate::state::store::write_result;
+    use crate::state::job::JobState;
+    use crate::state::JobStatus;
 
-    let st = read_state(ws, job_id).unwrap_or_else(|| JobState::new(job_id, started_at));
+    let st = store.read_state(job_id).unwrap_or_else(|| JobState::new(job_id, started_at));
     // 终态封盘：写 Running 前检查是否已落任意终态（不止 Cancelled），若是则直接返回，
     // 不再走下面的守卫写（避免用一次注定被拒的写掩盖真实早退语义）。
     if st.status.is_terminal() {
@@ -621,15 +633,15 @@ pub async fn run_job(
     }
     // 守卫写 Pending→Running：与上面的检查之间存在窗口——cancel 进程可能在此期间
     // 抢先落 Cancelled 并提交，若仍走裸 write_state 会把 Cancelled 覆回 Running
-    // （违反首个终态封盘）。改走 update_state_if_active，事务内 CAS，拒写不覆盖。
-    let wrote = crate::state::job::update_state_if_active(ws, job_id, |s| {
+    // （违反首个终态封盘）。改走 update_if_active，事务内 CAS，拒写不覆盖。
+    let wrote = store.update_if_active(job_id, |s| {
         s.status = JobStatus::Running;
         s.set_phase(crate::state::job::Phase::Collecting, None);
     })
     .unwrap_or(false);
     if !wrote {
         // 期间已被别的进程落了终态：重读真终态、返回其 exit_code（与上面早退同款语义）。
-        return read_state(ws, job_id).and_then(|s| s.exit_code).unwrap_or(0);
+        return store.read_state(job_id).and_then(|s| s.exit_code).unwrap_or(0);
     }
 
     let sink = JobCellSink { ws: ws.to_path_buf(), job_id: job_id.to_string() };
@@ -662,28 +674,37 @@ pub async fn run_job(
             // 同渲染 json + md 落盘（result 命令按 format 直读，避免反序列化 report 图）。
             let json = crate::output::render(&report, crate::output::Format::Json);
             let md = crate::output::render(&report, crate::output::Format::Md);
-            let _ = write_result(ws, job_id, &json);
-            let _ = crate::state::store::write_result_md(ws, job_id, &md);
+            // ③级终态写：失败必响（design §4）——不再静默吞，result 缺失/终态未落都要有痕迹。
+            if let Err(e) = store.write_result(job_id, &json) {
+                eprintln!("warn: job {job_id} write_result 失败: {e}");
+            }
+            if let Err(e) = store.write_result_md(job_id, &md) {
+                eprintln!("warn: job {job_id} write_result_md 失败: {e}");
+            }
             let models = report.run.models.clone();
             // 守卫写 Done：若期间已被 cancel（Cancelled 终态），守卫拒写、保留 Cancelled
             // （首个终态封盘）。progress/last_active 由 sink 运行期已写，这里只叠终态字段。
-            let _ = crate::state::job::update_state_if_active(ws, job_id, |st| {
+            match store.update_if_active(job_id, |st| {
                 st.status = JobStatus::Done;
                 st.exit_code = Some(code);
                 st.models = models;
                 st.result_path = Some(format!("proj.db#results/{job_id}"));
-            });
+            }) {
+                Ok(false) => eprintln!("warn: job {job_id} Done 终态写被终态封盘拒绝（可能已被 cancel）"),
+                Err(e) => eprintln!("warn: job {job_id} Done 终态写失败: {e}"),
+                Ok(true) => {}
+            }
             code
         }
         Outcome::Done(Err(e)) => {
-            let (report, code) = partial_report(ws, job_id, e.to_string());
-            write_partial_result(ws, job_id, JobStatus::Failed, &report, code, e.to_string());
+            let (report, code) = partial_report(store, job_id, e.to_string());
+            write_partial_result(store, job_id, JobStatus::Failed, &report, code, e.to_string());
             code
         }
         Outcome::TimedOut => {
             let reason = "timed out: deadline exceeded".to_string();
-            let (report, code) = partial_report(ws, job_id, reason.clone());
-            write_partial_result(ws, job_id, JobStatus::TimedOut, &report, code, reason);
+            let (report, code) = partial_report(store, job_id, reason.clone());
+            write_partial_result(store, job_id, JobStatus::TimedOut, &report, code, reason);
             code
         }
     }
@@ -696,8 +717,8 @@ pub async fn run_job(
 /// 窗口由「无 pid 放过」天然挡住，不会误收。
 /// 走守卫写：若此刻 worker 恰好真完成写了 Done，守卫拒写；无论写成功与否都重读 db 真相返回——
 /// 绝不落回调用方传入的陈旧 Running 快照 `st`（那会把已完成/已消失的 job 谎报成仍在 Running）。
-pub fn reap_if_dead(ws: &Path, st: crate::state::job::JobState) -> crate::state::job::JobState {
-    use crate::state::job::{read_state, JobStatus};
+pub fn reap_if_dead(store: &crate::state::JobStore, st: crate::state::job::JobState) -> crate::state::job::JobState {
+    use crate::state::JobStatus;
     if st.status != JobStatus::Running && st.status != JobStatus::Pending {
         return st;
     }
@@ -709,15 +730,22 @@ pub fn reap_if_dead(ws: &Path, st: crate::state::job::JobState) -> crate::state:
         return st;
     }
     let job_id = st.job_id.clone();
-    let wrote = crate::state::job::update_state_if_active(ws, &job_id, |s| {
+    // ③级终态写（收尸）：失败必响——收尸拒写通常是正常竞态（worker 抢先真完成/被 cancel），
+    // 但 Err（db 层异常）不该被静默吞掉，否则收尸失效会一直悄悄发生。
+    let wrote = match store.update_if_active(&job_id, |s| {
         s.status = JobStatus::Failed;
         s.error = Some("worker process died (reaped)".to_string());
         s.exit_code = Some(2);
-    })
-    .unwrap_or(false);
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("warn: job {job_id} 收尸写失败: {e}");
+            false
+        }
+    };
     // 成功：拿到刚写的 Failed；被拒（终态封盘生效，说明 worker 在探活与落笔间的极小窗口内
     // 已真完成/被 cancel）：重读拿到真终态，而非误判为 Running 或误写为 Failed。
-    match read_state(ws, &job_id) {
+    match store.read_state(&job_id) {
         Some(fresh) => fresh,
         None => {
             // 重读也扑空（job 状态被并发移除等极端情况）：明确降级返回 Failed，绝不复用
@@ -738,13 +766,18 @@ pub fn reap_if_dead(ws: &Path, st: crate::state::job::JobState) -> crate::state:
 /// panic 兜底落终态（E12-Q4）：worker 评审体 panic 时由 panic hook 调用，守卫式把 Running
 /// 落 Failed（error 只带 message、不带 backtrace/location——B 下报告要干净）。若 panic 发生在
 /// 真完成之后，守卫拒写、保留真终态。
-pub fn mark_failed_panic(ws: &Path, job_id: &str, msg: &str) {
+pub fn mark_failed_panic(store: &crate::state::JobStore, job_id: &str, msg: &str) {
     let msg = msg.to_string();
-    let _ = crate::state::job::update_state_if_active(ws, job_id, |st| {
-        st.status = crate::state::job::JobStatus::Failed;
+    // ③级终态写：失败必响（design §4）——panic 兜底若也悄悄失败，job 会永久悬在 Running。
+    match store.update_if_active(job_id, |st| {
+        st.status = crate::state::JobStatus::Failed;
         st.error = Some(format!("panic: {msg}"));
         st.exit_code = Some(2);
-    });
+    }) {
+        Ok(false) => eprintln!("warn: job {job_id} panic 兜底写被终态封盘拒绝（已有更早终态）"),
+        Err(e) => eprintln!("warn: job {job_id} panic 兜底写失败: {e}"),
+        Ok(true) => {}
+    }
 }
 
 #[cfg(test)]
@@ -810,8 +843,9 @@ mod job_tests {
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         crate::state::job::write_state(&ws, &crate::state::job::JobState::new("j1", 500)).unwrap();
+        let store = crate::state::JobStore::open(&ws).unwrap();
 
-        let code = run_job(&ws, "j1", &code_args(), &provider, &cfg(), dir.path(), 500).await;
+        let code = run_job(&ws, "j1", &code_args(), &provider, &cfg(), dir.path(), 500, &store).await;
 
         let st = read_state(&ws, "j1").unwrap();
         assert_eq!(st.status, JobStatus::Done);
@@ -833,7 +867,8 @@ mod job_tests {
         crate::state::job::write_state(ws, &crate::state::job::JobState::new("j2", 0)).unwrap();
         // 非 git 目录 → changed_files 失败 → run_review_dispatch Err → failed
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job(ws, "j2", &code_args(), &provider, &cfg(), dir.path(), 0).await;
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let code = run_job(ws, "j2", &code_args(), &provider, &cfg(), dir.path(), 0, &store).await;
         assert_eq!(code, 2);
         let st = read_state(ws, "j2").unwrap();
         assert_eq!(st.status, JobStatus::Failed);
@@ -855,7 +890,8 @@ mod job_tests {
 
         // 非 git 目录 → changed_files 失败 → run_review_dispatch Err，但已有 partial 记录
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job(ws, "j2b", &code_args(), &provider, &cfg(), dir.path(), 0).await;
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let code = run_job(ws, "j2b", &code_args(), &provider, &cfg(), dir.path(), 0, &store).await;
 
         assert_eq!(code, 2);
         let st = read_state(ws, "j2b").unwrap();
@@ -899,7 +935,8 @@ mod job_tests {
         ).unwrap();
 
         let provider = HangProvider;
-        let code = run_job(ws, "j-to", &code_args(), &provider, &cfg(), dir.path(), 0).await;
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let code = run_job(ws, "j-to", &code_args(), &provider, &cfg(), dir.path(), 0, &store).await;
 
         assert_eq!(code, 2);
         let st = read_state(ws, "j-to").unwrap();
@@ -924,7 +961,8 @@ mod job_tests {
         crate::state::job::write_state(ws, &pre).unwrap();
 
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let _code = run_job(ws, "j3", &code_args(), &provider, &cfg(), dir.path(), 0).await;
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let _code = run_job(ws, "j3", &code_args(), &provider, &cfg(), dir.path(), 0, &store).await;
 
         // 状态仍应是 Cancelled
         let st = read_state(ws, "j3").unwrap();
@@ -952,7 +990,8 @@ mod job_tests {
         crate::state::job::write_state(ws, &pre).unwrap();
 
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job(ws, "j-precancel-7", &code_args(), &provider, &cfg(), dir.path(), 0).await;
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let code = run_job(ws, "j-precancel-7", &code_args(), &provider, &cfg(), dir.path(), 0, &store).await;
 
         // (a) 返回值必须是 Cancelled 快照里的 exit_code，而非重新跑出的别的码
         assert_eq!(code, 7, "run_job 应原样返回 pre-cancel 的 exit_code");
@@ -974,7 +1013,8 @@ mod job_tests {
         crate::state::job::write_state(ws, &pre).unwrap();
 
         let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job(ws, "j-predone", &code_args(), &provider, &cfg(), dir.path(), 0).await;
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let code = run_job(ws, "j-predone", &code_args(), &provider, &cfg(), dir.path(), 0, &store).await;
 
         assert_eq!(code, 0);
         let st = read_state(ws, "j-predone").unwrap();
@@ -1034,7 +1074,8 @@ mod job_tests {
         st.pid = Some(pid);
         st.pid_start = None; // 降级纯存活探测；pid 已回收 → 死
         write_state(ws, &st).unwrap();
-        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let out = reap_if_dead(&store, read_state(ws, "j").unwrap());
         assert_eq!(out.status, JobStatus::Failed);
         assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Failed);
         assert!(out.error.as_deref().unwrap_or("").contains("reaped"));
@@ -1051,7 +1092,8 @@ mod job_tests {
         st.pid = Some(me);
         st.pid_start = crate::procinfo::start_time(me);
         write_state(ws, &st).unwrap();
-        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let out = reap_if_dead(&store, read_state(ws, "j").unwrap());
         assert_eq!(out.status, JobStatus::Running); // 活着 → 不动
     }
 
@@ -1064,7 +1106,8 @@ mod job_tests {
         st.status = JobStatus::Done;
         st.pid = Some(999_999); // 不存在的 pid，但已终态 → 不该被碰
         write_state(ws, &st).unwrap();
-        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let out = reap_if_dead(&store, read_state(ws, "j").unwrap());
         assert_eq!(out.status, JobStatus::Done);
     }
 
@@ -1083,7 +1126,8 @@ mod job_tests {
         st.pid_start = None;
         write_state(ws, &st).unwrap();
         assert_eq!(st.status, JobStatus::Pending, "前提：新建态是 Pending");
-        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let out = reap_if_dead(&store, read_state(ws, "j").unwrap());
         assert_eq!(out.status, JobStatus::Failed);
         assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Failed);
     }
@@ -1097,7 +1141,8 @@ mod job_tests {
         let ws = dir.path();
         let st = JobState::new("j", 0); // Pending，pid=None
         write_state(ws, &st).unwrap();
-        let out = reap_if_dead(ws, read_state(ws, "j").unwrap());
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let out = reap_if_dead(&store, read_state(ws, "j").unwrap());
         assert_eq!(out.status, JobStatus::Pending);
         assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Pending);
     }
@@ -1166,7 +1211,8 @@ mod job_tests {
         assert!(wrote, "模拟的「worker 真完成」写应成功（此时仍是 Running，未终态封盘）");
         // reap_if_dead 拿到的仍是旧的 stale 快照，但 db 里已是 Done：
         // 守卫写应被终态封盘拒绝，必须重读拿到真 Done——不可被冲成 Failed，也不可原样报告 Running。
-        let out = reap_if_dead(ws, stale);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let out = reap_if_dead(&store, stale);
         assert_eq!(out.status, JobStatus::Done, "必须重读拿到真 Done，而非陈旧 Running 快照或误杀 Failed");
         assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done, "db 现状不应被 reap 覆盖");
     }
@@ -1179,7 +1225,8 @@ mod job_tests {
         let mut st = JobState::new("j", 0);
         st.status = JobStatus::Running;
         write_state(ws, &st).unwrap();
-        mark_failed_panic(ws, "j", "index out of bounds");
+        let store = crate::state::JobStore::open(ws).unwrap();
+        mark_failed_panic(&store, "j", "index out of bounds");
         let back = read_state(ws, "j").unwrap();
         assert_eq!(back.status, JobStatus::Failed);
         let err = back.error.unwrap_or_default();
@@ -1196,7 +1243,8 @@ mod job_tests {
         let mut st = JobState::new("j", 0);
         st.status = JobStatus::Done;
         write_state(ws, &st).unwrap();
-        mark_failed_panic(ws, "j", "late panic");
+        let store = crate::state::JobStore::open(ws).unwrap();
+        mark_failed_panic(&store, "j", "late panic");
         assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done);
     }
 }
@@ -1289,8 +1337,9 @@ mod resume_tests {
 
         let provider = RecordingProvider::default();
         let cfg = Config::default();
+        let store = crate::state::JobStore::open(ws).unwrap();
 
-        let (report, _code) = run_resume(ws, "j", &provider, &cfg, dir.path()).await;
+        let (report, _code) = run_resume("j", &provider, &cfg, dir.path(), &store).await;
 
         let calls = provider.prompts.lock().unwrap();
         assert_eq!(calls.len(), 2, "只应对缺失的 2 个 cell 调用 provider");
@@ -1336,8 +1385,9 @@ mod resume_tests {
 
         let provider = RecordingProvider::default();
         let cfg = Config::default();
+        let store = crate::state::JobStore::open(ws).unwrap();
 
-        let (report, _code) = run_resume(ws, "j", &provider, &cfg, dir.path()).await;
+        let (report, _code) = run_resume("j", &provider, &cfg, dir.path(), &store).await;
 
         let calls = provider.prompts.lock().unwrap();
         assert_eq!(calls.len(), 1, "只应对缺失的 doc@beta 调用 provider（doc@alpha 已完成不得重跑）");
@@ -1370,7 +1420,8 @@ mod resume_tests {
         crate::state::store::write_args_raw(ws, "j", &serde_json::to_string(&args).unwrap()).unwrap();
 
         let provider = RecordingProvider::default();
-        let (report, code) = run_resume(ws, "j", &provider, &Config::default(), dir.path()).await;
+        let store = crate::state::JobStore::open(ws).unwrap();
+        let (report, code) = run_resume("j", &provider, &Config::default(), dir.path(), &store).await;
 
         assert_eq!(report.verdict, crate::domain::Verdict::Incomplete, "空 manifest 不得静默 Approve");
         assert_ne!(code, 0, "退出码非 0");
