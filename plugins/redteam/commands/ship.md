@@ -22,12 +22,24 @@ disable-model-invocation: true
 
 ## 0. 起手
 1. 运行 `${CLAUDE_PLUGIN_ROOT}/bin/redteam init`（幂等）；创建本会话目录
-   `.redteam/rounds/<YYYYMMDD-HHmmss>/`（本地时间，秒级）。
+   `.redteam/rounds/<YYYYMMDD>/<HHmmss>/`（两层：日期目录下再分秒级会话目录，本地时间）。
+   后文 `rounds/<session>/` 均指代此两层路径，不逐处展开。
 2. 先跑项目测试命令，红树即停（先修好基线，不拿坏基线喂评审）。
    **测试命令探测**（本会话缓存结论）：`.redteam/config.toml` 的 `test_command` >
    `Cargo.toml`→`cargo test` > `package.json` 有 `scripts.test`→`npm test` >
    `Makefile` 有 test 目标→`make test` > 项目 CLAUDE.md/记忆约定 > 都推断不出 →
    AskUserQuestion 一次并把答案记入 session.md；明确无测试的项目跳过测试步。
+
+## 0.1 跨轮状态重建（铁律：不信会话记忆）
+跨轮判定一律**从盘上重建**，不依赖本次对话上下文里记住的轮次/id 状态——长会话
+compaction 后模型记忆不可靠，唯一可信源是磁盘文件与 db 台账。三条重建口：
+- **轮次链/轮数**：`ls rounds/<session>/` 数 `rN.result.json` 序列即为已完成轮数；
+  每个 job id 读该文件内 `run.job_id`（下一轮 `--incremental-from` 的值即从此文件重建，
+  不必记在上下文里）。
+- **复裁资格**（每 id 至多一次升级复裁）：`${CLAUDE_PLUGIN_ROOT}/bin/redteam dismiss show <id>`
+  的 status + history——已复裁过 vs 首次再现，查这里定，不靠记忆比对。
+- **修复历史/销案争议资格**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam resolve show <id>` 的
+  history 条数——判断该 id 是否已被销案 ≥2 次（见下文销案争议查表口径）。
 
 ## 每轮 rN
 1. **起评审**：
@@ -52,8 +64,9 @@ disable-model-invocation: true
      turn 与 `finalizing` 尾段的 `last_active` 设计上静止，按「心跳停滞 N 分钟」判死会误杀正常慢 job。
    - **轮询期间不改动工作树**（评审与携带重锚定正在读活文件）。
 2. **取结果**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam result <job>` → 存档到
-   `rounds/<session>/rN.result.json`（结果已持久于 proj.db 可随时重取；此文件存档
-   供内循环 `dismiss add --from` 与收轮 `resolve --from` 读取快照四件套）。
+   `rounds/<session>/rN.result.json`——**链持久化协议义务，非取用便利**：跨轮状态
+   重建（§0.1）依赖此文件序列存在且可 `ls` 枚举，此步不可省略；同时供内循环
+   `dismiss add --from` 与收轮 `resolve add --from` 读取快照四件套。
    - job `failed/timed_out` 但有部分报告（`verdict: incomplete`）→ 用部分 findings
      照常裁决，简报注记 partial，**不算 approve**。
    - job 硬失败无产出（全 provider 挂等）→ 重试一次，再失败 → 停，报告用户。
@@ -77,7 +90,9 @@ disable-model-invocation: true
    - **属实 → 修**：root-cause 修法——共享函数一处守卫优于逐调用点补丁。
    - **resolution_disputed 项 → 按修复未生效处理**：重读代码确认——确实没修好 → 重修
      （修好后收轮时重新 resolve）；模型误判（其实已修好）→ 按误报走 dismiss 建卡。
-     **同一 id 第二次出现在 resolution_disputed → 走 §停机 销案争议刹车**。
+     **查表判定（非记忆比对）：该 id ∈ 本轮 `run.resolution_disputed` 且
+     `resolve show <id>` history 已有 ≥2 条 → 走 §停机 销案争议刹车**（语义等价于
+     「修过两次仍 disputed」：查表口径与原「第二次出现」记忆比对判的是同一件事）。
    - **误报 → 建判例卡**：`${CLAUDE_PLUGIN_ROOT}/bin/redteam dismiss add <id>
      --reason "<驳回理由>" --from rounds/<session>/rN.result.json --round rN`
      （快照四件套由 --from 自动抄写，勿手拼；理由写实质论据——它是未来 refute
@@ -94,7 +109,7 @@ disable-model-invocation: true
 修复全落 → 跑测试命令至绿 → **单次 commit（仅修复，不含 .redteam/）**，消息
 `fix(ship): rN <一句话摘要>`
 → **销案**（增量链条的关键一环，紧跟 commit）：对本轮每个「属实→已修」的 finding id 逐个
-  `${CLAUDE_PLUGIN_ROOT}/bin/redteam resolve <id> --from rounds/<session>/rN.result.json --round rN --reason "<一句修法>"`
+  `${CLAUDE_PLUGIN_ROOT}/bin/redteam resolve add <id> --from rounds/<session>/rN.result.json --round rN --reason "<一句修法>"`
   （快照四件套由 --from 自动抄写，与 dismiss add 对称；已修复≠误报，落独立表）。
   下一轮增量据此**不再携带**该 finding；若其 quote 未随修复消失，会自动进下轮「顺带验证」
   ——假修复会以 `resolution_disputed` 回来。**存疑未决项不 resolve**（携带到下轮继续在场）。
@@ -107,14 +122,31 @@ disable-model-invocation: true
 → 下一轮。
 
 ## 停机（每轮内循环完成后判定；即使 verdict=approve，待刹车 id 先走完刹车链)
-1. **verdict = approve**（合并集口径：携带 ∪ 本轮新发，redteam 已算好）→ 收工：写
-   `rounds/<session>/session.md` 总结（轮数、修复/驳回/销案统计、carried 遗留清单、遗留观察），
-   向用户报告可 ship。**可选终扫**：用户需要发版级信心时，建议手动裸跑一次全量
-   `redteam review`（不带 --incremental-from）——非默认步骤，成本一整轮，收益是对
-   跨文件耦合的最后一次全量对抗。
-2. **销案争议刹车**：同一 id **第二次**出现在 `run.resolution_disputed` → 停，
-   AskUserQuestion 交人裁决（修复者与评审者死锁不该机器无限循环；对称升级刹车链的
-   「每 id 至多一次复裁」精神）。
+1. **verdict = approve**（合并集口径：携带 ∪ 本轮新发，redteam 已算好）：
+   - **`run.failed_models` 为空**（对照集完整）→ 收工。
+   - **`run.failed_models` 非空**（半失败：N 个模型未参战，对抗火力不全）→ **不收工**，
+     `AskUserQuestion` 二选一交用户裁决：
+     - 「接受降级 approve（N 模型未参战，对抗火力不全）」→ 用户接受后按 approve 收工，
+       但下方 session.md 模板的判定行记 **「降级 approve（用户接受）」**（不得记「approve」）。
+     - 「重跑本轮」→ 不收工，回到本轮起评审重跑（同一轮次号，不新开 rN）。
+   - 收工时写 `rounds/<session>/session.md`，**固定模板**（宿主填值，禁自由发挥，
+     不得增删字段/改措辞）：
+     ```markdown
+     # ship session <date>/<time>
+     - 轮数：N（r1..rN，job id 清单）
+     - 判定：approve | 降级 approve（用户接受）| 停机（<守卫名>）
+     - 统计：修复 X · 驳回 Y（新judgment卡 Z）· 销案 W · 复裁 V
+     - 半失败注记：<有则列轮次与 failed_models>
+     - carried 遗留：<id+一句话 | 无>
+     - 遗留观察：<非 finding 级备忘 | 无>
+     ```
+     向用户报告可 ship。**可选终扫**：用户需要发版级信心时，建议手动裸跑一次全量
+     `redteam review`（不带 --incremental-from）——非默认步骤，成本一整轮，收益是对
+     跨文件耦合的最后一次全量对抗。
+2. **销案争议刹车**：**查表判定（非记忆比对）**：id ∈ 本轮 `run.resolution_disputed`
+   且 `resolve show <id>` history 已有 ≥2 条 → 停，AskUserQuestion 交人裁决（修复者与
+   评审者死锁不该机器无限循环；对称升级刹车链的「每 id 至多一次复裁」精神；语义等价于
+   原「同一 id 第二次出现」记忆比对判据——修过两次仍 disputed = 死锁交人）。
 3. **升级刹车链**（每 id 至多一次）：`run.dismissed_reappeared` 中处于 `dismissed` 状态
    的 id → 对照卡上驳回理由（`dismiss show <id>`），带新 finding body **复裁一次**：
    改判属实 → 修 + `dismiss set-status <id> withdrawn --round rM`；仍判误报 →
@@ -126,7 +158,8 @@ disable-model-invocation: true
    也按本条停机交人。
 5. **停滞守卫**：本轮仍有未豁免 findings 但零代码改动（未修也未新驳）→ 空转，停，交用户。
    增量轮的「empty delta」守卫报错同走本条（无新改动可审 = 空转）。
-6. `--max-rounds` 达限（仅用户显式给出时）→ 停，输出未收敛摘要。
+6. `--max-rounds` 达限（仅用户显式给出时）→ 停，输出未收敛摘要。轮数**按目录计数**：
+   `ls rounds/<session>/` 中 `rN.result.json` 的数量即已完成轮数，不自数（§0.1 铁律）。
 
 > 尾流守卫已随增量协议**退役**：增量轮的新 finding 定义上全是「衍生」（delta 就是上轮修复），
 > 「连续全衍生」失去判别力；自指尾流问题由「未动代码携带判决、只审 delta」结构性消解，

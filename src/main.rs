@@ -116,30 +116,12 @@ enum Cmd {
         #[command(subcommand)]
         action: DismissCmd,
     },
-    /// 销案：把「属实→已修复」的 finding 记入 resolve 台账（proj.db 独立表，不混 dismissed
-    /// ——已修复≠误报，不进豁免/预筛）。增量轮（review --incremental-from）据此不再携带该
-    /// finding；quote 未随修复消失的会注入下轮「顺带验证」防假修复。
+    /// 销案判例台账（.redteam/proj.db 独立表，不混 dismissed——已修复≠误报，不进豁免/预筛）：
+    /// 建卡/查卡。增量轮（review --incremental-from）据此不再携带该 finding；quote 未随修复
+    /// 消失的会注入下轮「顺带验证」防假修复。
     Resolve {
-        /// finding id（16 位 hex，来自评审报告）。
-        id: String,
-        /// 评审报告 JSON 路径——按 id 自动抄 title/file/quote/severity 快照。
-        #[arg(long)]
-        from: Option<String>,
-        /// 销案发生轮次（如 r2），可选。
-        #[arg(long, default_value = "")]
-        round: String,
-        /// 修法一句话（可选，进台账与 history 备审计）；再销案时缺省沿用卡上原理由。
-        #[arg(long, default_value = "")]
-        reason: String,
-        /// 快照字段（无 --from 时必须全给；与 --from 并用时覆盖抄写值）。
-        #[arg(long)]
-        title: Option<String>,
-        #[arg(long)]
-        file: Option<String>,
-        #[arg(long)]
-        quote: Option<String>,
-        #[arg(long)]
-        severity: Option<String>,
+        #[command(subcommand)]
+        action: ResolveCmd,
     },
     /// 幂等创建项目级 .redteam/ 骨架（config.toml 模板、.gitignore、rounds/、proj.db）。
     Init,
@@ -200,6 +182,37 @@ enum DismissCmd {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ResolveCmd {
+    /// 建卡（记一条「属实→已修复」销案判定）。快照四件套优先从 --from 报告按 id 自动抄写；
+    /// 再销案（同 id 二次 add）缺省沿用卡上原理由。
+    Add {
+        /// finding id（16 位 hex，来自评审报告）。
+        id: String,
+        /// 评审报告 JSON 路径——按 id 自动抄 title/file/quote/severity 快照。
+        #[arg(long)]
+        from: Option<String>,
+        /// 销案发生轮次（如 r2），可选。
+        #[arg(long, default_value = "")]
+        round: String,
+        /// 修法一句话（可选，进台账与 history 备审计）；再销案时缺省沿用卡上原理由。
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// 快照字段（无 --from 时必须全给；与 --from 并用时覆盖抄写值）。
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        quote: Option<String>,
+        #[arg(long)]
+        severity: Option<String>,
+    },
+    /// 单卡详情 + 全部修复历史（跨轮状态重建读口，D-QC1：ship.md 用 history 条数判断
+    /// 复裁资格，不信会话记忆）。查无此卡报错退非零。
+    Show { id: String },
 }
 
 #[derive(Subcommand)]
@@ -787,9 +800,7 @@ async fn main() {
             }
         },
         Cmd::Dismiss { action } => run_dismiss(action),
-        Cmd::Resolve { id, from, round, reason, title, file, quote, severity } => {
-            run_resolve(id, from, round, reason, title, file, quote, severity)
-        }
+        Cmd::Resolve { action } => run_resolve(action),
         Cmd::Init => {
             match redteam::project::init_project(std::path::Path::new(".")) {
                 Ok(c) if c.is_empty() => println!(".redteam/ already complete"),
@@ -906,45 +917,69 @@ fn dismiss_add(
     Ok(())
 }
 
-/// resolve 子命令（M13 决议 3）：dismiss add 对称的销案入账。
-#[allow(clippy::too_many_arguments)]
-fn run_resolve(
-    id: String, from: Option<String>, round: String, reason: String,
-    title: Option<String>, file: Option<String>, quote: Option<String>, severity: Option<String>,
-) -> i32 {
-    let r = (|| -> anyhow::Result<()> {
-        anyhow::ensure!(redteam::project::is_hex16(&id), "id must be a 16-hex finding id, got '{id}'");
-        let snap = match &from {
-            Some(path) => Some(snapshot_from_report(path, &id)?),
-            None => None,
-        };
-        let pick = |explicit: Option<String>, from_val: Option<String>, name: &str| -> anyhow::Result<String> {
-            explicit.or(from_val).ok_or_else(|| anyhow::anyhow!(
-                "missing snapshot field '{name}': pass --from <result.json> or --{name}"))
-        };
-        let (ft, ff, fq, fs) = match snap {
-            Some((t, f, q, s)) => (Some(t), Some(f), Some(q), Some(s)),
-            None => (None, None, None, None),
-        };
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut db = redteam::db::ProjDb::open(&cwd)?;
-        db.resolve_upsert(&redteam::db::ResolveCard {
-            id: id.clone(),
-            title: pick(title, ft, "title")?,
-            file: pick(file, ff, "file")?,
-            quote: pick(quote, fq, "quote")?,
-            severity: pick(severity, fs, "severity")?,
-            reason,
-            round,
-            updated_at: String::new(),
-        })?;
-        println!("resolved {id} recorded");
-        Ok(())
-    })();
+/// resolve 子命令族（M13 决议 3 + M17-d D-QC1）：dismiss 对称的销案入账 + 跨轮重建读口。
+fn run_resolve(action: ResolveCmd) -> i32 {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut db = match redteam::db::ProjDb::open(&cwd) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("error: {e}"); return 2; }
+    };
+    let r = match action {
+        ResolveCmd::Add { id, from, round, reason, title, file, quote, severity } => {
+            resolve_add(&mut db, id, from, round, reason, title, file, quote, severity)
+        }
+        ResolveCmd::Show { id } => resolve_show(&db, &id).map(|out| println!("{out}")),
+    };
     match r {
         Ok(()) => 0,
         Err(e) => { eprintln!("error: {e}"); 2 }
     }
+}
+
+/// resolve add：销案入账（与更名前的平铺 `resolve` 逐字等价，纯挪壳）。
+#[allow(clippy::too_many_arguments)]
+fn resolve_add(
+    db: &mut redteam::db::ProjDb,
+    id: String, from: Option<String>, round: String, reason: String,
+    title: Option<String>, file: Option<String>, quote: Option<String>, severity: Option<String>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(redteam::project::is_hex16(&id), "id must be a 16-hex finding id, got '{id}'");
+    let snap = match &from {
+        Some(path) => Some(snapshot_from_report(path, &id)?),
+        None => None,
+    };
+    let pick = |explicit: Option<String>, from_val: Option<String>, name: &str| -> anyhow::Result<String> {
+        explicit.or(from_val).ok_or_else(|| anyhow::anyhow!(
+            "missing snapshot field '{name}': pass --from <result.json> or --{name}"))
+    };
+    let (ft, ff, fq, fs) = match snap {
+        Some((t, f, q, s)) => (Some(t), Some(f), Some(q), Some(s)),
+        None => (None, None, None, None),
+    };
+    db.resolve_upsert(&redteam::db::ResolveCard {
+        id: id.clone(),
+        title: pick(title, ft, "title")?,
+        file: pick(file, ff, "file")?,
+        quote: pick(quote, fq, "quote")?,
+        severity: pick(severity, fs, "severity")?,
+        reason,
+        round,
+        updated_at: String::new(),
+    })?;
+    println!("resolved {id} recorded");
+    Ok(())
+}
+
+/// resolve show：卡片 JSON + 全部修复 history 逐条（对称 dismiss show 输出风格；
+/// resolve_history 无 status/at 列，故每行仅 round+reason）。查无此卡报错（调用方映射非零退出）。
+fn resolve_show(db: &redteam::db::ProjDb, id: &str) -> anyhow::Result<String> {
+    let card = db.resolve_get(id)?.ok_or_else(|| anyhow::anyhow!("no card with id {id}"))?;
+    let mut out = serde_json::to_string_pretty(&card)?;
+    out.push_str("\nhistory:");
+    for (round, reason) in db.resolve_history(id)? {
+        out.push_str(&format!("\n  ({round})  {reason}"));
+    }
+    Ok(out)
 }
 
 /// 从评审报告 JSON 按 id 抄快照四件套 (title, file, quote, severity)。
@@ -1196,5 +1231,78 @@ mod tests {
         let (msg, code) = out.unwrap_err();
         assert!(msg.contains("not done"), "msg: {msg}");
         assert_eq!(code, 2);
+    }
+
+    // ---- resolve add|show 子命令空间化（M17-d Task 1，D-QC1）----
+
+    /// ①等价锚：resolve_add 挪壳后行为与更名前的平铺 `resolve` 逐字一致
+    /// （id 校验 + 快照字段落卡 + reason/round 直传，不经 pick）。
+    #[test]
+    fn resolve_add_records_card_with_explicit_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = redteam::db::ProjDb::open_at(&dir.path().join("proj.db")).unwrap();
+        let id = "a1b2c3d4e5f60718".to_string();
+        resolve_add(
+            &mut db, id.clone(), None, "r2".into(), "修好了".into(),
+            Some("标题".into()), Some("src/x.rs".into()), Some("let x = 1;".into()), Some("high".into()),
+        ).unwrap();
+        let card = db.resolve_get(&id).unwrap().unwrap();
+        assert_eq!(card.title, "标题");
+        assert_eq!(card.file, "src/x.rs");
+        assert_eq!(card.quote, "let x = 1;");
+        assert_eq!(card.severity, "high");
+        assert_eq!(card.round, "r2");
+        assert_eq!(card.reason, "修好了");
+    }
+
+    /// 非 16-hex id 逐字拒绝（校验搬迁未变形）。
+    #[test]
+    fn resolve_add_rejects_non_hex16_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = redteam::db::ProjDb::open_at(&dir.path().join("proj.db")).unwrap();
+        let err = resolve_add(&mut db, "short".into(), None, "".into(), "".into(), None, None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("16-hex"), "{err}");
+    }
+
+    /// 无 --from 且快照字段未全给 → 明确报错（pick 逻辑逐字保留）。
+    #[test]
+    fn resolve_add_missing_snapshot_field_without_from_errs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = redteam::db::ProjDb::open_at(&dir.path().join("proj.db")).unwrap();
+        let err = resolve_add(
+            &mut db, "a1b2c3d4e5f60718".into(), None, "".into(), "".into(), None, None, None, None,
+        ).unwrap_err();
+        assert!(err.to_string().contains("missing snapshot field"), "{err}");
+    }
+
+    /// ②show 输出断言：卡四件套 + reason/round + 两条 history 逐条都在。
+    #[test]
+    fn resolve_show_renders_card_and_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = redteam::db::ProjDb::open_at(&dir.path().join("proj.db")).unwrap();
+        let id = "a1b2c3d4e5f60718".to_string();
+        resolve_add(
+            &mut db, id.clone(), None, "r1".into(), "第一次修".into(),
+            Some("标题".into()), Some("src/x.rs".into()), Some("let x = 1;".into()), Some("high".into()),
+        ).unwrap();
+        resolve_add(
+            &mut db, id.clone(), None, "r3".into(), "第二次修".into(),
+            Some("标题".into()), Some("src/x.rs".into()), Some("let x = 1;".into()), Some("high".into()),
+        ).unwrap();
+        let out = resolve_show(&db, &id).unwrap();
+        assert!(out.contains("标题") && out.contains("src/x.rs") && out.contains("let x = 1;") && out.contains("high"),
+            "缺卡四件套: {out}");
+        assert!(out.contains("r1") && out.contains("第一次修"), "缺第一条 history: {out}");
+        assert!(out.contains("r3") && out.contains("第二次修"), "缺第二条 history: {out}");
+    }
+
+    /// ③查无此卡 → resolve_show 返回 Err（run_resolve 外层映射为非零退出 + eprintln）。
+    #[test]
+    fn resolve_show_missing_card_errs_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redteam::db::ProjDb::open_at(&dir.path().join("proj.db")).unwrap();
+        let err = resolve_show(&db, "a1b2c3d4e5f60718").unwrap_err();
+        assert!(err.to_string().contains("a1b2c3d4e5f60718"), "{err}");
     }
 }
