@@ -237,9 +237,6 @@ enum ModelCmd {
     Check,
 }
 
-/// R1.2：worker 总时限——到点仍未完成的作业自我中止为 TimedOut（保留部分报告，见 cli::run_job）。
-const JOB_DEADLINE_SECS: u64 = 40 * 60;
-
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -533,8 +530,11 @@ async fn main() {
                         .map(|s| s.to_string())
                         .or_else(|| info.payload().downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "unknown".to_string());
-                    if let Ok(s) = redteam::state::JobStore::open(&ws_h) {
-                        redteam::cli::mark_failed_panic(&s, &jid_h, &msg);
+                    match redteam::state::JobStore::open(&ws_h) {
+                        Ok(s) => redteam::cli::mark_failed_panic(&s, &jid_h, &msg),
+                        Err(e) => eprintln!(
+                            "warn: panic hook 无法打开 proj.db，job {jid_h} 状态未落 Failed（需人工处理）: {e}"
+                        ),
                     }
                     default_hook(info);
                 }));
@@ -577,14 +577,9 @@ async fn main() {
                 .map(|s| s.started_at)
                 .unwrap_or_else(now_secs);
             // R1.2：worker 起手设 deadline_at（若尚未设置——例如状态文件是旧格式或已被设过）。
-            // 从裸覆写改为守卫式更新（C-Q4 决策点：行为收紧，见任务报告）。
-            if let Err(e) = store.update_if_active(&job_id, |st| {
-                if st.deadline_at.is_none() {
-                    st.deadline_at = Some(started + JOB_DEADLINE_SECS);
-                }
-            }) {
-                eprintln!("warn: job {job_id} deadline_at 回填失败: {e}");
-            }
+            // 从裸覆写改为守卫式更新（C-Q4 决策点：行为收紧），抽成 cli::stamp_deadline 小函数
+            // 便于单测锚住守卫语义（见 cli/mod.rs stamp_deadline_tests）。
+            redteam::cli::stamp_deadline(&store, &job_id, started);
             let code =
                 redteam::cli::run_job(&ws, &job_id, &args, &registry, &cfg, &cwd, started, &store)
                     .await;
@@ -665,18 +660,25 @@ async fn main() {
                         }
                     }
                     // 守卫写 Cancelled：若 worker 已抢先落终态（Done/Failed/TimedOut），守卫拒写、
-                    // 保留其终态（首个终态封盘/bug①）。wrote=false 即被封盘。
-                    let wrote = store.update_if_active(&job_id, |st| {
+                    // 保留其终态（首个终态封盘/bug①）。三分支化（评审 Important）：`.unwrap_or(false)`
+                    // 曾把「守卫拒写 Ok(false)」与「db 真错误 Err(e)」折成同一路径，掩盖真实故障；
+                    // 对照 cli/mod.rs 同批四处终态写的既有三分支模式拆开。
+                    match store.update_if_active(&job_id, |st| {
                         st.status = redteam::state::job::JobStatus::Cancelled;
-                    })
-                    .unwrap_or(false);
-                    if wrote {
-                        println!("cancelled {job_id}");
-                        0
-                    } else {
-                        let now = store.read_state(&job_id).map(|s| s.status);
-                        eprintln!("job {job_id} already finished ({now:?}), not cancelled");
-                        2
+                    }) {
+                        Ok(true) => {
+                            println!("cancelled {job_id}");
+                            0
+                        }
+                        Ok(false) => {
+                            let now = store.read_state(&job_id).map(|s| s.status);
+                            eprintln!("job {job_id} already finished ({now:?}), not cancelled");
+                            2
+                        }
+                        Err(e) => {
+                            eprintln!("error: job {job_id} cancel 写失败（非拒写，db 层异常）: {e}");
+                            2
+                        }
                     }
                 }
                 Some(s) => { eprintln!("job {job_id} not cancellable (status: {:?})", s.status); 2 }

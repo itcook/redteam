@@ -780,6 +780,22 @@ pub fn mark_failed_panic(store: &crate::state::JobStore, job_id: &str, msg: &str
     }
 }
 
+/// R1.2：worker 总时限——到点仍未完成的作业自我中止为 TimedOut（保留部分报告，见 `run_job`）。
+pub const JOB_DEADLINE_SECS: u64 = 40 * 60;
+
+/// worker 起手设 deadline_at（若尚未设置——例如状态文件是旧格式或已被设过），main.rs
+/// Cmd::Worker 分支调用。守卫式更新（C-Q4 决策点：从裸覆写收紧）：`update_if_active` 挡终态
+/// 覆写（首个终态封盘），闭包内 `is_none` 判挡已设 deadline 被覆写（不应缩短/改动已生效期限）。
+pub fn stamp_deadline(store: &crate::state::JobStore, job_id: &str, started: u64) {
+    if let Err(e) = store.update_if_active(job_id, |st| {
+        if st.deadline_at.is_none() {
+            st.deadline_at = Some(started + JOB_DEADLINE_SECS);
+        }
+    }) {
+        eprintln!("warn: job {job_id} deadline_at 回填失败: {e}");
+    }
+}
+
 #[cfg(test)]
 mod job_tests {
     use super::*;
@@ -1246,6 +1262,57 @@ mod job_tests {
         let store = crate::state::JobStore::open(ws).unwrap();
         mark_failed_panic(&store, "j", "late panic");
         assert_eq!(read_state(ws, "j").unwrap().status, JobStatus::Done);
+    }
+
+    // D5 回归锚：worker 起手回填 deadline_at 曾是裸 RMW（main.rs 直接 write_state），会把并发
+    // cancel 抢先落下的 Cancelled 终态覆盖回去（首个终态封盘第三例绕过）。抽成 stamp_deadline
+    // 后改走 update_if_active 守卫式更新，以下三例分别钉住：终态不被覆写、未设 deadline 被写、
+    // 已设 deadline 不被二次覆写（is_none 判生效）。
+
+    #[test]
+    fn stamp_deadline_respects_terminal_freeze() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Cancelled;
+        st.deadline_at = None;
+        write_state(ws, &st).unwrap();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        stamp_deadline(&store, "j", 0);
+        let back = read_state(ws, "j").unwrap();
+        assert_eq!(back.status, JobStatus::Cancelled, "终态封盘：status 不应被 stamp_deadline 动");
+        assert!(back.deadline_at.is_none(), "终态封盘：deadline_at 也不应被写入");
+    }
+
+    #[test]
+    fn stamp_deadline_writes_when_unset() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = JobState::new("j", 100);
+        st.status = JobStatus::Running;
+        st.deadline_at = None;
+        write_state(ws, &st).unwrap();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        stamp_deadline(&store, "j", 100);
+        let back = read_state(ws, "j").unwrap();
+        assert_eq!(back.deadline_at, Some(100 + super::JOB_DEADLINE_SECS), "尚未设置时应被写入");
+    }
+
+    #[test]
+    fn stamp_deadline_does_not_overwrite_existing() {
+        use crate::state::job::{write_state, JobState, JobStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let mut st = JobState::new("j", 100);
+        st.status = JobStatus::Running;
+        st.deadline_at = Some(999); // 已设置——例如 worker 重入或状态文件已带值
+        write_state(ws, &st).unwrap();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        stamp_deadline(&store, "j", 100);
+        let back = read_state(ws, "j").unwrap();
+        assert_eq!(back.deadline_at, Some(999), "已设置的 deadline 不应被二次覆写（is_none 判生效）");
     }
 }
 
