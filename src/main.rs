@@ -4,6 +4,7 @@ use redteam::model::Prober as _;
 use redteam::output::render;
 use redteam::provider::backends::backend_from_config;
 use redteam::provider::registry::ProviderRegistry;
+use redteam::provider::single_shot::SingleShotProvider;
 use redteam::provider::tool_loop::ToolLoopProvider;
 use clap::{Parser, Subcommand};
 use std::path::Path;
@@ -339,7 +340,6 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
     let tools_mode = args.tools.as_deref()
         .and_then(redteam::config::ToolsMode::from_flag)
         .unwrap_or(cfg.review.tools);
-    let tools_enabled = matches!(tools_mode, redteam::config::ToolsMode::On);
 
     let mut registry = ProviderRegistry::new();
     for pm in &planned {
@@ -356,7 +356,11 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
                 return Err(format!("{e}"));
             }
         };
-        registry.insert(pm.name.clone(), Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf(), tools_enabled)));
+        let provider: Box<dyn redteam::provider::ReviewProvider> = match tools_mode {
+            redteam::config::ToolsMode::On => Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf())),
+            _ => Box::new(SingleShotProvider::new(backend)),
+        };
+        registry.insert(pm.name.clone(), provider);
     }
 
     Ok(registry)
