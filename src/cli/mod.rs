@@ -360,41 +360,74 @@ fn now_unix() -> u64 {
 /// worker 自身、跨不进 cancel 进程；守卫靠 SQLite 写锁跨进程串行化，故 Mutex 退役）。
 /// 终态封盘：job 已终态（如被 cancel）时守卫拒写，sink 的迟到进度不复活状态。
 /// M17-c Task 3：`ws: PathBuf`（每次调用现开连接）改持 `Arc<JobStore>`（worker 全生命周期
-/// 单连接复用）；`let _ =` 吞错行为原样保留——②级披露是 Task 5 的事。
+/// 单连接复用）。
+/// M17-c Task 5（design §4 表②级）：checkpoint 写失败吞而有痕——`Err` 分支 eprintln（含
+/// job_id/操作名）+ `ckpt_failures` 计数；run_job 收尾读计数塞 `report.run.warnings`
+/// （detached worker stderr=null，warnings 才是唯一对外可见通道）。`Ok(false)`（终态封盘
+/// 拒写）是正常竞态，不计入失败、不打印——与 run_job 里 ③级终态写对 `Ok(false)` 的处理呼应。
 struct JobCellSink {
     store: std::sync::Arc<crate::state::JobStore>,
     job_id: String,
+    ckpt_failures: std::sync::atomic::AtomicU32,
 }
 
 impl CellSink for JobCellSink {
     fn manifest(&self, inputs: &[crate::state::CellInput]) {
-        let _ = self.store.write_manifest(&self.job_id, inputs);
+        if let Err(e) = self.store.write_manifest(&self.job_id, inputs) {
+            eprintln!("warn: job {} write_manifest 失败: {e}", self.job_id);
+            self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let total = inputs.len() as u32;
-        let _ = self.store.update_if_active(&self.job_id, |st| {
+        if let Err(e) = self.store.update_if_active(&self.job_id, |st| {
             st.progress.total = total;
             st.set_phase(crate::state::Phase::Fanout, None);
-        });
+        }) {
+            eprintln!("warn: job {} manifest 阶段 progress/phase 写失败: {e}", self.job_id);
+            self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn on_cell(&self, rec: crate::state::CellRecord) {
-        let _ = self.store.append_partial(&self.job_id, &rec);
-        let _ = self.store.update_if_active(&self.job_id, |st| {
+        if let Err(e) = self.store.append_partial(&self.job_id, &rec) {
+            eprintln!("warn: job {} append_partial 失败（cell {}）: {e}", self.job_id, rec.cell);
+            self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Err(e) = self.store.update_if_active(&self.job_id, |st| {
             st.last_active = now_unix();
             st.progress.done += 1;
-        });
+        }) {
+            eprintln!("warn: job {} on_cell 进度写失败: {e}", self.job_id);
+            self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn on_phase(&self, phase: crate::state::Phase, note: Option<String>) {
-        let _ = self.store.update_if_active(&self.job_id, |st| {
+        if let Err(e) = self.store.update_if_active(&self.job_id, |st| {
             st.set_phase(phase, note);
-        });
+        }) {
+            eprintln!("warn: job {} on_phase 写失败: {e}", self.job_id);
+            self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn on_meta(&self, models: &[String]) {
         let models = models.to_vec();
-        let _ = self.store.update_if_active(&self.job_id, |st| {
+        if let Err(e) = self.store.update_if_active(&self.job_id, |st| {
             st.models = models;
-        });
+        }) {
+            eprintln!("warn: job {} on_meta 写失败: {e}", self.job_id);
+            self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// ②级披露拼装（design §4 表②）：计数>0 才追加条目（正常路径 report 逐字节不变，design §6
+/// 契约冻结面——「零失败时 report 不变」）；文案含 job_id 与次数，且指出 resume 兜底路径。
+fn append_ckpt_failure_warning(report: &mut ReviewReport, job_id: &str, failures: u32) {
+    if failures > 0 {
+        report.run.warnings.push(format!(
+            "job {job_id}: 检查点落盘失败 {failures} 次（状态/进度可能陈旧；resume 可差集重放兜底）"
+        ));
     }
 }
 
@@ -646,7 +679,11 @@ pub async fn run_job(
         return store.read_state(job_id).and_then(|s| s.exit_code).unwrap_or(0);
     }
 
-    let sink = JobCellSink { store: std::sync::Arc::clone(&store), job_id: job_id.to_string() };
+    let sink = JobCellSink {
+        store: std::sync::Arc::clone(&store),
+        job_id: job_id.to_string(),
+        ckpt_failures: std::sync::atomic::AtomicU32::new(0),
+    };
     let dispatch = run_review_dispatch(args, provider, cfg, cwd, Some(&sink));
 
     // Outcome 只在本函数内构造/匹配一次，Box 间接层不值当——沿用 main.rs Cmd 枚举同款 allow。
@@ -668,11 +705,17 @@ pub async fn run_job(
         None => Outcome::Done(dispatch.await),
     };
 
+    // Task 5（design §4 表②级）：dispatch 生命周期内 sink 累计的 checkpoint 写失败数——
+    // dispatch 已 await/被 select 丢弃，&sink 借用随之结束，此处读计数安全。三条 outcome
+    // 分支（成功/dispatch 报错/超时）在写 result 前统一塞 report.run.warnings（若非零）。
+    let ckpt_failures = sink.ckpt_failures.load(std::sync::atomic::Ordering::Relaxed);
+
     match outcome {
         Outcome::Done(Ok((mut report, code))) => {
             // dispatch 无 job 上下文（TailCtx.job_id 恒空），此处回填——json/md 契约里
             // run.job_id 是消费者的自证 id（r1 20260703 实证恒空串）。
             report.run.job_id = job_id.to_string();
+            append_ckpt_failure_warning(&mut report, job_id, ckpt_failures);
             // 同渲染 json + md 落盘（result 命令按 format 直读，避免反序列化 report 图）。
             let json = crate::output::render(&report, crate::output::Format::Json);
             let md = crate::output::render(&report, crate::output::Format::Md);
@@ -699,13 +742,15 @@ pub async fn run_job(
             code
         }
         Outcome::Done(Err(e)) => {
-            let (report, code) = partial_report(&store, job_id, e.to_string());
+            let (mut report, code) = partial_report(&store, job_id, e.to_string());
+            append_ckpt_failure_warning(&mut report, job_id, ckpt_failures);
             write_partial_result(&store, job_id, JobStatus::Failed, &report, code, e.to_string());
             code
         }
         Outcome::TimedOut => {
             let reason = "timed out: deadline exceeded".to_string();
-            let (report, code) = partial_report(&store, job_id, reason.clone());
+            let (mut report, code) = partial_report(&store, job_id, reason.clone());
+            append_ckpt_failure_warning(&mut report, job_id, ckpt_failures);
             write_partial_result(&store, job_id, JobStatus::TimedOut, &report, code, reason);
             code
         }
@@ -872,6 +917,9 @@ mod job_tests {
         // result.json 落盘且是合法 JSON
         let res = store.read_result("j1").unwrap();
         assert!(res.contains("\"verdict\""));
+        // Task 5：零 checkpoint 失败的正常路径，report.run.warnings 不应长出「检查点落盘
+        // 失败」条目——契约冻结面「正常路径 report 逐字节不变」的直接锚。
+        assert!(!res.contains("检查点落盘失败"), "零失败路径不应出现披露 warning: {res}");
         // Bug C 回归：run_job 收尾 write_state 必须以 sink 运行期写的最新 progress 为底稿
         // 叠加终态字段，而不是复用函数入口那份陈旧 st（否则 done/total 会被重置回 0/0）。
         assert_eq!(st.progress.done, 1, "收尾不应吞掉 sink 写入的 progress");
@@ -1052,6 +1100,7 @@ mod job_tests {
         let sink = Arc::new(JobCellSink {
             store: Arc::clone(&store),
             job_id: "jc1".to_string(),
+            ckpt_failures: std::sync::atomic::AtomicU32::new(0),
         });
 
         let n = 20usize;
@@ -1916,7 +1965,7 @@ context_window_tokens = 40000
         let ws = dir.path().to_path_buf();
         let store = std::sync::Arc::new(crate::state::JobStore::open(&ws).unwrap());
         store.put_state_for_test(&JobState::new("j", 0)).unwrap();
-        let sink = JobCellSink { store: std::sync::Arc::clone(&store), job_id: "j".into() };
+        let sink = JobCellSink { store: std::sync::Arc::clone(&store), job_id: "j".into(), ckpt_failures: std::sync::atomic::AtomicU32::new(0) };
         use crate::orchestrate::CellSink;
         sink.manifest(&[crate::state::CellInput {
             cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
@@ -1929,9 +1978,97 @@ context_window_tokens = 40000
         let ws = dir.path().to_path_buf();
         let store = std::sync::Arc::new(crate::state::JobStore::open(&ws).unwrap());
         store.put_state_for_test(&JobState::new("j", 0)).unwrap();
-        let sink = JobCellSink { store: std::sync::Arc::clone(&store), job_id: "j".into() };
+        let sink = JobCellSink { store: std::sync::Arc::clone(&store), job_id: "j".into(), ckpt_failures: std::sync::atomic::AtomicU32::new(0) };
         use crate::orchestrate::CellSink;
         sink.on_phase(Phase::Finalizing, None);
         assert_eq!(store.read_state("j").unwrap().phase, Some(Phase::Finalizing));
+    }
+
+    /// Task 5 / ①（design §4 表②级）：正常写成功路径下 `ckpt_failures` 恒为 0——四个
+    /// on_* 全跑一遍不应误增计数。真实 db 写失败注入在 SQLite WAL 模式下不可靠（连接持有
+    /// 的 fd 在 open() 之后不受文件系统层 chmod/删除/uchg/截断影响，实测四种手法均未能
+    /// 制造出真实写错误，参见 task-c5-report.md「注入不可行」记录）——按 brief 5.1 降级为
+    /// 计数器语义测试：本测锚「成功不误计」，下一测锚「终态封盘拒写（Ok(false)）不误计入
+    /// 失败」（这才是 on_* 里 `if let Err(e)` 分支唯二会被跳过的两种非计数场景）。
+    #[tokio::test]
+    async fn jobcellsink_ckpt_failures_stays_zero_on_success() {
+        use crate::state::{CellInput, CellRecord, JobState, Phase};
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::state::JobStore::open(dir.path()).unwrap());
+        store.put_state_for_test(&JobState::new("j", 0)).unwrap();
+        let sink = JobCellSink {
+            store: std::sync::Arc::clone(&store),
+            job_id: "j".into(),
+            ckpt_failures: std::sync::atomic::AtomicU32::new(0),
+        };
+        use crate::orchestrate::CellSink;
+        sink.manifest(&[CellInput { cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
+        sink.on_cell(CellRecord::ok("c", "m", vec![]));
+        sink.on_phase(Phase::Finalizing, None);
+        sink.on_meta(&["m".to_string()]);
+        assert_eq!(
+            sink.ckpt_failures.load(std::sync::atomic::Ordering::Relaxed), 0,
+            "全部写成功时不应误增失败计数"
+        );
+    }
+
+    /// Task 5 / ①（design §4 表②级）：job 已落终态（首个终态封盘）时，`update_if_active`
+    /// 返回 `Ok(false)`（守卫拒写，非错误）——这是正常竞态（sink 迟到进度撞上已 cancel/
+    /// done 的 job），不应被误计为 checkpoint 失败（否则每个正常收尾的 job 都会被污染出
+    /// 一条假警告）。`manifest` 因同时含 write_manifest（不受终态封盘影响，仍会真写）+
+    /// update_if_active（受影响）——本测只挑 on_cell/on_phase/on_meta 三个纯 update_if_active
+    /// 路径，避免 write_manifest 那一半干扰断言。
+    #[tokio::test]
+    async fn jobcellsink_ckpt_failures_not_counted_on_terminal_guard_reject() {
+        use crate::state::{CellRecord, JobState, JobStatus, Phase};
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::state::JobStore::open(dir.path()).unwrap());
+        let mut st = JobState::new("j", 0);
+        st.status = JobStatus::Done; // 已终态：守卫对后续所有 update_if_active 一律拒写
+        store.put_state_for_test(&st).unwrap();
+        let sink = JobCellSink {
+            store: std::sync::Arc::clone(&store),
+            job_id: "j".into(),
+            ckpt_failures: std::sync::atomic::AtomicU32::new(0),
+        };
+        use crate::orchestrate::CellSink;
+        sink.on_cell(CellRecord::ok("c", "m", vec![]));
+        sink.on_phase(Phase::Finalizing, None);
+        sink.on_meta(&["m".to_string()]);
+        assert_eq!(
+            sink.ckpt_failures.load(std::sync::atomic::Ordering::Relaxed), 0,
+            "终态封盘拒写（Ok(false)）是正常竞态，不应计入 checkpoint 失败"
+        );
+        // 状态本身确实原样保留（未被迟到的 sink 写复活成 Running）——佐证守卫确实生效。
+        assert_eq!(store.read_state("j").unwrap().status, JobStatus::Done);
+    }
+
+    /// Task 5 / ②（design §4 表②级）：warnings 拼装——计数>0 才追加、含 job_id 与次数；
+    /// 计数=0 时 report 不变（design §6 契约冻结面「正常路径逐字节不变」的直接落点）。
+    #[test]
+    fn append_ckpt_failure_warning_only_appends_when_nonzero() {
+        fn empty_report() -> ReviewReport {
+            ReviewReport {
+                schema_version: "3".into(),
+                verdict: Verdict::Approve,
+                stats: Stats::from_findings(&[]),
+                findings: vec![],
+                clusters: vec![],
+                run: RunMeta { warnings: vec!["pre-existing".into()], ..Default::default() },
+            }
+        }
+        // 计数=0：warnings 原样不变（不多不少）。
+        let mut r0 = empty_report();
+        append_ckpt_failure_warning(&mut r0, "j1", 0);
+        assert_eq!(r0.run.warnings, vec!["pre-existing".to_string()]);
+
+        // 计数>0：追加一条含 job_id 与次数的简体中文条目，既有 warnings 不动。
+        let mut r3 = empty_report();
+        append_ckpt_failure_warning(&mut r3, "j1", 3);
+        assert_eq!(r3.run.warnings.len(), 2);
+        assert_eq!(r3.run.warnings[0], "pre-existing");
+        assert!(r3.run.warnings[1].contains("j1"), "warning 应含 job_id: {}", r3.run.warnings[1]);
+        assert!(r3.run.warnings[1].contains('3'), "warning 应含次数: {}", r3.run.warnings[1]);
+        assert!(r3.run.warnings[1].contains("检查点落盘失败"), "warning 应含文案: {}", r3.run.warnings[1]);
     }
 }
