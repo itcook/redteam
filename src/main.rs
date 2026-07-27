@@ -518,12 +518,14 @@ async fn main() {
             };
             // 进程级 panic 兜底（E12-Q4，真·顶层）：worker 评审体若 panic，落 Failed 终态再正常
             // 展开——否则状态永停 Running（惰性收尸只治「进程已死」，panic 与退出间有窗口）。
-            // hook 是 'static Fn：M17-c Task 3 前受限于闭包无法借用局部 &JobStore，只能在触发时
-            // 现开一个临时 store；现在 store 已是 Arc<JobStore>（Send+Sync，见 db.rs 的
-            // Mutex<ProjDb> 内部可变性），克隆进闭包即满足 'static，遂改为与主流程共享同一连接——
-            // 少一次 panic 时的临时连接开销，且不再需要 ws_h 这份路径 clone。
+            // c-T3 评审 Critical：此前曾把 hook 改为与主流程共享 Arc<JobStore>（同一把
+            // Mutex<ProjDb>）——若 panic 恰发生在 update_if_active 的 mutate 闭包执行期
+            // （MutexGuard 存活、未 Drop、未中毒——poison 要等 guard Drop 时才置位，而 hook
+            // 先于 unwind 跑到），hook 同线程再 lock() 同一把锁就是不可重入永久自死锁，进程
+            // 挂起、default_hook 永不执行。现改回现开一个全新连接（全新 Mutex）——结构性免疫
+            // 该重入场景，与主流程的 Arc 共享连接无关（run_job/JobCellSink 的单连接贯穿收益不动）。
             {
-                let store_h = std::sync::Arc::clone(&store);
+                let ws_h = ws.clone();
                 let jid_h = job_id.clone();
                 let default_hook = std::panic::take_hook();
                 std::panic::set_hook(Box::new(move |info| {
@@ -533,7 +535,12 @@ async fn main() {
                         .map(|s| s.to_string())
                         .or_else(|| info.payload().downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "unknown".to_string());
-                    redteam::cli::mark_failed_panic(&store_h, &jid_h, &msg);
+                    match redteam::state::JobStore::open(&ws_h) {
+                        Ok(fresh) => redteam::cli::mark_failed_panic(&fresh, &jid_h, &msg),
+                        Err(e) => eprintln!(
+                            "warn: panic hook 无法打开 proj.db，job {jid_h} 状态未落 Failed（需人工处理）: {e}"
+                        ),
+                    }
                     default_hook(info);
                 }));
             }
