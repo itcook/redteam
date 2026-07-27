@@ -54,8 +54,11 @@ pub async fn run_single_shot(
     }
 
     // 首发 parse 失败：补一轮 REPAIR_PROMPT + turn_final（ONE-shot，不循环）。
+    // T25：本轮若失败（超时/网络等），把首发已烧的 usage 附着到错误上，不再随 `?` 丢弃。
     messages.push(ChatMessage::User(REPAIR_PROMPT.to_string()));
-    let repair_turn = timed_turn_final(backend, &messages, per_turn, retry_budget).await?;
+    let repair_turn = timed_turn_final(backend, &messages, per_turn, retry_budget)
+        .await
+        .map_err(|e| e.attach_usage((in_tok, out_tok, cached_tok)))?;
     in_tok += repair_turn.input_tokens;
     out_tok += repair_turn.output_tokens;
     cached_tok += repair_turn.cached_input_tokens;
@@ -70,7 +73,7 @@ pub async fn run_single_shot(
             iterations: 2,
             tool_use: crate::tools::ToolUse::default(),
         }),
-        Err(_) => Err(diagnostic_parse_error(&repair_turn)),
+        Err(_) => Err(diagnostic_parse_error(&repair_turn).attach_usage((in_tok, out_tok, cached_tok))),
     }
 }
 
@@ -175,7 +178,9 @@ mod tests {
         let backend = FakeChatBackend::new(vec![final_turn("not json at all"), final_turn("still not json")]);
         let r = run_single_shot(&backend, "review", std::time::Duration::from_secs(60), 0).await;
         let err = r.unwrap_err();
-        assert!(matches!(err, ProviderError::Parse(_)), "got: {err:?}");
+        // T25：首发已烧 usage 非零，故这里的错误被 attach_usage 包成 WithUsage——
+        // 用 .inner() 见穿包装再断言内层真实变体。
+        assert!(matches!(err.inner(), ProviderError::Parse(_)), "got: {err:?}");
         assert!(
             err.to_string().contains("finish_reason=unknown"),
             "diagnostic message missing finish_reason context: {err}"

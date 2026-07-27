@@ -80,7 +80,11 @@ pub async fn run_tool_loop(
     // 往返，落 max_iters+1，>max_iters 即「触发过强制收尾」）；turn 级 retry 不计（网络
     // 抖动非探索深度）。
     for i in 0..max_iters {
-        let turn = crate::provider::timed_turn(backend, &messages, &tools, per_turn, retry_budget).await?;
+        // T25：本轮请求本身失败时，把之前各轮已累计的 usage 附着到错误上——不然候补链
+        // 全灭时这些真实花费在 CellRecord 里全记 0（见 orchestrate::run_one_bundle）。
+        let turn = crate::provider::timed_turn(backend, &messages, &tools, per_turn, retry_budget)
+            .await
+            .map_err(|e| e.attach_usage((in_tok, out_tok, cached_tok)))?;
         in_tok += turn.input_tokens;
         out_tok += turn.output_tokens;
         cached_tok += turn.cached_input_tokens;
@@ -107,7 +111,9 @@ pub async fn run_tool_loop(
                     // 的 repair 语义：补一轮 REPAIR_PROMPT + turn_final（ONE-shot，不循环），仍失败
                     // 才报诊断化 Parse 错误——不再无条件报废整个 cell。
                     messages.push(ChatMessage::User(REPAIR_PROMPT.to_string()));
-                    let repair_turn = crate::provider::timed_turn_final(backend, &messages, per_turn, retry_budget).await?;
+                    let repair_turn = crate::provider::timed_turn_final(backend, &messages, per_turn, retry_budget)
+                        .await
+                        .map_err(|e| e.attach_usage((in_tok, out_tok, cached_tok)))?;
                     in_tok += repair_turn.input_tokens;
                     out_tok += repair_turn.output_tokens;
                     cached_tok += repair_turn.cached_input_tokens;
@@ -124,7 +130,7 @@ pub async fn run_tool_loop(
                             iterations: i + 2,
                             tool_use: tool_use.clone(),
                         }),
-                        Err(_) => Err(diagnostic_parse_error(&repair_turn)),
+                        Err(_) => Err(diagnostic_parse_error(&repair_turn).attach_usage((in_tok, out_tok, cached_tok))),
                     };
                 }
             }
@@ -143,7 +149,9 @@ pub async fn run_tool_loop(
     // 要求模型基于已收集上下文仅产出最终 findings JSON。这把「function-calling 探索」与
     // 「structured-output 收尾」分阶段，避免中间轮强制 JSON 抑制工具调用（dogfood 反转教训）。
     messages.push(ChatMessage::User(FINALIZE_PROMPT.to_string()));
-    let turn = crate::provider::timed_turn_final(backend, &messages, per_turn, retry_budget).await?;
+    let turn = crate::provider::timed_turn_final(backend, &messages, per_turn, retry_budget)
+        .await
+        .map_err(|e| e.attach_usage((in_tok, out_tok, cached_tok)))?;
     in_tok += turn.input_tokens;
     out_tok += turn.output_tokens;
     cached_tok += turn.cached_input_tokens;
@@ -153,13 +161,15 @@ pub async fn run_tool_loop(
             // 截断/形状违约的常见根因是「篇幅超预算被 provider 截断」——不直接报废整个 cell，
             // 补一轮纠错重发（ONE-shot，不循环；这是新请求，不碰 retry_classified 的传输重试边界）。
             messages.push(ChatMessage::User(REPAIR_PROMPT.to_string()));
-            let repair_turn = crate::provider::timed_turn_final(backend, &messages, per_turn, retry_budget).await?;
+            let repair_turn = crate::provider::timed_turn_final(backend, &messages, per_turn, retry_budget)
+                .await
+                .map_err(|e| e.attach_usage((in_tok, out_tok, cached_tok)))?;
             in_tok += repair_turn.input_tokens;
             out_tok += repair_turn.output_tokens;
             cached_tok += repair_turn.cached_input_tokens;
             match parse_lens_output(&repair_turn.text) {
                 Ok(o) => (o, true),
-                Err(_) => return Err(diagnostic_parse_error(&repair_turn)),
+                Err(_) => return Err(diagnostic_parse_error(&repair_turn).attach_usage((in_tok, out_tok, cached_tok))),
             }
         }
     };
@@ -452,7 +462,8 @@ mod tests {
         let backend = FakeChatBackend::new(vec![final_turn("not json at all"), final_turn("still not json")]);
         let r = run_tool_loop(&backend, &ex, "sys", "review", 0, std::time::Duration::from_secs(60), 0).await;
         let err = r.unwrap_err();
-        assert!(matches!(err, ProviderError::Parse(_)), "got: {err:?}");
+        // T25：首发已烧 usage 非零，故错误被 attach_usage 包成 WithUsage——用 .inner() 见穿。
+        assert!(matches!(err.inner(), ProviderError::Parse(_)), "got: {err:?}");
         assert!(
             err.to_string().contains("finish_reason=unknown"),
             "diagnostic message missing finish_reason context: {err}"
@@ -500,7 +511,10 @@ mod tests {
         // max_iters=1：探索轮 1 次 tool_call → 进收尾轮 turn_final（挂起）→ 收尾轮 timeout 切断
         let r = run_tool_loop(&HangFinalBackend, &ex, "sys", "review", 1,
                               std::time::Duration::from_millis(30), 0).await;
-        assert!(matches!(r, Err(ProviderError::Timeout(_))), "finalize timeout: {r:?}");
+        // T25：探索轮已烧 usage 非零，收尾轮 timeout 错误被 attach_usage 包成 WithUsage——
+        // 用 .inner() 见穿再断言内层真实变体。
+        let err = r.unwrap_err();
+        assert!(matches!(err.inner(), ProviderError::Timeout(_)), "finalize timeout: {err:?}");
     }
 
     #[tokio::test]

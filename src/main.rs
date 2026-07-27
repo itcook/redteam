@@ -53,8 +53,10 @@ enum Cmd {
         /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定，但仍保留在报告中。
         #[arg(long)]
         conf_floor: Option<f32>,
-        /// 工具档位：off（纯无工具）| two-stage（默认：无工具评审；二阶段补查机制后续批次交付，
-        /// 当前等效 off）| on（对话式工具，诊断/对照档）。缺省读 config [review].tools。
+        /// 工具档位：off（单发单轮，无工具）| two-stage（默认：单发 + needs 声明触发的二阶段补查，
+        /// 已交付——注：当前实现里 off 与 two-stage 走同一 SingleShotProvider 且补查逻辑不看此
+        /// flag，故两档管线行为暂等价，仅 on 真正分叉）| on（对话式工具，诊断/对照档）。
+        /// 缺省读 config [review].tools。
         #[arg(long, value_parser = ["off", "two-stage", "on"])]
         tools: Option<String>,
         /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。
@@ -163,7 +165,10 @@ enum DismissCmd {
         format: String,
     },
     /// 单卡详情 + 全部历史事件。
-    Show { id: String },
+    Show {
+        /// finding id（16 位 hex，来自评审报告；查无此卡报错退非零）。
+        id: String,
+    },
     /// 状态迁移（协议动作：re-upheld=复裁仍误报 / human-confirmed=人裁终局 /
     /// withdrawn=改判属实 / dismissed=回滚）。历史全留痕；不做状态机硬约束。
     SetStatus {
@@ -213,7 +218,10 @@ enum ResolveCmd {
     },
     /// 单卡详情 + 全部修复历史（跨轮状态重建读口，D-QC1：ship.md 用 history 条数判断
     /// 复裁资格，不信会话记忆）。查无此卡报错退非零。
-    Show { id: String },
+    Show {
+        /// finding id（16 位 hex，来自评审报告；查无此卡报错退非零）。
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -788,13 +796,24 @@ async fn main() {
                     }
                 }
                 println!("configured provider '{provider}' (kind={}, model={model}, api_key_env={api_key_env})", k.as_str());
-                // 完成后自动跑一次 check
+                // 落盘后自动 probe 刚配置的这个 provider（只探它、不是全部 provider——
+                // 复用 probe.rs 按 kind 认证的 list_models）。probe 失败只警告、不回滚已
+                // 落盘的配置：离线环境先 setup、后续再联网核实是合理场景，不该因一次探测
+                // 失败被拒绝写入（T26，M18 decisions Q6 明确否掉「probe 失败拒绝落盘」的
+                // 旧 TODO 框架）。展示文案抽成纯函数 format_probe_outcome 以便单测覆盖。
                 let cfg = load_config_warned();
                 let prober = redteam::model::probe::HttpProber::new();
-                let avs = redteam::model::check_all(&cfg, &prober).await;
-                for a in &avs {
-                    println!("{}  {}", a.provider, a.status_str());
-                }
+                let probe_result = match cfg.providers.get(&provider) {
+                    Some(pc) => {
+                        let key = cfg.resolve_key(&provider);
+                        prober
+                            .list_models(&redteam::model::effective_base(pc), key.as_deref(), pc.kind)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    None => Err("provider missing from just-written config (unexpected)".into()),
+                };
+                println!("{}", format_probe_outcome(&provider, &model, &probe_result));
                 0
             }
             ModelCmd::List { remote } => {
@@ -838,6 +857,21 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// T26：`model setup` 落盘后自动 probe 该 provider 的结果文案——纯函数，网络调用
+/// 已在调用方完成，这里只管把 `Result<Vec<String>, String>` 渲成人读行，便于单测覆盖
+/// 「probe 失败仍要给出警告 + 复核提示」这条语义，不必真打网络。
+fn format_probe_outcome(provider: &str, model: &str, probe: &Result<Vec<String>, String>) -> String {
+    match probe {
+        Ok(ids) if ids.is_empty() || ids.iter().any(|m| m == model) => {
+            format!("{provider}  ✓ available")
+        }
+        Ok(_) => format!("{provider}  ⚠ reachable, model not in /models"),
+        Err(e) => format!(
+            "{provider}  ⚠ probe failed（{e}）——配置已保存，联网恢复后可用 `redteam model check` 复核"
+        ),
+    }
 }
 
 /// M5 批2：status 的人读时长（42s / 7m / 1h03m）。
@@ -1146,6 +1180,31 @@ mod tests {
         a.phase_history.last_mut().unwrap().at = 970; // 覆写为可控时刻（set_phase 用真实时钟）
         let out = render_status_table(&[a], 1000);
         assert!(out.contains("refute[9 targets] (30s)"), "phase 停留时长+注记: {out}");
+    }
+
+    /// T26：probe 成功且 model 在列表中 → available。
+    #[test]
+    fn format_probe_outcome_success_lists_model() {
+        let out = format_probe_outcome("alpha", "m1", &Ok(vec!["m1".into(), "m2".into()]));
+        assert_eq!(out, "alpha  ✓ available");
+    }
+
+    /// T26：probe 成功但配置的 model 不在返回列表里 → 软提示，非报错。
+    #[test]
+    fn format_probe_outcome_success_model_missing() {
+        let out = format_probe_outcome("alpha", "m1", &Ok(vec!["other".into()]));
+        assert_eq!(out, "alpha  ⚠ reachable, model not in /models");
+    }
+
+    /// T26 核心：probe 失败只警告 + 给复核提示，措辞里不出现「拒绝/回滚/失败退出」类字眼——
+    /// 已落盘的配置不受 probe 结果影响（离线 setup 场景）。
+    #[test]
+    fn format_probe_outcome_failure_warns_without_rollback_language() {
+        let out = format_probe_outcome("alpha", "m1", &Err("connection refused".into()));
+        assert!(out.contains("⚠ probe failed"), "应是警告而非错误: {out}");
+        assert!(out.contains("connection refused"), "应带上原始错误: {out}");
+        assert!(out.contains("redteam model check"), "应提示复核命令: {out}");
+        assert!(!out.contains("回滚") && !out.contains("rollback"), "不应暗示回滚: {out}");
     }
 
     #[test]

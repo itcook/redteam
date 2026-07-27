@@ -35,21 +35,62 @@ pub enum ProviderError {
     Parse(String),       // 我方 JSON 解析失败 → 不可重试
     #[error("provider unavailable: {0}")]
     Unavailable(String), // 未知兜底 → 保守可重试
+    /// T25：整链失败 token 入账——多轮 tool_loop/single_shot 在最终报错前已真实烧掉的
+    /// usage，原先随 `?`/Err 一起被丢弃（`orchestrate::run_one_bundle` 候补链全灭时
+    /// `CellRun.tokens` 恒 (0,0,0)，与真实花费不符）。只在 usage 非零时才包一层
+    /// （见 `attach_usage`），零使用量的错误路径（如首轮就 Auth 失败）字节级不变，
+    /// 现有 `matches!(err, ProviderError::X(_))` 断言不受影响。
+    #[error("{source}")]
+    WithUsage {
+        #[source]
+        source: Box<ProviderError>,
+        /// (input, output, cached_input) —— 与 `LensCall`/`CellRun.tokens` 同口径。
+        usage: (u64, u64, u64),
+    },
 }
 
 impl ProviderError {
     pub fn is_retryable(&self) -> bool {
-        matches!(self,
+        match self {
             ProviderError::RateLimited { .. }
             | ProviderError::Server(_)
             | ProviderError::Timeout(_)
             | ProviderError::Network(_)
-            | ProviderError::Unavailable(_))
+            | ProviderError::Unavailable(_) => true,
+            ProviderError::WithUsage { source, .. } => source.is_retryable(),
+            _ => false,
+        }
     }
     pub fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
             ProviderError::RateLimited { retry_after } => *retry_after,
+            ProviderError::WithUsage { source, .. } => source.retry_after(),
             _ => None,
+        }
+    }
+    /// 本错误携带的已烧 usage；非 `WithUsage` 恒 (0,0,0)（未观测/无花费两种情形不区分，
+    /// 调用方原本就以 0 处理）。
+    pub fn burned_usage(&self) -> (u64, u64, u64) {
+        match self {
+            ProviderError::WithUsage { usage, .. } => *usage,
+            _ => (0, 0, 0),
+        }
+    }
+    /// 见穿 `WithUsage` 包装取内层错误的引用——`verify.rs` 等按变体分派的调用点用它
+    /// 兼容新包装，不必对每个匹配点都补一层 `WithUsage` 分支。
+    pub fn inner(&self) -> &ProviderError {
+        match self {
+            ProviderError::WithUsage { source, .. } => source.inner(),
+            other => other,
+        }
+    }
+    /// 把已烧 usage 附着到错误上；usage 全零时原样返回（不引入包装，保持既有错误路径
+    /// 字节级不变）——多轮调用中途失败、且之前的轮次真花费了 token 时才需要它。
+    pub fn attach_usage(self, usage: (u64, u64, u64)) -> ProviderError {
+        if usage == (0, 0, 0) {
+            self
+        } else {
+            ProviderError::WithUsage { source: Box::new(self), usage }
         }
     }
 }

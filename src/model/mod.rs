@@ -126,9 +126,12 @@ pub fn derive_api_key_env(provider: &str) -> String {
 /// 整份 config 解析失败（如曾经的 kind="claude" → check 无输出）。
 pub fn validate_setup(kind: &str, base_url: Option<&str>) -> Result<(), String> {
     if ProviderKind::parse(kind).is_none() {
+        // 别名文案与 `ProviderKind` 各变体的 `#[serde(alias = ...)]` 手动保持同步——
+        // serde 的 alias 列表运行时不可反射，无法程序化生成；改一处务必顺手改另一处
+        // （batch4 polish 评估：converge 成本高于价值，改留交叉引用注释）。
         return Err(format!(
             "非法 provider kind '{kind}'。合法值：anthropic(别名 claude) / openai(别名 gpt) / \
-             openai-compatible / google(别名 gemini)"
+             openai-compatible(别名 openai_compatible/compatible) / google(别名 gemini)"
         ));
     }
     if let Some(b) = base_url {

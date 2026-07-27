@@ -547,7 +547,11 @@ pub async fn run_resume(
                 }
             }
         };
-        let _ = store.append_partial(job_id, &rec);
+        // resume 披露清零：checkpoint 写失败不再静默吞掉——foreground 命令，stderr 用户可见
+        // （与 line 394 CellSink::report 的写法保持一致，是全库最后一处生产 `let _ =` 静默点）。
+        if let Err(e) = store.append_partial(job_id, &rec) {
+            eprintln!("warn: job {job_id} append_partial 失败（cell {}）: {e}", rec.cell);
+        }
     }
 
     // 合并出报告：全部 ok:true 的 findings（已完成 + 新补）。

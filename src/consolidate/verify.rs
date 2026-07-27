@@ -184,7 +184,9 @@ async fn refute_one(
         // T43 层①：Parse 失败先嗅原文头部 verdict 前缀（层② repair 重试已由 tool_loop 内建——
         // 覆盖 FINALIZE 收尾轮与 toolless 默认路径首轮直出两条 parse 失败分支，Fix 4：final-review）。
         Err(e) => {
-            let sniffed = match &e {
+            // T25 附带修复：`ProviderError::WithUsage` 包装后 `&e` 直接按变体分派会漏判——
+            // 用 `.inner()` 见穿包装取内层真实变体，嗅探逻辑不受影响。
+            let sniffed = match e.inner() {
                 crate::provider::ProviderError::Parse(msg) => sniff_refute_verdict(msg),
                 _ => None,
             };
