@@ -422,7 +422,19 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    // T52：clap 解析错误默认退 2，与五档契约冲突（2=降级 approve、1=命令自身失败）——
+    // try_parse 接管：--help/--version 属正常展示走 e.exit()（退 0），真解析错误打印后退 1。
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                e.exit(); // 内部按展示类退 0
+            }
+            let _ = e.print();
+            std::process::exit(1);
+        }
+    };
     let code = match cli.cmd {
         Cmd::Review {
             base,
