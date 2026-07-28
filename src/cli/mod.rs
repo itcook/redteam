@@ -692,6 +692,19 @@ pub async fn run_job(
         }
         Err(e) => {
             eprintln!("error: job {job_id} Pending→Running 守卫写失败: {e}");
+            // dogfood r2 追打：detached worker 的退出码无人观测、stderr 进 null，仅 return
+            // 会把 job 行留在 Pending——best-effort 补一次 Failed 终态写（瞬时 DB 故障可
+            // 覆盖；持久故障本就无从落盘，残余由 status 惰性收尸兜底，损失仅 exit_code
+            // 精度 1→2）。
+            match store.update_if_active(job_id, |s| {
+                s.status = JobStatus::Failed;
+                s.error = Some(format!("Pending→Running 守卫写失败: {e}"));
+                s.exit_code = Some(1);
+            }) {
+                Ok(true) => {}
+                Ok(false) => eprintln!("warn: job {job_id} Failed 终态写被终态封盘拒绝"),
+                Err(e2) => eprintln!("warn: job {job_id} Failed 终态写亦失败: {e2}"),
+            }
             return 1;
         }
     }
