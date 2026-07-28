@@ -529,6 +529,19 @@ async fn main() {
                     }
                     Err(e) => {
                         eprintln!("error: failed to spawn worker: {e}");
+                        // dogfood F6：spawn 失败若不落终态，job 永悬 Pending 且无 pid——
+                        // reap_if_dead 对无 pid 的 Pending 不收尸（无从判活），僵尸卡永久
+                        // 累积。守卫写 Failed+exit 1（同 worker 配置失败分支范例）；拒写
+                        // 说明期间已被 cancel 等落了终态，保首个终态不覆盖。
+                        match store.update_if_active(&job_id, |st| {
+                            st.status = redteam::state::JobStatus::Failed;
+                            st.error = Some(format!("failed to spawn worker: {e}"));
+                            st.exit_code = Some(1);
+                        }) {
+                            Ok(false) => eprintln!("warn: job {job_id} 终态写被终态封盘拒绝"),
+                            Err(e2) => eprintln!("warn: job {job_id} 终态写失败: {e2}"),
+                            Ok(true) => {}
+                        }
                         std::process::exit(1);
                     }
                 }
@@ -925,11 +938,18 @@ fn run_dismiss(action: DismissCmd) -> i32 {
         })(),
         DismissCmd::Show { id } => (|| {
             let card = db.dismiss_get(&id)?.ok_or_else(|| anyhow::anyhow!("no card with id {id}"))?;
-            println!("{}", serde_json::to_string_pretty(&card)?);
-            println!("history:");
-            for (status, round, reason, at) in db.dismiss_history(&id)? {
-                println!("  {at}  {status}({round})  {reason}");
-            }
+            // dogfood F5 同步统一：history 并入 JSON 数组字段（每项 {status, round, reason, at}），
+            // 输出整体为合法 JSON 单文档，供 jq/脚本消费；此前 JSON 后拼散文行两不靠。
+            let mut v = serde_json::to_value(&card)?;
+            let history: Vec<serde_json::Value> = db
+                .dismiss_history(&id)?
+                .into_iter()
+                .map(|(status, round, reason, at)| {
+                    serde_json::json!({ "status": status, "round": round, "reason": reason, "at": at })
+                })
+                .collect();
+            v["history"] = serde_json::Value::Array(history);
+            println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
         })(),
         DismissCmd::SetStatus { id, status, round, reason } => (|| {
@@ -1036,16 +1056,20 @@ fn resolve_add(
     Ok(())
 }
 
-/// resolve show：卡片 JSON + 全部修复 history 逐条（对称 dismiss show 输出风格；
-/// resolve_history 无 status/at 列，故每行仅 round+reason）。查无此卡报错（调用方映射非零退出）。
+/// resolve show：纯 JSON 单文档——卡片对象内嵌 `history` 数组（每项 {round, reason}；
+/// resolve_history 无 status/at 列）。查无此卡报错（调用方映射非零退出）。
+/// dogfood F5：此前 JSON 后拼散文 history 行，整体非法 JSON，jq/脚本（ship 跨轮重建
+/// 引用此命令）无法消费——改为 history 并入 JSON 字段，dismiss show 同步统一。
 fn resolve_show(db: &redteam::db::ProjDb, id: &str) -> anyhow::Result<String> {
     let card = db.resolve_get(id)?.ok_or_else(|| anyhow::anyhow!("no card with id {id}"))?;
-    let mut out = serde_json::to_string_pretty(&card)?;
-    out.push_str("\nhistory:");
-    for (round, reason) in db.resolve_history(id)? {
-        out.push_str(&format!("\n  ({round})  {reason}"));
-    }
-    Ok(out)
+    let mut v = serde_json::to_value(&card)?;
+    let history: Vec<serde_json::Value> = db
+        .resolve_history(id)?
+        .into_iter()
+        .map(|(round, reason)| serde_json::json!({ "round": round, "reason": reason }))
+        .collect();
+    v["history"] = serde_json::Value::Array(history);
+    Ok(serde_json::to_string_pretty(&v)?)
 }
 
 /// 从评审报告 JSON 按 id 抄快照四件套 (title, file, quote, severity)。
@@ -1367,7 +1391,8 @@ mod tests {
         assert!(err.to_string().contains("missing snapshot field"), "{err}");
     }
 
-    /// ②show 输出断言：卡四件套 + reason/round + 两条 history 逐条都在。
+    /// ②show 输出断言：卡四件套 + reason/round + 两条 history 逐条都在；且（dogfood F5）
+    /// 整体必须是单份合法 JSON、history 为对象内数组字段——jq/脚本可直接消费。
     #[test]
     fn resolve_show_renders_card_and_history() {
         let dir = tempfile::tempdir().unwrap();
@@ -1382,10 +1407,17 @@ mod tests {
             Some("标题".into()), Some("src/x.rs".into()), Some("let x = 1;".into()), Some("high".into()),
         ).unwrap();
         let out = resolve_show(&db, &id).unwrap();
+        // dogfood F5 锚：输出整体可被 serde_json 解析（此前 JSON 后拼散文行会在此失败）。
+        let v: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("resolve show 输出必须是合法 JSON: {e}\n{out}"));
         assert!(out.contains("标题") && out.contains("src/x.rs") && out.contains("let x = 1;") && out.contains("high"),
             "缺卡四件套: {out}");
-        assert!(out.contains("r1") && out.contains("第一次修"), "缺第一条 history: {out}");
-        assert!(out.contains("r3") && out.contains("第二次修"), "缺第二条 history: {out}");
+        let hist = v["history"].as_array().expect("history 应为 JSON 数组字段");
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0]["round"], "r1");
+        assert_eq!(hist[0]["reason"], "第一次修");
+        assert_eq!(hist[1]["round"], "r3");
+        assert_eq!(hist[1]["reason"], "第二次修");
     }
 
     /// ③查无此卡 → resolve_show 返回 Err（run_resolve 外层映射为非零退出 + eprintln）。

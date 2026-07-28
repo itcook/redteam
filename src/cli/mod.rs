@@ -678,14 +678,35 @@ pub async fn run_job(
     // 守卫写 Pending→Running：与上面的检查之间存在窗口——cancel 进程可能在此期间
     // 抢先落 Cancelled 并提交，若仍走裸 write_state 会把 Cancelled 覆回 Running
     // （违反首个终态封盘）。改走 update_if_active，事务内 CAS，拒写不覆盖。
-    let wrote = store.update_if_active(job_id, |s| {
+    // 三态显式分流（dogfood F3 抓漏）：此前 Err 被 unwrap_or(false) 折叠进拒写分支，
+    // DB 故障会让 worker 沿「重读终态」路径静默退 0（job 悬 Pending、无终态无报错）——
+    // DB 错误既不是「已有终态」也不是「可以开跑」，必须报错退 1。
+    match store.update_if_active(job_id, |s| {
         s.status = JobStatus::Running;
         s.set_phase(crate::state::Phase::Collecting, None);
-    })
-    .unwrap_or(false);
-    if !wrote {
-        // 期间已被别的进程落了终态：重读真终态、返回其 exit_code（与上面早退同款语义）。
-        return store.read_state(job_id).and_then(|s| s.exit_code).unwrap_or(0);
+    }) {
+        Ok(true) => {}
+        Ok(false) => {
+            // 期间已被别的进程落了终态：重读真终态、返回其 exit_code（与上面早退同款语义）。
+            return store.read_state(job_id).and_then(|s| s.exit_code).unwrap_or(0);
+        }
+        Err(e) => {
+            eprintln!("error: job {job_id} Pending→Running 守卫写失败: {e}");
+            // dogfood r2 追打：detached worker 的退出码无人观测、stderr 进 null，仅 return
+            // 会把 job 行留在 Pending——best-effort 补一次 Failed 终态写（瞬时 DB 故障可
+            // 覆盖；持久故障本就无从落盘，残余由 status 惰性收尸兜底，损失仅 exit_code
+            // 精度 1→2）。
+            match store.update_if_active(job_id, |s| {
+                s.status = JobStatus::Failed;
+                s.error = Some(format!("Pending→Running 守卫写失败: {e}"));
+                s.exit_code = Some(1);
+            }) {
+                Ok(true) => {}
+                Ok(false) => eprintln!("warn: job {job_id} Failed 终态写被终态封盘拒绝"),
+                Err(e2) => eprintln!("warn: job {job_id} Failed 终态写亦失败: {e2}"),
+            }
+            return 1;
+        }
     }
 
     let sink = JobCellSink {
