@@ -196,7 +196,8 @@ pub fn config_paths() -> Vec<PathBuf> {
 }
 
 /// 把 [providers.<name>] 写进用户配置（config_paths()[0]），toml 深合并保留其他内容。
-/// 只写 kind/base_url/model/priority/api_key_env——**绝不写明文 key**。
+/// 只写 kind/base_url/model/priority/api_key_env/context_window_tokens——**绝不写明文 key**。
+/// `context_window_tokens`：None 不写键（预算按保守 128K 缺省），Some 写显式值。
 pub fn write_provider(
     name: &str,
     kind: &str,
@@ -204,6 +205,7 @@ pub fn write_provider(
     model: &str,
     priority: i32,
     api_key_env: Option<&str>,
+    context_window_tokens: Option<u32>,
 ) -> anyhow::Result<()> {
     let path = config_paths()
         .into_iter()
@@ -232,6 +234,9 @@ pub fn write_provider(
         t.insert("api_key_env".into(), toml::Value::String(e.to_string()));
     }
     t.insert("priority".into(), toml::Value::Integer(priority as i64));
+    if let Some(ctx) = context_window_tokens {
+        t.insert("context_window_tokens".into(), toml::Value::Integer(ctx as i64));
+    }
     providers_t.insert(name.to_string(), toml::Value::Table(t));
 
     if let Some(dir) = path.parent() {
@@ -260,7 +265,7 @@ mod tests {
         std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
         std::fs::write(&cfg_path, "[review]\nblock_threshold=\"high\"\n").unwrap();
 
-        write_provider("local", "openai-compatible", Some("http://localhost:11434/v1"), "qwen", 10, Some("LOCAL_KEY")).unwrap();
+        write_provider("local", "openai-compatible", Some("http://localhost:11434/v1"), "qwen", 10, Some("LOCAL_KEY"), None).unwrap();
 
         let cfg = Config::load().unwrap();
         let p = cfg.providers.get("local").expect("provider written");
@@ -268,11 +273,27 @@ mod tests {
         assert_eq!(p.priority, 10);
         assert_eq!(p.base_url.as_deref(), Some("http://localhost:11434/v1"));
         assert_eq!(p.api_key_env.as_deref(), Some("LOCAL_KEY"));
+        // None 不写键：文本无 context_window_tokens，读回为 None（预算走保守 128K 缺省）
+        assert_eq!(p.context_window_tokens, None);
         // 既有 [review] 保留
         assert_eq!(cfg.review.block_threshold, crate::domain::Severity::High);
         // 配置文本不含明文 key（只有 api_key_env 引用）
         let raw = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(!raw.contains("sk-"), "no plaintext key in config");
+        assert!(!raw.contains("context_window_tokens"), "None 不应写出该键");
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME"); }
+    }
+
+    /// --context-tokens 档位透传：Some 写显式值、可被 Config 读回（pack 预算消费同一字段）。
+    #[test]
+    fn write_provider_persists_context_window_tokens() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK 串行化
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()); }
+        write_provider("big", "openai", None, "big-ctx", 0, Some("BIG_KEY"), Some(1_000_000)).unwrap();
+        let cfg = Config::load().unwrap();
+        assert_eq!(cfg.providers.get("big").unwrap().context_window_tokens, Some(1_000_000));
         unsafe { std::env::remove_var("XDG_CONFIG_HOME"); }
     }
 

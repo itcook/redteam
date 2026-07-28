@@ -269,6 +269,10 @@ enum ModelCmd {
         /// key 去处：env(默认，打印 export) | secrets(写 secrets.toml chmod 600)
         #[arg(long, default_value = "env", value_parser = ["env", "secrets"])]
         key_store: String,
+        /// 模型 context window 档位（写 config 的 context_window_tokens，评审 pack 预算
+        /// 按启用模型最小窗计算）。缺省不写，预算按保守 128K 估——确知更大窗才声明。
+        #[arg(long, value_parser = ["128K", "256K", "512K", "1M"])]
+        context_tokens: Option<String>,
     },
     /// 列已配置 provider + 可用性 + 配置位置。
     List {
@@ -790,7 +794,7 @@ async fn main() {
                 }
                 redteam::model::check_exit_code(&avs)
             }
-            ModelCmd::Setup { provider, kind, base_url, model, key, priority, key_store } => {
+            ModelCmd::Setup { provider, kind, base_url, model, key, priority, key_store, context_tokens } => {
                 let k = redteam::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
                 // 写入前守卫：kind/base_url 不合法则提示并拒绝写入，不污染配置。
                 // kind 检查用原始 --kind 字符串（若显式给出，哪怕非法）而非 `k`——`derive_kind`
@@ -807,8 +811,17 @@ async fn main() {
                 };
                 let api_key_env = redteam::model::derive_api_key_env(&provider);
                 let prio = priority.unwrap_or(0);
+                // 档位→token 数（十进制约定，与预算函数/既有配置一致）；clap value_parser
+                // 已限四档，此处映射穷尽、无 _ 臂兜错。
+                let ctx_tokens = context_tokens.as_deref().map(|c| match c {
+                    "128K" => 128_000u32,
+                    "256K" => 256_000,
+                    "512K" => 512_000,
+                    "1M" => 1_000_000,
+                    _ => unreachable!("clap value_parser 已限值域"),
+                });
                 if let Err(e) = redteam::config::write_provider(
-                    &provider, k.as_str(), base_url.as_deref(), &model, prio, Some(&api_key_env),
+                    &provider, k.as_str(), base_url.as_deref(), &model, prio, Some(&api_key_env), ctx_tokens,
                 ) {
                     eprintln!("error: failed to write provider config: {e}");
                     std::process::exit(1);
