@@ -756,3 +756,26 @@ default_models=["m"]
     assert_eq!(report.verdict, Verdict::Approve, "已驳回判例命中不应 blocking");
     assert_eq!(code, 0, "approve 且对照集完整 → exit 0");
 }
+
+/// T52：clap 解析错误退出码归 1（命令自身失败档）——此前 clap 默认退 2，与五档契约
+/// 冲突（2=降级 approve）。真 spawn 二进制四路锚：非法 flag / 非法枚举值 / 裸命令无
+/// 子命令均退 1；--help 属正常展示退 0（DisplayHelp 分支不被误伤）。
+#[test]
+fn clap_parse_error_exits_1_help_exits_0() {
+    let bin = env!("CARGO_BIN_EXE_redteam");
+    let run = |args: &[&str]| {
+        std::process::Command::new(bin)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn 真二进制失败")
+            .code()
+            .expect("应有退出码")
+    };
+    assert_eq!(run(&["--badflag"]), 1, "非法 flag 应退 1（命令错误档）");
+    assert_eq!(run(&["model", "setup", "--provider", "X", "--context-tokens", "999K"]), 1,
+        "非法枚举值应退 1");
+    assert_eq!(run(&[]), 1, "裸命令缺子命令应退 1");
+    assert_eq!(run(&["--help"]), 0, "--help 是正常展示，应退 0");
+}
