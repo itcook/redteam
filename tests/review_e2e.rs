@@ -443,3 +443,64 @@ default_models=["alpha"]
     assert_eq!(store.read_manifest(job_id).len(), 1, "manifest 应可经同一 store 读回");
     assert_eq!(store.read_partial(job_id).len(), 1, "partial checkpoint 应可经同一 store 读回");
 }
+
+/// T47③：REDTEAM_TEST_PANIC 钩子 + 真 panic 全链路 e2e
+/// 真 spawn 二进制，设 REDTEAM_TEST_PANIC=1，fan-out 前触发 panic；
+/// panic hook 落 Failed 终态；断言封盘不变式（终态落定后不被覆盖）。
+#[test]
+fn worker_panic_hook_lands_failed_and_seals() {
+    use redteam::state::{JobState, JobStatus, JobStore};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let run_dir = dir.path();
+
+    // 预建 job 记录（worker 起手需要 args_raw + create_job）
+    let job_id = "panic-e2e-1";
+    let store = JobStore::open(run_dir).unwrap();
+    let fake_args = serde_json::json!({
+        "base": null, "scope": "working-tree", "spec": [], "focus": null,
+        "models": null, "models_all": false, "block_threshold": null, "conf_floor": null,
+        "background": true, "format": "json", "resume": null, "dismissed": null,
+        "no_dismissed": false, "incremental_from": null, "tools": null
+    });
+    store.write_args_raw(job_id, &fake_args.to_string()).unwrap();
+    store.create_job(job_id, 0).unwrap();
+
+    // spawn 真二进制，设 REDTEAM_TEST_PANIC=1
+    let bin = env!("CARGO_BIN_EXE_redteam");
+    let status = std::process::Command::new(bin)
+        .arg("worker")
+        .arg("--job-id")
+        .arg(job_id)
+        .env("REDTEAM_TEST_PANIC", "1")
+        .current_dir(run_dir)
+        .status()
+        .expect("spawn 真二进制失败");
+    // panic 导致非零退出
+    assert!(!status.success(), "panic 应导致非零退出");
+
+    // 轮询终态（最多 5 秒）
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let final_state: JobState = loop {
+        let st = store.read_state(job_id).expect("job state 应在场");
+        if st.status.is_terminal() {
+            break st;
+        }
+        assert!(Instant::now() < deadline, "超时：job 未在 5s 内落终态");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // 断言 Failed + error 含 panic 消息
+    assert_eq!(final_state.status, JobStatus::Failed, "panic 应落 Failed 终态");
+    let err = final_state.error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("REDTEAM_TEST_PANIC"),
+        "error 字段应含 panic 消息，实际: {err:?}"
+    );
+
+    // 封盘不变式：sleep 100ms 后再读，状态仍是 Failed
+    std::thread::sleep(Duration::from_millis(100));
+    let st2 = store.read_state(job_id).expect("二次读 state 应在场");
+    assert_eq!(st2.status, JobStatus::Failed, "封盘：终态不应被后续写覆盖");
+}

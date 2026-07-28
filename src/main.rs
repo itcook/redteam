@@ -594,6 +594,11 @@ async fn main() {
                     default_hook(info);
                 }));
             }
+            // e2e 回归资产，永久保留，不进 --help/prompt 面
+            // 测试钩子：REDTEAM_TEST_PANIC=1 时在 fan-out 前触发 panic，验证 panic hook 全链路
+            if std::env::var("REDTEAM_TEST_PANIC").is_ok() {
+                panic!("REDTEAM_TEST_PANIC");
+            }
             let args_json = match store.read_args_raw(&job_id) {
                 Some(j) => j,
                 None => {
