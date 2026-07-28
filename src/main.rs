@@ -13,7 +13,12 @@ use std::path::Path;
 // args_override_self：同名 flag 重复时后者胜（而非报错）——ship 等编排方把自己管理的
 // flag 追加在用户参数之后即权威生效，无需依赖 prompt 层把用户重复参数「摘干净」
 // （r5 dogfood 1c72b790：LLM 摘参不可靠，机制化消灭「重复即崩」类）。
-#[command(name = "redteam", version, about = "模型无关的对抗式代码评审器", args_override_self = true)]
+#[command(name = "redteam", version, about = "模型无关的对抗式代码评审器", args_override_self = true,
+    after_help = "快速上手：\n  \
+    1. redteam init                          # 项目内建 .redteam/ 骨架\n  \
+    2. redteam model setup --provider X …    # 配置至少一个 model（key 见 --key-store）\n  \
+    3. redteam review --base main            # 评审当前分支相对 main 的改动\n  \
+    后台跑：review --background 得 job id → status <id> 看进度 → result <id> 取报告。")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -22,7 +27,8 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// 发起对抗式评审：多模型扇出 + 工具检索 + 定向核实，输出 verdict/findings。
+    /// 发起对抗式评审：多模型扇出、单发全上下文评审（diff+改动源文全文+爆炸半径打包直喂，
+    /// 缺证据时二阶段补查）+ 孤证定向反驳，输出 verdict/findings。
     /// 退出码（五档）：0=干净 approve、1=命令自身失败（参数/IO/配置错误）、
     /// 2=降级 approve（部分模型未参与）、3=incomplete（不完整报告）、10=reject。
     Review {
@@ -85,6 +91,7 @@ enum Cmd {
     },
     /// 查询作业状态：无 id 列本项目全部；有 id 打印该作业 JSON。
     Status {
+        /// 作业 id（review --background 的输出）；缺省列出本项目全部作业。
         job_id: Option<String>,
         /// 输出格式：json（默认，机读契约）| table（人读）
         #[arg(long, default_value = "json", value_parser = ["json", "table"])]
@@ -96,13 +103,17 @@ enum Cmd {
     /// 取回作业的评审结果（持久存储于 .redteam/proj.db，永不过期、可重复取）。
     /// 任一终态可取（failed/timed_out 有部分报告也放行）；未终态是命令自身失败，退出码 1。
     Result {
+        /// 作业 id（review --background 的输出）。
         job_id: String,
         /// 输出格式：json（默认）| md。
         #[arg(long, default_value = "json", value_parser = ["json", "md"])]
         format: String,
     },
     /// 取消 running/pending 作业（发 SIGTERM）。
-    Cancel { job_id: String },
+    Cancel {
+        /// 作业 id（review --background 的输出）。
+        job_id: String,
+    },
     /// 隐藏：后台 worker（由 `review --background` re-exec 拉起，用户不直接调）。
     #[command(hide = true)]
     Worker {
@@ -148,10 +159,13 @@ enum DismissCmd {
         /// 快照字段（无 --from 时必须全给；与 --from 并用时覆盖抄写值）。
         #[arg(long)]
         title: Option<String>,
+        /// 快照：文件路径（同 title 规则）。
         #[arg(long)]
         file: Option<String>,
+        /// 快照：问题代码原文（refute 锚定与 gc 锚失效检测依赖它，同 title 规则）。
         #[arg(long)]
         quote: Option<String>,
+        /// 快照：严重度 low|medium|high|critical（同 title 规则）。
         #[arg(long)]
         severity: Option<String>,
     },
@@ -172,7 +186,9 @@ enum DismissCmd {
     /// 状态迁移（协议动作：re-upheld=复裁仍误报 / human-confirmed=人裁终局 /
     /// withdrawn=改判属实 / dismissed=回滚）。历史全留痕；不做状态机硬约束。
     SetStatus {
+        /// finding id（16 位 hex，来自评审报告；查无此卡报错退非零）。
         id: String,
+        /// 目标状态。
         #[arg(value_parser = redteam::db::STATUSES.to_vec())]
         status: String,
         /// 迁移发生轮次（如 r3），可选。
@@ -185,6 +201,7 @@ enum DismissCmd {
     /// 锚失效回收：quote 在当前代码中已不存在的活跃卡 → 标 stale（human-confirmed 豁免）。
     /// 默认 dry-run 只打印清单；--apply 才落账。
     Gc {
+        /// 真落账（缺省 dry-run 只打印将被标 stale 的清单）。
         #[arg(long)]
         apply: bool,
     },
@@ -209,10 +226,13 @@ enum ResolveCmd {
         /// 快照字段（无 --from 时必须全给；与 --from 并用时覆盖抄写值）。
         #[arg(long)]
         title: Option<String>,
+        /// 快照：文件路径（同 title 规则）。
         #[arg(long)]
         file: Option<String>,
+        /// 快照：问题代码原文（增量轮假修复检测依赖它，同 title 规则）。
         #[arg(long)]
         quote: Option<String>,
+        /// 快照：严重度 low|medium|high|critical（同 title 规则）。
         #[arg(long)]
         severity: Option<String>,
     },
