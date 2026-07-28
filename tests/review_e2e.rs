@@ -550,3 +550,209 @@ default_models=["m"]
     assert_eq!(code, 3, "Incomplete → exit 3");
     assert_eq!(exit_code(Verdict::Incomplete, false), 3, "exit_code 映射一致");
 }
+
+/// M18 发布覆盖门·测试一：`result --format md` 三态（真 spawn 二进制，走 `resolve_result` 真路由）。
+/// ①`rN.md` 在场 → 逐字直出，不重渲染；②`rN.md` 缺但 `rN.result.json` 在场 → 现算 `render_md`
+/// 出结构化 markdown（D3，M18批2：不静默回落成 json 格式）；③两者皆缺 → 报错、退出码 1。
+#[test]
+fn result_md_three_states() {
+    use redteam::domain::{Finding, Origin, ReviewReport, RunMeta, Severity, Stats, Verdict};
+    use redteam::state::{JobStatus, JobStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = JobStore::open(dir.path()).unwrap();
+    let bin = env!("CARGO_BIN_EXE_redteam");
+
+    fn spawn_result_md(bin: &str, dir: &std::path::Path, job_id: &str) -> std::process::Output {
+        std::process::Command::new(bin)
+            .args(["result", job_id, "--format", "md"])
+            .current_dir(dir)
+            .output()
+            .expect("spawn 真二进制失败")
+    }
+
+    // ① rN.md 存在 → 直出该文件内容（逐字，不经 render_md 重算）。
+    let id_a = "mdA";
+    store.create_job(id_a, 0).unwrap();
+    store
+        .update_if_active(id_a, |s| {
+            s.status = JobStatus::Done;
+            s.exit_code = Some(0);
+            s.result_path = Some("result.json".into());
+        })
+        .unwrap();
+    let literal_md = "# Literal MD\n\nhand-written content, not re-rendered\n";
+    store.write_result_md(id_a, literal_md).unwrap();
+    let out_a = spawn_result_md(bin, dir.path(), id_a);
+    assert!(out_a.status.success(), "状态①应成功退出: {out_a:?}");
+    let stdout_a = String::from_utf8_lossy(&out_a.stdout);
+    assert_eq!(
+        stdout_a.trim_end(),
+        literal_md.trim_end(),
+        "rN.md 在场时应逐字直出其内容，不应被重渲染: {stdout_a}"
+    );
+
+    // ② rN.md 缺失但 rN.result.json 在场 → 反序列化 ReviewReport 现算 render_md。
+    let id_b = "mdB";
+    store.create_job(id_b, 0).unwrap();
+    store
+        .update_if_active(id_b, |s| {
+            s.status = JobStatus::Done;
+            s.exit_code = Some(10);
+            s.result_path = Some("result.json".into());
+        })
+        .unwrap();
+    let report_b = ReviewReport {
+        schema_version: "3".into(),
+        verdict: Verdict::Reject,
+        stats: Stats { high: 1, total: 1, ..Default::default() },
+        findings: vec![Finding {
+            id: "abc123".into(),
+            severity: Severity::High,
+            title: "unvalidated write".into(),
+            body: "writes unvalidated input".into(),
+            file: "src/a.rs".into(),
+            line_start: 3,
+            line_end: 3,
+            confidence: 0.9,
+            recommendation: "validate".into(),
+            models: vec!["m".into()],
+            agreement: 1,
+            hard_constraint: false,
+            quote: "db.write(token);".into(),
+            cluster_id: None,
+            verify: None,
+            previously_dismissed: false,
+            origin: Origin::New,
+        }],
+        clusters: vec![],
+        run: RunMeta { job_id: id_b.into(), models: vec!["m".into()], ..Default::default() },
+    };
+    store.write_result(id_b, &serde_json::to_string(&report_b).unwrap()).unwrap();
+    let out_b = spawn_result_md(bin, dir.path(), id_b);
+    // `result` 命令回填该 job 落盘的 exit_code（此处沿用当年 reject 的 10），不是「取回成功=0」；
+    // 断言点是「拿到了渲染出的 md」而非进程状态本身。
+    assert_eq!(out_b.status.code(), Some(10), "应回填该 job 落盘的 exit_code: {out_b:?}");
+    let stdout_b = String::from_utf8_lossy(&out_b.stdout);
+    // md 渲染骨架（render_md 段名，非静默回落 JSON）：Summary + Finding Details 两段都在。
+    assert!(stdout_b.contains("## Summary"), "应含 Summary 段: {stdout_b}");
+    assert!(stdout_b.contains("## Finding Details"), "应含 Finding Details 段: {stdout_b}");
+    assert!(stdout_b.contains("### F1: unvalidated write"), "应含现算出的 finding 标题: {stdout_b}");
+    assert!(stdout_b.contains("❌ reject"), "verdict 应被渲染: {stdout_b}");
+    assert!(!stdout_b.trim_start().starts_with('{'), "不应静默回落成原始 JSON 格式: {stdout_b}");
+
+    // ③ 两者都缺 → 报错，退出码 1。
+    let id_c = "mdC";
+    store.create_job(id_c, 0).unwrap();
+    store
+        .update_if_active(id_c, |s| {
+            s.status = JobStatus::Done;
+            s.exit_code = Some(0);
+        })
+        .unwrap();
+    let out_c = spawn_result_md(bin, dir.path(), id_c);
+    assert_eq!(out_c.status.code(), Some(1), "两者皆缺应退出码 1: {out_c:?}");
+    let stderr_c = String::from_utf8_lossy(&out_c.stderr);
+    assert!(stderr_c.contains("result missing"), "stderr 应报结果缺失: {stderr_c}");
+}
+
+/// M18 发布覆盖门·测试二：历史台账（`dismiss add`）标记链路——先建判例卡 → 同 id 复现 →
+/// 断言 `previously_dismissed` 标记落地 + 该历史记录确实进入尾段（consolidate/verify，紧随
+/// fan-out 之后的「第二阶段」）处理管线，而非停留在台账文件里未被消费。
+/// 可观测证据取两处：①`run.ledger` 披露（台账被 zero-config 自动加载并喂入 TailCtx）；
+/// ②`run.dismissed_reappeared` 派生索引收到该 id（`mark_dismissed` 是尾段专属步骤，
+/// 在 anchor→dedup→verify 之后、compute_verdict 之前，见 `cli::tail::assemble_report`）。
+/// 精确 id 命中判例按设计（`refute_targets` 注释）不再进 refute 目标集，故 `verify` 字段
+/// 应保持 `None`——一并断言，避免测试预期与代码实际行为脱节。
+#[tokio::test]
+async fn dismissed_ledger_previously_dismissed_marks_and_feeds_second_stage() {
+    use redteam::cli::{run_code_review, ReviewArgs};
+    use redteam::config::Config;
+    use redteam::domain::{RawFinding, Severity, Verdict};
+    use redteam::evidence::git::FileChange;
+    use redteam::orchestrate::finding_id;
+    use redteam::provider::fake::FakeProvider;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
+
+    let title = "unvalidated write";
+    let file = "src/a.rs";
+    let quote = "db.write(token);";
+    // finding_id 是 file + 归一化 quote + 归一化 title 的确定性哈希、行号无关（orchestrate::finding_id
+    // 文档）——dismiss add 与后续评审各自独立构造 raw finding，仍确定性落到同一 id，无需手工同步行号。
+    let id = finding_id(file, quote, title, 1, 1);
+
+    // ① `dismiss add`：先登记一条人裁驳回判例（模拟上一轮 ship 判过此 finding 是误报）。
+    let bin = env!("CARGO_BIN_EXE_redteam");
+    let add_out = std::process::Command::new(bin)
+        .args([
+            "dismiss", "add", &id,
+            "--reason", "确认误报：token 已在上游校验",
+            "--title", title,
+            "--file", file,
+            "--quote", quote,
+            "--severity", "high",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn dismiss add 失败");
+    assert!(add_out.status.success(), "dismiss add 应成功: {add_out:?}");
+
+    // ② 同一 id 再跑一次评审：FakeProvider 复现同 file/title/quote 的 raw finding，
+    // enrich() 算出的 finding.id 与卡上 id 逐字相等。root 下 `.redteam/proj.db` 已由
+    // 上一步的 `dismiss add` 建出——zero-config 自动加载（无需 --dismissed）。
+    let cfg = Config::from_layers(&[r#"[review]
+default_models=["m"]
+"#]).unwrap();
+    let mut scripted = std::collections::BTreeMap::new();
+    scripted.insert(
+        "m".to_string(),
+        vec![RawFinding {
+            severity: Severity::High,
+            title: title.into(),
+            body: "writes unvalidated input".into(),
+            file: file.into(),
+            line_start: 1,
+            line_end: 1,
+            confidence: 0.9,
+            recommendation: "validate".into(),
+            hard_constraint: false,
+            quote: quote.into(),
+        }],
+    );
+    let provider = FakeProvider { scripted, tokens: (0, 0, 0) };
+    let args = ReviewArgs {
+        base: None, scope: "working-tree".into(),
+        spec: vec![], focus: None, models: Some("m".into()),
+        models_all: false,
+        block_threshold: None, conf_floor: None,
+        background: false, format: "json".into(),
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+    };
+    let changes = vec![FileChange { path: file.into(), diff: "+    db.write(token);".into() }];
+    let (report, code) =
+        run_code_review(&args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
+
+    let f = report.findings.iter().find(|f| f.id == id).expect("重现的 finding 应在场且 id 与卡一致");
+    assert!(f.previously_dismissed, "命中台账的条目应带 previously_dismissed 标记");
+
+    // ③ 该历史记录确实进入了尾段（第二阶段）处理，而非台账文件里的一条死数据：
+    // run.ledger 披露证明它被 zero-config 自动加载并喂入 TailCtx（precedents/dismissed 两路）；
+    // dismissed_reappeared 派生索引证明 mark_dismissed（尾段专属步骤）真的处理过它。
+    let ledger = report.run.ledger.as_ref().expect("台账应自动加载，run.ledger 应披露");
+    assert_eq!(ledger.loaded, 1, "应加载到刚写入的这 1 条判例");
+    assert!(ledger.source.contains("proj.db"), "来源应指向 .redteam/proj.db: {}", ledger.source);
+    assert!(
+        report.run.dismissed_reappeared.contains(&id),
+        "id 应进入 dismissed_reappeared 派生索引（mark_dismissed 尾段处理的直接产物）"
+    );
+    // 精确 id 命中判例按设计不再进 refute 目标集（refute_targets：「精确 id 已在台账者不
+    // refute，烧 LLM 纯浪费」）——verify 应保持 None，与 mark_dismissed 的豁免语义一致。
+    assert!(f.verify.is_none(), "精确 id 命中的历史记录不应再触发 refute（design 明确排除）");
+
+    // previously_dismissed 的 finding 不参与 blocking（R8.2）→ 干净 approve。
+    assert_eq!(report.verdict, Verdict::Approve, "已驳回判例命中不应 blocking");
+    assert_eq!(code, 0, "approve 且对照集完整 → exit 0");
+}
