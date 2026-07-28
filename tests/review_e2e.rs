@@ -504,3 +504,49 @@ fn worker_panic_hook_lands_failed_and_seals() {
     let st2 = store.read_state(job_id).expect("二次读 state 应在场");
     assert_eq!(st2.status, JobStatus::Failed, "封盘：终态不应被后续写覆盖");
 }
+
+/// 3-3①：exit 1——CLI 参数校验失败（--conf-floor 越界）→ 进程退出码 1。
+/// 注：CLI 无 --config 参数；--conf-floor 越界是最简的命令层 exit 1 触发路径
+/// （main.rs 显式 `process::exit(1)`，五档契约：命令自身失败）。
+#[test]
+fn exit_code_one_on_invalid_conf_floor() {
+    let bin = env!("CARGO_BIN_EXE_redteam");
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(bin)
+        .args(["review", "--conf-floor", "5.0"])
+        .current_dir(dir.path())
+        .status()
+        .expect("spawn binary");
+    assert_eq!(status.code(), Some(1), "--conf-floor 越界应退出码 1");
+}
+
+/// 3-3②：exit 3——run_resume 空 manifest（job 在 fan-out 前崩溃）→ Verdict::Incomplete → exit 3。
+#[tokio::test]
+async fn exit_code_three_on_incomplete_resume() {
+    use redteam::cli::{exit_code, run_resume};
+    use redteam::config::Config;
+    use redteam::domain::Verdict;
+    use redteam::provider::fake::FakeProvider;
+    use redteam::state::JobStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = JobStore::open(dir.path()).unwrap();
+    let job_id = "inc1";
+    // 写 args 但不写 manifest → run_resume 走 partial_report → Verdict::Incomplete → exit 3
+    let fake_args = serde_json::json!({
+        "base": null, "scope": "working-tree", "spec": [], "focus": null,
+        "models": null, "models_all": false, "block_threshold": null, "conf_floor": null,
+        "background": false, "format": "json", "resume": null, "dismissed": null,
+        "no_dismissed": false, "incremental_from": null, "tools": null
+    });
+    store.write_args_raw(job_id, &fake_args.to_string()).unwrap();
+
+    let cfg = Config::from_layers(&[r#"[review]
+default_models=["m"]
+"#]).unwrap();
+    let provider = FakeProvider { scripted: std::collections::BTreeMap::new(), tokens: (0, 0, 0) };
+    let (report, code) = run_resume(job_id, &provider, &cfg, dir.path(), &store).await;
+    assert_eq!(report.verdict, Verdict::Incomplete, "空 manifest → Incomplete");
+    assert_eq!(code, 3, "Incomplete → exit 3");
+    assert_eq!(exit_code(Verdict::Incomplete, false), 3, "exit_code 映射一致");
+}

@@ -185,4 +185,14 @@ mod tests {
         b.quote = "let _ = std::fs::remove_file(path);".into();
         assert!(!is_same_bug(&a, &b));
     }
+
+    #[test]
+    fn is_same_bug_true_for_synonym_titles_same_quote() {
+        // 标题措辞不同但语义相同（title Jaccard 低于阈值），quote 引同一行 → is_same_bug 应为 true
+        let mut a = f("1","a.rs",10,12,"unwrap() may panic","claude",Severity::High);
+        a.quote = "let val = opt.unwrap();".into();
+        let mut b = f("2","a.rs",10,12,"potential panic from unwrap","gpt",Severity::High);
+        b.quote = "let val = opt.unwrap();".into();
+        assert!(is_same_bug(&a, &b), "同义不全等标题 + 同 quote → is_same_bug 应为 true");
+    }
 }
