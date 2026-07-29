@@ -161,10 +161,14 @@ pub fn resolve_models(
     (models, replicate)
 }
 
-/// pack flat 预算（字节）——S2-b' 提到 256K：0 壳升级整文件后 cli.rs 级大文件（~90KB）
-/// 需装入（E7）；256K ≈ 1M-context 模型的 ~6%、256K 模型的 ~25%，安全。per-model 预算函数已落地
-/// （常数查表版，见下方 pack_budget_bytes）；T27 完整版（models.dev 策展表+真 tokenizer 校准）仍缓。
-const PACK_BUDGET_BYTES: usize = 256_000;
+/// pack flat 预算绝对帽（字节）。史：S2-b' 定 256K（装下 cli.rs 级 90KB 大文件，当时模型窗
+/// 普遍 128K）；2026-07-28 四 provider 全声明 1M 窗后提 768K——上限锚在 **gpt-5.6 的 272K
+/// 计费悬崖**之下（官方条款：input >272K 整单 2x input/1.5x output，见
+/// developers.openai.com/api/docs/models/gpt-5.6-sol）：按刻意保守的 3B/tok 记账
+/// 768K≈256K tok + 壳预留 8K tok ≈ 264K < 272K；真实换算 3.5-4B/tok 时实际 input 更低
+/// （~200-220K），双层安全垫。未声明窗口的缺省档改由窗口墙管（312K，见测试）。
+/// T27 完整版（models.dev 策展表+真 tokenizer 校准）仍缓。
+const PACK_BUDGET_BYTES: usize = 768_000;
 /// 预算函数三常数（design 2026-07-13 §2.2 逐字）：输出预留（推理型模型 findings JSON +
 /// reasoning）、字节/token 保守换算（代码英文 ~3.5-4B/token，往小估防超模型墙）、prompt
 /// 壳预留（rules/指令/信任声明，pack 预算外但占窗）。
@@ -1922,7 +1926,9 @@ mod tests {
     }
     #[test]
     fn pack_budget_respects_model_token_wall() {
-        // design §2.2 预算函数：min(256K, (min_ctx − 16K 输出预留)×3 − 24K 壳预留)。
+        // design §2.2 预算函数：min(768K 绝对帽, (min_ctx − 16K 输出预留)×3 − 24K 壳预留)。
+        // 2026-07-28 提帽 256K→768K（1M 窗时代，锚 gpt-5.6 272K 计费悬崖之下）——
+        // 128K 缺省档从「帽封顶 256K」翻为「窗口墙生效 312K」是本次显式入账的行为变化。
         let cfg = crate::config::Config::from_layers(&[r#"
 [providers.Big]
 kind = "openai"
@@ -1933,10 +1939,10 @@ kind = "openai"
 model = "small-ctx"
 context_window_tokens = 40000
 "#]).unwrap();
-        // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K → 字节帽 256K 生效
-        assert_eq!(pack_budget_bytes(&cfg, &["Unknown".into()]), 256_000);
-        // 大窗模型同样被字节帽封顶
-        assert_eq!(pack_budget_bytes(&cfg, &["Big".into()]), 256_000);
+        // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K < 768K → 窗口墙生效
+        assert_eq!(pack_budget_bytes(&cfg, &["Unknown".into()]), 312_000);
+        // 大窗模型（1M）：窗口墙 ≈2.9M → 绝对帽 768K 封顶（≈256K tok 记账 <272K 悬崖）
+        assert_eq!(pack_budget_bytes(&cfg, &["Big".into()]), 768_000);
         // 小窗模型：(40_000−16_000)*3−24_000 = 48_000
         assert_eq!(pack_budget_bytes(&cfg, &["Small".into()]), 48_000);
         // 多模型取最小窗（一份 pack 全模型安全）
