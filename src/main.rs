@@ -389,7 +389,7 @@ fn resolve_result(
 fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<ProviderRegistry, String> {
     let (planned, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
     if planned.is_empty() {
-        return Err("no provider available, please configure [providers.*] first".to_string());
+        return Err("no model available, please configure [models.*] (referencing [providers.*]) first".to_string());
     }
 
     // 工具档位生效值：--tools 覆盖 config [review].tools；未知/缺省字符串落 config 默认
@@ -851,7 +851,7 @@ async fn main() {
                 // 09-04 分离形状：[providers.<name>] + [models.<name>]（同名起步；
                 // setup 交互式化时再让用户分别命名）。
                 if let Err(e) = redteam::config::write_model(
-                    &provider, &provider, k.as_str(), base_url.as_deref(), &model, Some(&api_key_env), ctx_tokens,
+                    &provider, &provider, k.as_str(), base_url.as_deref(), &model, Some(&api_key_env), ctx_tokens, Some(prio),
                 ) {
                     eprintln!("error: failed to write provider config: {e}");
                     std::process::exit(1);
@@ -886,7 +886,7 @@ async fn main() {
                 let prober = redteam::model::probe::HttpProber::new();
                 let probe_result = match cfg.providers.get(&provider) {
                     Some(pc) => {
-                        let key = cfg.resolve_key(&provider);
+                        let key = cfg.resolve_provider_key(&provider);
                         prober
                             .list_models(&redteam::model::effective_base(pc), key.as_deref(), pc.kind)
                             .await
@@ -907,7 +907,7 @@ async fn main() {
                             None => { eprintln!("no such provider: {prov}"); std::process::exit(1); }
                         };
                         let base = redteam::model::effective_base(pc);
-                        let key = cfg.resolve_key(&prov);
+                        let key = cfg.resolve_provider_key(&prov);
                         match prober.list_models(&base, key.as_deref(), pc.kind).await {
                             Ok(models) => {
                                 for m in models { println!("{m}"); }
@@ -1361,8 +1361,8 @@ mod tests {
         assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");
         let msg = result.err().unwrap();
         assert!(
-            msg.contains("no provider"),
-            "错误消息应提示 provider 问题，实际: {msg}"
+            msg.contains("no model"),
+            "错误消息应提示 models 配置（09-04 分离后名字空间），实际: {msg}"
         );
     }
 

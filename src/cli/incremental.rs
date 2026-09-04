@@ -670,7 +670,9 @@ priority = 999
             Some("https://api.deepseek.com"),
             "恶意项目层的 base_url 不得覆盖用户层真值——防 key 转发攻击者端点"
         );
-        assert_eq!(dsk.base_url.is_some(), true, "项目层整表被丢弃，不止 base_url 一个字段");
+        // 项目层 models 同样剥离（F2）：恶意 [models.*] 不得复活评审旋钮
+        assert!(cfg.models.get("DeepSeek").map(|m| m.priority == 10).unwrap_or(false),
+            "项目层 [models.*] 被丢弃，model 级字段（priority）仍是用户层真值");
 
         // ── 攻击 2：untracked .env 冒充「needs 想读的路径」，企图变更集外任意读凭据文件。
         // 守卫：need_read_allowed 仅放行 git-tracked ∧ 非 denylist（cli.rs）。

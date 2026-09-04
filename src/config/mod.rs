@@ -197,12 +197,17 @@ impl Config {
             let mut v: toml::Value = toml::from_str(layer)?;
             if *is_project {
                 if let Some(table) = v.as_table_mut() {
-                    if let Some(removed) = table.remove("providers") {
-                        let non_empty = matches!(&removed, toml::Value::Table(t) if !t.is_empty());
-                        if non_empty {
-                            warnings.push(
-                                "项目层 .redteam/config.toml 的 [providers.*] 被安全策略丢弃（威胁模型 B：防不可信仓覆写端点偷 key）".to_string(),
-                            );
+                    // 威胁模型 B：项目层 providers 与 models 都剥离——models 携带
+                    // kind/output_limit/per_turn 等评审旋钮，不剥等于把守卫后门开着
+                    // （dogfood ccbedddcdd01 F2）。
+                    for section in ["providers", "models"] {
+                        if let Some(removed) = table.remove(section) {
+                            let non_empty = matches!(&removed, toml::Value::Table(t) if !t.is_empty());
+                            if non_empty {
+                                warnings.push(format!(
+                                    "项目层 .redteam/config.toml 的 [{section}.*] 被安全策略丢弃（威胁模型 B：防不可信仓覆写端点/评审旋钮偷 key）"
+                                ));
+                            }
                         }
                     }
                 }
@@ -212,6 +217,25 @@ impl Config {
         let cfg: Config = merged.clone().try_into()?;
         // 旧形状检测：providers 节出现 model/context_window_tokens/priority/per_turn_timeout_secs
         // （已迁至 [models.*]）时给指向性错误，不静默丢配置。
+        if let Some(toml::Value::Table(ms)) = merged.get("models") {
+            let legacy_m: &[&str] = &["context_window_tokens", "model"];
+            let mut found_m = Vec::new();
+            for (mname, mv) in ms {
+                if let toml::Value::Table(t) = mv {
+                    for f in legacy_m {
+                        if t.contains_key(*f) {
+                            found_m.push(format!("[models.{mname}] 的 {f:?}"));
+                        }
+                    }
+                }
+            }
+            if !found_m.is_empty() {
+                anyhow::bail!(
+                    "配置形状已升级（provider/model 分离，09-04）：{} 已更名（context_window_tokens→context_window、model→id）。\n迁移示例见 .redteam/config.toml 模板。",
+                    found_m.join("、")
+                );
+            }
+        }
         if let Some(toml::Value::Table(ps)) = merged.get("providers") {
             let legacy: &[&str] = &[
                 "model", "context_window_tokens", "priority", "per_turn_timeout_secs", "output_limit",
@@ -261,6 +285,20 @@ impl Config {
             }
         }
         secrets::load_secrets().get(&m.provider)?.get(&m.id).map(|e| e.api_key.clone())
+    }
+
+    /// provider 维度 key 解析（model list --remote / setup 落盘后 probe 用）：
+    /// provider.api_key_env(env) > secrets[provider] 下任一 model key（网关 key 通常
+    /// 同 provider 共享）。model 级差异化 key 请走 resolve_key(model)。
+    pub fn resolve_provider_key(&self, provider: &str) -> Option<String> {
+        if let Some(p) = self.providers.get(provider) {
+            if let Some(var) = &p.api_key_env {
+                if let Ok(v) = std::env::var(var) {
+                    return Some(v);
+                }
+            }
+        }
+        secrets::load_secrets().get(provider)?.values().next().map(|e| e.api_key.clone())
     }
 
     /// merged 视图：model 配置 + 所属 provider 的覆盖链成品。model 不存在 → None；
@@ -335,6 +373,7 @@ pub fn write_model(
     model_id: &str,
     api_key_env: Option<&str>,
     context_window: Option<u32>,
+    priority: Option<i32>,
 ) -> anyhow::Result<()> {
     let path = config_paths()
         .into_iter()
@@ -354,7 +393,9 @@ pub fn write_model(
     let providers_t = providers
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("[providers] is not a table"))?;
-    providers_t
+    // F5：已存在的 provider 节更新显式给出的通道字段（or_insert 只建不更，
+    // setup 重跑换 base_url 会静默保留旧端点）。
+    let entry = providers_t
         .entry(provider_name.to_string())
         .or_insert_with(|| {
             let mut t = toml::value::Table::new();
@@ -367,6 +408,15 @@ pub fn write_model(
             }
             toml::Value::Table(t)
         });
+    if let Some(t) = entry.as_table_mut() {
+        t.insert("kind".into(), toml::Value::String(provider_kind.to_string()));
+        if let Some(b) = base_url {
+            t.insert("base_url".into(), toml::Value::String(b.to_string()));
+        }
+        if let Some(e) = api_key_env {
+            t.insert("api_key_env".into(), toml::Value::String(e.to_string()));
+        }
+    }
 
     // 写 [models.<model_name>]
     let models = root_t
@@ -380,6 +430,9 @@ pub fn write_model(
     t.insert("id".into(), toml::Value::String(model_id.to_string()));
     if let Some(ctx) = context_window {
         t.insert("context_window".into(), toml::Value::Integer(ctx as i64));
+    }
+    if let Some(pr) = priority {
+        t.insert("priority".into(), toml::Value::Integer(pr as i64));
     }
     models_t.insert(model_name.to_string(), toml::Value::Table(t));
 
@@ -409,7 +462,7 @@ mod tests {
         std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
         std::fs::write(&cfg_path, "[review]\nblock_threshold=\"high\"\n").unwrap();
 
-        write_model("local", "ollama", "openai-compatible", Some("http://localhost:11434/v1"), "qwen", Some("LOCAL_KEY"), None).unwrap();
+        write_model("local", "ollama", "openai-compatible", Some("http://localhost:11434/v1"), "qwen", Some("LOCAL_KEY"), None, None).unwrap();
 
         let cfg = Config::load().unwrap();
         let m = cfg.models.get("local").expect("model written");
@@ -434,7 +487,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: ENV_LOCK 串行化
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()); }
-        write_model("big", "bigp", "openai", None, "big-ctx", Some("BIG_KEY"), Some(1_000_000)).unwrap();
+        write_model("big", "bigp", "openai", None, "big-ctx", Some("BIG_KEY"), Some(1_000_000), Some(10)).unwrap();
         let cfg = Config::load().unwrap();
         assert_eq!(cfg.effective_model("big").unwrap().context_window, 1_000_000);
         unsafe { std::env::remove_var("XDG_CONFIG_HOME"); }

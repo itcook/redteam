@@ -10,10 +10,29 @@ pub struct SecretEntry {
 
 /// 读取 ~/.config/redteam/secrets.toml → { provider: { model_id: { api_key } } }。
 /// 形状随 09-04-model-config-split 与 config 的 provider/model 分离对齐（key 粒度=model 级）。
+/// 旧扁平形状（`Kimi = "sk-..."`）解析不出新结构——返回空并打 stderr 警告
+/// （F1 防静默：write_secret 落盘前会先备份，旧 key 不丢）。
 pub fn load_secrets() -> BTreeMap<String, BTreeMap<String, SecretEntry>> {
     let path = secrets_path();
     let Ok(text) = std::fs::read_to_string(&path) else { return BTreeMap::new() };
-    toml::from_str(&text).unwrap_or_default()
+    match toml::from_str(&text) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "warning: {} 解析失败（{}）——若是 09-04 前的扁平形状请手动迁移为 [provider.\"model_id\"] 节；write_secret 前会自动备份原文件",
+                path.display(), e
+            );
+            BTreeMap::new()
+        }
+    }
+}
+
+/// secrets.toml 是否存在但解析不出新形状（旧扁平/损坏）——write_secret 用它决定备份。
+fn legacy_secrets_present() -> bool {
+    let path = secrets_path();
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    if text.trim().is_empty() { return false; }
+    toml::from_str::<BTreeMap<String, BTreeMap<String, SecretEntry>>>(&text).is_err()
 }
 
 pub fn secrets_path() -> PathBuf {
@@ -34,6 +53,13 @@ pub fn write_secret(provider: &str, model_id: &str, key: &str) -> anyhow::Result
     let path = secrets_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
+    }
+    // F1：旧形状/损坏文件首次写入前备份——load_secrets 解析不出会回空 map，
+    // 直接落盘等于物理销毁旧 key（不可逆）。备份后照常写新形状。
+    if legacy_secrets_present() {
+        let bak = path.with_extension("toml.bak");
+        std::fs::copy(&path, &bak)?;
+        eprintln!("warning: 旧形状 secrets.toml 已备份至 {}（含点 model_id 须引号：[provider.\"model.id\"]）", bak.display());
     }
     let mut map = load_secrets();
     map.entry(provider.to_string())
