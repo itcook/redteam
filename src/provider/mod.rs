@@ -111,18 +111,8 @@ pub(crate) async fn send_classified(
 /// 非 JSON 网关页——典型上游抖动或推理模型长思考后放弃）分类为 `Unavailable`（可重试），
 /// 而非 `Parse`。`Parse` 专指我方对**模型内容**的形状解析失败（不可重试）。
 /// 这是本层与 `retry_classified` 的接缝：误判为 Parse 会绕过重试，一次抖动烧掉整个 cell。
-pub(crate) async fn decode_json(resp: reqwest::Response) -> Result<serde_json::Value, ProviderError> {
-    let url = resp.url().to_string();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| ProviderError::Unavailable(format!("envelope body read failed for {url}: {e}")))?;
-    parse_envelope_json(&text, &url)
-}
-
-/// `decode_json` 的纯解析核（可测）：非法 JSON → `Unavailable` + 携带 body 前 200 字节。
-/// 证据留存：现场 body 一旦被 `.json()` 消费即灭迹，preview 让下次诊断不必活体复现。
-fn parse_envelope_json(text: &str, url: &str) -> Result<serde_json::Value, ProviderError> {
+/// 现由 Anthropic backend 的非 SSE 回退路径直接消费（SSE 主路径不需要整体 JSON 解码）。
+pub(crate) fn parse_envelope_json(text: &str, url: &str) -> Result<serde_json::Value, ProviderError> {
     serde_json::from_str(text).map_err(|e| {
         let preview: String = text.chars().take(200).collect();
         ProviderError::Unavailable(format!(
@@ -168,8 +158,28 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
 }
 
 pub(crate) const DEFAULT_RETRY_BUDGET: u32 = 2; // 首发 + 2 重试
-/// 单轮最长等待时间；tool_loop 与 single_shot 共用同一常量（原各私有一份，Task 2 评审 Minor 收敛）。
+/// 单轮默认最长等待；tool_loop 与 single_shot 共用（原各私有一份，Task 2 评审 Minor 收敛）。
 pub(crate) const PER_TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
+/// 单轮最长等待时间，env `REDTEAM_PER_TURN_SECS` 可覆盖——大上下文 bundle（40+ 文件）
+/// 配深思考模型（glm/kimi 等）单轮思考+生成可超 150s 被掐成 `turn timeout`（2026-09-03
+/// dogfood 实证，非网络不可达而是慢）。校准旋钮，对齐 `REDTEAM_HTTP_TIMEOUT_SECS`（9f7540b）
+/// 先例；调大时两旋钮需一起抬（HTTP 整请求超时默认 300s，先于此处掐断）。
+pub(crate) fn per_turn_deadline() -> std::time::Duration {
+    match std::env::var("REDTEAM_PER_TURN_SECS") {
+        Ok(s) => match s.parse::<u64>() {
+            Ok(v) => std::time::Duration::from_secs(v),
+            Err(_) => {
+                // F4：静默回落会让运维误以为旋钮已生效，复发时被迫活体复现调试。
+                eprintln!(
+                    "warning: REDTEAM_PER_TURN_SECS={s:?} 非法（需整秒数），回落默认 {:?}",
+                    PER_TURN_DEADLINE
+                );
+                PER_TURN_DEADLINE
+            }
+        },
+        Err(_) => PER_TURN_DEADLINE,
+    }
+}
 const RETRY_BACKOFF_BASE_MS: u64 = 200;
 const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
 const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);

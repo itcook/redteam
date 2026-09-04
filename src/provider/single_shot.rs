@@ -89,9 +89,16 @@ impl SingleShotProvider {
     pub fn new(backend: Box<dyn ChatBackend>) -> Self {
         SingleShotProvider {
             backend,
-            per_turn: crate::provider::PER_TURN_DEADLINE,
+            per_turn: crate::provider::per_turn_deadline(),
             retry_budget: crate::provider::DEFAULT_RETRY_BUDGET,
         }
+    }
+
+    /// per-provider 单轮超时覆盖（config [providers.X].per_turn_timeout_secs）——
+    /// 慢速模型结构性需要更长轮时预算；全局 env 仍是粗调通道。
+    pub fn with_per_turn(mut self, d: std::time::Duration) -> Self {
+        self.per_turn = d;
+        self
     }
 }
 

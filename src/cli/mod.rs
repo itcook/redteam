@@ -438,6 +438,23 @@ fn append_ckpt_failure_warning(report: &mut ReviewReport, job_id: &str, failures
     }
 }
 
+/// 从 proj.db cells 表把 per-cell 运行摘要回填进报告（诊断呈现：慢在哪/几轮/是否重试）。
+/// 三条终态路径统一调用；旧作业 JSON 无此字段（serde default 空）不受影响。
+pub fn attach_cells(store: &crate::state::JobStore, job_id: &str, report: &mut ReviewReport) {
+    report.run.cells = store.read_partial(job_id)
+        .into_iter()
+        .map(|r| crate::domain::CellSummary {
+            model: r.model,
+            ok: r.ok,
+            iterations: r.iterations,
+            attempts: r.attempts,
+            duration_ms: r.duration_ms,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+        })
+        .collect();
+}
+
 /// R2.2：失败/超时时从 proj.db 的 cell checkpoint 里已完成的 findings 组一份 `incomplete`
 /// 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。M 取 manifest 行数（若尚未
 /// 写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
@@ -531,22 +548,44 @@ pub async fn run_resume(
 
     let mut usage = (0u64, 0u64, 0u64);
     let mut warnings = Vec::new();
-    for cell in &pending {
-        let req = LensRequest { route_key: cell.model.clone(), prompt: cell.prompt.clone() };
-        let rec = match provider.run(req).await {
+    // T54：差集 cell 并行补跑（join_all 保序）——旧串行 for 循环 wall-clock = Σcell，
+    // 大 bundle 思考型模型单 cell 10-20min 时双 cell 串行轻易破 40min（2026-09-03 PR181
+    // dogfood：resume 三跑 49min 零落盘）。append_partial 内部 Mutex 单连接、逐 cell
+    // 覆盖写，天然无并发写冲突；usage/warnings 在 join 后按原序累计，输出与串行版逐字等价。
+    // (cell, outcome, elapsed)：elapsed 在 future 内起表——Cells 表的 duration 语义与
+    // fanout 侧一致（真实墙钟），不再恒 0（2026-09-03 PR181 补跑实证缺口）。
+    let outs: Vec<(&&crate::state::CellInput, Result<crate::provider::LensCall, crate::provider::ProviderError>, std::time::Duration)> =
+        futures::future::join_all(pending.iter().map(|cell| async move {
+            let t0 = std::time::Instant::now();
+            let req = LensRequest { route_key: cell.model.clone(), prompt: cell.prompt.clone() };
+            (cell, provider.run(req).await, t0.elapsed())
+        }))
+        .await;
+    for (cell, outcome, elapsed) in outs {
+        let rec = match outcome {
             Ok(call) => {
                 usage.0 += call.input_tokens;
                 usage.1 += call.output_tokens; usage.2 += call.cached_input_tokens;
                 let fs: Vec<Finding> =
                     call.findings.iter().map(|r| enrich(r, &cell.model)).collect();
-                crate::state::CellRecord::ok(cell.cell.clone(), cell.model.clone(), fs)
+                // 指标随落盘：duration/usage/iterations 来自胜出 call（与 fanout 侧 CellSink 同构）。
+                crate::state::CellRecord {
+                    cell: cell.cell.clone(), model: cell.model.clone(), ok: true,
+                    findings: fs, warn: None,
+                    duration_ms: elapsed.as_millis() as u64,
+                    input_tokens: call.input_tokens, output_tokens: call.output_tokens,
+                    cached_input_tokens: call.cached_input_tokens,
+                    attempts: 1, iterations: call.iterations,
+                    tool_use: call.tool_use.clone(),
+                }
             }
             Err(e) => {
                 warnings.push(format!("resume cell [{}] model {}: {e}", cell.cell, cell.model));
                 crate::state::CellRecord {
                     cell: cell.cell.clone(), model: cell.model.clone(), ok: false,
                     findings: vec![], warn: Some(e.to_string()),
-                    duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 1, iterations: 0,
+                    duration_ms: elapsed.as_millis() as u64,
+                    input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 1, iterations: 0,
                     tool_use: Default::default(),
                 }
             }
@@ -613,6 +652,19 @@ pub async fn run_resume(
     };
     match assemble_report(findings, ctx).await {
         Ok((mut report, mut code)) => {
+            attach_cells(store, job_id, &mut report);
+            // 回写 proj.db：resume 产出的合并报告（含新补 cell 的 findings/agreement）必须
+            // 覆盖 fanout 原始落盘——否则 result 命令永远返回旧报告、补齐的 findings 取不回
+            // （2026-09-03 PR181 实证：stdout 8 findings vs result 6 findings）。终态字段
+            // （status/exit_code）不动：作业仍 Done，变的只是报告内容。
+            let json = crate::output::render(&report, crate::output::Format::Json);
+            let md = crate::output::render(&report, crate::output::Format::Md);
+            if let Err(e) = store.write_result(job_id, &json) {
+                eprintln!("warn: job {job_id} resume write_result 失败: {e}");
+            }
+            if let Err(e) = store.write_result_md(job_id, &md) {
+                eprintln!("warn: job {job_id} resume write_result_md 失败: {e}");
+            }
             if still_missing > 0 {
                 report.verdict = Verdict::Incomplete;
                 report.run.warnings.push(format!("resume: {still_missing} cell(s) still missing after replay"));
@@ -634,8 +686,10 @@ fn write_partial_result(
     code: i32,
     error: String,
 ) {
-    let json = crate::output::render(report, crate::output::Format::Json);
-    let md = crate::output::render(report, crate::output::Format::Md);
+    let mut report = report.clone();
+    attach_cells(store, job_id, &mut report);
+    let json = crate::output::render(&report, crate::output::Format::Json);
+    let md = crate::output::render(&report, crate::output::Format::Md);
     // ③级终态写：失败必响（design §4）——result/result_md/终态任一落盘失败都不该被静默吞掉，
     // 否则 status/result 命令会永远看不到这份部分报告，且查无踪迹。
     if let Err(e) = store.write_result(job_id, &json) {
@@ -750,6 +804,7 @@ pub async fn run_job(
             // run.job_id 是消费者的自证 id（r1 20260703 实证恒空串）。
             report.run.job_id = job_id.to_string();
             append_ckpt_failure_warning(&mut report, job_id, ckpt_failures);
+            attach_cells(&store, job_id, &mut report);
             // 同渲染 json + md 落盘（result 命令按 format 直读，避免反序列化 report 图）。
             let json = crate::output::render(&report, crate::output::Format::Json);
             let md = crate::output::render(&report, crate::output::Format::Md);
@@ -1490,6 +1545,13 @@ mod resume_tests {
         drop(calls);
 
         assert_eq!(report.findings.len(), 3, "合并后应含 3 个 cell 的 findings（1 已完成 + 2 新补）");
+
+        // 回写锚：resume 合并报告必须覆盖 proj.db 落盘——否则 result 命令永远返回 fanout
+        // 原始报告，补齐的 findings 取不回（2026-09-03 PR181 实证）。md 同步。
+        let stored = store.read_result("j").expect("resume 后 result 必须可取且含新报告");
+        let parsed: ReviewReport = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed.findings.len(), 3, "proj.db 里的报告应为合并后的 3 findings");
+        assert!(store.read_result_md("j").unwrap().contains("issue-c1"), "md 快照同步回写");
     }
 
     /// final-review Important 回归：replicate 模式（同 cell 多 model 副本）manifest 的

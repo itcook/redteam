@@ -103,6 +103,26 @@ fn render_md(r: &ReviewReport) -> String {
     if let Some(l) = &r.run.ledger {
         s.push_str(&format!("  | Ledger        | {} card(s) from {} |\n", l.loaded, l.source));
     }
+    // T55（cell 级可观测）：per-model 运行摘要——耗时/轮次（>1=有 repair/多轮）/用量一眼可见，
+    // 不必再手查 proj.db。旧报告无此数据（serde default 空）不渲染。
+    if !r.run.cells.is_empty() {
+        s.push_str("\n- Cells\n\n");
+        s.push_str("  | Model | Status | Iter | Duration | In | Out |\n");
+        s.push_str("  | --- | --- | --- | --- | --- | --- |\n");
+        for c in &r.run.cells {
+            let st = if c.ok { "✓" } else { "✗" };
+            let att = if c.attempts > 1 { format!(" ({} att)", c.attempts) } else { String::new() };
+            s.push_str(&format!(
+                "  | {} | {st} | {}{} | {} | {} | {} |\n",
+                c.model,
+                c.iterations,
+                att,
+                fmt_duration(c.duration_ms),
+                human_tokens(c.input_tokens),
+                human_tokens(c.output_tokens),
+            ));
+        }
+    }
     // M13 增量轮注记（R5 决议：carried/new 终态语义住 result/rN.md，不进 status）。
     if r.run.incremental {
         let base = r.run.delta_base.as_deref().unwrap_or("?");

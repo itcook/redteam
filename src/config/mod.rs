@@ -54,6 +54,21 @@ pub struct ProviderConfig {
     /// （design 2026-07-13 §2.2）；确知更大窗的模型在此声明以解锁完整字节帽。
     #[serde(default)]
     pub context_window_tokens: Option<u32>,
+    /// 单轮超时（秒），per-provider 覆盖全局——慢速模型（30 tok/s 级输出）在大 max_tokens
+    /// （32K）下单轮需 1100s+，全局一个值对速度差 2 倍的模型必然顾此失彼（2026-09-03
+    /// PR181 实证：Kimi 3×600s 全超时系结构性不足而非抖动）。优先级：本字段 >
+    /// REDTEAM_PER_TURN_SECS env > 150s 默认。建议按 max_tokens÷模型最低 tok/s+prefill 余量。
+    #[serde(default)]
+    pub per_turn_timeout_secs: Option<u64>,
+}
+
+impl ProviderConfig {
+    /// 本 provider 的单轮 deadline：per_turn_timeout_secs > env REDTEAM_PER_TURN_SECS > 150s。
+    pub fn per_turn(&self) -> std::time::Duration {
+        self.per_turn_timeout_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(crate::provider::per_turn_deadline)
+    }
 }
 
 /// 评审工具档位（design 2026-07-13 §2.4，E8 裁决 A）：off=单发单轮无工具；two-stage

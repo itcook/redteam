@@ -363,7 +363,12 @@ fn resolve_result(
         }
         return match store.read_result(job_id) {
             Some(json) => match serde_json::from_str::<redteam::domain::ReviewReport>(&json) {
-                Ok(report) => Ok(render(&report, redteam::output::Format::Md)),
+                Ok(mut report) => {
+                    // md 快照缺失时的现算路径：从同库 cells 表补 per-cell 摘要（与终态
+                    // 落盘时 attach 同源，旧作业 json 无此字段时补回）。
+                    redteam::cli::attach_cells(store, job_id, &mut report);
+                    Ok(render(&report, redteam::output::Format::Md))
+                }
                 Err(e) => Err((format!("result for {job_id} 解析失败，无法渲染 md: {e}"), 1)),
             },
             None if st.status == JobStatus::Done => Err((format!("result missing for {job_id}"), 1)),
@@ -410,9 +415,14 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
                 return Err(format!("{e}"));
             }
         };
+        // per-provider 单轮超时：慢速模型（30 tok/s 级）在 32K max_tokens 下结构性需要
+        // 1100s+/轮——config 声明值 > 全局 env > 150s 默认（2026-09-03 PR181 Kimi 实证）。
+        let per_turn = pc.per_turn();
         let provider: Box<dyn redteam::provider::ReviewProvider> = match tools_mode {
-            redteam::config::ToolsMode::On => Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf())),
-            _ => Box::new(SingleShotProvider::new(backend)),
+            redteam::config::ToolsMode::On => {
+                Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf()).with_per_turn(per_turn))
+            }
+            _ => Box::new(SingleShotProvider::new(backend).with_per_turn(per_turn)),
         };
         registry.insert(pm.name.clone(), provider);
     }

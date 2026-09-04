@@ -8,7 +8,25 @@ use serde_json::{json, Value};
 
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
-const MAX_TOKENS: u64 = 8192;
+/// 单轮输出上限（仅 anthropic 协议必填 max_tokens 时注入；openai body 不传、走模型默认）。
+/// 思考型模型的 thinking tokens 也计入此额度，8192 旧值在大 bundle 评审下会被截断
+/// （finish_reason=max_tokens，findings JSON 解析失败，2026-09-03 dogfood 实证）。
+/// env `REDTEAM_MAX_TOKENS` 可覆盖，对齐 REDTEAM_HTTP_TIMEOUT_SECS/per_turn 旋钮先例。
+const MAX_TOKENS: u64 = 32768;
+
+fn max_tokens() -> u64 {
+    match std::env::var("REDTEAM_MAX_TOKENS") {
+        Ok(s) => match s.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                // F4：静默回落会让运维误以为旋钮已生效，复发时被迫活体复现调试。
+                eprintln!("warning: REDTEAM_MAX_TOKENS={s:?} 非法（需正整数），回落默认 {MAX_TOKENS}");
+                MAX_TOKENS
+            }
+        },
+        Err(_) => MAX_TOKENS,
+    }
+}
 
 /// 把 provider 无关的 messages 渲染成 Anthropic Messages API 请求体。
 /// system 提到顶层；tool_use / tool_result 用 content 块表达。
@@ -79,7 +97,152 @@ pub(crate) fn build_anthropic_tools_body(
         }
     }
     body.insert("messages".into(), json!(msgs));
+    // 流式：与 OpenAI backend 同理——非 stream 长思考期连接静默，被隧道/网关当空闲 reset、
+    // 或撞 Cloudflare 524（~100s 无首字节，2026-09-03 GLM/Kimi dogfood 实证）。stream 让服务器
+    // 随 token 增量发、reqwest 随到达消费 → 连接持续活跃。Anthropic 协议无 stream_options；
+    // usage 由 message_start（input/cache 分列）/message_delta（output）事件携带。
+    body.insert("stream".into(), json!(true));
     Value::Object(body)
+}
+
+/// body 是否星 SSE 形态：任意行**行首** `data:`（trim 后）。行首锚定比子串 `contains`
+/// 强得多——JSON 值里的 `"data": `、YAML 键、代码引文都不会裸置行首，免疫 F1 误路由。
+pub(crate) fn looks_like_sse(body: &str) -> bool {
+    body.lines().any(|l| l.trim_start().starts_with("data:"))
+}
+
+/// SSE 帧内 error 事件探测（D1 延续）：只扫行首 `data:` 行里 `type=="error"` 的事件，
+/// 复用 `error_body_to_provider_error` 语义分类（Anthropic error 形状 `{"type":"error","error":{...}}`
+/// 与 OpenAI 形状共享顶层 `error` 对象）。非 SSE 整体错误体由 turn 层「整体 JSON 优先」
+/// 分支消化（F1）。正常流（无 error 事件）→ None 不干预。
+fn sse_error_event(body: &str) -> Option<ProviderError> {
+    body.lines()
+        .filter_map(|l| l.trim_start().strip_prefix("data:"))
+        .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+        .filter(|v| v.get("type").and_then(Value::as_str) == Some("error"))
+        .find_map(|v| error_body_to_provider_error(&v))
+}
+
+/// 累积 Anthropic 流式（SSE）响应为一轮 AssistantTurn：`text_delta` 拼接、按 content_block
+/// index 聚合 tool_use（id/name 由 block_start 首现即取、`input_json_delta.partial_json` 逐片
+/// 拼接后整体 from_str）、usage 取 message_start（input/cache 分列，归一加回合成总输入）与
+/// message_delta（stop_reason/output 末现优先）。`thinking_delta` 不计入输出。
+/// 非 SSE 回退：端点忽略 `stream` 直接返完整 JSON 对象时按非流式解析。
+/// 与 OpenAI 版同假设：一 `data:` 行一 JSON 事件。
+pub(crate) fn parse_anthropic_stream(body: &str) -> Option<AssistantTurn> {
+    // 回退：非 SSE（端点无视 stream）→ 当完整 JSON 对象解析。行首锚定（F1）而非子串。
+    if !looks_like_sse(body) {
+        if let Ok(v) = serde_json::from_str::<Value>(body) {
+            return parse_anthropic_turn(&v);
+        }
+    }
+    let mut text = String::new();
+    // content_block index -> (tool id, tool name, partial_json 拼接)
+    let mut frags: std::collections::BTreeMap<u64, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    let mut finish_reason: Option<String> = None;
+    let mut input_tokens = 0u64;
+    let mut cache_read = 0u64;
+    let mut cache_creation = 0u64;
+    let mut output_tokens = 0u64;
+    let mut saw_event = false;
+    for line in body.lines() {
+        let data = match line.trim().strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        let chunk: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue, // ping/心跳/空白——跳过
+        };
+        saw_event = true;
+        match chunk.get("type").and_then(Value::as_str) {
+            // 官方流仅一个 message_start，携带完整 input/cache 分列 usage
+            Some("message_start") => {
+                let u = &chunk["message"]["usage"];
+                input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
+                cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                cache_creation = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            }
+            Some("content_block_start") => {
+                // tool_use 块：id/name 首现即取（block_start 携带，input 恒为空对象）
+                if chunk["content_block"]["type"].as_str() == Some("tool_use") {
+                    let e = frags.entry(chunk["index"].as_u64().unwrap_or(0)).or_default();
+                    if let Some(id) = chunk["content_block"]["id"].as_str() {
+                        if !id.is_empty() {
+                            e.0 = id.to_string();
+                        }
+                    }
+                    if let Some(n) = chunk["content_block"]["name"].as_str() {
+                        if !n.is_empty() {
+                            e.1 = n.to_string();
+                        }
+                    }
+                }
+            }
+            Some("content_block_delta") => {
+                let idx = chunk["index"].as_u64().unwrap_or(0);
+                let d = &chunk["delta"];
+                match d.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(t) = d.get("text").and_then(Value::as_str) {
+                            text.push_str(t);
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(p) = d.get("partial_json").and_then(Value::as_str) {
+                            frags.entry(idx).or_default().2.push_str(p);
+                        }
+                    }
+                    _ => {} // thinking_delta 等不计入输出
+                }
+            }
+            // 末现优先：stop_reason 与累积 output_tokens 官方由 message_delta 携带
+            Some("message_delta") => {
+                if let Some(fr) = chunk["delta"]["stop_reason"].as_str() {
+                    finish_reason = Some(fr.to_string());
+                }
+                if let Some(o) = chunk["usage"]["output_tokens"].as_u64() {
+                    output_tokens = o;
+                }
+            }
+            _ => {} // message_stop/ping/error（turn 层先行探测）等
+        }
+    }
+    if !saw_event {
+        return None; // 无一事件解析成功 → 让上层判 Parse/Unavailable
+    }
+    let mut malformed_tool_args = false;
+    let tool_calls: Vec<ToolCall> = frags
+        .into_values()
+        .filter(|(_, name, _)| !name.is_empty())
+        .map(|(id, name, args)| {
+            // 空 args = 无参调用合法落 {}；非空但解析失败 = 流/输出不完整（F2）——
+            // 不静默吞成 {} 让工具带空参跑垃圾，置 malformed 传导给 turn 层按截断处理。
+            let args = if args.is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&args).unwrap_or_else(|_| {
+                    malformed_tool_args = true;
+                    json!({})
+                })
+            };
+            ToolCall { id, name, args }
+        })
+        .collect();
+    // 截断/畸形传导（F2）：turn 层见 finish_reason=None → Unavailable 可重试；
+    // 宁可重试不烧格（与 error_body_to_provider_error 未知类型归 Unavailable 同哲学）。
+    let finish_reason = if malformed_tool_args { None } else { finish_reason };
+    // 与 parse_anthropic_turn 同归一：input_tokens 是「未缓存新输入」，加回 cache 分列合成「总输入」
+    let input_tokens = input_tokens + cache_read + cache_creation;
+    Some(AssistantTurn {
+        text,
+        tool_calls,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens: cache_read,
+        finish_reason,
+    })
 }
 
 /// 从 Anthropic 响应抽取这一轮：text 块拼接 + tool_use 块 → ToolCall；usage 取不到则 0。
@@ -139,26 +302,56 @@ impl ChatBackend for AnthropicBackend {
     ) -> Result<AssistantTurn, ProviderError> {
         let base = self.base_url.as_deref().unwrap_or(ANTHROPIC_DEFAULT_BASE);
         let url = super::anthropic_messages_url(base);
-        let body = build_anthropic_tools_body(&self.model, messages, tools, MAX_TOKENS);
-        let resp: Value = super::decode_json(
-            super::send_classified(
-                self.client
-                    .post(&url)
-                    .header("x-api-key", &self.api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json")
-                    .json(&body),
-            )
-            .await?,
+        let body = build_anthropic_tools_body(&self.model, messages, tools, max_tokens());
+        let resp = super::send_classified(
+            self.client
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body),
         )
-        .await?; // envelope 非法 JSON → Unavailable（可重试）；内容形状问题才是 Parse
-        // D1：网关有时在 HTTP 200 里塞 error 体（`{"type":"error","error":{...}}`）——parse 前先探，
-        // 按语义分类而非一律 Parse 烧格。
-        if let Some(e) = error_body_to_provider_error(&resp) {
-            return Err(e);
+        .await?;
+        // 读 SSE 全文（随到达消费）：reqwest 持续读 socket → 连接持续活跃，网关/隧道不当空闲
+        // reset、不撞 524（与 OpenAiBackend::post 同构）。中途断流 → Unavailable（可重试）。
+        let sse = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Unavailable(format!("stream body read failed for {url}: {e}")))?;
+        if sse.trim().is_empty() {
+            // 空体（keep-alive/上游放弃）→ 可重试，勿误判 Parse 烧格
+            return Err(ProviderError::Unavailable(format!("empty stream body for {url}")));
         }
-        parse_anthropic_turn(&resp)
-            .ok_or_else(|| ProviderError::Parse("anthropic response missing content".into()))
+        // 三层分流（F1：整体 JSON 优先，免疫「正文含 data: 子串的 JSON 被误路由到 SSE
+        // 解析器 → saw_event=false → 误判不可重试 Parse 烧 cell」）：
+        // 层1 整体 JSON（端点无视 stream 的完整响应、200-内-error 体、含 data: 子串的 JSON）
+        // 层2 SSE 流（行首 data: 锚定）
+        // 层3 兜底 envelope（HTML 网关页等非法 JSON → Unavailable 带 preview 可重试）
+        if let Ok(v) = serde_json::from_str::<Value>(sse.trim()) {
+            if let Some(e) = error_body_to_provider_error(&v) {
+                return Err(e);
+            }
+            return parse_anthropic_turn(&v)
+                .ok_or_else(|| ProviderError::Parse("anthropic response missing content".into()));
+        }
+        if looks_like_sse(&sse) {
+            // SSE 帧：先探帧内 error 事件（D1 的流式版），再聚合事件流。
+            if let Some(e) = sse_error_event(&sse) {
+                return Err(e);
+            }
+            let t = parse_anthropic_stream(&sse)
+                .ok_or_else(|| ProviderError::Parse("anthropic stream missing content".into()))?;
+            // F2 完整性门：finish_reason None = message_delta 未达（流中途断/网关放弃）
+            // 或 tool args 畸形（parse 内传导）→ 按传输层不完整走可重试 Unavailable，
+            // 不把半截产出当完整轮烧成 Parse——repair 轮救不了断流，重试才救得了。
+            if t.finish_reason.is_none() {
+                return Err(ProviderError::Unavailable(format!(
+                    "truncated anthropic stream for {url}: no finish_reason"
+                )));
+            }
+            return Ok(t);
+        }
+        Err(super::parse_envelope_json(&sse, &url).unwrap_err())
     }
 }
 
@@ -230,6 +423,10 @@ pub(crate) fn build_openai_tools_body(
     // 空闲 reset（非 stream 长思考期连接静默 = 被 reset/超时的根因）。include_usage 让末块带 usage。
     body.insert("stream".into(), json!(true));
     body.insert("stream_options".into(), json!({ "include_usage": true }));
+    // 显式 max_tokens：不传时兼容网关会注入自己的默认上限（api.aigocode.team 实测不够，
+    // 大 bundle 评审被截成 finish_reason=max_tokens，findings JSON 解析失败——2026-09-03
+    // PR181 dogfood 实证）。与 anthropic 路径同一旋钮（REDTEAM_MAX_TOKENS，默认 32768）。
+    body.insert("max_tokens".into(), json!(max_tokens()));
     Value::Object(body)
 }
 
@@ -272,8 +469,8 @@ pub(crate) fn parse_openai_turn(resp: &Value) -> Option<AssistantTurn> {
 /// 非 SSE 回退：端点忽略 `stream` 直接返完整 JSON 对象时按非流式解析。
 /// 假设 OpenAI 风格「一 `data:` 行一 JSON chunk」（多行 data 字段不支持，各家实测未用）。
 pub(crate) fn parse_openai_stream(body: &str) -> Option<AssistantTurn> {
-    // 回退：非 SSE（端点无视 stream）→ 当完整 JSON 对象解析。
-    if !body.contains("data:") {
+    // 回退：非 SSE（端点无视 stream）→ 当完整 JSON 对象解析。行首锚定（F1）而非子串。
+    if !looks_like_sse(body) {
         if let Ok(v) = serde_json::from_str::<Value>(body) {
             return parse_openai_turn(&v);
         }
@@ -395,20 +592,22 @@ impl OpenAiBackend {
             // 空体（keep-alive/上游放弃）→ 可重试，勿误判 Parse 烧格
             return Err(ProviderError::Unavailable(format!("empty stream body for {url}")));
         }
-        // D1：网关把错误塞进 HTTP 200 body 时走的正是这条「非 SSE、整体纯 JSON」路径——
-        // `parse_openai_stream` 内部回落分支（`!body.contains("data:")`）与此处判定同一条件，
-        // 在其解析前先探 error 形状，避免回落分支拿到 error 体、`parse_openai_turn` 因无
-        // `choices` 返回 `None`、最终误判 `Parse`（不可重试烧格）。SSE 帧内 error 事件不做
-        // （design 明确不强求）。
-        if !sse.contains("data:") {
-            if let Ok(v) = serde_json::from_str::<Value>(&sse) {
-                if let Some(e) = error_body_to_provider_error(&v) {
-                    return Err(e);
-                }
+        // 三层分流（F1 镜像 anthropic 侧）：层1 整体 JSON 优先——error 体、无视 stream 的
+        // 网关、以及正文含 data: 子串的 JSON（旧 `!sse.contains("data:")` 子串判定会把它误
+        // 路由到 SSE 解析器烧 cell）都在此层消化；层2 行首 data: 锚定的 SSE；层3 envelope 兜底。
+        if let Ok(v) = serde_json::from_str::<Value>(sse.trim()) {
+            // D1：网关把错误塞进 HTTP 200 body——在 parse 前探 error 形状，避免误判 Parse 烧格。
+            if let Some(e) = error_body_to_provider_error(&v) {
+                return Err(e);
             }
+            return parse_openai_turn(&v)
+                .ok_or_else(|| ProviderError::Parse("openai response missing choices".into()));
         }
-        parse_openai_stream(&sse)
-            .ok_or_else(|| ProviderError::Parse("openai stream missing choices".into()))
+        if looks_like_sse(&sse) {
+            return parse_openai_stream(&sse)
+                .ok_or_else(|| ProviderError::Parse("openai stream missing choices".into()));
+        }
+        Err(super::parse_envelope_json(&sse, &url).unwrap_err())
     }
 }
 
@@ -651,6 +850,104 @@ data: [DONE]\n";
     }
 
     #[test]
+    fn anthropic_body_requests_stream() {
+        let msgs = vec![ChatMessage::User("hi".into())];
+        let b = build_anthropic_tools_body("claude-x", &msgs, &specs(), MAX_TOKENS);
+        assert_eq!(b["stream"], true, "anthropic body 应流式（保连接活跃）");
+    }
+
+    #[test]
+    fn anthropic_stream_accumulates_text_tooluse_usage() {
+        // 官方事件序：message_start(input/cache 分列) → text 分片 → tool_use 块 + partial_json 分片
+        // → thinking_delta(忽略) → message_delta(stop_reason + output) → message_stop
+        let sse = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":10}}}\n\
+\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\
+\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_files\",\"input\":{}}}\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pa\"}}\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ths\\\":[]}\"}}\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"noise\"}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":42}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n";
+        let t = parse_anthropic_stream(sse).unwrap();
+        assert_eq!(t.text, "hello");
+        assert_eq!(t.tool_calls.len(), 1);
+        assert_eq!(t.tool_calls[0].id, "toolu_1");
+        assert_eq!(t.tool_calls[0].name, "read_files");
+        assert_eq!(t.tool_calls[0].args["paths"], json!([]));
+        assert_eq!(t.input_tokens, 110, "input 需加回 cache 分列（20+80+10）");
+        assert_eq!(t.output_tokens, 42);
+        assert_eq!(t.cached_input_tokens, 80);
+        assert_eq!(t.finish_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn anthropic_stream_falls_back_to_nonstream_json() {
+        // 端点无视 stream 直接返完整 JSON 对象 → 按非流式解析
+        let body = "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}";
+        let t = parse_anthropic_stream(body).unwrap();
+        assert_eq!(t.text, "hi");
+        assert_eq!(t.finish_reason.as_deref(), Some("end_turn"));
+        assert_eq!(t.input_tokens, 5);
+    }
+
+    #[test]
+    fn anthropic_sse_error_event_classified() {
+        // SSE 帧 error 事件 → 语义分类（overloaded → RateLimited），不 Parse 烧格
+        let sse = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
+        assert!(matches!(sse_error_event(sse), Some(ProviderError::RateLimited { .. })));
+        // 正常流（无 error 事件）→ None 不干预
+        let ok = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}";
+        assert!(sse_error_event(ok).is_none());
+        // 非 SSE 整体 JSON（含 error 体）不归此函数——turn 层「整体 JSON 优先」分支管（F1）
+        let whole_json = "{\"type\":\"error\",\"error\":{\"type\":\"timeout\",\"message\":\"upstream\"}}";
+        assert!(sse_error_event(whole_json).is_none());
+    }
+
+    #[test]
+    fn json_body_with_data_substring_routes_to_json_not_sse() {
+        // F1 核心：正文里含 "data:" 子串（YAML 键/代码引文/findings 引文）的完整 JSON
+        // 响应不得被子串判定误路由进 SSE 解析器——行首锚定 + 整体 JSON 优先双保险。
+        let json_with_sub = "{\"content\":[{\"type\":\"text\",\"text\":\"see data: below in yaml\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}";
+        assert!(!looks_like_sse(json_with_sub), "子串不在行首 → 不应判为 SSE");
+        let t = parse_anthropic_stream(json_with_sub).unwrap();
+        assert_eq!(t.text, "see data: below in yaml");
+        let t2 = parse_openai_stream(
+            "{\"choices\":[{\"message\":{\"content\":\"key data: here\"},\"finish_reason\":\"stop\"}]}",
+        )
+        .unwrap();
+        assert_eq!(t2.text, "key data: here");
+        // 真 SSE：行首 data: 锚定
+        assert!(looks_like_sse("data: {\"type\":\"message_start\"}\n\n"));
+        assert!(looks_like_sse("event: x\n  data: {\"a\":1}\n"), "行首空白容忍");
+    }
+
+    #[test]
+    fn anthropic_stream_malformed_tool_args_flags_truncation() {
+        // F2：流「完整」（message_delta 到达）但 tool args 拼接非合法 JSON → 不静默落 {}
+        // 跑垃圾，而是置 finish_reason=None 传导给 turn 层按截断走可重试。
+        let sse = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read_files\",\"input\":{}}}\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pat\"}}\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n";
+        let t = parse_anthropic_stream(sse).unwrap();
+        assert_eq!(t.tool_calls.len(), 1);
+        assert_eq!(t.tool_calls[0].args, json!({}), "畸形 args 仍落空对象（不跑垃圾靠门拦截）");
+        assert!(t.finish_reason.is_none(), "畸形 args 必须传导为 None 供 turn 层判截断");
+    }
+
+    #[test]
     fn parse_openai_stream_falls_back_to_nonstream_json() {
         // 端点无视 stream 直接返完整 JSON 对象 → 按非流式解析
         let json = "{\"choices\":[{\"message\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}";
@@ -805,11 +1102,13 @@ data: [DONE]\n";
         let anth = ProviderConfig {
             kind: ProviderKind::Anthropic, model: "m".into(),
             base_url: None, api_key_env: None, priority: 0, context_window_tokens: None,
+            per_turn_timeout_secs: None,
         };
         assert!(backend_from_config(&anth, "k".into()).is_ok());
         let goog = ProviderConfig {
             kind: ProviderKind::Google, model: "m".into(),
             base_url: None, api_key_env: None, priority: 0, context_window_tokens: None,
+            per_turn_timeout_secs: None,
         };
         assert!(matches!(
             backend_from_config(&goog, "k".into()),

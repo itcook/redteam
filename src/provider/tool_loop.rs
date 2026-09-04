@@ -219,9 +219,15 @@ impl ToolLoopProvider {
             executor: ToolExecutor::new(root),
             system: DEFAULT_SYSTEM.to_string(),
             max_iters: DEFAULT_MAX_ITERS,
-            per_turn: crate::provider::PER_TURN_DEADLINE,
+            per_turn: crate::provider::per_turn_deadline(),
             retry_budget: crate::provider::DEFAULT_RETRY_BUDGET,
         }
+    }
+
+    /// per-provider 单轮超时覆盖（config [providers.X].per_turn_timeout_secs）。
+    pub fn with_per_turn(mut self, d: std::time::Duration) -> Self {
+        self.per_turn = d;
+        self
     }
 }
 

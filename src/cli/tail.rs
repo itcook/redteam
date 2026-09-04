@@ -192,6 +192,7 @@ pub(crate) async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>
             needs: crate::domain::NeedsMeta {
                 triggered_cells: ctx.needs_stats.0, declared: ctx.needs_stats.1,
             },
+            cells: vec![],
             incremental,
             delta_base,
             resolved,

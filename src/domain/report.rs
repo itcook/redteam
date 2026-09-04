@@ -73,6 +73,21 @@ pub struct DossierMeta {
     pub injected: usize,      // 拿到非空卷宗的 bundle 数（其余=不支持语言/无符号/调用密度门<5）
 }
 
+/// 单 cell 运行摘要（诊断呈现：per-model 耗时/轮次/重试/用量）——result 时从 proj.db
+/// cells 表回填。旧报告 JSON 无此字段（serde default 空数组），向后兼容。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CellSummary {
+    pub model: String,
+    pub ok: bool,
+    /// 胜出 call 的 tool-loop 迭代数（单发单收=1；>1=有 repair/多轮）。
+    pub iterations: u32,
+    /// 候补链实际尝试的 model 数（成功=第几家成功；整链失败=链长）。
+    pub attempts: u32,
+    pub duration_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RunMeta {
     pub job_id: String,
@@ -116,6 +131,9 @@ pub struct RunMeta {
     /// 二阶段补查触发率（E8-E 指标）：恒写、零也写；serde default 兼容旧 JSON。
     #[serde(default)]
     pub needs: NeedsMeta,
+    /// per-cell 运行摘要（诊断呈现）。旧 JSON 无此字段，反序列化回空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<CellSummary>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
