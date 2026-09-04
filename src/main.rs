@@ -402,22 +402,28 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
 
     let mut registry = ProviderRegistry::new();
     for pm in &planned {
-        let pc = match cfg.providers.get(&pm.name) {
-            Some(p) => p.clone(),
+        let em = match cfg.effective_model(&pm.name) {
+            Some(e) => e,
             None => {
-                return Err(format!("model '{}' has no [providers.{}] config", pm.name, pm.name));
+                return Err(format!(
+                    "model '{}' has no [models.{}] config (provider/model 已分离，09-04)",
+                    pm.name, pm.name
+                ));
             }
         };
         let key = cfg.resolve_key(&pm.name).unwrap_or_default();
-        let backend = match backend_from_config(&pc, key) {
+        let backend = match backend_from_config(&em, key) {
             Ok(b) => b,
             Err(e) => {
                 return Err(format!("{e}"));
             }
         };
-        // per-provider 单轮超时：慢速模型（30 tok/s 级）在 32K max_tokens 下结构性需要
-        // 1100s+/轮——config 声明值 > 全局 env > 150s 默认（2026-09-03 PR181 Kimi 实证）。
-        let per_turn = pc.per_turn();
+        // per-model 单轮超时：慢速模型（30 tok/s 级）在 32K max_tokens 下结构性需要
+        // 1100s+/轮——model 级声明 > 全局 env > 150s 默认（2026-09-03 PR181 Kimi 实证）。
+        let per_turn = em
+            .per_turn_timeout_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(redteam::provider::per_turn_deadline);
         let provider: Box<dyn redteam::provider::ReviewProvider> = match tools_mode {
             redteam::config::ToolsMode::On => {
                 Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf()).with_per_turn(per_turn))
@@ -842,8 +848,10 @@ async fn main() {
                     "1M" => 1_000_000,
                     _ => unreachable!("clap value_parser 已限值域"),
                 });
-                if let Err(e) = redteam::config::write_provider(
-                    &provider, k.as_str(), base_url.as_deref(), &model, prio, Some(&api_key_env), ctx_tokens,
+                // 09-04 分离形状：[providers.<name>] + [models.<name>]（同名起步；
+                // setup 交互式化时再让用户分别命名）。
+                if let Err(e) = redteam::config::write_model(
+                    &provider, &provider, k.as_str(), base_url.as_deref(), &model, Some(&api_key_env), ctx_tokens,
                 ) {
                     eprintln!("error: failed to write provider config: {e}");
                     std::process::exit(1);
@@ -852,7 +860,7 @@ async fn main() {
                 match key_store.as_str() {
                     "secrets" => match key {
                         Some(k) => {
-                            if let Err(e) = redteam::config::secrets::write_secret(&provider, &k) {
+                            if let Err(e) = redteam::config::secrets::write_secret(&provider, &model, &k) {
                                 eprintln!("error: failed to write secret: {e}");
                                 std::process::exit(1);
                             }

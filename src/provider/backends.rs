@@ -284,12 +284,20 @@ pub struct AnthropicBackend {
     model: String,
     base_url: Option<String>,
     api_key: String,
+    /// model 级输出上限（[models.X].output_limit）；None → env/默认链。
+    output_limit: Option<u64>,
     client: reqwest::Client,
 }
 
 impl AnthropicBackend {
     pub fn new(model: String, base_url: Option<String>, api_key: String) -> Self {
-        AnthropicBackend { model, base_url, api_key, client: crate::provider::default_http_client() }
+        AnthropicBackend { model, base_url, api_key, output_limit: None, client: crate::provider::default_http_client() }
+    }
+
+    /// [models.X].output_limit 注入（优先于 REDTEAM_MAX_TOKENS env 与默认）。
+    pub fn with_max_tokens(mut self, limit: Option<u64>) -> Self {
+        self.output_limit = limit;
+        self
     }
 }
 
@@ -302,7 +310,7 @@ impl ChatBackend for AnthropicBackend {
     ) -> Result<AssistantTurn, ProviderError> {
         let base = self.base_url.as_deref().unwrap_or(ANTHROPIC_DEFAULT_BASE);
         let url = super::anthropic_messages_url(base);
-        let body = build_anthropic_tools_body(&self.model, messages, tools, max_tokens());
+        let body = build_anthropic_tools_body(&self.model, messages, tools, self.output_limit.unwrap_or_else(max_tokens));
         let resp = super::send_classified(
             self.client
                 .post(&url)
@@ -362,6 +370,7 @@ pub(crate) fn build_openai_tools_body(
     messages: &[ChatMessage],
     tools: &[ToolSpec],
     json_mode: bool,
+    output_limit: Option<u64>,
 ) -> Value {
     let mut msgs: Vec<Value> = Vec::new();
     for m in messages {
@@ -426,7 +435,7 @@ pub(crate) fn build_openai_tools_body(
     // 显式 max_tokens：不传时兼容网关会注入自己的默认上限（api.aigocode.team 实测不够，
     // 大 bundle 评审被截成 finish_reason=max_tokens，findings JSON 解析失败——2026-09-03
     // PR181 dogfood 实证）。与 anthropic 路径同一旋钮（REDTEAM_MAX_TOKENS，默认 32768）。
-    body.insert("max_tokens".into(), json!(max_tokens()));
+    body.insert("max_tokens".into(), json!(output_limit.unwrap_or_else(max_tokens)));
     Value::Object(body)
 }
 
@@ -561,12 +570,20 @@ pub struct OpenAiBackend {
     model: String,
     base_url: Option<String>,
     api_key: String,
+    /// model 级输出上限（[models.X].output_limit）；None → env/默认链。
+    output_limit: Option<u64>,
     client: reqwest::Client,
 }
 
 impl OpenAiBackend {
     pub fn new(model: String, base_url: Option<String>, api_key: String) -> Self {
-        OpenAiBackend { model, base_url, api_key, client: crate::provider::default_http_client() }
+        OpenAiBackend { model, base_url, api_key, output_limit: None, client: crate::provider::default_http_client() }
+    }
+
+    /// [models.X].output_limit 注入（优先于 REDTEAM_MAX_TOKENS env 与默认）。
+    pub fn with_max_tokens(mut self, limit: Option<u64>) -> Self {
+        self.output_limit = limit;
+        self
     }
 
     /// 共享 HTTP 发送：POST {base}/chat/completions（流式），累积 SSE 解析这一轮输出。
@@ -619,7 +636,7 @@ impl ChatBackend for OpenAiBackend {
         tools: &[ToolSpec],
     ) -> Result<AssistantTurn, ProviderError> {
         // 探索轮：带 tools、不强制 JSON（保留 function calling）。
-        let body = build_openai_tools_body(&self.model, messages, tools, false);
+        let body = build_openai_tools_body(&self.model, messages, tools, false, self.output_limit);
         self.post(&body).await
     }
 
@@ -628,27 +645,30 @@ impl ChatBackend for OpenAiBackend {
         messages: &[ChatMessage],
     ) -> Result<AssistantTurn, ProviderError> {
         // 收尾轮：不带 tools + response_format=json_object，强制产出最终 findings JSON。
-        let body = build_openai_tools_body(&self.model, messages, &[], true);
+        let body = build_openai_tools_body(&self.model, messages, &[], true, self.output_limit);
         self.post(&body).await
     }
 }
 
-/// 按 ProviderConfig.kind 造对应 backend（S2-2b 编排层入口）。Google 暂不支持。
+/// 按 EffectiveModel（model+provider 覆盖链成品）造对应 backend（编排层入口）。
+/// kind 已在 config::effective_model 里 merge（model.kind > provider.kind）。
+/// Google 暂不支持（占位规划）。max_tokens：model.output_limit 注入 backend
+/// （> REDTEAM_MAX_TOKENS env > 32768 默认，见 AnthropicBackend/OpenAiBackend 构造）。
 pub fn backend_from_config(
-    pc: &ProviderConfig,
+    em: &crate::config::EffectiveModel,
     api_key: String,
 ) -> Result<Box<dyn ChatBackend>, ProviderError> {
-    match pc.kind {
+    match em.kind {
         ProviderKind::Anthropic => Ok(Box::new(AnthropicBackend::new(
-            pc.model.clone(),
-            pc.base_url.clone(),
+            em.id.clone(),
+            em.base_url.clone(),
             api_key,
-        ))),
+        ).with_max_tokens(em.output_limit))),
         ProviderKind::Openai | ProviderKind::OpenaiCompatible => Ok(Box::new(OpenAiBackend::new(
-            pc.model.clone(),
-            pc.base_url.clone(),
+            em.id.clone(),
+            em.base_url.clone(),
             api_key,
-        ))),
+        ).with_max_tokens(em.output_limit))),
         ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
     }
 }
@@ -660,6 +680,15 @@ mod tests {
 
     fn specs() -> Vec<ToolSpec> {
         tool_specs()
+    }
+
+    /// 09-04 分离后 backend_from_config 吃 EffectiveModel——测试构造辅助。
+    fn eff(kind: crate::config::ProviderKind) -> crate::config::EffectiveModel {
+        crate::config::EffectiveModel {
+            name: "t".into(), id: "m".into(), provider: "p".into(), kind,
+            base_url: None, context_window: 128_000, output_limit: None,
+            per_turn_timeout_secs: None, priority: 0, reasoning: false, thinking_level: None,
+        }
     }
 
     #[test]
@@ -802,7 +831,7 @@ mod tests {
     #[test]
     fn openai_body_text_only_assistant_omits_tool_calls() {
         let msgs = vec![ChatMessage::Assistant { text: "hello".into(), tool_calls: vec![] }];
-        let b = build_openai_tools_body("m", &msgs, &specs(), false);
+        let b = build_openai_tools_body("m", &msgs, &specs(), false, None);
         let asst = &b["messages"][0];
         assert_eq!(asst["role"], "assistant");
         assert_eq!(asst["content"], "hello");
@@ -814,11 +843,11 @@ mod tests {
     #[test]
     fn openai_final_body_drops_tools_and_adds_json_object() {
         let msgs = vec![ChatMessage::User("finalize".into())];
-        let fin = build_openai_tools_body("gpt-x", &msgs, &[], true);
+        let fin = build_openai_tools_body("gpt-x", &msgs, &[], true, None);
         assert!(fin.get("tools").is_none(), "收尾轮不应带 tools, got: {fin}");
         assert_eq!(fin["response_format"]["type"], "json_object");
 
-        let explore = build_openai_tools_body("gpt-x", &msgs, &specs(), false);
+        let explore = build_openai_tools_body("gpt-x", &msgs, &specs(), false, None);
         assert!(explore.get("response_format").is_none(), "探索轮不应带 response_format");
         assert!(explore.get("tools").is_some(), "探索轮应带 tools");
         // 两轮都流式（保连接活跃）+ 带 include_usage
@@ -962,7 +991,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
             ChatMessage::System("sys".into()),
             ChatMessage::User("review".into()),
         ];
-        let b = build_openai_tools_body("gpt-x", &msgs, &specs(), false);
+        let b = build_openai_tools_body("gpt-x", &msgs, &specs(), false, None);
         assert_eq!(b["model"], "gpt-x");
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][1]["role"], "user");
@@ -988,7 +1017,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
                 content: "file body".into(),
             }]),
         ];
-        let b = build_openai_tools_body("m", &msgs, &specs(), false);
+        let b = build_openai_tools_body("m", &msgs, &specs(), false, None);
         let asst = &b["messages"][0];
         assert_eq!(asst["role"], "assistant");
         assert_eq!(asst["tool_calls"][0]["id"], "call_1");
@@ -1099,17 +1128,9 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
 
     #[test]
     fn from_config_maps_kind_to_backend() {
-        let anth = ProviderConfig {
-            kind: ProviderKind::Anthropic, model: "m".into(),
-            base_url: None, api_key_env: None, priority: 0, context_window_tokens: None,
-            per_turn_timeout_secs: None,
-        };
+        let anth = eff(ProviderKind::Anthropic);
         assert!(backend_from_config(&anth, "k".into()).is_ok());
-        let goog = ProviderConfig {
-            kind: ProviderKind::Google, model: "m".into(),
-            base_url: None, api_key_env: None, priority: 0, context_window_tokens: None,
-            per_turn_timeout_secs: None,
-        };
+        let goog = eff(ProviderKind::Google);
         assert!(matches!(
             backend_from_config(&goog, "k".into()),
             Err(ProviderError::Unavailable(_))

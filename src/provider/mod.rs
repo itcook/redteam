@@ -164,7 +164,7 @@ pub(crate) const PER_TURN_DEADLINE: std::time::Duration = std::time::Duration::f
 /// 配深思考模型（glm/kimi 等）单轮思考+生成可超 150s 被掐成 `turn timeout`（2026-09-03
 /// dogfood 实证，非网络不可达而是慢）。校准旋钮，对齐 `REDTEAM_HTTP_TIMEOUT_SECS`（9f7540b）
 /// 先例；调大时两旋钮需一起抬（HTTP 整请求超时默认 300s，先于此处掐断）。
-pub(crate) fn per_turn_deadline() -> std::time::Duration {
+pub fn per_turn_deadline() -> std::time::Duration {
     match std::env::var("REDTEAM_PER_TURN_SECS") {
         Ok(s) => match s.parse::<u64>() {
             Ok(v) => std::time::Duration::from_secs(v),

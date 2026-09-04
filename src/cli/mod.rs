@@ -135,8 +135,9 @@ pub fn resolve_models(
     cfg: &Config,
 ) -> (Vec<PlannedModel>, bool) {
     let all_by_priority = || -> Vec<String> {
-        let mut v: Vec<_> = cfg.providers.iter().collect();
-        v.sort_by_key(|p| std::cmp::Reverse(p.1.priority));
+        // 09-04 分离后：名字空间 = [models.*]，候补链按 model 级 priority。
+        let mut v: Vec<_> = cfg.models.iter().collect();
+        v.sort_by_key(|m| std::cmp::Reverse(m.1.priority));
         v.into_iter().map(|(k, _)| k.clone()).collect()
     };
     let (names, replicate): (Vec<String>, bool) = if models_all {
@@ -155,7 +156,7 @@ pub fn resolve_models(
         .iter()
         .map(|n| PlannedModel {
             name: n.clone(),
-            priority: cfg.providers.get(n).map(|p| p.priority).unwrap_or(0),
+            priority: cfg.models.get(n).map(|m| m.priority).unwrap_or(0),
         })
         .collect();
     (models, replicate)
@@ -182,7 +183,7 @@ const SHELL_RESERVE_BYTES: usize = 24_000;
 pub(crate) fn pack_budget_bytes(cfg: &Config, model_names: &[String]) -> usize {
     let min_ctx = model_names
         .iter()
-        .map(|m| cfg.providers.get(m).and_then(|p| p.context_window_tokens).unwrap_or(128_000))
+        .map(|m| cfg.models.get(m).and_then(|x| x.context_window).unwrap_or(128_000))
         .min()
         .unwrap_or(128_000);
     let by_window = (min_ctx.saturating_sub(OUTPUT_RESERVE_TOKENS) as usize)
@@ -975,7 +976,7 @@ mod job_tests {
     }
     fn cfg() -> Config {
         Config::from_layers(&[
-            "[providers.alpha]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
+            "[providers.alpha_p]\nkind=\"openai\"\n\n[models.alpha]\nprovider=\"alpha_p\"\nid=\"a\"\npriority=10\n\
              [review]\ndefault_models=[\"alpha\"]\n",
         ]).unwrap()
     }
@@ -1641,8 +1642,8 @@ mod resolve_tests {
         Config::from_layers(&[&toml]).unwrap()
     }
     fn provs() -> &'static str {
-        "[providers.alpha]\nkind=\"openai\"\nmodel=\"a\"\npriority=10\n\
-         [providers.beta]\nkind=\"openai\"\nmodel=\"b\"\npriority=5\n"
+        "[providers.alpha_p]\nkind=\"openai\"\n\n[models.alpha]\nprovider=\"alpha_p\"\nid=\"a\"\npriority=10\n\
+         [providers.beta_p]\nkind=\"openai\"\n\n[models.beta]\nprovider=\"beta_p\"\nid=\"b\"\npriority=5\n"
     }
 
     #[test]
@@ -1992,14 +1993,18 @@ mod tests {
         // 2026-07-28 提帽 256K→768K（1M 窗时代，锚 gpt-5.6 272K 计费悬崖之下）——
         // 128K 缺省档从「帽封顶 256K」翻为「窗口墙生效 312K」是本次显式入账的行为变化。
         let cfg = crate::config::Config::from_layers(&[r#"
-[providers.Big]
+[providers.bigp]
 kind = "openai"
-model = "big-ctx"
-context_window_tokens = 1000000
-[providers.Small]
+[providers.smallp]
 kind = "openai"
-model = "small-ctx"
-context_window_tokens = 40000
+[models.Big]
+provider = "bigp"
+id = "big-ctx"
+context_window = 1000000
+[models.Small]
+provider = "smallp"
+id = "small-ctx"
+context_window = 40000
 "#]).unwrap();
         // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K < 768K → 窗口墙生效
         assert_eq!(pack_budget_bytes(&cfg, &["Unknown".into()]), 312_000);

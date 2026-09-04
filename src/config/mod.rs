@@ -43,33 +43,71 @@ impl ProviderKind {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
-    pub model: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
-    #[serde(default)]
-    pub priority: i32,
-    /// 模型 context window（token）。缺省按保守 128K 估——预算函数用它护 token 硬墙
-    /// （design 2026-07-13 §2.2）；确知更大窗的模型在此声明以解锁完整字节帽。
-    #[serde(default)]
-    pub context_window_tokens: Option<u32>,
-    /// 单轮超时（秒），per-provider 覆盖全局——慢速模型（30 tok/s 级输出）在大 max_tokens
-    /// （32K）下单轮需 1100s+，全局一个值对速度差 2 倍的模型必然顾此失彼（2026-09-03
-    /// PR181 实证：Kimi 3×600s 全超时系结构性不足而非抖动）。优先级：本字段 >
-    /// REDTEAM_PER_TURN_SECS env > 150s 默认。建议按 max_tokens÷模型最低 tok/s+prefill 余量。
-    #[serde(default)]
-    pub per_turn_timeout_secs: Option<u64>,
 }
 
-impl ProviderConfig {
-    /// 本 provider 的单轮 deadline：per_turn_timeout_secs > env REDTEAM_PER_TURN_SECS > 150s。
-    pub fn per_turn(&self) -> std::time::Duration {
-        self.per_turn_timeout_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or_else(crate::provider::per_turn_deadline)
-    }
+/// 思考档位（schema 先行；backend 消费接 reasoning_effort/thinking budget，后续任务）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThinkingLevel { Off, Low, Medium, High }
+
+/// 模型层配置（[models.X]）：--models 的名字空间。模型属性与通道属性分离——
+/// 1 provider : N models；kind/api_key_env 若设则覆盖所属 provider。
+#[derive(Clone, Debug, Deserialize)]
+pub struct ModelConfig {
+    /// 所属 provider（[providers.X] 的 X）。
+    pub provider: String,
+    /// 请求体里的 model id（如 glm-5.3 / kimi-k3）。
+    pub id: String,
+    /// 人读显示名（缺省 = section 名）。
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 覆盖 provider.kind。
+    #[serde(default)]
+    pub kind: Option<ProviderKind>,
+    /// 覆盖 provider.api_key_env。
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// context window（token），pack 预算护墙用；缺省按 128K 保守估。
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    /// 输出上限（max_tokens 请求字段）：> REDTEAM_MAX_TOKENS env > 32768 默认。
+    #[serde(default)]
+    pub output_limit: Option<u64>,
+    /// 思考型模型（thinking 计入 output 额度——预算与截断判定参考）。
+    #[serde(default)]
+    pub reasoning: bool,
+    #[serde(default)]
+    pub thinking_level: Option<ThinkingLevel>,
+    /// 单轮超时（秒）：> REDTEAM_PER_TURN_SECS env > 150s。速度是模型属性（30 tok/s ×
+    /// 32K 需 1100s+，全局单值对速度差 2 倍的模型必然顾此失彼）。
+    #[serde(default)]
+    pub per_turn_timeout_secs: Option<u64>,
+    /// 候补链排序（--models/default 全空时按此降序；缺省 0）。
+    #[serde(default)]
+    pub priority: i32,
 }
+
+/// merged 视图：model + 所属 provider 的覆盖链成品，registry/backend 构造的唯一入口。
+#[derive(Clone, Debug)]
+pub struct EffectiveModel {
+    pub name: String,
+    pub id: String,
+    pub provider: String,
+    pub kind: ProviderKind,
+    pub base_url: Option<String>,
+    pub context_window: u32,
+    pub output_limit: Option<u64>,
+    pub per_turn_timeout_secs: Option<u64>,
+    pub priority: i32,
+    pub reasoning: bool,
+    pub thinking_level: Option<ThinkingLevel>,
+}
+
+
 
 /// 评审工具档位（design 2026-07-13 §2.4，E8 裁决 A）：off=单发单轮无工具；two-stage
 /// （默认）=单发 + needs 声明触发的二阶段补查（批 2/3/4 已交付，非"后续批次"）；
@@ -123,6 +161,8 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
+    pub models: BTreeMap<String, ModelConfig>,
+    #[serde(default)]
     pub review: ReviewConfig,
 }
 
@@ -169,7 +209,32 @@ impl Config {
             }
             merge(&mut merged, v);
         }
-        Ok((merged.try_into()?, warnings))
+        let cfg: Config = merged.clone().try_into()?;
+        // 旧形状检测：providers 节出现 model/context_window_tokens/priority/per_turn_timeout_secs
+        // （已迁至 [models.*]）时给指向性错误，不静默丢配置。
+        if let Some(toml::Value::Table(ps)) = merged.get("providers") {
+            let legacy: &[&str] = &[
+                "model", "context_window_tokens", "priority", "per_turn_timeout_secs", "output_limit",
+            ];
+            let mut found = Vec::new();
+            for (pname, pv) in ps {
+                if let toml::Value::Table(t) = pv {
+                    for f in legacy {
+                        if t.contains_key(*f) {
+                            found.push(format!("[providers.{pname}] 的 {f:?}"));
+                        }
+                    }
+                }
+            }
+            if !found.is_empty() {
+                anyhow::bail!(
+                    "配置形状已升级（provider/model 分离，09-04）：{} 属于 [models.*] 字段。\n迁移示例见 .redteam/config.toml 模板或 --help。",
+                    found.join("、")
+                );
+            }
+        }
+        cfg.validate()?;
+        Ok((cfg, warnings))
     }
 
     /// 薄封装：旧签名保留——全部按「非项目层」处理（既有调用点/测试零改动，
@@ -179,16 +244,63 @@ impl Config {
         Ok(Config::from_layers_tagged(&tagged)?.0)
     }
 
-    /// key 解析：env(api_key_env) 优先，回落 secrets.toml[provider]。
-    pub fn resolve_key(&self, provider: &str) -> Option<String> {
-        if let Some(pc) = self.providers.get(provider) {
-            if let Some(var) = &pc.api_key_env {
+    /// key 解析（model 级，覆盖链）：model.api_key_env(env) > provider.api_key_env(env)
+    /// > secrets.toml[provider.model_id].api_key。
+    pub fn resolve_key(&self, model: &str) -> Option<String> {
+        let m = self.models.get(model)?;
+        if let Some(var) = &m.api_key_env {
+            if let Ok(v) = std::env::var(var) {
+                return Some(v);
+            }
+        }
+        if let Some(p) = self.providers.get(&m.provider) {
+            if let Some(var) = &p.api_key_env {
                 if let Ok(v) = std::env::var(var) {
                     return Some(v);
                 }
             }
         }
-        secrets::load_secrets().get(provider).cloned()
+        secrets::load_secrets().get(&m.provider)?.get(&m.id).map(|e| e.api_key.clone())
+    }
+
+    /// merged 视图：model 配置 + 所属 provider 的覆盖链成品。model 不存在 → None；
+    /// provider 引用缺失 → None（validate() 在 load 时已聚合报错，这里防御）。
+    pub fn effective_model(&self, name: &str) -> Option<EffectiveModel> {
+        let m = self.models.get(name)?;
+        let p = self.providers.get(&m.provider)?;
+        Some(EffectiveModel {
+            name: name.to_string(),
+            id: m.id.clone(),
+            provider: m.provider.clone(),
+            kind: m.kind.unwrap_or(p.kind),
+            base_url: p.base_url.clone(),
+            context_window: m.context_window.unwrap_or(128_000),
+            output_limit: m.output_limit,
+            per_turn_timeout_secs: m.per_turn_timeout_secs,
+            priority: m.priority,
+            reasoning: m.reasoning,
+            thinking_level: m.thinking_level,
+        })
+    }
+
+    /// 结构校验（load 后必调）：provider 引用存在性 + 旧形状字段指引。
+    /// 返回 Err 时带聚合信息（全部问题一次说清，不挤牙膏）。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut errs = Vec::new();
+        for (name, m) in &self.models {
+            if !self.providers.contains_key(&m.provider) {
+                errs.push(format!(
+                    "[models.{name}] 引用了不存在的 provider {:?}",
+                    m.provider
+                ));
+            }
+        }
+        if !errs.is_empty() {
+            anyhow::bail!("model 配置校验失败：
+{}", errs.join("
+"));
+        }
+        Ok(())
     }
 }
 
@@ -213,14 +325,16 @@ pub fn config_paths() -> Vec<PathBuf> {
 /// 把 [providers.<name>] 写进用户配置（config_paths()[0]），toml 深合并保留其他内容。
 /// 只写 kind/base_url/model/priority/api_key_env/context_window_tokens——**绝不写明文 key**。
 /// `context_window_tokens`：None 不写键（预算按保守 128K 缺省），Some 写显式值。
-pub fn write_provider(
-    name: &str,
-    kind: &str,
+/// 写入 [models.X]（+ 所属 provider 节缺失时按给定通道属性补建）。
+/// setup CLI 交互后续交互式化，此处只保证落盘形状合法（09-04-model-config-split）。
+pub fn write_model(
+    model_name: &str,
+    provider_name: &str,
+    provider_kind: &str,
     base_url: Option<&str>,
-    model: &str,
-    priority: i32,
+    model_id: &str,
     api_key_env: Option<&str>,
-    context_window_tokens: Option<u32>,
+    context_window: Option<u32>,
 ) -> anyhow::Result<()> {
     let path = config_paths()
         .into_iter()
@@ -232,27 +346,42 @@ pub fn write_provider(
     let root_t = root
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
+
+    // ensure [providers.<provider_name>]
     let providers = root_t
         .entry("providers".to_string())
         .or_insert_with(|| toml::Value::Table(Default::default()));
     let providers_t = providers
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("[providers] is not a table"))?;
+    providers_t
+        .entry(provider_name.to_string())
+        .or_insert_with(|| {
+            let mut t = toml::value::Table::new();
+            t.insert("kind".into(), toml::Value::String(provider_kind.to_string()));
+            if let Some(b) = base_url {
+                t.insert("base_url".into(), toml::Value::String(b.to_string()));
+            }
+            if let Some(e) = api_key_env {
+                t.insert("api_key_env".into(), toml::Value::String(e.to_string()));
+            }
+            toml::Value::Table(t)
+        });
 
+    // 写 [models.<model_name>]
+    let models = root_t
+        .entry("models".to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let models_t = models
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[models] is not a table"))?;
     let mut t = toml::value::Table::new();
-    t.insert("kind".into(), toml::Value::String(kind.to_string()));
-    t.insert("model".into(), toml::Value::String(model.to_string()));
-    if let Some(b) = base_url {
-        t.insert("base_url".into(), toml::Value::String(b.to_string()));
+    t.insert("provider".into(), toml::Value::String(provider_name.to_string()));
+    t.insert("id".into(), toml::Value::String(model_id.to_string()));
+    if let Some(ctx) = context_window {
+        t.insert("context_window".into(), toml::Value::Integer(ctx as i64));
     }
-    if let Some(e) = api_key_env {
-        t.insert("api_key_env".into(), toml::Value::String(e.to_string()));
-    }
-    t.insert("priority".into(), toml::Value::Integer(priority as i64));
-    if let Some(ctx) = context_window_tokens {
-        t.insert("context_window_tokens".into(), toml::Value::Integer(ctx as i64));
-    }
-    providers_t.insert(name.to_string(), toml::Value::Table(t));
+    models_t.insert(model_name.to_string(), toml::Value::Table(t));
 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -270,7 +399,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn write_provider_persists_block_without_key() {
+    fn write_model_persists_provider_and_model() {
         let _g = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: ENV_LOCK 串行化
@@ -280,35 +409,34 @@ mod tests {
         std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
         std::fs::write(&cfg_path, "[review]\nblock_threshold=\"high\"\n").unwrap();
 
-        write_provider("local", "openai-compatible", Some("http://localhost:11434/v1"), "qwen", 10, Some("LOCAL_KEY"), None).unwrap();
+        write_model("local", "ollama", "openai-compatible", Some("http://localhost:11434/v1"), "qwen", Some("LOCAL_KEY"), None).unwrap();
 
         let cfg = Config::load().unwrap();
-        let p = cfg.providers.get("local").expect("provider written");
-        assert_eq!(p.model, "qwen");
-        assert_eq!(p.priority, 10);
-        assert_eq!(p.base_url.as_deref(), Some("http://localhost:11434/v1"));
-        assert_eq!(p.api_key_env.as_deref(), Some("LOCAL_KEY"));
-        // None 不写键：文本无 context_window_tokens，读回为 None（预算走保守 128K 缺省）
-        assert_eq!(p.context_window_tokens, None);
+        let m = cfg.models.get("local").expect("model written");
+        assert_eq!(m.id, "qwen");
+        assert_eq!(m.provider, "ollama");
+        let em = cfg.effective_model("local").unwrap();
+        assert_eq!(em.base_url.as_deref(), Some("http://localhost:11434/v1"));
+        // None 不写键：context_window 缺省走保守 128K
+        assert_eq!(em.context_window, 128_000);
         // 既有 [review] 保留
         assert_eq!(cfg.review.block_threshold, crate::domain::Severity::High);
-        // 配置文本不含明文 key（只有 api_key_env 引用）
+        // 配置文本不含明文 key（只有 api_key_env 引用挂在 provider 节）
         let raw = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(!raw.contains("sk-"), "no plaintext key in config");
-        assert!(!raw.contains("context_window_tokens"), "None 不应写出该键");
         unsafe { std::env::remove_var("XDG_CONFIG_HOME"); }
     }
 
-    /// --context-tokens 档位透传：Some 写显式值、可被 Config 读回（pack 预算消费同一字段）。
+    /// context_window 档位透传：Some 写显式值、可被 Config 读回（pack 预算消费同一字段）。
     #[test]
-    fn write_provider_persists_context_window_tokens() {
+    fn write_model_persists_context_window() {
         let _g = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: ENV_LOCK 串行化
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()); }
-        write_provider("big", "openai", None, "big-ctx", 0, Some("BIG_KEY"), Some(1_000_000)).unwrap();
+        write_model("big", "bigp", "openai", None, "big-ctx", Some("BIG_KEY"), Some(1_000_000)).unwrap();
         let cfg = Config::load().unwrap();
-        assert_eq!(cfg.providers.get("big").unwrap().context_window_tokens, Some(1_000_000));
+        assert_eq!(cfg.effective_model("big").unwrap().context_window, 1_000_000);
         unsafe { std::env::remove_var("XDG_CONFIG_HOME"); }
     }
 
@@ -358,9 +486,12 @@ tools = "on""#]).unwrap();
         // 用户层定义 DeepSeek(真 base_url/api_key_env);项目层试图覆写 base_url→攻击者
         let user = r#"[providers.DeepSeek]
 kind="openai"
-model="deepseek"
 base_url="https://api.deepseek.com"
 api_key_env="DEEPSEEK_KEY"
+
+[models.DeepSeek]
+provider="DeepSeek"
+id="deepseek"
 [review]
 max_concurrency=8"#;
         let proj = r#"[providers.DeepSeek]
@@ -378,10 +509,13 @@ max_concurrency=1"#;
     #[test]
     fn key_resolves_env_over_secrets() {
         std::env::set_var("REDTEAM_TEST_KEY", "from-env");
-        let toml = r#"[providers.x]
+        let toml = r#"[providers.xp]
 kind="openai"
-model="m"
 api_key_env="REDTEAM_TEST_KEY"
+
+[models.x]
+provider="xp"
+id="m"
 priority=10
 "#;
         let cfg = Config::from_layers(&[toml]).unwrap();

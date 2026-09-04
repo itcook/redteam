@@ -9,12 +9,23 @@ const CONFIG_TEMPLATE: &str = "\
 # redteam 项目级配置（优先级高于用户级 ~/.config/redteam/config.toml）。
 # 密钥走环境变量或用户级 secrets.toml——绝不写入本文件（本目录在仓库领地内）。
 #
-# [providers.MyProvider]
-# kind = \"openai\"          # openai | anthropic | openai-compatible
+# provider（通道层：1 provider : N models）
+# [providers.my-gateway]
+# kind = \"openai\"            # openai | anthropic | google(占位)
 # base_url = \"https://…\"
-# model = \"…\"
-# api_key_env = \"MY_KEY_ENV\"
-# priority = 0
+# api_key_env = \"MY_KEY_ENV\"  # model 可覆盖
+#
+# model（模型层：--models 引用的名字空间）
+# [models.GLM]
+# provider = \"my-gateway\"    # 引用 [providers.X]（必填）
+# id = \"glm-5.3\"             # 请求体里的 model id
+# kind = \"anthropic\"         # 可选：覆盖 provider.kind
+# context_window = 1000000     # pack 预算护墙（缺省 128K 保守）
+# output_limit = 32768         # max_tokens（> REDTEAM_MAX_TOKENS env > 默认）
+# reasoning = true             # 思考型（thinking 计入 output 额度）
+# thinking_level = \"medium\"  # off|low|medium|high
+# per_turn_timeout_secs = 900  # 单轮超时（> env > 150s；速度是模型属性）
+# priority = 0                 # 候补链排序
 #
 # ship 循环的测试命令（可选；不设则按 Cargo.toml/package.json/Makefile 推断）：
 # test_command = \"cargo test\"

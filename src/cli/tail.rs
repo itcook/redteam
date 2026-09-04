@@ -44,11 +44,11 @@ pub(crate) fn mark_dismissed(
     reappeared
 }
 
-/// provider 名 → model id 映射（人读报告显示 model 名，rN.md 模板 2026-07-03）。
+/// model 引用名 → 请求 id 映射（[models.X].id；人读报告显示 model 名，rN.md 模板 2026-07-03）。
 pub(crate) fn model_ids_for(names: &[String], cfg: &Config) -> Vec<String> {
     names
         .iter()
-        .map(|n| cfg.providers.get(n).map(|p| p.model.clone()).unwrap_or_else(|| n.clone()))
+        .map(|n| cfg.models.get(n).map(|m| m.id.clone()).unwrap_or_else(|| n.clone()))
         .collect()
 }
 

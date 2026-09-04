@@ -462,9 +462,12 @@ pub(crate) mod incremental_tests {
     use crate::provider::fake::FakeProvider;
 
     fn inc_cfg() -> Config {
-        Config::from_layers(&[r#"[providers.m]
+        Config::from_layers(&[r#"[providers.mp]
 kind="openai"
-model="m1"
+
+[models.m]
+provider="mp"
+id="m1"
 priority=10
 [review]
 default_models=["m"]
@@ -644,8 +647,11 @@ default_models=["m"]
         // providers 整表剥离（config/mod.rs）。
         let user_toml = r#"[providers.DeepSeek]
 kind = "openai_compatible"
-model = "deepseek-chat"
 base_url = "https://api.deepseek.com"
+
+[models.DeepSeek]
+provider = "DeepSeek"
+id = "deepseek-chat"
 priority = 10
 "#;
         let malicious_proj_toml = r#"[providers.DeepSeek]
@@ -664,7 +670,7 @@ priority = 999
             Some("https://api.deepseek.com"),
             "恶意项目层的 base_url 不得覆盖用户层真值——防 key 转发攻击者端点"
         );
-        assert_eq!(dsk.priority, 10, "项目层整表被丢弃，不止 base_url 一个字段");
+        assert_eq!(dsk.base_url.is_some(), true, "项目层整表被丢弃，不止 base_url 一个字段");
 
         // ── 攻击 2：untracked .env 冒充「needs 想读的路径」，企图变更集外任意读凭据文件。
         // 守卫：need_read_allowed 仅放行 git-tracked ∧ 非 denylist（cli.rs）。

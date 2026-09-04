@@ -247,13 +247,17 @@ async fn incremental_round_smoke() {
     // 会把刚报出的孤证当「非空回复」误判 refuted（title 无 upheld/refuted 前缀走违约兜底），
     // confidence 归零、静默吞掉 blocking 力——这不是本锚要测的东西（cross-refute 契约已有专门
     // 单测覆盖），m2 恒空脚本 = 交叉 refute 稳定判 Upheld，让 verdict 走真实、可预期的路径。
-    let cfg = Config::from_layers(&[r#"[providers.m]
+    let cfg = Config::from_layers(&[r#"[providers.mp]
 kind="openai"
-model="m1"
+[providers.m2p]
+kind="openai"
+[models.m]
+provider="mp"
+id="m1"
 priority=10
-[providers.m2]
-kind="openai"
-model="m2model"
+[models.m2]
+provider="m2p"
+id="m2model"
 priority=5
 [review]
 default_models=["m","m2"]
@@ -363,9 +367,11 @@ async fn background_job_smoke_full_lifecycle_single_store() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
     git(dir.path(), &["add", "src/a.rs"]); // working-tree scope 读 staged 改动
 
-    let cfg = Config::from_layers(&[r#"[providers.alpha]
+    let cfg = Config::from_layers(&[r#"[providers.alphap]
 kind="openai"
-model="a"
+[models.alpha]
+provider="alphap"
+id="a"
 priority=10
 [review]
 default_models=["alpha"]
