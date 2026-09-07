@@ -50,3 +50,26 @@ config 硬切新形状：[providers.X]通道层(kind/base_url/api_key_env,1:N)+[
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: P0 验证门收尾：E1 风险规则回放 + E3 疑点契约 A/B，.next/ 分支随行文档区迁移
+<!-- trellis-session: v=2 fp=8b884f84834698b9 -->
+
+**Date**: 2026-09-07
+**Task**: P0 验证门收尾：E1 风险规则回放 + E3 疑点契约 A/B，.next/ 分支随行文档区迁移
+**Branch**: `feat/m21-review-engine`
+
+### Summary
+
+E1：eval/risk_replay.py 零 LLM 回放 PR181，规则 v4（θ=1.5，H0 需 ≥2 类信号）主裁决集区间级 4/4、并集空热区 0.47；held-out 本仓 oracle B 区间级 20/34、文件级 29/34；预算三档 |H0| 中位 0/5/23。E3：DeepSeek v4 flash 同 bundle 同 focus 各 3 跑，疑点契约人工主题命中三跑并集 5:1 → design §4 成立；附带 c_hi 不成立、需钉推理档、quote 守约弱。迁移：.roadmap 与主 checkout .doc 的 M21 design/decisions/research 入 .next/（入库），PR181 细节与原始数据入 .next/private/（gitignored，远端公开仓）。待办：grill 必答项（涟漪去留、两类信号规则、θ 常量化、三档起步值、R11 改 agreement 口径）→ design 锁定 → 派生 M21a-e plan。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `44d7f75` | docs(next): 分支随行文档区 .next/——.roadmap 迁为 .next/roadmap，主 checkout .doc 的 M21 设计/决策/研究迁入 |
+| `1a44197` | feat(eval): P0 验证门 E1/E3——零 LLM 风险规则回放 + 疑点契约 A/B + 组包仪器，结果摘要入路线图 |
+
+### Status
+
+[OK] **Completed**
