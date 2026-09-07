@@ -1,0 +1,298 @@
+{
+ "repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+ "base": "095d383c583edb7514a170fe8ae7b38c17ab4e49~1",
+ "head": "095d383c583edb7514a170fe8ae7b38c17ab4e49",
+ "size": {
+  "files": 9,
+  "code_files": 0,
+  "adds": 947,
+  "dels": 0,
+  "hunks": 9,
+  "code_lines": 0
+ },
+ "params": {
+  "theta": 1.5,
+  "fanin_k": 5,
+  "extapi_k": 3,
+  "ripple": true,
+  "history_repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+  "history_ref": "095d383c583edb7514a170fe8ae7b38c17ab4e49~1",
+  "ledger": null,
+  "before": null,
+  "weights": {
+   "path_glob": 1.0,
+   "keyword": 0.5,
+   "keyword_cap": 1.5,
+   "sig_changed": 1.0,
+   "def_new": 0.5,
+   "def_deleted": 1.0,
+   "public_widen": 0.5,
+   "fanin": 1.0,
+   "churn": 0.5,
+   "extapi": 1.0,
+   "hist_fix3": 0.5,
+   "hist_fix6": 1.0,
+   "ledger_upheld": 1.0,
+   "ledger_dismissed": 0.5,
+   "test_mult": 0.3,
+   "doc_mult": 0.2,
+   "new_file": 0.5,
+   "ripple": 1.0,
+   "decl_only_mult": 0.5
+  }
+ },
+ "zones": [
+  {
+   "file": ".trellis/spec/backend/database-guidelines.md",
+   "ranges": [
+    [
+     1,
+     52
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    }
+   ],
+   "score": 0.1,
+   "lines": 52,
+   "ripple": false,
+   "changed_lines": 51,
+   "mult": 0.2
+  },
+  {
+   "file": ".trellis/spec/backend/directory-structure.md",
+   "ranges": [
+    [
+     1,
+     55
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.05,
+   "lines": 55,
+   "ripple": false,
+   "changed_lines": 54,
+   "mult": 0.1
+  },
+  {
+   "file": ".trellis/spec/backend/error-handling.md",
+   "ranges": [
+    [
+     1,
+     56
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:timeout,auth,resource_lifecycle",
+     "w": 1.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.2,
+   "lines": 56,
+   "ripple": false,
+   "changed_lines": 55,
+   "mult": 0.1
+  },
+  {
+   "file": ".trellis/spec/backend/index.md",
+   "ranges": [
+    [
+     1,
+     39
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    }
+   ],
+   "score": 0.1,
+   "lines": 39,
+   "ripple": false,
+   "changed_lines": 38,
+   "mult": 0.2
+  },
+  {
+   "file": ".trellis/spec/backend/logging-guidelines.md",
+   "ranges": [
+    [
+     1,
+     52
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.05,
+   "lines": 52,
+   "ripple": false,
+   "changed_lines": 51,
+   "mult": 0.1
+  },
+  {
+   "file": ".trellis/spec/backend/quality-guidelines.md",
+   "ranges": [
+    [
+     1,
+     52
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    }
+   ],
+   "score": 0.1,
+   "lines": 52,
+   "ripple": false,
+   "changed_lines": 51,
+   "mult": 0.2
+  },
+  {
+   "file": ".trellis/spec/guides/code-reuse-thinking-guide.md",
+   "ranges": [
+    [
+     1,
+     224
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:destructive,error_paths,resource_lifecycle",
+     "w": 1.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (223 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 224,
+   "ripple": false,
+   "changed_lines": 223,
+   "mult": 0.2
+  },
+  {
+   "file": ".trellis/spec/guides/cross-layer-thinking-guide.md",
+   "ranges": [
+    [
+     1,
+     328
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:timeout,numeric_bounds,error_paths,resource_lifecycle",
+     "w": 1.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (327 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 328,
+   "ripple": false,
+   "changed_lines": 327,
+   "mult": 0.2
+  },
+  {
+   "file": ".trellis/spec/guides/index.md",
+   "ranges": [
+    [
+     1,
+     98
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:destructive,numeric_bounds,error_paths",
+     "w": 1.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (97 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 98,
+   "ripple": false,
+   "changed_lines": 97,
+   "mult": 0.2
+  }
+ ],
+ "h0": [],
+ "theta": 1.5,
+ "R": 0.0,
+ "max_zone": 0.5
+}

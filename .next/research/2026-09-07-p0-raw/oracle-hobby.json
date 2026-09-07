@@ -1,0 +1,937 @@
+{
+ "kind": "hobby",
+ "head": null,
+ "entries": [
+  {
+   "id": "c43ccb44@918f973",
+   "source": "hobby",
+   "title": "Each store.rs operation opens a new ProjDb connection, re-executing DDL and pragma every time",
+   "severity": "medium",
+   "confidence": 0.9,
+   "anchors": [
+    {
+     "file": "src/state/store.rs",
+     "line_start": 37,
+     "line_end": 39
+    }
+   ],
+   "topic": null,
+   "job": "9d4d4df86b21",
+   "base": "33c4522",
+   "head": "918f9737608b87264d397885fe0249e0c98ffcd5",
+   "head_inferred": true,
+   "approx": false,
+   "created_at": "2026-07-03T14:17:00Z",
+   "anchored": true
+  },
+  {
+   "id": "df6c0f0b@918f973",
+   "source": "hobby",
+   "title": "`--dismissed` pass-through creates split-brain ledger: dismissal writes go to proj.db but review reads from user-provided db",
+   "severity": "high",
+   "confidence": 0.95,
+   "anchors": [
+    {
+     "file": "plugins/redteam/commands/ship.md",
+     "line_start": 19,
+     "line_end": 19
+    }
+   ],
+   "topic": null,
+   "job": "9d4d4df86b21",
+   "base": "33c4522",
+   "head": "918f9737608b87264d397885fe0249e0c98ffcd5",
+   "head_inferred": true,
+   "approx": false,
+   "created_at": "2026-07-03T14:17:00Z",
+   "anchored": true
+  },
+  {
+   "id": "94086b3c@918f973",
+   "source": "hobby",
+   "title": "cancel 的状态终态写用 `let _ =` 静默吞错，与 worker 收尾竞态可丢失取消",
+   "severity": "medium",
+   "confidence": 0.7,
+   "anchors": [
+    {
+     "file": "src/main.rs",
+     "line_start": 538,
+     "line_end": 540
+    }
+   ],
+   "topic": null,
+   "job": "9d4d4df86b21",
+   "base": "33c4522",
+   "head": "918f9737608b87264d397885fe0249e0c98ffcd5",
+   "head_inferred": true,
+   "approx": false,
+   "created_at": "2026-07-03T14:17:00Z",
+   "anchored": true
+  },
+  {
+   "id": "375e60d0@918f973",
+   "source": "hobby",
+   "title": "Markdown table broken by pipe character in human_tokens output",
+   "severity": "medium",
+   "confidence": 1.0,
+   "anchors": [
+    {
+     "file": "src/output/mod.rs",
+     "line_start": 16,
+     "line_end": 16
+    }
+   ],
+   "topic": null,
+   "job": "9d4d4df86b21",
+   "base": "33c4522",
+   "head": "918f9737608b87264d397885fe0249e0c98ffcd5",
+   "head_inferred": true,
+   "approx": false,
+   "created_at": "2026-07-03T14:17:00Z",
+   "anchored": true
+  },
+  {
+   "id": "0aebfc25@6f95c25",
+   "source": "hobby",
+   "title": "Empty bundles manifest breaks resume contract",
+   "severity": "medium",
+   "confidence": 0.85,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 441,
+     "line_end": 447
+    }
+   ],
+   "topic": null,
+   "job": "57e2b703d0a5",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T10:08:30Z",
+   "anchored": true
+  },
+  {
+   "id": "1eb780f4@6f95c25",
+   "source": "hobby",
+   "title": "Empty-bundles warning untested — regression would go undetected",
+   "severity": "medium",
+   "confidence": 0.95,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 1429,
+     "line_end": 1431
+    }
+   ],
+   "topic": null,
+   "job": "abc8a8bc1c6b",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T10:08:40Z",
+   "anchored": true
+  },
+  {
+   "id": "61120511@6f95c25",
+   "source": "hobby",
+   "title": "Refute classifier treats natural-language prefix variants as machine verdicts",
+   "severity": "medium",
+   "confidence": 0.84,
+   "anchors": [
+    {
+     "file": "src/consolidate/verify.rs",
+     "line_start": 71,
+     "line_end": 74
+    }
+   ],
+   "topic": null,
+   "job": "abc8a8bc1c6b",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T10:08:40Z",
+   "anchored": true
+  },
+  {
+   "id": "0052cb42@6f95c25",
+   "source": "hobby",
+   "title": "Silent error discard in `JobCellSink::on_meta` may leave job state with empty models/lenses during running phase",
+   "severity": "medium",
+   "confidence": 0.85,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 560,
+     "line_end": 567
+    }
+   ],
+   "topic": null,
+   "job": "abc8a8bc1c6b",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T10:08:40Z",
+   "anchored": true
+  },
+  {
+   "id": "4f647bc9@6f95c25",
+   "source": "hobby",
+   "title": "Partial and failed reports lack models/lenses metadata despite on_meta writing them to job state",
+   "severity": "high",
+   "confidence": 0.9,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 275,
+     "line_end": 282
+    }
+   ],
+   "topic": null,
+   "job": "d1b6a5636e53",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T10:36:33Z",
+   "anchored": true
+  },
+  {
+   "id": "e9c5a2db@6f95c25",
+   "source": "hobby",
+   "title": "Scope validation accepts --scope branch without --base, then fails with confusing error",
+   "severity": "medium",
+   "confidence": 0.75,
+   "anchors": [
+    {
+     "file": "src/main.rs",
+     "line_start": 392,
+     "line_end": 400
+    }
+   ],
+   "topic": null,
+   "job": "734dcf1a5fd1",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T10:36:33Z",
+   "anchored": true
+  },
+  {
+   "id": "9ebffba8@6f95c25",
+   "source": "hobby",
+   "title": "Unicode confusables bypass verdict prefix detection, flipping Upheld→Refuted",
+   "severity": "high",
+   "confidence": 0.92,
+   "anchors": [
+    {
+     "file": "src/consolidate/verify.rs",
+     "line_start": 70,
+     "line_end": 81
+    }
+   ],
+   "topic": null,
+   "job": "734dcf1a5fd1",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T10:36:33Z",
+   "anchored": false
+  },
+  {
+   "id": "c8335099@6f95c25",
+   "source": "hobby",
+   "title": "Only first finding's title determines verdict; subsequent findings silently ignored",
+   "severity": "high",
+   "confidence": 0.95,
+   "anchors": [
+    {
+     "file": "src/consolidate/verify.rs",
+     "line_start": 63,
+     "line_end": 68
+    }
+   ],
+   "topic": null,
+   "job": "734dcf1a5fd1",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T10:36:33Z",
+   "anchored": true
+  },
+  {
+   "id": "0d712f53@6f95c25",
+   "source": "hobby",
+   "title": "Silent write failure in JobCellSink::on_meta hides missing models/lenses from status",
+   "severity": "medium",
+   "confidence": 0.85,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 560,
+     "line_end": 567
+    }
+   ],
+   "topic": null,
+   "job": "9c00660c7d20",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T12:00:59Z",
+   "anchored": true
+  },
+  {
+   "id": "3bffa8c8@6f95c25",
+   "source": "hobby",
+   "title": "partial_report produces empty models/lenses despite job state having them via on_meta",
+   "severity": "medium",
+   "confidence": 0.85,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 595,
+     "line_end": 597
+    }
+   ],
+   "topic": null,
+   "job": "8498a2c007c7",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T12:07:20Z",
+   "anchored": true
+  },
+  {
+   "id": "0f2955d1@6f95c25",
+   "source": "hobby",
+   "title": "Scope/base validation only at CLI layer – library functions silently ignore --base",
+   "severity": "high",
+   "confidence": 0.92,
+   "anchors": [
+    {
+     "file": "src/main.rs",
+     "line_start": 392,
+     "line_end": 400
+    }
+   ],
+   "topic": null,
+   "job": "55acc9e44c33",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T13:17:12Z",
+   "anchored": true
+  },
+  {
+   "id": "87ca3675@6f95c25",
+   "source": "hobby",
+   "title": "on_meta stamps models/lenses into state before fan-out completes, causing state/report inconsistency on assemble_report failure",
+   "severity": "medium",
+   "confidence": 0.78,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 356,
+     "line_end": 357
+    }
+   ],
+   "topic": null,
+   "job": "55acc9e44c33",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T13:17:12Z",
+   "anchored": true
+  },
+  {
+   "id": "28c328a5@6f95c25",
+   "source": "hobby",
+   "title": "`partial_report` returns empty models/lenses despite `on_meta` having stamped them into state — partial-failure result JSON loses metadata",
+   "severity": "high",
+   "confidence": 0.85,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 275,
+     "line_end": 279
+    }
+   ],
+   "topic": null,
+   "job": "55acc9e44c33",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T13:17:12Z",
+   "anchored": true
+  },
+  {
+   "id": "2c249df6@6f95c25",
+   "source": "hobby",
+   "title": "Empty code evidence is still reported as a clean approve with exit code 0",
+   "severity": "high",
+   "confidence": 0.93,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 443,
+     "line_end": 447
+    }
+   ],
+   "topic": null,
+   "job": "caa9d455c216",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T13:28:13Z",
+   "anchored": true
+  },
+  {
+   "id": "9a4ad2a9@6f95c25",
+   "source": "hobby",
+   "title": "Contract-violating upheld findings are silently accepted",
+   "severity": "medium",
+   "confidence": 0.86,
+   "anchors": [
+    {
+     "file": "src/consolidate/verify.rs",
+     "line_start": 75,
+     "line_end": 76
+    }
+   ],
+   "topic": null,
+   "job": "caa9d455c216",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T13:28:13Z",
+   "anchored": true
+  },
+  {
+   "id": "4a24576e@6f95c25",
+   "source": "hobby",
+   "title": "Doc refute prompt requires line numbers it never provides",
+   "severity": "medium",
+   "confidence": 0.86,
+   "anchors": [
+    {
+     "file": "src/prompt/templates/adversarial-refute-doc.md",
+     "line_start": 34,
+     "line_end": 34
+    }
+   ],
+   "topic": null,
+   "job": "caa9d455c216",
+   "base": "6f95c25~1",
+   "head": "6f95c25d31d8321a797e4119061957286a2d486e",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-06T13:28:13Z",
+   "anchored": true
+  },
+  {
+   "id": "b8222d4c@8dcaf6f",
+   "source": "hobby",
+   "title": "模型控制的 needs 路径可实现项目内任意文件读取，导致信息泄露",
+   "severity": "high",
+   "confidence": 0.9,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 461,
+     "line_end": 462
+    }
+   ],
+   "topic": null,
+   "job": "292d5599c568",
+   "base": "4f52ac9",
+   "head": "8dcaf6f2d270add0fb69e12279a8b040ec3826d7",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-15T04:16:40Z",
+   "anchored": true
+  },
+  {
+   "id": "33fa8923@8dcaf6f",
+   "source": "hobby",
+   "title": "lens 字段从 output_contract 和 Finding 结构体中移除，丧失 finding 到攻击面规则的追溯能力",
+   "severity": "medium",
+   "confidence": 0.98,
+   "anchors": [
+    {
+     "file": "src/domain/finding.rs",
+     "line_start": 68,
+     "line_end": 72
+    }
+   ],
+   "topic": null,
+   "job": "292d5599c568",
+   "base": "4f52ac9",
+   "head": "8dcaf6f2d270add0fb69e12279a8b040ec3826d7",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-15T04:16:40Z",
+   "anchored": false
+  },
+  {
+   "id": "6d29b2f3@290236e",
+   "source": "hobby",
+   "title": "The PID identity anchor is disabled on every platform except macOS",
+   "severity": "high",
+   "confidence": 0.99,
+   "anchors": [
+    {
+     "file": "src/procinfo.rs",
+     "line_start": 28,
+     "line_end": 31
+    }
+   ],
+   "topic": null,
+   "job": "e8d9e3ec972a",
+   "base": "f028f92",
+   "head": "290236eb6c00ea82e61ab3df02e16f9c5fa15b45",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-23T01:49:31Z",
+   "anchored": true
+  },
+  {
+   "id": "e49a67aa@290236e",
+   "source": "hobby",
+   "title": "The parent still performs an unguarded stale write that can regress Running or overwrite a terminal state",
+   "severity": "high",
+   "confidence": 0.98,
+   "anchors": [
+    {
+     "file": "src/main.rs",
+     "line_start": 453,
+     "line_end": 454
+    }
+   ],
+   "topic": null,
+   "job": "e8d9e3ec972a",
+   "base": "f028f92",
+   "head": "290236eb6c00ea82e61ab3df02e16f9c5fa15b45",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-23T01:49:31Z",
+   "anchored": true
+  },
+  {
+   "id": "7a6f0a14@290236e",
+   "source": "hobby",
+   "title": "The global panic hook terminally fails the job for recoverable or unrelated panics",
+   "severity": "high",
+   "confidence": 0.96,
+   "anchors": [
+    {
+     "file": "src/main.rs",
+     "line_start": 496,
+     "line_end": 505
+    }
+   ],
+   "topic": null,
+   "job": "e8d9e3ec972a",
+   "base": "f028f92",
+   "head": "290236eb6c00ea82e61ab3df02e16f9c5fa15b45",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-23T01:49:31Z",
+   "anchored": true
+  },
+  {
+   "id": "a179f67e@290236e",
+   "source": "hobby",
+   "title": "Lazy reaping ignores dead workers that never reached Running",
+   "severity": "medium",
+   "confidence": 0.95,
+   "anchors": [
+    {
+     "file": "src/cli.rs",
+     "line_start": 1452,
+     "line_end": 1454
+    }
+   ],
+   "topic": null,
+   "job": "e8d9e3ec972a",
+   "base": "f028f92",
+   "head": "290236eb6c00ea82e61ab3df02e16f9c5fa15b45",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-23T01:49:31Z",
+   "anchored": true
+  },
+  {
+   "id": "c067b640@00e23fc",
+   "source": "hobby",
+   "title": "Exit code change for Incomplete verdict (from 2 to 3) and command errors (from 2 to 1) breaks automation compatibility",
+   "severity": "medium",
+   "confidence": 0.9,
+   "anchors": [
+    {
+     "file": "src/cli/tail.rs",
+     "line_start": 18,
+     "line_end": 25
+    }
+   ],
+   "topic": null,
+   "job": "cd3462c39936",
+   "base": "e8dc24f",
+   "head": "00e23fc3be193778b1bbc1bae58d9ef14ae2eec0",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T03:45:57Z",
+   "anchored": true
+  },
+  {
+   "id": "89e16e1f@00e23fc",
+   "source": "hobby",
+   "title": "`resolve show` output appends human-readable history lines to pretty-printed JSON, breaking machine consumption",
+   "severity": "medium",
+   "confidence": 1.0,
+   "anchors": [
+    {
+     "file": "src/main.rs",
+     "line_start": 1041,
+     "line_end": 1049
+    }
+   ],
+   "topic": null,
+   "job": "cd3462c39936",
+   "base": "e8dc24f",
+   "head": "00e23fc3be193778b1bbc1bae58d9ef14ae2eec0",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T03:45:57Z",
+   "anchored": true
+  },
+  {
+   "id": "907b0a53@00e23fc",
+   "source": "hobby",
+   "title": "Fuzzy carry matching can silently erase a distinct new finding",
+   "severity": "high",
+   "confidence": 0.98,
+   "anchors": [
+    {
+     "file": "src/consolidate/carry.rs",
+     "line_start": 86,
+     "line_end": 87
+    }
+   ],
+   "topic": null,
+   "job": "cd3462c39936",
+   "base": "e8dc24f",
+   "head": "00e23fc3be193778b1bbc1bae58d9ef14ae2eec0",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T03:45:57Z",
+   "anchored": true
+  },
+  {
+   "id": "37fb3614@00e23fc",
+   "source": "hobby",
+   "title": "A failed Pending-to-Running database update is converted into a successful worker exit",
+   "severity": "high",
+   "confidence": 0.98,
+   "anchors": [
+    {
+     "file": "src/cli/mod.rs",
+     "line_start": 681,
+     "line_end": 689
+    }
+   ],
+   "topic": null,
+   "job": "cd3462c39936",
+   "base": "e8dc24f",
+   "head": "00e23fc3be193778b1bbc1bae58d9ef14ae2eec0",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T03:45:57Z",
+   "anchored": true
+  },
+  {
+   "id": "9f03b485@00e23fc",
+   "source": "hobby",
+   "title": "Worker spawn failure leaves an unreapable Pending job",
+   "severity": "medium",
+   "confidence": 0.99,
+   "anchors": [
+    {
+     "file": "src/main.rs",
+     "line_start": 306,
+     "line_end": 309
+    }
+   ],
+   "topic": null,
+   "job": "cd3462c39936",
+   "base": "e8dc24f",
+   "head": "00e23fc3be193778b1bbc1bae58d9ef14ae2eec0",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T03:45:57Z",
+   "anchored": true
+  },
+  {
+   "id": "c067b640@3e60804",
+   "source": "hobby",
+   "title": "Exit code change for Incomplete verdict (from 2 to 3) and command errors (from 2 to 1) breaks automation compatibility",
+   "severity": "medium",
+   "confidence": 0.9,
+   "anchors": [
+    {
+     "file": "src/cli/tail.rs",
+     "line_start": 18,
+     "line_end": 25
+    }
+   ],
+   "topic": null,
+   "job": "275fe6d380ea",
+   "base": "e8dc24f",
+   "head": "3e60804f8c884e90aa6a1be5c6c736c473343f63",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T04:33:53Z",
+   "anchored": true
+  },
+  {
+   "id": "89e16e1f@3e60804",
+   "source": "hobby",
+   "title": "`resolve show` output appends human-readable history lines to pretty-printed JSON, breaking machine consumption",
+   "severity": "medium",
+   "confidence": 1.0,
+   "anchors": [
+    {
+     "file": "src/main.rs",
+     "line_start": 1063,
+     "line_end": 1071
+    }
+   ],
+   "topic": null,
+   "job": "275fe6d380ea",
+   "base": "e8dc24f",
+   "head": "3e60804f8c884e90aa6a1be5c6c736c473343f63",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T04:33:53Z",
+   "anchored": false
+  },
+  {
+   "id": "907b0a53@3e60804",
+   "source": "hobby",
+   "title": "Fuzzy carry matching can silently erase a distinct new finding",
+   "severity": "high",
+   "confidence": 0.98,
+   "anchors": [
+    {
+     "file": "src/consolidate/carry.rs",
+     "line_start": 86,
+     "line_end": 87
+    }
+   ],
+   "topic": null,
+   "job": "275fe6d380ea",
+   "base": "e8dc24f",
+   "head": "3e60804f8c884e90aa6a1be5c6c736c473343f63",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T04:33:53Z",
+   "anchored": true
+  },
+  {
+   "id": "9f03b485@3e60804",
+   "source": "hobby",
+   "title": "Worker spawn failure leaves an unreapable Pending job",
+   "severity": "medium",
+   "confidence": 0.99,
+   "anchors": [
+    {
+     "file": "src/main.rs",
+     "line_start": 306,
+     "line_end": 309
+    }
+   ],
+   "topic": null,
+   "job": "275fe6d380ea",
+   "base": "e8dc24f",
+   "head": "3e60804f8c884e90aa6a1be5c6c736c473343f63",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T04:33:53Z",
+   "anchored": false
+  },
+  {
+   "id": "a61f45fd@3e60804",
+   "source": "hobby",
+   "title": "Guard-write errors still leave background jobs non-terminal and externally report the wrong outcome",
+   "severity": "medium",
+   "confidence": 0.96,
+   "anchors": [
+    {
+     "file": "src/cli/mod.rs",
+     "line_start": 540,
+     "line_end": 543
+    }
+   ],
+   "topic": null,
+   "job": "275fe6d380ea",
+   "base": "e8dc24f",
+   "head": "3e60804f8c884e90aa6a1be5c6c736c473343f63",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T04:33:53Z",
+   "anchored": true
+  },
+  {
+   "id": "c067b640@99138bb",
+   "source": "hobby",
+   "title": "Exit code change for Incomplete verdict (from 2 to 3) and command errors (from 2 to 1) breaks automation compatibility",
+   "severity": "medium",
+   "confidence": 0.9,
+   "anchors": [
+    {
+     "file": "src/cli/tail.rs",
+     "line_start": 18,
+     "line_end": 25
+    }
+   ],
+   "topic": null,
+   "job": "48d667e24785",
+   "base": "e8dc24f",
+   "head": "99138bb185298ad55d678495472eb6ff0bf62755",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T04:40:54Z",
+   "anchored": true
+  },
+  {
+   "id": "907b0a53@99138bb",
+   "source": "hobby",
+   "title": "Fuzzy carry matching can silently erase a distinct new finding",
+   "severity": "high",
+   "confidence": 0.98,
+   "anchors": [
+    {
+     "file": "src/consolidate/carry.rs",
+     "line_start": 86,
+     "line_end": 87
+    }
+   ],
+   "topic": null,
+   "job": "48d667e24785",
+   "base": "e8dc24f",
+   "head": "99138bb185298ad55d678495472eb6ff0bf62755",
+   "head_inferred": false,
+   "approx": false,
+   "created_at": "2026-07-28T04:40:54Z",
+   "anchored": true
+  }
+ ],
+ "topics": {},
+ "sets": {
+  "33c4522..918f973": [
+   "c43ccb44@918f973",
+   "df6c0f0b@918f973",
+   "94086b3c@918f973",
+   "375e60d0@918f973"
+  ],
+  "6f95c25~1..6f95c25": [
+   "0aebfc25@6f95c25",
+   "1eb780f4@6f95c25",
+   "61120511@6f95c25",
+   "0052cb42@6f95c25",
+   "4f647bc9@6f95c25",
+   "e9c5a2db@6f95c25",
+   "9ebffba8@6f95c25",
+   "c8335099@6f95c25",
+   "0d712f53@6f95c25",
+   "3bffa8c8@6f95c25",
+   "0f2955d1@6f95c25",
+   "87ca3675@6f95c25",
+   "28c328a5@6f95c25",
+   "2c249df6@6f95c25",
+   "9a4ad2a9@6f95c25",
+   "4a24576e@6f95c25"
+  ],
+  "4f52ac9..8dcaf6f": [
+   "b8222d4c@8dcaf6f",
+   "33fa8923@8dcaf6f"
+  ],
+  "f028f92..290236e": [
+   "6d29b2f3@290236e",
+   "e49a67aa@290236e",
+   "7a6f0a14@290236e",
+   "a179f67e@290236e"
+  ],
+  "e8dc24f..00e23fc": [
+   "c067b640@00e23fc",
+   "89e16e1f@00e23fc",
+   "907b0a53@00e23fc",
+   "37fb3614@00e23fc",
+   "9f03b485@00e23fc"
+  ],
+  "e8dc24f..3e60804": [
+   "c067b640@3e60804",
+   "89e16e1f@3e60804",
+   "907b0a53@3e60804",
+   "9f03b485@3e60804",
+   "a61f45fd@3e60804"
+  ],
+  "e8dc24f..99138bb": [
+   "c067b640@99138bb",
+   "907b0a53@99138bb"
+  ],
+  "union": [
+   "c43ccb44@918f973",
+   "df6c0f0b@918f973",
+   "94086b3c@918f973",
+   "375e60d0@918f973",
+   "0aebfc25@6f95c25",
+   "1eb780f4@6f95c25",
+   "61120511@6f95c25",
+   "0052cb42@6f95c25",
+   "4f647bc9@6f95c25",
+   "e9c5a2db@6f95c25",
+   "9ebffba8@6f95c25",
+   "c8335099@6f95c25",
+   "0d712f53@6f95c25",
+   "3bffa8c8@6f95c25",
+   "0f2955d1@6f95c25",
+   "87ca3675@6f95c25",
+   "28c328a5@6f95c25",
+   "2c249df6@6f95c25",
+   "9a4ad2a9@6f95c25",
+   "4a24576e@6f95c25",
+   "b8222d4c@8dcaf6f",
+   "33fa8923@8dcaf6f",
+   "6d29b2f3@290236e",
+   "e49a67aa@290236e",
+   "7a6f0a14@290236e",
+   "a179f67e@290236e",
+   "c067b640@00e23fc",
+   "89e16e1f@00e23fc",
+   "907b0a53@00e23fc",
+   "37fb3614@00e23fc",
+   "9f03b485@00e23fc",
+   "c067b640@3e60804",
+   "89e16e1f@3e60804",
+   "907b0a53@3e60804",
+   "9f03b485@3e60804",
+   "a61f45fd@3e60804",
+   "c067b640@99138bb",
+   "907b0a53@99138bb"
+  ]
+ }
+}

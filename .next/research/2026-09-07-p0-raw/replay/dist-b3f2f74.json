@@ -1,0 +1,88 @@
+{
+ "repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+ "base": "b3f2f7494e323685c06214c011babe2ccb75e5b3~1",
+ "head": "b3f2f7494e323685c06214c011babe2ccb75e5b3",
+ "size": {
+  "files": 2,
+  "code_files": 0,
+  "adds": 26,
+  "dels": 2,
+  "hunks": 4,
+  "code_lines": 0
+ },
+ "params": {
+  "theta": 1.5,
+  "fanin_k": 5,
+  "extapi_k": 3,
+  "ripple": true,
+  "history_repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+  "history_ref": "b3f2f7494e323685c06214c011babe2ccb75e5b3~1",
+  "ledger": null,
+  "before": null,
+  "weights": {
+   "path_glob": 1.0,
+   "keyword": 0.5,
+   "keyword_cap": 1.5,
+   "sig_changed": 1.0,
+   "def_new": 0.5,
+   "def_deleted": 1.0,
+   "public_widen": 0.5,
+   "fanin": 1.0,
+   "churn": 0.5,
+   "extapi": 1.0,
+   "hist_fix3": 0.5,
+   "hist_fix6": 1.0,
+   "ledger_upheld": 1.0,
+   "ledger_dismissed": 0.5,
+   "test_mult": 0.3,
+   "doc_mult": 0.2,
+   "new_file": 0.5,
+   "ripple": 1.0,
+   "decl_only_mult": 0.5
+  }
+ },
+ "zones": [
+  {
+   "file": ".trellis/workspace/S.Kai/index.md",
+   "ranges": [
+    [
+     1,
+     42
+    ]
+   ],
+   "symbols": [],
+   "signals": [],
+   "score": 0.0,
+   "lines": 42,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.2
+  },
+  {
+   "file": ".trellis/workspace/S.Kai/journal-1.md",
+   "ranges": [
+    [
+     19,
+     53
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 35,
+   "ripple": false,
+   "changed_lines": 23,
+   "mult": 0.1
+  }
+ ],
+ "h0": [],
+ "theta": 1.5,
+ "R": 0.0,
+ "max_zone": 0.0
+}

@@ -26,3 +26,6 @@ secrets.toml
 
 # python bytecode
 __pycache__/
+
+# --- 分支随行文档区的私有分区：含公司仓（PR181）细节，远端公开仓永不入库 ---
+.next/private/

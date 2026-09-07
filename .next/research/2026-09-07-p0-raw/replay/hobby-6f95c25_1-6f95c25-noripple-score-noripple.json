@@ -1,0 +1,119 @@
+[
+ {
+  "set": "6f95c25~1..6f95c25",
+  "n": 15,
+  "theta": 1.5,
+  "h0_count": 3,
+  "in_any_zone": 11,
+  "dropped_unanchored": [
+   "9ebffba8@6f95c25"
+  ],
+  "hit_range": 7,
+  "hit_range_rate": 0.467,
+  "hit_file": 14,
+  "hit_file_rate": 0.933,
+  "empty_zones_range": 0,
+  "empty_zones_range_rate": 0.0,
+  "empty_zones_file": 0,
+  "empty_zones_file_rate": 0.0,
+  "misses": [
+   {
+    "id": "0aebfc25@6f95c25",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/cli.rs",
+      "line_start": 441,
+      "line_end": 447
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "1eb780f4@6f95c25",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/cli.rs",
+      "line_start": 1429,
+      "line_end": 1431
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "4f647bc9@6f95c25",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/cli.rs",
+      "line_start": 275,
+      "line_end": 282
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "3bffa8c8@6f95c25",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/cli.rs",
+      "line_start": 595,
+      "line_end": 597
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "87ca3675@6f95c25",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/cli.rs",
+      "line_start": 356,
+      "line_end": 357
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "28c328a5@6f95c25",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/cli.rs",
+      "line_start": 275,
+      "line_end": 279
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "2c249df6@6f95c25",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/cli.rs",
+      "line_start": 443,
+      "line_end": 447
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "4a24576e@6f95c25",
+    "file_hit": false,
+    "anchors": [
+     {
+      "file": "src/prompt/templates/adversarial-refute-doc.md",
+      "line_start": 34,
+      "line_end": 34
+     }
+    ],
+    "topic": null
+   }
+  ],
+  "empty_zone_list": []
+ }
+]

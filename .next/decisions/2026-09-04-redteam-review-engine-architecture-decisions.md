@@ -1,0 +1,293 @@
+# redteam 评审引擎架构·决策日志（M21）
+
+> 状态: WIP · 建于 2026-09-05（文件名取 design 同日期以对齐三联；D1 定于 09-04，D2-D5 定于 09-05）。
+> 对应 design：`../design/2026-09-04-redteam-review-engine-architecture-design.md`（各节以〔Dn〕引本文）。
+> 证据：`../research/2026-09-04-redteam-review-engine-architecture-research.md`。
+> 架构级单份决策日志、分节记。每条：议题 / 候选与被否 / 定案 / 依据 / 代价与残余。
+
+---
+
+## D1 串行三角色 → 风险路由 DAG（2026-09-04）
+
+**议题**：v1「scanner → reviewer → advisor」三角色串行能否兼顾快与好。
+
+**候选与被否**
+- 被否：固定串行三角色（各自独立提示词、共享工具）。
+- 被否：advisor 作为固定必走轮（含 per-PR 摘要一轮）。
+
+**定案**：快模型默认全景（分组并行）+ 确定性风险路由触发慢模型深挖 + 跨家族并行 + 定向 verify。矛盾从
+「时间 vs 质量」挪到「钱 vs 质量」：同一墙钟内用 token 买召回。
+
+**依据**（量化账见 research §11）
+- 墙钟 = 串行调用相加。reviewer 深挖与单发**同质**：聚焦省的是「看不该看的」，不是「写论证的 token」；top-K
+  若多于单发自发现，输出反涨。advisor 的 PR 级摘要是纯增一轮。合计 ≈ 12-15 min，劣于 DeepSeek 单发 5.3 min
+  两三倍。
+- PR181 实证：最复杂线路（ocr：LLM 分组 + agent 循环）最慢（30 min / 3 findings）。更复杂 ≠ 更快。
+- **分治 ≠ 角色分层**：分治并行摊平墙钟；角色分层串行相加。「快」的五个变量（TPS / 并行 / 输出精简 / 调用次数 /
+  增量+cache）角色分层全部中性或负。
+- 「发现便宜、论证贵」洞察成立，正确容器是同一次调用内的输出结构或风险路由的触发条件，不是三个独立 agent。
+
+**代价与残余**：非热区只有快模型深度；路由规则会漏（靠台账回流）。
+
+**勘误（2026-09-05，D6 连带）**：上表 reviewer 行「~25K @27 ≈ 10-11 min」把**总 output 同质**当成了**墙钟同质**。
+TPS 是单流约束，K 个疑点各一条流并行，墙钟 = max 不是 sum（rpiv F1.2）。单发的 30.9K 是一条拆不开的流，疑点索引
+把它变成 K 个可调度单元，这是 scanner 除宽召回外的第二重价值。此勘误**不复活串行三角色**（三角色的错在「固定串行」
+与「必走 advisor 轮」，结论不变），但修正推论：慢模型的广度成本是钱与有界墙钟，「典型 PR 不碰慢模型」的边界改由
+预算控制（D6）。上行「非热区只有快模型深度」随之改为「预算外疑点休眠、下一轮激活」。
+
+---
+
+## D2 波次模型 → 深挖优先级队列（2026-09-05）
+
+**议题**：v2 把深挖写成「波次 1（H0）/ 波次 2（H1）」两段；用户提出应为 producer/consumer 队列，H0 先入队。
+
+**候选与被否**
+- 被否：波次模型（等**全部**快扫完成才开第二波）。
+- 被否：FIFO 队列（话多的快模型会把规则命中的高分项排到后面）。
+- 被否：无预算上限（快模型标一切为 high/低置信时退化为「慢模型审一切」，「快」消失）。
+- 被否：深挖 cell 可再入队（链条无界）。
+
+**定案**：快扫 = 静态 fan-out、纯生产者；深挖 = 优先级队列 + worker 池；三种生产者（规则 H0 / 快扫触发项 /
+快扫 needs）产同一类型项；reduce 为 barrier。六条规则见 design §6。
+
+**依据**
+- 尾延迟：第 k 组扫完即可触发其热区深挖，不等最慢组；墙钟永不更差、尾部通常更短。
+- 限流：worker 池大小即并发上限，天然对网关 429/503 友好（ocr 35 请求撞限的教训）。
+- 统一抽象：H0 与 H1 同型，不特判波次；needs 与触发项同队列，不设三套机制。
+- 五个必须钉住的细节及原因：①优先级键 = 风险分（规则项先于噪音项）；②入队合并去重（五个组各报同一热点五次）；
+  ③预算截断且截断项**不静默**（以快扫 finding 原样进 reduce、标 `skipped(budget)`）；④终止显式（生产者关闭 →
+  排空 → 在途 0），因 agreement ≥ 2 跳 verify 需全集；⑤H0 无笔记。
+- **H0 无笔记的取舍**：给 H0 带笔记需等覆盖它的快扫组完成，重新引入串行依赖；独立审反而是多样性轴（同区域两模型
+  独立看，reduce 计 agreement）。快扫后来命中同区域按去重丢，其 finding 本身仍进 reduce。
+
+**代价与残余**：实现复杂度（mpsc + 池 + 终止条件）；`max_cells`/`workers` 默认值待实测（R9）。
+
+---
+
+## D3 分组：确定性引用图优先，LLM 语义分组 opt-in（2026-09-05）
+
+**议题**：design §4 对分组规则含糊；候选有 LLM 按 diff 分、AST + caller/callee、爆炸半径。
+
+**候选与被否**
+- 被否：默认 LLM 语义分组（ocr 路线）——多一次调用、丢确定性（C5、M15 重确定性）；对本仓价值未证。
+- 被否：AST 重解析——本仓 regex 引用索引 Rust recall 1.0，已够作基底。
+- 澄清：爆炸半径不是分组——分组看 changed 与 changed 的边，半径看 changed 与 unchanged 的边；同图两向。
+
+**定案**：changed files 间引用图（引用边 / import 边强、同目录边弱）→ 连通分量 → 超预算先切弱边 → 仍超不切强边
+改降内容（M15 L4「宁降不拆」）→ 孤立文件按目录 bin-packing。LLM 语义分组 `semantic = off` 默认，只喂路径 + churn，
+仅在孤立文件占比高时值得开。门默认值取 ocr 实测（4 / 200 / 10）。
+
+**依据**
+- M15 L4 已定「拆格仅在弱耦合缝，文件级 import/引用图，regex 可建」，本条是其落地。
+- 分组切错代价可控：半径已填（另一组的 caller 仍作上下文出现），reduce 再 dedup，退化为冗余而非盲区。
+- LLM 分组能抓「同 feature 无 import 边」（跨语言同改契约），但那正是孤立文件多的场景，先按目录打包也能成组；
+  留 opt-in 等 dogfood 出现 feature 级聚合缺失再开。
+
+**代价与残余**：跨语言/跨模块横切改动可能分到不同组，靠跨组指针与半径兜底（R8）。
+
+---
+
+## D4 装包单位：改动中心切片，默认待实验（2026-09-05）
+
+**议题**：文件粒度装包噪音大（几十个 helper 的 util 文件只改一个）；提示词「仅关注改动」对注意力约束有多强。
+
+**候选与被否**
+- 被否：直接把切片设为默认——lost-in-the-middle 未验证，F3 数据不足以裁决。
+- 被否：维持整文件为唯一形态——注意力稀释只能靠不发治。
+- 被否：依赖提示词约束——它约束「报什么」不约束「注意力分给谁」。
+
+**定案**：分组单位 = 文件，装包单位 = changed symbol。切片配方 = 核（改动 def 全文 + diff）+ 文件内一跳依赖全文 +
+文件地图（全部签名 + 文件头/模块 doc/常量块）+ 其余折叠 + 文件外片段 + 禁真空兜底。配置轴 `pack.body = full | slice`，
+**默认 full**，E2 实验定。报错位置噪音由确定性后滤（positioning `anchor_window`）治。diff + 改动 def 置尾。
+
+**依据**
+- F3「全文 > 符号」的失败模式是**真空**（锚定失败给空壳）与**缺依赖**（切掉了改动函数用到的同文件符号），不是
+  「少即差」的证明；两者分别由禁真空与文件内一跳补上。
+- 文件地图必留：「已有 `foo_safe` 该复用」类 finding 需要知道文件里有什么。
+- 位置：diff 置尾同时满足前缀缓存（稳定在前）与 LITM 高位，不需二选一。
+- input 侧 cache 命中 99%，切片的**成本**论据弱；**质量**论据（稀释）才是真的，而它需要数据。
+- Baz 文件级裁剪省 86% 不漏 + AACR naive RAG 反伤强模型：相关加入有益、无关加入有害或中性；切片是提高相关密度。
+
+**代价与残余**：切错 → 缺依赖类漏（兜底三层）；E2 前不变默认。
+
+---
+
+## D5 三方 callee 正确性：本地源契约注入四层（2026-09-05）
+
+**议题**：callee 为三方库时无文档/源码作上下文则调用方式错误发现不到；无 LSP，有也未必保证。
+
+**候选与被否**
+- 前提推翻：三方源码与契约**本地就有**（cargo registry / go mod cache / node `.d.ts` / site-packages）。
+- 被否：依赖 LSP——LSP 给的也只是签名 + doc，静态抽取同样拿得到；行为级 oracle 只有编译器与测试。
+- 被否：跳过三方 callee——关键模块的调用错误后果重。
+- 被否：仅按需注入契约——每 callee ~100 token、全注入几 K，input 慷慨；按需只留给函数体（C 层）。
+
+**定案**：四层。A 编译门（M15 D8 已有，类型级）；B 契约注入（S2-b 扩到 registry 源：签名 + doc + 短函数体，按
+Cargo.lock 精确版本，默认全注入）；C needs 联动（`needs{kind: api}` → 深挖队列 → 带契约与函数体）；D 测试执行
+（M20 R6 钩子位）。风险路由加「关键模块 + 外部 API 密集」结构信号。
+
+**依据**
+- B 层真正解决的是**版本漂移**：模型参数知识记某版本 API，代码用 Cargo.lock 那个版本，注入以后者为准。
+- Rust 定位链确定性：`use` → crate → Cargo.lock 版本 → registry 路径 → `pub fn` + `///` 块；歧义带 crate 标签全给。
+- S2-b 已证 callee 注入产量可观（单 fn 13 条、变更集 77 条）且 regex 做不到——扩根路径即可。
+
+**代价与残余**：doc 未写的前置条件 + 无测试 + 模型不知 → 不可发现，与无该库领域知识的人类评审者同一残余，
+接受为边界。非 Rust 生态定位链后置（R10）。
+
+---
+
+## D6 吸收 rpiv 交叉评审（2026-09-05）
+
+**议题**：用户另取两份 LLM 方案交叉。`~/llm-code-review-architecture.md` 为共同祖先（v0，无增量，其独有主张已在 D3
+与 research §6.3 裁过）；rpiv 研究（`.rpiv/artifacts/research/2026-09-04_10-26-56_llm-code-review-multi-agent.md`，含被
+追问「快」后的 F1-F5 追加）与 v3 逐点对照，证据摘录见 research §13。
+
+**采纳（8 项）**
+1. **快扫输出改疑点索引**（<50 token、quote 必填、疑似即列）：finding 模式门槛高，「知道哪里可疑但写不出来」的信号
+   蒸发；疑点模式召回高，筛与论证交慢模型。finding 只由深挖产出（C7）。
+2. **全部疑点入队 + 预算随风险分 + 必挖集**：v3「只有 severity ≥ high ∧ conf < τ 触发」与 rpiv「全部疑点吃预算」在
+   D1 勘误后合并——H0 规则项最高优先、必挖集（H0 ∪ 高置信 blocking）不截、其余按 `置信 × agreement × 严重度` 吃到
+   `f(R, 规模)`。不用置信阈值切（边界疑点是漏报敏感带）。
+3. **疑点台账 + 增量轮 delta 激活 + 收敛三维 + 活锁守卫**：预算截断从「漏」变「延迟到下一轮」，是预算敢保守的前提；
+   carry 机器零改动复用；休眠疑点不进 verdict（verdict 纯函数是资产）。
+4. **`[roles.X]` 角色层**：thinking_level 是角色属性（同模型两档消费），fallback 只在同 TPS 档（跨档回退 = 静默 4×
+   反转），项目层剥离清单加 roles。
+5. **正反向跨组索引 + `[delta]` 标注**：`extract_imports` 边算完即丢，提升为流水线产物零成本；反向索引是
+   manifestation-site 信息。
+6. **段序**：角色尾（输出契约 + 指令）移到证据与 diff 之后：共享前缀延伸到 diff，分化只在尾部；与 D4「diff 置尾」合并为
+   「diff 次尾 + 短角色尾」。
+7. **判例前移进快扫 prompt**（机械降级、不直接丢）：假阳从下游压制变上游不生成。
+8. **coverage 五集合 + 角色分级**（快扫失败硬 Incomplete / 深挖截断带债 approve）；小项：ocr 跨文件重定位、
+   `scanned_areas`、refute analysis 先于 verdict、deep cell 可选增量提交（价值是中途死亡持久化，非防截断）。
+
+**未采纳（5 项）**
+- 三阶段独立 orchestrator：单编排器 + 队列已是 rpiv F5「LLM 声明、编排器调度」形态；其四轴顾虑（CellRecord 装不下疑点、
+  resume 语义、per-fanout 单模型计划、manifest/partial）成立但属实现债，记 R14。
+- advisor 对每个疑点做 LLM 三元裁决：确定性排序 + 预算即可，rpiv F3 自己也转为机械排序。
+- 疑点索引必须工具化：体量太小（几十条 × 50 token）截不了；deep cell 可选开。
+- 扫描遍 0.5 min 估计：DeepSeek 单发实测 5.3 min，大头是读 145K 与想，不是写；分组并行后取 2-3 min。
+- 三阶段各自扇出粒度作为架构轴：队列项统一了粒度，不设三套扇出。
+
+**保留 v3 独有**：确定性风险路由 H0（rpiv 深挖目标全靠疑点；授权类 bug 所有快模型都弱，规则命中即深挖是漏报根源①
+最确定的对症）；L4 三方契约；D4 切片轴。
+
+**依据**：rpiv 文档贴代码写（ThinkingLevel 零消费、剥离清单、边被丢弃、harness 只测 dossier 召回），其实现级发现可
+直接进 plan；其外部证据（BitsAI-CR / Multi-Review / agreeableness bias / End of Code Review 等）补入 research §13。
+
+**代价与残余**：低风险 PR 墙钟 +1-2 min（预算内并行深挖）；台账激活依赖 delta 触及锚定文件；实现债 R14；
+findings-recall oracle 缺口 R15。
+
+---
+
+## D7 配置与基准（grill，2026-09-05）
+
+**议题**：用户提出配置改 YAML 并给出 providers / scanners / reviewers 形状；测试集换 aacr-bench。逐分支 grill 后定案。
+事实基础：本仓 config 已是 providers / models / review 三段、项目层剥离 providers+models、secrets 按 (provider, model_id)
+二维键、无 google kind、只有全局 max_concurrency、`model setup` 走 `toml::Value` 重序列化（注释已丢）；`serde_yaml`
+已弃用、替代品碎片化；aacr-bench 事实见 research §14。
+
+**A 配置**
+
+| # | 定案 | 被否 | 依据 |
+|---|---|---|---|
+| A1 | TOML；providers 键名表 | YAML | 同形状行数持平（33 vs 33）；`toml_edit` 支撑后续交互式配置保注释；`serde_yaml` 弃用；YAML 1.1 隐式类型踩坑面 |
+| A2 | 角色条目内联模型字段 + 可选 `name`；cell 命名向 config 对齐（scanner / reviewer / verifier） | `[models]` + `[roles]` 两层引用 | 典型 2-4 个模型，间接层不值；thinking 是角色属性在内联里天然成立；`name` 是身份串 |
+| A3 | 列表 = 活跃集全并行（scanners 疑点并集、reviewers 分派池、verifiers 选择池）；**无候补** | `standby` 候补、FIFO、failover 链 | 用户判断：失败根因是网关不稳，候补用不上且加复杂度（YAGNI）；失败路径由 coverage `failed` 分级承接；同角色即同档，D6 采纳项 4 的 fallback 部分撤回 |
+| A4 | verifier 保留、流式化（finding 落地即复核）、触发集 blocking + 判例变体、跳过 = 两异族 scanner + reviewer 三方一致、`enabled` 旋钮 + refute 率数据判决；`[[verifiers]]` 可选、缺省自动异族 | 砍掉复核；必配 verifiers；多 verifier 投票 | 复核墙钟 = 并行一次调用且可与深挖重叠，非大头；它是唯一以推翻为目标的环节与判例终审；去留交数据（铁律 1） |
+| A5 | provider 级 `max_concurrency` = 在途上限，缺省继承 `review.max_concurrency` | RPM 令牌桶（R16） | 实测失败形态是并发密度触发的 429/503/524；持续超速由重试退避吸收 |
+| A6 | 不新增 google 后端 | 顺手做 | 每个后端要重踩非流式 524 / SSE error / usage 低报 / finish_reason 缺失；R17 |
+| A7 | secrets：`[providers.X] api_key` + `"<model_id>" = key`（值可内联表）；引号守卫、未知键警告 | `[models.<id>]` 独立表；provider 嵌套 `models` 子表 | 用户判断：一 key 多 provider 几乎不出现，provider 内嵌最简且无歧义 |
+| A8 | 用户级唯一 `~/.redteam/`，`REDTEAM_HOME` 覆盖；项目 `.redteam/` 只状态与内容；评审旋钮走 CLI flag / env；`--test-command` | 保留项目层 config | provider 在途上限是 key 属性天然跨项目；项目层每一项要么是旋钮（PR 可改）要么是内容；剥离清单代码整段删除 |
+| A9 | 不做迁移与兼容 | `config migrate` | 未发布仅 dogfood |
+
+**B 基准**
+
+| # | 定案 | 被否 | 依据 |
+|---|---|---|---|
+| B1 | aacr-bench 全在 fork `itcook/aacr-bench`（数据、评估器、`reviewers/redteam.py`、子集）；本仓只 `eval/README` + `AACR_BENCH_DIR` | vendor 进 `eval/`；submodule | 用户判断：测试数据不在本仓维护；reviewer 硬编码在 pipeline 需改其代码，fork 是自然落点 |
+| B2 | `smoke` 5 正；`gate` 规模重启时按 spike 定 | 30+10 / 三语言全 114 | 成本；15 个 PR 约 60 条标注，<10pp 差异 N=1 不可分，故 gate N=3 |
+| B3 | mock judge 内循环取 Line-P/R（前三阶段确定性、零成本）；出口 GLM judge（家族与角色不重合）；可调 | 全程 LLM judge | 匹配四阶段只有 semantic 是 LLM |
+| B4 | **aacr 暂退役**；主场 PR181（连续性、网关真实度）+ dogfood（多轮、台账、ship）；重启点 M21c 翻转前 `smoke`、M21e 收官 `gate` | 现阶段跑 aacr | 用户判断：早期里程碑需分钟级信号，40 PR 四小时拖慢迭代；翻转与收官是绝对召回必须被量的两个时刻 |
+| B5 | ocr 参照 = deepseek-v4-pro 直连 chat-completions 流式，版本钉；Claude D 参照后置 | AGC 网关跑 ocr | PR181 三跑只有 chat-completions 流式未撞 524 |
+| B6 | 负样本 N=1；N=3 只在关键出口；估算按 pack 字节 ÷ 3.5 | — | 网关 usage 低报（GLM 7K vs 145K） |
+| B7 | P0 E1/E3 回 PR181 基座 + proj.db 历史 upheld 作小 oracle；`--pack-only` 预算仪表 M21a 顺手 | E1/E3 改 aacr 基座 | 随 B4 |
+
+**连带**：D6 采纳项 4（`[roles.X]` + 同档 fallback）中 fallback 撤回、角色层改为顶层角色列表；design v5 §12 重写；
+`priority` / `--models` / `--models-all` / 项目层配置 / `XDG_CONFIG_HOME` 退场。
+
+**代价与残余**：无候补下 provider 不稳直接体现为 coverage `failed`；PR181 + dogfood 无标注、测不出绝对召回，缺口在
+M21c 翻转前由 aacr smoke 补；RPM / google / diffsym 语言 / 交互式配置进 R16-R19。
+
+---
+
+## D8 scanner 组 pack 默认 `slice`（D4 修订，2026-09-05）
+
+**议题**：D4 把 `pack.body` 默认留 `full`、等 E2 出数据。用户直觉 full 必有噪音与 token 浪费，提议 slice 优先、full 留作
+召回受损时的回退测试。
+
+**候选与被否**
+- 被否：维持 `full` 默认等 E2——合成 util 文件实验不如真 PR 的 A/B，且 reviewer 侧本来就已切片，悬而不决只剩 scanner 一处。
+- 被否：删掉 `full`——回退需要它作对照与逃生口。
+
+**定案**：`[review.pack] body` 默认 `slice`，只管 scanner 的组 pack；reviewer 区域 pack 由构造即切片。保险四条：`full` 留旋钮；
+切片三层（禁真空兜底 / 文件内一跳 / 文件地图）同批交付；小文件（≤ `slice_min_bytes`，默认 8K）直接全文；回退信号写死
+（M21a 出口 PR181 A/B 中 slice 疑点命中低于 full，或 dogfood 中 scanner `needs{kind: evidence}` 触发率持续偏高 → 先二跳
+再 full）。E2 改为 M21a 出口的 slice vs full A/B，合成 LITM 实验降为可选。
+
+**依据**
+- reviewer cell 在 v5 §7 已是「热区切片 + 半径」，`body` 轴事实上只剩 scanner 一个消费者。
+- scanner 的职责是广度：改动 def 全文 + 一跳 + 全部签名足以「怀疑」，被折叠的函数体它知道存在，缺证据走 `needs`，由
+  reviewer 拿全文论证——这是设计里给它的出口。
+- full 的代价在 scanner 上被乘法放大：组 pack × scanner 条目数 × samples。
+- F3 的失败模式（真空、缺依赖）各有对症层；slice 优先是「配方修好了 F3」的赌注，保险即上述四条。
+
+**代价与残余**：若配方没修好 F3，M21a 出口 A/B 才会暴露；回退路径已定。切片装包从 M21d 提前到 M21a，M21a 范围再增。
+
+---
+
+## D9 提示词按角色分离（2026-09-05）
+
+**议题**：用户指出 design / roadmap 未明确「提示词按 scanner / reviewer / verifier 分离与优化」。此前散落在 §4 / §7 / §8.1 /
+§10.3，且 M6-b 提示词 harness 被并入 M20 backlog。
+
+**候选与被否**
+- 被否：单一模板 + mode 开关——分化段若在证据前会截断共享前缀（rpiv 段序翻转论据）；三种输出契约混在一个模板里与
+  parse 字段级对齐做不到；三种立场（广度怀疑 / 深度建设 / 单点推翻）互相污染。
+- 被否：提示词评测继续放 M20——三角色各有零新数据的离线回归集可用，不用等 harness 立项。
+
+**定案**：design §10.7。共享头（字节稳定：协议、规则、立场、CI 跳过清单、免疫段、brief、spec）+ 三个角色尾（唯一分化段，
+含各自输出契约与指令）；模板文件 `shared-head.md` + `scanner.md` / `reviewer.md` / `verifier.md`；注入段全过
+`neutralize_structure`；思考档位由条目给、prompt 不写散文；模板哈希入 RunMeta；离线回归集：verifier 用 proj.db
+dismissed（假阳）vs upheld（真）做二分类，scanner 用 PR181 疑点 oracle，reviewer 用确认率 + 其后 refute 率。
+
+**依据**
+- ReviewBench：结构化提示单独把某模型 F1 0.13→0.32，提示架构本身是性能面（research §10.4）。
+- PR-Agent 一命令一提示词的先例（research §10.2）；Critic 必须独立会话、独立立场（research §13.2）。
+- 段序翻转要求分化只在尾部（D6 采纳项 6），角色尾正是那个尾。
+- proj.db 的 dismissed / upheld 记录天然是 verifier 的标注集，零成本。
+
+**代价与残余**：三套模板维护；M6-b 的一部分提前进 M21a / M21b；scanner 与 reviewer 的回归集依赖 PR181 oracle，绝对值仍待
+aacr 重启。
+
+---
+
+## D10 收尾四项 + 不新开项目（2026-09-05）
+
+**议题**：用户问增量提交、项目状态 / 台账 / 内容数据、输入缓存优化是否还需讨论、放 M21 还是 followup；并担心重构面太大、
+旧文档与代码成为噪音，是否新开项目。
+
+**定案**
+
+| # | 定案 | 被否 | 依据 |
+|---|---|---|---|
+| 1 增量提交 | **客户端流式持久化**：SSE 流上对 `findings` 数组增量 JSON 解析，对象闭合即落盘；无 `submit` 旋钮，R13 消 | 工具循环 `submit_finding`；`final \| incremental` 旋钮 | 响应已是流式（附录坑：非流式 = 死刑）；不改模型契约、不重开工具循环（C4）、零额外 token；FINALIZE / REPAIR 仍管最终解析 |
+| 2 状态数据 | **proj.db schema v4 一次重置**（M21a）：cell 带角色、suspicions、queue_snapshot、coverage 五集合、runs meta；不写迁移；**重置前导出**旧库 dismissed / upheld findings 为 `eval/` 固定集 | 三个里程碑各迁一次 | 未发布仅 dogfood；分三次迁移 = 三份迁移代码与三次风险；旧库的 dismissed / upheld 是 verifier 离线回归集的全部数据，不能丢 |
+| 3 输入缓存 | **结构性部分在 M21a**：段序翻转 + anthropic kind 三段界 `cache_control` 断点（共享头末 / 证据段末 / 角色尾前）+ RunMeta 按 cell 记命中率；**非结构性进 R21**（provider 专属 context caching、跨 run 预热、磁盘缓存调参） | 全部后置；或全部进 M21 | 现有断点实现因三 provider 皆 openai kind 从未跑到，而用户的 GLM / Kimi 正是 anthropic kind，断点是免费收益；provider 专属 API 各家不同，先看命中率数据再定 |
+| 4 分支形态 | **分支硬切，无 `engine` 旗**：`feat/m21-review-engine` 直接删除旧编排（fan-out、候补链、`--models` 四分支、项目层配置）；对照基线 = `dev` 分支二进制并排跑同一 PR；切名前分支产物 `redteam-next`，插件与 ship 循环继续用 dev 的 `redteam`，M21c 切名 | `engine = legacy \| v2` 旗贯穿 M21a-c（原铁律 6） | 两条编排路径并存才是噪音与陈旧假设的温床（M15 翻转当天四个集成 bug 的 precedent）；对照能力由 dev 二进制提供，不需要在同一二进制里养两条路 |
+| PS 新开项目 | **不新开**，在本仓分支硬切 | 新 repo 重来 | 新 repo 丢掉的恰是最贵的：provider 层那串坑（524 / SSE error / usage 低报 / finish_reason）、路径注入修复与威胁模型 B、E11 注入加固、regex 引用索引（recall 1.0）、pack 梯子、dedup / carry、判例台账、exit code 契约、ship 协议、四百多个测试；design §15「其余原样」即这份清单。文档噪音靠 `CLAUDE.md` 常用节加「M21 阅读入口」压住，不搬 `.doc/`（互链会断） |
+
+**连带**：铁律 6 改写；M21a 验收「legacy 路径零行为变化」改为「dev 二进制基线归档」；M21c「默认翻转」改为「切名」；
+R13 消、R14 扩、R21 增；design §7 / §10.3 / §11 / §12.1 / §15 / §16 / §17 对应改。
+
+**代价与残余**：M21a、M21b 期间 `redteam-next` 审不出 finding，dogfood 靠 dev 二进制；两个二进制名要在 Makefile / 插件
+放置里区分；流式持久化只能保住已闭合的对象，未闭合的仍随 cell 死亡丢失。

@@ -2,11 +2,11 @@
 
 > 状态: 草案 v2（2026-09-05，grill〔D7〕后：配置节 / 无候补 / verifier 流式 / aacr 退役与重启点）· 分支 `feat/m21-review-engine`
 > · 工作树 `~/hobby/.worktrees/redteam/m21-review-engine`
-> 权威框架: `.doc/design/2026-09-04-redteam-review-engine-architecture-design.md`（v5，WIP，P0 出口锁定）
-> 证据 / 决策: `.doc/research/2026-09-04-redteam-review-engine-architecture-research.md`（§14 aacr 事实）·
-> `.doc/decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D7）
-> `.doc/` 是主 checkout 的私有工作区（gitignored），工作树内不可见；上述路径以主仓根 `~/hobby/redteam/` 为基。
-> 本目录独立于 `.doc/roadmap/`，只记本次重构；零散 polish 仍走 `.doc/TODO/`。
+> 权威框架: `../design/2026-09-04-redteam-review-engine-architecture-design.md`（v7，WIP，P0 出口锁定）
+> 证据 / 决策: `../research/2026-09-04-redteam-review-engine-architecture-research.md`（§14 aacr 事实）·
+> `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D10）
+> 2026-09-07 起本目录连同上述文档自主 checkout `.doc/` 迁入分支随行区 `.next/`（`../README.md`）；含公司仓细节者在 `../private/`（gitignored）。
+> 本目录独立于主 checkout `.doc/roadmap/`，只记本次重构；零散 polish 仍走 `.doc/TODO/`。
 
 ## 一句话
 
@@ -72,7 +72,7 @@ M21c 与 M21d 可并行（d 只依赖 reviewer cell 存在，不依赖台账）�
 - `.doc/roadmap/summary.md` 的 **M19 发布 1.0 后置于 M21e**：重构改 CLI 面（`--models` 退场、`--risk` / `--test-command`
   新增、配置搬到 `~/.redteam/`），`--help` 与 README 须在 M21e 定稿后再发。
 - M20 backlog：R6 执行判（design §9.4 D 层）、google 后端（R17）、RPM 令牌桶（R16）、交互式配置（R19）不在本 roadmap。
-- design 锁定后按规范派生 `.doc/plans/2026-*-redteam-m21{a..e}-*-plan.md`，本目录各里程碑文件是其范围与验收的上位定义。
+- design 锁定后按规范派生 `../plans/2026-*-redteam-m21{a..e}-*-plan.md`（`.next/plans/`），本目录各里程碑文件是其范围与验收的上位定义。
 
 ## 状态图例
 

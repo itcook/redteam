@@ -1,0 +1,74 @@
+{
+ "repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+ "base": "e83635ee9d0263e497e910f47ae63a296bcd0fb4~1",
+ "head": "e83635ee9d0263e497e910f47ae63a296bcd0fb4",
+ "size": {
+  "files": 1,
+  "code_files": 1,
+  "adds": 13,
+  "dels": 0,
+  "hunks": 1,
+  "code_lines": 13
+ },
+ "params": {
+  "theta": 1.5,
+  "fanin_k": 5,
+  "extapi_k": 3,
+  "ripple": true,
+  "history_repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+  "history_ref": "e83635ee9d0263e497e910f47ae63a296bcd0fb4~1",
+  "ledger": null,
+  "before": null,
+  "weights": {
+   "path_glob": 1.0,
+   "keyword": 0.5,
+   "keyword_cap": 1.5,
+   "sig_changed": 1.0,
+   "def_new": 0.5,
+   "def_deleted": 1.0,
+   "public_widen": 0.5,
+   "fanin": 1.0,
+   "churn": 0.5,
+   "extapi": 1.0,
+   "hist_fix3": 0.5,
+   "hist_fix6": 1.0,
+   "ledger_upheld": 1.0,
+   "ledger_dismissed": 0.5,
+   "test_mult": 0.3,
+   "doc_mult": 0.2,
+   "new_file": 0.5,
+   "ripple": 1.0,
+   "decl_only_mult": 0.5
+  }
+ },
+ "zones": [
+  {
+   "file": "src/cli/mod.rs",
+   "ranges": [
+    [
+     661,
+     788
+    ]
+   ],
+   "symbols": [
+    "run_job"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 128,
+   "ripple": false,
+   "changed_lines": 13,
+   "mult": 1.0
+  }
+ ],
+ "h0": [],
+ "theta": 1.5,
+ "R": 0.0,
+ "max_zone": 0.5
+}

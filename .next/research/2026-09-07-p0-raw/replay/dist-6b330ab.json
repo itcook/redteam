@@ -1,0 +1,242 @@
+{
+ "repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+ "base": "6b330ab9ea54975667f9460b564391d996beeb10~1",
+ "head": "6b330ab9ea54975667f9460b564391d996beeb10",
+ "size": {
+  "files": 6,
+  "code_files": 2,
+  "adds": 159,
+  "dels": 0,
+  "hunks": 6,
+  "code_lines": 3
+ },
+ "params": {
+  "theta": 1.5,
+  "fanin_k": 5,
+  "extapi_k": 3,
+  "ripple": true,
+  "history_repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+  "history_ref": "6b330ab9ea54975667f9460b564391d996beeb10~1",
+  "ledger": null,
+  "before": null,
+  "weights": {
+   "path_glob": 1.0,
+   "keyword": 0.5,
+   "keyword_cap": 1.5,
+   "sig_changed": 1.0,
+   "def_new": 0.5,
+   "def_deleted": 1.0,
+   "public_widen": 0.5,
+   "fanin": 1.0,
+   "churn": 0.5,
+   "extapi": 1.0,
+   "hist_fix3": 0.5,
+   "hist_fix6": 1.0,
+   "ledger_upheld": 1.0,
+   "ledger_dismissed": 0.5,
+   "test_mult": 0.3,
+   "doc_mult": 0.2,
+   "new_file": 0.5,
+   "ripple": 1.0,
+   "decl_only_mult": 0.5
+  }
+ },
+ "zones": [
+  {
+   "file": ".trellis/tasks/archive/2026-09/09-03-anthropic-streaming/check.jsonl",
+   "ranges": [
+    [
+     1,
+     2
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 2,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": ".trellis/tasks/archive/2026-09/09-03-anthropic-streaming/implement.jsonl",
+   "ranges": [
+    [
+     1,
+     3
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.25,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": ".trellis/tasks/archive/2026-09/09-03-anthropic-streaming/prd.md",
+   "ranges": [
+    [
+     1,
+     66
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:timeout,auth,resource_lifecycle",
+     "w": 1.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (65 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.25,
+   "lines": 66,
+   "ripple": false,
+   "changed_lines": 65,
+   "mult": 0.1
+  },
+  {
+   "file": ".trellis/tasks/archive/2026-09/09-03-anthropic-streaming/research/2026-09-03-524-spike.md",
+   "ranges": [
+    [
+     1,
+     43
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:resource_lifecycle",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (42 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.15,
+   "lines": 43,
+   "ripple": false,
+   "changed_lines": 42,
+   "mult": 0.1
+  },
+  {
+   "file": ".trellis/tasks/archive/2026-09/09-03-anthropic-streaming/research/2026-09-03-dogfood-findings.md",
+   "ranges": [
+    [
+     1,
+     24
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:concurrency,numeric_bounds",
+     "w": 1.0
+    }
+   ],
+   "score": 0.3,
+   "lines": 24,
+   "ripple": false,
+   "changed_lines": 23,
+   "mult": 0.2
+  },
+  {
+   "file": ".trellis/tasks/archive/2026-09/09-03-anthropic-streaming/task.json",
+   "ranges": [
+    [
+     1,
+     26
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:resource_lifecycle",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.1,
+   "lines": 26,
+   "ripple": false,
+   "changed_lines": 26,
+   "mult": 0.1
+  }
+ ],
+ "h0": [],
+ "theta": 1.5,
+ "R": 0.0,
+ "max_zone": 0.5
+}

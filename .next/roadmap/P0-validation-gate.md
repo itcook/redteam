@@ -11,7 +11,7 @@
 ## E1 · PR181 回放（零 LLM）
 
 - **产物**：`eval/risk_replay.py`（复用 `eval/harness.py` 的 materialize + 分桶框架，不引第三方依赖）。
-- **输入**：PR181 diff（40 文件 +1750/−69，base 见 `.doc/reviews/2026-09-04-pr181-three-way-redteam-ocr-rpiv.md`）；
+- **输入**：PR181 diff（40 文件 +1750/−69，base 见 `../private/reviews/2026-09-04-pr181-three-way-redteam-ocr-rpiv.md`）；
   三方 findings：GLM 6 条、DeepSeek 3 条、rpiv 8 条；另取本仓 proj.db 历史 dogfood 中 upheld 的 findings 作第二个小 oracle
   （D7 B7），看规则对它们所在文件 / 区域的命中率。
 - **基准说明**：aacr-bench 暂退役（D7 B4），P0 不用它；重启点在 M21c 翻转前 `smoke`、M21e 收官 `gate`（见 README）。
@@ -38,7 +38,7 @@
 - **必答项**（锁定前）：R5 预算函数形状、R11 `c_hi`、R6 `--risk all` 等价性的精确定义、R14 实现债路线
   （CellRecord 联合体 vs 疑点新表）。
 - **可后置项**：R1 / R3 / R7 / R8 / R9 / R10 / R12 / R13 / R15（各归属见 `followup.md`）。
-- **锁定动作**：design 状态头改「锁定」；派生 M21a-e plan 到 `.doc/plans/`；`.doc/roadmap/summary.md` 登记 M21
+- **锁定动作**：design 状态头改「锁定」；派生 M21a-e plan 到 `../plans/`；`.doc/roadmap/summary.md` 登记 M21
   并链回本目录；本文件状态 ✅。
 
 ## 出口条件

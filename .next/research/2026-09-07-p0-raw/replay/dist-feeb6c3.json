@@ -1,0 +1,218 @@
+{
+ "repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+ "base": "feeb6c3b617d9a794e1ee46961ffd3544cd9a338~1",
+ "head": "feeb6c3b617d9a794e1ee46961ffd3544cd9a338",
+ "size": {
+  "files": 2,
+  "code_files": 2,
+  "adds": 56,
+  "dels": 0,
+  "hunks": 2,
+  "code_lines": 56
+ },
+ "params": {
+  "theta": 1.5,
+  "fanin_k": 5,
+  "extapi_k": 3,
+  "ripple": true,
+  "history_repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+  "history_ref": "feeb6c3b617d9a794e1ee46961ffd3544cd9a338~1",
+  "ledger": null,
+  "before": null,
+  "weights": {
+   "path_glob": 1.0,
+   "keyword": 0.5,
+   "keyword_cap": 1.5,
+   "sig_changed": 1.0,
+   "def_new": 0.5,
+   "def_deleted": 1.0,
+   "public_widen": 0.5,
+   "fanin": 1.0,
+   "churn": 0.5,
+   "extapi": 1.0,
+   "hist_fix3": 0.5,
+   "hist_fix6": 1.0,
+   "ledger_upheld": 1.0,
+   "ledger_dismissed": 0.5,
+   "test_mult": 0.3,
+   "doc_mult": 0.2,
+   "new_file": 0.5,
+   "ripple": 1.0,
+   "decl_only_mult": 0.5
+  }
+ },
+ "zones": [
+  {
+   "file": "src/consolidate/dedup.rs",
+   "ranges": [
+    [
+     124,
+     198
+    ]
+   ],
+   "symbols": [
+    "is_same_bug_false_when_title_and_quote_both_low_similarity",
+    "is_same_bug_true_for_synonym_titles_same_quote",
+    "merges_cross_model_via_quote_when_titles_differ"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:is_same_bug_true_for_synonym_titles_same_quote",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.45,
+   "lines": 75,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 0.3
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     451,
+     506
+    ]
+   ],
+   "symbols": [
+    "worker_panic_hook_lands_failed_and_seals"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:numeric_bounds",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 56,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.3
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     512,
+     521
+    ]
+   ],
+   "symbols": [
+    "exit_code_one_on_invalid_conf_floor"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:exit_code_one_on_invalid_conf_floor",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:numeric_bounds,error_paths",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 10,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 0.15
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     525,
+     552
+    ]
+   ],
+   "symbols": [
+    "exit_code_three_on_incomplete_resume"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:exit_code_three_on_incomplete_resume",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "extapi",
+     "detail": "external calls×4",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (28 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.9,
+   "lines": 28,
+   "ripple": false,
+   "changed_lines": 28,
+   "mult": 0.3
+  }
+ ],
+ "h0": [],
+ "theta": 1.5,
+ "R": 0.0,
+ "max_zone": 0.9
+}

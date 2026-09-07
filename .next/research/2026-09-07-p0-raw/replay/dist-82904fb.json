@@ -1,0 +1,77 @@
+{
+ "repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+ "base": "82904fb54c0e22ae6cb4fb6923b085777fac7b20~1",
+ "head": "82904fb54c0e22ae6cb4fb6923b085777fac7b20",
+ "size": {
+  "files": 1,
+  "code_files": 0,
+  "adds": 365,
+  "dels": 0,
+  "hunks": 1,
+  "code_lines": 0
+ },
+ "params": {
+  "theta": 1.5,
+  "fanin_k": 5,
+  "extapi_k": 3,
+  "ripple": true,
+  "history_repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+  "history_ref": "82904fb54c0e22ae6cb4fb6923b085777fac7b20~1",
+  "ledger": null,
+  "before": null,
+  "weights": {
+   "path_glob": 1.0,
+   "keyword": 0.5,
+   "keyword_cap": 1.5,
+   "sig_changed": 1.0,
+   "def_new": 0.5,
+   "def_deleted": 1.0,
+   "public_widen": 0.5,
+   "fanin": 1.0,
+   "churn": 0.5,
+   "extapi": 1.0,
+   "hist_fix3": 0.5,
+   "hist_fix6": 1.0,
+   "ledger_upheld": 1.0,
+   "ledger_dismissed": 0.5,
+   "test_mult": 0.3,
+   "doc_mult": 0.2,
+   "new_file": 0.5,
+   "ripple": 1.0,
+   "decl_only_mult": 0.5
+  }
+ },
+ "zones": [
+  {
+   "file": ".rpiv/artifacts/research/2026-09-04_10-26-56_llm-code-review-multi-agent.md",
+   "ranges": [
+    [
+     1,
+     366
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:timeout,concurrency,auth,numeric_bounds,resource_lifecycle",
+     "w": 1.5
+    }
+   ],
+   "score": 0.4,
+   "lines": 366,
+   "ripple": false,
+   "changed_lines": 365,
+   "mult": 0.2
+  }
+ ],
+ "h0": [],
+ "theta": 1.5,
+ "R": 0.0,
+ "max_zone": 0.4
+}

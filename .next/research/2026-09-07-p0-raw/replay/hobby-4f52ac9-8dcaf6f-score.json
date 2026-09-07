@@ -1,0 +1,403 @@
+[
+ {
+  "set": "4f52ac9..8dcaf6f",
+  "n": 1,
+  "theta": 1.5,
+  "h0_count": 39,
+  "in_any_zone": 1,
+  "dropped_unanchored": [
+   "33fa8923@8dcaf6f"
+  ],
+  "hit_range": 1,
+  "hit_range_rate": 1.0,
+  "hit_file": 1,
+  "hit_file_rate": 1.0,
+  "empty_zones_range": 38,
+  "empty_zones_range_rate": 0.974,
+  "empty_zones_file": 21,
+  "empty_zones_file_rate": 0.538,
+  "misses": [],
+  "empty_zone_list": [
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      15,
+      48
+     ]
+    ],
+    "score": 1.75
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      362,
+      369
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      392,
+      437
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      440,
+      440
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      445,
+      445
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      449,
+      449
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      452,
+      457
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      490,
+      503
+     ]
+    ],
+    "score": 4.0
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      511,
+      575
+     ]
+    ],
+    "score": 4.5
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      582,
+      612
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      618,
+      707
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      711,
+      801
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      806,
+      972
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      1053,
+      1059
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      1061,
+      1067
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      1237,
+      1369
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/cli.rs",
+    "ranges": [
+     [
+      976,
+      1012
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/config/mod.rs",
+    "ranges": [
+     [
+      30,
+      43
+     ]
+    ],
+    "score": 1.75
+   },
+   {
+    "file": "src/consolidate/dedup.rs",
+    "ranges": [
+     [
+      57,
+      77
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/consolidate/dedup.rs",
+    "ranges": [
+     [
+      81,
+      97
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/consolidate/verify.rs",
+    "ranges": [
+     [
+      21,
+      21
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/consolidate/verify.rs",
+    "ranges": [
+     [
+      28,
+      95
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/consolidate/verify.rs",
+    "ranges": [
+     [
+      141,
+      183
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/dossier/mod.rs",
+    "ranges": [
+     [
+      66,
+      68
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/dossier/mod.rs",
+    "ranges": [
+     [
+      155,
+      179
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/dossier/mod.rs",
+    "ranges": [
+     [
+      182,
+      243
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/dossier/mod.rs",
+    "ranges": [
+     [
+      247,
+      284
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/output/mod.rs",
+    "ranges": [
+     [
+      6,
+      11
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/pack/mod.rs",
+    "ranges": [
+     [
+      121,
+      142
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/pack/mod.rs",
+    "ranges": [
+     [
+      148,
+      169
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/pack/mod.rs",
+    "ranges": [
+     [
+      215,
+      275
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/pack/mod.rs",
+    "ranges": [
+     [
+      348,
+      397
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/prompt/mod.rs",
+    "ranges": [
+     [
+      77,
+      106
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/prompt/mod.rs",
+    "ranges": [
+     [
+      111,
+      124
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/prompt/mod.rs",
+    "ranges": [
+     [
+      43,
+      72
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/tools/mod.rs",
+    "ranges": [
+     [
+      240,
+      289
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/tools/mod.rs",
+    "ranges": [
+     [
+      297,
+      308
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/tools/mod.rs",
+    "ranges": [
+     [
+      193,
+      235
+     ]
+    ],
+    "score": 1.5
+   }
+  ]
+ }
+]

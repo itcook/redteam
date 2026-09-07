@@ -1,0 +1,618 @@
+[
+ {
+  "set": "e8dc24f..00e23fc",
+  "n": 5,
+  "theta": 1.5,
+  "h0_count": 59,
+  "in_any_zone": 4,
+  "dropped_unanchored": [],
+  "hit_range": 2,
+  "hit_range_rate": 0.4,
+  "hit_file": 4,
+  "hit_file_rate": 0.8,
+  "empty_zones_range": 56,
+  "empty_zones_range_rate": 0.949,
+  "empty_zones_file": 36,
+  "empty_zones_file_rate": 0.61,
+  "misses": [
+   {
+    "id": "c067b640@00e23fc",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/cli/tail.rs",
+      "line_start": 18,
+      "line_end": 25
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "907b0a53@00e23fc",
+    "file_hit": false,
+    "anchors": [
+     {
+      "file": "src/consolidate/carry.rs",
+      "line_start": 86,
+      "line_end": 87
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "9f03b485@00e23fc",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/main.rs",
+      "line_start": 306,
+      "line_end": 309
+     }
+    ],
+    "topic": null
+   }
+  ],
+  "empty_zone_list": [
+   {
+    "file": "src/cli/deny.rs",
+    "ranges": [
+     [
+      25,
+      53
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/cli/incremental.rs",
+    "ranges": [
+     [
+      19,
+      154
+     ]
+    ],
+    "score": 4.0
+   },
+   {
+    "file": "src/cli/mod.rs",
+    "ranges": [
+     [
+      228,
+      326
+     ]
+    ],
+    "score": 4.5
+   },
+   {
+    "file": "src/cli/mod.rs",
+    "ranges": [
+     [
+      484,
+      621
+     ]
+    ],
+    "score": 5.0
+   },
+   {
+    "file": "src/cli/mod.rs",
+    "ranges": [
+     [
+      625,
+      653
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/cli/mod.rs",
+    "ranges": [
+     [
+      776,
+      820
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/cli/mod.rs",
+    "ranges": [
+     [
+      825,
+      837
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/cli/mod.rs",
+    "ranges": [
+     [
+      845,
+      853
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/cli/second_pass.rs",
+    "ranges": [
+     [
+      1,
+      436
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/cli/second_pass.rs",
+    "ranges": [
+     [
+      68,
+      102
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/cli/second_pass.rs",
+    "ranges": [
+     [
+      106,
+      119
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/cli/second_pass.rs",
+    "ranges": [
+     [
+      132,
+      214
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/cli/spec.rs",
+    "ranges": [
+     [
+      5,
+      5
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/cli/tail.rs",
+    "ranges": [
+     [
+      75,
+      108
+     ]
+    ],
+    "score": 1.75
+   },
+   {
+    "file": "src/cli/tail.rs",
+    "ranges": [
+     [
+      112,
+      205
+     ]
+    ],
+    "score": 4.0
+   },
+   {
+    "file": "src/config/mod.rs",
+    "ranges": [
+     [
+      33,
+      40
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/consolidate/verify.rs",
+    "ranges": [
+     [
+      19,
+      19
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/consolidate/verify.rs",
+    "ranges": [
+     [
+      33,
+      115
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/consolidate/verify.rs",
+    "ranges": [
+     [
+      214,
+      232
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/consolidate/verify.rs",
+    "ranges": [
+     [
+      277,
+      318
+     ]
+    ],
+    "score": 4.0
+   },
+   {
+    "file": "src/evidence/git.rs",
+    "ranges": [
+     [
+      42,
+      69
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      24,
+      131
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      194,
+      225
+     ]
+    ],
+    "score": 1.75
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      228,
+      261
+     ]
+    ],
+    "score": 1.75
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      318,
+      356
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      400,
+      865
+     ]
+    ],
+    "score": 4.5
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      870,
+      880
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      950,
+      984
+     ]
+    ],
+    "score": 4.0
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      987,
+      1003
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      1007,
+      1037
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      1067,
+      1109
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      1112,
+      1125
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/main.rs",
+    "ranges": [
+     [
+      1129,
+      1172
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/model/mod.rs",
+    "ranges": [
+     [
+      82,
+      88
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/output/mod.rs",
+    "ranges": [
+     [
+      27,
+      33
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/prompt/mod.rs",
+    "ranges": [
+     [
+      214,
+      254
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/prompt/mod.rs",
+    "ranges": [
+     [
+      275,
+      295
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/prompt/mod.rs",
+    "ranges": [
+     [
+      307,
+      320
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/provider/mod.rs",
+    "ranges": [
+     [
+      53,
+      63
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/provider/mod.rs",
+    "ranges": [
+     [
+      73,
+      78
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/provider/mod.rs",
+    "ranges": [
+     [
+      81,
+      86
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/provider/mod.rs",
+    "ranges": [
+     [
+      89,
+      95
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/provider/mod.rs",
+    "ranges": [
+     [
+      212,
+      226
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/provider/mod.rs",
+    "ranges": [
+     [
+      229,
+      242
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/provider/parse.rs",
+    "ranges": [
+     [
+      1,
+      276
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/provider/parse.rs",
+    "ranges": [
+     [
+      76,
+      97
+     ]
+    ],
+    "score": 3.0
+   },
+   {
+    "file": "src/provider/single_shot.rs",
+    "ranges": [
+     [
+      1,
+      182
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/provider/single_shot.rs",
+    "ranges": [
+     [
+      28,
+      78
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/provider/single_shot.rs",
+    "ranges": [
+     [
+      100,
+      102
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/provider/tool_loop.rs",
+    "ranges": [
+     [
+      58,
+      186
+     ]
+    ],
+    "score": 3.5
+   },
+   {
+    "file": "src/provider/tool_loop.rs",
+    "ranges": [
+     [
+      297,
+      303
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/state/mod.rs",
+    "ranges": [
+     [
+      1,
+      347
+     ]
+    ],
+    "score": 2.0
+   },
+   {
+    "file": "src/state/mod.rs",
+    "ranges": [
+     [
+      19,
+      27
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/state/mod.rs",
+    "ranges": [
+     [
+      64,
+      95
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/state/mod.rs",
+    "ranges": [
+     [
+      142,
+      169
+     ]
+    ],
+    "score": 1.5
+   },
+   {
+    "file": "src/state/mod.rs",
+    "ranges": [
+     [
+      208,
+      232
+     ]
+    ],
+    "score": 3.5
+   }
+  ]
+ }
+]

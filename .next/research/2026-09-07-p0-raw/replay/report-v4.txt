@@ -1,0 +1,47 @@
+pr181-r4.json:union                              θ1.5: hit 14/22 empty 8/17
+
+(规模, |H0|, R) 表（θ = 各 replay 自带）：
+replay                                   code_lines files  |H0|       R   max
+dist-095d383.json                                 0     0     0   0.000  0.50
+dist-1d974fd.json                                 0     0     0   0.000  0.00
+dist-1e3c948.json                                 0     0     0   0.000  0.00
+dist-3e60804.json                                 0     0     0   0.000  0.00
+dist-652ffb3.json                                 0     0     0   0.000  0.00
+dist-6b330ab.json                                 3     2     0   0.000  0.50
+dist-6f85bf8.json                                 0     0     0   0.000  0.00
+dist-82904fb.json                                 0     0     0   0.000  0.40
+dist-889c226.json                                37     2     0   0.000  1.00
+dist-88aaf16.json                                 1     1     0   0.000  0.75
+dist-88af262.json                                 0     0     0   0.000  0.10
+dist-99138bb.json                                 0     0     0   0.000  0.00
+dist-9a9204d.json                                 0     0     0   0.000  0.00
+dist-ac3b438.json                                 1     1     0   0.000  0.40
+dist-b3f2f74.json                                 0     0     0   0.000  0.00
+dist-d79bcc9.json                               206     1     0   0.000  1.05
+dist-e2772b2.json                                 0     0     0   0.000  0.00
+dist-e83635e.json                                13     1     0   0.000  0.50
+dist-feeb6c3.json                                56     2     0   0.000  0.90
+dist-feebc92.json                                 0     0     0   0.000  0.00
+dist-ab304cb.json                                66     2     1   0.288  1.50
+dist-1566636.json                                26     1     1   0.466  2.00
+dist-0f292f3.json                                24     1     1   0.711  3.00
+dist-397a73b.json                                84     2     3   1.011  2.00
+dist-ce0e2a8.json                                42     2     4   1.575  2.50
+hobby-6f95c25_1-6f95c25.json                    111     5     5   2.273  3.50
+dist-84e0136.json                               115     4     8   2.781  3.00
+hobby-f028f92-290236e.json                      681     6     8   2.924  4.50
+dist-69988af.json                             11533    31    14   2.946  2.50
+dist-aa48a66.json                               269    11    12   3.637  3.50
+pr181-r4.json                                  1322    27    17   4.336  3.00
+dist-2e797dc.json                               564    10    15   4.600  3.50
+hobby-33c4522-918f973.json                     2128    15    21   4.761  2.50
+dist-1ae876b.json                               526    11    23   6.605  3.50
+hobby-4f52ac9-8dcaf6f.json                     1675    25    39  11.930  4.50
+hobby-e8dc24f-00e23fc.json                     7621    30    67  17.230  5.00
+hobby-e8dc24f-99138bb.json                     7686    30    88  23.323  6.00
+hobby-e8dc24f-3e60804.json                     7673    30    88  23.327  6.00
+
+R 三分位切点 low<0.466≤mid<3.637≤high；各档 |H0| 中位数（max_cells 起步值）：
+  low  n=8 |H0| median=0 range=0-1
+  mid  n=8 |H0| median=5 range=1-14
+  high n=9 |H0| median=23 range=12-88

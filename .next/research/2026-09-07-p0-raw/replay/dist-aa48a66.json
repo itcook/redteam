@@ -1,0 +1,2159 @@
+{
+ "repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+ "base": "aa48a66d60cbe8e04f11cd0ab0a9ec9a474572b4~1",
+ "head": "aa48a66d60cbe8e04f11cd0ab0a9ec9a474572b4",
+ "size": {
+  "files": 11,
+  "code_files": 11,
+  "adds": 239,
+  "dels": 30,
+  "hunks": 29,
+  "code_lines": 269
+ },
+ "params": {
+  "theta": 1.5,
+  "fanin_k": 5,
+  "extapi_k": 3,
+  "ripple": true,
+  "history_repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+  "history_ref": "aa48a66d60cbe8e04f11cd0ab0a9ec9a474572b4~1",
+  "ledger": null,
+  "before": null,
+  "weights": {
+   "path_glob": 1.0,
+   "keyword": 0.5,
+   "keyword_cap": 1.5,
+   "sig_changed": 1.0,
+   "def_new": 0.5,
+   "def_deleted": 1.0,
+   "public_widen": 0.5,
+   "fanin": 1.0,
+   "churn": 0.5,
+   "extapi": 1.0,
+   "hist_fix3": 0.5,
+   "hist_fix6": 1.0,
+   "ledger_upheld": 1.0,
+   "ledger_dismissed": 0.5,
+   "test_mult": 0.3,
+   "doc_mult": 0.2,
+   "new_file": 0.5,
+   "ripple": 1.0,
+   "decl_only_mult": 0.5
+  }
+ },
+ "zones": [
+  {
+   "file": "src/cli/mod.rs",
+   "ranges": [
+    [
+     484,
+     621
+    ]
+   ],
+   "symbols": [
+    "run_resume"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:run_resume=5",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (6 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 138,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 1.0
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     1,
+     16
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 16,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.5
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     13,
+     22
+    ]
+   ],
+   "symbols": [
+    "ProviderKind"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:ProviderKind=45",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 10,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     44,
+     57
+    ]
+   ],
+   "symbols": [
+    "ProviderConfig"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:ProviderConfig=10",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (6 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.25,
+   "lines": 14,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 0.5
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     65,
+     65
+    ]
+   ],
+   "symbols": [
+    "ToolsMode"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     107,
+     112
+    ]
+   ],
+   "symbols": [
+    "Config"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "ripple:ProviderConfig",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 6,
+   "ripple": true,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     161,
+     205
+    ]
+   ],
+   "symbols": [
+    "refute_one"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 45,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 1.0
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     277,
+     318
+    ]
+   ],
+   "symbols": [
+    "verify_findings"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "ripple:refute_one",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:concurrency,numeric_bounds,error_paths",
+     "w": 1.5
+    }
+   ],
+   "score": 3.5,
+   "lines": 42,
+   "ripple": true,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     517,
+     527
+    ]
+   ],
+   "symbols": [
+    "refute_usage_sums_across_targets"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "ripple:refute_one",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.75,
+   "lines": 11,
+   "ripple": true,
+   "changed_lines": 0,
+   "mult": 0.3
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     24,
+     131
+    ]
+   ],
+   "symbols": [
+    "Cmd"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (6 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 108,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     134,
+     191
+    ]
+   ],
+   "symbols": [
+    "DismissCmd"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 58,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     194,
+     225
+    ]
+   ],
+   "symbols": [
+    "ResolveCmd"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 32,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     400,
+     860
+    ]
+   ],
+   "symbols": [
+    "main"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (25 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 461,
+   "ripple": false,
+   "changed_lines": 25,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     865,
+     875
+    ]
+   ],
+   "symbols": [
+    "format_probe_outcome"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:format_probe_outcome",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (11 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 11,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     878,
+     886
+    ]
+   ],
+   "symbols": [
+    "fmt_dur"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     1175,
+     1183
+    ]
+   ],
+   "symbols": [
+    "status_table_running_phase_shows_dwell_and_note"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (10 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.22,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 0.15
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     1187,
+     1190
+    ]
+   ],
+   "symbols": [
+    "format_probe_outcome_success_lists_model"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:format_probe_outcome_success_lists_model",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.22,
+   "lines": 4,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.15
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     1194,
+     1197
+    ]
+   ],
+   "symbols": [
+    "format_probe_outcome_success_model_missing"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:format_probe_outcome_success_model_missing",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.22,
+   "lines": 4,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.15
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     1202,
+     1208
+    ]
+   ],
+   "symbols": [
+    "format_probe_outcome_failure_warns_without_rollback_language"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:format_probe_outcome_failure_warns_without_rollback_language",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (7 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.29,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.15
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     1211,
+     1232
+    ]
+   ],
+   "symbols": [
+    "render_status_table_shapes_columns"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 22,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.15
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     982,
+     998
+    ]
+   ],
+   "symbols": [
+    "run_resolve"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "ripple:ResolveCmd",
+     "w": 1.0
+    }
+   ],
+   "score": 2.0,
+   "lines": 17,
+   "ripple": true,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/model/mod.rs",
+   "ranges": [
+    [
+     127,
+     144
+    ]
+   ],
+   "symbols": [
+    "validate_setup"
+   ],
+   "signals": [],
+   "score": 0.0,
+   "lines": 18,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 1.0
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     151,
+     201
+    ]
+   ],
+   "symbols": [
+    "run_one_bundle"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×9",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (11 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.6,
+   "lines": 51,
+   "ripple": false,
+   "changed_lines": 11,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     769,
+     816
+    ]
+   ],
+   "symbols": [
+    "mid_loop_model_death_degrades_gracefully"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×9",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 48,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     815,
+     840
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×9",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth,error_paths",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (10 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 26,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     821,
+     823
+    ]
+   ],
+   "symbols": [
+    "FailingWithUsage"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×9",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:FailingWithUsage",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.22,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.15
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     826,
+     829
+    ]
+   ],
+   "symbols": [
+    "run"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×9",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:run",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:timeout",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 4,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.15
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     835,
+     858
+    ]
+   ],
+   "symbols": [
+    "full_chain_failure_backfills_accumulated_usage"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×9",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:full_chain_failure_backfills_accumulated_usage",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (24 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.6,
+   "lines": 24,
+   "ripple": false,
+   "changed_lines": 24,
+   "mult": 0.3
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     15,
+     23
+    ]
+   ],
+   "symbols": [
+    "human_tokens"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     27,
+     33
+    ]
+   ],
+   "symbols": [
+    "fmt_duration"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:fmt_duration",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (7 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     35,
+     42
+    ]
+   ],
+   "symbols": [
+    "sev_emoji"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     47,
+     167
+    ]
+   ],
+   "symbols": [
+    "render_md"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 121,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     173,
+     182
+    ]
+   ],
+   "symbols": [
+    "report"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.07,
+   "lines": 10,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     185,
+     189
+    ]
+   ],
+   "symbols": [
+    "fmt_duration_sub_minute_shows_seconds"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:fmt_duration_sub_minute_shows_seconds",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:numeric_bounds",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.22,
+   "lines": 5,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     191,
+     194
+    ]
+   ],
+   "symbols": [
+    "fmt_duration_minute_and_above_keeps_mins_grain"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:fmt_duration_minute_and_above_keeps_mins_grain",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 4,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     196,
+     201
+    ]
+   ],
+   "symbols": [
+    "json_contains_verdict_and_provenance"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.07,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     6,
+     11
+    ]
+   ],
+   "symbols": [
+    "render"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "ripple:render_md",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 6,
+   "ripple": true,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     20,
+     50
+    ]
+   ],
+   "symbols": [
+    "ProviderError"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:ProviderError=91",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (14 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.25,
+   "lines": 31,
+   "ripple": false,
+   "changed_lines": 14,
+   "mult": 0.5
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     42,
+     106
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (6 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 65,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     53,
+     63
+    ]
+   ],
+   "symbols": [
+    "is_retryable"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:is_retryable=7",
+     "w": 1.0
+    }
+   ],
+   "score": 1.5,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     64,
+     70
+    ]
+   ],
+   "symbols": [
+    "retry_after"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:timeout",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     73,
+     78
+    ]
+   ],
+   "symbols": [
+    "burned_usage"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:burned_usage",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:burned_usage",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (6 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     81,
+     86
+    ]
+   ],
+   "symbols": [
+    "inner"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:inner",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:inner",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (6 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     89,
+     95
+    ]
+   ],
+   "symbols": [
+    "attach_usage"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:attach_usage",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:attach_usage",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:attach_usage=13",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (7 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 3.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/single_shot.rs",
+   "ranges": [
+    [
+     28,
+     78
+    ]
+   ],
+   "symbols": [
+    "run_single_shot"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "keywords:timeout",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (7 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 51,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/single_shot.rs",
+   "ranges": [
+    [
+     177,
+     189
+    ]
+   ],
+   "symbols": [
+    "repair_failure_returns_diagnostic_parse_error"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 13,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.3
+  },
+  {
+   "file": "src/provider/tool_loop.rs",
+   "ranges": [
+    [
+     58,
+     186
+    ]
+   ],
+   "symbols": [
+    "run_tool_loop"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:timeout",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (22 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 129,
+   "ripple": false,
+   "changed_lines": 22,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/tool_loop.rs",
+   "ranges": [
+    [
+     460,
+     472
+    ]
+   ],
+   "symbols": [
+    "finalize_parse_failure_exhausted_after_one_repair_returns_diagnostic_error"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 13,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.3
+  },
+  {
+   "file": "src/provider/tool_loop.rs",
+   "ranges": [
+    [
+     509,
+     518
+    ]
+   ],
+   "symbols": [
+    "per_turn_timeout_covers_finalize_round"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:timeout",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 10,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.3
+  },
+  {
+   "file": "src/tools/mod.rs",
+   "ranges": [
+    [
+     25,
+     35
+    ]
+   ],
+   "symbols": [
+    "ToolUse"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:ToolUse=8",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/tools/mod.rs",
+   "ranges": [
+    [
+     500,
+     509
+    ]
+   ],
+   "symbols": [
+    "tool_use_tally_counts_by_type_and_totals"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "ripple:ToolUse",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 10,
+   "ripple": true,
+   "changed_lines": 0,
+   "mult": 0.15
+  }
+ ],
+ "h0": [
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     277,
+     318
+    ]
+   ],
+   "symbols": [
+    "verify_findings"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "ripple:refute_one",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:concurrency,numeric_bounds,error_paths",
+     "w": 1.5
+    }
+   ],
+   "score": 3.5,
+   "lines": 42,
+   "ripple": true,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     400,
+     860
+    ]
+   ],
+   "symbols": [
+    "main"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (25 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 461,
+   "ripple": false,
+   "changed_lines": 25,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     865,
+     875
+    ]
+   ],
+   "symbols": [
+    "format_probe_outcome"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:format_probe_outcome",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (11 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 11,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     982,
+     998
+    ]
+   ],
+   "symbols": [
+    "run_resolve"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×21",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "ripple:ResolveCmd",
+     "w": 1.0
+    }
+   ],
+   "score": 2.0,
+   "lines": 17,
+   "ripple": true,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     27,
+     33
+    ]
+   ],
+   "symbols": [
+    "fmt_duration"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:fmt_duration",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (7 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     6,
+     11
+    ]
+   ],
+   "symbols": [
+    "render"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "ripple:render_md",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 6,
+   "ripple": true,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     42,
+     106
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (6 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 65,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     53,
+     63
+    ]
+   ],
+   "symbols": [
+    "is_retryable"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:is_retryable=7",
+     "w": 1.0
+    }
+   ],
+   "score": 1.5,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     73,
+     78
+    ]
+   ],
+   "symbols": [
+    "burned_usage"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:burned_usage",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:burned_usage",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (6 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     81,
+     86
+    ]
+   ],
+   "symbols": [
+    "inner"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:inner",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:inner",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (6 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/mod.rs",
+   "ranges": [
+    [
+     89,
+     95
+    ]
+   ],
+   "symbols": [
+    "attach_usage"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×4",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:attach_usage",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:attach_usage",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:attach_usage=13",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (7 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 3.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 1.0
+  },
+  {
+   "file": "src/provider/tool_loop.rs",
+   "ranges": [
+    [
+     58,
+     186
+    ]
+   ],
+   "symbols": [
+    "run_tool_loop"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:timeout",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (22 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 129,
+   "ripple": false,
+   "changed_lines": 22,
+   "mult": 1.0
+  }
+ ],
+ "theta": 1.5,
+ "R": 3.637,
+ "max_zone": 3.5
+}

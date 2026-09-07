@@ -1,0 +1,86 @@
+[
+ {
+  "set": "f028f92..290236e",
+  "n": 4,
+  "theta": 1.5,
+  "h0_count": 5,
+  "in_any_zone": 4,
+  "dropped_unanchored": [],
+  "hit_range": 2,
+  "hit_range_rate": 0.5,
+  "hit_file": 3,
+  "hit_file_rate": 0.75,
+  "empty_zones_range": 4,
+  "empty_zones_range_rate": 0.8,
+  "empty_zones_file": 2,
+  "empty_zones_file_rate": 0.4,
+  "misses": [
+   {
+    "id": "6d29b2f3@290236e",
+    "file_hit": true,
+    "anchors": [
+     {
+      "file": "src/procinfo.rs",
+      "line_start": 28,
+      "line_end": 31
+     }
+    ],
+    "topic": null
+   },
+   {
+    "id": "a179f67e@290236e",
+    "file_hit": false,
+    "anchors": [
+     {
+      "file": "src/cli.rs",
+      "line_start": 1452,
+      "line_end": 1454
+     }
+    ],
+    "topic": null
+   }
+  ],
+  "empty_zone_list": [
+   {
+    "file": "src/db.rs",
+    "ranges": [
+     [
+      393,
+      413
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/procinfo.rs",
+    "ranges": [
+     [
+      7,
+      26
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/procinfo.rs",
+    "ranges": [
+     [
+      38,
+      53
+     ]
+    ],
+    "score": 2.5
+   },
+   {
+    "file": "src/state/job.rs",
+    "ranges": [
+     [
+      146,
+      175
+     ]
+    ],
+    "score": 3.0
+   }
+  ]
+ }
+]

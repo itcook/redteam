@@ -1,0 +1,6933 @@
+{
+ "repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+ "base": "33c4522",
+ "head": "918f9737608b87264d397885fe0249e0c98ffcd5",
+ "size": {
+  "files": 21,
+  "code_files": 15,
+  "adds": 1394,
+  "dels": 929,
+  "hunks": 133,
+  "code_lines": 2128
+ },
+ "params": {
+  "theta": 1.5,
+  "fanin_k": 5,
+  "extapi_k": 3,
+  "ripple": false,
+  "history_repo": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine",
+  "history_ref": "33c4522",
+  "ledger": "/Users/weilai/hobby/redteam/.redteam/proj.db",
+  "before": "2026-07-03T14:17:00Z",
+  "weights": {
+   "path_glob": 1.0,
+   "keyword": 0.5,
+   "keyword_cap": 1.5,
+   "sig_changed": 1.0,
+   "def_new": 0.5,
+   "def_deleted": 1.0,
+   "public_widen": 0.5,
+   "fanin": 1.0,
+   "churn": 0.5,
+   "extapi": 1.0,
+   "hist_fix3": 0.5,
+   "hist_fix6": 1.0,
+   "ledger_upheld": 1.0,
+   "ledger_dismissed": 0.5,
+   "test_mult": 0.3,
+   "doc_mult": 0.2,
+   "new_file": 0.5,
+   "ripple": 1.0,
+   "decl_only_mult": 0.5
+  }
+ },
+ "zones": [
+  {
+   "file": "Cargo.lock",
+   "ranges": [
+    [
+     1,
+     29
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (12 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.1,
+   "lines": 29,
+   "ripple": false,
+   "changed_lines": 12,
+   "mult": 0.2
+  },
+  {
+   "file": "Cargo.lock",
+   "ranges": [
+    [
+     330,
+     367
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (12 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.05,
+   "lines": 38,
+   "ripple": false,
+   "changed_lines": 12,
+   "mult": 0.1
+  },
+  {
+   "file": "Cargo.lock",
+   "ranges": [
+    [
+     545,
+     594
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (18 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.05,
+   "lines": 50,
+   "ripple": false,
+   "changed_lines": 18,
+   "mult": 0.1
+  },
+  {
+   "file": "Cargo.lock",
+   "ranges": [
+    [
+     798,
+     824
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 27,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.1
+  },
+  {
+   "file": "Cargo.lock",
+   "ranges": [
+    [
+     895,
+     931
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (11 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.1,
+   "lines": 37,
+   "ripple": false,
+   "changed_lines": 11,
+   "mult": 0.2
+  },
+  {
+   "file": "Cargo.lock",
+   "ranges": [
+    [
+     986,
+     1017
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 32,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 0.1
+  },
+  {
+   "file": "Cargo.lock",
+   "ranges": [
+    [
+     1138,
+     1164
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 27,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.1
+  },
+  {
+   "file": "Cargo.lock",
+   "ranges": [
+    [
+     1216,
+     1255
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (14 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.1,
+   "lines": 40,
+   "ripple": false,
+   "changed_lines": 14,
+   "mult": 0.2
+  },
+  {
+   "file": "Cargo.lock",
+   "ranges": [
+    [
+     1838,
+     1875
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (12 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.05,
+   "lines": 38,
+   "ripple": false,
+   "changed_lines": 12,
+   "mult": 0.1
+  },
+  {
+   "file": "Cargo.toml",
+   "ranges": [
+    [
+     20,
+     46
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 27,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.1
+  },
+  {
+   "file": "plugins/redteam/codex-skills/ship/SKILL.md",
+   "ranges": [
+    [
+     1,
+     117
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×9",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (51 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.15,
+   "lines": 117,
+   "ripple": false,
+   "changed_lines": 51,
+   "mult": 0.1
+  },
+  {
+   "file": "plugins/redteam/commands/ship.md",
+   "ranges": [
+    [
+     1,
+     117
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×9",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (51 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.15,
+   "lines": 117,
+   "ripple": false,
+   "changed_lines": 51,
+   "mult": 0.1
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     16,
+     43
+    ]
+   ],
+   "symbols": [
+    "ReviewArgs"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:ReviewArgs=8",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (14 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.25,
+   "lines": 28,
+   "ripple": false,
+   "changed_lines": 14,
+   "mult": 0.5
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     47,
+     51
+    ]
+   ],
+   "symbols": [
+    "Ledger"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:Ledger",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:Ledger",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 5,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     55,
+     94
+    ]
+   ],
+   "symbols": [
+    "load_ledger"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:load_ledger",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:load_ledger",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (39 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.5,
+   "lines": 40,
+   "ripple": false,
+   "changed_lines": 39,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     96,
+     103
+    ]
+   ],
+   "symbols": [
+    "parse_sev"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     175,
+     192
+    ]
+   ],
+   "symbols": [
+    "mark_dismissed"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 18,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     195,
+     200
+    ]
+   ],
+   "symbols": [
+    "model_ids_for"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:model_ids_for",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 0.5
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     205,
+     230
+    ]
+   ],
+   "symbols": [
+    "TailCtx"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 26,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.5
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     234,
+     291
+    ]
+   ],
+   "symbols": [
+    "assemble_report"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 58,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     297,
+     389
+    ]
+   ],
+   "symbols": [
+    "run_review"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (23 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 93,
+   "ripple": false,
+   "changed_lines": 23,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     393,
+     471
+    ]
+   ],
+   "symbols": [
+    "run_code_review"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (20 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 79,
+   "ripple": false,
+   "changed_lines": 20,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     556,
+     591
+    ]
+   ],
+   "symbols": [
+    "partial_report"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 36,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     595,
+     602
+    ]
+   ],
+   "symbols": [
+    "empty_review_args"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     615,
+     744
+    ]
+   ],
+   "symbols": [
+    "run_resume"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (22 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 130,
+   "ripple": false,
+   "changed_lines": 22,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     747,
+     765
+    ]
+   ],
+   "symbols": [
+    "write_partial_result"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 19,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     770,
+     852
+    ]
+   ],
+   "symbols": [
+    "run_job"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 83,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     872,
+     880
+    ]
+   ],
+   "symbols": [
+    "doc_args"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.15
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     881,
+     886
+    ]
+   ],
+   "symbols": [
+    "cfg"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.15
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     1125,
+     1165
+    ]
+   ],
+   "symbols": [
+    "resume_only_runs_missing_cells"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 41,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     1174,
+     1217
+    ]
+   ],
+   "symbols": [
+    "resume_replicate_missing_model_copy_is_completed"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 44,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     1222,
+     1240
+    ]
+   ],
+   "symbols": [
+    "resume_empty_manifest_is_incomplete_not_approve"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 19,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     1324,
+     1352
+    ]
+   ],
+   "symbols": [
+    "lone_blocking_refuted_does_not_reject"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 29,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     1354,
+     1363
+    ]
+   ],
+   "symbols": [
+    "args"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 10,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.15
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     1406,
+     1427
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 22,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.3
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     1420,
+     1428
+    ]
+   ],
+   "symbols": [
+    "load_ledger_no_dismissed_and_missing_db_are_empty_without_side_effects"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:load_ledger_no_dismissed_and_missing_db_are_empty_without_side_effects",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (12 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.38,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 12,
+   "mult": 0.15
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     1431,
+     1465
+    ]
+   ],
+   "symbols": [
+    "load_ledger_csv_db_and_retired_dir"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:load_ledger_csv_db_and_retired_dir",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:destructive,error_paths",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (35 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.46,
+   "lines": 35,
+   "ripple": false,
+   "changed_lines": 35,
+   "mult": 0.15
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     1468,
+     1478
+    ]
+   ],
+   "symbols": [
+    "jobcellsink_manifest_sets_phase_fanout"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.15
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     56,
+     69
+    ]
+   ],
+   "symbols": [
+    "ReviewConfig"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 14,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     64,
+     86
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 23,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     71,
+     71
+    ]
+   ],
+   "symbols": [
+    "default_floor"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:default_ttl",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     72,
+     72
+    ]
+   ],
+   "symbols": [
+    "default_true"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     73,
+     73
+    ]
+   ],
+   "symbols": [
+    "default_concurrency"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     74,
+     94
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 21,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     75,
+     75
+    ]
+   ],
+   "symbols": [
+    "default"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/config/mod.rs",
+   "ranges": [
+    [
+     78,
+     83
+    ]
+   ],
+   "symbols": [
+    "default"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "sensitive path",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": "src/consolidate/dedup.rs",
+   "ranges": [
+    [
+     23,
+     34
+    ]
+   ],
+   "symbols": [
+    "quote_overlap"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "signature changed:quote_overlap",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 12,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 1.0
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     1,
+     17
+    ]
+   ],
+   "symbols": [],
+   "signals": [],
+   "score": 0.0,
+   "lines": 17,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 1.0
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     13,
+     19
+    ]
+   ],
+   "symbols": [
+    "matches_precedent"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:matches_precedent",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 9,
+   "mult": 1.0
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     22,
+     28
+    ]
+   ],
+   "symbols": [
+    "pick_cross_model"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     33,
+     58
+    ]
+   ],
+   "symbols": [
+    "refute_one"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (13 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 26,
+   "ripple": false,
+   "changed_lines": 13,
+   "mult": 1.0
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     69,
+     114
+    ]
+   ],
+   "symbols": [
+    "verify_findings"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (11 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 46,
+   "ripple": false,
+   "changed_lines": 11,
+   "mult": 1.0
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     140,
+     148
+    ]
+   ],
+   "symbols": [
+    "lone_blocking_refuted_drops_confidence_and_marks"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     151,
+     158
+    ]
+   ],
+   "symbols": [
+    "lone_blocking_upheld_keeps_confidence"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     161,
+     168
+    ]
+   ],
+   "symbols": [
+    "consensus_finding_is_skipped"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     171,
+     177
+    ]
+   ],
+   "symbols": [
+    "below_block_threshold_is_skipped"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     180,
+     189
+    ]
+   ],
+   "symbols": [
+    "doc_omission_lone_blocking_refuted"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 10,
+   "ripple": false,
+   "changed_lines": 9,
+   "mult": 0.3
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     191,
+     197
+    ]
+   ],
+   "symbols": [
+    "card"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:card",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.07,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.15
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     200,
+     209
+    ]
+   ],
+   "symbols": [
+    "precedent_prescreen_forces_refute_despite_consensus"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:precedent_prescreen_forces_refute_despite_consensus",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 10,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 0.3
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     212,
+     219
+    ]
+   ],
+   "symbols": [
+    "exact_ledger_id_skips_refute"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:exact_ledger_id_skips_refute",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.3,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.3
+  },
+  {
+   "file": "src/consolidate/verify.rs",
+   "ranges": [
+    [
+     222,
+     239
+    ]
+   ],
+   "symbols": [
+    "refute_failure_is_conservatively_upheld"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 18,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     1,
+     399
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (74 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 399,
+   "ripple": false,
+   "changed_lines": 74,
+   "mult": 1.0
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     11,
+     11
+    ]
+   ],
+   "symbols": [
+    "DB_FILE"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:DB_FILE",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:DB_FILE",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     15,
+     15
+    ]
+   ],
+   "symbols": [
+    "STATUSES"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:STATUSES",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:STATUSES",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     17,
+     17
+    ]
+   ],
+   "symbols": [
+    "ACTIVE_STATUSES"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:ACTIVE_STATUSES",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     20,
+     30
+    ]
+   ],
+   "symbols": [
+    "DismissCard"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:DismissCard",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:DismissCard",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:DismissCard=18",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (11 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 11,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     32,
+     34
+    ]
+   ],
+   "symbols": [
+    "ProjDb"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:ProjDb",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:ProjDb",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:ProjDb=12",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.25,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     38,
+     42
+    ]
+   ],
+   "symbols": [
+    "open"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:open",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:open",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 5,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     45,
+     89
+    ]
+   ],
+   "symbols": [
+    "open_at"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:open_at",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:open_at",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (45 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 45,
+   "ripple": false,
+   "changed_lines": 45,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     94,
+     110
+    ]
+   ],
+   "symbols": [
+    "dismiss_upsert"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_upsert",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:dismiss_upsert",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql,concurrency",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (17 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 17,
+   "ripple": false,
+   "changed_lines": 17,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     115,
+     139
+    ]
+   ],
+   "symbols": [
+    "dismiss_set_status"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_set_status",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:dismiss_set_status",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql,concurrency,error_paths",
+     "w": 1.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (25 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.75,
+   "lines": 25,
+   "ripple": false,
+   "changed_lines": 25,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     141,
+     150
+    ]
+   ],
+   "symbols": [
+    "dismiss_get"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_get",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:dismiss_get",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 10,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     153,
+     166
+    ]
+   ],
+   "symbols": [
+    "dismiss_list"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_list",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:dismiss_list",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (14 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.5,
+   "lines": 14,
+   "ripple": false,
+   "changed_lines": 14,
+   "mult": 1.0
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     169,
+     177
+    ]
+   ],
+   "symbols": [
+    "dismiss_history"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_history",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:dismiss_history",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 9,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     180,
+     186
+    ]
+   ],
+   "symbols": [
+    "active_ids"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:active_ids",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:active_ids",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     189,
+     196
+    ]
+   ],
+   "symbols": [
+    "active_cards"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:active_cards",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:active_cards",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     200,
+     207
+    ]
+   ],
+   "symbols": [
+    "job_put_state"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:job_put_state",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:job_put_state",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     209,
+     214
+    ]
+   ],
+   "symbols": [
+    "job_get_state"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:job_get_state",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:job_get_state",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     216,
+     223
+    ]
+   ],
+   "symbols": [
+    "job_put_args"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:job_put_args",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:job_put_args",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     225,
+     231
+    ]
+   ],
+   "symbols": [
+    "job_get_args"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:job_get_args",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:job_get_args",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     233,
+     240
+    ]
+   ],
+   "symbols": [
+    "job_put_manifest"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:job_put_manifest",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:job_put_manifest",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     242,
+     248
+    ]
+   ],
+   "symbols": [
+    "job_get_manifest"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:job_get_manifest",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:job_get_manifest",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     251,
+     257
+    ]
+   ],
+   "symbols": [
+    "job_all_states"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:job_all_states",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:job_all_states",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     260,
+     267
+    ]
+   ],
+   "symbols": [
+    "cell_put"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:cell_put",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:cell_put",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     269,
+     273
+    ]
+   ],
+   "symbols": [
+    "cell_all"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:cell_all",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:cell_all",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 5,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     276,
+     283
+    ]
+   ],
+   "symbols": [
+    "result_put"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:result_put",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:result_put",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     285,
+     292
+    ]
+   ],
+   "symbols": [
+    "result_get"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:result_get",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:result_get",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     295,
+     307
+    ]
+   ],
+   "symbols": [
+    "row_to_card"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:row_to_card",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (13 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 13,
+   "ripple": false,
+   "changed_lines": 13,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     313,
+     319
+    ]
+   ],
+   "symbols": [
+    "card"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:card",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.15
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     321,
+     327
+    ]
+   ],
+   "symbols": [
+    "mem_db"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:mem_db",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.22,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.15
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     330,
+     338
+    ]
+   ],
+   "symbols": [
+    "upsert_get_roundtrip_and_history"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:upsert_get_roundtrip_and_history",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.22,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 9,
+   "mult": 0.15
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     341,
+     351
+    ]
+   ],
+   "symbols": [
+    "set_status_transitions_and_warns_on_final_override"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:set_status_transitions_and_warns_on_final_override",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (11 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.29,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 11,
+   "mult": 0.15
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     354,
+     365
+    ]
+   ],
+   "symbols": [
+    "active_sets_exclude_withdrawn_and_stale"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:active_sets_exclude_withdrawn_and_stale",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (12 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.29,
+   "lines": 12,
+   "ripple": false,
+   "changed_lines": 12,
+   "mult": 0.15
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     368,
+     374
+    ]
+   ],
+   "symbols": [
+    "unknown_status_rejected"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:unknown_status_rejected",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.22,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.15
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     377,
+     397
+    ]
+   ],
+   "symbols": [
+    "jobs_cells_results_roundtrip"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:jobs_cells_results_roundtrip",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (21 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.29,
+   "lines": 21,
+   "ripple": false,
+   "changed_lines": 21,
+   "mult": 0.15
+  },
+  {
+   "file": "src/domain/report.rs",
+   "ranges": [
+    [
+     47,
+     65
+    ]
+   ],
+   "symbols": [
+    "RunMeta"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:RunMeta=5",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 19,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 0.5
+  },
+  {
+   "file": "src/domain/report.rs",
+   "ranges": [
+    [
+     68,
+     73
+    ]
+   ],
+   "symbols": [
+    "LedgerMeta"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:LedgerMeta",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:LedgerMeta",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:LedgerMeta=5",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/lib.rs",
+   "ranges": [
+    [
+     1,
+     18
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 18,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     1,
+     17
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 17,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     24,
+     116
+    ]
+   ],
+   "symbols": [
+    "Cmd"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (26 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 93,
+   "ripple": false,
+   "changed_lines": 26,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     119,
+     173
+    ]
+   ],
+   "symbols": [
+    "DismissCmd"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:DismissCmd",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (55 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 55,
+   "ripple": false,
+   "changed_lines": 55,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     176,
+     209
+    ]
+   ],
+   "symbols": [
+    "ModelCmd"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 34,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     254,
+     262
+    ]
+   ],
+   "symbols": [
+    "load_config_warned"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:prune_here",
+     "w": 1.0
+    }
+   ],
+   "score": 2.0,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     269,
+     296
+    ]
+   ],
+   "symbols": [
+    "resolve_result"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 28,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     337,
+     646
+    ]
+   ],
+   "symbols": [
+    "main"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (40 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 310,
+   "ripple": false,
+   "changed_lines": 40,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     660,
+     665
+    ]
+   ],
+   "symbols": [
+    "serde_str"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 9,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     668,
+     713
+    ]
+   ],
+   "symbols": [
+    "run_dismiss"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:run_dismiss",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (46 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 46,
+   "ripple": false,
+   "changed_lines": 46,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     716,
+     750
+    ]
+   ],
+   "symbols": [
+    "dismiss_add"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_add",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (35 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 35,
+   "ripple": false,
+   "changed_lines": 35,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     753,
+     764
+    ]
+   ],
+   "symbols": [
+    "snapshot_from_report"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:snapshot_from_report",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (12 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 12,
+   "ripple": false,
+   "changed_lines": 12,
+   "mult": 0.5
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     768,
+     810
+    ]
+   ],
+   "symbols": [
+    "dismiss_gc"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_gc",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (43 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 43,
+   "ripple": false,
+   "changed_lines": 43,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     814,
+     847
+    ]
+   ],
+   "symbols": [
+    "render_status_table"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 34,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     889,
+     922
+    ]
+   ],
+   "symbols": [
+    "build_registry_no_provider_returns_err"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 34,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.15
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     132,
+     280
+    ]
+   ],
+   "symbols": [
+    "run_code_fanout"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 149,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     314,
+     430
+    ]
+   ],
+   "symbols": [
+    "run_doc_fanout"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 117,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     467,
+     479
+    ]
+   ],
+   "symbols": [
+    "code_fanout_runs_every_bundle"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 13,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     498,
+     510
+    ]
+   ],
+   "symbols": [
+    "code_fanout_respects_max_concurrency"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 13,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     513,
+     526
+    ]
+   ],
+   "symbols": [
+    "code_fanout_explicit_unreachable_model_records_failed"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 14,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     529,
+     559
+    ]
+   ],
+   "symbols": [
+    "code_fanout_replicate_runs_every_model_per_bundle"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 31,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     562,
+     584
+    ]
+   ],
+   "symbols": [
+    "code_fanout_replicate_records_failed_model"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 23,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     594,
+     623
+    ]
+   ],
+   "symbols": [
+    "doc_fanout_replicate_runs_every_model"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 30,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     626,
+     639
+    ]
+   ],
+   "symbols": [
+    "doc_fanout_replicate_records_failed_model"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 14,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     642,
+     657
+    ]
+   ],
+   "symbols": [
+    "doc_fanout_fallback_chain_first_success_wins"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 16,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     675,
+     687
+    ]
+   ],
+   "symbols": [
+    "fanout_writes_manifest_and_each_cell"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 13,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     731,
+     752
+    ]
+   ],
+   "symbols": [
+    "on_cell_fires_per_cell_before_slow_sibling_completes"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 22,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/orchestrate/mod.rs",
+   "ranges": [
+    [
+     757,
+     805
+    ]
+   ],
+   "symbols": [
+    "mid_loop_model_death_degrades_gracefully"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×5",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 49,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     6,
+     11
+    ]
+   ],
+   "symbols": [
+    "render"
+   ],
+   "signals": [
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (34 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 34,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     14,
+     22
+    ]
+   ],
+   "symbols": [
+    "human_tokens"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:human_tokens",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 9,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     24,
+     31
+    ]
+   ],
+   "symbols": [
+    "sev_emoji"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:sev_emoji",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     36,
+     132
+    ]
+   ],
+   "symbols": [
+    "render_md"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (85 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 97,
+   "ripple": false,
+   "changed_lines": 85,
+   "mult": 1.0
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     148,
+     153
+    ]
+   ],
+   "symbols": [
+    "json_contains_verdict_and_provenance"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def deleted:md_groups_and_shows_location",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     155,
+     164
+    ]
+   ],
+   "symbols": [
+    "md_template_summary_and_finding_details"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:md_template_summary_and_finding_details",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.07,
+   "lines": 10,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     166,
+     173
+    ]
+   ],
+   "symbols": [
+    "md_no_debug_vec_rendering"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 6,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     175,
+     185
+    ]
+   ],
+   "symbols": [
+    "md_zero_findings_hides_table_and_details"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:md_zero_findings_hides_table_and_details",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (11 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.15,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 11,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     187,
+     205
+    ]
+   ],
+   "symbols": [
+    "md_info_table_models_tokens_ledger_and_jobid_title"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:md_info_table_models_tokens_ledger_and_jobid_title",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (18 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.22,
+   "lines": 19,
+   "ripple": false,
+   "changed_lines": 18,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     207,
+     222
+    ]
+   ],
+   "symbols": [
+    "md_cluster_renders_theme_relation_note"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def deleted:md_next_steps_absent_when_empty,md_next_steps_section_rendered_when_non_empty",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (14 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.22,
+   "lines": 16,
+   "ripple": false,
+   "changed_lines": 14,
+   "mult": 0.15
+  },
+  {
+   "file": "src/output/mod.rs",
+   "ranges": [
+    [
+     224,
+     230
+    ]
+   ],
+   "symbols": [
+    "md_marks_refuted_verify"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.15
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     8,
+     8
+    ]
+   ],
+   "symbols": [
+    "CONFIG_TEMPLATE"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.25,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 7,
+   "mult": 0.5
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     25,
+     46
+    ]
+   ],
+   "symbols": [
+    "init_project"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:is_hex16",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (29 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.5,
+   "lines": 22,
+   "ripple": false,
+   "changed_lines": 29,
+   "mult": 1.0
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     48,
+     50
+    ]
+   ],
+   "symbols": [
+    "is_hex16"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:is_hex16",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:is_hex16",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     54,
+     65
+    ]
+   ],
+   "symbols": [
+    "parse_dismissed"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:load_dismissed_notes",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (51 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 12,
+   "ripple": false,
+   "changed_lines": 51,
+   "mult": 1.0
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     58,
+     79
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.25,
+   "lines": 22,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     72,
+     82
+    ]
+   ],
+   "symbols": [
+    "init_creates_skeleton_and_is_idempotent"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.07,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.15
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     92,
+     103
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.07,
+   "lines": 12,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.15
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     94,
+     100
+    ]
+   ],
+   "symbols": [
+    "parse_dismissed_csv_valid_and_invalid"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:load_dismissed_notes_csv_or_missing_is_empty,load_dismissed_notes_dir_injects_content_sorted,load_dismissed_notes_truncates_long_entries,parse_dismissed_dir_takes_filenames_only",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (38 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.29,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 38,
+   "mult": 0.15
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     13,
+     36
+    ]
+   ],
+   "symbols": [
+    "output_language"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (16 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 24,
+   "ripple": false,
+   "changed_lines": 16,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     105,
+     118
+    ]
+   ],
+   "symbols": [
+    "rules_block"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:build_doc_prompt",
+     "w": 1.0
+    }
+   ],
+   "score": 2.0,
+   "lines": 14,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     123,
+     137
+    ]
+   ],
+   "symbols": [
+    "build_doc_prompt"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:build_doc_prompt",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:build_doc_prompt",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 15,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     142,
+     175
+    ]
+   ],
+   "symbols": [
+    "build_bundle_prompt"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 34,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     180,
+     210
+    ]
+   ],
+   "symbols": [
+    "render_precedents"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:render_precedents",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:render_precedents",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (31 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.5,
+   "lines": 31,
+   "ripple": false,
+   "changed_lines": 31,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     203,
+     224
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    }
+   ],
+   "score": 1.0,
+   "lines": 22,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     221,
+     231
+    ]
+   ],
+   "symbols": [
+    "output_language_zh_cn"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 11,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.15
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     280,
+     336
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 57,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.15
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     294,
+     322
+    ]
+   ],
+   "symbols": [
+    "render_precedents_ranks_same_file_first_and_caps_total"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:render_precedents_ranks_same_file_first_and_caps_total",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (29 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.38,
+   "lines": 29,
+   "ripple": false,
+   "changed_lines": 29,
+   "mult": 0.15
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     320,
+     362
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (11 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.29,
+   "lines": 43,
+   "ripple": false,
+   "changed_lines": 11,
+   "mult": 0.15
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     325,
+     325
+    ]
+   ],
+   "symbols": [
+    "bundle_prompt_interpolates_rules_files_and_contract"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 1,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.15
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     357,
+     373
+    ]
+   ],
+   "symbols": [
+    "external_content_placeholders_are_not_captured"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 17,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.15
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     372,
+     404
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.45,
+   "lines": 33,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.3
+  },
+  {
+   "file": "src/prompt/templates/adversarial-code-bundle.md",
+   "ranges": [
+    [
+     10,
+     35
+    ]
+   ],
+   "symbols": [],
+   "signals": [],
+   "score": 0.0,
+   "lines": 26,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.2
+  },
+  {
+   "file": "src/prompt/templates/adversarial-doc-bundle.md",
+   "ranges": [
+    [
+     34,
+     58
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    }
+   ],
+   "score": 0.1,
+   "lines": 25,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.2
+  },
+  {
+   "file": "src/state/job.rs",
+   "ranges": [
+    [
+     1,
+     13
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 13,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/job.rs",
+   "ranges": [
+    [
+     63,
+     81
+    ]
+   ],
+   "symbols": [
+    "new"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def deleted:list_all_states,select_jobs",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (48 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.75,
+   "lines": 19,
+   "ripple": false,
+   "changed_lines": 48,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/job.rs",
+   "ranges": [
+    [
+     72,
+     122
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 51,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/job.rs",
+   "ranges": [
+    [
+     85,
+     91
+    ]
+   ],
+   "symbols": [
+    "write_state"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:write_state=25",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/job.rs",
+   "ranges": [
+    [
+     94,
+     99
+    ]
+   ],
+   "symbols": [
+    "read_state"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:read_state=27",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/job.rs",
+   "ranges": [
+    [
+     102,
+     108
+    ]
+   ],
+   "symbols": [
+    "list_states"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/job.rs",
+   "ranges": [
+    [
+     199,
+     210
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.0,
+   "lines": 12,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.15
+  },
+  {
+   "file": "src/state/job.rs",
+   "ranges": [
+    [
+     202,
+     207
+    ]
+   ],
+   "symbols": [
+    "workspace_roundtrips"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def deleted:select_jobs_all_and_substr_filter,select_jobs_default_current_ws_only,select_jobs_substr_excludes_none_workspace",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (41 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.22,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 41,
+   "mult": 0.15
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     1,
+     17
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 17,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     13,
+     17
+    ]
+   ],
+   "symbols": [
+    "CellInput"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:CellInput=21",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 5,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     21,
+     28
+    ]
+   ],
+   "symbols": [
+    "CellRecord"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:CellRecord=23",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 8,
+   "ripple": false,
+   "changed_lines": 0,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     25,
+     155
+    ]
+   ],
+   "symbols": [],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 131,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     32,
+     34
+    ]
+   ],
+   "symbols": [
+    "ok"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def deleted:ENV_LOCK,WEDGE_THRESHOLD_SECS,append_log,append_log_accumulates_ndjson",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:ENV_LOCK=12,read_args_raw=5",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (457 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.25,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 457,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     37,
+     39
+    ]
+   ],
+   "symbols": [
+    "db"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:db",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.25,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     44,
+     49
+    ]
+   ],
+   "symbols": [
+    "write_manifest"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     52,
+     58
+    ]
+   ],
+   "symbols": [
+    "read_manifest"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     63,
+     68
+    ]
+   ],
+   "symbols": [
+    "append_partial"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:append_partial=7",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 6,
+   "ripple": false,
+   "changed_lines": 4,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     71,
+     77
+    ]
+   ],
+   "symbols": [
+    "read_partial"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:read_partial=6",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 7,
+   "ripple": false,
+   "changed_lines": 5,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     81,
+     83
+    ]
+   ],
+   "symbols": [
+    "write_args_raw"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:write_args_raw",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:write_args_raw",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     85,
+     87
+    ]
+   ],
+   "symbols": [
+    "read_args_raw"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:read_args_raw",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:read_args_raw",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "fan-in:read_args_raw=5",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 1.0,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     90,
+     94
+    ]
+   ],
+   "symbols": [
+    "write_result"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:write_result=5",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 5,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     96,
+     98
+    ]
+   ],
+   "symbols": [
+    "read_result"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "fan-in:read_result=7",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.5,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     100,
+     104
+    ]
+   ],
+   "symbols": [
+    "write_result_md"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 5,
+   "ripple": false,
+   "changed_lines": 3,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     106,
+     108
+    ]
+   ],
+   "symbols": [
+    "read_result_md"
+   ],
+   "signals": [
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    }
+   ],
+   "score": 0.0,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 1,
+   "mult": 0.5
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     114,
+     116
+    ]
+   ],
+   "symbols": [
+    "rec"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:rec",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.07,
+   "lines": 3,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.15
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     119,
+     127
+    ]
+   ],
+   "symbols": [
+    "manifest_roundtrip_and_missing_is_empty"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:manifest_roundtrip_and_missing_is_empty",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.15
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     130,
+     138
+    ]
+   ],
+   "symbols": [
+    "partial_same_cell_overwrites_retry_wins"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:partial_same_cell_overwrites_retry_wins",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 0.15
+  },
+  {
+   "file": "src/state/store.rs",
+   "ranges": [
+    [
+     141,
+     153
+    ]
+   ],
+   "symbols": [
+    "args_and_result_roundtrip_persistent"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "def new:args_and_result_roundtrip_persistent",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:error_paths",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (12 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 0.22,
+   "lines": 13,
+   "ripple": false,
+   "changed_lines": 12,
+   "mult": 0.15
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     12,
+     68
+    ]
+   ],
+   "symbols": [
+    "doc_review_end_to_end_rejects"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 57,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     71,
+     125
+    ]
+   ],
+   "symbols": [
+    "code_bundle_tool_loop_anchors_and_drops_fabricated"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 55,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     128,
+     174
+    ]
+   ],
+   "symbols": [
+    "code_replicate_two_models_yield_agreement_two"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 47,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     177,
+     218
+    ]
+   ],
+   "symbols": [
+    "code_replicate_unreachable_model_exits_two"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 42,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     221,
+     282
+    ]
+   ],
+   "symbols": [
+    "doc_review_keeps_omission_drops_fabricated_anchors_contradiction"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 62,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     285,
+     326
+    ]
+   ],
+   "symbols": [
+    "code_replicate_lone_blocking_refuted_stays_approve"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 42,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  },
+  {
+   "file": "tests/review_e2e.rs",
+   "ranges": [
+    [
+     332,
+     390
+    ]
+   ],
+   "symbols": [
+    "doc_d5_compliance_hard_cap_clamps_high_to_medium"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "mult",
+     "detail": "test code",
+     "w": 0.3
+    }
+   ],
+   "score": 0.15,
+   "lines": 59,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 0.3
+  }
+ ],
+ "h0": [
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     55,
+     94
+    ]
+   ],
+   "symbols": [
+    "load_ledger"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:load_ledger",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:load_ledger",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (39 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.5,
+   "lines": 40,
+   "ripple": false,
+   "changed_lines": 39,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     297,
+     389
+    ]
+   ],
+   "symbols": [
+    "run_review"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (23 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 93,
+   "ripple": false,
+   "changed_lines": 23,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     393,
+     471
+    ]
+   ],
+   "symbols": [
+    "run_code_review"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (20 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 79,
+   "ripple": false,
+   "changed_lines": 20,
+   "mult": 1.0
+  },
+  {
+   "file": "src/cli.rs",
+   "ranges": [
+    [
+     615,
+     744
+    ]
+   ],
+   "symbols": [
+    "run_resume"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (22 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 130,
+   "ripple": false,
+   "changed_lines": 22,
+   "mult": 1.0
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     94,
+     110
+    ]
+   ],
+   "symbols": [
+    "dismiss_upsert"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_upsert",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:dismiss_upsert",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql,concurrency",
+     "w": 1.0
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (17 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 17,
+   "ripple": false,
+   "changed_lines": 17,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     115,
+     139
+    ]
+   ],
+   "symbols": [
+    "dismiss_set_status"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_set_status",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:dismiss_set_status",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql,concurrency,error_paths",
+     "w": 1.5
+    },
+    {
+     "kind": "mult",
+     "detail": "declaration-only",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (25 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.75,
+   "lines": 25,
+   "ripple": false,
+   "changed_lines": 25,
+   "mult": 0.5
+  },
+  {
+   "file": "src/db.rs",
+   "ranges": [
+    [
+     153,
+     166
+    ]
+   ],
+   "symbols": [
+    "dismiss_list"
+   ],
+   "signals": [
+    {
+     "kind": "struct",
+     "detail": "new file",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_list",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:dismiss_list",
+     "w": 0.5
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:exec_sql",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (14 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.5,
+   "lines": 14,
+   "ripple": false,
+   "changed_lines": 14,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     254,
+     262
+    ]
+   ],
+   "symbols": [
+    "load_config_warned"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:prune_here",
+     "w": 1.0
+    }
+   ],
+   "score": 2.0,
+   "lines": 9,
+   "ripple": false,
+   "changed_lines": 10,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     337,
+     646
+    ]
+   ],
+   "symbols": [
+    "main"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (40 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 310,
+   "ripple": false,
+   "changed_lines": 40,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     668,
+     713
+    ]
+   ],
+   "symbols": [
+    "run_dismiss"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:run_dismiss",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (46 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 46,
+   "ripple": false,
+   "changed_lines": 46,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     716,
+     750
+    ]
+   ],
+   "symbols": [
+    "dismiss_add"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_add",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (35 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 35,
+   "ripple": false,
+   "changed_lines": 35,
+   "mult": 1.0
+  },
+  {
+   "file": "src/main.rs",
+   "ranges": [
+    [
+     768,
+     810
+    ]
+   ],
+   "symbols": [
+    "dismiss_gc"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×11",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:dismiss_gc",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (43 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 43,
+   "ripple": false,
+   "changed_lines": 43,
+   "mult": 1.0
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     25,
+     46
+    ]
+   ],
+   "symbols": [
+    "init_project"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:is_hex16",
+     "w": 1.0
+    },
+    {
+     "kind": "path",
+     "detail": "keywords:auth",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (29 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.5,
+   "lines": 22,
+   "ripple": false,
+   "changed_lines": 29,
+   "mult": 1.0
+  },
+  {
+   "file": "src/project.rs",
+   "ranges": [
+    [
+     54,
+     65
+    ]
+   ],
+   "symbols": [
+    "parse_dismissed"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×3",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:load_dismissed_notes",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (51 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 12,
+   "ripple": false,
+   "changed_lines": 51,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     13,
+     36
+    ]
+   ],
+   "symbols": [
+    "output_language"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (16 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 1.5,
+   "lines": 24,
+   "ripple": false,
+   "changed_lines": 16,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     105,
+     118
+    ]
+   ],
+   "symbols": [
+    "rules_block"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def deleted:build_doc_prompt",
+     "w": 1.0
+    }
+   ],
+   "score": 2.0,
+   "lines": 14,
+   "ripple": false,
+   "changed_lines": 8,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     123,
+     137
+    ]
+   ],
+   "symbols": [
+    "build_doc_prompt"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:build_doc_prompt",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:build_doc_prompt",
+     "w": 0.5
+    }
+   ],
+   "score": 2.0,
+   "lines": 15,
+   "ripple": false,
+   "changed_lines": 2,
+   "mult": 1.0
+  },
+  {
+   "file": "src/prompt/mod.rs",
+   "ranges": [
+    [
+     180,
+     210
+    ]
+   ],
+   "symbols": [
+    "render_precedents"
+   ],
+   "signals": [
+    {
+     "kind": "hist",
+     "detail": "fix commits×7",
+     "w": 1.0
+    },
+    {
+     "kind": "struct",
+     "detail": "def new:render_precedents",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "public widened:render_precedents",
+     "w": 0.5
+    },
+    {
+     "kind": "struct",
+     "detail": "churn Q3 (31 lines)",
+     "w": 0.5
+    }
+   ],
+   "score": 2.5,
+   "lines": 31,
+   "ripple": false,
+   "changed_lines": 31,
+   "mult": 1.0
+  }
+ ],
+ "theta": 1.5,
+ "R": 4.011,
+ "max_zone": 2.5
+}
