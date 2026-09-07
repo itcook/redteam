@@ -12,7 +12,7 @@ verifier 流式复核；墙钟由 worker 池、provider 在途上限与预算共
 
 | # | 项 | design | 落点 |
 |---|---|---|---|
-| 1 | 风险评分器：路径/类别、结构、外部 API、历史四类信号 → H0 + R；`[review.risk] mode` + `--risk off \| auto \| all`；规则集 = E1 初版；可回流 | §3.3 | `src/risk/`（新模块）, `src/cli` |
+| 1 | 风险评分器：路径/类别、结构、外部 API、历史四类信号 → H0 + R；无模式旋钮〔D11〕；规则集 = P0 v4 定案（涟漪二梯队、两类信号、常量化），`eval/risk_replay.py` 回放为回归门；可回流 | §3.3 | `src/risk/`（新模块）, `src/cli` |
 | 2 | 深挖优先级队列：键 = H0 最高 / `置信 × agreement × 严重度`；入队合并（enclosing def 扩、同文件重叠合并、quote 轻锚 + hint 归一、agreement 累加、在途去重）；预算 `max_cells = "auto"` = `f(R, 规模)` + **必挖集不截**；graceful drain；终止条件；**分派池**（每项一个 reviewer，空闲轮转，无候补） | §6 | `src/orchestrate/queue.rs`（新）：tokio mpsc + worker 池 |
 | 3 | provider 在途上限：每 provider 一把 Semaphore，cell 发请求前取许可；有效并行 = min(角色 `workers`, provider `max_concurrency`) | §12.3 | `src/provider/registry.rs` 或 `src/orchestrate` |
 | 4 | reviewer cell：区域 pack（由构造即切片 + 爆炸半径 + 跨组索引 + spec）；H0 无笔记 / 疑点带笔记；输出完整 finding；终端不再生产；**流式持久化**（SSE 增量 JSON 解析，`findings` 对象闭合即落盘，无 `submit` 旋钮，D10）；**`templates/reviewer.md` 角色尾**（「确认、驳回或补充」、笔记非事实、H0「独立评审此区域」措辞）+ 模板哈希 | §7, §10.7 | `src/pack/mod.rs`, `src/prompt/templates/reviewer.md`, `src/orchestrate` |
@@ -30,8 +30,8 @@ verifier 流式复核；墙钟由 worker 池、provider 在途上限与预算共
 
 ## 验收
 
-- PR181 `--risk auto`：findings oracle 命中 ≥ GLM 单发 6 条；低风险 PR 5-8 min、高风险 7-10 min（design §13 账）。
-- `--risk all` 与 legacy findings 集合一致（R6 对照档）；`--risk off` 只产疑点 + 披露、零 reviewer 调用。
+- PR181：findings oracle 命中 ≥ GLM 单发 6 条；低风险 PR 5-8 min、高风险 7-10 min（design §13 账）。
+- 对照（R6 销案〔D11〕）：dev 旧二进制与 `redteam-next` 并排跑 PR181，比 P0 oracle 22 条的命中数；预算截断数 / 台账落入数 / 保底格使用数入 RunMeta，供三档起步值回校。
 - 预算截断项 100% 出现在 RunMeta；必挖集从不被截（构造用例：`max_cells = 0` 时 H0 仍被挖）。
 - verifier：blocking finding 全部有复核记录或跳过理由；构造「scanners / reviewers 全 deepseek」配置 → 同族复核 + 「无异族
   verifier」warning；refute 率在 RunMeta 可读；复核尾部对总墙钟贡献 ≤ 1 min。

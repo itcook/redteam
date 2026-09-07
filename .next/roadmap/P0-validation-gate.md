@@ -1,6 +1,6 @@
 # P0 · 验证门（先于任何实现）
 
-> 状态: 🔨 · 依赖 — · design §16 E1 / E3 · 出口 = design v4 → 锁定 + M21 登记
+> 状态: ✅（2026-09-07，grill〔D11〕→ design 锁定 v8，M21 已登记主账本）· 依赖 — · design §16 E1 / E3
 > E2（lost-in-the-middle × 切片）需要 slice 实现才能 A/B，移至 M21d 作其验收门。
 > 2026-09-07：E1 / E3 数据已入 research §15 / §16（工具 `eval/risk_replay.py`、`eval/p0_oracle.py`、`eval/e3_contract_ab.py`、`examples/dump_pack.rs`；
 > 明细 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md`；原始数据入库区 `../research/2026-09-07-p0-raw/`（本仓 oracle B / 分布）
@@ -46,7 +46,7 @@
 
 ## 出口条件
 
-E1 与 E3 数据入 research → grill 必答项裁决入 decisions（D7+）→ design 锁定 → M21 登记。
+E1 与 E3 数据入 research → grill 必答项裁决入 decisions（D7+）→ design 锁定 → M21 登记。**已达成（2026-09-07）**：决策 D11、design v8 锁定、主账本登记；plan 派生另起任务。
 
 ## 结果摘要（2026-09-07；明细与表格在私有研究文件 §15 / §16）
 

@@ -1,7 +1,9 @@
-# redteam 评审引擎·风险路由 DAG 架构（M21 · v7）
+# redteam 评审引擎·风险路由 DAG 架构（M21 · v8）
 
-> 状态: WIP（v5，2026-09-05 grill〔D7〕：角色命名 scanner / reviewer / verifier；配置节 §12 重写为用户级唯一 TOML；
-> 无候补；verifier 流式化 + 数据判决；provider 在途上限；aacr-bench 退役至 M21c / M21e 重启）· 待 §16 前置验证后锁定。
+> 状态: **锁定**（v8，2026-09-07，P0 验证门出口〔D11〕：E1 风险规则 v4 成立、E3 疑点契约成立；§3.3 / §4 / §6 / §12.1 / §16 / §17 按 D11 改；
+> 无 `[review.risk]` / `--risk`）· 派生 plan：`../plans/`（待产出）。
+> v5（2026-09-05 grill〔D7〕：角色命名 scanner / reviewer / verifier；配置节 §12 重写为用户级唯一 TOML；
+> 无候补；verifier 流式化 + 数据判决；provider 在途上限；aacr-bench 退役至 M21c / M21e 重启）。
 > v6（2026-09-05）：scanner 组 pack 默认 `slice`〔D8〕；§10.7 提示词按角色分离〔D9〕；E2 改为 M21a 出口 slice vs full A/B。
 > v7（2026-09-05）〔D10〕：增量提交改为流式持久化（无 `submit` 旋钮）；proj.db schema v4 一次重置 + 台账导出；cache 断点进
 > M21a、其余 R21；分支硬切替代 `engine` 旗，对照基线 = `dev` 二进制。
@@ -115,8 +117,15 @@ body 与 callee 签名。同一张引用图、两个方向。分组切错退化�
 | 外部 API | 关键模块中 hunk 内外部 crate 符号调用密集（≥ k） | `use` 解析 + 改动行 | 三方误用（§9.4），reviewer cell 带契约 |
 | 历史 | 该文件有 upheld 记录、在 fix 类 commit 高频、台账有休眠疑点锚定于此 | 台账 + git log | 缺陷热点 |
 
-- `[review.risk] mode = off | auto | all`，`--risk` 覆盖：`off` = 纯快扫 + 台账；`auto` = 默认；`all` = 全部为热区且
-  预算无上限 = 慢模型全景（现状单发的等价对照档）。
+**规则 v4 定案〔D11，P0 E1 标定，明细见 P0 研究 §15.4〕**
+- 成区：hunk → enclosing def 块（局部 const 不算 def；无 def → hunk ± 10 行 padded，只与 padded 相邻合并；相邻函数各自成区）。
+  **主区** = 含改动行的区；**涟漪区** = 改动 / 新增 / 删除的声明名与 hunk 外围符号在本文件引用点（≤ 4 处，不跨文件）的 enclosing def。
+- 信号四类（路径/类别 · 结构 · 外部 API · 历史）与权重、乘子（声明区 ×0.5、测试含 `#[cfg(test)]` 之后 ×0.3、文档 ×0.2）为代码常量；
+  **入 H0 需 score ≥ θ=1.5 且命中 ≥ 2 类信号**，关键词类单独不成区。
+- 梯队：主区 = 必挖集、队列最前；涟漪区随预算、截断先截。R = Σ_{H0} score ÷ (1 + ln(1 + 代码改动行))，切点 0.5 / 3.5 分低 / 中 / 高三档（§6 预算）。
+- 无模式旋钮：不设 `[review.risk]`、不加 `--risk`；θ 与权重改动必须过 `eval/risk_replay.py` 回放 PR181 + 本仓 oracle B 并写进 research。
+  快扫档将来走独立途径。
+- 已知边界：PR181 主裁决集区间级 4/4、并集空热区 0.47；held-out oracle B 区间级 0.59 / 文件级 0.85，漏项主因是改动函数之外的交互点。
 - 规则集可回流：台账 dismissed/upheld 统计驱动规则增删（与假阳压制同一反馈环）。
 
 ---
@@ -136,7 +145,9 @@ scanned_areas: [{ file, ranges }]                                               
 - **scanner 不直接产 finding**；全部疑点入深挖队列（§6），needs 项同队列。
 - **判例前移**：prompt 注入同文件活跃判例摘要；机械匹配命中的疑点**降级候选**、不直接丢。
 - 可选：同模型多 lens 采样并集 `[review.scanners] samples = 1`（换召回，不换墙钟）。
-- `quote` 是跨模型疑点合并与判例预筛的锚（`quote_overlap` 口径复用）；`hint` 归一化规则见 R4。
+- `quote` 是跨模型疑点合并与判例预筛的锚（`quote_overlap` 口径复用）；**quote 逐字硬约束，不在文件即丢弃**（E3：疑点模式守约弱于 finding 模式）；
+  `category` 取 L0-L5；`hint` 归一化后置 M21c（R4，〔D11〕）。
+- scanner 请求显式钉推理档（角色条目 `thinking_level` 首个消费者）；零推理 + 短输出记 RunMeta 观测，不重跑（E3：疑点模式 2/3 跑几乎零推理）。
 - 提示词 = 共享头 + scanner 角色尾（§10.7）。
 
 ---
@@ -157,9 +168,9 @@ scanned_areas: [{ file, ranges }]                                               
 
 | # | 规则 | 内容 |
 |---|---|---|
-| 1 | 优先级 | H0 规则项最高。疑点项 = `confidence × agreement × 严重度类别权重`；needs 项取触发疑点分或默认中档。**非 FIFO；不用置信阈值切**。 |
+| 1 | 优先级 | 主区 H0 最高，涟漪区次之〔D11〕。疑点项 = `confidence × agreement × 类别权重`；needs 项取触发疑点分或默认中档。**非 FIFO；不用置信阈值切**。 |
 | 2 | 入队合并 | 区间扩到 enclosing def；同文件重叠/相邻区间合并为一项；跨模型同疑点以 quote 轻锚 + hint 归一合并、agreement 累加；已处理或在途的区域再来直接丢（set 语义）。 |
-| 3 | 预算 | `[review.reviewers] max_cells = "auto"`（= `f(R, 规模)`）或整数固定。**必挖集** = H0 ∪ {`confidence ≥ c_hi ∧ severity ≥ block`} 不受截断；其余按优先级吃到预算。到期 **graceful drain**：在途跑完，未开跑者落台账。 |
+| 3 | 预算 | `[review.reviewers] max_cells = "auto"`（按 R 三档：low 4 / mid 12 / high 32，硬帽 48，起步值）或整数固定〔D11〕。**必挖集** = 主区 H0 ∪ {agreement ≥ 2 的疑点} 不受截断（confidence 只进优先级不做门）；**保底**：每轮为 scanner 疑点保留 ⌈max_cells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并在 RunMeta 披露；涟漪区与其余疑点按优先级吃剩余预算。到期 **graceful drain**：在途跑完，未开跑者落台账。 |
 | 4 | 预算外去向 | **疑点台账**（§8.3）休眠；报告披露为低置信线索；**不进 verdict**。截断不静默。 |
 | 5 | 分派 | 活跃 reviewer 条目构成**分派池**：每项只由一个模型消费，按空闲轮转；多条目买吞吐与分散限流，不双审。 |
 | 6 | 终止 | 全部 scanner cell 返回 → 关闭入口 → worker 排空 → 在途归零 → 复核在途归零 → reduce barrier。 |
@@ -168,7 +179,7 @@ scanned_areas: [{ file, ranges }]                                               
 
 可观测面（cell/phase 已有框架）：队列深度、入队原因分布、去重命中数、预算截断数、台账落入数、项等待时长。
 实现落点：tokio mpsc + worker 池，scanner cell 为 sender、reviewer cell 为 receiver，复用现有 cell 抽象；reviewer
-cell 的 CellRecord 形状与 resume 语义见 R14。
+cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 
 ---
 
@@ -405,10 +416,6 @@ reenqueue = false
 enabled = true
 workers = 2
 
-[review.risk]
-mode = "auto"                         # off | auto | all；--risk 覆盖
-threshold = 0.3
-
 [review.grouping]
 min_files = 4
 bundle_line_threshold = 200
@@ -508,6 +515,9 @@ scanner 直接产 finding / `engine` 旗（对照基线 = `dev` 二进制）/ `s
 | E2 | slice vs full A/B（M21a 出口，PR181 + dogfood） | v2 scanner 两种 `pack.body` 各 N=3：疑点 oracle 命中、噪音比、输入 token、cache 命中率 | slice 命中 ≥ full → 维持默认；否则按 §10.2 回退信号处理。合成 util 文件 LITM 实验降为可选 |
 | E3 | 疑点模式 vs finding 模式召回（快模型） | PR181 同快模型两种契约各 N=3；oracle = GLM 6 ∪ rpiv 8 ∪ Kimi 3 ∪ ocr 3 去重 | 验证 §4 契约；校准 `c_hi`（R11） |
 
+结果（2026-09-07〔D11〕）：E1 规则 v4 成立（主裁决集区间级 4/4、空热区 0.47；四轮）；E3 疑点契约成立（人工主题命中三跑并集 5:1）；`c_hi` 数据不支持 → R11 改 agreement 口径。
+数字见 `../roadmap/P0-validation-gate.md`「结果摘要」，明细 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md`。E2 移至 M21a 出口。
+
 **测试主场**：PR181（连续性对照、网关真实度）+ 本仓 dogfood（增量轮、台账、ship）。
 **对照基线 = `dev` 分支二进制**〔D10〕：分支硬切、无 `engine` 旗，A/B 时两个二进制并排跑同一 PR；切名前分支产物名 `redteam-next`，
 插件与 ship 循环继续用 dev 的 `redteam`，M21c 切回。
@@ -524,17 +534,17 @@ ocr 参照 = deepseek-v4-pro 直连 chat-completions 流式，版本钉入元数
 |---|---|---|
 | R2 | reviewer cell 是否保留 `needs` 二阶段 | 沿用 two-stage；触发率实测后定 |
 | R3 | 分组阈值本仓校准 | ocr 默认起步（4/200/10），dogfood 调 |
-| R4 | 疑点 schema 细节：`hint` 归一化、`category` 枚举、`confidence` 刻度、合并 id 稳定性 | E3 数据 + design 补节 |
-| R5 | 风险规则初版 + 预算函数 `f(R, 规模)` 形状 | E1 数据驱动 |
-| R6 | `--risk all` 是否即现状路径（对照档等价性） | 应等价；作回归对照 |
+| R4 | 疑点 schema 细节 | **部分已裁〔D11〕**：category L0-L5、quote 逐字 + 丢弃；`hint` 归一化与合并 id 稳定性 → M21c 台账数据 |
+| R5 | 风险规则初版 + 预算函数形状 | **已裁〔D11〕**：规则 v4、涟漪二梯队、两类信号、常量化、三档 4 / 12 / 32 帽 48（§3.3 / §6） |
+| R6 | `--risk all` 对照档等价性 | **销案〔D11〕**：无 `--risk`；对照 = dev 二进制并排跑 PR181 比 oracle 命中 |
 | R7 | slice 回退信号阈值（`needs` 触发率、oracle 命中差）与 `slice_min_bytes` | M21a A/B 与 dogfood 定 |
 | R8 | LLM 语义分组何时值得开 | 跨组 import 边数阈值，dogfood 定 |
 | R9 | 角色 `workers` 与 provider `max_concurrency` 的默认值 | 网关限流实测定 |
 | R10 | L4-B 非 Rust 生态定位链 | Rust 先行 |
-| R11 | 必挖集阈值 `c_hi` | E3 校准 |
+| R11 | 必挖集阈值 `c_hi` | **已裁〔D11〕**：置信不做门；必挖 = 主区 ∪ agreement ≥ 2；疑点保底 ⌈max_cells/4⌉ 格 |
 | R12 | 台账激活上限 N 与停车通道形态 | 镜像 ship AskUser |
 | R13 | （已消：流式持久化无旋钮〔D10〕） | — |
-| R14 | 实现债：proj.db schema v4 一次重置（cell 带角色、suspicions、queue_snapshot、coverage、runs meta；重置前导出 dismissed / upheld 固定集）、resume 覆盖队列状态、per-fanout 单模型计划 → 角色化 | 先机械拆零语义再接线；不写迁移 |
+| R14 | 实现债 | **已裁〔D11〕**：cell 记录 `role` + 角色分叉输出枚举；单独表 = 疑点台账 + 队列快照；coverage 进作业元数据；resume 读快照重跑未完项；schema v4 一次重置〔D10〕 |
 | R15 | findings-recall 度量 | aacr 重启后接管；此前 PR181 三方并集 + proj.db upheld 小 oracle |
 | R16 | provider RPM 令牌桶 | 网关按 RPM 计费时再上 |
 | R17 | google 原生后端 | M20 provider 拓展 |

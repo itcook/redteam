@@ -44,7 +44,7 @@
   集合的命中可读。
 - schema v4：旧库导出的 dismissed / upheld 固定集可读、条数与旧库一致；新库从空建，不写迁移。
 - cache：anthropic kind 命中率按 cell 可读、≥ dev 基线。
-- `make verify` 绿；`--help` 含 `engine` / `--risk`（占位）/ `--test-command` / `--pack-only` 与配置路径说明。
+- `make verify` 绿；`--help` 含 `--test-command` / `--pack-only` 与配置路径说明（无 `engine` / `--risk`〔D10 / D11〕）。
 
 ## 风险与前置件
 

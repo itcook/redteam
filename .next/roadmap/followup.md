@@ -9,17 +9,17 @@
 |---|---|---|---|
 | R2 | reviewer cell 保留 `needs` 二阶段 | M21b | 触发率实测 |
 | R3 | 分组阈值本仓校准 | M21a 起步 / M21e 收口 | ocr 默认 4 / 200 / 10 → dogfood |
-| R4 | 疑点 schema 细节（hint 归一、category 枚举、confidence 刻度、合并 id 稳定性） | P0 E3 → M21a | 数据 + design 补节 |
-| R5 | 风险规则初版 + 预算函数 `f(R, 规模)` 形状 | P0 E1 → M21b | 回放数据 |
-| R6 | `--risk all` 与现状等价性 | M21b | 对照档回归 |
+| R4 | 疑点 schema 细节 | 部分已裁〔D11〕（category L0-L5、quote 逐字 + 丢弃）；hint 归一化 / 合并 id → M21c | 台账数据 |
+| R5 | 风险规则初版 + 预算函数形状 | 已裁〔D11〕→ M21b 实现（规则 v4、涟漪二梯队、两类信号、常量化、三档 4 / 12 / 32） | `eval/risk_replay.py` 回放为回归门 |
+| R6 | `--risk all` 与现状等价性 | 销案〔D11〕：无 `--risk`；对照 = dev 二进制并排跑 PR181 | — |
 | R7 | slice 回退信号阈值（`needs` 触发率、oracle 命中差）与 `slice_min_bytes` | M21a A/B 起步 / M21d 调优 | PR181 A/B + dogfood |
 | R8 | LLM 语义分组何时值得开 | M21e | 跨组 import 边数阈值 |
 | R9 | 角色 `workers` 与 provider `max_concurrency` 默认值 | M21b 起步 / M21e 收口 | 网关限流实测 |
 | R10 | L4-B 非 Rust 生态定位链 | M21d 后置 → M20 backlog | 按宿主语料 |
-| R11 | 必挖集阈值 `c_hi` | P0 E3 | 置信分布下沿 |
+| R11 | 必挖集阈值 `c_hi` | 已裁〔D11〕：置信不做门；必挖 = 主区 ∪ agreement ≥ 2 + 疑点保底格 → M21b | — |
 | R12 | 台账激活上限 N 与停车通道形态 | M21c 起步 / M21e 收口 | 镜像 ship AskUser |
 | R13 | （已消：流式持久化无旋钮，D10） | — | — |
-| R14 | 实现债（下表） | M21a / M21b | 先机械拆零语义再接线 |
+| R14 | 实现债（下表） | 已裁〔D11〕路线：role + 输出枚举、台账表 + 队列快照表 → M21a / M21b | 先机械拆零语义再接线 |
 | R15 | findings-recall 度量 | P0 小 oracle（PR181 三方并集 + proj.db upheld）/ aacr 重启后接管 | — |
 | R16 | provider RPM 令牌桶 | M20 | 网关按 RPM 计费时再上 |
 | R17 | google 原生后端 | M20 provider 拓展 | 第二家族需要 Gemini 原生协议时提前 |

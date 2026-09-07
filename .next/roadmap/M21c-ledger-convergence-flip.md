@@ -18,7 +18,7 @@
 | 5 | 判例前移进快扫 prompt：同文件活跃判例摘要；机械匹配命中 → 降级候选，不直接丢 | §4 | `src/prompt/mod.rs` render_precedents 复用；`src/consolidate/verify.rs` matches_precedent 前移调用点 |
 | 6 | 小项打包：refute prompt `analysis` 先于 verdict；positioning 跨文件重定位（changed files 内唯一命中，多/零命中拒绝）；`scanned_areas` 消费进 coverage | §8.1, §9 L2 | `src/prompt/templates/adversarial-refute.md`, `src/positioning` |
 | 7 | **切名前 aacr `smoke`**（D7 B4 重启点）：fork 上 5 个 rs / go / ts 正样本，legacy 与 v2 各 N=1，`JUDGE_USE_MOCK=true` 取 Line-P / Line-R；结果写回 research | design §16 | `~/codes/aacr-bench`（`reviewers/redteam.py` 已在 M21b 出口接好） |
-| 8 | **切名**（D10）：`redteam-next` → `redteam`，`make build` 放置新二进制，插件与 ship 指向它；dev 二进制归档为对照基线（`--risk all` 等价性 R6 已验）；`--help` / README 初稿按新 CLI 面 | 铁律 6 | Makefile, `plugins/redteam/`, `src/cli` |
+| 8 | **切名**（D10）：`redteam-next` → `redteam`，`make build` 放置新二进制，插件与 ship 指向它；dev 二进制归档为对照基线（R6 销案〔D11〕：对照 = 并排跑 PR181 比 oracle 命中）；`--help` / README 初稿按新 CLI 面 | 铁律 6 | Makefile, `plugins/redteam/`, `src/cli` |
 | 9 | dogfood 内循环：ship r1-rN 至 approve；发现修复回流；台账激活至少观测到一例 | — | — |
 
 ## 验收

@@ -291,3 +291,32 @@ R13 消、R14 扩、R21 增；design §7 / §10.3 / §11 / §12.1 / §15 / §16 
 
 **代价与残余**：M21a、M21b 期间 `redteam-next` 审不出 finding，dogfood 靠 dev 二进制；两个二进制名要在 Makefile / 插件
 放置里区分；流式持久化只能保住已闭合的对象，未闭合的仍随 cell 死亡丢失。
+
+---
+
+## D11 P0 出口裁决（grill，2026-09-07）
+
+**议题**：P0 验证门（E1 风险规则回放 + E3 疑点契约 A/B，数据见 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md`
+§15 / §16，纯数字摘要见 `../roadmap/P0-validation-gate.md`）之后，design 锁定前的必答项：R5（涟漪去留 / 两类信号 / θ 与权重落点 /
+预算三档）、R11 `c_hi`、R6 `--risk all` 等价性、R14 实现债路线。
+
+| # | 定案 | 被否 | 依据 |
+|---|---|---|---|
+| 1 R5-a | **涟漪卫星区保留，作 H0 第二梯队**：主区（有改动行）必挖且排最前；涟漪区（改动符号在本文件 ≤ 4 处引用点的 enclosing def）排主区之后、不进必挖集、预算截断先截它；不做跨文件涟漪 | 不进规则（靠疑点 / dossier 碰）；与主区同级 | PR181 主裁决集靠它 +1（T2，finding 引用未改动的 fence 代码）、oracle B +2；代价 H0 +30-40% 且新增区多为空——放第二梯队让可达性只花预算不挤主区 |
+| 2 R5-b | **两类独立信号规则写进 §3.3**：入 H0 需 score ≥ θ 且命中 ≥ 2 类信号（路径/类别、结构、外部 API、历史），关键词类单独不成区 | 只靠 θ 调 | v3→v4 唯一让 held-out 集守住的改动：大 diff 上 H0 占区 45-52% → 10-24%，PR181 主裁决集 4/4 不变；θ 单调不可兼得（2.0 时主裁决集 1/4） |
+| 3 R5-c | **不设 `[review.risk]`、不加 `--risk`**，规则只有一种行为；θ=1.5 与权重表为 Rust `risk` 模块常量，改动必须过 `eval/risk_replay.py` 回放 PR181（私有 fixture）+ 本仓 oracle B（入库 fixture）并把数字写进 research；快扫档将来走独立途径（如 `redteam triage`） | `mode = off\|auto\|all` 三档；权重进配置 | 用户判断：快速验证期不加分支特性；数字只在一个语料上标定过，开旋钮等于把标定责任推给用户，`--help` 还要解释十几个数字；§12.1 孤儿键 `threshold = 0.3` 无定义、随节删除 |
+| 4 R5-d | **预算**：R = Σ_{H0} score ÷ (1 + ln(1 + 代码改动行))，切点 0.5 / 3.5；`max_cells = "auto"` 起步 low 4 / mid 12 / high 32，硬帽 48；必挖集 = 主区不截，主区超帽时只做主区并在 RunMeta 披露；`max_cells` 整数固定上限保留 | high 24（保守）/ 48（激进） | 22 个有代码 diff 的 R 三分位 \|H0\| 中位 0 / 5 / 23，起步值 = 中位 + 疑点余量；起步值，M21b 出口按截断数 / 台账落入数回校 |
+| 5 R11 | **必挖集 = 主区 ∪ {agreement ≥ 2 的疑点}**（跨 scanner 或跨 samples 经 quote 轻锚 + hint 归一合并）；confidence 只进优先级公式不做门；删「severity ≥ block」（疑点无 severity）；**预算分池保底**：每轮为 scanner 疑点保留 ⌈max_cells/4⌉ 格（1 / 3 / 8），主区吃穿时帽 = \|主区\| + 保底 | `c_hi` 置信阈值；按 category 必挖 | E3：命中项 confidence 0.25-0.50、全体均值 0.36，`c_hi ≥ 0.5` 只留 1/8 命中——flash 级自评置信与命中无关；用户担心「agreement=1 且非热区的真 bug」被饿死（E3 有两例）→ 保底格保证最坏情况 top-K 疑点仍深挖，其余走台账休眠 + delta 激活 + 披露；category 自标可靠性未验，M21c 看台账数据再议 |
+| 6 R6 | **销案**：对照 = dev 旧二进制与新二进制并排跑 PR181，比 P0 oracle（22 条）命中数，不追求 finding 逐条相同（提示词已按角色分离）；M21b / M21c / M21e 三处 `--risk all` 验收改写；慢模型全景档不设 | 保留 `--risk all` 为对照档 / 全景档 | 随 3 无载体；D10 已定对照基线 = dev 二进制；M21e 收官对照是 dev 二进制最后一次上场，与仪器拆除条目一致 |
+| 7 R14 | **cell 记录加 `role` + 按角色分叉的输出枚举**（scanner：疑点 + needs + scanned_areas；reviewer：findings + needs；verifier：判决），一 cell 一条 JSON 记录；**单独建表只有疑点台账**（锚点、hint、状态、最近作业、激活次数）**与队列快照**；coverage 五集合进作业元数据；resume = 读快照重跑未完项，scanner cell 缺失才重跑（清单差集语义保留） | findings / suspicions / needs 各一张表；一条记录两个可空列表 | 产品从不按列查 finding、整条读；枚举让记录类型在类型上说清，避免两列表同时非空的糊涂态（M15 翻转当天集成 bug 的温床）；台账须跨作业按锚点查改状态，必须成表；拆多表 = 多份迁移面与测试面而 proj.db 是小库 |
+
+**E3 连带（实现级，数据支撑，随 D11 记）**
+- M21a scanner 请求显式钉推理档（`thinking_level` 首个消费者），`samples` 作方差对冲；零推理 + 短输出记 RunMeta 观测信号，不重跑（铁律 7）——E3 疑点臂 2/3 跑几乎零推理（11-16 s）。
+- 疑点契约：quote 逐字硬约束 + 不在文件即丢弃（E3 未定位 5/32 vs finding 契约 1/11）；category 保留 L0-L5；hint 归一化后置 M21c 看台账数据。
+- 规则初版已知边界写进 §3.3：P0 用了四轮（r2 / r3 为度量修正、r4 由 held-out 驱动）；held-out oracle B 区间级 0.59 / 文件级 0.85；漏项主因是改动函数之外的交互点。
+
+**连带**：design v8 锁定——§3.3 重写为规则 v4 定案、§4 补 quote 丢弃与推理档、§6 行 1 / 3 改写、§12.1 删 `[review.risk]`、§16 记结果、§17 R5 / R6 / R11 / R14 标已裁；
+roadmap P0 ✅、followup 四行归位、M21b / M21c / M21e / M21a 的 `--risk` 与 `engine` 提法清除；主 checkout `.doc/roadmap/summary.md` 登记 M21。
+
+**代价与残余**：默认配置（单 scanner、samples=1）下必挖集 = 纯规则主区，疑点全部走预算 + 保底；大 diff 首轮只保证 top-K 疑点深挖；
+规则权重不可用户调，跨语言 / 跨仓库校准留 R18；`--risk off` 型快扫无入口，需要时另立命令。

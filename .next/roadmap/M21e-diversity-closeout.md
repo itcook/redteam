@@ -15,7 +15,7 @@
 | 2 | 旧 CLI 面残余清理：`--models` / `--models-all` / `priority` 的文档与错误提示；`resolve_models` 角色驱动版收口 | §15 消亡 | `src/cli/mod.rs` |
 | 3 | **aacr `gate` 三方对照**（D7 重启点）：先 `--pack-only` spike 定规模（R20）；legacy / v2 / ocr 三方；ocr = deepseek-v4-pro 直连 chat-completions 流式、版本钉入元数据；GLM judge、`--eval-rounds 3`、正样本 N=3、负样本 N=1；数字写回 research；Claude D 参照后置 | design §16 | `~/codes/aacr-bench`；本仓 `eval/README` |
 | 4 | 校准收口：R3 分组阈值、R8 semantic grouping 触发阈值（跨组 import 边数）、R9 workers 分配、R12 激活上限 N；全部落配置默认值 | — | `src/config` + dogfood 数据 |
-| 5 | 仪器拆除（铁律 1）：dev 二进制基线数字归档后不再维护；`--risk all` 保留为慢模型全景档；scratch 实验脚本归档到 `eval/`；`skipped(budget)` 过渡披露并入台账口径 | — | — |
+| 5 | 仪器拆除（铁律 1）：dev 二进制基线数字归档后不再维护；scratch 实验脚本归档到 `eval/`；`skipped(budget)` 过渡披露并入台账口径 | — | — |
 | 6 | `--help` 定稿（裸终端唯一在场文档）；README / 安装 / 快速上手按新 CLI 面重写；codex-skills `make gen` 同步；`make verify` 零 diff | CLAUDE 原则 | `plugins/redteam/commands/`, Makefile 流程 |
 | 7 | 关账：`.doc/roadmap/done.md` 记 M21 明细；本目录全部里程碑 ✅；design 状态头「已交付」 | — | — |
 

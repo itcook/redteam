@@ -1,8 +1,8 @@
 # M21 评审引擎重构 · Roadmap
 
-> 状态: 草案 v2（2026-09-05，grill〔D7〕后：配置节 / 无候补 / verifier 流式 / aacr 退役与重启点）· 分支 `feat/m21-review-engine`
+> 状态: v3（2026-09-07 P0 出口〔D11〕：design 锁定 v8，P0 ✅；v2 2026-09-05 grill〔D7〕）· 分支 `feat/m21-review-engine`
 > · 工作树 `~/hobby/.worktrees/redteam/m21-review-engine`
-> 权威框架: `../design/2026-09-04-redteam-review-engine-architecture-design.md`（v7，WIP，P0 出口锁定）
+> 权威框架: `../design/2026-09-04-redteam-review-engine-architecture-design.md`（v8，锁定）
 > 证据 / 决策: `../research/2026-09-04-redteam-review-engine-architecture-research.md`（§14 aacr 事实）·
 > `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D10）· P0 明细 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md`
 > 2026-09-07 起本目录连同上述文档自主 checkout `.doc/` 迁入分支随行区 `.next/`（`../README.md`）；含公司仓细节者在 `../private/`（gitignored）。
@@ -32,7 +32,7 @@
 
 | 编号 | 名称 | 一句话 | 依赖 | 状态 | 详见 |
 |---|---|---|---|---|---|
-| **P0** | 验证门 | E1 PR181 回放定风险规则与预算形状；E3 疑点契约召回；grill → design 锁定、M21 登记 | — | 🔨 | `P0-validation-gate.md` |
+| **P0** | 验证门 | E1 PR181 回放定风险规则与预算形状；E3 疑点契约召回；grill → design 锁定、M21 登记 | — | ✅ | `P0-validation-gate.md` |
 | **M21a** | 疑点扫描地基 | 配置节（用户级唯一 `~/.redteam/`、角色列表、provider 在途上限）+ 引用图分组 + 正反向跨组索引 + **切片装包（scanner 默认 slice）** + 疑点契约 + 提示词共享头 / scanner 尾 + `--pack-only`；proj.db v4 一次重置 + cache 断点；出口 slice vs full A/B；分支硬切删除旧编排，`redteam-next` 仅 scanner 段 | P0 | ⏳ | `M21a-scan-foundation.md` |
 | **M21b** | 风险路由与深挖队列 | 风险评分器 + 优先级队列（分派池、无候补）+ reviewer cell + 预算 / 必挖集 + verifier 流式段；finding 只由深挖产出 | M21a | ⏳ | `M21b-risk-deep-queue.md` |
 | **M21c** | 台账·收敛·切名 | 疑点台账 + delta 激活 + 收敛三维 + coverage 分级 + 判例前移等小项；**切名前 aacr smoke**；`redteam-next` → `redteam` + dogfood | M21b | ⏳ | `M21c-ledger-convergence-flip.md` |
@@ -69,7 +69,7 @@ M21c 与 M21d 可并行（d 只依赖 reviewer cell 存在，不依赖台账）�
 
 ## 与既有账本的关系
 
-- `.doc/roadmap/summary.md` 的 **M19 发布 1.0 后置于 M21e**：重构改 CLI 面（`--models` 退场、`--risk` / `--test-command`
+- `.doc/roadmap/summary.md` 的 **M19 发布 1.0 后置于 M21e**：重构改 CLI 面（`--models` 退场、`--test-command`
   新增、配置搬到 `~/.redteam/`），`--help` 与 README 须在 M21e 定稿后再发。
 - M20 backlog：R6 执行判（design §9.4 D 层）、google 后端（R17）、RPM 令牌桶（R16）、交互式配置（R19）不在本 roadmap。
 - design 锁定后按规范派生 `../plans/2026-*-redteam-m21{a..e}-*-plan.md`（`.next/plans/`），本目录各里程碑文件是其范围与验收的上位定义。

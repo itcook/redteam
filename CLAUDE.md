@@ -21,7 +21,7 @@ prompt 只做裁决/编排等模型本职(例外:dev-time 临时仪器如 feedba
 
 - **M21 评审引擎重构期间(2026-09-05 起,分支 `feat/m21-review-engine`)**:以仓内 **`.next/`**(分支随行文档区,2026-09-07 自主
   checkout `.doc/` 迁入,`.next/README.md` 为索引)为准——`.next/roadmap/`(README + P0 + M21a-e + followup)、
-  `.next/design/2026-09-04-redteam-review-engine-architecture-design.md`(v7)及同名 decisions(D1-D10)/ research;
+  `.next/design/2026-09-04-redteam-review-engine-architecture-design.md`(v8 锁定)及同名 decisions(D1-D11)/ research;
   **`.next/private/`(gitignored,只在本工作树磁盘)**放含公司仓细节的 PR181 评审记录、P0 明细研究与原始数据——远端是公开仓,**永不入库**。
   `.doc/` 其余 design/plan 为历史,读到冲突以前者为准。分支硬切旧编排(无 `engine` 旗),对照基线 = `dev` 二进制;
   切名前分支产物名 `redteam-next`。
