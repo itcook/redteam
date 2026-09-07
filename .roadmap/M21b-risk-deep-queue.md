@@ -1,0 +1,50 @@
+# M21b · 风险路由与深挖队列
+
+> 状态: ⏳ · 依赖 M21a · design §3.3 / §6 / §7 / §8.1 / §12.3 / §13 · 决策 D1 勘误, D2, D6, D7
+> 出口：`redteam-next` 端到端产 finding 并流式复核；插件与 ship 仍用 dev `redteam`（切名在 M21c）
+
+## 目标
+
+finding 只由深挖产出。规则热区与 scanner 疑点进同一条优先级队列，reviewer 分派池按预算并行消费；finding 落地即由
+verifier 流式复核；墙钟由 worker 池、provider 在途上限与预算共同封顶。无候补。
+
+## 交付项
+
+| # | 项 | design | 落点 |
+|---|---|---|---|
+| 1 | 风险评分器：路径/类别、结构、外部 API、历史四类信号 → H0 + R；`[review.risk] mode` + `--risk off \| auto \| all`；规则集 = E1 初版；可回流 | §3.3 | `src/risk/`（新模块）, `src/cli` |
+| 2 | 深挖优先级队列：键 = H0 最高 / `置信 × agreement × 严重度`；入队合并（enclosing def 扩、同文件重叠合并、quote 轻锚 + hint 归一、agreement 累加、在途去重）；预算 `max_cells = "auto"` = `f(R, 规模)` + **必挖集不截**；graceful drain；终止条件；**分派池**（每项一个 reviewer，空闲轮转，无候补） | §6 | `src/orchestrate/queue.rs`（新）：tokio mpsc + worker 池 |
+| 3 | provider 在途上限：每 provider 一把 Semaphore，cell 发请求前取许可；有效并行 = min(角色 `workers`, provider `max_concurrency`) | §12.3 | `src/provider/registry.rs` 或 `src/orchestrate` |
+| 4 | reviewer cell：区域 pack（由构造即切片 + 爆炸半径 + 跨组索引 + spec）；H0 无笔记 / 疑点带笔记；输出完整 finding；终端不再生产；**流式持久化**（SSE 增量 JSON 解析，`findings` 对象闭合即落盘，无 `submit` 旋钮，D10）；**`templates/reviewer.md` 角色尾**（「确认、驳回或补充」、笔记非事实、H0「独立评审此区域」措辞）+ 模板哈希 | §7, §10.7 | `src/pack/mod.rs`, `src/prompt/templates/reviewer.md`, `src/orchestrate` |
+| 5 | **verifier 流式段**：finding 落地即入复核流；触发集 blocking + 判例变体；跳过 = 两异族 scanner 标记且 reviewer 确认；verifier 选择（`[[verifiers]]` 或自动异族，优先 reviewers 档，无异族 → 同族 + warning）；`[review.verifiers] enabled`；**`templates/verifier.md` 角色尾**（`analysis` 先于 verdict、「找出不成立的证据」）；refute 率入 RunMeta；**verifier 离线回归集**：proj.db dismissed（假阳）vs upheld（真）二分类准确率，改模板必跑 | §8.1, §10.7 | `src/consolidate/verify.rs` 改为流消费者, `src/prompt/templates/verifier.md`, `eval/`（回归脚本） |
+| 6 | 三标配：reviewer pack 注入互斥（笔记 vs needs 证据段）、证据段预算帽、读守卫（复用 `second_pass.rs`） | 铁律 4 | `src/cli/second_pass.rs` 机器复用 |
+| 7 | 预算外去向（M21c 台账前的过渡）：截断项标 `deep: skipped(budget)` 进 RunMeta 披露，不静默 | §6 规则 4 | RunMeta |
+| 8 | resume 覆盖队列状态（R14 第二刀）：checkpoint 队列快照；Phase 枚举加 `Scan` / `Deep` / `Verify`（serde lowercase 向后兼容） | — | `src/state/mod.rs`, `src/cli/mod.rs` resume |
+| 9 | barrier 语义：scanner 全完 ∧ 队列空 ∧ 在途 0 ∧ 复核在途 0 → reduce（dedup → 台账 → 报告） | §2 | `src/orchestrate` |
+| 10 | 观测：队列深度、入队原因分布（rule / scan / needs）、去重命中、预算截断数、项等待时长、每 cell 输出 token、复核触发数 / 跳过数 / refute 率、per-provider 在途峰值 | §6, §8.1 | RunMeta / phase_history |
+| 11 | 出口顺手：fork `~/codes/aacr-bench` 加 `evaluation/reviewers/redteam.py`（范围评审 → `{path, start_line, end_line, content}` 映射）与 pipeline 分支；本仓 `eval/README` + `AACR_BENCH_DIR` | D7 B1 | fork；本仓 `eval/` |
+
+## 不做
+
+台账与增量轮激活（M21c）· 三方契约注入（M21d，reviewer pack 预留槽位）· 默认翻转（M21c）· 候补 / failover（不做）。
+
+## 验收
+
+- PR181 `--risk auto`：findings oracle 命中 ≥ GLM 单发 6 条；低风险 PR 5-8 min、高风险 7-10 min（design §13 账）。
+- `--risk all` 与 legacy findings 集合一致（R6 对照档）；`--risk off` 只产疑点 + 披露、零 reviewer 调用。
+- 预算截断项 100% 出现在 RunMeta；必挖集从不被截（构造用例：`max_cells = 0` 时 H0 仍被挖）。
+- verifier：blocking finding 全部有复核记录或跳过理由；构造「scanners / reviewers 全 deepseek」配置 → 同族复核 + 「无异族
+  verifier」warning；refute 率在 RunMeta 可读；复核尾部对总墙钟贡献 ≤ 1 min。
+- provider 在途上限：`max_concurrency = 1` 时同 provider 请求串行可观测；PR181 全程无 429 / 503。
+- 后台 job 中途 kill → resume 从队列快照续跑，已落盘 finding（流式持久化）不丢、不双计；未闭合对象丢弃且计入 warning。
+- 每个 reviewer cell 输出 < `output_max_tokens` 的 1/2（有界性验证，FINALIZE / REPAIR 三层不触发）。
+- `reviewers/redteam.py` 能在 fork 的 `--preview` 检出上跑通一个样本（不计分，只验接线）。
+- verifier 离线回归集：对 proj.db 历史 dismissed / upheld findings 的二分类准确率有基线数字并入 research；reviewer 回归 =
+  PR181 上 H0 / 疑点 → finding 确认率与其后 refute 率可读。
+
+## 风险
+
+- 慢模型 per-turn 死亡只丢未闭合的 finding 对象（流式持久化兜底），不再有旋钮可调；死亡率高时调 `per_turn_timeout_secs`。
+- 预算函数形状依赖 E1；先三档常数起步，随 dogfood 调。
+- 队列合并的 hint 归一化若过松会误合并不同疑点：以 quote 为主锚、hint 只作辅助（R4）。
+- 无候补下 provider 抖动直接体现为 coverage `failed`：先把在途上限与重试退避调对，再看失败率。

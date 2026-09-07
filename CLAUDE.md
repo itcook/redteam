@@ -19,13 +19,17 @@ prompt 只做裁决/编排等模型本职(例外:dev-time 临时仪器如 feedba
 
 ## 常用
 
+- **M21 评审引擎重构期间(2026-09-05 起,分支 `feat/m21-review-engine`)**:以仓内 `.roadmap/`(README + P0 + M21a-e + followup)
+  与主 checkout `.doc/design/2026-09-04-redteam-review-engine-architecture-design.md`(v7)及同名 decisions(D1-D10)为准;
+  `.doc/` 其余 design/plan 为历史,读到冲突以前者为准。分支硬切旧编排(无 `engine` 旗),对照基线 = `dev` 二进制;
+  切名前分支产物名 `redteam-next`。
 - 挑活先读 `.doc/roadmap/summary.md`(项目级总览:五支柱账目+里程碑表;明细在同目录 done.md/followup.md);
   零散项在 `.doc/TODO/summary.md`(编号 T01+ 总览表,明细同目录)。注:`.doc/` 是
   维护者私有工作区(gitignored,不随仓分发)——外部克隆者没有这些文件,以 `redteam --help` 为准。
 - `make build` 编译并放置插件二进制;`make gen` 从 `plugins/redteam/commands/`(真相源)重生成
   codex-skills;`make verify` 防漂移——它先重新 gen 再要求零 diff,故 commands 与镜像不同步时**任何时刻**跑都会红
   (含已入库的漂移);唯一假红:本批 commands 改动尚未 commit 时,gen 产物与 HEAD 有合法差异。
-- 密钥在 `~/.config/redteam/secrets.toml`,永不入仓、永不入主配置。
+- 密钥在 `~/.config/redteam/secrets.toml`(M21a 起迁 `~/.redteam/secrets.toml`,配置用户级唯一、无项目层),永不入仓、永不入主配置。
 
 ## 文档规范(.doc,2026-07-07 定)
 
