@@ -4,7 +4,7 @@
 > · 工作树 `~/hobby/.worktrees/redteam/m21-review-engine`
 > 权威框架: `../design/2026-09-04-redteam-review-engine-architecture-design.md`（v7，WIP，P0 出口锁定）
 > 证据 / 决策: `../research/2026-09-04-redteam-review-engine-architecture-research.md`（§14 aacr 事实）·
-> `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D10）
+> `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D10）· P0 明细 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md`
 > 2026-09-07 起本目录连同上述文档自主 checkout `.doc/` 迁入分支随行区 `.next/`（`../README.md`）；含公司仓细节者在 `../private/`（gitignored）。
 > 本目录独立于主 checkout `.doc/roadmap/`，只记本次重构；零散 polish 仍走 `.doc/TODO/`。
 
