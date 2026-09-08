@@ -22,4 +22,7 @@
 - `p0_oracle.py` — 从 proj.db cells / rpiv 报告 / 人工对齐文件组装 oracle JSON（`pr181`），或从本仓 proj.db 取 upheld findings（`hobby`）。
 - `e3_contract_ab.py` — E3 疑点契约 vs finding 契约：`variant`（由 `examples/dump_pack.rs` 落盘的 prompt 派生 B 臂并断言只差两段）、
   `run`（DeepSeek 直连，复刻产品单发请求形状）、`score`（quote 定位 + 区间级命中 oracle + 人工确认表骨架）。
+- `export_ledger.py` — M21a 批 B-1（D10-2）：schema v4 一次重置前，把旧 proj.db 的 `dismissed` 全表与 `results` 里 verify=upheld 的
+  findings 导出为 `fixtures/ledger-dismissed.jsonl` / `ledger-upheld.jsonl`（verifier 离线回归集数据；本仓自己的数据，入库）。
+  `--db` 缺省 `.redteam/proj.db`、`--out-dir` 缺省 `eval/fixtures`；upheld 按 job×finding 计行带 `job_id`。
 - 被评仓路径、oracle、原始输出一律经参数传入并落 `.next/research/2026-09-07-p0-raw/`（本仓侧，入库）与 `.next/private/p0-raw/`（PR181 侧，gitignored）；本目录不含任何被评仓内容。
