@@ -312,7 +312,7 @@ pub(crate) mod incremental_tests {
     pub(super) fn write_prior(root: &std::path::Path, job: &str, head_sha: &str, findings: Vec<Finding>) {
         let stats = Stats::from_findings(&findings);
         let report = ReviewReport {
-            schema_version: "3".into(), verdict: Verdict::Approve,
+            schema_version: crate::domain::SCHEMA_VERSION.into(), verdict: Verdict::Approve,
             stats, findings, clusters: vec![],
             run: RunMeta {
                 job_id: job.into(), models: vec!["m".into()],
@@ -492,7 +492,7 @@ default_models=["m"]
         // 本轮模型只报新问题
         let provider = FakeProvider::with("m", vec![raw("a.rs", "leak(secret);", "secret leak")]);
         let (report, code) = run_incremental_review(&inc_args("dev0", "jprev"), "jprev", &provider, &inc_cfg(), dir.path(), None).await.unwrap();
-        assert_eq!(report.schema_version, "3");
+        assert_eq!(report.schema_version, crate::domain::SCHEMA_VERSION);
         assert!(report.run.incremental);
         assert_eq!(report.run.delta_base.as_deref(), Some(c1.as_str()));
         assert!(report.run.head_sha.is_some(), "本轮同样 stamp（下轮的 base）");

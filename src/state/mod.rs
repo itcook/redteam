@@ -69,6 +69,9 @@ pub struct JobState {
     pub progress: Progress,
     #[serde(default)]
     pub models: Vec<String>,
+    /// v4：本作业活跃的角色集（`scanner` / `reviewer` / `verifier`，design §2）；F-2 起填，旧 state 缺字段回空。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub roles: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pid: Option<u32>,
     /// pid 身份锚：`pid` 对应进程的启动时刻（Unix 秒），防 pid 复用误判（E12-Q3）。
@@ -102,6 +105,7 @@ impl JobState {
             started_at,
             progress: Progress::default(),
             models: vec![],
+            roles: vec![],
             pid: None,
             pid_start: None,
             exit_code: None,
@@ -463,6 +467,20 @@ mod tests {
     }
 
     #[test]
+    fn jobstate_roles_roundtrips_and_legacy_defaults_empty() {
+        // v4：roles 有值 → 序列化带键；默认空 → 省略；旧 state（无 roles 键）→ 空。
+        let mut s = JobState::new("j", 0);
+        assert!(!serde_json::to_string(&s).unwrap().contains("roles"));
+        s.roles = vec!["scanner".into(), "reviewer".into()];
+        let back: JobState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.roles, vec!["scanner", "reviewer"]);
+        let old: JobState = serde_json::from_str(
+            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[]}"#
+        ).unwrap();
+        assert!(old.roles.is_empty());
+    }
+
+    #[test]
     fn is_terminal_covers_four() {
         assert!(!JobStatus::Pending.is_terminal());
         assert!(!JobStatus::Running.is_terminal());
@@ -536,7 +554,7 @@ mod tests {
         let st = JobState {
             job_id: "job1".into(), status: JobStatus::Running,
             started_at: 1000, progress: Progress { done: 1, total: 3 },
-            models: vec!["alpha".into()],
+            models: vec!["alpha".into()], roles: vec![],
             pid: Some(4242), pid_start: None, exit_code: None, error: None, result_path: None,
             last_active: 1000, deadline_at: None, phase: None, phase_history: vec![], workspace: None,
         };

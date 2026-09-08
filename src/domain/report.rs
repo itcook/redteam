@@ -1,5 +1,11 @@
 use super::finding::{Cluster, Finding, Severity};
+use super::suspicion::Role;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// 报告 schema 版本（v4 = M21 疑点扫描地基：RunMeta coverage 五集合 / 模板哈希 / cache 命中 / 在途峰值 / refute 率，
+/// cell 记录按角色分叉）。所有 `ReviewReport` 构造点引用此常量，不再散写字面量。
+pub const SCHEMA_VERSION: &str = "4";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,6 +79,38 @@ pub struct DossierMeta {
     pub injected: usize,      // 拿到非空卷宗的 bundle 数（其余=不支持语言/无符号/调用密度门<5）
 }
 
+/// coverage 五集合（design §8.4，D11-7）：每集合按 role 分组的 cell 列表（计数 = 长度），五集合不相交、并 = 全集。
+/// selected=计划跑；completed=本轮跑成；reused=resume / 增量复用上轮；failed=重试耗尽（无候补）；waived=预算截断 / 规则豁免。
+/// 分级：scanner cell 失败 → verdict 硬 Incomplete；reviewer 失败 → 带债 approve；verifier 失败 → 保守 upheld。
+/// 本批只定形状（全 default），填值在 F-5（scanner）/ M21b（reviewer / verifier）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Coverage {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub selected: BTreeMap<Role, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub completed: BTreeMap<Role, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reused: BTreeMap<Role, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failed: BTreeMap<Role, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub waived: BTreeMap<Role, Vec<String>>,
+}
+
+impl Coverage {
+    pub fn is_empty(&self) -> bool {
+        self.selected.is_empty() && self.completed.is_empty() && self.reused.is_empty()
+            && self.failed.is_empty() && self.waived.is_empty()
+    }
+}
+
+/// 单 cell 的输入缓存命中率（cached_input ÷ input；D10-3 段序翻转与 anthropic 三段界断点的观测面，F-5 填）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CacheHit {
+    pub cell: String,
+    pub ratio: f32,
+}
+
 /// 单 cell 运行摘要（诊断呈现：per-model 耗时/轮次/重试/用量）——result 时从 proj.db
 /// cells 表回填。旧报告 JSON 无此字段（serde default 空数组），向后兼容。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -134,6 +172,21 @@ pub struct RunMeta {
     /// per-cell 运行摘要（诊断呈现）。旧 JSON 无此字段，反序列化回空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cells: Vec<CellSummary>,
+    /// v4：coverage 五集合（design §8.4）。空 = 未填（本批）/ 旧 JSON；不序列化。
+    #[serde(default, skip_serializing_if = "Coverage::is_empty")]
+    pub coverage: Coverage,
+    /// v4：本次渲染所用模板哈希（`shared_head` / `scanner` / … → fnv1a64 hex，D-4 填）；改模板必跑回归的归因键。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub template_hashes: BTreeMap<String, String>,
+    /// v4：每 cell 输入缓存命中率（F-5 填）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_hit_by_cell: Vec<CacheHit>,
+    /// v4：每 provider 在途请求峰值（provider 在途锁观测，F-2 / F-5 填）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_inflight_peak: BTreeMap<String, u32>,
+    /// v4：本轮 blocking finding 的 refute 率（design §8.1「去留由数据决定」，M21b 填）。None = 无 verifier 段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refute_rate: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -230,6 +283,44 @@ mod tests {
         for k in ["head_sha", "incremental", "delta_base", "resolved", "resolution_disputed", "carried_dropped"] {
             assert!(!d.contains(k), "默认态不应含 {k}: {d}");
         }
+    }
+
+    /// v4 五字段：默认态不产键（v2/v3 消费者零噪音）；赋值 round-trip；旧 v2/v3 JSON 可读且回默认。
+    #[test]
+    fn runmeta_v4_fields_roundtrip_and_skip_when_default() {
+        let d = serde_json::to_string(&RunMeta::default()).unwrap();
+        for k in ["coverage", "template_hashes", "cache_hit_by_cell", "provider_inflight_peak", "refute_rate"] {
+            assert!(!d.contains(k), "默认态不应含 {k}: {d}");
+        }
+        let mut m = RunMeta { job_id: "j".into(), refute_rate: Some(0.25), ..Default::default() };
+        m.coverage.selected.insert(Role::Scanner, vec!["scan[g1]@x#1".into(), "scan[g2]@x#1".into()]);
+        m.coverage.failed.insert(Role::Scanner, vec!["scan[g2]@x#1".into()]);
+        m.template_hashes.insert("shared_head".into(), "deadbeefdeadbeef".into());
+        m.cache_hit_by_cell.push(CacheHit { cell: "scan[g1]@x#1".into(), ratio: 0.5 });
+        m.provider_inflight_peak.insert("agc".into(), 3);
+        let j = serde_json::to_string(&m).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["coverage"]["selected"]["scanner"].as_array().unwrap().len(), 2, "role 作字符串键: {j}");
+        assert!(v["coverage"].get("completed").is_none(), "空集合不序列化: {j}");
+        assert_eq!(v["cache_hit_by_cell"][0]["cell"], "scan[g1]@x#1");
+        assert_eq!(v["provider_inflight_peak"]["agc"], 3);
+        assert_eq!(v["template_hashes"]["shared_head"], "deadbeefdeadbeef");
+        let back: RunMeta = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.coverage, m.coverage);
+        assert_eq!(back.cache_hit_by_cell, m.cache_hit_by_cell);
+        assert_eq!(back.refute_rate, Some(0.25));
+        assert_eq!(back.provider_inflight_peak, m.provider_inflight_peak);
+        // 旧 v2 形状（无任何 v4 键）→ 全默认
+        let old = r#"{"job_id":"j1","models":["m"],"lenses":["L1"],"duration_ms":1,
+                   "usage":{"input_tokens":1,"output_tokens":1},"warnings":[],"failed_models":[]}"#;
+        let r: RunMeta = serde_json::from_str(old).unwrap();
+        assert!(r.coverage.is_empty() && r.template_hashes.is_empty() && r.cache_hit_by_cell.is_empty());
+        assert!(r.provider_inflight_peak.is_empty() && r.refute_rate.is_none());
+    }
+
+    #[test]
+    fn schema_version_constant_is_4() {
+        assert_eq!(SCHEMA_VERSION, "4");
     }
 
     #[test]

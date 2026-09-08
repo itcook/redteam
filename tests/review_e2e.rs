@@ -609,7 +609,7 @@ fn result_md_three_states() {
         })
         .unwrap();
     let report_b = ReviewReport {
-        schema_version: "3".into(),
+        schema_version: redteam::domain::SCHEMA_VERSION.into(),
         verdict: Verdict::Reject,
         stats: Stats { high: 1, total: 1, ..Default::default() },
         findings: vec![Finding {

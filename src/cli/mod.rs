@@ -470,7 +470,7 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
     let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.output.into_findings()).collect();
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
-        schema_version: "3".into(),
+        schema_version: crate::domain::SCHEMA_VERSION.into(),
         verdict: Verdict::Incomplete,
         stats,
         findings,
@@ -2154,7 +2154,7 @@ context_window = 40000
     fn append_ckpt_failure_warning_only_appends_when_nonzero() {
         fn empty_report() -> ReviewReport {
             ReviewReport {
-                schema_version: "3".into(),
+                schema_version: crate::domain::SCHEMA_VERSION.into(),
                 verdict: Verdict::Approve,
                 stats: Stats::from_findings(&[]),
                 findings: vec![],
