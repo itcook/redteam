@@ -191,3 +191,27 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 ### Status
 
 [OK] **Completed**
+
+
+## Session 9: A/B/C 合并态三路核验 + 修补批（db 守卫 / 伪引用边 / super 假边 / 索引 e2e / 零值与空串 key / pack-only 不读 secrets）
+<!-- trellis-session: v=2 fp=a10136a2f649883d -->
+
+**Date**: 2026-09-08
+**Task**: A/B/C 合并态三路核验 + 修补批（db 守卫 / 伪引用边 / super 假边 / 索引 e2e / 零值与空串 key / pack-only 不读 secrets）
+**Branch**: `feat/m21-review-engine`
+
+### Summary
+
+三个只读子 agent 对照 M21a 计划核验合并后的批 A/B/C：全部交付；发现 B 库守卫在 user_version==4 时放行陌生库、C 同名 changed def 互成伪强边、顶层模块内联 mod 的 super 连到 lib.rs、跨组索引接线零集成测试，以及 A 零值校验 / 空串 env key / --pack-only 读 secrets 等边角。开 Trellis 任务 09-08-m21a-abc-fixup 一次修掉（8 项，5 个新单测 + 2 个新 e2e），其余九条接缝（cross_edges 口径、lib.rs 超级枢纽回放、CellOutput tag 口径、ScanOutput.suspicions 无 default、over_budget 未消费、TS 副作用导入、est_tokens 不含 system、setup 预检文案、并存期 secrets 提示）记 followup 交给 D/E/F。三道门：cargo test 499+16+7+16 绿、clippy 3 条既有、make verify 绿。结论：可以开 D / E。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `820bc46` | fix(m21a): db 陌生库守卫补 v4 分支 + 只读快路径 WAL 降级；同名 def 伪引用边；顶层模块内联 mod 的 super 假边 |
+| `093b454` | fix(m21a): 多组跨组索引 e2e；pack/grouping 零值与空串 env key 校验；--pack-only 不读 secrets |
+| `18d9b7c` | docs(followup): A/B/C 合并核验接缝九条（cross_edges/weak_cut 口径、lib.rs 超级枢纽回放、TS 副作用导入与同顶层模块弱边、est_tokens 不含 system、ScanOutput.suspicions 无 default、CellOutput tag 口径、over_budget 未消费、setup 预检文案、并存期 secrets 提示） |
+
+### Status
+
+[OK] **Completed**
