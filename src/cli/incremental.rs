@@ -459,14 +459,7 @@ pub(crate) mod incremental_tests {
     use crate::provider::fake::FakeProvider;
 
     fn inc_cfg() -> Config {
-        Config::from_layers(&[r#"[providers.mp]
-kind="openai"
-
-[[scanners]]
-name="m"
-provider="mp"
-model_id="m1"
-"#]).unwrap()
+        Config::from_json(r#"{"providers":{"mp":{"kind":"openai","models":{"m1":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap()
     }
 
     /// 主链路：F1 携带（quote 存活）、F2 消灭（quote 被修掉）、新 finding 入场 → v3 报告全字段。

@@ -40,13 +40,16 @@ pub fn infer_test_command(root: &Path) -> Option<String> {
     }
     if let Ok(pkg) = std::fs::read_to_string(root.join("package.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
-            if v.get("scripts").and_then(|s| s.get("test")).and_then(|t| t.as_str()).is_some() {
-                return Some("npm test".into());
+            // npm init 的占位脚本 `echo "Error: no test specified" && exit 1` 不算有测试（#11）。
+            if let Some(t) = v.get("scripts").and_then(|s| s.get("test")).and_then(|t| t.as_str()) {
+                if !t.contains("no test specified") {
+                    return Some("npm test".into());
+                }
             }
         }
     }
     if let Ok(mk) = std::fs::read_to_string(root.join("Makefile")) {
-        if mk.lines().any(|l| l.starts_with("test:")) {
+        if mk.lines().any(is_make_test_target) {
             return Some("make test".into());
         }
     }
@@ -54,6 +57,15 @@ pub fn infer_test_command(root: &Path) -> Option<String> {
         return Some("go test ./...".into());
     }
     None
+}
+
+/// Makefile 行是否为 `test` 目标行：`test:` / `test :` / `test: deps` / `test::`，
+/// 而非 `test:=` / `test ::=` 变量赋值，也不是 `tests:` / `test-unit:` 等别的目标（#11）。
+fn is_make_test_target(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("test") else { return false };
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let Some(after) = rest.strip_prefix(':') else { return false };
+    !after.starts_with('=') && !after.starts_with(":=")
 }
 
 pub fn is_hex16(s: &str) -> bool {
@@ -118,6 +130,20 @@ mod tests {
         let t2 = tempfile::tempdir().unwrap();
         std::fs::write(t2.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
         assert_eq!(infer_test_command(t2.path()), None);
+    }
+
+    #[test]
+    fn infer_test_command_edge_cases() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("Makefile"), "test:=1\nbuild:\n\techo\n").unwrap();
+        assert_eq!(infer_test_command(t.path()), None, "test:= 是变量赋值不是目标");
+        std::fs::write(t.path().join("Makefile"), "test :\n\tcargo test\n").unwrap();
+        assert_eq!(infer_test_command(t.path()).as_deref(), Some("make test"), "test : 允许空格");
+        let t2 = tempfile::tempdir().unwrap();
+        std::fs::write(t2.path().join("package.json"), r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#).unwrap();
+        assert_eq!(infer_test_command(t2.path()), None, "npm init 占位脚本不算");
+        assert!(is_make_test_target("test: build") && is_make_test_target("test::") && is_make_test_target("test\t:"));
+        assert!(!is_make_test_target("test ::= x") && !is_make_test_target("tests:") && !is_make_test_target("test-unit:"));
     }
 
     #[test]

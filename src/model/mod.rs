@@ -1,16 +1,16 @@
 pub mod probe;
 
-use crate::config::{Config, ProviderConfig, ProviderKind};
+use crate::config::{Config, ProviderKind};
 
 pub const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 pub const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 
-/// provider 有效 base URL：显式 base_url 优先，否则按 kind 取默认。
-pub fn effective_base(pc: &ProviderConfig) -> String {
-    if let Some(b) = &pc.base_url {
-        return b.clone();
+/// 有效 base URL：显式 baseUrl 优先，否则按 kind 取默认。
+pub fn effective_base(base_url: Option<&str>, kind: ProviderKind) -> String {
+    if let Some(b) = base_url {
+        return b.to_string();
     }
-    match pc.kind {
+    match kind {
         ProviderKind::Anthropic => ANTHROPIC_DEFAULT_BASE.to_string(),
         _ => OPENAI_DEFAULT_BASE.to_string(),
     }
@@ -58,20 +58,14 @@ impl Availability {
 /// 并查配置的 model 是否在返回列表中。取代仅 GET base 的弱探测（会对 key/端点不匹配假阳性）。
 pub async fn check_all(cfg: &Config, prober: &dyn Prober) -> Vec<Availability> {
     let mut out = Vec::new();
-    // 按三角色条目迭代（探测用 merged：条目.kind > provider.kind）；同一模型在两个角色各探一次（接受重复）。
-    for (role, entry) in cfg.all_entries() {
-        let Some(em) = cfg.effective(role, entry) else { continue };
-        let name = format!("{}:{}", role.as_str(), em.name);
-        let key = cfg.resolve_key(entry);
+    // 按活跃集迭代（scanner → reviewer → verifier；探测用模型有效 kind：模型层 > provider 层）；
+    // 同一模型兼多角色各探一次（接受重复）。
+    for em in cfg.active_roles().all() {
+        let name = format!("{}:{}", em.role.as_str(), em.name);
+        let key = cfg.resolve_key(&em.provider, &em.id);
         let key_present = key.is_some();
-        let pc = crate::config::ProviderConfig {
-            kind: em.kind,
-            base_url: em.base_url.clone(),
-            api_key_env: None,
-            max_concurrency: None,
-        };
         let (reachable, model_listed) =
-            match prober.list_models(&effective_base(&pc), key.as_deref(), pc.kind).await {
+            match prober.list_models(&effective_base(em.base_url.as_deref(), em.kind), key.as_deref(), em.kind).await {
                 Ok(ids) => {
                     let listed = if ids.is_empty() {
                         None
@@ -152,28 +146,24 @@ pub fn validate_setup(kind: &str, base_url: Option<&str>) -> Result<(), String> 
     Ok(())
 }
 
-/// 渲染三角色条目列表（每行 role:name/kind/model_id/status/@provider）+ 配置文件位置。
-pub fn render_model_list(cfg: &Config, avs: &[Availability], config_paths: &[String]) -> String {
+/// 渲染活跃集（每行 `[role] provider/id  (name)  [kind]  status`；无 name 时不重复打印）+ 配置文件位置。
+pub fn render_model_list(cfg: &Config, avs: &[Availability], config_path: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
-    for (role, entry) in cfg.all_entries() {
-        let Some(em) = cfg.effective(role, entry) else { continue };
-        let key = format!("{}:{}", role.as_str(), em.name);
+    for em in cfg.active_roles().all() {
+        let key = format!("{}:{}", em.role.as_str(), em.name);
         let status = avs
             .iter()
             .find(|a| a.provider == key)
             .map(|a| a.status_str())
             .unwrap_or("?");
-        let kind = format!("{:?}", em.kind).to_lowercase();
-        lines.push(format!("[{}] {}  [{kind}]  {}  {status}  @{}", role.as_str(), em.name, em.id, em.provider));
+        let display = if em.name == format!("{}/{}", em.provider, em.id) { String::new() } else { format!("  ({})", em.name) };
+        lines.push(format!("[{}] {}/{}{display}  [{}]  {status}", em.role.as_str(), em.provider, em.id, em.kind.as_str()));
     }
     if lines.is_empty() {
-        lines.push("(no [[scanners]] / [[reviewers]] / [[verifiers]] configured — `redteam model setup --role scanner …`)".into());
+        lines.push("(no model has roles.scanner / reviewer / verifier — `redteam model setup --provider X --model <id> --role scanner …`)".into());
     }
     let mut out = lines.join("\n");
-    out.push_str("\n\nconfig (user-level only; REDTEAM_HOME overrides):");
-    for p in config_paths {
-        out.push_str(&format!("\n  {p}"));
-    }
+    out.push_str(&format!("\n\nconfig: {config_path}  (user-level only; REDTEAM_HOME overrides)"));
     out
 }
 
@@ -198,7 +188,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn cfg_with(providers: &str) -> Config {
-        Config::from_layers(&[providers]).unwrap()
+        Config::from_json(providers).unwrap()
     }
 
     #[tokio::test]
@@ -207,8 +197,8 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("ALPHA_KEY", "k"); std::env::remove_var("BETA_KEY"); }
         let cfg = cfg_with(
-            "[providers.alpha_p]\nkind=\"openai\"\n[[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\napi_key_env=\"ALPHA_KEY\"\n\
-             [providers.beta_p]\nkind=\"openai\"\napi_key_env=\"BETA_KEY\"\n\n[[reviewers]]\nname=\"beta\"\nprovider=\"beta_p\"\nmodel_id=\"b\"\n",
+            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","apiKeyEnv":"ALPHA_KEY","roles":{"scanner":{}}}}},
+                "beta_p":{"kind":"openai","apiKeyEnv":"BETA_KEY","models":{"b":{"name":"beta","roles":{"reviewer":{}}}}}}}"#,
         );
         // 认证成功，/models 含 alpha 的 model "a"
         let ok = FakeProber { models: Some(vec!["a".into(), "z".into()]) };
@@ -221,7 +211,7 @@ mod tests {
 
         // 认证失败（401/连不上）→ 即便 key 在也不可用（修复 base 错配的假阳性）
         let cfg_a = cfg_with(
-            "[providers.alpha_p]\nkind=\"openai\"\n[[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\napi_key_env=\"ALPHA_KEY\"\n",
+            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","apiKeyEnv":"ALPHA_KEY","roles":{"scanner":{}}}}}}}"#,
         );
         let fail = FakeProber { models: None };
         let avs2 = check_all(&cfg_a, &fail).await;
@@ -284,28 +274,27 @@ mod tests {
 
     #[test]
     fn effective_base_defaults_by_kind() {
-        let pc: ProviderConfig = toml::from_str("kind=\"anthropic\"\nmodel=\"m\"").unwrap();
-        assert_eq!(effective_base(&pc), ANTHROPIC_DEFAULT_BASE);
-        let pc2: ProviderConfig = toml::from_str("kind=\"openai\"\nmodel=\"m\"").unwrap();
-        assert_eq!(effective_base(&pc2), OPENAI_DEFAULT_BASE);
-        let pc3: ProviderConfig = toml::from_str("kind=\"openai-compatible\"\nmodel=\"m\"\nbase_url=\"http://x/v1\"").unwrap();
-        assert_eq!(effective_base(&pc3), "http://x/v1");
+        assert_eq!(effective_base(None, ProviderKind::Anthropic), ANTHROPIC_DEFAULT_BASE);
+        assert_eq!(effective_base(None, ProviderKind::Openai), OPENAI_DEFAULT_BASE);
+        assert_eq!(effective_base(None, ProviderKind::OpenaiCompatible), OPENAI_DEFAULT_BASE);
+        assert_eq!(effective_base(Some("http://x/v1"), ProviderKind::OpenaiCompatible), "http://x/v1");
+        assert_eq!(effective_base(Some("https://gw/v1"), ProviderKind::Anthropic), "https://gw/v1", "显式 baseUrl 优先于 kind 默认");
     }
 
     #[test]
     fn render_model_list_one_line_per_provider_with_status() {
         let cfg = cfg_with(
-            "[providers.alpha_p]\nkind=\"openai\"\n\n[[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\n\
-             [providers.beta_p]\nkind=\"anthropic\"\n\n[[reviewers]]\nname=\"beta\"\nprovider=\"beta_p\"\nmodel_id=\"b\"\n",
+            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}},
+                "beta_p":{"kind":"anthropic","models":{"b":{"roles":{"reviewer":{}}}}}}}"#,
         );
         let avs = vec![
             Availability { provider: "scanner:alpha".into(), key_present: true, reachable: true, model_listed: Some(true) },
-            Availability { provider: "reviewer:beta".into(), key_present: false, reachable: true, model_listed: None },
+            Availability { provider: "reviewer:beta_p/b".into(), key_present: false, reachable: true, model_listed: None },
         ];
-        let out = render_model_list(&cfg, &avs, &["/u/config.toml".into()]);
+        let out = render_model_list(&cfg, &avs, "/u/config.json");
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines.iter().any(|l| l.contains("alpha") && l.contains("a") && l.contains("available")));
-        assert!(lines.iter().any(|l| l.contains("beta") && l.contains("missing key")));
-        assert!(out.contains("/u/config.toml"), "config 位置打印");
+        assert!(lines.iter().any(|l| l.starts_with("[scanner] alpha_p/a  (alpha)  [openai]") && l.contains("available")), "{out}");
+        assert!(lines.iter().any(|l| l.starts_with("[reviewer] beta_p/b  [anthropic]") && l.contains("missing key")), "无 name 不重复打印 provider/id：{out}");
+        assert!(out.contains("/u/config.json"), "config 位置打印");
     }
 }

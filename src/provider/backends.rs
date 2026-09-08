@@ -652,7 +652,7 @@ impl ChatBackend for OpenAiBackend {
 
 /// 按 EffectiveModel（角色条目+provider 覆盖链成品）造对应 backend（编排层入口）。
 /// kind 已在 config::effective 里 merge（条目.kind > provider.kind）。
-/// Google 暂不支持（占位规划）。max_tokens：条目 output_max_tokens 注入 backend
+/// Google 暂不支持（占位规划）。max_tokens：模型 maxOutputTokens 注入 backend
 /// （> REDTEAM_MAX_TOKENS env > 32768 默认，见 AnthropicBackend/OpenAiBackend 构造）。
 pub fn backend_from_config(
     em: &crate::config::EffectiveModel,
@@ -663,12 +663,12 @@ pub fn backend_from_config(
             em.id.clone(),
             em.base_url.clone(),
             api_key,
-        ).with_max_tokens(em.output_max_tokens))),
+        ).with_max_tokens(em.max_output_tokens))),
         ProviderKind::Openai | ProviderKind::OpenaiCompatible => Ok(Box::new(OpenAiBackend::new(
             em.id.clone(),
             em.base_url.clone(),
             api_key,
-        ).with_max_tokens(em.output_max_tokens))),
+        ).with_max_tokens(em.max_output_tokens))),
         ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
     }
 }
@@ -686,7 +686,7 @@ mod tests {
     fn eff(kind: crate::config::ProviderKind) -> crate::config::EffectiveModel {
         crate::config::EffectiveModel {
             name: "t".into(), id: "m".into(), provider: "p".into(), role: crate::config::Role::Scanner, kind,
-            base_url: None, context_window: 128_000, output_max_tokens: None,
+            base_url: None, context_window: 128_000, max_output_tokens: None,
             per_turn_timeout_secs: None, reasoning: false, thinking_level: None,
             family: "m".into(), max_concurrency: None,
         }

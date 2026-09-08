@@ -128,11 +128,11 @@ pub fn parse_format(s: &str) -> Format {
 }
 
 /// 角色集 → 旧 fan-out 编排参数（M21a 批 A **过渡适配器**，批 F 换成 scanner 路径后删）：
-/// `[[scanners]]` 列表即活跃集——每条各跑一遍（replicate）、无候补（no_fallback）；`priority` 恒 0
+/// 带 `roles.scanner` 的模型即活跃集——每个各跑一遍（replicate）、无候补（no_fallback）；`priority` 恒 0
 /// （候补链已退场，D7 A3）。scanners 为空是配置错误，交调用方报错退 1。
 pub fn legacy_opts_from_roles(roles: &RoleSets, max_concurrency: usize) -> Result<OrchestrateOpts, String> {
     if roles.scanners.is_empty() {
-        return Err("未配置 [[scanners]]：在 ~/.redteam/config.toml（REDTEAM_HOME 可覆盖）至少加一条，见 `redteam model setup --help`".to_string());
+        return Err("未配置 scanner：在 ~/.redteam/config.json（REDTEAM_HOME 可覆盖）给至少一个模型加 roles.scanner，见 `redteam model setup --help`".to_string());
     }
     Ok(OrchestrateOpts {
         models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0 }).collect(),
@@ -954,9 +954,7 @@ mod job_tests {
         run(&["add", file]);
     }
     fn cfg() -> Config {
-        Config::from_layers(&[
-            "[providers.alpha_p]\nkind=\"openai\"\n\n[[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\n",
-        ]).unwrap()
+        Config::from_json(r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}}}}"#).unwrap()
     }
 
     #[tokio::test]
@@ -1616,16 +1614,14 @@ mod resolve_tests {
     use super::*;
 
     fn provs() -> &'static str {
-        "[providers.alpha_p]\nkind=\"openai\"\n[providers.beta_p]\nkind=\"openai\"\n\
-         [[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\n\
-         [[scanners]]\nname=\"beta\"\nprovider=\"beta_p\"\nmodel_id=\"b\"\n\
-         [[reviewers]]\nname=\"pro\"\nprovider=\"beta_p\"\nmodel_id=\"p\"\n"
+        r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}},
+            "beta_p":{"kind":"openai","models":{"b":{"name":"beta","roles":{"scanner":{}}},"p":{"name":"pro","roles":{"reviewer":{}}}}}}}"#
     }
 
     /// 列表即活跃集：全部 scanner 各跑一遍（replicate）、无候补、priority 恒 0；reviewers 不进旧 fan-out。
     #[test]
     fn roles_adapter_replicates_all_scanners_without_fallback() {
-        let c = Config::from_layers(&[provs()]).unwrap();
+        let c = Config::from_json(provs()).unwrap();
         let o = legacy_opts_from_roles(&c.active_roles(), 4).unwrap();
         assert!(o.replicate && o.no_fallback);
         assert_eq!(o.max_concurrency, 4);
@@ -1635,9 +1631,9 @@ mod resolve_tests {
 
     #[test]
     fn roles_adapter_errors_when_no_scanner() {
-        let c = Config::from_layers(&["[providers.p]\nkind=\"openai\"\n[[reviewers]]\nprovider=\"p\"\nmodel_id=\"m\"\n"]).unwrap();
+        let c = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
         let err = legacy_opts_from_roles(&c.active_roles(), 4).unwrap_err();
-        assert!(err.contains("[[scanners]]"), "{err}");
+        assert!(err.contains("scanner"), "{err}");
     }
 }
 
@@ -1664,13 +1660,7 @@ mod code_review_tests {
         // 注：FakeProvider 是 prompt-blind 的——对同一 model 的任何调用（无论 review 还是 refute
         // prompt）都返回同一脚本，故 refute 调用返回非空 → refuted → confidence 0 → 不 reject。
         // 交叉 model 选择本身已在 verify.rs 单测验证；本测试只验「证伪翻转 verdict」全链路。
-        let cfg = Config::from_layers(&[r#"[providers.ap]
-kind="openai"
-[[scanners]]
-name="alpha"
-provider="ap"
-model_id="a"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"ap":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = crate::provider::fake::FakeProvider::with(
             "alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
         );
@@ -1716,17 +1706,7 @@ model_id="a"
         // 两个 model 都报真 finding → dedup 合并成 agreement=2 → 跳过层① verify，
         // 保持本测试「anchor 砍编造 + High→Reject」的原意（不被 S3-b verify 自审误伤）。
         // 编造 quote 只 m 报，anchor 因 quote 不在文件而丢弃。
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-[[scanners]]
-name="m2"
-provider="p"
-model_id="m2-id"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}},"m2-id":{"name":"m2","roles":{"scanner":{}}}}}}}"#).unwrap();
         let mut scripted = std::collections::BTreeMap::new();
         scripted.insert("m".to_string(), vec![
             raw("src/a.rs", "db.write(token);", Severity::High),
@@ -1748,13 +1728,7 @@ model_id="m2-id"
     #[tokio::test]
     async fn code_review_empty_changes_approves() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = FakeProvider::with("m", vec![]);
         let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
         assert!(report.findings.is_empty());
@@ -1764,13 +1738,7 @@ model_id="m-id"
     #[tokio::test]
     async fn code_review_stamps_head_sha_into_runmeta() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = FakeProvider::with("m", vec![]);
         // K1：无 --test-command 时按项目推断（Cargo.toml → cargo test）进 RunMeta。
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"\n").unwrap();
@@ -1837,13 +1805,7 @@ mod spec_tests {
         let spec_path = root.join("design.md");
         std::fs::write(&spec_path, "DESIGN D8: fail-open").unwrap();
 
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = SpecPromptRecorder::default();
         let args = spec_test_args(vec![spec_path.to_string_lossy().to_string()]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
@@ -1864,13 +1826,7 @@ model_id="m-id"
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
 
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = SpecPromptRecorder::default();
         let args = spec_test_args(vec![]); // 不带 --spec
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
@@ -1978,12 +1934,12 @@ mod tests {
         // design §2.2 预算函数：min(768K 绝对帽, (min_ctx − 16K 输出预留)×3 − 24K 壳预留)。
         // 2026-07-28 提帽 256K→768K（1M 窗时代，锚 gpt-5.6 272K 计费悬崖之下）——
         // 128K 缺省档从「帽封顶 256K」翻为「窗口墙生效 312K」是本次显式入账的行为变化。
-        let mk = |entries: &str| crate::config::Config::from_layers(&[&format!(
-            "[providers.bigp]\nkind = \"openai\"\n[providers.smallp]\nkind = \"openai\"\n{entries}"
-        )]).unwrap().active_roles();
-        let big = "[[scanners]]\nname=\"Big\"\nprovider=\"bigp\"\nmodel_id=\"big-ctx\"\ncontext_window=1000000\n";
-        let small = "[[scanners]]\nname=\"Small\"\nprovider=\"smallp\"\nmodel_id=\"small-ctx\"\ncontext_window=40000\n";
-        let unknown = "[[scanners]]\nname=\"Unknown\"\nprovider=\"bigp\"\nmodel_id=\"u\"\n";
+        let mk = |models: &str| crate::config::Config::from_json(
+            &r#"{"providers":{"p":{"kind":"openai","models":{MODELS}}}}"#.replace("MODELS", models),
+        ).unwrap().active_roles();
+        let big = r#""big-ctx":{"name":"Big","contextWindow":1000000,"roles":{"scanner":{}}}"#;
+        let small = r#""small-ctx":{"name":"Small","contextWindow":40000,"roles":{"scanner":{}}}"#;
+        let unknown = r#""u":{"name":"Unknown","roles":{"scanner":{}}}"#;
         // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K < 768K → 窗口墙生效
         assert_eq!(pack_budget_bytes(&mk(unknown)), 312_000);
         // 大窗模型（1M）：窗口墙 ≈2.9M → 绝对帽 768K 封顶（≈256K tok 记账 <272K 悬崖）
@@ -1991,7 +1947,7 @@ mod tests {
         // 小窗模型：(40_000−16_000)*3−24_000 = 48_000
         assert_eq!(pack_budget_bytes(&mk(small)), 48_000);
         // 多模型取最小窗（一份 pack 全模型安全）
-        assert_eq!(pack_budget_bytes(&mk(&format!("{big}{small}"))), 48_000);
+        assert_eq!(pack_budget_bytes(&mk(&format!("{big},{small}"))), 48_000);
         // 无 scanner → 缺省 128K 档
         assert_eq!(pack_budget_bytes(&crate::config::RoleSets::default()), 312_000);
     }

@@ -35,13 +35,7 @@ async fn code_bundle_tool_loop_anchors_and_drops_fabricated() {
     ]);
     let provider = ToolLoopProvider::new(Box::new(backend), root.path().to_path_buf());
 
-    let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
         spec: vec![], focus: None,
@@ -90,17 +84,7 @@ async fn code_replicate_two_models_yield_agreement_two() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
 
     // default_models=[alpha,beta] → replicate；两 model 对同位置同引用各报一条
-    let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="alpha"
-provider="p"
-model_id="a"
-[[scanners]]
-name="beta"
-provider="p"
-model_id="b"
-"#]).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}},"b":{"name":"beta","roles":{"scanner":{}}}}}}}"#).unwrap();
     let mut reg = ProviderRegistry::new();
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", Severity::High)])));
     reg.insert("beta", Box::new(FakeProvider::with("beta", vec![rf("src/a.rs", "db.write(token);", Severity::Critical)])));
@@ -147,17 +131,7 @@ async fn code_replicate_unreachable_model_exits_two() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
 
     // default=[alpha,ghost]：alpha 产 low（approve），ghost 不在 registry → failed_models → exit 2
-    let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="alpha"
-provider="p"
-model_id="a"
-[[scanners]]
-name="ghost"
-provider="p"
-model_id="g"
-"#]).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}},"g":{"name":"ghost","roles":{"scanner":{}}}}}}}"#).unwrap();
     let mut reg = ProviderRegistry::new();
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf_low("src/a.rs", "let x = 1;")])));
 
@@ -197,13 +171,7 @@ async fn code_replicate_lone_blocking_refuted_stays_approve() {
 
     // 单 model alpha 自审：review 报一条 High 孤证(agreement=1)；refute 退化自审 alpha，
     // FakeProvider 同脚本对 refute 也返回非空 → refuted → confidence 0 → 不翻 verdict。
-    let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="alpha"
-provider="p"
-model_id="a"
-"#]).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}}}}"#).unwrap();
     let mut reg = ProviderRegistry::new();
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", "missing auth", Severity::High)])));
 
@@ -270,19 +238,7 @@ async fn incremental_round_smoke() {
     // 会把刚报出的孤证当「非空回复」误判 refuted（title 无 upheld/refuted 前缀走违约兜底），
     // confidence 归零、静默吞掉 blocking 力——这不是本锚要测的东西（cross-refute 契约已有专门
     // 单测覆盖），m2 恒空脚本 = 交叉 refute 稳定判 Upheld，让 verdict 走真实、可预期的路径。
-    let cfg = Config::from_layers(&[r#"[providers.mp]
-kind="openai"
-[providers.m2p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="mp"
-model_id="m1"
-[[scanners]]
-name="m2"
-provider="m2p"
-model_id="m2model"
-"#]).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m1":{"name":"m","roles":{"scanner":{}}},"m2model":{"name":"m2","roles":{"scanner":{}}}}}}}"#).unwrap();
 
     // ① 全量评审（branch scope，base=dev0=c0）：fake provider 出 1 条 finding（m2 恒空）。
     let full_args = ReviewArgs {
@@ -388,14 +344,7 @@ async fn background_job_smoke_full_lifecycle_single_store() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
     git(dir.path(), &["add", "src/a.rs"]); // working-tree scope 读 staged 改动
 
-    let cfg = Config::from_layers(&[r#"[providers.alphap]
-kind="openai"
-[[scanners]]
-name="alpha"
-provider="alphap"
-model_id="a"
-"#])
-    .unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"alphap":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}}}}"#).unwrap();
 
     // 单 model 报一条 High（孤证 blocking）——既锚 Fanout 又必然触发 Refute 子阶段打点
     // （agreement==1 且 severity>=block_threshold）；单 model 交叉 refute 退化自审，
@@ -566,13 +515,7 @@ async fn exit_code_three_on_incomplete_resume() {
     });
     store.write_args_raw(job_id, &fake_args.to_string()).unwrap();
 
-    let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
     let provider = FakeProvider { scripted: std::collections::BTreeMap::new(), tokens: (0, 0, 0) };
     let (report, code) = run_resume(job_id, &provider, &cfg, dir.path(), &store).await;
     assert_eq!(report.verdict, Verdict::Incomplete, "空 manifest → Incomplete");
@@ -732,13 +675,7 @@ async fn dismissed_ledger_previously_dismissed_marks_and_feeds_second_stage() {
     // ② 同一 id 再跑一次评审：FakeProvider 复现同 file/title/quote 的 raw finding，
     // enrich() 算出的 finding.id 与卡上 id 逐字相等。root 下 `.redteam/proj.db` 已由
     // 上一步的 `dismiss add` 建出——zero-config 自动加载（无需 --dismissed）。
-    let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
     let mut scripted = std::collections::BTreeMap::new();
     scripted.insert(
         "m".to_string(),
