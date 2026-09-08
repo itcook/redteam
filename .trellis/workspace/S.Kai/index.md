@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 4
+- **Total Sessions**: 7
 - **Last Active**: 2026-09-08
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~98 | Active |
+| `journal-1.md` | ~126 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-09-08 | M21a 批 B schema v4：疑点 schema + 角色分叉 CellOutput + proj-next.db v4 + RunMeta 观测字段 + 固定集导出；code-review 审核修复并合回 | `0ef7798`, `08484bd`, `7c5e253`, `0ec7912`, `03b5c6c`, `3ac2332`, `2c4bb76` | `feat/m21a-schema` |
 | 4 | 2026-09-08 | grill D11 → design v8 锁定；M21a plan 派生（六批 + 出口） | `47fc9d8`, `dc2c008` | `feat/m21-review-engine` |
 | 3 | 2026-09-07 | P0 验证门收尾：E1 风险规则回放 + E3 疑点契约 A/B，.next/ 分支随行文档区迁移 | `44d7f75`, `1a44197` | `feat/m21-review-engine` |
 | 2 | 2026-09-04 | 模型配置重构：provider/model 概念分离 + ocr 三方对照实验 | `1ae876b`, `84e0136` | `dev` |

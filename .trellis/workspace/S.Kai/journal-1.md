@@ -96,3 +96,31 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 ### Status
 
 [OK] **Completed**
+
+
+## Session 7: M21a 批 B schema v4：疑点 schema + 角色分叉 CellOutput + proj-next.db v4 + RunMeta 观测字段 + 固定集导出；code-review 审核修复并合回
+<!-- trellis-session: v=2 fp=d0fc14d8945963aa -->
+
+**Date**: 2026-09-08
+**Task**: M21a 批 B schema v4：疑点 schema + 角色分叉 CellOutput + proj-next.db v4 + RunMeta 观测字段 + 固定集导出；code-review 审核修复并合回
+**Branch**: `feat/m21a-schema`
+
+### Summary
+
+批 B 四 task 落地（export_ledger 固定集 63/3/48、domain/suspicion.rs、CellRecord v4 + db 守卫、RunMeta 五字段 + SCHEMA_VERSION 4）；code-review 技能撞网关，主 agent 手工审读 + 五路视角出 20 余条，用户三裁定（proj-next.db 分库 / 导出内置搁置 / role 只由 output tag 派生）后修复两笔；两次合入 engine（含批 A、批 C）并 --no-ff 合回 b7af7d3；批 A JSON 重做后核验 config::Role / EffectiveModel.family / resume 回查三链完好。定：核心能力稳定前不跑 ship 评审。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0ef7798` | chore(eval): 导出旧 proj.db 的 dismissed / upheld 固定集（verifier 离线回归集数据，D10） |
+| `08484bd` | feat(domain): 疑点 schema（suspicion / category / scanned_areas / needs.kind）+ 按角色分叉的 CellOutput 枚举（D11 R14） |
+| `7c5e253` | feat(state): CellRecord 带 role/output 枚举/template_hash；proj.db schema v4 一次重置（cells.role + queue_items + suspicions 表壳） |
+| `0ec7912` | feat(report): RunMeta 加 coverage 五集合 / 模板哈希 / cache 命中 / 在途峰值 / refute 率字段；report schema_version 4 |
+| `03b5c6c` | fix(schema): 评审修复——守卫五改 + role 唯一真相源 + Role/family 复用批 A + 独立库文件 proj-next.db |
+| `3ac2332` | chore(eval): 固定集加 resolved / in_dismissed_ledger / head_sha，路径 URI 转义；oracle 兼容 v4 记录；followup 登记五条债 |
+| `2c4bb76` | chore(task): m21a-schema 规划与实施制品（prd / design / implement，含 code-review 审核修复记录） |
+
+### Status
+
+[OK] **Completed**
