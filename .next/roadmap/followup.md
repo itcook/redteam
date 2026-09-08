@@ -89,6 +89,9 @@
 | `--pack-body <full\|slice>` CLI 覆盖旗（镜像 `--tools`） | 批 E 不加（plan 范围）；A/B 走 `REDTEAM_HOME=<临时目录>` + `config.json` `{"review":{"pack":{"body":"full"}}}`，出口 3 双 scanner 配置本就要临时 config | 用户裁 / M21e |
 | 切片常数：一跳 K=3 调用点 / 名、`anchorWindow` 30、文件外段帽 = 组预算 / 8、名字上限 40、走仓上限 20000 文件、文件头 ≤ 80 行、多行签名 ≤ 6、胶水 ≤ 3 | 常量在 `src/pack/mod.rs`；`anchorWindow` / `sliceMinBytes` 已是配置键 | R7（出口 3 A/B 回退信号后调优 / M21d） |
 | 文件外搜索的读守卫口径 = `search_repo` 工具（ignore 走仓 + denylist，不逐文件 `git ls-files`）；路径非模型可控 | 未跟踪但未被 gitignore 的支持语言文件会被搜到调用点 | 威胁模型 B 若要求「只读 git-tracked」，一次 `git ls-files -z` 取集合再过滤（F-2 scanner 路径评估） |
+| 文件外走仓每组一次（N 组 = N 次串行全仓扫描，每文件新建 Searcher）；`> 20000` 文件截断处非确定（walker 序） | 本仓 2 组 2.0 s；PR181 规模 ≤ 5 组可接受 | 大仓变慢再做「一次走仓、按组分发」（build_packs 层合并名集）；截断时改按路径排序后截 |
+| 评审 PLAUSIBLE 未核实：增量路径 `extra_paths`（全分支非 delta 文件）是否会经文件外片段泄漏进 pack | 文件外搜索只排除 `changeset`（当轮 bundles 的文件），增量轮的非 delta 分支文件不在其中——会被当普通仓文件搜调用点（内容非密，但与跨组索引「只带路径」的口径不一致） | F-2 / 增量轮清单合并（D-3）时定口径：`changeset ∪ extra_paths` 或维持 |
+| 切片默认后 `Bundle.over_budget` 组的 pack 仍可能很大（本仓 cell-2：6 文件切片 + 1 梯子 = 220 KB） | 切片只降无关体，改动密集文件（本批 pack/mod.rs 核 57）切片 ≈ 全文 | R7 / lib.rs 超级枢纽议题一并看：分组预算门用估算字节、装包用切片字节，两者口径待对齐（M21b 前用 PR181 回放） |
 
 ## 跨里程碑观测面（每个里程碑出口必报，写进 RunMeta 或 research）
 
