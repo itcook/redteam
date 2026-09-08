@@ -459,7 +459,7 @@ pub(crate) mod incremental_tests {
     use crate::provider::fake::FakeProvider;
 
     fn inc_cfg() -> Config {
-        Config::from_json(r#"{"providers":{"mp":{"kind":"openai","models":{"m1":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap()
+        Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap()
     }
 
     /// 主链路：F1 携带（quote 存活）、F2 消灭（quote 被修掉）、新 finding 入场 → v3 报告全字段。
@@ -478,7 +478,7 @@ pub(crate) mod incremental_tests {
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    db.write(token);\n    sha256(pw);\n    leak(secret);\n}\n").unwrap();
         commit_all(dir.path(), "fix r1");
         // 本轮模型只报新问题
-        let provider = FakeProvider::with("m", vec![raw("a.rs", "leak(secret);", "secret leak")]);
+        let provider = FakeProvider::with("p/m", vec![raw("a.rs", "leak(secret);", "secret leak")]);
         let (report, code) = run_incremental_review(&inc_args("dev0", "jprev"), "jprev", &provider, &inc_cfg(), dir.path(), None).await.unwrap();
         assert_eq!(report.schema_version, "3");
         assert!(report.run.incremental);
@@ -517,7 +517,7 @@ pub(crate) mod incremental_tests {
         std::fs::write(dir.path().join("a.rs"), "fn f() {\n    md5(pw);\n    other_fixed();\n}\n").unwrap();
         commit_all(dir.path(), "fake fix");
         // 模型按 claimed 指令原样再报
-        let provider = FakeProvider::with("m", vec![raw("a.rs", "md5(pw);", "weak hash")]);
+        let provider = FakeProvider::with("p/m", vec![raw("a.rs", "md5(pw);", "weak hash")]);
         let (report, _) = run_incremental_review(&inc_args("dev0", "jprev"), "jprev", &provider, &inc_cfg(), dir.path(), None).await.unwrap();
         assert_eq!(report.run.resolved, vec![id1.clone()], "resolve 生效：不携带");
         assert_eq!(report.run.resolution_disputed, vec![id1.clone()], "同 id 再现 → 假修复回路");
@@ -541,7 +541,7 @@ pub(crate) mod incremental_tests {
         write_prior(dir.path(), "jprev", &c1, vec![f1]);
         std::fs::write(dir.path().join("a.rs"), "// touch\nfn f() {\n    db.write(token);\n}\n").unwrap();
         commit_all(dir.path(), "fix");
-        let provider = FakeProvider::with("m", vec![raw("a.rs", "db.write(token);", "unvalidated write")]);
+        let provider = FakeProvider::with("p/m", vec![raw("a.rs", "db.write(token);", "unvalidated write")]);
         let (report, _) = run_incremental_review(&inc_args("dev0", "jprev"), "jprev", &provider, &inc_cfg(), dir.path(), None).await.unwrap();
         assert_eq!(report.findings.len(), 1, "同 id 去重");
         assert_eq!(report.findings[0].origin, crate::domain::Origin::Carried);

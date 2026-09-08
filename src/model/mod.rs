@@ -146,7 +146,7 @@ pub fn validate_setup(kind: &str, base_url: Option<&str>) -> Result<(), String> 
     Ok(())
 }
 
-/// 渲染活跃集（每行 `[role] provider/id  (name)  [kind]  status`；无 name 时不重复打印）+ 配置文件位置。
+/// 渲染活跃集（每行 `[role] provider/id  (displayName)  [kind]  status`；无 displayName 不打印括号）+ 配置文件位置。
 pub fn render_model_list(cfg: &Config, avs: &[Availability], config_path: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     for em in cfg.active_roles().all() {
@@ -156,7 +156,7 @@ pub fn render_model_list(cfg: &Config, avs: &[Availability], config_path: &str) 
             .find(|a| a.provider == key)
             .map(|a| a.status_str())
             .unwrap_or("?");
-        let display = if em.name == format!("{}/{}", em.provider, em.id) { String::new() } else { format!("  ({})", em.name) };
+        let display = em.display_name.as_deref().map(|d| format!("  ({d})")).unwrap_or_default();
         lines.push(format!("[{}] {}/{}{display}  [{}]  {status}", em.role.as_str(), em.provider, em.id, em.kind.as_str()));
     }
     if lines.is_empty() {
@@ -184,8 +184,7 @@ impl Prober for FakeProber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::config::ENV_LOCK;
 
     fn cfg_with(providers: &str) -> Config {
         Config::from_json(providers).unwrap()
@@ -197,21 +196,21 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("ALPHA_KEY", "k"); std::env::remove_var("BETA_KEY"); }
         let cfg = cfg_with(
-            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","apiKeyEnv":"ALPHA_KEY","roles":{"scanner":{}}}}},
-                "beta_p":{"kind":"openai","apiKeyEnv":"BETA_KEY","models":{"b":{"name":"beta","roles":{"reviewer":{}}}}}}}"#,
+            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"displayName":"alpha","apiKeyEnv":"ALPHA_KEY","roles":{"scanner":{}}}}},
+                "beta_p":{"kind":"openai","apiKeyEnv":"BETA_KEY","models":{"b":{"displayName":"beta","roles":{"reviewer":{}}}}}}}"#,
         );
         // 认证成功，/models 含 alpha 的 model "a"
         let ok = FakeProber { models: Some(vec!["a".into(), "z".into()]) };
         let avs = check_all(&cfg, &ok).await;
-        let alpha = avs.iter().find(|a| a.provider == "scanner:alpha").unwrap();
-        let beta = avs.iter().find(|a| a.provider == "reviewer:beta").unwrap();
+        let alpha = avs.iter().find(|a| a.provider == "scanner:alpha_p/a").unwrap();
+        let beta = avs.iter().find(|a| a.provider == "reviewer:beta_p/b").unwrap();
         assert!(alpha.available() && alpha.model_listed == Some(true), "alpha: key+认证+model 在列表");
         assert!(!beta.available() && !beta.key_present, "beta: 缺 key");
         assert_eq!(check_exit_code(&avs), 1, "beta 缺 key→非 0");
 
         // 认证失败（401/连不上）→ 即便 key 在也不可用（修复 base 错配的假阳性）
         let cfg_a = cfg_with(
-            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","apiKeyEnv":"ALPHA_KEY","roles":{"scanner":{}}}}}}}"#,
+            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"displayName":"alpha","apiKeyEnv":"ALPHA_KEY","roles":{"scanner":{}}}}}}}"#,
         );
         let fail = FakeProber { models: None };
         let avs2 = check_all(&cfg_a, &fail).await;
@@ -284,11 +283,11 @@ mod tests {
     #[test]
     fn render_model_list_one_line_per_provider_with_status() {
         let cfg = cfg_with(
-            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}},
+            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"displayName":"alpha","roles":{"scanner":{}}}}},
                 "beta_p":{"kind":"anthropic","models":{"b":{"roles":{"reviewer":{}}}}}}}"#,
         );
         let avs = vec![
-            Availability { provider: "scanner:alpha".into(), key_present: true, reachable: true, model_listed: Some(true) },
+            Availability { provider: "scanner:alpha_p/a".into(), key_present: true, reachable: true, model_listed: Some(true) },
             Availability { provider: "reviewer:beta_p/b".into(), key_present: false, reachable: true, model_listed: None },
         ];
         let out = render_model_list(&cfg, &avs, "/u/config.json");

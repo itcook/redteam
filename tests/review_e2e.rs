@@ -35,7 +35,7 @@ async fn code_bundle_tool_loop_anchors_and_drops_fabricated() {
     ]);
     let provider = ToolLoopProvider::new(Box::new(backend), root.path().to_path_buf());
 
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
         spec: vec![], focus: None,
@@ -84,10 +84,10 @@ async fn code_replicate_two_models_yield_agreement_two() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
 
     // default_models=[alpha,beta] → replicate；两 model 对同位置同引用各报一条
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}},"b":{"name":"beta","roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"beta":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let mut reg = ProviderRegistry::new();
-    reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", Severity::High)])));
-    reg.insert("beta", Box::new(FakeProvider::with("beta", vec![rf("src/a.rs", "db.write(token);", Severity::Critical)])));
+    reg.insert("p/alpha", Box::new(FakeProvider::with("p/alpha", vec![rf("src/a.rs", "db.write(token);", Severity::High)])));
+    reg.insert("p/beta", Box::new(FakeProvider::with("p/beta", vec![rf("src/a.rs", "db.write(token);", Severity::Critical)])));
 
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
@@ -131,9 +131,9 @@ async fn code_replicate_unreachable_model_exits_two() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
 
     // default=[alpha,ghost]：alpha 产 low（approve），ghost 不在 registry → failed_models → exit 2
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}},"g":{"name":"ghost","roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"ghost":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let mut reg = ProviderRegistry::new();
-    reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf_low("src/a.rs", "let x = 1;")])));
+    reg.insert("p/alpha", Box::new(FakeProvider::with("p/alpha", vec![rf_low("src/a.rs", "let x = 1;")])));
 
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
@@ -146,7 +146,7 @@ async fn code_replicate_unreachable_model_exits_two() {
     let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
 
     assert_eq!(report.verdict, Verdict::Approve);   // 仅 low → approve
-    assert!(report.run.failed_models.contains(&"ghost".to_string()));
+    assert!(report.run.failed_models.contains(&"p/ghost".to_string()));
     assert_eq!(code, 2);                            // approve 但对照集不完整
 }
 
@@ -171,9 +171,9 @@ async fn code_replicate_lone_blocking_refuted_stays_approve() {
 
     // 单 model alpha 自审：review 报一条 High 孤证(agreement=1)；refute 退化自审 alpha，
     // FakeProvider 同脚本对 refute 也返回非空 → refuted → confidence 0 → 不翻 verdict。
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let mut reg = ProviderRegistry::new();
-    reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", "missing auth", Severity::High)])));
+    reg.insert("p/alpha", Box::new(FakeProvider::with("p/alpha", vec![rf("src/a.rs", "db.write(token);", "missing auth", Severity::High)])));
 
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
@@ -238,7 +238,7 @@ async fn incremental_round_smoke() {
     // 会把刚报出的孤证当「非空回复」误判 refuted（title 无 upheld/refuted 前缀走违约兜底），
     // confidence 归零、静默吞掉 blocking 力——这不是本锚要测的东西（cross-refute 契约已有专门
     // 单测覆盖），m2 恒空脚本 = 交叉 refute 稳定判 Upheld，让 verdict 走真实、可预期的路径。
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m1":{"name":"m","roles":{"scanner":{}}},"m2model":{"name":"m2","roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"m2":{"roles":{"scanner":{}}}}}}}"#).unwrap();
 
     // ① 全量评审（branch scope，base=dev0=c0）：fake provider 出 1 条 finding（m2 恒空）。
     let full_args = ReviewArgs {
@@ -248,12 +248,12 @@ async fn incremental_round_smoke() {
         resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
     };
     let mut full_scripted: std::collections::BTreeMap<String, Vec<RawFinding>> = std::collections::BTreeMap::new();
-    full_scripted.insert("m".into(), vec![RawFinding {
+    full_scripted.insert("p/m".into(), vec![RawFinding {
         severity: Severity::High, title: "unvalidated write".into(), body: "b".into(),
         file: "src/a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
         recommendation: "validate".into(), hard_constraint: false, quote: "db.write(token);".into(),
     }]);
-    full_scripted.insert("m2".into(), vec![]);
+    full_scripted.insert("p/m2".into(), vec![]);
     let full_provider = FakeProvider { scripted: full_scripted, tokens: (0, 0, 0) };
     let (prior_report, _prior_code) =
         run_review_dispatch(&full_args, &full_provider, &cfg, dir.path(), None).await.unwrap();
@@ -266,10 +266,10 @@ async fn incremental_round_smoke() {
     store.write_args_raw(job_id, &serde_json::to_string(&full_args).unwrap()).unwrap();
     store.write_result(job_id, &serde_json::to_string(&prior_report).unwrap()).unwrap();
     store.write_manifest(job_id, &[CellInput {
-        cell: "bundle[src/a.rs]".into(), model: "m".into(), prompt: "p".into(),
+        cell: "bundle[src/a.rs]".into(), model: "p/m".into(), prompt: "p".into(),
     }]).unwrap();
     store.append_partial(job_id, &CellRecord::ok(
-        "bundle[src/a.rs]", "m", prior_report.findings.clone(),
+        "bundle[src/a.rs]", "p/m", prior_report.findings.clone(),
     )).unwrap();
 
     // ② commit B 造 delta：旧问题行原样保留（验携带存活），新增一处问题行。
@@ -282,12 +282,12 @@ async fn incremental_round_smoke() {
     // ③ 增量轮：fake provider 只报新问题（m2 仍恒空——同一原因，供 refute 挑交叉 model）。
     let inc_args = ReviewArgs { incremental_from: Some(job_id.into()), ..full_args.clone() };
     let mut inc_scripted: std::collections::BTreeMap<String, Vec<RawFinding>> = std::collections::BTreeMap::new();
-    inc_scripted.insert("m".into(), vec![RawFinding {
+    inc_scripted.insert("p/m".into(), vec![RawFinding {
         severity: Severity::High, title: "secret leak".into(), body: "b".into(),
         file: "src/a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
         recommendation: "fix".into(), hard_constraint: false, quote: "leak(secret);".into(),
     }]);
-    inc_scripted.insert("m2".into(), vec![]);
+    inc_scripted.insert("p/m2".into(), vec![]);
     let inc_provider = FakeProvider { scripted: inc_scripted, tokens: (0, 0, 0) };
     let (report, code) =
         run_review_dispatch(&inc_args, &inc_provider, &cfg, dir.path(), None).await.unwrap();
@@ -344,7 +344,7 @@ async fn background_job_smoke_full_lifecycle_single_store() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
     git(dir.path(), &["add", "src/a.rs"]); // working-tree scope 读 staged 改动
 
-    let cfg = Config::from_json(r#"{"providers":{"alphap":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap();
 
     // 单 model 报一条 High（孤证 blocking）——既锚 Fanout 又必然触发 Refute 子阶段打点
     // （agreement==1 且 severity>=block_threshold）；单 model 交叉 refute 退化自审，
@@ -353,7 +353,7 @@ async fn background_job_smoke_full_lifecycle_single_store() {
     // 契约）→ confidence 归零、不 blocking → 全链路应稳定收敛到 Approve/exit 0（非 flake）。
     let mut scripted = std::collections::BTreeMap::new();
     scripted.insert(
-        "alpha".to_string(),
+        "p/alpha".to_string(),
         vec![RawFinding {
             severity: Severity::High,
             title: "unvalidated write".into(),
@@ -515,7 +515,7 @@ async fn exit_code_three_on_incomplete_resume() {
     });
     store.write_args_raw(job_id, &fake_args.to_string()).unwrap();
 
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let provider = FakeProvider { scripted: std::collections::BTreeMap::new(), tokens: (0, 0, 0) };
     let (report, code) = run_resume(job_id, &provider, &cfg, dir.path(), &store).await;
     assert_eq!(report.verdict, Verdict::Incomplete, "空 manifest → Incomplete");
@@ -675,10 +675,10 @@ async fn dismissed_ledger_previously_dismissed_marks_and_feeds_second_stage() {
     // ② 同一 id 再跑一次评审：FakeProvider 复现同 file/title/quote 的 raw finding，
     // enrich() 算出的 finding.id 与卡上 id 逐字相等。root 下 `.redteam/proj.db` 已由
     // 上一步的 `dismiss add` 建出——zero-config 自动加载（无需 --dismissed）。
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let mut scripted = std::collections::BTreeMap::new();
     scripted.insert(
-        "m".to_string(),
+        "p/m".to_string(),
         vec![RawFinding {
             severity: Severity::High,
             title: title.into(),

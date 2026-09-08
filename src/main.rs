@@ -266,16 +266,17 @@ enum ModelCmd {
         /// 角色，逗号分隔：scanner,reviewer,verifier（拥有该角色键的模型即活跃集，无候补）。
         #[arg(long)]
         role: String,
-        /// 模型身份串（route_key / 报告名；缺省 provider/id；全局唯一）。
+        /// 人读显示名（model list / 报告用）；身份串固定为 provider/id，不可配置。
         #[arg(long)]
-        name: Option<String>,
-        /// 协议类型：openai | anthropic（含 claude/gpt/gemini 等别名）。写在 provider 层；新建 provider 时缺省按名 / base_url 推断。
+        display_name: Option<String>,
+        /// 协议类型：openai | anthropic（含 claude/gpt/gemini 等别名）。新建 provider 时写 provider 层（缺省按名 / base_url 推断）；
+        /// provider 已存在时写模型层，不动共享的 provider 层。
         #[arg(long)]
         kind: Option<String>,
         /// API 端点 base URL（anthropic 网关须带 /v1）。
         #[arg(long)]
         base_url: Option<String>,
-        /// provider 级 key 环境变量名；新建 provider 时缺省 `<PROVIDER>_API_KEY`。
+        /// key 环境变量名：新建 provider 时写 provider 层（缺省 `<PROVIDER>_API_KEY`）；provider 已存在时写模型层。
         #[arg(long)]
         api_key_env: Option<String>,
         /// 该 provider 同时在途请求上限（缺省继承 review.maxConcurrency）。
@@ -293,12 +294,15 @@ enum ModelCmd {
         /// context window（token，如 1000000）；缺省不写，预算按保守 128K 估；下限 32000。
         #[arg(long)]
         context_window: Option<u32>,
-        /// 输出上限（max_tokens）；缺省 REDTEAM_MAX_TOKENS env / 32768。
+        /// 输出上限（max_tokens，≥ 1）；缺省 REDTEAM_MAX_TOKENS env / 32768。
         #[arg(long)]
         max_output_tokens: Option<u64>,
-        /// 思考型模型（thinking 计入 output 额度）；只在显式给出时写入。
+        /// 单轮超时秒数（模型层，≥ 1）；缺省 REDTEAM_PER_TURN_SECS > maxOutputTokens÷20+60 公式。
         #[arg(long)]
-        reasoning: bool,
+        per_turn_timeout_secs: Option<u64>,
+        /// 思考型模型（thinking 计入 output 额度）：`--reasoning` 即 true，`--reasoning false` 显式关；不给不写。
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        reasoning: Option<bool>,
         /// 本次 --role 各角色的思考档位（角色属性）：off | low | medium | high。
         #[arg(long, value_parser = ["off", "low", "medium", "high"])]
         thinking_level: Option<String>,
@@ -357,7 +361,7 @@ fn load_config_warned() -> Config {
     match Config::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("warning: 配置文件解析失败，回落默认/空配置：{e}");
+            eprintln!("warning: 配置加载失败（{e}），回落空配置");
             Config::default()
         }
     }
@@ -838,7 +842,7 @@ async fn main() {
                 }
                 redteam::model::check_exit_code(&avs)
             }
-            ModelCmd::Setup { provider, model, role, name, kind, base_url, api_key_env, max_concurrency, key, key_store, model_key, context_window, max_output_tokens, reasoning, thinking_level } => {
+            ModelCmd::Setup { provider, model, role, display_name, kind, base_url, api_key_env, max_concurrency, key, key_store, model_key, context_window, max_output_tokens, per_turn_timeout_secs, reasoning, thinking_level } => {
                 let mut roles: Vec<redteam::config::Role> = Vec::new();
                 for r in role.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     match redteam::config::Role::parse(r) {
@@ -861,8 +865,13 @@ async fn main() {
                     },
                     None => None,
                 };
+                // flag 组合校验全部在写盘前（评审 #2）：--model-key 只配 secrets；secrets 必须带 --key
                 if model_key && key_store != "secrets" {
                     eprintln!("error: --model-key 只与 --key-store secrets 并用（模型级 key 写 secrets.json providers.<provider>.models.<id>）");
+                    std::process::exit(1);
+                }
+                if key_store == "secrets" && key.is_none() {
+                    eprintln!("error: --key-store secrets requires --key");
                     std::process::exit(1);
                 }
                 let kind_if_new = redteam::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
@@ -873,59 +882,81 @@ async fn main() {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
+                // 写前预检（评审 #1）：key 走 env 时该模型必须能落到某个 apiKeyEnv——新 provider 由推断补齐；已存在 provider
+                // 须 provider 层 / 该模型层已有或本次 --api-key-env 给出，否则 --key 会指向配置里不存在的变量、静默失效。
+                let existing = redteam::config::Config::load_with_messages().map(|(c, _)| c).unwrap_or_default();
+                let env_configured = api_key_env.is_some()
+                    || match existing.providers.get(&provider) {
+                        None => true,
+                        Some(p) => p.api_key_env.is_some() || p.models.get(&model).is_some_and(|m| m.api_key_env.is_some()),
+                    };
+                if key_store == "env" && key.is_some() && !env_configured {
+                    eprintln!(
+                        "error: provider {provider} 已存在且未配置 apiKeyEnv（provider 层与该模型层皆无）：加 --api-key-env <VAR>（写入模型层）或改用 --key-store secrets [--model-key]"
+                    );
+                    std::process::exit(1);
+                }
                 // design v9 §12.1 形状：providers.<provider>.models.<id>.roles.<role>；三层只写显式给出的字段，
-                // 已存在的 provider 不被 --kind 缺省推断改写（D12 并入 code-review #3）；写前完整校验（#4）。
+                // 已存在的 provider 不被 --kind / --api-key-env 改写（这两项落模型层，评审 #3 / #5）；写前完整校验（#4）。
                 let patch = redteam::config::SetupPatch {
                     provider: provider.clone(),
                     model_id: model.clone(),
                     roles: roles.clone(),
-                    name: name.clone(),
+                    display_name: display_name.clone(),
                     kind: kind.as_deref().and_then(redteam::config::ProviderKind::parse),
                     base_url: base_url.clone(),
                     api_key_env: api_key_env.clone(),
                     max_concurrency,
                     context_window,
                     max_output_tokens,
-                    reasoning: reasoning.then_some(true),
+                    per_turn_timeout_secs,
+                    reasoning,
                     thinking_level,
                     kind_if_new,
                     api_key_env_if_new: Some(redteam::model::derive_api_key_env(&provider)),
                 };
                 let path = match redteam::config::write_setup(&patch) {
                     Ok(p) => p,
-                    Err(e) => { eprintln!("error: failed to write config: {e}"); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("error: failed to write config: {e}");
+                        if e.to_string().contains("缺 kind") {
+                            eprintln!("提示：加 --kind openai|anthropic（provider 已存在时写入该模型层）");
+                        }
+                        std::process::exit(1);
+                    }
                 };
-                // 落盘后重读：合并后的 provider 层（kind / apiKeyEnv / baseUrl）才是文案与探测的真相源。
+                // 落盘后重读：合并后的 provider / 模型层才是文案与探测的真相源。
                 let cfg = load_config_warned();
                 let Some(pc) = cfg.providers.get(&provider) else {
                     eprintln!("error: provider missing from just-written config (unexpected)");
                     std::process::exit(1);
                 };
-                let env_name = pc.api_key_env.clone().unwrap_or_else(|| redteam::model::derive_api_key_env(&provider));
+                let env_name = pc.models.get(&model).and_then(|m| m.api_key_env.clone()).or_else(|| pc.api_key_env.clone());
                 // key 去处：env(默认，打印 export) / secrets(写 secrets.json；--model-key 写模型级)
                 match key_store.as_str() {
-                    "secrets" => match key {
-                        Some(k) => {
-                            let mid = if model_key { Some(model.as_str()) } else { None };
-                            match redteam::config::secrets::write_secret(&provider, mid, &k) {
-                                Ok(p) => println!("wrote key to {} (chmod 600)", p.display()),
-                                Err(e) => { eprintln!("error: failed to write secret: {e}"); std::process::exit(1); }
-                            }
+                    "secrets" => {
+                        let mid = if model_key { Some(model.as_str()) } else { None };
+                        match redteam::config::secrets::write_secret(&provider, mid, key.as_deref().unwrap_or_default()) {
+                            Ok(p) => println!("wrote key to {} (chmod 600)", p.display()),
+                            Err(e) => { eprintln!("error: failed to write secret: {e}"); std::process::exit(1); }
                         }
-                        None => { eprintln!("error: --key-store secrets requires --key"); std::process::exit(1); }
-                    },
-                    _ => match key {
+                    }
+                    _ => match (&env_name, &key) {
                         // env 默认：主配置只记 apiKeyEnv，提示用户设 env。
-                        Some(k) => println!("add to your shell profile:\n  export {env_name}={k}"),
-                        None => println!("set the API key in your environment:\n  export {env_name}=<your-key>"),
+                        (Some(v), Some(k)) => println!("add to your shell profile:\n  export {v}={k}"),
+                        (Some(v), None) => println!("set the API key in your environment:\n  export {v}=<your-key>"),
+                        (None, _) => println!("notice: providers.{provider} 未配置 apiKeyEnv；key 可放 secrets.json（--key-store secrets [--model-key]）或补 --api-key-env"),
                     },
                 }
                 let em = cfg.effective(&provider, &model, roles[0]);
-                let identity = em.as_ref().map(|e| e.name.clone()).unwrap_or_else(|| format!("{provider}/{model}"));
                 let probe_kind = em.as_ref().map(|e| e.kind).unwrap_or_else(|| provider_probe_kind(pc));
+                let shown = display_name.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
                 println!(
-                    "configured providers.{provider}.models.{model} '{identity}' roles=[{}] (kind={}, apiKeyEnv={env_name}) → {}",
-                    roles.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(","), probe_kind.as_str(), path.display()
+                    "configured {provider}/{model}{shown} roles=[{}] (kind={}, apiKeyEnv={}) → {}",
+                    roles.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(","),
+                    probe_kind.as_str(),
+                    env_name.as_deref().unwrap_or("-"),
+                    path.display()
                 );
                 // 落盘后自动 probe 刚配置的这个模型所在 provider（只探它、不是全部——复用 probe.rs 按 kind 认证的
                 // list_models；key 走该模型的四级解析链 resolve_key(provider, id)，#5）。probe 失败只警告、不回滚

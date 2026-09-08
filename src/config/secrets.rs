@@ -128,15 +128,8 @@ pub fn write_secret(provider: &str, model_id: Option<&str>, key: &str) -> anyhow
             mo.insert(mid.to_string(), serde_json::json!(key));
         }
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&root)? + "\n")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    // 原子写 + 临时文件即 0600（评审 #6：无 umask 明文窗口、无半截文件）
+    crate::config::write_atomic(&path, &(serde_json::to_string_pretty(&root)? + "\n"), Some(0o600))?;
     Ok(path)
 }
 

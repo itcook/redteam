@@ -925,7 +925,7 @@ mod job_tests {
         Finding {
             id: "f".into(), severity: Severity::Medium, title: title.into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
+            models: vec!["p/alpha".into()], agreement: 1, hard_constraint: false,
             quote: "q".into(), cluster_id: None, verify: None, previously_dismissed: false,
             origin: Origin::New,
         }
@@ -954,7 +954,7 @@ mod job_tests {
         run(&["add", file]);
     }
     fn cfg() -> Config {
-        Config::from_json(r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}}}}"#).unwrap()
+        Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap()
     }
 
     #[tokio::test]
@@ -963,7 +963,7 @@ mod job_tests {
         git_staged(dir.path(), "a.rs", "fn main() {\n    let x = 1;\n}\n");
         // alpha 报一条锚得到的 low finding（不触发 refute），quote 在 a.rs 第 2 行
         let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
-        scripted.insert("alpha".into(), vec![RawFinding {
+        scripted.insert("p/alpha".into(), vec![RawFinding {
             severity: Severity::Low, title: "t".into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             hard_constraint: false, quote: "let x = 1;".into(),
@@ -1018,7 +1018,7 @@ mod job_tests {
         // 预置一条 partial（模拟崩溃前已完成 1 cell）
         store.append_partial(
             "j2b",
-            &crate::state::CellRecord::ok("bundle[a]", "alpha", vec![checkpointed_finding("checkpointed")]),
+            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", vec![checkpointed_finding("checkpointed")]),
         ).unwrap();
 
         // 非 git 目录 → changed_files 失败 → run_review_dispatch Err，但已有 partial 记录
@@ -1064,7 +1064,7 @@ mod job_tests {
         // 预置一条 partial（模拟 deadline 前已完成 1 cell）
         store.append_partial(
             "j-to",
-            &crate::state::CellRecord::ok("bundle[a]", "alpha", vec![checkpointed_finding("before-deadline")]),
+            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", vec![checkpointed_finding("before-deadline")]),
         ).unwrap();
 
         let provider = HangProvider;
@@ -1614,8 +1614,8 @@ mod resolve_tests {
     use super::*;
 
     fn provs() -> &'static str {
-        r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}},
-            "beta_p":{"kind":"openai","models":{"b":{"name":"beta","roles":{"scanner":{}}},"p":{"name":"pro","roles":{"reviewer":{}}}}}}}"#
+        r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"roles":{"scanner":{}}}}},
+            "beta_p":{"kind":"openai","models":{"b":{"roles":{"scanner":{}}},"p":{"displayName":"pro","roles":{"reviewer":{}}}}}}}"#
     }
 
     /// 列表即活跃集：全部 scanner 各跑一遍（replicate）、无候补、priority 恒 0；reviewers 不进旧 fan-out。
@@ -1625,7 +1625,7 @@ mod resolve_tests {
         let o = legacy_opts_from_roles(&c.active_roles(), 4).unwrap();
         assert!(o.replicate && o.no_fallback);
         assert_eq!(o.max_concurrency, 4);
-        assert_eq!(o.models.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
+        assert_eq!(o.models.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["alpha_p/a", "beta_p/b"], "身份串 = provider/id");
         assert!(o.models.iter().all(|p| p.priority == 0));
     }
 
@@ -1660,9 +1660,9 @@ mod code_review_tests {
         // 注：FakeProvider 是 prompt-blind 的——对同一 model 的任何调用（无论 review 还是 refute
         // prompt）都返回同一脚本，故 refute 调用返回非空 → refuted → confidence 0 → 不 reject。
         // 交叉 model 选择本身已在 verify.rs 单测验证；本测试只验「证伪翻转 verdict」全链路。
-        let cfg = Config::from_json(r#"{"providers":{"ap":{"kind":"openai","models":{"a":{"name":"alpha","roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = crate::provider::fake::FakeProvider::with(
-            "alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
+            "p/alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
         );
         let my_args = ReviewArgs {
             base: None, scope: "working-tree".into(),
@@ -1706,13 +1706,13 @@ mod code_review_tests {
         // 两个 model 都报真 finding → dedup 合并成 agreement=2 → 跳过层① verify，
         // 保持本测试「anchor 砍编造 + High→Reject」的原意（不被 S3-b verify 自审误伤）。
         // 编造 quote 只 m 报，anchor 因 quote 不在文件而丢弃。
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}},"m2-id":{"name":"m2","roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"m2":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let mut scripted = std::collections::BTreeMap::new();
-        scripted.insert("m".to_string(), vec![
+        scripted.insert("p/m".to_string(), vec![
             raw("src/a.rs", "db.write(token);", Severity::High),
             raw("src/a.rs", "this is fabricated", Severity::Critical),
         ]);
-        scripted.insert("m2".to_string(), vec![raw("src/a.rs", "db.write(token);", Severity::High)]);
+        scripted.insert("p/m2".to_string(), vec![raw("src/a.rs", "db.write(token);", Severity::High)]);
         let provider = FakeProvider { scripted, ..Default::default() };
         let my_args = args();
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
@@ -1728,8 +1728,8 @@ mod code_review_tests {
     #[tokio::test]
     async fn code_review_empty_changes_approves() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
-        let provider = FakeProvider::with("m", vec![]);
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let provider = FakeProvider::with("p/m", vec![]);
         let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
         assert!(report.findings.is_empty());
         assert_eq!(code, 0);
@@ -1738,8 +1738,8 @@ mod code_review_tests {
     #[tokio::test]
     async fn code_review_stamps_head_sha_into_runmeta() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
-        let provider = FakeProvider::with("m", vec![]);
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let provider = FakeProvider::with("p/m", vec![]);
         // K1：无 --test-command 时按项目推断（Cargo.toml → cargo test）进 RunMeta。
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"\n").unwrap();
         let (report, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(),
@@ -1805,7 +1805,7 @@ mod spec_tests {
         let spec_path = root.join("design.md");
         std::fs::write(&spec_path, "DESIGN D8: fail-open").unwrap();
 
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = SpecPromptRecorder::default();
         let args = spec_test_args(vec![spec_path.to_string_lossy().to_string()]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
@@ -1826,7 +1826,7 @@ mod spec_tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
 
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m-id":{"name":"m","roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = SpecPromptRecorder::default();
         let args = spec_test_args(vec![]); // 不带 --spec
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
@@ -1937,9 +1937,9 @@ mod tests {
         let mk = |models: &str| crate::config::Config::from_json(
             &r#"{"providers":{"p":{"kind":"openai","models":{MODELS}}}}"#.replace("MODELS", models),
         ).unwrap().active_roles();
-        let big = r#""big-ctx":{"name":"Big","contextWindow":1000000,"roles":{"scanner":{}}}"#;
-        let small = r#""small-ctx":{"name":"Small","contextWindow":40000,"roles":{"scanner":{}}}"#;
-        let unknown = r#""u":{"name":"Unknown","roles":{"scanner":{}}}"#;
+        let big = r#""big-ctx":{"contextWindow":1000000,"roles":{"scanner":{}}}"#;
+        let small = r#""small-ctx":{"contextWindow":40000,"roles":{"scanner":{}}}"#;
+        let unknown = r#""u":{"roles":{"scanner":{}}}"#;
         // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K < 768K → 窗口墙生效
         assert_eq!(pack_budget_bytes(&mk(unknown)), 312_000);
         // 大窗模型（1M）：窗口墙 ≈2.9M → 绝对帽 768K 封顶（≈256K tok 记账 <272K 悬崖）

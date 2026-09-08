@@ -93,9 +93,9 @@ pub struct RoleAttrs {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfig {
-    /// 身份串（route_key / 报告名）；缺省 `provider/id`。全局唯一（validate）。
+    /// 人读显示名（`model list` / 将来报告用）；**不是**身份串——身份串固定为 `provider/id`〔D12 定案 3〕。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub display_name: Option<String>,
     /// 覆盖 provider.kind；两层都缺 → validate 报错。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<ProviderKind>,
@@ -108,10 +108,10 @@ pub struct ModelConfig {
     /// context window（token），pack 预算护墙；缺省保守 128K；下限 `MIN_CONTEXT_WINDOW`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
-    /// 输出上限（max_tokens）：> REDTEAM_MAX_TOKENS env > 32768 默认。
+    /// 输出上限（max_tokens，≥ 1）：> REDTEAM_MAX_TOKENS env > 32768 默认。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
-    /// 单轮超时（秒）：> REDTEAM_PER_TURN_SECS > 公式（见 `EffectiveModel::per_turn_secs`）。
+    /// 单轮超时（秒，≥ 1）：> REDTEAM_PER_TURN_SECS > 公式（见 `EffectiveModel::per_turn_secs`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_turn_timeout_secs: Option<u64>,
     /// 思考型模型（thinking token 计入输出额度——预算与截断判定参考）。
@@ -143,8 +143,10 @@ pub const MIN_CONTEXT_WINDOW: u32 = 32_000;
 /// merged 视图：模型 + provider 覆盖链 + 角色属性成品，registry / backend 构造的唯一入口。
 #[derive(Clone, Debug)]
 pub struct EffectiveModel {
-    /// 身份串：`name` 或 `provider/id`（route_key / 报告名）。
+    /// 身份串 `provider/id`（route_key / 报告名 / 台账 model 字段）。
     pub name: String,
+    /// 人读显示名（可选，只作显示）。
+    pub display_name: Option<String>,
     /// 请求体里的 model id。
     pub id: String,
     pub provider: String,
@@ -160,12 +162,28 @@ pub struct EffectiveModel {
     pub max_concurrency: Option<u32>,
 }
 
+/// 单轮输出上限默认值（思考型模型的 thinking tokens 也计入；8192 旧值在大 bundle 下会被截断，2026-09-03 dogfood 实证）。
+pub const DEFAULT_MAX_TOKENS: u64 = 32_768;
+
+/// `REDTEAM_MAX_TOKENS` env 解析——backend 请求体与超时公式共用同一函数（评审 #7）：非法 / 0 → warning + 默认。
+pub fn env_max_tokens() -> u64 {
+    match std::env::var("REDTEAM_MAX_TOKENS") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                // 静默回落会让运维误以为旋钮已生效，复发时被迫活体复现调试。
+                eprintln!("warning: REDTEAM_MAX_TOKENS={s:?} 非法（需正整数），回落默认 {DEFAULT_MAX_TOKENS}");
+                DEFAULT_MAX_TOKENS
+            }
+        },
+        Err(_) => DEFAULT_MAX_TOKENS,
+    }
+}
+
 impl EffectiveModel {
-    /// backend 实际发送的 max_tokens：模型 `maxOutputTokens` > `REDTEAM_MAX_TOKENS` env > 32768（与 backends.rs 同链）。
+    /// backend 实际发送的 max_tokens：模型 `maxOutputTokens` > `REDTEAM_MAX_TOKENS` env > 32768（与 backends.rs 共用 `env_max_tokens`）。
     pub fn max_tokens_effective(&self) -> u64 {
-        self.max_output_tokens
-            .or_else(|| std::env::var("REDTEAM_MAX_TOKENS").ok().and_then(|s| s.trim().parse().ok()).filter(|v: &u64| *v > 0))
-            .unwrap_or(32_768)
+        self.max_output_tokens.unwrap_or_else(env_max_tokens)
     }
     /// 单轮超时（秒）〔D12 #6〕：模型 `perTurnTimeoutSecs` > `REDTEAM_PER_TURN_SECS` > `max_tokens_effective ÷ 20 TPS + 60s`。
     pub fn per_turn_secs(&self) -> u64 {
@@ -389,22 +407,35 @@ impl RoleSets {
     }
 }
 
-/// 身份串：`name` 或 `provider/id`。
-pub fn identity(provider: &str, id: &str, m: &ModelConfig) -> String {
-    m.name.clone().unwrap_or_else(|| format!("{provider}/{id}"))
+/// 身份串 = `provider/id`（route_key / 报告名 / 台账 model 字段）；`displayName` 只作显示〔D12 定案 3〕。
+pub fn identity(provider: &str, id: &str) -> String {
+    format!("{provider}/{id}")
 }
 
 impl Config {
     /// 真实加载：`$REDTEAM_HOME/config.json`；文件不存在 = 空配置；其他 io 错误传播（不吞成空配置，#13）；
-    /// 旧路径存在 → stderr 各一行提示（不读）；secrets 守卫 warning 走 stderr。
+    /// 新配置尚不存在而旧路径存在 → stderr 各一行提示（不读；新配置已在场即视为已迁移、不再刷提示——dev 二进制与本二进制
+    /// 并存期旧文件会长期存在）；secrets 守卫 warning 走 stderr。
     pub fn load() -> anyhow::Result<Config> {
+        let (cfg, messages) = Config::load_with_messages()?;
+        for m in &messages {
+            eprintln!("{m}");
+        }
+        Ok(cfg)
+    }
+
+    /// 同 `load`，但 notice / warning 行返回给调用方而非打印（`model setup` 写前预检用，避免重复刷屏）。
+    pub fn load_with_messages() -> anyhow::Result<(Config, Vec<String>)> {
+        let mut messages = Vec::new();
         let path = config_path()?;
-        for p in legacy_config_paths_present() {
-            eprintln!(
-                "notice: 配置已改读 {}（REDTEAM_HOME 可覆盖，严格 JSON）；旧文件 {} 未读，请手动迁移（redteam model setup --help）",
-                path.display(),
-                p.display()
-            );
+        if !path.is_file() {
+            for p in legacy_config_paths_present() {
+                messages.push(format!(
+                    "notice: 配置已改读 {}（REDTEAM_HOME 可覆盖，严格 JSON）；旧文件 {} 未读，请手动迁移（redteam model setup --help）",
+                    path.display(),
+                    p.display()
+                ));
+            }
         }
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
@@ -413,14 +444,10 @@ impl Config {
         };
         let (cfg, warnings) = Config::from_json_warned(&text)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        for w in &warnings {
-            eprintln!("warning: {w}");
-        }
+        messages.extend(warnings.iter().map(|w| format!("warning: {w}")));
         let secrets = secrets::load_secrets();
-        for w in secrets.warnings.iter().chain(cfg.secret_key_warnings(&secrets).iter()) {
-            eprintln!("warning: {w}");
-        }
-        Ok(cfg)
+        messages.extend(secrets.warnings.iter().chain(cfg.secret_key_warnings(&secrets).iter()).map(|w| format!("warning: {w}")));
+        Ok((cfg, messages))
     }
 
     /// 解析 + 旧形状指引 + 校验；空白文本 = 空配置。返回 warnings（无定义键、无角色模型）。
@@ -430,10 +457,7 @@ impl Config {
             return Ok((Config::default(), warnings));
         }
         let v: serde_json::Value = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("JSON 解析失败：{e}"))?;
-        legacy_shape_guard(&v)?;
-        if v.get("review").and_then(|r| r.get("risk")).is_some() {
-            warnings.push("review.risk 无定义（D11：无模式旋钮），已忽略".to_string());
-        }
+        warnings.extend(shape_guard(&v)?);
         let cfg: Config = serde_json::from_value(v).map_err(|e| anyhow::anyhow!("配置形状错误：{e}"))?;
         cfg.validate()?;
         for (pname, p) in &cfg.providers {
@@ -460,8 +484,8 @@ impl Config {
     /// 按身份串反查 (provider, id)。
     pub fn find(&self, name: &str) -> Option<(String, String)> {
         for (pname, p) in &self.providers {
-            for (id, m) in &p.models {
-                if identity(pname, id, m) == name {
+            for id in p.models.keys() {
+                if identity(pname, id) == name {
                     return Some((pname.clone(), id.clone()));
                 }
             }
@@ -474,7 +498,8 @@ impl Config {
         let (p, m) = self.model(provider, id)?;
         let kind = m.kind.or(p.kind)?;
         Some(EffectiveModel {
-            name: identity(provider, id, m),
+            name: identity(provider, id),
+            display_name: m.display_name.clone(),
             id: id.to_string(),
             provider: provider.to_string(),
             role,
@@ -565,12 +590,15 @@ impl Config {
         out
     }
 
-    /// 结构校验（load 后必调）：kind 可解析；contextWindow 下限；身份串全局唯一；review 数值 ≥ 1。全部问题聚合成一条错误。
+    /// 结构校验（load 后必调）：kind 可解析；contextWindow 下限；maxOutputTokens / perTurnTimeoutSecs / maxConcurrency ≥ 1（评审 #3）；
+    /// review 数值 ≥ 1。全部问题聚合成一条错误。
     /// 无 scanner 不在此报错（review 时报「未配置 scanner」）。
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut errs = Vec::new();
-        let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for (pname, p) in &self.providers {
+            if p.max_concurrency == Some(0) {
+                errs.push(format!("providers.{pname}.maxConcurrency 必须 ≥ 1"));
+            }
             for (id, m) in &p.models {
                 if m.kind.or(p.kind).is_none() {
                     errs.push(format!("providers.{pname}.models.{id}: 缺 kind（模型层或 provider 层至少一处：openai | anthropic）"));
@@ -580,9 +608,11 @@ impl Config {
                         errs.push(format!("providers.{pname}.models.{id}: contextWindow {cw} 低于下限 {MIN_CONTEXT_WINDOW}（单位是 token，128K 请写 128000）"));
                     }
                 }
-                let name = identity(pname, id, m);
-                if let Some(prev) = seen.insert(name.clone(), format!("{pname}/{id}")) {
-                    errs.push(format!("身份串 {name:?} 重复：{prev} 与 {pname}/{id}（给其中一个显式 name）"));
+                if m.max_output_tokens == Some(0) {
+                    errs.push(format!("providers.{pname}.models.{id}: maxOutputTokens 必须 ≥ 1"));
+                }
+                if m.per_turn_timeout_secs == Some(0) {
+                    errs.push(format!("providers.{pname}.models.{id}: perTurnTimeoutSecs 必须 ≥ 1"));
                 }
             }
         }
@@ -605,62 +635,106 @@ impl Config {
     }
 }
 
-/// 旧形状指引：顶层 `scanners` / `reviewers` / `verifiers` / `models`（批 A 首版 TOML 形状）、provider 下 `models` 为数组、
-/// snake_case 键 → 指向 D12 形状的错误，不静默丢配置。
-fn legacy_shape_guard(v: &serde_json::Value) -> anyhow::Result<()> {
-    let mut found = Vec::new();
-    if let Some(top) = v.as_object() {
-        for k in ["scanners", "reviewers", "verifiers", "models"] {
-            if top.contains_key(k) {
-                found.push(format!("顶层 {k:?}：角色列表已改为 providers.<name>.models.<id>.roles.<role>"));
+/// 形状守卫（解析前按 `Value` 走一遍已知层级）：旧形状 / snake_case / 改名键 / 非法角色 → **错误**并指向 D12 形状（不静默丢配置）；
+/// 已知层级下的无定义键 → **warning**（serde 默认忽略未知字段，评审 #4；不开 `deny_unknown_fields` 以保向前兼容）。
+/// provider 名 / model id 是用户键，不检查。新增配置字段时同步下面的已知键表（单测 `review_risk_and_roleless_model_warn` 兜底）。
+fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+    const ROOT: &[&str] = &["providers", "review"];
+    const PROVIDER: &[&str] = &["kind", "baseUrl", "apiKeyEnv", "maxConcurrency", "models"];
+    const MODEL: &[&str] = &["displayName", "kind", "apiKeyEnv", "family", "contextWindow", "maxOutputTokens", "perTurnTimeoutSecs", "reasoning", "roles"];
+    const ROLE_ATTRS: &[&str] = &["thinkingLevel"];
+    const REVIEW: &[&str] = &["blockThreshold", "confFloor", "maxConcurrency", "tools", "scanners", "reviewers", "verifiers", "grouping", "pack", "risk"];
+    const REVIEW_SECTIONS: &[(&str, &[&str])] = &[
+        ("scanners", &["workers", "samples"]),
+        ("reviewers", &["workers", "maxCells", "reenqueue"]),
+        ("verifiers", &["enabled", "workers"]),
+        ("grouping", &["minFiles", "bundleLineThreshold", "maxFilesPerGroup", "semantic"]),
+        ("pack", &["body", "anchorWindow", "sliceMinBytes"]),
+    ];
+    /// 已知层级的键检查：snake_case → 错误（指引 camelCase 拼写）；其余未知 → warning。
+    fn check(errors: &mut Vec<String>, warnings: &mut Vec<String>, path: &str, obj: &serde_json::Map<String, serde_json::Value>, known: &[&str], hint: &str) {
+        for k in obj.keys() {
+            if known.contains(&k.as_str()) {
+                continue;
             }
-        }
-        for k in top.keys() {
             if k.contains('_') {
-                found.push(format!("顶层键 {k:?}：键名为 camelCase"));
+                errors.push(format!("{path}.{k}：键名为 camelCase（{hint}）"));
+            } else {
+                warnings.push(format!("{path}.{k} 无定义，已忽略（已知键：{}）", known.join(" / ")));
             }
         }
-        if let Some(provs) = top.get("providers").and_then(|p| p.as_object()) {
-            for (pname, pv) in provs {
-                if let Some(po) = pv.as_object() {
-                    for k in po.keys() {
-                        if k.contains('_') {
-                            found.push(format!("providers.{pname}.{k}：键名为 camelCase（如 baseUrl / apiKeyEnv / maxConcurrency）"));
+    }
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    let Some(top) = v.as_object() else {
+        anyhow::bail!("config.json 顶层须是对象（{{\"providers\": …}}）");
+    };
+    for k in ["scanners", "reviewers", "verifiers", "models"] {
+        if top.contains_key(k) {
+            errors.push(format!("顶层 {k:?}：角色列表已改为 providers.<name>.models.<id>.roles.<role>"));
+        }
+    }
+    check(&mut errors, &mut warnings, "(顶层)", top, ROOT, "providers / review");
+    if let Some(provs) = top.get("providers").and_then(|p| p.as_object()) {
+        for (pname, pv) in provs {
+            let Some(po) = pv.as_object() else {
+                errors.push(format!("providers.{pname} 须是对象"));
+                continue;
+            };
+            check(&mut errors, &mut warnings, &format!("providers.{pname}"), po, PROVIDER, "baseUrl / apiKeyEnv / maxConcurrency");
+            match po.get("models") {
+                Some(serde_json::Value::Array(_)) => errors.push(format!("providers.{pname}.models 是数组：应为按 model id 做键的对象")),
+                Some(serde_json::Value::Object(ms)) => {
+                    for (id, mv) in ms {
+                        let Some(mo) = mv.as_object() else {
+                            errors.push(format!("providers.{pname}.models.{id} 须是对象"));
+                            continue;
+                        };
+                        let mpath = format!("providers.{pname}.models.{id}");
+                        if mo.contains_key("name") {
+                            errors.push(format!("{mpath}.name 已改名 displayName（身份串固定为 provider/id，不可配置）"));
                         }
-                    }
-                    match po.get("models") {
-                        Some(serde_json::Value::Array(_)) => found.push(format!("providers.{pname}.models 是数组：应为按 model id 做键的对象")),
-                        Some(serde_json::Value::Object(ms)) => {
-                            for (id, mv) in ms {
-                                if let Some(mo) = mv.as_object() {
-                                    for k in mo.keys() {
-                                        if k.contains('_') {
-                                            found.push(format!("providers.{pname}.models.{id}.{k}：键名为 camelCase（如 contextWindow / maxOutputTokens）"));
-                                        }
-                                    }
+                        check(&mut errors, &mut warnings, &mpath, mo, MODEL, "contextWindow / maxOutputTokens / perTurnTimeoutSecs / apiKeyEnv / displayName");
+                        if let Some(roles) = mo.get("roles") {
+                            let Some(ro) = roles.as_object() else {
+                                errors.push(format!("{mpath}.roles 须是对象（键为 scanner / reviewer / verifier）"));
+                                continue;
+                            };
+                            for (role, rv) in ro {
+                                if Role::parse(role).is_none() {
+                                    errors.push(format!("{mpath}.roles.{role}：角色取 scanner | reviewer | verifier"));
+                                    continue;
+                                }
+                                if let Some(ra) = rv.as_object() {
+                                    check(&mut errors, &mut warnings, &format!("{mpath}.roles.{role}"), ra, ROLE_ATTRS, "thinkingLevel");
                                 }
                             }
                         }
-                        _ => {}
                     }
                 }
-            }
-        }
-        if let Some(r) = top.get("review").and_then(|r| r.as_object()) {
-            for k in r.keys() {
-                if k.contains('_') {
-                    found.push(format!("review.{k}：键名为 camelCase（如 blockThreshold / confFloor / maxConcurrency）"));
-                }
+                Some(_) => errors.push(format!("providers.{pname}.models 须是对象")),
+                None => {}
             }
         }
     }
-    if !found.is_empty() {
+    if let Some(r) = top.get("review").and_then(|r| r.as_object()) {
+        check(&mut errors, &mut warnings, "review", r, REVIEW, "blockThreshold / confFloor / maxConcurrency");
+        if r.contains_key("risk") {
+            warnings.push("review.risk 无定义（D11：无模式旋钮），已忽略".to_string());
+        }
+        for (sec, known) in REVIEW_SECTIONS {
+            if let Some(so) = r.get(*sec).and_then(|s| s.as_object()) {
+                check(&mut errors, &mut warnings, &format!("review.{sec}"), so, known, "如 maxCells / minFiles / sliceMinBytes");
+            }
+        }
+    }
+    if !errors.is_empty() {
         anyhow::bail!(
             "配置形状已升级（JSON，providers → models → roles，design §12.1〔D12〕；见 redteam --help）：\n{}",
-            found.join("\n")
+            errors.join("\n")
         );
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// 配置根：`$REDTEAM_HOME`（非空）否则 `$HOME/.redteam`；两者皆缺 → 错误（#1：不退化为相对路径，防把项目层文件当用户配置读）。
@@ -723,13 +797,16 @@ pub struct SetupPatch {
     pub provider: String,
     pub model_id: String,
     pub roles: Vec<Role>,
-    pub name: Option<String>,
+    pub display_name: Option<String>,
+    /// 显式 `--kind`：新建 provider → provider 层；provider 已存在 → 模型层（不动共享的 provider 层，评审 #5）。
     pub kind: Option<ProviderKind>,
     pub base_url: Option<String>,
+    /// 显式 `--api-key-env`：落点规则同 `kind`。
     pub api_key_env: Option<String>,
     pub max_concurrency: Option<u32>,
     pub context_window: Option<u32>,
     pub max_output_tokens: Option<u64>,
+    pub per_turn_timeout_secs: Option<u64>,
     pub reasoning: Option<bool>,
     pub thinking_level: Option<ThinkingLevel>,
     /// 新建 provider 且未显式 `--kind` 时的推断值（已存在的 provider 不动）。
@@ -741,14 +818,14 @@ pub struct SetupPatch {
 impl Default for SetupPatch {
     fn default() -> Self {
         SetupPatch {
-            provider: String::new(), model_id: String::new(), roles: Vec::new(), name: None, kind: None, base_url: None,
-            api_key_env: None, max_concurrency: None, context_window: None, max_output_tokens: None, reasoning: None,
-            thinking_level: None, kind_if_new: ProviderKind::OpenaiCompatible, api_key_env_if_new: None,
+            provider: String::new(), model_id: String::new(), roles: Vec::new(), display_name: None, kind: None, base_url: None,
+            api_key_env: None, max_concurrency: None, context_window: None, max_output_tokens: None, per_turn_timeout_secs: None,
+            reasoning: None, thinking_level: None, kind_if_new: ProviderKind::OpenaiCompatible, api_key_env_if_new: None,
         }
     }
 }
 
-/// 三层显式合并 → 完整解析 + 校验 → 落盘（pretty JSON）。现有文件解析失败拒写不覆写（评审 #2/#4/#8 同策略）。
+/// 三层显式合并 → 完整解析 + 校验 → 原子落盘（pretty JSON）。现有文件解析失败拒写不覆写（评审 #2/#4/#8 同策略）。
 pub fn write_setup(patch: &SetupPatch) -> anyhow::Result<PathBuf> {
     let path = config_path()?;
     let existing = match std::fs::read_to_string(&path) {
@@ -768,21 +845,19 @@ pub fn write_setup(patch: &SetupPatch) -> anyhow::Result<PathBuf> {
     let is_new_provider = !provs_o.contains_key(&patch.provider);
     let pv = provs_o.entry(patch.provider.clone()).or_insert_with(|| serde_json::json!({}));
     let po = pv.as_object_mut().ok_or_else(|| anyhow::anyhow!("providers.{} 不是对象", patch.provider))?;
-    // provider 层：只写显式；新建时补推断的 kind / apiKeyEnv
-    if let Some(k) = patch.kind {
-        po.insert("kind".into(), serde_json::json!(k.as_str()));
-    } else if is_new_provider {
-        po.insert("kind".into(), serde_json::json!(patch.kind_if_new.as_str()));
-    }
-    if let Some(b) = &patch.base_url {
-        po.insert("baseUrl".into(), serde_json::json!(b));
-    }
-    if let Some(e) = &patch.api_key_env {
-        po.insert("apiKeyEnv".into(), serde_json::json!(e));
-    } else if is_new_provider {
-        if let Some(e) = &patch.api_key_env_if_new {
+    // provider 层：只写显式的 baseUrl / maxConcurrency；kind / apiKeyEnv 新建 provider 时写这里（显式或推断），
+    // provider 已存在时改写模型层（不动共享的 provider 层，评审 #3 / #5）。
+    let (model_kind, model_api_key_env) = if is_new_provider {
+        po.insert("kind".into(), serde_json::json!(patch.kind.unwrap_or(patch.kind_if_new).as_str()));
+        if let Some(e) = patch.api_key_env.as_ref().or(patch.api_key_env_if_new.as_ref()) {
             po.insert("apiKeyEnv".into(), serde_json::json!(e));
         }
+        (None, None)
+    } else {
+        (patch.kind, patch.api_key_env.clone())
+    };
+    if let Some(b) = &patch.base_url {
+        po.insert("baseUrl".into(), serde_json::json!(b));
     }
     if let Some(c) = patch.max_concurrency {
         po.insert("maxConcurrency".into(), serde_json::json!(c));
@@ -792,8 +867,17 @@ pub fn write_setup(patch: &SetupPatch) -> anyhow::Result<PathBuf> {
     let models_o = models.as_object_mut().ok_or_else(|| anyhow::anyhow!("providers.{}.models 不是对象", patch.provider))?;
     let mv = models_o.entry(patch.model_id.clone()).or_insert_with(|| serde_json::json!({}));
     let mo = mv.as_object_mut().ok_or_else(|| anyhow::anyhow!("models.{} 不是对象", patch.model_id))?;
-    if let Some(n) = &patch.name {
-        mo.insert("name".into(), serde_json::json!(n));
+    if let Some(n) = &patch.display_name {
+        mo.insert("displayName".into(), serde_json::json!(n));
+    }
+    if let Some(k) = model_kind {
+        mo.insert("kind".into(), serde_json::json!(k.as_str()));
+    }
+    if let Some(e) = &model_api_key_env {
+        mo.insert("apiKeyEnv".into(), serde_json::json!(e));
+    }
+    if let Some(s) = patch.per_turn_timeout_secs {
+        mo.insert("perTurnTimeoutSecs".into(), serde_json::json!(s));
     }
     if let Some(c) = patch.context_window {
         mo.insert("contextWindow".into(), serde_json::json!(c));
@@ -818,11 +902,43 @@ pub fn write_setup(patch: &SetupPatch) -> anyhow::Result<PathBuf> {
     // 写前完整校验（#4）
     let text = serde_json::to_string_pretty(&root)?;
     Config::from_json(&text).map_err(|e| anyhow::anyhow!("合并后配置无效，未写入：{e}"))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, text + "\n")?;
+    write_atomic(&path, &(text + "\n"), None)?;
     Ok(path)
+}
+
+/// 原子落盘（评审 #6）：同目录临时文件 + rename；`mode` 给定时临时文件即以该权限创建（secrets 不经 umask 明文窗口）。
+pub(crate) fn write_atomic(path: &std::path::Path, text: &str, mode: Option<u32>) -> anyhow::Result<()> {
+    let dir = path.parent().ok_or_else(|| anyhow::anyhow!("{} 无父目录", path.display()))?;
+    std::fs::create_dir_all(dir)?;
+    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("config");
+    let tmp = dir.join(format!(".{stem}.tmp-{}", std::process::id()));
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Some(m) = mode {
+                opts.mode(m);
+            }
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(m) = mode {
+            // 临时文件若已存在（上次中断残留），open 的 mode 不生效——补一次
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(m))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// 测试专用：跨 config 子模块串行化 REDTEAM_HOME / HOME 等环境变量写入，防并行测试污染。
@@ -839,7 +955,7 @@ mod tests {
     "deepseek": {
       "kind": "openai", "baseUrl": "https://api.deepseek.com", "apiKeyEnv": "DEEPSEEK_API_KEY", "maxConcurrency": 20,
       "models": {
-        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash", "contextWindow": 1000000, "maxOutputTokens": 384000, "reasoning": true,
+        "deepseek-v4-flash": { "displayName": "DeepSeek V4 Flash", "contextWindow": 1000000, "maxOutputTokens": 384000, "reasoning": true,
                                "roles": { "scanner": { "thinkingLevel": "low" } } },
         "deepseek-v4-pro":   { "contextWindow": 1000000, "maxOutputTokens": 384000, "reasoning": true, "perTurnTimeoutSecs": 1200,
                                "roles": { "reviewer": { "thinkingLevel": "high" } } }
@@ -869,7 +985,7 @@ mod tests {
         let cfg = Config::from_json(SAMPLE).unwrap();
         let roles = cfg.active_roles();
         // 顺序：provider 名字典序（agct < deepseek），再 id
-        assert_eq!(roles.scanners.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["agct/gemini-3.8-flash", "DeepSeek V4 Flash"]);
+        assert_eq!(roles.scanners.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["agct/gemini-3.8-flash", "deepseek/deepseek-v4-flash"]);
         assert_eq!(roles.reviewers.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["deepseek/deepseek-v4-pro"]);
         assert_eq!(roles.verifiers.len(), 1);
         let gem = &roles.scanners[0];
@@ -883,8 +999,10 @@ mod tests {
         assert_eq!(cfg.review.reviewers.max_cells, MaxCells::Auto);
         assert_eq!(cfg.review.pack.body, PackBody::Slice);
         assert_eq!(cfg.providers["deepseek"].max_concurrency, Some(20));
-        assert_eq!(roles.id_of("DeepSeek V4 Flash"), Some("deepseek-v4-flash"));
-        assert_eq!(cfg.find("DeepSeek V4 Flash"), Some(("deepseek".into(), "deepseek-v4-flash".into())));
+        assert_eq!(roles.id_of("deepseek/deepseek-v4-flash"), Some("deepseek-v4-flash"));
+        assert_eq!(roles.scanners[1].display_name.as_deref(), Some("DeepSeek V4 Flash"), "displayName 只作显示");
+        assert_eq!(cfg.find("deepseek/deepseek-v4-flash"), Some(("deepseek".into(), "deepseek-v4-flash".into())));
+        assert_eq!(cfg.find("DeepSeek V4 Flash"), None, "显示名不是身份串（D12 定案 3）");
     }
 
     #[test]
@@ -901,14 +1019,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_aggregates_kind_window_and_duplicate_identity() {
+    fn validate_aggregates_kind_window_and_zero_knobs() {
         let err = Config::from_json(r#"{"providers":{
             "p":{"models":{"a":{"roles":{"scanner":{}}}}},
-            "q":{"kind":"openai","models":{"b":{"contextWindow":128,"roles":{"scanner":{}}},"c":{"name":"q/b","roles":{"scanner":{}}}}}}}"#)
+            "q":{"kind":"openai","maxConcurrency":0,"models":{"b":{"contextWindow":128,"roles":{"scanner":{}}},
+                 "c":{"maxOutputTokens":0,"perTurnTimeoutSecs":0,"roles":{"scanner":{}}}}}}}"#)
             .unwrap_err().to_string();
         assert!(err.contains("providers.p.models.a: 缺 kind"), "{err}");
         assert!(err.contains("contextWindow 128 低于下限"), "{err}");
-        assert!(err.contains("身份串 \"q/b\" 重复"), "{err}");
+        assert!(err.contains("models.c: maxOutputTokens 必须 ≥ 1") && err.contains("models.c: perTurnTimeoutSecs 必须 ≥ 1"), "评审 #3: {err}");
+        assert!(err.contains("providers.q.maxConcurrency 必须 ≥ 1"), "{err}");
         let z = Config::from_json(r#"{"review":{"scanners":{"workers":0}}}"#).unwrap_err().to_string();
         assert!(z.contains("review.scanners.workers"), "{z}");
     }
@@ -923,6 +1043,12 @@ mod tests {
         assert!(e3.contains("camelCase") && e3.contains("base_url"), "{e3}");
         let e4 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"context_window":1}}}}}"#).unwrap_err().to_string();
         assert!(e4.contains("context_window"), "{e4}");
+        let e5 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{"thinking_level":"high"}}}}}},"review":{"reviewers":{"max_cells":4}}}"#).unwrap_err().to_string();
+        assert!(e5.contains("roles.scanner.thinking_level") && e5.contains("review.reviewers.max_cells"), "嵌套段 snake_case 也拦（评审 #4）: {e5}");
+        let e6 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"name":"M","roles":{"scanner":{}}}}}}}"#).unwrap_err().to_string();
+        assert!(e6.contains("name 已改名 displayName"), "{e6}");
+        let e7 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"judge":{}}}}}}}"#).unwrap_err().to_string();
+        assert!(e7.contains("roles.judge") && e7.contains("scanner | reviewer | verifier"), "{e7}");
         let bad = Config::from_json(r#"{"providers":{"p":{"kind":"openai",}}}"#).unwrap_err().to_string();
         assert!(bad.contains("line"), "解析错误须带行列: {bad}");
     }
@@ -933,6 +1059,11 @@ mod tests {
         assert!(warns.iter().any(|w| w.contains("review.risk")), "{warns:?}");
         assert!(warns.iter().any(|w| w.contains("未声明任何 roles")), "{warns:?}");
         assert!(cfg.active_roles().scanners.is_empty());
+        // 已知层级下的无定义键 → warning 不静默（评审 #4）
+        let (_, w2) = Config::from_json_warned(r#"{"providers":{"p":{"kind":"openai","extra":1,"models":{"m":{"contextWindows":1,"roles":{"scanner":{"depth":2}}}}}},"review":{"grouping":{"minFile":1}},"foo":{}}"#).unwrap();
+        for k in ["providers.p.extra", "providers.p.models.m.contextWindows", "providers.p.models.m.roles.scanner.depth", "review.grouping.minFile", "(顶层).foo"] {
+            assert!(w2.iter().any(|w| w.contains(k) && w.contains("无定义")), "{k}: {w2:?}");
+        }
     }
 
     #[test]
@@ -1015,8 +1146,8 @@ mod tests {
         unsafe { std::env::set_var("REDTEAM_HOME", "/tmp/rt-home-x"); }
         assert_eq!(config_path().unwrap(), PathBuf::from("/tmp/rt-home-x/config.json"));
         assert_eq!(secrets::secrets_path().unwrap(), PathBuf::from("/tmp/rt-home-x/secrets.json"));
-        unsafe { std::env::remove_var("REDTEAM_HOME"); }
-        assert!(redteam_home().unwrap().ends_with(".redteam"));
+        unsafe { std::env::remove_var("REDTEAM_HOME"); std::env::set_var("HOME", "/tmp/rt-home-h"); }
+        assert_eq!(redteam_home().unwrap(), PathBuf::from("/tmp/rt-home-h/.redteam"), "无 REDTEAM_HOME → HOME/.redteam（不依赖真实 HOME）");
         unsafe { std::env::remove_var("HOME"); }
         let err = redteam_home().unwrap_err().to_string();
         assert!(err.contains("REDTEAM_HOME 与 HOME"), "皆缺 → 报错而非相对路径（#1）: {err}");
@@ -1079,7 +1210,7 @@ mod tests {
         unsafe { std::env::set_var("REDTEAM_HOME", dir.path()); }
         // 手写：provider anthropic + 模型级字段
         std::fs::write(dir.path().join("config.json"), r#"{"providers":{"agc":{"kind":"anthropic","apiKeyEnv":"MY_KEY","models":{
-            "glm-5.3":{"name":"GLM","family":"fam","perTurnTimeoutSecs":999,"apiKeyEnv":"GLM_KEY","roles":{"scanner":{"thinkingLevel":"low"}}}}}},
+            "glm-5.3":{"displayName":"GLM","family":"fam","perTurnTimeoutSecs":999,"apiKeyEnv":"GLM_KEY","roles":{"scanner":{"thinkingLevel":"low"}}}}}},
             "review":{"blockThreshold":"high"}}"#).unwrap();
         // 已存在 provider：不带 --kind 且带 base_url 的 setup 不得改 kind / apiKeyEnv（#3）；模型层只加 contextWindow；追加 reviewer 角色
         let mut p = patch("agc", "glm-5.3", &[Role::Reviewer]);
@@ -1093,7 +1224,7 @@ mod tests {
         assert_eq!(prov.api_key_env.as_deref(), Some("MY_KEY"));
         assert_eq!(prov.base_url.as_deref(), Some("https://gw/v1"), "显式字段写入");
         let m = &prov.models["glm-5.3"];
-        assert_eq!(m.name.as_deref(), Some("GLM"), "手写 name 保留（#2）");
+        assert_eq!(m.display_name.as_deref(), Some("GLM"), "手写 displayName 保留（#2）");
         assert_eq!(m.family.as_deref(), Some("fam"));
         assert_eq!(m.per_turn_timeout_secs, Some(999));
         assert_eq!(m.api_key_env.as_deref(), Some("GLM_KEY"));
@@ -1107,8 +1238,20 @@ mod tests {
         assert_eq!(cfg2.providers["newp"].kind, Some(ProviderKind::OpenaiCompatible));
         assert_eq!(cfg2.providers["newp"].api_key_env.as_deref(), Some("P_API_KEY"));
         assert!(cfg2.providers["newp"].models["m1"].roles.contains_key(&Role::Scanner));
+        // 已存在 provider 上显式 --kind / --api-key-env / --per-turn-timeout-secs → 写模型层，provider 层不动（评审 #5）
+        let mut p2 = patch("agc", "k2", &[Role::Scanner]);
+        p2.kind = Some(ProviderKind::Openai);
+        p2.api_key_env = Some("K2_KEY".into());
+        p2.per_turn_timeout_secs = Some(300);
+        write_setup(&p2).unwrap();
+        let cfg3 = Config::load().unwrap();
+        assert_eq!(cfg3.providers["agc"].kind, Some(ProviderKind::Anthropic));
+        assert_eq!(cfg3.providers["agc"].api_key_env.as_deref(), Some("MY_KEY"));
+        let k2 = &cfg3.providers["agc"].models["k2"];
+        assert_eq!((k2.kind, k2.api_key_env.as_deref(), k2.per_turn_timeout_secs), (Some(ProviderKind::Openai), Some("K2_KEY"), Some(300)));
         let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
         assert!(!raw.contains("sk-"), "config 永不含明文 key");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".tmp-")), "原子写：无临时文件残留");
         unsafe { std::env::remove_var("REDTEAM_HOME"); }
     }
 
@@ -1126,10 +1269,11 @@ mod tests {
         let err = write_setup(&p).unwrap_err().to_string();
         assert!(err.contains("未写入") && err.contains("contextWindow"), "{err}");
         assert_eq!(std::fs::read_to_string(dir.path().join("config.json")).unwrap(), good);
-        // 身份串撞名 → 拒写
+        // maxOutputTokens 0 → 拒写、文件不变（评审 #3）
         let mut q = patch("p", "b", &[Role::Scanner]);
-        q.name = Some("p/a".into());
-        assert!(write_setup(&q).unwrap_err().to_string().contains("重复"));
+        q.max_output_tokens = Some(0);
+        assert!(write_setup(&q).unwrap_err().to_string().contains("maxOutputTokens 必须 ≥ 1"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("config.json")).unwrap(), good);
         // 现有文件解析失败 → 拒写（#2/#8 同策略）
         std::fs::write(dir.path().join("config.json"), "{\"providers\": {").unwrap();
         let err2 = write_setup(&patch("p", "a", &[Role::Scanner])).unwrap_err().to_string();
