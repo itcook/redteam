@@ -6,7 +6,7 @@ pub const PROJECT_DIR: &str = ".redteam";
 
 const GITIGNORE_BODY: &str = "*\n";
 
-/// 幂等创建 `.redteam/` 骨架（`.gitignore` / `rounds/` / `proj.db`），返回本次新建的条目；已存在的一律不动。
+/// 幂等创建 `.redteam/` 骨架（`.gitignore` / `rounds/` / `db::DB_FILE`），返回本次新建的条目；已存在的一律不动。
 /// 项目层 `config.toml` 已退场（M21a 批 A，D7 A8：配置用户级唯一，项目目录只放状态与内容）；
 /// dismissed/ 目录已随台账机器化退役（design 2026-07-03：台账/评审史统一 proj.db）。
 pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
@@ -83,10 +83,10 @@ mod tests {
     fn init_creates_skeleton_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let created = init_project(tmp.path()).unwrap();
-        assert_eq!(created.len(), 3, "rounds/ .gitignore proj.db");
+        assert_eq!(created.len(), 3, "rounds/ .gitignore db");
         assert!(!tmp.path().join(".redteam/config.toml").exists(), "项目层 config 退场（D7 A8）");
         assert!(tmp.path().join(".redteam/rounds").is_dir());
-        assert!(tmp.path().join(".redteam/proj.db").is_file(), "init 建库");
+        assert!(tmp.path().join(".redteam").join(crate::db::DB_FILE).is_file(), "init 建库（M21a-b 并行期文件名见 db::DB_FILE）");
         assert!(!tmp.path().join(".redteam/dismissed").exists(), "dismissed/ 目录已退役");
         assert_eq!(std::fs::read_to_string(tmp.path().join(".redteam/.gitignore")).unwrap(), "*\n");
         // 二跑：全部已存在 → 零创建

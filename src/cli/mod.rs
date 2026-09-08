@@ -67,7 +67,7 @@ pub(crate) struct Ledger {
     pub meta: Option<crate::domain::LedgerMeta>,
 }
 
-/// 加载台账：--no-dismissed → 空；缺省 → `.redteam/proj.db` 存在才加载（零副作用，不建库）；
+/// 加载台账：--no-dismissed → 空；缺省 → `.redteam/<db::DB_FILE>` 存在才加载（零副作用，不建库）；
 /// `--dismissed <值>` → 文件=db 路径覆盖 / 目录=已废弃形态报错引导迁移 / 否则 csv 仅豁免。
 pub(crate) fn load_ledger(
     dismissed: Option<&str>,
@@ -96,8 +96,8 @@ pub(crate) fn load_ledger(
             let p = Path::new(v);
             if p.is_dir() {
                 anyhow::bail!(
-                    "--dismissed: directory ledgers are retired; migrate cards into .redteam/proj.db \
-                     via 'redteam dismiss add' (see 'redteam dismiss --help')"
+                    "--dismissed: directory ledgers are retired; migrate cards into .redteam/{} \
+                     via 'redteam dismiss add' (see 'redteam dismiss --help')", crate::db::DB_FILE
                 );
             }
             if p.is_file() {
@@ -135,7 +135,7 @@ pub fn legacy_opts_from_roles(roles: &RoleSets, max_concurrency: usize) -> Resul
         return Err("未配置 [[scanners]]：在 ~/.redteam/config.toml（REDTEAM_HOME 可覆盖）至少加一条，见 `redteam model setup --help`".to_string());
     }
     Ok(OrchestrateOpts {
-        models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0 }).collect(),
+        models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0, family: m.family.clone() }).collect(),
         replicate: true,
         no_fallback: true,
         max_concurrency,
@@ -523,6 +523,12 @@ pub async fn run_resume(
         .collect();
     let pending: Vec<&crate::state::CellInput> =
         manifest.iter().filter(|c| !done.contains(&c.cell)).collect();
+    // 家族随记录落库：按 manifest 的 model 名回查当前角色条目（条目已删则空串）。
+    let roles = cfg.active_roles();
+    let family_of = |name: &str| -> String {
+        roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers)
+            .find(|m| m.name == name).map(|m| m.family.clone()).unwrap_or_default()
+    };
 
     let mut usage = (0u64, 0u64, 0u64);
     let mut warnings = Vec::new();
@@ -550,7 +556,7 @@ pub async fn run_resume(
                 let mut rec = crate::state::CellRecord::ok(
                     cell.cell.clone(), cell.model.clone(),
                     crate::domain::CellOutput::Review { findings: fs, needs: call.needs.clone() },
-                );
+                ).with_family(family_of(&cell.model));
                 rec.duration_ms = elapsed.as_millis() as u64;
                 rec.input_tokens = call.input_tokens;
                 rec.output_tokens = call.output_tokens;
@@ -564,7 +570,7 @@ pub async fn run_resume(
                 warnings.push(format!("resume cell [{}] model {}: {e}", cell.cell, cell.model));
                 let mut rec = crate::state::CellRecord::failed(
                     cell.cell.clone(), cell.model.clone(), crate::domain::Role::Reviewer, e.to_string(),
-                );
+                ).with_family(family_of(&cell.model));
                 rec.duration_ms = elapsed.as_millis() as u64;
                 rec.attempts = 1;
                 rec
@@ -2041,7 +2047,7 @@ mod tests {
         drop(db2);
         let l3 = load_ledger(None, false, &root).unwrap();
         assert_eq!(l3.cards.len(), 1);
-        assert!(l3.meta.as_ref().unwrap().source.contains("proj.db"));
+        assert!(l3.meta.as_ref().unwrap().source.contains(crate::db::DB_FILE), "{}", l3.meta.as_ref().unwrap().source);
     }
     #[tokio::test]
     async fn jobcellsink_manifest_sets_phase_fanout() {

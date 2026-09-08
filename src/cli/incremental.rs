@@ -1,5 +1,5 @@
 //! M13 增量评审（决议 2-5）：四守卫 preflight + 主流水线 `run_incremental_review`
-//! （delta fan-out → carry/merge → refute(new-only) → verdict → schema v3 报告）。
+//! （delta fan-out → carry/merge → refute(new-only) → verdict → schema v4 报告）。
 
 use crate::bundle::{group, select_files};
 use crate::config::Config;
@@ -14,7 +14,7 @@ use super::tail::{assemble_report, model_ids_for, CarryCtx, TailCtx};
 use super::{build_packs, legacy_opts_from_roles, load_ledger, merge_bundles, pack_budget_bytes, parse_sev, ReviewArgs};
 
 /// M13 增量轮主流水线（决议 2-5）：四守卫 → delta fan-out（<incremental_round> 注入）
-/// → carry/merge → refute(new-only) → verdict(合并集) → schema v3 报告。
+/// → carry/merge → refute(new-only) → verdict(合并集) → schema v4 报告。
 /// 只由 run_review_dispatch 路由进入（前台与后台 worker 共用）。
 pub async fn run_incremental_review(
     args: &ReviewArgs,

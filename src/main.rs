@@ -74,7 +74,7 @@ enum Cmd {
         #[arg(long)]
         resume: Option<String>,
         /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：
-        /// 项目存在 .redteam/proj.db 即自动加载（豁免 + refute 判例裁决），run.ledger 披露。
+        /// 项目存在 .redteam/proj-next.db 即自动加载（豁免 + refute 判例裁决），run.ledger 披露。
         #[arg(long)]
         dismissed: Option<String>,
         /// 本次评审完全关闭台账（豁免/预筛/判例注入全停）。
@@ -94,11 +94,11 @@ enum Cmd {
         /// 输出格式：json（默认，机读契约）| table（人读）
         #[arg(long, default_value = "json", value_parser = ["json", "table"])]
         format: String,
-        /// 输出该 job 的 cell 级明细（JSON 数组：duration_ms/tokens/attempts/warn，调试用）。
+        /// 输出该 job 的 cell 级明细（JSON 数组，schema v4：每条带 output{role,…} 角色分叉输出 + duration_ms/tokens/attempts/warn，调试用）。
         #[arg(long)]
         cells: bool,
     },
-    /// 取回作业的评审结果（持久存储于 .redteam/proj.db，永不过期、可重复取）。
+    /// 取回作业的评审结果（持久存储于 .redteam/proj-next.db，永不过期、可重复取）。
     /// 任一终态可取（failed/timed_out 有部分报告也放行）；未终态是命令自身失败，退出码 1。
     Result {
         /// 作业 id（review --background 的输出）。
@@ -123,19 +123,19 @@ enum Cmd {
         #[command(subcommand)]
         action: ModelCmd,
     },
-    /// 驳回判例台账（.redteam/proj.db）：建卡/查卡/状态迁移/锚失效回收。
+    /// 驳回判例台账（.redteam/proj-next.db）：建卡/查卡/状态迁移/锚失效回收。
     Dismiss {
         #[command(subcommand)]
         action: DismissCmd,
     },
-    /// 销案判例台账（.redteam/proj.db 独立表，不混 dismissed——已修复≠误报，不进豁免/预筛）：
+    /// 销案判例台账（.redteam/proj-next.db 独立表，不混 dismissed——已修复≠误报，不进豁免/预筛）：
     /// 建卡/查卡。增量轮（review --incremental-from）据此不再携带该 finding；quote 未随修复
     /// 消失的会注入下轮「顺带验证」防假修复。
     Resolve {
         #[command(subcommand)]
         action: ResolveCmd,
     },
-    /// 幂等创建项目级 .redteam/ 骨架（.gitignore、rounds/、proj.db；配置在用户级 ~/.redteam/，项目层不再有 config.toml）。
+    /// 幂等创建项目级 .redteam/ 骨架（.gitignore、rounds/、proj-next.db；配置在用户级 ~/.redteam/，项目层不再有 config.toml）。
     Init,
     /// 打印生效的测试命令（ship 循环第 2 步用）：--override > Cargo.toml→`cargo test` > package.json 有
     /// scripts.test→`npm test` > Makefile 有 test 目标→`make test` > go.mod→`go test ./...`；推不出 →

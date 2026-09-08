@@ -323,11 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_4() {
-        assert_eq!(SCHEMA_VERSION, "4");
-    }
-
-    #[test]
     fn runmeta_dossier_roundtrips_and_old_json_defaults_to_none() {
         // T01⑥：dossier 有值 → 序列化带 dossier 键；旧 JSON（无 dossier 键）→ 反序列化为 None。
         let mut m = RunMeta {

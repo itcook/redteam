@@ -775,7 +775,7 @@ model_id="m-id"
     // dismissed_reappeared 派生索引证明 mark_dismissed（尾段专属步骤）真的处理过它。
     let ledger = report.run.ledger.as_ref().expect("台账应自动加载，run.ledger 应披露");
     assert_eq!(ledger.loaded, 1, "应加载到刚写入的这 1 条判例");
-    assert!(ledger.source.contains("proj.db"), "来源应指向 .redteam/proj.db: {}", ledger.source);
+    assert!(ledger.source.contains(redteam::db::DB_FILE), "来源应指向 .redteam/{}: {}", redteam::db::DB_FILE, ledger.source);
     assert!(
         report.run.dismissed_reappeared.contains(&id),
         "id 应进入 dismissed_reappeared 派生索引（mark_dismissed 尾段处理的直接产物）"

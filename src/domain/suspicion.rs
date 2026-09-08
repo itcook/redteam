@@ -6,6 +6,9 @@
 use super::finding::{Finding, NeedEntry, VerifyVerdict};
 use serde::{Deserialize, Serialize};
 
+/// 角色枚举复用配置层定义（批 A `config::Role`：serde 小写、`parse` / `as_str` / `list_key`），domain 不另定义。
+pub use crate::config::Role;
+
 /// 规则家族 L0-L5（design §4：category 取 L0-L5；自标可靠性未验，M21c 看台账数据再议）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -43,21 +46,6 @@ pub struct ScanOutput {
     pub scanned_areas: Vec<ScannedArea>,
 }
 
-/// cell 角色（design §2 三角色）。序列化小写，与 `CellOutput` 的 tag 值、`cells.role` 列同串。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role { Scanner, Reviewer, Verifier }
-
-impl Role {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Role::Scanner => "scanner",
-            Role::Reviewer => "reviewer",
-            Role::Verifier => "verifier",
-        }
-    }
-}
-
 /// verifier cell 的单条判决（design §8.1：`REFUTED | UPHELD` + 一句理由；analysis 先于 verdict 是 prompt 字段序，不在此）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VerifyEntry {
@@ -69,7 +57,8 @@ pub struct VerifyEntry {
 }
 
 /// 一 cell 一条、按角色分叉（D11-7）。`role` 作内部 tag：缺失即 serde 报错，不默认——记录类型在类型上说清。
-/// tag 值与 [`Role`] 的串一致（`scanner` / `reviewer` / `verifier`），`CellRecord.role` 从 [`CellOutput::role`] 派生。
+/// tag 值与 [`Role`] 的串一致（`scanner` / `reviewer` / `verifier`），是记录角色的**唯一真相源**：
+/// `CellRecord::role()` 与 `cells.role` 列都从 [`CellOutput::role`] 派生（评审裁定 2026-09-08，不另存字段）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role")]
 pub enum CellOutput {
@@ -219,10 +208,13 @@ mod tests {
     }
 
     #[test]
-    fn role_serializes_lowercase_and_matches_as_str() {
-        for r in [Role::Scanner, Role::Reviewer, Role::Verifier] {
+    fn role_tag_matches_config_role_strings() {
+        // 复用 config::Role：serde 串、as_str、parse 与 CellOutput tag 三者同一张表。
+        for r in Role::ALL {
             assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{}\"", r.as_str()));
-            assert_eq!(serde_json::from_str::<Role>(&format!("\"{}\"", r.as_str())).unwrap(), r);
+            assert_eq!(Role::parse(r.as_str()), Some(r));
+            let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&CellOutput::empty(r)).unwrap()).unwrap();
+            assert_eq!(v["role"], r.as_str());
         }
     }
 
