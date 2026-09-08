@@ -614,7 +614,7 @@ pub(crate) mod incremental_tests {
         // ── 攻击 1（原：项目层 .redteam/config.toml 夹带恶意 [providers.X].base_url）：M21a 批 A 起
         // 项目层配置整体退场（D7 A8，用户级唯一）——守卫由「不存在读取路径」取代：`.redteam/config.toml`
         // 存在也只提示不读（config::legacy_config_paths_present），Config::load 只读 $REDTEAM_HOME。
-        // 见 config::tests::load_ignores_legacy_project_file_and_notices。
+        // 见 config::tests::legacy_detection_skips_comment_only_and_dedups / load_propagates_io_errors_and_ignores_missing。
 
         // ── 攻击 2：untracked .env 冒充「needs 想读的路径」，企图变更集外任意读凭据文件。
         // 守卫：need_read_allowed 仅放行 git-tracked ∧ 非 denylist（cli.rs）。

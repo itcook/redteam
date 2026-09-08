@@ -163,22 +163,10 @@ pub(crate) const PER_TURN_DEADLINE: std::time::Duration = std::time::Duration::f
 /// 单轮最长等待时间，env `REDTEAM_PER_TURN_SECS` 可覆盖——大上下文 bundle（40+ 文件）
 /// 配深思考模型（glm/kimi 等）单轮思考+生成可超 150s 被掐成 `turn timeout`（2026-09-03
 /// dogfood 实证，非网络不可达而是慢）。校准旋钮，对齐 `REDTEAM_HTTP_TIMEOUT_SECS`（9f7540b）
-/// 先例；调大时两旋钮需一起抬（HTTP 整请求超时默认 300s，先于此处掐断）。
+/// 先例。HTTP 整请求超时由 `backend_from_config` 按该模型 per_turn 自动抬（`http_timeout_for`，评审 M2），
+/// 不必再手动同步 `REDTEAM_HTTP_TIMEOUT_SECS`；env 解析与 `config::EffectiveModel::per_turn_secs` 共用 `config::env_per_turn_secs`（评审 S6）。
 pub fn per_turn_deadline() -> std::time::Duration {
-    match std::env::var("REDTEAM_PER_TURN_SECS") {
-        Ok(s) => match s.parse::<u64>() {
-            Ok(v) => std::time::Duration::from_secs(v),
-            Err(_) => {
-                // F4：静默回落会让运维误以为旋钮已生效，复发时被迫活体复现调试。
-                eprintln!(
-                    "warning: REDTEAM_PER_TURN_SECS={s:?} 非法（需整秒数），回落默认 {:?}",
-                    PER_TURN_DEADLINE
-                );
-                PER_TURN_DEADLINE
-            }
-        },
-        Err(_) => PER_TURN_DEADLINE,
-    }
+    crate::config::env_per_turn_secs().map(std::time::Duration::from_secs).unwrap_or(PER_TURN_DEADLINE)
 }
 const RETRY_BACKOFF_BASE_MS: u64 = 200;
 const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
@@ -251,19 +239,34 @@ pub(crate) async fn timed_turn_final(
     }).await
 }
 
-/// 带超时的共享 HTTP client（connect 10s / 整请求默认 300s，`REDTEAM_HTTP_TIMEOUT_SECS` 可覆盖）；
-/// 构建失败回落默认 client。整请求超时是**校准旋钮**：思考型模型（MiniMax-M3 等）在大上下文
-/// bundle 上单轮响应可 >120s（旧值），非网络不可达（ping 通）而是慢——留 env 供按模型/网络调。
-pub(crate) fn default_http_client() -> reqwest::Client {
-    let secs = std::env::var("REDTEAM_HTTP_TIMEOUT_SECS")
+/// `REDTEAM_HTTP_TIMEOUT_SECS`（整请求超时，缺省 300s）：思考型模型在大上下文 bundle 上单轮响应可 >120s（旧值），
+/// 非网络不可达（ping 通）而是慢——留 env 供按网络粗调；非法 / 0 → 缺省。
+pub(crate) fn http_timeout_env_secs() -> u64 {
+    std::env::var("REDTEAM_HTTP_TIMEOUT_SECS")
         .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(300);
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(300)
+}
+
+/// 整请求超时须罩住单轮超时（评审 M2：否则 reqwest 在 300s 先切断响应体，报 Unavailable 而非 Timeout，慢模型永远完不成一轮）：
+/// env 值与 `per_turn + 60s` 取大。
+pub(crate) fn http_timeout_for(per_turn_secs: u64) -> u64 {
+    http_timeout_env_secs().max(per_turn_secs.saturating_add(60))
+}
+
+/// 带超时的 HTTP client（connect 10s / 整请求 `secs`）；构建失败回落默认 client。
+pub(crate) fn http_client_with_timeout(secs: u64) -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(secs))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// 缺省 client：整请求超时取 env / 300s（`backend_from_config` 会按模型 per_turn 重建）。
+pub(crate) fn default_http_client() -> reqwest::Client {
+    http_client_with_timeout(http_timeout_env_secs())
 }
 
 /// Anthropic Messages 端点 URL：规范化 base 的 `/v1`——无论 base 含不含 `/v1`，最终都拼成

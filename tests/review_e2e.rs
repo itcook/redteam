@@ -743,7 +743,7 @@ fn clap_parse_error_exits_1_help_exits_0() {
             .expect("应有退出码")
     };
     assert_eq!(run(&["--badflag"]), 1, "非法 flag 应退 1（命令错误档）");
-    assert_eq!(run(&["model", "setup", "--provider", "X", "--context-tokens", "999K"]), 1,
+    assert_eq!(run(&["model", "setup", "--provider", "X", "--model", "m", "--role", "scanner", "--thinking-level", "ultra"]), 1,
         "非法枚举值应退 1");
     assert_eq!(run(&[]), 1, "裸命令缺子命令应退 1");
     assert_eq!(run(&["--help"]), 0, "--help 是正常展示，应退 0");

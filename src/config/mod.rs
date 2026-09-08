@@ -180,6 +180,20 @@ pub fn env_max_tokens() -> u64 {
     }
 }
 
+/// `REDTEAM_PER_TURN_SECS` env 解析（`per_turn_secs` 与 `provider::per_turn_deadline` 共用，评审 S6）：非法 / 0 → warning + None（按模型 / 公式）。
+pub fn env_per_turn_secs() -> Option<u64> {
+    match std::env::var("REDTEAM_PER_TURN_SECS") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(v) if v > 0 => Some(v),
+            _ => {
+                eprintln!("warning: REDTEAM_PER_TURN_SECS={s:?} 非法（需正整数秒），忽略——按模型 perTurnTimeoutSecs / 公式");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
 impl EffectiveModel {
     /// backend 实际发送的 max_tokens：模型 `maxOutputTokens` > `REDTEAM_MAX_TOKENS` env > 32768（与 backends.rs 共用 `env_max_tokens`）。
     pub fn max_tokens_effective(&self) -> u64 {
@@ -190,7 +204,7 @@ impl EffectiveModel {
         if let Some(s) = self.per_turn_timeout_secs {
             return s;
         }
-        if let Some(s) = std::env::var("REDTEAM_PER_TURN_SECS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|v| *v > 0) {
+        if let Some(s) = env_per_turn_secs() {
             return s;
         }
         self.max_tokens_effective() / 20 + 60
@@ -437,6 +451,16 @@ impl Config {
                 ));
             }
         }
+        let spath = secrets::secrets_path()?;
+        if !spath.is_file() {
+            for p in legacy_secrets_paths_present() {
+                messages.push(format!(
+                    "notice: 密钥已改读 {}（严格 JSON）；旧文件 {} 未读——用 `redteam model setup … --key-store secrets [--model-key]` 重写或手动迁移",
+                    spath.display(),
+                    p.display()
+                ));
+            }
+        }
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -458,7 +482,10 @@ impl Config {
         }
         let v: serde_json::Value = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("JSON 解析失败：{e}"))?;
         warnings.extend(shape_guard(&v)?);
-        let cfg: Config = serde_json::from_value(v).map_err(|e| anyhow::anyhow!("配置形状错误：{e}"))?;
+        let cfg: Config = serde_json::from_value(v.clone()).map_err(|e| {
+            let at = locate_shape_error(&v).map(|p| format!("{p}：")).unwrap_or_default();
+            anyhow::anyhow!("配置形状错误：{at}{e}")
+        })?;
         cfg.validate()?;
         for (pname, p) in &cfg.providers {
             for (id, m) in &p.models {
@@ -596,10 +623,16 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut errs = Vec::new();
         for (pname, p) in &self.providers {
+            if pname.is_empty() || pname.contains('/') {
+                errs.push(format!("provider 名 {pname:?} 非法：须非空且不含 '/'（身份串 provider/id 须可拆）"));
+            }
             if p.max_concurrency == Some(0) {
                 errs.push(format!("providers.{pname}.maxConcurrency 必须 ≥ 1"));
             }
             for (id, m) in &p.models {
+                if id.is_empty() {
+                    errs.push(format!("providers.{pname}.models 含空 model id"));
+                }
                 if m.kind.or(p.kind).is_none() {
                     errs.push(format!("providers.{pname}.models.{id}: 缺 kind（模型层或 provider 层至少一处：openai | anthropic）"));
                 }
@@ -627,6 +660,9 @@ impl Config {
             if v == 0 {
                 errs.push(format!("{k} 必须 ≥ 1"));
             }
+        }
+        if !(0.0..=1.0).contains(&r.conf_floor) {
+            errs.push(format!("review.confFloor {} 须在 0.0..=1.0（评审 S2）", r.conf_floor));
         }
         if !errs.is_empty() {
             anyhow::bail!("配置校验失败：\n{}", errs.join("\n"));
@@ -737,10 +773,44 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     Ok(warnings)
 }
 
+/// `from_value` 的错误不带字段路径（serde_json 只在语法错误带行列）：按 model / provider / review 段逐个试解析，
+/// 定位第一处失败的路径（评审 S3）。
+fn locate_shape_error(v: &serde_json::Value) -> Option<String> {
+    let top = v.as_object()?;
+    if let Some(provs) = top.get("providers").and_then(|p| p.as_object()) {
+        for (pname, pv) in provs {
+            if let Some(ms) = pv.get("models").and_then(|m| m.as_object()) {
+                for (id, mv) in ms {
+                    if serde_json::from_value::<ModelConfig>(mv.clone()).is_err() {
+                        return Some(format!("providers.{pname}.models.{id}"));
+                    }
+                }
+            }
+            let mut po = pv.clone();
+            if let Some(o) = po.as_object_mut() {
+                o.remove("models");
+            }
+            if serde_json::from_value::<ProviderConfig>(po).is_err() {
+                return Some(format!("providers.{pname}"));
+            }
+        }
+    }
+    if let Some(r) = top.get("review") {
+        if serde_json::from_value::<ReviewConfig>(r.clone()).is_err() {
+            return Some("review".into());
+        }
+    }
+    None
+}
+
 /// 配置根：`$REDTEAM_HOME`（非空）否则 `$HOME/.redteam`；两者皆缺 → 错误（#1：不退化为相对路径，防把项目层文件当用户配置读）。
 pub fn redteam_home() -> anyhow::Result<PathBuf> {
     if let Some(v) = std::env::var_os("REDTEAM_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(v));
+        let p = PathBuf::from(v);
+        if !p.is_absolute() {
+            anyhow::bail!("REDTEAM_HOME 须为绝对路径（当前 {}）——相对路径会随 CWD 把仓内文件当用户配置读（#1，评审 S8）", p.display());
+        }
+        return Ok(p);
     }
     if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(h).join(".redteam"));
@@ -766,16 +836,25 @@ fn comment_only(p: &Path) -> bool {
 /// 旧路径探测（只提示不读）：`$XDG_CONFIG_HOME/redteam/config.toml`、`~/.config/redteam/config.toml`（09-04 前用户层）、
 /// `./.redteam/config.toml`（项目层）、`$REDTEAM_HOME/config.toml`（批 A 首版 TOML）。纯注释文件不算；canonical 去重。
 pub fn legacy_config_paths_present() -> Vec<PathBuf> {
+    legacy_paths_present("config.toml")
+}
+
+/// dev 版 / 首版 `secrets.toml`：key 不会被读，只提示（评审 S7）。
+pub fn legacy_secrets_paths_present() -> Vec<PathBuf> {
+    legacy_paths_present("secrets.toml")
+}
+
+fn legacy_paths_present(file: &str) -> Vec<PathBuf> {
     let mut cands: Vec<PathBuf> = Vec::new();
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        cands.push(PathBuf::from(x).join("redteam").join("config.toml"));
+        cands.push(PathBuf::from(x).join("redteam").join(file));
     }
     if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from) {
-        cands.push(home.join(".config").join("redteam").join("config.toml"));
+        cands.push(home.join(".config").join("redteam").join(file));
     }
-    cands.push(PathBuf::from(".redteam").join("config.toml"));
+    cands.push(PathBuf::from(".redteam").join(file));
     if let Ok(h) = redteam_home() {
-        cands.push(h.join("config.toml"));
+        cands.push(h.join(file));
     }
     let mut out: Vec<PathBuf> = Vec::new();
     for p in cands {
@@ -1029,6 +1108,10 @@ mod tests {
         assert!(err.contains("contextWindow 128 低于下限"), "{err}");
         assert!(err.contains("models.c: maxOutputTokens 必须 ≥ 1") && err.contains("models.c: perTurnTimeoutSecs 必须 ≥ 1"), "评审 #3: {err}");
         assert!(err.contains("providers.q.maxConcurrency 必须 ≥ 1"), "{err}");
+        let cf = Config::from_json(r#"{"review":{"confFloor":5}}"#).unwrap_err().to_string();
+        assert!(cf.contains("review.confFloor"), "配置层 confFloor 越界（评审 S2）: {cf}");
+        let nm = Config::from_json(r#"{"providers":{"a/b":{"kind":"openai","models":{"":{"roles":{"scanner":{}}}}}}}"#).unwrap_err().to_string();
+        assert!(nm.contains("provider 名") && nm.contains("空 model id"), "空名 / 含 '/' 的 provider 名拒绝（评审 N6）: {nm}");
         let z = Config::from_json(r#"{"review":{"scanners":{"workers":0}}}"#).unwrap_err().to_string();
         assert!(z.contains("review.scanners.workers"), "{z}");
     }
@@ -1049,6 +1132,10 @@ mod tests {
         assert!(e6.contains("name 已改名 displayName"), "{e6}");
         let e7 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"judge":{}}}}}}}"#).unwrap_err().to_string();
         assert!(e7.contains("roles.judge") && e7.contains("scanner | reviewer | verifier"), "{e7}");
+        let e8 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"contextWindow":"1M","roles":{"scanner":{}}}}}}}"#).unwrap_err().to_string();
+        assert!(e8.contains("providers.p.models.m") && e8.contains("invalid type"), "形状错误带字段路径（评审 S3）: {e8}");
+        let e9 = Config::from_json(r#"{"review":{"tools":"maybe"}}"#).unwrap_err().to_string();
+        assert!(e9.contains("review：") || e9.contains("review:"), "{e9}");
         let bad = Config::from_json(r#"{"providers":{"p":{"kind":"openai",}}}"#).unwrap_err().to_string();
         assert!(bad.contains("line"), "解析错误须带行列: {bad}");
     }
@@ -1143,6 +1230,8 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let saved_home = std::env::var_os("HOME");
         // SAFETY: ENV_LOCK 串行化
+        unsafe { std::env::set_var("REDTEAM_HOME", ".redteam"); }
+        assert!(redteam_home().unwrap_err().to_string().contains("绝对路径"), "相对 REDTEAM_HOME 拒绝（评审 S8）");
         unsafe { std::env::set_var("REDTEAM_HOME", "/tmp/rt-home-x"); }
         assert_eq!(config_path().unwrap(), PathBuf::from("/tmp/rt-home-x/config.json"));
         assert_eq!(secrets::secrets_path().unwrap(), PathBuf::from("/tmp/rt-home-x/secrets.json"));
@@ -1188,6 +1277,9 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("home")).unwrap();
         std::fs::write(dir.path().join("home").join("config.toml"), "[review]\n").unwrap();
         assert!(legacy_config_paths_present().iter().any(|p| p.ends_with("home/config.toml")), "首版 TOML 也提示");
+        std::fs::write(dir.path().join("home").join("secrets.toml"), "[providers.p]\nx=\"y\"\n").unwrap();
+        assert!(legacy_secrets_paths_present().iter().any(|p| p.ends_with("home/secrets.toml")), "旧 secrets.toml 也提示（评审 S7）");
+        assert!(legacy_secrets_paths_present().iter().all(|p| !p.ends_with("config.toml")));
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
             std::env::remove_var("REDTEAM_HOME");

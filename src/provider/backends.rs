@@ -285,6 +285,12 @@ impl AnthropicBackend {
         self.output_limit = limit;
         self
     }
+
+    /// 整请求超时（秒）：`backend_from_config` 按该模型 per_turn 抬到罩住单轮（评审 M2）。
+    pub fn with_http_timeout(mut self, secs: u64) -> Self {
+        self.client = crate::provider::http_client_with_timeout(secs);
+        self
+    }
 }
 
 #[async_trait]
@@ -572,6 +578,12 @@ impl OpenAiBackend {
         self
     }
 
+    /// 整请求超时（秒）：`backend_from_config` 按该模型 per_turn 抬到罩住单轮（评审 M2）。
+    pub fn with_http_timeout(mut self, secs: u64) -> Self {
+        self.client = crate::provider::http_client_with_timeout(secs);
+        self
+    }
+
     /// 共享 HTTP 发送：POST {base}/chat/completions（流式），累积 SSE 解析这一轮输出。
     /// 流式消费的意义：reqwest 随 token 到达读 socket → 连接持续有数据流，隧道/网关不当空闲
     /// reset（非 stream 长思考期连接静默 = 超时/reset 根因）。
@@ -644,17 +656,19 @@ pub fn backend_from_config(
     em: &crate::config::EffectiveModel,
     api_key: String,
 ) -> Result<Box<dyn ChatBackend>, ProviderError> {
+    // 整请求超时罩住单轮（评审 M2）：慢模型 per_turn 1200s 时 reqwest 不再在 300s 先切断。
+    let http_secs = crate::provider::http_timeout_for(em.per_turn_secs());
     match em.kind {
         ProviderKind::Anthropic => Ok(Box::new(AnthropicBackend::new(
             em.id.clone(),
             em.base_url.clone(),
             api_key,
-        ).with_max_tokens(em.max_output_tokens))),
+        ).with_max_tokens(em.max_output_tokens).with_http_timeout(http_secs))),
         ProviderKind::Openai | ProviderKind::OpenaiCompatible => Ok(Box::new(OpenAiBackend::new(
             em.id.clone(),
             em.base_url.clone(),
             api_key,
-        ).with_max_tokens(em.max_output_tokens))),
+        ).with_max_tokens(em.max_output_tokens).with_http_timeout(http_secs))),
         ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
     }
 }
@@ -664,6 +678,21 @@ mod tests {
     use super::*;
     use crate::config::DEFAULT_MAX_TOKENS as MAX_TOKENS;
     use crate::tools::tool_specs;
+
+    /// 评审 M2：整请求超时随 per_turn 抬；env 更大时取 env。
+    #[test]
+    fn http_timeout_covers_per_turn() {
+        let _g = crate::config::ENV_LOCK.lock().unwrap();
+        // SAFETY: ENV_LOCK 串行化
+        unsafe { std::env::remove_var("REDTEAM_HTTP_TIMEOUT_SECS"); }
+        assert_eq!(crate::provider::http_timeout_for(100), 300, "短轮：缺省 300 罩得住");
+        assert_eq!(crate::provider::http_timeout_for(1200), 1260, "长轮：per_turn + 60");
+        unsafe { std::env::set_var("REDTEAM_HTTP_TIMEOUT_SECS", "2000"); }
+        assert_eq!(crate::provider::http_timeout_for(1200), 2000, "env 更大时取 env");
+        unsafe { std::env::set_var("REDTEAM_HTTP_TIMEOUT_SECS", "0"); }
+        assert_eq!(crate::provider::http_timeout_env_secs(), 300, "0 / 非法 → 缺省");
+        unsafe { std::env::remove_var("REDTEAM_HTTP_TIMEOUT_SECS"); }
+    }
 
     fn specs() -> Vec<ToolSpec> {
         tool_specs()

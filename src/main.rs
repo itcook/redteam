@@ -357,6 +357,18 @@ fn spawn_detached_worker(job_id: &str) -> std::io::Result<u32> {
 
 /// 加载配置；解析失败时打 stderr 警告（而非静默回落空配置——否则配置写错一个字段
 /// 就「无任何输出」无从诊断）后回落默认。
+/// 评审 / worker 路径：配置加载失败是硬错误（评审 S10：吞成空配置会把「解析失败」伪装成「未配置 scanner」，
+/// 后台 worker 的 stderr 还是 /dev/null，job 终态错误就指错方向）。
+fn load_config_or_exit() -> Config {
+    match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn load_config_warned() -> Config {
     match Config::load() {
         Ok(c) => c,
@@ -490,7 +502,7 @@ async fn main() {
             incremental_from,
             pack_only,
         } => {
-            let cfg = load_config_warned();
+            let cfg = load_config_or_exit();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
             let fmt = parse_format(&format);
@@ -656,7 +668,7 @@ async fn main() {
             }
         }
         Cmd::Worker { job_id } => {
-            let cfg = load_config_warned();
+            let cfg = load_config_or_exit();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let ws = cwd.clone();
             // ④级：worker 主进程打不开 store 是硬错误，直接报错退出。

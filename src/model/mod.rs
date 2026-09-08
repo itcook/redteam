@@ -81,9 +81,11 @@ pub async fn check_all(cfg: &Config, prober: &dyn Prober) -> Vec<Availability> {
     out
 }
 
-/// 退出码：非空且全部可用→0；否则→1（供脚本/循环 SKILL 评审前预检）。
+/// 退出码：至少一个 scanner 且全部可用→0；否则→1（供脚本/循环 SKILL 评审前预检；只配 reviewer / verifier 时 review 会因
+/// 无 scanner 失败，预检同步报 1，评审 S9）。
 pub fn check_exit_code(avs: &[Availability]) -> i32 {
-    if !avs.is_empty() && avs.iter().all(|a| a.available()) {
+    let has_scanner = avs.iter().any(|a| a.provider.starts_with("scanner:"));
+    if has_scanner && avs.iter().all(|a| a.available()) {
         0
     } else {
         1
@@ -231,6 +233,8 @@ mod tests {
     #[test]
     fn exit_code_empty_is_nonzero() {
         assert_eq!(check_exit_code(&[]), 1, "无 provider→非 0（预检无可用 model）");
+        let rev_only = [Availability { provider: "reviewer:p/m".into(), key_present: true, reachable: true, model_listed: Some(true) }];
+        assert_eq!(check_exit_code(&rev_only), 1, "无 scanner → 1（评审 S9）");
     }
 
     #[test]

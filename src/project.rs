@@ -42,7 +42,7 @@ pub fn infer_test_command(root: &Path) -> Option<String> {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
             // npm init 的占位脚本 `echo "Error: no test specified" && exit 1` 不算有测试（#11）。
             if let Some(t) = v.get("scripts").and_then(|s| s.get("test")).and_then(|t| t.as_str()) {
-                if !t.contains("no test specified") {
+                if !t.trim().is_empty() && !t.contains("no test specified") {
                     return Some("npm test".into());
                 }
             }
@@ -142,6 +142,8 @@ mod tests {
         let t2 = tempfile::tempdir().unwrap();
         std::fs::write(t2.path().join("package.json"), r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#).unwrap();
         assert_eq!(infer_test_command(t2.path()), None, "npm init 占位脚本不算");
+        std::fs::write(t2.path().join("package.json"), r#"{"scripts":{"test":""}}"#).unwrap();
+        assert_eq!(infer_test_command(t2.path()), None, "空 test 脚本不算（评审 N7）");
         assert!(is_make_test_target("test: build") && is_make_test_target("test::") && is_make_test_target("test\t:"));
         assert!(!is_make_test_target("test ::= x") && !is_make_test_target("tests:") && !is_make_test_target("test-unit:"));
     }
