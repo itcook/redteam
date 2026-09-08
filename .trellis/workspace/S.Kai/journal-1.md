@@ -215,3 +215,29 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 ### Status
 
 [OK] **Completed**
+
+
+## Session 10: M21a 批 D 契约与提示词：疑点 parse + shared-head/scanner 模板 + 四块段序 + 三段界 cache + 评分器 + 评审修复
+<!-- trellis-session: v=2 fp=f3e5b208a1f8f412 -->
+
+**Date**: 2026-09-08
+**Task**: M21a 批 D 契约与提示词：疑点 parse + shared-head/scanner 模板 + 四块段序 + 三段界 cache + 评分器 + 评审修复
+**Branch**: `feat/m21a-prompts`
+
+### Summary
+
+批 D 五步交付：parse_scan_output 字段级规整（缺 suspicions 即违约走 REPAIR_PROMPT_SCAN）+ anchor_suspicions（quote 不在文件即丢、就近命中、不可读单列计数）；shared-head.md（字节稳定 system：规则 / 立场 / 证据政策 / CI 跳过 / 免疫段 / brief / spec 槽）+ scanner.md（E3 B 臂疑似即列 + 判例槽 + needs 措辞 + 与 serde 字段逐一对应的契约）；build_scan_prompt 四块（参考 → 证据 → diff → 尾）+ cache_boundary + 独立 SCAN 中和表（旧 prompt 逐字节不变）；ChatMessage::UserBlocks 三段界 cache_control（末块规则守上限 4）+ template_hashes 入 CellRecord；eval/scan_score.py（E3 口径，本机复算 B 臂基线 union 9 一致）。code-review 子 agent 1 必修 + 11 建议 + 10 nit 并入 ced42e7；两项记 followup（结果 JSON 无 scanner 输出面 → F；增量轮框架语无槽 → M21c）。三道门 509+16+7+16 绿。待办：主工作树 --no-ff 合回；批 E 另开 session。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f84b5d7` | feat(parse): 疑点契约 parse 字段级对齐 + quote 不在文件即丢弃 + needs 帽（design §4〔D11〕） |
+| `e360cdf` | feat(prompt): 模板拆分 shared-head.md + scanner.md，build_scan_prompt 四块段序 + 注入互斥与中和（design §10.3 / §10.7〔D6 D9〕） |
+| `86521b2` | feat(provider): anthropic kind 三段界 cache_control + 模板哈希入 CellRecord（D10） |
+| `cfae1ec` | chore(eval): scan_score.py——scanner 疑点对 oracle 的离线回归评分（模板改动门，design §10.7） |
+| `ced42e7` | fix(prompt): 批 D 评审修复——user_focus 框架语、scan/legacy 中和表分离、骨架入哈希、行号 clamp、路径与 ranges 规范化、锚定分计数与就近命中、分块会话尾断点、评分器口径与边角 |
+
+### Status
+
+[OK] **Completed**

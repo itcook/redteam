@@ -22,6 +22,15 @@
 - `p0_oracle.py` — 从 proj.db cells / rpiv 报告 / 人工对齐文件组装 oracle JSON（`pr181`），或从本仓 proj.db 取 upheld findings（`hobby`）。
 - `e3_contract_ab.py` — E3 疑点契约 vs finding 契约：`variant`（由 A 臂 prompt 落盘产物派生 B 臂并断言只差两段；落盘器 `examples/dump_pack.rs` 已随 M21a 批 C 拆除，产品等价物 = `redteam review --pack-only` → `.redteam/packs/<job>/cell-*.md`）、
   `run`（DeepSeek 直连，复刻产品单发请求形状）、`score`（quote 定位 + 区间级命中 oracle + 人工确认表骨架）。
+- `scan_score.py` — M21a 批 D-5（design §10.7 离线回归集）：scanner 疑点对 oracle 的零 LLM 评分，**改模板必跑**。
+  `score <input>… --oracle <json> --repo <dir> [--head <sha>] [--set union] [--out score.json] [--baseline prev.json] [--fail-on-regression]`；
+  输入自动识别 redteam-next 结果 JSON（`cells[].output.suspicions`，role=scanner）/ E3 run JSON 或目录（`items[]`）/ 裸 `{"suspicions":[]}`；
+  口径 = E3 B 臂（`_oracle.py`：去全部空白子串定位、失败按自报行号计命中并计 unanchored；anchors 区间重叠即命中）——**比产品宽两点**
+  （产品 `locate_quote` 按行 / 词序匹配、定位失败直接丢），与 P0 基线可比优先；`selftest` 用合成仓自检。
+  产品面待接：`review --format json` 今天的 `run.cells` 只有 CellSummary、无 output——F 批需给结果 JSON 加 scanner 输出面（或评分器改读 proj-next.db `cells` 行）。
+  基线 = P0 E3 B 臂三跑对 oracle-pr181 union：union_oracle_hit 9 / mean_oracle_hit 5.33 / mean_noise 0.55（人工主题并集 5 见 P0 研究）。
+  用法（F 落地后）：`redteam-next review --base <base> --format json > out.json && python3 eval/scan_score.py score out.json --oracle … --repo … --baseline …`。
+- `_oracle.py` — `e3_contract_ab.py score` 与 `scan_score.py` 共用的命中口径（`show_file` / `anchor_quote` / `overlap` / `load_oracle` / `match_entries`）。
 - `export_ledger.py` — M21a 批 B-1（D10-2）：schema v4 一次重置前，把旧 proj.db 的 `dismissed` / `resolved` 全表与 `results` 里
   verify=upheld 的 findings 导出为 `fixtures/ledger-{dismissed,resolved,upheld}.jsonl`（verifier 离线回归集数据；本仓自己的数据，入库）。
   `--db` 缺省 `.redteam/proj.db`、`--out-dir` 缺省 `eval/fixtures`；upheld 按 job×finding 计行带 `job_id` / `head_sha`，
