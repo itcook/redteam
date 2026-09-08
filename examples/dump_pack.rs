@@ -34,9 +34,10 @@ const NO_TOOLS_SYSTEM: &str =
      rest on code analysis alone.";
 
 fn pack_budget_bytes(cfg: &Config, model_names: &[String]) -> usize {
+    let roles = cfg.active_roles();
     let min_ctx = model_names
         .iter()
-        .map(|m| cfg.models.get(m).and_then(|x| x.context_window).unwrap_or(128_000))
+        .map(|m| roles.all().find(|e| &e.name == m).map(|e| e.context_window).unwrap_or(128_000))
         .min()
         .unwrap_or(128_000);
     let by_window = (min_ctx.saturating_sub(OUTPUT_RESERVE_TOKENS) as usize)
@@ -72,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     let root = std::env::current_dir()?;
     let cfg = Config::load()?;
     for m in &models {
-        anyhow::ensure!(cfg.models.contains_key(m), "model {m} not in config");
+        anyhow::ensure!(cfg.active_roles().all().any(|e| &e.name == m), "entry {m} not in config (name / provider/model_id)");
     }
     let head = head_sha_at(&root)?;
     let changes = changed_files(&root, Some(&base), true)?;

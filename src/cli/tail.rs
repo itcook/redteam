@@ -1,7 +1,6 @@
 //! 尾段引擎（M17-a 尾段统一）：exit_code 映射、驳回标记、model id 映射、
 //! CarryCtx/TailCtx 携带态与共用尾段 `assemble_report`（anchor → dedup → verify → verdict → 组报告）。
 
-use crate::config::Config;
 use crate::consolidate::{dedup, refute_targets, verify_findings};
 use crate::domain::{DossierMeta, Finding, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::orchestrate::CellSink;
@@ -44,11 +43,11 @@ pub(crate) fn mark_dismissed(
     reappeared
 }
 
-/// model 引用名 → 请求 id 映射（[models.X].id；人读报告显示 model 名，rN.md 模板 2026-07-03）。
-pub(crate) fn model_ids_for(names: &[String], cfg: &Config) -> Vec<String> {
+/// 条目 display_name → 请求 id 映射（人读报告显示 name，rN.md 模板 2026-07-03）。
+pub(crate) fn model_ids_for(names: &[String], roles: &crate::config::RoleSets) -> Vec<String> {
     names
         .iter()
-        .map(|n| cfg.models.get(n).map(|m| m.id.clone()).unwrap_or_else(|| n.clone()))
+        .map(|n| roles.id_of(n).map(str::to_string).unwrap_or_else(|| n.clone()))
         .collect()
 }
 
@@ -105,6 +104,8 @@ pub(crate) struct TailCtx<'a> {
     /// Task 2（尾段引擎泛化）：增量携带态。None=既有全量/resume 路径逐字不变；
     /// Some=Task 3 消费，assemble_report 内 merge_carry + 回填 RunMeta 五字段。
     pub(crate) carry: Option<CarryCtx>,
+    /// ship 测试命令（`--test-command` 覆盖 > 推断；进 RunMeta.test_command，M21a 批 A K1）。
+    pub(crate) test_command: Option<String>,
 }
 
 /// 共用尾段：anchor → dedup → verify → verdict → 组装 report → 退出码。
@@ -173,6 +174,7 @@ pub(crate) async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>
             job_id: ctx.job_id,
             models: ctx.model_names,
             model_ids: ctx.model_ids,
+            test_command: ctx.test_command,
             duration_ms: ctx.duration_ms,
             usage: Usage {
                 input_tokens: ctx.usage.0, output_tokens: ctx.usage.1, cached_input_tokens: ctx.usage.2,
@@ -279,6 +281,7 @@ mod tests {
             sink: None,
             spec_docs: "",
             carry,
+            test_command: None,
         }
     }
 

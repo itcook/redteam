@@ -58,15 +58,17 @@ impl Availability {
 /// 并查配置的 model 是否在返回列表中。取代仅 GET base 的弱探测（会对 key/端点不匹配假阳性）。
 pub async fn check_all(cfg: &Config, prober: &dyn Prober) -> Vec<Availability> {
     let mut out = Vec::new();
-    // 09-04 分离后：按 [models.*] 迭代（探测用 merged：model.kind > provider.kind）。
-    for (name, _m) in &cfg.models {
-        let Some(em) = cfg.effective_model(name) else { continue };
-        let key = cfg.resolve_key(name);
+    // 按三角色条目迭代（探测用 merged：条目.kind > provider.kind）；同一模型在两个角色各探一次（接受重复）。
+    for (role, entry) in cfg.all_entries() {
+        let Some(em) = cfg.effective(role, entry) else { continue };
+        let name = format!("{}:{}", role.as_str(), em.name);
+        let key = cfg.resolve_key(entry);
         let key_present = key.is_some();
         let pc = crate::config::ProviderConfig {
             kind: em.kind,
             base_url: em.base_url.clone(),
             api_key_env: None,
+            max_concurrency: None,
         };
         let (reachable, model_listed) =
             match prober.list_models(&effective_base(&pc), key.as_deref(), pc.kind).await {
@@ -150,22 +152,25 @@ pub fn validate_setup(kind: &str, base_url: Option<&str>) -> Result<(), String> 
     Ok(())
 }
 
-/// 渲染已配置 provider 列表（每行 name/kind/model/status）+ 配置文件位置。
+/// 渲染三角色条目列表（每行 role:name/kind/model_id/status/@provider）+ 配置文件位置。
 pub fn render_model_list(cfg: &Config, avs: &[Availability], config_paths: &[String]) -> String {
     let mut lines: Vec<String> = Vec::new();
-    for (name, _m) in &cfg.models {
-        let Some(em) = cfg.effective_model(name) else { continue };
+    for (role, entry) in cfg.all_entries() {
+        let Some(em) = cfg.effective(role, entry) else { continue };
+        let key = format!("{}:{}", role.as_str(), em.name);
         let status = avs
             .iter()
-            .find(|a| &a.provider == name)
+            .find(|a| a.provider == key)
             .map(|a| a.status_str())
             .unwrap_or("?");
         let kind = format!("{:?}", em.kind).to_lowercase();
-        lines.push(format!("{name}  [{kind}]  {}  {status}  @{}", em.id, em.provider));
+        lines.push(format!("[{}] {}  [{kind}]  {}  {status}  @{}", role.as_str(), em.name, em.id, em.provider));
     }
-    lines.sort();
+    if lines.is_empty() {
+        lines.push("(no [[scanners]] / [[reviewers]] / [[verifiers]] configured — `redteam model setup --role scanner …`)".into());
+    }
     let mut out = lines.join("\n");
-    out.push_str("\n\nconfig files (low→high priority):");
+    out.push_str("\n\nconfig (user-level only; REDTEAM_HOME overrides):");
     for p in config_paths {
         out.push_str(&format!("\n  {p}"));
     }
@@ -202,21 +207,21 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("ALPHA_KEY", "k"); std::env::remove_var("BETA_KEY"); }
         let cfg = cfg_with(
-            "[providers.alpha_p]\nkind=\"openai\"\n[models.alpha]\nprovider=\"alpha_p\"\nid=\"a\"\napi_key_env=\"ALPHA_KEY\"\npriority=10\n\
-             [providers.beta_p]\nkind=\"openai\"\napi_key_env=\"BETA_KEY\"\n\n[models.beta]\nprovider=\"beta_p\"\nid=\"b\"\npriority=5\n",
+            "[providers.alpha_p]\nkind=\"openai\"\n[[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\napi_key_env=\"ALPHA_KEY\"\n\
+             [providers.beta_p]\nkind=\"openai\"\napi_key_env=\"BETA_KEY\"\n\n[[reviewers]]\nname=\"beta\"\nprovider=\"beta_p\"\nmodel_id=\"b\"\n",
         );
         // 认证成功，/models 含 alpha 的 model "a"
         let ok = FakeProber { models: Some(vec!["a".into(), "z".into()]) };
         let avs = check_all(&cfg, &ok).await;
-        let alpha = avs.iter().find(|a| a.provider == "alpha").unwrap();
-        let beta = avs.iter().find(|a| a.provider == "beta").unwrap();
+        let alpha = avs.iter().find(|a| a.provider == "scanner:alpha").unwrap();
+        let beta = avs.iter().find(|a| a.provider == "reviewer:beta").unwrap();
         assert!(alpha.available() && alpha.model_listed == Some(true), "alpha: key+认证+model 在列表");
         assert!(!beta.available() && !beta.key_present, "beta: 缺 key");
         assert_eq!(check_exit_code(&avs), 1, "beta 缺 key→非 0");
 
         // 认证失败（401/连不上）→ 即便 key 在也不可用（修复 base 错配的假阳性）
         let cfg_a = cfg_with(
-            "[providers.alpha_p]\nkind=\"openai\"\n[models.alpha]\nprovider=\"alpha_p\"\nid=\"a\"\napi_key_env=\"ALPHA_KEY\"\npriority=10\n",
+            "[providers.alpha_p]\nkind=\"openai\"\n[[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\napi_key_env=\"ALPHA_KEY\"\n",
         );
         let fail = FakeProber { models: None };
         let avs2 = check_all(&cfg_a, &fail).await;
@@ -290,12 +295,12 @@ mod tests {
     #[test]
     fn render_model_list_one_line_per_provider_with_status() {
         let cfg = cfg_with(
-            "[providers.alpha_p]\nkind=\"openai\"\n\n[models.alpha]\nprovider=\"alpha_p\"\nid=\"a\"\npriority=10\n\
-             [providers.beta_p]\nkind=\"anthropic\"\n\n[models.beta]\nprovider=\"beta_p\"\nid=\"b\"\npriority=5\n",
+            "[providers.alpha_p]\nkind=\"openai\"\n\n[[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\n\
+             [providers.beta_p]\nkind=\"anthropic\"\n\n[[reviewers]]\nname=\"beta\"\nprovider=\"beta_p\"\nmodel_id=\"b\"\n",
         );
         let avs = vec![
-            Availability { provider: "alpha".into(), key_present: true, reachable: true, model_listed: Some(true) },
-            Availability { provider: "beta".into(), key_present: false, reachable: true, model_listed: None },
+            Availability { provider: "scanner:alpha".into(), key_present: true, reachable: true, model_listed: Some(true) },
+            Availability { provider: "reviewer:beta".into(), key_present: false, reachable: true, model_listed: None },
         ];
         let out = render_model_list(&cfg, &avs, &["/u/config.toml".into()]);
         let lines: Vec<&str> = out.lines().collect();

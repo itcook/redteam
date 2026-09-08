@@ -187,6 +187,10 @@ pub struct RunMeta {
     /// v4：本轮 blocking finding 的 refute 率（design §8.1「去留由数据决定」，M21b 填）。None = 无 verifier 段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refute_rate: Option<f32>,
+    /// ship 循环的测试命令：`--test-command` 覆盖，否则 `project::infer_test_command` 推断；推不出 None
+    /// （M21a 批 A K1，与 `redteam test-command` 同一链）。serde default 兼容旧 JSON。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

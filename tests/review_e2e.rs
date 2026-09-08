@@ -35,16 +35,19 @@ async fn code_bundle_tool_loop_anchors_and_drops_fabricated() {
     ]);
     let provider = ToolLoopProvider::new(Box::new(backend), root.path().to_path_buf());
 
-    let cfg = Config::from_layers(&[r#"[review]
-default_models=["m"]
+    let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="m"
+provider="p"
+model_id="m-id"
 "#]).unwrap();
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, models: Some("m".into()),
-        models_all: false,
+        spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
         background: false, format: "json".into(),
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
     };
     let changes = vec![FileChange { path: "src/auth.rs".into(), diff: "+    db.write(token);".into() }];
 
@@ -87,8 +90,16 @@ async fn code_replicate_two_models_yield_agreement_two() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
 
     // default_models=[alpha,beta] → replicate；两 model 对同位置同引用各报一条
-    let cfg = Config::from_layers(&[r#"[review]
-default_models=["alpha","beta"]
+    let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="alpha"
+provider="p"
+model_id="a"
+[[scanners]]
+name="beta"
+provider="p"
+model_id="b"
 "#]).unwrap();
     let mut reg = ProviderRegistry::new();
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", Severity::High)])));
@@ -96,10 +107,10 @@ default_models=["alpha","beta"]
 
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, models: None, models_all: false,
+        spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
         background: false, format: "json".into(),
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
     let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
@@ -136,18 +147,26 @@ async fn code_replicate_unreachable_model_exits_two() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
 
     // default=[alpha,ghost]：alpha 产 low（approve），ghost 不在 registry → failed_models → exit 2
-    let cfg = Config::from_layers(&[r#"[review]
-default_models=["alpha","ghost"]
+    let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="alpha"
+provider="p"
+model_id="a"
+[[scanners]]
+name="ghost"
+provider="p"
+model_id="g"
 "#]).unwrap();
     let mut reg = ProviderRegistry::new();
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf_low("src/a.rs", "let x = 1;")])));
 
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, models: None, models_all: false,
+        spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
         background: false, format: "json".into(),
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
     let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
@@ -178,18 +197,22 @@ async fn code_replicate_lone_blocking_refuted_stays_approve() {
 
     // 单 model alpha 自审：review 报一条 High 孤证(agreement=1)；refute 退化自审 alpha，
     // FakeProvider 同脚本对 refute 也返回非空 → refuted → confidence 0 → 不翻 verdict。
-    let cfg = Config::from_layers(&[r#"[review]
-default_models=["alpha"]
+    let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="alpha"
+provider="p"
+model_id="a"
 "#]).unwrap();
     let mut reg = ProviderRegistry::new();
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", "missing auth", Severity::High)])));
 
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, models: None, models_all: false,
+        spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
         background: false, format: "json".into(),
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
     };
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
     let (report, code) = run_code_review(&args, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
@@ -251,24 +274,22 @@ async fn incremental_round_smoke() {
 kind="openai"
 [providers.m2p]
 kind="openai"
-[models.m]
+[[scanners]]
+name="m"
 provider="mp"
-id="m1"
-priority=10
-[models.m2]
+model_id="m1"
+[[scanners]]
+name="m2"
 provider="m2p"
-id="m2model"
-priority=5
-[review]
-default_models=["m","m2"]
+model_id="m2model"
 "#]).unwrap();
 
     // ① 全量评审（branch scope，base=dev0=c0）：fake provider 出 1 条 finding（m2 恒空）。
     let full_args = ReviewArgs {
         base: Some("dev0".into()), scope: "branch".into(),
-        spec: vec![], focus: None, models: None, models_all: false,
+        spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false, format: "json".into(),
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
     };
     let mut full_scripted: std::collections::BTreeMap<String, Vec<RawFinding>> = std::collections::BTreeMap::new();
     full_scripted.insert("m".into(), vec![RawFinding {
@@ -369,12 +390,10 @@ async fn background_job_smoke_full_lifecycle_single_store() {
 
     let cfg = Config::from_layers(&[r#"[providers.alphap]
 kind="openai"
-[models.alpha]
+[[scanners]]
+name="alpha"
 provider="alphap"
-id="a"
-priority=10
-[review]
-default_models=["alpha"]
+model_id="a"
 "#])
     .unwrap();
 
@@ -403,9 +422,9 @@ default_models=["alpha"]
 
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
-        models: None, models_all: false, block_threshold: None, conf_floor: None,
+        block_threshold: None, conf_floor: None,
         background: true, format: "json".into(), resume: None, dismissed: None,
-        no_dismissed: false, incremental_from: None, tools: None,
+        no_dismissed: false, incremental_from: None, tools: None, test_command: None,
     };
 
     // 模拟 main.rs 后台派发起手态（写 args 快照 + 起手 Pending）：单一 `JobStore::open`
@@ -547,8 +566,12 @@ async fn exit_code_three_on_incomplete_resume() {
     });
     store.write_args_raw(job_id, &fake_args.to_string()).unwrap();
 
-    let cfg = Config::from_layers(&[r#"[review]
-default_models=["m"]
+    let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="m"
+provider="p"
+model_id="m-id"
 "#]).unwrap();
     let provider = FakeProvider { scripted: std::collections::BTreeMap::new(), tokens: (0, 0, 0) };
     let (report, code) = run_resume(job_id, &provider, &cfg, dir.path(), &store).await;
@@ -709,8 +732,12 @@ async fn dismissed_ledger_previously_dismissed_marks_and_feeds_second_stage() {
     // ② 同一 id 再跑一次评审：FakeProvider 复现同 file/title/quote 的 raw finding，
     // enrich() 算出的 finding.id 与卡上 id 逐字相等。root 下 `.redteam/proj.db` 已由
     // 上一步的 `dismiss add` 建出——zero-config 自动加载（无需 --dismissed）。
-    let cfg = Config::from_layers(&[r#"[review]
-default_models=["m"]
+    let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="m"
+provider="p"
+model_id="m-id"
 "#]).unwrap();
     let mut scripted = std::collections::BTreeMap::new();
     scripted.insert(
@@ -731,11 +758,10 @@ default_models=["m"]
     let provider = FakeProvider { scripted, tokens: (0, 0, 0) };
     let args = ReviewArgs {
         base: None, scope: "working-tree".into(),
-        spec: vec![], focus: None, models: Some("m".into()),
-        models_all: false,
+        spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
         background: false, format: "json".into(),
-        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+        resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
     };
     let changes = vec![FileChange { path: file.into(), diff: "+    db.write(token);".into() }];
     let (report, code) =
