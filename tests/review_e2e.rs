@@ -895,3 +895,68 @@ fn pack_only_binary_exits_zero_without_reading_secrets() {
     assert!(!stderr.contains("secrets.json"), "--pack-only 不读 secrets（修补批 X-5）: {stderr}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("cell-1 files=1 bytes="), "{}", String::from_utf8_lossy(&out.stdout));
 }
+
+/// M21a 批 E（K1 / K13 / K14）：`Config::default()` 即 slice——> 8K 的改动文件走切片、他文件调用点进文件外片段、
+/// summary.json / stdout 报装包形态；`review.pack.body = "full"` 回到整文件且无文件外片段（对照臂）。
+#[test]
+fn pack_only_slices_large_file_and_reports_shape() {
+    use redteam::cli::{render_pack_only, run_pack_only, ReviewArgs};
+    use redteam::config::Config;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    git(dir.path(), &["config", "user.email", "t@example.com"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let mut big = String::from("//! big module\nuse std::fmt;\n\npub fn changed_target(x: u8) -> u8 {\n    x + 1\n}\n\nfn unrelated_big() -> u8 {\n");
+    for i in 0..600 {
+        big.push_str(&format!("    let u{i} = 7;\n"));
+    }
+    big.push_str("    0\n}\n");
+    assert!(big.len() > 8192);
+    std::fs::write(dir.path().join("src/big.rs"), &big).unwrap();
+    std::fs::write(dir.path().join("src/user.rs"), "/// consumer\nfn consume() -> u8 {\n    changed_target(1)\n}\n").unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-q", "-m", "base"]);
+    // 改 changed_target 一行并暂存：working-tree scope 的证据 = 这一个 hunk
+    let modified = big.replace("    x + 1\n", "    x + 2\n");
+    std::fs::write(dir.path().join("src/big.rs"), &modified).unwrap();
+    git(dir.path(), &["add", "-A"]);
+
+    let args = ReviewArgs {
+        pack_only: true,
+        base: None, scope: "working-tree".into(), spec: vec![], focus: None,
+        block_threshold: None, conf_floor: None, background: false,
+        format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
+    };
+    // slice 档（缺省〔D8〕）
+    let slice = run_pack_only(&args, &Config::default(), dir.path()).unwrap();
+    assert_eq!(slice.cells.len(), 1);
+    let c = &slice.cells[0];
+    assert_eq!((c.pack.body, c.pack.files, c.pack.sliced, c.pack.ladder), ("slice", 1, 1, 0), "{:?}", c.pack);
+    assert!(c.pack.folded_lines > 500 && c.pack.outside_sites == 1, "{:?}", c.pack);
+    let packs = std::path::Path::new(&slice.packs_dir);
+    let cell_slice = std::fs::read_to_string(packs.join("cell-1.md")).unwrap();
+    assert!(cell_slice.contains("src/big.rs:1-610（切片：核 1") && cell_slice.contains("行折叠：unrelated_big）"), "{cell_slice}");
+    assert!(cell_slice.contains("## 文件外片段") && cell_slice.contains("src/user.rs:1-4（调用点：changed_target）"), "{cell_slice}");
+    assert!(!cell_slice.contains("let u7 = 7;"), "无关体折叠: {cell_slice}");
+    let text = render_pack_only(&slice);
+    assert!(text.contains(" body=slice sliced=1 small=0 ladder=0 folded_lines=") && text.contains(" outside_sites=1 outside_sigs=0"), "{text}");
+    let summary: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(packs.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["cells"][0]["pack"]["body"], "slice");
+    assert_eq!(summary["cells"][0]["pack"]["sliced"], 1);
+
+    // full 档（对照臂，K10 / K14：配置切档，无 CLI 旗）
+    let cfg_full = Config::from_json(r#"{"review":{"pack":{"body":"full"}}}"#).unwrap();
+    let full = run_pack_only(&args, &cfg_full, dir.path()).unwrap();
+    let f = &full.cells[0];
+    assert_eq!((f.pack.body, f.pack.full, f.pack.sliced, f.pack.outside_sites), ("full", 1, 0, 0), "{:?}", f.pack);
+    assert!(f.pack_bytes > c.pack_bytes, "full {} > slice {}", f.pack_bytes, c.pack_bytes);
+    let cell_full = std::fs::read_to_string(std::path::Path::new(&full.packs_dir).join("cell-1.md")).unwrap();
+    assert!(cell_full.contains("src/big.rs:1-610（全文，610 行）") && cell_full.contains("let u7 = 7;"), "{cell_full}");
+    assert!(!cell_full.contains("文件外片段"), "{cell_full}");
+}

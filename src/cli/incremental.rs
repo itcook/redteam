@@ -98,7 +98,7 @@ pub async fn run_incremental_review(
     // `[delta]`；`<incremental_round>` 的双层清单本批不动，两份清单的合并留 D-3（K9）。
     let extra_paths: Vec<String> = all_files.iter().filter(|p| !delta_files.contains(*p)).cloned().collect();
     let CellPlan { bundles, dossiers, others, dossier_meta, .. } =
-        plan_cells(selected, root, budget, &cfg.review.grouping, &extra_paths, Some(&delta_files));
+        plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &extra_paths, Some(&delta_files));
     // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
     // dispute 契约不因补跑丢失。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
