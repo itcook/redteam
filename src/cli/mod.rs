@@ -11,7 +11,7 @@ use crate::output::Format;
 use crate::provider::{LensRequest, ReviewProvider};
 use std::path::Path;
 
-mod deny;
+pub(crate) mod deny;
 mod incremental;
 mod second_pass;
 mod spec;
@@ -187,12 +187,14 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     // M21a 批 C：bundles 来自引用图分组（design §3.2，门未过时退化为单包），每格只装自家文件——
     // 视野外的改动文件由跨组索引（`{{OTHER_CHANGED_FILES}}`）而非兄弟注入提供。超预算由 build_pack
     // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，分组「宁降不拆」不靠分格避让。
+    // 全变更集路径：文件外片段搜索排除（它们已在各自的 cell 里，视野外的由跨组索引提供）。
+    let changeset: Vec<String> = bundles.iter().flat_map(|b| &b.files).map(|f| f.path.clone()).collect();
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
             // 预算记账扣本格自己的 diff 字节（单格默认下即全变更集真实 diff）。
             let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
-            crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes, opts))
+            crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes, opts, &changeset))
         })
         .collect();
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
