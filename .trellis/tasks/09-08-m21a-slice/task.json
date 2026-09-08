@@ -1,0 +1,28 @@
+{
+  "id": "m21a-slice",
+  "name": "m21a-slice",
+  "title": "M21a 批 E：切片装包（文件内一跳 / 切片配方 / 文件外片段）",
+  "description": "M21a 批 E（feat/m21a-slice）：diffsym 文件内一跳解析、pack 改动中心切片六层配方（核/一跳/文件地图/折叠/文件外片段/禁真空兜底）、slice_min_bytes 小文件全文、[review.pack] body 默认 slice 接线与 --pack-only 两档对比",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P1",
+  "creator": "S.Kai",
+  "assignee": "S.Kai",
+  "createdAt": "2026-09-08",
+  "completedAt": null,
+  "branch": "feat/m21a-slice",
+  "base_branch": "feat/m21-review-engine",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "priority": "P1"
+  }
+}
