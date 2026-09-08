@@ -270,11 +270,14 @@ pub async fn run_code_review(
     // 弱缝先切 / 宁降不拆 / 孤立装箱。GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
     let bundles = group(selected, Some(root), &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() }).bundles;
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    // 跨组索引（design §10.6）：每组一份，与 dossiers 等长等序；全量路径无 delta 标注。
+    let others = crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, &[], None), bundles.len());
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "", &spec_section)
+        let other = others.get(idx).map(String::as_str).unwrap_or("");
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "", &spec_section, other)
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk), &spec_section).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk), &spec_section, &others).await;
     // T46①：--spec denylist/PEM 拒读 warnings 并入 run.warnings（CI/bot 可见，不仅 eprintln）。
     raw.warnings.extend(spec_warnings);
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。

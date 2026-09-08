@@ -220,23 +220,6 @@ const MANIFEST_MAX_CHARS: usize = 4000;
 /// （dogfood 20260703 r2 5361b545：注记后置追加曾致溢出预算）。
 const MANIFEST_SUFFIX_RESERVE: usize = 40;
 
-/// 全变更集清单（dogfood 20260702 #2）：`exclude` 号 bundle 之外所有变更文件的
-/// `path (+adds/-dels)`。注入单包评审 prompt，让模型知晓视野外还有哪些文件在变——
-/// 消「无证据实现/无 version」式跨 bundle 误报。空串 = 该包已覆盖全变更集。
-pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
-    let mut entries: Vec<String> = Vec::new();
-    for (i, b) in bundles.iter().enumerate() {
-        if i == exclude {
-            continue;
-        }
-        for fc in &b.files {
-            let (adds, dels) = count_plus_minus(&fc.diff);
-            entries.push(format!("{} (+{adds}/-{dels})", fc.path));
-        }
-    }
-    cap_entries(entries)
-}
-
 /// 双帽截断（条目数 + 总字符预算，先到者截断，尾注被截条数）——
 /// other_files_manifest 与 two_layer_manifest 共用同一体积防线。
 fn cap_entries(entries: Vec<String>) -> String {
@@ -274,6 +257,172 @@ pub fn two_layer_manifest(all_files: &[String], delta: &std::collections::BTreeS
         .map(|p| if delta.contains(p) { format!("{p} [delta]") } else { p.clone() })
         .collect();
     cap_entries(entries)
+}
+
+/// 跨组索引条目（design §10.6〔D6〕）：改动文件在哪一组、增删行数、正向（它 import / 引用的改动
+/// 文件）与反向（import / 引用它的改动文件）邻居、是否在增量轮 delta 集内。同目录边不进索引。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub path: String,
+    /// 所在组（0-based）；`None` = 只有路径的分支文件（增量轮非 delta，无 diff、无边）。
+    pub group: Option<usize>,
+    pub adds: usize,
+    pub dels: usize,
+    pub forward: Vec<String>,
+    pub backward: Vec<String>,
+    pub delta: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CrossIndex {
+    pub entries: Vec<IndexEntry>,
+}
+
+/// 由分组产物建索引（零 token：边集是 `group()` 的副产品）。`extra_paths` = 有路径无 diff 的文件
+/// （增量轮的全分支非 delta 文件）；`delta` 为 `Some` 时按集合标 `[delta]`，`None` 不标。
+pub fn cross_index(
+    bundles: &[Bundle],
+    extra_paths: &[String],
+    delta: Option<&std::collections::BTreeSet<String>>,
+) -> CrossIndex {
+    let in_delta = |p: &str| delta.map(|d| d.contains(p)).unwrap_or(false);
+    let mut entries = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (g, b) in bundles.iter().enumerate() {
+        for fc in &b.files {
+            let (adds, dels) = count_plus_minus(&fc.diff);
+            let mut forward: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut backward: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for e in &b.edges {
+                if e.kind == EdgeKind::SameDir {
+                    continue;
+                }
+                if e.from == fc.path {
+                    forward.insert(e.to.clone());
+                }
+                if e.to == fc.path {
+                    backward.insert(e.from.clone());
+                }
+            }
+            seen.insert(fc.path.clone());
+            entries.push(IndexEntry {
+                path: fc.path.clone(),
+                group: Some(g),
+                adds,
+                dels,
+                forward: forward.into_iter().collect(),
+                backward: backward.into_iter().collect(),
+                delta: in_delta(&fc.path),
+            });
+        }
+    }
+    for p in extra_paths {
+        if seen.insert(p.clone()) {
+            entries.push(IndexEntry {
+                path: p.clone(),
+                group: None,
+                adds: 0,
+                dels: 0,
+                forward: Vec::new(),
+                backward: Vec::new(),
+                delta: in_delta(p),
+            });
+        }
+    }
+    CrossIndex { entries }
+}
+
+/// 为第 `for_group` 组渲染 `{{OTHER_CHANGED_FILES}}` 槽内容：本组之外的每个文件一行
+/// `path (gN +a/-d) → [imports] ← [imported-by] [delta]`（空段省略；只有路径的分支文件只渲染路径）。
+/// 排序：与本组有边的在前，其次按组号、路径。双帽（`MANIFEST_MAX_ENTRIES` / `MANIFEST_MAX_CHARS`）
+/// 沿用：帽内先降质（`path → see group N`，不带边与计数）再尾注 `… and K more files (see groups …)`，
+/// 含尾注总长不超字符帽——「降质 + 留指针」，文件名不丢。候选为空（单组且无分支文件）→ 空串。
+/// 非空时以换行起头（槽位于冒号之后，多行条目各占一行）。组号 1-based，与 `cell-<n>` 对齐。
+pub fn render_cross_index(idx: &CrossIndex, for_group: usize) -> String {
+    let mine: std::collections::BTreeSet<&str> = idx
+        .entries
+        .iter()
+        .filter(|e| e.group == Some(for_group))
+        .map(|e| e.path.as_str())
+        .collect();
+    let connected = |e: &IndexEntry| e.forward.iter().chain(e.backward.iter()).any(|p| mine.contains(p.as_str()));
+    let mut cands: Vec<&IndexEntry> = idx.entries.iter().filter(|e| e.group != Some(for_group)).collect();
+    cands.sort_by(|a, b| {
+        (!connected(a), a.group.is_none(), a.group.unwrap_or(0), &a.path)
+            .cmp(&(!connected(b), b.group.is_none(), b.group.unwrap_or(0), &b.path))
+    });
+    if cands.is_empty() {
+        return String::new();
+    }
+    let full = |e: &IndexEntry| -> String {
+        let mut s = match e.group {
+            Some(g) => format!("{} (g{} +{}/-{})", e.path, g + 1, e.adds, e.dels),
+            None => e.path.clone(),
+        };
+        if !e.forward.is_empty() {
+            s.push_str(&format!(" → [{}]", e.forward.join(", ")));
+        }
+        if !e.backward.is_empty() {
+            s.push_str(&format!(" ← [{}]", e.backward.join(", ")));
+        }
+        if e.delta {
+            s.push_str(" [delta]");
+        }
+        s
+    };
+    let degraded = |e: &IndexEntry| -> String {
+        match e.group {
+            Some(g) => format!("{} → see group {}", e.path, g + 1),
+            None => e.path.clone(),
+        }
+    };
+    let budget = MANIFEST_MAX_CHARS - MANIFEST_SUFFIX_RESERVE;
+    let mut lines: Vec<String> = Vec::new();
+    let mut chars = 0usize;
+    let mut i = 0usize;
+    for tier in [&full as &dyn Fn(&IndexEntry) -> String, &degraded] {
+        while i < cands.len() && lines.len() < MANIFEST_MAX_ENTRIES {
+            let l = tier(cands[i]);
+            if chars + l.len() + 1 > budget {
+                break;
+            }
+            chars += l.len() + 1;
+            lines.push(l);
+            i += 1;
+        }
+    }
+    let tail_note = |omitted: &[&IndexEntry]| -> String {
+        let groups: std::collections::BTreeSet<usize> = omitted.iter().filter_map(|e| e.group.map(|g| g + 1)).collect();
+        let mut note = format!("… and {} more files", omitted.len());
+        if !groups.is_empty() {
+            let shown: Vec<String> = groups.iter().take(5).map(|g| g.to_string()).collect();
+            let more = if groups.len() > 5 { ", …" } else { "" };
+            note.push_str(&format!(" (see groups {}{more})", shown.join(", ")));
+        }
+        note
+    };
+    // 尾注计入总帽：放不下就再退掉尾部条目（它们并入尾注计数）。
+    loop {
+        let omitted = &cands[i..];
+        let note = if omitted.is_empty() { None } else { Some(tail_note(omitted)) };
+        let total = chars + note.as_ref().map(|n| n.len() + 1).unwrap_or(0);
+        if total <= MANIFEST_MAX_CHARS || lines.is_empty() {
+            if let Some(n) = note {
+                lines.push(n);
+            }
+            break;
+        }
+        if let Some(last) = lines.pop() {
+            chars -= last.len() + 1;
+            i -= 1;
+        }
+    }
+    format!("\n{}", lines.join("\n"))
+}
+
+/// 每组各渲染一份（与 `dossiers` 等长等序，供 fan-out / 二阶段补查按组取用）。
+pub fn render_cross_indices(idx: &CrossIndex, n_groups: usize) -> Vec<String> {
+    (0..n_groups).map(|g| render_cross_index(idx, g)).collect()
 }
 
 fn uf_find(parent: &mut [usize], x: usize) -> usize {
@@ -1601,53 +1750,110 @@ mod tests {
         assert!(ref_worthy("subscribers"), "≥ 8 字符纯小写放行");
     }
 
-    #[test]
-    fn other_files_manifest_lists_counts_and_excludes_self() {
-        let bundles = vec![
-            Bundle::from_files(vec![fc("a.rs", "+one\n+two\n-gone")]),
-            Bundle::from_files(vec![fc("b.rs", "--- a/b.rs\n+++ b/b.rs\n+x")]),
-        ];
-        let m = other_files_manifest(&bundles, 0);
-        assert_eq!(m, "b.rs (+1/-0)", "排除自身；+++/--- 头不计增删");
-        let m1 = other_files_manifest(&bundles, 1);
-        assert_eq!(m1, "a.rs (+2/-1)");
+    fn idx_bundle(files: &[(&str, &str)], edges: Vec<Edge>) -> Bundle {
+        let mut b = Bundle::from_files(files.iter().map(|(p, d)| fc(p, d)).collect());
+        b.edges = edges;
+        b
+    }
+
+    fn imp(from: &str, to: &str) -> Edge {
+        Edge { from: from.into(), to: to.into(), kind: EdgeKind::Import }
+    }
+
+    /// 两组三文件：g0 = {src/a.rs}，g1 = {src/b.rs, lib/c.rs}；a → b（import）、c → a（引用 ×2）、a–b 同目录。
+    fn two_groups() -> Vec<Bundle> {
+        let a_b = imp("src/a.rs", "src/b.rs");
+        let c_a = Edge { from: "lib/c.rs".into(), to: "src/a.rs".into(), kind: EdgeKind::Reference { count: 2 } };
+        let same = Edge { from: "src/a.rs".into(), to: "src/b.rs".into(), kind: EdgeKind::SameDir };
+        vec![
+            idx_bundle(&[("src/a.rs", "+one\n+two\n-gone")], vec![a_b.clone(), c_a.clone(), same.clone()]),
+            idx_bundle(&[("src/b.rs", "--- a/b.rs\n+++ b/b.rs\n+x"), ("lib/c.rs", "+c")], vec![a_b, c_a, same]),
+        ]
     }
 
     #[test]
-    fn other_files_manifest_counts_body_lines_starting_with_dashes() {
-        // 正文删除行内容为 "--sep"（diff 行 "---sep"）不得被当文件头跳过；真头 "--- a/…" 仍跳
-        let bundles = vec![
-            Bundle::from_files(vec![fc("self.rs", "+s")]),
-            Bundle::from_files(vec![fc("a.rs", "--- a/a.rs\n+++ b/a.rs\n---sep\n+++x")]),
-        ];
-        assert_eq!(other_files_manifest(&bundles, 0), "a.rs (+1/-1)", "裸 ---/+++ 正文行计入增删");
+    fn cross_index_forward_backward_and_groups() {
+        let idx = cross_index(&two_groups(), &["docs/readme.md".to_string()], None);
+        assert_eq!(idx.entries.len(), 4);
+        let a = &idx.entries[0];
+        assert_eq!((a.path.as_str(), a.group, a.adds, a.dels), ("src/a.rs", Some(0), 2, 1));
+        assert_eq!(a.forward, vec!["src/b.rs"], "a import b");
+        assert_eq!(a.backward, vec!["lib/c.rs"], "c 引用 a；同目录边不进索引");
+        let b = &idx.entries[1];
+        assert_eq!((b.group, b.adds, b.dels), (Some(1), 1, 0));
+        assert_eq!(b.backward, vec!["src/a.rs"]);
+        assert!(b.forward.is_empty());
+        let extra = &idx.entries[3];
+        assert_eq!((extra.path.as_str(), extra.group, extra.adds), ("docs/readme.md", None, 0));
+        assert!(idx.entries.iter().all(|e| !e.delta), "delta=None 不标");
     }
 
     #[test]
-    fn other_files_manifest_single_bundle_is_empty() {
-        let bundles = vec![Bundle::from_files(vec![fc("a.rs", "+x")])];
-        assert!(other_files_manifest(&bundles, 0).is_empty(), "单包即全变更集 → 空");
+    fn render_cross_index_snapshot_and_connected_first() {
+        let idx = cross_index(&two_groups(), &[], None);
+        // 组 0（a）看到 g1 的 b、c：两者都与 a 有边；组号 1-based
+        assert_eq!(
+            render_cross_index(&idx, 0),
+            "\nlib/c.rs (g2 +1/-0) → [src/a.rs]\nsrc/b.rs (g2 +1/-0) ← [src/a.rs]"
+        );
+        // 组 1 看到 a
+        assert_eq!(render_cross_index(&idx, 1), "\nsrc/a.rs (g1 +2/-1) → [src/b.rs] ← [lib/c.rs]");
+        // 有边者优先：给组 1 加一个与本组无边的 g3 文件 + 分支文件 → 排在有边者之后，分支文件最后
+        let mut bundles = two_groups();
+        bundles.push(idx_bundle(&[("aaa/z.rs", "+z")], vec![]));
+        let idx = cross_index(&bundles, &["branch/only.rs".to_string()], None);
+        assert_eq!(
+            render_cross_index(&idx, 1),
+            "\nsrc/a.rs (g1 +2/-1) → [src/b.rs] ← [lib/c.rs]\naaa/z.rs (g3 +1/-0)\nbranch/only.rs"
+        );
+        let all = render_cross_indices(&idx, 3);
+        assert_eq!(all.len(), 3);
+        assert!(all[2].contains("src/a.rs (g1") && all[2].contains("src/b.rs (g2"));
     }
 
     #[test]
-    fn other_files_manifest_truncates_over_cap() {
-        let files: Vec<_> = (0..MANIFEST_MAX_ENTRIES + 5).map(|i| fc(&format!("f{i}.rs"), "+x")).collect();
-        let bundles = vec![Bundle::from_files(vec![fc("self.rs", "+s")]), Bundle::from_files(files)];
-        let m = other_files_manifest(&bundles, 0);
-        assert!(m.contains("more files"), "超上限截断并注记条数: {m}");
-        assert!(m.len() <= MANIFEST_MAX_CHARS, "含注记总输出不超预算: len={}", m.len());
+    fn render_cross_index_single_group_is_empty() {
+        let b = idx_bundle(&[("src/a.rs", "+x"), ("src/b.rs", "+y")], vec![imp("src/a.rs", "src/b.rs")]);
+        let idx = cross_index(&[b], &[], None);
+        assert!(render_cross_index(&idx, 0).is_empty(), "单组无分支文件 → 空串（占位由 prompt 层渲染）");
     }
 
     #[test]
-    fn other_files_manifest_char_budget_truncates_long_paths() {
-        // 50 个超长路径（每条 ~120 字符）→ 字符帽先于条目帽触发
-        let files: Vec<_> = (0..50)
-            .map(|i| fc(&format!("very/deeply/nested/module/path/segment/that/keeps/going/and/going/file_number_{i:04}_with_long_name.rs"), "+x"))
-            .collect();
-        let bundles = vec![Bundle::from_files(vec![fc("self.rs", "+s")]), Bundle::from_files(files)];
-        let m = other_files_manifest(&bundles, 0);
-        assert!(m.len() <= MANIFEST_MAX_CHARS, "含注记总输出不超预算: len={}", m.len());
-        assert!(m.contains("more files"), "被截条数有注记: {m}");
+    fn render_cross_index_delta_only_marks_delta_set_and_extra_paths_plain() {
+        use std::collections::BTreeSet;
+        let delta: BTreeSet<String> = ["src/b.rs".to_string()].into();
+        let extra = vec!["branch/x.rs".to_string(), "src/a.rs".to_string()]; // 与组内重复的路径不重复登记
+        let idx = cross_index(&two_groups(), &extra, Some(&delta));
+        assert_eq!(idx.entries.len(), 4);
+        let s = render_cross_index(&idx, 0);
+        assert!(s.contains("src/b.rs (g2 +1/-0) ← [src/a.rs] [delta]"), "{s}");
+        assert!(!s.contains("lib/c.rs (g2 +1/-0) → [src/a.rs] [delta]"), "非 delta 不标: {s}");
+        assert!(s.ends_with("\nbranch/x.rs"), "分支文件只有路径、无边无计数无 delta: {s}");
+    }
+
+    #[test]
+    fn render_cross_index_degrades_then_truncates_within_cap() {
+        // 300 个长路径文件各自成组（带边），当前组 0：完整行装到帽 → 降质行 `see group N` → 尾注
+        let mut bundles: Vec<Bundle> = Vec::new();
+        for i in 0..300 {
+            let p = format!("very/deeply/nested/module/path/segment/that/keeps/going/file_number_{i:04}_with_long_name.rs");
+            let e = imp(&p, "very/deeply/nested/module/path/segment/that/keeps/going/file_number_0000_with_long_name.rs");
+            bundles.push(idx_bundle(&[(&p, "+x")], vec![e]));
+        }
+        let idx = cross_index(&bundles, &[], None);
+        let s = render_cross_index(&idx, 0);
+        assert!(s.len() <= MANIFEST_MAX_CHARS, "含尾注总长不超帽: {}", s.len());
+        assert!(s.contains(" → ["), "帽内先有完整行");
+        assert!(s.contains(" → see group "), "超出部分降质为指针: {s}");
+        assert!(s.contains("more files (see groups "), "仍超 → 尾注带组指针: {s}");
+        // 条目帽：短路径 300 组 → 至多 MANIFEST_MAX_ENTRIES 行 + 尾注
+        let bundles: Vec<Bundle> = (0..300).map(|i| idx_bundle(&[(&format!("f{i}.rs"), "+x")], vec![])).collect();
+        let s = render_cross_index(&cross_index(&bundles, &[], None), 0);
+        assert!(s.lines().count() <= MANIFEST_MAX_ENTRIES + 2, "{}", s.lines().count());
+        assert!(s.len() <= MANIFEST_MAX_CHARS, "{}", s.len());
+        let tail = s.lines().last().unwrap();
+        assert!(tail.starts_with("… and ") && tail.contains(" more files (see groups ") && tail.ends_with(", …)"),
+            "尾注列被截组号（至多 5 个 + …）: {tail}");
     }
 
     #[test]

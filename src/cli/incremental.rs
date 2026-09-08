@@ -104,12 +104,20 @@ pub async fn run_incremental_review(
     let budget = budget_raw.saturating_sub(spec_used);
     let bundles = group(selected, Some(root), &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() }).bundles;
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    // 跨组索引（design §10.6）：delta 组 + 全分支非 delta 文件（只有路径），`[delta]` 标本轮改动；
+    // `<incremental_round>` 的双层清单本批不动，两份清单的合并留 D-3（K9）。
+    let extra_paths: Vec<String> = all_files.iter().filter(|p| !delta_files.contains(*p)).cloned().collect();
+    let others = crate::bundle::render_cross_indices(
+        &crate::bundle::cross_index(&bundles, &extra_paths, Some(&delta_files)),
+        bundles.len(),
+    );
     // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
     // dispute 契约不因补跑丢失。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section, &spec_section)
+        let other = others.get(idx).map(String::as_str).unwrap_or("");
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section, &spec_section, other)
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk), &spec_section).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk), &spec_section, &others).await;
     // T46①：--spec denylist/PEM 拒读 warnings 并入 run.warnings（与 run_code_review 一致）。
     raw.warnings.extend(spec_warnings);
 

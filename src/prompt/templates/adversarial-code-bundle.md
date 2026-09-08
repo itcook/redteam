@@ -77,7 +77,7 @@ those files added. Do NOT declare needs for files already shown in full above.
 Target: {{TARGET_LABEL}}
 Files in this bundle: {{FILE_LIST}}
 Files changed elsewhere in this changeset: {{OTHER_CHANGED_FILES}}
-Do NOT claim something is missing, undeclared, or unimplemented ACROSS THE CHANGESET (e.g. "no version declared", "the announced X is implemented nowhere") without first checking the dossier below — this bundle covers the entire changeset, and the dossier's omission list (if any) is the ONLY signal that content was cut for budget rather than absent. If the deciding source appears in that list, lower your confidence or state the gap instead of asserting absence.
+Do NOT claim something is missing, undeclared, or unimplemented ACROSS THE CHANGESET (e.g. "no version declared", "the announced X is implemented nowhere") without first checking the cross-group index above and the dossier below. Files listed in that index are changed in this changeset but reviewed in other groups (a `→` / `←` edge means they import or reference files in this bundle); the dossier's omission list (if any) is the ONLY signal that content was cut for budget rather than absent. If the deciding source appears in either list, lower your confidence or state the gap instead of asserting absence.
 
 Changed hunks:
 {{BUNDLE_DIFFS}}
