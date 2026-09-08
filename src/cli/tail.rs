@@ -165,7 +165,7 @@ pub(crate) async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>
         None => (false, None, vec![], vec![]),
     };
     let report = ReviewReport {
-        schema_version: "3".into(),
+        schema_version: crate::domain::SCHEMA_VERSION.into(),
         verdict,
         stats,
         findings,
@@ -200,6 +200,12 @@ pub(crate) async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>
             resolved,
             resolution_disputed,
             carried_dropped,
+            // v4 观测字段：本批只定形状，填值在 F-5（scanner 路径）/ M21b（verifier）——旧 finding 路径恒默认。
+            coverage: Default::default(),
+            template_hashes: Default::default(),
+            cache_hit_by_cell: vec![],
+            provider_inflight_peak: Default::default(),
+            refute_rate: None,
         },
     };
     // 退出码：reject 优先 → 10；否则 approve 但对照集不完整 → 2；干净 approve → 0。

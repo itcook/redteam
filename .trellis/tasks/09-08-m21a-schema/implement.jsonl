@@ -1,0 +1,5 @@
+{"file": ".next/plans/2026-09-07-redteam-m21a-scan-foundation-plan.md", "reason": "批 B Task B-1~B-5 的权威任务书（文件、字段、测试、commit 文案）与 Global Constraints"}
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§4 疑点契约字段、§8.3 疑点台账列、§8.4 coverage 五集合与角色分级、§15 落地序 1"}
+{"file": ".next/decisions/2026-09-04-redteam-review-engine-architecture-decisions.md", "reason": "D10-2 proj.db v4 一次重置先导出；D11-7 R14 cell role + 角色分叉输出枚举、只建疑点台账与队列快照两表"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "CellRecord/RunMeta 是跨 domain→state→db→cli 的记录形状，新增字段需逐层核对消费点"}
+{"file": "eval/README.md", "reason": "eval 目录纪律：零第三方依赖、路径经参数传入、不含被评仓内容"}

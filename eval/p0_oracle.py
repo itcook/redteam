@@ -54,7 +54,9 @@ def product_findings(db, job, model):
     row = con.execute("select record_json from cells where job_id=? and cell like ?", (job, f"%@{model}")).fetchone()
     if not row:
         raise SystemExit(f"cell {job}@{model} not found in {db}")
-    return json.loads(row[0])["findings"]
+    rec = json.loads(row[0])
+    # v3 记录 findings 平铺；v4（M21a schema v4）挪到 output{role,…} 下，scanner 记录无 findings → 空
+    return rec.get("output", rec).get("findings", [])
 
 
 ANCHOR_RE = re.compile(r"`([^`\s:]+):(\d+)(?:-(\d+))?`|`:(\d+)(?:-(\d+))?`")

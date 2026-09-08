@@ -2,7 +2,7 @@
 //! 状态机（并发组 M16 定型，原地不动）。尾段引擎/spec/二阶段补查/增量评审已拆至
 //! 同目录子模块（M17-a 尾段统一，零语义 diff）。
 
-use crate::bundle::{group, select_files};
+use crate::bundle::{group, select_files, Bundle, GroupingOpts, GroupingStats};
 use crate::config::{Config, RoleSets};
 use crate::domain::{DossierMeta, Finding, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::git::FileChange;
@@ -57,6 +57,10 @@ pub struct ReviewArgs {
     /// 记入 `RunMeta.test_command`。serde default 保旧 args.json。
     #[serde(default)]
     pub test_command: Option<String>,
+    /// M21a 批 C：`--pack-only`——只收集证据、分组、装包并落盘，不调 provider（D7 B7 预算仪表）。
+    /// `serde(default)` 保旧 args.json（resume / 后台 job）兼容。
+    #[serde(default)]
+    pub pack_only: bool,
 }
 
 /// 台账加载产物（design 2026-07-03 #6 zero-config）：豁免 id 集 + 活跃判例卡 + 披露 meta。
@@ -67,7 +71,7 @@ pub(crate) struct Ledger {
     pub meta: Option<crate::domain::LedgerMeta>,
 }
 
-/// 加载台账：--no-dismissed → 空；缺省 → `.redteam/proj.db` 存在才加载（零副作用，不建库）；
+/// 加载台账：--no-dismissed → 空；缺省 → `.redteam/<db::DB_FILE>` 存在才加载（零副作用，不建库）；
 /// `--dismissed <值>` → 文件=db 路径覆盖 / 目录=已废弃形态报错引导迁移 / 否则 csv 仅豁免。
 pub(crate) fn load_ledger(
     dismissed: Option<&str>,
@@ -96,8 +100,8 @@ pub(crate) fn load_ledger(
             let p = Path::new(v);
             if p.is_dir() {
                 anyhow::bail!(
-                    "--dismissed: directory ledgers are retired; migrate cards into .redteam/proj.db \
-                     via 'redteam dismiss add' (see 'redteam dismiss --help')"
+                    "--dismissed: directory ledgers are retired; migrate cards into .redteam/{} \
+                     via 'redteam dismiss add' (see 'redteam dismiss --help')", crate::db::DB_FILE
                 );
             }
             if p.is_file() {
@@ -135,7 +139,7 @@ pub fn legacy_opts_from_roles(roles: &RoleSets, max_concurrency: usize) -> Resul
         return Err("未配置 scanner：在 ~/.redteam/config.json（REDTEAM_HOME 可覆盖）给至少一个模型加 roles.scanner，见 `redteam model setup --help`".to_string());
     }
     Ok(OrchestrateOpts {
-        models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0 }).collect(),
+        models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0, family: m.family.clone() }).collect(),
         replicate: true,
         no_fallback: true,
         max_concurrency,
@@ -173,18 +177,6 @@ pub(crate) fn pack_budget_bytes(roles: &RoleSets) -> usize {
     PACK_BUDGET_BYTES.min(by_window)
 }
 
-/// 单格全审默认（E9 判决，2026-07-13 转正）：全变更集恒并成一个 bundle——分格在全景 pack
-/// 范式下=N 倍重复喂同一全景（两跑实证 input −77%、质量未见系统性下降）。空输入原样放行
-/// （不产出「一个空文件的 bundle」）——上游两处空证据守卫（`run_code_review` 的「no reviewable
-/// evidence」警告、`run_incremental_review` 的 delta 全噪声过滤报错）靠 `bundles.is_empty()`
-/// 判空，语义须保持不变。
-fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bundle> {
-    if bundles.is_empty() {
-        return bundles;
-    }
-    vec![crate::bundle::Bundle { files: bundles.into_iter().flat_map(|b| b.files).collect() }]
-}
-
 /// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
 /// 唯一路径（E8-E 安乐死 SCIP/Dossier 引擎后 + Task 3 空臂 dev 开关整拆）：
 /// `build_pack`（0 壳完整体+省略清单，M15-S1）恒执行，无空臂开关。
@@ -192,9 +184,9 @@ fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bund
 /// meta.injected 是唯一可观测入口，供归因与生产诊断。
 /// `budget`=pack flat 预算（字节）；生产调用点由 `pack_budget_bytes` 按启用模型窗算出。
 pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
-    // 单格全审默认（E9）：bundles 恒为单元素（全变更集），每格即自家文件——原「兄弟改动
-    // 文件全景注入 + 依赖距离排序」随分格一并收缩（无兄弟可注入）。超预算由 build_pack
-    // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，不再靠分格避让。
+    // M21a 批 C：bundles 来自引用图分组（design §3.2，门未过时退化为单包），每格只装自家文件——
+    // 视野外的改动文件由跨组索引（`{{OTHER_CHANGED_FILES}}`）而非兄弟注入提供。超预算由 build_pack
+    // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，分组「宁降不拆」不靠分格避让。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
@@ -206,6 +198,41 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
     let meta = DossierMeta { bundles: bundles.len(), injected };
     (entries, meta)
+}
+
+/// 三条路径（全量 / 增量 / `--pack-only`）共用的「pack 预算 + spec 参照段」：spec 帽夹紧到 pack 预算一半
+/// （dogfood #2：64K 固定帽会吃穿小窗模型的整个输入窗），扣减后的预算给分组与装包。
+/// 返回 (budget, spec_section, warnings)。
+pub(crate) fn budget_and_spec(roles: &RoleSets, spec: &[String]) -> (usize, String, Vec<String>) {
+    let budget_raw = pack_budget_bytes(roles);
+    let (spec_section, spec_used, warnings) = render_spec_section_capped(spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
+    (budget_raw.saturating_sub(spec_used), spec_section, warnings)
+}
+
+/// cell 规划产物：分组 + 每组卷宗 + 每组跨组索引（三者等长等序）+ 观测。
+pub(crate) struct CellPlan {
+    pub bundles: Vec<Bundle>,
+    pub dossiers: Vec<String>,
+    pub others: Vec<String>,
+    pub dossier_meta: DossierMeta,
+    pub stats: GroupingStats,
+}
+
+/// 筛选后证据 → 引用图分组（design §3.2，预算门喂 pack 预算）→ 装包 → 跨组索引（design §10.6）。
+/// 全量 / 增量 / `--pack-only` 的唯一入口——预算仪表量的就是真实评审发出的那份 prompt 素材。
+pub(crate) fn plan_cells(
+    selected: Vec<FileChange>,
+    root: &Path,
+    budget: usize,
+    extra_paths: &[String],
+    delta: Option<&std::collections::BTreeSet<String>>,
+) -> CellPlan {
+    let grouping = group(selected, Some(root), &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() });
+    let bundles = grouping.bundles;
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    let others =
+        crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, extra_paths, delta), bundles.len());
+    CellPlan { bundles, dossiers, others, dossier_meta, stats: grouping.stats }
 }
 
 /// code 专属流水线（S2-2b）：bundle × model 工具循环 + positioning 尾段。
@@ -228,11 +255,8 @@ pub async fn run_code_review(
     let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, root)?;
     let t0 = std::time::Instant::now();
 
-    // 1. 确定性筛选 + 分包
-    // 单格全审默认（E9，2026-07-13）：全变更集并成一个 bundle——分格在全景 pack 范式下
-    // =N 倍重复喂全景（两跑实证 input −77%、质量未见下降）。bundle::group 保留（收集与
-    // 未来 L4 拆缝用）；超预算由降级梯子（骨架/hunk 窗/省略清单）承接，不拆格。
-    let bundles = merge_bundles(group(select_files(changes), Some(root)));
+    // 1. 确定性筛选；分组（design §3.2）推迟到 pack 预算算出之后——组预算门要喂它（K1 / K5）。
+    let selected = select_files(changes);
 
     // 3. 角色集 → 旧 fan-out 适配（M21a 批 A 过渡；批 F 换 scanner 路径）
     let roles = cfg.active_roles();
@@ -252,17 +276,16 @@ pub async fn run_code_review(
     // --spec 参照段（D2）：读 spec_docs → 从 pack 预算里扣掉它占用的字节，让 build_packs +
     // 第二趟补查都用缩后预算——总上下文守界，spec 与 pack 不叠加超模型墙。空 --spec →
     // (String::new(), 0) → budget 原样不变（既有回归行为零漂移）。
-    let budget_raw = pack_budget_bytes(&roles);
-    // spec 帽夹紧到 pack 预算一半（dogfood #2：64K 固定帽会吃穿小窗模型的整个输入窗）。
-    let (spec_section, spec_used, spec_warnings) =
-        render_spec_section_capped(&args.spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
-    let budget = budget_raw.saturating_sub(spec_used);
-    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
+    // 2. 分组 / 装包 / 跨组索引（plan_cells：与增量、--pack-only 同源）。门未过 → 单包（即原 E9 单格全审）。
+    // GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
+    let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &[], None);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "", &spec_section)
+        let other = others.get(idx).map(String::as_str).unwrap_or("");
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "", &spec_section, other)
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk), &spec_section).await;
+    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk), &spec_section, &others).await;
     // T46①：--spec denylist/PEM 拒读 warnings 并入 run.warnings（CI/bot 可见，不仅 eprintln）。
     raw.warnings.extend(spec_warnings);
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
@@ -337,6 +360,131 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// 进程内唯一 job-id（pid + secs + cwd 的 fnv 前 12 位）。主程序后台派发与 `--pack-only` 共用。
+pub fn gen_job_id(cwd: &Path) -> String {
+    let seed = format!("{}-{}", std::process::id(), now_unix());
+    let h = crate::hash::fnv1a64_hex(&[&seed, &cwd.to_string_lossy()]);
+    h[..12].to_string()
+}
+
+/// `--pack-only` 估算换算：代码英文 ~3.5 B/token（D7 B6，网关 usage 低报时以字节为准）。
+pub const PACK_BYTES_PER_TOKEN: f64 = 3.5;
+
+/// `--pack-only` 单 cell 记账：`bytes` = 完整 user prompt 字节（与真实评审同一 `build_bundle_prompt`
+/// 路径，可与 usage 对账）；`pack_bytes` = dossier 段；`over_budget` = 分组「宁降不拆」标记。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PackCell {
+    /// 1-based，对应 `packs/<job>/cell-<n>.md`。
+    pub cell: usize,
+    pub label: String,
+    pub files: usize,
+    pub bytes: usize,
+    pub est_tokens: u64,
+    pub pack_bytes: usize,
+    pub diff_bytes: usize,
+    pub over_budget: bool,
+}
+
+/// `--pack-only` 报告（stdout 文本行 + `packs/<job>/summary.json` 同源，K12）。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PackOnlyReport {
+    pub job_id: String,
+    pub head_sha: Option<String>,
+    pub target: String,
+    pub budget_bytes: usize,
+    pub cells: Vec<PackCell>,
+    pub grouping: crate::bundle::GroupingStats,
+    pub packs_dir: String,
+    pub warnings: Vec<String>,
+}
+
+/// `--pack-only` 预算仪表（M21a 批 C，D7 B7）：证据收集 → 门 / 分组 → 装包 → 按 cell 组 prompt →
+/// 落盘 `.redteam/packs/<job_id>/cell-<n>.md` 与 `summary.json`。不建 registry、不读 secrets、不调
+/// provider；无任何模型配置也能跑（预算按 128K 窗保守缺省）。
+pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Result<PackOnlyReport> {
+    let branch_scope = args.scope == "branch";
+    let changes = crate::evidence::git::changed_files(cwd, args.base.as_deref(), branch_scope)?;
+    let head_sha = crate::evidence::git::head_sha_at(cwd).ok();
+    let target = if branch_scope {
+        format!("branch {}...HEAD", args.base.as_deref().unwrap_or("?"))
+    } else {
+        "working tree".to_string()
+    };
+    // 预算取自与真实评审同一角色集（`active_roles` → scanners 最小窗），量的才是真实会发出的 prompt；
+    // 角色集为空（无配置）时按 128K 窗保守缺省，不报错——仪表无 provider 也能跑。
+    let roles = cfg.active_roles();
+    let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
+    let CellPlan { bundles, dossiers, others, stats, .. } = plan_cells(select_files(changes), cwd, budget, &[], None);
+    let focus = args.focus.clone().unwrap_or_default();
+
+    let job_id = gen_job_id(cwd);
+    let project_dir = cwd.join(crate::project::PROJECT_DIR);
+    let packs_dir = project_dir.join("packs").join(&job_id);
+    std::fs::create_dir_all(&packs_dir)?;
+    // 未 init 的项目：只补 `.redteam/.gitignore`（镜像 init_project 的 `*`），不建库、不建 rounds。
+    let gitignore = project_dir.join(".gitignore");
+    if !gitignore.exists() {
+        std::fs::write(&gitignore, crate::project::GITIGNORE_BODY)?;
+    }
+    let mut cells = Vec::new();
+    for (i, b) in bundles.iter().enumerate() {
+        let dossier = dossiers.get(i).map(String::as_str).unwrap_or("");
+        let other = others.get(i).map(String::as_str).unwrap_or("");
+        let prompt = crate::prompt::build_bundle_prompt(&target, b, &focus, other, "", dossier, &spec_section);
+        std::fs::write(packs_dir.join(format!("cell-{}.md", i + 1)), &prompt)?;
+        cells.push(PackCell {
+            cell: i + 1,
+            label: b.label(),
+            files: b.files.len(),
+            bytes: prompt.len(),
+            est_tokens: (prompt.len() as f64 / PACK_BYTES_PER_TOKEN).round() as u64,
+            pack_bytes: dossier.len(),
+            diff_bytes: b.files.iter().map(|f| f.diff.len()).sum(),
+            over_budget: b.over_budget,
+        });
+    }
+    if cells.is_empty() {
+        warnings.push(format!("no reviewable evidence: empty diff for {target} (0 cells)"));
+    }
+    let report = PackOnlyReport {
+        job_id,
+        head_sha,
+        target,
+        budget_bytes: budget,
+        cells,
+        grouping: stats,
+        packs_dir: packs_dir.to_string_lossy().into_owned(),
+        warnings,
+    };
+    std::fs::write(packs_dir.join("summary.json"), serde_json::to_string_pretty(&report)?)?;
+    Ok(report)
+}
+
+/// `--pack-only` stdout：每 cell 一行 + 分组统计一行 + packs 目录一行（+ warnings）。固定文本、不按
+/// `--format` 切换（机读走 summary.json）。
+pub fn render_pack_only(r: &PackOnlyReport) -> String {
+    let mut out = String::new();
+    for c in &r.cells {
+        out.push_str(&format!(
+            "cell-{} files={} bytes={} est_tokens={} pack_bytes={} diff_bytes={} over_budget={}\n",
+            c.cell, c.files, c.bytes, c.est_tokens, c.pack_bytes, c.diff_bytes, c.over_budget
+        ));
+    }
+    if r.cells.is_empty() {
+        out.push_str("cells=0\n");
+    }
+    let g = &r.grouping;
+    out.push_str(&format!(
+        "grouping gate={} groups={} edges={} weak_cut={} cross_edges={} isolated={} over_budget={}\n",
+        g.gate.as_str(), g.groups, g.edges, g.weak_cut, g.cross_edges, g.isolated, g.over_budget
+    ));
+    out.push_str(&format!("packs={}\n", r.packs_dir));
+    for w in &r.warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out
 }
 
 /// R2.1 job checkpoint sink：扇出前落 manifest（+刷 progress.total），每 cell 完成落 partial
@@ -444,10 +592,10 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
         .collect();
     let done = done_records.len();
     let total = manifest.len().max(done);
-    let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.findings).collect();
+    let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.output.into_findings()).collect();
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
-        schema_version: "3".into(),
+        schema_version: crate::domain::SCHEMA_VERSION.into(),
         verdict: Verdict::Incomplete,
         stats,
         findings,
@@ -523,6 +671,12 @@ pub async fn run_resume(
         .collect();
     let pending: Vec<&crate::state::CellInput> =
         manifest.iter().filter(|c| !done.contains(&c.cell)).collect();
+    // 家族随记录落库：按 manifest 的 model 名回查当前角色条目（条目已删则空串）。
+    let roles = cfg.active_roles();
+    let family_of = |name: &str| -> String {
+        roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers)
+            .find(|m| m.name == name).map(|m| m.family.clone()).unwrap_or_default()
+    };
 
     let mut usage = (0u64, 0u64, 0u64);
     let mut warnings = Vec::new();
@@ -547,25 +701,27 @@ pub async fn run_resume(
                 let fs: Vec<Finding> =
                     call.findings.iter().map(|r| enrich(r, &cell.model)).collect();
                 // 指标随落盘：duration/usage/iterations 来自胜出 call（与 fanout 侧 CellSink 同构）。
-                crate::state::CellRecord {
-                    cell: cell.cell.clone(), model: cell.model.clone(), ok: true,
-                    findings: fs, warn: None,
-                    duration_ms: elapsed.as_millis() as u64,
-                    input_tokens: call.input_tokens, output_tokens: call.output_tokens,
-                    cached_input_tokens: call.cached_input_tokens,
-                    attempts: 1, iterations: call.iterations,
-                    tool_use: call.tool_use.clone(),
-                }
+                let mut rec = crate::state::CellRecord::ok(
+                    cell.cell.clone(), cell.model.clone(),
+                    crate::domain::CellOutput::Review { findings: fs, needs: call.needs.clone() },
+                ).with_family(family_of(&cell.model));
+                rec.duration_ms = elapsed.as_millis() as u64;
+                rec.input_tokens = call.input_tokens;
+                rec.output_tokens = call.output_tokens;
+                rec.cached_input_tokens = call.cached_input_tokens;
+                rec.attempts = 1;
+                rec.iterations = call.iterations;
+                rec.tool_use = call.tool_use.clone();
+                rec
             }
             Err(e) => {
                 warnings.push(format!("resume cell [{}] model {}: {e}", cell.cell, cell.model));
-                crate::state::CellRecord {
-                    cell: cell.cell.clone(), model: cell.model.clone(), ok: false,
-                    findings: vec![], warn: Some(e.to_string()),
-                    duration_ms: elapsed.as_millis() as u64,
-                    input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 1, iterations: 0,
-                    tool_use: Default::default(),
-                }
+                let mut rec = crate::state::CellRecord::failed(
+                    cell.cell.clone(), cell.model.clone(), crate::domain::Role::Reviewer, e.to_string(),
+                ).with_family(family_of(&cell.model));
+                rec.duration_ms = elapsed.as_millis() as u64;
+                rec.attempts = 1;
+                rec
             }
         };
         // resume 披露清零：checkpoint 写失败不再静默吞掉——foreground 命令，stderr 用户可见
@@ -581,7 +737,7 @@ pub async fn run_resume(
         final_records.iter().filter(|r| r.ok).map(|r| r.cell.as_str()).collect();
     let still_missing = manifest.iter().filter(|c| !ok_cells.contains(c.cell.as_str())).count();
     let findings: Vec<Finding> =
-        final_records.into_iter().filter(|r| r.ok).flat_map(|r| r.findings).collect();
+        final_records.into_iter().filter(|r| r.ok).flat_map(|r| r.output.into_findings()).collect();
 
     // resume：角色集按当前配置重建（M21a 产品态不产 finding，与原作业模型不同可接受；记 followup 观察）。
     let roles = cfg.active_roles();
@@ -932,7 +1088,7 @@ mod job_tests {
     }
 
     fn code_args() -> ReviewArgs {
-        ReviewArgs {
+        ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(),
             spec: vec![], focus: None,
             block_threshold: None, conf_floor: None,
@@ -1018,7 +1174,7 @@ mod job_tests {
         // 预置一条 partial（模拟崩溃前已完成 1 cell）
         store.append_partial(
             "j2b",
-            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", vec![checkpointed_finding("checkpointed")]),
+            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("checkpointed")])),
         ).unwrap();
 
         // 非 git 目录 → changed_files 失败 → run_review_dispatch Err，但已有 partial 记录
@@ -1064,7 +1220,7 @@ mod job_tests {
         // 预置一条 partial（模拟 deadline 前已完成 1 cell）
         store.append_partial(
             "j-to",
-            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", vec![checkpointed_finding("before-deadline")]),
+            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("before-deadline")])),
         ).unwrap();
 
         let provider = HangProvider;
@@ -1177,7 +1333,7 @@ mod job_tests {
                     sink.on_cell(crate::state::CellRecord::ok(
                         format!("cell{i}"),
                         "m".to_string(),
-                        vec![],
+                        crate::domain::CellOutput::review(vec![]),
                     ));
                 })
             })
@@ -1498,10 +1654,10 @@ mod resume_tests {
         store.write_manifest("j", &inputs).unwrap();
         store.append_partial(
             "j",
-            &crate::state::CellRecord::ok("c1", "m", vec![anchorable_finding("issue-c1", "c1.rs")]),
+            &crate::state::CellRecord::ok("c1", "m", crate::domain::CellOutput::review(vec![anchorable_finding("issue-c1", "c1.rs")])),
         ).unwrap();
 
-        let args = ReviewArgs {
+        let args = ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(), spec: vec![],
             focus: None,
             block_threshold: None, conf_floor: None, background: true,
@@ -1553,10 +1709,10 @@ mod resume_tests {
         store.write_manifest("j", &inputs).unwrap();
         store.append_partial(
             "j",
-            &crate::state::CellRecord::ok("doc@alpha", "alpha", vec![anchorable_finding("issue-alpha", "alpha.rs")]),
+            &crate::state::CellRecord::ok("doc@alpha", "alpha", crate::domain::CellOutput::review(vec![anchorable_finding("issue-alpha", "alpha.rs")])),
         ).unwrap();
 
-        let args = ReviewArgs {
+        let args = ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(), spec: vec![],
             focus: None,
             block_threshold: None, conf_floor: None, background: true,
@@ -1591,7 +1747,7 @@ mod resume_tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
         // 只写 args，从不 write_manifest（模拟 fan-out 前崩溃）。
-        let args = ReviewArgs {
+        let args = ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(), spec: vec![],
             focus: None,
             block_threshold: None, conf_floor: None, background: true,
@@ -1664,7 +1820,7 @@ mod code_review_tests {
         let provider = crate::provider::fake::FakeProvider::with(
             "p/alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
         );
-        let my_args = ReviewArgs {
+        let my_args = ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(),
             spec: vec![], focus: None,
             block_threshold: None, conf_floor: None,
@@ -1681,7 +1837,7 @@ mod code_review_tests {
     }
 
     fn args() -> ReviewArgs {
-        ReviewArgs {
+        ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(),
             spec: vec![], focus: None,
             block_threshold: None, conf_floor: None,
@@ -1714,7 +1870,7 @@ mod code_review_tests {
         ]);
         scripted.insert("p/m2".to_string(), vec![raw("src/a.rs", "db.write(token);", Severity::High)]);
         let provider = FakeProvider { scripted, ..Default::default() };
-        let my_args = args();
+        let my_args = ReviewArgs { pack_only: false, ..args() };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
         let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
         assert_eq!(report.findings.len(), 1, "fabricated dropped, real merged across models");
@@ -1788,7 +1944,7 @@ mod spec_tests {
     }
 
     fn spec_test_args(spec: Vec<String>) -> ReviewArgs {
-        ReviewArgs {
+        ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(), spec, focus: None,
             block_threshold: None, conf_floor: None,
             background: false, format: "json".into(),
@@ -1875,14 +2031,14 @@ mod tests {
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
         std::fs::write(root.join("src/b.rs"), "pub fn other() {}\n").unwrap();
         let bundles = vec![
-            Bundle { files: vec![FileChange {
+            Bundle::from_files(vec![FileChange {
                 path: "src/a.rs".into(),
                 diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
-            }] },
-            Bundle { files: vec![FileChange {
+            }]),
+            Bundle::from_files(vec![FileChange {
                 path: "src/b.rs".into(),
                 diff: "@@ -1,0 +1,1 @@\n+pub fn other() {}\n".into(),
-            }] },
+            }]),
         ];
 
         let (entries, meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
@@ -1915,10 +2071,10 @@ mod tests {
             filler_line.repeat(PACK_BUDGET_BYTES / filler_line.len() + 10)
         );
         std::fs::write(root.join("src/b.rs"), &big).unwrap();
-        let bundles = vec![Bundle { files: vec![
+        let bundles = vec![Bundle::from_files(vec![
             FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() },
             FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() },
-        ] }];
+        ])];
         let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(on[0].contains("alpha_marker"), "小文件全文在场");
         // 真 diff 穿透证明（集成级）：超预算文件迫入 def 锚回落分支（changed_def_ranges
@@ -1995,7 +2151,7 @@ mod tests {
         drop(db2);
         let l3 = load_ledger(None, false, &root).unwrap();
         assert_eq!(l3.cards.len(), 1);
-        assert!(l3.meta.as_ref().unwrap().source.contains("proj.db"));
+        assert!(l3.meta.as_ref().unwrap().source.contains(crate::db::DB_FILE), "{}", l3.meta.as_ref().unwrap().source);
     }
     #[tokio::test]
     async fn jobcellsink_manifest_sets_phase_fanout() {
@@ -2042,7 +2198,7 @@ mod tests {
         };
         use crate::orchestrate::CellSink;
         sink.manifest(&[CellInput { cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
-        sink.on_cell(CellRecord::ok("c", "m", vec![]));
+        sink.on_cell(CellRecord::ok("c", "m", crate::domain::CellOutput::review(vec![])));
         sink.on_phase(Phase::Finalizing, None);
         sink.on_meta(&["m".to_string()]);
         assert_eq!(
@@ -2071,7 +2227,7 @@ mod tests {
             ckpt_failures: std::sync::atomic::AtomicU32::new(0),
         };
         use crate::orchestrate::CellSink;
-        sink.on_cell(CellRecord::ok("c", "m", vec![]));
+        sink.on_cell(CellRecord::ok("c", "m", crate::domain::CellOutput::review(vec![])));
         sink.on_phase(Phase::Finalizing, None);
         sink.on_meta(&["m".to_string()]);
         assert_eq!(
@@ -2088,7 +2244,7 @@ mod tests {
     fn append_ckpt_failure_warning_only_appends_when_nonzero() {
         fn empty_report() -> ReviewReport {
             ReviewReport {
-                schema_version: "3".into(),
+                schema_version: crate::domain::SCHEMA_VERSION.into(),
                 verdict: Verdict::Approve,
                 stats: Stats::from_findings(&[]),
                 findings: vec![],

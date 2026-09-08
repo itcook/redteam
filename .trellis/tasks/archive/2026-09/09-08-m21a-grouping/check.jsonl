@@ -1,0 +1,4 @@
+{"file": ".next/plans/2026-09-07-redteam-m21a-scan-foundation-plan.md", "reason": "批 C 每 task 的测试锚与 commit 文案；Global Constraints 的 clippy / make verify / 不顺手修 / 不入公司内容"}
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§3.2 步骤 3-5（弱缝先切 / 宁降不拆 / 孤立装箱）与 §10.6 降质留指针是否被实现逐字满足"}
+{"file": ".next/roadmap/M21a-scan-foundation.md", "reason": "验收：--help 含 --pack-only、无 engine / --risk 字样"}
+{"file": ".trellis/spec/guides/index.md", "reason": "AI 交叉评审假阳模式（信任边界混淆：bundle 路径来自 git diff 非模型可控）与 Pre-Modification 搜索规则"}

@@ -1,0 +1,7 @@
+{"file": ".next/plans/2026-09-07-redteam-m21a-scan-foundation-plan.md", "reason": "批 C 任务 C-1…C-5 的 Modify / 测试 / Commit 定义、Global Constraints（三标配、每 task 检查项）、波次碰撞点"}
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§3.2 分组算法七步〔D3〕、§10.6 跨组索引〔D6〕、§12.1 [review.grouping] 键与默认值 4/200/10"}
+{"file": ".next/decisions/2026-09-04-redteam-review-engine-architecture-decisions.md", "reason": "D3 分组定案与被否候选（LLM 分组 / AST）、D7 B6 ÷3.5 估算与 B7 --pack-only"}
+{"file": ".next/roadmap/M21a-scan-foundation.md", "reason": "交付项 2 / 3 / 8 与验收口径（PR181 分组 ≤ 5 组、跨组边可观测、--pack-only 差 < 20%）"}
+{"file": ".next/roadmap/followup.md", "reason": "实现债：extract_imports 三语言缺口、examples/dump_pack.rs 落地即删；R3 / R8 / R20 归属"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "改常量 / 新 helper 前先搜索：cap_entries、neutralize_structure、count 计数 helper 复用"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "bundle → cli → orchestrate → prompt 跨层数据流：others 与 dossiers 并行传递"}
