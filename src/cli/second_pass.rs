@@ -207,7 +207,8 @@ pub(crate) fn second_pass_prompt(
     // Important 修复：evidence（行窗证据段，已在上方按 NEED_SECTION_BYTE_CAP 分段封顶）先
     // 扣出 pack 预算再传入 build_pack——否则 evidence+pack 联合越过每模型字节预算，撞墙全归零
     // （design §2.2）。budget 耗尽时 build_pack 自身的降级链兜底，不会 panic。
-    let pack = crate::pack::build_pack(&pb, root, budget.saturating_sub(evidence.len()), own_diff_bytes);
+    // 批 E K2：needs 是显式索要全文，own 文件全文是超集——二阶段恒 `full`（本路径 F-4 退役）；预算由梯子守。
+    let pack = crate::pack::build_pack(&pb, root, budget.saturating_sub(evidence.len()), own_diff_bytes, &crate::pack::PackOpts::full());
     let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
     // `others`：本组的跨组索引串（调用方 `render_cross_indices` 预渲染，与第一趟同一份）。
     let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, others, incremental, &dossier, spec_docs);

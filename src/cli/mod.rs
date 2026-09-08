@@ -183,7 +183,7 @@ pub(crate) fn pack_budget_bytes(roles: &RoleSets) -> usize {
 /// degrades 静默于：不支持语言/无符号（pack 臂内部回落链承接）。
 /// meta.injected 是唯一可观测入口，供归因与生产诊断。
 /// `budget`=pack flat 预算（字节）；生产调用点由 `pack_budget_bytes` 按启用模型窗算出。
-pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
+pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize, opts: &crate::pack::PackOpts) -> (Vec<String>, DossierMeta) {
     // M21a 批 C：bundles 来自引用图分组（design §3.2，门未过时退化为单包），每格只装自家文件——
     // 视野外的改动文件由跨组索引（`{{OTHER_CHANGED_FILES}}`）而非兄弟注入提供。超预算由 build_pack
     // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，分组「宁降不拆」不靠分格避让。
@@ -192,7 +192,7 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
         .map(|b| {
             // 预算记账扣本格自己的 diff 字节（单格默认下即全变更集真实 diff）。
             let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
-            crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes))
+            crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes, opts))
         })
         .collect();
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
@@ -230,7 +230,8 @@ pub(crate) fn plan_cells(
 ) -> CellPlan {
     let grouping = group(selected, Some(root), &grouping_opts(grouping_cfg, budget));
     let bundles = grouping.bundles;
-    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    // ponytail: E-4 接 `cfg.review.pack`（plan_cells 加 pack_cfg 参数）；缺省即 slice〔D8〕
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget, &crate::pack::PackOpts::default());
     let others =
         crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, extra_paths, delta), bundles.len());
     CellPlan { bundles, dossiers, others, dossier_meta, stats: grouping.stats }
@@ -2063,7 +2064,7 @@ mod tests {
             }]),
         ];
 
-        let (entries, meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
+        let (entries, meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES, &crate::pack::PackOpts::full());
         assert!(entries[0].contains("target") && entries[0].contains("改动源文"), "bundle 1 自家内容非空含 0 壳: {entries:?}");
         assert!(entries[1].contains("other"), "bundle 2 自家内容非空: {entries:?}");
         assert_eq!(meta, DossierMeta { bundles: 2, injected: 2 });
@@ -2097,7 +2098,8 @@ mod tests {
             FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() },
             FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() },
         ])];
-        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
+        // full 档：本测试锚的是回落梯子的真 diff 穿透（slice 档由 pack::tests 覆盖）
+        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES, &crate::pack::PackOpts::full());
         assert!(on[0].contains("alpha_marker"), "小文件全文在场");
         // 真 diff 穿透证明（集成级）：超预算文件迫入 def 锚回落分支（changed_def_ranges
         // 消费其真 diff）——空 diff 占位回归下无锚可寻，以下两条断言全灭。

@@ -1,23 +1,279 @@
-//! pack 引擎（M15-S1，E8-E 安乐死 SCIP/1 壳引用点后收窄）：每 bundle 的预算治理上下文块——
-//! 0 壳改动源文全文（回落链：def 体→骨架→hunk 窗）+ 精确省略清单。唯一路径，无引擎分派。
-//! hermetic：喂 (bundle, root, budget) 出字符串，零 LLM。复用 src/diffsym 的 diff/符号解析核心
-//! （梯子降级用），不再消费其引用点搜索（该引擎已随 SCIP 一并拆除）。
+//! pack 引擎（M15-S1 起；M21a 批 E 升为改动中心切片）：每 bundle 的预算治理上下文块——
+//! 0 壳改动源文（`[review.pack] body = slice` 缺省〔D8〕：核 / 文件内一跳 / 文件地图 / 折叠 / 禁真空兜底；
+//! `full` 旋钮 = 整文件）+ 回落梯子（def 体 → 骨架 → hunk 窗 → omit 坐标）+ 精确省略清单。唯一路径，无引擎分派。
+//! hermetic：喂 (bundle, root, budget, opts) 出字符串与形态统计，零 LLM。复用 src/diffsym 的 diff / 符号 / 一跳解析。
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use regex::Regex;
 
 use crate::bundle::Bundle;
-use crate::diffsym::{changed_def_ranges, compile_defs, hunk_changed_lines, lang_for, match_def, parse_hunk_new_range};
+pub use crate::config::PackBody;
+use crate::config::PackCfg;
+use crate::diffsym::{
+    all_defs, changed_def_ranges, changed_defs, compile_defs, hunk_changed_lines, lang_for, match_def, one_hop,
+    parse_hunk_new_range, DefRange, OneHop,
+};
 
 /// 省略清单条目上限（防大 fan-in 撑爆；超出末尾计数兜底）。
 pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
+/// 文件头（首个 def 之前的注释 / doc / import 行）最多保留行数，其余折叠。
+const HEADER_MAX_LINES: usize = 80;
+/// 多行签名最多向下延续行数（到首个 `{` 或 `;` 为止）。
+const SIG_MAX_LINES: usize = 6;
+/// 顶层胶水（不在任何 def 内的行：impl 头 / 闭合括号 / 空行 / 属性）连续 ≤ 此行数原样保留，否则折叠。
+const GLUE_MAX_LINES: usize = 3;
 
-/// 0 壳段：改动文件全文（粒度对齐模型文件级消费，E7 残余读解剖）；单文件全文超剩余预算
-/// → 回落现状 def 体（支持语言）或 omit 坐标（非支持语言）。按 budget 字节封顶。
-/// 唯一路径（Task 3：粒度 A/B S 臂符号级 dev 开关已判决拆除,全文恒默认）。
-pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec<String>) -> String {
+/// 装包旋钮（`[review.pack]`，design §12.1）：`body` 形态、hunk 窗半径、小文件全文阈值。
+/// 由 `PackCfg` 转出（缺省值唯一真相源在 config），pack 自身不读 `Config`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackOpts {
+    pub body: PackBody,
+    pub anchor_window: usize,
+    pub slice_min_bytes: usize,
+}
+
+impl From<&PackCfg> for PackOpts {
+    fn from(p: &PackCfg) -> Self {
+        PackOpts { body: p.body, anchor_window: p.anchor_window as usize, slice_min_bytes: p.slice_min_bytes as usize }
+    }
+}
+
+impl Default for PackOpts {
+    /// = config 缺省（slice / 30 / 8192〔D8〕）。
+    fn default() -> Self { PackOpts::from(&PackCfg::default()) }
+}
+
+impl PackOpts {
+    /// `full` 档（其余取缺省）：二阶段补查（needs 显式索要全文，批 E K2）与 Full 路径测试用。
+    pub fn full() -> Self { PackOpts { body: PackBody::Full, ..PackOpts::default() } }
+}
+
+/// 装包形态统计（批 E K13，铁律 1）：`--pack-only` stdout + summary.json 可读；RunMeta 接线在 F-5。
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PackStats {
+    /// `slice` / `full`。
+    pub body: &'static str,
+    /// 有内容的改动文件数（工作树缺失的不计）。
+    pub files: usize,
+    /// 切片块入正文的文件数。
+    pub sliced: usize,
+    /// `≤ slice_min_bytes` 走全文的文件数（slice 档）。
+    pub small_full: usize,
+    /// 全文块入正文的文件数（full 档，或 slice 档无可解析 hunk）。
+    pub full: usize,
+    /// 第一级装不下、进入回落梯子（def 体 / 骨架 / hunk 窗）的文件数。
+    pub ladder: usize,
+    /// 有条目进省略清单的文件数。
+    pub omitted: usize,
+    /// 切片展开的一跳 def 总数。
+    pub one_hop_defs: usize,
+    /// 切片折叠掉的行数总和。
+    pub folded_lines: usize,
+    /// 文件外片段：调用点块数 / 签名块数 / 段字节。
+    pub outside_sites: usize,
+    pub outside_sigs: usize,
+    pub outside_bytes: usize,
+}
+
+/// `pack_bundle` 产物：正文 + 形态统计。
+#[derive(Clone, Debug)]
+pub struct Packed {
+    pub text: String,
+    pub stats: PackStats,
+}
+
+/// 切片块的形态（块头与统计用）。
+struct SliceOut {
+    text: String,
+    one_hop: usize,
+    folded_lines: usize,
+}
+
+/// diff 各 hunk 的新文件起止 `(c, d)`（`@@ -a,b +c,d @@`；d 缺省 1）。
+fn hunk_ranges(diff: &str) -> Vec<(usize, usize)> {
+    diff.lines().filter(|l| l.starts_with("@@")).filter_map(parse_hunk_new_range).collect()
+}
+
+/// 文件头保留行：注释 / doc / import / package / mod 一类（首个 def 之前的地图）。
+fn is_header_line(t: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "//", "/*", "*", "#", "--", "use ", "pub use ", "pub(crate) use ", "extern crate ", "import ", "export ", "from ",
+        "package ", "mod ", "pub mod ", "pub(crate) mod ", "require(",
+    ];
+    PREFIXES.iter().any(|p| t.starts_with(p))
+}
+
+/// def 签名尾行：从 start 向下到首个含 `{` 或以 `;` 结尾的行（含），最多 `SIG_MAX_LINES` 行，不越 def 尾。
+fn sig_end(lines: &[&str], d: &DefRange) -> usize {
+    let hi = d.end.min(d.start + SIG_MAX_LINES - 1).min(lines.len().saturating_sub(1));
+    (d.start..=hi).find(|&i| lines[i].contains('{') || lines[i].trim_end().ends_with(';')).unwrap_or(hi)
+}
+
+/// 区间排序 + 合并（重叠或相邻）。
+fn merge_ranges(mut v: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    v.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in v {
+        match out.last_mut() {
+            Some(last) if a <= last.1 + 1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// 改动中心切片（design §10.2〔D8〕，批 E K6 / K7）：`≤ slice_min_bytes` 或无可解析改动行 → None（调用方给全文）。
+/// 展开区间 = 核（`changed_defs`）∪ 一跳 ∪ 禁真空窗（任一改动行未被覆盖的 hunk 取 ±`anchor_window`）；
+/// 保留行 = 文件头（≤ `HEADER_MAX_LINES`）+ 全部 def 签名；其余按外围 def 折叠成 `…（a-b 行折叠：name）`，
+/// 顶层胶水 ≤ `GLUE_MAX_LINES` 原样、更长折叠成 `…（a-b 行折叠）`。非支持语言：无 def，展开只来自禁真空窗。
+fn slice_file(
+    path: &str,
+    content: &str,
+    diff: &str,
+    defs: Option<&[(&'static str, Regex)]>,
+    opts: &PackOpts,
+) -> Option<SliceOut> {
+    if content.len() <= opts.slice_min_bytes {
+        return None;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+    if n == 0 {
+        return None;
+    }
+    let changed_lines: BTreeSet<usize> = hunk_changed_lines(diff).into_iter().map(|l| l.min(n - 1)).collect();
+    if changed_lines.is_empty() {
+        return None;
+    }
+    let (all, changed, hop) = match defs {
+        Some(d) => {
+            let all = all_defs(&lines, d);
+            let changed = changed_defs(diff, &all);
+            let hop = one_hop(&lines, &all, &changed);
+            (all, changed, hop)
+        }
+        None => (Vec::new(), Vec::new(), OneHop::default()),
+    };
+    // 展开区间：核 ∪ 一跳
+    let mut expand: Vec<(usize, usize)> = changed
+        .iter()
+        .chain(hop.callees.iter())
+        .chain(hop.callers.iter())
+        .map(|d| (d.start, d.end.min(n - 1)))
+        .collect();
+    // 禁真空（K7）：某 hunk 有改动行不在任何展开区间 → 整 hunk ±N 窗并入
+    let covered = |l: usize, ex: &[(usize, usize)]| ex.iter().any(|&(a, b)| a <= l && l <= b);
+    for (c, d) in hunk_ranges(diff) {
+        let lo = c.saturating_sub(1).min(n - 1);
+        let hi = (c.saturating_sub(1) + d.max(1) - 1).min(n - 1);
+        if changed_lines.range(lo..=hi).any(|&l| !covered(l, &expand)) {
+            expand.push((lo.saturating_sub(opts.anchor_window), (hi + opts.anchor_window).min(n - 1)));
+        }
+    }
+    let expand = merge_ranges(expand);
+    // 保留行：文件头 + 签名
+    let mut keep: BTreeSet<usize> = BTreeSet::new();
+    let first_def = all.first().map(|d| d.start).unwrap_or(n);
+    let mut header_kept = 0usize;
+    for (i, line) in lines.iter().enumerate().take(first_def) {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if is_header_line(t) {
+            keep.insert(i);
+            header_kept += 1;
+            if header_kept >= HEADER_MAX_LINES {
+                break;
+            }
+        }
+    }
+    for d in &all {
+        for i in d.start..=sig_end(&lines, d) {
+            keep.insert(i);
+        }
+    }
+    // 每行最内层外围 def（折叠标记命名用）：按 start 升序赋值，内层后写覆盖外层
+    let mut owner: Vec<Option<usize>> = vec![None; n];
+    for (idx, d) in all.iter().enumerate() {
+        for o in owner.iter_mut().take(d.end.min(n - 1) + 1).skip(d.start) {
+            *o = Some(idx);
+        }
+    }
+    // 渲染
+    let mut body = String::new();
+    let (mut folds, mut folded_lines) = (0usize, 0usize);
+    let mut ei = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        while ei < expand.len() && expand[ei].1 < i {
+            ei += 1;
+        }
+        if let Some(&(a, b)) = expand.get(ei) {
+            if a <= i {
+                for l in &lines[i..=b] {
+                    body.push_str(l);
+                    body.push('\n');
+                }
+                i = b + 1;
+                continue;
+            }
+        }
+        if keep.contains(&i) {
+            body.push_str(lines[i]);
+            body.push('\n');
+            i += 1;
+            continue;
+        }
+        let next_expand = expand.get(ei).map(|e| e.0).unwrap_or(n);
+        let own = owner[i];
+        let mut j = i;
+        while j < n && j < next_expand && !keep.contains(&j) && owner[j] == own {
+            j += 1;
+        }
+        let len = j - i;
+        match own {
+            Some(idx) => {
+                body.push_str(&format!("…（{}-{} 行折叠：{}）\n", i + 1, j, all[idx].name));
+                folds += 1;
+                folded_lines += len;
+            }
+            None if len <= GLUE_MAX_LINES => {
+                for l in &lines[i..j] {
+                    body.push_str(l);
+                    body.push('\n');
+                }
+            }
+            None => {
+                body.push_str(&format!("…（{}-{} 行折叠）\n", i + 1, j));
+                folds += 1;
+                folded_lines += len;
+            }
+        }
+        i = j;
+    }
+    let one_hop = hop.callees.len() + hop.callers.len();
+    let head = format!("{path}:1-{n}（切片：核 {} · 一跳 {one_hop} · 折叠 {folds} 段）", changed.len());
+    Some(SliceOut { text: format!("{head}\n{body}\n"), one_hop, folded_lines })
+}
+
+/// 0 壳段：每个改动文件一块，第一级 = 切片块（slice 档、大文件）或全文块（full 档 / 小文件 / 无可解析 hunk），
+/// 装不下 → 回落梯子（不砍语义只降粒度）：def 体（支持语言）→ 骨架 → hunk 窗（非支持语言）→ omit 坐标。按 budget 字节封顶。
+pub(crate) fn body_section(
+    bundle: &Bundle,
+    root: &Path,
+    budget: usize,
+    omit: &mut Vec<String>,
+    opts: &PackOpts,
+    stats: &mut PackStats,
+) -> String {
     let mut out = String::new();
+    stats.body = match opts.body {
+        PackBody::Slice => "slice",
+        PackBody::Full => "full",
+    };
     // 填充序 = hub_order（枢纽先填、保全文；M21a 批 C K7）。
     for fc in bundle.fill_order() {
         // 工作树直读（bundle 路径来自 git diff、非模型可控，沿用 bundle::group 安全不变量）
@@ -25,28 +281,59 @@ pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &m
         if content.is_empty() {
             continue;
         }
+        stats.files += 1;
         let n_lines = content.lines().count();
-        let block = format!("{}:1-{}（全文，{} 行）\n{}\n\n", fc.path, n_lines, n_lines, content);
+        let lang = lang_for(&fc.path);
+        let defs = lang.map(compile_defs);
+        let omit_before = omit.len();
+        // 第一级：切片 / 全文
+        let full_block = || format!("{}:1-{}（全文，{} 行）\n{}\n\n", fc.path, n_lines, n_lines, content);
+        let mut sliced: Option<SliceOut> = None;
+        let (block, kind) = if opts.body == PackBody::Slice {
+            if content.len() <= opts.slice_min_bytes {
+                (full_block(), "small")
+            } else {
+                match slice_file(&fc.path, &content, &fc.diff, defs.as_deref(), opts) {
+                    Some(s) => {
+                        let text = s.text.clone();
+                        sliced = Some(s);
+                        (text, "slice")
+                    }
+                    None => (full_block(), "full"),
+                }
+            }
+        } else {
+            (full_block(), "full")
+        };
         if out.len() + block.len() <= budget {
             out.push_str(&block);
-            continue;
-        }
-        // def 体：全文超预算回落（不砍语义只降粒度）
-        let lang = match lang_for(&fc.path) {
-            Some(l) => l,
-            None => {
-                // 非支持语言超预算：先试 hunk±20 行窗（禁真空升级，Task 5）→ 装不下才 omit。
-                if let Some(block) = hunk_window_block(&fc.path, &content, &fc.diff, n_lines) {
-                    if out.len() + block.len() <= budget {
-                        out.push_str(&block);
-                        continue;
+            match kind {
+                "slice" => {
+                    stats.sliced += 1;
+                    if let Some(s) = sliced {
+                        stats.one_hop_defs += s.one_hop;
+                        stats.folded_lines += s.folded_lines;
                     }
                 }
-                omit.push(format!("{}:1-{} — 全文超预算（非支持语言无 def 回落）", fc.path, n_lines));
-                continue;
+                "small" => stats.small_full += 1,
+                _ => stats.full += 1,
             }
+            continue;
+        }
+        // 梯子：第一级装不下（不砍语义只降粒度）
+        stats.ladder += 1;
+        let Some(defs) = defs else {
+            // 非支持语言超预算：先试 hunk±N 行窗（禁真空升级，Task 5）→ 装不下才 omit。
+            if let Some(block) = hunk_window_block(&fc.path, &content, &fc.diff, n_lines, opts.anchor_window) {
+                if out.len() + block.len() <= budget {
+                    out.push_str(&block);
+                    continue;
+                }
+            }
+            omit.push(format!("{}:1-{} — 全文超预算（非支持语言无 def 回落）", fc.path, n_lines));
+            stats.omitted += 1;
+            continue;
         };
-        let defs = compile_defs(lang);
         let lines: Vec<&str> = content.lines().collect();
         let mut wrote_def = false; // 至少一个 def 体入了正文
         let mut omitted_def = false; // 至少一个 def 体超预算进了 omit 坐标
@@ -84,6 +371,9 @@ pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &m
         // 必须 omit 可观测（T42 场景）。
         if !wrote_def && !wrote_skeleton && !omitted_def {
             omit.push(format!("{}:1-{} — 全文超预算且 def 锚定失败（降级空产出）", fc.path, n_lines));
+        }
+        if omit.len() > omit_before {
+            stats.omitted += 1;
         }
     }
     if out.is_empty() {
@@ -124,21 +414,16 @@ pub(crate) fn skeleton_of(content: &str, diff: &str, defs: &[(&'static str, Rege
 }
 
 /// 非支持语言超预算兜底（回落链第 2 级插档，Task 5）：全文放不下、无 def 可回落时，从 diff
-/// 各 hunk 头解析新文件起止行 `(c, d)`，各取 `[c−20, c+d+20]` 窗、跨 hunk 合并成一个窗
-/// （单 cell diff 罕见多 hunk；合并窗简单可靠，偶尔多带无关行也由调用方 budget 判定兜底裁掉）。
+/// 各 hunk 头解析新文件起止行 `(c, d)`，各取 `[c−N, c+d+N]` 窗（N = `anchor_window`，批 E K16）、跨 hunk 合并
+/// 成一个窗（单 cell diff 罕见多 hunk；合并窗简单可靠，偶尔多带无关行也由调用方 budget 判定兜底裁掉）。
 /// 窗内容原样保留、不折叠——非支持语言无符号结构，折叠无意义。无可解析 hunk 头 → None。
-fn hunk_window_block(path: &str, content: &str, diff: &str, n_lines: usize) -> Option<String> {
+fn hunk_window_block(path: &str, content: &str, diff: &str, n_lines: usize, win: usize) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
     let mut lo = usize::MAX;
     let mut hi = 0usize;
-    for raw in diff.lines() {
-        if !raw.starts_with("@@") {
-            continue;
-        }
-        if let Some((c, d)) = parse_hunk_new_range(raw) {
-            lo = lo.min(c.saturating_sub(20).max(1));
-            hi = hi.max((c + d + 20).min(n_lines));
-        }
+    for (c, d) in hunk_ranges(diff) {
+        lo = lo.min(c.saturating_sub(win).max(1));
+        hi = hi.max((c + d + win).min(n_lines));
     }
     if hi == 0 {
         return None;
@@ -147,24 +432,22 @@ fn hunk_window_block(path: &str, content: &str, diff: &str, n_lines: usize) -> O
     if body.is_empty() {
         return None;
     }
-    Some(format!("{path}:{lo}-{hi}（hunk±20 窗）\n{body}\n\n"))
+    Some(format!("{path}:{lo}-{hi}（hunk±{win} 窗）\n{body}\n\n"))
 }
 
-/// 引擎入口：为一个 bundle 产 pack 正文（0 壳 + 省略清单），预算近→远填。
+/// 引擎入口：为一个 bundle 产 pack 正文（0 壳 + 省略清单）与形态统计，预算近→远填。
 /// 不含 `<dossier>` 包裹（那是 prompt 层的活）。空 = 无 pack（降级）。
 /// `own_diff_bytes`：本变更集 diff 的字节数（mandate——diff 是 prompt 恒渲染部分，永不砍，
 /// 但占预算记账）：先从 budget 扣出预留，pack 各段再按剩余近→远填充。由调用方传入而非在此
 /// 对 `bundle.files` 求和：二阶段补查传入的 augmented bundle 前插了 needs 文件，记账仍只按
 /// 原始变更集 diff 算。
-/// 唯一路径（E8-E 安乐死 SCIP/1 壳引用点后）：0 壳全文（+ 回落链：def 体→骨架→hunk 窗）是
-/// 全部内容，无 1 壳/callee 段、无引擎分派。
-pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: usize) -> String {
+pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: usize, opts: &PackOpts) -> Packed {
     let remaining = budget.saturating_sub(own_diff_bytes);
-
+    let mut stats = PackStats::default();
     let mut omit: Vec<String> = Vec::new();
 
-    // 0 壳：改动源文全文（唯一内容；overflow → omit）
-    let bodies = body_section(bundle, root, remaining, &mut omit);
+    // 0 壳：改动源文（切片 / 全文 + 梯子；overflow → omit）
+    let bodies = body_section(bundle, root, remaining, &mut omit, opts, &mut stats);
 
     // 组装：非空段拼接 + 省略清单（封顶 + 计数兜底）
     let mut sections: Vec<String> = Vec::new();
@@ -184,7 +467,12 @@ pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: u
         }
         sections.push(sec);
     }
-    sections.join("\n")
+    Packed { text: sections.join("\n"), stats }
+}
+
+/// 只要正文的薄包装（二阶段补查与测试用）。
+pub fn build_pack(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: usize, opts: &PackOpts) -> String {
+    pack_bundle(bundle, root, budget, own_diff_bytes, opts).text
 }
 
 #[cfg(test)]
@@ -205,7 +493,7 @@ mod tests {
             diff: "@@ -4,0 +5,1 @@\n+    let z = 2;\n".into(),
         }]);
         let mut omit = Vec::new();
-        let s = body_section(&b, root, 1_000_000, &mut omit);
+        let s = body_section(&b, root, 1_000_000, &mut omit, &PackOpts::full(), &mut PackStats::default());
         assert!(s.contains("## 改动源文（0 壳）"), "含 0 壳标题: {s}");
         assert!(s.contains("fn caller() {") && s.contains("let z = 2;"), "含 caller 完整体");
         assert!(s.contains("fn helper"), "全文含未改动的 helper（粒度对齐模型文件级消费，E7）");
@@ -226,7 +514,7 @@ mod tests {
             diff: "@@ -6,0 +6,1 @@\n+    let z = 2;\n".into(),
         }]);
         let mut omit = Vec::new();
-        let s = body_section(&b, root, 1_000_000, &mut omit);
+        let s = body_section(&b, root, 1_000_000, &mut omit, &PackOpts::full(), &mut PackStats::default());
         assert!(s.contains("## 改动源文（0 壳）"), "新段标题: {s}");
         assert!(s.contains("src/a.rs:1-8（全文，8 行）"), "全文块头带行数: {s}");
         // 粒度对齐（E7）：全文包含改动 def 之外的内容——imports 与相邻函数
@@ -251,7 +539,7 @@ mod tests {
         }]);
         // 预算 500B：全文（~3.4KB）放不下 → 回落 caller def 体（~30B）放得下
         let mut omit = Vec::new();
-        let s = body_section(&b, root, 500, &mut omit);
+        let s = body_section(&b, root, 500, &mut omit, &PackOpts::full(), &mut PackStats::default());
         assert!(s.contains("def 体，全文超预算回落"), "回落标注: {s}");
         assert!(s.contains("fn caller() {") && s.contains("work();"), "回落仍给改动 def 体");
         assert!(!s.contains("fn filler"), "回落不含无关大函数");
@@ -268,16 +556,16 @@ mod tests {
             path: "notes.md".into(), diff: "@@ -3,0 +3,1 @@\n+改动的文档内容。\n".into(),
         }]);
         let mut omit = Vec::new();
-        let s = body_section(&b, root, 1_000_000, &mut omit);
+        let s = body_section(&b, root, 1_000_000, &mut omit, &PackOpts::full(), &mut PackStats::default());
         assert!(s.contains("改动的文档内容。"), "非支持语言也给全文（E7：templates 格整读实证）: {s}");
-        // 超预算但装得下 hunk±20 窗（Task 5 骨架档兜底升级：非支持语言不再直接 omit）→ 窗内容替代 omit
+        // 超预算但装得下 hunk±30 窗（Task 5 骨架档兜底升级：非支持语言不再直接 omit）→ 窗内容替代 omit
         let mut omit2 = Vec::new();
-        let s2 = body_section(&b, root, 68, &mut omit2);
-        assert!(s2.contains("改动的文档内容。") && s2.contains("hunk±20 窗"), "窗兜底取代 omit: {s2}");
+        let s2 = body_section(&b, root, 68, &mut omit2, &PackOpts::full(), &mut PackStats::default());
+        assert!(s2.contains("改动的文档内容。") && s2.contains("hunk±30 窗"), "窗兜底取代 omit: {s2}");
         assert!(omit2.is_empty(), "窗已装下，无需 omit: {omit2:?}");
         // 连窗都装不下才落回现状消息（禁真空兜底不能丢）
         let mut omit3 = Vec::new();
-        let s3 = body_section(&b, root, 10, &mut omit3);
+        let s3 = body_section(&b, root, 10, &mut omit3, &PackOpts::full(), &mut PackStats::default());
         assert!(s3.is_empty() && omit3.len() == 1 && omit3[0].contains("notes.md"), "窗也装不下才进 omit: {omit3:?}");
     }
 
@@ -298,7 +586,7 @@ mod tests {
         }]);
         let mut omit = Vec::new();
         // 预算 800B：全文（~4.5KB）超、def 体（~4.2KB）超 → 骨架（3 签名行 + 折叠标记）应放得下
-        let s = body_section(&b, root, 800, &mut omit);
+        let s = body_section(&b, root, 800, &mut omit, &PackOpts::full(), &mut PackStats::default());
         // 块头对齐真实语义（评审修 3）：签名+改动行（非改动 def 全文——那会自败超预算）
         assert!(s.contains("（骨架：签名+改动行）"), "骨架档启用: {s}");
         assert!(s.contains("fn tiny_one()") && s.contains("fn tiny_two()"), "签名行全收");
@@ -325,7 +613,7 @@ mod tests {
         }]);
         let mut omit = Vec::new();
         // 全文/def 体（~4.6KB）双超 800B → 骨架；5 个改动行必须全在
-        let s = body_section(&b, root, 800, &mut omit);
+        let s = body_section(&b, root, 800, &mut omit, &PackOpts::full(), &mut PackStats::default());
         assert!(s.contains("骨架"), "骨架档启用: {s}");
         for c in ["let c1", "let c2", "let c3", "let c4", "let c5"] {
             assert!(s.contains(c), "多行 hunk 改动行全保留，缺 {c}: {s}");
@@ -350,7 +638,7 @@ mod tests {
         }]);
         let mut omit = Vec::new();
         // 800B：全文超、small def 体（~100B）入正文、big def 体（~4.2KB）超 → 溢出坐标，无骨架
-        let s = body_section(&b, root, 800, &mut omit);
+        let s = body_section(&b, root, 800, &mut omit, &PackOpts::full(), &mut PackStats::default());
         assert!(!s.contains("骨架"), "部分成功不叠加骨架: {s}");
         assert!(s.contains("fn small_changed") && s.contains("let a = 1;"), "已入 def 体保留: {s}");
         assert!(omit.iter().any(|o| o.contains("改动符号体")), "溢出 def 进 omit 坐标: {omit:?}");
@@ -369,8 +657,8 @@ mod tests {
             diff: "@@ -100,0 +100,1 @@\n+line 100\n".into(),
         }]);
         let mut omit = Vec::new();
-        let s = body_section(&b, root, 900, &mut omit);
-        assert!(s.contains("line 100") && s.contains("line 85"), "hunk±20 窗在场: {s}");
+        let s = body_section(&b, root, 900, &mut omit, &PackOpts::full(), &mut PackStats::default());
+        assert!(s.contains("line 100") && s.contains("line 85"), "hunk±30 窗在场: {s}");
         assert!(!s.contains("line 10\n"), "窗外内容不在");
     }
 
@@ -387,7 +675,7 @@ mod tests {
         }]);
         // 预算极小 → body 放不下 → 进 omit 坐标、正文空
         let mut omit = Vec::new();
-        let s = body_section(&b, root, 5, &mut omit);
+        let s = body_section(&b, root, 5, &mut omit, &PackOpts::full(), &mut PackStats::default());
         assert_eq!(s, "", "预算耗尽正文空");
         assert_eq!(omit.len(), 1, "body 降级为坐标");
         assert!(omit[0].contains("src/a.rs:"), "带坐标: {omit:?}");
@@ -404,7 +692,7 @@ mod tests {
             path: "src/gone.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn f() {}\n".into(),
         }]);
         let mut omit = Vec::new();
-        assert_eq!(body_section(&b, tmp.path(), 1_000_000, &mut omit), "", "文件缺失 → 空");
+        assert_eq!(body_section(&b, tmp.path(), 1_000_000, &mut omit, &PackOpts::full(), &mut PackStats::default()), "", "文件缺失 → 空");
         assert!(omit.is_empty(), "文件缺失不进 omit: {omit:?}");
     }
 
@@ -426,7 +714,7 @@ mod tests {
             diff: "@@ -1,0 +2,1 @@\n+// filler line\n".into(),
         }]);
         let mut omit = Vec::new();
-        let s = body_section(&b, root, 500, &mut omit);
+        let s = body_section(&b, root, 500, &mut omit, &PackOpts::full(), &mut PackStats::default());
         assert!(s.contains("src/a.rs") && s.contains("骨架"), "骨架档兜底承接：无签名行也不真空: {s}");
         assert!(omit.is_empty(), "骨架已承接，不再需要 omit 坐标: {omit:?}");
     }
@@ -451,11 +739,11 @@ mod tests {
         let budget = hub_block.len() + 2; // 装得下 hub 全文（或 a 全文），装不下两个
         let mut omit = Vec::new();
         let hub_first = Bundle { files: files.clone(), edges: vec![], hub_order: vec![1, 0], over_budget: false };
-        let out = body_section(&hub_first, root, budget, &mut omit);
+        let out = body_section(&hub_first, root, budget, &mut omit, &PackOpts::full(), &mut PackStats::default());
         assert!(out.contains("src/hub.rs:1-1（全文"), "枢纽先填得全文: {out}");
         assert!(!out.contains("src/a.rs:1-1（全文"), "非枢纽回落: {out}");
         let natural = Bundle::from_files(files);
-        let out = body_section(&natural, root, budget, &mut Vec::new());
+        let out = body_section(&natural, root, budget, &mut Vec::new(), &PackOpts::full(), &mut PackStats::default());
         assert!(out.contains("src/a.rs:1-1（全文") && !out.contains("src/hub.rs:1-1（全文"), "自然序对照: {out}");
     }
 
@@ -476,7 +764,7 @@ mod tests {
             "pub fn target() {\n    work();\n}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\n").unwrap();
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,3 @@\n+pub fn target() {\n+    work();\n+}\n");
         let own = b.files.iter().map(|fc| fc.diff.len()).sum();
-        let pack = build_pack(&b, root, 1_000_000, own);
+        let pack = build_pack(&b, root, 1_000_000, own, &PackOpts::full());
         assert!(pack.contains("## 改动源文（0 壳）"), "有 0 壳: {pack}");
         assert!(pack.contains("pub fn target() {"), "0 壳含 target 完整体");
         assert!(pack.contains("u1()"), "0 壳全文含 caller（非 1 壳引用点，1 壳已拆除）");
@@ -493,7 +781,7 @@ mod tests {
         let b = bundle_one("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn target() {}\n");
         // 预算极小：引用点填不下 → 省略清单带坐标（无工具默认下不指挥不存在的工具）
         let own = b.files.iter().map(|fc| fc.diff.len()).sum();
-        let pack = build_pack(&b, root, 60, own);
+        let pack = build_pack(&b, root, 60, own, &PackOpts::full());
         assert!(pack.contains("## 已省略（预算裁剪）"), "有省略段: {pack}");
         assert!(!pack.contains("read_files"), "无工具默认下省略段不得指挥不存在的工具");
         assert!(pack.contains("src/a.rs:"), "省略项带 file:line 坐标");
@@ -508,8 +796,178 @@ mod tests {
         let root = tmp.path();
         std::fs::write(root.join("app.py"), "def f(): pass\n").unwrap();
         let b = bundle_one("app.py", "@@ -1,0 +1,1 @@\n+def f(): pass\n");
-        let pack = build_pack(&b, root, 1_000_000, 0);
+        let pack = build_pack(&b, root, 1_000_000, 0, &PackOpts::full());
         assert!(pack.contains("## 改动源文（0 壳）"), "非支持语言也走 0 壳: {pack}");
         assert!(pack.contains("def f(): pass"), "含全文: {pack}");
+    }
+
+    // ---- 批 E E-2：切片配方 ----
+
+    /// 合成 > 8K 的 Rust 文件：模块 doc + use + helper_one（callee）/ changed_target / caller_of_target（caller）/ unrelated_big（600 行体）。
+    /// 行索引（0-based）：helper_one 3-6、changed_target 8-11、caller_of_target 13-15、unrelated_big 17-619（n = 620）。
+    fn big_rust_file() -> String {
+        let mut s = String::from("//! module doc line\nuse std::fmt;\n\n");
+        s += "fn helper_one() -> u8 {\n    let h = 1;\n    h + 1\n}\n\n";
+        s += "fn changed_target(x: u8) -> u8 {\n    let t = helper_one();\n    t + x\n}\n\n";
+        s += "fn caller_of_target() -> u8 {\n    changed_target(2)\n}\n\n";
+        s += "fn unrelated_big() -> u8 {\n";
+        for i in 0..600 {
+            s += &format!("    let u{i} = 7;\n");
+        }
+        s += "    0\n}\n";
+        assert!(s.len() > 8192);
+        s
+    }
+
+    fn plus_lines(diff: &str) -> Vec<String> {
+        diff.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).map(|l| l[1..].to_string()).collect()
+    }
+
+    fn slice_opts() -> PackOpts { PackOpts::default() }
+
+    #[test]
+    fn slice_expands_core_and_one_hop_folds_unrelated_keeps_map() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), big_rust_file()).unwrap();
+        let b = Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: "@@ -11,1 +11,1 @@\n+    t + x\n".into() }]);
+        let mut omit = Vec::new();
+        let mut stats = PackStats::default();
+        let s = body_section(&b, root, 1_000_000, &mut omit, &slice_opts(), &mut stats);
+        assert!(s.contains("src/a.rs:1-620（切片：核 1 · 一跳 2 · 折叠 1 段）"), "块头: {s}");
+        assert!(s.contains("fn changed_target(x: u8) -> u8 {\n    let t = helper_one();\n    t + x\n}"), "核全文: {s}");
+        assert!(s.contains("fn helper_one() -> u8 {\n    let h = 1;"), "callee 全文: {s}");
+        assert!(s.contains("fn caller_of_target() -> u8 {\n    changed_target(2)"), "caller 全文: {s}");
+        assert!(s.contains("//! module doc line\nuse std::fmt;\n"), "文件头保留: {s}");
+        assert!(s.contains("fn unrelated_big() -> u8 {\n…（19-620 行折叠：unrelated_big）\n"), "无关函数只留签名 + 带范围与名的折叠标记: {s}");
+        assert!(!s.contains("let u7 = 7;"), "无关函数体不在: {s}");
+        assert!(omit.is_empty());
+        assert_eq!((stats.body, stats.files, stats.sliced, stats.small_full, stats.full, stats.ladder), ("slice", 1, 1, 0, 0, 0));
+        assert_eq!((stats.one_hop_defs, stats.folded_lines), (2, 602));
+    }
+
+    #[test]
+    fn slice_no_vacuum_property_rs_go_ts_md() {
+        // 禁真空性质（K7）：四语言、多 hunk（文件头 use 区 / 无关大函数体内 / 横跨两 def / 纯删除）——diff 每个 + 行逐字在输出。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), big_rust_file()).unwrap();
+        let rs_diff = "@@ -2,1 +2,1 @@\n+use std::fmt;\n@@ -12,3 +12,3 @@\n+}\n+\n+fn caller_of_target() -> u8 {\n@@ -16,1 +15,0 @@\n-removed line\n@@ -101,1 +101,1 @@\n+    let u82 = 7;\n";
+
+        let mut go = String::from("package main\n\nimport \"fmt\"\n\nfunc helperOne() int {\n\treturn 1\n}\n\nfunc changedTarget(x int) int {\n\treturn helperOne() + x\n}\n\nfunc unrelatedBig() int {\n");
+        for i in 0..600 { go += &format!("\tunused_{i} := {i}\n"); }
+        go += "\treturn 0\n}\n";
+        assert!(go.len() > 8192);
+        std::fs::write(root.join("src/b.go"), &go).unwrap();
+        let go_diff = "@@ -10,1 +10,1 @@\n+\treturn helperOne() + x\n";
+
+        let mut ts = String::from("import { x } from './x';\n\nexport class Widget {\n  helperOne(): number {\n    return 1;\n  }\n  changedTarget(): number {\n    return this.helperOne();\n  }\n  unrelatedBig(): number {\n");
+        for i in 0..600 { ts += &format!("    const u{i} = 7;\n"); }
+        ts += "    return 0;\n  }\n}\n";
+        std::fs::write(root.join("src/c.ts"), &ts).unwrap();
+        let ts_diff = "@@ -8,1 +8,1 @@\n+    return this.helperOne();\n";
+
+        let md: String = (1..=1200).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(root.join("notes.md"), &md).unwrap();
+        let md_diff = "@@ -600,1 +600,1 @@\n+line 600\n";
+
+        let files = vec![
+            FileChange { path: "notes.md".into(), diff: md_diff.into() },
+            FileChange { path: "src/a.rs".into(), diff: rs_diff.into() },
+            FileChange { path: "src/b.go".into(), diff: go_diff.into() },
+            FileChange { path: "src/c.ts".into(), diff: ts_diff.into() },
+        ];
+        let b = Bundle::from_files(files.clone());
+        let mut stats = PackStats::default();
+        let s = body_section(&b, root, 1_000_000, &mut Vec::new(), &slice_opts(), &mut stats);
+        assert_eq!(stats.sliced, 4, "四文件全走切片: {stats:?}");
+        for fc in &files {
+            for l in plus_lines(&fc.diff) {
+                assert!(s.contains(&format!("{l}\n")), "改动行必须在切片里（{}）: {l:?}", fc.path);
+            }
+        }
+        // 横跨两 def 的 hunk：两个 def 都展开；删除点所在行有窗
+        assert!(s.contains("fn caller_of_target() -> u8 {\n    changed_target(2)\n}"), "{s}");
+        // 无关体只在被改的 hunk 附近展开，其余折叠
+        assert!(s.contains("行折叠：unrelated_big）") || s.contains("let u82 = 7;"), "{s}");
+        assert!(!s.contains("unused_7 := 7\n") && s.contains("import \"fmt\""), "go 无关体折叠、import 保留: {s}");
+        assert!(!s.contains("const u7 = 7;") && s.contains("import { x } from './x';"), "ts 无关体折叠、import 保留: {s}");
+        assert!(s.contains("notes.md:1-1200（切片：核 0 · 一跳 0 · 折叠 2 段）"), "非支持语言 = hunk 窗 + 折叠: {s}");
+        assert!(s.contains("…（1-569 行折叠）\nline 570\n") && s.contains("line 630\n…（631-1200 行折叠）\n"), "{s}");
+        assert!(!s.contains("line 300\n"), "窗外折叠");
+    }
+
+    #[test]
+    fn slice_small_file_equals_full_bytewise() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn helper() {}\n\nfn caller() {\n    helper();\n    let z = 2;\n}\n").unwrap();
+        let b = Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: "@@ -4,0 +5,1 @@\n+    let z = 2;\n".into() }]);
+        let mut st_s = PackStats::default();
+        let mut st_f = PackStats::default();
+        let sl = body_section(&b, root, 1_000_000, &mut Vec::new(), &slice_opts(), &mut st_s);
+        let fu = body_section(&b, root, 1_000_000, &mut Vec::new(), &PackOpts::full(), &mut st_f);
+        assert_eq!(sl, fu, "≤ slice_min_bytes 逐字节相同（K8）");
+        assert_eq!((st_s.small_full, st_s.sliced, st_f.full), (1, 0, 1));
+        // 阈值 0：小文件也切
+        let opts = PackOpts { slice_min_bytes: 0, ..PackOpts::default() };
+        let cut = body_section(&b, root, 1_000_000, &mut Vec::new(), &opts, &mut PackStats::default());
+        // `helper` 6 字符纯小写被 ref_worthy 过滤 → 一跳 0，但签名行仍在地图里
+        assert!(cut.contains("切片：核 1 · 一跳 0") && cut.contains("fn helper() {}"), "{cut}");
+    }
+
+    #[test]
+    fn slice_ladder_takes_over_when_over_budget() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), big_rust_file()).unwrap();
+        let b = Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: "@@ -11,1 +11,1 @@\n+    t + x\n".into() }]);
+        let huge = body_section(&b, root, 1_000_000, &mut Vec::new(), &slice_opts(), &mut PackStats::default());
+        let slice_len = huge.len() - "## 改动源文（0 壳）\n".len();
+        let mut omit = Vec::new();
+        let mut stats = PackStats::default();
+        let s = body_section(&b, root, slice_len - 1, &mut omit, &slice_opts(), &mut stats);
+        assert!(s.contains("def 体，全文超预算回落") && s.contains("let t = helper_one();"), "切片装不下 → def 体（K9）: {s}");
+        assert!(!s.contains("切片："), "{s}");
+        assert_eq!((stats.sliced, stats.ladder, stats.omitted), (0, 1, 0), "{stats:?}");
+    }
+
+    #[test]
+    fn full_mode_output_unchanged_by_slice() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let content = big_rust_file();
+        std::fs::write(root.join("src/a.rs"), &content).unwrap();
+        let b = Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: "@@ -11,1 +11,1 @@\n+    t + x\n".into() }]);
+        let mut stats = PackStats::default();
+        let s = body_section(&b, root, 1_000_000, &mut Vec::new(), &PackOpts::full(), &mut stats);
+        assert_eq!(s, format!("## 改动源文（0 壳）\nsrc/a.rs:1-620（全文，620 行）\n{content}\n\n"), "full 档 = 现状整文件（K10）");
+        assert_eq!((stats.body, stats.full, stats.sliced), ("full", 1, 0));
+    }
+
+    #[test]
+    fn pack_opts_from_cfg_and_defaults() {
+        let d = PackOpts::default();
+        assert_eq!((d.body, d.anchor_window, d.slice_min_bytes), (PackBody::Slice, 30, 8192), "= config 缺省〔D8〕");
+        let f = PackOpts::full();
+        assert_eq!((f.body, f.anchor_window), (PackBody::Full, 30));
+        let cfg = crate::config::Config::from_json(r#"{"review":{"pack":{"body":"full","anchorWindow":5,"sliceMinBytes":1}}}"#).unwrap();
+        let o = PackOpts::from(&cfg.review.pack);
+        assert_eq!((o.body, o.anchor_window, o.slice_min_bytes), (PackBody::Full, 5, 1));
     }
 }

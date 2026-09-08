@@ -233,7 +233,6 @@ pub(crate) fn ref_worthy(n: &str) -> bool {
 
 /// 文件级 def：0-based inclusive 行范围 + 名 + 种类（`Lang.defs` 的 kind 字面量）。
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
 pub(crate) struct DefRange {
     pub start: usize,
     pub end: usize,
@@ -244,14 +243,12 @@ pub(crate) struct DefRange {
 /// 可调用 / 值 def 屏蔽其块内的 def（批 E K4）：fn 体里的 `const LIMIT` / 嵌套 fn、TS 箭头函数或对象字面量
 /// （kind = const）体内的 `const x` 都是局部量，不是文件级符号。class / struct / trait 等容器不屏蔽——
 /// 体内方法仍是文件级符号。
-#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
 fn shields_nested(kind: &str) -> bool {
     matches!(kind, "fn" | "func" | "function" | "method" | "const" | "static")
 }
 
 /// 容器 def（class / struct / enum / trait / type）：体内方法是独立符号；容器本身不作一跳 caller，
 /// 有内部 def 时也不作 callee / 核（整段展开会把整个 class 拖进来，批 E K4 / K5）。
-#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
 pub(crate) fn is_container(kind: &str) -> bool {
     matches!(kind, "class" | "struct" | "enum" | "trait" | "type")
 }
@@ -259,7 +256,6 @@ pub(crate) fn is_container(kind: &str) -> bool {
 /// 文件级 def 全集（按 start 升序）：逐行 `match_def` + `block_end`；嵌在屏蔽 def 体内的命中丢弃。
 /// ponytail: block_end 括号配平被字符串 / 注释里的花括号带偏时，屏蔽区间会吞掉后续 def——与骨架档同源的
 /// 已知 heuristic 边角，禁真空兜底保证改动行仍在。
-#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
 pub(crate) fn all_defs(lines: &[&str], defs: &[(&'static str, Regex)]) -> Vec<DefRange> {
     let mut out = Vec::new();
     // 外围栈：(块尾行, 是否屏蔽)；内层 def 后入栈且先结束，栈顶即最内层。
@@ -282,7 +278,6 @@ pub(crate) fn all_defs(lines: &[&str], defs: &[(&'static str, Regex)]) -> Vec<De
 }
 
 /// 容器 def 体内是否还有文件级 def（class 带方法 / trait 带方法）。
-#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
 fn has_inner(all: &[DefRange], d: &DefRange) -> bool {
     all.iter().any(|o| o.start > d.start && o.end <= d.end)
 }
@@ -290,7 +285,6 @@ fn has_inner(all: &[DefRange], d: &DefRange) -> bool {
 /// 改动 def（批 E K3）：按 diff **全部改动行**（`hunk_changed_lines`，非仅每 hunk 首行）取最内层包含它的文件级
 /// def，按 start 去重升序。带内部 def 的容器（class 带方法）不整段入核——改动落在字段行时交禁真空窗。
 /// 既有 `changed_def_ranges`（hunk 首行锚定）供分组引用边与旧梯子，语义不变。
-#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
 pub(crate) fn changed_defs(diff: &str, all: &[DefRange]) -> Vec<DefRange> {
     let mut picked = std::collections::BTreeSet::new();
     for l in hunk_changed_lines(diff) {
@@ -310,7 +304,6 @@ pub(crate) fn changed_defs(diff: &str, all: &[DefRange]) -> Vec<DefRange> {
 }
 
 /// def 体内出现的 `ref_worthy` 标识符（去自身名）；注释行（`//` / `#` / `*` / `/*` 起始）不参与。
-#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
 pub(crate) fn body_names(lines: &[&str], r: &DefRange) -> std::collections::BTreeSet<String> {
     static IDENT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let ident = IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*").expect("static ident regex"));
@@ -334,7 +327,6 @@ pub(crate) fn body_names(lines: &[&str], r: &DefRange) -> std::collections::BTre
 /// 文件内一跳（design §10.2 一跳层）：callee = 改动 def 体内出现的同文件其他 def；caller = 体内出现改动 def 名的
 /// 其他同文件 def。两组按 start 升序、互斥（既 callee 又 caller 只在 callees）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
 pub(crate) struct OneHop {
     pub callees: Vec<DefRange>,
     pub callers: Vec<DefRange>,
@@ -342,7 +334,6 @@ pub(crate) struct OneHop {
 
 /// 只一跳、不传递；自引用与改动 def 之间的互引不计（它们本就在核里）；名字过滤 `ref_worthy`（批 E K5）。
 /// callee 允许无内部 def 的容器（struct / enum / type：字段可见有用），排除带方法的 class；caller 只取非容器。
-#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
 pub(crate) fn one_hop(lines: &[&str], all: &[DefRange], changed: &[DefRange]) -> OneHop {
     let changed_starts: std::collections::BTreeSet<usize> = changed.iter().map(|d| d.start).collect();
     let changed_names: std::collections::BTreeSet<&str> = changed.iter().map(|d| d.name.as_str()).collect();
