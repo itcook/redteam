@@ -652,18 +652,31 @@ pub fn config_paths() -> Vec<PathBuf> {
     vec![redteam_home().join("config.toml")]
 }
 
-/// 旧路径探测（只提示不读）：`~/.config/redteam/config.toml`（09-04 前用户层）与 `./.redteam/config.toml`（项目层）。
+/// 旧路径探测（只提示不读）：`$XDG_CONFIG_HOME/redteam/config.toml` 与 `~/.config/redteam/config.toml`（09-04 前用户层）、
+/// `./.redteam/config.toml`（项目层）。与当前生效路径相同的不算旧（REDTEAM_HOME 恰指向旧目录时不自相矛盾，ship 评审 6ddeea91）。
 pub fn legacy_config_paths_present() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let p = home.join(".config").join("redteam").join("config.toml");
-        if p.is_file() {
-            out.push(p);
-        }
+    let current = config_paths().into_iter().next().and_then(|p| p.canonicalize().ok());
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        cands.push(PathBuf::from(x).join("redteam").join("config.toml"));
     }
-    let proj = PathBuf::from(".redteam").join("config.toml");
-    if proj.is_file() {
-        out.push(proj);
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        cands.push(home.join(".config").join("redteam").join("config.toml"));
+    }
+    cands.push(PathBuf::from(".redteam").join("config.toml"));
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in cands {
+        if !p.is_file() {
+            continue;
+        }
+        let canon = p.canonicalize().ok();
+        if canon.is_some() && canon == current {
+            continue;
+        }
+        if out.iter().any(|o| o.canonicalize().ok() == canon) {
+            continue;
+        }
+        out.push(p);
     }
     out
 }
@@ -676,8 +689,14 @@ pub fn write_entry(role: Role, entry: &RoleEntry, provider: &ProviderConfig) -> 
         .next()
         .ok_or_else(|| anyhow::anyhow!("no config path"))?;
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut root: toml::Value =
-        toml::from_str(&existing).unwrap_or_else(|_| toml::Value::Table(Default::default()));
+    // 现有文件解析失败 → 拒写（不覆写用户配置；ship 评审 11f694cd：静默整档覆写 = 无备份丢失）。
+    let mut root: toml::Value = if existing.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str(&existing).map_err(|e| {
+            anyhow::anyhow!("{} 解析失败（{e}）：不覆写现有配置，请先修复该文件再 setup", path.display())
+        })?
+    };
     let root_t = root
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
@@ -1028,6 +1047,51 @@ model_id="m"
         let raw = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(!raw.contains("sk-"), "no plaintext key in config");
         unsafe { std::env::remove_var("REDTEAM_HOME"); }
+    }
+
+    /// ship 评审 11f694cd：现有 config.toml 解析失败时 write_entry 必须拒写，不得静默整档覆写。
+    #[test]
+    fn write_entry_refuses_to_overwrite_unparseable_config() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK 串行化
+        unsafe { std::env::set_var("REDTEAM_HOME", dir.path()); }
+        let cfg_path = config_paths()[0].clone();
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        let broken = "[providers.p\nkind=\"openai\"\n"; // 缺 ]，解析失败
+        std::fs::write(&cfg_path, broken).unwrap();
+        let prov = ProviderConfig { kind: ProviderKind::Openai, base_url: None, api_key_env: None, max_concurrency: None };
+        let entry = RoleEntry { name: None, provider: "p".into(), model_id: "m".into(), kind: None, api_key_env: None,
+            family: None, context_window: None, output_max_tokens: None, reasoning: false, thinking_level: None, per_turn_timeout_secs: None };
+        let err = write_entry(Role::Scanner, &entry, &prov).unwrap_err().to_string();
+        assert!(err.contains("不覆写"), "{err}");
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), broken, "原文件逐字保留");
+        unsafe { std::env::remove_var("REDTEAM_HOME"); }
+    }
+
+    /// ship 评审 6ddeea91：旧路径探测认 XDG 布局；REDTEAM_HOME 恰指向旧目录时不把当前文件当旧文件。
+    #[test]
+    fn legacy_detection_covers_xdg_and_excludes_current_home() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let xdg_cfg = dir.path().join("redteam");
+        std::fs::create_dir_all(&xdg_cfg).unwrap();
+        std::fs::write(xdg_cfg.join("config.toml"), "[review]\n").unwrap();
+        // SAFETY: ENV_LOCK 串行化
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            std::env::set_var("REDTEAM_HOME", dir.path().join("elsewhere"));
+        }
+        let legacy = legacy_config_paths_present();
+        assert!(legacy.iter().any(|p| p.starts_with(&xdg_cfg)), "XDG 布局的旧文件应被探测到: {legacy:?}");
+        // REDTEAM_HOME 指向同一目录 → 该文件是当前生效文件，不算旧
+        unsafe { std::env::set_var("REDTEAM_HOME", &xdg_cfg); }
+        let legacy2 = legacy_config_paths_present();
+        assert!(legacy2.iter().all(|p| !p.starts_with(&xdg_cfg)), "当前生效路径不得报旧: {legacy2:?}");
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("REDTEAM_HOME");
+        }
     }
 
     #[test]
