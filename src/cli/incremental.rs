@@ -1,5 +1,5 @@
 //! M13 增量评审（决议 2-5）：四守卫 preflight + 主流水线 `run_incremental_review`
-//! （delta fan-out → carry/merge → refute(new-only) → verdict → schema v3 报告）。
+//! （delta fan-out → carry/merge → refute(new-only) → verdict → schema v4 报告）。
 
 use crate::bundle::select_files;
 use crate::config::Config;
@@ -13,7 +13,7 @@ use super::tail::{assemble_report, model_ids_for, CarryCtx, TailCtx};
 use super::{budget_and_spec, legacy_opts_from_roles, load_ledger, parse_sev, plan_cells, CellPlan, ReviewArgs};
 
 /// M13 增量轮主流水线（决议 2-5）：四守卫 → delta fan-out（<incremental_round> 注入）
-/// → carry/merge → refute(new-only) → verdict(合并集) → schema v3 报告。
+/// → carry/merge → refute(new-only) → verdict(合并集) → schema v4 报告。
 /// 只由 run_review_dispatch 路由进入（前台与后台 worker 共用）。
 pub async fn run_incremental_review(
     args: &ReviewArgs,
@@ -308,7 +308,7 @@ pub(crate) mod incremental_tests {
     pub(super) fn write_prior(root: &std::path::Path, job: &str, head_sha: &str, findings: Vec<Finding>) {
         let stats = Stats::from_findings(&findings);
         let report = ReviewReport {
-            schema_version: "3".into(), verdict: Verdict::Approve,
+            schema_version: crate::domain::SCHEMA_VERSION.into(), verdict: Verdict::Approve,
             stats, findings, clusters: vec![],
             run: RunMeta {
                 job_id: job.into(), models: vec!["m".into()],
@@ -320,7 +320,7 @@ pub(crate) mod incremental_tests {
         let prior_args = ReviewArgs { pack_only: false, incremental_from: None, background: true, ..inc_args("dev0", "unused") };
         store.write_args_raw(job, &serde_json::to_string(&prior_args).unwrap()).unwrap();
         store.write_manifest(job, &[CellInput { cell: "bundle[a.rs]@m".into(), model: "m".into(), prompt: "p".into() }]).unwrap();
-        store.append_partial(job, &CellRecord::ok("bundle[a.rs]@m", "m", vec![])).unwrap();
+        store.append_partial(job, &CellRecord::ok("bundle[a.rs]@m", "m", crate::domain::CellOutput::review(vec![]))).unwrap();
     }
 
     #[test]
@@ -486,7 +486,7 @@ model_id="m1"
         // 本轮模型只报新问题
         let provider = FakeProvider::with("m", vec![raw("a.rs", "leak(secret);", "secret leak")]);
         let (report, code) = run_incremental_review(&inc_args("dev0", "jprev"), "jprev", &provider, &inc_cfg(), dir.path(), None).await.unwrap();
-        assert_eq!(report.schema_version, "3");
+        assert_eq!(report.schema_version, crate::domain::SCHEMA_VERSION);
         assert!(report.run.incremental);
         assert_eq!(report.run.delta_base.as_deref(), Some(c1.as_str()));
         assert!(report.run.head_sha.is_some(), "本轮同样 stamp（下轮的 base）");

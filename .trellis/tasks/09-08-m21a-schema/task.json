@@ -1,0 +1,28 @@
+{
+  "id": "m21a-schema",
+  "name": "m21a-schema",
+  "title": "M21a 批 B · schema v4",
+  "description": "疑点 schema + 角色分叉 CellOutput + CellRecord/proj.db v4 一次重置 + RunMeta coverage 字段 + 旧库 dismissed/upheld 固定集导出",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "S.Kai",
+  "assignee": "S.Kai",
+  "createdAt": "2026-09-08",
+  "completedAt": null,
+  "branch": "feat/m21a-schema",
+  "base_branch": "feat/m21-review-engine",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "worktree_path": "/Users/weilai/hobby/.worktrees/redteam/m21a-schema"
+  }
+}

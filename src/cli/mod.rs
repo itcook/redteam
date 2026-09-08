@@ -71,7 +71,7 @@ pub(crate) struct Ledger {
     pub meta: Option<crate::domain::LedgerMeta>,
 }
 
-/// 加载台账：--no-dismissed → 空；缺省 → `.redteam/proj.db` 存在才加载（零副作用，不建库）；
+/// 加载台账：--no-dismissed → 空；缺省 → `.redteam/<db::DB_FILE>` 存在才加载（零副作用，不建库）；
 /// `--dismissed <值>` → 文件=db 路径覆盖 / 目录=已废弃形态报错引导迁移 / 否则 csv 仅豁免。
 pub(crate) fn load_ledger(
     dismissed: Option<&str>,
@@ -100,8 +100,8 @@ pub(crate) fn load_ledger(
             let p = Path::new(v);
             if p.is_dir() {
                 anyhow::bail!(
-                    "--dismissed: directory ledgers are retired; migrate cards into .redteam/proj.db \
-                     via 'redteam dismiss add' (see 'redteam dismiss --help')"
+                    "--dismissed: directory ledgers are retired; migrate cards into .redteam/{} \
+                     via 'redteam dismiss add' (see 'redteam dismiss --help')", crate::db::DB_FILE
                 );
             }
             if p.is_file() {
@@ -139,7 +139,7 @@ pub fn legacy_opts_from_roles(roles: &RoleSets, max_concurrency: usize) -> Resul
         return Err("未配置 [[scanners]]：在 ~/.redteam/config.toml（REDTEAM_HOME 可覆盖）至少加一条，见 `redteam model setup --help`".to_string());
     }
     Ok(OrchestrateOpts {
-        models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0 }).collect(),
+        models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0, family: m.family.clone() }).collect(),
         replicate: true,
         no_fallback: true,
         max_concurrency,
@@ -592,10 +592,10 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
         .collect();
     let done = done_records.len();
     let total = manifest.len().max(done);
-    let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.findings).collect();
+    let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.output.into_findings()).collect();
     let stats = Stats::from_findings(&findings);
     let report = ReviewReport {
-        schema_version: "3".into(),
+        schema_version: crate::domain::SCHEMA_VERSION.into(),
         verdict: Verdict::Incomplete,
         stats,
         findings,
@@ -671,6 +671,12 @@ pub async fn run_resume(
         .collect();
     let pending: Vec<&crate::state::CellInput> =
         manifest.iter().filter(|c| !done.contains(&c.cell)).collect();
+    // 家族随记录落库：按 manifest 的 model 名回查当前角色条目（条目已删则空串）。
+    let roles = cfg.active_roles();
+    let family_of = |name: &str| -> String {
+        roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers)
+            .find(|m| m.name == name).map(|m| m.family.clone()).unwrap_or_default()
+    };
 
     let mut usage = (0u64, 0u64, 0u64);
     let mut warnings = Vec::new();
@@ -695,25 +701,27 @@ pub async fn run_resume(
                 let fs: Vec<Finding> =
                     call.findings.iter().map(|r| enrich(r, &cell.model)).collect();
                 // 指标随落盘：duration/usage/iterations 来自胜出 call（与 fanout 侧 CellSink 同构）。
-                crate::state::CellRecord {
-                    cell: cell.cell.clone(), model: cell.model.clone(), ok: true,
-                    findings: fs, warn: None,
-                    duration_ms: elapsed.as_millis() as u64,
-                    input_tokens: call.input_tokens, output_tokens: call.output_tokens,
-                    cached_input_tokens: call.cached_input_tokens,
-                    attempts: 1, iterations: call.iterations,
-                    tool_use: call.tool_use.clone(),
-                }
+                let mut rec = crate::state::CellRecord::ok(
+                    cell.cell.clone(), cell.model.clone(),
+                    crate::domain::CellOutput::Review { findings: fs, needs: call.needs.clone() },
+                ).with_family(family_of(&cell.model));
+                rec.duration_ms = elapsed.as_millis() as u64;
+                rec.input_tokens = call.input_tokens;
+                rec.output_tokens = call.output_tokens;
+                rec.cached_input_tokens = call.cached_input_tokens;
+                rec.attempts = 1;
+                rec.iterations = call.iterations;
+                rec.tool_use = call.tool_use.clone();
+                rec
             }
             Err(e) => {
                 warnings.push(format!("resume cell [{}] model {}: {e}", cell.cell, cell.model));
-                crate::state::CellRecord {
-                    cell: cell.cell.clone(), model: cell.model.clone(), ok: false,
-                    findings: vec![], warn: Some(e.to_string()),
-                    duration_ms: elapsed.as_millis() as u64,
-                    input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 1, iterations: 0,
-                    tool_use: Default::default(),
-                }
+                let mut rec = crate::state::CellRecord::failed(
+                    cell.cell.clone(), cell.model.clone(), crate::domain::Role::Reviewer, e.to_string(),
+                ).with_family(family_of(&cell.model));
+                rec.duration_ms = elapsed.as_millis() as u64;
+                rec.attempts = 1;
+                rec
             }
         };
         // resume 披露清零：checkpoint 写失败不再静默吞掉——foreground 命令，stderr 用户可见
@@ -729,7 +737,7 @@ pub async fn run_resume(
         final_records.iter().filter(|r| r.ok).map(|r| r.cell.as_str()).collect();
     let still_missing = manifest.iter().filter(|c| !ok_cells.contains(c.cell.as_str())).count();
     let findings: Vec<Finding> =
-        final_records.into_iter().filter(|r| r.ok).flat_map(|r| r.findings).collect();
+        final_records.into_iter().filter(|r| r.ok).flat_map(|r| r.output.into_findings()).collect();
 
     // resume：角色集按当前配置重建（M21a 产品态不产 finding，与原作业模型不同可接受；记 followup 观察）。
     let roles = cfg.active_roles();
@@ -1168,7 +1176,7 @@ mod job_tests {
         // 预置一条 partial（模拟崩溃前已完成 1 cell）
         store.append_partial(
             "j2b",
-            &crate::state::CellRecord::ok("bundle[a]", "alpha", vec![checkpointed_finding("checkpointed")]),
+            &crate::state::CellRecord::ok("bundle[a]", "alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("checkpointed")])),
         ).unwrap();
 
         // 非 git 目录 → changed_files 失败 → run_review_dispatch Err，但已有 partial 记录
@@ -1214,7 +1222,7 @@ mod job_tests {
         // 预置一条 partial（模拟 deadline 前已完成 1 cell）
         store.append_partial(
             "j-to",
-            &crate::state::CellRecord::ok("bundle[a]", "alpha", vec![checkpointed_finding("before-deadline")]),
+            &crate::state::CellRecord::ok("bundle[a]", "alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("before-deadline")])),
         ).unwrap();
 
         let provider = HangProvider;
@@ -1327,7 +1335,7 @@ mod job_tests {
                     sink.on_cell(crate::state::CellRecord::ok(
                         format!("cell{i}"),
                         "m".to_string(),
-                        vec![],
+                        crate::domain::CellOutput::review(vec![]),
                     ));
                 })
             })
@@ -1648,7 +1656,7 @@ mod resume_tests {
         store.write_manifest("j", &inputs).unwrap();
         store.append_partial(
             "j",
-            &crate::state::CellRecord::ok("c1", "m", vec![anchorable_finding("issue-c1", "c1.rs")]),
+            &crate::state::CellRecord::ok("c1", "m", crate::domain::CellOutput::review(vec![anchorable_finding("issue-c1", "c1.rs")])),
         ).unwrap();
 
         let args = ReviewArgs { pack_only: false,
@@ -1703,7 +1711,7 @@ mod resume_tests {
         store.write_manifest("j", &inputs).unwrap();
         store.append_partial(
             "j",
-            &crate::state::CellRecord::ok("doc@alpha", "alpha", vec![anchorable_finding("issue-alpha", "alpha.rs")]),
+            &crate::state::CellRecord::ok("doc@alpha", "alpha", crate::domain::CellOutput::review(vec![anchorable_finding("issue-alpha", "alpha.rs")])),
         ).unwrap();
 
         let args = ReviewArgs { pack_only: false,
@@ -2187,7 +2195,7 @@ mod tests {
         drop(db2);
         let l3 = load_ledger(None, false, &root).unwrap();
         assert_eq!(l3.cards.len(), 1);
-        assert!(l3.meta.as_ref().unwrap().source.contains("proj.db"));
+        assert!(l3.meta.as_ref().unwrap().source.contains(crate::db::DB_FILE), "{}", l3.meta.as_ref().unwrap().source);
     }
     #[tokio::test]
     async fn jobcellsink_manifest_sets_phase_fanout() {
@@ -2234,7 +2242,7 @@ mod tests {
         };
         use crate::orchestrate::CellSink;
         sink.manifest(&[CellInput { cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
-        sink.on_cell(CellRecord::ok("c", "m", vec![]));
+        sink.on_cell(CellRecord::ok("c", "m", crate::domain::CellOutput::review(vec![])));
         sink.on_phase(Phase::Finalizing, None);
         sink.on_meta(&["m".to_string()]);
         assert_eq!(
@@ -2263,7 +2271,7 @@ mod tests {
             ckpt_failures: std::sync::atomic::AtomicU32::new(0),
         };
         use crate::orchestrate::CellSink;
-        sink.on_cell(CellRecord::ok("c", "m", vec![]));
+        sink.on_cell(CellRecord::ok("c", "m", crate::domain::CellOutput::review(vec![])));
         sink.on_phase(Phase::Finalizing, None);
         sink.on_meta(&["m".to_string()]);
         assert_eq!(
@@ -2280,7 +2288,7 @@ mod tests {
     fn append_ckpt_failure_warning_only_appends_when_nonzero() {
         fn empty_report() -> ReviewReport {
             ReviewReport {
-                schema_version: "3".into(),
+                schema_version: crate::domain::SCHEMA_VERSION.into(),
                 verdict: Verdict::Approve,
                 stats: Stats::from_findings(&[]),
                 findings: vec![],

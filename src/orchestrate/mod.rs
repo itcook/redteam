@@ -27,6 +27,8 @@ pub trait CellSink: Send + Sync {
 pub struct PlannedModel {
     pub name: String,
     pub priority: i32,
+    /// 模型家族（角色条目 `EffectiveModel.family`），随 cell 记录落库；测试 / 未知为空串。
+    pub family: String,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +115,7 @@ fn top_priority_model(opts: &OrchestrateOpts) -> String {
 /// 单 cell 执行结果（成功/失败一体：`warn=None` 即成功）。运行学字段 2026-07-03 grill 定案。
 struct CellRun {
     model: String, // 胜出 model；整链失败为空
+    family: String, // 胜出 model 的家族（PlannedModel.family）；整链失败为空
     findings: Vec<Finding>,
     tokens: (u64, u64, u64), // (input, output, cached_input)
     duration_ms: u64,
@@ -131,20 +134,23 @@ impl CellRun {
     /// 转持久化记录；`fallback_model`：胜出者为空（整链失败）时的 model 标注
     /// （replicate 格=该格 model；候补链=空串，warn 已含逐家原因）。
     fn to_record(&self, cell_id: String, fallback_model: &str) -> CellRecord {
-        CellRecord {
-            cell: cell_id,
-            model: if self.model.is_empty() { fallback_model.to_string() } else { self.model.clone() },
-            ok: self.warn.is_none(),
-            findings: self.findings.clone(),
-            warn: self.warn.clone(),
-            duration_ms: self.duration_ms,
-            input_tokens: self.tokens.0,
-            output_tokens: self.tokens.1,
-            cached_input_tokens: self.tokens.2,
-            attempts: self.attempts,
-            iterations: self.iterations,
-            tool_use: self.tool_use.clone(),
-        }
+        let model = if self.model.is_empty() { fallback_model.to_string() } else { self.model.clone() };
+        // 旧 finding 路径（F-4 删）落为 reviewer 形态输出：findings + 剩余 needs 声明。统一走构造函数，
+        // 角色只来自 output tag（不手填）。
+        let mut rec = CellRecord::ok(
+            cell_id, model,
+            crate::domain::CellOutput::Review { findings: self.findings.clone(), needs: self.needs.clone() },
+        ).with_family(self.family.clone());
+        rec.ok = self.warn.is_none();
+        rec.warn = self.warn.clone();
+        rec.duration_ms = self.duration_ms;
+        rec.input_tokens = self.tokens.0;
+        rec.output_tokens = self.tokens.1;
+        rec.cached_input_tokens = self.tokens.2;
+        rec.attempts = self.attempts;
+        rec.iterations = self.iterations;
+        rec.tool_use = self.tool_use.clone();
+        rec
     }
 }
 
@@ -178,7 +184,7 @@ async fn run_one_bundle(
                     .map(|r| enrich(r, &pm.name))
                     .collect();
                 return CellRun {
-                    model: pm.name.clone(), findings: fs,
+                    model: pm.name.clone(), family: pm.family.clone(), findings: fs,
                     tokens: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                     duration_ms: t0.elapsed().as_millis() as u64,
                     attempts: i as u32 + 1, iterations: call.iterations, tool_use: call.tool_use,
@@ -193,7 +199,7 @@ async fn run_one_bundle(
         }
     }
     CellRun {
-        model: String::new(), findings: vec![], tokens: burned,
+        model: String::new(), family: String::new(), findings: vec![], tokens: burned,
         duration_ms: t0.elapsed().as_millis() as u64,
         attempts: chain.len() as u32, iterations: 0, tool_use: Default::default(),
         needs: vec![], warn: Some(errs.join("; ")),
@@ -237,6 +243,7 @@ where
         None => {
             let merged = CellRun {
                 model: run2.model,
+                family: run2.family,
                 findings: run2.findings, // 整体替换，非合并
                 tokens: (run.tokens.0 + run2.tokens.0, run.tokens.1 + run2.tokens.1, run.tokens.2 + run2.tokens.2),
                 duration_ms: run.duration_ms + run2.duration_ms,
@@ -444,7 +451,7 @@ mod tests {
     }
 
     fn need(path: &str, reason: &str) -> NeedEntry {
-        NeedEntry { path: path.into(), lines: None, reason: reason.into() }
+        NeedEntry { path: path.into(), lines: None, reason: reason.into(), kind: crate::domain::NeedKind::Evidence }
     }
 
     fn lens_call_with(findings: Vec<RawFinding>, needs: Vec<NeedEntry>) -> crate::provider::LensCall {
@@ -464,7 +471,7 @@ mod tests {
 
     fn opts_single() -> OrchestrateOpts {
         OrchestrateOpts {
-            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            models: vec![PlannedModel { name: "m".into(), priority: 10, family: String::new() }],
             replicate: false, no_fallback: false, max_concurrency: 4,
         }
     }
@@ -532,7 +539,7 @@ mod tests {
     async fn code_fanout_runs_every_bundle() {
         let p = FakeProvider::with("m", vec![raw_q("found")]);
         let opts = OrchestrateOpts {
-            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            models: vec![PlannedModel { name: "m".into(), priority: 10, family: String::new() }],
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
@@ -556,7 +563,7 @@ mod tests {
     async fn code_fanout_threads_per_bundle_dossier() {
         let p = PromptProbe { prompts: std::sync::Mutex::new(vec![]) };
         let opts = OrchestrateOpts {
-            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            models: vec![PlannedModel { name: "m".into(), priority: 10, family: String::new() }],
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs")];
@@ -594,7 +601,7 @@ mod tests {
     async fn code_fanout_respects_max_concurrency() {
         let probe = Arc::new(ConcProbe { inflight: AtomicUsize::new(0), max_seen: AtomicUsize::new(0) });
         let opts = OrchestrateOpts {
-            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            models: vec![PlannedModel { name: "m".into(), priority: 10, family: String::new() }],
             replicate: true, no_fallback: false, max_concurrency: 2,
         };
         let bundles: Vec<Bundle> = (0..6).map(|i| bundle(&format!("src/f{i}.rs"))).collect();
@@ -609,7 +616,7 @@ mod tests {
         // 显式模型完全不可用 → 整链失败 → failed_models 记该模型（守 exit-2）
         let p = FakeProvider::with("present", vec![]);
         let opts = OrchestrateOpts {
-            models: vec![PlannedModel { name: "absent".into(), priority: 10 }],
+            models: vec![PlannedModel { name: "absent".into(), priority: 10, family: String::new() }],
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs")];
@@ -634,8 +641,8 @@ mod tests {
         ];
         let opts = OrchestrateOpts {
             models: vec![
-                PlannedModel { name: "alpha".into(), priority: 10 },
-                PlannedModel { name: "beta".into(), priority: 5 },
+                PlannedModel { name: "alpha".into(), priority: 10, family: String::new() },
+                PlannedModel { name: "beta".into(), priority: 5, family: String::new() },
             ],
             replicate: true,
             no_fallback: false,
@@ -661,8 +668,8 @@ mod tests {
         let bundles = vec![Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }])];
         let opts = OrchestrateOpts {
             models: vec![
-                PlannedModel { name: "alpha".into(), priority: 10 },
-                PlannedModel { name: "beta".into(), priority: 5 },
+                PlannedModel { name: "alpha".into(), priority: 10, family: String::new() },
+                PlannedModel { name: "beta".into(), priority: 5, family: String::new() },
             ],
             replicate: true,
             no_fallback: false,
@@ -692,7 +699,7 @@ mod tests {
     async fn fanout_writes_manifest_and_each_cell() {
         let p = FakeProvider::with("m", vec![raw_q("found")]);
         let opts = OrchestrateOpts {
-            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            models: vec![PlannedModel { name: "m".into(), priority: 10, family: String::new() }],
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/a.rs"), bundle("src/b.rs"), bundle("src/c.rs")];
@@ -747,7 +754,7 @@ mod tests {
     async fn on_cell_fires_per_cell_before_slow_sibling_completes() {
         let provider = SlowFastProbe { slow_done: std::sync::atomic::AtomicBool::new(false) };
         let opts = OrchestrateOpts {
-            models: vec![PlannedModel { name: "m".into(), priority: 10 }],
+            models: vec![PlannedModel { name: "m".into(), priority: 10, family: String::new() }],
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
         let bundles = vec![bundle("src/slow.rs"), bundle("src/fast.rs")];
@@ -805,8 +812,8 @@ mod tests {
 
         let opts = OrchestrateOpts {
             models: vec![
-                PlannedModel { name: "good".into(), priority: 1 },
-                PlannedModel { name: "bad".into(), priority: 1 },
+                PlannedModel { name: "good".into(), priority: 1, family: String::new() },
+                PlannedModel { name: "bad".into(), priority: 1, family: String::new() },
             ],
             replicate: true, no_fallback: false, max_concurrency: 4,
         };
@@ -843,8 +850,8 @@ mod tests {
 
         let opts = OrchestrateOpts {
             models: vec![
-                PlannedModel { name: "first".into(), priority: 2 },
-                PlannedModel { name: "second".into(), priority: 1 },
+                PlannedModel { name: "first".into(), priority: 2, family: String::new() },
+                PlannedModel { name: "second".into(), priority: 1, family: String::new() },
             ],
             replicate: false, no_fallback: false, max_concurrency: 4,
         };

@@ -69,6 +69,9 @@ pub struct JobState {
     pub progress: Progress,
     #[serde(default)]
     pub models: Vec<String>,
+    /// v4：本作业活跃的角色集（design §2）；F-2 起填，旧 state 缺字段回空。枚举而非裸串：写错编译期即报。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub roles: Vec<crate::domain::Role>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pid: Option<u32>,
     /// pid 身份锚：`pid` 对应进程的启动时刻（Unix 秒），防 pid 复用误判（E12-Q3）。
@@ -102,6 +105,7 @@ impl JobState {
             started_at,
             progress: Progress::default(),
             models: vec![],
+            roles: vec![],
             pid: None,
             pid_start: None,
             exit_code: None,
@@ -137,13 +141,20 @@ pub struct CellInput {
 }
 
 /// partial 每 cell：单个 cell 的执行结果（db 同键覆盖：重试成功覆盖失败记录）。
-/// 运行学字段（duration/tokens/attempts，2026-07-03 grill 定案）serde default——旧记录零值兼容。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// v4（D11-7 R14）：输出按角色分叉为 [`CellOutput`]（scanner 疑点 / reviewer findings / verifier 判决），一 cell 一条记录；
+/// 角色只有一个真相源——`output` 的枚举 tag，[`CellRecord::role`] 与 `cells.role` 列都由它派生（不另存字段，评审裁定 2026-09-08）。
+/// 旧 v3 记录（`findings` 平铺、无 output）不再可读——由 `db::USER_VERSION` 守卫保证运行时读不到。
+/// 运行学字段（duration/tokens/attempts，2026-07-03 grill 定案）serde default——缺字段零值。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CellRecord {
     pub cell: String,
     pub model: String,
+    /// 模型家族（agreement 计家族数、verifier 异族选择的口径，design §5 / §8.1）：取角色条目 `EffectiveModel.family`
+    /// （批 A：`family` 缺省 model_id 首段小写），由调用方经 [`CellRecord::with_family`] 填；未知为空串。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub family: String,
     pub ok: bool,
-    pub findings: Vec<crate::domain::Finding>,
+    pub output: crate::domain::CellOutput,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warn: Option<String>,
     #[serde(default)]
@@ -166,16 +177,38 @@ pub struct CellRecord {
     /// serde default——旧记录/单发路径/整链失败为零值。
     #[serde(default)]
     pub tool_use: crate::tools::ToolUse,
+    /// 渲染该 cell 所用模板（共享头 / 角色尾）的哈希（D-4 填；前缀稳定回归与 cache 归因用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_hash: Option<String>,
 }
 
 impl CellRecord {
-    /// 便捷构造：ok=true, warn=None（运行学字段由调用方按需回填）。
-    pub fn ok(cell: impl Into<String>, model: impl Into<String>, findings: Vec<crate::domain::Finding>) -> Self {
+    /// 便捷构造：ok=true, warn=None, family 空（运行学字段与 family 由调用方按需回填）。
+    pub fn ok(cell: impl Into<String>, model: impl Into<String>, output: crate::domain::CellOutput) -> Self {
         Self {
-            cell: cell.into(), model: model.into(), ok: true, findings, warn: None,
+            cell: cell.into(), model: model.into(), family: String::new(), ok: true, output, warn: None,
             duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0,
-            tool_use: Default::default(),
+            tool_use: Default::default(), template_hash: None,
         }
+    }
+
+    /// 回填家族（来源：角色条目 `EffectiveModel.family`）。
+    pub fn with_family(mut self, family: impl Into<String>) -> Self {
+        self.family = family.into();
+        self
+    }
+
+    /// 记录角色 = `output` 的枚举 tag（唯一真相源）。
+    pub fn role(&self) -> crate::domain::Role {
+        self.output.role()
+    }
+
+    /// 失败格：ok=false + 该角色的空输出占位（类型仍明确），warn 带原因。
+    pub fn failed(cell: impl Into<String>, model: impl Into<String>, role: crate::domain::Role, warn: impl Into<String>) -> Self {
+        let mut rec = Self::ok(cell, model, crate::domain::CellOutput::empty(role));
+        rec.ok = false;
+        rec.warn = Some(warn.into());
+        rec
     }
 }
 
@@ -288,7 +321,7 @@ impl JobStore {
     /// 单 cell 结果落库（同 (job,cell) 覆盖——重试成功覆盖失败行，读取端零合并逻辑）。
     pub fn append_partial(&self, id: &str, record: &CellRecord) -> anyhow::Result<()> {
         let json = serde_json::to_string(record)?;
-        self.db.lock().unwrap().cell_put(id, &record.cell, &json)
+        self.db.lock().unwrap().cell_put(id, &record.cell, record.role().as_str(), &json)
     }
 
     /// 读全部 cell 记录；坏行跳过（坏一条不毁全部）。
@@ -437,6 +470,22 @@ mod tests {
     }
 
     #[test]
+    fn jobstate_roles_roundtrips_and_legacy_defaults_empty() {
+        // v4：roles 有值 → 序列化带键；默认空 → 省略；旧 state（无 roles 键）→ 空。
+        let mut s = JobState::new("j", 0);
+        assert!(!serde_json::to_string(&s).unwrap().contains("roles"));
+        s.roles = vec![crate::domain::Role::Scanner, crate::domain::Role::Reviewer];
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains("\"roles\":[\"scanner\",\"reviewer\"]"), "{j}");
+        let back: JobState = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.roles, s.roles);
+        let old: JobState = serde_json::from_str(
+            r#"{"job_id":"x","status":"running","started_at":1,"progress":{"done":0,"total":0},"models":[]}"#
+        ).unwrap();
+        assert!(old.roles.is_empty());
+    }
+
+    #[test]
     fn is_terminal_covers_four() {
         assert!(!JobStatus::Pending.is_terminal());
         assert!(!JobStatus::Running.is_terminal());
@@ -447,14 +496,58 @@ mod tests {
     }
 
     #[test]
-    fn cell_record_old_json_defaults_runtime_fields() {
-        // proj.db 里的旧记录没有运行学字段——default 零值兼容,不炸反序列化。
-        let old = r#"{"cell":"c","model":"m","ok":true,"findings":[]}"#;
-        let rec: CellRecord = serde_json::from_str(old).unwrap();
+    fn cell_record_v4_minimal_json_defaults_runtime_fields() {
+        // v4 最小形状（output 带 tag 必有）：运行学字段缺失 → default 零值；family / template_hash 缺失 → 空 / None。
+        let j = r#"{"cell":"c","model":"m","ok":true,"output":{"role":"reviewer","findings":[]}}"#;
+        let rec: CellRecord = serde_json::from_str(j).unwrap();
         assert_eq!(
             (rec.duration_ms, rec.input_tokens, rec.output_tokens, rec.attempts, rec.iterations),
             (0, 0, 0, 0, 0)
         );
+        assert_eq!(rec.role(), crate::domain::Role::Reviewer);
+        assert_eq!(rec.family, "");
+        assert_eq!(rec.template_hash, None);
+        // 顶层不再有 role 键；顶层多余的 role 键被 serde 忽略、不会与 output tag 打架
+        assert!(!serde_json::to_string(&rec).unwrap().contains("\"role\":\"reviewer\",\"model\""));
+        let j2 = r#"{"cell":"c","role":"scanner","model":"m","ok":true,"output":{"role":"reviewer","findings":[]}}"#;
+        assert_eq!(serde_json::from_str::<CellRecord>(j2).unwrap().role(), crate::domain::Role::Reviewer);
+    }
+
+    #[test]
+    fn cell_record_v3_shape_without_output_is_rejected() {
+        // 旧 v3 记录（findings 平铺、无 output）与缺 tag 的 output 都不可读——记录类型不靠猜（D11-7）。
+        for old in [
+            r#"{"cell":"c","model":"m","ok":true,"findings":[]}"#,
+            r#"{"cell":"c","model":"m","ok":true,"output":{"findings":[]}}"#,
+        ] {
+            assert!(serde_json::from_str::<CellRecord>(old).is_err(), "{old}");
+        }
+    }
+
+    #[test]
+    fn cell_record_v4_roundtrip_all_three_roles() {
+        use crate::domain::{CellOutput, Role, ScanOutput, Suspicion};
+        let scan = CellRecord::ok("scan[g1]@deepseek/deepseek-v4-flash#1", "deepseek/deepseek-v4-flash", CellOutput::Scan(ScanOutput {
+            suspicions: vec![Suspicion { file: "a.rs".into(), line_start: 1, line_end: 2, hint: "h".into(),
+                category: None, confidence: 0.3, quote: "q".into() }],
+            needs: vec![], scanned_areas: vec![],
+        })).with_family("deepseek");
+        assert_eq!(scan.role(), Role::Scanner);
+        assert_eq!(scan.family, "deepseek");
+        let review = CellRecord::ok("bundle[a]@m", "agc/glm-5.3", CellOutput::review(vec![]));
+        assert_eq!((review.role(), review.family.as_str()), (Role::Reviewer, ""), "未回填 family 为空串且不序列化");
+        assert!(!serde_json::to_string(&review).unwrap().contains("family"));
+        let mut verify = CellRecord::failed("verify[f1]@kimi", "kimi", Role::Verifier, "timeout").with_family("kimi");
+        verify.template_hash = Some("deadbeef".into());
+        assert_eq!((verify.role(), verify.family.as_str(), verify.ok), (Role::Verifier, "kimi", false));
+        for rec in [scan, review, verify] {
+            let j = serde_json::to_string(&rec).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+            assert!(v.get("role").is_none(), "顶层无 role 字段（唯一真相源是 output tag）: {j}");
+            assert_eq!(v["output"]["role"], rec.role().as_str());
+            let back: CellRecord = serde_json::from_str(&j).unwrap();
+            assert_eq!(back, rec);
+        }
     }
 
     // ── JobStore 集成测试（迁移自 job.rs/store.rs：fixture 换 store API，断言逐字保留）───
@@ -466,7 +559,7 @@ mod tests {
         let st = JobState {
             job_id: "job1".into(), status: JobStatus::Running,
             started_at: 1000, progress: Progress { done: 1, total: 3 },
-            models: vec!["alpha".into()],
+            models: vec!["alpha".into()], roles: vec![],
             pid: Some(4242), pid_start: None, exit_code: None, error: None, result_path: None,
             last_active: 1000, deadline_at: None, phase: None, phase_history: vec![], workspace: None,
         };
@@ -576,9 +669,11 @@ mod tests {
     }
 
     fn rec(cell: &str, ok: bool) -> CellRecord {
-        CellRecord { cell: cell.into(), model: "m".into(), ok, findings: vec![], warn: None,
-            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0,
-            tool_use: Default::default() }
+        if ok {
+            CellRecord::ok(cell, "m", crate::domain::CellOutput::review(vec![]))
+        } else {
+            CellRecord::failed(cell, "m", crate::domain::Role::Reviewer, "boom")
+        }
     }
 
     #[test]
@@ -591,6 +686,28 @@ mod tests {
         let all = store.read_partial("j1");
         assert_eq!(all.len(), 2, "同 cell 覆盖不追加");
         assert!(all.iter().find(|r| r.cell == "c1").unwrap().ok, "重试成功覆盖失败");
+    }
+
+    /// v4：read_partial 读回 role / output 枚举；db `cells.role` 列与记录一致（三角色各一）。
+    #[test]
+    fn partial_roundtrips_role_and_output_and_role_column_matches() {
+        use crate::domain::{CellOutput, Role, ScanOutput};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JobStore::open(tmp.path()).unwrap();
+        store.append_partial("j1", &CellRecord::ok("s", "deepseek-v4-flash", CellOutput::Scan(ScanOutput::default()))).unwrap();
+        store.append_partial("j1", &CellRecord::ok("r", "glm-5.3", CellOutput::review(vec![]))).unwrap();
+        store.append_partial("j1", &CellRecord::failed("v", "kimi_k3", Role::Verifier, "x")).unwrap();
+        let all = store.read_partial("j1");
+        let by = |c: &str| all.iter().find(|r| r.cell == c).unwrap().clone();
+        assert_eq!(by("s").role(), Role::Scanner);
+        assert!(matches!(by("s").output, CellOutput::Scan(_)));
+        assert_eq!(by("r").role(), Role::Reviewer);
+        assert_eq!(by("v").role(), Role::Verifier);
+        assert!(!by("v").ok);
+        let db = store.db.lock().unwrap();
+        for (c, role) in [("s", "scanner"), ("r", "reviewer"), ("v", "verifier")] {
+            assert_eq!(db.cell_role("j1", c).unwrap().as_deref(), Some(role), "cells.role 列 = 记录 role");
+        }
     }
 
     #[test]
@@ -634,7 +751,7 @@ mod tests {
         let st = store.read_state("j1").unwrap();
         assert_eq!(st.progress.done, 3);
         for i in 0..3 {
-            store.append_partial("j1", &CellRecord::ok(format!("c{i}"), "m", vec![])).unwrap();
+            store.append_partial("j1", &CellRecord::ok(format!("c{i}"), "m", crate::domain::CellOutput::review(vec![]))).unwrap();
         }
         assert_eq!(store.read_partial("j1").len(), 3);
         store.write_result("j1", r#"{"v":1}"#).unwrap();
