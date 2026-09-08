@@ -1,4 +1,4 @@
-use crate::domain::Finding;
+use crate::domain::{Finding, ScanOutput};
 use std::path::{Component, Path};
 
 const POS_READ_MAX_BYTES: usize = 512 * 1024;
@@ -109,6 +109,32 @@ pub fn anchor_near(root: &Path, file: &str, quote: &str, old_line: u32) -> Optio
     locate_quote_near(&content, quote, old_line)
 }
 
+/// scanner 疑点锚定结果（批 D-1）：`dropped` = quote 不在文件而被丢的条数——调用方写进 cell warn，绝不静默。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnchoredScan {
+    pub output: ScanOutput,
+    pub dropped: u32,
+}
+
+/// 疑点 quote 逐字硬约束（design §4〔D11〕：不在文件即丢弃）：定位成功改写 `line_start/line_end`，失败丢弃并计数；
+/// `needs` / `scanned_areas` 原样透传。与 `anchor` 同一 `safe_read` + `locate_quote` 口径（含软换行退路）。
+pub fn anchor_suspicions(root: &Path, mut out: ScanOutput) -> AnchoredScan {
+    let mut kept = Vec::with_capacity(out.suspicions.len());
+    let mut dropped = 0u32;
+    for mut s in out.suspicions.drain(..) {
+        match safe_read(root, &s.file).and_then(|c| locate_quote(&c, &s.quote)) {
+            Some((ls, le)) => {
+                s.line_start = ls;
+                s.line_end = le;
+                kept.push(s);
+            }
+            None => dropped += 1,
+        }
+    }
+    out.suspicions = kept;
+    AnchoredScan { output: out, dropped }
+}
+
 /// 把 quote 确定性定位到真实行；定位失败即丢弃（确定性幻觉过滤，code 线每条 finding 须指向真实代码）。
 pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -149,6 +175,28 @@ mod tests {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).unwrap(); }
         std::fs::File::create(p).unwrap().write_all(body.as_bytes()).unwrap();
+    }
+
+    /// 批 D-1 AC2：疑点 quote 在文件 → 改写行号；不在文件 / `..` 路径 → 丢弃并计数；needs / scanned_areas 透传。
+    #[test]
+    fn anchor_suspicions_rewrites_lines_and_counts_dropped() {
+        use crate::domain::{NeedEntry, NeedKind, ScanOutput, ScannedArea, Suspicion};
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "fn main() {}\n    let token = secret();\nok();\n");
+        let sus = |file: &str, quote: &str| Suspicion {
+            file: file.into(), line_start: 99, line_end: 99, hint: "h".into(), category: None, confidence: 0.5, quote: quote.into(),
+        };
+        let out = ScanOutput {
+            suspicions: vec![sus("src/a.rs", "let token = secret();"), sus("src/a.rs", "fabricated()"), sus("../a.rs", "ok();")],
+            needs: vec![NeedEntry { path: "src/b.rs".into(), lines: None, reason: "r".into(), kind: NeedKind::Api }],
+            scanned_areas: vec![ScannedArea { file: "src/a.rs".into(), ranges: vec!["1-3".into()] }],
+        };
+        let a = anchor_suspicions(dir.path(), out);
+        assert_eq!(a.dropped, 2);
+        assert_eq!(a.output.suspicions.len(), 1);
+        assert_eq!((a.output.suspicions[0].line_start, a.output.suspicions[0].line_end), (2, 2), "空白差异仍定位");
+        assert_eq!(a.output.needs.len(), 1);
+        assert_eq!(a.output.scanned_areas.len(), 1);
     }
 
     #[test]
