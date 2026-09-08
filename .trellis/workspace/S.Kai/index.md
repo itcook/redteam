@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
+- **Total Sessions**: 6
 - **Last Active**: 2026-09-08
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~126 | Active |
+| `journal-1.md` | ~151 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 6 | 2026-09-08 | M21a 批 A 重做：config.json + provider→models→roles（D12），身份串 provider/id，评审修复，合入批 B/C | `9b817da`, `e64276e`, `1f2f89c`, `1208166` | `feat/m21a-config-json` |
 | 5 | 2026-09-08 | M21a 批 C：引用图分组 + 跨组索引 + --pack-only 实施、code-review 十修、并入批 A 基线并 --no-ff 合回 | `0bc01b8`, `ca74eb5`, `bf161a5`, `a88c025`, `146bddb`, `a3d2908`, `00081cc` | `feat/m21a-grouping` |
 | 4 | 2026-09-08 | grill D11 → design v8 锁定；M21a plan 派生（六批 + 出口） | `47fc9d8`, `dc2c008` | `feat/m21-review-engine` |
 | 3 | 2026-09-07 | P0 验证门收尾：E1 风险规则回放 + E3 疑点契约 A/B，.next/ 分支随行文档区迁移 | `44d7f75`, `1a44197` | `feat/m21-review-engine` |
