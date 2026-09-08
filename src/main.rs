@@ -88,6 +88,12 @@ enum Cmd {
         /// 不静默降级全量。
         #[arg(long)]
         incremental_from: Option<String>,
+        /// 预算仪表（M21a）：只收集证据 → 分组 → 装包 → 落盘 .redteam/packs/<job>/cell-<n>.md 与
+        /// summary.json，每 cell 打印字节与估算 token（÷3.5）及分组统计；不建 registry、不调 provider，
+        /// 无模型配置也能跑，退出码 0。与 --background / --resume / --incremental-from 互斥；
+        /// --format 对本模式无效（固定文本行，机读看 summary.json）。
+        #[arg(long, conflicts_with_all = ["background", "resume", "incremental_from"])]
+        pack_only: bool,
     },
     /// 查询作业状态：无 id 列本项目全部；有 id 打印该作业 JSON。
     Status {
@@ -291,12 +297,6 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 生成进程内唯一 job-id（pid+secs+cwd 的 fnv 前 12 位）。
-fn gen_job_id(cwd: &std::path::Path) -> String {
-    let seed = format!("{}-{}", std::process::id(), now_secs());
-    let h = redteam::hash::fnv1a64_hex(&[&seed, &cwd.to_string_lossy()]);
-    h[..12].to_string()
-}
 
 /// spawn detached worker：re-exec 自身 `worker --job-id <id>`，setsid 新会话、stdio→null。
 /// 返回子进程 pid。
@@ -468,6 +468,7 @@ async fn main() {
             dismissed,
             no_dismissed,
             incremental_from,
+            pack_only,
         } => {
             let cfg = load_config_warned();
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -530,13 +531,27 @@ async fn main() {
             let args = ReviewArgs {
                 base: base.clone(), scope, spec, focus, models, models_all,
                 block_threshold, conf_floor, tools, background, format,
-                resume: None, dismissed, no_dismissed, incremental_from,
+                resume: None, dismissed, no_dismissed, incremental_from, pack_only,
             };
+
+            // --pack-only（M21a 批 C）：装包落盘即返回，不建 registry、不派发。
+            if pack_only {
+                match redteam::cli::run_pack_only(&args, &cfg, &cwd) {
+                    Ok(report) => {
+                        print!("{}", redteam::cli::render_pack_only(&report));
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
 
             // 后台：写 pending state + args 快照（proj.db）→ spawn detached worker → 打印 job-id 退出。
             if background {
                 let ws = cwd.clone();
-                let job_id = gen_job_id(&cwd);
+                let job_id = redteam::cli::gen_job_id(&cwd);
                 // ④级：store 打不开是硬错误，直冒。
                 let store = match redteam::state::JobStore::open(&ws) {
                     Ok(s) => s,
@@ -1331,6 +1346,21 @@ mod tests {
         assert_eq!(fmt_dur(3780), "1h03m");
     }
 
+    /// M21a 批 C（R-C4.3）：--pack-only 与 --background / --resume / --incremental-from 互斥。
+    #[test]
+    fn pack_only_conflicts_with_background_resume_incremental() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["redteam", "review", "--pack-only"]).is_ok());
+        assert!(Cli::try_parse_from(["redteam", "review", "--pack-only", "--base", "dev", "--focus", "x"]).is_ok());
+        for extra in [["--background", ""], ["--resume", "abc"], ["--incremental-from", "abc"]] {
+            let mut argv = vec!["redteam", "review", "--pack-only", extra[0]];
+            if !extra[1].is_empty() {
+                argv.push(extra[1]);
+            }
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?} 应冲突");
+        }
+    }
+
     /// C1：无 provider 配置的 Config + ReviewArgs → build_registry 返回 Err。
     #[test]
     fn build_registry_no_provider_returns_err() {
@@ -1340,7 +1370,7 @@ mod tests {
         // 空配置：无 [providers.*]，resolve_models 会产出空列表
         let cfg = Config::default();
         let cwd = std::path::Path::new(".");
-        let args = ReviewArgs {
+        let args = ReviewArgs { pack_only: false,
             base: None,
             scope: "working-tree".into(),
             spec: vec![],

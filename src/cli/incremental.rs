@@ -305,7 +305,7 @@ pub(crate) mod incremental_tests {
 
     /// 增量 args（branch scope）。
     pub(super) fn inc_args(base: &str, prior: &str) -> ReviewArgs {
-        ReviewArgs {
+        ReviewArgs { pack_only: false,
             base: Some(base.into()), scope: "branch".into(),
             spec: vec![], focus: None, models: Some("m".into()),
             models_all: false, block_threshold: None, conf_floor: None,
@@ -328,7 +328,7 @@ pub(crate) mod incremental_tests {
         };
         let store = crate::state::JobStore::open(root).unwrap();
         store.write_result(job, &serde_json::to_string(&report).unwrap()).unwrap();
-        let prior_args = ReviewArgs { incremental_from: None, background: true, ..inc_args("dev0", "unused") };
+        let prior_args = ReviewArgs { pack_only: false, incremental_from: None, background: true, ..inc_args("dev0", "unused") };
         store.write_args_raw(job, &serde_json::to_string(&prior_args).unwrap()).unwrap();
         store.write_manifest(job, &[CellInput { cell: "bundle[a.rs]@m".into(), model: "m".into(), prompt: "p".into() }]).unwrap();
         store.append_partial(job, &CellRecord::ok("bundle[a.rs]@m", "m", vec![])).unwrap();
@@ -451,13 +451,13 @@ pub(crate) mod incremental_tests {
         let e = incremental_preflight(&store, &nobase, "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("requires --base"), "{e}");
         // ②同族：上轮 scope 与本轮不一致
-        let mut prior_wt = ReviewArgs { scope: "working-tree".into(), base: None, ..inc_args("dev0", "x") };
+        let mut prior_wt = ReviewArgs { pack_only: false, scope: "working-tree".into(), base: None, ..inc_args("dev0", "x") };
         prior_wt.incremental_from = None;
         store.write_args_raw("jprev", &serde_json::to_string(&prior_wt).unwrap()).unwrap();
         let e = incremental_preflight(&store, &inc_args("dev0", "jprev"), "jprev", dir.path()).unwrap_err();
         assert!(e.to_string().contains("scope mismatch"), "{e}");
         // 恢复同族后：①谱系——stamp 指向不在祖先链上的假 sha
-        let good_args = ReviewArgs { incremental_from: None, background: true, ..inc_args("dev0", "x") };
+        let good_args = ReviewArgs { pack_only: false, incremental_from: None, background: true, ..inc_args("dev0", "x") };
         store.write_args_raw("jprev", &serde_json::to_string(&good_args).unwrap()).unwrap();
         let mut rebased: ReviewReport = serde_json::from_str(&store.read_result("jprev").unwrap()).unwrap();
         rebased.run.head_sha = Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into());

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """P0 E3 · 疑点契约 vs finding 契约召回（DeepSeek 直连 chat-completions，复刻产品单发请求形状）。
 
-零第三方依赖（urllib）。输入是 `examples/dump_pack.rs` 落盘的 A 臂 prompt（system + user）；B 臂只替换
+零第三方依赖（urllib）。输入是 A 臂 prompt 落盘产物（system + user；原落盘器 `examples/dump_pack.rs` 已随 M21a 批 C 拆除，
+产品等价物 = `redteam review --pack-only` 的 `.redteam/packs/<job>/cell-*.md`）；B 臂只替换
 `<finding_bar>` / `<output_contract>` 两段与 system 里的 schema 短语，其余字节相同（`variant` 落盘 diff 并断言）。
 
 子命令：

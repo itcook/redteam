@@ -120,6 +120,15 @@ pub enum Gate {
     Grouped,
 }
 
+impl Gate {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Gate::Single => "single",
+            Gate::Grouped => "grouped",
+        }
+    }
+}
+
 /// 分组观测（M21a 只在 `--pack-only` 打印与 summary.json；RunMeta 接线 F-5）。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct GroupingStats {
