@@ -175,8 +175,31 @@ pub struct ScanPrompt {
 impl ScanPrompt {
     /// openai kind / 落盘用：四块按序拼接（不含 system）。
     pub fn flatten(&self) -> String {
-        self.blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n\n")
+        flatten_blocks(&self.blocks)
     }
+}
+
+/// 分块 → 单条文本（openai kind 的 user content 与落盘形态；与 `ScanPrompt::flatten` 同一口径）。
+pub fn flatten_blocks(blocks: &[PromptBlock]) -> String {
+    blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n\n")
+}
+
+/// 模板哈希（design §10.7：共享头与每个角色尾各一 hash，A/B 归因 + 前缀稳定回归；`legacy_bundle` 给 F-4 前仍在跑的旧 fan-out）。
+/// 取模板原文（不含槽值）的 fnv1a64——槽值随 run 变，模板不变即哈希不变。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateHashes {
+    pub shared_head: String,
+    pub scanner_tail: String,
+    pub legacy_bundle: String,
+}
+
+pub fn template_hashes() -> &'static TemplateHashes {
+    static H: std::sync::OnceLock<TemplateHashes> = std::sync::OnceLock::new();
+    H.get_or_init(|| TemplateHashes {
+        shared_head: crate::hash::fnv1a64_hex(&[SHARED_HEAD_TPL]),
+        scanner_tail: crate::hash::fnv1a64_hex(&[SCANNER_TAIL_TPL]),
+        legacy_bundle: crate::hash::fnv1a64_hex(&[CODE_BUNDLE_TPL]),
+    })
 }
 
 /// `build_scan_prompt` 输入：全部注入段各自只有一个槽（注入互斥），全部经 `neutralize_structure`。
@@ -754,6 +777,18 @@ mod tests {
         let t = &p.blocks[3].text;
         assert_eq!((count(t, "precedents"), count(t, "scanner"), count(t, "output_contract")), (1, 1, 1), "{t}");
         assert!(t.contains("<\\/precedents>"), "中和后的可读形态仍在场: {t}");
+    }
+
+    /// 批 D-4：模板哈希稳定、三者互异、等于模板原文的 fnv（A/B 归因与前缀稳定回归用）。
+    #[test]
+    fn template_hashes_stable_and_distinct() {
+        let h = template_hashes();
+        assert_eq!(h, template_hashes());
+        assert_eq!(h.shared_head, crate::hash::fnv1a64_hex(&[SHARED_HEAD_TPL]));
+        assert_eq!(h.scanner_tail, crate::hash::fnv1a64_hex(&[SCANNER_TAIL_TPL]));
+        assert_eq!(h.legacy_bundle, crate::hash::fnv1a64_hex(&[CODE_BUNDLE_TPL]));
+        assert!(h.shared_head != h.scanner_tail && h.scanner_tail != h.legacy_bundle && h.shared_head != h.legacy_bundle);
+        assert_eq!(h.shared_head.len(), 16);
     }
 
     #[test]

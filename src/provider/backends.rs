@@ -24,10 +24,26 @@ pub(crate) fn build_anthropic_tools_body(
 ) -> Value {
     let mut system = String::new();
     let mut msgs: Vec<Value> = Vec::new();
+    // 显式断点计数（批 D-4 三段界）：有显式断点时 system 也打断点、末块不再自动加（Anthropic 每请求最多 4 个断点）。
+    let mut explicit_boundaries = 0usize;
     for m in messages {
         match m {
             ChatMessage::System(s) => system = s.clone(),
             ChatMessage::User(u) => msgs.push(json!({ "role": "user", "content": u })),
+            ChatMessage::UserBlocks(blocks) => {
+                let content: Vec<Value> = blocks
+                    .iter()
+                    .map(|b| {
+                        let mut o = json!({ "type": "text", "text": b.text });
+                        if b.cache_boundary {
+                            o["cache_control"] = json!({ "type": "ephemeral" });
+                            explicit_boundaries += 1;
+                        }
+                        o
+                    })
+                    .collect();
+                msgs.push(json!({ "role": "user", "content": content }));
+            }
             ChatMessage::Assistant { text, tool_calls } => {
                 let mut blocks: Vec<Value> = Vec::new();
                 if !text.is_empty() {
@@ -62,7 +78,12 @@ pub(crate) fn build_anthropic_tools_body(
     body.insert("max_tokens".into(), json!(max_tokens));
     // system 为空时省略该键，与 OpenAI 的 tool_calls 省略策略保持对称。
     if !system.is_empty() {
-        body.insert("system".into(), json!(system));
+        // 三段界之首（批 D-4）：分块请求把共享头 system 也打断点；旧裸 string 形态不变（既有 body 逐字节不变）。
+        if explicit_boundaries > 0 {
+            body.insert("system".into(), json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }]));
+        } else {
+            body.insert("system".into(), json!(system));
+        }
     }
     body.insert("tools".into(), json!(tool_decls));
     // L1 缓存：最后一个 message 的最后一个 content block 打 ephemeral 断点——前缀顺序
@@ -70,7 +91,8 @@ pub(crate) fn build_anthropic_tools_body(
     // tool-loop append-only 确定性渲染，前缀天然稳定：每轮把断点移到新末尾，命中前一轮写的前缀、
     // 只付增量写入，13 轮对话输入成本理论折减 ~80-90%（5min TTL 覆盖 cell 内轮间隔）。
     // 当前三 provider 全 openai kind，此 body 走不到；为将来配 Anthropic 直连即生效而备。
-    if let Some(last) = msgs.last_mut() {
+    let auto_tail = explicit_boundaries == 0;
+    if let Some(last) = msgs.last_mut().filter(|_| auto_tail) {
         let is_string = last.get("content").map(Value::is_string).unwrap_or(false);
         if is_string {
             // User 消息 content 是裸 string → 转带 cache_control 的 text block 数组
@@ -369,6 +391,7 @@ pub(crate) fn build_openai_tools_body(
         match m {
             ChatMessage::System(s) => msgs.push(json!({ "role": "system", "content": s })),
             ChatMessage::User(u) => msgs.push(json!({ "role": "user", "content": u })),
+            ChatMessage::UserBlocks(blocks) => msgs.push(json!({ "role": "user", "content": crate::prompt::flatten_blocks(blocks) })),
             ChatMessage::Assistant { text, tool_calls } => {
                 let calls: Vec<Value> = tool_calls
                     .iter()
@@ -742,6 +765,33 @@ mod tests {
         assert_eq!(tail[n - 1]["content"], "file body", "断点不破坏原 tool_result 内容: {b}");
         // 非尾 message（User）不受影响，仍是裸 string
         assert_eq!(b["messages"][0]["content"], "review", "非尾 message 不打断点: {b}");
+    }
+
+    /// 批 D-4：分块 user 消息 → anthropic 三段界 cache_control（system + 证据末 + 角色尾前），末块不再自动加断点；
+    /// openai 拼接后与裸 User 逐字节等价。
+    #[test]
+    fn user_blocks_three_cache_boundaries_and_openai_flatten() {
+        use crate::prompt::PromptBlock;
+        let blocks = vec![
+            PromptBlock { text: "<reference>r</reference>".into(), cache_boundary: false },
+            PromptBlock { text: "<evidence>e</evidence>".into(), cache_boundary: true },
+            PromptBlock { text: "<diff>d</diff>".into(), cache_boundary: true },
+            PromptBlock { text: "<scanner>t</scanner>".into(), cache_boundary: false },
+        ];
+        let msgs = vec![ChatMessage::System("head".into()), ChatMessage::UserBlocks(blocks.clone())];
+        let b = build_anthropic_tools_body("claude-x", &msgs, &[], MAX_TOKENS);
+        assert_eq!(b["system"][0]["text"], "head");
+        assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral", "共享头断点: {b}");
+        let content = b["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 4);
+        assert!(content[0].get("cache_control").is_none() && content[3].get("cache_control").is_none(), "末块不自动加断点: {b}");
+        assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(content[2]["cache_control"]["type"], "ephemeral");
+        assert_eq!(b.to_string().matches("cache_control").count(), 3, "恰三段界: {b}");
+        let flat = crate::prompt::flatten_blocks(&blocks);
+        let a = build_openai_tools_body("m", &[ChatMessage::System("head".into()), ChatMessage::UserBlocks(blocks)], &[], true, None);
+        let c = build_openai_tools_body("m", &[ChatMessage::System("head".into()), ChatMessage::User(flat)], &[], true, None);
+        assert_eq!(a, c, "openai 分块与拼接逐字节相同");
     }
 
     // I1 回归：system 为空时 Anthropic 请求体中不应含 "system" 键。
