@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hiapi/backend 穷人版卷宗可行性扫描(纯 grep,无 oracle):
+"""大型 Go/TS 仓穷人版卷宗可行性扫描(纯 grep,无 oracle；EVAL_REPO 指向被扫仓):
 1. 近期 fix commits 提 changed symbols(Go/TS 各自 def 正则)
 2. 每 symbol 名字桶规模(rg -w)+ 同名 def 数(歧义度)
 3. per-bundle 卷宗体积估算(±3行档 ~60 tok/引用点,redteam 仓校准值)
@@ -8,7 +8,7 @@
 import json, os, re, subprocess, sys
 from collections import defaultdict
 
-REPO = os.path.expanduser(os.environ.get("EVAL_REPO", "~/hiapi/backend"))
+REPO = os.path.expanduser(os.environ.get("EVAL_REPO", "."))
 
 GO_DEFS = [
     re.compile(r'^func\s+(?:\([^)]+\)\s+)?([A-Za-z_]\w*)\s*[(\[]'),

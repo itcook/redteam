@@ -303,7 +303,7 @@ git worktree add ~/hobby/.worktrees/redteam/m21a-grouping -b feat/m21a-grouping 
 
 ---
 
-## 出口验收（本工作树；`BK=~/hiapi/.worktrees/backend/artifact-transfer-reliability`，数据只落 `.next/private/m21a/`）
+## 出口验收（本工作树；`BK=<PR181 工作树绝对路径，只记在 .next/private/>`，数据只落 `.next/private/m21a/`）
 
 | # | 验收 | 命令 / 数据 | 门槛 |
 |---|---|---|---|

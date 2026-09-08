@@ -99,7 +99,7 @@ pub(crate) struct TailCtx<'a> {
     pub(crate) needs_stats: (u32, u32),
     /// 后台 job 的 phase 打点通路（refute 子阶段；前台/resume 为 None）。
     pub(crate) sink: Option<&'a dyn CellSink>,
-    /// --spec 参照段（Task 4，承 hiapi F2）——透传给 refute 趟；空 --spec=""（行为不变）。
+    /// --spec 参照段（Task 4，承 dogfood F2）——透传给 refute 趟；空 --spec=""（行为不变）。
     pub(crate) spec_docs: &'a str,
     /// Task 2（尾段引擎泛化）：增量携带态。None=既有全量/resume 路径逐字不变；
     /// Some=Task 3 消费，assemble_report 内 merge_carry + 回填 RunMeta 五字段。

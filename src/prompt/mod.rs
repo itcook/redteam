@@ -36,7 +36,7 @@ pub fn output_language() -> String {
 /// `dismissed_notes`：驳回台账判例（可空）——skeptic 见过往人裁，主题变体一致 refute。
 /// `source_context`：finding 声称位置的工作树快照（`verify::source_snippet` 产出，可空）——
 /// 免 refute 冷启动零 pack 裸奔重读（E7：解剖实测 14 调用/趟）；空串渲染为 `(none)`。
-/// `spec_docs`：--spec 参照段（Task 4，承 hiapi F2）——skeptic 拿到设计文档，就能把「像 bug
+/// `spec_docs`：--spec 参照段（Task 4，承 dogfood F2）——skeptic 拿到设计文档，就能把「像 bug
 /// 实为设计明确允许」的误报据 spec 驳回；空串渲染为 `(none)`（既有 refute 行为不变）。
 pub fn build_refute_prompt(
     finding: &crate::domain::Finding,
@@ -409,7 +409,7 @@ mod tests {
         assert!(p2.contains("(none)"), "空快照渲染占位");
     }
 
-    /// Task 4：refute prompt 接入 --spec 参照段（承 hiapi F2「结合设计判定为设计允许行为、驳回」）。
+    /// Task 4：refute prompt 接入 --spec 参照段（承 dogfood F2「结合设计判定为设计允许行为、驳回」）。
     #[test]
     fn refute_prompt_carries_spec() {
         use crate::domain::{Finding, Origin, Severity};

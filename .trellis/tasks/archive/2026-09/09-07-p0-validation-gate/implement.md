@@ -1,7 +1,7 @@
 # implement · P0 验证门
 
 > 顺序执行；每步的验证命令与产物写明。`P0_RAW=<worktree>/.next/private/p0-raw`、
-> `BK=~/hiapi/.worktrees/backend/artifact-transfer-reliability`。
+> `BK=<PR181 工作树绝对路径，只记在 .next/private/>`。
 
 ## 0. 预飞
 - [x] `git -C $BK rev-parse --short HEAD` = 215afd77b 且 `status --short` 空；`mkdir -p $P0_RAW/{replay,pack/pr181,e3/A,e3/B}`。
@@ -20,7 +20,7 @@
 - [x] `score <replay.json> <oracle.json> [--set topic_diff|strict_diff|union|hobby --job <id>]`：design §2 命中口径，两粒度都出。
 - [x] `report <dir>`：θ 曲线 + `(code_lines,|H0|,R)` 表 + 三档 `max_cells` 起步值。
 - [x] `selftest`：合成样本（rs/go/ts def 各 ≥ 3、块配平、相邻合并、交集判定、ledger 时间守卫）全绿。
-- 验证：`python3 eval/risk_replay.py selftest`；`python3 eval/risk_replay.py replay $BK a7c827b70 215afd77b --history-repo ~/hiapi/backend --history-ref dev --out $P0_RAW/replay/pr181-r1.json`。
+- 验证：`python3 eval/risk_replay.py selftest`；`python3 eval/risk_replay.py replay $BK <BASE> <HEAD> --history-repo <公司仓主 checkout> --history-ref dev --out $P0_RAW/replay/pr181-r1.json`。
 
 ## 3. E1 回放与裁决
 - [x] 第 1 轮：PR181 四集合 + oracle B 五个 diff（`6f95c25~1..6f95c25`、`4f52ac9..8dcaf6f`、`f028f92..290236e`、`e8dc24f..00e23fc`、

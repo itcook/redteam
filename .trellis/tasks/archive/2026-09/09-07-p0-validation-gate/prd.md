@@ -16,16 +16,16 @@ plan 派生、M21 登记是会话动作，不在本任务代码范围。
 ## Background（仓库 / 数据实测，2026-09-07）
 
 ### PR181 基座
-- 仓库 `~/hiapi/.worktrees/backend/artifact-transfer-reliability`（Go + TS，分支 `pr-181-review`），HEAD `215afd77b`，
+- 仓库 `<PR181 工作树，路径 / 分支 / HEAD 只记在 .next/private/>`（Go + TS），
   评审基线 `a7c827b70`；`git diff --stat a7c827b70 215afd77b` = 40 文件 +1750/−69，与全部评审记录一致。
   merge 进 dev 的 PR 头 `4317c8afce` 与 215afd77b 差 7 文件，**回放以 215afd77b 为准**（三方评审实际看到的树）。
-- 该仓是浅克隆（分支深度 88），主 checkout `~/hiapi/backend` 有完整 dev 历史（13375 commits）→ 历史信号从主 checkout 取。
+- 该仓是浅克隆（分支深度 88），主 checkout（公司仓）有完整 dev 历史→ 历史信号从主 checkout 取。
 - 三方 findings 落点（同仓 `.redteam/proj.db`）：
   - GLM 6 / Kimi 3：作业 `4065c30bae9e`，cells 表按 `@GLM` / `@Kimi` 分开（results 合并 8 条，1 条 GLM∩Kimi）；
     args：base `dev`（当时 = a7c827b70）、focus 文本 7 点、无 spec。
   - DeepSeek 3：作业 `03a7bffb58fe`（`deepseek-v4-flash`，同 focus，base a7c827b70，head 215afd77b，5.3 min，
     主 cell input 180.7K / output 32.6K；output 逼近 32768 上限，E3 须核 finish_reason）。
-  - rpiv 8：`~/hiapi/backend/.rpiv/artifacts/reviews/2026-09-03_08-20-31_pr-181-*.md`（I1-I4、Q1-Q4，`**Where**` 行给 `path:line` 锚）。
+  - rpiv 8：`<公司仓 .rpiv/artifacts/reviews/…pr-181-*.md，只记在 .next/private/>`（I1-I4、Q1-Q4，`**Where**` 行给 `path:line` 锚）。
   - ocr 3：**磁盘无原始产物**；从 `.doc/reviews/2026-09-04-pr181-three-way-*.md` 可恢复 2 条（错误码分类 fork；失败日志不区分瞬时/终态）。
 - finding JSON 字段：`id, severity, title, body, file, line_start, line_end, confidence, recommendation, models, agreement, quote, origin, verify{verdict}`。
 - 该仓 proj.db `dismissed` / `resolved` 均为 0 → 台账类历史信号在 PR181 上为空，只剩 git log。
