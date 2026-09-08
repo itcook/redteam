@@ -73,3 +73,26 @@ E1：eval/risk_replay.py 零 LLM 回放 PR181，规则 v4（θ=1.5，H0 需 ≥2
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: grill D11 → design v8 锁定；M21a plan 派生（六批 + 出口）
+<!-- trellis-session: v=2 fp=bc42fdeaaf037c56 -->
+
+**Date**: 2026-09-08
+**Task**: grill D11 → design v8 锁定；M21a plan 派生（六批 + 出口）
+**Branch**: `feat/m21-review-engine`
+
+### Summary
+
+grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk] 与 --risk、θ 权重常量化 / 预算 R 三档 4-12-32 帽 48 / 必挖 = 主区 ∪ agreement≥2 + 疑点保底 ⌈max_cells/4⌉ / R6 销案 / R14 role + 输出枚举 + 台账表 + 队列快照表）记入 decisions D11，design 锁定 v8，roadmap P0 ✅、followup 归位、主账本登记 M21。派生 M21a plan：.next/plans/2026-09-07-redteam-m21a-scan-foundation-plan.md，六批 A 配置节 / B schema v4 / C 分组索引 + --pack-only / D 契约提示词 / E 切片 / F 硬切并行 + 出口十条命令化验收；波次 A/B/C 并行（各自工作树与子分支）→ D/E → F → 出口。下一步：开三个 session 起 m21a-config / m21a-schema / m21a-grouping。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `47fc9d8` | docs(design): D11 P0 出口裁决——design 锁定 v8；roadmap P0 ✅、R5/R6/R11/R14 归位、--risk 提法清除 |
+| `dc2c008` | docs(plan): M21a 疑点扫描地基 plan 派生——六批 A-F + 出口验收，波次与子分支/工作树布局 |
+
+### Status
+
+[OK] **Completed**
