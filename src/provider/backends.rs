@@ -9,23 +9,9 @@ use serde_json::{json, Value};
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 /// 单轮输出上限（仅 anthropic 协议必填 max_tokens 时注入；openai body 不传、走模型默认）。
-/// 思考型模型的 thinking tokens 也计入此额度，8192 旧值在大 bundle 评审下会被截断
-/// （finish_reason=max_tokens，findings JSON 解析失败，2026-09-03 dogfood 实证）。
-/// env `REDTEAM_MAX_TOKENS` 可覆盖，对齐 REDTEAM_HTTP_TIMEOUT_SECS/per_turn 旋钮先例。
-const MAX_TOKENS: u64 = 32768;
-
+/// 默认值与 `REDTEAM_MAX_TOKENS` 解析统一在 `config::env_max_tokens`（与超时公式同链，评审 #7）。
 fn max_tokens() -> u64 {
-    match std::env::var("REDTEAM_MAX_TOKENS") {
-        Ok(s) => match s.parse::<u64>() {
-            Ok(v) => v,
-            Err(_) => {
-                // F4：静默回落会让运维误以为旋钮已生效，复发时被迫活体复现调试。
-                eprintln!("warning: REDTEAM_MAX_TOKENS={s:?} 非法（需正整数），回落默认 {MAX_TOKENS}");
-                MAX_TOKENS
-            }
-        },
-        Err(_) => MAX_TOKENS,
-    }
+    crate::config::env_max_tokens()
 }
 
 /// 把 provider 无关的 messages 渲染成 Anthropic Messages API 请求体。
@@ -294,7 +280,7 @@ impl AnthropicBackend {
         AnthropicBackend { model, base_url, api_key, output_limit: None, client: crate::provider::default_http_client() }
     }
 
-    /// [models.X].output_limit 注入（优先于 REDTEAM_MAX_TOKENS env 与默认）。
+    /// 模型 maxOutputTokens 注入（优先于 REDTEAM_MAX_TOKENS env 与默认）。
     pub fn with_max_tokens(mut self, limit: Option<u64>) -> Self {
         self.output_limit = limit;
         self
@@ -580,7 +566,7 @@ impl OpenAiBackend {
         OpenAiBackend { model, base_url, api_key, output_limit: None, client: crate::provider::default_http_client() }
     }
 
-    /// [models.X].output_limit 注入（优先于 REDTEAM_MAX_TOKENS env 与默认）。
+    /// 模型 maxOutputTokens 注入（优先于 REDTEAM_MAX_TOKENS env 与默认）。
     pub fn with_max_tokens(mut self, limit: Option<u64>) -> Self {
         self.output_limit = limit;
         self
@@ -652,7 +638,7 @@ impl ChatBackend for OpenAiBackend {
 
 /// 按 EffectiveModel（角色条目+provider 覆盖链成品）造对应 backend（编排层入口）。
 /// kind 已在 config::effective 里 merge（条目.kind > provider.kind）。
-/// Google 暂不支持（占位规划）。max_tokens：条目 output_max_tokens 注入 backend
+/// Google 暂不支持（占位规划）。max_tokens：模型 maxOutputTokens 注入 backend
 /// （> REDTEAM_MAX_TOKENS env > 32768 默认，见 AnthropicBackend/OpenAiBackend 构造）。
 pub fn backend_from_config(
     em: &crate::config::EffectiveModel,
@@ -663,12 +649,12 @@ pub fn backend_from_config(
             em.id.clone(),
             em.base_url.clone(),
             api_key,
-        ).with_max_tokens(em.output_max_tokens))),
+        ).with_max_tokens(em.max_output_tokens))),
         ProviderKind::Openai | ProviderKind::OpenaiCompatible => Ok(Box::new(OpenAiBackend::new(
             em.id.clone(),
             em.base_url.clone(),
             api_key,
-        ).with_max_tokens(em.output_max_tokens))),
+        ).with_max_tokens(em.max_output_tokens))),
         ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
     }
 }
@@ -676,6 +662,7 @@ pub fn backend_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_MAX_TOKENS as MAX_TOKENS;
     use crate::tools::tool_specs;
 
     fn specs() -> Vec<ToolSpec> {
@@ -685,8 +672,8 @@ mod tests {
     /// 09-04 分离后 backend_from_config 吃 EffectiveModel——测试构造辅助。
     fn eff(kind: crate::config::ProviderKind) -> crate::config::EffectiveModel {
         crate::config::EffectiveModel {
-            name: "t".into(), id: "m".into(), provider: "p".into(), role: crate::config::Role::Scanner, kind,
-            base_url: None, context_window: 128_000, output_max_tokens: None,
+            name: "t".into(), display_name: None, id: "m".into(), provider: "p".into(), role: crate::config::Role::Scanner, kind,
+            base_url: None, context_window: 128_000, max_output_tokens: None,
             per_turn_timeout_secs: None, reasoning: false, thinking_level: None,
             family: "m".into(), max_concurrency: None,
         }

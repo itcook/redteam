@@ -124,3 +124,28 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 ### Status
 
 [OK] **Completed**
+
+
+## Session 6: M21a 批 A 重做：config.json + provider→models→roles（D12），身份串 provider/id，评审修复，合入批 B/C
+<!-- trellis-session: v=2 fp=0d53da7a64ff9d83 -->
+
+**Date**: 2026-09-08
+**Task**: M21a 批 A 重做：config.json + provider→models→roles（D12），身份串 provider/id，评审修复，合入批 B/C
+**Branch**: `feat/m21a-config-json`
+
+### Summary
+
+批 A 按 D12 重做为严格 JSON（providers.<name>.models.<id>.roles.<role>，camelCase，无注释；toml 退出）；setup 走 SetupPatch 三层显式合并 + 写前校验 + 原子写；HOME 缺失报错、超时优先级、contextWindow 下限、零值校验、shape_guard（snake_case/旧键报错、未知键 warning）。用户裁定身份串固定 provider/id，name 改 displayName 只作显示。code-review 子 agent 报告 1 必修 + 6 建议 + 6 nit 全部并入（键序记 followup）。本机 TOML 已迁 JSON，model list 五条 ✓。feat/m21-review-engine（批 B/C）已预合并进本分支（三处机械冲突），并接上批 C followup 的 review.grouping→GroupingOpts；合并树 493+16+7+14 测试绿。待办：主工作树 --no-ff 合回。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9b817da` | feat(config): 批 A 重做——config.json + provider→models→roles（D12），setup 三层显式合并 + 写前校验，HOME 缺失报错，超时优先级，contextWindow 下限；toml 退出 |
+| `e64276e` | fix(config): 身份串固定 provider/id（name→displayName）+ 重做评审修复（env 提示必修、写前 flag 校验、零值校验、嵌套键守卫、kind/apiKeyEnv 落模型层、原子写、max_tokens 同链） |
+| `1f2f89c` | merge: feat/m21-review-engine（批 B schema v4 + 批 C 分组与索引）into feat/m21a-config-json——解三处冲突（ReviewArgs.pack_only 字段 / CellRecord::ok 的 CellOutput::review 包装 vs JSON 夹具 route_key p/<id> / Init 文案 proj-next.db + config.json）；合并树 492+16+7+14 测试绿 |
+| `1208166` | feat(cli): review.grouping 配置接到 GroupingOpts（批 C followup「后合者一行」）——plan_cells 三入口同源，缺省 4/200/10 不变；followup 行销案 |
+
+### Status
+
+[OK] **Completed**

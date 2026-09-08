@@ -362,7 +362,7 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
       "maxConcurrency": 20,
       "models": {
         "deepseek-v4-flash": {
-          "name": "DeepSeek V4 Flash",
+          "displayName": "DeepSeek V4 Flash",
           "contextWindow": 1000000,
           "maxOutputTokens": 384000,
           "reasoning": true,

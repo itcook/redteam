@@ -338,10 +338,11 @@ roadmap P0 ✅、followup 四行归位、M21b / M21c / M21e / M21a 的 `--risk` 
 1. **格式**：`$REDTEAM_HOME/config.json` + `secrets.json`（缺省 `~/.redteam/`），严格 JSON（`serde_json`，已是依赖），键 camelCase，
    无注释；`toml` 依赖退出。JSON 正好绕开 D7 A1 的三条顾虑。
 2. **形状**（模型固有字段只写一次，角色属性挂模型下）：
-   `providers.<name>{ kind?, baseUrl?, apiKeyEnv?, maxConcurrency?, models.<id>{ name?, kind?, apiKeyEnv?, family?, contextWindow?,
+   `providers.<name>{ kind?, baseUrl?, apiKeyEnv?, maxConcurrency?, models.<id>{ displayName?, kind?, apiKeyEnv?, family?, contextWindow?,
    maxOutputTokens?, perTurnTimeoutSecs?, reasoning?, roles.<scanner|reviewer|verifier>{ thinkingLevel? } } }` + `review{ … }`。
    某角色的活跃集 = 拥有该角色键的全部模型（列表即活跃集、无候补，D7 A3 不变）；顺序按 provider 名、model id 字典序（无语义，不为保序引依赖）。
-3. **身份**：route_key / 报告名 = `provider/id`；`name` 只作人读显示；`family` 缺省 id 首段。`kind` = 模型层 > provider 层，两者都缺 → 校验报错。
+3. **身份**：route_key / 报告名 = `provider/id`（两者都是必选、请求体里传的也是 id）；`displayName` 可选、只作人读显示（2026-09-08 重做评审后
+   由 `name` 改名，防被当身份串）；`family` 缺省 id 首段。`kind` = 模型层 > provider 层，两者都缺 → 校验报错。
 4. **secrets.json**：`{"providers": {"<name>": {"apiKey": "…", "models": {"<id>": "…"}}}}`；解析链：模型 `apiKeyEnv`(env) → secrets.models[id]
    → provider `apiKeyEnv`(env) → secrets.apiKey；守卫：secrets 里的 provider 名 / model id 在 config 无对应 → warning；chmod 600。
 5. **`model setup`**：`--provider X --model <id> --role scanner[,reviewer,verifier] [--name --kind --base-url --max-concurrency --context-window

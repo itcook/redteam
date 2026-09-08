@@ -132,11 +132,11 @@ pub fn parse_format(s: &str) -> Format {
 }
 
 /// 角色集 → 旧 fan-out 编排参数（M21a 批 A **过渡适配器**，批 F 换成 scanner 路径后删）：
-/// `[[scanners]]` 列表即活跃集——每条各跑一遍（replicate）、无候补（no_fallback）；`priority` 恒 0
+/// 带 `roles.scanner` 的模型即活跃集——每个各跑一遍（replicate）、无候补（no_fallback）；`priority` 恒 0
 /// （候补链已退场，D7 A3）。scanners 为空是配置错误，交调用方报错退 1。
 pub fn legacy_opts_from_roles(roles: &RoleSets, max_concurrency: usize) -> Result<OrchestrateOpts, String> {
     if roles.scanners.is_empty() {
-        return Err("未配置 [[scanners]]：在 ~/.redteam/config.toml（REDTEAM_HOME 可覆盖）至少加一条，见 `redteam model setup --help`".to_string());
+        return Err("未配置 scanner：在 ~/.redteam/config.json（REDTEAM_HOME 可覆盖）给至少一个模型加 roles.scanner，见 `redteam model setup --help`".to_string());
     }
     Ok(OrchestrateOpts {
         models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0, family: m.family.clone() }).collect(),
@@ -224,15 +224,27 @@ pub(crate) fn plan_cells(
     selected: Vec<FileChange>,
     root: &Path,
     budget: usize,
+    grouping_cfg: &crate::config::GroupingCfg,
     extra_paths: &[String],
     delta: Option<&std::collections::BTreeSet<String>>,
 ) -> CellPlan {
-    let grouping = group(selected, Some(root), &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() });
+    let grouping = group(selected, Some(root), &grouping_opts(grouping_cfg, budget));
     let bundles = grouping.bundles;
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     let others =
         crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, extra_paths, delta), bundles.len());
     CellPlan { bundles, dossiers, others, dossier_meta, stats: grouping.stats }
+}
+
+/// `review.grouping`（config.json，批 A-2 子表）→ 分组阈值；预算门由 pack 预算喂（批 C followup「后合者接一行」，2026-09-08 合入）。
+/// `semantic` 旋钮（R8）尚无消费点。
+pub(crate) fn grouping_opts(g: &crate::config::GroupingCfg, budget: usize) -> GroupingOpts {
+    GroupingOpts {
+        min_files: g.min_files as usize,
+        bundle_line_threshold: g.bundle_line_threshold as usize,
+        max_files_per_group: g.max_files_per_group as usize,
+        budget_bytes: Some(budget),
+    }
 }
 
 /// code 专属流水线（S2-2b）：bundle × model 工具循环 + positioning 尾段。
@@ -279,7 +291,7 @@ pub async fn run_code_review(
     let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
     // 2. 分组 / 装包 / 跨组索引（plan_cells：与增量、--pack-only 同源）。门未过 → 单包（即原 E9 单格全审）。
     // GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
-    let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &[], None);
+    let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &cfg.review.grouping, &[], None);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
         let other = others.get(idx).map(String::as_str).unwrap_or("");
@@ -416,7 +428,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     // 角色集为空（无配置）时按 128K 窗保守缺省，不报错——仪表无 provider 也能跑。
     let roles = cfg.active_roles();
     let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
-    let CellPlan { bundles, dossiers, others, stats, .. } = plan_cells(select_files(changes), cwd, budget, &[], None);
+    let CellPlan { bundles, dossiers, others, stats, .. } = plan_cells(select_files(changes), cwd, budget, &cfg.review.grouping, &[], None);
     let focus = args.focus.clone().unwrap_or_default();
 
     let job_id = gen_job_id(cwd);
@@ -1081,7 +1093,7 @@ mod job_tests {
         Finding {
             id: "f".into(), severity: Severity::Medium, title: title.into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            models: vec!["alpha".into()], agreement: 1, hard_constraint: false,
+            models: vec!["p/alpha".into()], agreement: 1, hard_constraint: false,
             quote: "q".into(), cluster_id: None, verify: None, previously_dismissed: false,
             origin: Origin::New,
         }
@@ -1110,9 +1122,7 @@ mod job_tests {
         run(&["add", file]);
     }
     fn cfg() -> Config {
-        Config::from_layers(&[
-            "[providers.alpha_p]\nkind=\"openai\"\n\n[[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\n",
-        ]).unwrap()
+        Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap()
     }
 
     #[tokio::test]
@@ -1121,7 +1131,7 @@ mod job_tests {
         git_staged(dir.path(), "a.rs", "fn main() {\n    let x = 1;\n}\n");
         // alpha 报一条锚得到的 low finding（不触发 refute），quote 在 a.rs 第 2 行
         let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
-        scripted.insert("alpha".into(), vec![RawFinding {
+        scripted.insert("p/alpha".into(), vec![RawFinding {
             severity: Severity::Low, title: "t".into(), body: "b".into(), file: "a.rs".into(),
             line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             hard_constraint: false, quote: "let x = 1;".into(),
@@ -1176,7 +1186,7 @@ mod job_tests {
         // 预置一条 partial（模拟崩溃前已完成 1 cell）
         store.append_partial(
             "j2b",
-            &crate::state::CellRecord::ok("bundle[a]", "alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("checkpointed")])),
+            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("checkpointed")])),
         ).unwrap();
 
         // 非 git 目录 → changed_files 失败 → run_review_dispatch Err，但已有 partial 记录
@@ -1222,7 +1232,7 @@ mod job_tests {
         // 预置一条 partial（模拟 deadline 前已完成 1 cell）
         store.append_partial(
             "j-to",
-            &crate::state::CellRecord::ok("bundle[a]", "alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("before-deadline")])),
+            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("before-deadline")])),
         ).unwrap();
 
         let provider = HangProvider;
@@ -1772,28 +1782,36 @@ mod resolve_tests {
     use super::*;
 
     fn provs() -> &'static str {
-        "[providers.alpha_p]\nkind=\"openai\"\n[providers.beta_p]\nkind=\"openai\"\n\
-         [[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\n\
-         [[scanners]]\nname=\"beta\"\nprovider=\"beta_p\"\nmodel_id=\"b\"\n\
-         [[reviewers]]\nname=\"pro\"\nprovider=\"beta_p\"\nmodel_id=\"p\"\n"
+        r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"roles":{"scanner":{}}}}},
+            "beta_p":{"kind":"openai","models":{"b":{"roles":{"scanner":{}}},"p":{"displayName":"pro","roles":{"reviewer":{}}}}}}}"#
+    }
+
+    /// 批 C followup：`review.grouping` 子表接到 `GroupingOpts`（缺省 4 / 200 / 10 与内置一致）。
+    #[test]
+    fn grouping_opts_read_review_grouping_config() {
+        let d = grouping_opts(&Config::default().review.grouping, 1000);
+        assert_eq!((d.min_files, d.bundle_line_threshold, d.max_files_per_group, d.budget_bytes), (4, 200, 10, Some(1000)));
+        let c = Config::from_json(r#"{"review":{"grouping":{"minFiles":1,"bundleLineThreshold":0,"maxFilesPerGroup":2}}}"#).unwrap();
+        let o = grouping_opts(&c.review.grouping, 5);
+        assert_eq!((o.min_files, o.bundle_line_threshold, o.max_files_per_group, o.budget_bytes), (1, 0, 2, Some(5)));
     }
 
     /// 列表即活跃集：全部 scanner 各跑一遍（replicate）、无候补、priority 恒 0；reviewers 不进旧 fan-out。
     #[test]
     fn roles_adapter_replicates_all_scanners_without_fallback() {
-        let c = Config::from_layers(&[provs()]).unwrap();
+        let c = Config::from_json(provs()).unwrap();
         let o = legacy_opts_from_roles(&c.active_roles(), 4).unwrap();
         assert!(o.replicate && o.no_fallback);
         assert_eq!(o.max_concurrency, 4);
-        assert_eq!(o.models.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
+        assert_eq!(o.models.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["alpha_p/a", "beta_p/b"], "身份串 = provider/id");
         assert!(o.models.iter().all(|p| p.priority == 0));
     }
 
     #[test]
     fn roles_adapter_errors_when_no_scanner() {
-        let c = Config::from_layers(&["[providers.p]\nkind=\"openai\"\n[[reviewers]]\nprovider=\"p\"\nmodel_id=\"m\"\n"]).unwrap();
+        let c = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
         let err = legacy_opts_from_roles(&c.active_roles(), 4).unwrap_err();
-        assert!(err.contains("[[scanners]]"), "{err}");
+        assert!(err.contains("scanner"), "{err}");
     }
 }
 
@@ -1820,15 +1838,9 @@ mod code_review_tests {
         // 注：FakeProvider 是 prompt-blind 的——对同一 model 的任何调用（无论 review 还是 refute
         // prompt）都返回同一脚本，故 refute 调用返回非空 → refuted → confidence 0 → 不 reject。
         // 交叉 model 选择本身已在 verify.rs 单测验证；本测试只验「证伪翻转 verdict」全链路。
-        let cfg = Config::from_layers(&[r#"[providers.ap]
-kind="openai"
-[[scanners]]
-name="alpha"
-provider="ap"
-model_id="a"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = crate::provider::fake::FakeProvider::with(
-            "alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
+            "p/alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
         );
         let my_args = ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(),
@@ -1872,23 +1884,13 @@ model_id="a"
         // 两个 model 都报真 finding → dedup 合并成 agreement=2 → 跳过层① verify，
         // 保持本测试「anchor 砍编造 + High→Reject」的原意（不被 S3-b verify 自审误伤）。
         // 编造 quote 只 m 报，anchor 因 quote 不在文件而丢弃。
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-[[scanners]]
-name="m2"
-provider="p"
-model_id="m2-id"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"m2":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let mut scripted = std::collections::BTreeMap::new();
-        scripted.insert("m".to_string(), vec![
+        scripted.insert("p/m".to_string(), vec![
             raw("src/a.rs", "db.write(token);", Severity::High),
             raw("src/a.rs", "this is fabricated", Severity::Critical),
         ]);
-        scripted.insert("m2".to_string(), vec![raw("src/a.rs", "db.write(token);", Severity::High)]);
+        scripted.insert("p/m2".to_string(), vec![raw("src/a.rs", "db.write(token);", Severity::High)]);
         let provider = FakeProvider { scripted, ..Default::default() };
         let my_args = ReviewArgs { pack_only: false, ..args() };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
@@ -1904,14 +1906,8 @@ model_id="m2-id"
     #[tokio::test]
     async fn code_review_empty_changes_approves() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
-        let provider = FakeProvider::with("m", vec![]);
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let provider = FakeProvider::with("p/m", vec![]);
         let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
         assert!(report.findings.is_empty());
         assert_eq!(code, 0);
@@ -1920,14 +1916,8 @@ model_id="m-id"
     #[tokio::test]
     async fn code_review_stamps_head_sha_into_runmeta() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
-        let provider = FakeProvider::with("m", vec![]);
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let provider = FakeProvider::with("p/m", vec![]);
         // K1：无 --test-command 时按项目推断（Cargo.toml → cargo test）进 RunMeta。
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"\n").unwrap();
         let (report, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(),
@@ -1993,13 +1983,7 @@ mod spec_tests {
         let spec_path = root.join("design.md");
         std::fs::write(&spec_path, "DESIGN D8: fail-open").unwrap();
 
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = SpecPromptRecorder::default();
         let args = spec_test_args(vec![spec_path.to_string_lossy().to_string()]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
@@ -2020,13 +2004,7 @@ model_id="m-id"
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
 
-        let cfg = Config::from_layers(&[r#"[providers.p]
-kind="openai"
-[[scanners]]
-name="m"
-provider="p"
-model_id="m-id"
-"#]).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let provider = SpecPromptRecorder::default();
         let args = spec_test_args(vec![]); // 不带 --spec
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
@@ -2134,12 +2112,12 @@ mod tests {
         // design §2.2 预算函数：min(768K 绝对帽, (min_ctx − 16K 输出预留)×3 − 24K 壳预留)。
         // 2026-07-28 提帽 256K→768K（1M 窗时代，锚 gpt-5.6 272K 计费悬崖之下）——
         // 128K 缺省档从「帽封顶 256K」翻为「窗口墙生效 312K」是本次显式入账的行为变化。
-        let mk = |entries: &str| crate::config::Config::from_layers(&[&format!(
-            "[providers.bigp]\nkind = \"openai\"\n[providers.smallp]\nkind = \"openai\"\n{entries}"
-        )]).unwrap().active_roles();
-        let big = "[[scanners]]\nname=\"Big\"\nprovider=\"bigp\"\nmodel_id=\"big-ctx\"\ncontext_window=1000000\n";
-        let small = "[[scanners]]\nname=\"Small\"\nprovider=\"smallp\"\nmodel_id=\"small-ctx\"\ncontext_window=40000\n";
-        let unknown = "[[scanners]]\nname=\"Unknown\"\nprovider=\"bigp\"\nmodel_id=\"u\"\n";
+        let mk = |models: &str| crate::config::Config::from_json(
+            &r#"{"providers":{"p":{"kind":"openai","models":{MODELS}}}}"#.replace("MODELS", models),
+        ).unwrap().active_roles();
+        let big = r#""big-ctx":{"contextWindow":1000000,"roles":{"scanner":{}}}"#;
+        let small = r#""small-ctx":{"contextWindow":40000,"roles":{"scanner":{}}}"#;
+        let unknown = r#""u":{"roles":{"scanner":{}}}"#;
         // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K < 768K → 窗口墙生效
         assert_eq!(pack_budget_bytes(&mk(unknown)), 312_000);
         // 大窗模型（1M）：窗口墙 ≈2.9M → 绝对帽 768K 封顶（≈256K tok 记账 <272K 悬崖）
@@ -2147,7 +2125,7 @@ mod tests {
         // 小窗模型：(40_000−16_000)*3−24_000 = 48_000
         assert_eq!(pack_budget_bytes(&mk(small)), 48_000);
         // 多模型取最小窗（一份 pack 全模型安全）
-        assert_eq!(pack_budget_bytes(&mk(&format!("{big}{small}"))), 48_000);
+        assert_eq!(pack_budget_bytes(&mk(&format!("{big},{small}"))), 48_000);
         // 无 scanner → 缺省 128K 档
         assert_eq!(pack_budget_bytes(&crate::config::RoleSets::default()), 312_000);
     }

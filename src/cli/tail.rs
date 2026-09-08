@@ -43,7 +43,7 @@ pub(crate) fn mark_dismissed(
     reappeared
 }
 
-/// 条目 display_name → 请求 id 映射（人读报告显示 name，rN.md 模板 2026-07-03）。
+/// 模型身份串 name → 请求 id 映射（人读报告显示 name，rN.md 模板 2026-07-03）。
 pub(crate) fn model_ids_for(names: &[String], roles: &crate::config::RoleSets) -> Vec<String> {
     names
         .iter()
