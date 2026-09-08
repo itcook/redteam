@@ -1,4 +1,4 @@
-use crate::config::{ProviderConfig, ProviderKind};
+use crate::config::ProviderKind;
 use crate::provider::parse::error_body_to_provider_error;
 use crate::provider::tool_loop::{AssistantTurn, ChatBackend, ChatMessage};
 use crate::provider::ProviderError;
@@ -650,9 +650,9 @@ impl ChatBackend for OpenAiBackend {
     }
 }
 
-/// 按 EffectiveModel（model+provider 覆盖链成品）造对应 backend（编排层入口）。
-/// kind 已在 config::effective_model 里 merge（model.kind > provider.kind）。
-/// Google 暂不支持（占位规划）。max_tokens：model.output_limit 注入 backend
+/// 按 EffectiveModel（角色条目+provider 覆盖链成品）造对应 backend（编排层入口）。
+/// kind 已在 config::effective 里 merge（条目.kind > provider.kind）。
+/// Google 暂不支持（占位规划）。max_tokens：条目 output_max_tokens 注入 backend
 /// （> REDTEAM_MAX_TOKENS env > 32768 默认，见 AnthropicBackend/OpenAiBackend 构造）。
 pub fn backend_from_config(
     em: &crate::config::EffectiveModel,
@@ -663,12 +663,12 @@ pub fn backend_from_config(
             em.id.clone(),
             em.base_url.clone(),
             api_key,
-        ).with_max_tokens(em.output_limit))),
+        ).with_max_tokens(em.output_max_tokens))),
         ProviderKind::Openai | ProviderKind::OpenaiCompatible => Ok(Box::new(OpenAiBackend::new(
             em.id.clone(),
             em.base_url.clone(),
             api_key,
-        ).with_max_tokens(em.output_limit))),
+        ).with_max_tokens(em.output_max_tokens))),
         ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
     }
 }
@@ -685,9 +685,10 @@ mod tests {
     /// 09-04 分离后 backend_from_config 吃 EffectiveModel——测试构造辅助。
     fn eff(kind: crate::config::ProviderKind) -> crate::config::EffectiveModel {
         crate::config::EffectiveModel {
-            name: "t".into(), id: "m".into(), provider: "p".into(), kind,
-            base_url: None, context_window: 128_000, output_limit: None,
-            per_turn_timeout_secs: None, priority: 0, reasoning: false, thinking_level: None,
+            name: "t".into(), id: "m".into(), provider: "p".into(), role: crate::config::Role::Scanner, kind,
+            base_url: None, context_window: 128_000, output_max_tokens: None,
+            per_turn_timeout_secs: None, reasoning: false, thinking_level: None,
+            family: "m".into(), max_concurrency: None,
         }
     }
 

@@ -43,6 +43,9 @@ git worktree add ~/hobby/.worktrees/redteam/m21a-grouping -b feat/m21a-grouping 
 
 ## 批 A · 配置节（`feat/m21a-config`，Trellis `m21a-config`）
 
+> 2026-09-08〔D12〕：首版按 TOML 形状完成并合回（be87c44）后，配置改为 JSON + provider → models → roles；重做在 `feat/m21a-config-json`
+> （Trellis `m21a-config-json`），任务清单以其 `implement.md` 为准，并入 code-review（high）的必修 / 建议项。下文 A-1 … A-6 为首版记录。
+
 先机械拆零语义再接线：A-1 → A-2 → A-3 独立可测，A-4 / A-5 把消费方接到新形状，旧 fan-out 通过 A-4 的适配器继续跑到 F 批为止。
 
 ### Task A-1 路径与层序：`~/.redteam/` + `REDTEAM_HOME`，删项目层

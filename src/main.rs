@@ -1,4 +1,4 @@
-use redteam::cli::{parse_format, resolve_models, ReviewArgs};
+use redteam::cli::{legacy_opts_from_roles, parse_format, ReviewArgs};
 use redteam::config::Config;
 use redteam::model::Prober as _;
 use redteam::output::render;
@@ -15,9 +15,10 @@ use std::path::Path;
 // （r5 dogfood 1c72b790：LLM 摘参不可靠，机制化消灭「重复即崩」类）。
 #[command(name = "redteam", version, about = "模型无关的对抗式代码评审器", args_override_self = true,
     after_help = "快速上手：\n  \
-    1. redteam init                          # 项目内建 .redteam/ 骨架\n  \
-    2. redteam model setup --provider X …    # 配置至少一个 model（key 见 --key-store）\n  \
-    3. redteam review --base main            # 评审当前分支相对 main 的改动\n  \
+    1. redteam init                                              # 项目内建 .redteam/ 骨架（状态与内容，无配置）\n  \
+    2. redteam model setup --role scanner --provider X --model … # 配置至少一条 [[scanners]]（key 见 --key-store）\n  \
+    3. redteam review --base main                                # 评审当前分支相对 main 的改动\n  \
+    配置：~/.redteam/config.toml + secrets.toml（REDTEAM_HOME 可覆盖；用户级唯一，无项目层）。\n  \
     后台跑：review --background 得 job id → status <id> 看进度 → result <id> 取报告。")]
 struct Cli {
     #[command(subcommand)]
@@ -46,13 +47,10 @@ enum Cmd {
         /// 用户聚焦提示，注入评审 prompt 引导注意力（如「重点看并发安全」）。
         #[arg(long)]
         focus: Option<String>,
-        /// 逗号分隔的 model 名，每个各评一遍（复评提升 agreement 信号，计费随模型数翻倍）；
-        /// 缺省用配置的 default_models，全空时才按 priority 组候补链取一。
+        /// ship 循环的测试命令覆盖（缺省按 Cargo.toml / package.json / Makefile / go.mod 推断，
+        /// 与 `redteam test-command` 同一推断链）；记入报告 run.test_command。
         #[arg(long)]
-        models: Option<String>,
-        /// 所有已配置 model 各评一遍（复评提升 agreement 信号），而非候补链取一。
-        #[arg(long)]
-        models_all: bool,
+        test_command: Option<String>,
         /// verdict 阻断阈值：low | medium（默认）| high | critical——达到即 reject。
         #[arg(long, value_parser = ["low", "medium", "high", "critical"])]
         block_threshold: Option<String>,
@@ -143,8 +141,16 @@ enum Cmd {
         #[command(subcommand)]
         action: ResolveCmd,
     },
-    /// 幂等创建项目级 .redteam/ 骨架（config.toml 模板、.gitignore、rounds/、proj.db）。
+    /// 幂等创建项目级 .redteam/ 骨架（.gitignore、rounds/、proj.db；配置在用户级 ~/.redteam/，项目层不再有 config.toml）。
     Init,
+    /// 打印生效的测试命令（ship 循环第 2 步用）：--override > Cargo.toml→`cargo test` > package.json 有
+    /// scripts.test→`npm test` > Makefile 有 test 目标→`make test` > go.mod→`go test ./...`；推不出 →
+    /// stderr 提示、退出码 2（调用方转 AskUser）。
+    TestCommand {
+        /// 覆盖推断（与 `review --test-command` 同义）。
+        #[arg(long = "override")]
+        override_cmd: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -251,10 +257,18 @@ enum ResolveCmd {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum ModelCmd {
-    /// 配置一个 provider/model（flag 驱动）。
+    /// 写一条角色条目（flag 驱动）：`[providers.<provider>]` + `[[scanners|reviewers|verifiers]]`，
+    /// 落 ~/.redteam/config.toml（REDTEAM_HOME 可覆盖）；同 provider/model_id 重跑即原位更新。
     Setup {
-        /// provider 名（配置块键名，如 DeepSeek、Kimi）。
+        /// 角色：scanner | reviewer | verifier（列表即活跃集，多模型即多条目，无候补）。
+        #[arg(long, value_parser = ["scanner", "reviewer", "verifier"])]
+        role: String,
+        /// 条目身份串（可选；缺省 provider/model_id）。
+        #[arg(long)]
+        name: Option<String>,
+        /// provider 名（[providers.X] 的 X，如 deepseek、agc）。
         #[arg(long)]
         provider: String,
         /// 协议类型：openai | anthropic（含 claude/gpt/gemini 等别名）。
@@ -263,22 +277,30 @@ enum ModelCmd {
         /// API 端点 base URL（anthropic 网关须带 /v1）。
         #[arg(long)]
         base_url: Option<String>,
-        /// model id（如 deepseek-v4-pro）。
+        /// 请求体里的 model id（如 deepseek-v4-flash）。
         #[arg(long)]
         model: Option<String>,
         /// API key（配合 --key-store 决定去处；不落 config.toml）。
         #[arg(long)]
         key: Option<String>,
-        /// 候补链优先级（大者先选）。
-        #[arg(long)]
-        priority: Option<i32>,
         /// key 去处：env(默认，打印 export) | secrets(写 secrets.toml chmod 600)
         #[arg(long, default_value = "env", value_parser = ["env", "secrets"])]
         key_store: String,
-        /// 模型 context window 档位（写 config 的 context_window_tokens，评审 pack 预算
-        /// 按启用模型最小窗计算）。缺省不写，预算按保守 128K 估——确知更大窗才声明。
-        #[arg(long, value_parser = ["128K", "256K", "512K", "1M"])]
-        context_tokens: Option<String>,
+        /// 与 --key-store secrets 并用：写模型级 `"<model_id>" = key` 而非 provider 级 api_key。
+        #[arg(long)]
+        model_key: bool,
+        /// context window（token）；缺省不写，预算按保守 128K 估——确知更大窗才声明。
+        #[arg(long)]
+        context_window: Option<u32>,
+        /// 输出上限（max_tokens）；缺省 REDTEAM_MAX_TOKENS env / 32768。
+        #[arg(long)]
+        output_max_tokens: Option<u64>,
+        /// 思考型模型（thinking 计入 output 额度）。
+        #[arg(long)]
+        reasoning: bool,
+        /// 思考档位（角色属性）：off | low | medium | high。
+        #[arg(long, value_parser = ["off", "low", "medium", "high"])]
+        thinking_level: Option<String>,
     },
     /// 列已配置 provider + 可用性 + 配置位置。
     List {
@@ -387,10 +409,10 @@ fn resolve_result(
 /// 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
 /// 返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
 fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<ProviderRegistry, String> {
-    let (planned, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
-    if planned.is_empty() {
-        return Err("no model available, please configure [models.*] (referencing [providers.*]) first".to_string());
-    }
+    // M21a 批 A：只注册 scanners（route_key = 条目 display_name）；reviewers / verifiers 在批 F 接线
+    // （同一模型跨角色同名时键会冲突，届时 route_key 带角色前缀）。scanners 为空 → 配置错误。
+    let roles = cfg.active_roles();
+    legacy_opts_from_roles(&roles, cfg.review.max_concurrency)?;
 
     // 工具档位生效值：--tools 覆盖 config [review].tools；未知/缺省字符串落 config 默认
     // （clap 已限值域，from_flag 返回 None 仅防漂移）。build_registry 是前台/resume/worker
@@ -401,27 +423,24 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
         .unwrap_or(cfg.review.tools);
 
     let mut registry = ProviderRegistry::new();
-    for pm in &planned {
-        let em = match cfg.effective_model(&pm.name) {
-            Some(e) => e,
-            None => {
-                return Err(format!(
-                    "model '{}' has no [models.{}] config (provider/model 已分离，09-04)",
-                    pm.name, pm.name
-                ));
-            }
-        };
-        let key = cfg.resolve_key(&pm.name).unwrap_or_default();
-        let backend = match backend_from_config(&em, key) {
+    for em in &roles.scanners {
+        let entry = cfg
+            .entries(em.role)
+            .iter()
+            .find(|e| e.display_name() == em.name)
+            .cloned()
+            .ok_or_else(|| format!("scanner '{}' 条目消失（不应发生）", em.name))?;
+        let key = cfg.resolve_key(&entry).unwrap_or_default();
+        let backend = match backend_from_config(em, key) {
             Ok(b) => b,
             Err(e) => {
                 return Err(format!("{e}"));
             }
         };
-        // per-model 单轮超时：慢速模型（30 tok/s 级）在 32K max_tokens 下结构性需要
-        // 1100s+/轮——model 级声明 > 全局 env > 150s 默认（2026-09-03 PR181 Kimi 实证）。
+        // 单轮超时：条目声明 > `output_max_tokens ÷ 20 TPS + 60s` 缺省公式 > 全局 env > 150s
+        // （慢速模型 30 tok/s 级在 32K max_tokens 下结构性需要 1100s+/轮，2026-09-03 PR181 Kimi 实证）。
         let per_turn = em
-            .per_turn_timeout_secs
+            .per_turn_secs_default()
             .map(std::time::Duration::from_secs)
             .unwrap_or_else(redteam::provider::per_turn_deadline);
         let provider: Box<dyn redteam::provider::ReviewProvider> = match tools_mode {
@@ -430,7 +449,7 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
             }
             _ => Box::new(SingleShotProvider::new(backend).with_per_turn(per_turn)),
         };
-        registry.insert(pm.name.clone(), provider);
+        registry.insert(em.name.clone(), provider);
     }
 
     Ok(registry)
@@ -457,8 +476,7 @@ async fn main() {
             scope,
             spec,
             focus,
-            models,
-            models_all,
+            test_command,
             block_threshold,
             conf_floor,
             tools,
@@ -529,9 +547,9 @@ async fn main() {
                 (None, false) => "working-tree".to_string(),
             };
             let args = ReviewArgs {
-                base: base.clone(), scope, spec, focus, models, models_all,
+                base: base.clone(), scope, spec, focus,
                 block_threshold, conf_floor, tools, background, format,
-                resume: None, dismissed, no_dismissed, incremental_from, pack_only,
+                resume: None, dismissed, no_dismissed, incremental_from, test_command, pack_only,
             };
 
             // --pack-only（M21a 批 C）：装包落盘即返回，不建 registry、不派发。
@@ -837,7 +855,18 @@ async fn main() {
                 }
                 redteam::model::check_exit_code(&avs)
             }
-            ModelCmd::Setup { provider, kind, base_url, model, key, priority, key_store, context_tokens } => {
+            ModelCmd::Setup { role, name, provider, kind, base_url, model, key, key_store, model_key, context_window, output_max_tokens, reasoning, thinking_level } => {
+                let role = match redteam::config::Role::parse(&role) {
+                    Some(r) => r,
+                    None => { eprintln!("error: --role 取 scanner | reviewer | verifier"); std::process::exit(1); }
+                };
+                let thinking_level = match thinking_level.as_deref() {
+                    Some(s) => match redteam::config::ThinkingLevel::parse(s) {
+                        Some(t) => Some(t),
+                        None => { eprintln!("error: --thinking-level 取 off | low | medium | high"); std::process::exit(1); }
+                    },
+                    None => None,
+                };
                 let k = redteam::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
                 // 写入前守卫：kind/base_url 不合法则提示并拒绝写入，不污染配置。
                 // kind 检查用原始 --kind 字符串（若显式给出，哪怕非法）而非 `k`——`derive_kind`
@@ -853,29 +882,24 @@ async fn main() {
                     None => { eprintln!("error: --model is required"); std::process::exit(1); }
                 };
                 let api_key_env = redteam::model::derive_api_key_env(&provider);
-                let prio = priority.unwrap_or(0);
-                // 档位→token 数（十进制约定，与预算函数/既有配置一致）；clap value_parser
-                // 已限四档，此处映射穷尽、无 _ 臂兜错。
-                let ctx_tokens = context_tokens.as_deref().map(|c| match c {
-                    "128K" => 128_000u32,
-                    "256K" => 256_000,
-                    "512K" => 512_000,
-                    "1M" => 1_000_000,
-                    _ => unreachable!("clap value_parser 已限值域"),
-                });
-                // 09-04 分离形状：[providers.<name>] + [models.<name>]（同名起步；
-                // setup 交互式化时再让用户分别命名）。
-                if let Err(e) = redteam::config::write_model(
-                    &provider, &provider, k.as_str(), base_url.as_deref(), &model, Some(&api_key_env), ctx_tokens, Some(prio),
-                ) {
-                    eprintln!("error: failed to write provider config: {e}");
+                // design §12.1 形状：[providers.<provider>] + [[<role>s]] 内联条目；同 provider/model_id 原位更新。
+                let prov_cfg = redteam::config::ProviderConfig {
+                    kind: k, base_url: base_url.clone(), api_key_env: Some(api_key_env.clone()), max_concurrency: None,
+                };
+                let entry = redteam::config::RoleEntry {
+                    name: name.clone(), provider: provider.clone(), model_id: model.clone(), kind: None, api_key_env: None,
+                    family: None, context_window, output_max_tokens, reasoning, thinking_level, per_turn_timeout_secs: None,
+                };
+                if let Err(e) = redteam::config::write_entry(role, &entry, &prov_cfg) {
+                    eprintln!("error: failed to write config: {e}");
                     std::process::exit(1);
                 }
-                // key 去处：env(默认，打印 export) / secrets(写 secrets.toml)
+                // key 去处：env(默认，打印 export) / secrets(写 secrets.toml；--model-key 写模型级)
                 match key_store.as_str() {
                     "secrets" => match key {
                         Some(k) => {
-                            if let Err(e) = redteam::config::secrets::write_secret(&provider, &model, &k) {
+                            let mid = if model_key { Some(model.as_str()) } else { None };
+                            if let Err(e) = redteam::config::secrets::write_secret(&provider, mid, &k) {
                                 eprintln!("error: failed to write secret: {e}");
                                 std::process::exit(1);
                             }
@@ -891,7 +915,10 @@ async fn main() {
                         }
                     }
                 }
-                println!("configured provider '{provider}' (kind={}, model={model}, api_key_env={api_key_env})", k.as_str());
+                println!(
+                    "configured [[{}]] '{}' (provider={provider}, kind={}, model_id={model}, api_key_env={api_key_env}) → {}",
+                    role.list_key(), entry.display_name(), k.as_str(), redteam::config::config_paths()[0].display()
+                );
                 // 落盘后自动 probe 刚配置的这个 provider（只探它、不是全部 provider——
                 // 复用 probe.rs 按 kind 认证的 list_models）。probe 失败只警告、不回滚已
                 // 落盘的配置：离线环境先 setup、后续再联网核实是合理场景，不该因一次探测
@@ -950,6 +977,16 @@ async fn main() {
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             }
             0
+        }
+        Cmd::TestCommand { override_cmd } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match override_cmd.or_else(|| redteam::project::infer_test_command(&root)) {
+                Some(c) => { println!("{c}"); 0 }
+                None => {
+                    eprintln!("test-command: 推断不出（无 Cargo.toml / package.json scripts.test / Makefile test 目标 / go.mod）；用 --override <cmd> 或 review --test-command 指定");
+                    2
+                }
+            }
         }
     };
     std::process::exit(code);
@@ -1367,7 +1404,7 @@ mod tests {
         use redteam::cli::ReviewArgs;
         use redteam::config::Config;
 
-        // 空配置：无 [providers.*]，resolve_models 会产出空列表
+        // 空配置：无 [[scanners]] → 角色集为空 → Err
         let cfg = Config::default();
         let cwd = std::path::Path::new(".");
         let args = ReviewArgs { pack_only: false,
@@ -1375,8 +1412,6 @@ mod tests {
             scope: "working-tree".into(),
             spec: vec![],
             focus: None,
-            models: None,
-            models_all: false,
             block_threshold: None,
             conf_floor: None,
             background: false,
@@ -1386,13 +1421,14 @@ mod tests {
             no_dismissed: false,
             incremental_from: None,
             tools: None,
+            test_command: None,
         };
         let result = build_registry(&args, &cfg, cwd);
-        assert!(result.is_err(), "无 provider 时 build_registry 应返回 Err");
+        assert!(result.is_err(), "无 scanner 时 build_registry 应返回 Err");
         let msg = result.err().unwrap();
         assert!(
-            msg.contains("no model"),
-            "错误消息应提示 models 配置（09-04 分离后名字空间），实际: {msg}"
+            msg.contains("[[scanners]]"),
+            "错误消息应指向 [[scanners]] 配置，实际: {msg}"
         );
     }
 

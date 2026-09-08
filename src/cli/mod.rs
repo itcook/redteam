@@ -3,7 +3,7 @@
 //! 同目录子模块（M17-a 尾段统一，零语义 diff）。
 
 use crate::bundle::{group, select_files, Bundle, GroupingOpts, GroupingStats};
-use crate::config::Config;
+use crate::config::{Config, RoleSets};
 use crate::domain::{DossierMeta, Finding, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::git::FileChange;
 use crate::orchestrate::{enrich, run_code_fanout, CellSink, OrchestrateOpts, PlannedModel};
@@ -30,8 +30,6 @@ pub struct ReviewArgs {
     pub scope: String,
     pub spec: Vec<String>,
     pub focus: Option<String>,
-    pub models: Option<String>,
-    pub models_all: bool,
     pub block_threshold: Option<String>,
     pub conf_floor: Option<f32>,
     // 前台同步路径是默认路径；`--background` 由 main 层解析并写入本字段。
@@ -55,6 +53,10 @@ pub struct ReviewArgs {
     /// resume/背景 job 重建不炸（旧 job 无此字段 → None → 落 config 默认）。
     #[serde(default)]
     pub tools: Option<String>,
+    /// `--test-command <cmd>`：ship 循环的测试命令覆盖；缺省由 `project::infer_test_command` 推断。
+    /// 记入 `RunMeta.test_command`。serde default 保旧 args.json。
+    #[serde(default)]
+    pub test_command: Option<String>,
     /// M21a 批 C：`--pack-only`——只收集证据、分组、装包并落盘，不调 provider（D7 B7 预算仪表）。
     /// `serde(default)` 保旧 args.json（resume / 后台 job）兼容。
     #[serde(default)]
@@ -129,41 +131,19 @@ pub fn parse_format(s: &str) -> Format {
     }
 }
 
-/// 统一 model 选取（S3-a）。返回 (planned_models, replicate)。
-/// 显式列表（`--models-all` / `--models` / 非空 `default_models` 任一）→ replicate=true。
-/// 三者全空 → 所有已配置 provider 按 priority 降序候补，replicate=false。
-/// `--models-all` 优先于 `--models`。
-pub fn resolve_models(
-    models_flag: Option<&str>,
-    models_all: bool,
-    cfg: &Config,
-) -> (Vec<PlannedModel>, bool) {
-    let all_by_priority = || -> Vec<String> {
-        // 09-04 分离后：名字空间 = [models.*]，候补链按 model 级 priority。
-        let mut v: Vec<_> = cfg.models.iter().collect();
-        v.sort_by_key(|m| std::cmp::Reverse(m.1.priority));
-        v.into_iter().map(|(k, _)| k.clone()).collect()
-    };
-    let (names, replicate): (Vec<String>, bool) = if models_all {
-        (all_by_priority(), true)
-    } else if let Some(s) = models_flag {
-        (
-            s.split(',').map(|x| x.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            true,
-        )
-    } else if !cfg.review.default_models.is_empty() {
-        (cfg.review.default_models.clone(), true)
-    } else {
-        (all_by_priority(), false)
-    };
-    let models = names
-        .iter()
-        .map(|n| PlannedModel {
-            name: n.clone(),
-            priority: cfg.models.get(n).map(|m| m.priority).unwrap_or(0),
-        })
-        .collect();
-    (models, replicate)
+/// 角色集 → 旧 fan-out 编排参数（M21a 批 A **过渡适配器**，批 F 换成 scanner 路径后删）：
+/// `[[scanners]]` 列表即活跃集——每条各跑一遍（replicate）、无候补（no_fallback）；`priority` 恒 0
+/// （候补链已退场，D7 A3）。scanners 为空是配置错误，交调用方报错退 1。
+pub fn legacy_opts_from_roles(roles: &RoleSets, max_concurrency: usize) -> Result<OrchestrateOpts, String> {
+    if roles.scanners.is_empty() {
+        return Err("未配置 [[scanners]]：在 ~/.redteam/config.toml（REDTEAM_HOME 可覆盖）至少加一条，见 `redteam model setup --help`".to_string());
+    }
+    Ok(OrchestrateOpts {
+        models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0 }).collect(),
+        replicate: true,
+        no_fallback: true,
+        max_concurrency,
+    })
 }
 
 /// pack flat 预算绝对帽（字节）。史：S2-b' 定 256K（装下 cli.rs 级 90KB 大文件，当时模型窗
@@ -184,10 +164,11 @@ const SHELL_RESERVE_BYTES: usize = 24_000;
 /// per-model pack 预算：min(字节帽, (启用模型最小窗 − 输出预留)×3 − 壳预留)。
 /// 双层墙——字节帽是策略、token limit 是硬墙；多模型取最小窗=一份 pack 全模型安全
 /// （常数查表，不复活 S2-c per-model 规划器）。未声明窗口 → 保守 128K。
-pub(crate) fn pack_budget_bytes(cfg: &Config, model_names: &[String]) -> usize {
-    let min_ctx = model_names
+pub(crate) fn pack_budget_bytes(roles: &RoleSets) -> usize {
+    let min_ctx = roles
+        .scanners
         .iter()
-        .map(|m| cfg.models.get(m).and_then(|x| x.context_window).unwrap_or(128_000))
+        .map(|m| m.context_window)
         .min()
         .unwrap_or(128_000);
     let by_window = (min_ctx.saturating_sub(OUTPUT_RESERVE_TOKENS) as usize)
@@ -222,8 +203,8 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
 /// 三条路径（全量 / 增量 / `--pack-only`）共用的「pack 预算 + spec 参照段」：spec 帽夹紧到 pack 预算一半
 /// （dogfood #2：64K 固定帽会吃穿小窗模型的整个输入窗），扣减后的预算给分组与装包。
 /// 返回 (budget, spec_section, warnings)。
-pub(crate) fn budget_and_spec(cfg: &Config, model_names: &[String], spec: &[String]) -> (usize, String, Vec<String>) {
-    let budget_raw = pack_budget_bytes(cfg, model_names);
+pub(crate) fn budget_and_spec(roles: &RoleSets, spec: &[String]) -> (usize, String, Vec<String>) {
+    let budget_raw = pack_budget_bytes(roles);
     let (spec_section, spec_used, warnings) = render_spec_section_capped(spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
     (budget_raw.saturating_sub(spec_used), spec_section, warnings)
 }
@@ -277,15 +258,10 @@ pub async fn run_code_review(
     // 1. 确定性筛选；分组（design §3.2）推迟到 pack 预算算出之后——组预算门要喂它（K1 / K5）。
     let selected = select_files(changes);
 
-    // 3. 模型集 + replicate 判定（统一 resolve_models）
-    let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
-    let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
-    let oopts = OrchestrateOpts {
-        models,
-        replicate,
-        no_fallback: false,
-        max_concurrency: cfg.review.max_concurrency,
-    };
+    // 3. 角色集 → 旧 fan-out 适配（M21a 批 A 过渡；批 F 换 scanner 路径）
+    let roles = cfg.active_roles();
+    let oopts = legacy_opts_from_roles(&roles, cfg.review.max_concurrency).map_err(|e| anyhow::anyhow!(e))?;
+    let model_names: Vec<String> = oopts.models.iter().map(|m| m.name.clone()).collect();
 
     // 4. fan-out（bundle × model）
     let focus = args.focus.clone().unwrap_or_default();
@@ -300,7 +276,7 @@ pub async fn run_code_review(
     // --spec 参照段（D2）：读 spec_docs → 从 pack 预算里扣掉它占用的字节，让 build_packs +
     // 第二趟补查都用缩后预算——总上下文守界，spec 与 pack 不叠加超模型墙。空 --spec →
     // (String::new(), 0) → budget 原样不变（既有回归行为零漂移）。
-    let (budget, spec_section, spec_warnings) = budget_and_spec(cfg, &model_names, &args.spec);
+    let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
     // 2. 分组 / 装包 / 跨组索引（plan_cells：与增量、--pack-only 同源）。门未过 → 单包（即原 E9 单格全审）。
     // GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
     let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &[], None);
@@ -329,7 +305,7 @@ pub async fn run_code_review(
     let ctx = TailCtx {
         root,
         provider,
-        model_ids: model_ids_for(&model_names, cfg),
+        model_ids: model_ids_for(&model_names, &roles),
         model_names,
         block,
         floor,
@@ -348,6 +324,7 @@ pub async fn run_code_review(
         sink,
         spec_docs: &spec_section,
         carry: None,
+        test_command: args.test_command.clone().or_else(|| crate::project::infer_test_command(root)),
     };
     if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
     assemble_report(raw.findings, ctx).await
@@ -435,10 +412,10 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     } else {
         "working tree".to_string()
     };
-    // 预算取自与真实评审同一模型集（resolve_models），量的才是真实会发出的 prompt。
-    let (models, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
-    let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
-    let (budget, spec_section, mut warnings) = budget_and_spec(cfg, &model_names, &args.spec);
+    // 预算取自与真实评审同一角色集（`active_roles` → scanners 最小窗），量的才是真实会发出的 prompt；
+    // 角色集为空（无配置）时按 128K 窗保守缺省，不报错——仪表无 provider 也能跑。
+    let roles = cfg.active_roles();
+    let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
     let CellPlan { bundles, dossiers, others, stats, .. } = plan_cells(select_files(changes), cwd, budget, &[], None);
     let focus = args.focus.clone().unwrap_or_default();
 
@@ -754,8 +731,9 @@ pub async fn run_resume(
     let findings: Vec<Finding> =
         final_records.into_iter().filter(|r| r.ok).flat_map(|r| r.findings).collect();
 
-    let (models, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
-    let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
+    // resume：角色集按当前配置重建（M21a 产品态不产 finding，与原作业模型不同可接受；记 followup 观察）。
+    let roles = cfg.active_roles();
+    let model_names: Vec<String> = roles.scanners.iter().map(|m| m.name.clone()).collect();
     let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     // resume 因重读 args.json 自然继承原 --dismissed/--no-dismissed；run_resume 不返回 Result
@@ -772,14 +750,14 @@ pub async fn run_resume(
     // 帽用与首趟同一夹紧公式（cap 不同会导致重渲截断点漂移、与首趟 spec 段不一致）。
     let (spec_section, _spec_used, spec_warnings) = render_spec_section_capped(
         &args.spec,
-        SPEC_BUDGET_BYTES.min(pack_budget_bytes(cfg, &model_names) / 2),
+        SPEC_BUDGET_BYTES.min(pack_budget_bytes(&roles) / 2),
     );
     // T46①：resume 重渲 --spec 段时若命中 denylist/PEM 拒读，同样并入 warnings（与首趟一致）。
     warnings.extend(spec_warnings);
     let ctx = TailCtx {
         root: cwd,
         provider,
-        model_ids: model_ids_for(&model_names, cfg),
+        model_ids: model_ids_for(&model_names, &roles),
         model_names,
         block,
         floor,
@@ -798,6 +776,7 @@ pub async fn run_resume(
         sink: None,
         spec_docs: &spec_section,
         carry: None,
+        test_command: args.test_command.clone().or_else(|| crate::project::infer_test_command(cwd)),
     };
     match assemble_report(findings, ctx).await {
         Ok((mut report, mut code)) => {
@@ -1103,10 +1082,10 @@ mod job_tests {
     fn code_args() -> ReviewArgs {
         ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None, models: None, models_all: false,
+            spec: vec![], focus: None,
             block_threshold: None, conf_floor: None,
             background: true, format: "json".into(),
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         }
     }
     /// 在 dir 建 git 仓库并 stage 一个含 content 的文件——doc 模式退场后（E10）run_job 测试改走
@@ -1124,8 +1103,7 @@ mod job_tests {
     }
     fn cfg() -> Config {
         Config::from_layers(&[
-            "[providers.alpha_p]\nkind=\"openai\"\n\n[models.alpha]\nprovider=\"alpha_p\"\nid=\"a\"\npriority=10\n\
-             [review]\ndefault_models=[\"alpha\"]\n",
+            "[providers.alpha_p]\nkind=\"openai\"\n\n[[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\n",
         ]).unwrap()
     }
 
@@ -1675,9 +1653,9 @@ mod resume_tests {
 
         let args = ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None, models: Some("m".into()), models_all: false,
+            focus: None,
             block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         };
         store.write_args_raw("j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1730,9 +1708,9 @@ mod resume_tests {
 
         let args = ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None, models: Some("alpha,beta".into()), models_all: false,
+            focus: None,
             block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         };
         store.write_args_raw("j", &serde_json::to_string(&args).unwrap()).unwrap();
 
@@ -1765,9 +1743,9 @@ mod resume_tests {
         // 只写 args，从不 write_manifest（模拟 fan-out 前崩溃）。
         let args = ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None, models: Some("m".into()), models_all: false,
+            focus: None,
             block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         };
         let store = crate::state::JobStore::open(ws).unwrap();
         store.write_args_raw("j", &serde_json::to_string(&args).unwrap()).unwrap();
@@ -1785,54 +1763,29 @@ mod resume_tests {
 mod resolve_tests {
     use super::*;
 
-    fn cfg(providers: &str, defaults: &str) -> Config {
-        let toml = format!("{providers}\n[review]\ndefault_models=[{defaults}]\n");
-        Config::from_layers(&[&toml]).unwrap()
-    }
     fn provs() -> &'static str {
-        "[providers.alpha_p]\nkind=\"openai\"\n\n[models.alpha]\nprovider=\"alpha_p\"\nid=\"a\"\npriority=10\n\
-         [providers.beta_p]\nkind=\"openai\"\n\n[models.beta]\nprovider=\"beta_p\"\nid=\"b\"\npriority=5\n"
+        "[providers.alpha_p]\nkind=\"openai\"\n[providers.beta_p]\nkind=\"openai\"\n\
+         [[scanners]]\nname=\"alpha\"\nprovider=\"alpha_p\"\nmodel_id=\"a\"\n\
+         [[scanners]]\nname=\"beta\"\nprovider=\"beta_p\"\nmodel_id=\"b\"\n\
+         [[reviewers]]\nname=\"pro\"\nprovider=\"beta_p\"\nmodel_id=\"p\"\n"
+    }
+
+    /// 列表即活跃集：全部 scanner 各跑一遍（replicate）、无候补、priority 恒 0；reviewers 不进旧 fan-out。
+    #[test]
+    fn roles_adapter_replicates_all_scanners_without_fallback() {
+        let c = Config::from_layers(&[provs()]).unwrap();
+        let o = legacy_opts_from_roles(&c.active_roles(), 4).unwrap();
+        assert!(o.replicate && o.no_fallback);
+        assert_eq!(o.max_concurrency, 4);
+        assert_eq!(o.models.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
+        assert!(o.models.iter().all(|p| p.priority == 0));
     }
 
     #[test]
-    fn explicit_models_flag_replicates() {
-        let c = cfg(provs(), "");
-        let (m, rep) = resolve_models(Some("alpha,beta"), false, &c);
-        assert!(rep);
-        assert_eq!(m.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
-    }
-
-    #[test]
-    fn models_all_replicates_all_providers_by_priority() {
-        let c = cfg(provs(), "");
-        let (m, rep) = resolve_models(None, true, &c);
-        assert!(rep);
-        // 按 priority 降序：alpha(10) 在 beta(5) 前
-        assert_eq!(m.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
-    }
-
-    #[test]
-    fn nonempty_default_models_replicates() {
-        let c = cfg(provs(), "\"beta\",\"alpha\"");
-        let (m, rep) = resolve_models(None, false, &c);
-        assert!(rep);
-        assert_eq!(m.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["beta", "alpha"]);
-    }
-
-    #[test]
-    fn empty_everything_falls_back_to_candidate_chain() {
-        let c = cfg(provs(), "");
-        let (m, rep) = resolve_models(None, false, &c);
-        assert!(!rep, "no explicit list → candidate chain (fallback)");
-        assert_eq!(m.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
-    }
-
-    #[test]
-    fn models_all_overrides_models_flag() {
-        let c = cfg(provs(), "");
-        let (m, rep) = resolve_models(Some("alpha"), true, &c);
-        assert!(rep);
-        assert_eq!(m.len(), 2, "--models-all takes precedence over --models");
+    fn roles_adapter_errors_when_no_scanner() {
+        let c = Config::from_layers(&["[providers.p]\nkind=\"openai\"\n[[reviewers]]\nprovider=\"p\"\nmodel_id=\"m\"\n"]).unwrap();
+        let err = legacy_opts_from_roles(&c.active_roles(), 4).unwrap_err();
+        assert!(err.contains("[[scanners]]"), "{err}");
     }
 }
 
@@ -1859,18 +1812,22 @@ mod code_review_tests {
         // 注：FakeProvider 是 prompt-blind 的——对同一 model 的任何调用（无论 review 还是 refute
         // prompt）都返回同一脚本，故 refute 调用返回非空 → refuted → confidence 0 → 不 reject。
         // 交叉 model 选择本身已在 verify.rs 单测验证；本测试只验「证伪翻转 verdict」全链路。
-        let cfg = Config::from_layers(&[r#"[review]
-default_models=["alpha"]
+        let cfg = Config::from_layers(&[r#"[providers.ap]
+kind="openai"
+[[scanners]]
+name="alpha"
+provider="ap"
+model_id="a"
 "#]).unwrap();
         let provider = crate::provider::fake::FakeProvider::with(
             "alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
         );
         let my_args = ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None, models: None, models_all: false,
+            spec: vec![], focus: None,
             block_threshold: None, conf_floor: None,
             background: false, format: "json".into(),
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
         let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
@@ -1884,11 +1841,10 @@ default_models=["alpha"]
     fn args() -> ReviewArgs {
         ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None, models: Some("m".into()),
-            models_all: false,
+            spec: vec![], focus: None,
             block_threshold: None, conf_floor: None,
             background: false, format: "json".into(),
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         }
     }
 
@@ -1908,8 +1864,16 @@ default_models=["alpha"]
         // 两个 model 都报真 finding → dedup 合并成 agreement=2 → 跳过层① verify，
         // 保持本测试「anchor 砍编造 + High→Reject」的原意（不被 S3-b verify 自审误伤）。
         // 编造 quote 只 m 报，anchor 因 quote 不在文件而丢弃。
-        let cfg = Config::from_layers(&[r#"[review]
-default_models=["m","m2"]
+        let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="m"
+provider="p"
+model_id="m-id"
+[[scanners]]
+name="m2"
+provider="p"
+model_id="m2-id"
 "#]).unwrap();
         let mut scripted = std::collections::BTreeMap::new();
         scripted.insert("m".to_string(), vec![
@@ -1918,7 +1882,7 @@ default_models=["m","m2"]
         ]);
         scripted.insert("m2".to_string(), vec![raw("src/a.rs", "db.write(token);", Severity::High)]);
         let provider = FakeProvider { scripted, ..Default::default() };
-        let my_args = ReviewArgs { pack_only: false, models: None, ..args() };
+        let my_args = ReviewArgs { pack_only: false, ..args() };
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
         let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
         assert_eq!(report.findings.len(), 1, "fabricated dropped, real merged across models");
@@ -1932,8 +1896,12 @@ default_models=["m","m2"]
     #[tokio::test]
     async fn code_review_empty_changes_approves() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_layers(&[r#"[review]
-default_models=["m"]
+        let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="m"
+provider="p"
+model_id="m-id"
 "#]).unwrap();
         let provider = FakeProvider::with("m", vec![]);
         let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
@@ -1944,13 +1912,24 @@ default_models=["m"]
     #[tokio::test]
     async fn code_review_stamps_head_sha_into_runmeta() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_layers(&[r#"[review]
-default_models=["m"]
+        let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="m"
+provider="p"
+model_id="m-id"
 "#]).unwrap();
         let provider = FakeProvider::with("m", vec![]);
+        // K1：无 --test-command 时按项目推断（Cargo.toml → cargo test）进 RunMeta。
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"\n").unwrap();
         let (report, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(),
             Some("abc123".into()), None).await.unwrap();
         assert_eq!(report.run.head_sha.as_deref(), Some("abc123"));
+        assert_eq!(report.run.test_command.as_deref(), Some("cargo test"));
+        // 显式 --test-command 覆盖推断
+        let over = ReviewArgs { test_command: Some("make check".into()), ..args() };
+        let (report2, _) = run_code_review(&over, &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
+        assert_eq!(report2.run.test_command.as_deref(), Some("make check"));
         let (report2, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
         assert_eq!(report2.run.head_sha, None, "非 git 环境如实 None，不编造");
     }
@@ -1991,10 +1970,9 @@ mod spec_tests {
     fn spec_test_args(spec: Vec<String>) -> ReviewArgs {
         ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(), spec, focus: None,
-            models: Some("m".into()), models_all: false,
             block_threshold: None, conf_floor: None,
             background: false, format: "json".into(),
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         }
     }
 
@@ -2007,8 +1985,12 @@ mod spec_tests {
         let spec_path = root.join("design.md");
         std::fs::write(&spec_path, "DESIGN D8: fail-open").unwrap();
 
-        let cfg = Config::from_layers(&[r#"[review]
-default_models=["m"]
+        let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="m"
+provider="p"
+model_id="m-id"
 "#]).unwrap();
         let provider = SpecPromptRecorder::default();
         let args = spec_test_args(vec![spec_path.to_string_lossy().to_string()]);
@@ -2030,8 +2012,12 @@ default_models=["m"]
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
 
-        let cfg = Config::from_layers(&[r#"[review]
-default_models=["m"]
+        let cfg = Config::from_layers(&[r#"[providers.p]
+kind="openai"
+[[scanners]]
+name="m"
+provider="p"
+model_id="m-id"
 "#]).unwrap();
         let provider = SpecPromptRecorder::default();
         let args = spec_test_args(vec![]); // 不带 --spec
@@ -2140,28 +2126,22 @@ mod tests {
         // design §2.2 预算函数：min(768K 绝对帽, (min_ctx − 16K 输出预留)×3 − 24K 壳预留)。
         // 2026-07-28 提帽 256K→768K（1M 窗时代，锚 gpt-5.6 272K 计费悬崖之下）——
         // 128K 缺省档从「帽封顶 256K」翻为「窗口墙生效 312K」是本次显式入账的行为变化。
-        let cfg = crate::config::Config::from_layers(&[r#"
-[providers.bigp]
-kind = "openai"
-[providers.smallp]
-kind = "openai"
-[models.Big]
-provider = "bigp"
-id = "big-ctx"
-context_window = 1000000
-[models.Small]
-provider = "smallp"
-id = "small-ctx"
-context_window = 40000
-"#]).unwrap();
+        let mk = |entries: &str| crate::config::Config::from_layers(&[&format!(
+            "[providers.bigp]\nkind = \"openai\"\n[providers.smallp]\nkind = \"openai\"\n{entries}"
+        )]).unwrap().active_roles();
+        let big = "[[scanners]]\nname=\"Big\"\nprovider=\"bigp\"\nmodel_id=\"big-ctx\"\ncontext_window=1000000\n";
+        let small = "[[scanners]]\nname=\"Small\"\nprovider=\"smallp\"\nmodel_id=\"small-ctx\"\ncontext_window=40000\n";
+        let unknown = "[[scanners]]\nname=\"Unknown\"\nprovider=\"bigp\"\nmodel_id=\"u\"\n";
         // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K < 768K → 窗口墙生效
-        assert_eq!(pack_budget_bytes(&cfg, &["Unknown".into()]), 312_000);
+        assert_eq!(pack_budget_bytes(&mk(unknown)), 312_000);
         // 大窗模型（1M）：窗口墙 ≈2.9M → 绝对帽 768K 封顶（≈256K tok 记账 <272K 悬崖）
-        assert_eq!(pack_budget_bytes(&cfg, &["Big".into()]), 768_000);
+        assert_eq!(pack_budget_bytes(&mk(big)), 768_000);
         // 小窗模型：(40_000−16_000)*3−24_000 = 48_000
-        assert_eq!(pack_budget_bytes(&cfg, &["Small".into()]), 48_000);
+        assert_eq!(pack_budget_bytes(&mk(small)), 48_000);
         // 多模型取最小窗（一份 pack 全模型安全）
-        assert_eq!(pack_budget_bytes(&cfg, &["Big".into(), "Small".into()]), 48_000);
+        assert_eq!(pack_budget_bytes(&mk(&format!("{big}{small}"))), 48_000);
+        // 无 scanner → 缺省 128K 档
+        assert_eq!(pack_budget_bytes(&crate::config::RoleSets::default()), 312_000);
     }
     #[test]
     fn load_ledger_no_dismissed_and_missing_db_are_empty_without_side_effects() {

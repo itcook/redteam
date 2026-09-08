@@ -5,33 +5,9 @@ use std::path::Path;
 pub const PROJECT_DIR: &str = ".redteam";
 
 pub(crate) const GITIGNORE_BODY: &str = "*\n";
-const CONFIG_TEMPLATE: &str = "\
-# redteam 项目级配置（优先级高于用户级 ~/.config/redteam/config.toml）。
-# 密钥走环境变量或用户级 secrets.toml——绝不写入本文件（本目录在仓库领地内）。
-#
-# provider（通道层：1 provider : N models）
-# [providers.my-gateway]
-# kind = \"openai\"            # openai | anthropic | google(占位)
-# base_url = \"https://…\"
-# api_key_env = \"MY_KEY_ENV\"  # model 可覆盖
-#
-# model（模型层：--models 引用的名字空间）
-# [models.GLM]
-# provider = \"my-gateway\"    # 引用 [providers.X]（必填）
-# id = \"glm-5.3\"             # 请求体里的 model id
-# kind = \"anthropic\"         # 可选：覆盖 provider.kind
-# context_window = 1000000     # pack 预算护墙（缺省 128K 保守）
-# output_limit = 32768         # max_tokens（> REDTEAM_MAX_TOKENS env > 默认）
-# reasoning = true             # 思考型（thinking 计入 output 额度）
-# thinking_level = \"medium\"  # off|low|medium|high
-# per_turn_timeout_secs = 900  # 单轮超时（> env > 150s；速度是模型属性）
-# priority = 0                 # 候补链排序
-#
-# ship 循环的测试命令（可选；不设则按 Cargo.toml/package.json/Makefile 推断）：
-# test_command = \"cargo test\"
-";
 
-/// 幂等创建 `.redteam/` 骨架，返回本次新建的条目；已存在的一律不动。
+/// 幂等创建 `.redteam/` 骨架（`.gitignore` / `rounds/` / `proj.db`），返回本次新建的条目；已存在的一律不动。
+/// 项目层 `config.toml` 已退场（M21a 批 A，D7 A8：配置用户级唯一，项目目录只放状态与内容）；
 /// dismissed/ 目录已随台账机器化退役（design 2026-07-03：台账/评审史统一 proj.db）。
 pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
     let dir = root.join(PROJECT_DIR);
@@ -41,12 +17,10 @@ pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
         std::fs::create_dir_all(&rounds)?;
         created.push(format!("{PROJECT_DIR}/rounds/"));
     }
-    for (name, body) in [(".gitignore", GITIGNORE_BODY), ("config.toml", CONFIG_TEMPLATE)] {
-        let p = dir.join(name);
-        if !p.exists() {
-            std::fs::write(&p, body)?;
-            created.push(format!("{PROJECT_DIR}/{name}"));
-        }
+    let gi = dir.join(".gitignore");
+    if !gi.exists() {
+        std::fs::write(&gi, GITIGNORE_BODY)?;
+        created.push(format!("{PROJECT_DIR}/.gitignore"));
     }
     let db_path = dir.join(crate::db::DB_FILE);
     if !db_path.exists() {
@@ -54,6 +28,32 @@ pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
         created.push(format!("{PROJECT_DIR}/{}", crate::db::DB_FILE));
     }
     Ok(created)
+}
+
+/// ship 循环的测试命令推断（M21a 批 A K1；项目层 `test_command` 随项目 config 退场）：
+/// Cargo.toml → `cargo test`；package.json 有 `scripts.test` → `npm test`；Makefile 有 `test:` 目标 →
+/// `make test`；go.mod → `go test ./...`；都没有 → None（`redteam test-command` 退出码 2）。
+/// `--test-command` / `--override` 覆盖本推断。
+pub fn infer_test_command(root: &Path) -> Option<String> {
+    if root.join("Cargo.toml").is_file() {
+        return Some("cargo test".into());
+    }
+    if let Ok(pkg) = std::fs::read_to_string(root.join("package.json")) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
+            if v.get("scripts").and_then(|s| s.get("test")).and_then(|t| t.as_str()).is_some() {
+                return Some("npm test".into());
+            }
+        }
+    }
+    if let Ok(mk) = std::fs::read_to_string(root.join("Makefile")) {
+        if mk.lines().any(|l| l.starts_with("test:")) {
+            return Some("make test".into());
+        }
+    }
+    if root.join("go.mod").is_file() {
+        return Some("go test ./...".into());
+    }
+    None
 }
 
 pub fn is_hex16(s: &str) -> bool {
@@ -83,7 +83,8 @@ mod tests {
     fn init_creates_skeleton_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let created = init_project(tmp.path()).unwrap();
-        assert_eq!(created.len(), 4, "rounds/ .gitignore config.toml proj.db");
+        assert_eq!(created.len(), 3, "rounds/ .gitignore proj.db");
+        assert!(!tmp.path().join(".redteam/config.toml").exists(), "项目层 config 退场（D7 A8）");
         assert!(tmp.path().join(".redteam/rounds").is_dir());
         assert!(tmp.path().join(".redteam/proj.db").is_file(), "init 建库");
         assert!(!tmp.path().join(".redteam/dismissed").exists(), "dismissed/ 目录已退役");
@@ -99,6 +100,24 @@ mod tests {
         std::fs::write(tmp.path().join(".redteam/.gitignore"), "custom\n").unwrap();
         init_project(tmp.path()).unwrap();
         assert_eq!(std::fs::read_to_string(tmp.path().join(".redteam/.gitignore")).unwrap(), "custom\n");
+    }
+
+    #[test]
+    fn infer_test_command_four_ecosystems_and_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(infer_test_command(tmp.path()), None);
+        std::fs::write(tmp.path().join("go.mod"), "module x\n").unwrap();
+        assert_eq!(infer_test_command(tmp.path()).as_deref(), Some("go test ./..."));
+        std::fs::write(tmp.path().join("Makefile"), "build:\n\techo\ntest: build\n\tcargo test\n").unwrap();
+        assert_eq!(infer_test_command(tmp.path()).as_deref(), Some("make test"), "Makefile test 目标优先于 go.mod");
+        std::fs::write(tmp.path().join("package.json"), r#"{"scripts":{"test":"vitest"}}"#).unwrap();
+        assert_eq!(infer_test_command(tmp.path()).as_deref(), Some("npm test"));
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert_eq!(infer_test_command(tmp.path()).as_deref(), Some("cargo test"));
+        // package.json 无 scripts.test 不算
+        let t2 = tempfile::tempdir().unwrap();
+        std::fs::write(t2.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert_eq!(infer_test_command(t2.path()), None);
     }
 
     #[test]
