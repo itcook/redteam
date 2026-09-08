@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 9
+- **Total Sessions**: 10
 - **Last Active**: 2026-09-08
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~217 | Active |
+| `journal-1.md` | ~243 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 10 | 2026-09-08 | M21a 批 D 契约与提示词：疑点 parse + shared-head/scanner 模板 + 四块段序 + 三段界 cache + 评分器 + 评审修复 | `f84b5d7`, `e360cdf`, `86521b2`, `cfae1ec`, `ced42e7` | `feat/m21a-prompts` |
 | 9 | 2026-09-08 | A/B/C 合并态三路核验 + 修补批（db 守卫 / 伪引用边 / super 假边 / 索引 e2e / 零值与空串 key / pack-only 不读 secrets） | `820bc46`, `093b454`, `18d9b7c` | `feat/m21-review-engine` |
 | 8 | 2026-09-08 | M21a 批 A 重做收尾：评审第二批修复 + 隐私清理 + followup（主分支直接落地，无任务） | `14b7289`, `a867504`, `3896bfb`, `da137fa` | `feat/m21-review-engine` |
 | 7 | 2026-09-08 | M21a 批 B schema v4：疑点 schema + 角色分叉 CellOutput + proj-next.db v4 + RunMeta 观测字段 + 固定集导出；code-review 审核修复并合回 | `0ef7798`, `08484bd`, `7c5e253`, `0ec7912`, `03b5c6c`, `3ac2332`, `2c4bb76` | `feat/m21a-schema` |
