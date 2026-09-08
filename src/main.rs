@@ -369,6 +369,22 @@ fn load_config_or_exit() -> Config {
     }
 }
 
+/// `--pack-only`：只装包不调 provider，不读 `secrets.json`（修补批 X-5）；配置错误同样硬失败。
+fn load_config_no_secrets_or_exit() -> Config {
+    match Config::load_no_secrets() {
+        Ok((c, messages)) => {
+            for m in &messages {
+                eprintln!("{m}");
+            }
+            c
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn load_config_warned() -> Config {
     match Config::load() {
         Ok(c) => c,
@@ -502,7 +518,7 @@ async fn main() {
             incremental_from,
             pack_only,
         } => {
-            let cfg = load_config_or_exit();
+            let cfg = if pack_only { load_config_no_secrets_or_exit() } else { load_config_or_exit() };
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
             let fmt = parse_format(&format);

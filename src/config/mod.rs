@@ -421,6 +421,11 @@ impl RoleSets {
     }
 }
 
+/// env 取值：未设或空白视为未设（`export X_API_KEY=` 占位不算有 key，修补批 X-4）。
+fn env_nonempty(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|v| !v.trim().is_empty())
+}
+
 /// 身份串 = `provider/id`（route_key / 报告名 / 台账 model 字段）；`displayName` 只作显示〔D12 定案 3〕。
 pub fn identity(provider: &str, id: &str) -> String {
     format!("{provider}/{id}")
@@ -440,6 +445,15 @@ impl Config {
 
     /// 同 `load`，但 notice / warning 行返回给调用方而非打印（`model setup` 写前预检用，避免重复刷屏）。
     pub fn load_with_messages() -> anyhow::Result<(Config, Vec<String>)> {
+        Self::load_with_messages_opts(true)
+    }
+
+    /// 不读 `secrets.json` 的加载：`--pack-only` 只装包不调 provider（design §6 / prd R-C4.1「不读密钥文件」，修补批 X-5）。
+    pub fn load_no_secrets() -> anyhow::Result<(Config, Vec<String>)> {
+        Self::load_with_messages_opts(false)
+    }
+
+    fn load_with_messages_opts(read_secrets: bool) -> anyhow::Result<(Config, Vec<String>)> {
         let mut messages = Vec::new();
         let path = config_path()?;
         if !path.is_file() {
@@ -469,8 +483,10 @@ impl Config {
         let (cfg, warnings) = Config::from_json_warned(&text)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         messages.extend(warnings.iter().map(|w| format!("warning: {w}")));
-        let secrets = secrets::load_secrets();
-        messages.extend(secrets.warnings.iter().chain(cfg.secret_key_warnings(&secrets).iter()).map(|w| format!("warning: {w}")));
+        if read_secrets {
+            let secrets = secrets::load_secrets();
+            messages.extend(secrets.warnings.iter().chain(cfg.secret_key_warnings(&secrets).iter()).map(|w| format!("warning: {w}")));
+        }
         Ok((cfg, messages))
     }
 
@@ -571,7 +587,7 @@ impl Config {
     pub fn resolve_key_with(&self, provider: &str, id: &str, secrets: &secrets::Secrets) -> Option<String> {
         let (p, m) = self.model(provider, id)?;
         if let Some(var) = &m.api_key_env {
-            if let Ok(v) = std::env::var(var) {
+            if let Some(v) = env_nonempty(var) {
                 return Some(v);
             }
         }
@@ -580,7 +596,7 @@ impl Config {
             return Some(k.clone());
         }
         if let Some(var) = &p.api_key_env {
-            if let Ok(v) = std::env::var(var) {
+            if let Some(v) = env_nonempty(var) {
                 return Some(v);
             }
         }
@@ -591,7 +607,7 @@ impl Config {
     pub fn resolve_provider_key(&self, provider: &str) -> Option<String> {
         if let Some(p) = self.providers.get(provider) {
             if let Some(var) = &p.api_key_env {
-                if let Ok(v) = std::env::var(var) {
+                if let Some(v) = env_nonempty(var) {
                     return Some(v);
                 }
             }
@@ -656,10 +672,16 @@ impl Config {
             ("review.scanners.samples", r.scanners.samples as u64),
             ("review.reviewers.workers", r.reviewers.workers as u64),
             ("review.verifiers.workers", r.verifiers.workers as u64),
+            ("review.pack.anchorWindow", r.pack.anchor_window as u64),
+            ("review.grouping.minFiles", r.grouping.min_files as u64),
+            ("review.grouping.maxFilesPerGroup", r.grouping.max_files_per_group as u64),
         ] {
             if v == 0 {
                 errs.push(format!("{k} 必须 ≥ 1"));
             }
+        }
+        if r.reviewers.max_cells == MaxCells::Fixed(0) {
+            errs.push("review.reviewers.maxCells 必须 ≥ 1（或 \"auto\"）".to_string());
         }
         if !(0.0..=1.0).contains(&r.conf_floor) {
             errs.push(format!("review.confFloor {} 须在 0.0..=1.0（评审 S2）", r.conf_floor));
@@ -1112,6 +1134,11 @@ mod tests {
         assert!(cf.contains("review.confFloor"), "配置层 confFloor 越界（评审 S2）: {cf}");
         let nm = Config::from_json(r#"{"providers":{"a/b":{"kind":"openai","models":{"":{"roles":{"scanner":{}}}}}}}"#).unwrap_err().to_string();
         assert!(nm.contains("provider 名") && nm.contains("空 model id"), "空名 / 含 '/' 的 provider 名拒绝（评审 N6）: {nm}");
+        let zz = Config::from_json(r#"{"review":{"pack":{"anchorWindow":0},"grouping":{"minFiles":0,"maxFilesPerGroup":0},"reviewers":{"maxCells":0}}}"#).unwrap_err().to_string();
+        for k in ["review.pack.anchorWindow", "review.grouping.minFiles", "review.grouping.maxFilesPerGroup", "review.reviewers.maxCells"] {
+            assert!(zz.contains(k), "{k} 零值须拦（修补批 X-4）: {zz}");
+        }
+        assert!(Config::from_json(r#"{"review":{"pack":{"sliceMinBytes":0},"reviewers":{"maxCells":"auto"}}}"#).is_ok(), "sliceMinBytes 0 与 auto 合法");
         let z = Config::from_json(r#"{"review":{"scanners":{"workers":0}}}"#).unwrap_err().to_string();
         assert!(z.contains("review.scanners.workers"), "{z}");
     }
@@ -1178,6 +1205,9 @@ mod tests {
             "m":{"apiKeyEnv":"REDTEAM_TEST_KEY","roles":{"scanner":{}}},"m2":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let sec = secrets::Secrets::parse(r#"{"providers":{"xp":{"apiKey":"prov-secret","models":{"m2":"model-secret"}}}}"#);
         assert_eq!(cfg.resolve_key_with("xp", "m", &sec).as_deref(), Some("from-model-env"));
+        unsafe { std::env::set_var("REDTEAM_TEST_KEY", "  "); }
+        assert_eq!(cfg.resolve_key_with("xp", "m", &sec).as_deref(), Some("from-provider-env"), "空白 env 视为未设，继续下一级（修补批 X-4）");
+        unsafe { std::env::set_var("REDTEAM_TEST_KEY", "from-model-env"); }
         assert_eq!(cfg.resolve_key_with("xp", "m2", &sec).as_deref(), Some("model-secret"));
         let sec2 = secrets::Secrets::parse(r#"{"providers":{"xp":{"apiKey":"prov-secret"}}}"#);
         assert_eq!(cfg.resolve_key_with("xp", "m2", &sec2).as_deref(), Some("from-provider-env"));
@@ -1244,6 +1274,23 @@ mod tests {
         unsafe {
             if let Some(h) = saved_home { std::env::set_var("HOME", h); }
         }
+    }
+
+    /// 修补批 X-5：`--pack-only` 路径不读 secrets.json（坏 secrets 不产 warning，配置照读）。
+    #[test]
+    fn load_no_secrets_skips_secrets_file() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK 串行化
+        unsafe { std::env::set_var("REDTEAM_HOME", dir.path()); }
+        std::fs::write(dir.path().join("config.json"), r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        std::fs::write(dir.path().join("secrets.json"), "{\"providers\": {").unwrap();
+        let (_, with) = Config::load_with_messages().unwrap();
+        assert!(with.iter().any(|m| m.contains("secrets.json")), "正常加载报 secrets 解析失败: {with:?}");
+        let (cfg, without) = Config::load_no_secrets().unwrap();
+        assert!(without.iter().all(|m| !m.contains("secrets.json")), "不读 secrets: {without:?}");
+        assert_eq!(cfg.active_roles().scanners.len(), 1);
+        unsafe { std::env::remove_var("REDTEAM_HOME"); }
     }
 
     #[test]

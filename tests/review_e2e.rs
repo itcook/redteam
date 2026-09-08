@@ -819,3 +819,79 @@ fn pack_only_empty_changes_reports_zero_cells() {
     let text = render_pack_only(&report);
     assert!(text.contains("cells=0\n") && text.contains("warning: no reviewable evidence"), "{text}");
 }
+
+/// 修补批 X-3：gate=grouped 两组时，每个 cell 的 `{{OTHER_CHANGED_FILES}}` 索引只列他组文件且带箭头——D 批重写 prompt 渲染的回归网。
+#[test]
+fn pack_only_two_groups_cross_index_lists_other_group_only() {
+    use redteam::cli::{run_pack_only, ReviewArgs};
+    use redteam::config::Config;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let big = |name: &str, import: &str| -> String {
+        let mut s = format!("import {{ x }} from '{import}';\n");
+        for i in 0..70 {
+            s.push_str(&format!("export const {name}_{i} = {i};\n"));
+        }
+        s
+    };
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    for (rel, body) in [
+        ("src/core/a.ts", big("a", "./b")), ("src/core/b.ts", big("b", "./a")),
+        ("src/other/c.ts", big("c", "./d")), ("src/other/d.ts", big("d", "./c")),
+    ] {
+        let p = dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    git(dir.path(), &["add", "-A"]);
+    let args = ReviewArgs {
+        pack_only: true,
+        base: None, scope: "working-tree".into(), spec: vec![], focus: None,
+        block_threshold: None, conf_floor: None, background: false,
+        format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
+    };
+    let report = run_pack_only(&args, &Config::default(), dir.path()).unwrap();
+    assert_eq!(report.cells.len(), 2, "四文件 / churn ≥ 200 / 两个连通分量 → 两组: {:?}", report.cells);
+    let packs = std::path::Path::new(&report.packs_dir);
+    let cell1 = std::fs::read_to_string(packs.join("cell-1.md")).unwrap();
+    let cell2 = std::fs::read_to_string(packs.join("cell-2.md")).unwrap();
+    // 索引行形如 `path (gN +a/-d) → [..] ← [..]`：cell-1 只列 g2，cell-2 只列 g1
+    assert!(cell1.contains("src/other/c.ts (g2") && cell1.contains("src/other/d.ts (g2"), "cell-1 索引须列他组文件:\n{cell1}");
+    assert!(!cell1.contains("src/core/a.ts (g1") && !cell1.contains("src/core/b.ts (g1"), "cell-1 索引不列自身组:\n{cell1}");
+    assert!(cell1.contains("→ [src/other/") && cell1.contains("← [src/other/"), "带正反向箭头:\n{cell1}");
+    assert!(cell2.contains("src/core/a.ts (g1") && !cell2.contains("src/other/c.ts (g2"), "cell-2 反之:\n{cell2}");
+    let summary: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(packs.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["grouping"]["gate"], "grouped");
+    assert_eq!(summary["grouping"]["groups"], 2);
+}
+
+/// 修补批 X-3 / X-5：真二进制 `review --pack-only` 退出码 0，且不读 `secrets.json`（坏 secrets 不产 warning）。
+#[test]
+fn pack_only_binary_exits_zero_without_reading_secrets() {
+    let bin = env!("CARGO_BIN_EXE_redteam");
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
+    git(&["add", "-A"]);
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("secrets.json"), "{\"providers\": {").unwrap(); // 非法：pack-only 不该读它
+    let out = std::process::Command::new(bin)
+        .current_dir(dir.path())
+        .env("REDTEAM_HOME", home.path())
+        .args(["review", "--pack-only"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("secrets.json"), "--pack-only 不读 secrets（修补批 X-5）: {stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("cell-1 files=1 bytes="), "{}", String::from_utf8_lossy(&out.stdout));
+}
