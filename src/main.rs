@@ -87,7 +87,7 @@ enum Cmd {
         #[arg(long)]
         incremental_from: Option<String>,
         /// 预算仪表（M21a）：只收集证据 → 分组 → 装包 → 落盘 .redteam/packs/<job>/cell-<n>.md 与
-        /// summary.json，每 cell 打印字节与估算 token（÷3.5）及分组统计；不建 registry、不调 provider，
+        /// summary.json，每 cell 打印字节与估算 token（÷3.5）、分组统计与装包形态（body=slice|full 随 `review.pack.body`，缺省 slice：切片 / 折叠行 / 文件外片段计数）；不建 registry、不调 provider，
         /// 无模型配置也能跑，退出码 0。与 --background / --resume / --incremental-from 互斥；
         /// --format 对本模式无效（固定文本行，机读看 summary.json）。
         #[arg(long, conflicts_with_all = ["background", "resume", "incremental_from"])]

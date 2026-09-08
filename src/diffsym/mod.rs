@@ -253,7 +253,32 @@ pub(crate) fn is_container(kind: &str) -> bool {
     matches!(kind, "class" | "struct" | "enum" | "trait" | "type")
 }
 
-/// 文件级 def 全集（按 start 升序）：逐行 `match_def` + `block_end`；嵌在屏蔽 def 体内的命中丢弃。
+/// 值 / 类型别名 def（const / static / Go var / TS const-let-var / type）：块尾按三种括号配平，行内已平衡即单行——
+/// 不能用 `block_end`（它只认 `{`，遇 Go `var X = f()` / TS 无分号 `const x = 1` / Go `type ID int` 会向下配平到下一个函数
+/// 的 `}`，把那个函数整个吞掉；评审修 3）。
+fn is_value_kind(kind: &str) -> bool {
+    matches!(kind, "const" | "static" | "type")
+}
+
+/// 值 def 的块尾（0-based）：从 i 起逐行累计 `([{` / `)]}` 深度，行末深度 ≤ 0 即止；上限 400 行护栏。
+pub(crate) fn value_end(lines: &[&str], i: usize) -> usize {
+    let mut depth: i32 = 0;
+    for (j, line) in lines.iter().enumerate().take((i + 400).min(lines.len())).skip(i) {
+        for ch in line.chars() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth <= 0 {
+            return j;
+        }
+    }
+    i
+}
+
+/// 文件级 def 全集（按 start 升序）：逐行 `match_def` + `block_end`（值 def 走 `value_end`）；嵌在屏蔽 def 体内的命中丢弃。
 /// ponytail: block_end 括号配平被字符串 / 注释里的花括号带偏时，屏蔽区间会吞掉后续 def——与骨架档同源的
 /// 已知 heuristic 边角，禁真空兜底保证改动行仍在。
 pub(crate) fn all_defs(lines: &[&str], defs: &[(&'static str, Regex)]) -> Vec<DefRange> {
@@ -268,7 +293,7 @@ pub(crate) fn all_defs(lines: &[&str], defs: &[(&'static str, Regex)]) -> Vec<De
         if stack.iter().any(|&(_, shield)| shield) {
             continue; // 局部量 / 嵌套 fn
         }
-        let end = block_end(lines, i);
+        let end = if is_value_kind(kind) { value_end(lines, i) } else { block_end(lines, i) };
         out.push(DefRange { start: i, end, name, kind });
         if end > i {
             stack.push((end, shields_nested(kind)));
@@ -301,6 +326,45 @@ pub(crate) fn changed_defs(diff: &str, all: &[DefRange]) -> Vec<DefRange> {
         }
     }
     picked.into_iter().map(|i| all[i].clone()).collect()
+}
+
+/// 一个 hunk 的新文件侧视图（批 E 评审修 4，切片重锚定用）：`start` / `count` 来自 `@@ +c,d @@`（0-based 起行）；
+/// `changed` = 本 hunk 的全部改动行（+ 行与删除点，同 `hunk_changed_lines` 语义）；`plus` = 每个 + 行的 (0-based 行, 文本)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Hunk {
+    pub start: usize,
+    pub count: usize,
+    pub changed: Vec<usize>,
+    pub plus: Vec<(usize, String)>,
+}
+
+/// 按 hunk 拆 diff（游走规则与 `hunk_changed_lines` 一致：`+++` / `---` 头与 `\` 标记跳过，删除点取当前新文件位置）。
+/// ponytail: 第三份平行的 hunk 游走（drift 风险）；三者若再动一起改。
+pub(crate) fn parse_hunks(diff: &str) -> Vec<Hunk> {
+    let mut out: Vec<Hunk> = Vec::new();
+    let mut new_line = 0usize;
+    for raw in diff.lines() {
+        if raw.starts_with("+++ ") || raw.starts_with("--- ") || raw.starts_with('\\') {
+            continue;
+        }
+        if raw.starts_with("@@") {
+            let (c, d) = parse_hunk_new_range(raw).unwrap_or((1, 1));
+            new_line = c;
+            out.push(Hunk { start: c.saturating_sub(1), count: d, changed: Vec::new(), plus: Vec::new() });
+            continue;
+        }
+        let Some(h) = out.last_mut() else { continue };
+        match raw.as_bytes().first() {
+            Some(b'+') => {
+                h.changed.push(new_line.saturating_sub(1));
+                h.plus.push((new_line.saturating_sub(1), raw[1..].to_string()));
+                new_line += 1;
+            }
+            Some(b'-') => h.changed.push(new_line.saturating_sub(1)),
+            _ => new_line += 1,
+        }
+    }
+    out
 }
 
 /// def 体内出现的 `ref_worthy` 标识符（去自身名）；注释行（`//` / `#` / `*` / `/*` 起始）不参与。
@@ -530,5 +594,32 @@ mod tests {
         assert_eq!(names(&hop.callees), vec!["RouteTable"], "{hop:?}");
         assert!(hop.callers.is_empty(), "注释里提到不算 caller: {hop:?}");
         assert!(body_names(&rs, &changed[0]).contains("RouteTable") && !body_names(&rs, &changed[0]).contains("wrap_body"));
+    }
+
+    #[test]
+    fn all_defs_value_defs_do_not_swallow_following_functions() {
+        // 评审修 3：Go 顶层 var / type 别名、TS 无分号 const 的块尾按括号配平，不再吞下一个函数。
+        let go: Vec<&str> = "var ErrNotFound = errors.New(\"x\")\ntype ID int\nfunc LoadUser(id int) error {\n\treturn nil\n}\nvar table = map[string]int{\n\t\"a\": 1,\n}\nfunc afterMap() {}\n".lines().collect();
+        let all = all_defs(&go, &compile_defs(lang_for("x.go").unwrap()));
+        assert_eq!(names(&all), vec!["ErrNotFound", "ID", "LoadUser", "table", "afterMap"], "{all:?}");
+        assert_eq!((all[0].end, all[1].end, all[3].end), (0, 1, 7));
+        let ts: Vec<&str> = "const limit = 3\nexport function handleRequest() {\n  return limit\n}\nconst arrow = () => {\n  const inner_value = 1\n}\nfunction afterArrow() {}\n".lines().collect();
+        let all = all_defs(&ts, &compile_defs(lang_for("x.ts").unwrap()));
+        assert_eq!(names(&all), vec!["limit", "handleRequest", "arrow", "afterArrow"], "{all:?}");
+        assert_eq!((all[0].end, all[2].end), (0, 6));
+    }
+
+    #[test]
+    fn parse_hunks_splits_with_plus_text_and_delete_points() {
+        let diff = "--- a/x\n+++ b/x\n@@ -2,1 +2,2 @@\n context\n+added one\n+added two\n@@ -10,1 +11,0 @@\n-gone\n\\ No newline at end of file\n";
+        let hs = parse_hunks(diff);
+        assert_eq!(hs.len(), 2);
+        assert_eq!((hs[0].start, hs[0].count), (1, 2));
+        assert_eq!(hs[0].plus, vec![(2, "added one".to_string()), (3, "added two".to_string())]);
+        assert_eq!(hs[0].changed, vec![2, 3]);
+        assert_eq!((hs[1].start, hs[1].count, hs[1].changed.clone(), hs[1].plus.len()), (10, 0, vec![10], 0));
+        // 与 hunk_changed_lines 同源
+        let flat: Vec<usize> = hs.iter().flat_map(|h| h.changed.clone()).collect();
+        assert_eq!(flat, hunk_changed_lines(diff));
     }
 }
