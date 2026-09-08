@@ -85,6 +85,11 @@ impl Bundle {
         Bundle { files, edges: Vec::new(), hub_order: Vec::new(), over_budget: false }
     }
 
+    /// cell 标签：文件路径逗号串（fan-out cell id 与 `--pack-only` 共用）。
+    pub fn label(&self) -> String {
+        self.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",")
+    }
+
     /// 按填充序遍历（`hub_order` 缺失或长度不符 → 自然序）。
     pub fn fill_order(&self) -> impl Iterator<Item = &FileChange> {
         let order: Vec<usize> = if self.hub_order.len() == self.files.len() && !self.hub_order.is_empty() {
@@ -229,8 +234,8 @@ const MANIFEST_MAX_CHARS: usize = 4000;
 /// （dogfood 20260703 r2 5361b545：注记后置追加曾致溢出预算）。
 const MANIFEST_SUFFIX_RESERVE: usize = 40;
 
-/// 双帽截断（条目数 + 总字符预算，先到者截断，尾注被截条数）——
-/// other_files_manifest 与 two_layer_manifest 共用同一体积防线。
+/// 双帽截断（条目数 + 总字符预算，先到者截断，尾注被截条数）——two_layer_manifest 的体积防线
+/// （跨组索引 `render_cross_index` 用同一对帽常量，但有降质档，不走本函数）。
 fn cap_entries(entries: Vec<String>) -> String {
     let total = entries.len();
     let mut kept = 0usize;
@@ -722,10 +727,10 @@ fn split_top_level(s: &str) -> Vec<&str> {
     out
 }
 
-/// 去 `pub` / `pub(crate)` 等可见性前缀。
+/// 去 `pub` / `pub(crate)` 等可见性前缀（要求 `pub` 后跟空白或 `(`，`pubsub::x` 之类标识符不剥）。
 fn strip_pub(t: &str) -> &str {
     match t.strip_prefix("pub") {
-        Some(r) => {
+        Some(r) if r.starts_with([' ', '\t', '(']) => {
             let r = r.trim_start();
             let r = if r.starts_with('(') {
                 match r.find(')') {
@@ -737,12 +742,24 @@ fn strip_pub(t: &str) -> &str {
             };
             r.trim_start()
         }
-        None => t,
+        _ => t,
     }
 }
 
-/// Go import 说明符（单行 `import "x"` 与 `import ( … )` 块，别名前缀允许）。
+/// Go import 说明符：单行 `import "x"` 与 `import ( … )` 块（别名前缀允许，行尾注释允许）。块内只认
+/// 「[别名] "spec"」整行——普通代码里的字符串字面量不算；`import ("fmt")` 单行块不进块态。
 fn go_imports(content: &str) -> Vec<String> {
+    fn spec_of(line: &str) -> Option<String> {
+        let code = line.split("//").next().unwrap_or("").trim();
+        let toks: Vec<&str> = code.split_whitespace().collect();
+        let quoted = match toks.as_slice() {
+            [q] => *q,
+            [alias, q] if alias.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') => *q,
+            _ => return None,
+        };
+        let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+        (!inner.is_empty() && !inner.contains('"')).then(|| inner.to_string())
+    }
     let mut out = Vec::new();
     let mut in_block = false;
     for line in content.lines() {
@@ -750,8 +767,13 @@ fn go_imports(content: &str) -> Vec<String> {
         if in_block {
             if t.starts_with(')') {
                 in_block = false;
-            } else if let Some(s) = quoted_after(t, "") {
-                out.push(s);
+                continue;
+            }
+            if let Some(spec) = spec_of(t.trim_end_matches(')')) {
+                out.push(spec);
+            }
+            if t.ends_with(')') {
+                in_block = false;
             }
             continue;
         }
@@ -761,12 +783,12 @@ fn go_imports(content: &str) -> Vec<String> {
         }
         let rest = rest.trim_start();
         if let Some(r) = rest.strip_prefix('(') {
-            in_block = true;
-            if let Some(s) = quoted_after(r, "") {
-                out.push(s);
+            if let Some(spec) = spec_of(r.trim_end_matches(')')) {
+                out.push(spec);
             }
-        } else if let Some(s) = quoted_after(rest, "") {
-            out.push(s);
+            in_block = !r.contains(')');
+        } else if let Some(spec) = spec_of(rest) {
+            out.push(spec);
         }
     }
     out
@@ -856,7 +878,14 @@ impl<'a> ImportResolver<'a> {
                 prel.push_str(".json");
             }
             if let Some(pc) = self.load_tsconfig(&prel, depth + 1) {
-                cfg = (*pc).clone(); // 数组 extends：后者覆盖前者
+                // 按属性合并（TS 语义）：后一个父配置只覆盖它声明了的属性，不抹掉前者的 baseUrl / paths。
+                if pc.base_url.is_some() {
+                    cfg.base_url = pc.base_url.clone();
+                }
+                if !pc.paths.is_empty() {
+                    cfg.paths = pc.paths.clone();
+                    cfg.paths_dir = pc.paths_dir.clone();
+                }
             }
         }
         let co = v.get("compilerOptions");
@@ -881,12 +910,16 @@ impl<'a> ImportResolver<'a> {
         Some(std::rc::Rc::new(cfg))
     }
 
-    /// 候选（可带或不带扩展名、可为目录）→ 改动集里的 TS/JS 文件：`key` 或 `key/index`。
+    /// 候选（可带或不带扩展名、可为目录）→ 改动集里的 TS/JS 文件：先按原样键查（`user.service` /
+    /// `app.module` 这类点号基名是键的一部分，不能剥），只有尾扩展名是 TS/JS 扩展名才剥（`./x.js` 指向
+    /// x.ts），最后试 `<cand>/index`。`./styles.css` 之类非代码扩展名不再误连同名 `styles.ts`。
     fn lookup_ts(&self, cand: &str) -> Vec<String> {
-        let key = strip_ext(cand);
-        let mut v = self.lookup(&key, TS_EXTS);
+        let mut v = self.lookup(cand, TS_EXTS);
+        if v.is_empty() && TS_EXTS.contains(&ext_of(cand)) {
+            v = self.lookup(&strip_ext(cand), TS_EXTS);
+        }
         if v.is_empty() {
-            v = self.lookup(&format!("{key}/index"), TS_EXTS);
+            v = self.lookup(&format!("{cand}/index"), TS_EXTS);
         }
         v
     }
@@ -984,21 +1017,18 @@ impl<'a> ImportResolver<'a> {
     }
 
     /// 模块路径 → 改动集里的 `.rs`：`<root>/a/b.rs` | `<root>/a/b/mod.rs`；尾段可能是 item，按最长存在前缀回退。
-    /// `allow_root`：回退到 crate 根文件（lib.rs / main.rs）——只给 `super::` / `self::` 相对路径
-    /// （`crate::x` 的首段恒是模块，回退到根文件会把所有 `use crate::…` 都连到改动的 lib.rs）。
+    /// 根文件（lib.rs / main.rs）回退只在「基模块就是 crate 根且只剩 ≤ 1 段」时成立：`use super::Thing`
+    /// （自顶层模块）/ `use crate::Thing` 指 crate 根里的 item。`super::Config` 自 `[net, client]` 指向 net
+    /// 模块文件、`crate::util::helper` 指向 util 模块——找不到就是没边，不能连到改动的根文件（否则每个
+    /// `mod tests { use super::*; }` 都会把文件粘到 lib.rs 上）。
     fn resolve_rust_path(&self, crate_root: &str, module: &[String], segs: &[String]) -> Vec<String> {
         let mut full: Vec<String> = Vec::new();
         let mut rest = segs;
-        let allow_root;
         match rest.first().map(|s| s.as_str()) {
-            Some("crate") => {
-                rest = &rest[1..];
-                allow_root = false;
-            }
+            Some("crate") => rest = &rest[1..],
             Some("self") => {
                 rest = &rest[1..];
                 full.extend_from_slice(module);
-                allow_root = true;
             }
             Some("super") => {
                 full.extend_from_slice(module);
@@ -1008,10 +1038,10 @@ impl<'a> ImportResolver<'a> {
                         return Vec::new();
                     }
                 }
-                allow_root = true;
             }
             _ => return Vec::new(), // 外部 crate / 2018 裸模块路径：不解析
         }
+        let allow_root = full.is_empty() && rest.len() <= 1;
         full.extend(rest.iter().cloned());
         for k in (0..=full.len()).rev() {
             let hits: Vec<String> = if k == 0 {
@@ -1045,7 +1075,9 @@ impl<'a> ImportResolver<'a> {
         };
         let mut pending: Option<String> = None; // 多行 use 语句累积
         for line in content.lines() {
-            let t = strip_pub(line.trim());
+            // 可见性前缀只在语句起始行剥；多行 use 的续行（`pubsub::Broker,`）原样累积。
+            let raw = line.trim();
+            let t = if pending.is_none() { strip_pub(raw) } else { raw };
             let stmt = match pending.take() {
                 Some(mut acc) => {
                     acc.push(' ');
@@ -1204,31 +1236,38 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
             }
         }
     }
-    let full_text = n <= REF_FULLTEXT_MAX_FILES;
+    // 引用边：全部文件的改动 def 名合成一个 regex，每个文件只扫一遍，命中按名反查归属（O(n × size)，
+    // 而非每对文件一次全文 regex）。
+    let mut owners: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for i in 0..n {
         let Some(content) = &contents[i] else { continue };
-        let names = changed_def_names(&paths[i], &changes[i].diff, content);
-        if names.is_empty() {
-            continue;
+        for name in changed_def_names(&paths[i], &changes[i].diff, content) {
+            owners.entry(name).or_default().push(i);
         }
-        let pat = format!(r"\b(?:{})\b", names.iter().map(|s| regex::escape(s)).collect::<Vec<_>>().join("|"));
-        let Ok(re) = regex::Regex::new(&pat) else { continue };
-        for j in 0..n {
-            if j == i {
-                continue;
+    }
+    if !owners.is_empty() {
+        let pat = format!(r"\b(?:{})\b", owners.keys().map(|s| regex::escape(s)).collect::<Vec<_>>().join("|"));
+        if let Ok(re) = regex::Regex::new(&pat) {
+            let full_text = n <= REF_FULLTEXT_MAX_FILES;
+            let mut counts: BTreeMap<(usize, usize), u32> = BTreeMap::new(); // (引用方 j, 被引用 i)
+            for j in 0..n {
+                let text: &str = if full_text {
+                    contents[j].as_deref().unwrap_or(&changes[j].diff)
+                } else {
+                    &changes[j].diff
+                };
+                for m in re.find_iter(text) {
+                    if let Some(is) = owners.get(m.as_str()) {
+                        for &i in is {
+                            if i != j {
+                                *counts.entry((j, i)).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
             }
-            let text: &str = if full_text {
-                contents[j].as_deref().unwrap_or(&changes[j].diff)
-            } else {
-                &changes[j].diff
-            };
-            let count = re.find_iter(text).count();
-            if count > 0 {
-                edges.push(Edge {
-                    from: paths[j].clone(),
-                    to: paths[i].clone(),
-                    kind: EdgeKind::Reference { count: count as u32 },
-                });
+            for ((j, i), count) in counts {
+                edges.push(Edge { from: paths[j].clone(), to: paths[i].clone(), kind: EdgeKind::Reference { count } });
             }
         }
     }
@@ -1439,10 +1478,14 @@ mod tests {
 
     #[test]
     fn import_edges_ts_relative() {
-        let src = "import {a} from '../util/b';\nconst c = require('./helper');\nimport x from 'react';\nexport * from './styles.css';\n";
-        let got = edges("src/feat/x.ts", src, &["src/feat/x.ts", "src/feat/helper.ts", "src/util/b.tsx", "src/feat/styles.css"], None);
-        // '../util/b' → src/util/b.tsx；'./helper' → src/feat/helper.ts；'react' 裸模块无 tsconfig → 丢；css 非 TS 扩展名不成边
-        assert_eq!(got, vec!["src/feat/helper.ts".to_string(), "src/util/b.tsx".to_string()]);
+        let src = "import {a} from '../util/b';\nconst c = require('./helper');\nimport x from 'react';\nexport * from './styles.css';\nimport {S} from './user.service';\nimport {m} from './mod.js';\n";
+        let changed = ["src/feat/x.ts", "src/feat/helper.ts", "src/util/b.tsx", "src/feat/styles.css", "src/feat/styles.ts",
+            "src/feat/user.service.ts", "src/feat/user.ts", "src/feat/mod.ts"];
+        let got = edges("src/feat/x.ts", src, &changed, None);
+        // '../util/b' → src/util/b.tsx；'./helper' → src/feat/helper.ts；'react' 裸模块无 tsconfig → 丢；
+        // './styles.css' 非代码扩展名不成边、也不误连同名 styles.ts；'./user.service' 点号基名精确匹配、不误连 user.ts；
+        // './mod.js'（ESM 写法指向 .ts）剥 js 扩展名后命中 mod.ts
+        assert_eq!(got, vec!["src/feat/helper.ts".to_string(), "src/feat/mod.ts".into(), "src/feat/user.service.ts".into(), "src/util/b.tsx".into()]);
     }
 
     #[test]
@@ -1473,6 +1516,12 @@ mod tests {
         write(dir.path(), "packages/web/tsconfig.json", r#"{"extends":"../../tsconfig.base","compilerOptions":{"strict":true}}"#);
         let got = edges("packages/web/src/a.ts", "import {b} from '~/b';\n", &["packages/web/src/a.ts", "packages/web/src/b.ts"], Some(dir.path()));
         assert_eq!(got, vec!["packages/web/src/b.ts".to_string()]);
+        // 数组 extends（TS 5）：后一个父配置只设 strict，不得抹掉前一个父配置的 baseUrl / paths
+        write(dir.path(), "packages/api/tsconfig.paths.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"]}}}"#);
+        write(dir.path(), "packages/api/tsconfig.strict.json", r#"{"compilerOptions":{"strict":true}}"#);
+        write(dir.path(), "packages/api/tsconfig.json", r#"{"extends":["./tsconfig.paths.json","./tsconfig.strict.json"]}"#);
+        let got = edges("packages/api/src/a.ts", "import {b} from '@/b';\n", &["packages/api/src/a.ts", "packages/api/src/b.ts"], Some(dir.path()));
+        assert_eq!(got, vec!["packages/api/src/b.ts".to_string()], "数组 extends 按属性合并");
     }
 
     #[test]
@@ -1508,18 +1557,32 @@ mod tests {
 
     #[test]
     fn import_edges_rust_mod_rs_item_tail_and_multiline() {
-        let src = "pub mod token;\nmod helper;\nuse crate::util::helper::Item;\nuse crate::util::{other, third::Thing};\nuse crate::{\n    x::One,\n    y,\n};\nuse crate::nothing::Here;\n";
-        let changed = ["src/auth/mod.rs", "src/auth/token.rs", "src/auth/helper/mod.rs", "src/util/helper.rs", "src/util/other/mod.rs", "src/util/third.rs", "src/x.rs", "src/y.rs", "src/lib.rs"];
+        let src = "pub mod token;\nmod helper;\nuse crate::util::helper::Item;\nuse crate::util::{other, third::Thing};\nuse crate::{\n    pubsub::Broker,\n    x::One,\n    y,\n};\npub(crate) use crate::publish::sink;\nuse crate::nothing::Here;\n";
+        let changed = ["src/auth/mod.rs", "src/auth/token.rs", "src/auth/helper/mod.rs", "src/util/helper.rs", "src/util/other/mod.rs", "src/util/third.rs", "src/x.rs", "src/y.rs", "src/lib.rs", "src/pubsub.rs", "src/publish.rs"];
         let got = edges("src/auth/mod.rs", src, &changed, None);
         // mod 声明 → 同目录子模块（.rs 或 /mod.rs）；`Item` / `Thing` 尾段是 item → 回退到最长存在前缀；
-        // 多行 use 累积到 `;`；`crate::nothing::Here` 不存在且 `crate::` 不回退到 lib.rs
+        // 多行 use 累积到 `;`（续行 `pubsub::Broker,` 不被 pub 前缀剥除）；`publish` 单行同理；
+        // `crate::nothing::Here` 多段不存在 → 无边、不回退到 lib.rs
         assert_eq!(got, vec![
-            "src/auth/helper/mod.rs".to_string(), "src/auth/token.rs".into(), "src/util/helper.rs".into(),
-            "src/util/other/mod.rs".into(), "src/util/third.rs".into(), "src/x.rs".into(), "src/y.rs".into(),
+            "src/auth/helper/mod.rs".to_string(), "src/auth/token.rs".into(), "src/publish.rs".into(), "src/pubsub.rs".into(),
+            "src/util/helper.rs".into(), "src/util/other/mod.rs".into(), "src/util/third.rs".into(), "src/x.rs".into(), "src/y.rs".into(),
         ]);
         // 非 mod.rs 文件的 `mod x;` 指向同名目录（2018 布局）
         let got = edges("src/auth.rs", "mod helper;\n", &["src/auth.rs", "src/auth/helper.rs", "src/helper.rs"], None);
         assert_eq!(got, vec!["src/auth/helper.rs".to_string()]);
+    }
+
+    #[test]
+    fn import_edges_rust_root_fallback_only_when_parent_is_crate_root() {
+        // [net, client] 的 `super::Config` / `super::*` 指向 net 模块文件（未改动）→ 无边，绝不连到改动的 lib.rs
+        let src = "use super::Config;\nuse super::*;\n#[cfg(test)]\nmod tests {\n    use super::*;\n}\n";
+        let got = edges("src/net/client.rs", src, &["src/net/client.rs", "src/lib.rs", "src/db/store.rs"], None);
+        assert!(got.is_empty(), "{got:?}");
+        // 顶层模块 [a] 的 `super::Thing` / `crate::Thing`：父模块即 crate 根 → lib.rs 合法
+        let got = edges("src/a.rs", "use super::Thing;\n", &["src/a.rs", "src/lib.rs"], None);
+        assert_eq!(got, vec!["src/lib.rs".to_string()]);
+        let got = edges("src/a.rs", "use crate::Thing;\nuse crate::util::helper;\n", &["src/a.rs", "src/lib.rs"], None);
+        assert_eq!(got, vec!["src/lib.rs".to_string()], "多段路径不回退到根文件");
     }
 
     #[test]
@@ -1547,6 +1610,11 @@ mod tests {
         // 无 go.mod → 不解析
         let dir2 = tempfile::tempdir().unwrap();
         assert!(edges("internal/api/handler.go", src, &changed, Some(dir2.path())).is_empty());
+        // 单行块 `import ("fmt")` 不进块态：其后代码里的字符串字面量不算 import；块内注释行与行尾注释允许
+        let src2 = "package api\n\nimport (\"fmt\")\n\nfunc f() {\n\tlog.Printf(\"example.com/svc/internal/store failed\")\n}\n\nimport (\n\t// 注释行\n\ts \"example.com/svc/pkg/util\" // 别名 + 行尾注释\n\t\"github.com/x/y\")\n";
+        let got = edges("internal/api/handler.go", src2, &changed, Some(dir.path()));
+        assert_eq!(got, vec!["pkg/util/u.go".to_string(), "pkg/util/u_test.go".into()], "{got:?}");
+        assert_eq!(go_imports("import (\n\t\"a\"\n)\nx := \"b\"\n"), vec!["a".to_string()]);
     }
 
     #[test]
@@ -1750,6 +1818,14 @@ mod tests {
         assert_eq!(g1.bundles.iter().map(paths_of).collect::<Vec<_>>(), g2.bundles.iter().map(paths_of).collect::<Vec<_>>());
         assert_eq!(g1.bundles.iter().map(|b| b.hub_order.clone()).collect::<Vec<_>>(), g2.bundles.iter().map(|b| b.hub_order.clone()).collect::<Vec<_>>());
         assert_eq!(g1.bundles.iter().map(|b| b.edges.clone()).collect::<Vec<_>>(), g2.bundles.iter().map(|b| b.edges.clone()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn count_plus_minus_skips_headers_but_counts_dash_body_lines() {
+        // dogfood 20260703 r4：正文删除行 "--sep"（diff 行 "---sep"）不得被当文件头跳过；真头 "--- a/…" 仍跳。
+        // 本口径同时驱动分组门的 churn 与跨组索引的 (+a/-d)。
+        assert_eq!(count_plus_minus("--- a/a.rs\n+++ b/a.rs\n---sep\n+++x"), (1, 1));
+        assert_eq!(count_plus_minus("+one\n+two\n-gone"), (2, 1));
     }
 
     #[test]

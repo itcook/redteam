@@ -2,7 +2,7 @@
 //! 状态机（并发组 M16 定型，原地不动）。尾段引擎/spec/二阶段补查/增量评审已拆至
 //! 同目录子模块（M17-a 尾段统一，零语义 diff）。
 
-use crate::bundle::{group, select_files, GroupingOpts};
+use crate::bundle::{group, select_files, Bundle, GroupingOpts, GroupingStats};
 use crate::config::Config;
 use crate::domain::{DossierMeta, Finding, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::git::FileChange;
@@ -203,9 +203,9 @@ pub(crate) fn pack_budget_bytes(cfg: &Config, model_names: &[String]) -> usize {
 /// meta.injected 是唯一可观测入口，供归因与生产诊断。
 /// `budget`=pack flat 预算（字节）；生产调用点由 `pack_budget_bytes` 按启用模型窗算出。
 pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
-    // 单格全审默认（E9）：bundles 恒为单元素（全变更集），每格即自家文件——原「兄弟改动
-    // 文件全景注入 + 依赖距离排序」随分格一并收缩（无兄弟可注入）。超预算由 build_pack
-    // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，不再靠分格避让。
+    // M21a 批 C：bundles 来自引用图分组（design §3.2，门未过时退化为单包），每格只装自家文件——
+    // 视野外的改动文件由跨组索引（`{{OTHER_CHANGED_FILES}}`）而非兄弟注入提供。超预算由 build_pack
+    // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，分组「宁降不拆」不靠分格避让。
     let entries: Vec<String> = bundles
         .iter()
         .map(|b| {
@@ -217,6 +217,41 @@ pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::P
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
     let meta = DossierMeta { bundles: bundles.len(), injected };
     (entries, meta)
+}
+
+/// 三条路径（全量 / 增量 / `--pack-only`）共用的「pack 预算 + spec 参照段」：spec 帽夹紧到 pack 预算一半
+/// （dogfood #2：64K 固定帽会吃穿小窗模型的整个输入窗），扣减后的预算给分组与装包。
+/// 返回 (budget, spec_section, warnings)。
+pub(crate) fn budget_and_spec(cfg: &Config, model_names: &[String], spec: &[String]) -> (usize, String, Vec<String>) {
+    let budget_raw = pack_budget_bytes(cfg, model_names);
+    let (spec_section, spec_used, warnings) = render_spec_section_capped(spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
+    (budget_raw.saturating_sub(spec_used), spec_section, warnings)
+}
+
+/// cell 规划产物：分组 + 每组卷宗 + 每组跨组索引（三者等长等序）+ 观测。
+pub(crate) struct CellPlan {
+    pub bundles: Vec<Bundle>,
+    pub dossiers: Vec<String>,
+    pub others: Vec<String>,
+    pub dossier_meta: DossierMeta,
+    pub stats: GroupingStats,
+}
+
+/// 筛选后证据 → 引用图分组（design §3.2，预算门喂 pack 预算）→ 装包 → 跨组索引（design §10.6）。
+/// 全量 / 增量 / `--pack-only` 的唯一入口——预算仪表量的就是真实评审发出的那份 prompt 素材。
+pub(crate) fn plan_cells(
+    selected: Vec<FileChange>,
+    root: &Path,
+    budget: usize,
+    extra_paths: &[String],
+    delta: Option<&std::collections::BTreeSet<String>>,
+) -> CellPlan {
+    let grouping = group(selected, Some(root), &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() });
+    let bundles = grouping.bundles;
+    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    let others =
+        crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, extra_paths, delta), bundles.len());
+    CellPlan { bundles, dossiers, others, dossier_meta, stats: grouping.stats }
 }
 
 /// code 专属流水线（S2-2b）：bundle × model 工具循环 + positioning 尾段。
@@ -265,17 +300,10 @@ pub async fn run_code_review(
     // --spec 参照段（D2）：读 spec_docs → 从 pack 预算里扣掉它占用的字节，让 build_packs +
     // 第二趟补查都用缩后预算——总上下文守界，spec 与 pack 不叠加超模型墙。空 --spec →
     // (String::new(), 0) → budget 原样不变（既有回归行为零漂移）。
-    let budget_raw = pack_budget_bytes(cfg, &model_names);
-    // spec 帽夹紧到 pack 预算一半（dogfood #2：64K 固定帽会吃穿小窗模型的整个输入窗）。
-    let (spec_section, spec_used, spec_warnings) =
-        render_spec_section_capped(&args.spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
-    let budget = budget_raw.saturating_sub(spec_used);
-    // 2. 引用图分组（M21a 批 C）：双阈值门未过 → 单包（即原 E9 单格全审）；过门 → 连通分量 /
-    // 弱缝先切 / 宁降不拆 / 孤立装箱。GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
-    let bundles = group(selected, Some(root), &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() }).bundles;
-    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
-    // 跨组索引（design §10.6）：每组一份，与 dossiers 等长等序；全量路径无 delta 标注。
-    let others = crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, &[], None), bundles.len());
+    let (budget, spec_section, spec_warnings) = budget_and_spec(cfg, &model_names, &args.spec);
+    // 2. 分组 / 装包 / 跨组索引（plan_cells：与增量、--pack-only 同源）。门未过 → 单包（即原 E9 单格全审）。
+    // GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
+    let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &[], None);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
         let other = others.get(idx).map(String::as_str).unwrap_or("");
@@ -407,21 +435,11 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     } else {
         "working tree".to_string()
     };
-    // 预算 = 全部已配置模型的最小窗（K15；批 A 合回后改读角色条目）。
-    let model_names: Vec<String> = cfg.models.keys().cloned().collect();
-    let budget_raw = pack_budget_bytes(cfg, &model_names);
-    let (spec_section, spec_used, mut warnings) =
-        render_spec_section_capped(&args.spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
-    let budget = budget_raw.saturating_sub(spec_used);
-    let grouping = group(
-        select_files(changes),
-        Some(cwd),
-        &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() },
-    );
-    let bundles = grouping.bundles;
-    let (dossiers, _meta) = build_packs(&bundles, cwd, budget);
-    let others =
-        crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, &[], None), bundles.len());
+    // 预算取自与真实评审同一模型集（resolve_models），量的才是真实会发出的 prompt。
+    let (models, _replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
+    let model_names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
+    let (budget, spec_section, mut warnings) = budget_and_spec(cfg, &model_names, &args.spec);
+    let CellPlan { bundles, dossiers, others, stats, .. } = plan_cells(select_files(changes), cwd, budget, &[], None);
     let focus = args.focus.clone().unwrap_or_default();
 
     let job_id = gen_job_id(cwd);
@@ -431,7 +449,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     // 未 init 的项目：只补 `.redteam/.gitignore`（镜像 init_project 的 `*`），不建库、不建 rounds。
     let gitignore = project_dir.join(".gitignore");
     if !gitignore.exists() {
-        std::fs::write(&gitignore, "*\n")?;
+        std::fs::write(&gitignore, crate::project::GITIGNORE_BODY)?;
     }
     let mut cells = Vec::new();
     for (i, b) in bundles.iter().enumerate() {
@@ -441,7 +459,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
         std::fs::write(packs_dir.join(format!("cell-{}.md", i + 1)), &prompt)?;
         cells.push(PackCell {
             cell: i + 1,
-            label: b.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(","),
+            label: b.label(),
             files: b.files.len(),
             bytes: prompt.len(),
             est_tokens: (prompt.len() as f64 / PACK_BYTES_PER_TOKEN).round() as u64,
@@ -459,7 +477,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
         target,
         budget_bytes: budget,
         cells,
-        grouping: grouping.stats,
+        grouping: stats,
         packs_dir: packs_dir.to_string_lossy().into_owned(),
         warnings,
     };

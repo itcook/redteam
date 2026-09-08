@@ -284,7 +284,7 @@ pub async fn run_code_fanout(
         .iter()
         .enumerate()
         .map(|(i, bundle)| {
-            let label = bundle.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
+            let label = bundle.label();
             let others = others.get(i).map(String::as_str).unwrap_or("");
             let dossier = dossiers.get(i).map(String::as_str).unwrap_or("");
             let prompt = build_bundle_prompt(target_label, bundle, focus, others, incremental, dossier, spec_docs);

@@ -1,7 +1,7 @@
 //! M13 增量评审（决议 2-5）：四守卫 preflight + 主流水线 `run_incremental_review`
 //! （delta fan-out → carry/merge → refute(new-only) → verdict → schema v3 报告）。
 
-use crate::bundle::{group, select_files, GroupingOpts};
+use crate::bundle::select_files;
 use crate::config::Config;
 use crate::domain::{Finding, ReviewReport, Verdict};
 use crate::orchestrate::{run_code_fanout, CellSink, OrchestrateOpts};
@@ -9,9 +9,8 @@ use crate::provider::ReviewProvider;
 use std::path::Path;
 
 use super::second_pass::second_pass_prompt;
-use super::spec::{render_spec_section_capped, SPEC_BUDGET_BYTES};
 use super::tail::{assemble_report, model_ids_for, CarryCtx, TailCtx};
-use super::{build_packs, load_ledger, pack_budget_bytes, parse_sev, resolve_models, ReviewArgs};
+use super::{budget_and_spec, load_ledger, parse_sev, plan_cells, resolve_models, CellPlan, ReviewArgs};
 
 /// M13 增量轮主流水线（决议 2-5）：四守卫 → delta fan-out（<incremental_round> 注入）
 /// → carry/merge → refute(new-only) → verdict(合并集) → schema v3 报告。
@@ -98,19 +97,12 @@ pub async fn run_incremental_review(
     // run_code_review 手法（cli.rs:801-808）：budget_raw → spec 帽夹紧到 pack 预算一半 →
     // 扣减出 budget → build_packs/mk/fan-out 与 TailCtx.spec_docs（喂 refute 趟）全用
     // 缩后预算 + 真值。空 --spec → (String::new(), 0) → budget 原样不变（回归零漂移）。
-    let budget_raw = pack_budget_bytes(cfg, &model_names);
-    let (spec_section, spec_used, spec_warnings) =
-        render_spec_section_capped(&args.spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
-    let budget = budget_raw.saturating_sub(spec_used);
-    let bundles = group(selected, Some(root), &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() }).bundles;
-    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
-    // 跨组索引（design §10.6）：delta 组 + 全分支非 delta 文件（只有路径），`[delta]` 标本轮改动；
-    // `<incremental_round>` 的双层清单本批不动，两份清单的合并留 D-3（K9）。
+    let (budget, spec_section, spec_warnings) = budget_and_spec(cfg, &model_names, &args.spec);
+    // 分组 / 装包 / 跨组索引（plan_cells，与全量同源）：跨组索引含全分支非 delta 文件（只带路径）并标
+    // `[delta]`；`<incremental_round>` 的双层清单本批不动，两份清单的合并留 D-3（K9）。
     let extra_paths: Vec<String> = all_files.iter().filter(|p| !delta_files.contains(*p)).cloned().collect();
-    let others = crate::bundle::render_cross_indices(
-        &crate::bundle::cross_index(&bundles, &extra_paths, Some(&delta_files)),
-        bundles.len(),
-    );
+    let CellPlan { bundles, dossiers, others, dossier_meta, .. } =
+        plan_cells(selected, root, budget, &extra_paths, Some(&delta_files));
     // 二阶段补查构造器：<incremental_round> 段原样带入第二趟——claimed-resolved 顺带验证/
     // dispute 契约不因补跑丢失。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
@@ -619,7 +611,7 @@ default_models=["m"]
         // M21a 批 C：原 E9「恒并单包」由分组门取代——小 delta（< min_files / churn）仍单包。
         use crate::evidence::git::FileChange;
         let fc = |p: &str| FileChange { path: p.into(), diff: format!("@@ -1,0 +1,1 @@\n+x // {p}\n") };
-        let g = group(vec![fc("src/a.rs"), fc("src/b.rs"), fc("docs/c.md")], None, &GroupingOpts::default());
+        let g = crate::bundle::group(vec![fc("src/a.rs"), fc("src/b.rs"), fc("docs/c.md")], None, &crate::bundle::GroupingOpts::default());
         assert_eq!(g.bundles.len(), 1, "门未过：全部并成一个 bundle");
         assert_eq!(g.bundles[0].files.len(), 3);
         assert_eq!(g.stats.gate, crate::bundle::Gate::Single);

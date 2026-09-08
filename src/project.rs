@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub const PROJECT_DIR: &str = ".redteam";
 
-const GITIGNORE_BODY: &str = "*\n";
+pub(crate) const GITIGNORE_BODY: &str = "*\n";
 const CONFIG_TEMPLATE: &str = "\
 # redteam 项目级配置（优先级高于用户级 ~/.config/redteam/config.toml）。
 # 密钥走环境变量或用户级 secrets.toml——绝不写入本文件（本目录在仓库领地内）。

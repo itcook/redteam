@@ -194,7 +194,8 @@ pub(crate) fn second_pass_prompt(
             FileChange { path: p, diff }
         })
         .collect();
-    for fc in own.files.iter() {
+    // 自家文件按第一趟的填充序（hub_order：枢纽先、保全文）放入——增强包重建为自然序时枢纽序仍成立。
+    for fc in own.fill_order() {
         if !files.iter().any(|e| e.path == fc.path) {
             files.push(fc.clone());
         }
@@ -256,6 +257,33 @@ mod tests {
         let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
         let (p2, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "", "", "");
         if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
+    }
+
+    /// M21a 批 C（评审修）：第二趟增强包沿用第一趟的 hub_order——枢纽文件仍先填、保全文。
+    #[test]
+    fn second_pass_prompt_keeps_hub_fill_order() {
+        use crate::bundle::Bundle;
+        use crate::domain::NeedEntry;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/hub.rs"), "pub fn hub_fn() {}\n").unwrap();
+        std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
+        crate::cli::incremental::incremental_tests::git_repo(root);
+        crate::cli::incremental::incremental_tests::commit_all(root, "init");
+        let files = vec![
+            FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn a() {}\n".into() },
+            FileChange { path: "src/hub.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn hub_fn() {}\n".into() },
+        ];
+        let mut own = Bundle::from_files(files);
+        own.hub_order = vec![1, 0];
+        let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
+        let (p, _) = second_pass_prompt(&[own], root, 1_000_000, "t", "", 0, &needs, &[], "", "", "");
+        let p = p.unwrap();
+        let (hub, a) = (p.find("src/hub.rs:1-1（全文").unwrap(), p.find("src/a.rs:1-1（全文").unwrap());
+        assert!(hub < a, "枢纽 hub.rs 先于 a.rs 填入: hub={hub} a={a}");
+        assert!(p.find("src/evidence.rs:1-1（全文").unwrap() < hub, "needs 文件仍前插");
     }
 
     #[test]
