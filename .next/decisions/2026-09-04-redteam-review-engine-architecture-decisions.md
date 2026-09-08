@@ -320,3 +320,39 @@ roadmap P0 ✅、followup 四行归位、M21b / M21c / M21e / M21a 的 `--risk` 
 
 **代价与残余**：默认配置（单 scanner、samples=1）下必挖集 = 纯规则主区，疑点全部走预算 + 保底；大 diff 首轮只保证 top-K 疑点深挖；
 规则权重不可用户调，跨语言 / 跨仓库校准留 R18；`--risk off` 型快扫无入口，需要时另立命令。
+
+---
+
+## D12 配置格式与形状：JSON + provider → models → roles（2026-09-08，取代 D7 A1 / A2）
+
+**议题**：批 A 按 D7 A2 落地（be87c44）后用户看到实际配置：同一模型在两个角色各写一遍全部字段、`[[scanners]]` 表数组不直观、
+角色 / 模型引用不清；批 A ship 评审与 code-review（high）的必修项 #2 #3 #4（原位更新整条替换、覆写共享 provider 字段、写前不校验）
+也都源于「内联条目 + 表数组」。用户重提格式（TOML 不喜欢；问 JSON）并给出 JSON 示例。
+
+**候选与被否**
+- 被否：保留 TOML 只改形状（两层 `[models]` + `[roles]`）——能解形状问题，但用户明确不用 TOML。
+- 被否：YAML——D7 A1 的三条理由仍成立（无成熟保注释编辑器、`serde_yaml` 弃用且替代碎片化、隐式类型脚枪）。
+- 被否：JSON 允许 `//` 注释（`json_comments` 剥离）——用户选不要注释：少一个 crate、少一条「写回丢注释」的解释。
+
+**定案**
+1. **格式**：`$REDTEAM_HOME/config.json` + `secrets.json`（缺省 `~/.redteam/`），严格 JSON（`serde_json`，已是依赖），键 camelCase，
+   无注释；`toml` 依赖退出。JSON 正好绕开 D7 A1 的三条顾虑。
+2. **形状**（模型固有字段只写一次，角色属性挂模型下）：
+   `providers.<name>{ kind?, baseUrl?, apiKeyEnv?, maxConcurrency?, models.<id>{ name?, kind?, apiKeyEnv?, family?, contextWindow?,
+   maxOutputTokens?, perTurnTimeoutSecs?, reasoning?, roles.<scanner|reviewer|verifier>{ thinkingLevel? } } }` + `review{ … }`。
+   某角色的活跃集 = 拥有该角色键的全部模型（列表即活跃集、无候补，D7 A3 不变）；顺序按 provider 名、model id 字典序（无语义，不为保序引依赖）。
+3. **身份**：route_key / 报告名 = `provider/id`；`name` 只作人读显示；`family` 缺省 id 首段。`kind` = 模型层 > provider 层，两者都缺 → 校验报错。
+4. **secrets.json**：`{"providers": {"<name>": {"apiKey": "…", "models": {"<id>": "…"}}}}`；解析链：模型 `apiKeyEnv`(env) → secrets.models[id]
+   → provider `apiKeyEnv`(env) → secrets.apiKey；守卫：secrets 里的 provider 名 / model id 在 config 无对应 → warning；chmod 600。
+5. **`model setup`**：`--provider X --model <id> --role scanner[,reviewer,verifier] [--name --kind --base-url --max-concurrency --context-window
+   --max-output-tokens --reasoning --thinking-level --key --key-store env|secrets --model-key]`；provider / model / role 三层各自**只合并显式给出的字段**；
+   写前对合并结果做完整解析 + 校验，失败拒写；现有文件解析失败拒写不覆写（`write_secret` 同策略）。
+6. **并入 code-review（high）项**：HOME 与 REDTEAM_HOME 皆缺 → 报错，不退化为相对路径（#1，安全）；单轮超时 = 模型 `perTurnTimeoutSecs` >
+   `REDTEAM_PER_TURN_SECS` > `实际生效 max_tokens ÷ 20 + 60` > 150s（#6）；`contextWindow` 下限（#7）；纯注释的旧 `.redteam/config.toml`
+   不刷提示（#9）；secrets 未知 provider 名告警（#10）；`infer_test_command` 不把 `test:=` / npm 占位脚本当测试命令（#11）；读配置区分
+   不存在与权限错误（#13）；`--resume` 帮助文案改正（#14）；setup 落盘后探测走刚写模型的解析链（#5）。ship.md 透传 `--models`（#12）记 followup，M21c 一并改。
+
+**依据**：用户判断（格式）；按 id 做键的对象天然消灭表数组与原位更新歧义；显式字段合并消灭跨条目覆写；`serde_json` 是本仓最稳的依赖。
+
+**代价与残余**：无注释——`--help` 与 `redteam model list` 是在场文档；批 A 首版（TOML）整体重做约半天，在 `feat/m21a-config-json`；
+手改 JSON 易错（尾逗号），报错须带行列；design §12 重写、roadmap M21a 交付项 1 与 plan 批 A 措辞同步。

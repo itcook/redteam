@@ -13,7 +13,7 @@
 
 | # | 项 | design | 落点 |
 |---|---|---|---|
-| 1 | **配置节**：`~/.redteam/config.toml` + `secrets.toml`，`REDTEAM_HOME` 覆盖；`[providers.X]` 键名表 + `max_concurrency`；`[[scanners]]` / `[[reviewers]]` / `[[verifiers]]` 内联条目，`name` 缺省 `provider/model_id`、`family` 缺省 model_id 首段；`[review.*]` 子表；secrets 新形状（`api_key` + `"<model_id>" = key`，值可内联表）+ 引号守卫 + 未知键警告；解析链；**删除项目层配置与剥离清单**；`--test-command` flag + 推断；`priority` / `--models` / `--models-all` / `XDG_CONFIG_HOME` 退场；`model setup` 写新形状 | §12 | `src/config/mod.rs`, `src/config/secrets.rs`, `src/cli/mod.rs` resolve_models, `src/main.rs` build_registry / setup |
+| 1 | **配置节**〔D12 改 JSON〕：`~/.redteam/config.json` + `secrets.json`，`REDTEAM_HOME` 覆盖；providers → models（按 id 做键）→ roles（`thinkingLevel` 角色属性）；`review.*` 子表；secrets 解析链 + 未知 provider / model 告警；`model setup` 三层只合并显式字段、写前校验、解析失败拒写；**删除项目层配置与剥离清单**；`--test-command` flag + `redteam test-command` 推断；`priority` / `--models` / `--models-all` / `XDG_CONFIG_HOME` / `toml` 依赖退场。首版（TOML，be87c44）已合回，按 D12 在 `feat/m21a-config-json` 重做并并入 code-review 项 | §12 | `src/config/mod.rs`, `src/config/secrets.rs`, `src/cli/mod.rs`, `src/main.rs` build_registry / setup |
 | 1b | **proj.db schema v4 一次重置**（D10）：cell 带角色、suspicions、queue_snapshot、coverage 五集合、runs meta（refute 率 / 台账数 / 模板哈希 / provider 在途峰值）；不写迁移；重置前把旧库 dismissed / upheld findings 导出为 `eval/fixtures/ledger-*.jsonl`（verifier 回归集数据） | §8, R14 | `src/state/mod.rs`, `src/db.rs`, `eval/` |
 | 2 | 引用图分组：changed 间引用边 / import 边 / 同目录边 → 连通分量 → 弱缝先切 → 宁降不拆 → 孤立文件 bin-packing；ocr 双阈值门（4 / 200 / 10 起步） | §3.2 | `src/bundle/mod.rs`：`group` / `extract_imports` 重写，**先补** TS 裸模块 / Rust `use crate` / Go 包路径；边集保留 |
 | 3 | 正反向跨组索引 + `{{OTHER_CHANGED_FILES}}` 槽升级 + 增量轮 `[delta]` 标注；omit 清单「降质 + 留指针」 | §10.6 | `src/bundle/mod.rs`, `src/prompt/mod.rs` |
@@ -31,8 +31,7 @@
 
 ## 验收
 
-- 配置：旧路径 `~/.config/redteam/` 与项目 `.redteam/config.toml` 存在时不读、打印一行提示；引用不存在的 provider →
-  聚合报错；secrets 里裸写带点 id → 「是否漏了引号」提示；未知 model_id 键 → warning；`--test-command` 覆盖推断。
+- 配置〔D12〕：旧路径 `~/.config/redteam/` 与项目 `.redteam/config.toml` 存在时不读、打印一行提示（纯注释模板不提示）；模型 `kind` 两层都缺 / `contextWindow` 低于下限 → 校验报错；secrets 里 provider 名或 model id 无对应 → warning；`model setup` 写前校验、解析失败拒写；HOME 与 REDTEAM_HOME 皆缺 → 报错；`--test-command` 覆盖推断。
 - PR181 v2 scan：分组 ≤ 5 组、跨组边数可观测；DeepSeek 分组并行墙钟 ≤ 3 min；疑点 oracle 命中 ≥ E3 基线；两个活跃
   scanner 时疑点并集与 agreement 正确。
 - 段序翻转后 dogfood cache 命中率 ≥ 翻转前。
