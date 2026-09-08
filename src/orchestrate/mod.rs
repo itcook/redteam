@@ -430,7 +430,7 @@ mod tests {
     }
 
     fn bundle(path: &str) -> Bundle {
-        Bundle { files: vec![FileChange { path: path.into(), diff: "+x".into() }] }
+        Bundle::from_files(vec![FileChange { path: path.into(), diff: "+x".into() }])
     }
 
     // ---- 二阶段补查测试助手（design §2.3）----
@@ -626,8 +626,8 @@ mod tests {
         scripted.insert("beta".into(), vec![raw_at("src/a.rs", "beta-issue", Severity::High)]);
         let provider = crate::provider::fake::FakeProvider { scripted, ..Default::default() };
         let bundles = vec![
-            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] },
-            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "+y".into() }] },
+            Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }]),
+            Bundle::from_files(vec![FileChange { path: "src/b.rs".into(), diff: "+y".into() }]),
         ];
         let opts = OrchestrateOpts {
             models: vec![
@@ -655,7 +655,7 @@ mod tests {
             "alpha",
             vec![raw_at("src/a.rs", "alpha-issue", Severity::High)],
         );
-        let bundles = vec![Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }] }];
+        let bundles = vec![Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: "+x".into() }])];
         let opts = OrchestrateOpts {
             models: vec![
                 PlannedModel { name: "alpha".into(), priority: 10 },

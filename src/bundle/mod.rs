@@ -9,9 +9,6 @@ const NOISE_NAMES: &[&str] = &[
     "poetry.lock", "Gemfile.lock", "composer.lock",
 ];
 
-/// 通用入口/聚合文件词干：同词干不代表逻辑相关，不参与同词干 union（只靠同目录 + import）。
-const GENERIC_STEMS: &[&str] = &["mod", "lib", "main", "index", "__init__", "init"];
-
 fn filename(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[i + 1..],
@@ -41,10 +38,178 @@ pub fn select_files(changes: Vec<FileChange>) -> Vec<FileChange> {
         .collect()
 }
 
+/// 边类型（design §3.2〔D3〕）：import 强；引用边按次数计（≥ 2 强、= 1 弱，K3）；同目录弱。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EdgeKind {
+    Import,
+    Reference { count: u32 },
+    SameDir,
+}
+
+/// 改动文件间的一条边。方向：Import = `from` 引入 `to`；Reference = `from` 的文本里出现 `to` 的
+/// 改动 def 名（`from` 引用 `to`）；SameDir 无向、存一次（`from < to`）。端点用路径而非索引：跨组边
+/// 要同时出现在两端 bundle 的 `edges` 里，路径键免去全局索引表传递。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Edge {
+    pub from: String,
+    pub to: String,
+    pub kind: EdgeKind,
+}
+
+impl Edge {
+    pub fn is_strong(&self) -> bool {
+        match &self.kind {
+            EdgeKind::Import => true,
+            EdgeKind::Reference { count } => *count >= 2,
+            EdgeKind::SameDir => false,
+        }
+    }
+}
+
+/// 一个评审组（cell 的装包单位）。
 #[derive(Clone, Debug)]
 pub struct Bundle {
+    /// 路径升序（cell label 稳定）。
     pub files: Vec<FileChange>,
+    /// 与本组文件相关的全部边（组内 + 跨组）。
+    pub edges: Vec<Edge>,
+    /// `files` 的填充序（枢纽先：组内 import 边数降序、同分按路径）；空 = 自然序。
+    pub hub_order: Vec<usize>,
+    /// 组仍超 `max_files_per_group` / 预算（切完弱边后）：宁降不拆，交装包梯子降内容。
+    pub over_budget: bool,
 }
+
+impl Bundle {
+    /// 无边、自然序、不超预算——测试与二阶段增强包用。
+    pub fn from_files(files: Vec<FileChange>) -> Bundle {
+        Bundle { files, edges: Vec::new(), hub_order: Vec::new(), over_budget: false }
+    }
+
+    /// 按填充序遍历（`hub_order` 缺失或长度不符 → 自然序）。
+    pub fn fill_order(&self) -> impl Iterator<Item = &FileChange> {
+        let order: Vec<usize> = if self.hub_order.len() == self.files.len() && !self.hub_order.is_empty() {
+            self.hub_order.clone()
+        } else {
+            (0..self.files.len()).collect()
+        };
+        order.into_iter().map(move |i| &self.files[i])
+    }
+}
+
+/// 分组旋钮（design §12.1 `[review.grouping]`，缺省 ocr 实测 4 / 200 / 10；配置解析归批 A，K1）。
+/// `budget_bytes`：组估算字节（Σ 文件全文 + diff）上限，由调用方喂 pack 预算；None 不按预算判。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupingOpts {
+    pub min_files: usize,
+    pub bundle_line_threshold: usize,
+    pub max_files_per_group: usize,
+    pub budget_bytes: Option<usize>,
+}
+
+impl Default for GroupingOpts {
+    fn default() -> Self {
+        GroupingOpts { min_files: 4, bundle_line_threshold: 200, max_files_per_group: 10, budget_bytes: None }
+    }
+}
+
+/// 双阈值门结果：`Single` = 文件数或 churn 未过门，全变更集一包。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gate {
+    Single,
+    Grouped,
+}
+
+/// 分组观测（M21a 只在 `--pack-only` 打印与 summary.json；RunMeta 接线 F-5）。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct GroupingStats {
+    pub gate: Gate,
+    pub groups: usize,
+    /// 全图边数（import + 引用 + 同目录）。
+    pub edges: usize,
+    /// 超限分量里被切掉的弱边数。
+    pub weak_cut: usize,
+    /// 端点异组的边数（分组切错的先验度量，R8）。
+    pub cross_edges: usize,
+    /// 原图无边的文件数。
+    pub isolated: usize,
+    /// `over_budget` 的组数。
+    pub over_budget: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct Grouping {
+    pub bundles: Vec<Bundle>,
+    pub stats: GroupingStats,
+}
+
+/// 引用边只看像「符号」的名字（K4，逐字移植 eval/risk_replay.py `fanin_worthy` / `GENERIC_NAMES`）：
+/// 过滤短名、通用名与纯小写短单词（cancel / resp / object 之类）。
+const GENERIC_NAMES: &[&str] = &[
+    "main", "init", "new", "string", "error", "handler", "handle", "run", "get", "set", "test", "default",
+    "index", "start", "stop", "close", "open", "read", "write", "name", "type", "value", "data", "config",
+];
+
+fn ref_worthy(n: &str) -> bool {
+    if n.len() < 4 || GENERIC_NAMES.contains(&n.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    if n.len() < 8 && n.chars().all(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    true
+}
+
+/// 改动 def 名（diffsym 支持语言）：hunk 外围 def 起行经 `match_def` 取名，`ref_worthy` 过滤，去重升序。
+fn changed_def_names(path: &str, diff: &str, content: &str) -> Vec<String> {
+    let Some(lang) = crate::diffsym::lang_for(path) else { return Vec::new() };
+    let defs = crate::diffsym::compile_defs(lang);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut names = std::collections::BTreeSet::new();
+    for (start, _end) in crate::diffsym::changed_def_ranges(diff, &lines, &defs) {
+        if let Some((_, name)) = lines.get(start).and_then(|l| crate::diffsym::match_def(l, &defs)) {
+            if ref_worthy(&name) {
+                names.insert(name);
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// 引用边扫描：改动文件数超此值时只扫对方 hunk（diff 文本）而非全文（design 允许「hunk 或全文」）。
+const REF_FULLTEXT_MAX_FILES: usize = 200;
+
+/// diff 增删行计数（排除 `+++ ` / `--- ` 文件头；裸 `---sep` 正文行计入——dogfood 20260703 r4）。
+/// 门的 churn 与清单 `(+a/-d)` 共用同一口径（K2）。
+pub(crate) fn count_plus_minus(diff: &str) -> (usize, usize) {
+    let (mut adds, mut dels) = (0usize, 0usize);
+    for l in diff.lines() {
+        if l.starts_with("+++ ") || l.starts_with("--- ") {
+            continue;
+        }
+        if l.starts_with('+') {
+            adds += 1;
+        } else if l.starts_with('-') {
+            dels += 1;
+        }
+    }
+    (adds, dels)
+}
+
+/// 并查集连通分量：`n` 个节点 + 边对 → 分量列表（每分量成员升序、分量按最小成员升序）。
+fn components(n: usize, pairs: impl Iterator<Item = (usize, usize)>) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..n).collect();
+    for (a, b) in pairs {
+        union(&mut parent, a, b);
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..n {
+        let r = uf_find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+    groups.into_values().collect()
+}
+
 
 /// 清单条目上限——超出截断为「… and N more files」（与 dismissed notes 同思路的体积防护）。
 const MANIFEST_MAX_ENTRIES: usize = 200;
@@ -65,20 +230,7 @@ pub fn other_files_manifest(bundles: &[Bundle], exclude: usize) -> String {
             continue;
         }
         for fc in &b.files {
-            let (mut adds, mut dels) = (0usize, 0usize);
-            for l in fc.diff.lines() {
-                // 文件头恒为 "--- a/…"/"+++ b/…"/"--- /dev/null"（带空格）；裸 "---"/"+++"
-                // 前缀会误跳正文增删行（如删除 "--separator" → diff 行 "---separator"，
-                // dogfood 20260703 r4 8eae1f24 agree=2）。
-                if l.starts_with("+++ ") || l.starts_with("--- ") {
-                    continue;
-                }
-                if l.starts_with('+') {
-                    adds += 1;
-                } else if l.starts_with('-') {
-                    dels += 1;
-                }
-            }
+            let (adds, dels) = count_plus_minus(&fc.diff);
             entries.push(format!("{} (+{adds}/-{dels})", fc.path));
         }
     }
@@ -122,27 +274,6 @@ pub fn two_layer_manifest(all_files: &[String], delta: &std::collections::BTreeS
         .map(|p| if delta.contains(p) { format!("{p} [delta]") } else { p.clone() })
         .collect();
     cap_entries(entries)
-}
-
-/// 单个文件包的文件数上限（超出按排序切块）。
-pub const BUNDLE_MAX_FILES: usize = 8;
-
-fn parent_dir(path: &str) -> &str {
-    match path.rfind('/') {
-        Some(i) => &path[..i],
-        None => "",
-    }
-}
-
-/// 词干：文件名去掉首个 '.' 之后部分（widget.test.ts 与 widget.ts 同词干 "widget"）。
-/// dotfile（首字符即 '.'）整名作词干，避免空词干把所有 dotfile 误并一包。
-fn stem(path: &str) -> &str {
-    let f = filename(path);
-    match f.find('.') {
-        Some(0) => f,
-        Some(i) => &f[..i],
-        None => f,
-    }
 }
 
 fn uf_find(parent: &mut [usize], x: usize) -> usize {
@@ -881,64 +1012,214 @@ pub fn import_edges(path: &str, content: &str, r: &ImportResolver<'_>) -> Vec<Im
     targets.into_iter().map(|to| ImportEdge { to }).collect()
 }
 
-/// 轻量分包（确定性）：同父目录、或同词干（排除通用入口名）、或 import 互引 → 并到一包；
-/// 超 cap 按排序切块。`root=Some` 时读各改动文件全文做 import union；`None` 退化到目录+词干。
-pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>) -> Vec<Bundle> {
+/// 确定性引用图分组（design §3.2〔D3〕）：边 = import（强）+ 引用（按次数）+ 同目录（弱）→
+/// 双阈值门（文件数 / churn 未过 → 单包）→ 连通分量 → 超限分量先整体切弱边（K3）→ 仍超标
+/// `over_budget`、宁降不拆 → 孤立与落单文件按目录 bin-packing（K6）→ 组按首文件路径升序，
+/// 组内 `hub_order` 按 import 边数降序（枢纽保全文）。`root=None` 时无全文：只有同目录边。
+/// 安全不变量：路径来自 git diff（仓内相对、非模型可控），`root.join` 直读；读失败即降级为无全文。
+pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingOpts) -> Grouping {
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     let n = changes.len();
+    let empty_stats = |gate: Gate| GroupingStats {
+        gate, groups: 0, edges: 0, weak_cut: 0, cross_edges: 0, isolated: 0, over_budget: 0,
+    };
     if n == 0 {
-        return Vec::new();
+        return Grouping { bundles: Vec::new(), stats: empty_stats(Gate::Single) };
     }
-    let mut parent: Vec<usize> = (0..n).collect();
-    #[allow(clippy::needless_range_loop)]
+    let paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+    let idx: BTreeMap<&str, usize> = paths.iter().enumerate().map(|(i, p)| (p.as_str(), i)).collect();
+    let contents: Vec<Option<String>> = match root {
+        Some(r) => changes.iter().map(|c| std::fs::read_to_string(r.join(&c.path)).ok()).collect(),
+        None => vec![None; n],
+    };
+
+    // ---- 边 ----
+    let mut edges: Vec<Edge> = Vec::new();
+    let resolver = ImportResolver::new(root, &paths);
     for i in 0..n {
-        for j in (i + 1)..n {
-            let same_dir = parent_dir(&changes[i].path) == parent_dir(&changes[j].path);
-            let si = stem(&changes[i].path);
-            let same_stem = si == stem(&changes[j].path) && !GENERIC_STEMS.contains(&si);
-            if same_dir || same_stem {
-                union(&mut parent, i, j);
-            }
-        }
-    }
-    // import union（仅当给定 root）：A 引用了同在改动集里的 B → 并包。
-    if let Some(root) = root {
-        let paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
-        let resolver = ImportResolver::new(Some(root), &paths);
-        let idx: BTreeMap<&str, usize> = paths.iter().enumerate().map(|(i, p)| (p.as_str(), i)).collect();
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..n {
-            // 安全不变量：changes[i].path 来自 git diff（仓内相对、git 跟踪、非模型可控），
-            // 故此处 root.join 直读无需 positioning::safe_read 的 canonical-root/软链防逃逸；
-            // 读失败即 continue 降级。若未来 caller 改喂不可信来源（spec/LLM 提议清单），须补该防护。
-            let full = root.join(&changes[i].path);
-            let content = match std::fs::read_to_string(&full) {
-                Ok(c) => c,
-                Err(_) => continue, // 读失败/二进制 → 跳过该文件 import（退化）
-            };
-            for e in import_edges(&changes[i].path, &content, &resolver) {
-                if let Some(&j) = idx.get(e.to.as_str()) {
-                    if i != j {
-                        union(&mut parent, i, j);
-                    }
+        let Some(content) = &contents[i] else { continue };
+        for e in import_edges(&paths[i], content, &resolver) {
+            if let Some(&j) = idx.get(e.to.as_str()) {
+                if i != j {
+                    edges.push(Edge { from: paths[i].clone(), to: paths[j].clone(), kind: EdgeKind::Import });
                 }
             }
         }
     }
-    // 按代表元聚组（成员索引升序，因已排序）
-    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let full_text = n <= REF_FULLTEXT_MAX_FILES;
     for i in 0..n {
-        let r = uf_find(&mut parent, i);
-        groups.entry(r).or_default().push(i);
-    }
-    let mut bundles = Vec::new();
-    for (_root_idx, idxs) in groups {
-        for chunk in idxs.chunks(BUNDLE_MAX_FILES) {
-            let files = chunk.iter().map(|&k| changes[k].clone()).collect();
-            bundles.push(Bundle { files });
+        let Some(content) = &contents[i] else { continue };
+        let names = changed_def_names(&paths[i], &changes[i].diff, content);
+        if names.is_empty() {
+            continue;
+        }
+        let pat = format!(r"\b(?:{})\b", names.iter().map(|s| regex::escape(s)).collect::<Vec<_>>().join("|"));
+        let Ok(re) = regex::Regex::new(&pat) else { continue };
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let text: &str = if full_text {
+                contents[j].as_deref().unwrap_or(&changes[j].diff)
+            } else {
+                &changes[j].diff
+            };
+            let count = re.find_iter(text).count();
+            if count > 0 {
+                edges.push(Edge {
+                    from: paths[j].clone(),
+                    to: paths[i].clone(),
+                    kind: EdgeKind::Reference { count: count as u32 },
+                });
+            }
         }
     }
-    bundles
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if dir_of(&paths[i]) == dir_of(&paths[j]) {
+                edges.push(Edge { from: paths[i].clone(), to: paths[j].clone(), kind: EdgeKind::SameDir });
+            }
+        }
+    }
+    let pair = |e: &Edge| (idx[e.from.as_str()], idx[e.to.as_str()]);
+    let est = |ids: &[usize]| -> usize {
+        ids.iter().map(|&i| contents[i].as_ref().map(|c| c.len()).unwrap_or(0) + changes[i].diff.len()).sum()
+    };
+    let oversize = |ids: &[usize]| {
+        ids.len() > opts.max_files_per_group || opts.budget_bytes.map(|b| est(ids) > b).unwrap_or(false)
+    };
+    let make_bundle = |ids: &[usize], over_budget: bool| -> Bundle {
+        let set: std::collections::BTreeSet<usize> = ids.iter().copied().collect();
+        let files: Vec<FileChange> = ids.iter().map(|&i| changes[i].clone()).collect();
+        let edges_g: Vec<Edge> = edges
+            .iter()
+            .filter(|e| {
+                let (a, b) = pair(e);
+                set.contains(&a) || set.contains(&b)
+            })
+            .cloned()
+            .collect();
+        let pos = |g: usize| ids.iter().position(|&x| x == g).unwrap_or(0);
+        let mut score = vec![0usize; ids.len()];
+        for e in &edges_g {
+            if e.kind == EdgeKind::Import {
+                let (a, b) = pair(e);
+                if set.contains(&a) && set.contains(&b) {
+                    score[pos(a)] += 1;
+                    score[pos(b)] += 1;
+                }
+            }
+        }
+        let mut hub_order: Vec<usize> = (0..ids.len()).collect();
+        hub_order.sort_by(|&x, &y| score[y].cmp(&score[x]).then_with(|| files[x].path.cmp(&files[y].path)));
+        Bundle { files, edges: edges_g, hub_order, over_budget }
+    };
+    let mut degree = vec![0usize; n];
+    for e in &edges {
+        let (a, b) = pair(e);
+        degree[a] += 1;
+        degree[b] += 1;
+    }
+    let isolated = degree.iter().filter(|&&d| d == 0).count();
+
+    // ---- 门 ----
+    let churn: usize = changes
+        .iter()
+        .map(|c| {
+            let (a, d) = count_plus_minus(&c.diff);
+            a + d
+        })
+        .sum();
+    if n < opts.min_files || churn < opts.bundle_line_threshold {
+        let all: Vec<usize> = (0..n).collect();
+        let bundle = make_bundle(&all, oversize(&all));
+        let stats = GroupingStats {
+            gate: Gate::Single, groups: 1, edges: edges.len(), weak_cut: 0, cross_edges: 0, isolated,
+            over_budget: bundle.over_budget as usize,
+        };
+        return Grouping { bundles: vec![bundle], stats };
+    }
+
+    // ---- 分量 → 弱缝切 → 落单回池 ----
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut pool: Vec<usize> = Vec::new();
+    let mut weak_cut = 0usize;
+    for comp in components(n, edges.iter().map(pair)) {
+        if comp.len() == 1 {
+            pool.push(comp[0]);
+            continue;
+        }
+        if !oversize(&comp) {
+            groups.push(comp);
+            continue;
+        }
+        let set: std::collections::BTreeSet<usize> = comp.iter().copied().collect();
+        let inside: Vec<&Edge> = edges
+            .iter()
+            .filter(|e| {
+                let (a, b) = pair(e);
+                set.contains(&a) && set.contains(&b)
+            })
+            .collect();
+        weak_cut += inside.iter().filter(|e| !e.is_strong()).count();
+        // 强边子分量：comp 内局部索引做并查集，再映射回全局索引
+        let local: BTreeMap<usize, usize> = comp.iter().enumerate().map(|(k, &g)| (g, k)).collect();
+        let strong_pairs = inside.iter().filter(|e| e.is_strong()).map(|e| {
+            let (a, b) = pair(e);
+            (local[&a], local[&b])
+        });
+        for sub in components(comp.len(), strong_pairs) {
+            let sub: Vec<usize> = sub.iter().map(|&k| comp[k]).collect();
+            if sub.len() == 1 {
+                pool.push(sub[0]);
+            } else {
+                groups.push(sub);
+            }
+        }
+    }
+    // 孤立 / 落单文件：按（目录，路径）排序后贪心装箱到文件数与预算上限（K6）。
+    pool.sort_by(|&a, &b| (dir_of(&paths[a]), &paths[a]).cmp(&(dir_of(&paths[b]), &paths[b])));
+    let mut bin: Vec<usize> = Vec::new();
+    for i in pool {
+        let fits = bin.len() < opts.max_files_per_group
+            && opts.budget_bytes.map(|b| est(&bin) + est(&[i]) <= b).unwrap_or(true);
+        if !bin.is_empty() && !fits {
+            groups.push(std::mem::take(&mut bin));
+        }
+        bin.push(i);
+    }
+    if !bin.is_empty() {
+        groups.push(bin);
+    }
+    for g in &mut groups {
+        g.sort_unstable();
+    }
+    groups.sort_by_key(|g| g[0]);
+
+    let mut group_of = vec![0usize; n];
+    for (gi, g) in groups.iter().enumerate() {
+        for &i in g {
+            group_of[i] = gi;
+        }
+    }
+    let cross_edges = edges
+        .iter()
+        .filter(|e| {
+            let (a, b) = pair(e);
+            group_of[a] != group_of[b]
+        })
+        .count();
+    let bundles: Vec<Bundle> = groups.iter().map(|g| make_bundle(g, oversize(g))).collect();
+    let stats = GroupingStats {
+        gate: Gate::Grouped,
+        groups: bundles.len(),
+        edges: edges.len(),
+        weak_cut,
+        cross_edges,
+        isolated,
+        over_budget: bundles.iter().filter(|b| b.over_budget).count(),
+    };
+    Grouping { bundles, stats }
 }
 
 #[cfg(test)]
@@ -984,49 +1265,6 @@ mod tests {
         ]);
         let paths: Vec<&str> = out.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, vec!["src/a.rs", "src/doc.rs"]);
-    }
-
-    #[test]
-    fn group_unions_same_directory() {
-        let out = group(vec![fc("src/auth/login.rs", "+a"), fc("src/auth/token.rs", "+b")], None);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].files.len(), 2);
-    }
-
-    #[test]
-    fn group_unions_same_stem_across_dirs() {
-        // widget.tsx 与 widget.css 同词干 → 同包
-        let out = group(vec![fc("ui/widget.tsx", "+a"), fc("styles/widget.css", "+b")], None);
-        assert_eq!(out.len(), 1);
-    }
-
-    #[test]
-    fn group_separates_unrelated() {
-        let out = group(vec![fc("src/auth/login.rs", "+a"), fc("docs/readme.md", "+b")], None);
-        assert_eq!(out.len(), 2);
-    }
-
-    #[test]
-    fn group_splits_oversized_at_cap() {
-        // 同目录 10 文件 → 切成 8 + 2
-        let changes: Vec<FileChange> = (0..10)
-            .map(|i| fc(&format!("src/m/f{i:02}.rs"), "+x"))
-            .collect();
-        let out = group(changes, None);
-        assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|b| b.files.len() <= BUNDLE_MAX_FILES));
-        assert_eq!(out[0].files.len() + out[1].files.len(), 10);
-        assert_eq!(out[0].files.len(), 8);
-        assert_eq!(out[1].files.len(), 2);
-        assert!(out[0].files[0].path.ends_with("f00.rs"));
-        assert!(out[1].files[0].path.ends_with("f08.rs"));
-    }
-
-    #[test]
-    fn group_does_not_union_distinct_dotfiles() {
-        // 修复前：两个 dotfile 空词干 → 被错误并一包；修复后各自成包
-        let out = group(vec![fc("a/.gitignore", "+x"), fc("b/.eslintrc", "+y")], None);
-        assert_eq!(out.len(), 2);
     }
 
     fn edges(path: &str, src: &str, changed: &[&str], root: Option<&Path>) -> Vec<String> {
@@ -1172,39 +1410,202 @@ mod tests {
         assert_eq!(got, vec!["pkg/api/models.py".to_string(), "pkg/api/pkg/__init__.py".into(), "pkg/db/repo.py".into()]);
     }
 
+    /// 过门旋钮（文件数 / churn 门关掉，只看图算法）。
+    fn open_gate(max_files: usize, budget: Option<usize>) -> GroupingOpts {
+        GroupingOpts { min_files: 1, bundle_line_threshold: 0, max_files_per_group: max_files, budget_bytes: budget }
+    }
+
+    fn paths_of(b: &Bundle) -> Vec<&str> {
+        b.files.iter().map(|f| f.path.as_str()).collect()
+    }
+
     #[test]
-    fn group_unions_by_relative_import_across_dirs() {
+    fn group_empty_input_is_empty() {
+        let g = group(vec![], None, &GroupingOpts::default());
+        assert!(g.bundles.is_empty());
+        assert_eq!(g.stats.groups, 0);
+    }
+
+    #[test]
+    fn group_gate_single_bundle_keeps_edges() {
+        // 文件数 < min_files → 单包，但边照算（跨组索引与观测要用）
+        let g = group(vec![fc("src/a.rs", "+a"), fc("src/b.rs", "+b"), fc("src/c.rs", "+c")], None, &GroupingOpts::default());
+        assert_eq!(g.bundles.len(), 1);
+        assert_eq!(g.stats.gate, Gate::Single);
+        assert_eq!(g.bundles[0].edges.len(), 3, "同目录三边: {:?}", g.bundles[0].edges);
+        assert_eq!(g.bundles[0].hub_order.len(), 3);
+        assert!(!g.bundles[0].over_budget);
+        // 文件数够但 churn < bundle_line_threshold → 仍单包
+        let five: Vec<FileChange> = (0..5).map(|i| fc(&format!("d{i}/f.rs"), "+x\n-y")).collect();
+        let g = group(five.clone(), None, &GroupingOpts::default());
+        assert_eq!((g.stats.gate, g.bundles.len()), (Gate::Single, 1));
+        // churn 过门（每文件 40 增删行 × 5 = 200）→ 分组
+        let big = "+x\n".repeat(40);
+        let five: Vec<FileChange> = (0..5).map(|i| fc(&format!("d{i}/f.rs"), &big)).collect();
+        let g = group(five, None, &GroupingOpts::default());
+        assert_eq!(g.stats.gate, Gate::Grouped);
+        assert_eq!(g.stats.isolated, 5, "五个不同目录、无全文 → 全孤立");
+    }
+
+    #[test]
+    fn group_two_components_by_same_dir() {
+        let g = group(
+            vec![fc("a/1.rs", "+x"), fc("a/2.rs", "+x"), fc("b/1.rs", "+x"), fc("b/2.rs", "+x")],
+            None,
+            &open_gate(10, None),
+        );
+        assert_eq!(g.bundles.len(), 2);
+        assert_eq!(paths_of(&g.bundles[0]), vec!["a/1.rs", "a/2.rs"]);
+        assert_eq!(paths_of(&g.bundles[1]), vec!["b/1.rs", "b/2.rs"]);
+        assert_eq!(g.stats, GroupingStats { gate: Gate::Grouped, groups: 2, edges: 2, weak_cut: 0, cross_edges: 0, isolated: 0, over_budget: 0 });
+    }
+
+    #[test]
+    fn group_unions_by_import_across_dirs() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src/feat")).unwrap();
-        std::fs::create_dir_all(dir.path().join("util")).unwrap();
-        std::fs::write(dir.path().join("src/feat/x.ts"), "import {b} from '../../util/b';\n").unwrap();
-        std::fs::write(dir.path().join("util/b.ts"), "export const b = 1;\n").unwrap();
-        // 不同目录、不同词干，仅靠 import 关联
-        let changes = vec![fc("src/feat/x.ts", "+import"), fc("util/b.ts", "+export")];
-        let out = group(changes, Some(dir.path()));
-        assert_eq!(out.len(), 1, "relative import should union across dirs");
-        assert_eq!(out[0].files.len(), 2);
+        write(dir.path(), "src/feat/x.ts", "import {b} from '../../util/b';\n");
+        write(dir.path(), "util/b.ts", "export const b = 1;\n");
+        write(dir.path(), "zzz/c.py", "c = 1\n");
+        write(dir.path(), "zzz/d.py", "d = 1\n");
+        let changes = vec![fc("src/feat/x.ts", "+import"), fc("util/b.ts", "+export"), fc("zzz/c.py", "+c"), fc("zzz/d.py", "+d")];
+        let g = group(changes, Some(dir.path()), &open_gate(2, None));
+        assert_eq!(g.bundles.len(), 2, "import 跨目录并组 + 同目录弱边并组: {:?}", g.bundles.iter().map(paths_of).collect::<Vec<_>>());
+        assert_eq!(paths_of(&g.bundles[0]), vec!["src/feat/x.ts", "util/b.ts"]);
+        assert!(g.bundles[0].edges.iter().any(|e| e.kind == EdgeKind::Import && e.from == "src/feat/x.ts" && e.to == "util/b.ts"));
+        assert_eq!(paths_of(&g.bundles[1]), vec!["zzz/c.py", "zzz/d.py"]);
     }
 
     #[test]
-    fn group_generic_stems_do_not_over_union() {
-        // 两个不同目录的 mod.rs：词干都是 "mod"（通用），不应仅因同词干并包
-        let out = group(vec![fc("a/mod.rs", "+x"), fc("b/mod.rs", "+y")], None);
-        assert_eq!(out.len(), 2, "generic stem 'mod' must not union unrelated files");
+    fn group_reference_edges_by_changed_def_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "pub fn compute_total() -> u32 { 1 }\n");
+        write(dir.path(), "src/b.rs", "fn x() { compute_total(); compute_total(); }\n");
+        write(dir.path(), "other/c.rs", "fn y() { let t = compute_total(); }\n");
+        write(dir.path(), "other/d.rs", "fn z() {}\n");
+        let changes = vec![
+            fc("src/a.rs", "@@ -1,0 +1,1 @@\n+pub fn compute_total() -> u32 { 1 }\n"),
+            fc("src/b.rs", "+x"), fc("other/c.rs", "+y"), fc("other/d.rs", "+z"),
+        ];
+        let g = group(changes, Some(dir.path()), &open_gate(10, None));
+        let all: Vec<&Edge> = g.bundles.iter().flat_map(|b| b.edges.iter()).collect();
+        assert!(all.iter().any(|e| e.from == "src/b.rs" && e.to == "src/a.rs" && e.kind == EdgeKind::Reference { count: 2 }), "{all:?}");
+        assert!(all.iter().any(|e| e.from == "other/c.rs" && e.to == "src/a.rs" && e.kind == EdgeKind::Reference { count: 1 }), "{all:?}");
+        assert!(!all.iter().any(|e| e.from == "other/d.rs" && e.kind != EdgeKind::SameDir), "d 不引用 a");
+        // 全部连通（a-b 同目录+强引用，c→a 弱引用，c-d 同目录）且 ≤ 10 → 一组
+        assert_eq!(g.bundles.len(), 1);
     }
 
     #[test]
-    fn group_none_root_falls_back_to_dir_and_stem() {
-        // root=None：无 import 提取，退化到目录+词干（同目录并包）
-        let out = group(vec![fc("src/auth/login.rs", "+a"), fc("src/auth/token.rs", "+b")], None);
-        assert_eq!(out.len(), 1);
+    fn group_cuts_weak_seam_when_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "m/a.ts", "import {b} from './b';\n");
+        write(dir.path(), "m/b.ts", "export const b = 1;\n");
+        write(dir.path(), "m/c.ts", "import {d} from './d';\n");
+        write(dir.path(), "m/d.ts", "export const d = 1;\n");
+        let changes = ["m/a.ts", "m/b.ts", "m/c.ts", "m/d.ts"].iter().map(|p| fc(p, "+x")).collect();
+        let g = group(changes, Some(dir.path()), &open_gate(2, None));
+        // 四文件同目录一个分量（6 弱 + 2 强）超 max=2 → 切全部弱边 → 强子分量 {a,b} {c,d}
+        assert_eq!(g.bundles.len(), 2, "{:?}", g.bundles.iter().map(paths_of).collect::<Vec<_>>());
+        assert_eq!(paths_of(&g.bundles[0]), vec!["m/a.ts", "m/b.ts"]);
+        assert_eq!(paths_of(&g.bundles[1]), vec!["m/c.ts", "m/d.ts"]);
+        assert_eq!(g.stats.weak_cut, 6);
+        assert_eq!(g.stats.cross_edges, 4, "跨组的 4 条同目录边仍是流水线产物");
+        assert_eq!(g.stats.over_budget, 0);
+        assert!(g.bundles[0].edges.iter().any(|e| e.kind == EdgeKind::SameDir && e.to == "m/c.ts"), "跨组边出现在两端 bundle");
+    }
+
+    #[test]
+    fn group_keeps_strong_component_marks_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a/a.ts", "import {b} from '../b/b';\n");
+        write(dir.path(), "b/b.ts", "import {c} from '../c/c';\n");
+        write(dir.path(), "c/c.ts", "export const c = 1;\n");
+        let changes: Vec<FileChange> = ["a/a.ts", "b/b.ts", "c/c.ts"].iter().map(|p| fc(p, "+x")).collect();
+        let g = group(changes.clone(), Some(dir.path()), &open_gate(2, None));
+        // 强链 a→b→c 超 max=2、无弱边可切 → 不拆、标 over_budget
+        assert_eq!(g.bundles.len(), 1);
+        assert!(g.bundles[0].over_budget);
+        assert_eq!((g.stats.weak_cut, g.stats.over_budget), (0, 1));
+        // 预算门：文件数够但估算字节超 → 同样 over_budget
+        let g = group(changes, Some(dir.path()), &open_gate(10, Some(10)));
+        assert_eq!(g.bundles.len(), 1);
+        assert!(g.bundles[0].over_budget);
+    }
+
+    #[test]
+    fn group_bin_packs_isolated_by_dir() {
+        let changes: Vec<FileChange> = ["e/1.rs", "a/1.rs", "c/1.rs", "b/1.rs", "d/1.rs"].iter().map(|p| fc(p, "+x")).collect();
+        let g = group(changes.clone(), None, &open_gate(2, None));
+        assert_eq!(g.bundles.iter().map(paths_of).collect::<Vec<_>>(), vec![vec!["a/1.rs", "b/1.rs"], vec!["c/1.rs", "d/1.rs"], vec!["e/1.rs"]]);
+        assert_eq!(g.stats.isolated, 5);
+        assert_eq!(g.stats.over_budget, 0);
+        // 预算装箱：无全文时估算 = diff 字节（"+x" = 2）→ 预算 3 每箱只装一个
+        let g = group(changes, None, &open_gate(10, Some(3)));
+        assert_eq!(g.bundles.len(), 5);
+        assert!(g.bundles.iter().all(|b| !b.over_budget));
+        // 单文件超预算 → 独占并标 over_budget
+        let g = group(vec![fc("a/1.rs", "+xxxxxxxx"), fc("b/1.rs", "+x")], None, &open_gate(10, Some(4)));
+        assert_eq!(g.bundles.len(), 2);
+        assert!(g.bundles[0].over_budget && !g.bundles[1].over_budget);
+    }
+
+    #[test]
+    fn group_repacks_singletons_after_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "m/a.ts", "import {b} from './b';\n");
+        write(dir.path(), "m/b.ts", "export const b = 1;\n");
+        write(dir.path(), "m/z.ts", "export const z = 1;\n");
+        let changes = ["m/a.ts", "m/b.ts", "m/z.ts"].iter().map(|p| fc(p, "+x")).collect();
+        let g = group(changes, Some(dir.path()), &open_gate(2, None));
+        // {a,b,z} 同目录超 max=2 → 切 3 弱边 → {a,b} 强 + z 落单回池装箱
+        assert_eq!(g.bundles.iter().map(paths_of).collect::<Vec<_>>(), vec![vec!["m/a.ts", "m/b.ts"], vec!["m/z.ts"]]);
+        assert_eq!(g.stats.weak_cut, 3);
+        assert_eq!(g.stats.isolated, 0, "z 原图有同目录边，不算孤立");
+    }
+
+    #[test]
+    fn hub_order_prefers_import_hubs() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["a", "b", "c"] {
+            write(dir.path(), &format!("m/{f}.ts"), "import {h} from './hub';\n");
+        }
+        write(dir.path(), "m/hub.ts", "export const h = 1;\n");
+        let changes = ["m/a.ts", "m/b.ts", "m/c.ts", "m/hub.ts"].iter().map(|p| fc(p, "+x")).collect();
+        let g = group(changes, Some(dir.path()), &open_gate(10, None));
+        assert_eq!(g.bundles.len(), 1);
+        assert_eq!(paths_of(&g.bundles[0]), vec!["m/a.ts", "m/b.ts", "m/c.ts", "m/hub.ts"], "files 保持路径序");
+        assert_eq!(g.bundles[0].hub_order, vec![3, 0, 1, 2], "hub（3 条 import 边）先填，其余按路径");
+        let filled: Vec<&str> = g.bundles[0].fill_order().map(|f| f.path.as_str()).collect();
+        assert_eq!(filled[0], "m/hub.ts");
+    }
+
+    #[test]
+    fn group_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "m/a.ts", "import {b} from './b';\n");
+        write(dir.path(), "m/b.ts", "export const b = 1;\n");
+        write(dir.path(), "n/c.ts", "export const c = 1;\n");
+        let mk = |order: &[&str]| order.iter().map(|p| fc(p, "+x")).collect::<Vec<_>>();
+        let g1 = group(mk(&["n/c.ts", "m/b.ts", "m/a.ts"]), Some(dir.path()), &open_gate(10, None));
+        let g2 = group(mk(&["m/a.ts", "n/c.ts", "m/b.ts"]), Some(dir.path()), &open_gate(10, None));
+        assert_eq!(g1.stats, g2.stats);
+        assert_eq!(g1.bundles.iter().map(paths_of).collect::<Vec<_>>(), g2.bundles.iter().map(paths_of).collect::<Vec<_>>());
+        assert_eq!(g1.bundles.iter().map(|b| b.hub_order.clone()).collect::<Vec<_>>(), g2.bundles.iter().map(|b| b.hub_order.clone()).collect::<Vec<_>>());
+        assert_eq!(g1.bundles.iter().map(|b| b.edges.clone()).collect::<Vec<_>>(), g2.bundles.iter().map(|b| b.edges.clone()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ref_worthy_filters_short_generic_and_plain_lowercase() {
+        assert!(ref_worthy("handleRequest") && ref_worthy("wrap_body") && ref_worthy("compute_total"));
+        assert!(!ref_worthy("cancel") && !ref_worthy("main") && !ref_worthy("Get") && !ref_worthy("abc"));
+        assert!(ref_worthy("subscribers"), "≥ 8 字符纯小写放行");
     }
 
     #[test]
     fn other_files_manifest_lists_counts_and_excludes_self() {
         let bundles = vec![
-            Bundle { files: vec![fc("a.rs", "+one\n+two\n-gone")] },
-            Bundle { files: vec![fc("b.rs", "--- a/b.rs\n+++ b/b.rs\n+x")] },
+            Bundle::from_files(vec![fc("a.rs", "+one\n+two\n-gone")]),
+            Bundle::from_files(vec![fc("b.rs", "--- a/b.rs\n+++ b/b.rs\n+x")]),
         ];
         let m = other_files_manifest(&bundles, 0);
         assert_eq!(m, "b.rs (+1/-0)", "排除自身；+++/--- 头不计增删");
@@ -1216,22 +1617,22 @@ mod tests {
     fn other_files_manifest_counts_body_lines_starting_with_dashes() {
         // 正文删除行内容为 "--sep"（diff 行 "---sep"）不得被当文件头跳过；真头 "--- a/…" 仍跳
         let bundles = vec![
-            Bundle { files: vec![fc("self.rs", "+s")] },
-            Bundle { files: vec![fc("a.rs", "--- a/a.rs\n+++ b/a.rs\n---sep\n+++x")] },
+            Bundle::from_files(vec![fc("self.rs", "+s")]),
+            Bundle::from_files(vec![fc("a.rs", "--- a/a.rs\n+++ b/a.rs\n---sep\n+++x")]),
         ];
         assert_eq!(other_files_manifest(&bundles, 0), "a.rs (+1/-1)", "裸 ---/+++ 正文行计入增删");
     }
 
     #[test]
     fn other_files_manifest_single_bundle_is_empty() {
-        let bundles = vec![Bundle { files: vec![fc("a.rs", "+x")] }];
+        let bundles = vec![Bundle::from_files(vec![fc("a.rs", "+x")])];
         assert!(other_files_manifest(&bundles, 0).is_empty(), "单包即全变更集 → 空");
     }
 
     #[test]
     fn other_files_manifest_truncates_over_cap() {
         let files: Vec<_> = (0..MANIFEST_MAX_ENTRIES + 5).map(|i| fc(&format!("f{i}.rs"), "+x")).collect();
-        let bundles = vec![Bundle { files: vec![fc("self.rs", "+s")] }, Bundle { files }];
+        let bundles = vec![Bundle::from_files(vec![fc("self.rs", "+s")]), Bundle::from_files(files)];
         let m = other_files_manifest(&bundles, 0);
         assert!(m.contains("more files"), "超上限截断并注记条数: {m}");
         assert!(m.len() <= MANIFEST_MAX_CHARS, "含注记总输出不超预算: len={}", m.len());
@@ -1243,7 +1644,7 @@ mod tests {
         let files: Vec<_> = (0..50)
             .map(|i| fc(&format!("very/deeply/nested/module/path/segment/that/keeps/going/and/going/file_number_{i:04}_with_long_name.rs"), "+x"))
             .collect();
-        let bundles = vec![Bundle { files: vec![fc("self.rs", "+s")] }, Bundle { files }];
+        let bundles = vec![Bundle::from_files(vec![fc("self.rs", "+s")]), Bundle::from_files(files)];
         let m = other_files_manifest(&bundles, 0);
         assert!(m.len() <= MANIFEST_MAX_CHARS, "含注记总输出不超预算: len={}", m.len());
         assert!(m.contains("more files"), "被截条数有注记: {m}");

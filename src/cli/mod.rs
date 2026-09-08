@@ -2,7 +2,7 @@
 //! 状态机（并发组 M16 定型，原地不动）。尾段引擎/spec/二阶段补查/增量评审已拆至
 //! 同目录子模块（M17-a 尾段统一，零语义 diff）。
 
-use crate::bundle::{group, select_files};
+use crate::bundle::{group, select_files, GroupingOpts};
 use crate::config::Config;
 use crate::domain::{DossierMeta, Finding, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
 use crate::evidence::git::FileChange;
@@ -192,18 +192,6 @@ pub(crate) fn pack_budget_bytes(cfg: &Config, model_names: &[String]) -> usize {
     PACK_BUDGET_BYTES.min(by_window)
 }
 
-/// 单格全审默认（E9 判决，2026-07-13 转正）：全变更集恒并成一个 bundle——分格在全景 pack
-/// 范式下=N 倍重复喂同一全景（两跑实证 input −77%、质量未见系统性下降）。空输入原样放行
-/// （不产出「一个空文件的 bundle」）——上游两处空证据守卫（`run_code_review` 的「no reviewable
-/// evidence」警告、`run_incremental_review` 的 delta 全噪声过滤报错）靠 `bundles.is_empty()`
-/// 判空，语义须保持不变。
-fn merge_bundles(bundles: Vec<crate::bundle::Bundle>) -> Vec<crate::bundle::Bundle> {
-    if bundles.is_empty() {
-        return bundles;
-    }
-    vec![crate::bundle::Bundle { files: bundles.into_iter().flat_map(|b| b.files).collect() }]
-}
-
 /// bundle → 卷宗段（每 bundle 一份，与 bundles 等长/等序）+ 覆盖 meta（T01⑥）。
 /// 唯一路径（E8-E 安乐死 SCIP/Dossier 引擎后 + Task 3 空臂 dev 开关整拆）：
 /// `build_pack`（0 壳完整体+省略清单，M15-S1）恒执行，无空臂开关。
@@ -247,11 +235,8 @@ pub async fn run_code_review(
     let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, root)?;
     let t0 = std::time::Instant::now();
 
-    // 1. 确定性筛选 + 分包
-    // 单格全审默认（E9，2026-07-13）：全变更集并成一个 bundle——分格在全景 pack 范式下
-    // =N 倍重复喂全景（两跑实证 input −77%、质量未见下降）。bundle::group 保留（收集与
-    // 未来 L4 拆缝用）；超预算由降级梯子（骨架/hunk 窗/省略清单）承接，不拆格。
-    let bundles = merge_bundles(group(select_files(changes), Some(root)));
+    // 1. 确定性筛选；分组（design §3.2）推迟到 pack 预算算出之后——组预算门要喂它（K1 / K5）。
+    let selected = select_files(changes);
 
     // 3. 模型集 + replicate 判定（统一 resolve_models）
     let (models, replicate) = resolve_models(args.models.as_deref(), args.models_all, cfg);
@@ -281,6 +266,9 @@ pub async fn run_code_review(
     let (spec_section, spec_used, spec_warnings) =
         render_spec_section_capped(&args.spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
     let budget = budget_raw.saturating_sub(spec_used);
+    // 2. 引用图分组（M21a 批 C）：双阈值门未过 → 单包（即原 E9 单格全审）；过门 → 连通分量 /
+    // 弱缝先切 / 宁降不拆 / 孤立装箱。GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
+    let bundles = group(selected, Some(root), &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() }).bundles;
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
@@ -1933,14 +1921,14 @@ mod tests {
             "pub fn target() {}\nfn u1() { target(); }\nfn u2() { target(); }\nfn u3() { target(); }\nfn u4() { target(); }\nfn u5() { target(); }\n").unwrap();
         std::fs::write(root.join("src/b.rs"), "pub fn other() {}\n").unwrap();
         let bundles = vec![
-            Bundle { files: vec![FileChange {
+            Bundle::from_files(vec![FileChange {
                 path: "src/a.rs".into(),
                 diff: "@@ -1,0 +1,1 @@\n+pub fn target() {}\n".into(),
-            }] },
-            Bundle { files: vec![FileChange {
+            }]),
+            Bundle::from_files(vec![FileChange {
                 path: "src/b.rs".into(),
                 diff: "@@ -1,0 +1,1 @@\n+pub fn other() {}\n".into(),
-            }] },
+            }]),
         ];
 
         let (entries, meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
@@ -1973,10 +1961,10 @@ mod tests {
             filler_line.repeat(PACK_BUDGET_BYTES / filler_line.len() + 10)
         );
         std::fs::write(root.join("src/b.rs"), &big).unwrap();
-        let bundles = vec![Bundle { files: vec![
+        let bundles = vec![Bundle::from_files(vec![
             FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() },
             FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() },
-        ] }];
+        ])];
         let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
         assert!(on[0].contains("alpha_marker"), "小文件全文在场");
         // 真 diff 穿透证明（集成级）：超预算文件迫入 def 锚回落分支（changed_def_ranges

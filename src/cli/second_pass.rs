@@ -199,7 +199,7 @@ pub(crate) fn second_pass_prompt(
         }
     }
     let own_diff_bytes: usize = own.files.iter().map(|fc| fc.diff.len()).sum();
-    let pb = crate::bundle::Bundle { files };
+    let pb = crate::bundle::Bundle::from_files(files);
     // 第二趟恒用 build_pack（唯一路径，E8-E 安乐死 SCIP 后无引擎可选）——needs 只消费
     // 0 壳全文分支（body_section）。
     // Important 修复：evidence（行窗证据段，已在上方按 NEED_SECTION_BYTE_CAP 分段封顶）先
@@ -233,8 +233,8 @@ mod tests {
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
         let bundles = vec![
-            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn sib() {}\n".into() }] },
+            Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into() }]),
+            Bundle::from_files(vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn sib() {}\n".into() }]),
         ];
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let drafts = vec![]; // 空草稿也合法
@@ -270,9 +270,9 @@ mod tests {
         std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
-        let bundles = vec![Bundle { files: vec![FileChange {
+        let bundles = vec![Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into(),
-        }] }];
+        }])];
         let needs = vec![
             NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() },
             NeedEntry { path: ".redteam/proj.db".into(), lines: None, reason: "peek ledger".into() },
@@ -305,9 +305,9 @@ mod tests {
         // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
-        let bundles = vec![Bundle { files: vec![FileChange {
+        let bundles = vec![Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into(),
-        }] }];
+        }])];
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let spec = "<spec_docs>\nDESIGN D8: fail-open\n</spec_docs>\n";
         let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", spec);
@@ -343,9 +343,9 @@ mod tests {
         // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
-        let bundles = vec![Bundle { files: vec![FileChange {
+        let bundles = vec![Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
-        }] }];
+        }])];
         let needs = vec![
             // 合法 lines → ±30 行窗独立补查段
             NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
@@ -394,9 +394,9 @@ mod tests {
         // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
-        let bundles = vec![Bundle { files: vec![FileChange {
+        let bundles = vec![Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
-        }] }];
+        }])];
         let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into() }];
         let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "");
         let p = p.unwrap();
