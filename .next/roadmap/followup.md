@@ -52,7 +52,7 @@
 | `--pack-only` 的 `est_tokens` 只计 user prompt，不含 system 段 | roadmap 出口「与真实 usage 差 < 20%」对账时会系统性偏低 | 出口验收对账时加回 system 段常量（或 F-5 直接记 usage） |
 | D-1 接缝：`ScanOutput.suspicions` 无 `serde(default)`（`src/domain/suspicion.rs:42`） | 模型输出缺该键即解析失败 | D-1 parse 层决定：容忍缺键 / 走 REPAIR，不在 domain 改 |
 | D / F 接缝：`CellOutput` tag 值 = `scanner` / `reviewer` / `verifier`（批 B 裁定 3：tag == `Role` 串 == `cells.role` 列），不是计划 B-2 文本的 `scan` / `review` / `verify` | 契约文档与 prompt 输出协议须按前者写 | D-2 写 `<output_contract>` 时对齐；`missing_role_tag_is_error_not_default` 可加 `"role":"scan"` 报错断言 |
-| E-2 接缝：`Bundle.over_budget` 到 pack 层只是可见、未被消费；二阶段 `second_pass_prompt` 用 `Bundle::from_files` 重建 → `edges` / `over_budget` 清零、`hub_order` 只靠插入序 | 梯子（全文 → def 体 → 骨架 → hunk 窗 → omit）纯按预算触发 | E-2 若要「over_budget 组直接切片」自行接线；切片逻辑若依赖 `edges` 需兼容二阶段重建 |
+| E-2 接缝：`Bundle.over_budget` 到 pack 层只是可见、未被消费；二阶段 `second_pass_prompt` 用 `Bundle::from_files` 重建 → `edges` / `over_budget` 清零、`hub_order` 只靠插入序 | 梯子（切片 / 全文 → def 体 → 骨架 → hunk 窗 → omit）纯按预算触发 | ✅ 批 E K9 定论（2026-09-08）：pack 不消费 `over_budget`——slice 已是缩形、标记无法再降，消费它会污染 full 对照臂；标记留 `--pack-only` 仪表。切片不依赖 `edges`；二阶段恒 `full`（K2） |
 | `model setup` 写前预检对「原文件 JSON 合法但校验失败」的文案 | `load_with_messages` 失败 → `existing = default` → 之后报「合并后配置无效」，实际是原文件已无效；不丢数据（拒写），仅误导 | M21e 清扫：预检失败直接报原文件错误 |
 | 并存期 secrets 提示 | dev 二进制的 `~/.config/redteam/secrets.toml` 长期存在，`secrets.json` 未创建前每次调用都打「密钥已改读」notice；只用 env 存 key 的用户永远看到 | M21c 切名再议（如只在 `model list / check` 打） |
 | 批 A 重做评审子 agent 提出、未核实项（2026-09-08） | `eval/e3_contract_ab.py:315` `anchored` 疑似恒真式；`eval/risk_replay.py` parse_diff 疑似把列首 `--` / `++` 内容行当文件头；`provider_probe_kind` 对混协议网关取字典序首个模型的 kind（只影响 `model list --remote`）；`check_all` 串行探测、每次 `resolve_key` 重读 secrets（性能观感） | M21b 起用 `risk_replay.py` 作回归门前先核实前两条；其余 M21e 清扫 |
@@ -80,6 +80,15 @@
 | `--pack-only` 预算的模型窗来源 | ✅ 合入批 A 时已改读 `cfg.active_roles()`（与真实评审同一 `budget_and_spec`） | — |
 | `GroupingStats` 只在 `--pack-only` 可见 | stdout + `summary.json`；真实评审的 RunMeta 未接线（避免撞批 B 的 `report.rs`） | F-5 观测接线 |
 | `review.grouping` 未接配置 | ✅ 批 A 重做合入时接上（2026-09-08）：`cli::grouping_opts(cfg.review.grouping, budget)`，`plan_cells` 三个入口同源；`semantic`（R8）仍无消费点 | — |
+
+## M21a 批 E 延后项（2026-09-08，Trellis `09-08-m21a-slice`，prd R-E4.6）
+
+| 项 | 现状 | 归属 |
+|---|---|---|
+| 切片层次的提示词措辞：dossier 前言（`render_dossier_section`）仍描述「0 壳全文 + 1 壳引用点」；scanner 尾需说明「折叠体 `…（a-b 行折叠：name）` 只是签名可见、缺证据走 `needs{kind: evidence}`」与「文件外片段是调用点 ±N / 签名 + doc，非全文」 | pack 段序：`## 改动源文（0 壳）` → `## 文件外片段` → `## 已省略（预算裁剪）`；块头 `path:1-N（切片：核 c · 一跳 h · 折叠 f 段）` / `path:a-b（调用点：name）` / `path:a-b（签名：name）` | D-2 共享头 / scanner 尾（`src/prompt/*` 归批 D，E 不碰） |
+| `--pack-body <full\|slice>` CLI 覆盖旗（镜像 `--tools`） | 批 E 不加（plan 范围）；A/B 走 `REDTEAM_HOME=<临时目录>` + `config.json` `{"review":{"pack":{"body":"full"}}}`，出口 3 双 scanner 配置本就要临时 config | 用户裁 / M21e |
+| 切片常数：一跳 K=3 调用点 / 名、`anchorWindow` 30、文件外段帽 = 组预算 / 8、名字上限 40、走仓上限 20000 文件、文件头 ≤ 80 行、多行签名 ≤ 6、胶水 ≤ 3 | 常量在 `src/pack/mod.rs`；`anchorWindow` / `sliceMinBytes` 已是配置键 | R7（出口 3 A/B 回退信号后调优 / M21d） |
+| 文件外搜索的读守卫口径 = `search_repo` 工具（ignore 走仓 + denylist，不逐文件 `git ls-files`）；路径非模型可控 | 未跟踪但未被 gitignore 的支持语言文件会被搜到调用点 | 威胁模型 B 若要求「只读 git-tracked」，一次 `git ls-files -z` 取集合再过滤（F-2 scanner 路径评估） |
 
 ## 跨里程碑观测面（每个里程碑出口必报，写进 RunMeta 或 research）
 
