@@ -91,7 +91,12 @@ pub(crate) fn build_anthropic_tools_body(
     // tool-loop append-only 确定性渲染，前缀天然稳定：每轮把断点移到新末尾，命中前一轮写的前缀、
     // 只付增量写入，13 轮对话输入成本理论折减 ~80-90%（5min TTL 覆盖 cell 内轮间隔）。
     // 当前三 provider 全 openai kind，此 body 走不到；为将来配 Anthropic 直连即生效而备。
-    let auto_tail = explicit_boundaries == 0;
+    // 末块自动断点：末条 message 本身是分块（断点已显式给出）则不再加；其后追加的 Assistant / ToolResults / REPAIR 轮仍拿到
+    // 移动尾断点（tool-loop 逐轮增量缓存不因分块会话失效），总数守 Anthropic 上限 4（评审 #12）。
+    let last_is_blocks = matches!(messages.last(), Some(ChatMessage::UserBlocks(_)));
+    let placed = explicit_boundaries + usize::from(!system.is_empty() && explicit_boundaries > 0);
+    debug_assert!(placed <= 4, "anthropic cache_control 断点上限 4，已放 {placed}");
+    let auto_tail = !last_is_blocks && placed < 4;
     if let Some(last) = msgs.last_mut().filter(|_| auto_tail) {
         let is_string = last.get("content").map(Value::is_string).unwrap_or(false);
         if is_string {
@@ -788,6 +793,12 @@ mod tests {
         assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
         assert_eq!(content[2]["cache_control"]["type"], "ephemeral");
         assert_eq!(b.to_string().matches("cache_control").count(), 3, "恰三段界: {b}");
+        // 分块之后再追加 tool_result 尾：尾块仍拿到移动断点，总数 4 ≤ 上限（评审 #12）
+        let mut multi = msgs.clone();
+        multi.push(ChatMessage::ToolResults(vec![crate::tools::ToolResult { id: "t1".into(), content: "file".into() }]));
+        let b2 = build_anthropic_tools_body("claude-x", &multi, &[], MAX_TOKENS);
+        assert_eq!(b2["messages"][1]["content"][0]["cache_control"]["type"], "ephemeral", "尾 tool_result 仍打断点: {b2}");
+        assert_eq!(b2.to_string().matches("cache_control").count(), 4, "{b2}");
         let flat = crate::prompt::flatten_blocks(&blocks);
         let a = build_openai_tools_body("m", &[ChatMessage::System("head".into()), ChatMessage::UserBlocks(blocks)], &[], true, None);
         let c = build_openai_tools_body("m", &[ChatMessage::System("head".into()), ChatMessage::User(flat)], &[], true, None);

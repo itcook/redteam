@@ -22,8 +22,14 @@ fn safe_read(root: &Path, rel: &str) -> Option<String> {
         return None;
     }
     let data = std::fs::read(&real).ok()?;
-    let slice = if data.len() > POS_READ_MAX_BYTES { &data[..POS_READ_MAX_BYTES] } else { &data[..] };
-    String::from_utf8(slice.to_vec()).ok()
+    let truncated = data.len() > POS_READ_MAX_BYTES;
+    let slice = if truncated { &data[..POS_READ_MAX_BYTES] } else { &data[..] };
+    match std::str::from_utf8(slice) {
+        Ok(s) => Some(s.to_string()),
+        // 截断切在多字节字符中间（错误只在末尾且确为截断）→ 退到最后一个完整字符；正文里的非法 UTF-8 仍视为二进制（评审 #22）
+        Err(e) if truncated && e.error_len().is_none() => std::str::from_utf8(&slice[..e.valid_up_to()]).ok().map(str::to_string),
+        Err(_) => None,
+    }
 }
 
 /// 把 quote 在给定内容中确定性定位到行跨度；空 quote 或未命中返回 None。
@@ -109,30 +115,39 @@ pub fn anchor_near(root: &Path, file: &str, quote: &str, old_line: u32) -> Optio
     locate_quote_near(&content, quote, old_line)
 }
 
-/// scanner 疑点锚定结果（批 D-1）：`dropped` = quote 不在文件而被丢的条数——调用方写进 cell warn，绝不静默。
+/// scanner 疑点锚定结果（批 D-1）：`dropped` = 被丢总数（quote 不在文件 + 文件不可读），`dropped_unreadable` 单列文件不可读
+/// （不存在 / 越界 / 二进制），F 写 cell warn 时分开说，不把「读不到」误诊成「quote 幻觉」（评审 #10）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnchoredScan {
     pub output: ScanOutput,
     pub dropped: u32,
+    pub dropped_unreadable: u32,
 }
 
 /// 疑点 quote 逐字硬约束（design §4〔D11〕：不在文件即丢弃）：定位成功改写 `line_start/line_end`，失败丢弃并计数；
-/// `needs` / `scanned_areas` 原样透传。与 `anchor` 同一 `safe_read` + `locate_quote` 口径（含软换行退路）。
+/// `needs` / `scanned_areas` 原样透传。与 `anchor` 同一 `safe_read` 防线；定位用 `locate_quote_near`（同匹配优先级，多命中时取最接近
+/// 模型自报行号者——scanner 的 quote 是短指针，`x.unwrap();` 类极易在同文件复现，首现会把疑点锚错地方，评审 #11）。
 pub fn anchor_suspicions(root: &Path, mut out: ScanOutput) -> AnchoredScan {
     let mut kept = Vec::with_capacity(out.suspicions.len());
-    let mut dropped = 0u32;
+    let (mut dropped, mut dropped_unreadable) = (0u32, 0u32);
     for mut s in out.suspicions.drain(..) {
-        match safe_read(root, &s.file).and_then(|c| locate_quote(&c, &s.quote)) {
-            Some((ls, le)) => {
-                s.line_start = ls;
-                s.line_end = le;
-                kept.push(s);
+        match safe_read(root, &s.file) {
+            None => {
+                dropped += 1;
+                dropped_unreadable += 1;
             }
-            None => dropped += 1,
+            Some(content) => match locate_quote_near(&content, &s.quote, s.line_start) {
+                Some((ls, le)) => {
+                    s.line_start = ls;
+                    s.line_end = le;
+                    kept.push(s);
+                }
+                None => dropped += 1,
+            },
         }
     }
     out.suspicions = kept;
-    AnchoredScan { output: out, dropped }
+    AnchoredScan { output: out, dropped, dropped_unreadable }
 }
 
 /// 把 quote 确定性定位到真实行；定位失败即丢弃（确定性幻觉过滤，code 线每条 finding 须指向真实代码）。
@@ -192,11 +207,15 @@ mod tests {
             scanned_areas: vec![ScannedArea { file: "src/a.rs".into(), ranges: vec!["1-3".into()] }],
         };
         let a = anchor_suspicions(dir.path(), out);
-        assert_eq!(a.dropped, 2);
+        assert_eq!((a.dropped, a.dropped_unreadable), (2, 1), "quote 幻觉 1 + 路径越界 1（评审 #10 分开计）");
         assert_eq!(a.output.suspicions.len(), 1);
         assert_eq!((a.output.suspicions[0].line_start, a.output.suspicions[0].line_end), (2, 2), "空白差异仍定位");
         assert_eq!(a.output.needs.len(), 1);
         assert_eq!(a.output.scanned_areas.len(), 1);
+        // 短 quote 多命中：取最接近模型自报行号的那处，而非首现（评审 #11）
+        write(dir.path(), "src/b.rs", "a();\nx.unwrap();\nb();\nc();\nd();\nx.unwrap();\n");
+        let near = anchor_suspicions(dir.path(), ScanOutput { suspicions: vec![sus("src/b.rs", "x.unwrap();")].into_iter().map(|mut s| { s.line_start = 6; s.line_end = 6; s }).collect(), ..Default::default() });
+        assert_eq!(near.output.suspicions[0].line_start, 6);
     }
 
     #[test]

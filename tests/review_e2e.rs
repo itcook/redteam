@@ -416,7 +416,7 @@ async fn background_job_smoke_full_lifecycle_single_store() {
     // manifest/partial 两张表经它可读，证明写读全在一条连接上，未散落到别的打开实例。
     assert_eq!(store.read_manifest(job_id).len(), 1, "manifest 应可经同一 store 读回");
     assert_eq!(store.read_partial(job_id).len(), 1, "partial checkpoint 应可经同一 store 读回");
-    assert!(store.read_partial(job_id)[0].template_hash.is_some(), "批 D-4：cell 记录带模板哈希（A/B 归因）");
+    assert_eq!(store.read_partial(job_id)[0].template_hash.as_deref(), Some(redteam::prompt::template_hashes().legacy_bundle.as_str()), "批 D-4：旧 fan-out 的 cell 记录带旧模板哈希（A/B 归因）");
 }
 
 /// T47③：REDTEAM_TEST_PANIC 钩子 + 真 panic 全链路 e2e

@@ -1,5 +1,7 @@
 """oracle 命中口径（零依赖）：`e3_contract_ab.py score` 与 `scan_score.py` 共用——
 quote 去全部空白后在 `git show <head>:<path>` 内容里子串匹配 → 行区间；与 oracle 条目的 anchors 区间重叠即命中。
+注意这是 **E3 口径，比产品宽**两点：产品 `positioning::locate_quote` 只把空白归一为单空格后按行 / 词序匹配（`foo (bar)` 对 `foo(bar)`
+产品丢、这里命中）；产品对定位失败的疑点直接丢弃（D11），评分器按自报行号计命中并计 unanchored。与 P0 基线可比优先于与产品一致。
 本模块不含任何被评仓内容；仓路径 / head / oracle 一律由调用方参数传入。"""
 import json
 import subprocess
@@ -13,7 +15,7 @@ def show_file(repo, head, path):
 
 
 def anchor_quote(repo, head, path, quote):
-    """产品同口径（positioning::locate_quote 的去空白子串层）：返回 (line_start, line_end) 或 None。"""
+    """E3 口径（见模块说明）：quote 去全部空白后子串匹配；返回 (line_start, line_end) 或 None。"""
     if not quote or not path:
         return None
     k = (repo, head, path)
@@ -52,6 +54,8 @@ def load_oracle(path, set_name="union"):
     → (entries 子集, head)。set 缺失 → 全部条目。"""
     oracle = json.load(open(path, encoding="utf-8"))
     sets = oracle.get("sets") or {}
+    if sets and set_name not in sets:
+        raise ValueError(f"oracle 无子集 {set_name!r}（可选：{sorted(sets)}）")
     if set_name in sets:
         ids = set(sets[set_name])
         entries = [e for e in oracle["entries"] if e["id"] in ids]

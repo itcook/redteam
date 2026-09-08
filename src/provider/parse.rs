@@ -114,18 +114,18 @@ pub fn parse_scan_output_with_stats(raw: &str) -> Result<(ScanOutput, ScanParseS
             stats.dropped_malformed += 1;
             continue;
         };
-        let file = o.get("file").and_then(Value::as_str).map(str::trim).unwrap_or("");
-        if file.is_empty() || !safe_rel_path(file) {
+        let Some(file) = o.get("file").and_then(Value::as_str).and_then(normalize_rel_path) else {
             stats.dropped_bad_path += 1;
             continue;
-        }
+        };
         let quote = o.get("quote").and_then(Value::as_str).unwrap_or("");
         if quote.trim().is_empty() {
             stats.dropped_no_quote += 1;
             continue;
         }
-        let line_start = o.get("line_start").and_then(Value::as_i64).unwrap_or(1).max(1) as u32;
-        let line_end = (o.get("line_end").and_then(Value::as_i64).unwrap_or(0).max(0) as u32).max(line_start);
+        // 先夹在 u32 域内再转换：`as u32` 对越界值截断（4294967296 → 0）会违反 line_start ≥ 1（评审 #4）
+        let line_start = o.get("line_start").and_then(Value::as_i64).unwrap_or(1).clamp(1, u32::MAX as i64) as u32;
+        let line_end = (o.get("line_end").and_then(Value::as_i64).unwrap_or(0).clamp(0, u32::MAX as i64) as u32).max(line_start);
         let hint: String = o.get("hint").and_then(Value::as_str).unwrap_or("").trim().chars().take(300).collect();
         let category = o
             .get("category")
@@ -137,13 +137,19 @@ pub fn parse_scan_output_with_stats(raw: &str) -> Result<(ScanOutput, ScanParseS
             _ => 0.5,
         };
         let confidence = if confidence.is_finite() { confidence.clamp(0.0, 1.0) as f32 } else { 0.5 };
-        out.suspicions.push(Suspicion { file: file.to_string(), line_start, line_end, hint, category, confidence, quote: quote.to_string() });
+        out.suspicions.push(Suspicion { file, line_start, line_end, hint, category, confidence, quote: quote.to_string() });
     }
     if let Some(needs) = v.get("needs").and_then(Value::as_array) {
         for n in needs {
             match serde_json::from_value::<NeedEntry>(n.clone()) {
-                Ok(e) if !e.path.trim().is_empty() => out.needs.push(e),
-                _ => stats.needs_dropped += 1,
+                Ok(mut e) => match normalize_rel_path(&e.path) {
+                    Some(p) => {
+                        e.path = p;
+                        out.needs.push(e);
+                    }
+                    None => stats.needs_dropped += 1,
+                },
+                Err(_) => stats.needs_dropped += 1,
             }
         }
         if out.needs.len() > NEEDS_CAP {
@@ -157,19 +163,18 @@ pub fn parse_scan_output_with_stats(raw: &str) -> Result<(ScanOutput, ScanParseS
                 stats.dropped_malformed += 1;
                 continue;
             };
-            let file = ao.get("file").and_then(Value::as_str).map(str::trim).unwrap_or("");
-            if file.is_empty() {
+            let Some(file) = ao.get("file").and_then(Value::as_str).and_then(normalize_rel_path) else {
                 stats.dropped_malformed += 1;
                 continue;
-            }
+            };
             let mut ranges = Vec::new();
             for r in ao.get("ranges").and_then(Value::as_array).into_iter().flatten() {
-                match r.as_str().filter(|s| valid_range(s)) {
-                    Some(s) => ranges.push(s.trim().to_string()),
+                match r.as_str().and_then(valid_range) {
+                    Some(s) => ranges.push(s),
                     None => stats.ranges_dropped += 1,
                 }
             }
-            out.scanned_areas.push(ScannedArea { file: file.to_string(), ranges });
+            out.scanned_areas.push(ScannedArea { file, ranges });
         }
     }
     Ok((out, stats))
@@ -178,19 +183,35 @@ pub fn parse_scan_output_with_stats(raw: &str) -> Result<(ScanOutput, ScanParseS
 /// needs 帽（design §4：cap 5）。
 pub const NEEDS_CAP: usize = 5;
 
-/// 仓内相对路径：非绝对、无 `..` 段（与 `positioning::safe_read` 同口径，parse 层先挡一道）。
-fn safe_rel_path(p: &str) -> bool {
-    let path = Path::new(p);
-    !path.is_absolute() && !path.components().any(|c| matches!(c, Component::ParentDir))
+/// 仓内相对路径规范化（与 `positioning::safe_read` 同口径，parse 层先挡一道）：非绝对、无 `..` 段；去 `./` 与重复分隔符，
+/// 按 `/` 重组——同一文件在不同 cell 里写法不同（`./src/a.rs` vs `src/a.rs`）时并集 / coverage 对账按串比对不会错开（评审 #9）。
+fn normalize_rel_path(p: &str) -> Option<String> {
+    let path = Path::new(p.trim());
+    if path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    let parts: Vec<&str> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
 }
 
-/// `scanned_areas.ranges` 项形如 `a-b`，a ≤ b（design §4 覆盖自报）。
-fn valid_range(s: &str) -> bool {
-    let Some((a, b)) = s.trim().split_once('-') else { return false };
-    match (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
-        (Ok(a), Ok(b)) => a >= 1 && a <= b,
-        _ => false,
+/// `scanned_areas.ranges` 项形如 `a-b`（纯数字，1 ≤ a ≤ b，design §4 覆盖自报）→ 规范串 `"a-b"`。
+fn valid_range(s: &str) -> Option<String> {
+    let (a, b) = s.trim().split_once('-')?;
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() || b.is_empty() || !a.chars().all(|c| c.is_ascii_digit()) || !b.chars().all(|c| c.is_ascii_digit()) {
+        return None;
     }
+    let (a, b) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
+    (a >= 1 && a <= b).then(|| format!("{a}-{b}"))
 }
 
 /// D1：兼容网关有时把错误塞进 HTTP 200 响应体（不触发 4xx/5xx，`send_classified` 判"成功"）——
@@ -299,6 +320,24 @@ mod tests {
         assert!(REPAIR_PROMPT_SCAN.contains("suspicions"));
         // 空扫描合法
         assert!(parse_scan_output("{\"suspicions\":[],\"scanned_areas\":[]}").unwrap().suspicions.is_empty());
+    }
+
+    /// 评审 #4 #8 #9 #21：行号越界不截成 0；路径去 `./` 重组；ranges 规范化且拒 `+`；needs.path / scanned_areas.file 同规则。
+    #[test]
+    fn scan_parse_normalizes_paths_lines_and_ranges() {
+        let raw = r#"{"suspicions":[{"file":"./src//a.rs","line_start":4294967296,"line_end":1,"hint":"h","confidence":0.5,"quote":"q"}],
+            "needs":[{"path":"./n.rs","reason":"r"},{"path":"../n.rs","reason":"r"}],
+            "scanned_areas":[{"file":"./src/a.rs","ranges":[" 3 - 5 ","+3-5","3-x"]},{"file":"/abs.rs","ranges":["1-1"]}]}"#;
+        let (out, stats) = parse_scan_output_with_stats(raw).unwrap();
+        let s = &out.suspicions[0];
+        assert_eq!(s.file, "src/a.rs");
+        assert_eq!((s.line_start, s.line_end), (u32::MAX, u32::MAX), "clamp 到 u32 域而非截断成 0");
+        assert_eq!(out.needs.len(), 1);
+        assert_eq!(out.needs[0].path, "n.rs");
+        assert_eq!(stats.needs_dropped, 1);
+        assert_eq!(out.scanned_areas.len(), 1);
+        assert_eq!((out.scanned_areas[0].file.as_str(), out.scanned_areas[0].ranges.as_slice()), ("src/a.rs", ["3-5".to_string()].as_slice()));
+        assert_eq!((stats.ranges_dropped, stats.dropped_malformed), (2, 1));
     }
 
     #[test]

@@ -25,7 +25,9 @@
 - `scan_score.py` — M21a 批 D-5（design §10.7 离线回归集）：scanner 疑点对 oracle 的零 LLM 评分，**改模板必跑**。
   `score <input>… --oracle <json> --repo <dir> [--head <sha>] [--set union] [--out score.json] [--baseline prev.json] [--fail-on-regression]`；
   输入自动识别 redteam-next 结果 JSON（`cells[].output.suspicions`，role=scanner）/ E3 run JSON 或目录（`items[]`）/ 裸 `{"suspicions":[]}`；
-  口径与 E3 B 臂一致（`_oracle.py`：quote 去空白定位，失败按自报行号计 unanchored；anchors 区间重叠即命中）；`selftest` 用合成仓自检。
+  口径 = E3 B 臂（`_oracle.py`：去全部空白子串定位、失败按自报行号计命中并计 unanchored；anchors 区间重叠即命中）——**比产品宽两点**
+  （产品 `locate_quote` 按行 / 词序匹配、定位失败直接丢），与 P0 基线可比优先；`selftest` 用合成仓自检。
+  产品面待接：`review --format json` 今天的 `run.cells` 只有 CellSummary、无 output——F 批需给结果 JSON 加 scanner 输出面（或评分器改读 proj-next.db `cells` 行）。
   基线 = P0 E3 B 臂三跑对 oracle-pr181 union：union_oracle_hit 9 / mean_oracle_hit 5.33 / mean_noise 0.55（人工主题并集 5 见 P0 研究）。
   用法（F 落地后）：`redteam-next review --base <base> --format json > out.json && python3 eval/scan_score.py score out.json --oracle … --repo … --baseline …`。
 - `_oracle.py` — `e3_contract_ab.py score` 与 `scan_score.py` 共用的命中口径（`show_file` / `anchor_quote` / `overlap` / `load_oracle` / `match_entries`）。
