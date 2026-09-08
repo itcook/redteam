@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::diffsym::ref_worthy;
 use crate::evidence::git::FileChange;
 
 /// 噪声文件名（锁文件等，评审无价值）。
@@ -155,23 +156,6 @@ pub struct GroupingStats {
 pub struct Grouping {
     pub bundles: Vec<Bundle>,
     pub stats: GroupingStats,
-}
-
-/// 引用边只看像「符号」的名字（K4，逐字移植 eval/risk_replay.py `fanin_worthy` / `GENERIC_NAMES`）：
-/// 过滤短名、通用名与纯小写短单词（cancel / resp / object 之类）。
-const GENERIC_NAMES: &[&str] = &[
-    "main", "init", "new", "string", "error", "handler", "handle", "run", "get", "set", "test", "default",
-    "index", "start", "stop", "close", "open", "read", "write", "name", "type", "value", "data", "config",
-];
-
-fn ref_worthy(n: &str) -> bool {
-    if n.len() < 4 || GENERIC_NAMES.contains(&n.to_ascii_lowercase().as_str()) {
-        return false;
-    }
-    if n.len() < 8 && n.chars().all(|c| c.is_ascii_lowercase()) {
-        return false;
-    }
-    true
 }
 
 /// 改动 def 名（diffsym 支持语言）：hunk 外围 def 起行经 `match_def` 取名，`ref_worthy` 过滤，去重升序。

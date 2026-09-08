@@ -210,6 +210,170 @@ pub(crate) fn changed_def_ranges(diff: &str, file_lines: &[&str], defs: &[(&'sta
     starts.into_iter().map(|i| (i, block_end(file_lines, i))).collect()
 }
 
+// ---------------------------------------------------------------------------------------------
+// 文件级 def 集 / 改动 def / 文件内一跳（M21a 批 E E-1，design §10.2 核与一跳层）
+// ---------------------------------------------------------------------------------------------
+
+/// 引用边 / 一跳 / 文件外片段只看像「符号」的名字（逐字移植 eval/risk_replay.py `fanin_worthy` / `GENERIC_NAMES`，
+/// M21a 批 C K4；批 E K5 迁入本模块作唯一口径）：过滤短名、通用名与纯小写短单词（cancel / resp / object 之类）。
+pub(crate) const GENERIC_NAMES: &[&str] = &[
+    "main", "init", "new", "string", "error", "handler", "handle", "run", "get", "set", "test", "default",
+    "index", "start", "stop", "close", "open", "read", "write", "name", "type", "value", "data", "config",
+];
+
+pub(crate) fn ref_worthy(n: &str) -> bool {
+    if n.len() < 4 || GENERIC_NAMES.contains(&n.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    if n.len() < 8 && n.chars().all(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    true
+}
+
+/// 文件级 def：0-based inclusive 行范围 + 名 + 种类（`Lang.defs` 的 kind 字面量）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
+pub(crate) struct DefRange {
+    pub start: usize,
+    pub end: usize,
+    pub name: String,
+    pub kind: &'static str,
+}
+
+/// 可调用 / 值 def 屏蔽其块内的 def（批 E K4）：fn 体里的 `const LIMIT` / 嵌套 fn、TS 箭头函数或对象字面量
+/// （kind = const）体内的 `const x` 都是局部量，不是文件级符号。class / struct / trait 等容器不屏蔽——
+/// 体内方法仍是文件级符号。
+#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
+fn shields_nested(kind: &str) -> bool {
+    matches!(kind, "fn" | "func" | "function" | "method" | "const" | "static")
+}
+
+/// 容器 def（class / struct / enum / trait / type）：体内方法是独立符号；容器本身不作一跳 caller，
+/// 有内部 def 时也不作 callee / 核（整段展开会把整个 class 拖进来，批 E K4 / K5）。
+#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
+pub(crate) fn is_container(kind: &str) -> bool {
+    matches!(kind, "class" | "struct" | "enum" | "trait" | "type")
+}
+
+/// 文件级 def 全集（按 start 升序）：逐行 `match_def` + `block_end`；嵌在屏蔽 def 体内的命中丢弃。
+/// ponytail: block_end 括号配平被字符串 / 注释里的花括号带偏时，屏蔽区间会吞掉后续 def——与骨架档同源的
+/// 已知 heuristic 边角，禁真空兜底保证改动行仍在。
+#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
+pub(crate) fn all_defs(lines: &[&str], defs: &[(&'static str, Regex)]) -> Vec<DefRange> {
+    let mut out = Vec::new();
+    // 外围栈：(块尾行, 是否屏蔽)；内层 def 后入栈且先结束，栈顶即最内层。
+    let mut stack: Vec<(usize, bool)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        while stack.last().is_some_and(|&(end, _)| end < i) {
+            stack.pop();
+        }
+        let Some((kind, name)) = match_def(line, defs) else { continue };
+        if stack.iter().any(|&(_, shield)| shield) {
+            continue; // 局部量 / 嵌套 fn
+        }
+        let end = block_end(lines, i);
+        out.push(DefRange { start: i, end, name, kind });
+        if end > i {
+            stack.push((end, shields_nested(kind)));
+        }
+    }
+    out
+}
+
+/// 容器 def 体内是否还有文件级 def（class 带方法 / trait 带方法）。
+#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
+fn has_inner(all: &[DefRange], d: &DefRange) -> bool {
+    all.iter().any(|o| o.start > d.start && o.end <= d.end)
+}
+
+/// 改动 def（批 E K3）：按 diff **全部改动行**（`hunk_changed_lines`，非仅每 hunk 首行）取最内层包含它的文件级
+/// def，按 start 去重升序。带内部 def 的容器（class 带方法）不整段入核——改动落在字段行时交禁真空窗。
+/// 既有 `changed_def_ranges`（hunk 首行锚定）供分组引用边与旧梯子，语义不变。
+#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
+pub(crate) fn changed_defs(diff: &str, all: &[DefRange]) -> Vec<DefRange> {
+    let mut picked = std::collections::BTreeSet::new();
+    for l in hunk_changed_lines(diff) {
+        let inner = all
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.start <= l && l <= d.end)
+            .max_by_key(|(_, d)| d.start);
+        if let Some((idx, d)) = inner {
+            if is_container(d.kind) && has_inner(all, d) {
+                continue;
+            }
+            picked.insert(idx);
+        }
+    }
+    picked.into_iter().map(|i| all[i].clone()).collect()
+}
+
+/// def 体内出现的 `ref_worthy` 标识符（去自身名）；注释行（`//` / `#` / `*` / `/*` 起始）不参与。
+#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
+pub(crate) fn body_names(lines: &[&str], r: &DefRange) -> std::collections::BTreeSet<String> {
+    static IDENT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let ident = IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*").expect("static ident regex"));
+    let mut out = std::collections::BTreeSet::new();
+    let end = r.end.min(lines.len().saturating_sub(1));
+    for line in lines.iter().take(end + 1).skip(r.start) {
+        let t = line.trim_start();
+        if t.starts_with("//") || t.starts_with('#') || t.starts_with('*') || t.starts_with("/*") {
+            continue;
+        }
+        for m in ident.find_iter(line) {
+            let s = m.as_str();
+            if s != r.name && ref_worthy(s) {
+                out.insert(s.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 文件内一跳（design §10.2 一跳层）：callee = 改动 def 体内出现的同文件其他 def；caller = 体内出现改动 def 名的
+/// 其他同文件 def。两组按 start 升序、互斥（既 callee 又 caller 只在 callees）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
+pub(crate) struct OneHop {
+    pub callees: Vec<DefRange>,
+    pub callers: Vec<DefRange>,
+}
+
+/// 只一跳、不传递；自引用与改动 def 之间的互引不计（它们本就在核里）；名字过滤 `ref_worthy`（批 E K5）。
+/// callee 允许无内部 def 的容器（struct / enum / type：字段可见有用），排除带方法的 class；caller 只取非容器。
+#[allow(dead_code)] // 批 E-2 接入 pack 后拆除
+pub(crate) fn one_hop(lines: &[&str], all: &[DefRange], changed: &[DefRange]) -> OneHop {
+    let changed_starts: std::collections::BTreeSet<usize> = changed.iter().map(|d| d.start).collect();
+    let changed_names: std::collections::BTreeSet<&str> = changed.iter().map(|d| d.name.as_str()).collect();
+    let mut callee_idx = std::collections::BTreeSet::new();
+    for c in changed {
+        let names = body_names(lines, c);
+        for (i, d) in all.iter().enumerate() {
+            if changed_starts.contains(&d.start) || !names.contains(&d.name) {
+                continue;
+            }
+            if is_container(d.kind) && has_inner(all, d) {
+                continue;
+            }
+            callee_idx.insert(i);
+        }
+    }
+    let mut caller_idx = std::collections::BTreeSet::new();
+    for (i, d) in all.iter().enumerate() {
+        if changed_starts.contains(&d.start) || is_container(d.kind) || callee_idx.contains(&i) {
+            continue;
+        }
+        if body_names(lines, d).iter().any(|n| changed_names.contains(n.as_str())) {
+            caller_idx.insert(i);
+        }
+    }
+    OneHop {
+        callees: callee_idx.into_iter().map(|i| all[i].clone()).collect(),
+        callers: caller_idx.into_iter().map(|i| all[i].clone()).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +455,89 @@ mod tests {
         let diff = "@@ -2,1 +2,1 @@\n-    a0();\n+    a();\n@@ -3,1 +3,1 @@\n-    b0();\n+    b();\n";
         let ranges = changed_def_ranges(diff, &file, &d);
         assert_eq!(ranges, vec![(0usize, 3usize)], "同 def 多 hunk 去重成一体");
+    }
+
+    // ---- 批 E E-1：文件级 def / 改动 def / 一跳 ----
+
+    fn names(v: &[DefRange]) -> Vec<&str> { v.iter().map(|d| d.name.as_str()).collect() }
+
+    #[test]
+    fn all_defs_skips_nested_in_callable_keeps_class_methods() {
+        // Rust：fn 体内的局部 const / 嵌套 fn 不是文件级 def；impl 内方法是。
+        let rs: Vec<&str> = "pub struct Cfg { a: u8 }\nimpl Cfg {\n    pub fn build_value(&self) -> u8 {\n        const LIMIT: u8 = 3;\n        fn inner_helper() {}\n        self.a + LIMIT\n    }\n}\nfn top_level_helper() {}\n".lines().collect();
+        let all = all_defs(&rs, &rust_defs());
+        assert_eq!(names(&all), vec!["Cfg", "build_value", "top_level_helper"], "{all:?}");
+        assert_eq!((all[1].start, all[1].end, all[1].kind), (2, 6, "fn"));
+        // TS：class 内方法保留；方法体与箭头函数体内的 const 不计。
+        let ts: Vec<&str> = "export class Widget {\n  render(props: P): void {\n    const local_value = 1;\n  }\n  private helperMethod() {}\n}\nconst arrowFn = () => {\n  const inner_thing = 2;\n};\n".lines().collect();
+        let all = all_defs(&ts, &compile_defs(lang_for("x.ts").unwrap()));
+        assert_eq!(names(&all), vec!["Widget", "render", "helperMethod", "arrowFn"], "{all:?}");
+        // Go：方法 + 顶层 func + type。
+        let go: Vec<&str> = "type Server struct {}\nfunc (s *Server) TableName() string {\n    return \"x\"\n}\nfunc helperFunc() {}\n".lines().collect();
+        let all = all_defs(&go, &compile_defs(lang_for("x.go").unwrap()));
+        assert_eq!(names(&all), vec!["Server", "TableName", "helperFunc"], "{all:?}");
+    }
+
+    #[test]
+    fn changed_defs_anchors_every_changed_line() {
+        // 单 hunk 横跨两 def：hunk 首行锚定（changed_def_ranges）只见 alpha，全改动行锚定两者都见（K3）。
+        let file: Vec<&str> = "fn alpha_one() {\n    a();\n}\nfn beta_two() {\n    b();\n}\n".lines().collect();
+        let diff = "@@ -2,3 +2,3 @@\n+    a();\n }\n+fn beta_two() {\n";
+        let d = rust_defs();
+        assert_eq!(changed_def_ranges(diff, &file, &d).len(), 1, "旧口径只锚 hunk 首行");
+        let all = all_defs(&file, &d);
+        assert_eq!(names(&changed_defs(diff, &all)), vec!["alpha_one", "beta_two"]);
+        // 改动落在 def 之外（文件头 use 区）→ 无核（交禁真空窗）。
+        let file2: Vec<&str> = "use std::fmt;\n\nfn only_fn() {}\n".lines().collect();
+        assert!(changed_defs("@@ -1,0 +1,1 @@\n+use std::fmt;\n", &all_defs(&file2, &d)).is_empty());
+    }
+
+    #[test]
+    fn changed_defs_skips_container_with_inner_defs_and_takes_innermost() {
+        let ts: Vec<&str> = "export class Widget {\n  private count_value = 0;\n  render(props: P): void {\n    draw(props);\n  }\n}\n".lines().collect();
+        let all = all_defs(&ts, &compile_defs(lang_for("x.ts").unwrap()));
+        // 改字段行：最内层是带方法的 class → 不整段入核
+        assert!(changed_defs("@@ -2,1 +2,1 @@\n+  private count_value = 0;\n", &all).is_empty());
+        // 改方法体：最内层是方法 → 只取方法
+        assert_eq!(names(&changed_defs("@@ -4,1 +4,1 @@\n+    draw(props);\n", &all)), vec!["render"]);
+    }
+
+    #[test]
+    fn one_hop_callee_and_caller_rust_go_ts() {
+        let rs: Vec<&str> = "fn compute_total(xs: &[u8]) -> u8 { xs.iter().sum() }\nfn wrap_body(x: u8) -> u8 { compute_total(&[x]) + helper_thing() }\nfn helper_thing() -> u8 { 1 }\nfn outer_caller() -> u8 { wrap_body(3) }\nfn unrelated_fn() -> u8 { 9 }\n".lines().collect();
+        let d = rust_defs();
+        let all = all_defs(&rs, &d);
+        let changed: Vec<DefRange> = all.iter().filter(|x| x.name == "wrap_body").cloned().collect();
+        let hop = one_hop(&rs, &all, &changed);
+        assert_eq!(names(&hop.callees), vec!["compute_total", "helper_thing"], "{hop:?}");
+        assert_eq!(names(&hop.callers), vec!["outer_caller"], "{hop:?}");
+
+        let go: Vec<&str> = "func computeTotal(xs []int) int { return 0 }\nfunc wrapBody(x int) int { return computeTotal(nil) }\nfunc outerCaller() int { return wrapBody(1) }\n".lines().collect();
+        let gd = compile_defs(lang_for("x.go").unwrap());
+        let all = all_defs(&go, &gd);
+        let changed: Vec<DefRange> = all.iter().filter(|x| x.name == "wrapBody").cloned().collect();
+        let hop = one_hop(&go, &all, &changed);
+        assert_eq!((names(&hop.callees), names(&hop.callers)), (vec!["computeTotal"], vec!["outerCaller"]));
+
+        let ts: Vec<&str> = "export class Widget {\n  computeTotal(): number { return 1 }\n  wrapBody(): number { return this.computeTotal() }\n  outerCaller(): number { return this.wrapBody() }\n}\n".lines().collect();
+        let td = compile_defs(lang_for("x.ts").unwrap());
+        let all = all_defs(&ts, &td);
+        let changed: Vec<DefRange> = all.iter().filter(|x| x.name == "wrapBody").cloned().collect();
+        let hop = one_hop(&ts, &all, &changed);
+        assert_eq!((names(&hop.callees), names(&hop.callers)), (vec!["computeTotal"], vec!["outerCaller"]));
+        assert!(!hop.callers.iter().any(|c| c.name == "Widget"), "容器不作 caller");
+    }
+
+    #[test]
+    fn one_hop_excludes_self_generic_names_containers_with_inner_and_comment_mentions() {
+        let rs: Vec<&str> = "pub struct RouteTable { pub depth: u8 }\npub trait Walker {\n    fn walk_tree(&self);\n}\nfn handle() {}\nfn wrap_body(c: RouteTable) -> u8 {\n    handle();\n    wrap_body(c);\n    c.depth\n}\nfn commenter() {\n    // wrap_body is mentioned only in a comment\n    let x = 1;\n}\nfn data() {}\n".lines().collect();
+        let d = rust_defs();
+        let all = all_defs(&rs, &d);
+        let changed: Vec<DefRange> = all.iter().filter(|x| x.name == "wrap_body").cloned().collect();
+        let hop = one_hop(&rs, &all, &changed);
+        // RouteTable（无内部 def 的容器）作 callee；handle / data 通用名不计；自引用不计；Walker（带方法的 trait）不计
+        assert_eq!(names(&hop.callees), vec!["RouteTable"], "{hop:?}");
+        assert!(hop.callers.is_empty(), "注释里提到不算 caller: {hop:?}");
+        assert!(body_names(&rs, &changed[0]).contains("RouteTable") && !body_names(&rs, &changed[0]).contains("wrap_body"));
     }
 }
