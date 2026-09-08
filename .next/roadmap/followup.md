@@ -68,7 +68,7 @@
 | 增量轮两份清单 | `{{OTHER_CHANGED_FILES}}` 跨组索引已含全分支非 delta 文件（只带路径）+ `[delta]`，而 `<incremental_round>` 仍渲染 `two_layer_manifest` 双层清单（同信息两处，≤ 8K 字符） | D-3 段序翻转时合并：索引为唯一来源，`two_layer_manifest` 与其 E11-Q5 红测测试群随段重写迁移 |
 | `--pack-only` 预算的模型窗来源 | ✅ 合入批 A 时已改读 `cfg.active_roles()`（与真实评审同一 `budget_and_spec`） | — |
 | `GroupingStats` 只在 `--pack-only` 可见 | stdout + `summary.json`；真实评审的 RunMeta 未接线（避免撞批 B 的 `report.rs`） | F-5 观测接线 |
-| `[review.grouping]` 未接配置 | `GroupingOpts::default()` 内置 4 / 200 / 10，cli 只喂 `budget_bytes` | 批 A-2 定义子表后，后合者把 `cfg.review.grouping → GroupingOpts` 接上（一行） |
+| `review.grouping` 未接配置 | ✅ 批 A 重做合入时接上（2026-09-08）：`cli::grouping_opts(cfg.review.grouping, budget)`，`plan_cells` 三个入口同源；`semantic`（R8）仍无消费点 | — |
 
 ## 跨里程碑观测面（每个里程碑出口必报，写进 RunMeta 或 research）
 

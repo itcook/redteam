@@ -224,15 +224,27 @@ pub(crate) fn plan_cells(
     selected: Vec<FileChange>,
     root: &Path,
     budget: usize,
+    grouping_cfg: &crate::config::GroupingCfg,
     extra_paths: &[String],
     delta: Option<&std::collections::BTreeSet<String>>,
 ) -> CellPlan {
-    let grouping = group(selected, Some(root), &GroupingOpts { budget_bytes: Some(budget), ..GroupingOpts::default() });
+    let grouping = group(selected, Some(root), &grouping_opts(grouping_cfg, budget));
     let bundles = grouping.bundles;
     let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
     let others =
         crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, extra_paths, delta), bundles.len());
     CellPlan { bundles, dossiers, others, dossier_meta, stats: grouping.stats }
+}
+
+/// `review.grouping`（config.json，批 A-2 子表）→ 分组阈值；预算门由 pack 预算喂（批 C followup「后合者接一行」，2026-09-08 合入）。
+/// `semantic` 旋钮（R8）尚无消费点。
+pub(crate) fn grouping_opts(g: &crate::config::GroupingCfg, budget: usize) -> GroupingOpts {
+    GroupingOpts {
+        min_files: g.min_files as usize,
+        bundle_line_threshold: g.bundle_line_threshold as usize,
+        max_files_per_group: g.max_files_per_group as usize,
+        budget_bytes: Some(budget),
+    }
 }
 
 /// code 专属流水线（S2-2b）：bundle × model 工具循环 + positioning 尾段。
@@ -279,7 +291,7 @@ pub async fn run_code_review(
     let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
     // 2. 分组 / 装包 / 跨组索引（plan_cells：与增量、--pack-only 同源）。门未过 → 单包（即原 E9 单格全审）。
     // GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
-    let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &[], None);
+    let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &cfg.review.grouping, &[], None);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
         let other = others.get(idx).map(String::as_str).unwrap_or("");
@@ -416,7 +428,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     // 角色集为空（无配置）时按 128K 窗保守缺省，不报错——仪表无 provider 也能跑。
     let roles = cfg.active_roles();
     let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
-    let CellPlan { bundles, dossiers, others, stats, .. } = plan_cells(select_files(changes), cwd, budget, &[], None);
+    let CellPlan { bundles, dossiers, others, stats, .. } = plan_cells(select_files(changes), cwd, budget, &cfg.review.grouping, &[], None);
     let focus = args.focus.clone().unwrap_or_default();
 
     let job_id = gen_job_id(cwd);
@@ -1772,6 +1784,16 @@ mod resolve_tests {
     fn provs() -> &'static str {
         r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"roles":{"scanner":{}}}}},
             "beta_p":{"kind":"openai","models":{"b":{"roles":{"scanner":{}}},"p":{"displayName":"pro","roles":{"reviewer":{}}}}}}}"#
+    }
+
+    /// 批 C followup：`review.grouping` 子表接到 `GroupingOpts`（缺省 4 / 200 / 10 与内置一致）。
+    #[test]
+    fn grouping_opts_read_review_grouping_config() {
+        let d = grouping_opts(&Config::default().review.grouping, 1000);
+        assert_eq!((d.min_files, d.bundle_line_threshold, d.max_files_per_group, d.budget_bytes), (4, 200, 10, Some(1000)));
+        let c = Config::from_json(r#"{"review":{"grouping":{"minFiles":1,"bundleLineThreshold":0,"maxFilesPerGroup":2}}}"#).unwrap();
+        let o = grouping_opts(&c.review.grouping, 5);
+        assert_eq!((o.min_files, o.bundle_line_threshold, o.max_files_per_group, o.budget_bytes), (1, 0, 2, Some(5)));
     }
 
     /// 列表即活跃集：全部 scanner 各跑一遍（replicate）、无候补、priority 恒 0；reviewers 不进旧 fan-out。
