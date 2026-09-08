@@ -108,6 +108,16 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 ### Summary
 
 批 C 五个 task 全部落地：import_edges 三语言（tsconfig/go.mod/crate 根）、引用图分组（强弱边/弱缝先切/宁降不拆/孤立装箱/双阈值门）、跨组索引进 {{OTHER_CHANGED_FILES}}（降质+留指针+[delta]）、--pack-only 预算仪表；code-review high 十条 findings 修复并补测试；merge 已合入批 A 的 feat/m21-review-engine（6 处冲突，预算改读 active_roles）；用户裁决跳过 ship 评审，直接 --no-ff 合回 feat/m21-review-engine（7b3559b）。延后项记 followup：增量轮两份清单合并（D-3）、GroupingStats→RunMeta（F-5）、[review.grouping] 接线。
+## Session 7: M21a 批 B schema v4：疑点 schema + 角色分叉 CellOutput + proj-next.db v4 + RunMeta 观测字段 + 固定集导出；code-review 审核修复并合回
+<!-- trellis-session: v=2 fp=d0fc14d8945963aa -->
+
+**Date**: 2026-09-08
+**Task**: M21a 批 B schema v4：疑点 schema + 角色分叉 CellOutput + proj-next.db v4 + RunMeta 观测字段 + 固定集导出；code-review 审核修复并合回
+**Branch**: `feat/m21a-schema`
+
+### Summary
+
+批 B 四 task 落地（export_ledger 固定集 63/3/48、domain/suspicion.rs、CellRecord v4 + db 守卫、RunMeta 五字段 + SCHEMA_VERSION 4）；code-review 技能撞网关，主 agent 手工审读 + 五路视角出 20 余条，用户三裁定（proj-next.db 分库 / 导出内置搁置 / role 只由 output tag 派生）后修复两笔；两次合入 engine（含批 A、批 C）并 --no-ff 合回 b7af7d3；批 A JSON 重做后核验 config::Role / EffectiveModel.family / resume 回查三链完好。定：核心能力稳定前不跑 ship 评审。
 
 ### Git Commits
 
@@ -145,6 +155,13 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 | `e64276e` | fix(config): 身份串固定 provider/id（name→displayName）+ 重做评审修复（env 提示必修、写前 flag 校验、零值校验、嵌套键守卫、kind/apiKeyEnv 落模型层、原子写、max_tokens 同链） |
 | `1f2f89c` | merge: feat/m21-review-engine（批 B schema v4 + 批 C 分组与索引）into feat/m21a-config-json——解三处冲突（ReviewArgs.pack_only 字段 / CellRecord::ok 的 CellOutput::review 包装 vs JSON 夹具 route_key p/<id> / Init 文案 proj-next.db + config.json）；合并树 492+16+7+14 测试绿 |
 | `1208166` | feat(cli): review.grouping 配置接到 GroupingOpts（批 C followup「后合者一行」）——plan_cells 三入口同源，缺省 4/200/10 不变；followup 行销案 |
+| `0ef7798` | chore(eval): 导出旧 proj.db 的 dismissed / upheld 固定集（verifier 离线回归集数据，D10） |
+| `08484bd` | feat(domain): 疑点 schema（suspicion / category / scanned_areas / needs.kind）+ 按角色分叉的 CellOutput 枚举（D11 R14） |
+| `7c5e253` | feat(state): CellRecord 带 role/output 枚举/template_hash；proj.db schema v4 一次重置（cells.role + queue_items + suspicions 表壳） |
+| `0ec7912` | feat(report): RunMeta 加 coverage 五集合 / 模板哈希 / cache 命中 / 在途峰值 / refute 率字段；report schema_version 4 |
+| `03b5c6c` | fix(schema): 评审修复——守卫五改 + role 唯一真相源 + Role/family 复用批 A + 独立库文件 proj-next.db |
+| `3ac2332` | chore(eval): 固定集加 resolved / in_dismissed_ledger / head_sha，路径 URI 转义；oracle 兼容 v4 记录；followup 登记五条债 |
+| `2c4bb76` | chore(task): m21a-schema 规划与实施制品（prd / design / implement，含 code-review 审核修复记录） |
 
 ### Status
 
