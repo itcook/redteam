@@ -96,3 +96,31 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: M21a 批 C：引用图分组 + 跨组索引 + --pack-only 实施、code-review 十修、并入批 A 基线并 --no-ff 合回
+<!-- trellis-session: v=2 fp=b0d9310c006976fb -->
+
+**Date**: 2026-09-08
+**Task**: M21a 批 C：引用图分组 + 跨组索引 + --pack-only 实施、code-review 十修、并入批 A 基线并 --no-ff 合回
+**Branch**: `feat/m21a-grouping`
+
+### Summary
+
+批 C 五个 task 全部落地：import_edges 三语言（tsconfig/go.mod/crate 根）、引用图分组（强弱边/弱缝先切/宁降不拆/孤立装箱/双阈值门）、跨组索引进 {{OTHER_CHANGED_FILES}}（降质+留指针+[delta]）、--pack-only 预算仪表；code-review high 十条 findings 修复并补测试；merge 已合入批 A 的 feat/m21-review-engine（6 处冲突，预算改读 active_roles）；用户裁决跳过 ship 评审，直接 --no-ff 合回 feat/m21-review-engine（7b3559b）。延后项记 followup：增量轮两份清单合并（D-3）、GroupingStats→RunMeta（F-5）、[review.grouping] 接线。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0bc01b8` | feat(bundle): import 边补 TS 裸模块 / Rust use crate / Go 包路径（followup 实现债）——import_edges 替代 extract_imports：ImportResolver 惰性缓存 tsconfig（baseUrl/paths/extends 链、JSONC 容错）/ go.mod module 映射 / crate 根（workspace 子 crate 各自为根，尾段 item 回退），目标 ∈ 改动集才成边、越出 root 即丢；Python 相对沿用 |
+| `ca74eb5` | feat(bundle): 引用图分组——强弱边连通分量、弱缝先切、宁降不拆、孤立 bin-packing、ocr 双阈值门（design §3.2〔D3〕）——Bundle 带 edges/hub_order/over_budget，Grouping + GroupingStats/GroupingOpts(4/200/10)；引用边按改动 def 名词边界计次（ref_worthy 移植 risk_replay）；落单文件回池装箱；pack 按 hub_order 填（枢纽保全文）；merge_bundles 与 examples/dump_pack.rs 退场（followup 实现债），run_code_review / 增量路径分组下移到预算之后 |
+| `bf161a5` | feat(prompt): 正反向跨组索引进 {{OTHER_CHANGED_FILES}} 槽 + [delta] 标注 + omit 留指针（design §10.6〔D6〕）——bundle::cross_index / render_cross_index：每文件一行 path (gN +a/-d) → [imports] ← [imported-by] [delta]，与本组有边者优先，双帽内先降质为 see group N 再尾注带组指针；调用方按组预渲染 others 与 dossiers 同形传入 fan-out / 二阶段补查；增量轮喂全分支非 delta 文件为只带路径的条目；other_files_manifest 退场；旧模板第 80 行改组感知措辞（K10） |
+| `a88c025` | feat(cli): --pack-only 预算仪表——只装包、按 cell 报字节与 ÷3.5 估算，不调 provider（D7 B7）——run_pack_only：证据 → 门/分组 → 装包 → 同源 build_bundle_prompt 落盘 .redteam/packs/<job>/cell-<n>.md + summary.json，stdout 固定文本行（cell 字节/估算/pack/diff/over_budget + grouping 统计 + packs 目录）；与 --background/--resume/--incremental-from 互斥；gen_job_id 外移到 cli；examples/dump_pack.rs 的 eval 引用改历史注记 |
+| `146bddb` | docs(followup): 批 C 延后项——增量轮两份清单合并（D-3）/ --pack-only 预算改角色条目（A 合回后）/ GroupingStats→RunMeta（F-5）/ [review.grouping] 接线；extract_imports 与 dump_pack 两条实现债标已偿 |
+| `a3d2908` | fix(ship): 批 C code-review 十修——TS 点号基名精确匹配再剥扩展名（user.service 不误连 user.ts）；Rust 根文件回退只在父模块即 crate 根且 ≤1 段（super::* 不再粘到 lib.rs）；pub 前缀只在语句首行且需空白/括号（pubsub 续行不被剥）；tsconfig 数组 extends 按属性合并；Go 单行 import 块不进块态、块内只认 [别名] "spec" 整行；count_plus_minus 补 ---sep 正文行测试；引用边改单次合并 regex 扫描 O(n×size)；二阶段增强包沿用 hub_order；plan_cells/budget_and_spec 抽共用，--pack-only 预算改用 resolve_models 同一模型集、label/GITIGNORE_BODY 复用；过期注释更新 |
+| `00081cc` | merge: feat/m21-review-engine（含批 A 配置节 be87c44 与 D12 文档）并入 feat/m21a-grouping——解 6 处冲突：project.rs 取批 A 版并保留 GITIGNORE_BODY pub(crate)；ReviewArgs 同时带 test_command / pack_only；预算改由 budget_and_spec(&RoleSets) 读 cfg.active_roles()（全量 / 增量 / --pack-only 同源，K15 已偿）；dump_pack.rs 保持删除；followup 双方条目合并 |
+
+### Status
+
+[OK] **Completed**
