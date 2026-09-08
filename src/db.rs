@@ -151,7 +151,8 @@ impl ProjDb {
         // 跨进程写并发（后台 job 写 state/results × 宿主 dismiss add）下 WAL 写锁冲突
         // 默认立即 SQLITE_BUSY——busy_timeout 让写者排队而非报错。
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        if Self::needs_setup(&conn)? {
+        let wrote = Self::needs_setup(&conn)?;
+        if wrote {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             if let Err(e) = Self::setup_schema(&conn, path) {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -159,8 +160,14 @@ impl ProjDb {
             }
             conn.execute_batch("COMMIT")?;
         }
-        // WAL 在守卫之后：被拒开的旧库 / 陌生库不被改写 journal 模式。
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // WAL 在守卫之后：被拒开的旧库 / 陌生库不被改写 journal 模式。只读打开（只读文件 / 只读挂载）的 delete 模式 v4 库
+        // 切不了 WAL：快路径降级 warning、继续只读使用，不拒开（修补批 X-1）；刚建 / 补过表的库切失败仍是错误。
+        if let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
+            if wrote {
+                return Err(e.into());
+            }
+            eprintln!("warning: {} 只读打开，无法切换 journal_mode=WAL（{e}），继续以只读方式使用", path.display());
+        }
         Ok(Self { conn })
     }
 
@@ -212,13 +219,17 @@ impl ProjDb {
             "`{p}` 是 schema v{version} 的库，高于本二进制支持的 v{USER_VERSION}：请用更新的 redteam 打开，本版本不降级",
             p = path.display()
         );
-        if version < USER_VERSION && !have.is_empty() {
+        // 陌生表在任何版本号下都拒开（含 user_version 恰为 4 的业务库——修补批 X-1：原只在 < v4 分支内查，
+        // 版本相等而表不全的陌生库会被建入 redteam 表并切 WAL）。
+        if !have.is_empty() {
             let foreign: Vec<&str> = have.iter().map(String::as_str).filter(|t| !TABLES.contains(t)).collect();
             anyhow::ensure!(
                 foreign.is_empty(),
                 "`{p}` 不是 redteam 项目库（含陌生表 {foreign:?}），拒绝改写",
                 p = path.display()
             );
+        }
+        if version < USER_VERSION && !have.is_empty() {
             let already_v4 = have.iter().any(|t| t == "cells") && Self::has_column(conn, "cells", "role")?;
             if !already_v4 {
                 let mut rows = 0i64;
@@ -910,6 +921,42 @@ mod guard_tests {
         Connection::open(&path2).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY);").unwrap();
         assert!(ProjDb::open_at(&path2).is_err());
         assert_eq!(table_names(&Connection::open(&path2).unwrap()), ["users"]);
+    }
+
+    /// 修补批 X-1：user_version 恰为 4 的陌生库（业务库把 user_version 当自己的迁移计数）也拒开、零改写。
+    #[test]
+    fn foreign_v4_versioned_db_is_refused_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.sqlite3");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users (name) VALUES ('a');").unwrap();
+            c.pragma_update(None, "user_version", USER_VERSION).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let err = ProjDb::open_at(&path).err().expect("v4 版本号的陌生库必须拒开").to_string();
+        assert!(err.contains("陌生表") && err.contains("users"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "字节零改写（含 journal 模式）");
+        assert_eq!(table_names(&Connection::open(&path).unwrap()), ["users"]);
+    }
+
+    /// 修补批 X-1：delete 模式（未切过 WAL）的只读 v4 库也可开——快路径切不了 WAL 时降级 warning 而非拒开。
+    #[cfg(unix)]
+    #[test]
+    fn readonly_delete_mode_v4_db_opens_with_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.db");
+        {
+            let db = ProjDb::open_at(&path).unwrap();
+            db.cell_put("j", "c", "scanner", "{}").unwrap();
+        }
+        // 切回 delete 模式（`.dump | sqlite3` 恢复或旧工具写出的库）
+        Connection::open(&path).unwrap().pragma_update(None, "journal_mode", "DELETE").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let db = ProjDb::open_at(&path).expect("只读 delete 模式 v4 库应可开");
+        assert_eq!(db.cell_role("j", "c").unwrap().as_deref(), Some("scanner"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     /// `.dump | sqlite3` 恢复的 v4 库丢了 user_version（归 0）但结构已是 v4 → 视为 v4、只补版本号、数据保留。

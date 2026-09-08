@@ -1074,10 +1074,28 @@ impl<'a> ImportResolver<'a> {
             _ => strip_ext(file),
         };
         let mut pending: Option<String> = None; // 多行 use 语句累积
+        // 内联 `mod x { … }` 块栈（名, 进入时花括号深度）：块内的 `super::` 指向本文件模块自身而非文件的父模块
+        // （修补批 X-2：原按文件顶层算，`mod tests { use super::*; }` 把每个顶层模块粘到 lib.rs）。行级花括号计数是
+        // 启发式（字符串 / 注释里的括号会失准），最坏只退回旧行为。上一行的括号变化在本行开始时生效。
+        let mut inline_mods: Vec<(String, usize)> = Vec::new();
+        let mut depth: usize = 0;
+        let (mut prev_opens, mut prev_closes) = (0usize, 0usize);
         for line in content.lines() {
+            depth = (depth + prev_opens).saturating_sub(prev_closes);
+            while inline_mods.last().is_some_and(|(_, d)| depth <= *d) {
+                inline_mods.pop();
+            }
             // 可见性前缀只在语句起始行剥；多行 use 的续行（`pubsub::Broker,`）原样累积。
             let raw = line.trim();
+            (prev_opens, prev_closes) = (raw.matches('{').count(), raw.matches('}').count());
             let t = if pending.is_none() { strip_pub(raw) } else { raw };
+            if pending.is_none() {
+                if let Some(name) = t.strip_prefix("mod ").and_then(|r| r.strip_suffix('{')).map(str::trim) {
+                    if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        inline_mods.push((name.to_string(), depth));
+                    }
+                }
+            }
             let stmt = match pending.take() {
                 Some(mut acc) => {
                     acc.push(' ');
@@ -1107,8 +1125,9 @@ impl<'a> ImportResolver<'a> {
             let Some(root) = crate_root.as_deref() else { continue };
             let mut paths = Vec::new();
             expand_use_tree(&[], &stmt[..end], &mut paths);
+            let module_here: Vec<String> = module.iter().cloned().chain(inline_mods.iter().map(|(n, _)| n.clone())).collect();
             for p in paths {
-                out.extend(self.resolve_rust_path(root, &module, &p));
+                out.extend(self.resolve_rust_path(root, &module_here, &p));
             }
         }
         out
@@ -1258,6 +1277,11 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
                 };
                 for m in re.find_iter(text) {
                     if let Some(is) = owners.get(m.as_str()) {
+                        // 修补批 X-2：j 自身也定义同名 changed def 时，这些命中是它自己的定义与内部调用，不是对别人的引用
+                        // （trait 方法 / Go `Validate()` / TS 同名类方法会把互不相关的文件粘成无法切割的强边）。
+                        if is.contains(&j) {
+                            continue;
+                        }
                         for &i in is {
                             if i != j {
                                 *counts.entry((j, i)).or_insert(0) += 1;
@@ -1474,6 +1498,26 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, content).unwrap();
+    }
+
+    /// 修补批 X-2：顶层模块内联 `mod tests { use super::*; }` 的 super 指向自身，不连 lib.rs；文件顶层的 `use super::X` 仍指 crate 根；
+    /// 嵌套模块两种写法各归其位。
+    #[test]
+    fn import_edges_rust_inline_mod_super_points_to_self_not_root() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/lib.rs", "pub mod a;\npub mod b;\npub struct Thing;\n");
+        write(dir.path(), "src/a.rs", "pub fn f() {}\n");
+        write(dir.path(), "src/b/mod.rs", "pub fn g() {}\npub mod c;\n");
+        write(dir.path(), "src/b/c.rs", "pub fn h() {}\n");
+        let root = Some(dir.path());
+        let inline = "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn t() { f(); }\n}\n";
+        assert!(edges("src/a.rs", inline, &["src/a.rs", "src/lib.rs"], root).is_empty(), "内联 mod 里的 super = 自身，不成边");
+        assert_eq!(edges("src/a.rs", "use super::Thing;\n", &["src/a.rs", "src/lib.rs"], root), vec!["src/lib.rs"], "文件顶层 super 仍指 crate 根");
+        assert_eq!(edges("src/b/c.rs", "use super::g;\n", &["src/b/c.rs", "src/b/mod.rs"], root), vec!["src/b/mod.rs"]);
+        assert!(edges("src/b/c.rs", "mod tests {\n    use super::*;\n}\n", &["src/b/c.rs", "src/b/mod.rs"], root).is_empty());
+        // 块结束后恢复：同文件后续的顶层 `use super::Thing` 照旧指 crate 根
+        let after = "mod tests {\n    use super::*;\n}\nuse super::Thing;\n";
+        assert_eq!(edges("src/a.rs", after, &["src/a.rs", "src/lib.rs"], root), vec!["src/lib.rs"]);
     }
 
     #[test]
@@ -1699,6 +1743,27 @@ mod tests {
         assert_eq!(paths_of(&g.bundles[0]), vec!["src/feat/x.ts", "util/b.ts"]);
         assert!(g.bundles[0].edges.iter().any(|e| e.kind == EdgeKind::Import && e.from == "src/feat/x.ts" && e.to == "util/b.ts"));
         assert_eq!(paths_of(&g.bundles[1]), vec!["zzz/c.py", "zzz/d.py"]);
+    }
+
+    /// 修补批 X-2：同名 changed def 是「各自定义」不是引用——文件自身拥有该名时不计引用边，否则互不相关的文件被强边粘死。
+    #[test]
+    fn group_same_name_defs_do_not_make_reference_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let def_line = "pub fn validate_input(x: &str) -> bool { x.len() > 1 }";
+        write(dir.path(), "p/a.rs", &format!("{def_line}\nfn run_a() {{ validate_input(\"a\"); validate_input(\"b\"); }}\n"));
+        write(dir.path(), "q/b.rs", &format!("{def_line}\nfn run_b() {{ validate_input(\"c\"); validate_input(\"d\"); }}\n"));
+        write(dir.path(), "r/c.rs", "fn use_it() { validate_input(\"e\"); }\n");
+        let def = format!("@@ -1,0 +1,1 @@\n+{def_line}\n");
+        let changes = vec![fc("p/a.rs", &def), fc("q/b.rs", &def), fc("r/c.rs", "+u")];
+        let g = group(changes, Some(dir.path()), &open_gate(10, None));
+        let all: Vec<&Edge> = g.bundles.iter().flat_map(|b| b.edges.iter()).collect();
+        assert!(
+            !all.iter().any(|e| (e.from == "p/a.rs" || e.from == "q/b.rs") && matches!(e.kind, EdgeKind::Reference { .. })),
+            "同名定义者之间无引用边: {all:?}"
+        );
+        // 真引用方 c 对两个定义者各一条（count 1）
+        assert!(all.iter().any(|e| e.from == "r/c.rs" && e.to == "p/a.rs" && e.kind == EdgeKind::Reference { count: 1 }), "{all:?}");
+        assert!(all.iter().any(|e| e.from == "r/c.rs" && e.to == "q/b.rs" && e.kind == EdgeKind::Reference { count: 1 }), "{all:?}");
     }
 
     #[test]
