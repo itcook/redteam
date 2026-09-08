@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 7
+- **Total Sessions**: 8
 - **Last Active**: 2026-09-08
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~168 | Active |
+| `journal-1.md` | ~193 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 8 | 2026-09-08 | M21a 批 A 重做收尾：评审第二批修复 + 隐私清理 + followup（主分支直接落地，无任务） | `14b7289`, `a867504`, `3896bfb`, `da137fa` | `feat/m21-review-engine` |
 | 7 | 2026-09-08 | M21a 批 B schema v4：疑点 schema + 角色分叉 CellOutput + proj-next.db v4 + RunMeta 观测字段 + 固定集导出；code-review 审核修复并合回 | `0ef7798`, `08484bd`, `7c5e253`, `0ec7912`, `03b5c6c`, `3ac2332`, `2c4bb76` | `feat/m21a-schema` |
 | 6 | 2026-09-08 | M21a 批 A 重做：config.json + provider→models→roles（D12），身份串 provider/id，评审修复，合入批 B/C | `9b817da`, `e64276e`, `1f2f89c`, `1208166` | `feat/m21a-config-json` |
 | 5 | 2026-09-08 | M21a 批 C：引用图分组 + 跨组索引 + --pack-only 实施、code-review 十修、并入批 A 基线并 --no-ff 合回 | `0bc01b8`, `ca74eb5`, `bf161a5`, `a88c025`, `146bddb`, `a3d2908`, `00081cc` | `feat/m21a-grouping` |

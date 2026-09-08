@@ -166,3 +166,28 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 ### Status
 
 [OK] **Completed**
+
+
+## Session 8: M21a 批 A 重做收尾：评审第二批修复 + 隐私清理 + followup（主分支直接落地，无任务）
+<!-- trellis-session: v=2 fp=004b61a73f46bb1f -->
+
+**Date**: 2026-09-08
+**Task**: M21a 批 A 重做收尾：评审第二批修复 + 隐私清理 + followup（主分支直接落地，无任务）
+**Branch**: `feat/m21-review-engine`
+
+### Summary
+
+批 A 重做合回后，评审子 agent 第二轮报告直接在 feat/m21-review-engine 修：HTTP 整请求超时随模型 per_turn 自动抬（慢模型不再被 300s 先切断）、REDTEAM_PER_TURN_SECS 解析统一、confFloor / 空 provider 名 / 含 '/' / 空 model id 校验、形状错误带字段路径、旧 secrets.toml 提示、相对 REDTEAM_HOME 拒绝、model check 无 scanner 退 1、review / worker 路径配置错误硬失败、package.json 空 test 脚本不算、悬空测试引用修正。隐私：已跟踪文件清除公司仓路径 / 分支 / SHA / 名称（P0 归档 prd+implement、plan 出口验收、524 spike、crosslang-scan 默认路径、三处注释）。followup：评审未核实四项、perTurnTimeoutSecs 退役议题（用户提，按分组/切片后 dogfood 轮时数据裁决）。真机：用户改配置后 model list 四条 ✓（qwen 走 provider 级 apiKey 第 4 级）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `14b7289` | fix(config): 重做评审第二批——HTTP 整请求超时罩住单轮（M2）、confFloor/空名/含 '/' 校验、形状错误带字段路径、旧 secrets.toml 提示、相对 REDTEAM_HOME 拒绝、model check 无 scanner 退 1、评审路径配置错误硬失败 |
+| `a867504` | chore(privacy): 已跟踪文件清除公司仓路径 / 分支 / SHA / 名称引用（P0 task 归档 prd+implement、plan 出口验收、524 spike、crosslang-scan 默认路径、三处「承 hiapi F2」注释）——远端为公开仓，公司细节只记 .next/private/ |
+| `3896bfb` | docs(followup): 记批 A 重做评审子 agent 未核实项（e3_contract_ab anchored 恒真式、risk_replay parse_diff 列首 --/++、probe kind 取首模型、check_all 串行）——M21b 用 risk_replay 作回归门前先核实 |
+| `da137fa` | docs(followup): perTurnTimeoutSecs 退役议题——分组/切片落地后按 dogfood 轮时数据决定，M21e 拆除时旧键走 warning |
+
+### Status
+
+[OK] **Completed**
