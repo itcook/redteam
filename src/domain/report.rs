@@ -134,6 +134,10 @@ pub struct RunMeta {
     /// per-cell 运行摘要（诊断呈现）。旧 JSON 无此字段，反序列化回空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cells: Vec<CellSummary>,
+    /// ship 循环的测试命令：`--test-command` 覆盖，否则 `project::infer_test_command` 推断；推不出 None
+    /// （M21a 批 A K1，与 `redteam test-command` 同一链）。serde default 兼容旧 JSON。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

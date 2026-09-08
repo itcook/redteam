@@ -49,6 +49,10 @@
 | `adversarial-code-bundle.md` / `adversarial-refute.md` 单模板 | 角色协议段在头部、三立场混一 | M21a 拆 `shared-head.md` + `scanner.md`；M21b 加 `reviewer.md` / `verifier.md`（D9） |
 | M6-b 提示词 harness（M20 backlog） | 无角色级回归集 | 三角色离线回归集随 M21a / M21b 落地（verifier 用 proj.db dismissed vs upheld，零新数据）；M20 只剩通用 harness |
 | `examples/dump_pack.rs`（P0 E3 dev-time 组包仪器） | 用 lib pub API 照抄三处 `pub(crate)` 辅助与 `NO_TOOLS_SYSTEM` 落盘单发 prompt；随 `cargo test` 编译 | M21a `--pack-only` 落地即删（铁律 1 建了拆）；`eval/risk_replay.py` 保留为 M21b 风险规则的离线回归器 |
+| `redteam test-command` 子命令（M21a 批 A K1，过渡形态） | 项目层 `test_command` 随项目 config 退场后，推断链进二进制（Cargo / package.json / Makefile / go.mod）；`review --test-command` 记 RunMeta | ship 协议进二进制（M21c 切名后 ship.md 第 2 步改调本子命令；协议整体内置时评估把它拆卸 / 并入）——用户 2026-09-08 要求记下拆卸 |
+| ship.md 第 2 步「测试命令探测」仍在 prompt 侧 | 插件在 M21a-b 跑 dev 二进制，无 `test-command` | M21c 切名后改为调用 `${CLAUDE_PLUGIN_ROOT}/bin/redteam test-command`（退出码 2 → AskUser），删 prompt 侧启发式 |
+| `--resume` 老作业按当前 `[[scanners]]` 重建 registry | 批 A 删 `--models` 后 args.json 里的模型集不再是权威源 | M21b 队列快照落地后 resume 读快照里的角色条目；此前只在 dogfood 观察，不修 |
+| `legacy_opts_from_roles` 适配器（cli）+ `PlannedModel.priority` 恒 0 | 旧 fan-out 靠它跑到批 F | 批 F-4 硬切时删除 |
 
 ## 跨里程碑观测面（每个里程碑出口必报，写进 RunMeta 或 research）
 
