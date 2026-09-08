@@ -73,6 +73,7 @@ M21c 与 M21d 可并行（d 只依赖 reviewer cell 存在，不依赖台账）�
   新增、配置搬到 `~/.redteam/`），`--help` 与 README 须在 M21e 定稿后再发。
 - M20 backlog：R6 执行判（design §9.4 D 层）、google 后端（R17）、RPM 令牌桶（R16）、交互式配置（R19）不在本 roadmap。
 - design 锁定后按规范派生 `../plans/2026-*-redteam-m21{a..e}-*-plan.md`（`.next/plans/`），本目录各里程碑文件是其范围与验收的上位定义。
+  已派生：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08，六批 A-F + 出口，波次：A/B/C 并行 → D/E → F → 出口）。
 
 ## 状态图例
 

@@ -1,7 +1,7 @@
 # redteam 评审引擎·风险路由 DAG 架构（M21 · v8）
 
 > 状态: **锁定**（v8，2026-09-07，P0 验证门出口〔D11〕：E1 风险规则 v4 成立、E3 疑点契约成立；§3.3 / §4 / §6 / §12.1 / §16 / §17 按 D11 改；
-> 无 `[review.risk]` / `--risk`）· 派生 plan：`../plans/`（待产出）。
+> 无 `[review.risk]` / `--risk`）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；M21b-e 待产出。
 > v5（2026-09-05 grill〔D7〕：角色命名 scanner / reviewer / verifier；配置节 §12 重写为用户级唯一 TOML；
 > 无候补；verifier 流式化 + 数据判决；provider 在途上限；aacr-bench 退役至 M21c / M21e 重启）。
 > v6（2026-09-05）：scanner 组 pack 默认 `slice`〔D8〕；§10.7 提示词按角色分离〔D9〕；E2 改为 M21a 出口 slice vs full A/B。
