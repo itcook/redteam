@@ -292,7 +292,7 @@ default_models=["m","m2"]
         cell: "bundle[src/a.rs]".into(), model: "m".into(), prompt: "p".into(),
     }]).unwrap();
     store.append_partial(job_id, &CellRecord::ok(
-        "bundle[src/a.rs]", "m", prior_report.findings.clone(),
+        "bundle[src/a.rs]", "m", redteam::domain::CellOutput::review(prior_report.findings.clone()),
     )).unwrap();
 
     // ② commit B 造 delta：旧问题行原样保留（验携带存活），新增一处问题行。

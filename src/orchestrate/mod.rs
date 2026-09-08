@@ -131,11 +131,15 @@ impl CellRun {
     /// 转持久化记录；`fallback_model`：胜出者为空（整链失败）时的 model 标注
     /// （replicate 格=该格 model；候补链=空串，warn 已含逐家原因）。
     fn to_record(&self, cell_id: String, fallback_model: &str) -> CellRecord {
+        let model = if self.model.is_empty() { fallback_model.to_string() } else { self.model.clone() };
+        // 旧 finding 路径（F-4 删）落为 reviewer 形态输出：findings + 剩余 needs 声明。
         CellRecord {
             cell: cell_id,
-            model: if self.model.is_empty() { fallback_model.to_string() } else { self.model.clone() },
+            role: crate::domain::Role::Reviewer,
+            family: crate::state::family_of(&model),
+            model,
             ok: self.warn.is_none(),
-            findings: self.findings.clone(),
+            output: crate::domain::CellOutput::Review { findings: self.findings.clone(), needs: self.needs.clone() },
             warn: self.warn.clone(),
             duration_ms: self.duration_ms,
             input_tokens: self.tokens.0,
@@ -144,6 +148,7 @@ impl CellRun {
             attempts: self.attempts,
             iterations: self.iterations,
             tool_use: self.tool_use.clone(),
+            template_hash: None,
         }
     }
 }

@@ -10,6 +10,12 @@ use std::path::Path;
 /// 库文件名（挂在项目 `.redteam/` 下）。
 pub const DB_FILE: &str = "proj.db";
 
+/// schema 版本（`PRAGMA user_version`）。v4 = M21 一次重置（D10-2）：cells 带 role 列、疑点台账与队列快照表壳。
+/// 低于此版本且有数据的库**拒开不迁移**——先 `eval/export_ledger.py` 导出固定集，再删库重建。
+pub const USER_VERSION: i64 = 4;
+/// 「库非空」判定所看的数据表（判例 / 作业 / 评审史）；history 表随主表、sqlite 内部表不计。
+const DATA_TABLES: &[&str] = &["dismissed", "resolved", "jobs", "cells", "results"];
+
 /// dismissed 状态枚举（应用层校验；sqlite 存 TEXT）。
 /// withdrawn=改判属实（替代删卡）、stale=gc 判定锚失效——两者读取时视同无卡。
 pub const STATUSES: &[&str] = &["dismissed", "re-upheld", "human-confirmed", "withdrawn", "stale"];
@@ -63,6 +69,7 @@ impl ProjDb {
         // 默认立即 SQLITE_BUSY——busy_timeout 让写者排队而非报错。
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        Self::guard_schema_version(&conn, path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS dismissed (
                id TEXT PRIMARY KEY,
@@ -110,6 +117,7 @@ impl ProjDb {
              CREATE TABLE IF NOT EXISTS cells (
                job_id TEXT NOT NULL,
                cell TEXT NOT NULL,
+               role TEXT NOT NULL,
                record_json TEXT NOT NULL,
                PRIMARY KEY (job_id, cell)
              );
@@ -118,9 +126,64 @@ impl ProjDb {
                json TEXT NOT NULL,
                md TEXT NOT NULL DEFAULT '',
                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             );
+             CREATE TABLE IF NOT EXISTS queue_items (
+               job_id TEXT NOT NULL,
+               item_id TEXT NOT NULL,
+               state TEXT NOT NULL,
+               json TEXT NOT NULL,
+               PRIMARY KEY (job_id, item_id)
+             );
+             CREATE TABLE IF NOT EXISTS suspicions (
+               id TEXT PRIMARY KEY,
+               file TEXT NOT NULL,
+               quote_norm TEXT NOT NULL,
+               hint TEXT NOT NULL DEFAULT '',
+               status TEXT NOT NULL,
+               first_job TEXT NOT NULL DEFAULT '',
+               last_job TEXT NOT NULL DEFAULT '',
+               activations INTEGER NOT NULL DEFAULT 0,
+               json TEXT NOT NULL
              );",
         )?;
+        // v4 表壳说明（design §8.3 / D11-7）：`queue_items` = 深挖队列快照（resume 读快照重跑未完项，M21b 写）；
+        // `suspicions` = 疑点台账（quote 锚 + hint + 状态 + 最近作业 + 激活次数，M21c 写）。本里程碑只建不写。
+        conn.pragma_update(None, "user_version", USER_VERSION)?;
         Ok(Self { conn })
+    }
+
+    /// schema v4 一次重置守卫（D10-2，不写迁移）。三分支：
+    /// - 全新文件（无用户表）→ 放行建表；
+    /// - `user_version < 4` 且已有表但数据表全空（如 dev 二进制 `init` 出的空库）→ 丢表重建，零数据零风险；
+    /// - `user_version < 4` 且有数据 → 拒开，提示先导出固定集再删库重建。守卫只读计数、不改写有数据的旧库。
+    fn guard_schema_version(conn: &Connection, path: &Path) -> Result<()> {
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version >= USER_VERSION {
+            return Ok(());
+        }
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let mut rows = 0i64;
+        for t in DATA_TABLES {
+            if tables.iter().any(|x| x == t) {
+                rows += conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get::<_, i64>(0))?;
+            }
+        }
+        anyhow::ensure!(
+            rows == 0,
+            "proj.db schema v{version} < v{USER_VERSION}（M21 一次重置，不迁移）：先 `python3 eval/export_ledger.py --db {p}` \
+             导出 dismissed / upheld 固定集，再删除 {p} 重建（`redteam init`）",
+            p = path.display()
+        );
+        for t in &tables {
+            conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{t}\""))?;
+        }
+        Ok(())
     }
 
     // ---- dismissed 台账 ----
@@ -351,13 +414,22 @@ impl ProjDb {
     }
 
     /// cell checkpoint：同 (job,cell) 覆盖（重试成功覆盖失败记录，读取端零过滤合并）。
-    pub fn cell_put(&self, job_id: &str, cell: &str, record_json: &str) -> Result<()> {
+    /// `role` 列冗余存 `CellRecord.role`（v4）：M21b resume 按角色差集查表，不必反序列化整列 JSON。
+    pub fn cell_put(&self, job_id: &str, cell: &str, role: &str, record_json: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO cells (job_id, cell, record_json) VALUES (?1,?2,?3)
-             ON CONFLICT(job_id, cell) DO UPDATE SET record_json=?3",
-            params![job_id, cell, record_json],
+            "INSERT INTO cells (job_id, cell, role, record_json) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(job_id, cell) DO UPDATE SET role=?3, record_json=?4",
+            params![job_id, cell, role, record_json],
         )?;
         Ok(())
+    }
+
+    /// 测试/诊断：某 cell 的 role 列值（v4 列与记录一致性断言用）。
+    pub fn cell_role(&self, job_id: &str, cell: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT role FROM cells WHERE job_id=?1 AND cell=?2", params![job_id, cell], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn cell_all(&self, job_id: &str) -> Result<Vec<String>> {
@@ -525,11 +597,13 @@ mod tests {
         assert_eq!(db.job_get_manifest("j1").unwrap().unwrap(), "[]");
         assert!(db.job_get_args("nope").unwrap().is_none());
 
-        db.cell_put("j1", "bundle[a]@m", r#"{"ok":false}"#).unwrap();
-        db.cell_put("j1", "bundle[a]@m", r#"{"ok":true}"#).unwrap();
+        db.cell_put("j1", "bundle[a]@m", "reviewer", r#"{"ok":false}"#).unwrap();
+        db.cell_put("j1", "bundle[a]@m", "scanner", r#"{"ok":true}"#).unwrap();
         let cells = db.cell_all("j1").unwrap();
         assert_eq!(cells.len(), 1, "同 cell 覆盖（重试成功覆盖失败）");
         assert_eq!(cells[0], r#"{"ok":true}"#);
+        assert_eq!(db.cell_role("j1", "bundle[a]@m").unwrap().as_deref(), Some("scanner"), "覆盖写同时更新 role 列");
+        assert_eq!(db.cell_role("j1", "nope").unwrap(), None);
 
         db.result_put_json("j1", "{}").unwrap();
         db.result_put_md("j1", "# md").unwrap();
@@ -671,6 +745,77 @@ mod guard_tests {
             Some(r#"{"v":2}"#.to_string())
         }).unwrap();
         assert_eq!(db.job_get_state("j").unwrap().as_deref(), Some(r#"{"v":2}"#));
+    }
+
+    fn table_names(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
+            .query_map([], |r| r.get::<_, String>(0)).unwrap()
+            .collect::<std::result::Result<_, _>>().unwrap()
+    }
+    fn user_version(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap()
+    }
+
+    /// v4 空建：既有七表 + queue_items / suspicions 两张表壳，user_version = 4（出口 8）。
+    #[test]
+    fn fresh_db_builds_v4_tables_and_user_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ProjDb::open(dir.path()).unwrap();
+        assert_eq!(
+            table_names(&db.conn),
+            ["cells", "dismissed", "dismissed_history", "jobs", "queue_items", "resolved", "resolved_history", "results", "suspicions"]
+        );
+        assert_eq!(user_version(&db.conn), USER_VERSION);
+        // cells 带 role 列；再开一次幂等
+        db.cell_put("j", "c", "scanner", "{}").unwrap();
+        drop(db);
+        let again = ProjDb::open(dir.path()).unwrap();
+        assert_eq!(user_version(&again.conn), USER_VERSION);
+        assert_eq!(again.cell_role("j", "c").unwrap().as_deref(), Some("scanner"));
+    }
+
+    /// 旧库（user_version 0 且有数据）拒开、文案指向导出脚本与库路径；库文件不被改写。
+    #[test]
+    fn old_db_with_data_is_refused_with_export_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE dismissed (id TEXT PRIMARY KEY, status TEXT NOT NULL, reason TEXT NOT NULL);
+                 CREATE TABLE cells (job_id TEXT NOT NULL, cell TEXT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY (job_id, cell));
+                 INSERT INTO dismissed VALUES ('a1b2c3d4e5f60718', 'dismissed', '误报');",
+            ).unwrap();
+        }
+        let err = ProjDb::open_at(&path).err().expect("旧库有数据必须拒开").to_string();
+        assert!(err.contains("export_ledger.py"), "{err}");
+        assert!(err.contains("proj.db"), "{err}");
+        assert!(err.contains("v0 < v4"), "{err}");
+        // 守卫只读：旧表与数据原样
+        let c = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&c), 0);
+        assert_eq!(c.query_row("SELECT count(*) FROM dismissed", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(table_names(&c), ["cells", "dismissed"]);
+    }
+
+    /// 旧形状但全空（dev 二进制 `init` 出的空库）→ 丢表重建为 v4（cells 长出 role 列）。
+    #[test]
+    fn old_empty_db_is_rebuilt_as_v4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE dismissed (id TEXT PRIMARY KEY, status TEXT NOT NULL, reason TEXT NOT NULL);
+                 CREATE TABLE dismissed_history (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL);
+                 CREATE TABLE cells (job_id TEXT NOT NULL, cell TEXT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY (job_id, cell));",
+            ).unwrap();
+        }
+        let db = ProjDb::open_at(&path).unwrap();
+        assert_eq!(user_version(&db.conn), USER_VERSION);
+        assert_eq!(table_names(&db.conn).len(), 9);
+        db.cell_put("j", "c", "verifier", "{}").unwrap();
+        assert_eq!(db.cell_role("j", "c").unwrap().as_deref(), Some("verifier"));
     }
 
     #[test]

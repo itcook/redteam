@@ -324,7 +324,7 @@ pub(crate) mod incremental_tests {
         let prior_args = ReviewArgs { incremental_from: None, background: true, ..inc_args("dev0", "unused") };
         store.write_args_raw(job, &serde_json::to_string(&prior_args).unwrap()).unwrap();
         store.write_manifest(job, &[CellInput { cell: "bundle[a.rs]@m".into(), model: "m".into(), prompt: "p".into() }]).unwrap();
-        store.append_partial(job, &CellRecord::ok("bundle[a.rs]@m", "m", vec![])).unwrap();
+        store.append_partial(job, &CellRecord::ok("bundle[a.rs]@m", "m", crate::domain::CellOutput::review(vec![]))).unwrap();
     }
 
     #[test]
