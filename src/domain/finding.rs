@@ -44,14 +44,27 @@ pub struct RawFinding {
     pub quote: String,
 }
 
+/// needs 条目种类（design §4 / §9.4 L4-B）：evidence=缺证据文件（二阶段补查）、api=缺第三方 callee 契约（M21b 入队）。
+/// 旧 JSON 无此键 → 缺省 evidence。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NeedKind {
+    #[default]
+    Evidence,
+    Api,
+}
+
 /// 二阶段补查的证据声明（design 2026-07-13 §2.3，E8 裁决 C）：模型声明「判这个 claim
 /// 还缺哪个文件」，非对话式工具调用。lines 可选 "start-end"（超大文件只载区间±上下文）。
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+/// `Serialize`：随 `CellOutput`（scanner / reviewer 输出）落库。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NeedEntry {
     pub path: String,
     #[serde(default)]
     pub lines: Option<String>,
     pub reason: String,
+    #[serde(default)]
+    pub kind: NeedKind,
 }
 
 /// 模型每次 lens 调用的完整输出。
@@ -63,8 +76,8 @@ pub struct LensOutput {
     pub needs: Vec<NeedEntry>,
 }
 
-/// 本地在 dedup 时 enrich 后的 finding。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// 本地在 dedup 时 enrich 后的 finding。`PartialEq`：随 `CellOutput` 参与记录相等性断言。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
     pub id: String,
     pub severity: Severity,

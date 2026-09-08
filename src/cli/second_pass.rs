@@ -236,7 +236,7 @@ mod tests {
             Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into() }] },
             Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn sib() {}\n".into() }] },
         ];
-        let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
+        let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into(), kind: crate::domain::NeedKind::Evidence }];
         let drafts = vec![]; // 空草稿也合法
         let (p, warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "");
         let p = p.unwrap();
@@ -252,7 +252,7 @@ mod tests {
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段带入第二趟: {pi}");
         assert!(pi.contains("pub const LIMIT"), "增量第二趟 needs 证据仍在场");
         // 路径逃逸：绝对路径 needs 被 skip、不 panic、其余照常
-        let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
+        let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into(), kind: crate::domain::NeedKind::Evidence }];
         let (p2, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "", "");
         if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
     }
@@ -274,8 +274,8 @@ mod tests {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into(),
         }] }];
         let needs = vec![
-            NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() },
-            NeedEntry { path: ".redteam/proj.db".into(), lines: None, reason: "peek ledger".into() },
+            NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into(), kind: crate::domain::NeedKind::Evidence },
+            NeedEntry { path: ".redteam/proj.db".into(), lines: None, reason: "peek ledger".into(), kind: crate::domain::NeedKind::Evidence },
         ];
         let (p, warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "");
         assert!(p.is_some(), "其余合法 needs 仍让补跑照常进行");
@@ -284,7 +284,7 @@ mod tests {
         assert!(warnings[0].contains("denylist") || warnings[0].contains("敏感路径"), "{warnings:?}");
 
         // 全体 needs 都被拒 → prompt 为 None，但 warnings 仍须带出（此前会随 None 分支被吞掉）。
-        let all_denied = vec![NeedEntry { path: ".redteam/proj.db".into(), lines: None, reason: "x".into() }];
+        let all_denied = vec![NeedEntry { path: ".redteam/proj.db".into(), lines: None, reason: "x".into(), kind: crate::domain::NeedKind::Evidence }];
         let (p_none, warnings_none) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &all_denied, &[], "", "");
         assert!(p_none.is_none(), "全体 needs 被拒 → 不补跑");
         assert_eq!(warnings_none.len(), 1, "{warnings_none:?}");
@@ -308,7 +308,7 @@ mod tests {
         let bundles = vec![Bundle { files: vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into(),
         }] }];
-        let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
+        let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into(), kind: crate::domain::NeedKind::Evidence }];
         let spec = "<spec_docs>\nDESIGN D8: fail-open\n</spec_docs>\n";
         let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", spec);
         let p = p.unwrap();
@@ -348,9 +348,9 @@ mod tests {
         }] }];
         let needs = vec![
             // 合法 lines → ±30 行窗独立补查段
-            NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
+            NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into(), kind: crate::domain::NeedKind::Evidence },
             // 坏格式 lines → 按整文件（前插 bundle 路径，全文进 0 壳）
-            NeedEntry { path: "src/other.rs".into(), lines: Some("abc".into()), reason: "r".into() },
+            NeedEntry { path: "src/other.rs".into(), lines: Some("abc".into()), reason: "r".into(), kind: crate::domain::NeedKind::Evidence },
         ];
         let drafts = vec![Finding {
             id: "x".into(), severity: Severity::High, title: "weak hash".into(), body: "b".into(),
@@ -369,8 +369,8 @@ mod tests {
 
         // 互斥：同 path 既有整文件条目又有行窗条目 → 全文优先（超集），行窗段不再重复注入
         let both = vec![
-            NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
-            NeedEntry { path: "src/long.rs".into(), lines: None, reason: "r".into() },
+            NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into(), kind: crate::domain::NeedKind::Evidence },
+            NeedEntry { path: "src/long.rs".into(), lines: None, reason: "r".into(), kind: crate::domain::NeedKind::Evidence },
         ];
         let (pb, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &both, &drafts, "", "");
         let pb = pb.unwrap();
@@ -397,7 +397,7 @@ mod tests {
         let bundles = vec![Bundle { files: vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
         }] }];
-        let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into() }];
+        let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into(), kind: crate::domain::NeedKind::Evidence }];
         let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "");
         let p = p.unwrap();
         assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);

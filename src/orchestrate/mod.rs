@@ -441,7 +441,7 @@ mod tests {
     }
 
     fn need(path: &str, reason: &str) -> NeedEntry {
-        NeedEntry { path: path.into(), lines: None, reason: reason.into() }
+        NeedEntry { path: path.into(), lines: None, reason: reason.into(), kind: crate::domain::NeedKind::Evidence }
     }
 
     fn lens_call_with(findings: Vec<RawFinding>, needs: Vec<NeedEntry>) -> crate::provider::LensCall {
