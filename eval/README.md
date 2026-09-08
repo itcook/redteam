@@ -20,7 +20,7 @@
   `score <replay.json> <oracle.json>`（区间级 / 文件级命中、空热区）、`report`（θ 曲线 + 规模/|H0|/R 表）、`selftest`。
   规则定案（v4）见主检出 research §15；M21b 移植 Rust 后本脚本保留为离线回归器。
 - `p0_oracle.py` — 从 proj.db cells / rpiv 报告 / 人工对齐文件组装 oracle JSON（`pr181`），或从本仓 proj.db 取 upheld findings（`hobby`）。
-- `e3_contract_ab.py` — E3 疑点契约 vs finding 契约：`variant`（由 `examples/dump_pack.rs` 落盘的 prompt 派生 B 臂并断言只差两段）、
+- `e3_contract_ab.py` — E3 疑点契约 vs finding 契约：`variant`（由 A 臂 prompt 落盘产物派生 B 臂并断言只差两段；落盘器 `examples/dump_pack.rs` 已随 M21a 批 C 拆除，产品等价物 = `redteam review --pack-only` → `.redteam/packs/<job>/cell-*.md`）、
   `run`（DeepSeek 直连，复刻产品单发请求形状）、`score`（quote 定位 + 区间级命中 oracle + 人工确认表骨架）。
 - `export_ledger.py` — M21a 批 B-1（D10-2）：schema v4 一次重置前，把旧 proj.db 的 `dismissed` / `resolved` 全表与 `results` 里
   verify=upheld 的 findings 导出为 `fixtures/ledger-{dismissed,resolved,upheld}.jsonl`（verifier 离线回归集数据；本仓自己的数据，入库）。

@@ -1,7 +1,7 @@
-# redteam 评审引擎·风险路由 DAG 架构（M21 · v8）
+# redteam 评审引擎·风险路由 DAG 架构（M21 · v9）
 
 > 状态: **锁定**（v8，2026-09-07，P0 验证门出口〔D11〕：E1 风险规则 v4 成立、E3 疑点契约成立；§3.3 / §4 / §6 / §12.1 / §16 / §17 按 D11 改；
-> 无 `[review.risk]` / `--risk`）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；M21b-e 待产出。
+> 无 `[review.risk]` / `--risk`；v9 2026-09-08〔D12〕§12 改 JSON + provider → models → roles）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；M21b-e 待产出。
 > v5（2026-09-05 grill〔D7〕：角色命名 scanner / reviewer / verifier；配置节 §12 重写为用户级唯一 TOML；
 > 无候补；verifier 流式化 + 数据判决；provider 在途上限；aacr-bench 退役至 M21c / M21e 重启）。
 > v6（2026-09-05）：scanner 组 pack 默认 `slice`〔D8〕；§10.7 提示词按角色分离〔D9〕；E2 改为 M21a 出口 slice vs full A/B。
@@ -345,111 +345,92 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
 
 ---
 
-## 12. 配置（用户级唯一 TOML）〔D7〕
+## 12. 配置（用户级唯一 JSON）〔D7, D12〕
 
-**位置**：`~/.redteam/config.toml` + `~/.redteam/secrets.toml`（chmod 600），`REDTEAM_HOME` 覆盖目录。**没有项目级配置**：
-项目 `.redteam/` 只装状态（proj.db、rounds、台账）与内容（`brief.md`）；评审旋钮的按次覆盖走 CLI flag / env；
-`--test-command` flag，缺省按 Cargo.toml / package.json / Makefile 推断。原威胁模型 B 的项目层剥离清单随之删除。
-不做迁移与兼容（未发布）。
+`$REDTEAM_HOME/config.json` + `secrets.json`（缺省 `~/.redteam/`，D7 A8 用户级唯一、无项目层）；严格 JSON、键 camelCase、无注释。
+形状 = provider → models（按 id 做键）→ roles：模型固有字段只写一次，角色属性挂模型下；某角色的活跃集 = 拥有该角色键的全部模型
+（列表即活跃集、无候补〔D7 A3〕）。
 
-### 12.1 config.toml
-```toml
-[providers.deepseek]                  # 键名即 provider 名
-kind = "openai"                       # openai | anthropic
-base_url = "https://api.deepseek.com"
-api_key_env = "DEEPSEEK_API_KEY"
-max_concurrency = 20                  # 该 provider 同时在途请求上限；缺省 = review.max_concurrency
-
-[providers.agct]
-kind = "openai"
-base_url = "https://api.aigocode.team/v1"
-max_concurrency = 20
-
-[[scanners]]                          # 列表 = 活跃集，全部并行，疑点并集；没有候补
-name = "flash"                        # 可选；缺省 "deepseek/deepseek-v4-flash"；报告/台账/异族判定用它
-provider = "deepseek"
-model_id = "deepseek-v4-flash"
-context_window = 1_000_000
-output_max_tokens = 384_000
-reasoning = true
-thinking_level = "low"                # 角色属性：同一模型可在 scanner 位 low、reviewer 位 high
-
-[[scanners]]
-name = "gemini-flash"
-provider = "agct"
-model_id = "gemini-3.8-flash"
-kind = "openai"                       # 可选，覆盖 provider 的 kind
-api_key_env = "AGCT_GEMINI_API_KEY"   # 可选，模型级 key
-family = "gemini"                     # 可选；缺省取 model_id 首段（deepseek / gemini / glm / kimi）
-context_window = 1_048_576
-output_max_tokens = 65_536
-reasoning = true
-thinking_level = "low"
-
-[[reviewers]]                         # 列表 = 分派池：每个队列项只由一个模型消费，多条目买吞吐与分散限流
-name = "pro"
-provider = "deepseek"
-model_id = "deepseek-v4-pro"
-context_window = 1_000_000
-output_max_tokens = 384_000
-reasoning = true
-thinking_level = "high"
-per_turn_timeout_secs = 1200          # 可选；缺省 output_max_tokens ÷ 最低 TPS + 余量
-
-# [[verifiers]]                       # 可选；缺省自动：家族 ≠ finding 的 reviewer 家族，优先 reviewers 档
-
-[review]
-block_threshold = "medium"
-conf_floor = 0.5
-max_concurrency = 8                   # 全局在途上限；provider 级缺省继承
-
-[review.scanners]
-workers = 4
-samples = 1                           # 同模型多 lens 采样并集
-
-[review.reviewers]
-workers = 2
-max_cells = "auto"                    # "auto" = f(风险分, 规模)；整数 = 固定上限
-reenqueue = false
-
-[review.verifiers]
-enabled = true
-workers = 2
-
-[review.grouping]
-min_files = 4
-bundle_line_threshold = 200
-max_files_per_group = 10
-semantic = false
-
-[review.pack]
-body = "full"                         # full | slice（E2 后定默认）
-anchor_window = 30
+### 12.1 config.json
+```json
+{
+  "providers": {
+    "deepseek": {
+      "kind": "openai",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "maxConcurrency": 20,
+      "models": {
+        "deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash",
+          "contextWindow": 1000000,
+          "maxOutputTokens": 384000,
+          "reasoning": true,
+          "roles": { "scanner": { "thinkingLevel": "low" } }
+        },
+        "deepseek-v4-pro": {
+          "contextWindow": 1000000,
+          "maxOutputTokens": 384000,
+          "reasoning": true,
+          "perTurnTimeoutSecs": 1200,
+          "roles": { "reviewer": { "thinkingLevel": "high" } }
+        }
+      }
+    },
+    "agct": {
+      "baseUrl": "https://api.aigocode.team/v1",
+      "maxConcurrency": 20,
+      "models": {
+        "gemini-3.8-flash": {
+          "kind": "openai",
+          "apiKeyEnv": "AGCT_GEMINI_API_KEY",
+          "family": "gemini",
+          "contextWindow": 1048576,
+          "maxOutputTokens": 65536,
+          "reasoning": true,
+          "roles": { "scanner": { "thinkingLevel": "low" }, "verifier": { "thinkingLevel": "high" } }
+        }
+      }
+    }
+  },
+  "review": {
+    "blockThreshold": "medium",
+    "confFloor": 0.5,
+    "maxConcurrency": 8,
+    "scanners":  { "workers": 4, "samples": 1 },
+    "reviewers": { "workers": 2, "maxCells": "auto", "reenqueue": false },
+    "verifiers": { "enabled": true, "workers": 2 },
+    "grouping":  { "minFiles": 4, "bundleLineThreshold": 200, "maxFilesPerGroup": 10, "semantic": false },
+    "pack":      { "body": "slice", "anchorWindow": 30, "sliceMinBytes": 8192 }
+  }
+}
 ```
 
-条目字段：模型固有属性（`context_window` / `output_max_tokens` / `per_turn_timeout_secs` / `reasoning`）与角色属性
-（`thinking_level`）同写在条目里；同一模型在两个角色各写一次，接受重复。`priority` 字段退场（无候补链）；
-`--models` / `--models-all` 旧语义退场，多模型即多条目。
+字段：provider 层 `kind`（模型层可覆盖，两层都缺 → 校验报错）/ `baseUrl` / `apiKeyEnv` / `maxConcurrency`（该 provider 在途上限，缺省继承
+`review.maxConcurrency`）；模型层 `name`（人读显示，缺省 `provider/id`）/ `kind` / `apiKeyEnv` / `family`（缺省 id 首段）/ `contextWindow`
+（缺省保守 128K，有下限）/ `maxOutputTokens` / `perTurnTimeoutSecs` / `reasoning`（思考 token 计入输出额度）；角色层 `thinkingLevel`
+（`off | low | medium | high`，角色属性：同一模型可 scanner 位 low、reviewer 位 high）。route_key / 报告名 = `provider/id`；活跃集顺序按
+provider 名、model id 字典序（无语义）。`verifiers` 无任何模型声明 → 自动异族（§8.1）。无 `priority`、无 `--models`（多模型即多条目）。
 
-### 12.2 secrets.toml
-```toml
-[providers.deepseek]
-api_key = "sk-…"
-
-[providers.agct]
-api_key = "sk-gateway"
-"gemini-3.8-flash" = "sk-model-specific"      # 模型级覆盖；带点的 id 必须引号
-# "kimi-k3" = { api_key = "…", org = "…" }    # 值可为内联表，为将来的额外凭据字段留位
+### 12.2 secrets.json
+```json
+{
+  "providers": {
+    "deepseek": { "apiKey": "sk-…" },
+    "agct": { "apiKey": "sk-gateway", "models": { "gemini-3.8-flash": "sk-model-specific" } }
+  }
+}
 ```
-- 解析链：条目 `api_key_env` → `[providers.X]."<model_id>"` → `[providers.X].api_key_env` → `[providers.X].api_key`。
-- 守卫：provider 表下出现子表（裸写带点 id 的产物）→ 提示「是否漏了引号」；除 `api_key` 外的键若在 config 中该 provider
-  下无对应 `model_id` → warning。
-- `api_key` 只出现在 secrets.toml。`redteam model setup --key-store secrets` 按此形状写入。
+- 解析链：模型 `apiKeyEnv`(env) → `secrets.providers.X.models[id]` → provider `apiKeyEnv`(env) → `secrets.providers.X.apiKey`。
+- 守卫：secrets 里的 provider 名或 model id 在 config 无对应 → warning（拼写）；文件 chmod 600；`apiKey` 只出现在 secrets.json。
+- `redteam model setup --key-store secrets [--model-key]` 按此形状写入；provider / model / role 三层只合并显式给出的字段，写前完整校验，
+  现有文件解析失败拒写不覆写〔D12〕。
 
 ### 12.3 路由与限流
-- 编排层按角色发 route_key（registry 已支持任意粒度）；有效并行 = min(角色 `workers`, provider `max_concurrency`)；
+- 编排层按角色发 route_key（`provider/id`；registry 已支持任意粒度）；有效并行 = min(角色 `workers`, provider `maxConcurrency`)；
   同一 provider 下的 scanner 与 reviewer 共享该 provider 的在途锁。
 - 同角色即同档：不设 `tier` 字段。
+- 单轮超时：模型 `perTurnTimeoutSecs` > `REDTEAM_PER_TURN_SECS` > `实际生效 max_tokens ÷ 20 + 60s` > 150s〔D12〕。
 - 实测 TPS：DeepSeek v4 flash ~103、GLM 5.3 ~27（含思考）、Kimi K3 ~30。流式 + 显式 max_tokens 硬要求。
 
 ---

@@ -42,7 +42,7 @@ name="m"
 provider="p"
 model_id="m-id"
 "#]).unwrap();
-    let args = ReviewArgs {
+    let args = ReviewArgs { pack_only: false,
         base: None, scope: "working-tree".into(),
         spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
@@ -105,7 +105,7 @@ model_id="b"
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", Severity::High)])));
     reg.insert("beta", Box::new(FakeProvider::with("beta", vec![rf("src/a.rs", "db.write(token);", Severity::Critical)])));
 
-    let args = ReviewArgs {
+    let args = ReviewArgs { pack_only: false,
         base: None, scope: "working-tree".into(),
         spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
@@ -161,7 +161,7 @@ model_id="g"
     let mut reg = ProviderRegistry::new();
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf_low("src/a.rs", "let x = 1;")])));
 
-    let args = ReviewArgs {
+    let args = ReviewArgs { pack_only: false,
         base: None, scope: "working-tree".into(),
         spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
@@ -207,7 +207,7 @@ model_id="a"
     let mut reg = ProviderRegistry::new();
     reg.insert("alpha", Box::new(FakeProvider::with("alpha", vec![rf("src/a.rs", "db.write(token);", "missing auth", Severity::High)])));
 
-    let args = ReviewArgs {
+    let args = ReviewArgs { pack_only: false,
         base: None, scope: "working-tree".into(),
         spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
@@ -285,7 +285,7 @@ model_id="m2model"
 "#]).unwrap();
 
     // ① 全量评审（branch scope，base=dev0=c0）：fake provider 出 1 条 finding（m2 恒空）。
-    let full_args = ReviewArgs {
+    let full_args = ReviewArgs { pack_only: false,
         base: Some("dev0".into()), scope: "branch".into(),
         spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false, format: "json".into(),
@@ -324,7 +324,7 @@ model_id="m2model"
     let _c2 = commit_all(dir.path(), "commit B: new leak");
 
     // ③ 增量轮：fake provider 只报新问题（m2 仍恒空——同一原因，供 refute 挑交叉 model）。
-    let inc_args = ReviewArgs { incremental_from: Some(job_id.into()), ..full_args.clone() };
+    let inc_args = ReviewArgs { pack_only: false, incremental_from: Some(job_id.into()), ..full_args.clone() };
     let mut inc_scripted: std::collections::BTreeMap<String, Vec<RawFinding>> = std::collections::BTreeMap::new();
     inc_scripted.insert("m".into(), vec![RawFinding {
         severity: Severity::High, title: "secret leak".into(), body: "b".into(),
@@ -420,7 +420,7 @@ model_id="a"
     );
     let provider = FakeProvider { scripted, tokens: (0, 0, 0) };
 
-    let args = ReviewArgs {
+    let args = ReviewArgs { pack_only: false,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
         background: true, format: "json".into(), resume: None, dismissed: None,
@@ -756,7 +756,7 @@ model_id="m-id"
         }],
     );
     let provider = FakeProvider { scripted, tokens: (0, 0, 0) };
-    let args = ReviewArgs {
+    let args = ReviewArgs { pack_only: false,
         base: None, scope: "working-tree".into(),
         spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
@@ -810,4 +810,75 @@ fn clap_parse_error_exits_1_help_exits_0() {
         "非法枚举值应退 1");
     assert_eq!(run(&[]), 1, "裸命令缺子命令应退 1");
     assert_eq!(run(&["--help"]), 0, "--help 是正常展示，应退 0");
+}
+
+/// M21a 批 C（R-C4）：`--pack-only` 在无 provider / 无模型配置下跑通——只装包落盘，不调 provider。
+#[test]
+fn pack_only_writes_packs_and_reports_bytes() {
+    use redteam::cli::{render_pack_only, run_pack_only, ReviewArgs, PACK_BYTES_PER_TOKEN};
+    use redteam::config::Config;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
+    std::fs::write(dir.path().join("src/b.rs"), "fn beta() { alpha_marker(); }\n").unwrap();
+    git(dir.path(), &["add", "-A"]); // working-tree scope：staged 新文件即证据
+
+    let args = ReviewArgs {
+        pack_only: true,
+        base: None, scope: "working-tree".into(), spec: vec![], focus: Some("预算试跑".into()),
+        block_threshold: None, conf_floor: None, background: false,
+        format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
+    };
+    let report = run_pack_only(&args, &Config::default(), dir.path()).expect("pack-only 无需 provider");
+    assert_eq!(report.cells.len(), 1, "两文件 < min_files → 门未过单包");
+    let c = &report.cells[0];
+    assert_eq!((c.cell, c.files, c.over_budget), (1, 2, false));
+    assert_eq!(c.est_tokens, (c.bytes as f64 / PACK_BYTES_PER_TOKEN).round() as u64);
+    assert!(c.bytes > c.pack_bytes && c.pack_bytes > 0, "prompt 含 dossier: {c:?}");
+    assert_eq!(report.budget_bytes, 312_000, "无模型配置 → 128K 窗保守预算");
+
+    let text = render_pack_only(&report);
+    assert!(text.contains("cell-1 files=2 bytes=") && text.contains(" est_tokens="), "{text}");
+    assert!(text.contains("grouping gate=single groups=1 edges="), "{text}");
+    assert!(text.contains(&format!("packs={}", report.packs_dir)), "{text}");
+
+    let packs = std::path::Path::new(&report.packs_dir);
+    let cell1 = std::fs::read_to_string(packs.join("cell-1.md")).unwrap();
+    assert_eq!(cell1.len(), c.bytes, "落盘即 prompt 本体");
+    assert!(cell1.contains("alpha_marker") && cell1.contains("预算试跑"), "prompt 含 0 壳与 focus");
+    let summary: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(packs.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["cells"][0]["bytes"], c.bytes);
+    assert_eq!(summary["grouping"]["gate"], "single");
+    assert_eq!(summary["job_id"], report.job_id);
+    assert_eq!(std::fs::read_to_string(dir.path().join(".redteam/.gitignore")).unwrap(), "*\n", "未 init 项目补 .gitignore");
+    assert!(!dir.path().join(".redteam/proj.db").exists(), "不建库");
+}
+
+#[test]
+fn pack_only_empty_changes_reports_zero_cells() {
+    use redteam::cli::{render_pack_only, run_pack_only, ReviewArgs};
+    use redteam::config::Config;
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    let args = ReviewArgs {
+        pack_only: true,
+        base: None, scope: "working-tree".into(), spec: vec![], focus: None,
+        block_threshold: None, conf_floor: None, background: false,
+        format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
+    };
+    let report = run_pack_only(&args, &Config::default(), dir.path()).unwrap();
+    assert!(report.cells.is_empty());
+    assert!(report.warnings.iter().any(|w| w.contains("no reviewable evidence")), "{:?}", report.warnings);
+    let text = render_pack_only(&report);
+    assert!(text.contains("cells=0\n") && text.contains("warning: no reviewable evidence"), "{text}");
 }

@@ -18,7 +18,8 @@ pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
 /// 唯一路径（Task 3：粒度 A/B S 臂符号级 dev 开关已判决拆除,全文恒默认）。
 pub(crate) fn body_section(bundle: &Bundle, root: &Path, budget: usize, omit: &mut Vec<String>) -> String {
     let mut out = String::new();
-    for fc in &bundle.files {
+    // 填充序 = hub_order（枢纽先填、保全文；M21a 批 C K7）。
+    for fc in bundle.fill_order() {
         // 工作树直读（bundle 路径来自 git diff、非模型可控，沿用 bundle::group 安全不变量）
         let content = std::fs::read_to_string(root.join(&fc.path)).unwrap_or_default();
         if content.is_empty() {
@@ -199,10 +200,10 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"),
             "fn helper() {}\n\nfn caller() {\n    helper();\n    let z = 2;\n}\n").unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(),
             diff: "@@ -4,0 +5,1 @@\n+    let z = 2;\n".into(),
-        }] };
+        }]);
         let mut omit = Vec::new();
         let s = body_section(&b, root, 1_000_000, &mut omit);
         assert!(s.contains("## 改动源文（0 壳）"), "含 0 壳标题: {s}");
@@ -220,10 +221,10 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"),
             "use std::fmt;\n\nfn helper() {}\n\nfn caller() {\n    helper();\n    let z = 2;\n}\n").unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(),
             diff: "@@ -6,0 +6,1 @@\n+    let z = 2;\n".into(),
-        }] };
+        }]);
         let mut omit = Vec::new();
         let s = body_section(&b, root, 1_000_000, &mut omit);
         assert!(s.contains("## 改动源文（0 壳）"), "新段标题: {s}");
@@ -244,10 +245,10 @@ mod tests {
         let filler = format!("fn filler() {{\n{}}}\n", "    let x = 0;\n".repeat(200));
         std::fs::write(root.join("src/a.rs"),
             format!("{filler}\nfn caller() {{\n    work();\n}}\n")).unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(),
             diff: "@@ -204,0 +204,1 @@\n+    work();\n".into(),
-        }] };
+        }]);
         // 预算 500B：全文（~3.4KB）放不下 → 回落 caller def 体（~30B）放得下
         let mut omit = Vec::new();
         let s = body_section(&b, root, 500, &mut omit);
@@ -263,9 +264,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("notes.md"), "# 标题\n\n改动的文档内容。\n").unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "notes.md".into(), diff: "@@ -3,0 +3,1 @@\n+改动的文档内容。\n".into(),
-        }] };
+        }]);
         let mut omit = Vec::new();
         let s = body_section(&b, root, 1_000_000, &mut omit);
         assert!(s.contains("改动的文档内容。"), "非支持语言也给全文（E7：templates 格整读实证）: {s}");
@@ -291,10 +292,10 @@ mod tests {
         let big_body = "    let x = 0;\n".repeat(300);
         std::fs::write(root.join("src/a.rs"),
             format!("fn tiny_one() {{}}\nfn changed_big() {{\n{big_body}}}\nfn tiny_two() {{}}\n")).unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(),
             diff: "@@ -3,0 +3,1 @@\n+    let x = 0;\n".into(),
-        }] };
+        }]);
         let mut omit = Vec::new();
         // 预算 800B：全文（~4.5KB）超、def 体（~4.2KB）超 → 骨架（3 签名行 + 折叠标记）应放得下
         let s = body_section(&b, root, 800, &mut omit);
@@ -317,11 +318,11 @@ mod tests {
         let changed = "    let c1 = 1;\n    let c2 = 2;\n    let c3 = 3;\n    let c4 = 4;\n    let c5 = 5;\n";
         std::fs::write(root.join("src/a.rs"),
             format!("fn big_changed() {{\n{filler}{changed}}}\n")).unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(),
             // 新文件 302-306 行 = c1..c5（一个 5 行 hunk）
             diff: format!("@@ -301,0 +302,5 @@\n{}", changed.lines().map(|l| format!("+{l}\n")).collect::<String>()),
-        }] };
+        }]);
         let mut omit = Vec::new();
         // 全文/def 体（~4.6KB）双超 800B → 骨架；5 个改动行必须全在
         let s = body_section(&b, root, 800, &mut omit);
@@ -342,11 +343,11 @@ mod tests {
         let big_body = "    let x = 0;\n".repeat(300);
         std::fs::write(root.join("src/a.rs"),
             format!("fn small_changed() {{\n    let a = 1;\n}}\nfn big_changed() {{\n{big_body}}}\n")).unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(),
             // 两 hunk：一个落 small 体内、一个落 big 体内
             diff: "@@ -2,0 +2,1 @@\n+    let a = 1;\n@@ -5,0 +5,1 @@\n+    let x = 0;\n".into(),
-        }] };
+        }]);
         let mut omit = Vec::new();
         // 800B：全文超、small def 体（~100B）入正文、big def 体（~4.2KB）超 → 溢出坐标，无骨架
         let s = body_section(&b, root, 800, &mut omit);
@@ -363,10 +364,10 @@ mod tests {
         let root = tmp.path();
         let body: String = (1..=200).map(|i| format!("line {i}\n")).collect();
         std::fs::write(root.join("notes.md"), &body).unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "notes.md".into(),
             diff: "@@ -100,0 +100,1 @@\n+line 100\n".into(),
-        }] };
+        }]);
         let mut omit = Vec::new();
         let s = body_section(&b, root, 900, &mut omit);
         assert!(s.contains("line 100") && s.contains("line 85"), "hunk±20 窗在场: {s}");
@@ -381,9 +382,9 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "fn caller() {\n    work();\n}\n").unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -2,0 +2,1 @@\n+    work();\n".into(),
-        }] };
+        }]);
         // 预算极小 → body 放不下 → 进 omit 坐标、正文空
         let mut omit = Vec::new();
         let s = body_section(&b, root, 5, &mut omit);
@@ -399,9 +400,9 @@ mod tests {
         use crate::bundle::Bundle;
         use crate::evidence::git::FileChange;
         let tmp = tempfile::tempdir().unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "src/gone.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn f() {}\n".into(),
-        }] };
+        }]);
         let mut omit = Vec::new();
         assert_eq!(body_section(&b, tmp.path(), 1_000_000, &mut omit), "", "文件缺失 → 空");
         assert!(omit.is_empty(), "文件缺失不进 omit: {omit:?}");
@@ -420,20 +421,48 @@ mod tests {
         // 大文件（超 500B 预算）+ diff 行落在无 def 可锚处（文件头注释区）
         let filler = format!("// header\n{}", "// filler line\n".repeat(200));
         std::fs::write(root.join("src/a.rs"), &filler).unwrap();
-        let b = Bundle { files: vec![FileChange {
+        let b = Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(),
             diff: "@@ -1,0 +2,1 @@\n+// filler line\n".into(),
-        }] };
+        }]);
         let mut omit = Vec::new();
         let s = body_section(&b, root, 500, &mut omit);
         assert!(s.contains("src/a.rs") && s.contains("骨架"), "骨架档兜底承接：无签名行也不真空: {s}");
         assert!(omit.is_empty(), "骨架已承接，不再需要 omit 坐标: {omit:?}");
     }
 
+    #[test]
+    fn body_section_fills_hub_first() {
+        // M21a 批 C K7：填充序 = hub_order（枢纽保全文）——预算只够一个文件全文时，枢纽先得。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let a_src = "fn a() {}\n";
+        let hub_src = "pub fn hub_fn() {}\n";
+        std::fs::write(root.join("src/a.rs"), a_src).unwrap();
+        std::fs::write(root.join("src/hub.rs"), hub_src).unwrap();
+        let files = vec![
+            FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn a() {}\n".into() },
+            FileChange { path: "src/hub.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn hub_fn() {}\n".into() },
+        ];
+        let hub_block = format!("src/hub.rs:1-1（全文，1 行）\n{hub_src}\n\n");
+        let budget = hub_block.len() + 2; // 装得下 hub 全文（或 a 全文），装不下两个
+        let mut omit = Vec::new();
+        let hub_first = Bundle { files: files.clone(), edges: vec![], hub_order: vec![1, 0], over_budget: false };
+        let out = body_section(&hub_first, root, budget, &mut omit);
+        assert!(out.contains("src/hub.rs:1-1（全文"), "枢纽先填得全文: {out}");
+        assert!(!out.contains("src/a.rs:1-1（全文"), "非枢纽回落: {out}");
+        let natural = Bundle::from_files(files);
+        let out = body_section(&natural, root, budget, &mut Vec::new());
+        assert!(out.contains("src/a.rs:1-1（全文") && !out.contains("src/hub.rs:1-1（全文"), "自然序对照: {out}");
+    }
+
     fn bundle_one(path: &str, diff: &str) -> crate::bundle::Bundle {
-        crate::bundle::Bundle { files: vec![crate::evidence::git::FileChange {
+        crate::bundle::Bundle::from_files(vec![crate::evidence::git::FileChange {
             path: path.into(), diff: diff.into(),
-        }] }
+        }])
     }
 
     #[test]
