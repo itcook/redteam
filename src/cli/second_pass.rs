@@ -140,6 +140,7 @@ pub(crate) fn second_pass_prompt(
     drafts: &[Finding],
     incremental: &str,
     spec_docs: &str,
+    others: &str,
 ) -> (Option<String>, Vec<String>) {
     let mut warnings = Vec::new();
     let Some(own) = bundles.get(idx) else { return (None, warnings) };
@@ -193,13 +194,14 @@ pub(crate) fn second_pass_prompt(
             FileChange { path: p, diff }
         })
         .collect();
-    for fc in own.files.iter() {
+    // 自家文件按第一趟的填充序（hub_order：枢纽先、保全文）放入——增强包重建为自然序时枢纽序仍成立。
+    for fc in own.fill_order() {
         if !files.iter().any(|e| e.path == fc.path) {
             files.push(fc.clone());
         }
     }
     let own_diff_bytes: usize = own.files.iter().map(|fc| fc.diff.len()).sum();
-    let pb = crate::bundle::Bundle { files };
+    let pb = crate::bundle::Bundle::from_files(files);
     // 第二趟恒用 build_pack（唯一路径，E8-E 安乐死 SCIP 后无引擎可选）——needs 只消费
     // 0 壳全文分支（body_section）。
     // Important 修复：evidence（行窗证据段，已在上方按 NEED_SECTION_BYTE_CAP 分段封顶）先
@@ -207,8 +209,8 @@ pub(crate) fn second_pass_prompt(
     // （design §2.2）。budget 耗尽时 build_pack 自身的降级链兜底，不会 panic。
     let pack = crate::pack::build_pack(&pb, root, budget.saturating_sub(evidence.len()), own_diff_bytes);
     let dossier = crate::prompt::render_dossier_section(&format!("{evidence}{pack}"));
-    let others = crate::bundle::other_files_manifest(bundles, idx);
-    let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, &others, incremental, &dossier, spec_docs);
+    // `others`：本组的跨组索引串（调用方 `render_cross_indices` 预渲染，与第一趟同一份）。
+    let mut p = crate::prompt::build_bundle_prompt(target_label, own, focus, others, incremental, &dossier, spec_docs);
     p.push_str(&draft_block(drafts));
     (Some(p), warnings)
 }
@@ -233,12 +235,12 @@ mod tests {
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
         let bundles = vec![
-            Bundle { files: vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into() }] },
-            Bundle { files: vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn sib() {}\n".into() }] },
+            Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into() }]),
+            Bundle::from_files(vec![FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn sib() {}\n".into() }]),
         ];
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let drafts = vec![]; // 空草稿也合法
-        let (p, warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "");
+        let (p, warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "", "");
         let p = p.unwrap();
         assert!(p.contains("pub const LIMIT"), "needs 文件全文进包: {p}");
         assert!(p.contains("first_pass_draft"), "草稿段在场");
@@ -247,14 +249,41 @@ mod tests {
         assert!(warnings.is_empty(), "放行的 needs 不应产生拒读 warning: {warnings:?}");
         // 增量轮：inc_section 原样带入第二趟（claimed-resolved/dispute 契约不因补跑丢失）
         let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
-        let (pi, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, &inc, "");
+        let (pi, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, &inc, "", "");
         let pi = pi.unwrap();
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段带入第二趟: {pi}");
         assert!(pi.contains("pub const LIMIT"), "增量第二趟 needs 证据仍在场");
         // 路径逃逸：绝对路径 needs 被 skip、不 panic、其余照常
         let evil = vec![NeedEntry { path: "/etc/passwd".into(), lines: None, reason: "x".into() }];
-        let (p2, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "", "");
+        let (p2, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &evil, &drafts, "", "", "");
         if let Some(p2) = p2 { assert!(!p2.contains("root:")); }
+    }
+
+    /// M21a 批 C（评审修）：第二趟增强包沿用第一趟的 hub_order——枢纽文件仍先填、保全文。
+    #[test]
+    fn second_pass_prompt_keeps_hub_fill_order() {
+        use crate::bundle::Bundle;
+        use crate::domain::NeedEntry;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/hub.rs"), "pub fn hub_fn() {}\n").unwrap();
+        std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
+        crate::cli::incremental::incremental_tests::git_repo(root);
+        crate::cli::incremental::incremental_tests::commit_all(root, "init");
+        let files = vec![
+            FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn a() {}\n".into() },
+            FileChange { path: "src/hub.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn hub_fn() {}\n".into() },
+        ];
+        let mut own = Bundle::from_files(files);
+        own.hub_order = vec![1, 0];
+        let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
+        let (p, _) = second_pass_prompt(&[own], root, 1_000_000, "t", "", 0, &needs, &[], "", "", "");
+        let p = p.unwrap();
+        let (hub, a) = (p.find("src/hub.rs:1-1（全文").unwrap(), p.find("src/a.rs:1-1（全文").unwrap());
+        assert!(hub < a, "枢纽 hub.rs 先于 a.rs 填入: hub={hub} a={a}");
+        assert!(p.find("src/evidence.rs:1-1（全文").unwrap() < hub, "needs 文件仍前插");
     }
 
     #[test]
@@ -270,14 +299,14 @@ mod tests {
         std::fs::write(root.join("src/evidence.rs"), "pub const LIMIT: usize = 7;\n").unwrap();
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
-        let bundles = vec![Bundle { files: vec![FileChange {
+        let bundles = vec![Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into(),
-        }] }];
+        }])];
         let needs = vec![
             NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() },
             NeedEntry { path: ".redteam/proj.db".into(), lines: None, reason: "peek ledger".into() },
         ];
-        let (p, warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "");
+        let (p, warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "", "");
         assert!(p.is_some(), "其余合法 needs 仍让补跑照常进行");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains(".redteam/proj.db"), "{warnings:?}");
@@ -285,7 +314,7 @@ mod tests {
 
         // 全体 needs 都被拒 → prompt 为 None，但 warnings 仍须带出（此前会随 None 分支被吞掉）。
         let all_denied = vec![NeedEntry { path: ".redteam/proj.db".into(), lines: None, reason: "x".into() }];
-        let (p_none, warnings_none) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &all_denied, &[], "", "");
+        let (p_none, warnings_none) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &all_denied, &[], "", "", "");
         assert!(p_none.is_none(), "全体 needs 被拒 → 不补跑");
         assert_eq!(warnings_none.len(), 1, "{warnings_none:?}");
         assert!(warnings_none[0].contains(".redteam/proj.db"), "{warnings_none:?}");
@@ -305,17 +334,17 @@ mod tests {
         // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
-        let bundles = vec![Bundle { files: vec![FileChange {
+        let bundles = vec![Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+ let z = 1;\n".into(),
-        }] }];
+        }])];
         let needs = vec![NeedEntry { path: "src/evidence.rs".into(), lines: None, reason: "verify LIMIT".into() }];
         let spec = "<spec_docs>\nDESIGN D8: fail-open\n</spec_docs>\n";
-        let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", spec);
+        let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", spec, "");
         let p = p.unwrap();
         assert!(p.contains("DESIGN D8: fail-open"), "spec 段在第二趟原样注入: {p}");
         assert!(p.contains("pub const LIMIT"), "needs 证据段独立并存、不被 spec 段挤占: {p}");
 
-        let (p_empty, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "");
+        let (p_empty, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "", "");
         let p_empty = p_empty.unwrap();
         assert!(p_empty.contains("(none — no spec docs provided)"), "空 spec 走既有占位: {p_empty}");
         assert!(!p_empty.contains("DESIGN D8"), "空 spec 不泄漏内容: {p_empty}");
@@ -323,7 +352,7 @@ mod tests {
         // T44：增量分支——inc_section 与 spec 同时非空须共存不互相挤占（run_incremental_review
         // 的 mk 闭包现同时透传两者，此前 spec 处恒占位 ""）。
         let inc = crate::prompt::render_incremental_section("abc123def456", "src/a.rs [delta]", &[]);
-        let (pi, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], &inc, spec);
+        let (pi, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], &inc, spec, "");
         let pi = pi.unwrap();
         assert!(pi.contains("<incremental_round>") && pi.contains("abc123def456"), "增量段在场: {pi}");
         assert!(pi.contains("<spec_docs>") && pi.contains("DESIGN D8: fail-open"), "spec 段与增量段共存: {pi}");
@@ -343,9 +372,9 @@ mod tests {
         // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
-        let bundles = vec![Bundle { files: vec![FileChange {
+        let bundles = vec![Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
-        }] }];
+        }])];
         let needs = vec![
             // 合法 lines → ±30 行窗独立补查段
             NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
@@ -359,7 +388,7 @@ mod tests {
             hard_constraint: false, quote: "md5(pw)".into(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New,
         }];
-        let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "");
+        let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &drafts, "", "", "");
         let p = p.unwrap();
         assert!(p.contains("## 补查证据"), "行窗补查段在场");
         assert!(p.contains("src/long.rs:70-132"), "±30 行窗头: {p}");
@@ -372,7 +401,7 @@ mod tests {
             NeedEntry { path: "src/long.rs".into(), lines: Some("100-102".into()), reason: "r".into() },
             NeedEntry { path: "src/long.rs".into(), lines: None, reason: "r".into() },
         ];
-        let (pb, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &both, &drafts, "", "");
+        let (pb, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &both, &drafts, "", "", "");
         let pb = pb.unwrap();
         assert!(pb.contains("src/long.rs:1-200（全文"), "全文条目在场: {pb}");
         assert!(!pb.contains("## 补查证据"), "同 path 行窗段被全文超集互斥掉: {pb}");
@@ -394,11 +423,11 @@ mod tests {
         // needs 读守卫（E11-Q4）要求 git-tracked——固件须是提交过的 git 仓。
         crate::cli::incremental::incremental_tests::git_repo(root);
         crate::cli::incremental::incremental_tests::commit_all(root, "init");
-        let bundles = vec![Bundle { files: vec![FileChange {
+        let bundles = vec![Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+fn own() {}\n".into(),
-        }] }];
+        }])];
         let needs = vec![NeedEntry { path: "src/minified.rs".into(), lines: Some("1-1".into()), reason: "r".into() }];
-        let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "");
+        let (p, _warnings) = second_pass_prompt(&bundles, root, 1_000_000, "t", "", 0, &needs, &[], "", "", "");
         let p = p.unwrap();
         assert!(p.contains("…（截断）"), "证据段超帽应带截断注记: {}", &p[..p.len().min(200)]);
         assert!(p.contains("fn own()"), "证据段截断后 pack 仍照常渲染自家文件");

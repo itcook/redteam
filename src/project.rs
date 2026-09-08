@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub const PROJECT_DIR: &str = ".redteam";
 
-const GITIGNORE_BODY: &str = "*\n";
+pub(crate) const GITIGNORE_BODY: &str = "*\n";
 
 /// 幂等创建 `.redteam/` 骨架（`.gitignore` / `rounds/` / `proj.db`），返回本次新建的条目；已存在的一律不动。
 /// 项目层 `config.toml` 已退场（M21a 批 A，D7 A8：配置用户级唯一，项目目录只放状态与内容）；
