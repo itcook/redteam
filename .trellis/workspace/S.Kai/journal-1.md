@@ -281,3 +281,44 @@ Trellis 09-08-m21a-slice：diffsym 文件级 def / 全改动行锚定 / 一跳�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 13: M21a 批 D / E 合并后核验与修补（feat/m21-review-engine）
+<!-- trellis-session: v=2 fp=1b4cf2fccab4e14d -->
+
+**Date**: 2026-09-09
+**Task**: M21a 批 D / E 合并后核验与修补（feat/m21-review-engine）
+**Branch**: `feat/m21-review-engine`
+
+### Summary
+
+用户要求 D / E 合入后再核验一遍。两个只读审计子 agent 分别对照 prd / design / plan 审批 D（parse / anchor / 模板 / 段序 / 三段界 / 哈希 / 评分器）与批 E（diffsym / pack / 文件外 / 接线），加本仓 --pack-only 冒烟与临时干净工作树受控对照。D 自身范围零必修；E 一条必修（文件外调用点 regex 交替最左优先，短名是长名前缀时长名调用点漏检，临时仓复现）。合并后接缝两处：证据段前言仍描述「0 壳全文 + 1 壳」（批 E 交 D-2，但 D-2 早已合入，悬空）、build_scan_prompt 对已包装 dossier / 带壳 spec 会双壳。全部一次修掉并补测试；followup 关闭两项、新增合并后核验延后表。
+
+### Main Changes
+
+- scan 路径独立卷宗前言 SCAN_DOSSIER_PREAMBLE（描述切片块头 / 折叠标记 / 梯子标注 / 文件外调用点与签名块 / 省略清单，入 scanner 模板哈希）；scanner.md needs 措辞覆盖折叠体 / 省略片段；旧 render_dossier_section 前言抽常量、输出逐字节不变（golden 哈希 525ddd85186e20e9）
+- build_scan_prompt 剥掉 CellPlan.dossiers 外壳 + 旧前言、cli::spec 带壳段（unwrap_shell），裸值与带壳值逐字节相同；scan 中和表移出 bundle / incremental_round
+- anthropic 分块显式断点运行时封顶（每会话至多 3 显式 + system，多余静默降级，断点被吞掉的末条分块仍拿尾断点）
+- pack：文件外调用点 regex 交替按长度降序；名字截断提示只在真正走仓时写；段帽 = 组预算 / 8（design 口径，原 remaining / 8）；-U0 式尾部删除点并入 hunk 跨度；diffsym is_comment_line 不把 *g = f() 解引用行当注释
+- parse：行号数字串 / 浮点也认；needs.kind 大小写宽容
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8622dbc` | fix(prompt,provider,pack,parse): 批 D / E 合并后核验修补——scan 卷宗前言改描述切片形态（切片块头 / 折叠标记 / 梯子标注 / 文件外调用点与签名块 / 省略清单，入 scanner 模板哈希）+ scanner 尾 needs 措辞覆盖折叠体与省略片段；build_scan_prompt 剥掉已包装的 CellPlan.dossiers 与 cli::spec 带壳段（不双壳、真闭合不被中和）；anthropic 显式断点运行时封顶（每会话至多 3 显式 + system，多余静默降级）；旧 build_bundle_prompt 字节级 golden 哈希；文件外调用点 regex 交替按长度降序（短名是长名前缀时长名调用点漏检）、名字截断提示只在真正走仓时写、段帽以组预算为基（design 口径）、-U0 式尾部删除点并入 hunk 跨度；`*g = f()` 解引用行不当注释；parse 行号数字串 / 浮点与 needs.kind 大小写宽容；scan 中和表移出 scan 路径不存在的 bundle / incremental |
+| `2170de4` | docs(followup): 批 D / E 合并后核验——关闭「切片层次的提示词措辞」与「ScanOutput.suspicions 缺键」两项；新增合并后核验延后表（多行 quote 只核首行 / 中和 vs quote 锚定 / F 接线备忘（scanner 通路、template_hash 合成、--pack-only 口径）/ dropped_malformed 混计 / _oracle 报错形态 / Full 档脏树与 dev 差异 / FileCtx 二次解析 / bracket_delta_code 块注释 / anchor_offset PLAUSIBLE / 批 E 制品测试名 / 骨架级梯子无测试） |
+
+### Testing
+
+- [OK] cargo test：lib 552（+8 新测试）/ 16 / 7 / e2e 17 绿；clippy 7 = 基线；make verify 绿
+- [OK] 受控对照（临时干净工作树、同 diff 4163c46..HEAD）：切片 / 折叠数字不变，outside_sites 4→4、outside_sigs 12→14；--pack-only 对 dev / 1b50db6 / 4163c46 三个基线均跑通
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 批 F 硬切与并行（feat/m21a-cutover）；F 接线备忘见 followup「合并后核验」表：新开 scanner 通路（System(head) + UserBlocks → parse_scan_output_with_stats → REPAIR_PROMPT_SCAN → anchor_suspicions）、CellRecord.template_hash 合成、--pack-only 口径切到 scan prompt
+- 延后项：多行 quote 只核首行（M21c 合并逻辑时定）、中和 vs quote 锚定（F 出口看 dropped 计数）、FileCtx 二次解析 / bracket_delta_code 块注释 / anchor_offset PLAUSIBLE（dogfood 观测）

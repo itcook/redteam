@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 12
+- **Total Sessions**: 13
 - **Last Active**: 2026-09-09
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~283 | Active |
+| `journal-1.md` | ~324 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 13 | 2026-09-09 | M21a 批 D / E 合并后核验与修补（feat/m21-review-engine） | `8622dbc`, `2170de4` | `feat/m21-review-engine` |
 | 12 | 2026-09-09 | M21a 批 E 第二轮复审：code-review high 九修一不改（feat/m21a-slice） | `687335d` | `feat/m21a-slice` |
 | 11 | 2026-09-08 | M21a 批 E：切片装包（feat/m21a-slice）——E-1 一跳 / E-2 切片配方 / E-3 文件外片段 / E-4 接线与观测 + code-review 十修 | `ef8773e`, `9ff03c3`, `c09636e`, `d374040`, `4512734`, `e492334`, `e9693e8`, `e827f15` | `feat/m21a-slice` |
 | 10 | 2026-09-08 | M21a 批 D 契约与提示词：疑点 parse + shared-head/scanner 模板 + 四块段序 + 三段界 cache + 评分器 + 评审修复 | `f84b5d7`, `e360cdf`, `86521b2`, `cfae1ec`, `ced42e7` | `feat/m21a-prompts` |
