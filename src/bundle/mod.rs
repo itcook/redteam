@@ -119,7 +119,7 @@ impl Default for GroupingOpts {
 }
 
 /// 双阈值门结果：`Single` = 文件数或 churn 未过门，全变更集一包。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Gate {
     Single,
@@ -136,7 +136,7 @@ impl Gate {
 }
 
 /// 分组观测（M21a 只在 `--pack-only` 打印与 summary.json；RunMeta 接线 F-5）。
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GroupingStats {
     pub gate: Gate,
     pub groups: usize,
@@ -217,45 +217,6 @@ const MANIFEST_MAX_CHARS: usize = 4000;
 /// 截断注记（"… and N more files"）的预留额——预算含注记本身，总输出不超帽
 /// （dogfood 20260703 r2 5361b545：注记后置追加曾致溢出预算）。
 const MANIFEST_SUFFIX_RESERVE: usize = 40;
-
-/// 双帽截断（条目数 + 总字符预算，先到者截断，尾注被截条数）——two_layer_manifest 的体积防线
-/// （跨组索引 `render_cross_index` 用同一对帽常量，但有降质档，不走本函数）。
-fn cap_entries(entries: Vec<String>) -> String {
-    let total = entries.len();
-    let mut kept = 0usize;
-    let mut chars = 0usize;
-    for e in &entries {
-        if kept >= MANIFEST_MAX_ENTRIES
-            || chars + e.len() + 2 > MANIFEST_MAX_CHARS - MANIFEST_SUFFIX_RESERVE
-        {
-            break;
-        }
-        chars += e.len() + 2;
-        kept += 1;
-    }
-    let mut entries = entries;
-    entries.truncate(kept);
-    let mut s = entries.join(", ");
-    let extra = total - kept;
-    if extra > 0 {
-        if s.is_empty() {
-            s = format!("… and {extra} more files");
-        } else {
-            s.push_str(&format!(", … and {extra} more files"));
-        }
-    }
-    s
-}
-
-/// M13 双层 manifest（决议 4）：全分支变更文件清单 + 标注哪些在本轮 delta 内——
-/// 压增量轮的视野塌缩型「无证据实现」误报。体积防线复用双帽。
-pub fn two_layer_manifest(all_files: &[String], delta: &std::collections::BTreeSet<String>) -> String {
-    let entries: Vec<String> = all_files
-        .iter()
-        .map(|p| if delta.contains(p) { format!("{p} [delta]") } else { p.clone() })
-        .collect();
-    cap_entries(entries)
-}
 
 /// 跨组索引条目（design §10.6〔D6〕）：改动文件在哪一组、增删行数、正向（它 import / 引用的改动
 /// 文件）与反向（import / 引用它的改动文件）邻居、是否在增量轮 delta 集内。同目录边不进索引。
@@ -1990,18 +1951,4 @@ mod tests {
             "尾注列被截组号（至多 5 个 + …）: {tail}");
     }
 
-    #[test]
-    fn two_layer_manifest_marks_delta_membership_and_caps() {
-        use std::collections::BTreeSet;
-        let all = vec!["src/a.rs".to_string(), "src/b.rs".into(), "src/c.rs".into()];
-        let delta: BTreeSet<String> = ["src/b.rs".to_string()].into();
-        let s = two_layer_manifest(&all, &delta);
-        assert!(s.contains("src/b.rs [delta]"), "{s}");
-        assert!(s.contains("src/a.rs") && !s.contains("src/a.rs [delta]"), "{s}");
-        // 复用双帽：大清单截断注记
-        let many: Vec<String> = (0..500).map(|i| format!("src/file{i:04}.rs")).collect();
-        let s = two_layer_manifest(&many, &BTreeSet::new());
-        assert!(s.contains("more files"), "{s}");
-        assert!(s.chars().count() <= 4000, "{}", s.chars().count());
-    }
 }

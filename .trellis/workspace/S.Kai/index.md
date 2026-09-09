@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 13
+- **Total Sessions**: 14
 - **Last Active**: 2026-09-09
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~324 | Active |
+| `journal-1.md` | ~370 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 14 | 2026-09-09 | M21a 批 F 硬切与并行：F-1…F-6 实施 + dogfood + code-review 十修（feat/m21a-cutover） | `495c80e`, `4335a23`, `eb0b3ad`, `1cf6003`, `acbc161`, `3af7048`, `3411a0e`, `5e4856f` | `feat/m21a-cutover` |
 | 13 | 2026-09-09 | M21a 批 D / E 合并后核验与修补（feat/m21-review-engine） | `8622dbc`, `2170de4` | `feat/m21-review-engine` |
 | 12 | 2026-09-09 | M21a 批 E 第二轮复审：code-review high 九修一不改（feat/m21a-slice） | `687335d` | `feat/m21a-slice` |
 | 11 | 2026-09-08 | M21a 批 E：切片装包（feat/m21a-slice）——E-1 一跳 / E-2 切片配方 / E-3 文件外片段 / E-4 接线与观测 + code-review 十修 | `ef8773e`, `9ff03c3`, `c09636e`, `d374040`, `4512734`, `e492334`, `e9693e8`, `e827f15` | `feat/m21a-slice` |

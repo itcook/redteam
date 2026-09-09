@@ -121,6 +121,19 @@ impl CellOutput {
     }
 }
 
+/// 合并后的疑点（批 F-3，design §5）：同组内跨 cell 以 quote 为锚并集；`agreement` = 家族数（同家族多 samples 计一次）；
+/// `suspicion` = 代表（confidence 最高者）；`hints` 全部保留不归一（M21c R4）；`cell_ids` 追溯来源。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MergedSuspicion {
+    /// 组索引（0-based，对应报告 `scan.groups[group]`）。
+    pub group: usize,
+    pub suspicion: Suspicion,
+    pub agreement: u32,
+    pub families: Vec<String>,
+    pub cell_ids: Vec<String>,
+    pub hints: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

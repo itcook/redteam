@@ -32,6 +32,9 @@ pub struct AssistantTurn {
     /// 模型这一轮的结束原因（openai choices[0].finish_reason / anthropic stop_reason）——
     /// 缺失记 None。用于把 parse 失败区分为「截断(length/max_tokens)」vs「形状违约」。
     pub finish_reason: Option<String>,
+    /// 推理 token（openai kind `usage.completion_tokens_details.reasoning_tokens`）；provider 不分列（anthropic）→ None。
+    /// 批 F-2：scanner 钉推理档后「零推理 + 短输出」只观测不重跑（prd K5）。
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// 单轮往返抽象：给定历史 + 工具声明，返回模型这一轮的输出。
@@ -52,6 +55,17 @@ pub trait ChatBackend: Send + Sync {
         messages: &[ChatMessage],
     ) -> Result<AssistantTurn, ProviderError> {
         self.turn(messages, &[]).await
+    }
+}
+
+/// `Arc<T>` 透传：测试与编排层可在把 backend 交给 registry（`Box<dyn ChatBackend>`）后仍持一份句柄观测（批 F-4）。
+#[async_trait]
+impl<T: ChatBackend + ?Sized> ChatBackend for std::sync::Arc<T> {
+    async fn turn(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> Result<AssistantTurn, ProviderError> {
+        (**self).turn(messages, tools).await
+    }
+    async fn turn_final(&self, messages: &[ChatMessage]) -> Result<AssistantTurn, ProviderError> {
+        (**self).turn_final(messages).await
     }
 }
 
@@ -255,24 +269,44 @@ impl ReviewProvider for ToolLoopProvider {
 /// 行为不变）——区分调用路径的锚：首发必须走 `turn`，`turn_final` 只应出现在 repair/FINALIZE。
 pub struct FakeChatBackend {
     turns: Mutex<VecDeque<Result<AssistantTurn, ProviderError>>>,
+    /// 批 F-2：`repeating` 形态——每轮都回同一 turn（扇出测试里多 cell 共用一个 backend）。
+    repeat: Mutex<Option<AssistantTurn>>,
+    /// 每轮人为延迟（并发上限 / 峰值断言用）。
+    delay: Option<std::time::Duration>,
     seen: Mutex<Vec<Vec<ChatMessage>>>,
     final_calls: std::sync::atomic::AtomicUsize,
+    inflight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeChatBackend {
     pub fn new(turns: Vec<AssistantTurn>) -> Self {
-        FakeChatBackend {
-            turns: Mutex::new(turns.into_iter().map(Ok).collect()),
-            seen: Mutex::new(Vec::new()),
-            final_calls: std::sync::atomic::AtomicUsize::new(0),
-        }
+        Self::new_results(turns.into_iter().map(Ok).collect())
     }
     pub fn new_results(turns: Vec<Result<AssistantTurn, ProviderError>>) -> Self {
         FakeChatBackend {
             turns: Mutex::new(turns.into()),
+            repeat: Mutex::new(None),
+            delay: None,
             seen: Mutex::new(Vec::new()),
             final_calls: std::sync::atomic::AtomicUsize::new(0),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+    /// 每轮都回同一 turn（不消耗队列）。
+    pub fn repeating(turn: AssistantTurn) -> Self {
+        let b = Self::new_results(vec![]);
+        *b.repeat.lock().unwrap() = Some(turn);
+        b
+    }
+    pub fn with_delay(mut self, d: std::time::Duration) -> Self {
+        self.delay = Some(d);
+        self
+    }
+    /// 观测到的最大并发轮数（并发上限断言）。
+    pub fn peak_inflight(&self) -> usize {
+        self.peak.load(std::sync::atomic::Ordering::SeqCst)
     }
     pub fn turn_count(&self) -> usize {
         self.seen.lock().unwrap().len()
@@ -293,12 +327,24 @@ impl ChatBackend for FakeChatBackend {
         messages: &[ChatMessage],
         _tools: &[ToolSpec],
     ) -> Result<AssistantTurn, ProviderError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let cur = self.inflight.fetch_add(1, SeqCst) + 1;
+        self.peak.fetch_max(cur, SeqCst);
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
         self.seen.lock().unwrap().push(messages.to_vec());
-        self.turns
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| Err(ProviderError::Unavailable("no scripted turn".into())))
+        let repeat = self.repeat.lock().unwrap().clone();
+        let out = match repeat {
+            Some(t) => Ok(t),
+            None => self.turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(ProviderError::Unavailable("no scripted turn".into()))),
+        };
+        self.inflight.fetch_sub(1, SeqCst);
+        out
     }
 
     /// 覆写仅为计数，行为照旧转发默认实现（不带 tools 调 `turn`）——
@@ -322,7 +368,7 @@ mod tests {
     const FINDINGS_JSON: &str = r#"{"findings":[{"severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}]}"#;
 
     fn final_turn(text: &str) -> AssistantTurn {
-        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None }
+        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None }
     }
 
     fn toolcall_turn(name: &str, args: serde_json::Value) -> AssistantTurn {
@@ -332,7 +378,7 @@ mod tests {
             input_tokens: 2,
             output_tokens: 3,
             cached_input_tokens: 0,
-            finish_reason: None,
+            finish_reason: None, reasoning_tokens: None,
         }
     }
 
@@ -505,7 +551,7 @@ mod tests {
             Ok(AssistantTurn {
                 text: String::new(),
                 tool_calls: vec![ToolCall { id: "c1".into(), name: "read_file".into(), args: json!({"path":"a.rs"}) }],
-                input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None,
+                input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None,
             })
         }
         async fn turn_final(&self, _m: &[ChatMessage]) -> Result<AssistantTurn, ProviderError> {

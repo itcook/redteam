@@ -322,3 +322,49 @@ Trellis 09-08-m21a-slice：diffsym 文件级 def / 全改动行锚定 / 一跳�
 
 - 批 F 硬切与并行（feat/m21a-cutover）；F 接线备忘见 followup「合并后核验」表：新开 scanner 通路（System(head) + UserBlocks → parse_scan_output_with_stats → REPAIR_PROMPT_SCAN → anchor_suspicions）、CellRecord.template_hash 合成、--pack-only 口径切到 scan prompt
 - 延后项：多行 quote 只核首行（M21c 合并逻辑时定）、中和 vs quote 锚定（F 出口看 dropped 计数）、FileCtx 二次解析 / bracket_delta_code 块注释 / anchor_offset PLAUSIBLE（dogfood 观测）
+
+
+## Session 14: M21a 批 F 硬切与并行：F-1…F-6 实施 + dogfood + code-review 十修（feat/m21a-cutover）
+<!-- trellis-session: v=2 fp=abba01f26731ef4e -->
+
+**Date**: 2026-09-09
+**Task**: M21a 批 F 硬切与并行：F-1…F-6 实施 + dogfood + code-review 十修（feat/m21a-cutover）
+**Branch**: `feat/m21a-cutover`
+
+### Summary
+
+用户「开批 F 硬切与并行」。建子分支 feat/m21a-cutover 与工作树、Trellis 任务 09-09-m21a-cutover；三个只读研究子 agent 出代码地图，写 prd（K1-K15）/ design / implement。F-1 产物改名 redteam-next（make build 不覆盖 dev、gitignore、packaging 断言）；F-2 scanner 通路（scan_shot 两轮单发、registry scan 表 + provider 在途门、thinking 映射表按 (kind, family, id)、reasoning_tokens、run_scan_fanout 组 × 条目 × samples、CellInput.scan）；F-3 疑点并集 agreement = 家族数 + ScanOnly 报告 + md；F-4 硬切：cli 四条路径收 ProviderRegistry、finish_scan_report / scanned_coverage、resume scan 重放、增量 bail、pack-only 切 scan prompt、删旧扇出 / 旧模板 / 旧尾段 / 二阶段构造器，e2e 与 cli 单测改 scan；F-5 观测单测；F-6 dogfood（3 组 × DeepSeek / Qwen，6 cell scan-only 366 s，57 疑点，覆盖 0.87，零告警）+ 评分器读取验证 + code-review high 十条全修（resume 旧作业覆盖、partial 丢失败格、gpt-4 误发 reasoning_effort、合并顺序依赖改并查集、resume 贫化收口共用 scan_cell_record、manifest 模板哈希、lease 先门后 worker、glm-4 Off、pinned 看映射、覆盖率分母）+ 帽外五项；followup / roadmap 打勾。三道门：lib 531 / 16 / 7 / e2e 17 绿、clippy 三条既有、make verify 绿。未 push；待用户 --no-ff 合回 feat/m21-review-engine。
+
+### Main Changes
+
+- F-1：[[bin]] redteam-next、CARGO_BIN_EXE_redteam-next、Makefile BIN/cp、.gitignore、packaging 断言、clap name/about
+- F-2：provider/scan_shot.rs、registry scan 表 + InflightGate + lease、backends thinking_params(kind, family, id, level) + *_ext body + with_thinking + reasoning_tokens、orchestrate run_scan_fanout / scan_cell_record / ScanEntrySpec、CellInput.scan + template_hash、FakeChatBackend repeating/with_delay
+- F-3：consolidate/scan.rs merge_suspicions（并查集）、Verdict::ScanOnly、ScanReport / MergedSuspicion、ReviewReport.{scan, cells}、RunMeta.grouping、md Scan 段
+- F-4：cli scan 路径（run_code_review / finish_scan_report / scanned_coverage / run_resume / partial_report / run_pack_only）、增量 bail、删旧扇出与模板、--help 文案、main build_registry 只装 scan 条目、Phase::Scan、Arc<T>: ChatBackend
+- F-5 / F-6：观测单测、dogfood、code-review 十修 + 五帽外、followup / roadmap 更新
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `495c80e` | chore(task): m21a-cutover 规划制品（prd / design / implement / jsonl）——批 F 硬切与并行：K1-K15 定案（route_key = provider/id、registry scan 表 + 在途门、thinking 映射表、CellInput.scan、agreement = 家族数、ScanOnly 退出码 0、报告顶层 cells、模板哈希 head+tail、增量 bail、gitignore redteam-next、--pack-only 切 scan prompt） |
+| `4335a23` | chore(build): 分支产物改名 redteam-next，make build 不覆盖插件 dev redteam（D10）——[[bin]] name / CARGO_BIN_EXE_redteam-next 六处 / Makefile BIN 与 cp 改名、删 chmod、加 build-dev-baseline 说明 / .gitignore 忽略 plugins/redteam/bin/**/redteam-next（防 5 MB 分支二进制误入公开仓）/ packaging 断言 commands 与 codex 镜像不出现 redteam-next / clap name·about·after_help 标「M21 重构分支产物」/ CLAUDE.md 常用节一句 |
+| `eb0b3ad` | feat(orchestrate): scanner 扇出——组 × 条目 × samples，route_key 按角色条目，thinking_level 首个消费者，provider 在途锁（design §5 / §12.3）——provider/scan_shot.rs 两轮单发（System(共享头) + UserBlocks → parse_scan_output_with_stats → REPAIR_PROMPT_SCAN + turn_final → diagnostic_parse_error，usage / reasoning 跨轮累加）；registry 加 scan 表 + per-provider InflightGate（Semaphore + 在途峰值）+ warnings，同 provider 多条目共享一把门；backends thinking_params 映射表按 (kind, family, level)（deepseek / glm / kimi / gpt·o / gemini / qwen / claude，无映射 → 不发 + thin |
+| `1cf6003` | feat(consolidate): 疑点并集与 agreement（家族数）+ scan-only 报告（design §5〔D7〕）——consolidate/scan.rs merge_suspicions：同组 ∧ 同文件 ∧ 行重叠 ±LINE_GAP ∧（去空白 quote 相等 ∨ quote_overlap ≥ QUOTE_SIM）→ 合并，agreement = 家族数（同家族多 samples 计一次，不复用 dedup::merge_into 的模型数口径），代表 = 高置信者、hint 全留不归一、cell_ids 追溯、跨组不合并、输出按 (group, file, line, hint) 排序；domain：Verdict::ScanOnly（"scan-only"）、MergedSuspicion、ScanGroup / ScanStats / ScanReport、ReviewReport.{scan, cells: Vec<CellRecord>}（评分器读顶层 cells[].output）、RunMeta.grouping、CellSummary. |
+| `acbc161` | refactor(orchestrate): 硬切旧 fan-out / 候补链 / 单发 finding 路径——scanner 疑点路径唯一（铁律 6〔D10〕）——cli：run_code_review / run_review_dispatch / run_job / run_resume 收 ProviderRegistry，scan 路径 = plan_cells → run_scan_fanout → finish_scan_report（merge_suspicions → ScanReport / RunMeta coverage 五集合 · template_hashes · cache_hit_by_cell · provider_inflight_peak · grouping · cells 摘要与顶层 cells → 任一 cell 失败 Incomplete/3 否则 ScanOnly/0）；scanned_coverage（改动行 ∩ scanned_areas）；resume 用 manifest.scan 重放（旧格式作业记失败）；partial_r |
+| `3af7048` | feat(state): scanner cell 落盘 + RunMeta 观测（分组 / 疑点数 / 覆盖率 / cache / 墙钟 / 在途峰值 / coverage 五集合）——观测填值随 F-4 的 finish_scan_report 落地（coverage selected / completed / reused / failed、template_hashes 两键、cache_hit_by_cell = cached ÷ input、provider_inflight_peak、grouping、每 cell 摘要含 cell / role / cached、needs triggered / declared、scanned_coverage、Phase::Scan、JobState.roles）；本 task 补定向单测 finish_scan_report_fills_observability_and_flips_incomplete_on_failed_cell（组骨架补齐、类别分布、agreement ≥ 2、usage 从记录重算、失败格 usage |
+| `3411a0e` | fix(orchestrate,cli,provider): 评审修复（code-review high 十条 + 帽外五项）——resume 拒旧格式作业不覆盖原报告、旧非 scanner 记录翻失败格；partial 报告收全部记录（失败格进 coverage.failed / usage）；thinking_params 加 id：gpt-4 系无映射 + warning、GLM-5.x 不可关 / 4.x Off 真关；merge_suspicions 并查集传递闭包 + 输入按 cell id 序（六排列同结果）+ 琐碎 quote 只认相等；orchestrate::scan_cell_record 扇出 / resume 共用，resume 沿用原报告 groups / grouping / head_sha / dossier / scanned_coverage 并并入 registry warnings；CellInput.template_hash 随 manifest 落盘、重放优先取之（不一致 warning）；registry lease 先过 provid |
+| `5e4856f` | docs(task,followup,roadmap): 批 F 收口——implement 收口记录（dogfood 6 cell scan-only 366 s / 57 疑点 / agreement≥2 六条 / 覆盖 0.87 / thinking 映射零告警）与评审修记录；followup 关闭 `--pack-only` system 段 / legacy 适配器 / GroupingStats 接线 / 结果 JSON scanner 输出面四项，新增批 F 延后表（resume 生产验证 / GLM anthropic 映射 / 增量与台账 M21c / 无消费者旗 / finding 形态字段恒空 / attempts 口径 / 保留旧件 / 大 diff 组体量 / 分种计数 / thinking+tools 守卫 / resolve 文案 / exit_code 第二参 / ScanResults 字段 / anchor 重读）；roadmap M21a 交付项 1-9 打勾、状态 🟢 机制完成待验收、README 同步；出口验收 1-10 另起 session |
+
+### Testing
+
+- [OK] cargo test lib 531 / 16 / 7 / e2e 17；clippy 三条既有；make verify 绿；make build 产 redteam-next 不覆盖 dev；dogfood scan-only 退出 0；scan_score.py selftest + 读 dogfood 报告
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 用户 --no-ff 合回 feat/m21-review-engine；出口验收 1-10 另起 session（需 .next/private：PR181 单 / 双 scanner、E2 slice vs full A/B、cache 命中、--pack-only 误差、模板回归、dev 基线归档、schema v4 计数）
+- M21b 前：GLM anthropic 形态 thinking 映射、resume 生产验证、GroupingStats 分种计数（followup 批 F 延后表）

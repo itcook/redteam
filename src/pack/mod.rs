@@ -59,10 +59,10 @@ impl PackOpts {
 }
 
 /// 装包形态统计（批 E K13，铁律 1）：`--pack-only` stdout + summary.json 可读；RunMeta 接线在 F-5。
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PackStats {
-    /// `slice` / `full`。
-    pub body: &'static str,
+    /// `slice` / `full`（批 F-3 改 String：进报告 JSON 需 Deserialize）。
+    pub body: String,
     /// 有内容的改动文件数（工作树缺失的不计）。
     pub files: usize,
     /// 切片块入正文的文件数。
@@ -415,8 +415,8 @@ pub(crate) fn body_section(
 fn body_section_ctx(files: &[FileCtx<'_>], budget: usize, omit: &mut Vec<String>, opts: &PackOpts, stats: &mut PackStats) -> String {
     let mut out = String::new();
     stats.body = match opts.body {
-        PackBody::Slice => "slice",
-        PackBody::Full => "full",
+        PackBody::Slice => "slice".to_string(),
+        PackBody::Full => "full".to_string(),
     };
     for ctx in files {
         let (path, content, n_lines, diff) = (&ctx.fc.path, &ctx.content, ctx.n_lines, ctx.diff.as_str());
@@ -1296,7 +1296,7 @@ mod tests {
         assert!(s.contains("fn unrelated_big() -> u8 {\n…（19-620 行折叠：unrelated_big）\n"), "无关函数只留签名 + 带范围与名的折叠标记: {s}");
         assert!(!s.contains("let u7 = 7;"), "无关函数体不在: {s}");
         assert!(omit.is_empty());
-        assert_eq!((stats.body, stats.files, stats.sliced, stats.small_full, stats.full, stats.ladder), ("slice", 1, 1, 0, 0, 0));
+        assert_eq!((stats.body.as_str(), stats.files, stats.sliced, stats.small_full, stats.full, stats.ladder), ("slice", 1, 1, 0, 0, 0));
         assert_eq!((stats.one_hop_defs, stats.folded_lines), (2, 602));
     }
 
@@ -1408,7 +1408,7 @@ mod tests {
         let mut stats = PackStats::default();
         let s = body_section(&b, root, 1_000_000, &mut Vec::new(), &PackOpts::full(), &mut stats);
         assert_eq!(s, format!("## 改动源文（0 壳）\nsrc/a.rs:1-620（全文，620 行）\n{content}\n\n"), "full 档 = 现状整文件（K10）");
-        assert_eq!((stats.body, stats.full, stats.sliced), ("full", 1, 0));
+        assert_eq!((stats.body.as_str(), stats.full, stats.sliced), ("full", 1, 0));
     }
 
     #[test]
@@ -1680,7 +1680,7 @@ mod tests {
         let (tmp, b, changeset) = outside_repo();
         let p = pack_bundle(&b, tmp.path(), 1_000_000, 0, &PackOpts::second_pass(&PackOpts::default()), &changeset);
         assert!(p.text.contains("src/core.rs:1-1（全文，1 行）") && p.text.contains("## 文件外片段"), "{}", p.text);
-        assert_eq!((p.stats.body, p.stats.small_full, p.stats.sliced), ("slice", 2, 0));
+        assert_eq!((p.stats.body.as_str(), p.stats.small_full, p.stats.sliced), ("slice", 2, 0));
     }
 
     // ---- 复审修（2026-09-09 第二轮 code-review high）----

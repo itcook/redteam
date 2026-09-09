@@ -8,7 +8,7 @@ name = "redteam"
 path = "src/lib.rs"
 
 [[bin]]
-name = "redteam"
+name = "redteam-next"
 path = "src/main.rs"
 
 [dependencies]

@@ -58,6 +58,8 @@ fn commands_frontmatter_and_invocation_policy() {
             !body.contains("redteam-darwin-arm64"),
             "{name}: must not reference the old flat binary name"
         );
+        // M21（D10）：插件与 ship 循环全程指向 dev `redteam`，分支产物 redteam-next 不进 commands
+        assert!(!body.contains("redteam-next"), "{name}: commands must keep pointing at the dev launcher, never redteam-next");
         assert!(body.contains("$ARGUMENTS"), "{name}: must forward $ARGUMENTS");
     }
     // review/ship 计费重（ship 是烧钱长循环，同 review 政策）→ 禁模型自动调用
@@ -128,6 +130,7 @@ fn codex_skills_have_name_and_no_claude_var() {
             "{name}: codex skill must invoke the bin/redteam launcher");
         assert!(!s.contains("redteam-darwin-arm64"),
             "{name}: must not reference the old flat binary name");
+        assert!(!s.contains("redteam-next"), "{name}: codex mirror must not reference redteam-next");
     }
 }
 

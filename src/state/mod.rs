@@ -40,9 +40,10 @@ impl JobStatus {
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
     Collecting, // worker 起手，收集证据，fanout 前
-    Fanout,     // cell 并发执行中（progress.done 推进）
-    Finalizing, // 尾段：dedup/verify/verdict（progress/last_active 静止）
-    Refute,     // finalizing 子阶段：targeted refute（LLM 并发；note 带 targets 数）
+    Fanout,     // 旧 finding 扇出（F-4 后不再打；旧作业 state 可读）
+    Scan,       // 批 F-5：scanner 静态扇出（cell 并发执行中，progress.done 推进）
+    Finalizing, // 尾段：合并 / 报告（progress/last_active 静止）
+    Refute,     // M21b verifier 子阶段：targeted refute（LLM 并发；note 带 targets 数）
 }
 
 /// phase 时间线一格（2026-07-03 grill 定案：finalizing 黑盒可观测）。
@@ -137,7 +138,15 @@ impl JobState {
 pub struct CellInput {
     pub cell: String,
     pub model: String,
+    /// 扁平 prompt：scan cell 留空（全文在 `scan`，不双存——每 cell 可达 MB 级，评审帽外项）；旧路径 / 旧作业为渲染后全文。
     pub prompt: String,
+    /// scanner cell 的完整请求（system + 分块 + cache 断点，批 F-2 prd K7）：resume 差集重放的唯一输入——扁平串会丢 system
+    /// 与断点。旧路径 / 旧作业为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<crate::prompt::ScanPrompt>,
+    /// 渲染 `scan` 时的模板哈希（`prompt::scan_template_hash`）：resume 重放盖此值而非当前二进制的（评审修 6，A/B 归因不失真）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_hash: Option<String>,
 }
 
 /// partial 每 cell：单个 cell 的执行结果（db 同键覆盖：重试成功覆盖失败记录）。
@@ -408,6 +417,9 @@ mod tests {
         assert!(j.contains("\"phase\":\"fanout\""), "phase 应小写序列化: {j}");
         let back: JobState = serde_json::from_str(&j).unwrap();
         assert_eq!(back.phase, Some(Phase::Fanout));
+        // 批 F-5：Scan 阶段小写序列化 round-trip；旧 fanout 串仍可读
+        assert_eq!(serde_json::to_string(&Phase::Scan).unwrap(), "\"scan\"");
+        assert_eq!(serde_json::from_str::<Phase>("\"scan\"").unwrap(), Phase::Scan);
     }
 
     #[test]
@@ -660,7 +672,7 @@ mod tests {
     fn manifest_roundtrip_and_missing_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let store = JobStore::open(tmp.path()).unwrap();
-        let inputs = vec![CellInput { cell: "c1".into(), model: "m".into(), prompt: "p".into() }];
+        let inputs = vec![CellInput { template_hash: None, cell: "c1".into(), model: "m".into(), prompt: "p".into(), scan: None }];
         store.write_manifest("j1", &inputs).unwrap();
         let back = store.read_manifest("j1");
         assert_eq!(back.len(), 1);

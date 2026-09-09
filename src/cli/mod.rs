@@ -4,11 +4,13 @@
 
 use crate::bundle::{group, select_files, Bundle, GroupingOpts, GroupingStats};
 use crate::config::{Config, RoleSets};
-use crate::domain::{DossierMeta, Finding, ReviewReport, RunMeta, Severity, Stats, Usage, Verdict};
+use crate::domain::{CacheHit, CellSummary, DossierMeta, NeedsMeta, ReviewReport, Role, RunMeta, ScanGroup, ScanReport, ScanStats, Stats, Usage, Verdict};
 use crate::evidence::git::FileChange;
-use crate::orchestrate::{enrich, run_code_fanout, CellSink, OrchestrateOpts, PlannedModel};
+use crate::orchestrate::{run_scan_fanout, scan_cells_from_records, CellSink, ScanCellResult, ScanEntrySpec, ScanFanoutInput, ScanResults};
 use crate::output::Format;
-use crate::provider::{LensRequest, ReviewProvider};
+use crate::provider::registry::ProviderRegistry;
+use crate::state::CellRecord;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub(crate) mod deny;
@@ -20,9 +22,11 @@ mod tail;
 pub use incremental::run_incremental_review;
 pub use tail::exit_code;
 
-use second_pass::second_pass_prompt;
 use spec::{render_spec_section_capped, SPEC_BUDGET_BYTES};
-use tail::{assemble_report, model_ids_for, TailCtx};
+use tail::model_ids_for;
+
+/// scanners 为空时的配置错误文案（`build_registry` 与 `run_code_review` 共用）。
+pub const NO_SCANNER_MSG: &str = "未配置 scanner：在 ~/.redteam/config.json（REDTEAM_HOME 可覆盖）给至少一个模型加 roles.scanner，见 `redteam-next model setup --help`";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReviewArgs {
@@ -66,7 +70,10 @@ pub struct ReviewArgs {
 /// 台账加载产物（design 2026-07-03 #6 zero-config）：豁免 id 集 + 活跃判例卡 + 披露 meta。
 #[derive(Default, Debug)]
 pub(crate) struct Ledger {
+    /// 豁免 id 集 / 活跃判例卡：M21a scan-only 只披露 meta，不消费（M21c 判例前移 + 豁免裁决消费）。
+    #[allow(dead_code)]
     pub ids: std::collections::HashSet<String>,
+    #[allow(dead_code)]
     pub cards: Vec<crate::db::DismissCard>,
     pub meta: Option<crate::domain::LedgerMeta>,
 }
@@ -114,36 +121,12 @@ pub(crate) fn load_ledger(
     }
 }
 
-fn parse_sev(s: &str) -> Severity {
-    match s {
-        "low" => Severity::Low,
-        "high" => Severity::High,
-        "critical" => Severity::Critical,
-        _ => Severity::Medium,
-    }
-}
-
 pub fn parse_format(s: &str) -> Format {
     if s == "md" {
         Format::Md
     } else {
         Format::Json
     }
-}
-
-/// 角色集 → 旧 fan-out 编排参数（M21a 批 A **过渡适配器**，批 F 换成 scanner 路径后删）：
-/// 带 `roles.scanner` 的模型即活跃集——每个各跑一遍（replicate）、无候补（no_fallback）；`priority` 恒 0
-/// （候补链已退场，D7 A3）。scanners 为空是配置错误，交调用方报错退 1。
-pub fn legacy_opts_from_roles(roles: &RoleSets, max_concurrency: usize) -> Result<OrchestrateOpts, String> {
-    if roles.scanners.is_empty() {
-        return Err("未配置 scanner：在 ~/.redteam/config.json（REDTEAM_HOME 可覆盖）给至少一个模型加 roles.scanner，见 `redteam model setup --help`".to_string());
-    }
-    Ok(OrchestrateOpts {
-        models: roles.scanners.iter().map(|m| PlannedModel { name: m.name.clone(), priority: 0, family: m.family.clone() }).collect(),
-        replicate: true,
-        no_fallback: true,
-        max_concurrency,
-    })
 }
 
 /// pack flat 预算绝对帽（字节）。史：S2-b' 定 256K（装下 cli.rs 级 90KB 大文件，当时模型窗
@@ -199,8 +182,9 @@ pub(crate) fn build_packs(
         .map(|b| {
             // 预算记账扣本格自己的 diff 字节（单格默认下即全变更集真实 diff）。
             let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
+            // 批 F-4：直接产裸 pack 正文（`build_scan_prompt` 自己包 <dossier> 与切片形态前言）。
             let packed = crate::pack::pack_bundle(b, root, budget, own_diff_bytes, opts, &changeset);
-            (crate::prompt::render_dossier_section(&packed.text), packed.stats)
+            (packed.text, packed.stats)
         })
         .unzip();
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
@@ -217,7 +201,7 @@ pub(crate) fn budget_and_spec(roles: &RoleSets, spec: &[String]) -> (usize, Stri
     (budget_raw.saturating_sub(spec_used), spec_section, warnings)
 }
 
-/// cell 规划产物：分组 + 每组卷宗 + 每组跨组索引 + 每组装包形态（四者等长等序）+ 观测。
+/// cell 规划产物：分组 + 每组裸 pack 正文（`dossiers`）+ 每组跨组索引 + 每组装包形态（四者等长等序）+ 观测。
 pub(crate) struct CellPlan {
     pub bundles: Vec<Bundle>,
     pub dossiers: Vec<String>,
@@ -259,12 +243,12 @@ pub(crate) fn grouping_opts(g: &crate::config::GroupingCfg, budget: usize) -> Gr
     }
 }
 
-/// code 专属流水线（S2-2b）：bundle × model 工具循环 + positioning 尾段。
-/// 退出码：0=approve、10=reject、2=对照集不完整（failed_models 非空）。
+/// scan-only 流水线（M21a 批 F-4 硬切，design §2 / §4 / §5）：证据筛选 → 分组 / 装包 / 跨组索引 → scanner 扇出（组 × 条目 × samples）
+/// → 疑点并集 + agreement → scan-only 报告。不产 finding；退出码：0 = scan 完成、3 = 任一 scanner cell 失败（Incomplete，design §8.4）。
 /// `--background` 由 main.rs 在 dispatch 之前分叉（spawn worker）；到达这里即路由 bug。
 pub async fn run_code_review(
     args: &ReviewArgs,
-    provider: &dyn ReviewProvider,
+    registry: &ProviderRegistry,
     cfg: &Config,
     changes: Vec<FileChange>,
     root: &Path,
@@ -274,90 +258,265 @@ pub async fn run_code_review(
     if args.background {
         anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
     }
-    // Fix 3（final-review）：台账加载上提到 fan-out 之前 fail-fast——坏值不再烧完 LLM
-    // 调用才报错。zero-config：缺省自动加载 .redteam/proj.db（存在才启用）。
+    // 台账加载 fail-fast（坏值不烧 LLM）；M21a scan-only 只披露 run.ledger，不消费（M21c 判例前移）。
     let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, root)?;
     let t0 = std::time::Instant::now();
 
-    // 1. 确定性筛选；分组（design §3.2）推迟到 pack 预算算出之后——组预算门要喂它（K1 / K5）。
     let selected = select_files(changes);
-
-    // 3. 角色集 → 旧 fan-out 适配（M21a 批 A 过渡；批 F 换 scanner 路径）
     let roles = cfg.active_roles();
-    let oopts = legacy_opts_from_roles(&roles, cfg.review.max_concurrency).map_err(|e| anyhow::anyhow!(e))?;
-    let model_names: Vec<String> = oopts.models.iter().map(|m| m.name.clone()).collect();
+    if roles.scanners.is_empty() {
+        anyhow::bail!(NO_SCANNER_MSG);
+    }
+    let entries: Vec<ScanEntrySpec> = roles.scanners.iter().map(ScanEntrySpec::from).collect();
+    let model_names: Vec<String> = entries.iter().map(|e| e.route_key.clone()).collect();
 
-    // 4. fan-out（bundle × model）
     let focus = args.focus.clone().unwrap_or_default();
     let target_label = if args.scope == "branch" {
         format!("branch {}...HEAD", args.base.as_deref().unwrap_or("?"))
     } else {
         "working tree".to_string()
     };
-    // job 上下文时由 run_job 传 JobCellSink；直调路径（无 job）传 None，行为不变。
-    // 台账不再注入 review prompt（design 2026-07-03 #2，判定后置 consolidate）。
     if let Some(s) = sink { s.on_meta(&model_names); }
-    // --spec 参照段（D2）：读 spec_docs → 从 pack 预算里扣掉它占用的字节，让 build_packs +
-    // 第二趟补查都用缩后预算——总上下文守界，spec 与 pack 不叠加超模型墙。空 --spec →
-    // (String::new(), 0) → budget 原样不变（既有回归行为零漂移）。
+    // --spec 参照段（D2）：从 pack 预算里扣掉它占用的字节。
     let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
-    // 2. 分组 / 装包 / 跨组索引（plan_cells：与增量、--pack-only 同源）。门未过 → 单包（即原 E9 单格全审）。
-    // GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
-    let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
-    // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
-    let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
-        let other = others.get(idx).map(String::as_str).unwrap_or("");
-        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "", &spec_section, other, &crate::pack::PackOpts::from(&cfg.review.pack))
+    // 分组 / 装包 / 跨组索引（plan_cells：与 --pack-only 同源）。门未过 → 单包。
+    let CellPlan { bundles, dossiers, others, dossier_meta, stats, pack_stats } =
+        plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
+    let input = ScanFanoutInput {
+        target_label: &target_label, bundles: &bundles, dossiers: &dossiers, others: &others,
+        user_focus: &focus, spec_docs: &spec_section, root, entries: &entries,
+        workers: cfg.review.scanners.workers as usize, samples: cfg.review.scanners.samples,
     };
-    let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk), &spec_section, &others).await;
-    // T46①：--spec denylist/PEM 拒读 warnings 并入 run.warnings（CI/bot 可见，不仅 eprintln）。
-    raw.warnings.extend(spec_warnings);
+    let results = run_scan_fanout(registry, &input, sink).await;
+    let mut warnings: Vec<String> = registry.warnings().to_vec();
+    warnings.extend(spec_warnings);
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
-        raw.warnings.push(format!(
-            "no reviewable evidence: empty diff for {target_label} (0 cells) — the verdict reflects zero reviewed content"
+        warnings.push(format!(
+            "no reviewable evidence: empty diff for {target_label} (0 cells) — the scan-only report reflects zero reviewed content"
         ));
     }
-
-    // 5-8. 共用尾段：anchor → dedup → verify → verdict → 组报告
-    let block = args
-        .block_threshold
-        .as_deref()
-        .map(parse_sev)
-        .unwrap_or(cfg.review.block_threshold);
-    let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
-    let ctx = TailCtx {
-        root,
-        provider,
-        model_ids: model_ids_for(&model_names, &roles),
+    if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
+    let groups: Vec<ScanGroup> = bundles
+        .iter()
+        .enumerate()
+        .map(|(g, b)| ScanGroup {
+            label: b.label(),
+            files: b.files.iter().map(|f| f.path.clone()).collect(),
+            cells: vec![],
+            suspicions: 0,
+            pack: pack_stats.get(g).cloned().unwrap_or_default(),
+        })
+        .collect();
+    let scanned_coverage = scanned_coverage(&bundles, &results.cells);
+    Ok(finish_scan_report(ScanFinish {
+        groups,
+        scanned_coverage,
+        grouping: Some(stats),
+        dossier_meta: Some(dossier_meta),
+        results,
         model_names,
-        block,
-        floor,
-        max_concurrency: cfg.review.max_concurrency,
-        job_id: String::new(),
-        duration_ms: t0.elapsed().as_millis() as u64,
-        usage: raw.usage,
-        warnings: raw.warnings,
-        failed_models: raw.failed_models,
-        dismissed: &ledger.ids,
-        precedents: &ledger.cards,
+        roles: Some(&roles),
+        warnings,
+        inflight_peak: registry.inflight_peaks(),
         ledger_meta: ledger.meta.clone(),
         head_sha,
-        dossier_meta: Some(dossier_meta),
-        needs_stats: raw.needs_stats,
-        sink,
-        spec_docs: &spec_section,
-        carry: None,
+        duration_ms: t0.elapsed().as_millis() as u64,
         test_command: args.test_command.clone().or_else(|| crate::project::infer_test_command(root)),
-    };
-    if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
-    assemble_report(raw.findings, ctx).await
+        job_id: String::new(),
+        reused: vec![],
+    }))
 }
 
+/// scan-only 报告收口的输入（全量 / resume / partial 三路共用，批 F-3 / F-5）。
+pub(crate) struct ScanFinish<'a> {
+    /// 组骨架（label / files / pack 已填；cells / suspicions 计数由本函数填）；resume / partial 无 bundles 时可空，按 cell id 补齐。
+    pub groups: Vec<ScanGroup>,
+    pub scanned_coverage: Option<f32>,
+    pub grouping: Option<GroupingStats>,
+    pub dossier_meta: Option<DossierMeta>,
+    pub results: ScanResults,
+    pub model_names: Vec<String>,
+    pub roles: Option<&'a RoleSets>,
+    pub warnings: Vec<String>,
+    pub inflight_peak: BTreeMap<String, u32>,
+    pub ledger_meta: Option<crate::domain::LedgerMeta>,
+    pub head_sha: Option<String>,
+    pub duration_ms: u64,
+    pub test_command: Option<String>,
+    pub job_id: String,
+    /// resume 沿用上次已完成的 cell（coverage `reused`）。
+    pub reused: Vec<String>,
+}
+
+/// 疑点并集 → ScanReport + RunMeta 观测（design §5 / §8.4 / F-5 表）→ verdict：任一 scanner cell 失败 → `Incomplete`（退出码 3），
+/// 否则 `ScanOnly`（0）。usage / needs / coverage 全部从 cell 记录重算（全量 / resume / partial 同一口径）。
+pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
+    let merged = crate::consolidate::merge_suspicions(&f.results.cells);
+    let mut groups = f.groups;
+    let max_group = f.results.cells.iter().map(|c| c.group + 1).max().unwrap_or(0);
+    while groups.len() < max_group {
+        groups.push(ScanGroup { label: format!("g{}", groups.len() + 1), ..Default::default() });
+    }
+    for c in &f.results.cells {
+        if let Some(g) = groups.get_mut(c.group) {
+            g.cells.push(c.cell_id.clone());
+        }
+    }
+    for m in &merged {
+        if let Some(g) = groups.get_mut(m.group) {
+            g.suspicions += 1;
+        }
+    }
+    let mut by_category: BTreeMap<String, u32> = BTreeMap::new();
+    for m in &merged {
+        if let Some(c) = m.suspicion.category {
+            *by_category.entry(format!("{c:?}")).or_insert(0) += 1;
+        }
+    }
+    let cells_ok = f.results.cells.iter().filter(|c| c.record.ok).count() as u32;
+    let failed: Vec<String> = f.results.cells.iter().filter(|c| !c.record.ok).map(|c| c.cell_id.clone()).collect();
+    let (mut needs_declared, mut triggered) = (0u32, 0u32);
+    for c in &f.results.cells {
+        if let Some(o) = &c.output {
+            if !o.needs.is_empty() {
+                triggered += 1;
+                needs_declared += o.needs.len() as u32;
+            }
+        }
+    }
+    let stats = ScanStats {
+        total: merged.len() as u32,
+        cells_ok,
+        cells_failed: failed.len() as u32,
+        agreement_ge2: merged.iter().filter(|m| m.agreement >= 2).count() as u32,
+        by_category,
+        needs_declared,
+    };
+    let scan = ScanReport { groups, suspicions: merged, scanned_coverage: f.scanned_coverage, stats };
+
+    // coverage 五集合（design §8.4）：selected = 全部；completed = ok 且非沿用；reused = resume 沿用；failed = 失败；waived 空。
+    let mut coverage = crate::domain::Coverage::default();
+    let selected: Vec<String> = f.results.cells.iter().map(|c| c.cell_id.clone()).collect();
+    if !selected.is_empty() {
+        coverage.selected.insert(Role::Scanner, selected);
+    }
+    let completed: Vec<String> = f.results.cells.iter()
+        .filter(|c| c.record.ok && !f.reused.contains(&c.cell_id)).map(|c| c.cell_id.clone()).collect();
+    if !completed.is_empty() {
+        coverage.completed.insert(Role::Scanner, completed);
+    }
+    let reused: Vec<String> = f.results.cells.iter()
+        .filter(|c| c.record.ok && f.reused.contains(&c.cell_id)).map(|c| c.cell_id.clone()).collect();
+    if !reused.is_empty() {
+        coverage.reused.insert(Role::Scanner, reused);
+    }
+    if !failed.is_empty() {
+        coverage.failed.insert(Role::Scanner, failed.clone());
+    }
+    let mut usage = Usage::default();
+    for c in &f.results.cells {
+        usage.input_tokens += c.record.input_tokens;
+        usage.output_tokens += c.record.output_tokens;
+        usage.cached_input_tokens += c.record.cached_input_tokens;
+    }
+    let cache_hit_by_cell: Vec<CacheHit> = f.results.cells.iter()
+        .filter(|c| c.record.input_tokens > 0)
+        .map(|c| CacheHit { cell: c.cell_id.clone(), ratio: c.record.cached_input_tokens as f32 / c.record.input_tokens as f32 })
+        .collect();
+    let cells_summary: Vec<CellSummary> = f.results.cells.iter().map(|c| CellSummary::from_record(&c.record)).collect();
+    let h = crate::prompt::template_hashes();
+    let template_hashes: BTreeMap<String, String> = [("shared_head", &h.shared_head), ("scanner_tail", &h.scanner_tail)]
+        .into_iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    let mut warnings = f.warnings;
+    warnings.extend(f.results.warnings.iter().cloned());
+    let verdict = if failed.is_empty() { Verdict::ScanOnly } else {
+        warnings.push(format!(
+            "scan incomplete: {} scanner cell(s) failed ({}) — verdict hard Incomplete (design §8.4)",
+            failed.len(), failed.join(", ")
+        ));
+        Verdict::Incomplete
+    };
+    let model_ids = match f.roles {
+        Some(r) => model_ids_for(&f.model_names, r),
+        None => f.model_names.clone(),
+    };
+    let run = RunMeta {
+        job_id: f.job_id,
+        models: f.model_names,
+        model_ids,
+        duration_ms: f.duration_ms,
+        usage,
+        warnings,
+        failed_models: vec![],
+        ledger: f.ledger_meta,
+        head_sha: f.head_sha,
+        dossier: f.dossier_meta,
+        needs: NeedsMeta { triggered_cells: triggered, declared: needs_declared },
+        cells: cells_summary,
+        coverage,
+        template_hashes,
+        cache_hit_by_cell,
+        provider_inflight_peak: f.inflight_peak,
+        grouping: f.grouping,
+        test_command: f.test_command,
+        ..Default::default()
+    };
+    let cells: Vec<CellRecord> = f.results.cells.into_iter().map(|c| c.record).collect();
+    let report = ReviewReport {
+        schema_version: crate::domain::SCHEMA_VERSION.into(),
+        verdict,
+        stats: Stats::default(),
+        findings: vec![],
+        clusters: vec![],
+        run,
+        scan: Some(scan),
+        cells,
+    };
+    let code = exit_code(verdict, false);
+    (report, code)
+}
+
+/// 覆盖自报（design §4 `scanned_areas`，F-5）：改动行 = 各文件 diff hunk 的 `+` 行（0-based 新文件坐标；删除点不计——它在工作树里不存在，
+/// scanner 永远覆盖不到，评审修 10）被任一 ok cell 自报区间（`a-b`，1-based）覆盖的比例；无 `+` 行（纯删除 / 空）→ None。
+pub(crate) fn scanned_coverage(bundles: &[Bundle], cells: &[ScanCellResult]) -> Option<f32> {
+    let mut changed: std::collections::BTreeSet<(String, usize)> = std::collections::BTreeSet::new();
+    for b in bundles {
+        for fc in &b.files {
+            for h in crate::diffsym::parse_hunks(&fc.diff) {
+                for (l, _) in h.plus {
+                    changed.insert((fc.path.clone(), l));
+                }
+            }
+        }
+    }
+    if changed.is_empty() {
+        return None;
+    }
+    let mut ranges: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    for c in cells {
+        let Some(o) = &c.output else { continue };
+        for a in &o.scanned_areas {
+            for r in &a.ranges {
+                if let Some((s, e)) = r.split_once('-') {
+                    if let (Ok(s), Ok(e)) = (s.trim().parse::<usize>(), e.trim().parse::<usize>()) {
+                        if s >= 1 && e >= s {
+                            ranges.entry(a.file.clone()).or_default().push((s - 1, e - 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let hit = changed.iter().filter(|(file, line)| {
+        ranges.get(file).is_some_and(|rs| rs.iter().any(|&(s, e)| s <= *line && *line <= e))
+    }).count();
+    Some(hit as f32 / changed.len() as f32)
+}
 /// 评审分发（前台 main 与后台 worker 共用）：增量轮路由，否则 git changed_files → run_code_review。
 pub async fn run_review_dispatch(
     args: &ReviewArgs,
-    provider: &dyn ReviewProvider,
+    registry: &ProviderRegistry,
     cfg: &Config,
     cwd: &Path,
     sink: Option<&dyn CellSink>,
@@ -369,14 +528,14 @@ pub async fn run_review_dispatch(
     let branch_scope = sync_args.scope == "branch";
     // M13：增量轮路由（前台与后台 worker 共用本单点；scope 守卫在 preflight 内）。
     if let Some(prior) = sync_args.incremental_from.clone() {
-        return run_incremental_review(&sync_args, &prior, provider, cfg, cwd, sink).await;
+        return run_incremental_review(&sync_args, &prior, cfg, cwd).await;
     }
 
     let changes = crate::evidence::git::changed_files(cwd, sync_args.base.as_deref(), branch_scope)?;
     // R3：stamp 权威时刻 = 证据收集实跑刻（与 changed_files 同刻同 cwd）；
     // 非 git 目录折 None——前台裸 review 与后台 job 共用本单点，前后台天然同 sha。
     let head_sha = crate::evidence::git::head_sha_at(cwd).ok();
-    run_code_review(&sync_args, provider, cfg, changes, cwd, head_sha, sink).await
+    run_code_review(&sync_args, registry, cfg, changes, cwd, head_sha, sink).await
 }
 
 fn now_unix() -> u64 {
@@ -396,8 +555,8 @@ pub fn gen_job_id(cwd: &Path) -> String {
 /// `--pack-only` 估算换算：代码英文 ~3.5 B/token（D7 B6，网关 usage 低报时以字节为准）。
 pub const PACK_BYTES_PER_TOKEN: f64 = 3.5;
 
-/// `--pack-only` 单 cell 记账：`bytes` = 完整 user prompt 字节（与真实评审同一 `build_bundle_prompt`
-/// 路径，可与 usage 对账）；`pack_bytes` = dossier 段；`over_budget` = 分组「宁降不拆」标记。
+/// `--pack-only` 单 cell 记账：`bytes` = 真实发出的 scanner prompt 字节（共享头 system + 四块 user，与真实评审同一
+/// `build_scan_prompt`，可与 usage 对账；批 F-4 K15）；`pack_bytes` = 裸 pack 正文；`over_budget` = 分组「宁降不拆」标记。
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PackCell {
     /// 1-based，对应 `packs/<job>/cell-<n>.md`。
@@ -459,7 +618,12 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     for (i, b) in bundles.iter().enumerate() {
         let dossier = dossiers.get(i).map(String::as_str).unwrap_or("");
         let other = others.get(i).map(String::as_str).unwrap_or("");
-        let prompt = crate::prompt::build_bundle_prompt(&target, b, &focus, other, "", dossier, &spec_section);
+        let sp = crate::prompt::build_scan_prompt(&crate::prompt::ScanPromptInput {
+            target_label: &target, bundle: b, user_focus: &focus, cross_index: other, precedents: "",
+            dossier, spec_docs: &spec_section, repo_brief: "",
+        });
+        // 落盘形态 = system + 四块（openai kind 的 flatten 口径）；字节含 system 段（followup「--pack-only 口径切到 scan prompt」）。
+        let prompt = format!("{}\n\n{}", sp.system, sp.flatten());
         std::fs::write(packs_dir.join(format!("cell-{}.md", i + 1)), &prompt)?;
         cells.push(PackCell {
             cell: i + 1,
@@ -543,7 +707,7 @@ impl CellSink for JobCellSink {
         let total = inputs.len() as u32;
         if let Err(e) = self.store.update_if_active(&self.job_id, |st| {
             st.progress.total = total;
-            st.set_phase(crate::state::Phase::Fanout, None);
+            st.set_phase(crate::state::Phase::Scan, None);
         }) {
             eprintln!("warn: job {} manifest 阶段 progress/phase 写失败: {e}", self.job_id);
             self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -582,6 +746,17 @@ impl CellSink for JobCellSink {
             self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    /// 批 F-2 / F-5：本次作业的角色集（`JobState.roles`，status 可见）。
+    fn on_roles(&self, roles: &[Role]) {
+        let roles = roles.to_vec();
+        if let Err(e) = self.store.update_if_active(&self.job_id, |st| {
+            st.roles = roles;
+        }) {
+            eprintln!("warn: job {} on_roles 写失败: {e}", self.job_id);
+            self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// ②级披露拼装（design §4 表②）：计数>0 才追加条目（正常路径 report 逐字节不变，design §6
@@ -594,81 +769,59 @@ fn append_ckpt_failure_warning(report: &mut ReviewReport, job_id: &str, failures
     }
 }
 
-/// 从 proj.db cells 表把 per-cell 运行摘要回填进报告（诊断呈现：慢在哪/几轮/是否重试）。
+/// 从 proj.db cells 表把 cell 记录回填进报告：`run.cells` 摘要（诊断呈现）+ 顶层 `cells`（含 output，评分器形态）。
 /// 三条终态路径统一调用；旧作业 JSON 无此字段（serde default 空）不受影响。
 pub fn attach_cells(store: &crate::state::JobStore, job_id: &str, report: &mut ReviewReport) {
-    report.run.cells = store.read_partial(job_id)
-        .into_iter()
-        .map(|r| crate::domain::CellSummary {
-            model: r.model,
-            ok: r.ok,
-            iterations: r.iterations,
-            attempts: r.attempts,
-            duration_ms: r.duration_ms,
-            input_tokens: r.input_tokens,
-            output_tokens: r.output_tokens,
-        })
-        .collect();
+    let records = store.read_partial(job_id);
+    report.run.cells = records.iter().map(CellSummary::from_record).collect();
+    report.cells = records;
 }
-
-/// R2.2：失败/超时时从 proj.db 的 cell checkpoint 里已完成的 findings 组一份 `incomplete`
-/// 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。M 取 manifest 行数（若尚未
-/// 写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
+/// R2.2：失败/超时时从 proj.db 的 cell checkpoint 组一份 `incomplete` 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。
+/// 全部落盘记录（含失败格）都进收口：失败格进 coverage.failed / cells_failed、烧掉的 usage 入账，与随后 `attach_cells` 回填的
+/// `run.cells` / 顶层 `cells` 一致（评审修 2）。M 取 manifest 行数（若尚未写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
 fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) -> (ReviewReport, i32) {
     let manifest = store.read_manifest(job_id);
-    let done_records: Vec<_> = store.read_partial(job_id)
-        .into_iter()
-        .filter(|r| r.ok)
-        .collect();
-    let done = done_records.len();
-    let total = manifest.len().max(done);
-    let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.output.into_findings()).collect();
-    let stats = Stats::from_findings(&findings);
-    let report = ReviewReport {
-        schema_version: crate::domain::SCHEMA_VERSION.into(),
-        verdict: Verdict::Incomplete,
-        stats,
-        findings,
-        clusters: vec![],
-        run: RunMeta {
-            job_id: job_id.to_string(),
-            models: vec![],
-            model_ids: vec![],
-            duration_ms: 0,
-            usage: Usage::default(),
-            warnings: vec![format!("partial: {done}/{total} cells"), reason],
-            failed_models: vec![],
-            dismissed_reappeared: vec![],
-            ledger: None,
-            ..Default::default()
-        },
-    };
+    let records: Vec<CellRecord> = store.read_partial(job_id);
+    let done = records.iter().filter(|r| r.ok).count();
+    let total = manifest.len().max(records.len());
+    let results = ScanResults { cells: scan_cells_from_records(records), ..Default::default() };
+    let (mut report, _) = finish_scan_report(ScanFinish {
+        groups: vec![],
+        scanned_coverage: None,
+        grouping: None,
+        dossier_meta: None,
+        results,
+        model_names: vec![],
+        roles: None,
+        warnings: vec![format!("partial: {done}/{total} cells"), reason],
+        inflight_peak: BTreeMap::new(),
+        ledger_meta: None,
+        head_sha: None,
+        duration_ms: 0,
+        test_command: None,
+        job_id: job_id.to_string(),
+        reused: vec![],
+    });
+    report.verdict = Verdict::Incomplete;
     let code = exit_code(Verdict::Incomplete, false);
     (report, code)
 }
-
-/// R2.3：resume 差集补跑。读 `manifest`（全集 M）+ `partial`（已完成 ok:true 的 cell 集）→
-/// `待跑 = M − 已完成`；对待跑 cell **直接用 manifest 里渲染好的 prompt 重放**
-/// `provider.run(LensRequest{route_key,prompt})`——不重收集证据、不重 build prompt（确定性）；
-/// append_partial 落盘后，`read_partial` 取全部 ok:true 的 findings（已完成 + 新补）走 mode
-/// 对应的共用尾段（`assemble_report`）组出完整报告。全集补齐→verdict 正常；仍有缺失→`Incomplete`。
-///
-/// ponytail：候补链 cell（未指定 `--models`）的 `CellInput.model` 只是 manifest 写入时「最高
-/// priority 候选」的近似快照（见设计 §6.5 ⚠️）——resume 按此近似重放。若该模型正是触发 resume
-/// 的卡死模型，这次重放会再失败，该 cell 仍缺，可再次 `--resume`（渐进收敛，不会更糟）。精确解
-/// 是重放完整候补链或把 manifest.model 升级为 `Vec<String>` 快照，本 task 不做（显式/replicate
-/// cell 的 manifest.model 已是精确值，dogfood 常见场景不受影响）。
+/// R2.3：resume 差集补跑（批 F-4 scan 版）。读 `manifest`（全集 M）+ `partial`（已完成 ok:true 的 scanner cell 集）→ `待跑 = M − 已完成`；
+/// 对待跑 cell 用 manifest 里落盘的 `scan` 请求（system + 分块 + cache 断点）重放 `registry.scan`——不重收集证据、不重 build prompt
+/// （确定性）；无 `scan` 字段（旧格式作业）的 cell 记失败。单格收口与扇出同款（[`crate::orchestrate::scan_cell_record`]），模板哈希取 manifest
+/// 落盘值（与当前二进制不一致时 warning，评审修 6）。全部记录（已完成 + 新补 + 失败）走 scan-only 收口；组骨架 / 分组观测 / head_sha /
+/// 覆盖自报从作业原报告沿用（resume 不重收集证据，评审修 5）；全集补齐 → scan-only；仍有缺失 → `Incomplete`。
+/// 旧格式作业（批 B-E 的 reviewer 形态记录）不可 resume（评审修 1）。角色集按当前配置重建（M21b 队列快照落地后改读快照）。
 pub async fn run_resume(
     job_id: &str,
-    provider: &dyn ReviewProvider,
+    registry: &ProviderRegistry,
     cfg: &Config,
     cwd: &Path,
     store: &crate::state::JobStore,
 ) -> (ReviewReport, i32) {
     let t0 = std::time::Instant::now();
     let manifest = store.read_manifest(job_id);
-    // 空 manifest = job 在 fan-out 写 manifest 前就崩溃：没有任何 work-list，尾段会把 0 findings
-    // 组装成干净 Approve（假阳性——评审工具静默给未经审查的通过）。护栏：直接出 Incomplete。
+    // 空 manifest = job 在扇出写 manifest 前就崩溃：没有任何 work-list → 直接 Incomplete（不假装 scan 完成）。
     if manifest.is_empty() {
         return partial_report(
             store, job_id,
@@ -686,162 +839,128 @@ pub async fn run_resume(
             );
         }
     };
-    // M13：增量 job 的差集重放只补 fan-out cell，不重跑 carry/merge 尾段——直接拒绝，
-    // 引导重跑增量评审（守卫与 carry 必须整链执行）。
     if args.incremental_from.is_some() {
         return partial_report(
             store, job_id,
-            "resume: incremental jobs cannot be resumed; re-run `redteam review --incremental-from <prior-job>`".into(),
+            "resume: incremental jobs cannot be resumed; re-run `redteam-next review --incremental-from <prior-job>`".into(),
         );
     }
-    let done: std::collections::BTreeSet<String> = store.read_partial(job_id)
-        .into_iter()
-        .filter(|r| r.ok)
-        .map(|r| r.cell)
-        .collect();
+    let prior_records = store.read_partial(job_id);
+    if prior_records.iter().any(|r| !matches!(r.output, crate::domain::CellOutput::Scan(_))) {
+        return partial_report(
+            store, job_id,
+            "resume: job has non-scanner cell records (pre-M21a finding job); cannot resume with the scan-only binary — re-run review".into(),
+        );
+    }
+    let done: std::collections::BTreeSet<String> = prior_records.into_iter().filter(|r| r.ok).map(|r| r.cell).collect();
     let pending: Vec<&crate::state::CellInput> =
         manifest.iter().filter(|c| !done.contains(&c.cell)).collect();
-    // 家族随记录落库：按 manifest 的 model 名回查当前角色条目（条目已删则空串）。
     let roles = cfg.active_roles();
+    let entry_of = |name: &str| -> Option<crate::orchestrate::ScanEntrySpec> {
+        roles.scanners.iter().find(|m| m.name == name).map(crate::orchestrate::ScanEntrySpec::from)
+    };
     let family_of = |name: &str| -> String {
         roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers)
             .find(|m| m.name == name).map(|m| m.family.clone()).unwrap_or_default()
     };
+    let current_hash = crate::prompt::scan_template_hash();
 
-    let mut usage = (0u64, 0u64, 0u64);
-    let mut warnings = Vec::new();
-    // T54：差集 cell 并行补跑（join_all 保序）——旧串行 for 循环 wall-clock = Σcell，
-    // 大 bundle 思考型模型单 cell 10-20min 时双 cell 串行轻易破 40min（2026-09-03 PR181
-    // dogfood：resume 三跑 49min 零落盘）。append_partial 内部 Mutex 单连接、逐 cell
-    // 覆盖写，天然无并发写冲突；usage/warnings 在 join 后按原序累计，输出与串行版逐字等价。
-    // (cell, outcome, elapsed)：elapsed 在 future 内起表——Cells 表的 duration 语义与
-    // fanout 侧一致（真实墙钟），不再恒 0（2026-09-03 PR181 补跑实证缺口）。
-    let outs: Vec<(&&crate::state::CellInput, Result<crate::provider::LensCall, crate::provider::ProviderError>, std::time::Duration)> =
-        futures::future::join_all(pending.iter().map(|cell| async move {
-            let t0 = std::time::Instant::now();
-            let req = LensRequest { route_key: cell.model.clone(), prompt: cell.prompt.clone() };
-            (cell, provider.run(req).await, t0.elapsed())
-        }))
-        .await;
-    for (cell, outcome, elapsed) in outs {
-        let rec = match outcome {
-            Ok(call) => {
-                usage.0 += call.input_tokens;
-                usage.1 += call.output_tokens; usage.2 += call.cached_input_tokens;
-                let fs: Vec<Finding> =
-                    call.findings.iter().map(|r| enrich(r, &cell.model)).collect();
-                // 指标随落盘：duration/usage/iterations 来自胜出 call（与 fanout 侧 CellSink 同构）。
-                let mut rec = crate::state::CellRecord::ok(
-                    cell.cell.clone(), cell.model.clone(),
-                    crate::domain::CellOutput::Review { findings: fs, needs: call.needs.clone() },
-                ).with_family(family_of(&cell.model));
-                rec.duration_ms = elapsed.as_millis() as u64;
-                rec.input_tokens = call.input_tokens;
-                rec.output_tokens = call.output_tokens;
-                rec.cached_input_tokens = call.cached_input_tokens;
-                rec.attempts = 1;
-                rec.iterations = call.iterations;
-                rec.tool_use = call.tool_use.clone();
-                rec
-            }
-            Err(e) => {
-                warnings.push(format!("resume cell [{}] model {}: {e}", cell.cell, cell.model));
-                let mut rec = crate::state::CellRecord::failed(
-                    cell.cell.clone(), cell.model.clone(), crate::domain::Role::Reviewer, e.to_string(),
-                ).with_family(family_of(&cell.model));
-                rec.duration_ms = elapsed.as_millis() as u64;
-                rec.attempts = 1;
-                rec
-            }
+    let mut warnings: Vec<String> = registry.warnings().to_vec();
+    // 差集 cell 并行补跑（join_all 保序）；provider 在途门在 registry 内。
+    let outs = futures::future::join_all(pending.iter().map(|cell| async move {
+        let t0 = std::time::Instant::now();
+        let res = match &cell.scan {
+            Some(p) => registry.scan(&cell.model, p).await,
+            None => Err(crate::provider::ProviderError::Unavailable(
+                "manifest 无 scan prompt（旧格式作业），无法重放；请重新 review".into(),
+            )),
         };
-        // resume 披露清零：checkpoint 写失败不再静默吞掉——foreground 命令，stderr 用户可见
-        // （与 line 394 CellSink::report 的写法保持一致，是全库最后一处生产 `let _ =` 静默点）。
+        (cell, res, t0.elapsed())
+    }))
+    .await;
+    let mut hash_mismatch = false;
+    for (cell, outcome, elapsed) in outs {
+        if outcome.is_err() {
+            if let Err(e) = &outcome {
+                warnings.push(format!("resume cell [{}] model {}: {e}", cell.cell, cell.model));
+            }
+        }
+        let hash = match &cell.template_hash {
+            Some(h) => {
+                if *h != current_hash {
+                    hash_mismatch = true;
+                }
+                h.clone()
+            }
+            None => current_hash.clone(),
+        };
+        let pinned = entry_of(&cell.model).map(|e| e.thinking_pinned).unwrap_or(false);
+        let (rec, _) = crate::orchestrate::scan_cell_record(
+            &cell.cell, &cell.model, &family_of(&cell.model), pinned, cwd, outcome, elapsed.as_millis() as u64, hash,
+        );
         if let Err(e) = store.append_partial(job_id, &rec) {
             eprintln!("warn: job {job_id} append_partial 失败（cell {}）: {e}", rec.cell);
         }
     }
+    if hash_mismatch {
+        warnings.push(format!(
+            "resume: replayed cells use the manifest's template hash (frozen prompt), which differs from the current binary's {current_hash}; template A/B attribution follows the manifest value"
+        ));
+    }
 
-    // 合并出报告：全部 ok:true 的 findings（已完成 + 新补）。
+    // 收口：全部记录（已完成 + 新补 + 失败）；组骨架 / 分组观测 / head_sha / 覆盖自报 / dossier 从原报告沿用（resume 不重收集证据）。
     let final_records = store.read_partial(job_id);
     let ok_cells: std::collections::BTreeSet<&str> =
         final_records.iter().filter(|r| r.ok).map(|r| r.cell.as_str()).collect();
     let still_missing = manifest.iter().filter(|c| !ok_cells.contains(c.cell.as_str())).count();
-    let findings: Vec<Finding> =
-        final_records.into_iter().filter(|r| r.ok).flat_map(|r| r.output.into_findings()).collect();
-
-    // resume：角色集按当前配置重建（M21a 产品态不产 finding，与原作业模型不同可接受；记 followup 观察）。
-    let roles = cfg.active_roles();
+    let reused: Vec<String> = final_records.iter().filter(|r| r.ok && done.contains(&r.cell)).map(|r| r.cell.clone()).collect();
     let model_names: Vec<String> = roles.scanners.iter().map(|m| m.name.clone()).collect();
-    let block = args.block_threshold.as_deref().map(parse_sev).unwrap_or(cfg.review.block_threshold);
-    let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
-    // resume 因重读 args.json 自然继承原 --dismissed/--no-dismissed；run_resume 不返回 Result
-    //（异步状态机式），故此处不能用 `?`——加载失败按既有约定折成 partial_report。
     let ledger = match load_ledger(args.dismissed.as_deref(), args.no_dismissed, cwd) {
         Ok(l) => l,
         Err(e) => {
             return partial_report(store, job_id, format!("resume: bad ledger: {e}"));
         }
     };
-
-    // Task 4：resume 的 refute 趟同原运行拿 --spec 参照段——从 args.spec 重渲（resume 已按同法
-    // 重导 models/block/floor/ledger），与首趟缓存 prompt 里烘干的 spec 保持一致；空 --spec→""。
-    // 帽用与首趟同一夹紧公式（cap 不同会导致重渲截断点漂移、与首趟 spec 段不一致）。
-    let (spec_section, _spec_used, spec_warnings) = render_spec_section_capped(
-        &args.spec,
-        SPEC_BUDGET_BYTES.min(pack_budget_bytes(&roles) / 2),
-    );
-    // T46①：resume 重渲 --spec 段时若命中 denylist/PEM 拒读，同样并入 warnings（与首趟一致）。
-    warnings.extend(spec_warnings);
-    let ctx = TailCtx {
-        root: cwd,
-        provider,
-        model_ids: model_ids_for(&model_names, &roles),
+    let prior: Option<ReviewReport> = store.read_result(job_id).and_then(|j| serde_json::from_str(&j).ok());
+    let groups: Vec<ScanGroup> = prior
+        .as_ref()
+        .and_then(|r| r.scan.as_ref())
+        .map(|sc| sc.groups.iter().map(|g| ScanGroup { label: g.label.clone(), files: g.files.clone(), cells: vec![], suspicions: 0, pack: g.pack.clone() }).collect())
+        .unwrap_or_default();
+    let results = ScanResults { cells: scan_cells_from_records(final_records), ..Default::default() };
+    let (mut report, mut code) = finish_scan_report(ScanFinish {
+        groups,
+        scanned_coverage: prior.as_ref().and_then(|r| r.scan.as_ref()).and_then(|sc| sc.scanned_coverage),
+        grouping: prior.as_ref().and_then(|r| r.run.grouping.clone()),
+        dossier_meta: prior.as_ref().and_then(|r| r.run.dossier.clone()),
+        results,
         model_names,
-        block,
-        floor,
-        max_concurrency: cfg.review.max_concurrency,
-        job_id: job_id.to_string(),
-        duration_ms: t0.elapsed().as_millis() as u64,
-        usage,
+        roles: Some(&roles),
         warnings,
-        failed_models: vec![],
-        dismissed: &ledger.ids,
-        precedents: &ledger.cards,
+        inflight_peak: registry.inflight_peaks(),
         ledger_meta: ledger.meta.clone(),
-        head_sha: None,
-        dossier_meta: None,
-        needs_stats: (0, 0),
-        sink: None,
-        spec_docs: &spec_section,
-        carry: None,
+        head_sha: prior.as_ref().and_then(|r| r.run.head_sha.clone()),
+        duration_ms: t0.elapsed().as_millis() as u64,
         test_command: args.test_command.clone().or_else(|| crate::project::infer_test_command(cwd)),
-    };
-    match assemble_report(findings, ctx).await {
-        Ok((mut report, mut code)) => {
-            attach_cells(store, job_id, &mut report);
-            // 回写 proj.db：resume 产出的合并报告（含新补 cell 的 findings/agreement）必须
-            // 覆盖 fanout 原始落盘——否则 result 命令永远返回旧报告、补齐的 findings 取不回
-            // （2026-09-03 PR181 实证：stdout 8 findings vs result 6 findings）。终态字段
-            // （status/exit_code）不动：作业仍 Done，变的只是报告内容。
-            let json = crate::output::render(&report, crate::output::Format::Json);
-            let md = crate::output::render(&report, crate::output::Format::Md);
-            if let Err(e) = store.write_result(job_id, &json) {
-                eprintln!("warn: job {job_id} resume write_result 失败: {e}");
-            }
-            if let Err(e) = store.write_result_md(job_id, &md) {
-                eprintln!("warn: job {job_id} resume write_result_md 失败: {e}");
-            }
-            if still_missing > 0 {
-                report.verdict = Verdict::Incomplete;
-                report.run.warnings.push(format!("resume: {still_missing} cell(s) still missing after replay"));
-                code = exit_code(Verdict::Incomplete, false);
-            }
-            (report, code)
-        }
-        Err(e) => partial_report(store, job_id, format!("resume tail failed: {e}")),
+        job_id: job_id.to_string(),
+        reused,
+    });
+    if still_missing > 0 {
+        report.verdict = Verdict::Incomplete;
+        report.run.warnings.push(format!("resume: {still_missing} cell(s) still missing after replay"));
+        code = exit_code(Verdict::Incomplete, false);
     }
+    // 回写 proj.db：resume 产出的合并报告覆盖扇出原始落盘（否则 result 命令永远返回旧报告）。终态字段不动。
+    let json = crate::output::render(&report, crate::output::Format::Json);
+    let md = crate::output::render(&report, crate::output::Format::Md);
+    if let Err(e) = store.write_result(job_id, &json) {
+        eprintln!("warn: job {job_id} resume write_result 失败: {e}");
+    }
+    if let Err(e) = store.write_result_md(job_id, &md) {
+        eprintln!("warn: job {job_id} resume write_result_md 失败: {e}");
+    }
+    (report, code)
 }
-
 /// 落终态部分报告：渲染 json+md、写 result 文件、守卫式把 state 转终态并记录错误原因。
 /// 走 `update_state_if_active`：若期间已被 cancel（终态），守卫拒写、保留 Cancelled（首个终态封盘）。
 fn write_partial_result(
@@ -885,7 +1004,7 @@ fn write_partial_result(
 pub async fn run_job(
     job_id: &str,
     args: &ReviewArgs,
-    provider: &dyn ReviewProvider,
+    registry: &ProviderRegistry,
     cfg: &Config,
     cwd: &Path,
     started_at: u64,
@@ -938,7 +1057,7 @@ pub async fn run_job(
         job_id: job_id.to_string(),
         ckpt_failures: std::sync::atomic::AtomicU32::new(0),
     };
-    let dispatch = run_review_dispatch(args, provider, cfg, cwd, Some(&sink));
+    let dispatch = run_review_dispatch(args, registry, cfg, cwd, Some(&sink));
 
     // Outcome 只在本函数内构造/匹配一次，Box 间接层不值当——沿用 main.rs Cmd 枚举同款 allow。
     #[allow(clippy::large_enum_variant)]
@@ -1101,20 +1220,25 @@ pub fn stamp_deadline(store: &crate::state::JobStore, job_id: &str, started: u64
 #[cfg(test)]
 mod job_tests {
     use super::*;
+    use crate::provider::tool_loop::{AssistantTurn, ChatBackend, ChatMessage, FakeChatBackend};
     use crate::state::{JobState, JobStatus};
-    use crate::provider::fake::FakeProvider;
-    use crate::domain::{Finding, Origin, RawFinding, Severity};
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    fn checkpointed_finding(title: &str) -> Finding {
-        Finding {
-            id: "f".into(), severity: Severity::Medium, title: title.into(), body: "b".into(),
-            file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            models: vec!["p/alpha".into()], agreement: 1, hard_constraint: false,
-            quote: "q".into(), cluster_id: None, verify: None, previously_dismissed: false,
-            origin: Origin::New,
-        }
+    fn scan_turn(json: &str) -> AssistantTurn {
+        AssistantTurn { text: json.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None }
+    }
+    fn scan_registry(route_key: &str, json: &str) -> ProviderRegistry {
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan(route_key, "p", 8, Box::new(FakeChatBackend::repeating(scan_turn(json))), std::time::Duration::from_secs(5), 0);
+        reg
+    }
+    /// 预置 checkpoint 用的 scanner 记录（hint 作可观测标记）。
+    fn checkpointed_scan(cell: &str, hint: &str) -> CellRecord {
+        let out = crate::domain::ScanOutput {
+            suspicions: vec![crate::domain::Suspicion { file: "a.rs".into(), line_start: 1, line_end: 1, hint: hint.into(), category: None, confidence: 0.5, quote: "q".into() }],
+            ..Default::default()
+        };
+        CellRecord::ok(cell, "p/alpha", crate::domain::CellOutput::Scan(out))
     }
 
     fn code_args() -> ReviewArgs {
@@ -1147,28 +1271,25 @@ mod job_tests {
     async fn run_job_done_writes_result_and_state() {
         let dir = tempfile::tempdir().unwrap();
         git_staged(dir.path(), "a.rs", "fn main() {\n    let x = 1;\n}\n");
-        // alpha 报一条锚得到的 low finding（不触发 refute），quote 在 a.rs 第 2 行
-        let mut scripted: BTreeMap<String, Vec<RawFinding>> = BTreeMap::new();
-        scripted.insert("p/alpha".into(), vec![RawFinding {
-            severity: Severity::Low, title: "t".into(), body: "b".into(), file: "a.rs".into(),
-            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: "let x = 1;".into(),
-        }]);
-        let provider = FakeProvider { scripted, ..Default::default() };
+        // alpha 报一条锚得到的疑点，quote 在 a.rs 第 2 行
+        let registry = scan_registry("p/alpha", r#"{"suspicions":[{"file":"a.rs","line_start":1,"line_end":1,"hint":"t","confidence":0.9,"quote":"let x = 1;"}],"scanned_areas":[{"file":"a.rs","ranges":["1-3"]}]}"#);
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let store = Arc::new(crate::state::JobStore::open(&ws).unwrap());
         store.put_state_for_test(&JobState::new("j1", 500)).unwrap();
 
-        let code = run_job("j1", &code_args(), &provider, &cfg(), dir.path(), 500, Arc::clone(&store)).await;
+        let code = run_job("j1", &code_args(), &registry, &cfg(), dir.path(), 500, Arc::clone(&store)).await;
 
         let st = store.read_state("j1").unwrap();
         assert_eq!(st.status, JobStatus::Done);
         assert_eq!(st.exit_code, Some(code));
         assert!(st.result_path.is_some());
-        // result.json 落盘且是合法 JSON
+        assert_eq!(st.roles, vec![Role::Scanner], "on_roles 落 JobState.roles");
+        assert_eq!(st.phase_history.iter().map(|p| p.phase).collect::<Vec<_>>(), vec![crate::state::Phase::Collecting, crate::state::Phase::Scan, crate::state::Phase::Finalizing]);
+        // result.json 落盘且是合法 JSON（scan-only）
         let res = store.read_result("j1").unwrap();
-        assert!(res.contains("\"verdict\""));
+        assert!(res.contains("\"verdict\": \"scan-only\"") && res.contains("\"suspicions\""), "{res}");
+        assert_eq!(code, 0);
         // Task 5：零 checkpoint 失败的正常路径，report.run.warnings 不应长出「检查点落盘
         // 失败」条目——契约冻结面「正常路径 report 逐字节不变」的直接锚。
         assert!(!res.contains("检查点落盘失败"), "零失败路径不应出现披露 warning: {res}");
@@ -1185,8 +1306,8 @@ mod job_tests {
         let store = Arc::new(crate::state::JobStore::open(ws).unwrap());
         store.put_state_for_test(&JobState::new("j2", 0)).unwrap();
         // 非 git 目录 → changed_files 失败 → run_review_dispatch Err → failed
-        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job("j2", &code_args(), &provider, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
+        let registry = ProviderRegistry::new();
+        let code = run_job("j2", &code_args(), &registry, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
         assert_eq!(code, 3); // 五档：dispatch 失败落 partial_report → Verdict::Incomplete → 3
         let st = store.read_state("j2").unwrap();
         assert_eq!(st.status, JobStatus::Failed);
@@ -1202,14 +1323,11 @@ mod job_tests {
         let store = Arc::new(crate::state::JobStore::open(ws).unwrap());
         store.put_state_for_test(&JobState::new("j2b", 0)).unwrap();
         // 预置一条 partial（模拟崩溃前已完成 1 cell）
-        store.append_partial(
-            "j2b",
-            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("checkpointed")])),
-        ).unwrap();
+        store.append_partial("j2b", &checkpointed_scan("scan[g1]@p/alpha#1", "checkpointed")).unwrap();
 
         // 非 git 目录 → changed_files 失败 → run_review_dispatch Err，但已有 partial 记录
-        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job("j2b", &code_args(), &provider, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
+        let registry = ProviderRegistry::new();
+        let code = run_job("j2b", &code_args(), &registry, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
 
         assert_eq!(code, 3); // 五档：partial 报告 verdict=incomplete → 3
         let st = store.read_state("j2b").unwrap();
@@ -1218,18 +1336,20 @@ mod job_tests {
         let res = store.read_result("j2b").unwrap();
         assert!(res.contains("\"incomplete\""), "verdict 应为 incomplete: {res}");
         assert!(res.contains("partial:"), "warnings 应含 partial 标记: {res}");
-        assert!(res.contains("checkpointed"), "已 checkpoint 的 finding 不应丢失: {res}");
+        assert!(res.contains("checkpointed"), "已 checkpoint 的疑点不应丢失: {res}");
+        let parsed: ReviewReport = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed.scan.as_ref().map(|sc| sc.suspicions.len()), Some(1));
     }
 
-    /// 永不完成的 provider——保证 dispatch 分支不可能赢得 deadline race（而非靠真实短
+    /// 永不完成的 backend——保证 dispatch 分支不可能赢得 deadline race（而非靠真实短
     /// sleep+timeout 的时序假设）。用于 R1.2 deadline 超时测试，0 依赖、0 wall-clock 等待。
-    struct HangProvider;
+    struct HangBackend;
 
     #[async_trait::async_trait]
-    impl crate::provider::ReviewProvider for HangProvider {
-        async fn run(&self, _req: crate::provider::LensRequest) -> Result<crate::provider::LensCall, crate::provider::ProviderError> {
+    impl ChatBackend for HangBackend {
+        async fn turn(&self, _m: &[ChatMessage], _t: &[crate::tools::ToolSpec]) -> Result<AssistantTurn, crate::provider::ProviderError> {
             std::future::pending::<()>().await;
-            unreachable!("HangProvider never resolves")
+            unreachable!("HangBackend never resolves")
         }
     }
 
@@ -1239,7 +1359,7 @@ mod job_tests {
     async fn run_job_timeout_writes_incomplete_partial_report() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
-        // git 仓库 + staged 改动：dispatch 得以推进到 provider（HangProvider 挂起），
+        // git 仓库 + staged 改动：dispatch 得以推进到 provider（HangBackend 挂起），
         // 让 deadline 分支赢得 select（非 git 目录会先在 changed_files 处 Err，选不到超时分支）。
         git_staged(dir.path(), "a.rs", "fn main() {\n    let x = 1;\n}\n");
 
@@ -1248,13 +1368,11 @@ mod job_tests {
         let store = Arc::new(crate::state::JobStore::open(ws).unwrap());
         store.put_state_for_test(&st).unwrap();
         // 预置一条 partial（模拟 deadline 前已完成 1 cell）
-        store.append_partial(
-            "j-to",
-            &crate::state::CellRecord::ok("bundle[a]", "p/alpha", crate::domain::CellOutput::review(vec![checkpointed_finding("before-deadline")])),
-        ).unwrap();
+        store.append_partial("j-to", &checkpointed_scan("scan[g1]@p/alpha#1", "before-deadline")).unwrap();
 
-        let provider = HangProvider;
-        let code = run_job("j-to", &code_args(), &provider, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
+        let mut registry = ProviderRegistry::new();
+        registry.insert_scan("p/alpha", "p", 8, Box::new(HangBackend), std::time::Duration::from_secs(3600), 0);
+        let code = run_job("j-to", &code_args(), &registry, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
 
         assert_eq!(code, 3); // 五档：超时 partial 报告 verdict=incomplete → 3
         let st = store.read_state("j-to").unwrap();
@@ -1279,8 +1397,8 @@ mod job_tests {
         let store = Arc::new(crate::state::JobStore::open(ws).unwrap());
         store.put_state_for_test(&pre).unwrap();
 
-        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let _code = run_job("j3", &code_args(), &provider, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
+        let registry = ProviderRegistry::new();
+        let _code = run_job("j3", &code_args(), &registry, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
 
         // 状态仍应是 Cancelled
         let st = store.read_state("j3").unwrap();
@@ -1308,8 +1426,8 @@ mod job_tests {
         let store = Arc::new(crate::state::JobStore::open(ws).unwrap());
         store.put_state_for_test(&pre).unwrap();
 
-        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job("j-precancel-7", &code_args(), &provider, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
+        let registry = ProviderRegistry::new();
+        let code = run_job("j-precancel-7", &code_args(), &registry, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
 
         // (a) 返回值必须是 Cancelled 快照里的 exit_code，而非重新跑出的别的码
         assert_eq!(code, 7, "run_job 应原样返回 pre-cancel 的 exit_code");
@@ -1331,8 +1449,8 @@ mod job_tests {
         let store = Arc::new(crate::state::JobStore::open(ws).unwrap());
         store.put_state_for_test(&pre).unwrap();
 
-        let provider = FakeProvider { scripted: BTreeMap::new(), ..Default::default() };
-        let code = run_job("j-predone", &code_args(), &provider, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
+        let registry = ProviderRegistry::new();
+        let code = run_job("j-predone", &code_args(), &registry, &cfg(), dir.path(), 0, Arc::clone(&store)).await;
 
         assert_eq!(code, 0);
         let st = store.read_state("j-predone").unwrap();
@@ -1611,198 +1729,178 @@ mod job_tests {
 #[cfg(test)]
 mod resume_tests {
     use super::*;
-    use crate::domain::{Finding, Origin, RawFinding, Severity};
+    use crate::prompt::ScanPrompt;
+    use crate::provider::tool_loop::{AssistantTurn, ChatMessage, FakeChatBackend};
     use crate::state::CellInput;
+    use std::sync::Arc;
 
-    /// 记录每次 `run` 调用的 prompt，脚本化返回一条低 severity finding（避免触发 verify 的
-    /// 二次 provider 调用，测试只关心 resume 对缺失 cell 的调用次数）。finding 的 file 从
-    /// prompt 派生（每 cell 独立文件），quote 恒 "marker"——各 cell 落在不同文件 → 通过 code
-    /// `anchor` 存活且互不 dedup（doc 模式退场后尾段走 code anchor，2026-07-14）。
-    #[derive(Default)]
-    struct RecordingProvider {
-        prompts: std::sync::Mutex<Vec<String>>,
+    /// 每次调用都回同一份疑点 JSON（quote "marker" 在各 cell 的文件里可锚）；`Arc` 句柄留在测试侧观测调用次数与 system。
+    fn recording_registry(route_key: &str, file: &str) -> (ProviderRegistry, Arc<FakeChatBackend>) {
+        let json = format!(r#"{{"suspicions":[{{"file":"{file}","line_start":1,"line_end":1,"hint":"issue","confidence":0.6,"quote":"marker"}}],"scanned_areas":[]}}"#);
+        let backend = Arc::new(FakeChatBackend::repeating(AssistantTurn {
+            text: json, tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None,
+        }));
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan(route_key, "p", 8, Box::new(Arc::clone(&backend)), std::time::Duration::from_secs(5), 0);
+        (reg, backend)
     }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ReviewProvider for RecordingProvider {
-        async fn run(
-            &self,
-            req: crate::provider::LensRequest,
-        ) -> Result<crate::provider::LensCall, crate::provider::ProviderError> {
-            self.prompts.lock().unwrap().push(req.prompt.clone());
-            Ok(crate::provider::LensCall {
-                findings: vec![RawFinding {
-                    severity: Severity::Low,
-                    title: format!("issue-{}", req.prompt),
-                    body: "b".into(),
-                    file: format!("{}.rs", req.prompt.trim()),
-                    line_start: 1,
-                    line_end: 1,
-                    confidence: 0.9,
-                    recommendation: "r".into(),
-                    hard_constraint: false,
-                    quote: "marker".into(),
-                }],
-                input_tokens: 1,
-                output_tokens: 1,
-                cached_input_tokens: 0,
-                iterations: 1,
-                tool_use: Default::default(),
-                needs: vec![],
-            })
+    fn input(cell: &str, model: &str, system: &str) -> CellInput {
+        CellInput { template_hash: None, cell: cell.into(), model: model.into(), prompt: system.into(), scan: Some(ScanPrompt { system: system.into(), blocks: vec![] }) }
+    }
+    fn done_scan(cell: &str, model: &str, file: &str) -> CellRecord {
+        let out = crate::domain::ScanOutput {
+            suspicions: vec![crate::domain::Suspicion { file: file.into(), line_start: 1, line_end: 1, hint: "issue".into(), category: None, confidence: 0.6, quote: "marker".into() }],
+            ..Default::default()
+        };
+        CellRecord::ok(cell, model, crate::domain::CellOutput::Scan(out))
+    }
+    fn args() -> ReviewArgs {
+        ReviewArgs { pack_only: false,
+            base: None, scope: "working-tree".into(), spec: vec![],
+            focus: None,
+            block_threshold: None, conf_floor: None, background: true,
+            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         }
     }
-
-    /// 预置 checkpoint 用的可锚 finding：quote="marker"，file 由调用方给（须已写入根目录）。
-    fn anchorable_finding(title: &str, file: &str) -> Finding {
-        Finding {
-            id: title.into(), severity: Severity::Low, title: title.into(), body: "b".into(),
-            file: file.into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), models: vec!["m".into()], agreement: 1,
-            hard_constraint: false, quote: "marker".into(), cluster_id: None, verify: None,
-            previously_dismissed: false, origin: Origin::New,
-        }
+    fn systems(b: &FakeChatBackend) -> Vec<String> {
+        (0..b.turn_count()).filter_map(|i| match &b.messages_at(i)[0] { ChatMessage::System(s) => Some(s.clone()), _ => None }).collect()
     }
 
-    /// T7 核心测试：manifest 3 cell、partial 已完成 1（c1）→ resume 只应对缺失的 c2/c3 调用
-    /// provider，最终报告合并出全部 3 个 cell 的 findings。
+    /// T7 核心（批 F-4 scan 版）：manifest 3 cell、partial 已完成 1 → resume 只对缺失的 2 个 cell 用 manifest 的 scan 请求重放，
+    /// 报告含全部 3 个 cell（reused 1 + completed 2）、三组各一疑点、verdict scan-only；回写 proj.db。
     #[tokio::test]
     async fn resume_only_runs_missing_cells() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
-        // 每 cell 一个可锚文件（code anchor 读 root.join(file) 匹配 "marker"）。
-        for f in ["c1.rs", "P2.rs", "P3.rs"] {
-            std::fs::write(dir.path().join(f), "marker\n").unwrap();
-        }
-
-        let inputs = vec![
-            CellInput { cell: "c1".into(), model: "m".into(), prompt: "P1".into() },
-            CellInput { cell: "c2".into(), model: "m".into(), prompt: "P2".into() },
-            CellInput { cell: "c3".into(), model: "m".into(), prompt: "P3".into() },
-        ];
+        std::fs::write(ws.join("c.rs"), "marker\n").unwrap();
+        let inputs = vec![input("scan[g1]@p/m#1", "p/m", "P1"), input("scan[g2]@p/m#1", "p/m", "P2"), input("scan[g3]@p/m#1", "p/m", "P3")];
         let store = crate::state::JobStore::open(ws).unwrap();
         store.write_manifest("j", &inputs).unwrap();
-        store.append_partial(
-            "j",
-            &crate::state::CellRecord::ok("c1", "m", crate::domain::CellOutput::review(vec![anchorable_finding("issue-c1", "c1.rs")])),
-        ).unwrap();
+        store.append_partial("j", &done_scan("scan[g1]@p/m#1", "p/m", "c.rs")).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let (reg, backend) = recording_registry("p/m", "c.rs");
 
-        let args = ReviewArgs { pack_only: false,
-            base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None,
-            block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
-        };
-        store.write_args_raw("j", &serde_json::to_string(&args).unwrap()).unwrap();
+        let (report, code) = run_resume("j", &reg, &Config::default(), ws, &store).await;
 
-        let provider = RecordingProvider::default();
-        let cfg = Config::default();
-
-        let (report, _code) = run_resume("j", &provider, &cfg, dir.path(), &store).await;
-
-        let calls = provider.prompts.lock().unwrap();
-        assert_eq!(calls.len(), 2, "只应对缺失的 2 个 cell 调用 provider");
-        assert!(calls.contains(&"P2".to_string()), "应补跑 c2");
-        assert!(calls.contains(&"P3".to_string()), "应补跑 c3");
-        assert!(!calls.contains(&"P1".to_string()), "已完成的 c1 不应重跑");
-        drop(calls);
-
-        assert_eq!(report.findings.len(), 3, "合并后应含 3 个 cell 的 findings（1 已完成 + 2 新补）");
-
-        // 回写锚：resume 合并报告必须覆盖 proj.db 落盘——否则 result 命令永远返回 fanout
-        // 原始报告，补齐的 findings 取不回（2026-09-03 PR181 实证）。md 同步。
-        let stored = store.read_result("j").expect("resume 后 result 必须可取且含新报告");
-        let parsed: ReviewReport = serde_json::from_str(&stored).unwrap();
-        assert_eq!(parsed.findings.len(), 3, "proj.db 里的报告应为合并后的 3 findings");
-        assert!(store.read_result_md("j").unwrap().contains("issue-c1"), "md 快照同步回写");
+        let sys = systems(&backend);
+        assert_eq!(sys.len(), 2, "只应对缺失的 2 个 cell 调用: {sys:?}");
+        assert!(sys.contains(&"P2".to_string()) && sys.contains(&"P3".to_string()) && !sys.contains(&"P1".to_string()));
+        assert_eq!(report.verdict, Verdict::ScanOnly);
+        assert_eq!(code, 0);
+        let scan = report.scan.as_ref().unwrap();
+        assert_eq!(scan.suspicions.len(), 3, "三组各一条（跨组不合并）: {:?}", scan.suspicions);
+        assert_eq!(report.cells.len(), 3);
+        assert_eq!(report.run.coverage.reused.get(&Role::Scanner).map(Vec::len), Some(1));
+        assert_eq!(report.run.coverage.completed.get(&Role::Scanner).map(Vec::len), Some(2));
+        let stored: ReviewReport = serde_json::from_str(&store.read_result("j").unwrap()).unwrap();
+        assert_eq!(stored.scan.unwrap().suspicions.len(), 3, "proj.db 里的报告应为合并后的 3 条");
+        assert!(store.read_result_md("j").unwrap().contains("scan-only"), "md 快照同步回写");
     }
 
-    /// final-review Important 回归：replicate 模式（同 cell 多 model 副本）manifest 的
-    /// cell-id 必须带上 model（如 `doc@alpha`/`doc@beta`），否则 resume 的差集判定（join on
-    /// cell）会把「同 cell 任一 model 已完成」误判为「该 cell 全部完成」，缺失的 model 副本
-    /// 永不补跑，还会静默拼出一份只含部分 model 的「完整」报告。
-    /// 这里手工构造 manifest 模拟 replicate fan-out 的输出（2 行，cell 各自带 @model），
-    /// partial 只完成 doc@alpha → 断言 doc@beta 必须被补跑，且合并结果含两个 model 的 finding。
+    /// 同组两条目副本（`scan[g1]@alpha#1` / `scan[g1]@beta#1`）：只完成 alpha → beta 必须被补跑，合并结果 agreement 2、非 Incomplete。
     #[tokio::test]
-    async fn resume_replicate_missing_model_copy_is_completed() {
+    async fn resume_missing_entry_copy_is_completed() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
-        for f in ["alpha.rs", "P-beta.rs"] {
-            std::fs::write(dir.path().join(f), "marker\n").unwrap();
-        }
-
-        let inputs = vec![
-            CellInput { cell: "doc@alpha".into(), model: "alpha".into(), prompt: "P-alpha".into() },
-            CellInput { cell: "doc@beta".into(), model: "beta".into(), prompt: "P-beta".into() },
-        ];
+        std::fs::write(ws.join("c.rs"), "marker\n").unwrap();
+        let inputs = vec![input("scan[g1]@p/alpha#1", "p/alpha", "P-alpha"), input("scan[g1]@p/beta#1", "p/beta", "P-beta")];
         let store = crate::state::JobStore::open(ws).unwrap();
         store.write_manifest("j", &inputs).unwrap();
-        store.append_partial(
-            "j",
-            &crate::state::CellRecord::ok("doc@alpha", "alpha", crate::domain::CellOutput::review(vec![anchorable_finding("issue-alpha", "alpha.rs")])),
-        ).unwrap();
+        store.append_partial("j", &done_scan("scan[g1]@p/alpha#1", "p/alpha", "c.rs").with_family("alpha")).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let (reg, backend) = recording_registry("p/beta", "c.rs");
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"beta":{"roles":{"scanner":{}}}}}}}"#).unwrap();
 
-        let args = ReviewArgs { pack_only: false,
-            base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None,
-            block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
-        };
-        store.write_args_raw("j", &serde_json::to_string(&args).unwrap()).unwrap();
+        let (report, _code) = run_resume("j", &reg, &cfg, ws, &store).await;
 
-        let provider = RecordingProvider::default();
-        let cfg = Config::default();
-
-        let (report, _code) = run_resume("j", &provider, &cfg, dir.path(), &store).await;
-
-        let calls = provider.prompts.lock().unwrap();
-        assert_eq!(calls.len(), 1, "只应对缺失的 doc@beta 调用 provider（doc@alpha 已完成不得重跑）");
-        assert!(calls.contains(&"P-beta".to_string()), "beta 副本必须被补跑，不能被 alpha 的完成状态静默坍缩");
-        drop(calls);
-
-        assert_eq!(
-            report.findings.len(), 2,
-            "合并后应含 alpha+beta 两个 model 副本的 findings，不能只含 alpha 就报完整"
-        );
-        assert_ne!(
-            report.verdict, crate::domain::Verdict::Incomplete,
-            "两个 model 副本都已补齐，不应再是 Incomplete"
-        );
+        assert_eq!(systems(&backend), vec!["P-beta".to_string()], "只补跑缺失的 beta 副本");
+        assert_ne!(report.verdict, Verdict::Incomplete);
+        let scan = report.scan.unwrap();
+        assert_eq!((scan.suspicions.len(), scan.suspicions[0].agreement), (1, 2), "{:?}", scan.suspicions);
+        assert_eq!(scan.suspicions[0].families, vec!["alpha", "beta"]);
     }
 
-    /// 假阳性防护：manifest 从未写出（job 在 fan-out 前崩溃）→ resume 不得静默出 Approve，
-    /// 必须 Incomplete + 非零退出，且不调 provider。
+    /// 评审修 1：旧格式作业（partial 里是 reviewer 形态记录、且全部 ok）→ 不重放、不覆盖为空 scan-only，直接 Incomplete + 理由。
+    #[tokio::test]
+    async fn resume_refuses_pre_scan_job_with_reviewer_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[CellInput { cell: "bundle[a.rs]@p/m".into(), model: "p/m".into(), prompt: "P".into(), scan: None, template_hash: None }]).unwrap();
+        store.append_partial("j", &CellRecord::ok("bundle[a.rs]@p/m", "p/m", crate::domain::CellOutput::review(vec![]))).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        store.write_result("j", "{\"marker\": \"original\"}").unwrap();
+        let (reg, backend) = recording_registry("p/m", "c.rs");
+        let (report, code) = run_resume("j", &reg, &Config::default(), ws, &store).await;
+        assert_eq!((report.verdict, code), (Verdict::Incomplete, 3));
+        assert_eq!(backend.turn_count(), 0);
+        assert!(report.run.warnings.iter().any(|w| w.contains("non-scanner cell records")), "{:?}", report.run.warnings);
+        assert_eq!(store.read_result("j").as_deref(), Some("{\"marker\": \"original\"}"), "原报告不被空 scan-only 覆盖");
+    }
+
+    /// 评审修 6：重放 cell 的模板哈希取 manifest 落盘值；与当前二进制不一致 → warning。评审修 5：原报告的组骨架 / head_sha / 覆盖自报沿用。
+    #[tokio::test]
+    async fn resume_keeps_manifest_template_hash_and_prior_report_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(ws.join("c.rs"), "marker\n").unwrap();
+        let mut inp = input("scan[g1]@p/m#1", "p/m", "P1");
+        inp.template_hash = Some("aaaa+bbbb".into());
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[inp]).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let prior = ReviewReport {
+            schema_version: "4".into(), verdict: Verdict::Incomplete, stats: Stats::default(), findings: vec![], clusters: vec![],
+            run: RunMeta { head_sha: Some("deadbeef".into()), grouping: Some(crate::bundle::GroupingStats { gate: crate::bundle::Gate::Single, groups: 1, edges: 0, weak_cut: 0, cross_edges: 0, isolated: 0, over_budget: 0 }), ..Default::default() },
+            scan: Some(ScanReport { groups: vec![ScanGroup { label: "c.rs".into(), files: vec!["c.rs".into()], cells: vec![], suspicions: 0, pack: Default::default() }], suspicions: vec![], scanned_coverage: Some(0.75), stats: Default::default() }),
+            cells: vec![],
+        };
+        store.write_result("j", &serde_json::to_string(&prior).unwrap()).unwrap();
+        let (reg, _backend) = recording_registry("p/m", "c.rs");
+        let (report, code) = run_resume("j", &reg, &Config::default(), ws, &store).await;
+        assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0));
+        assert_eq!(report.cells[0].template_hash.as_deref(), Some("aaaa+bbbb"), "取 manifest 哈希，不盖当前值");
+        assert!(report.run.warnings.iter().any(|w| w.contains("manifest's template hash")), "{:?}", report.run.warnings);
+        let scan = report.scan.as_ref().unwrap();
+        assert_eq!((scan.groups[0].label.as_str(), scan.groups[0].files.len(), scan.groups[0].cells.len()), ("c.rs", 1, 1));
+        assert_eq!(scan.scanned_coverage, Some(0.75));
+        assert_eq!(report.run.head_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(report.run.grouping.as_ref().map(|g| g.groups), Some(1));
+    }
+
+    /// 旧格式 manifest（无 scan 请求）→ 该 cell 记失败 → Incomplete；不调 backend。
+    #[tokio::test]
+    async fn resume_legacy_manifest_without_scan_prompt_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[CellInput { template_hash: None, cell: "bundle[a.rs]".into(), model: "p/m".into(), prompt: "P".into(), scan: None }]).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let (reg, backend) = recording_registry("p/m", "c.rs");
+        let (report, code) = run_resume("j", &reg, &Config::default(), ws, &store).await;
+        assert_eq!((report.verdict, code), (Verdict::Incomplete, 3));
+        assert_eq!(backend.turn_count(), 0);
+        assert!(report.run.warnings.iter().any(|w| w.contains("旧格式作业")), "{:?}", report.run.warnings);
+    }
+
+    /// 假阳性防护：manifest 从未写出（job 在扇出前崩溃）→ resume 不得静默 scan-only，必须 Incomplete + 非零退出，且不调 backend。
     #[tokio::test]
     async fn resume_empty_manifest_is_incomplete_not_approve() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
-        // 只写 args，从不 write_manifest（模拟 fan-out 前崩溃）。
-        let args = ReviewArgs { pack_only: false,
-            base: None, scope: "working-tree".into(), spec: vec![],
-            focus: None,
-            block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
-        };
         let store = crate::state::JobStore::open(ws).unwrap();
-        store.write_args_raw("j", &serde_json::to_string(&args).unwrap()).unwrap();
-
-        let provider = RecordingProvider::default();
-        let (report, code) = run_resume("j", &provider, &Config::default(), dir.path(), &store).await;
-
-        assert_eq!(report.verdict, crate::domain::Verdict::Incomplete, "空 manifest 不得静默 Approve");
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let (reg, backend) = recording_registry("p/m", "c.rs");
+        let (report, code) = run_resume("j", &reg, &Config::default(), ws, &store).await;
+        assert_eq!(report.verdict, Verdict::Incomplete, "空 manifest 不得静默 scan-only");
         assert_ne!(code, 0, "退出码非 0");
-        assert_eq!(provider.prompts.lock().unwrap().len(), 0, "无 cell 可跑，不应调 provider");
+        assert_eq!(backend.turn_count(), 0, "无 cell 可跑，不应调 backend");
     }
 }
 
 #[cfg(test)]
 mod resolve_tests {
     use super::*;
-
-    fn provs() -> &'static str {
-        r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"roles":{"scanner":{}}}}},
-            "beta_p":{"kind":"openai","models":{"b":{"roles":{"scanner":{}}},"p":{"displayName":"pro","roles":{"reviewer":{}}}}}}}"#
-    }
 
     /// 批 C followup：`review.grouping` 子表接到 `GroupingOpts`（缺省 4 / 200 / 10 与内置一致）。
     #[test]
@@ -1814,31 +1912,13 @@ mod resolve_tests {
         assert_eq!((o.min_files, o.bundle_line_threshold, o.max_files_per_group, o.budget_bytes), (1, 0, 2, Some(5)));
     }
 
-    /// 列表即活跃集：全部 scanner 各跑一遍（replicate）、无候补、priority 恒 0；reviewers 不进旧 fan-out。
-    #[test]
-    fn roles_adapter_replicates_all_scanners_without_fallback() {
-        let c = Config::from_json(provs()).unwrap();
-        let o = legacy_opts_from_roles(&c.active_roles(), 4).unwrap();
-        assert!(o.replicate && o.no_fallback);
-        assert_eq!(o.max_concurrency, 4);
-        assert_eq!(o.models.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), vec!["alpha_p/a", "beta_p/b"], "身份串 = provider/id");
-        assert!(o.models.iter().all(|p| p.priority == 0));
-    }
-
-    #[test]
-    fn roles_adapter_errors_when_no_scanner() {
-        let c = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
-        let err = legacy_opts_from_roles(&c.active_roles(), 4).unwrap_err();
-        assert!(err.contains("scanner"), "{err}");
-    }
 }
 
 #[cfg(test)]
 mod code_review_tests {
     use super::*;
-    use crate::domain::{RawFinding, Verdict};
     use crate::evidence::git::FileChange;
-    use crate::provider::fake::FakeProvider;
+    use crate::provider::tool_loop::{AssistantTurn, FakeChatBackend};
     use std::io::Write;
 
     fn write(dir: &std::path::Path, rel: &str, body: &str) {
@@ -1846,36 +1926,6 @@ mod code_review_tests {
         if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).unwrap(); }
         std::fs::File::create(p).unwrap().write_all(body.as_bytes()).unwrap();
     }
-
-    #[tokio::test]
-    async fn lone_blocking_refuted_does_not_reject() {
-        use crate::domain::{Severity, Verdict, VerifyVerdict};
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
-        // 单 model alpha：review 报一条 High 孤证(单 model → agreement=1)；refute 退化自审 alpha。
-        // 注：FakeProvider 是 prompt-blind 的——对同一 model 的任何调用（无论 review 还是 refute
-        // prompt）都返回同一脚本，故 refute 调用返回非空 → refuted → confidence 0 → 不 reject。
-        // 交叉 model 选择本身已在 verify.rs 单测验证；本测试只验「证伪翻转 verdict」全链路。
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap();
-        let provider = crate::provider::fake::FakeProvider::with(
-            "p/alpha", vec![raw("src/a.rs", "db.write(token);", Severity::High)],
-        );
-        let my_args = ReviewArgs { pack_only: false,
-            base: None, scope: "working-tree".into(),
-            spec: vec![], focus: None,
-            block_threshold: None, conf_floor: None,
-            background: false, format: "json".into(),
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
-        };
-        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
-        let f = &report.findings[0];
-        assert_eq!(f.verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
-        assert_eq!(f.confidence, 0.0);
-        assert_eq!(report.verdict, Verdict::Approve, "孤证被自审 refute 证伪 → 不翻 verdict");
-        assert!(code == 0 || code == 2, "approve → 0 或 2（不 10）");
-    }
-
     fn args() -> ReviewArgs {
         ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(),
@@ -1885,104 +1935,161 @@ mod code_review_tests {
             resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         }
     }
-
-    fn raw(file: &str, quote: &str, sev: crate::domain::Severity) -> RawFinding {
-        RawFinding {
-            severity: sev, title: "issue".into(), body: "b".into(), file: file.into(),
-            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "fix".into(),
-            hard_constraint: false, quote: quote.into(),
+    fn registry(entries: &[(&str, &str)]) -> ProviderRegistry {
+        let mut reg = ProviderRegistry::new();
+        for (key, json) in entries {
+            let turn = AssistantTurn { text: (*json).into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None };
+            reg.insert_scan(*key, "p", 8, Box::new(FakeChatBackend::repeating(turn)), std::time::Duration::from_secs(5), 0);
         }
+        reg
+    }
+    fn susp(hint: &str, quote: &str, conf: f32) -> String {
+        format!(r#"{{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"{hint}","confidence":{conf},"quote":"{quote}"}}"#)
     }
 
+    /// 两条目都报真疑点 → 合并 agreement 2；编造 quote 只 m 报、锚定丢弃并记 cell warn；scan-only / 0。
     #[tokio::test]
-    async fn code_review_anchors_real_drops_fabricated() {
-        use crate::domain::Severity;
+    async fn scan_review_anchors_real_drops_fabricated_and_merges_families() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
-        // 两个 model 都报真 finding → dedup 合并成 agreement=2 → 跳过层① verify，
-        // 保持本测试「anchor 砍编造 + High→Reject」的原意（不被 S3-b verify 自审误伤）。
-        // 编造 quote 只 m 报，anchor 因 quote 不在文件而丢弃。
         let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"m2":{"roles":{"scanner":{}}}}}}}"#).unwrap();
-        let mut scripted = std::collections::BTreeMap::new();
-        scripted.insert("p/m".to_string(), vec![
-            raw("src/a.rs", "db.write(token);", Severity::High),
-            raw("src/a.rs", "this is fabricated", Severity::Critical),
+        let reg = registry(&[
+            ("p/m", &format!(r#"{{"suspicions":[{},{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8), susp("fab", "this is fabricated", 0.9))),
+            ("p/m2", &format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("unvalidated", "db.write(token);", 0.6))),
         ]);
-        scripted.insert("p/m2".to_string(), vec![raw("src/a.rs", "db.write(token);", Severity::High)]);
-        let provider = FakeProvider { scripted, ..Default::default() };
-        let my_args = ReviewArgs { pack_only: false, ..args() };
-        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&my_args, &provider, &cfg, changes, dir.path(), None, None).await.unwrap();
-        assert_eq!(report.findings.len(), 1, "fabricated dropped, real merged across models");
-        assert_eq!(report.findings[0].file, "src/a.rs");
-        assert_eq!(report.findings[0].line_start, 2);
-        assert_eq!(report.findings[0].agreement, 2, "two models agree → skips verify (layer ①)");
-        assert_eq!(report.verdict, Verdict::Reject); // High agreement≥2，verify 跳过 → Reject
-        assert_eq!(code, 10);
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+        assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0));
+        let scan = report.scan.as_ref().unwrap();
+        assert_eq!(scan.suspicions.len(), 1, "编造丢弃、真疑点跨家族合并: {:?}", scan.suspicions);
+        assert_eq!((scan.suspicions[0].agreement, scan.suspicions[0].suspicion.line_start), (2, 2));
+        assert_eq!(scan.suspicions[0].families, vec!["m", "m2"]);
+        assert_eq!(report.cells.len(), 2);
+        assert!(report.cells[0].warn.as_deref().unwrap_or("").contains("1 suspicions dropped"), "{:?}", report.cells[0].warn);
+        assert!(report.cells[1].warn.is_none());
+        assert_eq!(report.run.models, vec!["p/m", "p/m2"]);
+        assert_eq!(report.run.template_hashes.len(), 2);
+        assert_eq!(report.run.grouping.as_ref().map(|g| g.groups), Some(1));
+        assert_eq!(scan.groups.len(), 1);
+        assert_eq!((scan.groups[0].cells.len(), scan.groups[0].suspicions), (2, 1));
+    }
+
+    /// 空变更集：0 cell、warning 可观测、scan-only / 0（不是假绿灯 approve）。
+    #[tokio::test]
+    async fn scan_review_empty_changes_is_scan_only_with_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let reg = registry(&[("p/m", r#"{"suspicions":[],"scanned_areas":[]}"#)]);
+        let (report, code) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), None, None).await.unwrap();
+        assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0));
+        assert!(report.cells.is_empty() && report.scan.as_ref().unwrap().suspicions.is_empty());
+        assert!(report.run.warnings.iter().any(|w| w.contains("no reviewable evidence")), "{:?}", report.run.warnings);
+        assert_eq!(report.scan.as_ref().unwrap().scanned_coverage, None);
+    }
+
+    /// 未配置 scanner → 配置错误（Err，不产报告）。
+    #[tokio::test]
+    async fn scan_review_errors_without_scanner_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let err = run_code_review(&args(), &ProviderRegistry::new(), &cfg, vec![], dir.path(), None, None).await.unwrap_err();
+        assert!(err.to_string().contains("scanner"), "{err}");
     }
 
     #[tokio::test]
-    async fn code_review_empty_changes_approves() {
+    async fn scan_review_stamps_head_sha_and_test_command_into_runmeta() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
-        let provider = FakeProvider::with("p/m", vec![]);
-        let (report, code) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
-        assert!(report.findings.is_empty());
-        assert_eq!(code, 0);
-    }
-
-    #[tokio::test]
-    async fn code_review_stamps_head_sha_into_runmeta() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
-        let provider = FakeProvider::with("p/m", vec![]);
+        let reg = registry(&[("p/m", r#"{"suspicions":[],"scanned_areas":[]}"#)]);
         // K1：无 --test-command 时按项目推断（Cargo.toml → cargo test）进 RunMeta。
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"\n").unwrap();
-        let (report, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(),
-            Some("abc123".into()), None).await.unwrap();
+        let (report, _) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), Some("abc123".into()), None).await.unwrap();
         assert_eq!(report.run.head_sha.as_deref(), Some("abc123"));
         assert_eq!(report.run.test_command.as_deref(), Some("cargo test"));
-        // 显式 --test-command 覆盖推断
         let over = ReviewArgs { test_command: Some("make check".into()), ..args() };
-        let (report2, _) = run_code_review(&over, &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
+        let (report2, _) = run_code_review(&over, &reg, &cfg, vec![], dir.path(), None, None).await.unwrap();
         assert_eq!(report2.run.test_command.as_deref(), Some("make check"));
-        let (report2, _) = run_code_review(&args(), &provider, &cfg, vec![], dir.path(), None, None).await.unwrap();
         assert_eq!(report2.run.head_sha, None, "非 git 环境如实 None，不编造");
+    }
+
+    /// 覆盖自报：改动行 2 被 `1-3` 覆盖 → 1.0；只报 `5-9` → 0.0；两文件各一改动行、只覆盖其一 → 0.5。
+    #[test]
+    fn scanned_coverage_ratio_cases() {
+        use crate::bundle::Bundle;
+        use crate::orchestrate::ScanCellResult;
+        let b = |path: &str| Bundle::from_files(vec![FileChange { path: path.into(), diff: "@@ -2,1 +2,1 @@\n+x".into() }]);
+        let cell = |areas: Vec<(&str, &str)>| {
+            let out = crate::domain::ScanOutput {
+                scanned_areas: areas.into_iter().map(|(f, r)| crate::domain::ScannedArea { file: f.into(), ranges: vec![r.into()] }).collect(),
+                ..Default::default()
+            };
+            ScanCellResult { cell_id: "c".into(), group: 0, route_key: "p/m".into(), family: "m".into(), sample: 1, record: CellRecord::ok("c", "p/m", crate::domain::CellOutput::Scan(out.clone())), output: Some(out) }
+        };
+        assert_eq!(scanned_coverage(&[b("a.rs")], &[cell(vec![("a.rs", "1-3")])]), Some(1.0));
+        assert_eq!(scanned_coverage(&[b("a.rs")], &[cell(vec![("a.rs", "5-9")])]), Some(0.0));
+        assert_eq!(scanned_coverage(&[b("a.rs"), b("b.rs")], &[cell(vec![("a.rs", "2-2")])]), Some(0.5));
+        assert_eq!(scanned_coverage(&[], &[cell(vec![("a.rs", "1-3")])]), None, "无改动行 → None");
+        assert_eq!(scanned_coverage(&[b("a.rs")], &[cell(vec![("a.rs", "x-y"), ("a.rs", "0-3")])]), Some(0.0), "坏区间不计");
+        // 评审修 10：删除点不进分母——纯删除 → None；混合 diff 只计 + 行
+        let del = Bundle::from_files(vec![FileChange { path: "old.rs".into(), diff: "@@ -1,3 +0,0 @@\n-a\n-b\n-c".into() }]);
+        assert_eq!(scanned_coverage(std::slice::from_ref(&del), &[cell(vec![])]), None, "纯删除无可扫改动行");
+        assert_eq!(scanned_coverage(&[del, b("a.rs")], &[cell(vec![("a.rs", "1-3")])]), Some(1.0), "删除文件不拉低覆盖率");
+    }
+
+    /// 评审修 2：partial 报告把失败格也算进 coverage.failed / cells_failed / usage（与 attach_cells 回填的 cells 一致）。
+    #[test]
+    fn partial_report_keeps_failed_cells_in_coverage_and_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::state::JobStore::open(dir.path()).unwrap();
+        let ok = CellRecord::ok("scan[g1]@p/a#1", "p/a", crate::domain::CellOutput::Scan(Default::default()));
+        let mut failed = CellRecord::failed("scan[g1]@p/b#1", "p/b", Role::Scanner, "auth error: no key");
+        failed.input_tokens = 7;
+        store.append_partial("j", &ok).unwrap();
+        store.append_partial("j", &failed).unwrap();
+        let (r, code) = partial_report(&store, "j", "timed out".into());
+        assert_eq!((r.verdict, code), (Verdict::Incomplete, 3));
+        assert_eq!(r.run.coverage.failed[&Role::Scanner], vec!["scan[g1]@p/b#1"]);
+        assert_eq!(r.run.coverage.completed[&Role::Scanner], vec!["scan[g1]@p/a#1"]);
+        assert_eq!(r.run.usage.input_tokens, 7, "失败格烧掉的 usage 入账");
+        assert_eq!(r.scan.as_ref().unwrap().stats.cells_failed, 1);
+        assert!(r.run.warnings.iter().any(|w| w.starts_with("partial: 1/2")), "{:?}", r.run.warnings);
+        assert_eq!(r.cells.len(), 2);
+    }
+
+    /// 评审修 9：`thinking_pinned` 只在 (kind, family, id) 真有映射且会发出时为 true。
+    #[test]
+    fn scan_entry_spec_pinned_requires_a_thinking_mapping() {
+        use crate::orchestrate::ScanEntrySpec;
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{
+            "deepseek-v4-flash":{"roles":{"scanner":{"thinkingLevel":"low"}}},
+            "grok-4":{"roles":{"scanner":{"thinkingLevel":"high"}}},
+            "gpt-5":{"roles":{"scanner":{"thinkingLevel":"off"}}},
+            "qwen3":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let roles = cfg.active_roles();
+        let pinned: std::collections::BTreeMap<String, bool> = roles.scanners.iter().map(|em| (em.id.clone(), ScanEntrySpec::from(em).thinking_pinned)).collect();
+        assert!(pinned["deepseek-v4-flash"]);
+        assert!(!pinned["grok-4"], "无映射家族不算 pinned");
+        assert!(!pinned["gpt-5"], "Off 不算 pinned");
+        assert!(!pinned["qwen3"], "未配档位不算 pinned");
     }
 }
 
 #[cfg(test)]
 mod spec_tests {
     use super::*;
+    use crate::provider::tool_loop::{AssistantTurn, ChatMessage, FakeChatBackend};
     use spec::render_spec_section;
-    // ---- Task 2：--spec 接入第一趟主评审的接线级回归（集成测试，非纯构造器单测）----
+    use std::sync::Arc;
+    // ---- Task 2：--spec 接入第一趟主评审的接线级回归（集成测试，非纯构造器单测；批 F-4 改看 scan prompt 的 system）----
 
-    /// 记录每次 `run` 调用的 prompt；空脚本化返回（0 findings）——本组测试只关心 prompt 内容，
-    /// 不关心 findings/verify 链路（同 resume_tests::RecordingProvider 手法）。
-    #[derive(Default)]
-    struct SpecPromptRecorder {
-        prompts: std::sync::Mutex<Vec<String>>,
+    fn recorder() -> (ProviderRegistry, Arc<FakeChatBackend>) {
+        let backend = Arc::new(FakeChatBackend::repeating(AssistantTurn {
+            text: r#"{"suspicions":[],"scanned_areas":[]}"#.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None,
+        }));
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/m", "p", 8, Box::new(Arc::clone(&backend)), std::time::Duration::from_secs(5), 0);
+        (reg, backend)
     }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ReviewProvider for SpecPromptRecorder {
-        async fn run(
-            &self,
-            req: crate::provider::LensRequest,
-        ) -> Result<crate::provider::LensCall, crate::provider::ProviderError> {
-            self.prompts.lock().unwrap().push(req.prompt.clone());
-            Ok(crate::provider::LensCall {
-                findings: vec![],
-                input_tokens: 1,
-                output_tokens: 1,
-                cached_input_tokens: 0,
-                iterations: 1,
-                tool_use: Default::default(),
-                needs: vec![],
-            })
-        }
-    }
-
     fn spec_test_args(spec: Vec<String>) -> ReviewArgs {
         ReviewArgs { pack_only: false,
             base: None, scope: "working-tree".into(), spec, focus: None,
@@ -1991,51 +2098,48 @@ mod spec_tests {
             resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
         }
     }
+    fn system_of(b: &FakeChatBackend) -> String {
+        match &b.messages_at(0)[0] { ChatMessage::System(s) => s.clone(), other => panic!("首条须是 system: {other:?}") }
+    }
 
     #[tokio::test]
-    async fn code_review_with_spec_injects_reference() {
+    async fn scan_review_with_spec_injects_reference_into_shared_head() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
         let spec_path = root.join("design.md");
         std::fs::write(&spec_path, "DESIGN D8: fail-open").unwrap();
-
         let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
-        let provider = SpecPromptRecorder::default();
+        let (reg, backend) = recorder();
         let args = spec_test_args(vec![spec_path.to_string_lossy().to_string()]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
 
-        run_code_review(&args, &provider, &cfg, changes, root, None, None).await.unwrap();
+        run_code_review(&args, &reg, &cfg, changes, root, None, None).await.unwrap();
 
-        let prompts = provider.prompts.lock().unwrap();
-        assert_eq!(prompts.len(), 1, "单格全审默认下第一趟只应有一次 provider 调用");
-        assert!(prompts[0].contains("<spec_docs>"), "第一趟 prompt 须含 spec_docs 段: {}", prompts[0]);
-        assert!(prompts[0].contains("DESIGN D8: fail-open"), "spec 内容须原样注入: {}", prompts[0]);
-        assert!(!prompts[0].contains("{{SPEC_DOCS}}"), "no residual placeholder");
+        assert_eq!(backend.turn_count(), 1, "单格全审默认下第一趟只应有一次调用");
+        let sys = system_of(&backend);
+        assert_eq!(sys.matches("<spec_docs>").count(), 1, "共享头恰一段 spec_docs（无双壳）: {sys}");
+        assert!(sys.contains("DESIGN D8: fail-open"), "spec 内容须原样注入: {sys}");
+        assert!(!sys.contains("{{SPEC_DOCS}}") && !sys.contains("<\\/spec_docs>"), "无残留占位、真闭合不被中和: {sys}");
     }
 
     #[tokio::test]
-    async fn code_review_without_spec_unchanged() {
+    async fn scan_review_without_spec_renders_placeholder() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
-
         let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
-        let provider = SpecPromptRecorder::default();
-        let args = spec_test_args(vec![]); // 不带 --spec
+        let (reg, backend) = recorder();
+        let args = spec_test_args(vec![]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
 
-        run_code_review(&args, &provider, &cfg, changes, root, None, None).await.unwrap();
+        run_code_review(&args, &reg, &cfg, changes, root, None, None).await.unwrap();
 
-        let prompts = provider.prompts.lock().unwrap();
-        assert_eq!(prompts.len(), 1);
-        // 无 --spec → prompt 无 spec 段内容，仅占位散文（既有评审 prompt 零变化）。
-        assert!(prompts[0].contains("(none — no spec docs provided)"), "空 spec 渲染占位: {}", prompts[0]);
-        assert!(!prompts[0].contains("DESIGN"), "不应有任何 spec 内容泄漏: {}", prompts[0]);
-        // budget 未扣（D2）：空 --spec → render_spec_section 用掉 0 字节 → saturating_sub(0)
-        // 是恒等运算，pack 预算与不带本 feature 时完全一致。
+        let sys = system_of(&backend);
+        assert!(sys.contains("(none — no spec docs provided)"), "空 spec 渲染占位: {sys}");
+        assert!(!sys.contains("DESIGN"), "不应有任何 spec 内容泄漏: {sys}");
         let (_, spec_used, _spec_warnings) = render_spec_section(&args.spec);
         assert_eq!(spec_used, 0, "空 spec 不得占用任何预算字节");
     }
@@ -2086,6 +2190,75 @@ mod tests {
         assert!(entries[1].contains("other"), "bundle 2 自家内容非空: {entries:?}");
         assert_eq!(meta, DossierMeta { bundles: 2, injected: 2 });
     }
+    /// 批 F-5：scan-only 收口的 RunMeta 观测面——coverage 五集合（selected / completed / reused / failed）、cache 命中率、模板哈希两键、
+    /// 在途峰值、needs 计数、类别分布、agreement ≥ 2、usage 从记录重算；任一 cell 失败 → Incomplete/3 + warning；组骨架按 cell id 补齐。
+    #[test]
+    fn finish_scan_report_fills_observability_and_flips_incomplete_on_failed_cell() {
+        use crate::domain::{Category, CellOutput, NeedEntry, NeedKind, ScanOutput, Suspicion};
+        use crate::orchestrate::{ScanCellResult, ScanResults};
+        let susp = |file: &str, hint: &str, quote: &str, cat: Category, conf: f32| Suspicion {
+            file: file.into(), line_start: 1, line_end: 1, hint: hint.into(), category: Some(cat), confidence: conf, quote: quote.into(),
+        };
+        let mk = |id: &str, group: usize, family: &str, ok: bool, susps: Vec<Suspicion>, needs: usize, input: u64, cached: u64| {
+            let out = ScanOutput {
+                suspicions: susps,
+                needs: (0..needs).map(|i| NeedEntry { path: format!("n{i}.rs"), lines: None, reason: "r".into(), kind: NeedKind::Evidence }).collect(),
+                scanned_areas: vec![],
+            };
+            let mut rec = if ok { CellRecord::ok(id, "p/x", CellOutput::Scan(out.clone())) } else { CellRecord::failed(id, "p/x", Role::Scanner, "boom") };
+            rec.input_tokens = input;
+            rec.cached_input_tokens = cached;
+            rec.output_tokens = 5;
+            ScanCellResult { cell_id: id.into(), group, route_key: "p/x".into(), family: family.into(), sample: 1, record: rec, output: if ok { Some(out) } else { None } }
+        };
+        let cells = vec![
+            mk("scan[g1]@p/x#1", 0, "alpha", true, vec![susp("a.rs", "h1", "q1", Category::L1, 0.5)], 2, 100, 50),
+            mk("scan[g1]@p/y#1", 0, "beta", true, vec![susp("a.rs", "h1b", "q1", Category::L1, 0.7)], 0, 100, 0),
+            mk("scan[g2]@p/x#1", 1, "alpha", true, vec![susp("b.rs", "h2", "q2", Category::L3, 0.4)], 0, 0, 0),
+        ];
+        let roles = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"x":{"roles":{"scanner":{}}},"y":{"roles":{"scanner":{}}}}}}}"#).unwrap().active_roles();
+        let base = |cells: Vec<ScanCellResult>, reused: Vec<String>| ScanFinish {
+            groups: vec![], scanned_coverage: Some(0.5), grouping: None, dossier_meta: None,
+            results: ScanResults { cells, ..Default::default() },
+            model_names: vec!["p/x".into(), "p/y".into()], roles: Some(&roles), warnings: vec![],
+            inflight_peak: [("p".to_string(), 2u32)].into_iter().collect(), ledger_meta: None, head_sha: None,
+            duration_ms: 7, test_command: None, job_id: "j".into(), reused,
+        };
+        let (r, code) = finish_scan_report(base(cells.clone(), vec!["scan[g1]@p/y#1".into()]));
+        assert_eq!((r.verdict, code), (Verdict::ScanOnly, 0));
+        let scan = r.scan.as_ref().unwrap();
+        assert_eq!(scan.groups.len(), 2, "组骨架按 cell id 补齐");
+        assert_eq!((scan.groups[0].cells.len(), scan.groups[0].suspicions, scan.groups[1].suspicions), (2, 1, 1));
+        assert_eq!((scan.stats.total, scan.stats.agreement_ge2, scan.stats.needs_declared, scan.stats.cells_ok, scan.stats.cells_failed), (2, 1, 2, 3, 0));
+        assert_eq!((scan.stats.by_category.get("L1"), scan.stats.by_category.get("L3")), (Some(&1), Some(&1)));
+        assert_eq!(scan.scanned_coverage, Some(0.5));
+        let cov = &r.run.coverage;
+        assert_eq!(cov.selected[&Role::Scanner].len(), 3);
+        assert_eq!(cov.completed[&Role::Scanner], vec!["scan[g1]@p/x#1", "scan[g2]@p/x#1"]);
+        assert_eq!(cov.reused[&Role::Scanner], vec!["scan[g1]@p/y#1"]);
+        assert!(cov.failed.is_empty() && cov.waived.is_empty());
+        assert_eq!(r.run.cache_hit_by_cell.len(), 2, "input 0 的不计");
+        assert_eq!((r.run.cache_hit_by_cell[0].cell.as_str(), r.run.cache_hit_by_cell[0].ratio), ("scan[g1]@p/x#1", 0.5));
+        assert_eq!(r.run.template_hashes.len(), 2);
+        assert_eq!(r.run.provider_inflight_peak.get("p"), Some(&2));
+        assert_eq!((r.run.needs.triggered_cells, r.run.needs.declared), (1, 2));
+        assert_eq!((r.run.usage.input_tokens, r.run.usage.cached_input_tokens, r.run.usage.output_tokens), (200, 50, 15));
+        assert_eq!(r.run.model_ids, vec!["x", "y"]);
+        assert_eq!(r.run.cells.len(), 3);
+        assert_eq!((r.run.cells[0].role.as_str(), r.run.cells[0].cached_input_tokens), ("scanner", 50));
+        assert_eq!(r.cells.len(), 3);
+        assert!(r.run.failed_models.is_empty() && r.findings.is_empty());
+        // 一 cell 失败 → Incomplete / 3 + coverage.failed + warning；失败格烧掉的 usage 入账
+        let mut failing = cells;
+        failing.push(mk("scan[g2]@p/y#1", 1, "beta", false, vec![], 0, 3, 0));
+        let (r2, code2) = finish_scan_report(base(failing, vec![]));
+        assert_eq!((r2.verdict, code2), (Verdict::Incomplete, 3));
+        assert_eq!(r2.run.coverage.failed[&Role::Scanner], vec!["scan[g2]@p/y#1"]);
+        assert!(r2.run.warnings.iter().any(|w| w.contains("verdict hard Incomplete")), "{:?}", r2.run.warnings);
+        assert_eq!(r2.scan.as_ref().unwrap().stats.cells_failed, 1);
+        assert_eq!(r2.run.usage.input_tokens, 203);
+    }
+
     #[test]
     fn run_meta_needs_always_serialized_zeros_included() {
         // E8-E 观测面：needs 统计恒写、零也写。
@@ -2195,7 +2368,7 @@ mod tests {
         assert!(l3.meta.as_ref().unwrap().source.contains(crate::db::DB_FILE), "{}", l3.meta.as_ref().unwrap().source);
     }
     #[tokio::test]
-    async fn jobcellsink_manifest_sets_phase_fanout() {
+    async fn jobcellsink_manifest_sets_phase_scan() {
         use crate::state::{JobState, Phase};
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().to_path_buf();
@@ -2203,9 +2376,9 @@ mod tests {
         store.put_state_for_test(&JobState::new("j", 0)).unwrap();
         let sink = JobCellSink { store: std::sync::Arc::clone(&store), job_id: "j".into(), ckpt_failures: std::sync::atomic::AtomicU32::new(0) };
         use crate::orchestrate::CellSink;
-        sink.manifest(&[crate::state::CellInput {
-            cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
-        assert_eq!(store.read_state("j").unwrap().phase, Some(Phase::Fanout));
+        sink.manifest(&[crate::state::CellInput { template_hash: None,
+            cell: "c".into(), model: "m".into(), prompt: "p".into(), scan: None }]);
+        assert_eq!(store.read_state("j").unwrap().phase, Some(Phase::Scan));
     }
     #[tokio::test]
     async fn jobcellsink_on_phase_writes_phase() {
@@ -2238,7 +2411,7 @@ mod tests {
             ckpt_failures: std::sync::atomic::AtomicU32::new(0),
         };
         use crate::orchestrate::CellSink;
-        sink.manifest(&[CellInput { cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
+        sink.manifest(&[CellInput { template_hash: None, cell: "c".into(), model: "m".into(), prompt: "p".into(), scan: None }]);
         sink.on_cell(CellRecord::ok("c", "m", crate::domain::CellOutput::review(vec![])));
         sink.on_phase(Phase::Finalizing, None);
         sink.on_meta(&["m".to_string()]);
@@ -2284,7 +2457,7 @@ mod tests {
     #[test]
     fn append_ckpt_failure_warning_only_appends_when_nonzero() {
         fn empty_report() -> ReviewReport {
-            ReviewReport {
+            ReviewReport { scan: None, cells: vec![],
                 schema_version: crate::domain::SCHEMA_VERSION.into(),
                 verdict: Verdict::Approve,
                 stats: Stats::from_findings(&[]),

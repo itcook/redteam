@@ -2,6 +2,7 @@ pub mod backends;
 pub mod fake;
 pub mod parse;
 pub mod registry;
+pub mod scan_shot;
 pub mod single_shot;
 pub mod tool_loop;
 
@@ -157,7 +158,7 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
         .map(std::time::Duration::from_secs)
 }
 
-pub(crate) const DEFAULT_RETRY_BUDGET: u32 = 2; // 首发 + 2 重试
+pub const DEFAULT_RETRY_BUDGET: u32 = 2; // 首发 + 2 重试（bin 侧 build_registry 装 scan 条目也用它，批 F-2）
 /// 单轮默认最长等待；tool_loop 与 single_shot 共用（原各私有一份，Task 2 评审 Minor 收敛）。
 pub(crate) const PER_TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
 /// 单轮最长等待时间，env `REDTEAM_PER_TURN_SECS` 可覆盖——大上下文 bundle（40+ 文件）

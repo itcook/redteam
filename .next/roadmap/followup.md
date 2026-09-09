@@ -49,7 +49,7 @@
 | `GroupingStats.cross_edges` / `weak_cut` 口径（A/B/C 合并核验 2026-09-08） | `cross_edges` 计全部边种（同目录分量一切即被 SameDir 边灌满），`weak_cut` 计超限分量内全部弱边（含留在同一强子分量内、实际未切的）；design §3.2 步 6 的 R8 触发度量是「跨组 **import** 边数」 | F-5 接 RunMeta 前分种计数（import / reference / samedir），`weak_cut` 只计真切的边 |
 | Rust 仓 `lib.rs` / `main.rs` 超级枢纽 | `mod x;` 边是强边：改 `lib.rs` 一行 `pub mod x;` 即把所有改动顶层模块粘成不可切的强分量 → 单 cell `over_budget`；设计如此（import 强），对 PR181 规模（出口「≤ 5 组」）风险实在 | M21b 前用 `.next/private` 数据回放 `--pack-only` 看组数；超标则议 `mod x;` 边降为弱边或根文件特判 |
 | C 精度缺口：TS 副作用导入 `import './x'`（无 `from`）不解析；弱边只认同父目录，design §3.2 写「同目录 / 同顶层模块」 | 索引与分组少边，不产错边 | M21e 清扫时按 dogfood 数据决定是否回补 |
-| `--pack-only` 的 `est_tokens` 只计 user prompt，不含 system 段 | roadmap 出口「与真实 usage 差 < 20%」对账时会系统性偏低 | 出口验收对账时加回 system 段常量（或 F-5 直接记 usage） |
+| `--pack-only` 的 `est_tokens` 只计 user prompt，不含 system 段 | roadmap 出口「与真实 usage 差 < 20%」对账时会系统性偏低 | ✅ 批 F-4 K15（2026-09-09）：`bytes` = 共享头 system + 四块 user，与真实 scanner 请求同一 `build_scan_prompt`；`cell-n.md` 落盘同形 |
 | D-1 接缝：`ScanOutput.suspicions` 无 `serde(default)`（`src/domain/suspicion.rs:42`） | 模型输出缺该键即解析失败 | ✅ D-1 定论（2026-09-08）：缺键 = 违约 → `Parse` 错走 `REPAIR_PROMPT_SCAN`（契约段明写「A response without the "suspicions" key is invalid」），domain 不改 |
 | D / F 接缝：`CellOutput` tag 值 = `scanner` / `reviewer` / `verifier`（批 B 裁定 3：tag == `Role` 串 == `cells.role` 列），不是计划 B-2 文本的 `scan` / `review` / `verify` | 契约文档与 prompt 输出协议须按前者写 | D-2 写 `<output_contract>` 时对齐；`missing_role_tag_is_error_not_default` 可加 `"role":"scan"` 报错断言 |
 | E-2 接缝：`Bundle.over_budget` 到 pack 层只是可见、未被消费；二阶段 `second_pass_prompt` 用 `Bundle::from_files` 重建 → `edges` / `over_budget` 清零、`hub_order` 只靠插入序 | 梯子（切片 / 全文 → def 体 → 骨架 → hunk 窗 → omit）纯按预算触发 | ✅ 批 E K9 定论（2026-09-08）：pack 不消费 `over_budget`——slice 已是缩形、标记无法再降，消费它会污染 full 对照臂；标记留 `--pack-only` 仪表。切片不依赖 `edges`；二阶段恒 `full`（K2） |
@@ -65,7 +65,7 @@
 | `redteam test-command` 子命令（M21a 批 A K1，过渡形态） | 项目层 `test_command` 随项目 config 退场后，推断链进二进制（Cargo / package.json / Makefile / go.mod）；`review --test-command` 记 RunMeta | ship 协议进二进制（M21c 切名后 ship.md 第 2 步改调本子命令；协议整体内置时评估把它拆卸 / 并入）——用户 2026-09-08 要求记下拆卸 |
 | ship.md 第 2 步「测试命令探测」仍在 prompt 侧（且第 28 行仍引用已退场的项目层 `.redteam/config.toml` `test_command`）；第 13 行仍透传 `--models`（code-review #12） | 插件在 M21a-b 跑 dev 二进制，无 `test-command`；`--models` 已被 clap 拒收 | M21c 切名后改为调用 `${CLAUDE_PLUGIN_ROOT}/bin/redteam test-command`（退出码 2 → AskUser）并删 `--models` 透传，删 prompt 侧启发式与旧路径引用 |
 | `--resume` 老作业按当前 `[[scanners]]` 重建 registry 与 RunMeta.models | 批 A 删 `--models` 后 args.json 里的模型集不再是权威源（批 A ship 评审 8fc07250 亦指出） | M21b 队列快照落地后 resume 读快照里的角色条目；此前只在 dogfood 观察，不修 |
-| `legacy_opts_from_roles` 适配器（cli）+ `PlannedModel.priority` 恒 0 | 旧 fan-out 靠它跑到批 F | 批 F-4 硬切时删除 |
+| `legacy_opts_from_roles` 适配器（cli）+ `PlannedModel.priority` 恒 0 | 旧 fan-out 靠它跑到批 F | ✅ 批 F-4（2026-09-09）已删，连同 `run_code_fanout` / 候补链 / `TailCtx` / 旧模板 |
 | `redteam-next` 独立库文件 `.redteam/proj-next.db`（批 B 评审裁定 2026-09-08：与 dev `proj.db` 分库，避免 v4 `cells.role NOT NULL` 让 dev checkpoint 写失败、旧库被 v4 守卫拒开） | `db::DB_FILE = "proj-next.db"`；`--help` / `load_ledger` / `init` 文案随之；dev 的 63 张判例卡对 next 不可见（M21a-b 不产 finding，无需） | M21c 切名时定切换程序：导出旧 `proj.db` 固定集 → 删 → `proj-next.db` 改名回 `proj.db`（或 `DB_FILE` 定回），`--help` 文案回改；`--dismissed` 指向 v0 `proj.db` 的只读复用届时一并议 |
 | `SCHEMA_VERSION = "4"` 先于形状变化翻号 | 批 B 报告 JSON 与 v3 逐字节相同（五个 v4 字段全 default 不序列化），版本号已是 4（plan B-4 明文） | F-5 落 coverage / cache / 模板哈希值时不再翻号；若届时需区分「v4 未填」与「v4 无 coverage」再议 `4.1` |
 | 台账固定集导出在仓内 python 脚本（`eval/export_ledger.py`） | 拒开文案指向它，插件分发不含 `eval/`；评审建议内置 `redteam ledger export`（CLAUDE.md 内置命令优先） | 用户 2026-09-08 裁定搁置（M21a-b 未发布、暂无导出需求）；发布前若保留拒开路径再评估内置 |
@@ -77,9 +77,9 @@
 | 项 | 现状 | 归属 |
 |---|---|---|
 | 增量轮两份清单 | 旧 prompt：`{{OTHER_CHANGED_FILES}}` 跨组索引已含全分支非 delta 文件 + `[delta]`，`<incremental_round>` 仍渲染 `two_layer_manifest` 双层清单（同信息两处，≤ 8K 字符）。新 `build_scan_prompt`（批 D-3，2026-09-08）只保住 `[delta]`（跨组索引槽），增量轮框架语（delta base 一句 + 上轮 claimed/resolved 顺带验证清单）**无槽** | 旧 prompt 与 `two_layer_manifest`、E11-Q5 红测群随 F-4 整体删；增量轮框架语 + 顺带验证清单在 M21c 台账回流时给 scan prompt 加槽（参考块内，需中和） |
-| `review --format json` 无 scanner 输出面 | `run.cells` 是 CellSummary（无 output）；`eval/scan_score.py` 的 `cells[].output.suspicions` 输入形态今天没有产品面产出 | F 批 prd 明确：结果 JSON 加 scanner 输出（或评分器读 proj-next.db `cells` 行）——否则「改模板必跑」的门接不上线 |
+| `review --format json` 无 scanner 输出面 | `run.cells` 是 CellSummary（无 output）；`eval/scan_score.py` 的 `cells[].output.suspicions` 输入形态今天没有产品面产出 | ✅ 批 F-3 / F-4（2026-09-09）：报告顶层 `cells: Vec<CellRecord>`（含 `output`，tag `role`），前台 / job / resume 三路都填；评分器零改 |
 | `--pack-only` 预算的模型窗来源 | ✅ 合入批 A 时已改读 `cfg.active_roles()`（与真实评审同一 `budget_and_spec`） | — |
-| `GroupingStats` 只在 `--pack-only` 可见 | stdout + `summary.json`；真实评审的 RunMeta 未接线（避免撞批 B 的 `report.rs`） | F-5 观测接线 |
+| `GroupingStats` 只在 `--pack-only` 可见 | stdout + `summary.json`；真实评审的 RunMeta 未接线（避免撞批 B 的 `report.rs`） | ✅ 批 F-5（2026-09-09）`RunMeta.grouping`；分种计数（:49）仍待 |
 | `review.grouping` 未接配置 | ✅ 批 A 重做合入时接上（2026-09-08）：`cli::grouping_opts(cfg.review.grouping, budget)`，`plan_cells` 三个入口同源；`semantic`（R8）仍无消费点 | — |
 
 ## M21a 批 E 延后项（2026-09-08，Trellis `09-08-m21a-slice`，prd R-E4.6）
@@ -116,6 +116,26 @@
 | `anchor_offset` 锚错位置（PLAUSIBLE，未构造实证） | hunk 只有一个有信息量但内容常见的 `+` 行（如 `Ok(())`）且坐标陈旧时取最近同文本行为偏移；禁真空性质仍成立、语义定位可能错 | dogfood 观测（脏树评审场景） |
 | 批 E 归档制品 `implement.md` §2 / §3 自报测试名与实际不符 | 测试按场景合并重命名（覆盖在，见审计映射） | 归档制品不改；此处记一笔 |
 | slice 档骨架级梯子无测试 | `slice_ladder_takes_over_when_over_budget` 只到 def 体级；骨架级代码与 Full 共用 | M21e 清扫时补 |
+
+## M21a 批 F 延后项（2026-09-09，Trellis `09-09-m21a-cutover`）
+
+| 项 | 现状 | 归属 |
+|---|---|---|
+| resume scan 重放无生产验证 | `run_resume` 用 manifest `scan` 请求重放差集 cell（旧格式作业记失败）；只有单测 / e2e 空 manifest 锚，无真 provider dogfood；角色集按当前配置重建 | M21b 队列快照 checkpoint 落地后重做（resume 读快照里的角色条目） |
+| thinking 映射未在真网关实测的家族 | 映射表按官方文档（2026-09-09）：GLM anthropic 形态文档无字段 → 无映射 + warning；Qwen `enable_thinking` / Gemini `reasoning_effort` 未实测；本仓 dogfood 只覆盖 DeepSeek（`thinking` + `reasoning_effort`）与 Qwen（openai 形态） | 出口 2（GLM 5.3 双 scanner）前补 GLM anthropic 形态；其余按模型接入时实测 |
+| 增量轮显式报错 | `run_incremental_review` bail（M21c 恢复）；e2e `incremental_from_bails_until_m21c` 锚住报错；原 carry 端到端锚（携带 / dispute / re-raise）与 `render_incremental_section` / `two_layer_manifest` 随旧路径删 | M21c 疑点台账 + delta 激活时按 scan prompt 参考块加槽重建（批 C 延后项已记） |
+| dismissed 台账只披露不消费 | `load_ledger` 仍加载并进 `run.ledger`；`Ledger.ids / cards` 无消费者（`mark_dismissed` / 判例注入随旧尾段删）；e2e 改为披露断言 | M21c 判例前移进 scanner prompt（`<precedents>` 槽已在 D-2）+ 豁免裁决 |
+| 无消费者的旗 | `--block-threshold` / `--conf-floor` / `--tools` / `--dismissed` / `--no-dismissed` 保留、`--help` 注明生效里程碑（prd K13） | M21b（前三）/ M21c（后二）接消费者；届时改回文案 |
+| 报告里的 finding 形态字段恒空 | `stats` 全零、`findings` / `clusters` 空数组仍序列化（schema 不翻号，followup :70）；插件 `result.md` / `review.md` 文案「呈现 findings」 | M21b 深挖产 finding 后自然填；插件文案 M21c 切名时改 |
+| `CellSummary.attempts` 口径 | 字段注释仍写「候补链尝试的 model 数」，scan 路径恒 1（无候补，D7 A3） | M21e 清扫改注释或删字段 |
+| 保留未用的旧件 | `provider/{single_shot,tool_loop,fake}.rs` 的 `ReviewProvider` 表 / `run_single_shot` / `NO_TOOLS_SYSTEM`、`consolidate/{dedup,verify,carry}`、`cli/second_pass` 零件（`allow(dead_code)`）、`orchestrate::enrich / finding_id`、`adversarial-refute.md` | M21b reviewer / verifier 复用；未复用的 M21e 删 |
+| 大 diff 组的单 cell 体量 | 本分支 dogfood diff：cell-3 26 文件 / 466 KB diff / 782 KB prompt（≈ 224K token，16 文件走梯子）——分组预算门按估算字节、装包按切片字节（批 E 延后项已记） | R7 / lib.rs 超级枢纽议题一并看；M21b 前用 PR181 回放 |
+| `GroupingStats` 分种计数 | `RunMeta.grouping` 已接（F-5），`cross_edges` / `weak_cut` 仍按全部边种计（:49） | M21b 前分种 |
+| Anthropic thinking 注入未按 tools 守卫 | `thinking{enabled}` 与工具往返同发时 Anthropic 要求 `tool_choice` / 交替约束，M21b reviewer 工具循环走 anthropic kind 会 400（评审帽外项，当前 scanner 无工具不可达） | M21b reviewer 接线时在 `build_anthropic_tools_body_ext` 按 tools 非空守卫 |
+| `resolve --help` 文案仍承诺增量轮消费 | `resolve` 子命令 doc「增量轮据此不再携带该 finding」——增量轮 M21c 恢复前无消费者 | M21c 恢复增量轮时一并核文案 |
+| `exit_code(verdict, failed_models_nonempty)` 第二参在 scan 路径恒 false | 五档契约保留 2 档给 M21b（reviewer 失败带债 approve） | M21b 定 failed_models 语义后再定是否收敛签名 |
+| `ScanResults.usage / failed / needs_declared` 生产无消费者 | `finish_scan_report` 从记录重算；三字段只有测试读 | M21e 清扫时删或改成 `#[cfg(test)]` 访问器 |
+| `anchor_suspicions` 每疑点重读同文件 | 一 cell 几十条疑点 × `safe_read` | 语料大时按文件缓存一次读（M21c 跨文件重定位落地时顺手） |
 
 ## 跨里程碑观测面（每个里程碑出口必报，写进 RunMeta 或 research）
 
