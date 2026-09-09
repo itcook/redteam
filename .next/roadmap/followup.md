@@ -50,7 +50,7 @@
 | Rust 仓 `lib.rs` / `main.rs` 超级枢纽 | `mod x;` 边是强边：改 `lib.rs` 一行 `pub mod x;` 即把所有改动顶层模块粘成不可切的强分量 → 单 cell `over_budget`；设计如此（import 强），对 PR181 规模（出口「≤ 5 组」）风险实在 | M21b 前用 `.next/private` 数据回放 `--pack-only` 看组数；超标则议 `mod x;` 边降为弱边或根文件特判 |
 | C 精度缺口：TS 副作用导入 `import './x'`（无 `from`）不解析；弱边只认同父目录，design §3.2 写「同目录 / 同顶层模块」 | 索引与分组少边，不产错边 | M21e 清扫时按 dogfood 数据决定是否回补 |
 | `--pack-only` 的 `est_tokens` 只计 user prompt，不含 system 段 | roadmap 出口「与真实 usage 差 < 20%」对账时会系统性偏低 | 出口验收对账时加回 system 段常量（或 F-5 直接记 usage） |
-| D-1 接缝：`ScanOutput.suspicions` 无 `serde(default)`（`src/domain/suspicion.rs:42`） | 模型输出缺该键即解析失败 | D-1 parse 层决定：容忍缺键 / 走 REPAIR，不在 domain 改 |
+| D-1 接缝：`ScanOutput.suspicions` 无 `serde(default)`（`src/domain/suspicion.rs:42`） | 模型输出缺该键即解析失败 | ✅ D-1 定论（2026-09-08）：缺键 = 违约 → `Parse` 错走 `REPAIR_PROMPT_SCAN`（契约段明写「A response without the "suspicions" key is invalid」），domain 不改 |
 | D / F 接缝：`CellOutput` tag 值 = `scanner` / `reviewer` / `verifier`（批 B 裁定 3：tag == `Role` 串 == `cells.role` 列），不是计划 B-2 文本的 `scan` / `review` / `verify` | 契约文档与 prompt 输出协议须按前者写 | D-2 写 `<output_contract>` 时对齐；`missing_role_tag_is_error_not_default` 可加 `"role":"scan"` 报错断言 |
 | E-2 接缝：`Bundle.over_budget` 到 pack 层只是可见、未被消费；二阶段 `second_pass_prompt` 用 `Bundle::from_files` 重建 → `edges` / `over_budget` 清零、`hub_order` 只靠插入序 | 梯子（切片 / 全文 → def 体 → 骨架 → hunk 窗 → omit）纯按预算触发 | ✅ 批 E K9 定论（2026-09-08）：pack 不消费 `over_budget`——slice 已是缩形、标记无法再降，消费它会污染 full 对照臂；标记留 `--pack-only` 仪表。切片不依赖 `edges`；二阶段恒 `full`（K2） |
 | `model setup` 写前预检对「原文件 JSON 合法但校验失败」的文案 | `load_with_messages` 失败 → `existing = default` → 之后报「合并后配置无效」，实际是原文件已无效；不丢数据（拒写），仅误导 | M21e 清扫：预检失败直接报原文件错误 |
@@ -86,7 +86,7 @@
 
 | 项 | 现状 | 归属 |
 |---|---|---|
-| 切片层次的提示词措辞：dossier 前言（`render_dossier_section`）仍描述「0 壳全文 + 1 壳引用点」；scanner 尾需说明「折叠体 `…（a-b 行折叠：name）` 只是签名可见、缺证据走 `needs{kind: evidence}`」与「文件外片段是调用点 ±N / 签名 + doc，非全文」 | pack 段序：`## 改动源文（0 壳）` → `## 文件外片段` → `## 已省略（预算裁剪）`；块头 `path:1-N（切片：核 c · 一跳 h · 折叠 f 段）` / `path:a-b（调用点：name）` / `path:a-b（签名：name）` | D-2 共享头 / scanner 尾（`src/prompt/*` 归批 D，E 不碰） |
+| 切片层次的提示词措辞：dossier 前言（`render_dossier_section`）仍描述「0 壳全文 + 1 壳引用点」；scanner 尾需说明「折叠体 `…（a-b 行折叠：name）` 只是签名可见、缺证据走 `needs{kind: evidence}`」与「文件外片段是调用点 ±N / 签名 + doc，非全文」 | ✅ 2026-09-09 合并后核验修补：scan 路径独立前言 `SCAN_DOSSIER_PREAMBLE`（描述全文 / 切片块头、折叠标记、梯子标注、`## 文件外片段` 两类块、省略清单与行号 / quote / needs 用法；入 scanner 模板哈希）+ scanner.md `<needs_policy>`「折叠体 / 省略片段 / 包外文件未展示 → 对该路径与行段声明 need」；旧路径 `render_dossier_section` 前言抽常量、输出逐字节不变（golden 测试） | — |
 | `--pack-body <full\|slice>` CLI 覆盖旗（镜像 `--tools`） | 批 E 不加（plan 范围）；A/B 走 `REDTEAM_HOME=<临时目录>` + `config.json` `{"review":{"pack":{"body":"full"}}}`，出口 3 双 scanner 配置本就要临时 config | 用户裁 / M21e |
 | 切片常数：一跳 K=3 调用点 / 名、`anchorWindow` 30、文件外段帽 = 组预算 / 8、名字上限 40、走仓上限 20000 文件、文件头 ≤ 80 行、多行签名 ≤ 6、胶水 ≤ 3 | 常量在 `src/pack/mod.rs`；`anchorWindow` / `sliceMinBytes` 已是配置键 | R7（出口 3 A/B 回退信号后调优 / M21d） |
 | 文件外搜索的读守卫口径 = `search_repo` 工具（ignore 走仓 + denylist，不逐文件 `git ls-files`）；路径非模型可控 | 未跟踪但未被 gitignore 的支持语言文件会被搜到调用点 | 威胁模型 B 若要求「只读 git-tracked」，一次 `git ls-files -z` 取集合再过滤（F-2 scanner 路径评估） |
@@ -94,6 +94,28 @@
 | 评审 PLAUSIBLE 未核实：增量路径 `extra_paths`（全分支非 delta 文件）是否会经文件外片段泄漏进 pack | 文件外搜索只排除 `changeset`（当轮 bundles 的文件），增量轮的非 delta 分支文件不在其中——会被当普通仓文件搜调用点（内容非密，但与跨组索引「只带路径」的口径不一致） | F-2 / 增量轮清单合并（D-3）时定口径：`changeset ∪ extra_paths` 或维持 |
 | 切片默认后 `Bundle.over_budget` 组的 pack 仍可能很大（本仓 cell-2：6 文件切片 + 1 梯子 = 220 KB） | 切片只降无关体，改动密集文件（本批 pack/mod.rs 核 57）切片 ≈ 全文 | R7 / lib.rs 超级枢纽议题一并看：分组预算门用估算字节、装包用切片字节，两者口径待对齐（M21b 前用 PR181 回放） |
 | 「改动 def 名」两套口径：分组引用边 `bundle::changed_def_names`（hunk 首行锚定 + `block_end`、含测试 def）vs 文件外搜索键 `pack::outside_names`（全改动行 + `value_end` + 容器 / 测试排除 + 重锚定坐标） | 边与搜索键落在不同符号集上；分组侧改口径会扰动 C 的确定性测试与 stats | M21b 风险规则复用 `changed_defs` 时一并统一（分组侧改为吃 `all_defs` / `changed_defs`），届时重跑分组回归 |
+
+## M21a 批 D / E 合并后核验（2026-09-09，两个只读审计子 agent + 冒烟）延后项
+
+已修（同日提交）：scan 卷宗前言与 needs 措辞（上表 ✅）· `build_scan_prompt` 接受已包装的 `CellPlan.dossiers` 与 `cli::spec` 带壳段（剥壳，
+不双壳）· anthropic 显式断点运行时封顶（每会话至多 3 显式 + system，多余静默降级）· 旧 `build_bundle_prompt` 字节级 golden 哈希测试 ·
+文件外调用点 regex 交替按长度降序（短名是长名前缀时长名调用点漏检）· 名字截断提示只在真正走仓时写 · 段帽以组预算为基（design 口径）·
+`-U0` 式尾部删除点并入 hunk 跨度 · `*g = f()` 解引用行不当注释 · parse 行号数字串 / 浮点与 `needs.kind` 大小写宽容 · scan 中和表移出
+`bundle` / `incremental_round`。
+
+| 项 | 现状 | 归属 |
+|---|---|---|
+| 多行 quote 只核首行 | `positioning::locate_quote_near` 只对 quote 首个非空行做精确 / 子串匹配，后续行按行数外推（与 `locate_quote` 同口径，prd R2 如此）；design §4 写「quote 逐字硬约束」，scanner 的 quote 是跨模型合并与判例预筛的锚——真实首行 + 编造后续行能过「不在文件即丢」门 | M21c 疑点合并（`quote_overlap`）落地时定是否对 scanner 走全行匹配（空白归一） |
+| 中和 vs quote 锚定 | scan 中和表含 `diff` / `evidence` / `reference` 等常见词：被审源码里字面 `</diff>` 等被改写成 `<\/diff>`（且小写化），模型照抄的 quote 锚不回文件被丢。已移出 scan 路径不存在的 `bundle` / `incremental_round`；其余标签是真包裹段，不能删 | F 出口 dogfood 看 `dropped` 计数；若可归因到此，改中和形态为保大小写 + 在前言告知模型「quote 取原文」 |
+| F 接线备忘（批 D 审计 I 项） | `run_single_shot(backend, user_prompt: &str, ..)` 硬编 `NO_TOOLS_SYSTEM` + `User(String)` + `parse_lens_output`；`LensRequest { prompt: String }` / `LensCall { findings }` 承载不了 `ScanPrompt` / `ScanOutput` | F-2 新开 scanner 通路：`[System(head), UserBlocks(blocks)]` → `parse_scan_output_with_stats` → `REPAIR_PROMPT_SCAN` → `anchor_suspicions(root, ..)`；`CellRecord.template_hash` 单值，F 定 head + tail 合成（如 `fnv1a64_hex(&[head, tail])`）；`--pack-only` 的 `bytes` / `est_tokens` 仍按旧 `build_bundle_prompt` 计，F 切到 scan prompt 后同步换（含 system 段） |
+| `ScanParseStats.dropped_malformed` 混计 | 非对象疑点与无 `file` 的 `scanned_area` 同一计数 | F 写 warn 文案若需分开再拆字段 |
+| `eval/_oracle.load_oracle` 缺 `--set` 直接 `ValueError` 回溯 | 非友好提示 | M21e 清扫 |
+| Full 档脏树场景与 dev 基线的差异 | `synth_diff` 一旦任一 hunk 重锚定偏移，梯子 `changed_def_ranges` 锚点从「每 hunk 首行」变「全部改动行」（每行一个单行 hunk）→ Full 档 def 体级产出比 dev 多；K10「Full = 现状」应加此例外（复审修 2 有记录、措辞未更新） | 出口 3 A/B 用干净树即无此差异；prd K10 措辞补例外 |
+| `FileCtx`「一次解析」未尽 | `all_defs` 对同一文件在 `slice_file` 与 `outside_names` 各算一次，`content.lines().collect()` 三次（切片 / 梯子 / 文件外） | 大仓变慢再缓存进 `FileCtx`（与「N 组 N 次走仓」同批） |
+| `bracket_delta_code` 只认行内 `//` | 块注释 / 多行字符串里的括号仍计深度（多为 `value_end` 400 行护栏回落单行 = 少吞，或 import 组保留提前截止） | 语料出现再修 |
+| `anchor_offset` 锚错位置（PLAUSIBLE，未构造实证） | hunk 只有一个有信息量但内容常见的 `+` 行（如 `Ok(())`）且坐标陈旧时取最近同文本行为偏移；禁真空性质仍成立、语义定位可能错 | dogfood 观测（脏树评审场景） |
+| 批 E 归档制品 `implement.md` §2 / §3 自报测试名与实际不符 | 测试按场景合并重命名（覆盖在，见审计映射） | 归档制品不改；此处记一笔 |
+| slice 档骨架级梯子无测试 | `slice_ladder_takes_over_when_over_budget` 只到 def 体级；骨架级代码与 Full 共用 | M21e 清扫时补 |
 
 ## 跨里程碑观测面（每个里程碑出口必报，写进 RunMeta 或 research）
 
