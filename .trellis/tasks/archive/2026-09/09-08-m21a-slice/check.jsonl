@@ -1,0 +1,4 @@
+{"file": ".next/plans/2026-09-07-redteam-m21a-scan-foundation-plan.md", "reason": "批 E 每 task 的测试锚（禁真空性质 / 小文件逐字节 / 折叠计数 / 梯子接管 / K 帽 / omit / 不越 root）与 commit 文案；Global Constraints 的 clippy / make verify / 不入公司内容"}
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§10.2 六层是否逐层被实现：核 / 一跳 / 地图 / 折叠 / 文件外 / 禁真空；小文件全文；full 旋钮仍可用"}
+{"file": ".next/roadmap/M21a-scan-foundation.md", "reason": "验收：--help 不变（无新旗）、make verify 绿；对照基线 dev 二进制不受影响（make build 未跑）"}
+{"file": ".trellis/spec/guides/index.md", "reason": "AI 交叉评审假阳模式（信任边界：walker / git diff 路径非模型可控 vs needs 模型可控）与 Pre-Modification 搜索规则"}

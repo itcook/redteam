@@ -1,0 +1,7 @@
+{"file": ".next/plans/2026-09-07-redteam-m21a-scan-foundation-plan.md", "reason": "批 E 任务 E-1…E-4 的 Modify / 测试 / Commit 定义、Global Constraints（三标配、每 task 检查项、不顺手修）、波次碰撞（D 与 E 无交集、C 已合回）"}
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§10.1 装包单位 = 改动中心切片；§10.2 六层配方表、slice_min_bytes、三层同批、回退信号；§10.3 段序与 cache 断点（切片块在证据段内）"}
+{"file": ".next/decisions/2026-09-04-redteam-review-engine-architecture-decisions.md", "reason": "D4 切片定案与 F3 失败模式（真空 / 缺依赖）；D8 slice 默认与四条保险（full 旋钮 / 三层同批 / 小文件全文 / 回退信号）"}
+{"file": ".next/roadmap/M21a-scan-foundation.md", "reason": "交付项 5b 与验收「E2 slice vs full A/B」口径（本批只交付仪表，A/B 在出口 3）"}
+{"file": ".next/roadmap/followup.md", "reason": "R7 slice 回退信号 / slice_min_bytes；:55 over_budget 未消费接缝；:50 lib.rs 超级枢纽（切片后单 cell 体积）"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "新 helper 前先搜：ref_worthy / skeleton_of / hunk_window_block / WalkBuilder+grep_searcher（tools）/ is_denylisted_path 复用而非复制"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "config → cli(pack_opts) → pack → prompt(render_dossier_section) 跨层数据流；PackStats 与 dossiers 并行传递"}

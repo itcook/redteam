@@ -11,7 +11,7 @@ use crate::output::Format;
 use crate::provider::{LensRequest, ReviewProvider};
 use std::path::Path;
 
-mod deny;
+pub(crate) mod deny;
 mod incremental;
 mod second_pass;
 mod spec;
@@ -183,21 +183,29 @@ pub(crate) fn pack_budget_bytes(roles: &RoleSets) -> usize {
 /// degrades 静默于：不支持语言/无符号（pack 臂内部回落链承接）。
 /// meta.injected 是唯一可观测入口，供归因与生产诊断。
 /// `budget`=pack flat 预算（字节）；生产调用点由 `pack_budget_bytes` 按启用模型窗算出。
-pub(crate) fn build_packs(bundles: &[crate::bundle::Bundle], root: &std::path::Path, budget: usize) -> (Vec<String>, DossierMeta) {
+pub(crate) fn build_packs(
+    bundles: &[crate::bundle::Bundle],
+    root: &std::path::Path,
+    budget: usize,
+    opts: &crate::pack::PackOpts,
+) -> (Vec<String>, DossierMeta, Vec<crate::pack::PackStats>) {
     // M21a 批 C：bundles 来自引用图分组（design §3.2，门未过时退化为单包），每格只装自家文件——
     // 视野外的改动文件由跨组索引（`{{OTHER_CHANGED_FILES}}`）而非兄弟注入提供。超预算由 build_pack
     // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，分组「宁降不拆」不靠分格避让。
-    let entries: Vec<String> = bundles
+    // 全变更集路径：文件外片段搜索排除（它们已在各自的 cell 里，视野外的由跨组索引提供）。
+    let changeset: Vec<String> = bundles.iter().flat_map(|b| &b.files).map(|f| f.path.clone()).collect();
+    let (entries, stats): (Vec<String>, Vec<crate::pack::PackStats>) = bundles
         .iter()
         .map(|b| {
             // 预算记账扣本格自己的 diff 字节（单格默认下即全变更集真实 diff）。
             let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
-            crate::prompt::render_dossier_section(&crate::pack::build_pack(b, root, budget, own_diff_bytes))
+            let packed = crate::pack::pack_bundle(b, root, budget, own_diff_bytes, opts, &changeset);
+            (crate::prompt::render_dossier_section(&packed.text), packed.stats)
         })
-        .collect();
+        .unzip();
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
     let meta = DossierMeta { bundles: bundles.len(), injected };
-    (entries, meta)
+    (entries, meta, stats)
 }
 
 /// 三条路径（全量 / 增量 / `--pack-only`）共用的「pack 预算 + spec 参照段」：spec 帽夹紧到 pack 预算一半
@@ -209,13 +217,15 @@ pub(crate) fn budget_and_spec(roles: &RoleSets, spec: &[String]) -> (usize, Stri
     (budget_raw.saturating_sub(spec_used), spec_section, warnings)
 }
 
-/// cell 规划产物：分组 + 每组卷宗 + 每组跨组索引（三者等长等序）+ 观测。
+/// cell 规划产物：分组 + 每组卷宗 + 每组跨组索引 + 每组装包形态（四者等长等序）+ 观测。
 pub(crate) struct CellPlan {
     pub bundles: Vec<Bundle>,
     pub dossiers: Vec<String>,
     pub others: Vec<String>,
     pub dossier_meta: DossierMeta,
     pub stats: GroupingStats,
+    /// 每组装包形态（批 E K13）：`--pack-only` 消费；RunMeta 接线 F-5。
+    pub pack_stats: Vec<crate::pack::PackStats>,
 }
 
 /// 筛选后证据 → 引用图分组（design §3.2，预算门喂 pack 预算）→ 装包 → 跨组索引（design §10.6）。
@@ -225,15 +235,17 @@ pub(crate) fn plan_cells(
     root: &Path,
     budget: usize,
     grouping_cfg: &crate::config::GroupingCfg,
+    pack_cfg: &crate::config::PackCfg,
     extra_paths: &[String],
     delta: Option<&std::collections::BTreeSet<String>>,
 ) -> CellPlan {
     let grouping = group(selected, Some(root), &grouping_opts(grouping_cfg, budget));
     let bundles = grouping.bundles;
-    let (dossiers, dossier_meta) = build_packs(&bundles, root, budget);
+    // `review.pack`（config.json，批 A-2 子表）→ 装包旋钮：缺省 slice〔D8〕、`full` 留旋钮（批 E K1）。
+    let (dossiers, dossier_meta, pack_stats) = build_packs(&bundles, root, budget, &crate::pack::PackOpts::from(pack_cfg));
     let others =
         crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, extra_paths, delta), bundles.len());
-    CellPlan { bundles, dossiers, others, dossier_meta, stats: grouping.stats }
+    CellPlan { bundles, dossiers, others, dossier_meta, stats: grouping.stats, pack_stats }
 }
 
 /// `review.grouping`（config.json，批 A-2 子表）→ 分组阈值；预算门由 pack 预算喂（批 C followup「后合者接一行」，2026-09-08 合入）。
@@ -291,11 +303,11 @@ pub async fn run_code_review(
     let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
     // 2. 分组 / 装包 / 跨组索引（plan_cells：与增量、--pack-only 同源）。门未过 → 单包（即原 E9 单格全审）。
     // GroupingStats 暂只在 --pack-only 报（RunMeta 接线 F-5）。
-    let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &cfg.review.grouping, &[], None);
+    let CellPlan { bundles, dossiers, others, dossier_meta, .. } = plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
     // 二阶段补查构造器（design §2.3）：cell 声明 needs → 置换式重建 prompt 补跑一趟。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
         let other = others.get(idx).map(String::as_str).unwrap_or("");
-        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "", &spec_section, other)
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, "", &spec_section, other, &crate::pack::PackOpts::from(&cfg.review.pack))
     };
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, "", &dossiers, &oopts, sink, Some(&mk), &spec_section, &others).await;
     // T46①：--spec denylist/PEM 拒读 warnings 并入 run.warnings（CI/bot 可见，不仅 eprintln）。
@@ -397,6 +409,8 @@ pub struct PackCell {
     pub pack_bytes: usize,
     pub diff_bytes: usize,
     pub over_budget: bool,
+    /// 装包形态（批 E K13）：body / sliced / small_full / ladder / folded_lines / outside_*。
+    pub pack: crate::pack::PackStats,
 }
 
 /// `--pack-only` 报告（stdout 文本行 + `packs/<job>/summary.json` 同源，K12）。
@@ -428,7 +442,8 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     // 角色集为空（无配置）时按 128K 窗保守缺省，不报错——仪表无 provider 也能跑。
     let roles = cfg.active_roles();
     let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
-    let CellPlan { bundles, dossiers, others, stats, .. } = plan_cells(select_files(changes), cwd, budget, &cfg.review.grouping, &[], None);
+    let CellPlan { bundles, dossiers, others, stats, pack_stats, .. } =
+        plan_cells(select_files(changes), cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
     let focus = args.focus.clone().unwrap_or_default();
 
     let job_id = gen_job_id(cwd);
@@ -455,6 +470,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
             pack_bytes: dossier.len(),
             diff_bytes: b.files.iter().map(|f| f.diff.len()).sum(),
             over_budget: b.over_budget,
+            pack: pack_stats.get(i).cloned().unwrap_or_default(),
         });
     }
     if cells.is_empty() {
@@ -479,9 +495,11 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
 pub fn render_pack_only(r: &PackOnlyReport) -> String {
     let mut out = String::new();
     for c in &r.cells {
+        let p = &c.pack;
         out.push_str(&format!(
-            "cell-{} files={} bytes={} est_tokens={} pack_bytes={} diff_bytes={} over_budget={}\n",
-            c.cell, c.files, c.bytes, c.est_tokens, c.pack_bytes, c.diff_bytes, c.over_budget
+            "cell-{} files={} bytes={} est_tokens={} pack_bytes={} diff_bytes={} over_budget={} body={} sliced={} small={} ladder={} folded_lines={} outside_sites={} outside_sigs={}\n",
+            c.cell, c.files, c.bytes, c.est_tokens, c.pack_bytes, c.diff_bytes, c.over_budget,
+            p.body, p.sliced, p.small_full, p.ladder, p.folded_lines, p.outside_sites, p.outside_sigs
         ));
     }
     if r.cells.is_empty() {
@@ -2063,7 +2081,7 @@ mod tests {
             }]),
         ];
 
-        let (entries, meta) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
+        let (entries, meta, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES, &crate::pack::PackOpts::full());
         assert!(entries[0].contains("target") && entries[0].contains("改动源文"), "bundle 1 自家内容非空含 0 壳: {entries:?}");
         assert!(entries[1].contains("other"), "bundle 2 自家内容非空: {entries:?}");
         assert_eq!(meta, DossierMeta { bundles: 2, injected: 2 });
@@ -2097,7 +2115,8 @@ mod tests {
             FileChange { path: "src/a.rs".into(), diff: "@@ -1,0 +1,1 @@\n+pub fn alpha_marker() {}\n".into() },
             FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() },
         ])];
-        let (on, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES);
+        // full 档：本测试锚的是回落梯子的真 diff 穿透（slice 档由 pack::tests 覆盖）
+        let (on, _, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES, &crate::pack::PackOpts::full());
         assert!(on[0].contains("alpha_marker"), "小文件全文在场");
         // 真 diff 穿透证明（集成级）：超预算文件迫入 def 锚回落分支（changed_def_ranges
         // 消费其真 diff）——空 diff 占位回归下无锚可寻，以下两条断言全灭。

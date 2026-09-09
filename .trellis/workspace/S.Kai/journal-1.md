@@ -217,6 +217,16 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 [OK] **Completed**
 
 
+## Session 11: M21a 批 E：切片装包（feat/m21a-slice）——E-1 一跳 / E-2 切片配方 / E-3 文件外片段 / E-4 接线与观测 + code-review 十修
+<!-- trellis-session: v=2 fp=2f671af057c86a97 -->
+
+**Date**: 2026-09-08
+**Task**: M21a 批 E：切片装包（feat/m21a-slice）——E-1 一跳 / E-2 切片配方 / E-3 文件外片段 / E-4 接线与观测 + code-review 十修
+**Branch**: `feat/m21a-slice`
+
+### Summary
+
+Trellis 09-08-m21a-slice：diffsym 文件级 def / 全改动行锚定 / 一跳（ref_worthy 迁入）；pack 改动中心切片（核 / 一跳 / 文件头 + 全部签名 / 折叠标记带行号与 def 名 / 禁真空 hunk 窗 / 小文件全文逐字节等同 full / 梯子接管）与文件外片段（调用点 ±30、签名 + doc、四类跳过、段帽 = 组预算 / 8、每名 K=3）；plan_cells 读 review.pack、--pack-only 报 PackStats；e2e 覆盖两档。code-review high 十条全修（hunk 重锚定、值 def 括号配平、名字优先级与测试排除、sink 有效命中、import 行非调用点、非支持语言头限顶、多行 import 组、二阶段 second_pass 档、凭据判据拆分、cap 早退与 omit 收敛）。本仓两档对比：slice 比 full 省 28% pack 字节 / 20% token。三道门：lib 524 / e2e 17 绿、clippy 7 = 基线、make verify 绿。待用户 --no-ff 合回 feat/m21-review-engine；followup 记切片措辞交 D-2、--pack-body 旗待裁、常数归 R7、N 组 N 次走仓、extra_paths 泄漏 PLAUSIBLE、over_budget 组切片仍大。
 ## Session 10: M21a 批 D 契约与提示词：疑点 parse + shared-head/scanner 模板 + 四块段序 + 三段界 cache + 评分器 + 评审修复
 <!-- trellis-session: v=2 fp=f3e5b208a1f8f412 -->
 
@@ -232,6 +242,36 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 
 | Hash | Message |
 |------|---------|
+| `ef8773e` | feat(diffsym): 文件内一跳（改动 def 的同文件 callee / caller）——DefRange / all_defs / changed_defs 全改动行锚定，ref_worthy 迁入 |
+| `9ff03c3` | feat(pack): 改动中心切片——核/一跳/文件地图/折叠/禁真空兜底，slice_min_bytes 小文件全文（design §10.2〔D8〕） |
+| `c09636e` | feat(pack): 文件外片段——caller 调用点 ±N 与 callee 签名，受预算帽（design §10.2 文件外层） |
+| `d374040` | feat(cli): [review.pack] body 接线——slice 默认、full 旋钮、--pack-only 报装包形态（PackStats） |
+| `4512734` | docs(followup): 批 E 延后项——切片措辞交 D-2 / --pack-body 旗待裁 / 常数归 R7 / 文件外读守卫口径；关闭「over_budget 未消费」（K9 定论） |
+| `e492334` | fix(pack): 评审修复（code-review high 十条）——hunk 重锚定、值 def 括号配平、调用点名字优先级与测试排除、sink 只计有效命中、import 行非调用点、非支持语言头限顶、多行 import 组、二阶段带文件外片段、凭据判据拆分、cap 早退与 omit 收敛 |
+| `e9693e8` | docs(followup): 批 E 评审帽外项——N 组 N 次走仓 / 截断非确定、增量 extra_paths 泄漏（PLAUSIBLE）、over_budget 组切片仍大（预算门与装包口径待对齐） |
+| `e827f15` | chore(task): m21a-slice 规划与实施制品（prd / design / implement / jsonl，含 code-review 审核修复记录与两档对比数字） |
+
+### Status
+
+[OK] **Completed**
+
+
+## Session 12: M21a 批 E 第二轮复审：code-review high 九修一不改（feat/m21a-slice）
+<!-- trellis-session: v=2 fp=dd82b7d1b225f1fb -->
+
+**Date**: 2026-09-09
+**Task**: M21a 批 E 第二轮复审：code-review high 九修一不改（feat/m21a-slice）
+**Branch**: `feat/m21a-slice`
+
+### Summary
+
+用户要求再跑一轮 code-review 复审（只传 effort + SendMessage 钉范围，评审员开头即确认范围）。12 条送验证 → 前十条九条成立一次修掉：二阶段沿用用户 review.pack（full 对照臂不再被切成 slice）、FileCtx 一次读取 / 编译 / 重锚定供 0 壳梯子与文件外搜索共用、评分式重锚定（低信息行不定位、容忍个别行被改）、export def 不被 import 短路 + body_names 剔除关键字、$ 标识符手工边界（非消耗式）、签名名小写优先、item 级 #[cfg(test)] 区间、字符串感知括号计数、增强包文件不二次注入；不改：非支持语言 hunk 窗 ±30（plan 原文，prd K10/K16 已明示）。帽外记 followup：分组边与文件外键的「改动 def 名」两套口径。三道门：lib 534 / e2e 17 绿、clippy 7 = 基线、make verify 绿。待用户 --no-ff 合回 feat/m21-review-engine。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `687335d` | fix(pack): 复审修复（第二轮 code-review high 九条 + 帽外项）——二阶段沿用用户 review.pack、FileCtx 一次解析 / 一次重锚定共用、评分式重锚定、export def 不被短路、$ 标识符边界、签名名小写优先、item 级 cfg(test) 区间、字符串感知括号计数、增强包文件不二次注入 |
 | `f84b5d7` | feat(parse): 疑点契约 parse 字段级对齐 + quote 不在文件即丢弃 + needs 帽（design §4〔D11〕） |
 | `e360cdf` | feat(prompt): 模板拆分 shared-head.md + scanner.md，build_scan_prompt 四块段序 + 注入互斥与中和（design §10.3 / §10.7〔D6 D9〕） |
 | `86521b2` | feat(provider): anthropic kind 三段界 cache_control + 模板哈希入 CellRecord（D10） |
