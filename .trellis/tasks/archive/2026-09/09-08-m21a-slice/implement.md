@@ -59,6 +59,21 @@ outside_sites=0 因本批改动 def 的调用点只在变更集文件与 `tests/
 帽外项（`--help` 已补装包形态文案；N 组 N 次走仓 / 截断非确定 / 增量 `extra_paths` 泄漏 PLAUSIBLE / over_budget 组切片仍大）记 followup。
 修后：lib 524 / e2e 17 绿，clippy 7 = 基线，make verify 绿；本仓复跑 2 组 2.0 s（cell-2：sliced 6 / ladder 1 / outside_sites 1 / sigs 5）。
 
+### 第二轮复审（2026-09-09，用户要求再跑一轮 `/code-review high`，范围同上 + 首轮十修）
+8 角度 → 12 条送验证（11 CONFIRMED / 1 PLAUSIBLE），前十条：九条成立一次修掉（commit `fix(pack): 复审修复…`），一条不改：
+1. 二阶段硬编码 `PackOpts::second_pass()` 无视 `review.pack`（full 对照臂被切成 slice）→ `second_pass(&user)` 只改 `slice_min_bytes`，`second_pass_prompt` 穿 `PackOpts`（两处调用方传 `cfg.review.pack`）。
+2. 重锚定只在 slice_file，梯子与 outside_names 仍用陈旧坐标 → `FileCtx` 一次读取 / 编译 / 重锚定，全部消费者共用（顺带修帽外效率项：改动文件读 3 次、compile_defs 2 次、classify 跑两遍）。
+3. `is_import_line` 含 `export ` 短路掉 `export function foo(` → export 只算 re-export；连带 `body_names` 剔除能过 ref_worthy 的关键字（`function` 等）。
+4. `anchor_offset` 精确全匹配 + 低信息 `}` 行误锚 → 只按有信息量 + 行打分，容忍个别行被改，纯括号行不定位。
+5. 首个 `#[cfg(test)]` 之后一刀切 → `rust_test_ranges`（mod 级整块 / item 级单 item）。
+6. `value_end` 把字符串 / 注释里的括号算进深度（`const RE: &str = r"(";` 吞后续 fn）→ `bracket_delta_code`。
+7. sig_of ASCII 序截断偏向大写 std 名 → 小写开头优先再截。
+8. 二阶段 `changeset_paths` 不含增强包文件 → needs 文件同内容双份 → 排除集并上 `pb.files`。
+9. `\b` 边界让 `items$` 永不命中 → 裸 alternation + 手工标识符边界（非消耗式，顺带修「相邻两名互吃边界」）。
+10. **不改**：非支持语言 hunk 窗 ±20→±30 破坏「full = 现状」——plan E-2 原文即 `hunk_window_block(±anchor_window)`，prd K10 / K16 已明示例外；E2 A/B 的两臂都在同一二进制内比较，dev 基线是单独归档的对照集。
+帽外：`changed_def_names`（分组边）与 `outside_names`（文件外键）口径分叉（hunk 首行 + block_end vs 全改动行 + value_end + 测试排除）记 followup；`is_comment_line` 已统一到 diffsym；`hunk_window_block` 上界多算一行为基线既有。
+修后：lib 534 / e2e 17 绿，clippy 7 = 基线，make verify 绿。
+
 ## 验证命令
 ```
 cargo test
