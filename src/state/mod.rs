@@ -168,6 +168,10 @@ pub struct CellRecord {
     pub warn: Option<String>,
     #[serde(default)]
     pub duration_ms: u64,
+    /// 排队等待毫秒（provider 在途门 + 角色 worker 许可），含在 `duration_ms` 内；扇出路径填，resume / 旧记录 0
+    /// （M21a 出口验收：PR181 7 格 / workers 4 时 100-140 s 排队与生成时长不可分）。
+    #[serde(default)]
+    pub queue_wait_ms: u64,
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
@@ -196,7 +200,7 @@ impl CellRecord {
     pub fn ok(cell: impl Into<String>, model: impl Into<String>, output: crate::domain::CellOutput) -> Self {
         Self {
             cell: cell.into(), model: model.into(), family: String::new(), ok: true, output, warn: None,
-            duration_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0,
+            duration_ms: 0, queue_wait_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0,
             tool_use: Default::default(), template_hash: None,
         }
     }

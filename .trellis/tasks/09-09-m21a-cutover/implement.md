@@ -81,3 +81,12 @@ dogfood：`cargo run -q -- review --base feat/m21-review-engine --format json`�
 帽外已验证并修：`--incremental-from --background` 先建 job 再在 worker 里 bail → main 层早拒（e2e 锚）；琐碎 quote（`}`）经 min-set 公式误合并 → 去空白 < 12 字符只认相等；hint 换行伪造 md bullet → 渲染单行化；`CellSummary` 两处手写映射 → `CellSummary::from_record`；`CellInput.prompt` 与 `scan` 双存（每 cell MB 级）→ scan cell 留空。
 未改（记 followup）：Anthropic thinking + tools 互斥守卫（M21b 工具往返才可达）；`resolve --help` 仍提增量轮消费（M21c）；`exit_code` 第二参在 scan 路径恒 false；`ScanResults.usage / failed / needs_declared` 生产无消费者（测试用）；`lines_overlap` 与 `dedup::overlaps` 同形不同型；`anchor_suspicions` 每疑点重读同文件。
 修后：lib 531 / 16 / 7 / e2e 17 绿；clippy 三条既有；make verify 绿。
+
+## 7. 出口验收（2026-09-09，另起 session；plan 表 4；记录 `.next/private/m21a/2026-09-09-m21a-exit-acceptance-record.md`）
+
+- [x] 1-10 全部跑完：8 过；验收 1 的分组（7 > 5）与墙钟（311 / 403 / 458 s > 3 min）未过——成因、数据与处置选项登记 followup「M21a 出口验收延后项」，roadmap M21a 状态 🟡 待裁。
+- [x] 顺手修两处观测缺口（本 session 改码，lib 532 / e2e 17 / clippy 3 = 基线）：`parse_anthropic_stream` 对 `message_delta` 的 input / cache 分列在场即覆盖（agc 网关 GLM 格 usage 恒 0）+ 单测；`ScanCall.repair_note` 首发解析失败诊断进 cell warn（dogfood 一格三跑全 REPAIR、直发三次皆合法，待诊断定位）+ 断言。
+- [x] research §17 dev 对照基线、§18 E2 slice vs full；E3 评分基线 → `score-slice.json`（改模板后 `--baseline` 用）。
+- [x] 用户裁（2026-09-09）：墙钟按 workers / 并发开大后可接受、门槛改按「排队 + 最长格」可读；分组「≤ 5」撤、改可观测项，拆大格保持 followup 待 aacr-bench；workers 形态（自适应规则 / 改命令参数不设配置键）留 grill。
+- [x] 出口修补批：排队告警（cell 数 > workers → run.warnings）、`CellRecord/CellSummary.queue_wait_ms`（含在 duration_ms 内）、零疑点短输出 cell warn（阈值 2,000 token）、`review --help` 并发说明；lib 533 / clippy 3 / e2e 17 / make verify 绿；roadmap M21a ✅、README 同步。
+- [x] 墙钟 A/B（2026-09-09 09:46）：`run_scan_fanout` 大格先发（按组 diff 字节降序派发、plan 序回收）+ 单测；A 现状 311 / 402 / 457 → B1 workers 4：283 / 247 / 234 → B2 workers 8：189 / 202 / 251 s。scanner 并发的约束门是 `review.scanners.workers`（缺省 4），provider `maxConcurrency` 不是；lib 533 / e2e 17 / clippy 3。

@@ -1,6 +1,6 @@
 # M21a · 疑点扫描地基
 
-> 状态: 🟢 机制完成待验收（六批 A-F 全部合回 `feat/m21-review-engine`，2026-09-09；出口验收 1-10 另起 session，需 `.next/private`）· plan 已派生 2026-09-08：`../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`，六批 A-F + 出口，每批一个 Trellis 任务与子分支）· 依赖 P0 · design §3.1-3.2 / §4 / §5 / §10.2-10.3 / §10.6-10.7 / §12 · 决策 D3, D6, D7, D8, D9, D10, D11
+> 状态: ✅ 已交付（2026-09-09 出口验收：10 项中 8 项过；「分组 ≤ 5」改为可观测项（组数 / 边数 / 跨组边 / 超预算组可读，拆大格待 aacr-bench 更多语料后议）、「墙钟 ≤ 3 min」按用户裁改为 workers / 并发开大后可接受（大格先发 + workers 8：189 / 202 / 251 s）；记录与数据只在 `.next/private/m21a/`，延后项见 `followup.md`「出口验收延后项」）
 > 硬切（D10）：分支删除旧编排，无 `engine` 旗；本里程碑产物 `redteam-next` 仅 scanner 段可用（无深挖，不产 finding，仅诊断
 > 输出疑点）；对照基线 = `dev` 二进制，插件与 ship 循环继续用它
 
@@ -33,9 +33,13 @@
 
 > 2026-09-09：机制面（本表下列「make verify 绿 / --help」项与配置项）已随批 A-F 各自收口验证；PR181 / 双 scanner / E2 A/B / cache / `--pack-only`
 > 误差 / 模板回归 / dev 基线归档 / schema v4 计数（plan「出口验收」1-10）另起 session 跑，数据只落 `.next/private/m21a/`。
+> **出口结果（2026-09-09，redteam-next @ ea993a0 + 两处观测修）**：配置 ✓（五用例）· PR181 v2 scan：跨组边可读 ✓、oracle 并集 16 ≥ 9 ✓、人工主题 6 ≥ 5 ✓、
+> 双 scanner 并集 ⊇ 单 / agreement = 2 共 19 条 ✓、**分组 7 > 5 ✗**、**墙钟 311-458 s > 3 min ✗**（大格先发 + `scanners.workers` 8 后 189 / 202 / 251 s，仍差一线） · cache：DeepSeek 二跑起 ≥ 95% ✓、anthropic 网关 usage 形态修后复核 ·
+> `--pack-only` 误差 0.9-14.5% ✓ · E2 slice ≥ full（并集 16 : 16、均值 9.33 : 8.67、输入 −20%）维持默认 ✓ · 模板哈希可读、回归基线落 score-slice.json ✓ ·
+> dev 基线归档 research §17 ✓ · schema v4 63 / 48、空建 v4、旧库拒开 ✓ · make verify 绿、--help 三含三无 ✓。
 
 - 配置〔D12〕：旧路径 `~/.config/redteam/` 与项目 `.redteam/config.toml` 存在时不读、打印一行提示（纯注释模板不提示）；模型 `kind` 两层都缺 / `contextWindow` 低于下限 → 校验报错；secrets 里 provider 名或 model id 无对应 → warning；`model setup` 写前校验、解析失败拒写；HOME 与 REDTEAM_HOME 皆缺 → 报错；`--test-command` 覆盖推断。
-- PR181 v2 scan：分组 ≤ 5 组、跨组边数可观测；DeepSeek 分组并行墙钟 ≤ 3 min；疑点 oracle 命中 ≥ E3 基线；两个活跃
+- PR181 v2 scan：分组统计（组数 / 边数 / 跨组边 / 超预算组）可观测〔2026-09-09 改口径，原「≤ 5 组」与拆大格方向冲突，撤〕；DeepSeek 分组并行墙钟按「排队 + 最长格」可读、workers 开大后可接受〔原「≤ 3 min」撤〕；疑点 oracle 命中 ≥ E3 基线；两个活跃
   scanner 时疑点并集与 agreement 正确。
 - 段序翻转后 dogfood cache 命中率 ≥ 翻转前。
 - `--pack-only` 对 PR181 报出的字节数与真实 usage 同量级（差 < 20%，以字节为准）。

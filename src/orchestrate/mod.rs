@@ -133,6 +133,9 @@ pub struct ScanResults {
 
 /// 零推理观测阈值：钉了档位、`reasoning_tokens == Some(0)` 且输出 token 低于此值 → cell warn（不重跑，K5）。
 pub const ZERO_REASONING_SHORT_OUTPUT_TOKENS: u64 = 200;
+/// 零疑点观测阈值：锚定后 0 疑点且输出 token 低于此值 → cell warn（M21a 出口验收：PR181 某格 8 s / 883 token / 0 疑点，
+/// 其他跑同格 1-3 条，是 E3 §16.3「零推理短输出」双峰的产品侧再现；正常格输出 8-38K）。不重跑，只观测。
+pub const ZERO_SUSPICION_SHORT_OUTPUT_TOKENS: u64 = 2_000;
 
 /// cell 命名（K1）：`scan[g<n>]@<provider/id>#<k>`，n / k 均从 1 起。
 pub fn scan_cell_id(group: usize, route_key: &str, sample: u32) -> String {
@@ -217,32 +220,56 @@ pub async fn run_scan_fanout(
         s.manifest(&inputs);
     }
     let workers = Arc::new(Semaphore::new(input.workers.max(1)));
-    let futs = plan.iter().map(|(g, e, k, id)| {
+    // 大格先发（M21a 出口验收）：worker 许可 FIFO、join_all 按序首轮 poll → 派发序 = 许可序。7 组 / 4 worker 时最大组排第六
+    // 让总墙钟 = 排队 + 最慢格；按组 diff 字节（输出量的主因）降序、次键 prompt 字节、再按 plan 序派发，结果仍按 plan 序回收
+    // （cell_id / manifest / 报告顺序不变）。workers ≥ 组数时无排队，此序无影响。
+    let diff_bytes: Vec<usize> = input.bundles.iter().map(|b| b.files.iter().map(|f| f.diff.len()).sum()).collect();
+    let prompt_bytes: Vec<usize> = prompts.iter().map(|p| p.system.len() + p.blocks.iter().map(|b| b.text.len()).sum::<usize>()).collect();
+    let mut dispatch: Vec<usize> = (0..plan.len()).collect();
+    dispatch.sort_by(|&a, &b| {
+        let (ga, gb) = (plan[a].0, plan[b].0);
+        diff_bytes[gb].cmp(&diff_bytes[ga]).then(prompt_bytes[gb].cmp(&prompt_bytes[ga])).then(a.cmp(&b))
+    });
+    let futs = dispatch.iter().map(|&pi| {
+        let (g, e, k, id) = &plan[pi];
         let workers = Arc::clone(&workers);
         let prompt = &prompts[*g];
         let template_hash = template_hash.clone();
         async move {
             let t0 = std::time::Instant::now();
+            let mut queue_wait_ms = 0u64;
             // 先过 provider 在途门，再取 worker 许可（评审修 7）；未注册条目在此即失败（不占 worker）。
             let res = match registry.lease(&e.route_key).await {
                 Ok(lease) => {
                     let _permit = workers.acquire().await.expect("workers semaphore never closed");
+                    queue_wait_ms = t0.elapsed().as_millis() as u64; // 两道门都过了才算发出：之前全是排队
                     lease.run(prompt).await
                 }
                 Err(err) => Err(err),
             };
             let duration_ms = t0.elapsed().as_millis() as u64;
-            let (record, output) = scan_cell_record(id, &e.route_key, &e.family, e.thinking_pinned, input.root, res, duration_ms, template_hash);
+            let (mut record, output) = scan_cell_record(id, &e.route_key, &e.family, e.thinking_pinned, input.root, res, duration_ms, template_hash);
+            record.queue_wait_ms = queue_wait_ms;
             if let Some(s) = sink {
                 s.on_cell(record.clone());
             }
-            ScanCellResult {
+            (pi, ScanCellResult {
                 cell_id: id.clone(), group: *g, route_key: e.route_key.clone(), family: e.family.clone(), sample: *k, record, output,
-            }
+            })
         }
     });
-    let cells: Vec<ScanCellResult> = futures::future::join_all(futs).await;
+    let mut cells: Vec<(usize, ScanCellResult)> = futures::future::join_all(futs).await;
+    cells.sort_by_key(|(pi, _)| *pi);
+    let cells: Vec<ScanCellResult> = cells.into_iter().map(|(_, c)| c).collect();
     let mut out = ScanResults::default();
+    let workers_n = input.workers.max(1);
+    if plan.len() > workers_n {
+        // 排队告警（M21a 出口验收）：墙钟 = 排队 + 最长格；用户能看见是哪道门在限流。
+        out.warnings.push(format!(
+            "scanner cells {} > review.scanners.workers {}: {} cell(s) queued (wall = queue wait + slowest cell; raise workers or check provider maxConcurrency)",
+            plan.len(), workers_n, plan.len() - workers_n
+        ));
+    }
     for c in &cells {
         out.usage.0 += c.record.input_tokens;
         out.usage.1 += c.record.output_tokens;
@@ -276,9 +303,13 @@ pub fn scan_cell_record(
     let (mut record, output) = match res {
         Ok(call) => {
             let anchored = anchor_suspicions(root, call.output);
-            let notes = scan_cell_notes(
+            let mut notes = scan_cell_notes(
                 &call.stats, anchored.dropped, anchored.dropped_unreadable, thinking_pinned, call.reasoning_tokens, call.output_tokens,
+                anchored.output.suspicions.len(),
             );
+            if let Some(n) = call.repair_note {
+                notes.push(n); // 首发解析失败的诊断进 cell warn（cell 仍 ok；出口验收观察）
+            }
             let mut rec = CellRecord::ok(cell_id, route_key, CellOutput::Scan(anchored.output.clone())).with_family(family);
             rec.input_tokens = call.input_tokens;
             rec.output_tokens = call.output_tokens;
@@ -309,6 +340,7 @@ fn scan_cell_notes(
     pinned: bool,
     reasoning: Option<u64>,
     output_tokens: u64,
+    suspicions: usize,
 ) -> Vec<String> {
     let mut notes = Vec::new();
     if st.dropped_no_quote + st.dropped_bad_path + st.dropped_malformed > 0 {
@@ -331,6 +363,9 @@ fn scan_cell_notes(
     }
     if pinned && reasoning == Some(0) && output_tokens < ZERO_REASONING_SHORT_OUTPUT_TOKENS {
         notes.push(format!("pinned thinking but zero reasoning tokens (output {output_tokens} tokens)"));
+    }
+    if suspicions == 0 && output_tokens < ZERO_SUSPICION_SHORT_OUTPUT_TOKENS {
+        notes.push(format!("0 suspicions with short output ({output_tokens} tokens)"));
     }
     notes
 }
@@ -389,7 +424,7 @@ mod tests {
 mod scan_tests {
     use super::*;
     use crate::evidence::git::FileChange;
-    use crate::provider::tool_loop::{AssistantTurn, FakeChatBackend};
+    use crate::provider::tool_loop::{AssistantTurn, ChatMessage, FakeChatBackend};
     use crate::provider::ProviderError;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -423,6 +458,31 @@ mod scan_tests {
     }
     fn input<'a>(bundles: &'a [Bundle], dossiers: &'a [String], others: &'a [String], root: &'a std::path::Path, entries: &'a [ScanEntrySpec], workers: usize, samples: u32) -> ScanFanoutInput<'a> {
         ScanFanoutInput { target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", root, entries, workers, samples }
+    }
+
+    /// 大格先发：workers = 1 串行化派发，三组 diff 字节 小 / 大 / 中 → 调用序 g2, g3, g1；`res.cells` 仍按 plan 序（g1, g2, g3）。
+    #[tokio::test]
+    async fn scan_fanout_dispatches_largest_diff_first_but_returns_plan_order() {
+        let repo = repo();
+        let mut reg = ProviderRegistry::new();
+        let backend = std::sync::Arc::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)));
+        reg.insert_scan("p/a", "p", 8, Box::new(std::sync::Arc::clone(&backend)), Duration::from_secs(5), 0);
+        let b: Vec<Bundle> = [("+s", 1), ("+L", 300), ("+M", 100)]
+            .iter()
+            .enumerate()
+            .map(|(i, (tag, n))| Bundle::from_files(vec![FileChange { path: format!("src/f{i}.rs"), diff: format!("{tag}{}", "x".repeat(*n)) }]))
+            .collect();
+        let entries = vec![entry("p/a", "alpha", false)];
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1, 1), None).await;
+        let ids: Vec<&str> = res.cells.iter().map(|c| c.cell_id.as_str()).collect();
+        assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g2]@p/a#1", "scan[g3]@p/a#1"], "结果按 plan 序回收");
+        let tag_of = |i: usize| -> &'static str {
+            let text = backend.messages_at(i).iter().filter_map(|m| match m { ChatMessage::UserBlocks(bl) => Some(bl.iter().map(|b| b.text.clone()).collect::<String>()), _ => None }).next().unwrap();
+            if text.contains("+Lxxx") { "L" } else if text.contains("+Mxxx") { "M" } else { "s" }
+        };
+        assert_eq!((tag_of(0), tag_of(1), tag_of(2)), ("L", "M", "s"), "派发序 = diff 字节降序");
+        assert!(res.warnings.iter().any(|w| w.contains("scanner cells 3 > review.scanners.workers 1: 2 cell(s) queued")), "{:?}", res.warnings);
+        assert!(res.cells.iter().all(|c| c.record.queue_wait_ms <= c.record.duration_ms), "排队时长含在 duration 内");
     }
 
     /// prd AC2：两条目 × 两组 = 四 cell；cell_id / route_key / manifest（含 scan prompt、model = route_key）/ roles / 模板哈希 / needs 计数 / usage。
@@ -535,8 +595,12 @@ mod scan_tests {
         let unpinned = vec![entry("p/a", "alpha", false)];
         let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &unpinned, 4, 1), None).await;
         assert!(!res2.cells[0].record.warn.as_deref().unwrap().contains("zero reasoning"));
-        assert!(!scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 300).iter().any(|n| n.contains("zero reasoning")));
-        assert!(scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 10).len() == 1);
-        assert!(scan_cell_notes(&Default::default(), 0, 0, true, None, 10).is_empty(), "provider 不分列 → 不报");
+        assert!(!scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 300, 1).iter().any(|n| n.contains("zero reasoning")));
+        assert!(scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 10, 1).len() == 1);
+        // 零疑点短输出（出口验收）：0 疑点 + 883 token → warn；0 疑点但输出正常体量不 warn；有疑点不 warn。
+        assert!(scan_cell_notes(&Default::default(), 0, 0, false, None, 883, 0).iter().any(|n| n.contains("0 suspicions with short output")));
+        assert!(scan_cell_notes(&Default::default(), 0, 0, false, None, 9_000, 0).is_empty());
+        assert!(scan_cell_notes(&Default::default(), 0, 0, false, None, 883, 1).is_empty());
+        assert!(scan_cell_notes(&Default::default(), 0, 0, true, None, 10, 1).is_empty(), "provider 不分列 → 不报");
     }
 }

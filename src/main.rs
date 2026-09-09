@@ -30,6 +30,8 @@ enum Cmd {
     /// （× samples）并行扇出 → 疑点并集（agreement = 家族数）→ 疑点索引 + 覆盖自报报告。**不产 finding**
     /// （深挖 / 复核 / verdict 在 M21b 起）。退出码：0=scan 完成（verdict scan-only）、1=命令自身失败（参数/IO/配置错误）、
     /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口）；2 / 10 在 M21b 深挖落地前不可达。
+    /// 并发 = min(`review.scanners.workers`（缺省 4）, provider `maxConcurrency`)：cell 数超过 workers 即排队，
+    /// 墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）。
     Review {
         /// diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]

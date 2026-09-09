@@ -255,7 +255,7 @@ mod tests {
         let susp = |file: &str, ls: u32, hint: &str, conf: f32, quote: &str| Suspicion { file: file.into(), line_start: ls, line_end: ls, hint: hint.into(), category: Some(Category::L1), confidence: conf, quote: quote.into() };
         let mut run = RunMeta { job_id: "j9".into(), models: vec!["p/a".into(), "q/b".into()], ..Default::default() };
         run.coverage.failed.insert(Role::Scanner, vec!["scan[g2]@q/b#1".into()]);
-        run.cells.push(CellSummary { cell: "scan[g1]@p/a#1".into(), model: "p/a".into(), role: "scanner".into(), ok: true, iterations: 1, attempts: 1, duration_ms: 1200, input_tokens: 1000, output_tokens: 50, cached_input_tokens: 400 });
+        run.cells.push(CellSummary { cell: "scan[g1]@p/a#1".into(), model: "p/a".into(), role: "scanner".into(), ok: true, iterations: 1, attempts: 1, duration_ms: 1200, queue_wait_ms: 0, input_tokens: 1000, output_tokens: 50, cached_input_tokens: 400 });
         let scan = ScanReport {
             groups: vec![
                 ScanGroup { label: "src/a.rs".into(), files: vec!["src/a.rs".into()], cells: vec!["scan[g1]@p/a#1".into(), "scan[g1]@q/b#1".into()], suspicions: 2, pack: crate::pack::PackStats { body: "slice".into(), sliced: 1, folded_lines: 30, ..Default::default() } },

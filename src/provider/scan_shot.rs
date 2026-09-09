@@ -26,6 +26,9 @@ pub struct ScanCall {
     pub finish_reason: Option<String>,
     /// 各轮 `reasoning_tokens` 之和；provider 不分列（anthropic）则 None。零推理 + 短输出的观测口径（prd K5）。
     pub reasoning_tokens: Option<u64>,
+    /// 首发解析失败、经 REPAIR 成功时的诊断（finish_reason / 文本长度 / 文本头）；首发即成功为 None。
+    /// 出口验收观察：dogfood 某格三跑全走 REPAIR 而直发同 prompt 三次首发皆合法——不落原因无从定位。
+    pub repair_note: Option<String>,
 }
 
 fn sum_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -50,12 +53,19 @@ pub async fn run_scan_shot(
     if let Ok((output, stats)) = parse_scan_output_with_stats(&turn.text) {
         return Ok(ScanCall {
             output, stats, input_tokens: in_tok, output_tokens: out_tok, cached_input_tokens: cached_tok,
-            iterations: 1, finish_reason: turn.finish_reason, reasoning_tokens: reasoning,
+            iterations: 1, finish_reason: turn.finish_reason, reasoning_tokens: reasoning, repair_note: None,
         });
     }
 
     // 首发 parse 失败：把模型的原话作为 assistant 轮回灌（模型能看见自己写了什么；anthropic 要求角色交替），再补
     // REPAIR_PROMPT_SCAN + turn_final。本轮若失败（超时 / 网络），把首发已烧的 usage 附着到错误上（T25 口径）。
+    let head: String = turn.text.trim().chars().take(80).collect();
+    let repair_note = format!(
+        "first turn parse failed (finish={}, text_len={}, head={:?}); repaired",
+        turn.finish_reason.as_deref().unwrap_or("none"),
+        turn.text.len(),
+        head
+    );
     if !turn.text.trim().is_empty() {
         messages.push(ChatMessage::Assistant { text: turn.text.clone(), tool_calls: vec![] });
     }
@@ -71,7 +81,7 @@ pub async fn run_scan_shot(
     match parse_scan_output_with_stats(&repair.text) {
         Ok((output, stats)) => Ok(ScanCall {
             output, stats, input_tokens: in_tok, output_tokens: out_tok, cached_input_tokens: cached_tok,
-            iterations: 2, finish_reason: repair.finish_reason, reasoning_tokens: reasoning,
+            iterations: 2, finish_reason: repair.finish_reason, reasoning_tokens: reasoning, repair_note: Some(repair_note),
         }),
         Err(_) => Err(diagnostic_parse_error(&repair).attach_usage((in_tok, out_tok, cached_tok))),
     }
@@ -128,6 +138,8 @@ mod tests {
         assert_eq!(call.iterations, 2);
         assert_eq!((call.input_tokens, call.output_tokens, call.cached_input_tokens), (20, 8, 4));
         assert_eq!(call.reasoning_tokens, Some(8));
+        let note = call.repair_note.as_deref().expect("repair 路径须落诊断");
+        assert!(note.contains("first turn parse failed (finish=stop, text_len=20, head=\"sorry, here is prose\")"), "{note}");
         assert_eq!(b.final_call_count(), 1);
         let seen = b.messages_at(1);
         assert_eq!(seen.len(), 4, "system + blocks + assistant 原话 + repair: {seen:?}");

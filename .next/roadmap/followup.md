@@ -122,7 +122,7 @@
 | 项 | 现状 | 归属 |
 |---|---|---|
 | resume scan 重放无生产验证 | `run_resume` 用 manifest `scan` 请求重放差集 cell（旧格式作业记失败）；只有单测 / e2e 空 manifest 锚，无真 provider dogfood；角色集按当前配置重建 | M21b 队列快照 checkpoint 落地后重做（resume 读快照里的角色条目） |
-| thinking 映射未在真网关实测的家族 | 映射表按官方文档（2026-09-09）：GLM anthropic 形态文档无字段 → 无映射 + warning；Qwen `enable_thinking` / Gemini `reasoning_effort` 未实测；本仓 dogfood 只覆盖 DeepSeek（`thinking` + `reasoning_effort`）与 Qwen（openai 形态） | 出口 2（GLM 5.3 双 scanner）前补 GLM anthropic 形态；其余按模型接入时实测 |
+| thinking 映射未在真网关实测的家族 | 映射表按官方文档（2026-09-09）：GLM anthropic 形态文档无字段 → 无映射 + warning；Qwen `enable_thinking` / Gemini `reasoning_effort` 未实测；本仓 dogfood 只覆盖 DeepSeek（`thinking` + `reasoning_effort`）与 Qwen（openai 形态） | 出口 2 已跑（2026-09-09）：GLM 5.3 anthropic 形态无映射 → registry warning 1、未发思考参数，网关默认仍有推理输出，并集 / agreement 正常；映射待 Z.ai anthropic 文档给字段；其余按模型接入时实测 |
 | 增量轮显式报错 | `run_incremental_review` bail（M21c 恢复）；e2e `incremental_from_bails_until_m21c` 锚住报错；原 carry 端到端锚（携带 / dispute / re-raise）与 `render_incremental_section` / `two_layer_manifest` 随旧路径删 | M21c 疑点台账 + delta 激活时按 scan prompt 参考块加槽重建（批 C 延后项已记） |
 | dismissed 台账只披露不消费 | `load_ledger` 仍加载并进 `run.ledger`；`Ledger.ids / cards` 无消费者（`mark_dismissed` / 判例注入随旧尾段删）；e2e 改为披露断言 | M21c 判例前移进 scanner prompt（`<precedents>` 槽已在 D-2）+ 豁免裁决 |
 | 无消费者的旗 | `--block-threshold` / `--conf-floor` / `--tools` / `--dismissed` / `--no-dismissed` 保留、`--help` 注明生效里程碑（prd K13） | M21b（前三）/ M21c（后二）接消费者；届时改回文案 |
@@ -136,6 +136,22 @@
 | `exit_code(verdict, failed_models_nonempty)` 第二参在 scan 路径恒 false | 五档契约保留 2 档给 M21b（reviewer 失败带债 approve） | M21b 定 failed_models 语义后再定是否收敛签名 |
 | `ScanResults.usage / failed / needs_declared` 生产无消费者 | `finish_scan_report` 从记录重算；三字段只有测试读 | M21e 清扫时删或改成 `#[cfg(test)]` 访问器 |
 | `anchor_suspicions` 每疑点重读同文件 | 一 cell 几十条疑点 × `safe_read` | 语料大时按文件缓存一次读（M21c 跨文件重定位落地时顺手） |
+
+## M21a 出口验收延后项（2026-09-09，另起 session；记录与原始数据只在 `.next/private/m21a/`，本表不含被评仓细节）
+
+结果：验收 1-10 中 8 过；未过两项都在验收 1（PR181 v2 scan）：**分组 7 > 5**、**墙钟 311 / 403 / 458 s > 3 min**。oracle 并集 16 / 22（E3 基线 9）、
+人工主题严格并集 6（≥ 5）、`--pack-only` 误差 0.9-14.5%、DeepSeek 磁盘缓存二跑起 ≥ 95%、E2 slice ≥ full 维持默认、双 scanner agreement 正确、schema v4 / 配置 / 门与文档全过。
+
+| 项 | 现状 | 归属 |
+|---|---|---|
+| 分组 ≤ 5 未达（PR181 7 组） | 7 组中 4 组是 ≤ 3 文件的小强分量（同目录文档对、schema + 其测试对）；`bundle::group` 只对孤立**单文件**按目录装箱，多文件小分量不并箱（design「孤立文件 bin-packing」原文如此）→ 组数随小分量数线性涨，每组一次 scanner 调用 | 用户裁：小分量（文件数 ≤ 3 且估算字节远小于预算）与孤立文件同池装箱（代价：不相关文件同格）或把门槛改为「组数 ≤ 强分量数 + 1」；M21b 前定 |
+| 墙钟 ≤ 3 min 未达 | 分解（三跑仿真与实测逐跑吻合）：总墙钟 = 排队等待 + 最长生成格；排队来自 `review.scanners.workers`（缺省 4）< 组数 7 且按索引序派发（最大组排第六）；生成速度各格一致 ≈ 110 tok/s，最长格输出 20-38K token。✅ 已改（2026-09-09）：扇出按组 diff 字节降序派发（结果仍按 plan 序）；A/B：现状 311 / 402 / 457 s → 大格先发 + workers 4：283 / 247 / 234 s → + workers 8：189 / 202 / 251 s（无排队，= 最长生成格）。provider `maxConcurrency` 不是约束门，用户配置要同时提 `review.scanners.workers` | 用户裁（2026-09-09）：workers / 并发开大后可接受，门槛不再按 3 min 硬卡；剩余手段只有继续拆大格（组预算 / 超预算组再切）→ M21b 前与「小分量并箱」一起议分组策略；✅ 出口修补批（2026-09-09）：cell 数 > workers 时 run.warnings 排队告警；`CellRecord.queue_wait_ms` / `CellSummary.queue_wait_ms`（含在 duration_ms 内）；0 疑点且输出 < 2,000 token 的格 cell warn；`review --help` 补并发说明。`scanners.workers` 缺省 4 vs provider `maxConcurrency` 两道门的分工见 design §12.3（有效并行 = min），是否让 workers 缺省随组数自适应待议 |
+| 「拆大格」的杠杆不是字节预算 | 每 cell pack 预算 = min(768,000 B, (最小 scanner 窗 − 16K)×3 − 24K)；DeepSeek 1M 窗下即 768 KB ≈ 219K token。PR181 两个 over_budget 组（11 / 12 文件）都是撞 `maxFilesPerGroup`=10 的文件数门，估算字节 351K / 142K、落盘 pack 265K / 149K 只占预算 34% / 19%。墙钟驱动量是**每格 diff 字节**（输出 token ∝ diff：g6 49K diff → 22-38K 输出，g4 35K → 20-26K，g3 23K → 13K），与 pack 字节无关 | 用户裁（2026-09-09）：保持 followup——样本太少，aacr-bench 重启、跑更多测试集后再看要不要拆；届时拆分键按每格 diff 字节、先切引用计数最低的强边、切开边进交叉索引 |
+| `scanners.workers` 形态（用户 2026-09-09 提） | 现为用户级配置键 `review.scanners.workers`（缺省 4，design §12.3 列为角色并行池）。用户意见：① 自适应规则要看 provider `maxConcurrency`、同 provider 下是否还有 reviewer / verifier 及其在跑情况，需一轮 grill；② 不设用户级配置项——workers 与评审内容相关（改动大小决定并行数），应由每次命令参数约束，与 provider 级 `maxConcurrency` 分层 | grill 后定：候选 = 运行时按 cell 数与各 provider 上限算缺省 + `--workers` 覆盖，删配置键；M21b reviewer / verifier 接线前定 |
+| scanner 首发解析失败原因不可观测 | dogfood 提交 3411a0e 的 slice 大格三跑首发全失败走 REPAIR（输入翻倍），直发同 prompt 三次首发皆合法 JSON（产品解析器 OK）→ 产品路径与直发的差异未定位 | ✅ 已加观测（2026-09-09）：`ScanCall.repair_note`（finish / 文本长度 / 文本头）进 cell warn；加观测后复跑一次首发即成功（未复现，此前三跑与另一队列并跑），下次出现由 cell warn 定位 |
+| 网关 anthropic 流 usage 形态 | agc 网关 `message_start` 报 input 0、真值只在 `message_delta`（直发探测证实）→ GLM 格 input / cache 恒 0，`cache_hit_by_cell` 不含 GLM | ✅ 已修（2026-09-09）：`parse_anthropic_stream` 对 message_delta 的 input / cache 分列「在场即覆盖」+ 单测；双 scanner 复跑核 |
+| 换思考档失去 DeepSeek 磁盘缓存前缀 | medium 与 high 落盘 prompt 逐字节相同，但 input token 差 13、cached 0.6% → DeepSeek 按 `reasoning_effort` 注入内部前缀 | 只记：生产档位固定无影响；A/B 或调档实验按新前缀计首跑成本 |
+| `noise` 口径 | scan_score 噪音比 = 非 oracle 条 ÷ 总条（0.84），条数 52 vs E3 10.7 → 噪音比随条数涨，是上界；两臂各自独有的稳定项说明非纯噪音 | M21b 深挖 / verifier 落地后用 refute 率替代；R11 agreement 口径已在双 scanner 数据里可读（19 条） |
 
 ## 跨里程碑观测面（每个里程碑出口必报，写进 RunMeta 或 research）
 

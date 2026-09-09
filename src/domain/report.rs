@@ -131,6 +131,9 @@ pub struct CellSummary {
     /// 候补链实际尝试的 model 数（成功=第几家成功；整链失败=链长）。
     pub attempts: u32,
     pub duration_ms: u64,
+    /// 排队等待毫秒（含在 duration_ms 内；M21a 出口验收）；旧 JSON 0。
+    #[serde(default)]
+    pub queue_wait_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// 命中缓存读的输入量（批 F-5，cache 命中率归因）。
@@ -149,6 +152,7 @@ impl CellSummary {
             iterations: r.iterations,
             attempts: r.attempts,
             duration_ms: r.duration_ms,
+            queue_wait_ms: r.queue_wait_ms,
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
             cached_input_tokens: r.cached_input_tokens,

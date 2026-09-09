@@ -236,13 +236,25 @@ pub(crate) fn parse_anthropic_stream(body: &str) -> Option<AssistantTurn> {
                     _ => {} // thinking_delta 等不计入输出
                 }
             }
-            // 末现优先：stop_reason 与累积 output_tokens 官方由 message_delta 携带
+            // 末现优先：stop_reason 与累积 output_tokens 官方由 message_delta 携带；input / cache 分列官方也在此重复
+            // 累计值，而部分网关（agc 2026-09-09 实测：GLM anthropic 形态）message_start 报 input 0、只在 message_delta 给
+            // 真值 → 字段在场即覆盖，缺席保留 message_start 的值（M21a 出口验收 4：GLM 格 input 恒 0、cache 命中不可读）。
             Some("message_delta") => {
                 if let Some(fr) = chunk["delta"]["stop_reason"].as_str() {
                     finish_reason = Some(fr.to_string());
                 }
-                if let Some(o) = chunk["usage"]["output_tokens"].as_u64() {
+                let u = &chunk["usage"];
+                if let Some(o) = u["output_tokens"].as_u64() {
                     output_tokens = o;
+                }
+                if let Some(i) = u["input_tokens"].as_u64() {
+                    input_tokens = i;
+                }
+                if let Some(c) = u["cache_read_input_tokens"].as_u64() {
+                    cache_read = c;
+                }
+                if let Some(c) = u["cache_creation_input_tokens"].as_u64() {
+                    cache_creation = c;
                 }
             }
             _ => {} // message_stop/ping/error（turn 层先行探测）等
@@ -1187,6 +1199,24 @@ data: {\"type\":\"message_stop\"}\n";
         assert_eq!(t.output_tokens, 42);
         assert_eq!(t.cached_input_tokens, 80);
         assert_eq!(t.finish_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn anthropic_stream_takes_input_and_cache_from_message_delta_when_present() {
+        // 网关形态（agc GLM anthropic，2026-09-09 实测）：message_start 报 input 0，真值只在 message_delta.usage；
+        // 官方形态 message_delta 也重复累计 input / cache 分列——在场即覆盖，缺席保留 message_start（出口验收 4）。
+        let gateway = "\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":19,\"output_tokens\":32,\"cache_read_input_tokens\":7}}\n\
+data: {\"type\":\"message_stop\"}\n";
+        let t = parse_anthropic_stream(gateway).unwrap();
+        assert_eq!((t.input_tokens, t.cached_input_tokens, t.output_tokens), (26, 7, 32), "delta 在场即覆盖：19 + cache 7 合成总输入");
+        let official_only_start = "\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":80}}}\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n";
+        let t = parse_anthropic_stream(official_only_start).unwrap();
+        assert_eq!((t.input_tokens, t.cached_input_tokens), (100, 80), "delta 缺席保留 message_start 分列");
     }
 
     #[test]
