@@ -20,6 +20,8 @@ pub fn exit_code(verdict: Verdict, failed_models_nonempty: bool) -> i32 {
         (Verdict::Approve, true) => 2,
         (Verdict::Approve, false) => 0,
         (Verdict::Incomplete, _) => 3,
+        // 批 F-3（D10）：scan-only 完成 = 0；scanner cell 失败在调用方已改判 Incomplete（design §8.4），不经 failed_models。
+        (Verdict::ScanOnly, _) => 0,
     }
 }
 
@@ -164,13 +166,13 @@ pub(crate) async fn assemble_report(findings: Vec<Finding>, mut ctx: TailCtx<'_>
         Some((resolved_applied, dropped, base)) => (true, Some(base), resolved_applied, dropped),
         None => (false, None, vec![], vec![]),
     };
-    let report = ReviewReport {
+    let report = ReviewReport { scan: None, cells: vec![],
         schema_version: crate::domain::SCHEMA_VERSION.into(),
         verdict,
         stats,
         findings,
         clusters,
-        run: RunMeta {
+        run: RunMeta { grouping: None,
             job_id: ctx.job_id,
             models: ctx.model_names,
             model_ids: ctx.model_ids,

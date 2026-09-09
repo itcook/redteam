@@ -575,7 +575,7 @@ fn result_md_three_states() {
             s.result_path = Some("result.json".into());
         })
         .unwrap();
-    let report_b = ReviewReport {
+    let report_b = ReviewReport { scan: None, cells: vec![],
         schema_version: redteam::domain::SCHEMA_VERSION.into(),
         verdict: Verdict::Reject,
         stats: Stats { high: 1, total: 1, ..Default::default() },
@@ -938,7 +938,7 @@ fn pack_only_slices_large_file_and_reports_shape() {
     let slice = run_pack_only(&args, &Config::default(), dir.path()).unwrap();
     assert_eq!(slice.cells.len(), 1);
     let c = &slice.cells[0];
-    assert_eq!((c.pack.body, c.pack.files, c.pack.sliced, c.pack.ladder), ("slice", 1, 1, 0), "{:?}", c.pack);
+    assert_eq!((c.pack.body.as_str(), c.pack.files, c.pack.sliced, c.pack.ladder), ("slice", 1, 1, 0), "{:?}", c.pack);
     assert!(c.pack.folded_lines > 500 && c.pack.outside_sites == 1, "{:?}", c.pack);
     let packs = std::path::Path::new(&slice.packs_dir);
     let cell_slice = std::fs::read_to_string(packs.join("cell-1.md")).unwrap();
@@ -955,7 +955,7 @@ fn pack_only_slices_large_file_and_reports_shape() {
     let cfg_full = Config::from_json(r#"{"review":{"pack":{"body":"full"}}}"#).unwrap();
     let full = run_pack_only(&args, &cfg_full, dir.path()).unwrap();
     let f = &full.cells[0];
-    assert_eq!((f.pack.body, f.pack.full, f.pack.sliced, f.pack.outside_sites), ("full", 1, 0, 0), "{:?}", f.pack);
+    assert_eq!((f.pack.body.as_str(), f.pack.full, f.pack.sliced, f.pack.outside_sites), ("full", 1, 0, 0), "{:?}", f.pack);
     assert!(f.pack_bytes > c.pack_bytes, "full {} > slice {}", f.pack_bytes, c.pack_bytes);
     let cell_full = std::fs::read_to_string(std::path::Path::new(&full.packs_dir).join("cell-1.md")).unwrap();
     assert!(cell_full.contains("src/big.rs:1-610（全文，610 行）") && cell_full.contains("let u7 = 7;"), "{cell_full}");

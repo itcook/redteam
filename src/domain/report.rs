@@ -14,6 +14,8 @@ pub enum Verdict {
     Reject,
     #[serde(rename = "incomplete")]
     Incomplete,
+    /// M21a 批 F-3（D10）：scan-only 报告——只有疑点索引与覆盖自报、不产 finding，退出码 0；M21b 深挖落地前 `review` 的终态。
+    ScanOnly,
 }
 
 impl Verdict {
@@ -22,6 +24,7 @@ impl Verdict {
             Verdict::Approve => "approve",
             Verdict::Reject => "reject",
             Verdict::Incomplete => "incomplete",
+            Verdict::ScanOnly => "scan-only",
         }
     }
 }
@@ -115,7 +118,13 @@ pub struct CacheHit {
 /// cells 表回填。旧报告 JSON 无此字段（serde default 空数组），向后兼容。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CellSummary {
+    /// cell id（批 F-5：`scan[g<n>]@<provider/id>#<k>`）；旧 JSON 无此字段 → 空。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cell: String,
     pub model: String,
+    /// 角色串（`scanner` / `reviewer` / `verifier`），批 F-5 填；旧 JSON 空。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
     pub ok: bool,
     /// 胜出 call 的 tool-loop 迭代数（单发单收=1；>1=有 repair/多轮）。
     pub iterations: u32,
@@ -124,6 +133,42 @@ pub struct CellSummary {
     pub duration_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 命中缓存读的输入量（批 F-5，cache 命中率归因）。
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+}
+
+/// scan-only 报告的组摘要（批 F-3）：组标签 / 文件 / cell 列表 / 合并后疑点数 / 装包形态（批 E `PackStats`）。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScanGroup {
+    pub label: String,
+    pub files: Vec<String>,
+    pub cells: Vec<String>,
+    pub suspicions: u32,
+    #[serde(default)]
+    pub pack: crate::pack::PackStats,
+}
+
+/// scan-only 统计（批 F-3）：合并后总数、cell 成败、agreement ≥ 2 的条数、按类别、needs 声明数。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScanStats {
+    pub total: u32,
+    pub cells_ok: u32,
+    pub cells_failed: u32,
+    pub agreement_ge2: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_category: BTreeMap<String, u32>,
+    pub needs_declared: u32,
+}
+
+/// scan-only 报告段（batch F-3，design §4 / §5）：按组的疑点索引 + 覆盖自报（`scanned_areas` ∪ ∩ 改动行 ÷ 改动行）。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScanReport {
+    pub groups: Vec<ScanGroup>,
+    pub suspicions: Vec<super::suspicion::MergedSuspicion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanned_coverage: Option<f32>,
+    pub stats: ScanStats,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -191,6 +236,9 @@ pub struct RunMeta {
     /// （M21a 批 A K1，与 `redteam test-command` 同一链）。serde default 兼容旧 JSON。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_command: Option<String>,
+    /// 批 F-5：引用图分组观测（批 C `GroupingStats`，此前只在 `--pack-only` 可见）；旧 JSON / 无分组路径 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouping: Option<crate::bundle::GroupingStats>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -209,6 +257,13 @@ pub struct ReviewReport {
     pub findings: Vec<Finding>,
     pub clusters: Vec<Cluster>,
     pub run: RunMeta,
+    /// 批 F-3：scan-only 段（疑点索引 + 覆盖自报）；finding 路径 / 旧 JSON 为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<ScanReport>,
+    /// 批 F-3 / F-5：全部 cell 记录（含 `output`，tag `role`）——`eval/scan_score.py` 读顶层 `cells[].output.suspicions`
+    /// （followup「结果 JSON 加 scanner 输出」）；`run.cells` 保留摘要。旧 JSON 为空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<crate::state::CellRecord>,
 }
 
 #[cfg(test)]
@@ -235,6 +290,38 @@ mod tests {
     #[test]
     fn verdict_incomplete_serializes() {
         assert_eq!(serde_json::to_string(&Verdict::Incomplete).unwrap(), "\"incomplete\"");
+    }
+
+    /// 批 F-3：scan-only verdict 串；ScanReport 与顶层 cells round-trip，`cells[].output.role == "scanner"`（评分器形态）；
+    /// 默认态不产 scan / cells 键。
+    #[test]
+    fn scan_only_verdict_and_scan_report_roundtrip() {
+        assert_eq!(serde_json::to_string(&Verdict::ScanOnly).unwrap(), "\"scan-only\"");
+        assert_eq!(serde_json::from_str::<Verdict>("\"scan-only\"").unwrap(), Verdict::ScanOnly);
+        assert_eq!(Verdict::ScanOnly.as_str(), "scan-only");
+        let susp = crate::domain::Suspicion { file: "a.rs".into(), line_start: 3, line_end: 3, hint: "h".into(), category: Some(crate::domain::Category::L1), confidence: 0.7, quote: "q".into() };
+        let out = crate::domain::ScanOutput { suspicions: vec![susp.clone()], ..Default::default() };
+        let rec = crate::state::CellRecord::ok("scan[g1]@p/m#1", "p/m", crate::domain::CellOutput::Scan(out)).with_family("fam");
+        let scan = ScanReport {
+            groups: vec![ScanGroup { label: "a.rs".into(), files: vec!["a.rs".into()], cells: vec!["scan[g1]@p/m#1".into()], suspicions: 1, pack: crate::pack::PackStats { body: "slice".into(), ..Default::default() } }],
+            suspicions: vec![crate::domain::MergedSuspicion { group: 0, suspicion: susp, agreement: 1, families: vec!["fam".into()], cell_ids: vec!["scan[g1]@p/m#1".into()], hints: vec!["h".into()] }],
+            scanned_coverage: Some(0.5),
+            stats: ScanStats { total: 1, cells_ok: 1, ..Default::default() },
+        };
+        let r = ReviewReport { schema_version: SCHEMA_VERSION.into(), verdict: Verdict::ScanOnly, stats: Stats::default(), findings: vec![], clusters: vec![], run: RunMeta { grouping: Some(crate::bundle::GroupingStats { gate: crate::bundle::Gate::Grouped, groups: 1, edges: 0, weak_cut: 0, cross_edges: 0, isolated: 0, over_budget: 0 }), ..Default::default() }, scan: Some(scan.clone()), cells: vec![rec] };
+        let j = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["verdict"], "scan-only");
+        assert_eq!(v["cells"][0]["output"]["role"], "scanner");
+        assert_eq!(v["cells"][0]["output"]["suspicions"][0]["quote"], "q");
+        assert_eq!(v["scan"]["groups"][0]["pack"]["body"], "slice");
+        assert_eq!(v["run"]["grouping"]["gate"], "grouped");
+        let back: ReviewReport = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.scan.unwrap(), scan);
+        assert_eq!(back.cells.len(), 1);
+        assert_eq!(back.run.grouping.unwrap().groups, 1);
+        let d = serde_json::to_string(&ReviewReport { schema_version: "4".into(), verdict: Verdict::Approve, stats: Stats::default(), findings: vec![], clusters: vec![], run: RunMeta::default(), scan: None, cells: vec![] }).unwrap();
+        assert!(!d.contains("\"scan\"") && !d.contains("\"cells\"") && !d.contains("grouping"), "默认态不产键: {d}");
     }
 
     #[test]

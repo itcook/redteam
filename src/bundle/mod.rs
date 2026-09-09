@@ -119,7 +119,7 @@ impl Default for GroupingOpts {
 }
 
 /// 双阈值门结果：`Single` = 文件数或 churn 未过门，全变更集一包。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Gate {
     Single,
@@ -136,7 +136,7 @@ impl Gate {
 }
 
 /// 分组观测（M21a 只在 `--pack-only` 打印与 summary.json；RunMeta 接线 F-5）。
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GroupingStats {
     pub gate: Gate,
     pub groups: usize,

@@ -307,7 +307,7 @@ pub(crate) mod incremental_tests {
     /// 上轮固件：result(v3, approve, head_sha=Some(sha)) + args(branch) + manifest/partial 全 ok。
     pub(super) fn write_prior(root: &std::path::Path, job: &str, head_sha: &str, findings: Vec<Finding>) {
         let stats = Stats::from_findings(&findings);
-        let report = ReviewReport {
+        let report = ReviewReport { scan: None, cells: vec![],
             schema_version: crate::domain::SCHEMA_VERSION.into(), verdict: Verdict::Approve,
             stats, findings, clusters: vec![],
             run: RunMeta {

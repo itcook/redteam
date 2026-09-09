@@ -53,6 +53,7 @@ fn render_md(r: &ReviewReport) -> String {
     let verdict = match r.verdict.as_str() {
         "approve" => "✅ approve",
         "reject" => "❌ reject",
+        "scan-only" => "🔎 scan-only（疑点索引，不产 finding）",
         _ => "⚠️ incomplete",
     };
     let mut s = String::new();
@@ -107,19 +108,21 @@ fn render_md(r: &ReviewReport) -> String {
     // 不必再手查 proj.db。旧报告无此数据（serde default 空）不渲染。
     if !r.run.cells.is_empty() {
         s.push_str("\n- Cells\n\n");
-        s.push_str("  | Model | Status | Iter | Duration | In | Out |\n");
-        s.push_str("  | --- | --- | --- | --- | --- | --- |\n");
+        s.push_str("  | Cell | Model | Status | Iter | Duration | In | Out | Cached |\n");
+        s.push_str("  | --- | --- | --- | --- | --- | --- | --- | --- |\n");
         for c in &r.run.cells {
             let st = if c.ok { "✓" } else { "✗" };
             let att = if c.attempts > 1 { format!(" ({} att)", c.attempts) } else { String::new() };
             s.push_str(&format!(
-                "  | {} | {st} | {}{} | {} | {} | {} |\n",
+                "  | {} | {} | {st} | {}{} | {} | {} | {} | {} |\n",
+                if c.cell.is_empty() { "-" } else { c.cell.as_str() },
                 c.model,
                 c.iterations,
                 att,
                 fmt_duration(c.duration_ms),
                 human_tokens(c.input_tokens),
                 human_tokens(c.output_tokens),
+                human_tokens(c.cached_input_tokens),
             ));
         }
     }
@@ -140,6 +143,7 @@ fn render_md(r: &ReviewReport) -> String {
             s.push_str(&format!("  | ⚠️ Disputed    | {} |\n", r.run.resolution_disputed.join(", ")));
         }
     }
+    render_scan_md(r, &mut s);
     if !r.run.warnings.is_empty() {
         s.push_str("\n- Warnings\n\n");
         for (i, w) in r.run.warnings.iter().enumerate() {
@@ -186,12 +190,57 @@ fn render_md(r: &ReviewReport) -> String {
     s
 }
 
+/// scan-only 段（批 F-3）：组表（label / 文件数 / cells / 疑点数 / 装包形态）→ 失败 cell → 按组疑点列表
+/// （file:a-b · 类别 · 置信 · agreement（家族）· 全部 hint；quote 首行 ≤ 120 字符）→ 覆盖自报与 needs 计数在首行。
+fn render_scan_md(r: &ReviewReport, s: &mut String) {
+    let Some(scan) = &r.scan else { return };
+    s.push_str("\n## Scan\n\n");
+    let cov = scan.scanned_coverage.map(|c| format!("{:.0}%", c * 100.0)).unwrap_or_else(|| "n/a".into());
+    s.push_str(&format!(
+        "- Groups: {} · Cells: {} ok / {} failed · Suspicions: {} (agreement ≥ 2: {}) · Changed-line coverage: {cov} · Needs declared: {}\n",
+        scan.groups.len(), scan.stats.cells_ok, scan.stats.cells_failed, scan.stats.total, scan.stats.agreement_ge2, scan.stats.needs_declared
+    ));
+    if !scan.groups.is_empty() {
+        s.push_str("\n  | Group | Files | Cells | Suspicions | Pack |\n  | --- | --- | --- | --- | --- |\n");
+        for (i, g) in scan.groups.iter().enumerate() {
+            s.push_str(&format!(
+                "  | g{} `{}` | {} | {} | {} | {} · sliced {} · folded {} · outside {} |\n",
+                i + 1, g.label, g.files.len(), g.cells.len(), g.suspicions, g.pack.body, g.pack.sliced, g.pack.folded_lines, g.pack.outside_sites
+            ));
+        }
+    }
+    let failed: Vec<&str> = r.run.coverage.failed.values().flatten().map(String::as_str).collect();
+    if !failed.is_empty() {
+        s.push_str(&format!("\n- Failed cells: {}\n", failed.join(", ")));
+    }
+    if !scan.suspicions.is_empty() {
+        s.push_str("\n### Suspicions\n");
+        let mut cur: Option<usize> = None;
+        for m in &scan.suspicions {
+            if cur != Some(m.group) {
+                cur = Some(m.group);
+                s.push_str(&format!("\n#### g{}\n\n", m.group + 1));
+            }
+            let cat = m.suspicion.category.map(|c| format!("[{c:?}] ")).unwrap_or_default();
+            s.push_str(&format!(
+                "- `{}:{}-{}` {cat}conf {:.2} · agreement {} ({}) — {}\n",
+                m.suspicion.file, m.suspicion.line_start, m.suspicion.line_end, m.suspicion.confidence, m.agreement,
+                m.families.join(", "), m.hints.join(" / ")
+            ));
+            let first: String = m.suspicion.quote.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().chars().take(120).collect();
+            if !first.is_empty() {
+                s.push_str(&format!("  > `{}`\n", first.replace('`', "'")));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::*;
     fn report() -> ReviewReport {
-        ReviewReport { schema_version:"2".into(), verdict:Verdict::Reject,
+        ReviewReport { scan: None, cells: vec![], schema_version:"2".into(), verdict:Verdict::Reject,
             stats:Stats{high:1,total:1,..Default::default()},
             findings:vec![Finding{ id:"1".into(),severity:Severity::High,title:"boom".into(),body:"b".into(),
                 file:"a.rs".into(),line_start:3,line_end:5,confidence:0.9,recommendation:"fix".into(),
@@ -200,6 +249,46 @@ mod tests {
                 origin:Origin::New}],
             clusters:vec![], run:RunMeta::default() }
     }
+    /// 批 F-3 AC3：scan-only md——verdict 行、组表、失败 cell、按组疑点（类别 / 置信 / agreement / 家族 / hint / quote 首行）、覆盖自报。
+    #[test]
+    fn scan_only_md_renders_groups_suspicions_and_coverage() {
+        let susp = |file: &str, ls: u32, hint: &str, conf: f32, quote: &str| Suspicion { file: file.into(), line_start: ls, line_end: ls, hint: hint.into(), category: Some(Category::L1), confidence: conf, quote: quote.into() };
+        let mut run = RunMeta { job_id: "j9".into(), models: vec!["p/a".into(), "q/b".into()], ..Default::default() };
+        run.coverage.failed.insert(Role::Scanner, vec!["scan[g2]@q/b#1".into()]);
+        run.cells.push(CellSummary { cell: "scan[g1]@p/a#1".into(), model: "p/a".into(), role: "scanner".into(), ok: true, iterations: 1, attempts: 1, duration_ms: 1200, input_tokens: 1000, output_tokens: 50, cached_input_tokens: 400 });
+        let scan = ScanReport {
+            groups: vec![
+                ScanGroup { label: "src/a.rs".into(), files: vec!["src/a.rs".into()], cells: vec!["scan[g1]@p/a#1".into(), "scan[g1]@q/b#1".into()], suspicions: 2, pack: crate::pack::PackStats { body: "slice".into(), sliced: 1, folded_lines: 30, ..Default::default() } },
+                ScanGroup { label: "src/b.rs".into(), files: vec!["src/b.rs".into()], cells: vec!["scan[g2]@p/a#1".into(), "scan[g2]@q/b#1".into()], suspicions: 1, pack: crate::pack::PackStats { body: "slice".into(), ..Default::default() } },
+            ],
+            suspicions: vec![
+                MergedSuspicion { group: 0, suspicion: susp("src/a.rs", 3, "leak", 0.8, "let t = secret();\nlog(t);"), agreement: 2, families: vec!["alpha".into(), "beta".into()], cell_ids: vec![], hints: vec!["leak".into(), "secret logged".into()] },
+                MergedSuspicion { group: 0, suspicion: susp("src/a.rs", 9, "unchecked", 0.4, "x.unwrap()"), agreement: 1, families: vec!["alpha".into()], cell_ids: vec![], hints: vec!["unchecked".into()] },
+                MergedSuspicion { group: 1, suspicion: susp("src/b.rs", 1, "race", 0.5, "static mut X"), agreement: 1, families: vec!["beta".into()], cell_ids: vec![], hints: vec!["race".into()] },
+            ],
+            scanned_coverage: Some(0.75),
+            stats: ScanStats { total: 3, cells_ok: 3, cells_failed: 1, agreement_ge2: 1, needs_declared: 2, ..Default::default() },
+        };
+        let r = ReviewReport { schema_version: "4".into(), verdict: Verdict::ScanOnly, stats: Stats::default(), findings: vec![], clusters: vec![], run, scan: Some(scan), cells: vec![] };
+        let md = render(&r, Format::Md);
+        for must in [
+            "- Verdict: 🔎 scan-only",
+            "## Scan",
+            "- Groups: 2 · Cells: 3 ok / 1 failed · Suspicions: 3 (agreement ≥ 2: 1) · Changed-line coverage: 75% · Needs declared: 2",
+            "| g1 `src/a.rs` | 1 | 2 | 2 | slice · sliced 1 · folded 30 · outside 0 |",
+            "- Failed cells: scan[g2]@q/b#1",
+            "#### g1",
+            "- `src/a.rs:3-3` [L1] conf 0.80 · agreement 2 (alpha, beta) — leak / secret logged",
+            "  > `let t = secret();`",
+            "#### g2",
+            "- `src/b.rs:1-1` [L1] conf 0.50 · agreement 1 (beta) — race",
+            "| scan[g1]@p/a#1 | p/a | ✓ | 1 | ≈ 1 s | `1000` (1.00K) | `50` | `400` |",
+        ] {
+            assert!(md.contains(must), "缺「{must}」:\n{md}");
+        }
+        assert!(!md.contains("## Finding Details"));
+    }
+
     // 批 4 polish：Duration <1min 应显整数秒，而非恒 "0.0 mins"/"0.8 mins" 之类无意义粒度。
     #[test]
     fn fmt_duration_sub_minute_shows_seconds() {

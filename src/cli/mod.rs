@@ -600,6 +600,7 @@ pub fn attach_cells(store: &crate::state::JobStore, job_id: &str, report: &mut R
     report.run.cells = store.read_partial(job_id)
         .into_iter()
         .map(|r| crate::domain::CellSummary {
+            cell: r.cell.clone(), role: r.role().as_str().to_string(), cached_input_tokens: r.cached_input_tokens,
             model: r.model,
             ok: r.ok,
             iterations: r.iterations,
@@ -624,7 +625,7 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
     let total = manifest.len().max(done);
     let findings: Vec<_> = done_records.into_iter().flat_map(|r| r.output.into_findings()).collect();
     let stats = Stats::from_findings(&findings);
-    let report = ReviewReport {
+    let report = ReviewReport { scan: None, cells: vec![],
         schema_version: crate::domain::SCHEMA_VERSION.into(),
         verdict: Verdict::Incomplete,
         stats,
@@ -2284,7 +2285,7 @@ mod tests {
     #[test]
     fn append_ckpt_failure_warning_only_appends_when_nonzero() {
         fn empty_report() -> ReviewReport {
-            ReviewReport {
+            ReviewReport { scan: None, cells: vec![],
                 schema_version: crate::domain::SCHEMA_VERSION.into(),
                 verdict: Verdict::Approve,
                 stats: Stats::from_findings(&[]),

@@ -62,8 +62,8 @@ pub struct RawResults {
 pub type SecondPrompt<'a> =
     Option<&'a (dyn Fn(usize, &[NeedEntry], &[Finding]) -> (Option<String>, Vec<String>) + Sync)>;
 
-/// R8.1：quote 去除全部空白（保大小写）——token 序列即身份，免疫 reformat。
-fn normalize_quote(q: &str) -> String {
+/// R8.1：quote 去除全部空白（保大小写）——token 序列即身份，免疫 reformat。批 F-3 `consolidate::scan` 复用。
+pub(crate) fn normalize_quote(q: &str) -> String {
     q.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
