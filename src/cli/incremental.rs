@@ -103,7 +103,7 @@ pub async fn run_incremental_review(
     // dispute 契约不因补跑丢失。
     let mk = |idx: usize, needs: &[crate::domain::NeedEntry], drafts: &[Finding]| {
         let other = others.get(idx).map(String::as_str).unwrap_or("");
-        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section, &spec_section, other)
+        second_pass_prompt(&bundles, root, budget, &target_label, &focus, idx, needs, drafts, &inc_section, &spec_section, other, &crate::pack::PackOpts::from(&cfg.review.pack))
     };
     let mut raw = run_code_fanout(provider, &target_label, &bundles, &focus, &inc_section, &dossiers, &oopts, sink, Some(&mk), &spec_section, &others).await;
     // T46①：--spec denylist/PEM 拒读 warnings 并入 run.warnings（与 run_code_review 一致）。

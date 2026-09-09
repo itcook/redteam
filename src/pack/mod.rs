@@ -1,7 +1,8 @@
 //! pack 引擎（M15-S1 起；M21a 批 E 升为改动中心切片）：每 bundle 的预算治理上下文块——
 //! 0 壳改动源文（`[review.pack] body = slice` 缺省〔D8〕：核 / 文件内一跳 / 文件地图 / 折叠 / 禁真空兜底；
-//! `full` 旋钮 = 整文件）+ 回落梯子（def 体 → 骨架 → hunk 窗 → omit 坐标）+ 精确省略清单。唯一路径，无引擎分派。
-//! hermetic：喂 (bundle, root, budget, opts) 出字符串与形态统计，零 LLM。复用 src/diffsym 的 diff / 符号 / 一跳解析。
+//! `full` 旋钮 = 整文件）+ 文件外片段（slice 档）+ 回落梯子（def 体 → 骨架 → hunk 窗 → omit 坐标）+ 精确省略清单。
+//! 唯一路径，无引擎分派。hermetic：喂 (bundle, root, budget, opts) 出字符串与形态统计，零 LLM。
+//! 复用 src/diffsym 的 diff / 符号 / 一跳解析；每个改动文件只读一次、hunk 只重锚定一次（`FileCtx`）。
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -12,9 +13,11 @@ use crate::bundle::Bundle;
 pub use crate::config::PackBody;
 use crate::config::PackCfg;
 use crate::diffsym::{
-    all_defs, body_names, changed_def_ranges, changed_defs, compile_defs, hunk_changed_lines, lang_for, match_def, one_hop,
-    parse_hunk_new_range, parse_hunks, ref_worthy, DefRange, OneHop,
+    all_defs, body_names, bracket_delta_code, changed_def_ranges, changed_defs, compile_defs, hunk_changed_lines,
+    is_comment_line, lang_for, match_def, one_hop, parse_hunk_new_range, parse_hunks, ref_worthy, rust_test_ranges,
+    DefRange, Hunk, OneHop,
 };
+use crate::evidence::git::FileChange;
 
 /// 省略清单条目上限（防大 fan-in 撑爆；超出末尾计数兜底）。
 pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
@@ -49,9 +52,10 @@ impl PackOpts {
     /// `full` 档（其余取缺省）：Full 路径 / 对照臂。
     pub fn full() -> Self { PackOpts { body: PackBody::Full, ..PackOpts::default() } }
 
-    /// 二阶段补查档（批 E K2，评审修 9）：needs 显式索要全文 → 每文件都走全文块（`slice_min_bytes = MAX`），但仍是
-    /// slice 档——第一趟 draft 引用的 `## 文件外片段` 在第二趟同样在场。
-    pub fn second_pass() -> Self { PackOpts { body: PackBody::Slice, slice_min_bytes: usize::MAX, ..PackOpts::default() } }
+    /// 二阶段补查档（批 E K2，复审修 1 / 9）：在用户配置之上只改一件事——`slice_min_bytes = MAX`，每文件都走全文块
+    /// （needs 是显式索要全文）；`body` / `anchor_window` 沿用用户值：slice 档第一趟 draft 引用的 `## 文件外片段`
+    /// 第二趟同样在场，full 对照臂不被切成 slice。
+    pub fn second_pass(base: &PackOpts) -> Self { PackOpts { slice_min_bytes: usize::MAX, ..base.clone() } }
 }
 
 /// 装包形态统计（批 E K13，铁律 1）：`--pack-only` stdout + summary.json 可读；RunMeta 接线在 F-5。
@@ -95,6 +99,118 @@ struct SliceOut {
     folded_lines: usize,
 }
 
+// ---------------------------------------------------------------------------------------------
+// 改动文件上下文：一次读取 / 一次 def 编译 / 一次 hunk 重锚定，0 壳与文件外片段共用（复审修 2 + 效率项）
+// ---------------------------------------------------------------------------------------------
+
+struct FileCtx<'a> {
+    fc: &'a FileChange,
+    content: String,
+    n_lines: usize,
+    defs: Option<Vec<(&'static str, Regex)>>,
+    /// 重锚定后的 hunk（坐标已按 + 行文本对齐到工作树内容）。
+    hunks: Vec<Hunk>,
+    /// 供旧口径 API（`changed_def_ranges` / `skeleton_of` / `hunk_window_block` / `changed_defs`）消费的 diff：
+    /// 坐标未偏移时就是原 diff；偏移过则是按重锚定坐标合成的只含坐标的 diff。
+    diff: String,
+}
+
+/// 按填充序（`hub_order`，枢纽先）准备每个改动文件；工作树缺失 / 空内容的跳过（沿用 bundle::group 安全不变量：
+/// 路径来自 git diff、非模型可控）。
+fn prepare_files<'a>(bundle: &'a Bundle, root: &Path) -> Vec<FileCtx<'a>> {
+    let mut out = Vec::new();
+    for fc in bundle.fill_order() {
+        let content = std::fs::read_to_string(root.join(&fc.path)).unwrap_or_default();
+        if content.is_empty() {
+            continue;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        let n_lines = lines.len();
+        let (hunks, shifted) = anchor_hunks(&lines, parse_hunks(&fc.diff));
+        let diff = if shifted { synth_diff(&hunks) } else { fc.diff.clone() };
+        let defs = lang_for(&fc.path).map(compile_defs);
+        out.push(FileCtx { fc, content, n_lines, defs, hunks, diff });
+    }
+    out
+}
+
+/// hunk 重锚定搜索半径（行）。
+const ANCHOR_SEARCH_MAX: usize = 2000;
+
+/// 有信息量的 + 行：去空白后 ≥ 4 字符且含字母数字——只含 `}` / `)` / 空行的 + 行在任何函数里都能对上，不参与定位。
+fn informative(text: &str) -> bool {
+    let t = text.trim();
+    t.len() >= 4 && t.chars().any(|c| c.is_alphanumeric())
+}
+
+/// hunk 的整体行偏移（评审修 4，复审修 4）：只按有信息量的 + 行打分；声明坐标处全部吻合 → 0；否则按 ±1、±2 … 找首个
+/// 全部吻合的偏移；都不全吻合时取得分最高、且 ≥ 一半 + 行并严格优于原位的偏移（容忍 hunk 内个别行被后续编辑改过）；
+/// 无有信息量的 + 行（纯删除 / 只有括号行）→ 0（保留原坐标，禁真空窗兜底）。
+fn anchor_offset(lines: &[&str], h: &Hunk) -> i64 {
+    let plus: Vec<(usize, &str)> = h.plus.iter().filter(|(_, t)| informative(t)).map(|(l, t)| (*l, t.as_str())).collect();
+    if plus.is_empty() {
+        return 0;
+    }
+    let score = |off: i64| -> usize {
+        plus.iter()
+            .filter(|(l, text)| {
+                let i = *l as i64 + off;
+                i >= 0 && (i as usize) < lines.len() && lines[i as usize] == *text
+            })
+            .count()
+    };
+    let total = plus.len();
+    let at_zero = score(0);
+    if at_zero == total {
+        return 0;
+    }
+    let (mut best_off, mut best) = (0i64, at_zero);
+    for d in 1..=ANCHOR_SEARCH_MAX as i64 {
+        for off in [d, -d] {
+            let sc = score(off);
+            if sc == total {
+                return off;
+            }
+            if sc > best {
+                best = sc;
+                best_off = off;
+            }
+        }
+    }
+    if best > at_zero && best * 2 >= total { best_off } else { 0 }
+}
+
+/// 逐 hunk 重锚定；返回 (偏移后的 hunks, 是否有偏移)。
+fn anchor_hunks(lines: &[&str], hunks: Vec<Hunk>) -> (Vec<Hunk>, bool) {
+    let n = lines.len();
+    let mut shifted = false;
+    let out = hunks
+        .into_iter()
+        .map(|h| {
+            let off = anchor_offset(lines, &h);
+            if off == 0 || n == 0 {
+                return h;
+            }
+            shifted = true;
+            let sh = |l: usize| ((l as i64 + off).max(0) as usize).min(n - 1);
+            Hunk {
+                start: sh(h.start),
+                count: h.count,
+                changed: h.changed.iter().map(|&l| sh(l)).collect(),
+                plus: h.plus.into_iter().map(|(l, t)| (sh(l), t)).collect(),
+            }
+        })
+        .collect();
+    (out, shifted)
+}
+
+/// 由重锚定后的 hunk 合成一份只含坐标的 diff（每个改动行一个单行 hunk），喂 `changed_def_ranges` / `skeleton_of` /
+/// `hunk_window_block` / `changed_defs`——这些旧口径 API 只消费坐标。
+fn synth_diff(hunks: &[Hunk]) -> String {
+    let lines: BTreeSet<usize> = hunks.iter().flat_map(|h| h.changed.iter().copied()).collect();
+    lines.iter().map(|l| format!("@@ -{0},1 +{0},1 @@\n+\n", l + 1)).collect()
+}
+
 /// diff 各 hunk 的新文件起止 `(c, d)`（`@@ -a,b +c,d @@`；d 缺省 1）。
 fn hunk_ranges(diff: &str) -> Vec<(usize, usize)> {
     diff.lines().filter(|l| l.starts_with("@@")).filter_map(parse_hunk_new_range).collect()
@@ -107,6 +223,14 @@ fn is_header_line(t: &str) -> bool {
         "package ", "mod ", "pub mod ", "pub(crate) mod ", "require(",
     ];
     PREFIXES.iter().any(|p| t.starts_with(p))
+}
+
+/// import 类行（多行 import 组的开头；调用点判定排除，评审修 6 / 8）。`export` 只算 re-export（`export {…} from` /
+/// `export *`）——`export function foo(` / `export const x = f()` 是 def / 代码行，不能被短路掉（复审修 3）。
+fn is_import_line(t: &str) -> bool {
+    const P: &[&str] = &["use ", "pub use ", "pub(crate) use ", "extern crate ", "import ", "from ", "require(", "mod ", "pub mod ", "pub(crate) mod "];
+    P.iter().any(|p| t.starts_with(p))
+        || (t.starts_with("export ") && (t.starts_with("export {") || t.starts_with("export *") || t.contains(" from ")))
 }
 
 /// def 签名尾行：从 start 向下到首个含 `{` 或以 `;` 结尾的行（含），最多 `SIG_MAX_LINES` 行，不越 def 尾。
@@ -128,93 +252,33 @@ fn merge_ranges(mut v: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     out
 }
 
-/// import 类行（多行 import 组的开头；调用点判定排除，评审修 6 / 8）。
-fn is_import_line(t: &str) -> bool {
-    const P: &[&str] = &["use ", "pub use ", "pub(crate) use ", "extern crate ", "import ", "export ", "from ", "require(", "mod ", "pub mod ", "pub(crate) mod "];
-    P.iter().any(|p| t.starts_with(p))
-}
-
-/// 行内 `([{` 与 `)]}` 的数量差。
-fn bracket_delta(t: &str) -> i32 {
-    t.chars().map(|c| match c { '(' | '[' | '{' => 1, ')' | ']' | '}' => -1, _ => 0 }).sum()
-}
-
-/// hunk 重锚定搜索半径（行）。
-const ANCHOR_SEARCH_MAX: usize = 2000;
-
-/// hunk 的整体行偏移（评审修 4）：+ 行文本在声明坐标处全部吻合 → 0；否则按 ±1、±2 … 找一个让全部 + 行吻合的偏移；
-/// 无 + 行（纯删除）或找不到 → 0（保留原坐标）。
-fn anchor_offset(lines: &[&str], h: &crate::diffsym::Hunk) -> i64 {
-    if h.plus.is_empty() {
-        return 0;
-    }
-    let fits = |off: i64| {
-        h.plus.iter().all(|(l, text)| {
-            let i = *l as i64 + off;
-            i >= 0 && (i as usize) < lines.len() && lines[i as usize] == text
-        })
-    };
-    if fits(0) {
-        return 0;
-    }
-    for d in 1..=ANCHOR_SEARCH_MAX as i64 {
-        if fits(d) {
-            return d;
-        }
-        if fits(-d) {
-            return -d;
-        }
-    }
-    0
-}
-
-/// 由（重锚定后的）改动行合成一份只含坐标的 diff（每行一个单行 hunk），喂 `changed_defs` 锚定。
-fn synth_diff(changed: &BTreeSet<usize>) -> String {
-    changed.iter().map(|l| format!("@@ -{0},1 +{0},1 @@\n+\n", l + 1)).collect()
-}
-
 /// 改动中心切片（design §10.2〔D8〕，批 E K6 / K7）：`≤ slice_min_bytes` 或无可解析改动行 → None（调用方给全文）。
 /// 展开区间 = 核（`changed_defs`）∪ 一跳 ∪ 禁真空窗（任一改动行未被覆盖的 hunk 取 ±`anchor_window`）；
 /// 保留行 = 文件头（≤ `HEADER_MAX_LINES`）+ 全部 def 签名；其余按外围 def 折叠成 `…（a-b 行折叠：name）`，
 /// 顶层胶水 ≤ `GLUE_MAX_LINES` 原样、更长折叠成 `…（a-b 行折叠）`。非支持语言：无 def，展开只来自禁真空窗。
-fn slice_file(
-    path: &str,
-    content: &str,
-    diff: &str,
-    defs: Option<&[(&'static str, Regex)]>,
-    opts: &PackOpts,
-) -> Option<SliceOut> {
-    if content.len() <= opts.slice_min_bytes {
+fn slice_file(ctx: &FileCtx<'_>, opts: &PackOpts) -> Option<SliceOut> {
+    if ctx.content.len() <= opts.slice_min_bytes {
         return None;
     }
-    let lines: Vec<&str> = content.lines().collect();
+    let lines: Vec<&str> = ctx.content.lines().collect();
     let n = lines.len();
     if n == 0 {
         return None;
     }
-    // hunk 重锚定（评审修 4）：diff 坐标（index / 基线侧）与工作树内容可能错位——staged + unstaged 拼接、branch scope 脏树；
-    // 每 hunk 用 + 行文本核对，不符则在文件内找整体偏移；找不到保留原坐标（禁真空窗仍按原坐标兜底）。
-    let hunks = parse_hunks(diff);
+    // 改动行与每 hunk 跨度（坐标已在 prepare_files 重锚定）
     let mut changed_lines: BTreeSet<usize> = BTreeSet::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut shifted = false;
-    for h in hunks.iter().filter(|h| !h.changed.is_empty()) {
-        let off = anchor_offset(&lines, h);
-        shifted |= off != 0;
-        let sh = |l: usize| ((l as i64 + off).max(0) as usize).min(n - 1);
-        changed_lines.extend(h.changed.iter().map(|&l| sh(l)));
-        spans.push((sh(h.start), sh(h.start + h.count.max(1) - 1)));
+    for h in ctx.hunks.iter().filter(|h| !h.changed.is_empty()) {
+        changed_lines.extend(h.changed.iter().map(|&l| l.min(n - 1)));
+        spans.push((h.start.min(n - 1), (h.start + h.count.max(1) - 1).min(n - 1)));
     }
     if changed_lines.is_empty() {
         return None;
     }
-    // 重锚定后的 diff：核 / 一跳按偏移后的改动行锚定
-    let anchored_diff = shifted.then(|| synth_diff(&changed_lines));
-    let diff = anchored_diff.as_deref().unwrap_or(diff);
-    let (all, changed, hop) = match defs {
+    let (all, changed, hop) = match ctx.defs.as_deref() {
         Some(d) => {
             let all = all_defs(&lines, d);
-            let changed = changed_defs(diff, &all);
+            let changed = changed_defs(&ctx.diff, &all);
             let hop = one_hop(&lines, &all, &changed);
             (all, changed, hop)
         }
@@ -236,10 +300,10 @@ fn slice_file(
     }
     let expand = merge_ranges(expand);
     // 保留行：文件头 + 签名。非支持语言无 def，「头」只看文件顶部 HEADER_MAX_LINES 行（评审修 7）；多行 import 组
-    // （Go `import (`、Rust `use x::{`、TS `import {`）按括号配平整组保留（评审修 8）。
+    // （Go `import (`、Rust `use x::{`、TS `import {`）按代码内括号配平整组保留（评审修 8；字符串 / 注释里的括号不计）。
     let mut keep: BTreeSet<usize> = BTreeSet::new();
     let first_def = all.first().map(|d| d.start).unwrap_or(n);
-    let header_limit = if defs.is_some() { first_def } else { HEADER_MAX_LINES.min(n) };
+    let header_limit = if ctx.defs.is_some() { first_def } else { HEADER_MAX_LINES.min(n) };
     let mut header_kept = 0usize;
     let mut open_depth: i32 = 0;
     for (i, line) in lines.iter().enumerate().take(header_limit) {
@@ -247,14 +311,14 @@ fn slice_file(
         if open_depth > 0 {
             keep.insert(i);
             header_kept += 1;
-            open_depth += bracket_delta(t);
+            open_depth += bracket_delta_code(t);
         } else if t.is_empty() {
             continue;
         } else if is_header_line(t) {
             keep.insert(i);
             header_kept += 1;
             if is_import_line(t) {
-                open_depth = bracket_delta(t).max(0);
+                open_depth = bracket_delta_code(t).max(0);
             }
         }
         if header_kept >= HEADER_MAX_LINES {
@@ -326,12 +390,14 @@ fn slice_file(
         i = j;
     }
     let one_hop = hop.callees.len() + hop.callers.len();
-    let head = format!("{path}:1-{n}（切片：核 {} · 一跳 {one_hop} · 折叠 {folds} 段）", changed.len());
+    let head = format!("{}:1-{n}（切片：核 {} · 一跳 {one_hop} · 折叠 {folds} 段）", ctx.fc.path, changed.len());
     Some(SliceOut { text: format!("{head}\n{body}\n"), one_hop, folded_lines })
 }
 
 /// 0 壳段：每个改动文件一块，第一级 = 切片块（slice 档、大文件）或全文块（full 档 / 小文件 / 无可解析 hunk），
 /// 装不下 → 回落梯子（不砍语义只降粒度）：def 体（支持语言）→ 骨架 → hunk 窗（非支持语言）→ omit 坐标。按 budget 字节封顶。
+/// 测试入口（生产路径 `pack_bundle` 走 `body_section_ctx`，复用已准备好的 `FileCtx`）。
+#[cfg(test)]
 pub(crate) fn body_section(
     bundle: &Bundle,
     root: &Path,
@@ -340,31 +406,28 @@ pub(crate) fn body_section(
     opts: &PackOpts,
     stats: &mut PackStats,
 ) -> String {
+    let files = prepare_files(bundle, root);
+    body_section_ctx(&files, budget, omit, opts, stats)
+}
+
+fn body_section_ctx(files: &[FileCtx<'_>], budget: usize, omit: &mut Vec<String>, opts: &PackOpts, stats: &mut PackStats) -> String {
     let mut out = String::new();
     stats.body = match opts.body {
         PackBody::Slice => "slice",
         PackBody::Full => "full",
     };
-    // 填充序 = hub_order（枢纽先填、保全文；M21a 批 C K7）。
-    for fc in bundle.fill_order() {
-        // 工作树直读（bundle 路径来自 git diff、非模型可控，沿用 bundle::group 安全不变量）
-        let content = std::fs::read_to_string(root.join(&fc.path)).unwrap_or_default();
-        if content.is_empty() {
-            continue;
-        }
+    for ctx in files {
+        let (path, content, n_lines, diff) = (&ctx.fc.path, &ctx.content, ctx.n_lines, ctx.diff.as_str());
         stats.files += 1;
-        let n_lines = content.lines().count();
-        let lang = lang_for(&fc.path);
-        let defs = lang.map(compile_defs);
         let omit_before = omit.len();
         // 第一级：切片 / 全文
-        let full_block = || format!("{}:1-{}（全文，{} 行）\n{}\n\n", fc.path, n_lines, n_lines, content);
+        let full_block = || format!("{path}:1-{n_lines}（全文，{n_lines} 行）\n{content}\n\n");
         let mut sliced: Option<SliceOut> = None;
         let (block, kind) = if opts.body == PackBody::Slice {
             if content.len() <= opts.slice_min_bytes {
                 (full_block(), "small")
             } else {
-                match slice_file(&fc.path, &content, &fc.diff, defs.as_deref(), opts) {
+                match slice_file(ctx, opts) {
                     Some(s) => {
                         let text = s.text.clone();
                         sliced = Some(s);
@@ -391,33 +454,33 @@ pub(crate) fn body_section(
             }
             continue;
         }
-        // 梯子：第一级装不下（不砍语义只降粒度）
+        // 梯子：第一级装不下（不砍语义只降粒度）；坐标用重锚定后的 diff
         stats.ladder += 1;
-        let Some(defs) = defs else {
+        let Some(defs) = ctx.defs.as_deref() else {
             // 非支持语言超预算：先试 hunk±N 行窗（禁真空升级，Task 5）→ 装不下才 omit。
-            if let Some(block) = hunk_window_block(&fc.path, &content, &fc.diff, n_lines, opts.anchor_window) {
+            if let Some(block) = hunk_window_block(path, content, diff, n_lines, opts.anchor_window) {
                 if out.len() + block.len() <= budget {
                     out.push_str(&block);
                     continue;
                 }
             }
-            omit.push(format!("{}:1-{} — 全文超预算（非支持语言无 def 回落）", fc.path, n_lines));
+            omit.push(format!("{path}:1-{n_lines} — 全文超预算（非支持语言无 def 回落）"));
             stats.omitted += 1;
             continue;
         };
         let lines: Vec<&str> = content.lines().collect();
         let mut wrote_def = false; // 至少一个 def 体入了正文
         let mut omitted_def = false; // 至少一个 def 体超预算进了 omit 坐标
-        for (start, end) in changed_def_ranges(&fc.diff, &lines, &defs) {
+        for (start, end) in changed_def_ranges(diff, &lines, defs) {
             let end = end.min(lines.len().saturating_sub(1));
             let body = lines.get(start..=end).unwrap_or(&[]).join("\n");
             if body.is_empty() {
                 continue;
             }
-            let head = format!("{}:{}-{}（def 体，全文超预算回落）", fc.path, start + 1, end + 1);
+            let head = format!("{path}:{}-{}（def 体，全文超预算回落）", start + 1, end + 1);
             let block = format!("{head}\n{body}\n\n");
             if out.len() + block.len() > budget {
-                omit.push(format!("{}:{}-{} — 改动符号体", fc.path, start + 1, end + 1));
+                omit.push(format!("{path}:{}-{} — 改动符号体", start + 1, end + 1));
                 omitted_def = true;
             } else {
                 out.push_str(&block);
@@ -430,8 +493,8 @@ pub(crate) fn body_section(
         // 其余 def 体确实缺席，坐标仍真。骨架也装不下 → 落回现状消息（下方）。
         let mut wrote_skeleton = false;
         if !wrote_def {
-            let skel = skeleton_of(&content, &fc.diff, &defs);
-            let head = format!("{}:1-{}（骨架：签名+改动行）", fc.path, n_lines);
+            let skel = skeleton_of(content, diff, defs);
+            let head = format!("{path}:1-{n_lines}（骨架：签名+改动行）");
             let block = format!("{head}\n{skel}\n");
             if out.len() + block.len() <= budget {
                 out.push_str(&block);
@@ -441,7 +504,7 @@ pub(crate) fn body_section(
         // E8 裁决 D：降级空产出禁真空——def 体没入、骨架没入、连溢出坐标都没有（锚定失败）时
         // 必须 omit 可观测（T42 场景）。
         if !wrote_def && !wrote_skeleton && !omitted_def {
-            omit.push(format!("{}:1-{} — 全文超预算且 def 锚定失败（降级空产出）", fc.path, n_lines));
+            omit.push(format!("{path}:1-{n_lines} — 全文超预算且 def 锚定失败（降级空产出）"));
         }
         if omit.len() > omit_before {
             stats.omitted += 1;
@@ -518,7 +581,8 @@ const OUTSIDE_FILE_MAX_BYTES: u64 = 512 * 1024;
 const OUTSIDE_FILE_MAX_HITS: usize = 200;
 /// 搜调用点的改动 def 名上限：可调用 def 优先、按填充序（非字典序，评审修 1），超出记 omit 一行。
 const OUTSIDE_CALLER_NAMES_MAX: usize = 64;
-/// 搜签名的引用名上限（只限合成 regex 体量；std 类型等无 def 命中的名自然落空）。
+/// 搜签名的引用名上限（只限合成 regex 体量）：小写开头（函数 / 变量样）优先于大写开头（类型样，多为仓外 std 名），
+/// 超出记 omit 一行（复审修 7）。
 const OUTSIDE_SIG_NAMES_MAX: usize = 256;
 /// 渲染的签名块上限。
 const OUTSIDE_SIG_BLOCKS_MAX: usize = 40;
@@ -533,15 +597,25 @@ const OUTSIDE_SPILL_LIST_MAX: usize = 10;
 /// 签名上方紧邻 doc / 注释最多带的行数。
 const OUTSIDE_DOC_MAX_LINES: usize = 10;
 
+/// 裸 alternation 命中后按标识符边界过滤（前后字符不是 `[A-Za-z0-9_$]`）：非消耗式，相邻两个名不会互吃边界，
+/// 含 `$` 的 JS/TS 标识符也能命中（复审修 9）。
+fn word_hits<'a>(re: &Regex, line: &'a str) -> Vec<&'a str> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let bytes = line.as_bytes();
+    re.find_iter(line)
+        .filter(|m| {
+            let before = m.start().checked_sub(1).map(|i| bytes[i]);
+            let after = bytes.get(m.end()).copied();
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        })
+        .map(|m| m.as_str())
+        .collect()
+}
+
 /// 测试文件口径（逐字移植 `eval/risk_replay.py` `TEST_PATH`，批 E K12；M21b 风险规则同口径）。
 fn test_path_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(_test\.go$|\.test\.(ts|js|tsx)$|(^|/)tests?/|(^|/)__tests__/|_spec\.)").expect("static test path regex"))
-}
-
-/// 注释 / doc 行前缀（签名上方 doc 带入 + 调用点排除纯注释行）。
-fn is_comment_line(t: &str) -> bool {
-    t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with('#') || t.starts_with("--")
 }
 
 fn is_callable_kind(kind: &str) -> bool {
@@ -549,36 +623,28 @@ fn is_callable_kind(kind: &str) -> bool {
 }
 
 /// 组内改动 def 名（搜调用点，可调用优先、填充序）与改动 def 体内引用、组内任何文件都未定义的名（搜签名）。
-/// 测试代码不算：改动文件本身匹配 `TEST_PATH` 整文件跳过；Rust 文件首个 `#[cfg(test)]` 之后的 def 不计（`risk_replay.py` 同口径）。
+/// 测试代码不算：改动文件本身匹配 `TEST_PATH` 整文件跳过；Rust 落在 `#[cfg(test)]` 标注的 item / mod 块内的 def 不计
+/// （`rust_test_ranges`，复审修 5）。坐标用重锚定后的 diff（复审修 2）。
 struct OutsideNames {
     callers_of: Vec<String>,
-    sig_of: BTreeSet<String>,
+    sig_of: Vec<String>,
 }
 
-fn outside_names(bundle: &Bundle, root: &Path, omit: &mut Vec<String>) -> OutsideNames {
+fn outside_names(files: &[FileCtx<'_>], omit: &mut Vec<String>) -> OutsideNames {
     let mut callers: Vec<(u8, String)> = Vec::new(); // (优先级, 名)，填充序
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     let mut group_defs: BTreeSet<String> = BTreeSet::new();
-    for fc in bundle.fill_order() {
-        let Some(lang) = lang_for(&fc.path) else { continue };
-        if test_path_re().is_match(&fc.path) {
+    for ctx in files {
+        let Some(defs) = ctx.defs.as_deref() else { continue };
+        if test_path_re().is_match(&ctx.fc.path) {
             continue;
         }
-        let content = std::fs::read_to_string(root.join(&fc.path)).unwrap_or_default();
-        if content.is_empty() {
-            continue;
-        }
-        let defs = compile_defs(lang);
-        let lines: Vec<&str> = content.lines().collect();
-        let all = all_defs(&lines, &defs);
+        let lines: Vec<&str> = ctx.content.lines().collect();
+        let all = all_defs(&lines, defs);
         group_defs.extend(all.iter().map(|d| d.name.clone()));
-        let cfg_test_line = if fc.path.ends_with(".rs") {
-            lines.iter().position(|l| l.trim_start().starts_with("#[cfg(test)]")).unwrap_or(usize::MAX)
-        } else {
-            usize::MAX
-        };
-        for c in changed_defs(&fc.diff, &all) {
-            if c.start >= cfg_test_line {
+        let test_ranges = if ctx.fc.path.ends_with(".rs") { rust_test_ranges(&lines) } else { Vec::new() };
+        for c in changed_defs(&ctx.diff, &all) {
+            if test_ranges.iter().any(|&(a, b)| a <= c.start && c.start <= b) {
                 continue;
             }
             if ref_worthy(&c.name) && !callers.iter().any(|(_, n)| *n == c.name) {
@@ -593,11 +659,12 @@ fn outside_names(bundle: &Bundle, root: &Path, omit: &mut Vec<String>) -> Outsid
         callers.truncate(OUTSIDE_CALLER_NAMES_MAX);
     }
     let callers_of: Vec<String> = callers.into_iter().map(|(_, n)| n).collect();
-    let mut sig_of: BTreeSet<String> =
-        referenced.difference(&group_defs).filter(|n| !callers_of.contains(n)).cloned().collect();
+    let mut sig_of: Vec<String> = referenced.difference(&group_defs).filter(|n| !callers_of.contains(n)).cloned().collect();
+    // 小写开头（函数 / 变量样）优先；同类保持字典序（BTreeSet 已排）
+    sig_of.sort_by_key(|n| n.chars().next().is_some_and(|c| c.is_uppercase()));
     if sig_of.len() > OUTSIDE_SIG_NAMES_MAX {
         omit.push(format!("文件外签名名字截断 +{}", sig_of.len() - OUTSIDE_SIG_NAMES_MAX));
-        sig_of = sig_of.into_iter().take(OUTSIDE_SIG_NAMES_MAX).collect();
+        sig_of.truncate(OUTSIDE_SIG_NAMES_MAX);
     }
     OutsideNames { callers_of, sig_of }
 }
@@ -606,8 +673,9 @@ fn outside_names(bundle: &Bundle, root: &Path, omit: &mut Vec<String>) -> Outsid
 /// 测试文件 / 凭据类路径 / 非支持语言 / 超大文件；命中按 (path, line) 排序后每名 ≤ K 处调用点、每名首个签名；段字节 ≤ `cap`，
 /// 超帽块进 omit。路径来自 walker 与 git diff、非模型可控，读守卫与 `search_repo` 工具同口径（不逐文件 `git ls-files`）；
 /// denylist 只用凭据判据（扩展名 / `.env` / `id_rsa` / 工具目录），不用敏感词子串（`token_bucket.rs` 是源码，评审修 10）。
+/// 名字边界用 `[^\w$]`（含 `$` 的 JS/TS 标识符 `items$` 在 `\b` 下永不命中，复审修 9）。
 fn outside_section(
-    bundle: &Bundle,
+    files: &[FileCtx<'_>],
     root: &Path,
     opts: &PackOpts,
     changeset: &[String],
@@ -615,7 +683,7 @@ fn outside_section(
     omit: &mut Vec<String>,
     stats: &mut PackStats,
 ) -> String {
-    let names = outside_names(bundle, root, omit);
+    let names = outside_names(files, omit);
     if names.callers_of.is_empty() && names.sig_of.is_empty() {
         return String::new();
     }
@@ -625,11 +693,12 @@ fn outside_section(
     }
     let caller_set: std::collections::HashSet<&str> = names.callers_of.iter().map(String::as_str).collect();
     let sig_set: std::collections::HashSet<&str> = names.sig_of.iter().map(String::as_str).collect();
-    let pat = format!(
-        r"\b(?:{})\b",
-        names.callers_of.iter().chain(names.sig_of.iter()).map(|s| regex::escape(s)).collect::<Vec<_>>().join("|")
-    );
+    // 边界不用 `\b`（`$` 属 \W，`items$` 永不命中）也不用消耗式 `[^\w$]`（相邻两个名会互吃边界）：
+    // 先按裸 alternation 命中，再手工看前后字符是否标识符字节（复审修 9）。
+    let alt = names.callers_of.iter().chain(names.sig_of.iter()).map(|s| regex::escape(s)).collect::<Vec<_>>().join("|");
+    let pat = format!("(?:{alt})");
     let (Ok(re), Ok(matcher)) = (Regex::new(&pat), grep_regex::RegexMatcher::new(&pat)) else { return String::new() };
+
     let changeset: std::collections::HashSet<&str> = changeset.iter().map(String::as_str).collect();
     let mut defs_by_ext: std::collections::BTreeMap<String, Vec<(&'static str, Regex)>> = Default::default();
     // 一行的分类：定义行（名 ∈ sig_of）→ 签名候选；含 callers_of 名的非定义 / 非注释 / 非 import 行 → 调用点候选
@@ -640,8 +709,7 @@ fn outside_section(
         }
         let def_name = match_def(line, defs).map(|(_, n)| n);
         let (mut sig, mut site) = (Vec::new(), Vec::new());
-        for m in re.find_iter(line) {
-            let name = m.as_str();
+        for name in word_hits(&re, line) {
             if def_name.as_deref() == Some(name) {
                 if sig_set.contains(name) {
                     sig.push(name.to_string());
@@ -677,24 +745,23 @@ fn outside_section(
         }
         let ext = rel.rsplit('.').next().unwrap_or("").to_string();
         let defs = defs_by_ext.entry(ext).or_insert_with(|| compile_defs(lang));
-        let mut local: Vec<(u64, String)> = Vec::new();
+        // sink 内直接分类并收集结果（不再回放第二遍）
+        let mut local: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
         let mut searcher = grep_searcher::SearcherBuilder::new().line_number(true).build();
         let _ = searcher.search_path(
             &matcher,
             dent.path(),
             grep_searcher::sinks::UTF8(|lnum, line| {
-                let line = line.trim_end();
-                let (sig, site) = classify(line, defs);
+                let (sig, site) = classify(line.trim_end(), defs);
                 if !sig.is_empty() || !site.is_empty() {
-                    local.push((lnum, line.to_string()));
+                    local.push((lnum as usize, sig, site));
                 }
                 Ok(local.len() < OUTSIDE_FILE_MAX_HITS)
             }),
         );
-        for (lnum, line) in local {
-            let (sig, site) = classify(&line, defs);
-            sigs.extend(sig.into_iter().map(|n| (rel.clone(), lnum as usize, n)));
-            sites.extend(site.into_iter().map(|n| (rel.clone(), lnum as usize, n)));
+        for (lnum, sig, site) in local {
+            sigs.extend(sig.into_iter().map(|n| (rel.clone(), lnum, n)));
+            sites.extend(site.into_iter().map(|n| (rel.clone(), lnum, n)));
         }
     }
     sites.sort();
@@ -796,7 +863,7 @@ fn outside_section(
     format!("## 文件外片段\n{text}")
 }
 
-/// 引擎入口：为一个 bundle 产 pack 正文（0 壳 + 省略清单）与形态统计，预算近→远填。
+/// 引擎入口：为一个 bundle 产 pack 正文（0 壳 + 文件外片段 + 省略清单）与形态统计，预算近→远填。
 /// 不含 `<dossier>` 包裹（那是 prompt 层的活）。空 = 无 pack（降级）。
 /// `own_diff_bytes`：本变更集 diff 的字节数（mandate——diff 是 prompt 恒渲染部分，永不砍，
 /// 但占预算记账）：先从 budget 扣出预留，pack 各段再按剩余近→远填充。由调用方传入而非在此
@@ -807,13 +874,14 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
     let remaining = budget.saturating_sub(own_diff_bytes);
     let mut stats = PackStats::default();
     let mut omit: Vec<String> = Vec::new();
+    let files = prepare_files(bundle, root);
 
     // 0 壳：改动源文（切片 / 全文 + 梯子；overflow → omit）
-    let bodies = body_section(bundle, root, remaining, &mut omit, opts, &mut stats);
+    let bodies = body_section_ctx(&files, remaining, &mut omit, opts, &mut stats);
     // 文件外片段（仅 slice 档）：帽 = min(0 壳后剩余, 组预算 / 8)
     let outside = if opts.body == PackBody::Slice {
         let cap = remaining.saturating_sub(bodies.len()).min(remaining / OUTSIDE_BUDGET_SHARE);
-        outside_section(bundle, root, opts, changeset, cap, &mut omit, &mut stats)
+        outside_section(&files, root, opts, changeset, cap, &mut omit, &mut stats)
     } else {
         String::new()
     };
@@ -1541,8 +1609,116 @@ mod tests {
     fn second_pass_opts_full_blocks_with_outside_section() {
         // 评审修 9：二阶段档 = 全文块 + 文件外片段。
         let (tmp, b, changeset) = outside_repo();
-        let p = pack_bundle(&b, tmp.path(), 1_000_000, 0, &PackOpts::second_pass(), &changeset);
+        let p = pack_bundle(&b, tmp.path(), 1_000_000, 0, &PackOpts::second_pass(&PackOpts::default()), &changeset);
         assert!(p.text.contains("src/core.rs:1-1（全文，1 行）") && p.text.contains("## 文件外片段"), "{}", p.text);
         assert_eq!((p.stats.body, p.stats.small_full, p.stats.sliced), ("slice", 2, 0));
+    }
+
+    // ---- 复审修（2026-09-09 第二轮 code-review high）----
+
+    #[test]
+    fn second_pass_opts_follow_user_config() {
+        // 复审修 1：二阶段只改 slice_min_bytes，body / anchor_window 沿用用户配置；full 对照臂不被切成 slice。
+        let full = PackOpts::second_pass(&PackOpts { anchor_window: 7, ..PackOpts::full() });
+        assert_eq!((full.body, full.anchor_window, full.slice_min_bytes), (PackBody::Full, 7, usize::MAX));
+        let (tmp, b, changeset) = outside_repo();
+        let p = pack_bundle(&b, tmp.path(), 1_000_000, 0, &full, &changeset);
+        assert!(!p.text.contains("文件外片段") && p.text.contains("（全文，1 行）"), "{}", p.text);
+    }
+
+    #[test]
+    fn second_pass_changeset_excludes_needs_file_from_outside_search() {
+        // 复审修 8：needs 前插的文件已在 0 壳全文，不再当「文件外」二次注入。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let (tmp, b, mut changeset) = outside_repo();
+        let mut files = vec![FileChange { path: "src/user.rs".into(), diff: String::new() }];
+        files.extend(b.files.iter().cloned());
+        changeset.push("src/user.rs".into());
+        let pb = Bundle::from_files(files);
+        let p = pack_bundle(&pb, tmp.path(), 1_000_000, 0, &PackOpts::second_pass(&PackOpts::default()), &changeset);
+        assert!(p.text.contains("src/user.rs:1-5（全文，5 行）"), "{}", p.text);
+        assert!(!p.text.contains("src/user.rs:1-5（调用点"), "needs 文件不再进文件外片段: {}", p.text);
+        assert!(p.text.contains("（签名：parse_widget）"), "其余文件外片段照常: {}", p.text);
+    }
+
+    #[test]
+    fn outside_names_use_reanchored_coordinates() {
+        // 复审修 2：diff 坐标比工作树早 15 行（顶部未暂存插入）——文件外搜索用重锚定后的改动 def 名，而不是陈旧坐标处的注释。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let (tmp, _, changeset) = outside_repo();
+        let prefix: String = (0..15).map(|i| format!("// drift {i}\n")).collect();
+        std::fs::write(tmp.path().join("src/core.rs"), format!("{prefix}pub fn compute_total(xs: &[u8]) -> u8 {{ parse_widget(xs) }}\n")).unwrap();
+        let b = Bundle::from_files(vec![FileChange {
+            path: "src/core.rs".into(),
+            diff: "@@ -1,1 +1,1 @@\n+pub fn compute_total(xs: &[u8]) -> u8 { parse_widget(xs) }\n".into(),
+        }]);
+        let p = pack_bundle(&b, tmp.path(), 1_000_000, 0, &PackOpts::default(), &changeset);
+        assert!(p.text.contains("（调用点：compute_total）") && p.text.contains("（签名：parse_widget）"), "{}", p.text);
+    }
+
+    #[test]
+    fn outside_ts_export_function_is_signature_candidate() {
+        // 复审修 3：`export function parseWidget(` 是 def 行，不能被 import 短路掉。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/lib")).unwrap();
+        std::fs::write(root.join("src/api.ts"), "export function wrapBody(): number {\n  return parseWidget(1);\n}\n").unwrap();
+        std::fs::write(root.join("src/lib/widget.ts"), "/** parse it */\nexport function parseWidget(x: number): number {\n  return x;\n}\nexport const items$ = wrapBody();\n").unwrap();
+        std::fs::write(root.join("src/view.ts"), "import { items$ } from './lib/widget';\nexport const view = items$ + wrapBody();\n").unwrap();
+        let b = Bundle::from_files(vec![FileChange {
+            path: "src/api.ts".into(),
+            diff: "@@ -2,1 +2,1 @@\n+  return parseWidget(1);\n".into(),
+        }]);
+        let p = pack_bundle(&b, root, 1_000_000, 0, &PackOpts::default(), &["src/api.ts".to_string()]);
+        assert!(p.text.contains("src/lib/widget.ts:1-2（签名：parseWidget）\n/** parse it */\nexport function parseWidget(x: number): number {"), "{}", p.text);
+        // 调用点：widget.ts 的 `export const items$ = wrapBody();` 与 view.ts 第 2 行都算；view.ts 的 import 行不算
+        assert!(p.text.contains("（调用点：wrapBody）"), "{}", p.text);
+        assert!(!p.text.contains("src/view.ts:1-1（"), "{}", p.text);
+    }
+
+    #[test]
+    fn outside_dollar_names_match_with_custom_boundary() {
+        // 复审修 9：`items$` 这类含 `$` 的标识符用 [^\w$] 边界才能命中。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/store.ts"), "export const items$ = makeSubject();\n").unwrap();
+        std::fs::write(root.join("src/view.ts"), "const sub = items$.pipe(x => x);\n").unwrap();
+        let b = Bundle::from_files(vec![FileChange { path: "src/store.ts".into(), diff: "@@ -1,1 +1,1 @@\n+export const items$ = makeSubject();\n".into() }]);
+        let p = pack_bundle(&b, root, 1_000_000, 0, &PackOpts::default(), &["src/store.ts".to_string()]);
+        assert!(p.text.contains("src/view.ts:1-1（调用点：items$）"), "{}", p.text);
+    }
+
+    #[test]
+    fn outside_cfg_test_item_level_keeps_following_production_defs() {
+        // 复审修 5：item 级 `#[cfg(test)]` 只屏蔽该 item，其后的生产 def 仍搜调用点。
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let (tmp, _, _) = outside_repo();
+        let root = tmp.path();
+        std::fs::write(root.join("src/core.rs"), "#[cfg(test)]\nfn test_wrapper() -> u8 { 1 }\npub fn compute_total(xs: &[u8]) -> u8 { xs.len() as u8 }\n").unwrap();
+        let diff = "@@ -2,2 +2,2 @@\n+fn test_wrapper() -> u8 { 1 }\n+pub fn compute_total(xs: &[u8]) -> u8 { xs.len() as u8 }\n";
+        let b = Bundle::from_files(vec![FileChange { path: "src/core.rs".into(), diff: diff.into() }]);
+        let p = pack_bundle(&b, root, 1_000_000, 0, &PackOpts::default(), &["src/core.rs".to_string()]);
+        assert!(p.text.contains("（调用点：compute_total）"), "{}", p.text);
+    }
+
+    #[test]
+    fn anchor_offset_scores_informative_lines_and_tolerates_one_edit() {
+        // 复审修 4：5 个 + 行里 1 个被后续编辑改过仍能定位（4/5 ≥ 一半且优于原位）；只有 `}` 的 + 行不定位（返回 0）。
+        let mut file: Vec<String> = (0..100).map(|i| format!("// pad {i}")).collect();
+        file.extend(["fn beta_fn() {", "    let a1 = compute(1);", "    let a2 = compute(2);", "    let a3 = compute(3);", "    let a4 = compute(4);", "    let a5 = EDITED;", "}"].map(String::from));
+        let refs: Vec<&str> = file.iter().map(String::as_str).collect();
+        let plus: Vec<(usize, String)> = (0..5).map(|k| (1 + k, format!("    let a{} = compute({});", k + 1, k + 1))).collect();
+        let h = crate::diffsym::Hunk { start: 1, count: 5, changed: (1..6).collect(), plus };
+        assert_eq!(anchor_offset(&refs, &h), 100, "4/5 吻合 → 偏移 +100");
+        let braces = crate::diffsym::Hunk { start: 3, count: 1, changed: vec![3], plus: vec![(3, "}".into())] };
+        assert_eq!(anchor_offset(&refs, &braces), 0, "低信息 + 行不参与定位");
     }
 }

@@ -124,79 +124,15 @@ pub(crate) fn parse_hunk_new_range(line: &str) -> Option<(usize, usize)> {
     Some((c, d))
 }
 
-fn parse_hunk_new_start(line: &str) -> Option<usize> {
-    parse_hunk_new_range(line).map(|(c, _)| c)
-}
-
 /// diff 全部改动行（0-based 新文件坐标）：每个 + 行的行号；纯删除行取删除点坐标
-/// （同 hunk_anchors 语义——删除发生处的新文件位置，连续删除会重复、调用方去重）。
-/// 供骨架档保留 hunk 的全部改动行（hunk_anchors 只给每 hunk 首行，多行 hunk 会丢内容）。
-/// ponytail: 与 hunk_anchors 平行的 hunk 游走（drift 风险，见 hunk_anchors 注记）；若再动一起改。
+/// （删除发生处的新文件位置，连续删除会重复、调用方去重）。派生自 `parse_hunks`（批 E 复审：三份平行游走合一）。
 pub(crate) fn hunk_changed_lines(diff: &str) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut new_line = 0usize;
-    for raw in diff.lines() {
-        if raw.starts_with("+++ ") || raw.starts_with("--- ") {
-            continue;
-        }
-        if raw.starts_with("@@") {
-            new_line = parse_hunk_new_start(raw).unwrap_or(1);
-            continue;
-        }
-        if raw.starts_with('\\') {
-            continue; // No-newline 标记非内容行
-        }
-        match raw.as_bytes().first() {
-            Some(b'+') => {
-                out.push(new_line.saturating_sub(1));
-                new_line += 1;
-            }
-            Some(b'-') => out.push(new_line.saturating_sub(1)),
-            _ => new_line += 1,
-        }
-    }
-    out
+    parse_hunks(diff).into_iter().flat_map(|h| h.changed).collect()
 }
 
-/// 每个 hunk 的首个改动行（0-based 新文件坐标），供 0 壳外围 def 定位。
-/// ponytail: 与 hunk_changed_lines 的 hunk 游走平行（drift 风险）；两者若再动一起改，热点再统一。
+/// 每个 hunk 的首个改动行（0-based 新文件坐标），供 0 壳外围 def 定位（旧梯子 `changed_def_ranges`）。
 pub(crate) fn hunk_anchors(diff: &str) -> Vec<usize> {
-    let mut anchors = Vec::new();
-    let mut new_line = 0usize;
-    let mut hunk_anchor: Option<usize> = None;
-    for raw in diff.lines() {
-        if raw.starts_with("+++ ") || raw.starts_with("--- ") {
-            continue;
-        }
-        if raw.starts_with("@@") {
-            if let Some(a) = hunk_anchor.take() {
-                anchors.push(a);
-            }
-            new_line = parse_hunk_new_start(raw).unwrap_or(1);
-            continue;
-        }
-        if raw.starts_with('\\') {
-            continue; // No-newline 标记非内容行
-        }
-        match raw.as_bytes().first() {
-            Some(b'+') => {
-                if hunk_anchor.is_none() {
-                    hunk_anchor = Some(new_line.saturating_sub(1));
-                }
-                new_line += 1;
-            }
-            Some(b'-') => {
-                if hunk_anchor.is_none() {
-                    hunk_anchor = Some(new_line.saturating_sub(1));
-                }
-            }
-            _ => new_line += 1,
-        }
-    }
-    if let Some(a) = hunk_anchor.take() {
-        anchors.push(a);
-    }
-    anchors
+    parse_hunks(diff).iter().filter_map(|h| h.changed.first().copied()).collect()
 }
 
 /// 改动 hunk 的外围 def 完整体行范围（0-based inclusive），按 def 起行去重、升序。
@@ -260,17 +196,44 @@ fn is_value_kind(kind: &str) -> bool {
     matches!(kind, "const" | "static" | "type")
 }
 
-/// 值 def 的块尾（0-based）：从 i 起逐行累计 `([{` / `)]}` 深度，行末深度 ≤ 0 即止；上限 400 行护栏。
+/// 注释 / doc 行前缀（三语言 `//` / `/*` / `*`，Rust 属性 `#`，SQL/Lua `--`）：一跳取名、签名 doc、调用点判定共用一个口径。
+pub(crate) fn is_comment_line(t: &str) -> bool {
+    t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with('#') || t.starts_with("--")
+}
+
+/// 一行代码里 `([{` 与 `)]}` 的数量差，跳过字符串字面量（`"…"` 含转义、`'x'` / `'\x'` 字符字面量——
+/// 生命周期 `'a` 不当引号）与 `//` 行尾注释：`const RE: &str = r"(";` 不能把外围块的深度带偏（批 E 复审修 6）。
+pub(crate) fn bracket_delta_code(line: &str) -> i32 {
+    let b = line.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'\'' if i + 2 < b.len() && (b[i + 2] == b'\'' || (b[i + 1] == b'\\' && i + 3 < b.len() && b[i + 3] == b'\'')) => {
+                i += if b[i + 1] == b'\\' { 3 } else { 2 };
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'/' => break,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// 值 def 的块尾（0-based）：从 i 起逐行累计代码内 `([{` / `)]}` 深度（`bracket_delta_code`），行末深度 ≤ 0 即止；
+/// 上限 400 行护栏，配平失败回落单行（宁少吞不多吞）。
 pub(crate) fn value_end(lines: &[&str], i: usize) -> usize {
     let mut depth: i32 = 0;
     for (j, line) in lines.iter().enumerate().take((i + 400).min(lines.len())).skip(i) {
-        for ch in line.chars() {
-            match ch {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth -= 1,
-                _ => {}
-            }
-        }
+        depth += bracket_delta_code(line);
         if depth <= 0 {
             return j;
         }
@@ -298,6 +261,25 @@ pub(crate) fn all_defs(lines: &[&str], defs: &[(&'static str, Regex)]) -> Vec<De
         if end > i {
             stack.push((end, shields_nested(kind)));
         }
+    }
+    out
+}
+
+/// Rust 测试代码区间（0-based inclusive）：每个 `#[cfg(test)]` 属性之后首个非属性 / 非空行是被标注的 item——
+/// `mod … {` → 整个块；其他 item（测试便利 wrapper 等）→ 只该 item 的块（批 E 复审修 5：不再用「首个 `#[cfg(test)]`
+/// 之后全算测试」一刀切，`src/cli/spec.rs` 那种 item 级标注后面还有生产函数）。与 `eval/risk_replay.py:433` 口径的差别在此。
+pub(crate) fn rust_test_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.trim_start().starts_with("#[cfg(test)]") {
+            continue;
+        }
+        let Some(item) = (i + 1..lines.len()).find(|&j| {
+            let t = lines[j].trim_start();
+            !t.is_empty() && !t.starts_with("#[") && !t.starts_with("//")
+        }) else { continue };
+        let end = block_end(lines, item);
+        out.push((item, end.max(item)));
     }
     out
 }
@@ -338,8 +320,8 @@ pub(crate) struct Hunk {
     pub plus: Vec<(usize, String)>,
 }
 
-/// 按 hunk 拆 diff（游走规则与 `hunk_changed_lines` 一致：`+++` / `---` 头与 `\` 标记跳过，删除点取当前新文件位置）。
-/// ponytail: 第三份平行的 hunk 游走（drift 风险）；三者若再动一起改。
+/// 按 hunk 拆 diff（唯一的 hunk 游走：`+++` / `---` 头与 `\` 标记跳过，删除点取当前新文件位置；
+/// `hunk_changed_lines` / `hunk_anchors` 由此派生）。
 pub(crate) fn parse_hunks(diff: &str) -> Vec<Hunk> {
     let mut out: Vec<Hunk> = Vec::new();
     let mut new_line = 0usize;
@@ -367,20 +349,26 @@ pub(crate) fn parse_hunks(diff: &str) -> Vec<Hunk> {
     out
 }
 
-/// def 体内出现的 `ref_worthy` 标识符（去自身名）；注释行（`//` / `#` / `*` / `/*` 起始）不参与。
+/// 三语言关键字里能过 `ref_worthy` 的（≥ 8 字符小写或含大写）：不是符号引用，取名时剔除（复审修 3 连带）。
+const BODY_KEYWORDS: &[&str] = &[
+    "function", "continue", "interface", "implements", "instanceof", "protected", "readonly", "abstract", "override",
+    "declare", "namespace", "undefined", "constructor", "extends", "private", "public", "static", "typeof", "package",
+    "fallthrough", "unsafe", "return", "struct", "import", "export", "default", "switch", "finally", "boolean",
+];
+
+/// def 体内出现的 `ref_worthy` 标识符（去自身名与语言关键字）；注释行（`//` / `#` / `*` / `/*` 起始）不参与。
 pub(crate) fn body_names(lines: &[&str], r: &DefRange) -> std::collections::BTreeSet<String> {
     static IDENT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let ident = IDENT.get_or_init(|| Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*").expect("static ident regex"));
     let mut out = std::collections::BTreeSet::new();
     let end = r.end.min(lines.len().saturating_sub(1));
     for line in lines.iter().take(end + 1).skip(r.start) {
-        let t = line.trim_start();
-        if t.starts_with("//") || t.starts_with('#') || t.starts_with('*') || t.starts_with("/*") {
+        if is_comment_line(line.trim_start()) {
             continue;
         }
         for m in ident.find_iter(line) {
             let s = m.as_str();
-            if s != r.name && ref_worthy(s) {
+            if s != r.name && ref_worthy(s) && !BODY_KEYWORDS.contains(&s) {
                 out.insert(s.to_string());
             }
         }
@@ -621,5 +609,29 @@ mod tests {
         // 与 hunk_changed_lines 同源
         let flat: Vec<usize> = hs.iter().flat_map(|h| h.changed.clone()).collect();
         assert_eq!(flat, hunk_changed_lines(diff));
+    }
+
+    #[test]
+    fn value_end_ignores_brackets_in_strings_and_comments() {
+        // 复审修 6：mod 内 `const RE: &str = r"(";` 不能吞掉其后的 fn。
+        let src: Vec<&str> = "mod m {\n    const RE: &str = r\"(\";\n    fn foo_fn() { bar(\n        1\n    ); }\n    fn baz_fn() { qux(); } // trailing ) comment\n}\n".lines().collect();
+        assert_eq!(value_end(&src, 1), 1);
+        let all = all_defs(&src, &rust_defs());
+        assert_eq!(names(&all), vec!["RE", "foo_fn", "baz_fn"], "{all:?}");
+        assert_eq!(bracket_delta_code("let c = '(' ; let s = \"{{\"; // )"), 0);
+        assert_eq!(bracket_delta_code("fn f<'a>(x: &'a str) {"), 1, "生命周期 'a 不当引号");
+    }
+
+    #[test]
+    fn rust_test_ranges_item_level_vs_mod_level() {
+        let src: Vec<&str> = "#[cfg(test)]\nfn test_wrapper() -> u8 {\n    1\n}\npub fn production_fn() -> u8 { 2 }\n#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\n    fn case_one() {}\n}\n".lines().collect();
+        assert_eq!(rust_test_ranges(&src), vec![(1, 3), (7, 9)]);
+    }
+
+    #[test]
+    fn hunk_helpers_derive_from_parse_hunks() {
+        let diff = "@@ -1,2 +1,3 @@\n a\n+b\n+c\n@@ -9,1 +10,0 @@\n-gone\n";
+        assert_eq!(hunk_changed_lines(diff), vec![1, 2, 9]);
+        assert_eq!(hunk_anchors(diff), vec![1, 9]);
     }
 }
