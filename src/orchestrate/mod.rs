@@ -5,8 +5,6 @@ use crate::positioning::anchor_suspicions;
 use crate::prompt::{build_scan_prompt, ScanPrompt, ScanPromptInput};
 use crate::provider::registry::ProviderRegistry;
 use crate::state::{CellInput, CellRecord};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 /// 扇出持久化钩子：扇出前写输入快照（`manifest`，全集一次性），每 cell 完成即写结果（`on_cell`）。
 /// `sink=None` 时全跳过——`run_review`/`run_code_review` 无 job 上下文的直调路径行为不变。
@@ -92,7 +90,7 @@ impl From<&crate::config::EffectiveModel> for ScanEntrySpec {
 }
 
 /// 扇出输入：`bundles` / `dossiers` / `others` 等长等序（`cli::plan_cells` 产物）；`entries` = 活跃 scanner 列表（design §5：每条对每组各跑
-/// 一次）；`workers` = 角色层并发（`review.scanners.workers`）；`samples` = 同模型多 lens 采样（`review.scanners.samples`）。
+/// 一次）；`samples` = 同模型多 lens 采样（`review.scanners.samples`）。并发无角色级旋钮：只受各 provider 在途门（唯一闸，D13）。
 pub struct ScanFanoutInput<'a> {
     pub target_label: &'a str,
     pub bundles: &'a [Bundle],
@@ -102,7 +100,6 @@ pub struct ScanFanoutInput<'a> {
     pub spec_docs: &'a str,
     pub root: &'a std::path::Path,
     pub entries: &'a [ScanEntrySpec],
-    pub workers: usize,
     pub samples: u32,
 }
 
@@ -173,8 +170,8 @@ pub fn scan_cells_from_records(records: Vec<CellRecord>) -> Vec<ScanCellResult> 
 }
 
 /// scanner 静态扇出（design §2：纯生产者、无候补）：cell = 组 × 条目 × samples；prompt 每组只构造一次（同组各条目 / samples 字节相同 →
-/// 共享头 cache 命中）；并发 = provider 在途门（registry `lease`，先过）× 角色 `workers` 信号量（门后取，饱和 provider 不占 worker 槽，
-/// 评审修 7）。单格 = [`scan_cell_record`]（resume 同款）。needs 只随 cell 落库并计数。
+/// 共享头 cache 命中）；并发 = provider 在途门（registry `lease`；唯一闸，无角色级 workers，D13）。单格 = [`scan_cell_record`]
+/// （resume 同款）。needs 只随 cell 落库并计数。
 pub async fn run_scan_fanout(
     registry: &ProviderRegistry,
     input: &ScanFanoutInput<'_>,
@@ -219,10 +216,9 @@ pub async fn run_scan_fanout(
             .collect();
         s.manifest(&inputs);
     }
-    let workers = Arc::new(Semaphore::new(input.workers.max(1)));
-    // 大格先发（M21a 出口验收）：worker 许可 FIFO、join_all 按序首轮 poll → 派发序 = 许可序。7 组 / 4 worker 时最大组排第六
+    // 大格先发（M21a 出口验收）：provider 门 FIFO、join_all 按序首轮 poll → 派发序 = 门序。7 组 / 门宽 4 时最大组排第六
     // 让总墙钟 = 排队 + 最慢格；按组 diff 字节（输出量的主因）降序、次键 prompt 字节、再按 plan 序派发，结果仍按 plan 序回收
-    // （cell_id / manifest / 报告顺序不变）。workers ≥ 组数时无排队，此序无影响。
+    // （cell_id / manifest / 报告顺序不变）。门宽 ≥ 路由到该 provider 的格数时无排队，此序无影响。
     let diff_bytes: Vec<usize> = input.bundles.iter().map(|b| b.files.iter().map(|f| f.diff.len()).sum()).collect();
     let prompt_bytes: Vec<usize> = prompts.iter().map(|p| p.system.len() + p.blocks.iter().map(|b| b.text.len()).sum::<usize>()).collect();
     let mut dispatch: Vec<usize> = (0..plan.len()).collect();
@@ -232,17 +228,15 @@ pub async fn run_scan_fanout(
     });
     let futs = dispatch.iter().map(|&pi| {
         let (g, e, k, id) = &plan[pi];
-        let workers = Arc::clone(&workers);
         let prompt = &prompts[*g];
         let template_hash = template_hash.clone();
         async move {
             let t0 = std::time::Instant::now();
             let mut queue_wait_ms = 0u64;
-            // 先过 provider 在途门，再取 worker 许可（评审修 7）；未注册条目在此即失败（不占 worker）。
+            // 过 provider 在途门即发出（唯一闸，D13）；未注册条目在此即失败。
             let res = match registry.lease(&e.route_key).await {
                 Ok(lease) => {
-                    let _permit = workers.acquire().await.expect("workers semaphore never closed");
-                    queue_wait_ms = t0.elapsed().as_millis() as u64; // 两道门都过了才算发出：之前全是排队
+                    queue_wait_ms = t0.elapsed().as_millis() as u64; // 门等待 = 排队
                     lease.run(prompt).await
                 }
                 Err(err) => Err(err),
@@ -262,13 +256,22 @@ pub async fn run_scan_fanout(
     cells.sort_by_key(|(pi, _)| *pi);
     let cells: Vec<ScanCellResult> = cells.into_iter().map(|(_, c)| c).collect();
     let mut out = ScanResults::default();
-    let workers_n = input.workers.max(1);
-    if plan.len() > workers_n {
-        // 排队告警（M21a 出口验收）：墙钟 = 排队 + 最长格；用户能看见是哪道门在限流。
-        out.warnings.push(format!(
-            "scanner cells {} > review.scanners.workers {}: {} cell(s) queued (wall = queue wait + slowest cell; raise workers or check provider maxConcurrency)",
-            plan.len(), workers_n, plan.len() - workers_n
-        ));
+    // 排队告警（M21a 出口验收；D13 按 provider 计）：路由到同一 provider 的格数 > 其门宽即排队，墙钟 = 排队 + 最长格；
+    // 文案指向唯一的旋钮 providers.<p>.maxConcurrency。未注册条目不计（它们进 failed）。
+    let mut per_provider: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (_, e, _, _) in &plan {
+        if let Some(p) = registry.provider_of(&e.route_key) {
+            *per_provider.entry(p).or_default() += 1;
+        }
+    }
+    for (p, n) in per_provider {
+        let cap = registry.cap_of(p).unwrap_or(1) as usize;
+        if n > cap {
+            out.warnings.push(format!(
+                "scanner cells {n} on provider {p} > maxConcurrency {cap}: {} cell(s) queued (wall = queue wait + slowest cell; raise providers.{p}.maxConcurrency)",
+                n - cap
+            ));
+        }
     }
     for c in &cells {
         out.usage.0 += c.record.input_tokens;
@@ -456,24 +459,24 @@ mod scan_tests {
         fn on_cell(&self, rec: CellRecord) { self.cells.lock().unwrap().push(rec); }
         fn on_roles(&self, roles: &[Role]) { self.roles.lock().unwrap().extend_from_slice(roles); }
     }
-    fn input<'a>(bundles: &'a [Bundle], dossiers: &'a [String], others: &'a [String], root: &'a std::path::Path, entries: &'a [ScanEntrySpec], workers: usize, samples: u32) -> ScanFanoutInput<'a> {
-        ScanFanoutInput { target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", root, entries, workers, samples }
+    fn input<'a>(bundles: &'a [Bundle], dossiers: &'a [String], others: &'a [String], root: &'a std::path::Path, entries: &'a [ScanEntrySpec], samples: u32) -> ScanFanoutInput<'a> {
+        ScanFanoutInput { target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", root, entries, samples }
     }
 
-    /// 大格先发：workers = 1 串行化派发，三组 diff 字节 小 / 大 / 中 → 调用序 g2, g3, g1；`res.cells` 仍按 plan 序（g1, g2, g3）。
+    /// 大格先发：provider 门宽 1 串行化派发，三组 diff 字节 小 / 大 / 中 → 调用序 g2, g3, g1；`res.cells` 仍按 plan 序（g1, g2, g3）。
     #[tokio::test]
     async fn scan_fanout_dispatches_largest_diff_first_but_returns_plan_order() {
         let repo = repo();
         let mut reg = ProviderRegistry::new();
         let backend = std::sync::Arc::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)));
-        reg.insert_scan("p/a", "p", 8, Box::new(std::sync::Arc::clone(&backend)), Duration::from_secs(5), 0);
+        reg.insert_scan("p/a", "p", 1, Box::new(std::sync::Arc::clone(&backend)), Duration::from_secs(5), 0);
         let b: Vec<Bundle> = [("+s", 1), ("+L", 300), ("+M", 100)]
             .iter()
             .enumerate()
             .map(|(i, (tag, n))| Bundle::from_files(vec![FileChange { path: format!("src/f{i}.rs"), diff: format!("{tag}{}", "x".repeat(*n)) }]))
             .collect();
         let entries = vec![entry("p/a", "alpha", false)];
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1, 1), None).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None).await;
         let ids: Vec<&str> = res.cells.iter().map(|c| c.cell_id.as_str()).collect();
         assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g2]@p/a#1", "scan[g3]@p/a#1"], "结果按 plan 序回收");
         let tag_of = |i: usize| -> &'static str {
@@ -481,7 +484,7 @@ mod scan_tests {
             if text.contains("+Lxxx") { "L" } else if text.contains("+Mxxx") { "M" } else { "s" }
         };
         assert_eq!((tag_of(0), tag_of(1), tag_of(2)), ("L", "M", "s"), "派发序 = diff 字节降序");
-        assert!(res.warnings.iter().any(|w| w.contains("scanner cells 3 > review.scanners.workers 1: 2 cell(s) queued")), "{:?}", res.warnings);
+        assert!(res.warnings.iter().any(|w| w.contains("scanner cells 3 on provider p > maxConcurrency 1: 2 cell(s) queued (wall = queue wait + slowest cell; raise providers.p.maxConcurrency)")), "{:?}", res.warnings);
         assert!(res.cells.iter().all(|c| c.record.queue_wait_ms <= c.record.duration_ms), "排队时长含在 duration 内");
     }
 
@@ -497,7 +500,7 @@ mod scan_tests {
         let others = vec!["src/f1.rs (g2 +1/-0)".to_string(), "src/f0.rs (g1 +1/-0)".to_string()];
         let entries = vec![entry("p/a", "alpha", false), entry("q/b", "beta", false)];
         let sink = RecSink::new();
-        let res = run_scan_fanout(&reg, &input(&b, &dossiers, &others, repo.path(), &entries, 4, 1), Some(&sink)).await;
+        let res = run_scan_fanout(&reg, &input(&b, &dossiers, &others, repo.path(), &entries, 1), Some(&sink)).await;
         let ids: Vec<&str> = res.cells.iter().map(|c| c.cell_id.as_str()).collect();
         assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g1]@q/b#1", "scan[g2]@p/a#1", "scan[g2]@q/b#1"]);
         assert!(res.cells.iter().all(|c| c.record.ok && c.record.role() == Role::Scanner), "{:?}", res.cells);
@@ -531,27 +534,32 @@ mod scan_tests {
         reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300))), Duration::from_secs(5), 0);
         let b = bundles(1);
         let entries = vec![entry("p/a", "alpha", false)];
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 4, 2), None).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 2), None).await;
         let ids: Vec<&str> = res.cells.iter().map(|c| c.cell_id.as_str()).collect();
         assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g1]@p/a#2"]);
         assert_eq!(res.cells[1].sample, 2);
     }
 
-    /// prd AC2：并发两层——workers 1 / provider 帽 8 → 在途峰值 1；workers 4 / 帽 2 → 峰值 2。
+    /// prd AC2（D13 单层）：provider 门宽 1 → 在途峰值 1 + 排队告警；门宽 2 → 峰值 2；门宽 ≥ 格数 → 无排队告警。
     #[tokio::test]
-    async fn scan_fanout_workers_and_provider_cap_bound_inflight() {
+    async fn scan_fanout_provider_cap_bounds_inflight() {
         let repo = repo();
         let b = bundles(4);
         let entries = vec![entry("p/a", "alpha", false)];
         let mut reg = ProviderRegistry::new();
-        reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)).with_delay(Duration::from_millis(30))), Duration::from_secs(5), 0);
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1, 1), None).await;
+        reg.insert_scan("p/a", "p", 1, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)).with_delay(Duration::from_millis(30))), Duration::from_secs(5), 0);
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None).await;
         assert_eq!(res.cells.len(), 4);
-        assert_eq!(reg.inflight_peaks().get("p"), Some(&1), "workers 1 封顶");
+        assert_eq!(reg.inflight_peaks().get("p"), Some(&1), "门宽 1 封顶");
+        assert!(res.warnings.iter().any(|w| w.contains("scanner cells 4 on provider p > maxConcurrency 1: 3 cell(s) queued")), "{:?}", res.warnings);
         let mut reg2 = ProviderRegistry::new();
         reg2.insert_scan("p/a", "p", 2, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)).with_delay(Duration::from_millis(30))), Duration::from_secs(5), 0);
-        let _ = run_scan_fanout(&reg2, &input(&b, &[], &[], repo.path(), &entries, 4, 1), None).await;
-        assert_eq!(reg2.inflight_peaks().get("p"), Some(&2), "provider 帽 2 封顶");
+        let _ = run_scan_fanout(&reg2, &input(&b, &[], &[], repo.path(), &entries, 1), None).await;
+        assert_eq!(reg2.inflight_peaks().get("p"), Some(&2), "门宽 2 封顶");
+        let mut reg3 = ProviderRegistry::new();
+        reg3.insert_scan("p/a", "p", 4, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300))), Duration::from_secs(5), 0);
+        let res3 = run_scan_fanout(&reg3, &input(&b, &[], &[], repo.path(), &entries, 1), None).await;
+        assert!(res3.warnings.is_empty(), "门宽 ≥ 格数无排队告警: {:?}", res3.warnings);
     }
 
     /// prd AC2：失败格——未注册条目 Unavailable、Auth 带 usage → failed 列表 + warning + 烧掉的 usage 入账；成功格不受影响。
@@ -564,7 +572,7 @@ mod scan_tests {
         let b = bundles(1);
         let entries = vec![entry("p/a", "alpha", false), entry("p/dead", "alpha", false), entry("ghost/x", "gamma", false)];
         let sink = RecSink::new();
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 4, 1), Some(&sink)).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&sink)).await;
         assert_eq!(res.failed, vec!["scan[g1]@p/dead#1", "scan[g1]@ghost/x#1"]);
         assert_eq!(res.warnings.len(), 2);
         assert!(res.warnings[0].contains("auth error") && res.warnings[1].contains("scanner not in registry"), "{:?}", res.warnings);
@@ -584,7 +592,7 @@ mod scan_tests {
         reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn(&scan_json(extra), Some(0), 50))), Duration::from_secs(5), 0);
         let b = bundles(1);
         let pinned = vec![entry("p/a", "alpha", true)];
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &pinned, 4, 1), None).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &pinned, 1), None).await;
         let rec = &res.cells[0].record;
         assert!(rec.ok);
         let w = rec.warn.as_deref().unwrap();
@@ -593,7 +601,7 @@ mod scan_tests {
         assert_eq!(res.needs_declared, 1);
         // 未钉档位 → 不报零推理；输出长 → 不报
         let unpinned = vec![entry("p/a", "alpha", false)];
-        let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &unpinned, 4, 1), None).await;
+        let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &unpinned, 1), None).await;
         assert!(!res2.cells[0].record.warn.as_deref().unwrap().contains("zero reasoning"));
         assert!(!scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 300, 1).iter().any(|n| n.contains("zero reasoning")));
         assert!(scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 10, 1).len() == 1);

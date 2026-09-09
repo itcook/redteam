@@ -13,22 +13,28 @@ use tokio::sync::Semaphore;
 /// `provider_inflight_peak`，铁律 1）。
 pub struct InflightGate {
     sem: Semaphore,
+    cap: u32,
     current: AtomicU32,
     peak: AtomicU32,
 }
 
 impl InflightGate {
     fn new(cap: u32) -> Self {
-        InflightGate { sem: Semaphore::new(cap.max(1) as usize), current: AtomicU32::new(0), peak: AtomicU32::new(0) }
+        let cap = cap.max(1);
+        InflightGate { sem: Semaphore::new(cap as usize), cap, current: AtomicU32::new(0), peak: AtomicU32::new(0) }
     }
     pub fn peak(&self) -> u32 {
         self.peak.load(Ordering::SeqCst)
     }
-    /// 取名额（不计在途：租约可能还在等角色 worker 许可，评审修 7 后门先于 worker）。
+    /// 门宽（provider `maxConcurrency` 或继承的缺省）。
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+    /// 取名额（不计在途：在途从真正发请求起算）。
     async fn enter(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ProviderError> {
         self.sem.acquire().await.map_err(|_| ProviderError::Unavailable("inflight gate closed".into()))
     }
-    /// 真正发请求时计在途（峰值 = 同时在途的 HTTP 请求数，不含等 worker 的租约）。
+    /// 真正发请求时计在途（峰值 = 同时在途的 HTTP 请求数，不含等门的租约）。
     fn activate(&self) -> ActiveGuard<'_> {
         let cur = self.current.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(cur, Ordering::SeqCst);
@@ -110,9 +116,16 @@ impl ProviderRegistry {
     pub fn inflight_peaks(&self) -> BTreeMap<String, u32> {
         self.gates.iter().map(|(p, g)| (p.clone(), g.peak())).collect()
     }
+    /// route_key → 所属 provider（扇出层按 provider 计排队告警，D13）。
+    pub fn provider_of(&self, route_key: &str) -> Option<&str> {
+        self.scan.get(route_key).map(|e| e.provider.as_str())
+    }
+    /// provider 门宽（`maxConcurrency` 或继承的缺省）；未建门 → None。
+    pub fn cap_of(&self, provider: &str) -> Option<u32> {
+        self.gates.get(provider).map(|g| g.cap())
+    }
 
-    /// 先过 provider 在途门再拿到条目（评审修 7）：扇出层在门后才取角色 `workers` 许可——饱和 / 限流的 provider 不占 worker 槽，
-    /// 其他 provider 的 cell 不被饿死。未注册 → `Unavailable`（该格入 coverage failed）。
+    /// 过 provider 在途门再拿到条目（唯一闸，D13：无角色级 workers）。未注册 → `Unavailable`（该格入 coverage failed）。
     pub async fn lease(&self, route_key: &str) -> Result<ScanLease<'_>, ProviderError> {
         let Some(entry) = self.scan.get(route_key) else {
             return Err(ProviderError::Unavailable(format!("scanner not in registry: {route_key}")));

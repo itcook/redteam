@@ -30,8 +30,8 @@ enum Cmd {
     /// （× samples）并行扇出 → 疑点并集（agreement = 家族数）→ 疑点索引 + 覆盖自报报告。**不产 finding**
     /// （深挖 / 复核 / verdict 在 M21b 起）。退出码：0=scan 完成（verdict scan-only）、1=命令自身失败（参数/IO/配置错误）、
     /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口）；2 / 10 在 M21b 深挖落地前不可达。
-    /// 并发 = min(`review.scanners.workers`（缺省 4）, provider `maxConcurrency`)：cell 数超过 workers 即排队，
-    /// 墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）。
+    /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
+    /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）。
     Review {
         /// diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]
@@ -445,7 +445,7 @@ fn resolve_result(
 }
 
 /// 构造 ProviderRegistry（前台与 worker 共用）：只装 scanner 条目（route_key = `provider/id`，批 F-2 prd K1）——scanner 一律
-/// scan 单发（`--tools` 对 scanner 无效，K3）；provider 在途帽 = `maxConcurrency` 缺省继承 `review.max_concurrency`（D7 A5）；
+/// scan 单发（`--tools` 对 scanner 无效，K3）；provider 在途门 = `maxConcurrency` 缺省继承 `review.max_concurrency`（D7 A5；唯一闸，无角色级 workers，D13）；
 /// thinkingLevel 无映射的告警进 registry.warnings → RunMeta.warnings。reviewers / verifiers 在 M21b 接线（同一模型跨角色同名时键会
 /// 冲突，届时 route_key 带角色前缀）。scanners 为空 → 配置错误；返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
 fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<ProviderRegistry, String> {

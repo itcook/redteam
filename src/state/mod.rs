@@ -168,8 +168,8 @@ pub struct CellRecord {
     pub warn: Option<String>,
     #[serde(default)]
     pub duration_ms: u64,
-    /// 排队等待毫秒（provider 在途门 + 角色 worker 许可），含在 `duration_ms` 内；扇出路径填，resume / 旧记录 0
-    /// （M21a 出口验收：PR181 7 格 / workers 4 时 100-140 s 排队与生成时长不可分）。
+    /// 排队等待毫秒（provider 在途门，唯一闸，D13），含在 `duration_ms` 内；扇出路径填，resume / 旧记录 0
+    /// （M21a 出口验收：PR181 7 格 / 角色 workers 4 时 100-140 s 排队与生成时长不可分——角色帽随 D13 删除）。
     #[serde(default)]
     pub queue_wait_ms: u64,
     #[serde(default)]

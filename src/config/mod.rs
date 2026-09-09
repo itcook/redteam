@@ -258,31 +258,28 @@ impl Serialize for MaxCells {
 #[serde(rename_all = "kebab-case")]
 pub enum PackBody { Full, Slice }
 
+/// 角色节（design §12.1〔D13〕）：无角色级 `workers`——并发只看 provider `maxConcurrency`（唯一闸，§12.3）。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScannersCfg {
-    #[serde(default = "d_workers_4")]
-    pub workers: u32,
     /// 同模型多 lens 采样并集（E3：方差对冲旋钮）。
     #[serde(default = "d_one")]
     pub samples: u32,
 }
 impl Default for ScannersCfg {
-    fn default() -> Self { ScannersCfg { workers: d_workers_4(), samples: d_one() } }
+    fn default() -> Self { ScannersCfg { samples: d_one() } }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewersCfg {
-    #[serde(default = "d_workers_2")]
-    pub workers: u32,
     #[serde(default = "d_max_cells")]
     pub max_cells: MaxCells,
     #[serde(default)]
     pub reenqueue: bool,
 }
 impl Default for ReviewersCfg {
-    fn default() -> Self { ReviewersCfg { workers: d_workers_2(), max_cells: d_max_cells(), reenqueue: false } }
+    fn default() -> Self { ReviewersCfg { max_cells: d_max_cells(), reenqueue: false } }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -290,11 +287,9 @@ impl Default for ReviewersCfg {
 pub struct VerifiersCfg {
     #[serde(default = "d_true")]
     pub enabled: bool,
-    #[serde(default = "d_workers_2")]
-    pub workers: u32,
 }
 impl Default for VerifiersCfg {
-    fn default() -> Self { VerifiersCfg { enabled: true, workers: d_workers_2() } }
+    fn default() -> Self { VerifiersCfg { enabled: true } }
 }
 
 /// `review.grouping`：ocr 双阈值门起步值（4 / 200 / 10，D3）；`semantic` 默认关（R8）。
@@ -333,8 +328,6 @@ impl Default for PackCfg {
 
 fn d_one() -> u32 { 1 }
 fn d_true() -> bool { true }
-fn d_workers_4() -> u32 { 4 }
-fn d_workers_2() -> u32 { 2 }
 fn d_max_cells() -> MaxCells { MaxCells::Auto }
 fn d_min_files() -> u32 { 4 }
 fn d_bundle_lines() -> u32 { 200 }
@@ -350,7 +343,8 @@ pub struct ReviewConfig {
     pub block_threshold: Severity,
     #[serde(default = "default_floor")]
     pub conf_floor: f32,
-    /// 全局在途上限；provider 级缺省继承。
+    /// 全局在途上限缺省（10，D13）；provider 级 `maxConcurrency` 缺省继承它。provider 在途门是唯一一道闸（design §12.3）：
+    /// 无角色级 workers；> `MAX_CONCURRENCY_SANE` 只 warning（像是把 maxOutputTokens 填错了字段）。
     #[serde(default = "default_concurrency")]
     pub max_concurrency: usize,
     /// 工具档位：off | two-stage（默认）| on。
@@ -369,7 +363,9 @@ pub struct ReviewConfig {
 }
 fn default_block() -> Severity { Severity::Medium }
 fn default_floor() -> f32 { 0.5 }
-fn default_concurrency() -> usize { 8 }
+fn default_concurrency() -> usize { 10 }
+/// `maxConcurrency` 合理上限（D13）：超过只 warning 不拒——撞 429 时门会自动收敛，但多半是填错字段。
+pub const MAX_CONCURRENCY_SANE: u32 = 128;
 impl Default for ReviewConfig {
     fn default() -> Self {
         ReviewConfig {
@@ -504,11 +500,17 @@ impl Config {
         })?;
         cfg.validate()?;
         for (pname, p) in &cfg.providers {
+            if let Some(c) = p.max_concurrency.filter(|c| *c > MAX_CONCURRENCY_SANE) {
+                warnings.push(format!("providers.{pname}.maxConcurrency = {c} 像是填错字段（maxOutputTokens？）：它是该 provider 的同时在途请求数上限；撞 429 时门会自动收敛，仍建议改回"));
+            }
             for (id, m) in &p.models {
                 if m.roles.is_empty() {
                     warnings.push(format!("providers.{pname}.models.{id} 未声明任何 roles，不会参与评审"));
                 }
             }
+        }
+        if cfg.review.max_concurrency > MAX_CONCURRENCY_SANE as usize {
+            warnings.push(format!("review.maxConcurrency = {} 像是填错字段（maxOutputTokens？）：它是 provider 在途上限的缺省；撞 429 时门会自动收敛，仍建议改回", cfg.review.max_concurrency));
         }
         Ok((cfg, warnings))
     }
@@ -668,10 +670,7 @@ impl Config {
         let r = &self.review;
         for (k, v) in [
             ("review.maxConcurrency", r.max_concurrency as u64),
-            ("review.scanners.workers", r.scanners.workers as u64),
             ("review.scanners.samples", r.scanners.samples as u64),
-            ("review.reviewers.workers", r.reviewers.workers as u64),
-            ("review.verifiers.workers", r.verifiers.workers as u64),
             ("review.pack.anchorWindow", r.pack.anchor_window as u64),
             ("review.grouping.minFiles", r.grouping.min_files as u64),
             ("review.grouping.maxFilesPerGroup", r.grouping.max_files_per_group as u64),
@@ -703,9 +702,9 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     const ROLE_ATTRS: &[&str] = &["thinkingLevel"];
     const REVIEW: &[&str] = &["blockThreshold", "confFloor", "maxConcurrency", "tools", "scanners", "reviewers", "verifiers", "grouping", "pack", "risk"];
     const REVIEW_SECTIONS: &[(&str, &[&str])] = &[
-        ("scanners", &["workers", "samples"]),
-        ("reviewers", &["workers", "maxCells", "reenqueue"]),
-        ("verifiers", &["enabled", "workers"]),
+        ("scanners", &["samples"]),
+        ("reviewers", &["maxCells", "reenqueue"]),
+        ("verifiers", &["enabled"]),
         ("grouping", &["minFiles", "bundleLineThreshold", "maxFilesPerGroup", "semantic"]),
         ("pack", &["body", "anchorWindow", "sliceMinBytes"]),
     ];
@@ -782,7 +781,17 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
         }
         for (sec, known) in REVIEW_SECTIONS {
             if let Some(so) = r.get(*sec).and_then(|s| s.as_object()) {
-                check(&mut errors, &mut warnings, &format!("review.{sec}"), so, known, "如 maxCells / minFiles / sliceMinBytes");
+                // D13：角色级 workers 已删——专属提示（去哪调），不叠加通用「无定义」；其余键照旧检查。
+                let so = if matches!(*sec, "scanners" | "reviewers" | "verifiers") && so.contains_key("workers") {
+                    warnings.push(format!(
+                        "review.{sec}.workers 已删除（D13）：并发只看 provider maxConcurrency（缺省 review.maxConcurrency = {}），已忽略",
+                        default_concurrency()
+                    ));
+                    so.iter().filter(|(k, _)| k.as_str() != "workers").map(|(k, v)| (k.clone(), v.clone())).collect::<serde_json::Map<_, _>>()
+                } else {
+                    so.clone()
+                };
+                check(&mut errors, &mut warnings, &format!("review.{sec}"), &so, known, "如 maxCells / minFiles / sliceMinBytes");
             }
         }
     }
@@ -1072,10 +1081,10 @@ mod tests {
     }
   },
   "review": {
-    "blockThreshold": "medium", "confFloor": 0.5, "maxConcurrency": 8,
-    "scanners": { "workers": 4, "samples": 1 },
-    "reviewers": { "workers": 2, "maxCells": "auto", "reenqueue": false },
-    "verifiers": { "enabled": true, "workers": 2 },
+    "blockThreshold": "medium", "confFloor": 0.5, "maxConcurrency": 10,
+    "scanners": { "samples": 1 },
+    "reviewers": { "maxCells": "auto", "reenqueue": false },
+    "verifiers": { "enabled": true },
     "grouping": { "minFiles": 4, "bundleLineThreshold": 200, "maxFilesPerGroup": 10, "semantic": false },
     "pack": { "body": "slice", "anchorWindow": 30, "sliceMinBytes": 8192 }
   }
@@ -1115,7 +1124,7 @@ mod tests {
         assert_eq!(em.context_window, 128_000);
         assert_eq!(em.thinking_level, None);
         assert_eq!(cfg.review.pack.body, PackBody::Slice, "D8：slice 默认");
-        assert_eq!(cfg.review.scanners.workers, 4);
+        assert_eq!(cfg.review.max_concurrency, 10, "D13：缺省 10，provider 门是唯一闸");
         assert!(Config::from_json("  \n").unwrap().providers.is_empty(), "空白 = 空配置");
     }
 
@@ -1139,8 +1148,24 @@ mod tests {
             assert!(zz.contains(k), "{k} 零值须拦（修补批 X-4）: {zz}");
         }
         assert!(Config::from_json(r#"{"review":{"pack":{"sliceMinBytes":0},"reviewers":{"maxCells":"auto"}}}"#).is_ok(), "sliceMinBytes 0 与 auto 合法");
-        let z = Config::from_json(r#"{"review":{"scanners":{"workers":0}}}"#).unwrap_err().to_string();
-        assert!(z.contains("review.scanners.workers"), "{z}");
+        let z = Config::from_json(r#"{"review":{"scanners":{"samples":0}}}"#).unwrap_err().to_string();
+        assert!(z.contains("review.scanners.samples"), "{z}");
+    }
+
+    /// D13：三个角色 `workers` 键已删——旧配置解析成功、专属 warning（去哪调）、不叠加通用「无定义」；maxConcurrency > 128 只警不拒。
+    #[test]
+    fn removed_workers_keys_and_huge_max_concurrency_warn() {
+        let (cfg, w) = Config::from_json_warned(r#"{"providers":{"p":{"kind":"openai","maxConcurrency":65536,"models":{"m":{"roles":{"scanner":{}}}}}},
+            "review":{"maxConcurrency":384000,"scanners":{"workers":4,"samples":1},"reviewers":{"workers":2},"verifiers":{"workers":2,"enabled":true}}}"#).unwrap();
+        for sec in ["scanners", "reviewers", "verifiers"] {
+            assert!(w.iter().any(|x| x.contains(&format!("review.{sec}.workers 已删除（D13）"))), "{sec}: {w:?}");
+        }
+        assert!(!w.iter().any(|x| x.contains("workers 无定义")), "专属提示不叠加通用 warning: {w:?}");
+        assert!(w.iter().any(|x| x.contains("providers.p.maxConcurrency = 65536 像是填错字段")), "{w:?}");
+        assert!(w.iter().any(|x| x.contains("review.maxConcurrency = 384000 像是填错字段")), "{w:?}");
+        assert_eq!((cfg.providers["p"].max_concurrency, cfg.review.max_concurrency, cfg.review.scanners.samples), (Some(65536), 384000, 1), "只警不拒");
+        let (_, w128) = Config::from_json_warned(r#"{"review":{"maxConcurrency":128}}"#).unwrap();
+        assert!(w128.iter().all(|x| !x.contains("像是填错")), "128 是边界，不警: {w128:?}");
     }
 
     #[test]

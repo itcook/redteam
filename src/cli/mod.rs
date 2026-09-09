@@ -284,8 +284,7 @@ pub async fn run_code_review(
         plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
     let input = ScanFanoutInput {
         target_label: &target_label, bundles: &bundles, dossiers: &dossiers, others: &others,
-        user_focus: &focus, spec_docs: &spec_section, root, entries: &entries,
-        workers: cfg.review.scanners.workers as usize, samples: cfg.review.scanners.samples,
+        user_focus: &focus, spec_docs: &spec_section, root, entries: &entries, samples: cfg.review.scanners.samples,
     };
     let results = run_scan_fanout(registry, &input, sink).await;
     let mut warnings: Vec<String> = registry.warnings().to_vec();
