@@ -2106,6 +2106,75 @@ mod tests {
         assert!(entries[1].contains("other"), "bundle 2 自家内容非空: {entries:?}");
         assert_eq!(meta, DossierMeta { bundles: 2, injected: 2 });
     }
+    /// 批 F-5：scan-only 收口的 RunMeta 观测面——coverage 五集合（selected / completed / reused / failed）、cache 命中率、模板哈希两键、
+    /// 在途峰值、needs 计数、类别分布、agreement ≥ 2、usage 从记录重算；任一 cell 失败 → Incomplete/3 + warning；组骨架按 cell id 补齐。
+    #[test]
+    fn finish_scan_report_fills_observability_and_flips_incomplete_on_failed_cell() {
+        use crate::domain::{Category, CellOutput, NeedEntry, NeedKind, ScanOutput, Suspicion};
+        use crate::orchestrate::{ScanCellResult, ScanResults};
+        let susp = |file: &str, hint: &str, quote: &str, cat: Category, conf: f32| Suspicion {
+            file: file.into(), line_start: 1, line_end: 1, hint: hint.into(), category: Some(cat), confidence: conf, quote: quote.into(),
+        };
+        let mk = |id: &str, group: usize, family: &str, ok: bool, susps: Vec<Suspicion>, needs: usize, input: u64, cached: u64| {
+            let out = ScanOutput {
+                suspicions: susps,
+                needs: (0..needs).map(|i| NeedEntry { path: format!("n{i}.rs"), lines: None, reason: "r".into(), kind: NeedKind::Evidence }).collect(),
+                scanned_areas: vec![],
+            };
+            let mut rec = if ok { CellRecord::ok(id, "p/x", CellOutput::Scan(out.clone())) } else { CellRecord::failed(id, "p/x", Role::Scanner, "boom") };
+            rec.input_tokens = input;
+            rec.cached_input_tokens = cached;
+            rec.output_tokens = 5;
+            ScanCellResult { cell_id: id.into(), group, route_key: "p/x".into(), family: family.into(), sample: 1, record: rec, output: if ok { Some(out) } else { None } }
+        };
+        let cells = vec![
+            mk("scan[g1]@p/x#1", 0, "alpha", true, vec![susp("a.rs", "h1", "q1", Category::L1, 0.5)], 2, 100, 50),
+            mk("scan[g1]@p/y#1", 0, "beta", true, vec![susp("a.rs", "h1b", "q1", Category::L1, 0.7)], 0, 100, 0),
+            mk("scan[g2]@p/x#1", 1, "alpha", true, vec![susp("b.rs", "h2", "q2", Category::L3, 0.4)], 0, 0, 0),
+        ];
+        let roles = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"x":{"roles":{"scanner":{}}},"y":{"roles":{"scanner":{}}}}}}}"#).unwrap().active_roles();
+        let base = |cells: Vec<ScanCellResult>, reused: Vec<String>| ScanFinish {
+            groups: vec![], scanned_coverage: Some(0.5), grouping: None, dossier_meta: None,
+            results: ScanResults { cells, ..Default::default() },
+            model_names: vec!["p/x".into(), "p/y".into()], roles: Some(&roles), warnings: vec![],
+            inflight_peak: [("p".to_string(), 2u32)].into_iter().collect(), ledger_meta: None, head_sha: None,
+            duration_ms: 7, test_command: None, job_id: "j".into(), reused,
+        };
+        let (r, code) = finish_scan_report(base(cells.clone(), vec!["scan[g1]@p/y#1".into()]));
+        assert_eq!((r.verdict, code), (Verdict::ScanOnly, 0));
+        let scan = r.scan.as_ref().unwrap();
+        assert_eq!(scan.groups.len(), 2, "组骨架按 cell id 补齐");
+        assert_eq!((scan.groups[0].cells.len(), scan.groups[0].suspicions, scan.groups[1].suspicions), (2, 1, 1));
+        assert_eq!((scan.stats.total, scan.stats.agreement_ge2, scan.stats.needs_declared, scan.stats.cells_ok, scan.stats.cells_failed), (2, 1, 2, 3, 0));
+        assert_eq!((scan.stats.by_category.get("L1"), scan.stats.by_category.get("L3")), (Some(&1), Some(&1)));
+        assert_eq!(scan.scanned_coverage, Some(0.5));
+        let cov = &r.run.coverage;
+        assert_eq!(cov.selected[&Role::Scanner].len(), 3);
+        assert_eq!(cov.completed[&Role::Scanner], vec!["scan[g1]@p/x#1", "scan[g2]@p/x#1"]);
+        assert_eq!(cov.reused[&Role::Scanner], vec!["scan[g1]@p/y#1"]);
+        assert!(cov.failed.is_empty() && cov.waived.is_empty());
+        assert_eq!(r.run.cache_hit_by_cell.len(), 2, "input 0 的不计");
+        assert_eq!((r.run.cache_hit_by_cell[0].cell.as_str(), r.run.cache_hit_by_cell[0].ratio), ("scan[g1]@p/x#1", 0.5));
+        assert_eq!(r.run.template_hashes.len(), 2);
+        assert_eq!(r.run.provider_inflight_peak.get("p"), Some(&2));
+        assert_eq!((r.run.needs.triggered_cells, r.run.needs.declared), (1, 2));
+        assert_eq!((r.run.usage.input_tokens, r.run.usage.cached_input_tokens, r.run.usage.output_tokens), (200, 50, 15));
+        assert_eq!(r.run.model_ids, vec!["x", "y"]);
+        assert_eq!(r.run.cells.len(), 3);
+        assert_eq!((r.run.cells[0].role.as_str(), r.run.cells[0].cached_input_tokens), ("scanner", 50));
+        assert_eq!(r.cells.len(), 3);
+        assert!(r.run.failed_models.is_empty() && r.findings.is_empty());
+        // 一 cell 失败 → Incomplete / 3 + coverage.failed + warning；失败格烧掉的 usage 入账
+        let mut failing = cells;
+        failing.push(mk("scan[g2]@p/y#1", 1, "beta", false, vec![], 0, 3, 0));
+        let (r2, code2) = finish_scan_report(base(failing, vec![]));
+        assert_eq!((r2.verdict, code2), (Verdict::Incomplete, 3));
+        assert_eq!(r2.run.coverage.failed[&Role::Scanner], vec!["scan[g2]@p/y#1"]);
+        assert!(r2.run.warnings.iter().any(|w| w.contains("verdict hard Incomplete")), "{:?}", r2.run.warnings);
+        assert_eq!(r2.scan.as_ref().unwrap().stats.cells_failed, 1);
+        assert_eq!(r2.run.usage.input_tokens, 203);
+    }
+
     #[test]
     fn run_meta_needs_always_serialized_zeros_included() {
         // E8-E 观测面：needs 统计恒写、零也写。

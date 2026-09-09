@@ -37,9 +37,9 @@
 - [x] Commit：`refactor(orchestrate): 硬切旧 fan-out / 候补链 / 单发 finding 路径——scanner 疑点路径唯一（铁律 6〔D10〕）`
 
 ## 5. F-5 观测落盘（`src/cli/mod.rs` / `src/state/mod.rs` / `src/domain/report.rs`）
-- [ ] `Phase::Scan`；RunMeta 全表填值（design §5）；`ReviewReport.cells` 前台 / job / resume 三路都填；`attach_cells` 扩字段。
-- [ ] 测试：RunMeta 快照（coverage / template_hashes / cache_hit_by_cell / provider_inflight_peak / grouping / phase_history）；一 cell 失败 → Incomplete / 3；覆盖率三例。
-- [ ] Commit：`feat(state): scanner cell 落盘 + RunMeta 观测（分组 / 疑点数 / 覆盖率 / cache / 墙钟 / 在途峰值 / coverage 五集合）`
+- [x] `Phase::Scan`；RunMeta 全表填值（design §5）；`ReviewReport.cells` 前台 / job / resume 三路都填；`attach_cells` 扩字段。
+- [x] 测试：RunMeta 快照（coverage / template_hashes / cache_hit_by_cell / provider_inflight_peak / grouping / phase_history）；一 cell 失败 → Incomplete / 3；覆盖率三例。
+- [x] Commit：`feat(state): scanner cell 落盘 + RunMeta 观测（分组 / 疑点数 / 覆盖率 / cache / 墙钟 / 在途峰值 / coverage 五集合）`
 
 ## 6. F-6 收口
 - [ ] dogfood：`cargo run -q -- review --base feat/m21-review-engine --format json > /tmp/rt-scan.json`（真实 scanner，K14）；`python3 eval/scan_score.py selftest` + 对 dogfood 输出 `score` 读取（合成 oracle）；记录 cells / 疑点数 / 覆盖率 / 墙钟 / thinking warning 到 §收口记录。

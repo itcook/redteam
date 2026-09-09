@@ -414,6 +414,9 @@ mod tests {
         assert!(j.contains("\"phase\":\"fanout\""), "phase 应小写序列化: {j}");
         let back: JobState = serde_json::from_str(&j).unwrap();
         assert_eq!(back.phase, Some(Phase::Fanout));
+        // 批 F-5：Scan 阶段小写序列化 round-trip；旧 fanout 串仍可读
+        assert_eq!(serde_json::to_string(&Phase::Scan).unwrap(), "\"scan\"");
+        assert_eq!(serde_json::from_str::<Phase>("\"scan\"").unwrap(), Phase::Scan);
     }
 
     #[test]
