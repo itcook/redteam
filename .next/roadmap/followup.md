@@ -76,7 +76,8 @@
 
 | 项 | 现状 | 归属 |
 |---|---|---|
-| 增量轮两份清单 | `{{OTHER_CHANGED_FILES}}` 跨组索引已含全分支非 delta 文件（只带路径）+ `[delta]`，而 `<incremental_round>` 仍渲染 `two_layer_manifest` 双层清单（同信息两处，≤ 8K 字符） | D-3 段序翻转时合并：索引为唯一来源，`two_layer_manifest` 与其 E11-Q5 红测测试群随段重写迁移 |
+| 增量轮两份清单 | 旧 prompt：`{{OTHER_CHANGED_FILES}}` 跨组索引已含全分支非 delta 文件 + `[delta]`，`<incremental_round>` 仍渲染 `two_layer_manifest` 双层清单（同信息两处，≤ 8K 字符）。新 `build_scan_prompt`（批 D-3，2026-09-08）只保住 `[delta]`（跨组索引槽），增量轮框架语（delta base 一句 + 上轮 claimed/resolved 顺带验证清单）**无槽** | 旧 prompt 与 `two_layer_manifest`、E11-Q5 红测群随 F-4 整体删；增量轮框架语 + 顺带验证清单在 M21c 台账回流时给 scan prompt 加槽（参考块内，需中和） |
+| `review --format json` 无 scanner 输出面 | `run.cells` 是 CellSummary（无 output）；`eval/scan_score.py` 的 `cells[].output.suspicions` 输入形态今天没有产品面产出 | F 批 prd 明确：结果 JSON 加 scanner 输出（或评分器读 proj-next.db `cells` 行）——否则「改模板必跑」的门接不上线 |
 | `--pack-only` 预算的模型窗来源 | ✅ 合入批 A 时已改读 `cfg.active_roles()`（与真实评审同一 `budget_and_spec`） | — |
 | `GroupingStats` 只在 `--pack-only` 可见 | stdout + `summary.json`；真实评审的 RunMeta 未接线（避免撞批 B 的 `report.rs`） | F-5 观测接线 |
 | `review.grouping` 未接配置 | ✅ 批 A 重做合入时接上（2026-09-08）：`cli::grouping_opts(cfg.review.grouping, budget)`，`plan_cells` 三个入口同源；`semantic`（R8）仍无消费点 | — |

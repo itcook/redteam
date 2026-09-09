@@ -244,47 +244,9 @@ def cmd_run(a):
 
 
 # ---------------- score ----------------
-def show_file(repo, head, path):
-    r = subprocess.run(["git", "-C", repo, "show", f"{head}:{path}"], capture_output=True, text=True, errors="replace")
-    return r.stdout if r.returncode == 0 else None
-
-
-_STRIP_CACHE = {}
-
-
-def anchor_quote(repo, head, path, quote):
-    """产品同口径：quote 去全部空白后子串匹配；返回 (line_start, line_end) 或 None。"""
-    if not quote or not path:
-        return None
-    k = (repo, head, path)
-    if k not in _STRIP_CACHE:
-        content = show_file(repo, head, path)
-        if content is None:
-            _STRIP_CACHE[k] = None
-        else:
-            chars, lines_of = [], []
-            ln = 1
-            for ch in content:
-                if ch == "\n":
-                    ln += 1
-                elif not ch.isspace():
-                    chars.append(ch)
-                    lines_of.append(ln)
-            _STRIP_CACHE[k] = ("".join(chars), lines_of)
-    if _STRIP_CACHE[k] is None:
-        return None
-    s, lines_of = _STRIP_CACHE[k]
-    q = "".join(ch for ch in quote if not ch.isspace())
-    if not q:
-        return None
-    i = s.find(q)
-    if i < 0:
-        return None
-    return lines_of[i], lines_of[min(i + len(q) - 1, len(lines_of) - 1)]
-
-
-def overlap(a, b):
-    return a[0] <= b[1] and b[0] <= a[1]
+# 命中口径抽到 `_oracle.py`（批 D-5：与 scan_score.py 共用，行为不变）。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _oracle import anchor_quote, overlap, show_file  # noqa: E402,F401
 
 
 def cmd_score(a):

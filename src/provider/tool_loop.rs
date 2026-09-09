@@ -11,6 +11,9 @@ use std::sync::Mutex;
 pub enum ChatMessage {
     System(String),
     User(String),
+    /// 分块 user 内容（批 D-4）：anthropic kind 按块的 `cache_boundary` 打 cache_control（与 system 共三段界，design §10.3〔D10〕）；
+    /// openai kind 拼成一条 content（`prompt::flatten_blocks`，靠字节稳定前缀自动命中）。
+    UserBlocks(Vec<crate::prompt::PromptBlock>),
     Assistant { text: String, tool_calls: Vec<ToolCall> },
     ToolResults(Vec<ToolResult>),
 }

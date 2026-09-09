@@ -227,6 +227,16 @@ grill 七项必答（涟漪二梯队 / 两类信号进 §3.3 / 无 [review.risk]
 ### Summary
 
 Trellis 09-08-m21a-slice：diffsym 文件级 def / 全改动行锚定 / 一跳（ref_worthy 迁入）；pack 改动中心切片（核 / 一跳 / 文件头 + 全部签名 / 折叠标记带行号与 def 名 / 禁真空 hunk 窗 / 小文件全文逐字节等同 full / 梯子接管）与文件外片段（调用点 ±30、签名 + doc、四类跳过、段帽 = 组预算 / 8、每名 K=3）；plan_cells 读 review.pack、--pack-only 报 PackStats；e2e 覆盖两档。code-review high 十条全修（hunk 重锚定、值 def 括号配平、名字优先级与测试排除、sink 有效命中、import 行非调用点、非支持语言头限顶、多行 import 组、二阶段 second_pass 档、凭据判据拆分、cap 早退与 omit 收敛）。本仓两档对比：slice 比 full 省 28% pack 字节 / 20% token。三道门：lib 524 / e2e 17 绿、clippy 7 = 基线、make verify 绿。待用户 --no-ff 合回 feat/m21-review-engine；followup 记切片措辞交 D-2、--pack-body 旗待裁、常数归 R7、N 组 N 次走仓、extra_paths 泄漏 PLAUSIBLE、over_budget 组切片仍大。
+## Session 10: M21a 批 D 契约与提示词：疑点 parse + shared-head/scanner 模板 + 四块段序 + 三段界 cache + 评分器 + 评审修复
+<!-- trellis-session: v=2 fp=f3e5b208a1f8f412 -->
+
+**Date**: 2026-09-08
+**Task**: M21a 批 D 契约与提示词：疑点 parse + shared-head/scanner 模板 + 四块段序 + 三段界 cache + 评分器 + 评审修复
+**Branch**: `feat/m21a-prompts`
+
+### Summary
+
+批 D 五步交付：parse_scan_output 字段级规整（缺 suspicions 即违约走 REPAIR_PROMPT_SCAN）+ anchor_suspicions（quote 不在文件即丢、就近命中、不可读单列计数）；shared-head.md（字节稳定 system：规则 / 立场 / 证据政策 / CI 跳过 / 免疫段 / brief / spec 槽）+ scanner.md（E3 B 臂疑似即列 + 判例槽 + needs 措辞 + 与 serde 字段逐一对应的契约）；build_scan_prompt 四块（参考 → 证据 → diff → 尾）+ cache_boundary + 独立 SCAN 中和表（旧 prompt 逐字节不变）；ChatMessage::UserBlocks 三段界 cache_control（末块规则守上限 4）+ template_hashes 入 CellRecord；eval/scan_score.py（E3 口径，本机复算 B 臂基线 union 9 一致）。code-review 子 agent 1 必修 + 11 建议 + 10 nit 并入 ced42e7；两项记 followup（结果 JSON 无 scanner 输出面 → F；增量轮框架语无槽 → M21c）。三道门 509+16+7+16 绿。待办：主工作树 --no-ff 合回；批 E 另开 session。
 
 ### Git Commits
 
@@ -262,6 +272,11 @@ Trellis 09-08-m21a-slice：diffsym 文件级 def / 全改动行锚定 / 一跳�
 | Hash | Message |
 |------|---------|
 | `687335d` | fix(pack): 复审修复（第二轮 code-review high 九条 + 帽外项）——二阶段沿用用户 review.pack、FileCtx 一次解析 / 一次重锚定共用、评分式重锚定、export def 不被短路、$ 标识符边界、签名名小写优先、item 级 cfg(test) 区间、字符串感知括号计数、增强包文件不二次注入 |
+| `f84b5d7` | feat(parse): 疑点契约 parse 字段级对齐 + quote 不在文件即丢弃 + needs 帽（design §4〔D11〕） |
+| `e360cdf` | feat(prompt): 模板拆分 shared-head.md + scanner.md，build_scan_prompt 四块段序 + 注入互斥与中和（design §10.3 / §10.7〔D6 D9〕） |
+| `86521b2` | feat(provider): anthropic kind 三段界 cache_control + 模板哈希入 CellRecord（D10） |
+| `cfae1ec` | chore(eval): scan_score.py——scanner 疑点对 oracle 的离线回归评分（模板改动门，design §10.7） |
+| `ced42e7` | fix(prompt): 批 D 评审修复——user_focus 框架语、scan/legacy 中和表分离、骨架入哈希、行号 clamp、路径与 ranges 规范化、锚定分计数与就近命中、分块会话尾断点、评分器口径与边角 |
 
 ### Status
 

@@ -141,6 +141,8 @@ impl CellRun {
             cell_id, model,
             crate::domain::CellOutput::Review { findings: self.findings.clone(), needs: self.needs.clone() },
         ).with_family(self.family.clone());
+        // 批 D-4：记录所用模板哈希（旧 fan-out = 旧 bundle 模板；F 切 scanner 后换 shared_head + scanner_tail）。
+        rec.template_hash = Some(crate::prompt::template_hashes().legacy_bundle.clone());
         rec.ok = self.warn.is_none();
         rec.warn = self.warn.clone();
         rec.duration_ms = self.duration_ms;
