@@ -443,7 +443,7 @@ fn worker_panic_hook_lands_failed_and_seals() {
     store.create_job(job_id, 0).unwrap();
 
     // spawn 真二进制，设 REDTEAM_TEST_PANIC=1
-    let bin = env!("CARGO_BIN_EXE_redteam");
+    let bin = env!("CARGO_BIN_EXE_redteam-next");
     let status = std::process::Command::new(bin)
         .arg("worker")
         .arg("--job-id")
@@ -485,7 +485,7 @@ fn worker_panic_hook_lands_failed_and_seals() {
 /// （main.rs 显式 `process::exit(1)`，五档契约：命令自身失败）。
 #[test]
 fn exit_code_one_on_invalid_conf_floor() {
-    let bin = env!("CARGO_BIN_EXE_redteam");
+    let bin = env!("CARGO_BIN_EXE_redteam-next");
     let dir = tempfile::tempdir().unwrap();
     let status = std::process::Command::new(bin)
         .args(["review", "--conf-floor", "5.0"])
@@ -534,7 +534,7 @@ fn result_md_three_states() {
 
     let dir = tempfile::tempdir().unwrap();
     let store = JobStore::open(dir.path()).unwrap();
-    let bin = env!("CARGO_BIN_EXE_redteam");
+    let bin = env!("CARGO_BIN_EXE_redteam-next");
 
     fn spawn_result_md(bin: &str, dir: &std::path::Path, job_id: &str) -> std::process::Output {
         std::process::Command::new(bin)
@@ -658,7 +658,7 @@ async fn dismissed_ledger_previously_dismissed_marks_and_feeds_second_stage() {
     let id = finding_id(file, quote, title, 1, 1);
 
     // ① `dismiss add`：先登记一条人裁驳回判例（模拟上一轮 ship 判过此 finding 是误报）。
-    let bin = env!("CARGO_BIN_EXE_redteam");
+    let bin = env!("CARGO_BIN_EXE_redteam-next");
     let add_out = std::process::Command::new(bin)
         .args([
             "dismiss", "add", &id,
@@ -732,7 +732,7 @@ async fn dismissed_ledger_previously_dismissed_marks_and_feeds_second_stage() {
 /// 子命令均退 1；--help 属正常展示退 0（DisplayHelp 分支不被误伤）。
 #[test]
 fn clap_parse_error_exits_1_help_exits_0() {
-    let bin = env!("CARGO_BIN_EXE_redteam");
+    let bin = env!("CARGO_BIN_EXE_redteam-next");
     let run = |args: &[&str]| {
         std::process::Command::new(bin)
             .args(args)
@@ -873,7 +873,7 @@ fn pack_only_two_groups_cross_index_lists_other_group_only() {
 /// 修补批 X-3 / X-5：真二进制 `review --pack-only` 退出码 0，且不读 `secrets.json`（坏 secrets 不产 warning）。
 #[test]
 fn pack_only_binary_exits_zero_without_reading_secrets() {
-    let bin = env!("CARGO_BIN_EXE_redteam");
+    let bin = env!("CARGO_BIN_EXE_redteam-next");
     let dir = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();

@@ -13,11 +13,11 @@ use std::path::Path;
 // args_override_self：同名 flag 重复时后者胜（而非报错）——ship 等编排方把自己管理的
 // flag 追加在用户参数之后即权威生效，无需依赖 prompt 层把用户重复参数「摘干净」
 // （r5 dogfood 1c72b790：LLM 摘参不可靠，机制化消灭「重复即崩」类）。
-#[command(name = "redteam", version, about = "模型无关的对抗式代码评审器", args_override_self = true,
+#[command(name = "redteam-next", version, about = "redteam-next（M21 重构分支产物）：模型无关的对抗式代码评审器——scanner 疑点扫描地基；插件与 ship 循环仍用 dev `redteam`，M21c 切名", args_override_self = true,
     after_help = "快速上手：\n  \
-    1. redteam init                                              # 项目内建 .redteam/ 骨架（状态与内容，无配置）\n  \
-    2. redteam model setup --provider X --model <id> --role scanner # 给至少一个模型配 scanner 角色（key 见 --key-store）\n  \
-    3. redteam review --base main                                # 评审当前分支相对 main 的改动\n  \
+    1. redteam-next init                                              # 项目内建 .redteam/ 骨架（状态与内容，无配置）\n  \
+    2. redteam-next model setup --provider X --model <id> --role scanner # 给至少一个模型配 scanner 角色（key 见 --key-store）\n  \
+    3. redteam-next review --base main                                # 评审当前分支相对 main 的改动\n  \
     配置：~/.redteam/config.json + secrets.json（REDTEAM_HOME 可覆盖；用户级唯一，无项目层；严格 JSON、无注释）。\n  \
     后台跑：review --background 得 job id → status <id> 看进度 → result <id> 取报告。")]
 struct Cli {
