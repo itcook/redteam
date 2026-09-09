@@ -244,3 +244,25 @@ Trellis 09-08-m21a-slice：diffsym 文件级 def / 全改动行锚定 / 一跳�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 12: M21a 批 E 第二轮复审：code-review high 九修一不改（feat/m21a-slice）
+<!-- trellis-session: v=2 fp=dd82b7d1b225f1fb -->
+
+**Date**: 2026-09-09
+**Task**: M21a 批 E 第二轮复审：code-review high 九修一不改（feat/m21a-slice）
+**Branch**: `feat/m21a-slice`
+
+### Summary
+
+用户要求再跑一轮 code-review 复审（只传 effort + SendMessage 钉范围，评审员开头即确认范围）。12 条送验证 → 前十条九条成立一次修掉：二阶段沿用用户 review.pack（full 对照臂不再被切成 slice）、FileCtx 一次读取 / 编译 / 重锚定供 0 壳梯子与文件外搜索共用、评分式重锚定（低信息行不定位、容忍个别行被改）、export def 不被 import 短路 + body_names 剔除关键字、$ 标识符手工边界（非消耗式）、签名名小写优先、item 级 #[cfg(test)] 区间、字符串感知括号计数、增强包文件不二次注入；不改：非支持语言 hunk 窗 ±30（plan 原文，prd K10/K16 已明示）。帽外记 followup：分组边与文件外键的「改动 def 名」两套口径。三道门：lib 534 / e2e 17 绿、clippy 7 = 基线、make verify 绿。待用户 --no-ff 合回 feat/m21-review-engine。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `687335d` | fix(pack): 复审修复（第二轮 code-review high 九条 + 帽外项）——二阶段沿用用户 review.pack、FileCtx 一次解析 / 一次重锚定共用、评分式重锚定、export def 不被短路、$ 标识符边界、签名名小写优先、item 级 cfg(test) 区间、字符串感知括号计数、增强包文件不二次注入 |
+
+### Status
+
+[OK] **Completed**
