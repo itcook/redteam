@@ -211,7 +211,7 @@ pub struct ScanPromptInput<'a> {
     pub cross_index: &'a str,
     /// 同文件活跃判例摘要（M21c 填；本批空渲染 `(none)`）。
     pub precedents: &'a str,
-    /// 证据 pack（`pack::build_packs` 产出的卷宗条目，可空）。
+    /// 证据 pack：裸 pack 正文（`pack::Packed.text` / `CellPlan.packs`）或已包装的 `CellPlan.dossiers` 条目皆可（后者剥壳 + 去旧前言），可空。
     pub dossier: &'a str,
     pub spec_docs: &'a str,
     /// 仓库简介（`.redteam/brief.md`，M21d 填；按不可信证据注入）。
@@ -223,9 +223,9 @@ const SCAN_REFERENCE_TPL: &str = "<reference>\n<cross_index>\nFiles changed else
 const SCAN_EVIDENCE_TPL: &str = "<evidence>\n{{EVIDENCE_PACK}}\n</evidence>";
 const SCAN_DIFF_TPL: &str = "<diff>\nTarget: {{TARGET_LABEL}}\nFiles in this group: {{FILE_LIST}}\nDo NOT claim something is missing, undeclared, or unimplemented ACROSS THE CHANGESET without first checking the cross-group index and the evidence pack above: files listed in the index are changed in this changeset but reviewed in other groups, and the pack's omission list (if any) is the ONLY signal that content was cut for budget rather than absent. If the deciding source appears in either, declare a need or lower your confidence instead of asserting absence.\n\nChanged hunks:\n{{BUNDLE_DIFFS}}\n</diff>";
 
-/// scanner 尾 + 三块骨架 = 「scanner 模板」的全部字节（哈希取这四份）。
-fn scan_template_parts() -> [&'static str; 4] {
-    [SCANNER_TAIL_TPL, SCAN_REFERENCE_TPL, SCAN_EVIDENCE_TPL, SCAN_DIFF_TPL]
+/// scanner 尾 + 三块骨架 + 卷宗前言 = 「scanner 模板」的全部字节（哈希取这五份；改一字即哈希变）。
+fn scan_template_parts() -> [&'static str; 5] {
+    [SCANNER_TAIL_TPL, SCAN_REFERENCE_TPL, SCAN_EVIDENCE_TPL, SCAN_DIFF_TPL, SCAN_DOSSIER_PREAMBLE]
 }
 
 /// 段序（design §10.3，稳定性降序）：共享头(system) → 参考 → 证据 → diff 次尾 → 角色尾。cache 断点在证据块末与 diff 块末
@@ -239,14 +239,15 @@ pub fn build_scan_prompt(i: &ScanPromptInput<'_>) -> ScanPrompt {
     let system = render(SHARED_HEAD_TPL, &[
         ("{{OUTPUT_LANGUAGE}}", &output_language()),
         ("{{REPO_BRIEF}}", &slot(i.repo_brief, "(none)")),
-        ("{{SPEC_DOCS}}", &slot(i.spec_docs, "(none — no spec docs provided)")),
+        // `cli::spec` 产出自带 <spec_docs> 外壳（旧模板双壳属既有瑕疵）；共享头自己包裹槽位，故剥壳后再中和。
+        ("{{SPEC_DOCS}}", &slot(unwrap_shell(i.spec_docs, "spec_docs").unwrap_or(i.spec_docs), "(none — no spec docs provided)")),
     ]);
     let reference = render(SCAN_REFERENCE_TPL, &[
         ("{{CROSS_INDEX}}", &slot(i.cross_index, "(none — this group covers the entire changeset)")),
         ("{{USER_FOCUS}}", &slot(i.user_focus, "(none)")),
     ]);
-    // 卷宗先按 scan 表中和（旧 render_dossier_section 只认旧表，`</evidence>` 会漏），再包 <dossier>；二次中和幂等。
-    let dossier = render_dossier_section(&neutralize_structure(i.dossier, SCAN_STRUCTURAL_TAGS));
+    // 卷宗：剥掉既有生产者的外壳与旧前言（`CellPlan.dossiers` 是 render_dossier_section 包装产物），按 scan 表中和后包上切片形态前言。
+    let dossier = render_scan_dossier(i.dossier);
     let evidence = render(SCAN_EVIDENCE_TPL, &[(
         "{{EVIDENCE_PACK}}",
         if dossier.is_empty() { "(no evidence pack — judge from the changed hunks below with reduced confidence)" } else { dossier.as_str() },
@@ -425,11 +426,13 @@ fn neutralize_closing_tag(content: &str, tag_name: &str) -> String {
 const DOSSIER_STRUCTURAL_TAGS: &[&str] =
     &["dossier", "bundle", "output_contract", "rules", "spec_docs", "incremental_round"];
 
-/// scan prompt（批 D-3）的中和表 = 旧表 + 新包裹段（reference / cross_index / user_focus / evidence / diff / scanner /
-/// precedents / repo_brief）：注入内容落在这些段里，伪造其闭合标签即可越权到角色尾 / 契约段。与旧表分开——旧
+/// scan prompt（批 D-3）的中和表 = 旧表里 scan 路径仍有的段 + 新包裹段（reference / cross_index / user_focus / evidence / diff /
+/// scanner / precedents / repo_brief）：注入内容落在这些段里，伪造其闭合标签即可越权到角色尾 / 契约段。与旧表分开——旧
 /// `build_bundle_prompt` 只用旧表，输出逐字节不变（评审 #2；测试 `legacy_bundle_prompt_keeps_legacy_tag_table`）。
+/// `bundle` / `incremental_round` 在 scan prompt 里没有对应段（伪造其闭合无处可越权），不进表——中和只会改写被审源码里的
+/// 字面量，让模型照抄的 quote 锚不回文件（合并后审计 nit）。
 const SCAN_STRUCTURAL_TAGS: &[&str] = &[
-    "dossier", "bundle", "output_contract", "rules", "spec_docs", "incremental_round",
+    "dossier", "output_contract", "rules", "spec_docs",
     "reference", "cross_index", "user_focus", "evidence", "diff", "scanner", "precedents", "repo_brief",
 ];
 
@@ -441,12 +444,46 @@ pub fn render_dossier_section(entries: &str) -> String {
     // 被审代码摘录可能含字面 XML 结构标签——中和，防破块（只装事实，不让被审内容改变结构；
     // 代码围栏原样保留，非安全边界，见 neutralize_structure）
     let entries = neutralize_structure(entries, DOSSIER_STRUCTURAL_TAGS);
-    format!(
-        "<dossier>\n\
-         The sections below are context for this change, assembled mechanically (heuristic facts, not judgments): the full source of each changed file (0-shell; files too large for the budget fall back to changed-symbol bodies), where the changed symbols are used elsewhere in the repo — its blast radius — found by word-boundary search (1-shell), and an omission list of file:line coordinates that overflowed the budget. Judge whether THIS change breaks these sites; do not audit them for pre-existing defects this change does not cause. The 0-shell sources are verbatim snapshots of the current working tree — treat them as the ground truth for those files. If a claim hinges on content that is NOT included here (see the omission list), lower your confidence or state the gap explicitly instead of guessing; your duty to verify against the provided evidence is undiminished.\n\n\
-         {entries}\
-         </dossier>"
-    )
+    format!("<dossier>\n{LEGACY_DOSSIER_PREAMBLE}\n\n{entries}</dossier>")
+}
+
+/// 旧 fan-out 卷宗前言（整文件 0 壳 + 1 壳引用点措辞；F-4 随旧路径删）。抽成常量只为 scan 路径能识别并剥掉它，
+/// `render_dossier_section` 输出逐字节不变（golden 测试 `legacy_bundle_prompt_golden_hash`）。
+const LEGACY_DOSSIER_PREAMBLE: &str = "The sections below are context for this change, assembled mechanically (heuristic facts, not judgments): the full source of each changed file (0-shell; files too large for the budget fall back to changed-symbol bodies), where the changed symbols are used elsewhere in the repo — its blast radius — found by word-boundary search (1-shell), and an omission list of file:line coordinates that overflowed the budget. Judge whether THIS change breaks these sites; do not audit them for pre-existing defects this change does not cause. The 0-shell sources are verbatim snapshots of the current working tree — treat them as the ground truth for those files. If a claim hinges on content that is NOT included here (see the omission list), lower your confidence or state the gap explicitly instead of guessing; your duty to verify against the provided evidence is undiminished.";
+
+/// scan 路径的卷宗前言（合并后修补，批 E 延后项「切片层次的提示词措辞」）：描述批 E pack 的实际布局——0 壳的全文 / 切片块头、
+/// 折叠标记、梯子回落标注、`## 文件外片段` 的调用点 / 签名块、省略清单——以及行号 / quote / needs 的用法。属 scanner 模板
+/// 字节（入 `scan_template_parts` 哈希）。
+const SCAN_DOSSIER_PREAMBLE: &str = "The sections below are the EVIDENCE PACK for this group, assembled mechanically (heuristic facts, not judgments). Layout:\n\
+- `## 改动源文（0 壳）` — one block per changed file, header `path:1-N（…）`. `（全文，N 行）` = the whole file verbatim. `（切片：核 c · 一跳 h · 折叠 f 段）` = a SLICE: the changed symbols (core) and the same-file symbols they call or are called by (one hop) are shown in full, the file header and EVERY signature are kept, and unrelated bodies are replaced by a fold marker `…（a-b 行折叠：name）` meaning lines a..b of that file (the body of `name`) are NOT shown — only its signature is. `（def 体…）` / `（骨架：签名+改动行）` / `（hunk±N 窗）` are budget fallbacks showing only changed-symbol bodies / signatures plus changed lines / ±N lines around each hunk.\n\
+- `## 文件外片段` — excerpts from OTHER files in the repository: `path:a-b（调用点：name）` = ±N lines around a place where a changed symbol is used (a caller); `path:a-b（签名：name）` = the signature and doc comment of a symbol the changed code calls (a callee). Excerpts, never full files.\n\
+- `## 已省略（预算裁剪）` — the omission list: coordinates and fragments cut for budget. It is the ONLY signal that something was cut rather than absent.\n\
+Every shown line is a verbatim snapshot of the current working tree — quote from it exactly. Block headers and fold markers carry the file's real line ranges; use them to locate what you see. Judge whether THIS change breaks the shown sites; do not audit them for pre-existing defects this change does not cause. If a claim hinges on a folded body, an omitted fragment, or a file not shown here, declare it through the output contract (a need for that path and line range) or lower your confidence instead of guessing; your duty to verify against the provided evidence is undiminished.";
+
+/// 剥掉既有生产者自带的 `<tag>…</tag>` 外壳（`cli::spec` 的 spec 段、`render_dossier_section` 的卷宗）：scan 模板自己包裹槽位，
+/// 传入已包壳的值会双壳且真闭合被中和成 `<\/tag>`。裸值原样返回；只剥最外层、且须首尾成对。
+fn unwrap_shell<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
+    let t = s.trim();
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    t.strip_prefix(open.as_str()).and_then(|x| x.strip_suffix(close.as_str())).map(|inner| inner.trim_matches('\n'))
+}
+
+/// scan 路径卷宗：接受裸 pack 正文（`pack::Packed.text`）或 `render_dossier_section` 的包装产物（`CellPlan.dossiers`，剥壳 + 去旧前言），
+/// 条目按 scan 中和表中和后包上切片形态前言；空 → 空串（空渲染纪律）。
+fn render_scan_dossier(dossier: &str) -> String {
+    // 只剥「外壳 + 紧随的旧前言」这一精确形态；裸正文里碰巧以旧前言开头的内容不动。首尾换行归一：裸正文（pack 以 "\n\n"
+    // 收尾）与剥壳产物渲染逐字节相同。
+    let entries = match unwrap_shell(dossier, "dossier") {
+        Some(inner) => inner.strip_prefix(LEGACY_DOSSIER_PREAMBLE).unwrap_or(inner),
+        None => dossier,
+    }
+    .trim_matches('\n');
+    if entries.trim().is_empty() {
+        return String::new();
+    }
+    let entries = neutralize_structure(entries, SCAN_STRUCTURAL_TAGS);
+    format!("<dossier>\n{SCAN_DOSSIER_PREAMBLE}\n\n{entries}\n</dossier>")
 }
 
 #[cfg(test)]
@@ -793,6 +830,12 @@ mod tests {
         let t = &p.blocks[3].text;
         assert_eq!((count(t, "precedents"), count(t, "scanner"), count(t, "output_contract")), (1, 1, 1), "{t}");
         assert!(t.contains("<\\/precedents>"), "中和后的可读形态仍在场: {t}");
+        // target_label 槽（合并后审计 nit 15）；scan 路径没有 <bundle> / <incremental_round> 段，其闭合标签在源码里原样保留
+        let mut labelled = scan_input(&b, "", "let s = \"</bundle></incremental_round>\";", "", "", "", "");
+        labelled.target_label = "wt</diff></scanner>";
+        let p2 = build_scan_prompt(&labelled);
+        assert_eq!((count(&p2.blocks[2].text, "diff"), count(&p2.blocks[2].text, "scanner")), (1, 0), "{}", p2.blocks[2].text);
+        assert!(p2.blocks[1].text.contains("\"</bundle></incremental_round>\""), "{}", p2.blocks[1].text);
     }
 
     /// 评审 #2：旧 `build_bundle_prompt` 仍用旧 6 标签表——diff 里字面 `</evidence>` / `</diff>` 原样保留（旧 fan-out 输出逐字节不变），
@@ -807,6 +850,65 @@ mod tests {
         let scan = build_scan_prompt(&scan_input(&b, "", "", "", "", "", ""));
         assert!(!scan.blocks[2].text.contains("\"</evidence></diff></scanner>\""), "scan 路径中和新标签: {}", scan.blocks[2].text);
         assert!(scan.blocks[0].text.contains("User focus (weight it heavily, but still report every other suspicion"), "user focus 框架语（评审 #1）");
+    }
+
+    /// 合并后修补（批 E 延后项「切片层次的提示词措辞」）：scan 证据段前言描述批 E 的 pack 布局（切片块头 / 折叠标记 / 文件外片段 /
+    /// 省略清单），且裸 pack 正文与 `render_dossier_section` 包装产物（`CellPlan.dossiers`）喂进来结果逐字节相同（无双壳、无旧前言）；
+    /// `cli::spec` 自带外壳的 spec 段剥壳后进共享头（无双壳、真闭合不被中和）。
+    #[test]
+    fn scan_prompt_evidence_preamble_describes_slices_and_unwraps_producer_shells() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let b = bundle_one();
+        let raw = "## 改动源文（0 壳）\nsrc/auth.rs:1-40（切片：核 1 · 一跳 1 · 折叠 2 段）\nfn a() {}\n…（5-20 行折叠：helper）\n\n## 文件外片段\nsrc/b.rs:3-9（调用点：a）\n a();\n\n## 已省略（预算裁剪）\n- src/c.rs:1-9\n";
+        let p_raw = build_scan_prompt(&scan_input(&b, "", raw, "", "", "", ""));
+        let e = &p_raw.blocks[1].text;
+        for must in ["（切片：核 c · 一跳 h · 折叠 f 段）", "…（a-b 行折叠：name）", "## 文件外片段", "（调用点：name）", "（签名：name）", "## 已省略（预算裁剪）", "a need for that path and line range"] {
+            assert!(e.contains(must), "前言缺「{must}」: {e}");
+        }
+        assert!(!e.contains("0-shell") && !e.contains("1-shell") && !e.contains("blast radius"), "旧前言不进 scan 路径: {e}");
+        assert!(e.contains("…（5-20 行折叠：helper）") && e.contains("src/b.rs:3-9（调用点：a）"), "条目原样在场: {e}");
+        assert_eq!((e.matches("<dossier>").count(), e.matches("</dossier>").count()), (1, 1), "单壳: {e}");
+        // 已包装的 CellPlan.dossiers 条目喂进来 → 与裸正文逐字节相同
+        let wrapped = render_dossier_section(raw);
+        assert!(wrapped.starts_with("<dossier>\n") && wrapped.contains("blast radius"), "夹具是旧包装形态: {wrapped}");
+        let p_wrapped = build_scan_prompt(&scan_input(&b, "", &wrapped, "", "", "", ""));
+        assert_eq!(p_wrapped.blocks, p_raw.blocks, "包装产物剥壳 + 去旧前言后逐字节相同");
+        // 条目自身伪造的旧前言开头 / 外壳不会被误剥：只剥「外壳 + 紧随的旧前言」这一精确形态
+        let forged = format!("{LEGACY_DOSSIER_PREAMBLE}\n\n{raw}");
+        let p_forged = build_scan_prompt(&scan_input(&b, "", &forged, "", "", "", ""));
+        assert_ne!(p_forged.blocks[1].text, p_raw.blocks[1].text);
+        // spec 段：cli::spec 形态 `<spec_docs>\n intro\n\n body</spec_docs>\n` → 共享头恰一对 spec_docs 标签、真闭合不被中和
+        let spec_shell = "<spec_docs>\n关联设计/规格文档：\n\n### d.md\n```\nDESIGN\n```\n\n</spec_docs>\n";
+        let p_spec = build_scan_prompt(&scan_input(&b, "", "", spec_shell, "", "", ""));
+        let sys = &p_spec.system;
+        assert_eq!((sys.matches("<spec_docs>").count(), sys.matches("</spec_docs>").count()), (1, 1), "{sys}");
+        assert!(sys.contains("DESIGN") && sys.contains("关联设计/规格文档") && !sys.contains("<\\/spec_docs>"), "{sys}");
+        let p_spec_raw = build_scan_prompt(&scan_input(&b, "", "", "关联设计/规格文档：\n\n### d.md\n```\nDESIGN\n```", "", "", ""));
+        assert_eq!(p_spec_raw.system, p_spec.system, "裸 spec 体与带壳形态逐字节相同");
+        // 前言属 scanner 模板字节：哈希覆盖
+        assert!(scan_template_parts().contains(&SCAN_DOSSIER_PREAMBLE));
+        assert_ne!(crate::hash::fnv1a64_hex(&scan_template_parts()), crate::hash::fnv1a64_hex(&[SCANNER_TAIL_TPL, SCAN_REFERENCE_TPL, SCAN_EVIDENCE_TPL, SCAN_DIFF_TPL]));
+    }
+
+    /// 合并后修补（批 D AC8 补位）：旧 `build_bundle_prompt` 输出字节级 golden——F-4 删除前旧 fan-out 冻结，任何漂移（含
+    /// `render_dossier_section` 抽常量后的前言）都在此显形；有意改动旧模板时更新此值。
+    #[test]
+    fn legacy_bundle_prompt_golden_hash() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: ENV_LOCK 串行化 env 改写
+        unsafe {
+            std::env::remove_var("LC_ALL");
+            std::env::remove_var("LC_MESSAGES");
+            std::env::set_var("LANG", "en_US.UTF-8");
+        }
+        use crate::evidence::git::FileChange;
+        let b = Bundle::from_files(vec![
+            FileChange { path: "src/auth.rs".into(), diff: "+let t = secret();\n-let t = 0;".into() },
+            FileChange { path: "src/util.rs".into(), diff: "+fn helper() {}".into() },
+        ]);
+        let dossier = render_dossier_section("## 改动源文（0 壳）\nsrc/auth.rs:1-1（全文，1 行）\nlet t = secret();\n\n");
+        let p = build_bundle_prompt("wt", &b, "focus on auth", "src/z.rs (g2 +1/-0)", "", &dossier, "<spec_docs>\nS\n</spec_docs>\n");
+        assert_eq!(crate::hash::fnv1a64_hex(&[&p]), "525ddd85186e20e9", "旧 prompt 字节漂移（若为有意改动旧模板，更新此 golden）");
     }
 
     /// 批 D-4：模板哈希稳定、三者互异、等于模板原文的 fnv（A/B 归因与前缀稳定回归用）。

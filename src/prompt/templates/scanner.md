@@ -11,7 +11,7 @@ The following suspicions in these files were reviewed before and DISMISSED by a 
 </precedents>
 
 <needs_policy>
-When a suspicion can only be resolved with evidence NOT present in the provided context, declare a need instead of guessing. "kind": "evidence" means a file in this repository you must see; "kind": "api" means a third-party callee whose contract must be verified. Declare needs ONLY for genuinely decisive evidence (max 5), and do NOT declare needs for files already shown in full above.
+When a suspicion can only be resolved with evidence NOT present in the provided context, declare a need instead of guessing. "kind": "evidence" means a file in this repository you must see; "kind": "api" means a third-party callee whose contract must be verified. Declare needs ONLY for genuinely decisive evidence (max 5), and do NOT declare needs for content already shown above. A folded body (`…（a-b 行折叠：name）`), a budget-omitted fragment, or a file outside the pack is NOT shown: if it is decisive, declare a need for that path and line range instead of guessing at what it contains.
 </needs_policy>
 
 <output_contract>

@@ -124,8 +124,8 @@ pub fn parse_scan_output_with_stats(raw: &str) -> Result<(ScanOutput, ScanParseS
             continue;
         }
         // 先夹在 u32 域内再转换：`as u32` 对越界值截断（4294967296 → 0）会违反 line_start ≥ 1（评审 #4）
-        let line_start = o.get("line_start").and_then(Value::as_i64).unwrap_or(1).clamp(1, u32::MAX as i64) as u32;
-        let line_end = (o.get("line_end").and_then(Value::as_i64).unwrap_or(0).clamp(0, u32::MAX as i64) as u32).max(line_start);
+        let line_start = as_line(o.get("line_start")).unwrap_or(1).clamp(1, u32::MAX as i64) as u32;
+        let line_end = (as_line(o.get("line_end")).unwrap_or(0).clamp(0, u32::MAX as i64) as u32).max(line_start);
         let hint: String = o.get("hint").and_then(Value::as_str).unwrap_or("").trim().chars().take(300).collect();
         let category = o
             .get("category")
@@ -141,7 +141,12 @@ pub fn parse_scan_output_with_stats(raw: &str) -> Result<(ScanOutput, ScanParseS
     }
     if let Some(needs) = v.get("needs").and_then(Value::as_array) {
         for n in needs {
-            match serde_json::from_value::<NeedEntry>(n.clone()) {
+            // `kind` 大小写宽容（`"Evidence"` 不整条丢；与 category 的 to_uppercase 同宽严，合并后审计 nit）
+            let mut n = n.clone();
+            if let Some(k) = n.get("kind").and_then(Value::as_str).map(|s| s.trim().to_lowercase()) {
+                n["kind"] = Value::String(k);
+            }
+            match serde_json::from_value::<NeedEntry>(n) {
                 Ok(mut e) => match normalize_rel_path(&e.path) {
                     Some(p) => {
                         e.path = p;
@@ -204,6 +209,16 @@ fn normalize_rel_path(p: &str) -> Option<String> {
 }
 
 /// `scanned_areas.ranges` 项形如 `a-b`（纯数字，1 ≤ a ≤ b，design §4 覆盖自报）→ 规范串 `"a-b"`。
+/// 行号：整数 / 浮点（`9.0`）/ 数字串（`"7"`）都认（模型输出形态不一，合并后审计 nit）；其余 → None（调用方取缺省）。
+fn as_line(v: Option<&Value>) -> Option<i64> {
+    let float = |f: f64| f.is_finite().then_some(f as i64);
+    match v? {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().and_then(float)),
+        Value::String(s) => s.trim().parse::<i64>().ok().or_else(|| s.trim().parse::<f64>().ok().and_then(float)),
+        _ => None,
+    }
+}
+
 fn valid_range(s: &str) -> Option<String> {
     let (a, b) = s.trim().split_once('-')?;
     let (a, b) = (a.trim(), b.trim());
@@ -338,6 +353,18 @@ mod tests {
         assert_eq!(out.scanned_areas.len(), 1);
         assert_eq!((out.scanned_areas[0].file.as_str(), out.scanned_areas[0].ranges.as_slice()), ("src/a.rs", ["3-5".to_string()].as_slice()));
         assert_eq!((stats.ranges_dropped, stats.dropped_malformed), (2, 1));
+    }
+
+    /// 合并后修补：行号数字串 / 浮点也认；needs.kind 大小写宽容。
+    #[test]
+    fn scan_parse_tolerates_numeric_strings_and_kind_case() {
+        let raw = r#"{"suspicions":[{"file":"a.rs","line_start":"7","line_end":9.0,"hint":"h","confidence":0.5,"quote":"q"}],
+            "needs":[{"path":"n.rs","reason":"r","kind":"Evidence"},{"path":"m.rs","reason":"r","kind":" API "}]}"#;
+        let (out, stats) = parse_scan_output_with_stats(raw).unwrap();
+        assert_eq!((out.suspicions[0].line_start, out.suspicions[0].line_end), (7, 9));
+        assert_eq!(out.needs.len(), 2, "{stats:?}");
+        assert_eq!((out.needs[0].kind, out.needs[1].kind), (crate::domain::NeedKind::Evidence, crate::domain::NeedKind::Api));
+        assert_eq!(stats.needs_dropped, 0);
     }
 
     #[test]

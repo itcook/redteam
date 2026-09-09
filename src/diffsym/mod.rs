@@ -198,7 +198,9 @@ fn is_value_kind(kind: &str) -> bool {
 
 /// 注释 / doc 行前缀（三语言 `//` / `/*` / `*`，Rust 属性 `#`，SQL/Lua `--`）：一跳取名、签名 doc、调用点判定共用一个口径。
 pub(crate) fn is_comment_line(t: &str) -> bool {
-    t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with('#') || t.starts_with("--")
+    // `*` 只当块注释续行（` * text` / `*/` / 单独 `*`）；`*g = f()` / `*self.x += 1` 解引用赋值是代码（合并后审计建议 2）
+    let star_comment = t.strip_prefix('*').is_some_and(|rest| matches!(rest.chars().next(), None | Some(' ' | '\t' | '/')));
+    t.starts_with("//") || t.starts_with("/*") || star_comment || t.starts_with('#') || t.starts_with("--")
 }
 
 /// 一行代码里 `([{` 与 `)]}` 的数量差，跳过字符串字面量（`"…"` 含转义、`'x'` / `'\x'` 字符字面量——
@@ -582,6 +584,23 @@ mod tests {
         assert_eq!(names(&hop.callees), vec!["RouteTable"], "{hop:?}");
         assert!(hop.callers.is_empty(), "注释里提到不算 caller: {hop:?}");
         assert!(body_names(&rs, &changed[0]).contains("RouteTable") && !body_names(&rs, &changed[0]).contains("wrap_body"));
+    }
+
+    /// 合并后审计建议 2：`*g = helper_thing();` 解引用赋值行不是注释——一跳取名与调用点判定都要看见它；块注释续行仍是注释。
+    #[test]
+    fn is_comment_line_keeps_deref_assignment_as_code() {
+        for c in ["* doc line", "*/", "*", "*\tindented", "// x", "/* x", "# attr", "-- sql"] {
+            assert!(is_comment_line(c), "{c:?} 应为注释");
+        }
+        for code in ["*g = helper_thing();", "*self.count += 1;", "*p = 0", "**pp = 1"] {
+            assert!(!is_comment_line(code), "{code:?} 应为代码");
+        }
+        let rs: Vec<&str> = "fn helper_thing() -> u8 { 1 }\nfn wrap_body(g: &mut u8) {\n    *g = helper_thing();\n}\n".lines().collect();
+        let all = all_defs(&rs, &rust_defs());
+        let changed: Vec<DefRange> = all.iter().filter(|x| x.name == "wrap_body").cloned().collect();
+        let hop = one_hop(&rs, &all, &changed);
+        assert_eq!(names(&hop.callees), vec!["helper_thing"], "{hop:?}");
+        assert!(body_names(&rs, &changed[0]).contains("helper_thing"));
     }
 
     #[test]

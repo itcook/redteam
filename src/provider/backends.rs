@@ -14,6 +14,11 @@ fn max_tokens() -> u64 {
     crate::config::env_max_tokens()
 }
 
+/// Anthropic 每请求 `cache_control` 断点上限（API 硬限制）。
+const ANTHROPIC_CACHE_BOUNDARIES_MAX: usize = 4;
+/// 分块 user 消息里兑现的显式断点上限：留 1 个给共享头 system（三段界 = system + 证据末 + 角色尾前 = 3）。
+const ANTHROPIC_EXPLICIT_BOUNDARIES_MAX: usize = ANTHROPIC_CACHE_BOUNDARIES_MAX - 1;
+
 /// 把 provider 无关的 messages 渲染成 Anthropic Messages API 请求体。
 /// system 提到顶层；tool_use / tool_result 用 content 块表达。
 pub(crate) fn build_anthropic_tools_body(
@@ -25,8 +30,14 @@ pub(crate) fn build_anthropic_tools_body(
     let mut system = String::new();
     let mut msgs: Vec<Value> = Vec::new();
     // 显式断点计数（批 D-4 三段界）：有显式断点时 system 也打断点、末块不再自动加（Anthropic 每请求最多 4 个断点）。
+    // 运行时守卫（合并后修补）：显式断点只兑现前 ANTHROPIC_EXPLICIT_BOUNDARIES_MAX 个（system 占第 4 个），多余的静默
+    // 降为普通块——一次会话若出现多条 UserBlocks（或一条带 ≥ 4 个断点），release 下不会发出第 5 个断点被 API 400 拒掉整格。
     let mut explicit_boundaries = 0usize;
+    // 末条 message 是否带「已兑现」的显式断点：是则不再自动加尾断点（断点已显式给出）；否则（普通消息 / 断点被守卫吞掉的分块）
+    // 仍给尾块移动断点，tool-loop 逐轮增量缓存不因分块会话失效。
+    let mut last_msg_honored = false;
     for m in messages {
+        last_msg_honored = false;
         match m {
             ChatMessage::System(s) => system = s.clone(),
             ChatMessage::User(u) => msgs.push(json!({ "role": "user", "content": u })),
@@ -35,9 +46,10 @@ pub(crate) fn build_anthropic_tools_body(
                     .iter()
                     .map(|b| {
                         let mut o = json!({ "type": "text", "text": b.text });
-                        if b.cache_boundary {
+                        if b.cache_boundary && explicit_boundaries < ANTHROPIC_EXPLICIT_BOUNDARIES_MAX {
                             o["cache_control"] = json!({ "type": "ephemeral" });
                             explicit_boundaries += 1;
+                            last_msg_honored = true;
                         }
                         o
                     })
@@ -93,10 +105,9 @@ pub(crate) fn build_anthropic_tools_body(
     // 当前三 provider 全 openai kind，此 body 走不到；为将来配 Anthropic 直连即生效而备。
     // 末块自动断点：末条 message 本身是分块（断点已显式给出）则不再加；其后追加的 Assistant / ToolResults / REPAIR 轮仍拿到
     // 移动尾断点（tool-loop 逐轮增量缓存不因分块会话失效），总数守 Anthropic 上限 4（评审 #12）。
-    let last_is_blocks = matches!(messages.last(), Some(ChatMessage::UserBlocks(_)));
     let placed = explicit_boundaries + usize::from(!system.is_empty() && explicit_boundaries > 0);
-    debug_assert!(placed <= 4, "anthropic cache_control 断点上限 4，已放 {placed}");
-    let auto_tail = !last_is_blocks && placed < 4;
+    debug_assert!(placed <= ANTHROPIC_CACHE_BOUNDARIES_MAX, "anthropic cache_control 断点上限 4，已放 {placed}");
+    let auto_tail = !last_msg_honored && placed < ANTHROPIC_CACHE_BOUNDARIES_MAX;
     if let Some(last) = msgs.last_mut().filter(|_| auto_tail) {
         let is_string = last.get("content").map(Value::is_string).unwrap_or(false);
         if is_string {
@@ -803,6 +814,44 @@ mod tests {
         let a = build_openai_tools_body("m", &[ChatMessage::System("head".into()), ChatMessage::UserBlocks(blocks)], &[], true, None);
         let c = build_openai_tools_body("m", &[ChatMessage::System("head".into()), ChatMessage::User(flat)], &[], true, None);
         assert_eq!(a, c, "openai 分块与拼接逐字节相同");
+    }
+
+    /// 合并后修补：显式断点运行时封顶——多条 UserBlocks（或一条带 ≥ 4 断点）只兑现前 3 个，连同 system 恒 ≤ 4；
+    /// 断点被吞掉的末条分块仍拿到移动尾断点（不因守卫丢掉逐轮增量缓存）。
+    #[test]
+    fn user_blocks_explicit_boundaries_capped_at_api_limit() {
+        use crate::prompt::PromptBlock;
+        let two = |tag: &str| vec![
+            PromptBlock { text: format!("<{tag}>a</{tag}>"), cache_boundary: true },
+            PromptBlock { text: format!("<{tag}>b</{tag}>"), cache_boundary: true },
+        ];
+        // 两条分块各 2 断点：第一条全兑现、第二条只兑现 1 个（3 + system = 4），末块不再自动加。
+        let msgs = vec![ChatMessage::System("head".into()), ChatMessage::UserBlocks(two("x")), ChatMessage::UserBlocks(two("y"))];
+        let b = build_anthropic_tools_body("claude-x", &msgs, &[], MAX_TOKENS);
+        assert_eq!(b.to_string().matches("cache_control").count(), 4, "封顶 4: {b}");
+        let m1 = b["messages"][1]["content"].as_array().unwrap();
+        assert!(m1[0].get("cache_control").is_some() && m1[1].get("cache_control").is_none(), "第二条只兑现首个: {b}");
+        // 三条分块：第三条断点全被吞掉 → 不自动补尾断点（已满 4）；总数仍 4。
+        let mut three = msgs.clone();
+        three.push(ChatMessage::UserBlocks(two("z")));
+        let b3 = build_anthropic_tools_body("claude-x", &three, &[], MAX_TOKENS);
+        assert_eq!(b3.to_string().matches("cache_control").count(), 4, "{b3}");
+        // 一条带 5 断点的分块：兑现前 3 个 + system = 4。
+        let five: Vec<PromptBlock> = (0..5).map(|k| PromptBlock { text: format!("b{k}"), cache_boundary: true }).collect();
+        let b5 = build_anthropic_tools_body("claude-x", &[ChatMessage::System("head".into()), ChatMessage::UserBlocks(five)], &[], MAX_TOKENS);
+        assert_eq!(b5.to_string().matches("cache_control").count(), 4, "{b5}");
+        let c5 = b5["messages"][0]["content"].as_array().unwrap();
+        assert!(c5[2].get("cache_control").is_some() && c5[3].get("cache_control").is_none() && c5[4].get("cache_control").is_none(), "{b5}");
+        // 无 system、末条是断点被吞掉的分块：尾块拿到移动断点，总数 4。
+        let no_sys = vec![ChatMessage::UserBlocks(two("x")), ChatMessage::UserBlocks(two("y"))];
+        let b0 = build_anthropic_tools_body("claude-x", &no_sys, &[], MAX_TOKENS);
+        assert!(b0.get("system").is_none());
+        assert_eq!(b0.to_string().matches("cache_control").count(), 3, "{b0}");
+        let swallowed = vec![ChatMessage::UserBlocks(two("x")), ChatMessage::UserBlocks(two("y")), ChatMessage::UserBlocks(two("z"))];
+        let bs = build_anthropic_tools_body("claude-x", &swallowed, &[], MAX_TOKENS);
+        let last = bs["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(bs.to_string().matches("cache_control").count(), 4, "{bs}");
+        assert!(last[1].get("cache_control").is_some(), "断点被吞掉的末条分块拿到尾断点: {bs}");
     }
 
     // I1 回归：system 为空时 Anthropic 请求体中不应含 "system" 键。

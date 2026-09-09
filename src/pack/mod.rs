@@ -270,7 +270,9 @@ fn slice_file(ctx: &FileCtx<'_>, opts: &PackOpts) -> Option<SliceOut> {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     for h in ctx.hunks.iter().filter(|h| !h.changed.is_empty()) {
         changed_lines.extend(h.changed.iter().map(|&l| l.min(n - 1)));
-        spans.push((h.start.min(n - 1), (h.start + h.count.max(1) - 1).min(n - 1)));
+        // hunk 跨度；无后随上下文的尾部纯删除点（= start + count，`-U0` / 合成 diff）也并入，否则它不触发禁真空窗（合并后审计 nit 7）
+        let hi = (h.start + h.count.max(1) - 1).max(h.changed.iter().copied().max().unwrap_or(0));
+        spans.push((h.start.min(n - 1), hi.min(n - 1)));
     }
     if changed_lines.is_empty() {
         return None;
@@ -628,9 +630,12 @@ fn is_callable_kind(kind: &str) -> bool {
 struct OutsideNames {
     callers_of: Vec<String>,
     sig_of: Vec<String>,
+    /// 名字帽截断数：只在真正走仓时写入省略清单（未搜索的组不报「截断」，合并后审计建议 3）。
+    callers_truncated: usize,
+    sigs_truncated: usize,
 }
 
-fn outside_names(files: &[FileCtx<'_>], omit: &mut Vec<String>) -> OutsideNames {
+fn outside_names(files: &[FileCtx<'_>]) -> OutsideNames {
     let mut callers: Vec<(u8, String)> = Vec::new(); // (优先级, 名)，填充序
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     let mut group_defs: BTreeSet<String> = BTreeSet::new();
@@ -654,19 +659,15 @@ fn outside_names(files: &[FileCtx<'_>], omit: &mut Vec<String>) -> OutsideNames 
         }
     }
     callers.sort_by_key(|(p, _)| *p); // 稳定：同优先级保持填充序
-    if callers.len() > OUTSIDE_CALLER_NAMES_MAX {
-        omit.push(format!("文件外调用点名字截断 +{}", callers.len() - OUTSIDE_CALLER_NAMES_MAX));
-        callers.truncate(OUTSIDE_CALLER_NAMES_MAX);
-    }
+    let callers_truncated = callers.len().saturating_sub(OUTSIDE_CALLER_NAMES_MAX);
+    callers.truncate(OUTSIDE_CALLER_NAMES_MAX);
     let callers_of: Vec<String> = callers.into_iter().map(|(_, n)| n).collect();
     let mut sig_of: Vec<String> = referenced.difference(&group_defs).filter(|n| !callers_of.contains(n)).cloned().collect();
     // 小写开头（函数 / 变量样）优先；同类保持字典序（BTreeSet 已排）
     sig_of.sort_by_key(|n| n.chars().next().is_some_and(|c| c.is_uppercase()));
-    if sig_of.len() > OUTSIDE_SIG_NAMES_MAX {
-        omit.push(format!("文件外签名名字截断 +{}", sig_of.len() - OUTSIDE_SIG_NAMES_MAX));
-        sig_of.truncate(OUTSIDE_SIG_NAMES_MAX);
-    }
-    OutsideNames { callers_of, sig_of }
+    let sigs_truncated = sig_of.len().saturating_sub(OUTSIDE_SIG_NAMES_MAX);
+    sig_of.truncate(OUTSIDE_SIG_NAMES_MAX);
+    OutsideNames { callers_of, sig_of, callers_truncated, sigs_truncated }
 }
 
 /// 文件外片段段（仅 slice 档，K10）：一条合成 regex 走仓（gitignore 感知、不跟符号链接、隐藏目录跳过），跳过变更集文件 /
@@ -683,7 +684,7 @@ fn outside_section(
     omit: &mut Vec<String>,
     stats: &mut PackStats,
 ) -> String {
-    let names = outside_names(files, omit);
+    let names = outside_names(files);
     if names.callers_of.is_empty() && names.sig_of.is_empty() {
         return String::new();
     }
@@ -691,11 +692,21 @@ fn outside_section(
         omit.push(format!("文件外片段：预算不足（帽 {cap} 字节 < {OUTSIDE_MIN_CAP}），未搜索"));
         return String::new();
     }
+    if names.callers_truncated > 0 {
+        omit.push(format!("文件外调用点名字截断 +{}", names.callers_truncated));
+    }
+    if names.sigs_truncated > 0 {
+        omit.push(format!("文件外签名名字截断 +{}", names.sigs_truncated));
+    }
     let caller_set: std::collections::HashSet<&str> = names.callers_of.iter().map(String::as_str).collect();
     let sig_set: std::collections::HashSet<&str> = names.sig_of.iter().map(String::as_str).collect();
     // 边界不用 `\b`（`$` 属 \W，`items$` 永不命中）也不用消耗式 `[^\w$]`（相邻两个名会互吃边界）：
     // 先按裸 alternation 命中，再手工看前后字符是否标识符字节（复审修 9）。
-    let alt = names.callers_of.iter().chain(names.sig_of.iter()).map(|s| regex::escape(s)).collect::<Vec<_>>().join("|");
+    // 交替按长度降序（同长按字典序）：regex 交替最左优先，短名是长名前缀（`build_pack` / `build_packs`）时先命中短名、
+    // 边界过滤否决后不回溯，长名调用点全部漏检（合并后审计必修）。最长分支被边界否决时任何更短前缀同样被否决，故长度降序即正确。
+    let mut alts: Vec<&str> = names.callers_of.iter().chain(names.sig_of.iter()).map(String::as_str).collect();
+    alts.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+    let alt = alts.iter().map(|s| regex::escape(s)).collect::<Vec<_>>().join("|");
     let pat = format!("(?:{alt})");
     let (Ok(re), Ok(matcher)) = (Regex::new(&pat), grep_regex::RegexMatcher::new(&pat)) else { return String::new() };
 
@@ -880,7 +891,7 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
     let bodies = body_section_ctx(&files, remaining, &mut omit, opts, &mut stats);
     // 文件外片段（仅 slice 档）：帽 = min(0 壳后剩余, 组预算 / 8)
     let outside = if opts.body == PackBody::Slice {
-        let cap = remaining.saturating_sub(bodies.len()).min(remaining / OUTSIDE_BUDGET_SHARE);
+        let cap = remaining.saturating_sub(bodies.len()).min(budget / OUTSIDE_BUDGET_SHARE);
         outside_section(&files, root, opts, changeset, cap, &mut omit, &mut stats)
     } else {
         String::new()
@@ -1593,6 +1604,64 @@ mod tests {
         assert!(p.text.contains("src/token_bucket.rs:1-1（调用点：compute_total）"), "敏感词源码照搜: {}", p.text);
         assert!(!p.text.contains("src/z.rs"), "测试 fn 的调用点不搜: {}", p.text);
         assert!(!p.text.contains("id_rsa.rs"), "凭据基名仍跳过: {}", p.text);
+    }
+
+    /// 合并后审计必修：regex 交替最左优先——短名是长名前缀（build_pack / build_packs）时先命中短名、边界否决后不回溯，
+    /// 长名调用点漏检；交替按长度降序后两者都命中。
+    #[test]
+    fn outside_prefix_names_both_hit_longest_first() {
+        let (tmp, _b, _cs) = outside_repo();
+        let root = tmp.path();
+        std::fs::write(root.join("src/core.rs"), "pub fn build_pack(x: u8) -> u8 { x }\npub fn build_packs(x: u8) -> u8 { x }\n").unwrap();
+        std::fs::write(root.join("src/user_pack.rs"), "fn a() { build_pack(1); }\n").unwrap();
+        std::fs::write(root.join("src/user_packs.rs"), "fn b() { build_packs(1); }\n").unwrap();
+        let diff = "@@ -1,2 +1,2 @@\n+pub fn build_pack(x: u8) -> u8 { x }\n+pub fn build_packs(x: u8) -> u8 { x }\n";
+        let b = crate::bundle::Bundle::from_files(vec![crate::evidence::git::FileChange { path: "src/core.rs".into(), diff: diff.into() }]);
+        let changeset = vec!["src/core.rs".to_string()];
+        let p = pack_bundle(&b, root, 1_000_000, 0, &PackOpts::default(), &changeset);
+        assert!(p.text.contains("src/user_pack.rs:1-1（调用点：build_pack）"), "{}", p.text);
+        assert!(p.text.contains("src/user_packs.rs:1-1（调用点：build_packs）"), "{}", p.text);
+        assert_eq!(p.stats.outside_sites, 2, "{:?}", p.stats);
+    }
+
+    /// 合并后审计建议 3：帽不足未走仓时不报「名字截断」；走仓时截断行照旧。
+    #[test]
+    fn outside_name_truncation_reported_only_when_searched() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let n = OUTSIDE_CALLER_NAMES_MAX + 3;
+        let src: String = (0..n).map(|i| format!("pub fn changed_symbol_{i:03}() {{}}\n")).collect();
+        std::fs::write(root.join("src/core.rs"), &src).unwrap();
+        std::fs::write(root.join("src/user.rs"), "fn u() { changed_symbol_000(); }\n").unwrap();
+        let diff = format!("@@ -1,{n} +1,{n} @@\n{}", src.lines().map(|l| format!("+{l}\n")).collect::<String>());
+        let b = Bundle::from_files(vec![FileChange { path: "src/core.rs".into(), diff }]);
+        let changeset = vec!["src/core.rs".to_string()];
+        let searched = pack_bundle(&b, root, 1_000_000, 0, &PackOpts::default(), &changeset);
+        assert!(searched.text.contains("文件外调用点名字截断 +3"), "{}", searched.text);
+        let starved = pack_bundle(&b, root, 900, 0, &PackOpts::default(), &changeset);
+        assert!(starved.text.contains("未搜索") && !starved.text.contains("名字截断"), "{}", starved.text);
+    }
+
+    /// 合并后审计 nit 7：`-U0` 式尾部纯删除（无后随上下文）删除点 = start + count，落在 hunk 跨度外——并入跨度后禁真空窗覆盖它。
+    #[test]
+    fn slice_tail_deletion_without_context_gets_vacuum_window() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let content: String = (1..=8).map(|i| format!("l{i}\n")).collect();
+        std::fs::write(root.join("src/a.rs"), &content).unwrap();
+        // 新文件坐标 3..5 为上下文，删除点在其后（0-based 5）
+        let diff = "@@ -3,4 +3,3 @@\n l3\n l4\n l5\n-gone\n";
+        let b = Bundle::from_files(vec![FileChange { path: "src/a.rs".into(), diff: diff.into() }]);
+        let opts = PackOpts { body: PackBody::Slice, anchor_window: 1, slice_min_bytes: 0 };
+        let p = pack_bundle(&b, root, 1_000_000, 0, &opts, &["src/a.rs".to_string()]);
+        assert!(p.text.contains("（切片："), "{}", p.text);
+        assert!(p.text.contains("l5\nl6\nl7\n"), "删除点 ±1 窗（l5..l7）在场: {}", p.text);
     }
 
     #[test]
