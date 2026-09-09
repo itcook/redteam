@@ -1,0 +1,7 @@
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§12.3 路由与限流〔D13〕：唯一闸 = provider 门、单把 FIFO 不预留、429 排队重试三条规则与 RunMeta / warnings 字段；§4 scanner 逐 cell 交付、只受 provider 门限流；§6 规则 7 无角色 workers；§12.1 样例配置（删三键、maxConcurrency 10、>128 warning）；§17 R9 / R16"}
+{"file": ".next/decisions/2026-09-04-redteam-review-engine-architecture-decisions.md", "reason": "D13：Q1-Q5 候选与被否（为什么不预留、为什么删三键、为什么缩门按在途接受数而非缩 1、为什么 notify_one）；代价与残余（只降不升、无单次节流）"}
+{"file": ".next/roadmap/followup.md", "reason": "「scanners.workers 形态」行：代码分两步——本任务 = M21a 收口批只动 scanner 路径，队列侧五态与 agreement 两字段随 M21b；R9 行；跨里程碑观测面（每角色在途峰值 / 门等待 / 429 收敛门宽）"}
+{"file": ".next/roadmap/M21b-risk-deep-queue.md", "reason": "交付项 3：reviewer / verifier 接门与入队序在 M21b——本任务不碰 single_shot / tool_loop / verify.rs 的 429 与信号量（K11）"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "新 helper 前先搜：retry_classified / timed_turn 已有，挂点用 _with 变体转调而非复制循环；FakeChatBackend 已有 new_results / repeating / with_delay，不造新替身"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "RunMeta 新增 provider_rate_limit 跨 provider → registry → orchestrate/cli → report 四层；config 删键跨 serde 结构 / validate / shape_guard / 样例测试；一处漏改即静默"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "ProviderError 分类与可重试语义（RateLimited / Server / Timeout …）、attach_usage 口径；429 排队重试不得改变其它变体的重试路径"}

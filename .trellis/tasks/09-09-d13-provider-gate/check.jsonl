@@ -1,0 +1,5 @@
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "对照 §12.3 逐条核：收门公式 max(1, min(cap−1, 在途接受数))、只降不升、持名额等下一完成或 Retry-After 取晚者、每次完成只唤醒一个、多余名额释放即丢弃、独立计数上限、RunMeta 与 warnings 记 429×N 与门宽 A→B；§12.1 样例与代码测试样例逐字节同步"}
+{"file": ".next/decisions/2026-09-04-redteam-review-engine-architecture-decisions.md", "reason": "D13 代价与残余：无单次节流、只降不升、reviewer 常态只看一家笔记——评审时不得以「加旋钮」为由重新引入 workers 或 --workers"}
+{"file": ".next/roadmap/followup.md", "reason": "验收对照：本任务范围 = scanner 路径；队列侧不动；「scanners.workers 形态」行收口后归属列要追加 commit"}
+{"file": ".trellis/spec/guides/index.md", "reason": "AI 交叉检查触发：并发原语（Mutex 不跨 await、Notify 先建后检）、跨层字段一致性、测试确定性（并发用例不靠时序断言语义）"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "检查 429 分支放弃时错误原样返回（含 WithUsage 包装与 burned usage），cell 失败仍进 coverage failed → 硬 Incomplete"}
