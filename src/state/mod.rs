@@ -137,7 +137,12 @@ impl JobState {
 pub struct CellInput {
     pub cell: String,
     pub model: String,
+    /// 人读 / 旧路径的扁平 prompt（scan cell = `ScanPrompt::flatten()`，不含 system）。
     pub prompt: String,
+    /// scanner cell 的完整请求（system + 分块 + cache 断点，批 F-2 prd K7）：resume 差集重放的唯一输入——扁平串会丢 system
+    /// 与断点。旧路径 / 旧作业为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<crate::prompt::ScanPrompt>,
 }
 
 /// partial 每 cell：单个 cell 的执行结果（db 同键覆盖：重试成功覆盖失败记录）。
@@ -660,7 +665,7 @@ mod tests {
     fn manifest_roundtrip_and_missing_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let store = JobStore::open(tmp.path()).unwrap();
-        let inputs = vec![CellInput { cell: "c1".into(), model: "m".into(), prompt: "p".into() }];
+        let inputs = vec![CellInput { cell: "c1".into(), model: "m".into(), prompt: "p".into(), scan: None }];
         store.write_manifest("j1", &inputs).unwrap();
         let back = store.read_manifest("j1");
         assert_eq!(back.len(), 1);

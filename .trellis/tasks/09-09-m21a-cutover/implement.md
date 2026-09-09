@@ -3,24 +3,24 @@
 > 顺序执行，每 task 一 commit（简体中文 `type(scope): 摘要——细节`），绝不 push；三道门每 task：`cargo test`、`cargo clippy --all-targets`（≤ 基线 7 行）、`make verify`。决策编号见 `prd.md` K1-K15，定论见 `design.md`。
 
 ## 0. 预飞
-- [ ] `git status --short` 空（除本任务目录）、`git branch --show-current` = `feat/m21a-cutover`、`git merge-base HEAD feat/m21-review-engine` = fff7405。
-- [ ] 基线：lib 552 / 16 / 7 / e2e 17；clippy 7 行；`make verify` 绿。
-- [ ] Commit：`chore(task): m21a-cutover 规划制品（prd / design / implement / jsonl）`。
+- [x] `git status --short` 空（除本任务目录）、`git branch --show-current` = `feat/m21a-cutover`、`git merge-base HEAD feat/m21-review-engine` = fff7405。
+- [x] 基线：lib 552 / 16 / 7 / e2e 17；clippy 7 行；`make verify` 绿。
+- [x] Commit：`chore(task): m21a-cutover 规划制品（prd / design / implement / jsonl）`。
 
 ## 1. F-1 改名（`Cargo.toml` / `Makefile` / `.gitignore` / `tests/{packaging,review_e2e}.rs` / `src/main.rs` / `CLAUDE.md`）
-- [ ] `[[bin]] name = "redteam-next"`；六处 `CARGO_BIN_EXE_redteam-next`；Makefile `BIN` / `cp` / 删 `chmod` / `build-dev-baseline` 注释；`.gitignore` 规则；packaging 两处「不含 `redteam-next`」断言；clap `name` / `about` / `after_help`；CLAUDE.md 一句。
-- [ ] 门 + `make build`（产出 `redteam-next`、`git status` 干净、dev `redteam` sha 不变）。
-- [ ] Commit：`chore(build): 分支产物改名 redteam-next，make build 不覆盖插件 dev redteam（D10）`
+- [x] `[[bin]] name = "redteam-next"`；六处 `CARGO_BIN_EXE_redteam-next`；Makefile `BIN` / `cp` / 删 `chmod` / `build-dev-baseline` 注释；`.gitignore` 规则；packaging 两处「不含 `redteam-next`」断言；clap `name` / `about` / `after_help`；CLAUDE.md 一句。
+- [x] 门 + `make build`（产出 `redteam-next`、`git status` 干净、dev `redteam` sha 不变）。
+- [x] Commit：`chore(build): 分支产物改名 redteam-next，make build 不覆盖插件 dev redteam（D10）`
 
 ## 2. F-2 scanner 通路（`src/provider/{scan_shot,registry,backends,tool_loop,mod}.rs` / `src/orchestrate/mod.rs` / `src/state/mod.rs` / `src/main.rs`）
-- [ ] `AssistantTurn.reasoning_tokens` + 16 处构造点 + openai 解析两处。
-- [ ] `thinking_params` 映射表 + 两 body 构造器 `thinking` 参数 + `with_thinking` + `backend_from_config` 注入 + `thinking_warning`；测试：每 (kind, family) 一断言、`None` 逐字节不变、anthropic budget 夹紧。
-- [ ] `scan_shot.rs`：`ScanCall` / `run_scan_shot`；测试：首发不用 `turn_final`、parse 失败走 `REPAIR_PROMPT_SCAN` 且 usage 累加、二次失败 `diagnostic_parse_error`。
-- [ ] registry：scan 表 / `InflightGate` / `insert_scan` / `scan` / `inflight_peaks` / warnings；测试：未注册 Unavailable、同 provider 两条目共享门、峰值计数。
-- [ ] `CellInput.scan: Option<ScanPrompt>`（`PromptBlock` / `ScanPrompt` 派生 serde）；`CellSink::on_roles`。
-- [ ] `run_scan_fanout` + `ScanEntrySpec` / `ScanFanoutInput` / `ScanCellResult` / `ScanResults` / `scan_template_hash`；测试：两条目 × 两组 = 四 cell（cell_id / route_key / manifest 含 scan）、workers 1 / 帽 8 → 峰值 1、帽 2 / workers 4 → 峰值 ≤ 2、失败 cell 入 `failed` + burned usage、warn 拼接（dropped / 零推理）、`on_cell` 逐格回调、needs 计数。
-- [ ] `build_registry` 改 `insert_scan`（旧 `insert` 路径与 `legacy_opts_from_roles` 校验暂留到 F-4）。
-- [ ] Commit：`feat(orchestrate): scanner 扇出——组 × 条目 × samples，route_key 按角色条目，thinking_level 首个消费者，provider 在途锁（design §5 / §12.3）`
+- [x] `AssistantTurn.reasoning_tokens` + 16 处构造点 + openai 解析两处。
+- [x] `thinking_params` 映射表 + 两 body 构造器 `thinking` 参数 + `with_thinking` + `backend_from_config` 注入 + `thinking_warning`；测试：每 (kind, family) 一断言、`None` 逐字节不变、anthropic budget 夹紧。
+- [x] `scan_shot.rs`：`ScanCall` / `run_scan_shot`；测试：首发不用 `turn_final`、parse 失败走 `REPAIR_PROMPT_SCAN` 且 usage 累加、二次失败 `diagnostic_parse_error`。
+- [x] registry：scan 表 / `InflightGate` / `insert_scan` / `scan` / `inflight_peaks` / warnings；测试：未注册 Unavailable、同 provider 两条目共享门、峰值计数。
+- [x] `CellInput.scan: Option<ScanPrompt>`（`PromptBlock` / `ScanPrompt` 派生 serde）；`CellSink::on_roles`。
+- [x] `run_scan_fanout` + `ScanEntrySpec` / `ScanFanoutInput` / `ScanCellResult` / `ScanResults` / `scan_template_hash`；测试：两条目 × 两组 = 四 cell（cell_id / route_key / manifest 含 scan）、workers 1 / 帽 8 → 峰值 1、帽 2 / workers 4 → 峰值 ≤ 2、失败 cell 入 `failed` + burned usage、warn 拼接（dropped / 零推理）、`on_cell` 逐格回调、needs 计数。
+- [x] `build_registry` 改 `insert_scan`（旧 `insert` 路径与 `legacy_opts_from_roles` 校验暂留到 F-4）。
+- [x] Commit：`feat(orchestrate): scanner 扇出——组 × 条目 × samples，route_key 按角色条目，thinking_level 首个消费者，provider 在途锁（design §5 / §12.3）`
 
 ## 3. F-3 并集与报告（`src/consolidate/{scan,mod,dedup}.rs` / `src/domain/report.rs` / `src/cli/tail.rs` / `src/output/mod.rs` / `src/bundle/mod.rs` / `src/pack/mod.rs`）
 - [ ] `merge_suspicions` + `MergedSuspicion`；`dedup::{QUOTE_SIM, LINE_GAP}` 与 `orchestrate::normalize_quote` 升 `pub(crate)`。

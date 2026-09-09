@@ -118,7 +118,7 @@ mod tests {
     const FINDINGS_JSON: &str = r#"{"findings":[{"severity":"high","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"}]}"#;
 
     fn final_turn(text: &str) -> AssistantTurn {
-        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None }
+        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None }
     }
 
     // 迁移自 tool_loop::tests::tools_disabled_swaps_system_and_still_parses：system 恒

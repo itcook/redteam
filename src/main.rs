@@ -464,12 +464,28 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
     let mut registry = ProviderRegistry::new();
     for em in &roles.scanners {
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
-        let backend = match backend_from_config(em, key) {
+        let backend = match backend_from_config(em, key.clone()) {
             Ok(b) => b,
             Err(e) => {
                 return Err(format!("{e}"));
             }
         };
+        // 批 F-2：scanner 条目一律 scan 单发（--tools 对 scanner 无效，prd K3）；provider 在途帽缺省继承 review.max_concurrency（D7 A5）；
+        // thinkingLevel 无映射的告警进 registry.warnings → RunMeta.warnings。旧 ReviewProvider 表并存到 F-4。
+        let scan_backend = match backend_from_config(em, key) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(format!("{e}"));
+            }
+        };
+        if let Some(w) = redteam::provider::backends::thinking_warning(em) {
+            registry.push_warning(w);
+        }
+        let cap = em.max_concurrency.unwrap_or(cfg.review.max_concurrency as u32);
+        registry.insert_scan(
+            em.name.clone(), &em.provider, cap, scan_backend,
+            std::time::Duration::from_secs(em.per_turn_secs()), redteam::provider::DEFAULT_RETRY_BUDGET,
+        );
         // 单轮超时（design v9 §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`
         // （慢速模型 30 tok/s 级在 32K max_tokens 下结构性需要 1100s+/轮，2026-09-03 PR181 Kimi 实证）。
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());

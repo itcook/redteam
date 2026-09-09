@@ -1676,9 +1676,9 @@ mod resume_tests {
         }
 
         let inputs = vec![
-            CellInput { cell: "c1".into(), model: "m".into(), prompt: "P1".into() },
-            CellInput { cell: "c2".into(), model: "m".into(), prompt: "P2".into() },
-            CellInput { cell: "c3".into(), model: "m".into(), prompt: "P3".into() },
+            CellInput { cell: "c1".into(), model: "m".into(), prompt: "P1".into(), scan: None },
+            CellInput { cell: "c2".into(), model: "m".into(), prompt: "P2".into(), scan: None },
+            CellInput { cell: "c3".into(), model: "m".into(), prompt: "P3".into(), scan: None },
         ];
         let store = crate::state::JobStore::open(ws).unwrap();
         store.write_manifest("j", &inputs).unwrap();
@@ -1732,8 +1732,8 @@ mod resume_tests {
         }
 
         let inputs = vec![
-            CellInput { cell: "doc@alpha".into(), model: "alpha".into(), prompt: "P-alpha".into() },
-            CellInput { cell: "doc@beta".into(), model: "beta".into(), prompt: "P-beta".into() },
+            CellInput { cell: "doc@alpha".into(), model: "alpha".into(), prompt: "P-alpha".into(), scan: None },
+            CellInput { cell: "doc@beta".into(), model: "beta".into(), prompt: "P-beta".into(), scan: None },
         ];
         let store = crate::state::JobStore::open(ws).unwrap();
         store.write_manifest("j", &inputs).unwrap();
@@ -2204,7 +2204,7 @@ mod tests {
         let sink = JobCellSink { store: std::sync::Arc::clone(&store), job_id: "j".into(), ckpt_failures: std::sync::atomic::AtomicU32::new(0) };
         use crate::orchestrate::CellSink;
         sink.manifest(&[crate::state::CellInput {
-            cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
+            cell: "c".into(), model: "m".into(), prompt: "p".into(), scan: None }]);
         assert_eq!(store.read_state("j").unwrap().phase, Some(Phase::Fanout));
     }
     #[tokio::test]
@@ -2238,7 +2238,7 @@ mod tests {
             ckpt_failures: std::sync::atomic::AtomicU32::new(0),
         };
         use crate::orchestrate::CellSink;
-        sink.manifest(&[CellInput { cell: "c".into(), model: "m".into(), prompt: "p".into() }]);
+        sink.manifest(&[CellInput { cell: "c".into(), model: "m".into(), prompt: "p".into(), scan: None }]);
         sink.on_cell(CellRecord::ok("c", "m", crate::domain::CellOutput::review(vec![])));
         sink.on_phase(Phase::Finalizing, None);
         sink.on_meta(&["m".to_string()]);

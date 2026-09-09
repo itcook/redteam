@@ -158,7 +158,7 @@ pub fn build_bundle_prompt(
 }
 
 /// 一段 user 内容 + 是否在其末尾放 cache 断点（anthropic kind 三段界之二：证据段末、角色尾前；design §10.3〔D10〕）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PromptBlock {
     pub text: String,
     pub cache_boundary: bool,
@@ -166,7 +166,7 @@ pub struct PromptBlock {
 
 /// scanner 请求成品（批 D-2 / D-3）：`system` = 共享头（字节稳定，含 spec / 简介，跨 cell 不变 → cache 区）；
 /// `blocks` = 参考（跨组索引 + 判例 + focus）→ 证据（pack）→ diff 次尾 → scanner 角色尾。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScanPrompt {
     pub system: String,
     pub blocks: Vec<PromptBlock>,
@@ -200,6 +200,13 @@ pub fn template_hashes() -> &'static TemplateHashes {
         scanner_tail: crate::hash::fnv1a64_hex(&scan_template_parts()),
         legacy_bundle: crate::hash::fnv1a64_hex(&[CODE_BUNDLE_TPL]),
     })
+}
+
+/// scanner cell 记录的模板哈希（批 F-2，prd K10）：`CellRecord.template_hash` 是单值，两段 16 hex 用 `+` 连——共享头与角色尾
+/// 各自可归因；`RunMeta.template_hashes` 分存两键。
+pub fn scan_template_hash() -> String {
+    let h = template_hashes();
+    format!("{}+{}", h.shared_head, h.scanner_tail)
 }
 
 /// `build_scan_prompt` 输入：全部注入段各自只有一个槽（注入互斥），全部经 `neutralize_structure`。

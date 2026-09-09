@@ -29,9 +29,9 @@ async fn code_bundle_tool_loop_anchors_and_drops_fabricated() {
             input_tokens: 2,
             output_tokens: 2,
             cached_input_tokens: 0,
-            finish_reason: None,
+            finish_reason: None, reasoning_tokens: None,
         },
-        AssistantTurn { text: findings_json.into(), tool_calls: vec![], input_tokens: 3, output_tokens: 5, cached_input_tokens: 0, finish_reason: None },
+        AssistantTurn { text: findings_json.into(), tool_calls: vec![], input_tokens: 3, output_tokens: 5, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None },
     ]);
     let provider = ToolLoopProvider::new(Box::new(backend), root.path().to_path_buf());
 
@@ -265,7 +265,7 @@ async fn incremental_round_smoke() {
     let store = redteam::state::JobStore::open(dir.path()).unwrap();
     store.write_args_raw(job_id, &serde_json::to_string(&full_args).unwrap()).unwrap();
     store.write_result(job_id, &serde_json::to_string(&prior_report).unwrap()).unwrap();
-    store.write_manifest(job_id, &[CellInput {
+    store.write_manifest(job_id, &[CellInput { scan: None,
         cell: "bundle[src/a.rs]".into(), model: "p/m".into(), prompt: "p".into(),
     }]).unwrap();
     store.append_partial(job_id, &CellRecord::ok(

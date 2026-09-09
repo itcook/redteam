@@ -319,7 +319,7 @@ pub(crate) mod incremental_tests {
         store.write_result(job, &serde_json::to_string(&report).unwrap()).unwrap();
         let prior_args = ReviewArgs { pack_only: false, incremental_from: None, background: true, ..inc_args("dev0", "unused") };
         store.write_args_raw(job, &serde_json::to_string(&prior_args).unwrap()).unwrap();
-        store.write_manifest(job, &[CellInput { cell: "bundle[a.rs]@m".into(), model: "m".into(), prompt: "p".into() }]).unwrap();
+        store.write_manifest(job, &[CellInput { cell: "bundle[a.rs]@m".into(), model: "m".into(), prompt: "p".into(), scan: None }]).unwrap();
         store.append_partial(job, &CellRecord::ok("bundle[a.rs]@m", "m", crate::domain::CellOutput::review(vec![]))).unwrap();
     }
 
@@ -403,7 +403,7 @@ pub(crate) mod incremental_tests {
         store.write_result("jpartial", &serde_json::to_string(&ok2).unwrap()).unwrap();
         store.write_args_raw("jpartial", &store.read_args_raw("jok").unwrap()).unwrap();
         store.write_manifest("jpartial", &[
-            crate::state::CellInput { cell: "c-never-ran".into(), model: "m".into(), prompt: "p".into() },
+            crate::state::CellInput { cell: "c-never-ran".into(), model: "m".into(), prompt: "p".into(), scan: None },
         ]).unwrap();
         let e = incremental_preflight(&store, &inc_args("dev0", "jpartial"), "jpartial", dir.path()).unwrap_err();
         assert!(e.to_string().contains("without an ok record"), "{e}");
