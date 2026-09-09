@@ -114,6 +114,29 @@ async fn unreachable_scanner_cell_makes_scan_incomplete_exit_three() {
     assert_eq!((scan.suspicions.len(), scan.stats.cells_ok, scan.stats.cells_failed), (1, 1, 1));
 }
 
+/// 评审帽外项：`--incremental-from` 与 `--background` 同给 → 命令层直接退 1，不建 job（否则 worker 内 bail 落成 Failed 作业）。
+#[test]
+fn incremental_from_background_is_rejected_before_spawning_job() {
+    let bin = env!("CARGO_BIN_EXE_redteam-next");
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.json"), r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+    let out = std::process::Command::new(bin)
+        .current_dir(dir.path())
+        .env("REDTEAM_HOME", home.path())
+        .args(["review", "--background", "--base", "main", "--incremental-from", "prior1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("M21c"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!dir.path().join(".redteam").join(redteam::db::DB_FILE).exists(), "不建 job / 不落库");
+}
+
 /// M21a 批 F-4：增量轮在 M21c 台账回流前显式报错（不静默降级全量），走 `run_review_dispatch` 真路由。
 #[tokio::test]
 async fn incremental_from_bails_until_m21c() {

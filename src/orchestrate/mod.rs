@@ -81,11 +81,13 @@ pub struct ScanEntrySpec {
 
 impl From<&crate::config::EffectiveModel> for ScanEntrySpec {
     fn from(em: &crate::config::EffectiveModel) -> Self {
-        ScanEntrySpec {
-            route_key: em.name.clone(),
-            family: em.family.clone(),
-            thinking_pinned: em.thinking_level.is_some_and(|l| l != crate::config::ThinkingLevel::Off),
-        }
+        // pinned = 配置了非 Off 档位 **且** 该 (kind, family, id) 真有参数映射并会发出（评审修 9：无映射家族不该触发零推理告警）。
+        let pinned = em.thinking_level.is_some_and(|l| {
+            l != crate::config::ThinkingLevel::Off
+                && crate::provider::backends::thinking_params(em.kind, &em.family, &em.id, l, em.max_tokens_effective())
+                    .is_some_and(|v| !v.is_empty())
+        });
+        ScanEntrySpec { route_key: em.name.clone(), family: em.family.clone(), thinking_pinned: pinned }
     }
 }
 
@@ -151,8 +153,13 @@ pub fn parse_scan_cell_id(id: &str) -> Option<(usize, String, u32)> {
 pub fn scan_cells_from_records(records: Vec<CellRecord>) -> Vec<ScanCellResult> {
     records
         .into_iter()
-        .map(|rec| {
+        .map(|mut rec| {
             let (group, route_key, sample) = parse_scan_cell_id(&rec.cell).unwrap_or((0, rec.model.clone(), 1));
+            // 旧格式记录（批 B-E 的 reviewer 形态）：不是 scanner 输出 → 按失败格计（评审修 1：不能既 ok 又无疑点地混进 scan-only 报告）。
+            if rec.ok && !matches!(rec.output, CellOutput::Scan(_)) {
+                rec.ok = false;
+                rec.warn = Some(format!("legacy non-scanner record (role {}); re-run review", rec.role().as_str()));
+            }
             let output = match (&rec.ok, &rec.output) {
                 (true, CellOutput::Scan(o)) => Some(o.clone()),
                 _ => None,
@@ -163,9 +170,8 @@ pub fn scan_cells_from_records(records: Vec<CellRecord>) -> Vec<ScanCellResult> 
 }
 
 /// scanner 静态扇出（design §2：纯生产者、无候补）：cell = 组 × 条目 × samples；prompt 每组只构造一次（同组各条目 / samples 字节相同 →
-/// 共享头 cache 命中）；并发 = 角色 `workers` 信号量（此处）× provider 在途门（registry 内，D7 A5）。单格：`registry.scan` →
-/// `anchor_suspicions`（quote 不在文件即丢，design §4）→ `CellRecord`；parse / 锚定丢弃计数与零推理观测拼进 `warn`（cell 仍 ok）；
-/// 失败格 `CellRecord::failed` + 烧掉的 usage 入账，进 `failed`。needs 只随 cell 落库并计数。
+/// 共享头 cache 命中）；并发 = provider 在途门（registry `lease`，先过）× 角色 `workers` 信号量（门后取，饱和 provider 不占 worker 槽，
+/// 评审修 7）。单格 = [`scan_cell_record`]（resume 同款）。needs 只随 cell 落库并计数。
 pub async fn run_scan_fanout(
     registry: &ProviderRegistry,
     input: &ScanFanoutInput<'_>,
@@ -194,59 +200,39 @@ pub async fn run_scan_fanout(
             input.entries.iter().flat_map(move |e| (1..=samples).map(move |k| (g, e, k, scan_cell_id(g, &e.route_key, k))))
         })
         .collect();
+    let template_hash = crate::prompt::scan_template_hash();
     if let Some(s) = sink {
         s.on_roles(&[Role::Scanner]);
+        // manifest：`scan` 存完整请求，`prompt` 留空（不双存）；模板哈希随请求落盘（resume 重放盖它，评审修 6）。
         let inputs: Vec<CellInput> = plan
             .iter()
             .map(|(g, e, _, id)| CellInput {
                 cell: id.clone(),
                 model: e.route_key.clone(),
-                prompt: prompts[*g].flatten(),
+                prompt: String::new(),
                 scan: Some(prompts[*g].clone()),
+                template_hash: Some(template_hash.clone()),
             })
             .collect();
         s.manifest(&inputs);
     }
     let workers = Arc::new(Semaphore::new(input.workers.max(1)));
-    let template_hash = crate::prompt::scan_template_hash();
     let futs = plan.iter().map(|(g, e, k, id)| {
         let workers = Arc::clone(&workers);
         let prompt = &prompts[*g];
         let template_hash = template_hash.clone();
         async move {
-            let _permit = workers.acquire().await.expect("workers semaphore never closed");
             let t0 = std::time::Instant::now();
-            let res = registry.scan(&e.route_key, prompt).await;
-            let duration_ms = t0.elapsed().as_millis() as u64;
-            let (mut record, output) = match res {
-                Ok(call) => {
-                    let anchored = anchor_suspicions(input.root, call.output);
-                    let notes = scan_cell_notes(
-                        &call.stats, anchored.dropped, anchored.dropped_unreadable,
-                        e.thinking_pinned, call.reasoning_tokens, call.output_tokens,
-                    );
-                    let mut rec = CellRecord::ok(id.clone(), e.route_key.clone(), CellOutput::Scan(anchored.output.clone()))
-                        .with_family(e.family.clone());
-                    rec.input_tokens = call.input_tokens;
-                    rec.output_tokens = call.output_tokens;
-                    rec.cached_input_tokens = call.cached_input_tokens;
-                    rec.iterations = call.iterations;
-                    rec.warn = if notes.is_empty() { None } else { Some(notes.join("; ")) };
-                    (rec, Some(anchored.output))
+            // 先过 provider 在途门，再取 worker 许可（评审修 7）；未注册条目在此即失败（不占 worker）。
+            let res = match registry.lease(&e.route_key).await {
+                Ok(lease) => {
+                    let _permit = workers.acquire().await.expect("workers semaphore never closed");
+                    lease.run(prompt).await
                 }
-                Err(err) => {
-                    let (i, o, c) = err.burned_usage();
-                    let mut rec = CellRecord::failed(id.clone(), e.route_key.clone(), Role::Scanner, err.to_string())
-                        .with_family(e.family.clone());
-                    rec.input_tokens = i;
-                    rec.output_tokens = o;
-                    rec.cached_input_tokens = c;
-                    (rec, None)
-                }
+                Err(err) => Err(err),
             };
-            record.duration_ms = duration_ms;
-            record.attempts = 1;
-            record.template_hash = Some(template_hash);
+            let duration_ms = t0.elapsed().as_millis() as u64;
+            let (record, output) = scan_cell_record(id, &e.route_key, &e.family, e.thinking_pinned, input.root, res, duration_ms, template_hash);
             if let Some(s) = sink {
                 s.on_cell(record.clone());
             }
@@ -274,6 +260,47 @@ pub async fn run_scan_fanout(
     out
 }
 
+/// 单格收口（扇出与 resume 共用，评审修 5）：成功 → `anchor_suspicions`（quote 不在文件即丢，design §4）→ `CellRecord::ok`，parse /
+/// 锚定丢弃计数与零推理观测拼进 `warn`（cell 仍 ok）；失败 → `CellRecord::failed` + 烧掉的 usage 入账。`attempts` 恒 1（无候补）。
+#[allow(clippy::too_many_arguments)]
+pub fn scan_cell_record(
+    cell_id: &str,
+    route_key: &str,
+    family: &str,
+    thinking_pinned: bool,
+    root: &std::path::Path,
+    res: Result<crate::provider::scan_shot::ScanCall, crate::provider::ProviderError>,
+    duration_ms: u64,
+    template_hash: String,
+) -> (CellRecord, Option<ScanOutput>) {
+    let (mut record, output) = match res {
+        Ok(call) => {
+            let anchored = anchor_suspicions(root, call.output);
+            let notes = scan_cell_notes(
+                &call.stats, anchored.dropped, anchored.dropped_unreadable, thinking_pinned, call.reasoning_tokens, call.output_tokens,
+            );
+            let mut rec = CellRecord::ok(cell_id, route_key, CellOutput::Scan(anchored.output.clone())).with_family(family);
+            rec.input_tokens = call.input_tokens;
+            rec.output_tokens = call.output_tokens;
+            rec.cached_input_tokens = call.cached_input_tokens;
+            rec.iterations = call.iterations;
+            rec.warn = if notes.is_empty() { None } else { Some(notes.join("; ")) };
+            (rec, Some(anchored.output))
+        }
+        Err(err) => {
+            let (i, o, c) = err.burned_usage();
+            let mut rec = CellRecord::failed(cell_id, route_key, Role::Scanner, err.to_string()).with_family(family);
+            rec.input_tokens = i;
+            rec.output_tokens = o;
+            rec.cached_input_tokens = c;
+            (rec, None)
+        }
+    };
+    record.duration_ms = duration_ms;
+    record.attempts = 1;
+    record.template_hash = Some(template_hash);
+    (record, output)
+}
 /// cell warn 片段：parse 丢弃 / 截断计数、锚定丢弃、零推理观测——不静默（批 D-1 注释「丢弃 / 截断计数由调用方写进 cell warn」）。
 fn scan_cell_notes(
     st: &crate::provider::parse::ScanParseStats,
@@ -428,7 +455,7 @@ mod scan_tests {
         let m = sink.manifest.lock().unwrap();
         assert_eq!(m.len(), 4);
         assert_eq!(m[0].model, "p/a");
-        assert!(m.iter().all(|i| i.scan.is_some() && i.prompt == i.scan.as_ref().unwrap().flatten()));
+        assert!(m.iter().all(|i| i.scan.is_some() && i.prompt.is_empty() && i.template_hash.as_deref() == Some(crate::prompt::scan_template_hash().as_str())), "scan 存全文、prompt 留空、模板哈希随 manifest");
         assert_eq!(m[0].scan, m[1].scan, "同组各条目同一 prompt（cache 命中）");
         assert_ne!(m[0].scan, m[2].scan);
         assert!(m[0].scan.as_ref().unwrap().blocks[0].text.contains("src/f1.rs (g2"), "跨组索引进参考块");

@@ -424,11 +424,7 @@ pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
         .filter(|c| c.record.input_tokens > 0)
         .map(|c| CacheHit { cell: c.cell_id.clone(), ratio: c.record.cached_input_tokens as f32 / c.record.input_tokens as f32 })
         .collect();
-    let cells_summary: Vec<CellSummary> = f.results.cells.iter().map(|c| CellSummary {
-        cell: c.cell_id.clone(), model: c.route_key.clone(), role: c.record.role().as_str().to_string(),
-        ok: c.record.ok, iterations: c.record.iterations, attempts: c.record.attempts, duration_ms: c.record.duration_ms,
-        input_tokens: c.record.input_tokens, output_tokens: c.record.output_tokens, cached_input_tokens: c.record.cached_input_tokens,
-    }).collect();
+    let cells_summary: Vec<CellSummary> = f.results.cells.iter().map(|c| CellSummary::from_record(&c.record)).collect();
     let h = crate::prompt::template_hashes();
     let template_hashes: BTreeMap<String, String> = [("shared_head", &h.shared_head), ("scanner_tail", &h.scanner_tail)]
         .into_iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
@@ -481,14 +477,14 @@ pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
     (report, code)
 }
 
-/// 覆盖自报（design §4 `scanned_areas`，F-5）：改动行（各文件 diff hunk 的 `+` 行与删除点，0-based 新文件坐标）被任一 ok cell
-/// 自报区间（`a-b`，1-based）覆盖的比例；无改动行 → None。
+/// 覆盖自报（design §4 `scanned_areas`，F-5）：改动行 = 各文件 diff hunk 的 `+` 行（0-based 新文件坐标；删除点不计——它在工作树里不存在，
+/// scanner 永远覆盖不到，评审修 10）被任一 ok cell 自报区间（`a-b`，1-based）覆盖的比例；无 `+` 行（纯删除 / 空）→ None。
 pub(crate) fn scanned_coverage(bundles: &[Bundle], cells: &[ScanCellResult]) -> Option<f32> {
     let mut changed: std::collections::BTreeSet<(String, usize)> = std::collections::BTreeSet::new();
     for b in bundles {
         for fc in &b.files {
             for h in crate::diffsym::parse_hunks(&fc.diff) {
-                for l in h.changed {
+                for (l, _) in h.plus {
                     changed.insert((fc.path.clone(), l));
                 }
             }
@@ -777,29 +773,18 @@ fn append_ckpt_failure_warning(report: &mut ReviewReport, job_id: &str, failures
 /// 三条终态路径统一调用；旧作业 JSON 无此字段（serde default 空）不受影响。
 pub fn attach_cells(store: &crate::state::JobStore, job_id: &str, report: &mut ReviewReport) {
     let records = store.read_partial(job_id);
-    report.run.cells = records
-        .iter()
-        .map(|r| CellSummary {
-            cell: r.cell.clone(), role: r.role().as_str().to_string(), cached_input_tokens: r.cached_input_tokens,
-            model: r.model.clone(),
-            ok: r.ok,
-            iterations: r.iterations,
-            attempts: r.attempts,
-            duration_ms: r.duration_ms,
-            input_tokens: r.input_tokens,
-            output_tokens: r.output_tokens,
-        })
-        .collect();
+    report.run.cells = records.iter().map(CellSummary::from_record).collect();
     report.cells = records;
 }
-/// R2.2：失败/超时时从 proj.db 的 cell checkpoint 里已完成的 scanner 记录组一份 `incomplete` 报告——绝不因为 dispatch 出错/超时就
-/// 静默丢掉已经跑完的 cell。M 取 manifest 行数（若尚未写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
+/// R2.2：失败/超时时从 proj.db 的 cell checkpoint 组一份 `incomplete` 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。
+/// 全部落盘记录（含失败格）都进收口：失败格进 coverage.failed / cells_failed、烧掉的 usage 入账，与随后 `attach_cells` 回填的
+/// `run.cells` / 顶层 `cells` 一致（评审修 2）。M 取 manifest 行数（若尚未写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
 fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) -> (ReviewReport, i32) {
     let manifest = store.read_manifest(job_id);
-    let done_records: Vec<CellRecord> = store.read_partial(job_id).into_iter().filter(|r| r.ok).collect();
-    let done = done_records.len();
-    let total = manifest.len().max(done);
-    let results = ScanResults { cells: scan_cells_from_records(done_records), ..Default::default() };
+    let records: Vec<CellRecord> = store.read_partial(job_id);
+    let done = records.iter().filter(|r| r.ok).count();
+    let total = manifest.len().max(records.len());
+    let results = ScanResults { cells: scan_cells_from_records(records), ..Default::default() };
     let (mut report, _) = finish_scan_report(ScanFinish {
         groups: vec![],
         scanned_coverage: None,
@@ -821,10 +806,12 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
     let code = exit_code(Verdict::Incomplete, false);
     (report, code)
 }
-/// R2.3：resume 差集补跑（批 F-4 scan 版）。读 `manifest`（全集 M）+ `partial`（已完成 ok:true 的 cell 集）→ `待跑 = M − 已完成`；
+/// R2.3：resume 差集补跑（批 F-4 scan 版）。读 `manifest`（全集 M）+ `partial`（已完成 ok:true 的 scanner cell 集）→ `待跑 = M − 已完成`；
 /// 对待跑 cell 用 manifest 里落盘的 `scan` 请求（system + 分块 + cache 断点）重放 `registry.scan`——不重收集证据、不重 build prompt
-/// （确定性）；无 `scan` 字段（旧格式作业）的 cell 记失败。append_partial 落盘后，全部记录（已完成 + 新补 + 失败）走 scan-only 收口
-/// （`finish_scan_report`）；全集补齐 → scan-only；仍有缺失 → `Incomplete`。角色集按当前配置重建（M21b 队列快照落地后改读快照）。
+/// （确定性）；无 `scan` 字段（旧格式作业）的 cell 记失败。单格收口与扇出同款（[`crate::orchestrate::scan_cell_record`]），模板哈希取 manifest
+/// 落盘值（与当前二进制不一致时 warning，评审修 6）。全部记录（已完成 + 新补 + 失败）走 scan-only 收口；组骨架 / 分组观测 / head_sha /
+/// 覆盖自报从作业原报告沿用（resume 不重收集证据，评审修 5）；全集补齐 → scan-only；仍有缺失 → `Incomplete`。
+/// 旧格式作业（批 B-E 的 reviewer 形态记录）不可 resume（评审修 1）。角色集按当前配置重建（M21b 队列快照落地后改读快照）。
 pub async fn run_resume(
     job_id: &str,
     registry: &ProviderRegistry,
@@ -858,21 +845,27 @@ pub async fn run_resume(
             "resume: incremental jobs cannot be resumed; re-run `redteam-next review --incremental-from <prior-job>`".into(),
         );
     }
-    let done: std::collections::BTreeSet<String> = store.read_partial(job_id)
-        .into_iter()
-        .filter(|r| r.ok)
-        .map(|r| r.cell)
-        .collect();
+    let prior_records = store.read_partial(job_id);
+    if prior_records.iter().any(|r| !matches!(r.output, crate::domain::CellOutput::Scan(_))) {
+        return partial_report(
+            store, job_id,
+            "resume: job has non-scanner cell records (pre-M21a finding job); cannot resume with the scan-only binary — re-run review".into(),
+        );
+    }
+    let done: std::collections::BTreeSet<String> = prior_records.into_iter().filter(|r| r.ok).map(|r| r.cell).collect();
     let pending: Vec<&crate::state::CellInput> =
         manifest.iter().filter(|c| !done.contains(&c.cell)).collect();
     let roles = cfg.active_roles();
+    let entry_of = |name: &str| -> Option<crate::orchestrate::ScanEntrySpec> {
+        roles.scanners.iter().find(|m| m.name == name).map(crate::orchestrate::ScanEntrySpec::from)
+    };
     let family_of = |name: &str| -> String {
         roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers)
             .find(|m| m.name == name).map(|m| m.family.clone()).unwrap_or_default()
     };
-    let template_hash = crate::prompt::scan_template_hash();
+    let current_hash = crate::prompt::scan_template_hash();
 
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = registry.warnings().to_vec();
     // 差集 cell 并行补跑（join_all 保序）；provider 在途门在 registry 内。
     let outs = futures::future::join_all(pending.iter().map(|cell| async move {
         let t0 = std::time::Instant::now();
@@ -885,41 +878,37 @@ pub async fn run_resume(
         (cell, res, t0.elapsed())
     }))
     .await;
+    let mut hash_mismatch = false;
     for (cell, outcome, elapsed) in outs {
-        let mut rec = match outcome {
-            Ok(call) => {
-                let anchored = crate::positioning::anchor_suspicions(cwd, call.output);
-                let mut rec = CellRecord::ok(cell.cell.clone(), cell.model.clone(), crate::domain::CellOutput::Scan(anchored.output))
-                    .with_family(family_of(&cell.model));
-                rec.input_tokens = call.input_tokens;
-                rec.output_tokens = call.output_tokens;
-                rec.cached_input_tokens = call.cached_input_tokens;
-                rec.iterations = call.iterations;
-                if anchored.dropped + anchored.dropped_unreadable > 0 {
-                    rec.warn = Some(format!("{} suspicions dropped: quote not found in file", anchored.dropped + anchored.dropped_unreadable));
-                }
-                rec
-            }
-            Err(e) => {
+        if outcome.is_err() {
+            if let Err(e) = &outcome {
                 warnings.push(format!("resume cell [{}] model {}: {e}", cell.cell, cell.model));
-                let (i, o, c) = e.burned_usage();
-                let mut rec = CellRecord::failed(cell.cell.clone(), cell.model.clone(), Role::Scanner, e.to_string())
-                    .with_family(family_of(&cell.model));
-                rec.input_tokens = i;
-                rec.output_tokens = o;
-                rec.cached_input_tokens = c;
-                rec
             }
+        }
+        let hash = match &cell.template_hash {
+            Some(h) => {
+                if *h != current_hash {
+                    hash_mismatch = true;
+                }
+                h.clone()
+            }
+            None => current_hash.clone(),
         };
-        rec.duration_ms = elapsed.as_millis() as u64;
-        rec.attempts = 1;
-        rec.template_hash = Some(template_hash.clone());
+        let pinned = entry_of(&cell.model).map(|e| e.thinking_pinned).unwrap_or(false);
+        let (rec, _) = crate::orchestrate::scan_cell_record(
+            &cell.cell, &cell.model, &family_of(&cell.model), pinned, cwd, outcome, elapsed.as_millis() as u64, hash,
+        );
         if let Err(e) = store.append_partial(job_id, &rec) {
             eprintln!("warn: job {job_id} append_partial 失败（cell {}）: {e}", rec.cell);
         }
     }
+    if hash_mismatch {
+        warnings.push(format!(
+            "resume: replayed cells use the manifest's template hash (frozen prompt), which differs from the current binary's {current_hash}; template A/B attribution follows the manifest value"
+        ));
+    }
 
-    // 收口：全部记录（已完成 + 新补 + 失败）。
+    // 收口：全部记录（已完成 + 新补 + 失败）；组骨架 / 分组观测 / head_sha / 覆盖自报 / dossier 从原报告沿用（resume 不重收集证据）。
     let final_records = store.read_partial(job_id);
     let ok_cells: std::collections::BTreeSet<&str> =
         final_records.iter().filter(|r| r.ok).map(|r| r.cell.as_str()).collect();
@@ -932,19 +921,25 @@ pub async fn run_resume(
             return partial_report(store, job_id, format!("resume: bad ledger: {e}"));
         }
     };
+    let prior: Option<ReviewReport> = store.read_result(job_id).and_then(|j| serde_json::from_str(&j).ok());
+    let groups: Vec<ScanGroup> = prior
+        .as_ref()
+        .and_then(|r| r.scan.as_ref())
+        .map(|sc| sc.groups.iter().map(|g| ScanGroup { label: g.label.clone(), files: g.files.clone(), cells: vec![], suspicions: 0, pack: g.pack.clone() }).collect())
+        .unwrap_or_default();
     let results = ScanResults { cells: scan_cells_from_records(final_records), ..Default::default() };
     let (mut report, mut code) = finish_scan_report(ScanFinish {
-        groups: vec![],
-        scanned_coverage: None,
-        grouping: None,
-        dossier_meta: None,
+        groups,
+        scanned_coverage: prior.as_ref().and_then(|r| r.scan.as_ref()).and_then(|sc| sc.scanned_coverage),
+        grouping: prior.as_ref().and_then(|r| r.run.grouping.clone()),
+        dossier_meta: prior.as_ref().and_then(|r| r.run.dossier.clone()),
         results,
         model_names,
         roles: Some(&roles),
         warnings,
         inflight_peak: registry.inflight_peaks(),
         ledger_meta: ledger.meta.clone(),
-        head_sha: None,
+        head_sha: prior.as_ref().and_then(|r| r.run.head_sha.clone()),
         duration_ms: t0.elapsed().as_millis() as u64,
         test_command: args.test_command.clone().or_else(|| crate::project::infer_test_command(cwd)),
         job_id: job_id.to_string(),
@@ -1750,7 +1745,7 @@ mod resume_tests {
         (reg, backend)
     }
     fn input(cell: &str, model: &str, system: &str) -> CellInput {
-        CellInput { cell: cell.into(), model: model.into(), prompt: system.into(), scan: Some(ScanPrompt { system: system.into(), blocks: vec![] }) }
+        CellInput { template_hash: None, cell: cell.into(), model: model.into(), prompt: system.into(), scan: Some(ScanPrompt { system: system.into(), blocks: vec![] }) }
     }
     fn done_scan(cell: &str, model: &str, file: &str) -> CellRecord {
         let out = crate::domain::ScanOutput {
@@ -1825,13 +1820,61 @@ mod resume_tests {
         assert_eq!(scan.suspicions[0].families, vec!["alpha", "beta"]);
     }
 
+    /// 评审修 1：旧格式作业（partial 里是 reviewer 形态记录、且全部 ok）→ 不重放、不覆盖为空 scan-only，直接 Incomplete + 理由。
+    #[tokio::test]
+    async fn resume_refuses_pre_scan_job_with_reviewer_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[CellInput { cell: "bundle[a.rs]@p/m".into(), model: "p/m".into(), prompt: "P".into(), scan: None, template_hash: None }]).unwrap();
+        store.append_partial("j", &CellRecord::ok("bundle[a.rs]@p/m", "p/m", crate::domain::CellOutput::review(vec![]))).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        store.write_result("j", "{\"marker\": \"original\"}").unwrap();
+        let (reg, backend) = recording_registry("p/m", "c.rs");
+        let (report, code) = run_resume("j", &reg, &Config::default(), ws, &store).await;
+        assert_eq!((report.verdict, code), (Verdict::Incomplete, 3));
+        assert_eq!(backend.turn_count(), 0);
+        assert!(report.run.warnings.iter().any(|w| w.contains("non-scanner cell records")), "{:?}", report.run.warnings);
+        assert_eq!(store.read_result("j").as_deref(), Some("{\"marker\": \"original\"}"), "原报告不被空 scan-only 覆盖");
+    }
+
+    /// 评审修 6：重放 cell 的模板哈希取 manifest 落盘值；与当前二进制不一致 → warning。评审修 5：原报告的组骨架 / head_sha / 覆盖自报沿用。
+    #[tokio::test]
+    async fn resume_keeps_manifest_template_hash_and_prior_report_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(ws.join("c.rs"), "marker\n").unwrap();
+        let mut inp = input("scan[g1]@p/m#1", "p/m", "P1");
+        inp.template_hash = Some("aaaa+bbbb".into());
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[inp]).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let prior = ReviewReport {
+            schema_version: "4".into(), verdict: Verdict::Incomplete, stats: Stats::default(), findings: vec![], clusters: vec![],
+            run: RunMeta { head_sha: Some("deadbeef".into()), grouping: Some(crate::bundle::GroupingStats { gate: crate::bundle::Gate::Single, groups: 1, edges: 0, weak_cut: 0, cross_edges: 0, isolated: 0, over_budget: 0 }), ..Default::default() },
+            scan: Some(ScanReport { groups: vec![ScanGroup { label: "c.rs".into(), files: vec!["c.rs".into()], cells: vec![], suspicions: 0, pack: Default::default() }], suspicions: vec![], scanned_coverage: Some(0.75), stats: Default::default() }),
+            cells: vec![],
+        };
+        store.write_result("j", &serde_json::to_string(&prior).unwrap()).unwrap();
+        let (reg, _backend) = recording_registry("p/m", "c.rs");
+        let (report, code) = run_resume("j", &reg, &Config::default(), ws, &store).await;
+        assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0));
+        assert_eq!(report.cells[0].template_hash.as_deref(), Some("aaaa+bbbb"), "取 manifest 哈希，不盖当前值");
+        assert!(report.run.warnings.iter().any(|w| w.contains("manifest's template hash")), "{:?}", report.run.warnings);
+        let scan = report.scan.as_ref().unwrap();
+        assert_eq!((scan.groups[0].label.as_str(), scan.groups[0].files.len(), scan.groups[0].cells.len()), ("c.rs", 1, 1));
+        assert_eq!(scan.scanned_coverage, Some(0.75));
+        assert_eq!(report.run.head_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(report.run.grouping.as_ref().map(|g| g.groups), Some(1));
+    }
+
     /// 旧格式 manifest（无 scan 请求）→ 该 cell 记失败 → Incomplete；不调 backend。
     #[tokio::test]
     async fn resume_legacy_manifest_without_scan_prompt_is_incomplete() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
         let store = crate::state::JobStore::open(ws).unwrap();
-        store.write_manifest("j", &[CellInput { cell: "bundle[a.rs]".into(), model: "p/m".into(), prompt: "P".into(), scan: None }]).unwrap();
+        store.write_manifest("j", &[CellInput { template_hash: None, cell: "bundle[a.rs]".into(), model: "p/m".into(), prompt: "P".into(), scan: None }]).unwrap();
         store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
         let (reg, backend) = recording_registry("p/m", "c.rs");
         let (report, code) = run_resume("j", &reg, &Config::default(), ws, &store).await;
@@ -1987,6 +2030,47 @@ mod code_review_tests {
         assert_eq!(scanned_coverage(&[b("a.rs"), b("b.rs")], &[cell(vec![("a.rs", "2-2")])]), Some(0.5));
         assert_eq!(scanned_coverage(&[], &[cell(vec![("a.rs", "1-3")])]), None, "无改动行 → None");
         assert_eq!(scanned_coverage(&[b("a.rs")], &[cell(vec![("a.rs", "x-y"), ("a.rs", "0-3")])]), Some(0.0), "坏区间不计");
+        // 评审修 10：删除点不进分母——纯删除 → None；混合 diff 只计 + 行
+        let del = Bundle::from_files(vec![FileChange { path: "old.rs".into(), diff: "@@ -1,3 +0,0 @@\n-a\n-b\n-c".into() }]);
+        assert_eq!(scanned_coverage(std::slice::from_ref(&del), &[cell(vec![])]), None, "纯删除无可扫改动行");
+        assert_eq!(scanned_coverage(&[del, b("a.rs")], &[cell(vec![("a.rs", "1-3")])]), Some(1.0), "删除文件不拉低覆盖率");
+    }
+
+    /// 评审修 2：partial 报告把失败格也算进 coverage.failed / cells_failed / usage（与 attach_cells 回填的 cells 一致）。
+    #[test]
+    fn partial_report_keeps_failed_cells_in_coverage_and_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::state::JobStore::open(dir.path()).unwrap();
+        let ok = CellRecord::ok("scan[g1]@p/a#1", "p/a", crate::domain::CellOutput::Scan(Default::default()));
+        let mut failed = CellRecord::failed("scan[g1]@p/b#1", "p/b", Role::Scanner, "auth error: no key");
+        failed.input_tokens = 7;
+        store.append_partial("j", &ok).unwrap();
+        store.append_partial("j", &failed).unwrap();
+        let (r, code) = partial_report(&store, "j", "timed out".into());
+        assert_eq!((r.verdict, code), (Verdict::Incomplete, 3));
+        assert_eq!(r.run.coverage.failed[&Role::Scanner], vec!["scan[g1]@p/b#1"]);
+        assert_eq!(r.run.coverage.completed[&Role::Scanner], vec!["scan[g1]@p/a#1"]);
+        assert_eq!(r.run.usage.input_tokens, 7, "失败格烧掉的 usage 入账");
+        assert_eq!(r.scan.as_ref().unwrap().stats.cells_failed, 1);
+        assert!(r.run.warnings.iter().any(|w| w.starts_with("partial: 1/2")), "{:?}", r.run.warnings);
+        assert_eq!(r.cells.len(), 2);
+    }
+
+    /// 评审修 9：`thinking_pinned` 只在 (kind, family, id) 真有映射且会发出时为 true。
+    #[test]
+    fn scan_entry_spec_pinned_requires_a_thinking_mapping() {
+        use crate::orchestrate::ScanEntrySpec;
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{
+            "deepseek-v4-flash":{"roles":{"scanner":{"thinkingLevel":"low"}}},
+            "grok-4":{"roles":{"scanner":{"thinkingLevel":"high"}}},
+            "gpt-5":{"roles":{"scanner":{"thinkingLevel":"off"}}},
+            "qwen3":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let roles = cfg.active_roles();
+        let pinned: std::collections::BTreeMap<String, bool> = roles.scanners.iter().map(|em| (em.id.clone(), ScanEntrySpec::from(em).thinking_pinned)).collect();
+        assert!(pinned["deepseek-v4-flash"]);
+        assert!(!pinned["grok-4"], "无映射家族不算 pinned");
+        assert!(!pinned["gpt-5"], "Off 不算 pinned");
+        assert!(!pinned["qwen3"], "未配档位不算 pinned");
     }
 }
 
@@ -2292,7 +2376,7 @@ mod tests {
         store.put_state_for_test(&JobState::new("j", 0)).unwrap();
         let sink = JobCellSink { store: std::sync::Arc::clone(&store), job_id: "j".into(), ckpt_failures: std::sync::atomic::AtomicU32::new(0) };
         use crate::orchestrate::CellSink;
-        sink.manifest(&[crate::state::CellInput {
+        sink.manifest(&[crate::state::CellInput { template_hash: None,
             cell: "c".into(), model: "m".into(), prompt: "p".into(), scan: None }]);
         assert_eq!(store.read_state("j").unwrap().phase, Some(Phase::Scan));
     }
@@ -2327,7 +2411,7 @@ mod tests {
             ckpt_failures: std::sync::atomic::AtomicU32::new(0),
         };
         use crate::orchestrate::CellSink;
-        sink.manifest(&[CellInput { cell: "c".into(), model: "m".into(), prompt: "p".into(), scan: None }]);
+        sink.manifest(&[CellInput { template_hash: None, cell: "c".into(), model: "m".into(), prompt: "p".into(), scan: None }]);
         sink.on_cell(CellRecord::ok("c", "m", crate::domain::CellOutput::review(vec![])));
         sink.on_phase(Phase::Finalizing, None);
         sink.on_meta(&["m".to_string()]);

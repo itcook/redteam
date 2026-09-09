@@ -24,21 +24,24 @@ impl InflightGate {
     pub fn peak(&self) -> u32 {
         self.peak.load(Ordering::SeqCst)
     }
-    async fn enter(&self) -> Result<InflightGuard<'_>, ProviderError> {
-        let permit = self.sem.acquire().await.map_err(|_| ProviderError::Unavailable("inflight gate closed".into()))?;
+    /// 取名额（不计在途：租约可能还在等角色 worker 许可，评审修 7 后门先于 worker）。
+    async fn enter(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ProviderError> {
+        self.sem.acquire().await.map_err(|_| ProviderError::Unavailable("inflight gate closed".into()))
+    }
+    /// 真正发请求时计在途（峰值 = 同时在途的 HTTP 请求数，不含等 worker 的租约）。
+    fn activate(&self) -> ActiveGuard<'_> {
         let cur = self.current.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(cur, Ordering::SeqCst);
-        Ok(InflightGuard { gate: self, _permit: permit })
+        ActiveGuard { gate: self }
     }
 }
 
 /// 在途计数守卫：Drop 即减一（panic / 提前返回都安全）。
-struct InflightGuard<'a> {
+struct ActiveGuard<'a> {
     gate: &'a InflightGate,
-    _permit: tokio::sync::SemaphorePermit<'a>,
 }
 
-impl Drop for InflightGuard<'_> {
+impl Drop for ActiveGuard<'_> {
     fn drop(&mut self) {
         self.gate.current.fetch_sub(1, Ordering::SeqCst);
     }
@@ -108,14 +111,34 @@ impl ProviderRegistry {
         self.gates.iter().map(|(p, g)| (p.clone(), g.peak())).collect()
     }
 
-    /// scanner 调用：未注册 → `Unavailable`（该格入 coverage failed）；否则过 provider 在途门 → 两轮单发。
-    pub async fn scan(&self, route_key: &str, prompt: &ScanPrompt) -> Result<ScanCall, ProviderError> {
+    /// 先过 provider 在途门再拿到条目（评审修 7）：扇出层在门后才取角色 `workers` 许可——饱和 / 限流的 provider 不占 worker 槽，
+    /// 其他 provider 的 cell 不被饿死。未注册 → `Unavailable`（该格入 coverage failed）。
+    pub async fn lease(&self, route_key: &str) -> Result<ScanLease<'_>, ProviderError> {
         let Some(entry) = self.scan.get(route_key) else {
             return Err(ProviderError::Unavailable(format!("scanner not in registry: {route_key}")));
         };
         let gate = self.gates.get(&entry.provider).ok_or_else(|| ProviderError::Unavailable(format!("no inflight gate for provider {}", entry.provider)))?;
-        let _guard = gate.enter().await?;
-        run_scan_shot(entry.backend.as_ref(), prompt, entry.per_turn, entry.retry_budget).await
+        let permit = gate.enter().await?;
+        Ok(ScanLease { entry, gate, _permit: permit })
+    }
+
+    /// scanner 调用：过 provider 在途门 → 两轮单发（`lease` + `run`）。
+    pub async fn scan(&self, route_key: &str, prompt: &ScanPrompt) -> Result<ScanCall, ProviderError> {
+        self.lease(route_key).await?.run(prompt).await
+    }
+}
+
+/// 已过在途门的 scanner 条目租约：持有期间占该 provider 一个名额；`run` 走两轮单发并计在途峰值。
+pub struct ScanLease<'a> {
+    entry: &'a ScanEntry,
+    gate: &'a InflightGate,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl ScanLease<'_> {
+    pub async fn run(&self, prompt: &ScanPrompt) -> Result<ScanCall, ProviderError> {
+        let _active = self.gate.activate();
+        run_scan_shot(self.entry.backend.as_ref(), prompt, self.entry.per_turn, self.entry.retry_budget).await
     }
 }
 

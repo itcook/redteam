@@ -225,7 +225,7 @@ fn render_scan_md(r: &ReviewReport, s: &mut String) {
             s.push_str(&format!(
                 "- `{}:{}-{}` {cat}conf {:.2} · agreement {} ({}) — {}\n",
                 m.suspicion.file, m.suspicion.line_start, m.suspicion.line_end, m.suspicion.confidence, m.agreement,
-                m.families.join(", "), m.hints.join(" / ")
+                m.families.join(", "), m.hints.iter().map(|h| h.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" / ")
             ));
             let first: String = m.suspicion.quote.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().chars().take(120).collect();
             if !first.is_empty() {

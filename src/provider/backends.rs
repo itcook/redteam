@@ -749,7 +749,7 @@ pub fn backend_from_config(
     // 整请求超时罩住单轮（评审 M2）：慢模型 per_turn 1200s 时 reqwest 不再在 300s 先切断。
     let http_secs = crate::provider::http_timeout_for(em.per_turn_secs());
     // 批 F-2：角色条目 thinkingLevel 首个消费者——按 (kind, family) 查表；无映射 → 不发（warning 由 `thinking_warning` 给调用方）。
-    let thinking = em.thinking_level.and_then(|l| thinking_params(em.kind, &em.family, l, em.max_tokens_effective()));
+    let thinking = em.thinking_level.and_then(|l| thinking_params(em.kind, &em.family, &em.id, l, em.max_tokens_effective()));
     match em.kind {
         ProviderKind::Anthropic => Ok(Box::new(AnthropicBackend::new(
             em.id.clone(),
@@ -768,43 +768,49 @@ pub fn backend_from_config(
 /// 配置了 thinkingLevel 但 (kind, family) 无参数映射 → 一条 warning（进 RunMeta.warnings，铁律 1 可观测）；否则 None。
 pub fn thinking_warning(em: &crate::config::EffectiveModel) -> Option<String> {
     let level = em.thinking_level?;
-    if thinking_params(em.kind, &em.family, level, em.max_tokens_effective()).is_some() {
+    if thinking_params(em.kind, &em.family, &em.id, level, em.max_tokens_effective()).is_some() {
         return None;
     }
     Some(format!(
-        "thinkingLevel {} 对 {}（kind {:?}，family {}）无参数映射，未发送；已知映射：anthropic+claude / openai+deepseek·glm·kimi·gpt·gemini·qwen",
+        "thinkingLevel {} 对 {}（kind {:?}，family {}）无参数映射，未发送；已知映射：anthropic+claude / openai+deepseek·glm·kimi·gpt-5·o 系·gemini·qwen",
         level.as_str(), em.name, em.kind, em.family
     ))
 }
 
-/// 家族串（`EffectiveModel.family`：配置 `family` 或 model id 首段小写，如 `qwen3` / `glm` / `deepseek`）→ 映射表键。
-fn family_class(family: &str) -> &'static str {
+/// 家族串（`EffectiveModel.family`：配置 `family` 或 model id 首段小写，如 `qwen3` / `glm` / `deepseek` / `gpt`）+ model id → 映射表键。
+/// `gpt` 家族只有推理型（gpt-5 系 / o 系）接受 `reasoning_effort`，gpt-4 系发了即 400（评审修 3）——按 id 区分，分不清的归
+/// `gpt-legacy`（无映射 + warning）。
+fn family_class(family: &str, id: &str) -> &'static str {
     let f = family.trim().to_ascii_lowercase();
-    let o_series = f.len() > 1 && f.starts_with('o') && f[1..].chars().all(|c| c.is_ascii_digit());
+    let i = id.trim().to_ascii_lowercase();
+    let o_series = |s: &str| s.len() > 1 && s.starts_with('o') && s[1..].starts_with(|c: char| c.is_ascii_digit());
     if f.starts_with("deepseek") { "deepseek" }
     else if f.starts_with("glm") || f.starts_with("zhipu") || f == "zai" || f == "z.ai" { "glm" }
     else if f.starts_with("kimi") || f.starts_with("moonshot") { "kimi" }
-    else if f.starts_with("gpt") || f == "openai" || o_series { "openai" }
+    else if f == "openai" || o_series(&f) || o_series(&i) || f.starts_with("gpt-5") || f == "gpt5" || i.starts_with("gpt-5") || i.starts_with("gpt5") { "openai" }
+    else if f.starts_with("gpt") { "gpt-legacy" }
     else if f.starts_with("gemini") { "gemini" }
     else if f.starts_with("qwen") { "qwen" }
     else if f.starts_with("claude") || f == "anthropic" { "claude" }
     else { "unknown" }
 }
-
 /// 思考档位 → 请求体参数对（批 F-2，ThinkingLevel 首个消费者；design §4「scanner 请求显式钉推理档」）。
-/// 按 (kind, family) 查表——各家参数名互斥（Kimi 同发 `thinking` 与 `reasoning_effort` 即 400；GLM-5.3 不可关闭；Anthropic 要求
-/// `1024 ≤ budget_tokens < max_tokens`）。`None` = 无映射（调用方不发 + warning）；`Some(vec![])` = 该档位就是「不发任何参数」。
+/// 按 (kind, family, id) 查表——各家参数名互斥（Kimi 同发 `thinking` 与 `reasoning_effort` 即 400；GLM-5.x 不可关闭而 GLM-4.x 可关；
+/// gpt-4 系不认 `reasoning_effort`；Anthropic 要求 `1024 ≤ budget_tokens < max_tokens`）。`None` = 无映射（调用方不发 + warning）；
+/// `Some(vec![])` = 该档位就是「不发任何参数」。
 /// 官方文档核实 2026-09-09：DeepSeek（`thinking{type}` + `reasoning_effort low|high|max`）、Z.ai GLM-5.3（openai 形态同上，不可 disable；
 /// anthropic 形态文档无字段说明 → 无映射）、Moonshot（只认 `thinking{type}`）、Anthropic（`thinking{enabled, budget_tokens}`）、
-/// OpenAI / Gemini（`reasoning_effort low|medium|high`）、DashScope Qwen（`enable_thinking`）。
+/// OpenAI 推理型 / Gemini（`reasoning_effort low|medium|high`）、DashScope Qwen（`enable_thinking`）。
 pub(crate) fn thinking_params(
     kind: ProviderKind,
     family: &str,
+    id: &str,
     level: ThinkingLevel,
     max_tokens: u64,
 ) -> Option<Vec<(&'static str, Value)>> {
     use ThinkingLevel::*;
-    let class = family_class(family);
+    let class = family_class(family, id);
+    let lid = id.trim().to_ascii_lowercase();
     match kind {
         ProviderKind::Anthropic => match class {
             "claude" => {
@@ -824,10 +830,16 @@ pub(crate) fn thinking_params(
                 Medium => vec![("thinking", json!({ "type": "enabled" })), ("reasoning_effort", json!("high"))],
                 High => vec![("thinking", json!({ "type": "enabled" })), ("reasoning_effort", json!("max"))],
             }),
-            "glm" => Some(vec![
-                ("thinking", json!({ "type": "enabled" })),
-                ("reasoning_effort", json!(match level { Off | Low => "low", Medium => "high", High => "max" })),
-            ]),
+            "glm" => {
+                // GLM-5.x：不可关闭（Off → enabled + low，文档迁移口径）；GLM-4.x 及未知版本：Off 真关（评审修 8）。
+                let v5 = lid.starts_with("glm-5") || lid.starts_with("glm5") || family.trim().to_ascii_lowercase().starts_with("glm-5");
+                Some(match level {
+                    Off if !v5 => vec![("thinking", json!({ "type": "disabled" }))],
+                    Off | Low => vec![("thinking", json!({ "type": "enabled" })), ("reasoning_effort", json!("low"))],
+                    Medium => vec![("thinking", json!({ "type": "enabled" })), ("reasoning_effort", json!("high"))],
+                    High => vec![("thinking", json!({ "type": "enabled" })), ("reasoning_effort", json!("max"))],
+                })
+            }
             "kimi" => Some(vec![("thinking", json!({ "type": if level == Off { "disabled" } else { "enabled" } }))]),
             "openai" | "gemini" => Some(match level {
                 Off => vec![],
@@ -841,7 +853,6 @@ pub(crate) fn thinking_params(
         ProviderKind::Google => None,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1399,18 +1410,23 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
     fn thinking_params_table_by_kind_and_family() {
         use crate::config::ProviderKind::*;
         use ThinkingLevel::*;
-        let get = |kind, fam: &str, level, max| thinking_params(kind, fam, level, max);
+        let get = |kind, fam: &str, level, max| thinking_params(kind, fam, fam, level, max);
+        let get_id = |kind, fam: &str, id: &str, level, max| thinking_params(kind, fam, id, level, max);
         let pairs = |v: Option<Vec<(&'static str, Value)>>| v.map(|v| serde_json::to_string(&serde_json::Map::from_iter(v.into_iter().map(|(k, x)| (k.to_string(), x)))).unwrap());
         assert_eq!(pairs(get(Openai, "deepseek", Low, 32768)).unwrap(), r#"{"reasoning_effort":"low","thinking":{"type":"enabled"}}"#);
         assert_eq!(pairs(get(Openai, "deepseek", Off, 32768)).unwrap(), r#"{"thinking":{"type":"disabled"}}"#);
         assert_eq!(pairs(get(Openai, "deepseek", High, 32768)).unwrap(), r#"{"reasoning_effort":"max","thinking":{"type":"enabled"}}"#);
-        assert_eq!(pairs(get(OpenaiCompatible, "glm", Off, 32768)).unwrap(), r#"{"reasoning_effort":"low","thinking":{"type":"enabled"}}"#, "GLM-5.3 不可关：Off → enabled+low");
+        assert_eq!(pairs(get_id(OpenaiCompatible, "glm", "glm-5.3", Off, 32768)).unwrap(), r#"{"reasoning_effort":"low","thinking":{"type":"enabled"}}"#, "GLM-5.3 不可关：Off → enabled+low");
+        assert_eq!(pairs(get_id(Openai, "glm", "glm-4.6", Off, 32768)).unwrap(), r#"{"thinking":{"type":"disabled"}}"#, "GLM-4.x Off 真关（评审修 8）");
+        assert!(get_id(Openai, "gpt", "gpt-4.1", Low, 32768).is_none(), "gpt-4 系不认 reasoning_effort → 无映射（评审修 3）");
+        assert_eq!(pairs(get_id(Openai, "gpt", "gpt-5.6", Low, 32768)).unwrap(), r#"{"reasoning_effort":"low"}"#);
+        assert_eq!(pairs(get_id(Openai, "o3", "o3-mini", Low, 32768)).unwrap(), r#"{"reasoning_effort":"low"}"#);
         assert_eq!(pairs(get(Openai, "glm", Medium, 32768)).unwrap(), r#"{"reasoning_effort":"high","thinking":{"type":"enabled"}}"#);
         assert_eq!(pairs(get(Openai, "kimi", High, 32768)).unwrap(), r#"{"thinking":{"type":"enabled"}}"#, "Kimi 不发 reasoning_effort");
         assert_eq!(pairs(get(Openai, "moonshot", Off, 32768)).unwrap(), r#"{"thinking":{"type":"disabled"}}"#);
-        assert_eq!(pairs(get(Openai, "gpt", Medium, 32768)).unwrap(), r#"{"reasoning_effort":"medium"}"#);
+        assert_eq!(pairs(get(Openai, "openai", Medium, 32768)).unwrap(), r#"{"reasoning_effort":"medium"}"#, "显式 family=openai 视为推理型");
         assert_eq!(pairs(get(Openai, "o3", Low, 32768)).unwrap(), r#"{"reasoning_effort":"low"}"#);
-        assert_eq!(pairs(get(Openai, "gpt", Off, 32768)).unwrap(), "{}", "openai Off = 不发");
+        assert_eq!(pairs(get_id(Openai, "gpt", "gpt-5", Off, 32768)).unwrap(), "{}", "openai Off = 不发");
         assert_eq!(pairs(get(Openai, "gemini", High, 32768)).unwrap(), r#"{"reasoning_effort":"high"}"#);
         assert_eq!(pairs(get(Openai, "qwen3", Low, 32768)).unwrap(), r#"{"enable_thinking":true}"#, "family 取 id 首段 qwen3 也命中");
         assert_eq!(pairs(get(Openai, "qwen", Off, 32768)).unwrap(), r#"{"enable_thinking":false}"#);
@@ -1429,13 +1445,13 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         let base_a = build_anthropic_tools_body("claude-x", &msgs, &[], MAX_TOKENS);
         assert_eq!(base_a, build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, None));
         assert_eq!(base_a, build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, Some(&[])));
-        let th = thinking_params(ProviderKind::Anthropic, "claude", ThinkingLevel::Low, MAX_TOKENS).unwrap();
+        let th = thinking_params(ProviderKind::Anthropic, "claude", "claude-x", ThinkingLevel::Low, MAX_TOKENS).unwrap();
         let a = build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, Some(&th));
         assert_eq!(a["thinking"]["budget_tokens"], 2048);
         assert_eq!(a["thinking"]["type"], "enabled");
         let base_o = build_openai_tools_body("m", &msgs, &[], false, None);
         assert_eq!(base_o, build_openai_tools_body_ext("m", &msgs, &[], false, None, None));
-        let th = thinking_params(ProviderKind::Openai, "deepseek", ThinkingLevel::Low, MAX_TOKENS).unwrap();
+        let th = thinking_params(ProviderKind::Openai, "deepseek", "deepseek-v4-flash", ThinkingLevel::Low, MAX_TOKENS).unwrap();
         let o = build_openai_tools_body_ext("m", &msgs, &[], false, None, Some(&th));
         assert_eq!(o["thinking"]["type"], "enabled");
         assert_eq!(o["reasoning_effort"], "low");

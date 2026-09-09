@@ -568,6 +568,12 @@ async fn main() {
                 resume: None, dismissed, no_dismissed, incremental_from, test_command, pack_only,
             };
 
+            // 批 F-4（评审帽外项）：增量轮在 M21c 恢复前对前台 / 后台都在这里拒收——不能先建 job 再在 worker 里 bail 落成 Failed 作业。
+            if args.incremental_from.is_some() {
+                eprintln!("error: --incremental-from（增量轮）在 M21c 疑点台账回流后恢复；M21a scan-only 请跑全量 `review --base <base>`");
+                std::process::exit(1);
+            }
+
             // --pack-only（M21a 批 C）：装包落盘即返回，不建 registry、不派发。
             if pack_only {
                 match redteam::cli::run_pack_only(&args, &cfg, &cwd) {

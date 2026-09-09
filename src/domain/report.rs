@@ -138,6 +138,24 @@ pub struct CellSummary {
     pub cached_input_tokens: u64,
 }
 
+impl CellSummary {
+    /// 从落库记录派生摘要（前台收口与 `attach_cells` 共用一处映射，评审帽外项）。
+    pub fn from_record(r: &crate::state::CellRecord) -> Self {
+        CellSummary {
+            cell: r.cell.clone(),
+            model: r.model.clone(),
+            role: r.role().as_str().to_string(),
+            ok: r.ok,
+            iterations: r.iterations,
+            attempts: r.attempts,
+            duration_ms: r.duration_ms,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            cached_input_tokens: r.cached_input_tokens,
+        }
+    }
+}
+
 /// scan-only 报告的组摘要（批 F-3）：组标签 / 文件 / cell 列表 / 合并后疑点数 / 装包形态（批 E `PackStats`）。
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScanGroup {
