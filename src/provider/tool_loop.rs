@@ -58,6 +58,17 @@ pub trait ChatBackend: Send + Sync {
     }
 }
 
+/// `Arc<T>` 透传：测试与编排层可在把 backend 交给 registry（`Box<dyn ChatBackend>`）后仍持一份句柄观测（批 F-4）。
+#[async_trait]
+impl<T: ChatBackend + ?Sized> ChatBackend for std::sync::Arc<T> {
+    async fn turn(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> Result<AssistantTurn, ProviderError> {
+        (**self).turn(messages, tools).await
+    }
+    async fn turn_final(&self, messages: &[ChatMessage]) -> Result<AssistantTurn, ProviderError> {
+        (**self).turn_final(messages).await
+    }
+}
+
 /// 多轮工具循环：发→若 tool_calls 则执行回灌→直至最终文本→解析为 findings。
 /// usage 跨轮累加；超过 max_iters 仍未收敛则 Parse 错误。
 /// `per_turn` 为单轮最长等待时间；超时返回 `ProviderError::Timeout`。

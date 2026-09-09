@@ -1,11 +1,9 @@
-use redteam::cli::{legacy_opts_from_roles, parse_format, ReviewArgs};
+use redteam::cli::{parse_format, ReviewArgs};
 use redteam::config::Config;
 use redteam::model::Prober as _;
 use redteam::output::render;
 use redteam::provider::backends::backend_from_config;
 use redteam::provider::registry::ProviderRegistry;
-use redteam::provider::single_shot::SingleShotProvider;
-use redteam::provider::tool_loop::ToolLoopProvider;
 use clap::{Parser, Subcommand};
 use std::path::Path;
 
@@ -28,10 +26,10 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// 发起对抗式评审：多模型扇出、单发全上下文评审（diff+改动源文全文+爆炸半径打包直喂，
-    /// 缺证据时二阶段补查）+ 孤证定向反驳，输出 verdict/findings。
-    /// 退出码（五档）：0=干净 approve、1=命令自身失败（参数/IO/配置错误）、
-    /// 2=降级 approve（部分模型未参与）、3=incomplete（不完整报告）、10=reject。
+    /// 发起对抗式评审（M21a：scan-only）：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目
+    /// （× samples）并行扇出 → 疑点并集（agreement = 家族数）→ 疑点索引 + 覆盖自报报告。**不产 finding**
+    /// （深挖 / 复核 / verdict 在 M21b 起）。退出码：0=scan 完成（verdict scan-only）、1=命令自身失败（参数/IO/配置错误）、
+    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口）；2 / 10 在 M21b 深挖落地前不可达。
     Review {
         /// diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]
@@ -51,16 +49,15 @@ enum Cmd {
         /// 与 `redteam test-command` 同一推断链）；记入报告 run.test_command。
         #[arg(long)]
         test_command: Option<String>,
-        /// verdict 阻断阈值：low | medium（默认）| high | critical——达到即 reject。
+        /// verdict 阻断阈值：low | medium（默认）| high | critical——达到即 reject。M21b 深挖产 finding 后生效；
+        /// M21a scan-only 下记录不消费。
         #[arg(long, value_parser = ["low", "medium", "high", "critical"])]
         block_threshold: Option<String>,
-        /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定，但仍保留在报告中。
+        /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定。M21b 起生效；M21a scan-only 下记录不消费。
         #[arg(long)]
         conf_floor: Option<f32>,
-        /// 工具档位：off（单发单轮，无工具）| two-stage（默认：单发 + needs 声明触发的二阶段补查，
-        /// 已交付——注：当前实现里 off 与 two-stage 走同一 SingleShotProvider 且补查逻辑不看此
-        /// flag，故两档管线行为暂等价，仅 on 真正分叉）| on（对话式工具，诊断/对照档）。
-        /// 缺省读 config [review].tools。
+        /// 工具档位：off | two-stage | on。scanner 恒单发（无工具、needs 只记录不补跑，M21b 深挖队列消费）；本旗对 scanner 无效，
+        /// 留给 M21b reviewer 的工具分层授予（design §11）。缺省读 config [review].tools。
         #[arg(long, value_parser = ["off", "two-stage", "on"])]
         tools: Option<String>,
         /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。
@@ -74,21 +71,21 @@ enum Cmd {
         #[arg(long)]
         resume: Option<String>,
         /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：
-        /// 项目存在 .redteam/proj-next.db 即自动加载（豁免 + refute 判例裁决），run.ledger 披露。
+        /// 项目存在 .redteam/proj-next.db 即自动加载，run.ledger 披露。M21a scan-only 下只披露不消费
+        /// （判例前移进 scanner prompt 与豁免 / refute 裁决在 M21c 疑点台账起）。
         #[arg(long)]
         dismissed: Option<String>,
         /// 本次评审完全关闭台账（豁免/预筛/判例注入全停）。
         #[arg(long)]
         no_dismissed: bool,
-        /// 增量轮（M13）：以指定作业的评审为基线，只审其 stamped HEAD 以来已提交的 fix delta，
-        /// 未动代码的 findings 重锚定携带。仅 branch scope（须 --base）；上轮须干净
-        /// 全量（非 incomplete、无 failed_models、经 --background 持久化）。守卫违例显式报错，
-        /// 不静默降级全量。
+        /// 增量轮（M13）：以指定作业的评审为基线只审 fix delta。M21a 硬切后**暂不可用**（显式报错，不静默降级全量）——
+        /// M21c 疑点台账 + delta 激活落地后恢复；仅 branch scope（须 --base）。
         #[arg(long)]
         incremental_from: Option<String>,
-        /// 预算仪表（M21a）：只收集证据 → 分组 → 装包 → 落盘 .redteam/packs/<job>/cell-<n>.md 与
-        /// summary.json，每 cell 打印字节与估算 token（÷3.5）、分组统计与装包形态（body=slice|full 随 `review.pack.body`，缺省 slice：切片 / 折叠行 / 文件外片段计数）；不建 registry、不调 provider，
-        /// 无模型配置也能跑，退出码 0。与 --background / --resume / --incremental-from 互斥；
+        /// 预算仪表（M21a）：只收集证据 → 分组 → 装包 → 落盘 .redteam/packs/<job>/cell-<n>.md（= 真实发出的 scanner prompt：
+        /// 共享头 system + 参考 / 证据 / diff / 角色尾四块）与 summary.json，每 cell 打印字节（含 system 段）与估算 token（÷3.5）、
+        /// 分组统计与装包形态（body=slice|full 随 `review.pack.body`，缺省 slice：切片 / 折叠行 / 文件外片段计数）；不建 registry、
+        /// 不调 provider，无模型配置也能跑，退出码 0。与 --background / --resume / --incremental-from 互斥；
         /// --format 对本模式无效（固定文本行，机读看 summary.json）。
         #[arg(long, conflicts_with_all = ["background", "resume", "incremental_from"])]
         pack_only: bool,
@@ -445,34 +442,19 @@ fn resolve_result(
     }
 }
 
-/// 构造 ProviderRegistry（前台与 worker 共用，避免重复逻辑）。
-/// 返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
-fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<ProviderRegistry, String> {
-    // M21a 批 A：只注册 scanners（route_key = 模型身份串 name，缺省 provider/id）；reviewers / verifiers 在批 F 接线
-    // （同一模型跨角色同名时键会冲突，届时 route_key 带角色前缀）。scanners 为空 → 配置错误。
+/// 构造 ProviderRegistry（前台与 worker 共用）：只装 scanner 条目（route_key = `provider/id`，批 F-2 prd K1）——scanner 一律
+/// scan 单发（`--tools` 对 scanner 无效，K3）；provider 在途帽 = `maxConcurrency` 缺省继承 `review.max_concurrency`（D7 A5）；
+/// thinkingLevel 无映射的告警进 registry.warnings → RunMeta.warnings。reviewers / verifiers 在 M21b 接线（同一模型跨角色同名时键会
+/// 冲突，届时 route_key 带角色前缀）。scanners 为空 → 配置错误；返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
+fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<ProviderRegistry, String> {
     let roles = cfg.active_roles();
-    legacy_opts_from_roles(&roles, cfg.review.max_concurrency)?;
-
-    // 工具档位生效值：--tools 覆盖 config [review].tools；未知/缺省字符串落 config 默认
-    // （clap 已限值域，from_flag 返回 None 仅防漂移）。build_registry 是前台/resume/worker
-    // 三条路径唯一的 registry 构造点，且已持有 args+cfg——在此就地解析，无需再加参数
-    // 穿透调用方（resume 传入的是重建后的 args，天然拿到重建值）。
-    let tools_mode = args.tools.as_deref()
-        .and_then(redteam::config::ToolsMode::from_flag)
-        .unwrap_or(cfg.review.tools);
-
+    if roles.scanners.is_empty() {
+        return Err(redteam::cli::NO_SCANNER_MSG.to_string());
+    }
     let mut registry = ProviderRegistry::new();
     for em in &roles.scanners {
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
-        let backend = match backend_from_config(em, key.clone()) {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(format!("{e}"));
-            }
-        };
-        // 批 F-2：scanner 条目一律 scan 单发（--tools 对 scanner 无效，prd K3）；provider 在途帽缺省继承 review.max_concurrency（D7 A5）；
-        // thinkingLevel 无映射的告警进 registry.warnings → RunMeta.warnings。旧 ReviewProvider 表并存到 F-4。
-        let scan_backend = match backend_from_config(em, key) {
+        let backend = match backend_from_config(em, key) {
             Ok(b) => b,
             Err(e) => {
                 return Err(format!("{e}"));
@@ -481,23 +463,11 @@ fn build_registry(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> Result<Provide
         if let Some(w) = redteam::provider::backends::thinking_warning(em) {
             registry.push_warning(w);
         }
-        let cap = em.max_concurrency.unwrap_or(cfg.review.max_concurrency as u32);
-        registry.insert_scan(
-            em.name.clone(), &em.provider, cap, scan_backend,
-            std::time::Duration::from_secs(em.per_turn_secs()), redteam::provider::DEFAULT_RETRY_BUDGET,
-        );
-        // 单轮超时（design v9 §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`
-        // （慢速模型 30 tok/s 级在 32K max_tokens 下结构性需要 1100s+/轮，2026-09-03 PR181 Kimi 实证）。
+        // 单轮超时（design §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`。
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
-        let provider: Box<dyn redteam::provider::ReviewProvider> = match tools_mode {
-            redteam::config::ToolsMode::On => {
-                Box::new(ToolLoopProvider::new(backend, cwd.to_path_buf()).with_per_turn(per_turn))
-            }
-            _ => Box::new(SingleShotProvider::new(backend).with_per_turn(per_turn)),
-        };
-        registry.insert(em.name.clone(), provider);
+        let cap = em.max_concurrency.unwrap_or(cfg.review.max_concurrency as u32);
+        registry.insert_scan(em.name.clone(), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
     }
-
     Ok(registry)
 }
 

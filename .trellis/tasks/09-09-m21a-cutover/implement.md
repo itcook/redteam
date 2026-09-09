@@ -23,18 +23,18 @@
 - [x] Commit：`feat(orchestrate): scanner 扇出——组 × 条目 × samples，route_key 按角色条目，thinking_level 首个消费者，provider 在途锁（design §5 / §12.3）`
 
 ## 3. F-3 并集与报告（`src/consolidate/{scan,mod,dedup}.rs` / `src/domain/report.rs` / `src/cli/tail.rs` / `src/output/mod.rs` / `src/bundle/mod.rs` / `src/pack/mod.rs`）
-- [ ] `merge_suspicions` + `MergedSuspicion`；`dedup::{QUOTE_SIM, LINE_GAP}` 与 `orchestrate::normalize_quote` 升 `pub(crate)`。
-- [ ] `Verdict::ScanOnly`、`ScanReport` / `ScanGroup` / `ScanStats`、`ReviewReport.{scan, cells}`、`RunMeta.grouping`、`CellSummary` 三字段、`GroupingStats` / `Gate` / `PackStats` 补 `Deserialize`；`exit_code` 臂；md 渲染。
-- [ ] 测试：两家族 agreement 2 / 同家族两 samples 1 / 跨组不合并 / 半重叠合并 / 排序确定；`exit_code(ScanOnly)`；md 快照；`ReviewReport` 序列化含 `cells[].output.role == "scanner"`。
-- [ ] Commit：`feat(consolidate): 疑点并集与 agreement（家族数）+ scan-only 报告（design §5〔D7〕）`
+- [x] `merge_suspicions` + `MergedSuspicion`；`dedup::{QUOTE_SIM, LINE_GAP}` 与 `orchestrate::normalize_quote` 升 `pub(crate)`。
+- [x] `Verdict::ScanOnly`、`ScanReport` / `ScanGroup` / `ScanStats`、`ReviewReport.{scan, cells}`、`RunMeta.grouping`、`CellSummary` 三字段、`GroupingStats` / `Gate` / `PackStats` 补 `Deserialize`；`exit_code` 臂；md 渲染。
+- [x] 测试：两家族 agreement 2 / 同家族两 samples 1 / 跨组不合并 / 半重叠合并 / 排序确定；`exit_code(ScanOnly)`；md 快照；`ReviewReport` 序列化含 `cells[].output.role == "scanner"`。
+- [x] Commit：`feat(consolidate): 疑点并集与 agreement（家族数）+ scan-only 报告（design §5〔D7〕）`
 
 ## 4. F-4 硬切（`src/cli/{mod,tail,incremental,second_pass}.rs` / `src/orchestrate/mod.rs` / `src/prompt/{mod.rs,templates/}` / `src/bundle/mod.rs` / `src/main.rs` / `tests/review_e2e.rs` / `src/provider/registry.rs`）
-- [ ] `run_code_review` 切 scan 路径（`finish_scan_report` 共用）；`scanned_coverage`；`run_resume` scan 重放；`partial_report`；`run_incremental_review` bail；`run_pack_only` 改 `build_scan_prompt`（K15）；`build_packs` 产裸 pack 文本。
-- [ ] 删：orchestrate 旧扇出与 13 测试；`legacy_opts_from_roles` 与两测；`TailCtx` / `assemble_report` / `mark_dismissed` / `CarryCtx` 与测试；`second_pass_prompt` 与其 prompt 文本测试；`build_bundle_prompt` / `CODE_BUNDLE_TPL` / 模板文件 / `legacy_bundle` / `render_dossier_section` + 旧前言 / `DOSSIER_STRUCTURAL_TAGS`（若无他用）/ `render_incremental_section` 与测试群；`two_layer_manifest` 与测试；`consolidate` 私有项 `#[allow(dead_code)]`。
-- [ ] `--help` 文案（K13）；`build_registry` 去 legacy 校验；`JobCellSink` `Phase::Scan` + `on_roles`。
-- [ ] e2e：四例改 scan、两例 `#[ignore]`、一例删、`result_md_three_states` 补字段、`pack_only_*` 回归；cli 单测（`code_review_tests` / `spec_tests` / `job_tests` / `resume_tests`）改 scan fake。
-- [ ] 门：全量绿、clippy ≤ 基线、`--help` 无 `--models`、`adversarial-code-bundle.md` 不存在。
-- [ ] Commit：`refactor(orchestrate): 硬切旧 fan-out / 候补链 / 单发 finding 路径——scanner 疑点路径唯一（铁律 6〔D10〕）`
+- [x] `run_code_review` 切 scan 路径（`finish_scan_report` 共用）；`scanned_coverage`；`run_resume` scan 重放；`partial_report`；`run_incremental_review` bail；`run_pack_only` 改 `build_scan_prompt`（K15）；`build_packs` 产裸 pack 文本。
+- [x] 删：orchestrate 旧扇出与 13 测试；`legacy_opts_from_roles` 与两测；`TailCtx` / `assemble_report` / `mark_dismissed` / `CarryCtx` 与测试；`second_pass_prompt` 与其 prompt 文本测试；`build_bundle_prompt` / `CODE_BUNDLE_TPL` / 模板文件 / `legacy_bundle` / `render_dossier_section` + 旧前言 / `DOSSIER_STRUCTURAL_TAGS`（若无他用）/ `render_incremental_section` 与测试群；`two_layer_manifest` 与测试；`consolidate` 私有项 `#[allow(dead_code)]`。
+- [x] `--help` 文案（K13）；`build_registry` 去 legacy 校验；`JobCellSink` `Phase::Scan` + `on_roles`。
+- [x] e2e：四例改 scan、两例 `#[ignore]`、一例删、`result_md_three_states` 补字段、`pack_only_*` 回归；cli 单测（`code_review_tests` / `spec_tests` / `job_tests` / `resume_tests`）改 scan fake。
+- [x] 门：全量绿、clippy ≤ 基线、`--help` 无 `--models`、`adversarial-code-bundle.md` 不存在。
+- [x] Commit：`refactor(orchestrate): 硬切旧 fan-out / 候补链 / 单发 finding 路径——scanner 疑点路径唯一（铁律 6〔D10〕）`
 
 ## 5. F-5 观测落盘（`src/cli/mod.rs` / `src/state/mod.rs` / `src/domain/report.rs`）
 - [ ] `Phase::Scan`；RunMeta 全表填值（design §5）；`ReviewReport.cells` 前台 / job / resume 三路都填；`attach_cells` 扩字段。

@@ -40,9 +40,10 @@ impl JobStatus {
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
     Collecting, // worker 起手，收集证据，fanout 前
-    Fanout,     // cell 并发执行中（progress.done 推进）
-    Finalizing, // 尾段：dedup/verify/verdict（progress/last_active 静止）
-    Refute,     // finalizing 子阶段：targeted refute（LLM 并发；note 带 targets 数）
+    Fanout,     // 旧 finding 扇出（F-4 后不再打；旧作业 state 可读）
+    Scan,       // 批 F-5：scanner 静态扇出（cell 并发执行中，progress.done 推进）
+    Finalizing, // 尾段：合并 / 报告（progress/last_active 静止）
+    Refute,     // M21b verifier 子阶段：targeted refute（LLM 并发；note 带 targets 数）
 }
 
 /// phase 时间线一格（2026-07-03 grill 定案：finalizing 黑盒可观测）。
