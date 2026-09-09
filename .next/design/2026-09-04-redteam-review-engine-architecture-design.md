@@ -1,7 +1,9 @@
-# redteam 评审引擎·风险路由 DAG 架构（M21 · v9）
+# redteam 评审引擎·风险路由 DAG 架构（M21 · v10）
 
 > 状态: **锁定**（v8，2026-09-07，P0 验证门出口〔D11〕：E1 风险规则 v4 成立、E3 疑点契约成立；§3.3 / §4 / §6 / §12.1 / §16 / §17 按 D11 改；
-> 无 `[review.risk]` / `--risk`；v9 2026-09-08〔D12〕§12 改 JSON + provider → models → roles）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；M21b-e 待产出。
+> 无 `[review.risk]` / `--risk`；v9 2026-09-08〔D12〕§12 改 JSON + provider → models → roles；**v10 2026-09-09〔D13〕并发形态**：删角色 `workers`、无 `--workers`，
+> 唯一闸 = provider 在途门（单把 FIFO + scanner 先于 H0 的入队序 + 429 排队重试，`review.maxConcurrency` 缺省 10），队列入口五态并入 + 跨轮沿用结案带守卫，
+> scanner 逐 cell 交付、reviewer 逐 finding 落盘定性为持久化旁路；§0 / §2 / §4 / §5 / §6 / §7 / §8.1 / §12 / §13 / §14 / §15 / §17 对应改）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；M21b-e 待产出。
 > v5（2026-09-05 grill〔D7〕：角色命名 scanner / reviewer / verifier；配置节 §12 重写为用户级唯一 TOML；
 > 无候补；verifier 流式化 + 数据判决；provider 在途上限；aacr-bench 退役至 M21c / M21e 重启）。
 > v6（2026-09-05）：scanner 组 pack 默认 `slice`〔D8〕；§10.7 提示词按角色分离〔D9〕；E2 改为 M21a 出口 slice vs full A/B。
@@ -9,7 +11,7 @@
 > M21a、其余 R21；分支硬切替代 `engine` 旗，对照基线 = `dev` 二进制。
 > 定论依据: `../research/2026-09-04-redteam-review-engine-architecture-research.md`（§1-10 证据、§11 否决账、§12 映射、
 > §13 rpiv 补充、§14 aacr-bench 事实）。
-> 决策记录（WHY/权衡/被否）: `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D10，各节以〔Dn〕引）。
+> 决策记录（WHY/权衡/被否）: `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D13，各节以〔Dn〕引）。
 > 里程碑: roadmap **M21**（`../roadmap/`，随分支入库；锁定后登记主 checkout `.doc/roadmap/`）。派生 plan: 待产出。
 > 曾名 `2026-09-04-redteam-tri-agent-architecture-design.md`（同日改名）。
 
@@ -20,7 +22,7 @@
 **scanner 疑点扫描（分组并行）+ 确定性风险路由 + 深挖优先级队列（reviewer 定向消费，预算随风险分）+ 疑点台账跨轮
 激活 + 跨家族并行 + verifier 流式复核。**
 不消灭「快 vs 好」的矛盾，而是把它挪到第三个轴：同一墙钟内**用 token 买召回**。慢模型的广度成本是**钱与有界墙钟**
-（worker 池封顶），不是线性时间〔D1 勘误〕。
+（provider 在途门与预算封顶），不是线性时间〔D1 勘误〕。
 
 **词汇约定**〔D7〕：三个**角色** = `scanner` / `reviewer` / `verifier`（配置里的 `[[scanners]]` / `[[reviewers]]` /
 `[[verifiers]]`）；三个**阶段** = 快扫 / 深挖 / 复核；cell 按角色命名（scanner cell / reviewer cell / verifier cell）。
@@ -56,7 +58,7 @@
    （纯生产者，疑点模式低门槛；                    H0 最高优先 · 键 = 置信 × agreement × 严重度
      多个活跃 scanner 并行 → 疑点并集）            入队合并去重 · 预算 = f(R, 规模) · 必挖集不截
                                                       ▼
-                                               [reviewer worker 池]（分派池 · 并发限 · 终端不再生产）
+                                               [reviewer 分派池]（按 provider 门空位派发 · 终端不再生产）
                                                       │  预算外 → 疑点台账（休眠）
                                                       │  finding 落地即发射 ──▶ [verifier 流式复核]
                                                       ▼                          （blocking / 判例变体才触发）
@@ -65,7 +67,7 @@
   reduce：dedup → 台账（判例 + 疑点）→ 报告 → 增量轮（delta 激活休眠疑点）
 ```
 
-**墙钟 = max(最慢 scanner cell, 队列排空) + 最后一条复核；队列排空 ≈ ceil(K / workers) × 单疑点时长，K 由预算封顶。**
+**墙钟 = max(最慢 scanner cell, 队列排空) + 最后一条复核；队列排空 ≈ ceil(K / reviewer 各 provider 门宽之和) × 单项时长，K 由预算封顶〔D13〕。**
 复核与深挖尾部重叠，不再是独立阶段。
 
 原则：scanner 是静态 fan-out、纯生产者；reviewer 是动态队列消费者池；verifier 是 finding 流的消费者；barrier 只为
@@ -132,7 +134,8 @@ body 与 callee 签名。同一张引用图、两个方向。分组切错退化�
 
 ## 4. scanner cells（静态 fan-out，纯生产者，疑点模式）〔D6〕
 
-每组一个 cell，并行，`[review.scanners] workers` 与 provider 在途上限双重限流。输入 = 该组 pack（§10）+ 同文件活跃
+每组一个 cell，并行，只受各 provider 在途门限流（无角色级 `workers`〔D13〕）。**逐 cell 交付**：cell 返回后其全部疑点经 §6 入口并入队列；
+不做逐疑点流式（思考模型的可见 JSON 只在每格尾部 10-20 s 内产出，且只有最后一格在关键路径上，收益不值〔D13〕）。输入 = 该组 pack（§10）+ 同文件活跃
 判例摘要（判例前移）。**多个活跃 scanner 条目对同一组各跑一次，疑点并集**（§5）。
 
 **输出契约（疑点索引，非 finding）**
@@ -143,7 +146,9 @@ scanned_areas: [{ file, ranges }]                                               
 ```
 - **门槛：疑似即列**，不要求论证、不管假阳；假阳交深挖与复核。快模型「知道哪里可疑但写不出来」的信号不蒸发。
 - **scanner 不直接产 finding**；全部疑点入深挖队列（§6），needs 项同队列。
-- **判例前移**：prompt 注入同文件活跃判例摘要；机械匹配命中的疑点**降级候选**、不直接丢。
+- **判例前移**：prompt 注入同文件活跃判例摘要。机械匹配命中的疑点在 §6 入口按**跨轮沿用结案**处理，守卫 = 锚定可重定位（carry 机器 anchor_near）
+  ∧ 该区域自判例以来无 delta：过守卫 → dismissed 即豁免不入队、upheld 即 carry 不重挖；不过 → 正常入队、带判例笔记〔D13，替代 v9「降级候选」；
+  无守卫的漏报路径 = fix 引入新 bug 被旧判例盖住〕。
 - 可选：同模型多 lens 采样并集 `[review.scanners] samples = 1`（换召回，不换墙钟）。
 - `quote` 是跨模型疑点合并与判例预筛的锚（`quote_overlap` 口径复用）；**quote 逐字硬约束，不在文件即丢弃**（E3：疑点模式守约弱于 finding 模式）；
   `category` 取 L0-L5；`hint` 归一化后置 M21c（R4，〔D11〕）。
@@ -158,6 +163,8 @@ scanned_areas: [{ file, ranges }]                                               
   优先级键与 §8.1 跳过规则）。
 - 第二条优选异家族快档；30 tok/s 档在疑点输出体量下仍落在快扫窗口内。
 - 代价：input × 条目数（cache 不跨模型）；墙钟不增。无候补语义：列表里没有备胎，只有并跑者。
+- **agreement 是活值**〔D13〕：在 §6 入口随后到的同疑点并入而累加；排队中的项每次并入后重算优先级与必挖资格；已派发的项只改记录不回头；
+  §8.1 跳过规则按 finding 落地时刻的值算，后涨不回溯。三个消费者（优先级键 / 必挖集 / 跳过规则）不变。
 
 ---
 
@@ -169,16 +176,16 @@ scanned_areas: [{ file, ranges }]                                               
 | # | 规则 | 内容 |
 |---|---|---|
 | 1 | 优先级 | 主区 H0 最高，涟漪区次之〔D11〕。疑点项 = `confidence × agreement × 类别权重`；needs 项取触发疑点分或默认中档。**非 FIFO；不用置信阈值切**。 |
-| 2 | 入队合并 | 区间扩到 enclosing def；同文件重叠/相邻区间合并为一项；跨模型同疑点以 quote 轻锚 + hint 归一合并、agreement 累加；已处理或在途的区域再来直接丢（set 语义）。 |
-| 3 | 预算 | `[review.reviewers] max_cells = "auto"`（按 R 三档：low 4 / mid 12 / high 32，硬帽 48，起步值）或整数固定〔D11〕。**必挖集** = 主区 H0 ∪ {agreement ≥ 2 的疑点} 不受截断（confidence 只进优先级不做门）；**保底**：每轮为 scanner 疑点保留 ⌈max_cells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并在 RunMeta 披露；涟漪区与其余疑点按优先级吃剩余预算。到期 **graceful drain**：在途跑完，未开跑者落台账。 |
+| 2 | 入队合并 | 区间扩到 enclosing def；同文件重叠/相邻区间合并为一项；跨模型同疑点以 quote 轻锚 + hint 归一合并（谓词复用 M21a `merge_suspicions`：同文件 ∧ 行重叠 ∧ quote 相等或不琐碎重叠）。**入口五态**〔D13〕：无命中 → 新项 agreement = 1；命中排队中项 → 并入（异族 agreement + 1、notes 追加、区间取并、重算 score，≥ 2 即标必挖）；命中在途项 → 只改记录（agreement + 1、hint 附记录），运行中的请求不注入、不重挖；命中本轮已结案 → 同上并沿用结案；命中跨轮判例 → §4 守卫（过 → 沿用结案不入队；不过 → 按无命中入队、带判例笔记）。同家族重复只合并不加 agreement。入口是编排器确定性代码，零 token；派发前再核一次在途 / 已结案。 |
+| 3 | 预算 | `[review.reviewers] max_cells = "auto"`（按 R 三档：low 4 / mid 12 / high 32，硬帽 48，起步值）或整数固定〔D11〕。**必挖集** = 主区 H0 ∪ {agreement ≥ 2 的疑点} 不受截断（confidence 只进优先级不做门；保护的是仍在排队的项，已派发项已在挖〔D13〕）；**保底**：每轮为 scanner 疑点保留 ⌈max_cells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并在 RunMeta 披露；涟漪区与其余疑点按优先级吃剩余预算。到期 **graceful drain**：在途跑完，未开跑者落台账。 |
 | 4 | 预算外去向 | **疑点台账**（§8.3）休眠；报告披露为低置信线索；**不进 verdict**。截断不静默。 |
-| 5 | 分派 | 活跃 reviewer 条目构成**分派池**：每项只由一个模型消费，按空闲轮转；多条目买吞吐与分散限流，不双审。 |
-| 6 | 终止 | 全部 scanner cell 返回 → 关闭入口 → worker 排空 → 在途归零 → 复核在途归零 → reduce barrier。 |
-| 7 | 并发 | `[review.reviewers] workers`；有效并行 = min(workers, 各 provider 在途上限)。 |
+| 5 | 分派 | 活跃 reviewer 条目构成**分派池**：每项只由一个模型消费，按空闲轮转；多条目买吞吐与分散限流，不双审。派发由 provider 门驱动：某 reviewer 条目所在 provider 有空位时才弹出最高优先项交它，无角色级池大小〔D13〕。scan 来源项**不等**同组其他家族 cell 返回（先到先挖，后到并入记录；是否加同组 hold 由派发时 / 落地时 agreement 数据在 M21e 定〔D13〕）。 |
+| 6 | 终止 | 全部 scanner cell 返回 → 关闭入口 → 队列排空 → 在途归零 → 复核在途归零 → reduce barrier。 |
+| 7 | 并发 | 无角色级 `workers`〔D13〕；有效并行 = 各 reviewer 条目所在 provider 的在途门（§12.3）。 |
 | 8 | 终端 | reviewer cell 不再生产。`reenqueue = false` 默认。 |
 
-可观测面（cell/phase 已有框架）：队列深度、入队原因分布、去重命中数、预算截断数、台账落入数、项等待时长。
-实现落点：tokio mpsc + worker 池，scanner cell 为 sender、reviewer cell 为 receiver，复用现有 cell 抽象；reviewer
+可观测面（cell/phase 已有框架）：队列深度、入队原因分布、去重命中数、预算截断数、台账落入数、项等待时长、派发时 / 落地时 agreement〔D13〕。
+实现落点：tokio mpsc + 单派发器（按各 reviewer provider 门空位弹出最高优先项，不设 worker 数〔D13〕），scanner cell 为 sender、reviewer cell 为 receiver，复用现有 cell 抽象；reviewer
 cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 
 ---
@@ -188,14 +195,16 @@ cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 - **H0 项（origin = rule）**：无笔记，**独立**审。覆盖它的 scanner 组尚未完成；同一区域两模型独立看，reduce 里
   agreement 计数即多样性轴。
 - **疑点项（origin = scan | needs）**：带疑点作「一位评审者的笔记」注入，指令「确认、驳回或补充」，**不是**「验证以下」
-  （防锚定）。
+  （防锚定）。在途期间后到的同疑点只并入记录（§6 入口第三态），不注入运行中的请求；落地的 finding 继承记录当时的 agreement〔D13〕。
 - **输入 pack**：热区切片（§10.2）+ 爆炸半径邻居（caller body、callee 签名）+ 跨组索引（§10.6）+ 三方契约（§9.4 B 层，
   `kind = api` 时含函数体）+ spec 段（`--spec` 已有）。确定性代码预装配，**不拿工具自主探查**。
   区域 pack **由构造即切片**，不受 `[review.pack] body` 控制（该轴只管 scanner 的组 pack）。
 - **输出**：完整 finding（危害链、修复建议）。**finding 只由此产出**（C7）。每 cell 输出天然有界。思考档由条目
   `thinking_level` 给（典型 high）。
 - **流式持久化**〔D10〕：响应 SSE 流上对 `findings` 数组做增量 JSON 解析，每个对象闭合即落盘，cell 中途死亡时已产出项不丢。
-  不改模型契约、不引入工具循环、无 `submit` 旋钮；FINALIZE / REPAIR 仍管最终整体解析，流式持久化只是旁路。
+  不改模型契约、不引入工具循环、无 `submit` 旋钮；FINALIZE / REPAIR 仍管最终整体解析，流式持久化只是旁路。**定性为持久化旁路**〔D13〕：
+  思考模型的可见 JSON 在尾部数秒内闭合，逐 finding 与逐 cell 在墙钟上等价；价值在格中途死亡时已闭合对象不丢。模型在一次请求内不能边调工具边交付，
+  客户端工具循环每轮重付 TTFT 与整段推理，故不以工具循环换粒度。
 - finding 落地即发射给 verifier（§8.1），不等 barrier。
 - 终端：不入队新项（§6 规则 8）。
 - 提示词 = 共享头 + reviewer 角色尾（§10.7）。
@@ -208,7 +217,8 @@ cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 - **触发集**：`severity ≥ block ∧ confidence ≥ floor` 的 finding（blocking）、以及命中判例变体的 finding。低危不触发。
 - **跳过**：该 finding 的区域被**两个不同家族的 scanner** 独立标记（疑点 agreement ≥ 2）且由 reviewer 确认——三方一致才
   免验；carried 项（出生轮已复核）；精确 id 已在台账者。
-- **流式**：finding 一落地即复核，与深挖尾部重叠；跳过规则所需的 agreement 与判例匹配均可单条计算，不需 barrier。
+- **流式**：finding 一落地即复核，与深挖尾部重叠；跳过规则所需的 agreement 与判例匹配均可单条计算，不需 barrier。跳过规则按 finding **落地时刻**的
+  agreement 算，后涨不回溯〔D13〕。
 - **verifier 选择**：`[[verifiers]]` 有条目则从中选；缺省自动：**家族 ≠ 该 finding 的 reviewer 家族**（`family` 缺省取
   `model_id` 首段，条目可覆盖），优先 reviewers 档，其次 scanners 档；一个异族都没有 → 同族复核并在 RunMeta 与报告
   warning「无异族 verifier」。
@@ -396,10 +406,10 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
   "review": {
     "blockThreshold": "medium",
     "confFloor": 0.5,
-    "maxConcurrency": 8,
-    "scanners":  { "workers": 4, "samples": 1 },
-    "reviewers": { "workers": 2, "maxCells": "auto", "reenqueue": false },
-    "verifiers": { "enabled": true, "workers": 2 },
+    "maxConcurrency": 10,
+    "scanners":  { "samples": 1 },
+    "reviewers": { "maxCells": "auto", "reenqueue": false },
+    "verifiers": { "enabled": true },
     "grouping":  { "minFiles": 4, "bundleLineThreshold": 200, "maxFilesPerGroup": 10, "semantic": false },
     "pack":      { "body": "slice", "anchorWindow": 30, "sliceMinBytes": 8192 }
   }
@@ -407,10 +417,10 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
 ```
 
 字段：provider 层 `kind`（模型层可覆盖，两层都缺 → 校验报错）/ `baseUrl` / `apiKeyEnv` / `maxConcurrency`（该 provider 在途上限，缺省继承
-`review.maxConcurrency`）；模型层 `name`（人读显示，缺省 `provider/id`）/ `kind` / `apiKeyEnv` / `family`（缺省 id 首段）/ `contextWindow`
+`review.maxConcurrency` = 10；> 128 校验 warning「像是填错字段」〔D13〕）；模型层 `name`（人读显示，缺省 `provider/id`）/ `kind` / `apiKeyEnv` / `family`（缺省 id 首段）/ `contextWindow`
 （缺省保守 128K，有下限）/ `maxOutputTokens` / `perTurnTimeoutSecs` / `reasoning`（思考 token 计入输出额度）；角色层 `thinkingLevel`
 （`off | low | medium | high`，角色属性：同一模型可 scanner 位 low、reviewer 位 high）。route_key / 报告名 = `provider/id`；活跃集顺序按
-provider 名、model id 字典序（无语义）。`verifiers` 无任何模型声明 → 自动异族（§8.1）。无 `priority`、无 `--models`（多模型即多条目）。
+provider 名、model id 字典序（无语义）。`verifiers` 无任何模型声明 → 自动异族（§8.1）。无 `priority`、无 `--models`（多模型即多条目）。无角色级 `workers`、无 `--workers`〔D13〕。
 
 ### 12.2 secrets.json
 ```json
@@ -426,9 +436,17 @@ provider 名、model id 字典序（无语义）。`verifiers` 无任何模型�
 - `redteam model setup --key-store secrets [--model-key]` 按此形状写入；provider / model / role 三层只合并显式给出的字段，写前完整校验，
   现有文件解析失败拒写不覆写〔D12〕。
 
-### 12.3 路由与限流
-- 编排层按角色发 route_key（`provider/id`；registry 已支持任意粒度）；有效并行 = min(角色 `workers`, provider `maxConcurrency`)；
-  同一 provider 下的 scanner 与 reviewer 共享该 provider 的在途锁。
+### 12.3 路由与限流〔D13〕
+- 编排层按角色发 route_key（`provider/id`；registry 已支持任意粒度）。**唯一一道闸 = provider 在途门**（`maxConcurrency`，缺省继承
+  `review.maxConcurrency` = 10）：同一 provider 下全部角色条目共享一把；无角色级 `workers`、无 `--workers`（角色帽在 PR181 实测只起副作用：
+  缺省 4 < 7 格排队 100-130 s，而跨 provider 全局一把还把两个独立 scanner provider 卡在同一个数上；单次节流的真实需求是跨进程的，旗解决不了）。
+- 门 = 单把 FIFO，不设调度器、不设预留：门饱和时预留只换顺序不换总量，还让 reviewer 用不完整信息提前吃预算；最长链优先 = scanner 格先于 H0 项
+  入门（t=0 入队序），reviewer / verifier 项天然后到。真正缩尾巴的杠杆是拆大 scanner 格（followup）。
+- **429 排队重试**（R16 最小替身）：某 provider 撞 429 / overloaded → 该 provider 门宽 ← max(1, min(门宽 − 1, 此刻仍在跑且已被接受的请求数))，
+  本轮不回升——一波 429 内收敛到网关真实上限，错配 `maxConcurrency`（如误填 maxOutputTokens）也能自愈；撞 429 的请求持名额不放，等本 provider
+  下一个请求完成（每次完成只唤醒一个等待者）或 Retry-After 取晚者再重试；429 重试独立计数，上限 = 当时有效门宽 × 2，不吃 2 次抖动预算；门收窄后
+  多出的名额在释放时丢弃不归还（`InflightGate` 自管计数 + Notify）。RunMeta 与 run.warnings 记「provider X：429 × N，门宽 A → B」；每 provider
+  每角色在途峰值、每 cell 门等待时长（`queue_wait_ms`）可读；路由到某 provider 的 cell 数 > 其门宽 → 排队告警指向 `maxConcurrency`。
 - 同角色即同档：不设 `tier` 字段。
 - 单轮超时：模型 `perTurnTimeoutSecs` > `REDTEAM_PER_TURN_SECS` > `实际生效 max_tokens ÷ 20 + 60s` > 150s〔D12〕。
 - 实测 TPS：DeepSeek v4 flash ~103、GLM 5.3 ~27（含思考）、Kimi K3 ~30。流式 + 显式 max_tokens 硬要求。
@@ -440,7 +458,7 @@ provider 名、model id 字典序（无语义）。`verifiers` 无任何模型�
 | | 现状 GLM 单发 | 现状 DeepSeek 单发 | v5 低风险 PR | v5 高风险 PR |
 |---|---|---|---|---|
 | 快扫（分组并行，疑点输出） | 19 min（单流 30.9K） | 5.3 min | 2-3 min | 2-3 min |
-| 深挖（并行，预算内） | - | - | 必挖集 ≈ 1 轮 ≈ 2-4 min | ceil(K/workers) 轮 ≈ 4-6 min |
+| 深挖（并行，预算内） | - | - | 必挖集 ≈ 1 轮 ≈ 2-4 min | ceil(K / reviewer 门宽和) 轮 ≈ 4-6 min |
 | 复核（流式，与深挖尾部重叠） | 含 | 含 | 尾部 +0.3-1 min | 尾部 +0.3-1 min |
 | **合计** | 19 | 5.3 | **5-8** | **7-10** |
 
@@ -454,7 +472,7 @@ verifier 怀疑者复核（唯一以推翻为目标的环节）。
 
 - **预算外疑点休眠而非丢**，但当轮不进 verdict；delta 永不触及其锚定文件则永不激活。
 - **路由规则会漏**。只能靠疑点并集与台账兜。
-- **无候补**：provider 不稳时 cell 失败直接进 coverage，靠 provider 在途上限与重试退避降低发生率，不靠换模型重跑。
+- **无候补**：provider 不稳时 cell 失败直接进 coverage，靠 provider 在途门、429 排队重试与重试退避降低发生率，不靠换模型重跑。
 - **切片若切错 → 缺依赖类漏**。三层兜底 + 小文件全文 + 回退信号（§10.2）。
 - **小 PR 净变慢**（阶段固定开销）：`min_files` 以下单包直达 + needs 快路径旁路。
 - **三方残余**（§9.4）。
@@ -464,14 +482,14 @@ verifier 怀疑者复核（唯一以推翻为目标的环节）。
 
 ## 15. 与现状 delta 与落地序
 
-**新增**：风险评分器（H0 + R）· 深挖队列 + worker 池 + 预算函数 · reviewer cell 类型 · verifier 流式段 · 配置节
+**新增**：风险评分器（H0 + R）· 深挖队列 + 门驱动派发器 + 预算函数 · reviewer cell 类型 · verifier 流式段 · 配置节
 （用户级唯一、角色列表、provider 在途上限、secrets 新形状、`REDTEAM_HOME`）· 分组算法 + 正反向跨组索引 · 疑点 schema +
 疑点台账表 + 增量轮激活 + 收敛三维 · coverage 五集合 + 角色分级 · L4-B 三方契约注入 · 切片装包（scanner 默认 slice）· 提示词共享头 + 三角色尾 + 模板哈希 + 离线回归集 · 段序角色尾 ·
-判例前移 · 跨文件重定位 · `scanned_areas` · refute 字段序 · `--pack-only` 预算仪表 · `--test-command` · 流式持久化 · proj.db schema v4（一次重置，先导出台账）· cache 断点（anthropic kind 三段界）。
+判例前移 · 跨文件重定位 · `scanned_areas` · refute 字段序 · `--pack-only` 预算仪表 · `--test-command` · 流式持久化 · proj.db schema v4（一次重置，先导出台账）· cache 断点（anthropic kind 三段界）· 429 排队重试与门收敛〔D13〕。
 **移植**：ocr 双阈值门。
 **其余原样**：pack、dedup、carry、判例台账、流式、per-model 超时、no-tools 默认、needs 二阶段。
 **消亡**：`--models` / `--models-all` / `priority` 候补链 / 项目级 config.toml 与剥离清单 / `XDG_CONFIG_HOME` 路径 /
-scanner 直接产 finding / `engine` 旗（对照基线 = `dev` 二进制）/ `submit` 旋钮。
+scanner 直接产 finding / `engine` 旗（对照基线 = `dev` 二进制）/ `submit` 旋钮 / 角色级 `workers` 与 `--workers`〔D13〕。
 
 落地序：
 1. 配置节 + 分组（引用图 + 正反向索引）+ 切片装包（scanner 默认 slice）+ scanner 疑点契约 + 提示词共享头 / scanner 尾拆分 + proj.db v4 一次重置（先导出台账）+ cache 断点（墙钟与召回地基）
@@ -520,14 +538,14 @@ ocr 参照 = deepseek-v4-pro 直连 chat-completions 流式，版本钉入元数
 | R6 | `--risk all` 对照档等价性 | **销案〔D11〕**：无 `--risk`；对照 = dev 二进制并排跑 PR181 比 oracle 命中 |
 | R7 | slice 回退信号阈值（`needs` 触发率、oracle 命中差）与 `slice_min_bytes` | M21a A/B 与 dogfood 定 |
 | R8 | LLM 语义分组何时值得开 | 跨组 import 边数阈值，dogfood 定 |
-| R9 | 角色 `workers` 与 provider `max_concurrency` 的默认值 | 网关限流实测定 |
+| R9 | provider `maxConcurrency` 缺省值（10 起步；角色 `workers` 已删〔D13〕） | 网关限流实测定；429 排队重试的收敛门宽是数据来源 |
 | R10 | L4-B 非 Rust 生态定位链 | Rust 先行 |
 | R11 | 必挖集阈值 `c_hi` | **已裁〔D11〕**：置信不做门；必挖 = 主区 ∪ agreement ≥ 2；疑点保底 ⌈max_cells/4⌉ 格 |
 | R12 | 台账激活上限 N 与停车通道形态 | 镜像 ship AskUser |
 | R13 | （已消：流式持久化无旋钮〔D10〕） | — |
 | R14 | 实现债 | **已裁〔D11〕**：cell 记录 `role` + 角色分叉输出枚举；单独表 = 疑点台账 + 队列快照；coverage 进作业元数据；resume 读快照重跑未完项；schema v4 一次重置〔D10〕 |
 | R15 | findings-recall 度量 | aacr 重启后接管；此前 PR181 三方并集 + proj.db upheld 小 oracle |
-| R16 | provider RPM 令牌桶 | 网关按 RPM 计费时再上 |
+| R16 | provider RPM 令牌桶 | 网关按 RPM 计费时再上；并发密度限流已由 429 排队重试（§12.3〔D13〕）兜 |
 | R17 | google 原生后端 | M20 provider 拓展 |
 | R18 | diffsym 补语言（Python 等） | 语料需要时 |
 | R19 | 交互式配置（verifiers 选项 Auto / New Model / Same As Scanner / Same As Reviewer；`toml_edit` 保注释） | M20 |
@@ -541,7 +559,7 @@ ocr 参照 = deepseek-v4-pro 直连 chat-completions 流式，版本钉入元数
 ## 18. 关联
 
 - research：`../research/2026-09-04-redteam-review-engine-architecture-research.md`（§13 rpiv、§14 aacr-bench）。
-- decisions：`../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D7）。
+- decisions：`../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D13）。
 - 交叉评审输入：`.rpiv/artifacts/research/2026-09-04_10-26-56_llm-code-review-multi-agent.md`；`~/llm-code-review-architecture.md`。
 - 基准 fork：`~/codes/aacr-bench`（`itcook/aacr-bench`）。
 - 前置设计：`2026-07-06-redteam-context-management-design.md` · `2026-07-13-redteam-no-tools-default-design.md` ·

@@ -7,7 +7,7 @@
 |---|---|---|
 | `roadmap/` | M21 路线图（原 `.roadmap/`）：README · P0 · M21a-e · followup | ✅ |
 | `design/` | `2026-09-04-redteam-review-engine-architecture-design.md`（v7，P0 出口锁定） | ✅ |
-| `decisions/` | 同名 decisions（D1-D10） | ✅ |
+| `decisions/` | 同名 decisions（D1-D13） | ✅ |
 | `research/` | 同名 research（§0-14；§15/16 为指针）· `2026-09-07-p0-raw/`（本仓 oracle B 与分布语料、v4 报告） | ✅ |
 | `reviews/` | `2026-09-04-b-roll-verdict.md`（aisdk vs 自建收发层） | ✅ |
 | `plans/` | 里程碑实施计划：`2026-09-07-redteam-m21a-scan-foundation-plan.md`（六批 + 出口）；M21b-e 待派生 | ✅ |

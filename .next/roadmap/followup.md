@@ -14,7 +14,7 @@
 | R6 | `--risk all` 与现状等价性 | 销案〔D11〕：无 `--risk`；对照 = dev 二进制并排跑 PR181 | — |
 | R7 | slice 回退信号阈值（`needs` 触发率、oracle 命中差）与 `slice_min_bytes` | M21a A/B 起步 / M21d 调优 | PR181 A/B + dogfood |
 | R8 | LLM 语义分组何时值得开 | M21e | 跨组 import 边数阈值 |
-| R9 | 角色 `workers` 与 provider `max_concurrency` 默认值 | M21b 起步 / M21e 收口 | 网关限流实测 |
+| R9 | provider `maxConcurrency` 缺省值（角色 `workers` 已删〔D13〕） | 缺省 10 起步（M21a 收口批）/ M21e 收口 | 429 排队重试的收敛门宽 + 网关限流实测 |
 | R10 | L4-B 非 Rust 生态定位链 | M21d 后置 → M20 backlog | 按宿主语料 |
 | R11 | 必挖集阈值 `c_hi` | 已裁〔D11〕：置信不做门；必挖 = 主区 ∪ agreement ≥ 2 + 疑点保底格 → M21b | — |
 | R12 | 台账激活上限 N 与停车通道形态 | M21c 起步 / M21e 收口 | 镜像 ship AskUser |
@@ -145,9 +145,9 @@
 | 项 | 现状 | 归属 |
 |---|---|---|
 | 分组 ≤ 5 未达（PR181 7 组） | 7 组中 4 组是 ≤ 3 文件的小强分量（同目录文档对、schema + 其测试对）；`bundle::group` 只对孤立**单文件**按目录装箱，多文件小分量不并箱（design「孤立文件 bin-packing」原文如此）→ 组数随小分量数线性涨，每组一次 scanner 调用 | 用户裁：小分量（文件数 ≤ 3 且估算字节远小于预算）与孤立文件同池装箱（代价：不相关文件同格）或把门槛改为「组数 ≤ 强分量数 + 1」；M21b 前定 |
-| 墙钟 ≤ 3 min 未达 | 分解（三跑仿真与实测逐跑吻合）：总墙钟 = 排队等待 + 最长生成格；排队来自 `review.scanners.workers`（缺省 4）< 组数 7 且按索引序派发（最大组排第六）；生成速度各格一致 ≈ 110 tok/s，最长格输出 20-38K token。✅ 已改（2026-09-09）：扇出按组 diff 字节降序派发（结果仍按 plan 序）；A/B：现状 311 / 402 / 457 s → 大格先发 + workers 4：283 / 247 / 234 s → + workers 8：189 / 202 / 251 s（无排队，= 最长生成格）。provider `maxConcurrency` 不是约束门，用户配置要同时提 `review.scanners.workers` | 用户裁（2026-09-09）：workers / 并发开大后可接受，门槛不再按 3 min 硬卡；剩余手段只有继续拆大格（组预算 / 超预算组再切）→ M21b 前与「小分量并箱」一起议分组策略；✅ 出口修补批（2026-09-09）：cell 数 > workers 时 run.warnings 排队告警；`CellRecord.queue_wait_ms` / `CellSummary.queue_wait_ms`（含在 duration_ms 内）；0 疑点且输出 < 2,000 token 的格 cell warn；`review --help` 补并发说明。`scanners.workers` 缺省 4 vs provider `maxConcurrency` 两道门的分工见 design §12.3（有效并行 = min），是否让 workers 缺省随组数自适应待议 |
+| 墙钟 ≤ 3 min 未达 | 分解（三跑仿真与实测逐跑吻合）：总墙钟 = 排队等待 + 最长生成格；排队来自 `review.scanners.workers`（缺省 4）< 组数 7 且按索引序派发（最大组排第六）；生成速度各格一致 ≈ 110 tok/s，最长格输出 20-38K token。✅ 已改（2026-09-09）：扇出按组 diff 字节降序派发（结果仍按 plan 序）；A/B：现状 311 / 402 / 457 s → 大格先发 + workers 4：283 / 247 / 234 s → + workers 8：189 / 202 / 251 s（无排队，= 最长生成格）。provider `maxConcurrency` 不是约束门，用户配置要同时提 `review.scanners.workers` | 用户裁（2026-09-09）：workers / 并发开大后可接受，门槛不再按 3 min 硬卡；剩余手段只有继续拆大格（组预算 / 超预算组再切）→ M21b 前与「小分量并箱」一起议分组策略；✅ 出口修补批（2026-09-09）：cell 数 > workers 时 run.warnings 排队告警；`CellRecord.queue_wait_ms` / `CellSummary.queue_wait_ms`（含在 duration_ms 内）；0 疑点且输出 < 2,000 token 的格 cell warn；`review --help` 补并发说明。两道门的分工已裁〔D13〕：删角色 `workers`、唯一闸 = provider 门，见下行 |
 | 「拆大格」的杠杆不是字节预算 | 每 cell pack 预算 = min(768,000 B, (最小 scanner 窗 − 16K)×3 − 24K)；DeepSeek 1M 窗下即 768 KB ≈ 219K token。PR181 两个 over_budget 组（11 / 12 文件）都是撞 `maxFilesPerGroup`=10 的文件数门，估算字节 351K / 142K、落盘 pack 265K / 149K 只占预算 34% / 19%。墙钟驱动量是**每格 diff 字节**（输出 token ∝ diff：g6 49K diff → 22-38K 输出，g4 35K → 20-26K，g3 23K → 13K），与 pack 字节无关 | 用户裁（2026-09-09）：保持 followup——样本太少，aacr-bench 重启、跑更多测试集后再看要不要拆；届时拆分键按每格 diff 字节、先切引用计数最低的强边、切开边进交叉索引 |
-| `scanners.workers` 形态（用户 2026-09-09 提） | 现为用户级配置键 `review.scanners.workers`（缺省 4，design §12.3 列为角色并行池）。用户意见：① 自适应规则要看 provider `maxConcurrency`、同 provider 下是否还有 reviewer / verifier 及其在跑情况，需一轮 grill；② 不设用户级配置项——workers 与评审内容相关（改动大小决定并行数），应由每次命令参数约束，与 provider 级 `maxConcurrency` 分层 | grill 后定：候选 = 运行时按 cell 数与各 provider 上限算缺省 + `--workers` 覆盖，删配置键；M21b reviewer / verifier 接线前定 |
+| `scanners.workers` 形态（用户 2026-09-09 提） | 现为用户级配置键 `review.scanners.workers`（缺省 4，design §12.3 列为角色并行池）。用户意见：① 自适应规则要看 provider `maxConcurrency`、同 provider 下是否还有 reviewer / verifier 及其在跑情况，需一轮 grill；② 不设用户级配置项——workers 与评审内容相关（改动大小决定并行数），应由每次命令参数约束，与 provider 级 `maxConcurrency` 分层 | ✅ 已裁（2026-09-09 grill〔D13〕，design v10 §12.3）：删三个角色 `workers` 键、不设 `--workers`；唯一闸 = provider 在途门（单把 FIFO、scanner 先于 H0 的入队序、不预留）；`review.maxConcurrency` 缺省 8 → 10 + 429 排队重试（门收敛到网关真实上限、持名额等下一完成、独立计数）+ `maxConcurrency > 128` warning；队列入口五态并入 + 跨轮沿用结案带守卫；scan 项不等同组兄弟 cell，记派发时 / 落地时 agreement 供 M21e 定 hold。代码分两步：M21a 收口批只动 scanner 路径（删键、删角色信号量、按 provider 计排队告警、`InflightGate` 429 排队重试、help、测试）；队列侧五态与 agreement 字段随 M21b |
 | scanner 首发解析失败原因不可观测 | dogfood 提交 3411a0e 的 slice 大格三跑首发全失败走 REPAIR（输入翻倍），直发同 prompt 三次首发皆合法 JSON（产品解析器 OK）→ 产品路径与直发的差异未定位 | ✅ 已加观测（2026-09-09）：`ScanCall.repair_note`（finish / 文本长度 / 文本头）进 cell warn；加观测后复跑一次首发即成功（未复现，此前三跑与另一队列并跑），下次出现由 cell warn 定位 |
 | 网关 anthropic 流 usage 形态 | agc 网关 `message_start` 报 input 0、真值只在 `message_delta`（直发探测证实）→ GLM 格 input / cache 恒 0，`cache_hit_by_cell` 不含 GLM | ✅ 已修（2026-09-09）：`parse_anthropic_stream` 对 message_delta 的 input / cache 分列「在场即覆盖」+ 单测；双 scanner 复跑核 |
 | 换思考档失去 DeepSeek 磁盘缓存前缀 | medium 与 high 落盘 prompt 逐字节相同，但 input token 差 13、cached 0.6% → DeepSeek 按 `reasoning_effort` 注入内部前缀 | 只记：生产档位固定无影响；A/B 或调档实验按新前缀计首跑成本 |
@@ -156,7 +156,7 @@
 ## 跨里程碑观测面（每个里程碑出口必报，写进 RunMeta 或 research）
 
 墙钟（PR181 低 / 高风险各一）· findings oracle 命中数 · cache 命中率 · 疑点数与噪音比 · 预算截断数 · 台账落入 / 激活数 ·
-每 cell 输出 token 与 output_max_tokens 比 · 复核触发 / 跳过 / refute 率 · per-provider 在途峰值 · 429 / 503 计数 ·
+每 cell 输出 token 与 output_max_tokens 比 · 复核触发 / 跳过 / refute 率 · per-provider 每角色在途峰值 · 门等待时长 · 429 / 503 计数与 429 收敛门宽 · 派发时 / 落地时 agreement〔D13〕·
 coverage `failed` 数。
 
 ## 明确不在本 roadmap

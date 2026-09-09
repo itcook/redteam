@@ -1,10 +1,10 @@
 # M21 评审引擎重构 · Roadmap
 
-> 状态: v3（2026-09-07 P0 出口〔D11〕：design 锁定 v8，P0 ✅；v2 2026-09-05 grill〔D7〕）· 分支 `feat/m21-review-engine`
+> 状态: v4（2026-09-09 并发形态 grill〔D13〕：design v10，M21a ✅；v3 2026-09-07 P0 出口〔D11〕；v2 2026-09-05 grill〔D7〕）· 分支 `feat/m21-review-engine`
 > · 工作树 `~/hobby/.worktrees/redteam/m21-review-engine`
-> 权威框架: `../design/2026-09-04-redteam-review-engine-architecture-design.md`（v8，锁定）
+> 权威框架: `../design/2026-09-04-redteam-review-engine-architecture-design.md`（v10，锁定）
 > 证据 / 决策: `../research/2026-09-04-redteam-review-engine-architecture-research.md`（§14 aacr 事实）·
-> `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D10）· P0 明细 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md`
+> `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D13）· P0 明细 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md`
 > 2026-09-07 起本目录连同上述文档自主 checkout `.doc/` 迁入分支随行区 `.next/`（`../README.md`）；含公司仓细节者在 `../private/`（gitignored）。
 > 本目录独立于主 checkout `.doc/roadmap/`，只记本次重构；零散 polish 仍走 `.doc/TODO/`。
 

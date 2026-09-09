@@ -58,7 +58,8 @@ TPS 是单流约束，K 个疑点各一条流并行，墙钟 = max 不是 sum（
   ③预算截断且截断项**不静默**（以快扫 finding 原样进 reduce、标 `skipped(budget)`）；④终止显式（生产者关闭 →
   排空 → 在途 0），因 agreement ≥ 2 跳 verify 需全集；⑤H0 无笔记。
 - **H0 无笔记的取舍**：给 H0 带笔记需等覆盖它的快扫组完成，重新引入串行依赖；独立审反而是多样性轴（同区域两模型
-  独立看，reduce 计 agreement）。快扫后来命中同区域按去重丢，其 finding 本身仍进 reduce。
+  独立看，reduce 计 agreement）。快扫后来命中同区域按去重丢，其 finding 本身仍进 reduce。〔勘误 D13：改为并入记录（agreement 累加、
+  hint 附记录）并沿用结案，不丢；agreement 成活值。〕
 
 **代价与残余**：实现复杂度（mpsc + 池 + 终止条件）；`max_cells`/`workers` 默认值待实测（R9）。
 
@@ -357,3 +358,43 @@ roadmap P0 ✅、followup 四行归位、M21b / M21c / M21e / M21a 的 `--risk` 
 
 **代价与残余**：无注释——`--help` 与 `redteam model list` 是在场文档；批 A 首版（TOML）整体重做约半天，在 `feat/m21a-config-json`；
 手改 JSON 易错（尾逗号），报错须带行列；design §12 重写、roadmap M21a 交付项 1 与 plan 批 A 措辞同步。
+
+---
+
+## D13 并发形态：删角色 `workers`、唯一闸 = provider 门、队列入口五态、429 排队重试（grill，2026-09-09）
+
+**议题**：M21a 出口验收发现 `review.scanners.workers`（缺省 4）< PR181 7 格造成 100-130 s 排队，而 provider `maxConcurrency` 从不是约束门；
+用户提出 workers 不该是用户级配置键，且自适应规则要看同 provider 上 reviewer / verifier 的占用。grill 走到根问题：角色级并行数到底解决什么。
+中途用户校正两处前提（agreement 是否要等两家 scanner；是否逐疑点 / 逐 finding 边跑边入队），先核文档再定。
+
+**事实核定（grill 中查证）**
+- 角色信号量是跨 provider 全局一把：deepseek + qwen 双 scanner 14 格被同一个 4 卡住，两个独立 provider 互相拖累。
+- 设计里 scanner → 队列一直是逐 cell 交付（D2「第 k 组扫完即可触发」），从未写逐疑点；reviewer → verifier 逐 finding 是 D10 客户端增量解析；
+  深挖队列是优先级队列，D2 明确否掉 FIFO（本次说的 FIFO 是 provider 门的排队序，两者不同）。
+- 模型在一次请求内不能反复调工具再交付：工具调用结束该轮，循环由客户端驱动、每轮重付 TTFT 与整段推理（思考模型分钟级）；provider 托管工具
+  要求公网端点，不适用本地仓库。故「边挖边交」只能是客户端解析输出流，D10 已定，不需要工具。
+- PR181 每格输出 10-20K token，疑点 JSON 总计约 1-2K，可见 JSON 只在每格尾部 10-20 s 产出 → scanner 逐疑点流式上限收益 10-20 s 且只在最后一格。
+- 用户当前配置 scanner（deepseek / qwen）与 reviewer / verifier（agc）不共享 provider；唯一共享是 reviewer 对 verifier。
+- 现有 429 路径：可重试、预算首发 + 2、退避 Retry-After（整数秒、封顶 30 s）或 400 / 800 ms，重试期间持门名额；占网关槽位的是分钟级生成请求，
+  1.2 s 内的重试必再撞，兜的是抖动不是超发。
+
+**候选与被否**
+| # | 定案 | 被否 | 依据 |
+|---|---|---|---|
+| Q1 角色 `workers` 的用途 | 只有「共享 provider 时的角色间分配」一个正当用途；不做节流帽、不设 `--workers` | A 保护 provider（与 `maxConcurrency` 重复）；C 单次节流旗 | 角色帽在 PR181 只起副作用；单次节流的真实需求（两个进程打同一 provider）是跨进程的，旗解决不了；用户：减心智模型 + YAGNI |
+| Q2 门上仲裁 | C：单把 FIFO Semaphore + 入队序（t=0 scanner 格先于 H0 项）；无调度器、无数字；观测每 provider 每角色在途峰值与门等待 | A 静态预留数；B 下游优先（verifier > reviewer > scanner） | 墙钟下界 = 最长链（最后一个 scanner 格 → 其 reviewer 项 → 复核），任何预留改不了；门饱和时 FIFO 无空转，预留只换顺序不换总量（60 格 / 32 项 / 门 16 仿真：两臂都贴 17.25 min 下界）；预留让 reviewer 用不完整信息提前吃 `max_cells` 预算，质量更差；下游优先会让 H0 项饿死 scanner，最长链最晚开工；最长链优先 = scanner ≥ reviewer ≥ verifier，恰是 FIFO 自然序。用户最初担心「reviewer / verifier 单元更长却排队」——按链长而非单元时长看，排在后面是对的 |
+| Q3 键删几个 | 三个一起删（scanners / reviewers / verifiers） | 只删 scanners | 另两个无消费者、C 后无数字可填；形状守卫对未知键只 warning，老配置不炸；示例配置一次改齐 |
+| Q-B 交付粒度 | 按文档现状定死：scanner 逐 cell 交付、队列项按区域、reviewer 逐 finding 落盘定性为持久化旁路（墙钟视同逐 cell）；不加 scanner 逐疑点流式 | scanner 逐疑点流式 | 收益上限 10-20 s 且只在最后一格；D10 价值是格死亡时已闭合对象不丢，非延迟 |
+| Q-A 同轮并入 + 跨轮沿用结案 | 队列入口五态（无命中 / 排队中并入 / 在途只改记录 / 本轮已结案沿用 / 跨轮判例守卫）；守卫 = 锚定可重定位 ∧ 区域自判例以来无 delta；agreement 成活值，三消费者不变，跳过规则按落地时刻 | v9「已处理或在途直接丢（set 语义）」；v9「判例命中降级候选」；无守卫直接沿用 | 丢会让必挖集与跳过规则中途看不到 agreement；无守卫的漏报路径 = fix 引入新 bug 被旧判例盖住；守卫用 carry 机器 anchor_near，零新件；入口是编排器确定性代码，scanner 单发看不到别家、reviewer 永远见不到重复 |
+| Q4 同组 hold | A 不等同组兄弟 cell（先到先挖，后到并入记录）；记派发时 / 落地时 agreement | B 等同组兄弟 cell 攒齐两家笔记 | 用户配置下常态是先到项已在途，agreement 2 只落记录；hold 代价 = 最后一组尾巴多等两家返回时差；数据先行，M21e 看两字段再定 |
+| Q5 缺省与 429 | `review.maxConcurrency` 8 → 10；429 排队重试：门宽 ← max(1, min(门宽 − 1, 此刻仍在跑且已被接受数))、本轮不回升；撞 429 者持名额等本 provider 下一完成（每次完成只唤醒一个）或 Retry-After 取晚者；独立计数上限 = 当时有效门宽 × 2；门收窄后多余名额释放时丢弃；`maxConcurrency > 128` warning；RunMeta / warnings 记 429 次数与门宽 A → B | A 只改数字；缺省 16（样本只有 deepseek 一家）；C 删全局缺省强制显式；「缩 1」（对误填 65536 无效） | 抬缺省的理由「有兜底就可激进」只在有真排队重试时成立；按在途接受数收门一波内收敛到网关真实上限，错配 `maxConcurrency` 自愈；单唤醒防 95 个等待者一起重试；机制来源无关，显式与继承同门；R16 令牌桶的最小替身，与 A5「失败形态是并发密度」对上 |
+
+**依据（用户判断）**：并发与评审内容相关、不是用户偏好，不该是配置键；规则合理则 `--workers` 也不要（减心智模型 + YAGNI）；预留问题在
+「reviewer 无消费物则不排队、有积压才排」的前提下只剩共享 provider 一种情形，按链长论证接受不预留。
+
+**代价与残余**
+- 没有任何单次节流手段；两个进程同打一个 provider 仍会超发，靠 429 排队重试兜（跨进程门是 R16 / M20）。
+- 门本轮只降不升：一次偶发 429 会让该 provider 本轮少一个槽；可接受，RunMeta 可见。
+- reviewer 常态只看一家笔记；agreement 对派发的影响只在积压时体现；两字段数据决定 M21e 是否加 hold。
+- `InflightGate` 从 tokio Semaphore 换自管计数 + Notify；M21a 收口批只动 scanner 路径，队列入口五态、agreement 两字段随 M21b。
+- design v10：§0 / §2 / §4 / §5 / §6 / §7 / §8.1 / §12 / §12.3 / §13 / §14 / §15 / §17 对应改；D2 加勘误；roadmap followup / M21a / M21b / M21c / M21e / README 同步。
