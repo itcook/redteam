@@ -318,6 +318,7 @@ pub async fn run_code_review(
         roles: Some(&roles),
         warnings,
         inflight_peak: registry.inflight_peaks(),
+        rate_limit: registry.rate_limit_meta(),
         ledger_meta: ledger.meta.clone(),
         head_sha,
         duration_ms: t0.elapsed().as_millis() as u64,
@@ -339,6 +340,8 @@ pub(crate) struct ScanFinish<'a> {
     pub roles: Option<&'a RoleSets>,
     pub warnings: Vec<String>,
     pub inflight_peak: BTreeMap<String, u32>,
+    /// D13：撞过 429 的 provider 的收敛记录（`registry.rate_limit_meta()`）；partial 报告为空。
+    pub rate_limit: BTreeMap<String, crate::domain::report::RateLimitMeta>,
     pub ledger_meta: Option<crate::domain::LedgerMeta>,
     pub head_sha: Option<String>,
     pub duration_ms: u64,
@@ -457,6 +460,7 @@ pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
         template_hashes,
         cache_hit_by_cell,
         provider_inflight_peak: f.inflight_peak,
+        provider_rate_limit: f.rate_limit,
         grouping: f.grouping,
         test_command: f.test_command,
         ..Default::default()
@@ -794,6 +798,7 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
         roles: None,
         warnings: vec![format!("partial: {done}/{total} cells"), reason],
         inflight_peak: BTreeMap::new(),
+        rate_limit: BTreeMap::new(),
         ledger_meta: None,
         head_sha: None,
         duration_ms: 0,
@@ -926,6 +931,7 @@ pub async fn run_resume(
         .and_then(|r| r.scan.as_ref())
         .map(|sc| sc.groups.iter().map(|g| ScanGroup { label: g.label.clone(), files: g.files.clone(), cells: vec![], suspicions: 0, pack: g.pack.clone() }).collect())
         .unwrap_or_default();
+    warnings.extend(registry.gate_warnings()); // D13：补跑期间撞过 429 的 provider 收敛记录
     let results = ScanResults { cells: scan_cells_from_records(final_records), ..Default::default() };
     let (mut report, mut code) = finish_scan_report(ScanFinish {
         groups,
@@ -937,6 +943,7 @@ pub async fn run_resume(
         roles: Some(&roles),
         warnings,
         inflight_peak: registry.inflight_peaks(),
+        rate_limit: registry.rate_limit_meta(),
         ledger_meta: ledger.meta.clone(),
         head_sha: prior.as_ref().and_then(|r| r.run.head_sha.clone()),
         duration_ms: t0.elapsed().as_millis() as u64,
@@ -2220,7 +2227,7 @@ mod tests {
             groups: vec![], scanned_coverage: Some(0.5), grouping: None, dossier_meta: None,
             results: ScanResults { cells, ..Default::default() },
             model_names: vec!["p/x".into(), "p/y".into()], roles: Some(&roles), warnings: vec![],
-            inflight_peak: [("p".to_string(), 2u32)].into_iter().collect(), ledger_meta: None, head_sha: None,
+            inflight_peak: [("p".to_string(), 2u32)].into_iter().collect(), rate_limit: BTreeMap::new(), ledger_meta: None, head_sha: None,
             duration_ms: 7, test_command: None, job_id: "j".into(), reused,
         };
         let (r, code) = finish_scan_report(base(cells.clone(), vec!["scan[g1]@p/y#1".into()]));

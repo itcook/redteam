@@ -1,62 +1,219 @@
+use crate::domain::report::RateLimitMeta;
 use crate::prompt::ScanPrompt;
-use crate::provider::scan_shot::{run_scan_shot, ScanCall};
+use crate::provider::scan_shot::{run_scan_shot_with, ScanCall};
 use crate::provider::tool_loop::ChatBackend;
-use crate::provider::{LensCall, LensRequest, ProviderError, ReviewProvider};
+use crate::provider::{AttemptPolicy, LensCall, LensRequest, ProviderError, ReviewProvider};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+use tokio::sync::Notify;
 
-/// provider 级在途门（design §12.3 / D7 A5）：`Semaphore` = 在途上限（provider `maxConcurrency`，缺省继承 `review.max_concurrency`），
-/// 同一 provider 下的全部角色条目共享一把（scanner 与 M21b 的 reviewer 同门）；`peak` 记本次进程内观测到的在途峰值（RunMeta
-/// `provider_inflight_peak`，铁律 1）。
+/// provider 级在途门（design §12.3〔D13〕）：**唯一一道闸**。名额 = 门宽（provider `maxConcurrency`，缺省继承 `review.max_concurrency`），
+/// 同一 provider 下全部角色条目共享一把（scanner 与 M21b 的 reviewer / verifier 同门）。自管计数 + `Notify` 而非 tokio `Semaphore`：
+/// 撞 429 时门宽只降不升，收窄后多出的**已发**名额要在释放时丢弃（`Semaphore::forget_permits` 只能忘掉可用名额）。
+/// `peak` = 同时在途的 HTTP 请求峰值（RunMeta `provider_inflight_peak`，铁律 1）。
 pub struct InflightGate {
-    sem: Semaphore,
-    cap: u32,
-    current: AtomicU32,
+    state: Mutex<GateState>,
+    /// 名额释放 → `notify_one`：唤醒一个等门者（无等待者时存一次许可；等门循环重检条件吸收虚假唤醒）。
+    slot_free: Notify,
+    /// 非 429 的请求结束 → `notify_one`：每次完成只放一个 429 等待者重试（排队语义，K6）；在途归零 → `notify_waiters`（K8：
+    /// 全员 429 时不互相等死）。
+    completed: Notify,
+    /// 非 429 结束计数：429 等待者以「计数超过入睡时的值」判断等到的是新完成，而不是 `notify_one` 存下的旧许可。
+    completions: AtomicU64,
     peak: AtomicU32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GateState {
+    /// 配置门宽。
+    cap_initial: u32,
+    /// 当前门宽（≤ cap_initial；429 收敛只降不升）。
+    cap: u32,
+    /// 已发出的名额数（收窄后可暂大于 cap：释放即丢弃，不唤醒）。
+    held: u32,
+    /// 在途 HTTP 请求数（`attempt_begin` .. `attempt_end`）。
+    active: u32,
+    /// 本轮撞 429 / overloaded 次数。
+    rate_limited: u32,
+}
+
+/// 每 provider 门的观测（RunMeta / warnings）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateStat {
+    pub cap: u32,
+    pub effective_cap: u32,
+    pub rate_limited: u32,
+    pub peak: u32,
 }
 
 impl InflightGate {
     fn new(cap: u32) -> Self {
         let cap = cap.max(1);
-        InflightGate { sem: Semaphore::new(cap as usize), cap, current: AtomicU32::new(0), peak: AtomicU32::new(0) }
+        InflightGate {
+            state: Mutex::new(GateState { cap_initial: cap, cap, held: 0, active: 0, rate_limited: 0 }),
+            slot_free: Notify::new(),
+            completed: Notify::new(),
+            completions: AtomicU64::new(0),
+            peak: AtomicU32::new(0),
+        }
+    }
+    /// 临界区只有几条整数运算，从不跨 await 持锁；poison 直接取内层（状态是纯计数，不会半更新）。
+    fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
     pub fn peak(&self) -> u32 {
         self.peak.load(Ordering::SeqCst)
     }
-    /// 门宽（provider `maxConcurrency` 或继承的缺省）。
-    pub fn cap(&self) -> u32 {
-        self.cap
+    /// 配置门宽（provider `maxConcurrency` 或继承的缺省）。
+    pub fn configured_cap(&self) -> u32 {
+        self.lock().cap_initial
     }
-    /// 取名额（不计在途：在途从真正发请求起算）。
-    async fn enter(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ProviderError> {
-        self.sem.acquire().await.map_err(|_| ProviderError::Unavailable("inflight gate closed".into()))
+    pub fn stat(&self) -> GateStat {
+        let s = *self.lock();
+        GateStat { cap: s.cap_initial, effective_cap: s.cap, rate_limited: s.rate_limited, peak: self.peak() }
     }
-    /// 真正发请求时计在途（峰值 = 同时在途的 HTTP 请求数，不含等门的租约）。
-    fn activate(&self) -> ActiveGuard<'_> {
-        let cur = self.current.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(cur, Ordering::SeqCst);
-        ActiveGuard { gate: self }
+    /// 取名额：`held < cap` 即取，否则等一次释放再重检。`notified()` 先于条件检查建立，释放发生在两者之间也不丢唤醒。
+    async fn enter(&self) -> GatePermit<'_> {
+        loop {
+            let notified = self.slot_free.notified();
+            {
+                let mut s = self.lock();
+                if s.held < s.cap {
+                    s.held += 1;
+                    return GatePermit { gate: self };
+                }
+            }
+            notified.await;
+        }
+    }
+    #[cfg(test)]
+    fn shrink_to(&self, cap: u32) {
+        let mut s = self.lock();
+        s.cap = cap.max(1).min(s.cap);
     }
 }
 
-/// 在途计数守卫：Drop 即减一（panic / 提前返回都安全）。
-struct ActiveGuard<'a> {
+/// 已发名额：Drop 归还；门已收窄到 `held ≥ cap` 时不唤醒 = 名额丢弃（K6）。
+pub struct GatePermit<'a> {
     gate: &'a InflightGate,
 }
 
-impl Drop for ActiveGuard<'_> {
+impl Drop for GatePermit<'_> {
     fn drop(&mut self) {
-        self.gate.current.fetch_sub(1, Ordering::SeqCst);
+        let wake = {
+            let mut s = self.gate.lock();
+            s.held = s.held.saturating_sub(1);
+            s.held < s.cap
+        };
+        if wake {
+            self.gate.slot_free.notify_one();
+        }
+    }
+}
+
+/// 429 无他人在途时的探测退避基数与封顶；重试次数上限 = `max(RL_RETRY_FLOOR, 当时门宽 × 2)`（K9：D13 写「门宽 × 2」，
+/// 门收敛到 1 时只剩 2 次太薄，加下限）。
+const RL_BACKOFF_BASE: Duration = Duration::from_millis(500);
+const RL_BACKOFF_CAP: Duration = Duration::from_secs(30);
+const RL_RETRY_FLOOR: u32 = 4;
+
+/// 429 排队重试策略（design §12.3〔D13〕）：每次 `ScanLease::run` 新建一个，挂在 `retry_classified_with` 上。
+/// 撞 429 → 该 provider 门宽 ← max(1, min(门宽 − 1, 此刻仍在跑的请求数))，本轮不回升（一波 429 内收敛到网关真实上限，
+/// 误填 `maxConcurrency` 也自愈）；撞门者持名额不放，等本 provider 下一个非 429 完成（每次完成只唤醒一个）或 Retry-After 取晚者
+/// 再重试；无他人在途则退避探测；重试独立计数，不吃 2 次抖动预算。
+pub(crate) struct GateAttempts<'a> {
+    gate: &'a InflightGate,
+    retries: AtomicU32,
+    backoff_base: Duration,
+}
+
+impl<'a> GateAttempts<'a> {
+    pub(crate) fn new(gate: &'a InflightGate) -> Self {
+        Self::with_backoff_base(gate, RL_BACKOFF_BASE)
+    }
+    pub(crate) fn with_backoff_base(gate: &'a InflightGate, backoff_base: Duration) -> Self {
+        GateAttempts { gate, retries: AtomicU32::new(0), backoff_base }
+    }
+    /// 第 n 次（1 起）429 重试的探测间隔：base × 2^(n−1)，封顶 30 s。
+    fn backoff(&self, n: u32) -> Duration {
+        self.backoff_base.saturating_mul(1u32 << n.saturating_sub(1).min(16)).min(RL_BACKOFF_CAP)
+    }
+}
+
+#[async_trait]
+impl AttemptPolicy for GateAttempts<'_> {
+    fn attempt_begin(&self) {
+        let cur = {
+            let mut s = self.gate.lock();
+            s.active += 1;
+            s.active
+        };
+        self.gate.peak.fetch_max(cur, Ordering::SeqCst);
+    }
+
+    fn attempt_end(&self, rate_limited: bool) {
+        let zero = {
+            let mut s = self.gate.lock();
+            s.active = s.active.saturating_sub(1);
+            s.active == 0
+        };
+        if !rate_limited {
+            self.gate.completions.fetch_add(1, Ordering::SeqCst);
+            self.gate.completed.notify_one();
+        }
+        if zero {
+            self.gate.completed.notify_waiters();
+        }
+    }
+
+    async fn on_rate_limited(&self, retry_after: Option<Duration>) -> bool {
+        let n = self.retries.fetch_add(1, Ordering::SeqCst) + 1;
+        let (others, limit) = {
+            let mut s = self.gate.lock();
+            s.rate_limited += 1;
+            // 本请求已 attempt_end，此刻 active 只剩别人 = 网关仍在服务的请求数（同一波 429 逐个到达时，最后一个看到的就是真实上限）。
+            let others = s.active;
+            let new_cap = s.cap.saturating_sub(1).min(others).max(1);
+            if new_cap < s.cap {
+                s.cap = new_cap;
+            }
+            (others, (s.cap * 2).max(RL_RETRY_FLOOR))
+        };
+        if n > limit {
+            return false;
+        }
+        let retry_after = retry_after.map(|d| d.min(RL_BACKOFF_CAP));
+        if others == 0 {
+            // 没人在跑，等完成事件无意义：按 Retry-After 或退避探测（K8）。
+            tokio::time::sleep(retry_after.unwrap_or_else(|| self.backoff(n))).await;
+            return true;
+        }
+        let seq0 = self.gate.completions.load(Ordering::SeqCst);
+        let wait_completion = async {
+            loop {
+                let notified = self.gate.completed.notified();
+                {
+                    let s = self.gate.lock();
+                    // 等到新完成，或其余人也都退出了（无人可等，直接探测）。
+                    if self.gate.completions.load(Ordering::SeqCst) > seq0 || s.active == 0 {
+                        break;
+                    }
+                }
+                notified.await;
+            }
+        };
+        tokio::join!(wait_completion, tokio::time::sleep(retry_after.unwrap_or(Duration::ZERO)));
+        true
     }
 }
 
 /// scanner 条目（批 F-2 prd K2）：route_key → backend + 单轮超时 + 重试预算 + 所属 provider（取在途门）。
 struct ScanEntry {
     backend: Box<dyn ChatBackend>,
-    per_turn: std::time::Duration,
+    per_turn: Duration,
     retry_budget: u32,
     provider: String,
 }
@@ -94,7 +251,7 @@ impl ProviderRegistry {
         provider: &str,
         cap: u32,
         backend: Box<dyn ChatBackend>,
-        per_turn: std::time::Duration,
+        per_turn: Duration,
         retry_budget: u32,
     ) {
         self.gates.entry(provider.to_string()).or_insert_with(|| Arc::new(InflightGate::new(cap)));
@@ -122,7 +279,36 @@ impl ProviderRegistry {
     }
     /// provider 门宽（`maxConcurrency` 或继承的缺省）；未建门 → None。
     pub fn cap_of(&self, provider: &str) -> Option<u32> {
-        self.gates.get(provider).map(|g| g.cap())
+        self.gates.get(provider).map(|g| g.configured_cap())
+    }
+    /// 每 provider 门的观测快照。
+    pub fn gate_stats(&self) -> BTreeMap<String, GateStat> {
+        self.gates.iter().map(|(p, g)| (p.clone(), g.stat())).collect()
+    }
+    /// RunMeta `provider_rate_limit`：只含本轮撞过 429 的 provider（空时报告不产键）。
+    pub fn rate_limit_meta(&self) -> BTreeMap<String, RateLimitMeta> {
+        self.gates
+            .iter()
+            .filter_map(|(p, g)| {
+                let s = g.stat();
+                (s.rate_limited > 0).then(|| (p.clone(), RateLimitMeta { hits: s.rate_limited, cap: s.cap, effective_cap: s.effective_cap }))
+            })
+            .collect()
+    }
+    /// run.warnings：每个撞过 429 的 provider 一条「429 × N，门宽 A → B」，指向唯一的旋钮。
+    pub fn gate_warnings(&self) -> Vec<String> {
+        self.gates
+            .iter()
+            .filter_map(|(p, g)| {
+                let s = g.stat();
+                (s.rate_limited > 0).then(|| {
+                    format!(
+                        "provider {p}: 429 x {}, maxConcurrency {} -> {} (gate shrank to the gateway's real limit this run; set providers.{p}.maxConcurrency <= {})",
+                        s.rate_limited, s.cap, s.effective_cap, s.effective_cap
+                    )
+                })
+            })
+            .collect()
     }
 
     /// 过 provider 在途门再拿到条目（唯一闸，D13：无角色级 workers）。未注册 → `Unavailable`（该格入 coverage failed）。
@@ -131,7 +317,7 @@ impl ProviderRegistry {
             return Err(ProviderError::Unavailable(format!("scanner not in registry: {route_key}")));
         };
         let gate = self.gates.get(&entry.provider).ok_or_else(|| ProviderError::Unavailable(format!("no inflight gate for provider {}", entry.provider)))?;
-        let permit = gate.enter().await?;
+        let permit = gate.enter().await;
         Ok(ScanLease { entry, gate, _permit: permit })
     }
 
@@ -141,17 +327,18 @@ impl ProviderRegistry {
     }
 }
 
-/// 已过在途门的 scanner 条目租约：持有期间占该 provider 一个名额；`run` 走两轮单发并计在途峰值。
+/// 已过在途门的 scanner 条目租约：持有期间占该 provider 一个名额（撞 429 排队期间也不放）；`run` 走两轮单发，
+/// 每次 HTTP 尝试经 `GateAttempts` 计在途峰值并处理 429。
 pub struct ScanLease<'a> {
     entry: &'a ScanEntry,
     gate: &'a InflightGate,
-    _permit: tokio::sync::SemaphorePermit<'a>,
+    _permit: GatePermit<'a>,
 }
 
 impl ScanLease<'_> {
     pub async fn run(&self, prompt: &ScanPrompt) -> Result<ScanCall, ProviderError> {
-        let _active = self.gate.activate();
-        run_scan_shot(self.entry.backend.as_ref(), prompt, self.entry.per_turn, self.entry.retry_budget).await
+        let policy = GateAttempts::new(self.gate);
+        run_scan_shot_with(self.entry.backend.as_ref(), prompt, self.entry.per_turn, self.entry.retry_budget, Some(&policy)).await
     }
 }
 
@@ -214,6 +401,10 @@ mod tests {
         ScanPrompt { system: "h".into(), blocks: vec![PromptBlock { text: "b".into(), cache_boundary: false }] }
     }
 
+    fn rate_limited() -> ProviderError {
+        ProviderError::RateLimited { retry_after: None }
+    }
+
     /// 批 F-2：scan 表按 route_key 路由；未注册 → Unavailable（不碰旧表）。
     #[tokio::test]
     async fn scan_routes_and_unknown_is_unavailable() {
@@ -225,6 +416,8 @@ mod tests {
         let e = reg.scan("p/b", &prompt()).await.unwrap_err();
         assert!(matches!(e, ProviderError::Unavailable(ref m) if m.contains("scanner not in registry")), "{e}");
         assert_eq!(reg.inflight_peaks().get("p"), Some(&1));
+        assert_eq!((reg.provider_of("p/a"), reg.provider_of("p/b"), reg.cap_of("p"), reg.cap_of("q")), (Some("p"), None, Some(4), None));
+        assert!(reg.rate_limit_meta().is_empty() && reg.gate_warnings().is_empty(), "无 429 不产键不告警");
     }
 
     /// 批 F-2：同 provider 两条目共享一把在途门——帽 2、8 个并发调用 → 两个 backend 的峰值之和 ≤ 2；异 provider 各自独立。
@@ -247,5 +440,73 @@ mod tests {
         let peaks = reg.inflight_peaks();
         assert_eq!(peaks.get("p"), Some(&2), "同 provider 共享帽 2（首次 cap 为准）: {peaks:?}");
         assert_eq!(peaks.get("q"), Some(&3), "{peaks:?}");
+    }
+
+    /// D13 ①：门宽 3；p/b 两格慢 OK 先在途（200 ms），p/a 首发 429 → 门宽收敛到在途接受数 2 → 等到一次完成再重试 → OK；
+    /// 三格全成功，RunMeta / warnings 记 429 × 1、3 → 2。
+    #[tokio::test]
+    async fn gate_shrinks_to_accepted_count_on_429_and_waits_for_a_completion() {
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/a", "p", 3, Box::new(FakeChatBackend::new_results(vec![Err(rate_limited()), Ok(scan_turn())])), Duration::from_secs(5), 0);
+        reg.insert_scan("p/b", "p", 3, Box::new(FakeChatBackend::repeating(scan_turn()).with_delay(Duration::from_millis(200))), Duration::from_secs(5), 0);
+        let pr = prompt();
+        let slow = || { let pr = &pr; let reg = &reg; async move { reg.scan("p/b", pr).await.map(|_| ()) } };
+        let t0 = std::time::Instant::now();
+        let rl = async {
+            tokio::time::sleep(Duration::from_millis(30)).await; // 让两个慢格先在途
+            (reg.scan("p/a", &pr).await.map(|_| ()), t0.elapsed())
+        };
+        let (a, b, (ra, took)) = tokio::join!(slow(), slow(), rl);
+        assert!(a.is_ok() && b.is_ok() && ra.is_ok(), "{a:?} {b:?} {ra:?}");
+        let st = reg.gate_stats()["p"];
+        assert_eq!((st.cap, st.effective_cap, st.rate_limited, st.peak), (3, 2, 1, 3), "{st:?}");
+        assert!(took >= Duration::from_millis(190), "撞 429 者等到一次完成才重试，而非立即重试: {took:?}");
+        assert_eq!(reg.rate_limit_meta()["p"], RateLimitMeta { hits: 1, cap: 3, effective_cap: 2 });
+        let w = reg.gate_warnings();
+        assert!(w.len() == 1 && w[0].contains("provider p: 429 x 1, maxConcurrency 3 -> 2") && w[0].contains("providers.p.maxConcurrency <= 2"), "{w:?}");
+    }
+
+    /// D13 ②：独自撞 429（无他人在途）→ 退避探测；超过 max(4, 门宽 × 2) 次即放弃，错误原样返回，抖动预算不参与；门宽收敛到 1。
+    #[tokio::test]
+    async fn gate_alone_on_429_backs_off_and_gives_up_after_bound() {
+        let gate = InflightGate::new(1);
+        let policy = GateAttempts::with_backoff_base(&gate, Duration::from_millis(1));
+        let calls = AtomicU32::new(0);
+        let r: Result<(), ProviderError> = crate::provider::retry_classified_with(2, Some(&policy), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(rate_limited()) }
+        })
+        .await;
+        assert!(matches!(r, Err(ProviderError::RateLimited { .. })), "{r:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 5, "首发 + 4 次 429 重试（下限 4）");
+        let st = gate.stat();
+        assert_eq!((st.cap, st.effective_cap, st.rate_limited, st.peak), (1, 1, 5, 1), "{st:?}");
+        // 无策略 = 旧行为：429 吃抖动预算（首发 + 2）。
+        let calls2 = AtomicU32::new(0);
+        let r2: Result<(), ProviderError> = crate::provider::retry_classified_with(2, None, || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            async { Err(ProviderError::RateLimited { retry_after: Some(Duration::from_millis(1)) }) }
+        })
+        .await;
+        assert!(r2.is_err() && calls2.load(Ordering::SeqCst) == 3);
+    }
+
+    /// D13 ③：门宽 3 取满后收窄到 1——释放两个名额都不放人（多余名额丢弃），释放第三个才进。
+    #[tokio::test]
+    async fn gate_drops_surplus_permits_after_shrink() {
+        let gate = InflightGate::new(3);
+        let a = gate.enter().await;
+        let b = gate.enter().await;
+        let c = gate.enter().await;
+        gate.shrink_to(1);
+        let mut waiter = Box::pin(gate.enter());
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut waiter).await.is_err(), "满门等待");
+        drop(a);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut waiter).await.is_err(), "held 3 → 2 仍 > cap 1：名额丢弃");
+        drop(b);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut waiter).await.is_err(), "held 2 → 1 = cap：仍不放");
+        drop(c);
+        let _d = tokio::time::timeout(Duration::from_millis(200), &mut waiter).await.expect("held 1 → 0 < cap 1：放入");
+        assert_eq!(gate.stat().effective_cap, 1);
     }
 }

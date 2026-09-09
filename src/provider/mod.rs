@@ -173,19 +173,50 @@ const RETRY_BACKOFF_BASE_MS: u64 = 200;
 const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
 const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 429 排队重试的挂点（design §12.3〔D13〕）：`retry_classified_with` 在每次真正发请求前后回调（provider 门据此计在途峰值、
+/// 发「请求完成」事件），撞 429 / overloaded 时把等待与去留交给策略——不吃 2 次抖动预算。无策略 = 旧行为（429 按 Retry-After /
+/// 指数退避，计入预算）。实现者：`registry::GateAttempts`（provider 在途门）；`single_shot` / `tool_loop` 暂不挂（M21b 接线时再挂）。
+#[async_trait]
+pub(crate) trait AttemptPolicy: Send + Sync {
+    /// 一次 HTTP 尝试开始（在途 + 1）。
+    fn attempt_begin(&self);
+    /// 一次 HTTP 尝试结束；`rate_limited` = 本次撞 429（不算「完成」，不唤醒排队者）。
+    fn attempt_end(&self, rate_limited: bool);
+    /// 撞 429 后：返回 true = 已按策略等完、请重试；false = 放弃（超 429 重试上限），错误原样返回给调用方。
+    async fn on_rate_limited(&self, retry_after: Option<std::time::Duration>) -> bool;
+}
+
 /// 通用重试：`op` 产 `Result<T, ProviderError>`；可重试错→退避后重试，不可重试→立即返回。
 /// 退避：RateLimited 有 retry_after 用之（封顶 30s），否则指数（200·2^(n+1) ms，
 /// 首试 400ms，封顶 5s；n=attempt 从 0 计，故首次退避即左移一位而非 200ms）。
-pub(crate) async fn retry_classified<T, F, Fut>(budget: u32, mut op: F) -> Result<T, ProviderError>
+/// 尝试挂点（D13）：有 `policy` 时 429 走 `on_rate_limited`（排队等本 provider 下一完成 / Retry-After，独立计数）、
+/// 不计入 `budget`；其余可重试错照旧退避。`None` = 旧行为。
+pub(crate) async fn retry_classified_with<T, F, Fut>(budget: u32, policy: Option<&dyn AttemptPolicy>, mut op: F) -> Result<T, ProviderError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, ProviderError>>,
 {
     let mut attempt = 0u32;
     loop {
-        match op().await {
+        if let Some(p) = policy {
+            p.attempt_begin();
+        }
+        let r = op().await;
+        let rate_limited = matches!(&r, Err(e) if matches!(e.inner(), ProviderError::RateLimited { .. }));
+        if let Some(p) = policy {
+            p.attempt_end(rate_limited);
+        }
+        match r {
             Ok(v) => return Ok(v),
             Err(e) => {
+                if rate_limited {
+                    if let Some(p) = policy {
+                        if p.on_rate_limited(e.retry_after()).await {
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
                 if attempt >= budget || !e.is_retryable() {
                     return Err(e);
                 }
@@ -207,7 +238,7 @@ pub trait ReviewProvider: Send + Sync {
 }
 
 /// 单轮 timeout+retry 包装（带 tools，对应 `ChatBackend::turn`）：超时归 `ProviderError::Timeout`，
-/// 外层套 `retry_classified`。tool_loop 与 single_shot 共享，避免各自手写同一手写块（B2 抽取）。
+/// 外层套 `retry_classified_with`。tool_loop 与 single_shot 共享，避免各自手写同一手写块（B2 抽取）。
 pub(crate) async fn timed_turn(
     backend: &dyn crate::provider::tool_loop::ChatBackend,
     messages: &[crate::provider::tool_loop::ChatMessage],
@@ -215,7 +246,19 @@ pub(crate) async fn timed_turn(
     per_turn: std::time::Duration,
     retry_budget: u32,
 ) -> Result<crate::provider::tool_loop::AssistantTurn, ProviderError> {
-    retry_classified(retry_budget, || async {
+    timed_turn_with(backend, messages, tools, per_turn, retry_budget, None).await
+}
+
+/// `timed_turn` + 尝试挂点（D13：provider 门的 429 排队重试）。
+pub(crate) async fn timed_turn_with(
+    backend: &dyn crate::provider::tool_loop::ChatBackend,
+    messages: &[crate::provider::tool_loop::ChatMessage],
+    tools: &[crate::tools::ToolSpec],
+    per_turn: std::time::Duration,
+    retry_budget: u32,
+    policy: Option<&dyn AttemptPolicy>,
+) -> Result<crate::provider::tool_loop::AssistantTurn, ProviderError> {
+    retry_classified_with(retry_budget, policy, || async {
         match tokio::time::timeout(per_turn, backend.turn(messages, tools)).await {
             Ok(r) => r,
             Err(_) => Err(ProviderError::Timeout(
@@ -231,7 +274,18 @@ pub(crate) async fn timed_turn_final(
     per_turn: std::time::Duration,
     retry_budget: u32,
 ) -> Result<crate::provider::tool_loop::AssistantTurn, ProviderError> {
-    retry_classified(retry_budget, || async {
+    timed_turn_final_with(backend, messages, per_turn, retry_budget, None).await
+}
+
+/// `timed_turn_final` + 尝试挂点（D13）。
+pub(crate) async fn timed_turn_final_with(
+    backend: &dyn crate::provider::tool_loop::ChatBackend,
+    messages: &[crate::provider::tool_loop::ChatMessage],
+    per_turn: std::time::Duration,
+    retry_budget: u32,
+    policy: Option<&dyn AttemptPolicy>,
+) -> Result<crate::provider::tool_loop::AssistantTurn, ProviderError> {
+    retry_classified_with(retry_budget, policy, || async {
         match tokio::time::timeout(per_turn, backend.turn_final(messages)).await {
             Ok(r) => r,
             Err(_) => Err(ProviderError::Timeout(
@@ -388,7 +442,7 @@ mod tests {
     async fn retry_classified_retries_then_succeeds() {
         use std::cell::Cell;
         let calls = Cell::new(0u32);
-        let r: Result<u32, ProviderError> = super::retry_classified(2, || {
+        let r: Result<u32, ProviderError> = super::retry_classified_with(2, None, || {
             let n = calls.get();
             calls.set(n + 1);
             async move {
@@ -403,7 +457,7 @@ mod tests {
     async fn retry_classified_non_retryable_fails_fast() {
         use std::cell::Cell;
         let calls = Cell::new(0u32);
-        let r: Result<u32, ProviderError> = super::retry_classified(5, || {
+        let r: Result<u32, ProviderError> = super::retry_classified_with(5, None, || {
             calls.set(calls.get() + 1);
             async move { Err::<u32, _>(ProviderError::Auth("401".into())) }
         }).await;
@@ -415,7 +469,7 @@ mod tests {
     async fn retry_classified_exhausts_budget() {
         use std::cell::Cell;
         let calls = Cell::new(0u32);
-        let r: Result<u32, ProviderError> = super::retry_classified(2, || {
+        let r: Result<u32, ProviderError> = super::retry_classified_with(2, None, || {
             calls.set(calls.get() + 1);
             async move { Err::<u32, _>(ProviderError::Network("down".into())) }
         }).await;

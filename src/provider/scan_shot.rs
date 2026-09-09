@@ -10,7 +10,7 @@ use crate::domain::ScanOutput;
 use crate::prompt::ScanPrompt;
 use crate::provider::parse::{diagnostic_parse_error, parse_scan_output_with_stats, ScanParseStats, REPAIR_PROMPT_SCAN};
 use crate::provider::tool_loop::{ChatBackend, ChatMessage};
-use crate::provider::{timed_turn, timed_turn_final, ProviderError};
+use crate::provider::{timed_turn_final_with, timed_turn_with, AttemptPolicy, ProviderError};
 
 /// 一次 scanner 调用的成品：规整后的疑点输出 + parse 丢弃统计 + usage / 迭代数 / 结束原因 / 推理 token（观测）。
 #[derive(Clone, Debug)]
@@ -44,9 +44,20 @@ pub async fn run_scan_shot(
     per_turn: std::time::Duration,
     retry_budget: u32,
 ) -> Result<ScanCall, ProviderError> {
+    run_scan_shot_with(backend, prompt, per_turn, retry_budget, None).await
+}
+
+/// `run_scan_shot` + 尝试挂点（D13：registry 传 provider 门的 `GateAttempts`——429 排队重试 + 在途峰值）。
+pub(crate) async fn run_scan_shot_with(
+    backend: &dyn ChatBackend,
+    prompt: &ScanPrompt,
+    per_turn: std::time::Duration,
+    retry_budget: u32,
+    policy: Option<&dyn AttemptPolicy>,
+) -> Result<ScanCall, ProviderError> {
     let mut messages = vec![ChatMessage::System(prompt.system.clone()), ChatMessage::UserBlocks(prompt.blocks.clone())];
 
-    let turn = timed_turn(backend, &messages, &[], per_turn, retry_budget).await?;
+    let turn = timed_turn_with(backend, &messages, &[], per_turn, retry_budget, policy).await?;
     let (mut in_tok, mut out_tok, mut cached_tok) = (turn.input_tokens, turn.output_tokens, turn.cached_input_tokens);
     let mut reasoning = turn.reasoning_tokens;
 
@@ -70,7 +81,7 @@ pub async fn run_scan_shot(
         messages.push(ChatMessage::Assistant { text: turn.text.clone(), tool_calls: vec![] });
     }
     messages.push(ChatMessage::User(REPAIR_PROMPT_SCAN.to_string()));
-    let repair = timed_turn_final(backend, &messages, per_turn, retry_budget)
+    let repair = timed_turn_final_with(backend, &messages, per_turn, retry_budget, policy)
         .await
         .map_err(|e| e.attach_usage((in_tok, out_tok, cached_tok)))?;
     in_tok += repair.input_tokens;

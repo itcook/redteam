@@ -251,6 +251,9 @@ pub struct RunMeta {
     /// v4：每 provider 在途请求峰值（provider 在途锁观测，F-2 / F-5 填）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_inflight_peak: BTreeMap<String, u32>,
+    /// v4（D13）：每 provider 的 429 收敛记录——只含本轮撞过 429 的 provider；空不序列化（旧消费者零噪音）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_rate_limit: BTreeMap<String, RateLimitMeta>,
     /// v4：本轮 blocking finding 的 refute 率（design §8.1「去留由数据决定」，M21b 填）。None = 无 verifier 段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refute_rate: Option<f32>,
@@ -261,6 +264,14 @@ pub struct RunMeta {
     /// 批 F-5：引用图分组观测（批 C `GroupingStats`，此前只在 `--pack-only` 可见）；旧 JSON / 无分组路径 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grouping: Option<crate::bundle::GroupingStats>,
+}
+
+/// v4（D13）：某 provider 本轮撞 429 的收敛记录——`hits` 次数、`cap` 配置门宽、`effective_cap` 收敛后门宽（design §12.3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitMeta {
+    pub hits: u32,
+    pub cap: u32,
+    pub effective_cap: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -402,10 +413,11 @@ mod tests {
     #[test]
     fn runmeta_v4_fields_roundtrip_and_skip_when_default() {
         let d = serde_json::to_string(&RunMeta::default()).unwrap();
-        for k in ["coverage", "template_hashes", "cache_hit_by_cell", "provider_inflight_peak", "refute_rate"] {
+        for k in ["coverage", "template_hashes", "cache_hit_by_cell", "provider_inflight_peak", "provider_rate_limit", "refute_rate"] {
             assert!(!d.contains(k), "默认态不应含 {k}: {d}");
         }
         let mut m = RunMeta { job_id: "j".into(), refute_rate: Some(0.25), ..Default::default() };
+        m.provider_rate_limit.insert("agc".into(), RateLimitMeta { hits: 2, cap: 20, effective_cap: 5 });
         m.coverage.selected.insert(Role::Scanner, vec!["scan[g1]@x#1".into(), "scan[g2]@x#1".into()]);
         m.coverage.failed.insert(Role::Scanner, vec!["scan[g2]@x#1".into()]);
         m.template_hashes.insert("shared_head".into(), "deadbeefdeadbeef".into());
@@ -417,8 +429,10 @@ mod tests {
         assert!(v["coverage"].get("completed").is_none(), "空集合不序列化: {j}");
         assert_eq!(v["cache_hit_by_cell"][0]["cell"], "scan[g1]@x#1");
         assert_eq!(v["provider_inflight_peak"]["agc"], 3);
+        assert_eq!((v["provider_rate_limit"]["agc"]["hits"].as_u64(), v["provider_rate_limit"]["agc"]["effective_cap"].as_u64()), (Some(2), Some(5)), "{j}");
         assert_eq!(v["template_hashes"]["shared_head"], "deadbeefdeadbeef");
         let back: RunMeta = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.provider_rate_limit, m.provider_rate_limit);
         assert_eq!(back.coverage, m.coverage);
         assert_eq!(back.cache_hit_by_cell, m.cache_hit_by_cell);
         assert_eq!(back.refute_rate, Some(0.25));

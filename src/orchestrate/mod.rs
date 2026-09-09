@@ -273,6 +273,8 @@ pub async fn run_scan_fanout(
             ));
         }
     }
+    // 429 收敛告警（D13）：撞过 429 的 provider 各一条「429 × N，门宽 A → B」。
+    out.warnings.extend(registry.gate_warnings());
     for c in &cells {
         out.usage.0 += c.record.input_tokens;
         out.usage.1 += c.record.output_tokens;
