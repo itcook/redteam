@@ -1,0 +1,7 @@
+{"file": ".next/plans/2026-09-07-redteam-m21a-scan-foundation-plan.md", "reason": "批 F 任务 F-1…F-6 的 Modify / 测试 / Commit 定义、Global Constraints、出口验收 8 / 9 / 10"}
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§2 编排形状（静态 fan-out、无候补）；§4 scanner 输出契约；§5 多 scanner 并集与 agreement = 家族数；§8.4 coverage 五集合与 scanner 失败硬 Incomplete；§10.3 段序与三段界；§12.3 route_key / 两层限流"}
+{"file": ".next/decisions/2026-09-04-redteam-review-engine-architecture-decisions.md", "reason": "D7 A3 无候补 / A5 provider 级 max_concurrency；D10 分支硬切、redteam-next、对照 = dev 二进制；D6 采纳 1（疑点索引）与 8（coverage 分级）"}
+{"file": ".next/roadmap/M21a-scan-foundation.md", "reason": "交付项 6 / 7 / 8 / 9 与验收（make verify、--help 无 engine / --risk / --models）"}
+{"file": ".next/roadmap/followup.md", "reason": ":37 ThinkingLevel 首个消费者；:41 角色化；:49 GroupingStats 口径（F-5 前不分种）；:52 / :110 --pack-only 口径与 F 接线备忘；:54 CellOutput tag；:68 legacy_opts_from_roles 删；:69 proj-next.db 勿回改；:70 schema 不翻号；:79-82 批 C 延后项（旧 prompt 随 F-4 删、结果 JSON 加 scanner 输出、GroupingStats 接 RunMeta）"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "新 helper 前先搜：timed_turn / timed_turn_final / diagnostic_parse_error / quote_overlap / LINE_GAP / normalize_quote / exit_code / attach_cells 复用而非复制"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "config(EffectiveModel) → main(build_registry) → provider(registry gate / backend thinking) → orchestrate(fanout) → cli(report / RunMeta) → output(md) 跨层数据流"}
