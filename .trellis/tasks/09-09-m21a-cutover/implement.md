@@ -42,11 +42,42 @@
 - [x] Commit：`feat(state): scanner cell 落盘 + RunMeta 观测（分组 / 疑点数 / 覆盖率 / cache / 墙钟 / 在途峰值 / coverage 五集合）`
 
 ## 6. F-6 收口
-- [ ] dogfood：`cargo run -q -- review --base feat/m21-review-engine --format json > /tmp/rt-scan.json`（真实 scanner，K14）；`python3 eval/scan_score.py selftest` + 对 dogfood 输出 `score` 读取（合成 oracle）；记录 cells / 疑点数 / 覆盖率 / 墙钟 / thinking warning 到 §收口记录。
-- [ ] code-review 子 agent（范围 `feat/m21-review-engine...HEAD`）→ 修 → §评审修。
-- [ ] followup 登记（resume 生产验证 / GLM anthropic thinking 映射 / `result.md` 文案 / 增量与 dismissed e2e ignore / `Stats` 恒零）；roadmap `M21a-scan-foundation.md` 交付项 6 / 7 / 8 / 9 打 ✅、验收段注明出口另起。
+- [x] dogfood：`cargo run -q -- review --base feat/m21-review-engine --format json > /tmp/rt-scan.json`（真实 scanner，K14）；`python3 eval/scan_score.py selftest` + 对 dogfood 输出 `score` 读取（合成 oracle）；记录 cells / 疑点数 / 覆盖率 / 墙钟 / thinking warning 到 §收口记录。
+- [x] code-review 子 agent（范围 `feat/m21-review-engine...HEAD`）→ 修 → §评审修。
+- [x] followup 登记（resume 生产验证 / GLM anthropic thinking 映射 / `result.md` 文案 / 增量与 dismissed e2e ignore / `Stats` 恒零）；roadmap `M21a-scan-foundation.md` 交付项 6 / 7 / 8 / 9 打 ✅、验收段注明出口另起。
 - [ ] journal；（用户）`--no-ff` 合回。
 
-## 收口记录（F-6 填）
+## 收口记录（F-6 填，2026-09-09）
 
-## 评审修（F-6 填）
+dogfood：`cargo run -q -- review --base feat/m21-review-engine --format json`（本分支 F-1…F-5 + 制品，diff 3 组：4 / 4 / 26 文件；`--pack-only` 预估 cell-3 782 KB ≈ 224K token、over_budget=1）；活跃 scanner = `deepseek/deepseek-v4-flash`（thinkingLevel high → `thinking enabled` + `reasoning_effort max`）+ `qwen/qwen3.8-flash`（medium → `enable_thinking true`）。
+
+| 项 | 结果 |
+|---|---|
+| verdict / 退出码 | scan-only / 0；warnings 0（两家族 thinking 映射都命中，无「无映射」告警） |
+| cells | 6 = 3 组 × 2 条目，全部 ok（coverage selected 6 / completed 6 / failed 0）；provider 在途峰值 deepseek 2 / qwen 3 |
+| 墙钟 | 366.5 s（最慢 cell：qwen g3 288 s；deepseek g3 137 s）；每 cell 一轮（iterations 1，无 REPAIR） |
+| usage | input 496,869 / output 77,092 / cached 2,048（qwen 两格各 1,024；deepseek 三格 0——`prompt_cache_hit_tokens` 未命中或该网关不回报） |
+| 疑点 | 合并后 57（agreement ≥ 2：6）；by_category L0 5 / L1 7 / L2 9 / L3 8 / L4 20 / L5 8；needs 21（6 cell 全触发） |
+| 覆盖自报 | scanned_coverage 0.868（改动行 ∩ 自报区间） |
+| 锚定丢弃（cell warn） | deepseek g1 1 / g2 2+2（unreadable：已删除的 `adversarial-code-bundle.md` 一类）/ g3 4；qwen g2 1+1 |
+| 评分器 | `eval/scan_score.py selftest` ok；对本报告 + 合成 oracle（3 条：Cargo.toml / Makefile 两条命中锚、1 条不存在文件）`score` 读取顶层 `cells[]` 形态成功（结果见 `/tmp/rt-score.json`，仅验读取，非 oracle 评分） |
+| `.redteam/` | 前台评审不落盘（无 job）；`--pack-only` 落 `packs/<job>`（gitignored） |
+
+观察（不改代码，记 followup / 出口）：① g1 / g2 的疑点几乎全落在 `.trellis` 制品与构建文件上（本分支 diff 含大量文档）——出口用 PR181 才有代码语料；② DeepSeek 三格 cached 0：三组 prompt 共享同一共享头（≥ 64 token），按其磁盘缓存应命中——出口 4 对照 dev 基线时看 `prompt_cache_hit_tokens` 字段是否被该网关回报；③ qwen 单格 288 s（输出 22K token，medium thinking）是墙钟大头，出口 1「≤ 3 min」用 DeepSeek 单 scanner 配置跑。
+
+## 评审修（F-6 填，2026-09-09，`/code-review high`，范围 feat/m21-review-engine...HEAD，SendMessage 钉范围）
+
+8 角度 39 候选 → 33 送验证 → 存活 29，按上限报 10 条（正确性优先）+ 帽外已验证项。十条全部核实成立，一次修掉（commit「fix(orchestrate,cli,provider): 评审修复…」）：
+1. `run_resume` 对旧格式作业（partial 全是 reviewer 记录且 ok）会产出空 scan-only 覆盖原报告 → 任一非 scanner 记录即拒 resume（`partial_report` 带理由，不覆盖）；`scan_cells_from_records` 把 ok 的非 scanner 记录翻成失败格。
+2. `partial_report` 只喂 ok 记录 → 失败格从 coverage.failed / cells_failed / usage 消失、与 `attach_cells` 回填自相矛盾 → 全部记录进收口。
+3. `family_class` 把 gpt-4 系归推理型发 `reasoning_effort` → 400 且无 warning → `thinking_params` 加 id 参数：gpt-5 / o 系 / 显式 family=openai 才映射，其余 gpt → `gpt-legacy` 无映射 + warning。
+4. `merge_suspicions` 就地换代表导致簇归属依赖输入顺序（plan 序 vs db 序两路不同）→ 并查集传递闭包 + 输入按 cell id 排序 + 代表末选（六种排列测试）。
+5. `run_resume` 贫化收口（组骨架 / 分组 / head_sha / 覆盖自报 / dossier 全 None、丢 registry warnings、单格 warn 契约不同）→ 抽 `orchestrate::scan_cell_record` 两路共用；沿用作业原报告的 groups / grouping / head_sha / dossier / scanned_coverage；并入 `registry.warnings()`。
+6. resume 重放冻结 prompt 却盖当前模板哈希 → `CellInput.template_hash` 随 manifest 落盘，重放优先取之，与当前不一致 warning。
+7. workers 许可在 provider 门前被占（饱和 / 限流 provider 饿死其他 provider）→ registry `lease`（先门后 worker 许可）；在途峰值改在真正发请求时计（等 worker 的租约不计）。
+8. glm Off 对 4.x 仍发 enabled+low → 按 id 区分：GLM-5.x 不可关保留迁移口径，其余 Off 真关（`thinking disabled`）。
+9. `thinking_pinned` 不看映射 → 无映射家族误报零推理 → `ScanEntrySpec::from` 只在 `thinking_params` 有非空映射时为 true。
+10. 覆盖率分母含删除点（纯删除恒 0%、混合低报）→ 只计 `+` 行；纯删除 → None。
+帽外已验证并修：`--incremental-from --background` 先建 job 再在 worker 里 bail → main 层早拒（e2e 锚）；琐碎 quote（`}`）经 min-set 公式误合并 → 去空白 < 12 字符只认相等；hint 换行伪造 md bullet → 渲染单行化；`CellSummary` 两处手写映射 → `CellSummary::from_record`；`CellInput.prompt` 与 `scan` 双存（每 cell MB 级）→ scan cell 留空。
+未改（记 followup）：Anthropic thinking + tools 互斥守卫（M21b 工具往返才可达）；`resolve --help` 仍提增量轮消费（M21c）；`exit_code` 第二参在 scan 路径恒 false；`ScanResults.usage / failed / needs_declared` 生产无消费者（测试用）；`lines_overlap` 与 `dedup::overlaps` 同形不同型；`anchor_suspicions` 每疑点重读同文件。
+修后：lib 531 / 16 / 7 / e2e 17 绿；clippy 三条既有；make verify 绿。
