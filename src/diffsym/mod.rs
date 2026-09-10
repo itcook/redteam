@@ -10,6 +10,12 @@ pub(crate) struct Lang {
     defs: &'static [(&'static str, &'static str)],
 }
 
+impl Lang {
+    pub(crate) fn exts(&self) -> &'static [&'static str] {
+        self.exts
+    }
+}
+
 // Rust def 正则：逐条照抄 eval/harness.py DEF_PATTERNS（已验证 119/119 符号锚定）。
 pub(crate) const RUST: Lang = Lang {
     exts: &["rs"],
@@ -320,6 +326,8 @@ pub(crate) struct Hunk {
     pub count: usize,
     pub changed: Vec<usize>,
     pub plus: Vec<(usize, String)>,
+    /// 删除行正文（不含 `-` 前缀），供风险规则结构信号（def 删除 / 签名改）。
+    pub minus: Vec<String>,
 }
 
 /// 按 hunk 拆 diff（唯一的 hunk 游走：`+++` / `---` 头与 `\` 标记跳过，删除点取当前新文件位置；
@@ -334,7 +342,7 @@ pub(crate) fn parse_hunks(diff: &str) -> Vec<Hunk> {
         if raw.starts_with("@@") {
             let (c, d) = parse_hunk_new_range(raw).unwrap_or((1, 1));
             new_line = c;
-            out.push(Hunk { start: c.saturating_sub(1), count: d, changed: Vec::new(), plus: Vec::new() });
+            out.push(Hunk { start: c.saturating_sub(1), count: d, changed: Vec::new(), plus: Vec::new(), minus: Vec::new() });
             continue;
         }
         let Some(h) = out.last_mut() else { continue };
@@ -344,7 +352,10 @@ pub(crate) fn parse_hunks(diff: &str) -> Vec<Hunk> {
                 h.plus.push((new_line.saturating_sub(1), raw[1..].to_string()));
                 new_line += 1;
             }
-            Some(b'-') => h.changed.push(new_line.saturating_sub(1)),
+            Some(b'-') => {
+                h.changed.push(new_line.saturating_sub(1));
+                h.minus.push(raw[1..].to_string());
+            }
             _ => new_line += 1,
         }
     }
@@ -623,6 +634,7 @@ mod tests {
         assert_eq!(hs.len(), 2);
         assert_eq!((hs[0].start, hs[0].count), (1, 2));
         assert_eq!(hs[0].plus, vec![(2, "added one".to_string()), (3, "added two".to_string())]);
+        assert_eq!(hs[1].minus, vec!["gone".to_string()]);
         assert_eq!(hs[0].changed, vec![2, 3]);
         assert_eq!((hs[1].start, hs[1].count, hs[1].changed.clone(), hs[1].plus.len()), (10, 0, vec![10], 0));
         // 与 hunk_changed_lines 同源

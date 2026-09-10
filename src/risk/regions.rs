@@ -20,7 +20,7 @@ pub enum RegionKind {
 }
 
 /// 四类信号占位（A-2 填充分数）；成区阶段只标 kind 槽。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SignalKind {
     Path,
     Struct,
@@ -28,7 +28,7 @@ pub enum SignalKind {
     Hist,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Region {
     pub file: String,
     /// 1-based inclusive，与 `risk_replay.py` 区间口径一致。
@@ -38,6 +38,12 @@ pub struct Region {
     pub symbols: Vec<String>,
     pub padded: bool,
     pub signals: Vec<SignalKind>,
+    /// 归属本区的新增行正文（无 `+` 前缀）；涟漪区为空。
+    pub added: Vec<String>,
+    /// 归属本区的删除行正文（无 `-` 前缀）；涟漪区为空。
+    pub removed: Vec<String>,
+    pub score: f32,
+    pub mult: f32,
 }
 
 struct RawZone {
@@ -45,6 +51,8 @@ struct RawZone {
     end: usize,
     symbols: BTreeSet<String>,
     padded: bool,
+    added: Vec<String>,
+    removed: Vec<String>,
 }
 
 /// `changes` 与 `contents` 按 path 对齐：缺全文的文件不成区（head 树无此文件 / 读失败）。
@@ -89,12 +97,13 @@ fn zones_for_file(path: &str, diff: &str, content: &str) -> Vec<Region> {
                 }
             }
         }
+        let mut hz: Vec<RawZone> = Vec::new();
         for (_, (a, b, name)) in groups {
             let mut symbols = BTreeSet::new();
             if !name.is_empty() {
                 symbols.insert(name);
             }
-            raw.push(RawZone { start: a, end: b, symbols, padded: false });
+            hz.push(RawZone { start: a, end: b, symbols, padded: false, added: Vec::new(), removed: Vec::new() });
         }
         let nodef: Vec<usize> = nodef
             .into_iter()
@@ -105,8 +114,26 @@ fn zones_for_file(path: &str, diff: &str, content: &str) -> Vec<Region> {
         if !nodef.is_empty() {
             let lo = nodef.iter().copied().min().unwrap().saturating_sub(NO_DEF_PAD).max(1);
             let hi = (nodef.iter().copied().max().unwrap() + NO_DEF_PAD).min(lines.len());
-            raw.push(RawZone { start: lo, end: hi.max(lo), symbols: BTreeSet::new(), padded: true });
+            hz.push(RawZone {
+                start: lo,
+                end: hi.max(lo),
+                symbols: BTreeSet::new(),
+                padded: true,
+                added: Vec::new(),
+                removed: Vec::new(),
+            });
         }
+        for (ln0, t) in &h.plus {
+            let ln = ln0 + 1;
+            let idx = hz.iter().position(|z| z.start <= ln && ln <= z.end).or_else(|| hz.first().map(|_| 0));
+            if let Some(i) = idx {
+                hz[i].added.push(t.clone());
+            }
+        }
+        if let Some(first) = hz.first_mut() {
+            first.removed.extend(h.minus.iter().cloned());
+        }
+        raw.extend(hz);
     }
     raw.sort_by_key(|z| (z.start, z.end));
     let merged = merge_zones(raw);
@@ -120,6 +147,10 @@ fn zones_for_file(path: &str, diff: &str, content: &str) -> Vec<Region> {
             symbols: z.symbols.into_iter().collect(),
             padded: z.padded,
             signals: Vec::new(),
+            added: z.added,
+            removed: z.removed,
+            score: 0.0,
+            mult: 1.0,
         })
         .collect();
 
@@ -178,6 +209,10 @@ fn zones_for_file(path: &str, diff: &str, content: &str) -> Vec<Region> {
                 symbols: sym,
                 padded: false,
                 signals: Vec::new(),
+                added: Vec::new(),
+                removed: Vec::new(),
+                score: 0.0,
+                mult: 1.0,
             });
         }
     }
@@ -194,6 +229,8 @@ fn merge_zones(raw: Vec<RawZone>) -> Vec<RawZone> {
             m.end = m.end.max(z.end);
             m.symbols.extend(z.symbols);
             m.padded = m.padded && z.padded;
+            m.added.extend(z.added);
+            m.removed.extend(z.removed);
         } else {
             merged.push(z);
         }
@@ -216,7 +253,7 @@ fn word_hit(line: &str, name: &str) -> bool {
 }
 
 /// 结构信号与 enclosing 只认真正声明：const/var 只在顶层（无缩进）计入（对照 `is_decl`）。
-fn match_decl(line: &str, defs: &[(&'static str, regex::Regex)]) -> Option<(&'static str, String)> {
+pub(crate) fn match_decl(line: &str, defs: &[(&'static str, regex::Regex)]) -> Option<(&'static str, String)> {
     let (kind, name) = diffsym::match_def(line, defs)?;
     if kind == "const" && line.starts_with(|c: char| c.is_whitespace()) {
         return None;

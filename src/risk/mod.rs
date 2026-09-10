@@ -2,5 +2,7 @@
 //! 规则即 spec：P0 §15.4 v4 定案常量化，零 LLM、零配置旋钮。
 
 mod regions;
+mod signals;
 
-pub use regions::{regions, Region, RegionKind};
+pub use regions::{regions, Region, RegionKind, SignalKind};
+pub use signals::{score_regions, GitEnv, ScoreEnv};
