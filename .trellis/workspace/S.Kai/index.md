@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 14
-- **Last Active**: 2026-09-09
+- **Total Sessions**: 15
+- **Last Active**: 2026-09-10
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~370 | Active |
+| `journal-1.md` | ~398 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 15 | 2026-09-10 | D13 并发形态 grill 落文档 + Trellis 任务 d13-provider-gate 交付（provider 门唯一闸、429 排队重试、评审修 11 条、真跑核验） | `84dee09`, `f5cb451`, `641b4d3`, `f7bae23`, `3fe0f94`, `4aabec3`, `2c32703` | `feat/m21-review-engine` |
 | 14 | 2026-09-09 | M21a 批 F 硬切与并行：F-1…F-6 实施 + dogfood + code-review 十修（feat/m21a-cutover） | `495c80e`, `4335a23`, `eb0b3ad`, `1cf6003`, `acbc161`, `3af7048`, `3411a0e`, `5e4856f` | `feat/m21a-cutover` |
 | 13 | 2026-09-09 | M21a 批 D / E 合并后核验与修补（feat/m21-review-engine） | `8622dbc`, `2170de4` | `feat/m21-review-engine` |
 | 12 | 2026-09-09 | M21a 批 E 第二轮复审：code-review high 九修一不改（feat/m21a-slice） | `687335d` | `feat/m21a-slice` |

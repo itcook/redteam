@@ -368,3 +368,31 @@ Trellis 09-08-m21a-slice：diffsym 文件级 def / 全改动行锚定 / 一跳�
 
 - 用户 --no-ff 合回 feat/m21-review-engine；出口验收 1-10 另起 session（需 .next/private：PR181 单 / 双 scanner、E2 slice vs full A/B、cache 命中、--pack-only 误差、模板回归、dev 基线归档、schema v4 计数）
 - M21b 前：GLM anthropic 形态 thinking 映射、resume 生产验证、GroupingStats 分种计数（followup 批 F 延后表）
+
+
+## Session 15: D13 并发形态 grill 落文档 + Trellis 任务 d13-provider-gate 交付（provider 门唯一闸、429 排队重试、评审修 11 条、真跑核验）
+<!-- trellis-session: v=2 fp=ebe634fe9e51eef7 -->
+
+**Date**: 2026-09-10
+**Task**: D13 并发形态 grill 落文档 + Trellis 任务 d13-provider-gate 交付（provider 门唯一闸、429 排队重试、评审修 11 条、真跑核验）
+**Branch**: `feat/m21-review-engine`
+
+### Summary
+
+grill 定 D13（删角色 workers / 无 --workers、provider 门单把 FIFO 不预留、队列入口五态并入 + 跨轮沿用结案带守卫、scan 项不等兄弟 cell、maxConcurrency 缺省 10 + 429 排队重试）→ design v10 / D13 / roadmap 落文档；Trellis 任务：config 删三键 + 缺省 10 + >128 warning、扇出删角色信号量 + 排队告警按 provider、InflightGate 自管 + Notify + 429 排队重试 + RunMeta.provider_rate_limit；code-review 三批 16 条修 11（准入 + 退避不齐发、只成功算完成、429 按 HTTP 调用计、RAII、529、attempts / queue_wait_ms 口径、removed 键表、u32 饱和）延后 5 进 followup；真跑：缺省门宽零排队、门宽 1 排队告警 + queue_wait 173.5 s；门 lib 538 / e2e 17 / clippy 7 / verify 绿
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `84dee09` | docs(design,decisions,roadmap): D13 并发形态 grill 落文档——design v10：删角色 workers / 无 --workers，唯一闸 = provider 在途门（单把 FIFO + scanner 先于 H0 入队序 + 429 排队重试，review.maxConcurrency 缺省 10、> 128 warning）、队列入口五态并入 + 跨轮沿用结案带守卫（锚定可重定位 ∧ 区域无 delta）、agreement 活值、scanner 逐 cell 交付 / reviewer 逐 finding 定性为持久化旁路、scan 项不等同组兄弟 cell（记派发时 / 落地时 agreement）；decisions 新增 D13（Q1-Q5 / Q-A / Q-B / Q4 候选与被否）+ D2 勘误；roadmap followup 关闭「scanners.workers 形态」行、R9 收窄，M21a 状态句、M21b 目标 / 交付 2-3-10 / 验收、M21c 判例前移改沿用结案带守卫、M21e 校准项、READM |
+| `f5cb451` | chore(task): d13-provider-gate 规划制品（prd / design / implement / jsonl） |
+| `641b4d3` | refactor(config,orchestrate): 删角色 workers 三键与扇出信号量——唯一闸 = provider 门，排队告警按 provider 计，review.maxConcurrency 缺省 10 + >128 warning（design v10 §12.3〔D13〕） |
+| `f7bae23` | feat(provider): InflightGate 自管计数 + Notify，429 排队重试——门宽收敛到网关真实上限、持名额等本 provider 下一完成或 Retry-After、独立计数；RunMeta.provider_rate_limit（design v10 §12.3〔D13〕） |
+| `3fe0f94` | docs(roadmap,task): D13 收口批落地记录——followup「scanners.workers 形态」行归位（641b4d3 / f7bae23）、implement 步 0-3 打勾；真跑核验（缺省门宽零排队；门宽 1 时排队告警 + g1 queue_wait 173.5 s + 峰值 1）记录只在 .next/private/d13/ |
+| `4aabec3` | fix(provider,config,cli): D13 收口批评审修——429 等待者先退避再准入（active < 有效门宽才预占，门满回去等下一完成，不齐发）；只有成功完成才唤醒等待者（Timeout / 5xx 不算）；429 计数按每次 HTTP 调用独立；尝试括号 RAII（取消不泄漏在途）；Notify enable 先注册再检条件、seq0 与 others 同临界区；HTTP 529 归 RateLimited；attempts = 轮次 + 429 重试、queue_wait_ms = 门等待 + 429 排队；排队告警扇出 / resume 共用 registry::queue_warnings 且按有效门宽（已收窄不劝调大）；resume 记 queue_wait_ms；config 已删键统一 removed 表（risk / workers）；review.maxConcurrency usize→u32 饱和；删 run_scan_shot 壳、shrink_to 与收门共用 |
+| `2c32703` | docs(design,roadmap,task): D13 收口批评审收口——design §12.3 评审修补记（准入 / 只成功算完成 / 529 / attempts 与 queue_wait_ms 口径）、followup 新表「D13 收口批评审延后项」（速率型 429 棘轮 / 时间预算放弃 / 策略非 Option / 503 / cap.max(1)）+ 行归位 4aabec3、prd K13-K20 与 AC 打勾、task design §5.1、implement §3-4 打勾 |
+
+### Status
+
+[OK] **Completed**
