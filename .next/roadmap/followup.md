@@ -181,3 +181,11 @@ coverage `failed` 数。
 - aacr-bench 的 vendor / submodule：不做，fork 承载（D7 B1）。
 - `engine = legacy | v2` 旗：不做，分支硬切、对照 = dev 二进制（D10）。
 - 新开项目 / 新 repo：不做，理由见 decisions D10。
+
+## M21b 批 B 接口接缝（2026-09-10，Trellis `09-10-m21b-review-primitives`，批 C 接线直接消费）
+
+- **批 C 零件清单**（本批产出、签名即契约）：`pack::region::{QueueItemSpec（Origin 三值 + H0 无笔记构造校验）、RegionPack{evidence, cross_index, notes, stats}、build(item, bundle, root, idx, budget, opts, needs_evidence) -> Result<RegionPack, String>}`（互斥/读守卫在 build 内构造期执行，Err/退化不 panic）；`prompt::{ReviewPromptInput、build_review_prompt、review_template_hash}`；`provider::parse::{parse_review_output(_with_stats)(raw, model)、ReviewParseStats、REPAIR_PROMPT_REVIEW}`；`positioning::anchor_review_findings(findings, root) -> (kept, dropped, dropped_unreadable)`（`ReviewParseStats.dropped_quote` 由它回填）；`provider::stream_json::IncrementalFindings{feed/take/discarded/done}`。
+- **`ChatBackend::on_text_delta` take 语义**（非 guard——MutexGuard 跨 await 非 Send）：backend 内部槽 take/put-back，FINALIZE/REPAIR 后续轮继续喂；共享 registry 实例不挂回调（缺省 None 逐字节不变），批 C 的 run_review_shot 须 **per-cell 构造 backend 实例**（`backend_from_config().with_text_delta(feed 闭包)`）再跑，reqwest Client 复用不贵。
+- **`read_sse_with_delta` 与 `resp.text()` 等价性**：bytes_stream 聚合 + `from_utf8_lossy`；有效 UTF-8（SSE 恒是）下逐字节相同；无回调时 extract 短路（读取路径只剩字节聚合）。Cargo.toml 因此 +reqwest `stream` feature。
+- **agreement / models 真值**：`parse_review_output_with_stats` 经 `orchestrate::enrich` 填 agreement=1、models=[model]——批 C 按队列记录改写落地时刻 agreement（D13）。
+- **区域 pack 的 spec 段裁定**：spec 走共享头槽（与 scanner 共享头逐字节相同的验收迫使），不进 RegionPack——plan B-1 文本的「+ spec 段」按此解读，避免双份 token。
