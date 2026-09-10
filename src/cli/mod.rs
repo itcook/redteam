@@ -4,7 +4,7 @@
 
 use crate::bundle::{group, select_files, Bundle, GroupingOpts, GroupingStats};
 use crate::config::{Config, RoleSets};
-use crate::domain::{CacheHit, CellSummary, DossierMeta, NeedsMeta, ReviewReport, Role, RunMeta, ScanGroup, ScanReport, ScanStats, Stats, Usage, Verdict};
+use crate::domain::{CacheHit, CellSummary, DossierMeta, NeedsMeta, ReviewReport, RiskMeta, Role, RunMeta, ScanGroup, ScanReport, ScanStats, Stats, Usage, Verdict};
 use crate::evidence::git::FileChange;
 use crate::orchestrate::{run_scan_fanout, scan_cells_from_records, CellSink, ScanCellResult, ScanEntrySpec, ScanFanoutInput, ScanResults};
 use crate::output::Format;
@@ -243,6 +243,35 @@ pub(crate) fn grouping_opts(g: &crate::config::GroupingCfg, budget: usize) -> Gr
     }
 }
 
+/// 阶段 0 风险路由（plan_cells 前）。ledger 路径：`--dismissed` 文件覆盖，否则 `.redteam/proj-next.db`（存在才读）。
+fn stage0_risk(selected: &[FileChange], root: &Path, args: &ReviewArgs, cfg: &Config, head: Option<&str>) -> Option<RiskMeta> {
+    let head = head.unwrap_or("HEAD");
+    let base = args.base.as_deref().unwrap_or("HEAD");
+    let ledger = match args.dismissed.as_deref() {
+        Some(p) if Path::new(p).is_file() => Some(Path::new(p).to_path_buf()),
+        None if !args.no_dismissed => {
+            let p = root.join(crate::project::PROJECT_DIR).join(crate::db::DB_FILE);
+            p.exists().then_some(p)
+        }
+        _ => None,
+    };
+    let route = crate::risk::route_from_git(
+        selected,
+        root,
+        head,
+        base,
+        ledger.as_deref(),
+        None,
+        cfg.review.reviewers.max_cells,
+    );
+    Some(RiskMeta {
+        hotspots: route.hotspots.len() as u32,
+        r: route.r,
+        tier: route.tier,
+        budget_cells: route.budget_cells_hint,
+    })
+}
+
 /// scan-only 流水线（M21a 批 F-4 硬切，design §2 / §4 / §5）：证据筛选 → 分组 / 装包 / 跨组索引 → scanner 扇出（组 × 条目 × samples）
 /// → 疑点并集 + agreement → scan-only 报告。不产 finding；退出码：0 = scan 完成、3 = 任一 scanner cell 失败（Incomplete，design §8.4）。
 /// `--background` 由 main.rs 在 dispatch 之前分叉（spawn worker）；到达这里即路由 bug。
@@ -263,6 +292,7 @@ pub async fn run_code_review(
     let t0 = std::time::Instant::now();
 
     let selected = select_files(changes);
+    let risk = stage0_risk(&selected, root, args, cfg, head_sha.as_deref());
     let roles = cfg.active_roles();
     if roles.scanners.is_empty() {
         anyhow::bail!(NO_SCANNER_MSG);
@@ -312,6 +342,7 @@ pub async fn run_code_review(
         groups,
         scanned_coverage,
         grouping: Some(stats),
+        risk,
         dossier_meta: Some(dossier_meta),
         results,
         model_names,
@@ -334,6 +365,7 @@ pub(crate) struct ScanFinish<'a> {
     pub groups: Vec<ScanGroup>,
     pub scanned_coverage: Option<f32>,
     pub grouping: Option<GroupingStats>,
+    pub risk: Option<RiskMeta>,
     pub dossier_meta: Option<DossierMeta>,
     pub results: ScanResults,
     pub model_names: Vec<String>,
@@ -462,6 +494,7 @@ pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
         provider_inflight_peak: f.inflight_peak,
         provider_rate_limit: f.rate_limit,
         grouping: f.grouping,
+        risk: f.risk,
         test_command: f.test_command,
         ..Default::default()
     };
@@ -584,6 +617,8 @@ pub struct PackOnlyReport {
     pub budget_bytes: usize,
     pub cells: Vec<PackCell>,
     pub grouping: crate::bundle::GroupingStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskMeta>,
     pub packs_dir: String,
     pub warnings: Vec<String>,
 }
@@ -604,8 +639,10 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     // 角色集为空（无配置）时按 128K 窗保守缺省，不报错——仪表无 provider 也能跑。
     let roles = cfg.active_roles();
     let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
+    let selected = select_files(changes);
+    let risk = stage0_risk(&selected, cwd, args, cfg, head_sha.as_deref());
     let CellPlan { bundles, dossiers, others, stats, pack_stats, .. } =
-        plan_cells(select_files(changes), cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
+        plan_cells(selected, cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
     let focus = args.focus.clone().unwrap_or_default();
 
     let job_id = gen_job_id(cwd);
@@ -650,6 +687,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
         budget_bytes: budget,
         cells,
         grouping: stats,
+        risk,
         packs_dir: packs_dir.to_string_lossy().into_owned(),
         warnings,
     };
@@ -679,6 +717,12 @@ pub fn render_pack_only(r: &PackOnlyReport) -> String {
         "grouping gate={} groups={} edges={} cross_edges={} cross_import={} cross_reference={} cross_same_dir={} pooled_small={} isolated={} over_budget={}\n",
         g.gate.as_str(), g.groups, g.edges, g.cross_edges, kind(g.cross_import), kind(g.cross_reference), kind(g.cross_same_dir), kind(g.pooled_small_components), g.isolated, g.over_budget
     ));
+    if let Some(risk) = &r.risk {
+        out.push_str(&format!(
+            "risk hotspots={} r={} tier={} budget_cells={}\n",
+            risk.hotspots, risk.r, risk.tier, risk.budget_cells
+        ));
+    }
     out.push_str(&format!("packs={}\n", r.packs_dir));
     for w in &r.warnings {
         out.push_str(&format!("warning: {w}\n"));
@@ -794,6 +838,7 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
         groups: vec![],
         scanned_coverage: None,
         grouping: None,
+        risk: None,
         dossier_meta: None,
         results,
         model_names: vec![],
@@ -949,6 +994,7 @@ pub async fn run_resume(
         groups,
         scanned_coverage: prior.as_ref().and_then(|r| r.scan.as_ref()).and_then(|sc| sc.scanned_coverage),
         grouping: prior.as_ref().and_then(|r| r.run.grouping.clone()),
+        risk: prior.as_ref().and_then(|r| r.run.risk.clone()),
         dossier_meta: prior.as_ref().and_then(|r| r.run.dossier.clone()),
         results,
         model_names,
@@ -2236,7 +2282,9 @@ mod tests {
         ];
         let roles = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"x":{"roles":{"scanner":{}}},"y":{"roles":{"scanner":{}}}}}}}"#).unwrap().active_roles();
         let base = |cells: Vec<ScanCellResult>, reused: Vec<String>| ScanFinish {
-            groups: vec![], scanned_coverage: Some(0.5), grouping: None, dossier_meta: None,
+            groups: vec![], scanned_coverage: Some(0.5), grouping: None,
+            risk: Some(crate::domain::RiskMeta { hotspots: 2, r: 1.25, tier: crate::risk::Tier::Mid, budget_cells: 12 }),
+            dossier_meta: None,
             results: ScanResults { cells, ..Default::default() },
             model_names: vec!["p/x".into(), "p/y".into()], roles: Some(&roles), warnings: vec![],
             inflight_peak: [("p".to_string(), 2u32)].into_iter().collect(), rate_limit: BTreeMap::new(), ledger_meta: None, head_sha: None,
@@ -2262,6 +2310,9 @@ mod tests {
         assert_eq!((r.run.needs.triggered_cells, r.run.needs.declared), (1, 2));
         assert_eq!((r.run.usage.input_tokens, r.run.usage.cached_input_tokens, r.run.usage.output_tokens), (200, 50, 15));
         assert_eq!(r.run.model_ids, vec!["x", "y"]);
+        let risk = r.run.risk.as_ref().expect("risk 段");
+        assert_eq!((risk.hotspots, risk.budget_cells), (2, 12));
+        assert_eq!(risk.tier, crate::risk::Tier::Mid);
         assert_eq!(r.run.cells.len(), 3);
         assert_eq!((r.run.cells[0].role.as_str(), r.run.cells[0].cached_input_tokens), ("scanner", 50));
         assert_eq!(r.cells.len(), 3);

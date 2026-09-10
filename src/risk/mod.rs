@@ -33,6 +33,16 @@ pub enum Tier {
     High,
 }
 
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Tier::Low => "low",
+            Tier::Mid => "mid",
+            Tier::High => "high",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Hotspot {
     pub file: String,

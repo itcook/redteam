@@ -529,6 +529,7 @@ fn pack_only_writes_packs_and_reports_bytes() {
     let text = render_pack_only(&report);
     assert!(text.contains("cell-1 files=2 bytes=") && text.contains(" est_tokens="), "{text}");
     assert!(text.contains("grouping gate=single groups=1 edges=") && text.contains(" cross_import=") && text.contains(" cross_same_dir=") && text.contains(" pooled_small="), "{text}");
+    assert!(text.contains("risk hotspots=") && text.contains(" tier="), "{text}");
     assert!(text.contains(&format!("packs={}", report.packs_dir)), "{text}");
 
     let packs = std::path::Path::new(&report.packs_dir);
@@ -564,6 +565,7 @@ fn pack_only_empty_changes_reports_zero_cells() {
     assert!(report.warnings.iter().any(|w| w.contains("no reviewable evidence")), "{:?}", report.warnings);
     let text = render_pack_only(&report);
     assert!(text.contains("cells=0\n") && text.contains("warning: no reviewable evidence"), "{text}");
+    assert!(text.contains("risk hotspots=0 r=0") && text.contains("tier=low"), "empty diff → r=0 low: {text}");
 }
 
 /// 修补批 X-3：gate=grouped 两组时，每个 cell 的 `{{OTHER_CHANGED_FILES}}` 索引只列他组文件且带箭头——D 批重写 prompt 渲染的回归网。
