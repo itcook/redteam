@@ -16,11 +16,11 @@ reviewer cell 的全部静态零件：`RegionPack` 构造即切片（+爆炸半�
 
 ## Acceptance Criteria
 
-- [ ] `cargo test` / `clippy` / `make verify` 全绿；改动只在批 B 列出的文件与测试
-- [ ] 禁真空性质测试（ranges 的 diff 行全在 pack 内）；小文件 slice 与 full 逐字节相同
-- [ ] 共享头与 scanner prompt 头逐字节相同；模板哈希入册；模板字段名与 parse 一一对应（字段扫描测试）
-- [ ] 流式旁路：三 finding 分片 → 三次 emit + 最终聚合一致；截断 → 已闭合保留、余下 discard 计数；无回调 backend 逐字节不变
-- [ ] 互斥断言（笔记 + needs 证据并存 → 构造期报错）；读守卫命中用例
+- [x] `cargo test` / `clippy` / `make verify` 全绿；改动只在批 B 列出的文件与测试（外加必要延伸：bundle/mod.rs 索引函数、Cargo.toml reqwest+stream、positioning 计数版 anchor——均在任务语义内）
+- [x] 禁真空性质测试（ranges 的 diff 行全在 pack 内）；小文件 slice 与 full 逐字节相同
+- [x] 共享头与 scanner prompt 头逐字节相同；模板哈希入册；模板字段名与 parse 一一对应（字段扫描测试）
+- [x] 流式旁路：三 finding 分片 → 三次 emit + 最终聚合一致；截断 → 已闭合保留、余下 discard 计数；无回调 backend 逐字节不变
+- [x] 互斥断言（笔记 + needs 证据并存 → 构造期报错）；读守卫命中用例（untracked + denylist）
 - [ ] 收口：dev `redteam` ship 评审通过 → `--no-ff` 合回
 
 ## Out of Scope
