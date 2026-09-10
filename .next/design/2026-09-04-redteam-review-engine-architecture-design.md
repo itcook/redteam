@@ -1,6 +1,7 @@
 # redteam 评审引擎·风险路由 DAG 架构（M21 · v10）
 
-> 状态: **锁定**（v8，2026-09-07，P0 验证门出口〔D11〕：E1 风险规则 v4 成立、E3 疑点契约成立；§3.3 / §4 / §6 / §12.1 / §16 / §17 按 D11 改；
+> 状态: **锁定**（**键名勘误 2026-09-10**：正文 TOML / snake_case 配置残留统一为 §12.1 JSON camelCase，无语义变化，不升版；
+> v8，2026-09-07，P0 验证门出口〔D11〕：E1 风险规则 v4 成立、E3 疑点契约成立；§3.3 / §4 / §6 / §12.1 / §16 / §17 按 D11 改；
 > 无 `[review.risk]` / `--risk`；v9 2026-09-08〔D12〕§12 改 JSON + provider → models → roles；**v10 2026-09-09〔D13〕并发形态**：删角色 `workers`、无 `--workers`，
 > 唯一闸 = provider 在途门（单把 FIFO + scanner 先于 H0 的入队序 + 429 排队重试，`review.maxConcurrency` 缺省 10），队列入口五态并入 + 跨轮沿用结案带守卫，
 > scanner 逐 cell 交付、reviewer 逐 finding 落盘定性为持久化旁路；§0 / §2 / §4 / §5 / §6 / §7 / §8.1 / §12 / §13 / §14 / §15 / §17 对应改）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；M21b-e 待产出。
@@ -24,8 +25,8 @@
 不消灭「快 vs 好」的矛盾，而是把它挪到第三个轴：同一墙钟内**用 token 买召回**。慢模型的广度成本是**钱与有界墙钟**
 （provider 在途门与预算封顶），不是线性时间〔D1 勘误〕。
 
-**词汇约定**〔D7〕：三个**角色** = `scanner` / `reviewer` / `verifier`（配置里的 `[[scanners]]` / `[[reviewers]]` /
-`[[verifiers]]`）；三个**阶段** = 快扫 / 深挖 / 复核；cell 按角色命名（scanner cell / reviewer cell / verifier cell）。
+**词汇约定**〔D7，D12 键名勘误 2026-09-10〕：三个**角色** = `scanner` / `reviewer` / `verifier`（配置 = 模型下
+`roles.scanner / reviewer / verifier`，§12.1）；三个**阶段** = 快扫 / 深挖 / 复核；cell 按角色命名（scanner cell / reviewer cell / verifier cell）。
 
 ---
 
@@ -93,13 +94,13 @@ diff 解析 → 噪声过滤（锁文件/生成物剔除，测试半权）→ ch
 | 同目录边 | 同目录 / 同顶层模块 | 弱 |
 
 算法：
-1. 文件数 < `min_files` 或 churn < `bundle_line_threshold` → 单包直达，不分组。
+1. 文件数 < `review.grouping.minFiles` 或 churn < `bundleLineThreshold` → 单包直达，不分组。
 2. 连通分量 = 初始分组。
-3. 分量超 `max_files_per_group` 或超预算 → **先切弱边**（同目录边、单次引用边）。
+3. 分量超 `maxFilesPerGroup` 或超预算 → **先切弱边**（同目录边、单次引用边）。
 4. 仍超 → **不切强边，改降内容**（M15 梯子：全文 → 改动 def 体 → 骨架），即「宁降不拆」；组内填充顺序按
    「与组内其他文件的 import 边数」降序（枢纽文件保全文）。
 5. 孤立文件（无边）→ 按目录 bin-packing 到预算。
-6. LLM 语义分组 `[review.grouping] semantic = false` 默认；只喂路径 + churn 元数据；失败回退步骤 5。
+6. LLM 语义分组 `review.grouping.semantic = false` 默认；只喂路径 + churn 元数据；失败回退步骤 5。
    触发是否值得可免费度量：分组边界上的跨组 import 边数（多 = 先验切错、有信息可买；零 = 白花钱）。
 7. **边集不丢弃**，提升为流水线产物 → §10.6 正反向跨组索引。
 
@@ -125,7 +126,7 @@ body 与 callee 签名。同一张引用图、两个方向。分组切错退化�
 - 信号四类（路径/类别 · 结构 · 外部 API · 历史）与权重、乘子（声明区 ×0.5、测试含 `#[cfg(test)]` 之后 ×0.3、文档 ×0.2）为代码常量；
   **入 H0 需 score ≥ θ=1.5 且命中 ≥ 2 类信号**，关键词类单独不成区。
 - 梯队：主区 = 必挖集、队列最前；涟漪区随预算、截断先截。R = Σ_{H0} score ÷ (1 + ln(1 + 代码改动行))，切点 0.5 / 3.5 分低 / 中 / 高三档（§6 预算）。
-- 无模式旋钮：不设 `[review.risk]`、不加 `--risk`；θ 与权重改动必须过 `eval/risk_replay.py` 回放 PR181 + 本仓 oracle B 并写进 research。
+- 无模式旋钮：不设 `review.risk`、不加 `--risk`；θ 与权重改动必须过 `eval/risk_replay.py` 回放 PR181 + 本仓 oracle B 并写进 research。
   快扫档将来走独立途径。
 - 已知边界：PR181 主裁决集区间级 4/4、并集空热区 0.47；held-out oracle B 区间级 0.59 / 文件级 0.85，漏项主因是改动函数之外的交互点。
 - 规则集可回流：台账 dismissed/upheld 统计驱动规则增删（与假阳压制同一反馈环）。
@@ -149,17 +150,17 @@ scanned_areas: [{ file, ranges }]                                               
 - **判例前移**：prompt 注入同文件活跃判例摘要。机械匹配命中的疑点在 §6 入口按**跨轮沿用结案**处理，守卫 = 锚定可重定位（carry 机器 anchor_near）
   ∧ 该区域自判例以来无 delta：过守卫 → dismissed 即豁免不入队、upheld 即 carry 不重挖；不过 → 正常入队、带判例笔记〔D13，替代 v9「降级候选」；
   无守卫的漏报路径 = fix 引入新 bug 被旧判例盖住〕。
-- 可选：同模型多 lens 采样并集 `[review.scanners] samples = 1`（换召回，不换墙钟）。
+- 可选：同模型多 lens 采样并集 `review.scanners.samples = 1`（换召回，不换墙钟）。
 - `quote` 是跨模型疑点合并与判例预筛的锚（`quote_overlap` 口径复用）；**quote 逐字硬约束，不在文件即丢弃**（E3：疑点模式守约弱于 finding 模式）；
   `category` 取 L0-L5；`hint` 归一化后置 M21c（R4，〔D11〕）。
-- scanner 请求显式钉推理档（角色条目 `thinking_level` 首个消费者）；零推理 + 短输出记 RunMeta 观测，不重跑（E3：疑点模式 2/3 跑几乎零推理）。
+- scanner 请求显式钉推理档（角色属性 `thinkingLevel` 首个消费者）；零推理 + 短输出记 RunMeta 观测，不重跑（E3：疑点模式 2/3 跑几乎零推理）。
 - 提示词 = 共享头 + scanner 角色尾（§10.7）。
 
 ---
 
 ## 5. 多样性轴：多个活跃 scanner 并行（疑点并集）〔D7〕
 
-- `[[scanners]]` 列表即活跃集：每条对每组各跑一次，**并行**、疑点并集、`agreement` = 列出该疑点的**家族数**（入 §6
+- `scanner` 角色模型集即活跃集（D12 roles）：每条对每组各跑一次，**并行**、疑点并集、`agreement` = 列出该疑点的**家族数**（入 §6
   优先级键与 §8.1 跳过规则）。
 - 第二条优选异家族快档；30 tok/s 档在疑点输出体量下仍落在快扫窗口内。
 - 代价：input × 条目数（cache 不跨模型）；墙钟不增。无候补语义：列表里没有备胎，只有并跑者。
@@ -177,7 +178,7 @@ scanned_areas: [{ file, ranges }]                                               
 |---|---|---|
 | 1 | 优先级 | 主区 H0 最高，涟漪区次之〔D11〕。疑点项 = `confidence × agreement × 类别权重`；needs 项取触发疑点分或默认中档。**非 FIFO；不用置信阈值切**。 |
 | 2 | 入队合并 | 区间扩到 enclosing def；同文件重叠/相邻区间合并为一项；跨模型同疑点以 quote 轻锚 + hint 归一合并（谓词复用 M21a `merge_suspicions`：同文件 ∧ 行重叠 ∧ quote 相等或不琐碎重叠）。**入口五态**〔D13〕：无命中 → 新项 agreement = 1；命中排队中项 → 并入（异族 agreement + 1、notes 追加、区间取并、重算 score，≥ 2 即标必挖）；命中在途项 → 只改记录（agreement + 1、hint 附记录），运行中的请求不注入、不重挖；命中本轮已结案 → 同上并沿用结案；命中跨轮判例 → §4 守卫（过 → 沿用结案不入队；不过 → 按无命中入队、带判例笔记）。同家族重复只合并不加 agreement。入口是编排器确定性代码，零 token；派发前再核一次在途 / 已结案。 |
-| 3 | 预算 | `[review.reviewers] max_cells = "auto"`（按 R 三档：low 4 / mid 12 / high 32，硬帽 48，起步值）或整数固定〔D11〕。**必挖集** = 主区 H0 ∪ {agreement ≥ 2 的疑点} 不受截断（confidence 只进优先级不做门；保护的是仍在排队的项，已派发项已在挖〔D13〕）；**保底**：每轮为 scanner 疑点保留 ⌈max_cells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并在 RunMeta 披露；涟漪区与其余疑点按优先级吃剩余预算。到期 **graceful drain**：在途跑完，未开跑者落台账。 |
+| 3 | 预算 | `review.reviewers.maxCells = "auto"`（按 R 三档：low 4 / mid 12 / high 32，硬帽 48，起步值）或整数固定〔D11〕。**必挖集** = 主区 H0 ∪ {agreement ≥ 2 的疑点} 不受截断（confidence 只进优先级不做门；保护的是仍在排队的项，已派发项已在挖〔D13〕）；**保底**：每轮为 scanner 疑点保留 ⌈maxCells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并在 RunMeta 披露；涟漪区与其余疑点按优先级吃剩余预算。到期 **graceful drain**：在途跑完，未开跑者落台账。 |
 | 4 | 预算外去向 | **疑点台账**（§8.3）休眠；报告披露为低置信线索；**不进 verdict**。截断不静默。 |
 | 5 | 分派 | 活跃 reviewer 条目构成**分派池**：每项只由一个模型消费，按空闲轮转；多条目买吞吐与分散限流，不双审。派发由 provider 门驱动：某 reviewer 条目所在 provider 有空位时才弹出最高优先项交它，无角色级池大小〔D13〕。scan 来源项**不等**同组其他家族 cell 返回（先到先挖，后到并入记录；是否加同组 hold 由派发时 / 落地时 agreement 数据在 M21e 定〔D13〕）。 |
 | 6 | 终止 | 全部 scanner cell 返回 → 关闭入口 → 队列排空 → 在途归零 → 复核在途归零 → reduce barrier。 |
@@ -198,9 +199,9 @@ cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
   （防锚定）。在途期间后到的同疑点只并入记录（§6 入口第三态），不注入运行中的请求；落地的 finding 继承记录当时的 agreement〔D13〕。
 - **输入 pack**：热区切片（§10.2）+ 爆炸半径邻居（caller body、callee 签名）+ 跨组索引（§10.6）+ 三方契约（§9.4 B 层，
   `kind = api` 时含函数体）+ spec 段（`--spec` 已有）。确定性代码预装配，**不拿工具自主探查**。
-  区域 pack **由构造即切片**，不受 `[review.pack] body` 控制（该轴只管 scanner 的组 pack）。
-- **输出**：完整 finding（危害链、修复建议）。**finding 只由此产出**（C7）。每 cell 输出天然有界。思考档由条目
-  `thinking_level` 给（典型 high）。
+  区域 pack **由构造即切片**，不受 `review.pack.body` 控制（该轴只管 scanner 的组 pack）。
+- **输出**：完整 finding（危害链、修复建议）。**finding 只由此产出**（C7）。每 cell 输出天然有界。思考档由角色属性
+  `thinkingLevel` 给（典型 high）。
 - **流式持久化**〔D10〕：响应 SSE 流上对 `findings` 数组做增量 JSON 解析，每个对象闭合即落盘，cell 中途死亡时已产出项不丢。
   不改模型契约、不引入工具循环、无 `submit` 旋钮；FINALIZE / REPAIR 仍管最终整体解析，流式持久化只是旁路。**定性为持久化旁路**〔D13〕：
   思考模型的可见 JSON 在尾部数秒内闭合，逐 finding 与逐 cell 在墙钟上等价；价值在格中途死亡时已闭合对象不丢。模型在一次请求内不能边调工具边交付，
@@ -219,12 +220,12 @@ cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
   免验；carried 项（出生轮已复核）；精确 id 已在台账者。
 - **流式**：finding 一落地即复核，与深挖尾部重叠；跳过规则所需的 agreement 与判例匹配均可单条计算，不需 barrier。跳过规则按 finding **落地时刻**的
   agreement 算，后涨不回溯〔D13〕。
-- **verifier 选择**：`[[verifiers]]` 有条目则从中选；缺省自动：**家族 ≠ 该 finding 的 reviewer 家族**（`family` 缺省取
+- **verifier 选择**：verifiers 活跃集（拥有 `verifier` 角色的模型）非空则从中选；缺省自动：**家族 ≠ 该 finding 的 reviewer 家族**（`family` 缺省取
   `model_id` 首段，条目可覆盖），优先 reviewers 档，其次 scanners 档；一个异族都没有 → 同族复核并在 RunMeta 与报告
   warning「无异族 verifier」。
 - **动作**：finding + ±60 行快照（骨架中档）+ 相关判例 + spec 段 → `REFUTED | UPHELD` 加一句理由；prompt 字段序
   **analysis 先于 verdict**。refuted → confidence 归零、永不 blocking；upheld → 原样；调用失败 → 保守 upheld + warning。
-- **去留由数据决定**：`[review.verifiers] enabled = true`；RunMeta 记每轮 blocking finding 的 refute 率；dogfood 数轮后
+- **去留由数据决定**：`review.verifiers.enabled = true`；RunMeta 记每轮 blocking finding 的 refute 率；dogfood 数轮后
   refute 率接近零则关默认（铁律 1）。
 - 提示词 = 共享头 + verifier 角色尾（§10.7）；离线回归集 = proj.db 已 dismissed（已知假阳）与 upheld（已知真）findings。
 
@@ -279,7 +280,7 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
 ### 10.1 单位
 **分组单位 = 文件**（§3.2）；**装包单位 = 改动中心切片**（changed symbol，非文件）。
 
-### 10.2 改动中心切片（`[review.pack] body = "slice"`）
+### 10.2 改动中心切片（`review.pack.body = "slice"`）
 
 | 层 | 内容 | 形态 |
 |---|---|---|
@@ -291,7 +292,7 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
 | 兜底 | 锚定失败 → hunk ±N → 全文 | 禁真空 |
 
 **默认 `slice`**〔D8〕。该轴只管 scanner 的组 pack（reviewer 区域 pack 由构造即切片）；`full` 保留为旋钮。
-- **小文件直接全文**：文件 ≤ `[review.pack] slice_min_bytes`（默认 8K）不切，此时 slice 与 full 等价。
+- **小文件直接全文**：文件 ≤ `review.pack.sliceMinBytes`（默认 8K）不切，此时 slice 与 full 等价。
 - **三层同批**：禁真空兜底、文件内一跳、文件地图缺一不可，否则重演 F3。
 - **回退信号**（任一出现先试二跳、再试 `full`）：M21a 出口 PR181 A/B 中 slice 的疑点 oracle 命中低于 full；dogfood 中 scanner
   `needs{kind: evidence}` 触发率持续偏高（反复索要被折叠的函数体）。
@@ -308,7 +309,7 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
   前缀自动命中。RunMeta 按 cell 记命中率。非结构性优化（provider 专属 context caching、跨 run 预热）见 R21。
 
 ### 10.4 「仅关注改动」的约束强度
-提示词约束**弱**。报错位置噪音 → 确定性后滤 `[review.pack] anchor_window = ±N`；注意力稀释 → 只能靠不发（§10.2）。
+提示词约束**弱**。报错位置噪音 → 确定性后滤 `review.pack.anchorWindow = ±N`；注意力稀释 → 只能靠不发（§10.2）。
 
 ### 10.5 仓库简介与反面教材
 - **仓库简介入稳定前缀**：项目 `.redteam/brief.md`（约 2K token，**内容非配置**，按不可信证据注入）或复用 `--spec`。
@@ -334,7 +335,7 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
 - **共享头内容**：系统协议、评审规则、对抗立场、CI 已覆盖类别跳过清单（L1）、不可信输入免疫段（威胁模型 B）、仓库简介、spec。
   角色尾不重复共享头。
 - **注入段全部过 `neutralize_structure`**：笔记、判例摘要、跨组索引、brief、三方契约。
-- **思考档位由条目 `thinking_level` 给**，prompt 不写「仔细思考」类散文。
+- **思考档位由角色属性 `thinkingLevel` 给**，prompt 不写「仔细思考」类散文。
 - **模板哈希入 RunMeta**：共享头与每个角色尾各一 hash，A/B 归因用。
 - **离线回归集**（M6-b 提示词 harness 的复活形态，零新数据；改模板必跑对应集）：
   - verifier：proj.db 已 dismissed findings = 已知假阳、upheld = 已知真 → 二分类准确率；
@@ -480,7 +481,7 @@ verifier 怀疑者复核（唯一以推翻为目标的环节）。
 - **路由规则会漏**。只能靠疑点并集与台账兜。
 - **无候补**：provider 不稳时 cell 失败直接进 coverage，靠 provider 在途门、429 排队重试与重试退避降低发生率，不靠换模型重跑。
 - **切片若切错 → 缺依赖类漏**。三层兜底 + 小文件全文 + 回退信号（§10.2）。
-- **小 PR 净变慢**（阶段固定开销）：`min_files` 以下单包直达 + needs 快路径旁路。
+- **小 PR 净变慢**（阶段固定开销）：`minFiles` 以下单包直达 + needs 快路径旁路。
 - **三方残余**（§9.4）。
 - **成本上升**。input × scanner 条目数 + 预算内深挖 + 契约注入；换的是时间。
 
@@ -505,7 +506,7 @@ scanner 直接产 finding / `engine` 旗（对照基线 = `dev` 二进制）/ `s
 5. L4-B 三方契约 + `needs{kind: api}`
 6. 第二家族 scanner（疑点并集）
 7. 仓库简介入稳定前缀
-8. 切片调优（二跳 / `slice_min_bytes`，按回退信号）
+8. 切片调优（二跳 / `sliceMinBytes`，按回退信号）
 
 每个新编排 pass 三大标配：注入互斥、证据段预算帽、读守卫；输出契约与 parse 字段级对齐；截断修复 per-backend 单点；
 观测仪表随行。
@@ -542,11 +543,11 @@ ocr 参照 = deepseek-v4-pro 直连 chat-completions 流式，版本钉入元数
 | R4 | 疑点 schema 细节 | **部分已裁〔D11〕**：category L0-L5、quote 逐字 + 丢弃；`hint` 归一化与合并 id 稳定性 → M21c 台账数据 |
 | R5 | 风险规则初版 + 预算函数形状 | **已裁〔D11〕**：规则 v4、涟漪二梯队、两类信号、常量化、三档 4 / 12 / 32 帽 48（§3.3 / §6） |
 | R6 | `--risk all` 对照档等价性 | **销案〔D11〕**：无 `--risk`；对照 = dev 二进制并排跑 PR181 比 oracle 命中 |
-| R7 | slice 回退信号阈值（`needs` 触发率、oracle 命中差）与 `slice_min_bytes` | M21a A/B 与 dogfood 定 |
+| R7 | slice 回退信号阈值（`needs` 触发率、oracle 命中差）与 `sliceMinBytes` | M21a A/B 与 dogfood 定 |
 | R8 | LLM 语义分组何时值得开 | 跨组 import 边数阈值，dogfood 定 |
 | R9 | provider `maxConcurrency` 缺省值（10 起步；角色 `workers` 已删〔D13〕） | 网关限流实测定；429 排队重试的收敛门宽是数据来源 |
 | R10 | L4-B 非 Rust 生态定位链 | Rust 先行 |
-| R11 | 必挖集阈值 `c_hi` | **已裁〔D11〕**：置信不做门；必挖 = 主区 ∪ agreement ≥ 2；疑点保底 ⌈max_cells/4⌉ 格 |
+| R11 | 必挖集阈值 `c_hi` | **已裁〔D11〕**：置信不做门；必挖 = 主区 ∪ agreement ≥ 2；疑点保底 ⌈maxCells/4⌉ 格 |
 | R12 | 台账激活上限 N 与停车通道形态 | 镜像 ship AskUser |
 | R13 | （已消：流式持久化无旋钮〔D10〕） | — |
 | R14 | 实现债 | **已裁〔D11〕**：cell 记录 `role` + 角色分叉输出枚举；单独表 = 疑点台账 + 队列快照；coverage 进作业元数据；resume 读快照重跑未完项；schema v4 一次重置〔D10〕 |
