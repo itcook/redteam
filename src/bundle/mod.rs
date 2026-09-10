@@ -183,17 +183,17 @@ pub struct Grouping {
     pub stats: GroupingStats,
 }
 
-/// 改动 def 名（diffsym 支持语言）：hunk 外围 def 起行经 `match_def` 取名，`ref_worthy` 过滤，去重升序。
+/// 改动 def 名（diffsym 支持语言）：吃 `all_defs` / `changed_defs`（全改动行 + 最内层 + 容器排除），
+/// `ref_worthy` 过滤，去重升序。与 `pack::outside_names` 同源（M21b 批 A 口径统一）。
 fn changed_def_names(path: &str, diff: &str, content: &str) -> Vec<String> {
     let Some(lang) = crate::diffsym::lang_for(path) else { return Vec::new() };
     let defs = crate::diffsym::compile_defs(lang);
     let lines: Vec<&str> = content.lines().collect();
+    let all = crate::diffsym::all_defs(&lines, &defs);
     let mut names = std::collections::BTreeSet::new();
-    for (start, _end) in crate::diffsym::changed_def_ranges(diff, &lines, &defs) {
-        if let Some((_, name)) = lines.get(start).and_then(|l| crate::diffsym::match_def(l, &defs)) {
-            if ref_worthy(&name) {
-                names.insert(name);
-            }
+    for d in crate::diffsym::changed_defs(diff, &all) {
+        if ref_worthy(&d.name) {
+            names.insert(d.name);
         }
     }
     names.into_iter().collect()
