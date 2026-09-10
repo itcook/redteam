@@ -45,7 +45,7 @@
 - [x] dogfood：`cargo run -q -- review --base feat/m21-review-engine --format json > /tmp/rt-scan.json`（真实 scanner，K14）；`python3 eval/scan_score.py selftest` + 对 dogfood 输出 `score` 读取（合成 oracle）；记录 cells / 疑点数 / 覆盖率 / 墙钟 / thinking warning 到 §收口记录。
 - [x] code-review 子 agent（范围 `feat/m21-review-engine...HEAD`）→ 修 → §评审修。
 - [x] followup 登记（resume 生产验证 / GLM anthropic thinking 映射 / `result.md` 文案 / 增量与 dismissed e2e ignore / `Stats` 恒零）；roadmap `M21a-scan-foundation.md` 交付项 6 / 7 / 8 / 9 打 ✅、验收段注明出口另起。
-- [ ] journal；（用户）`--no-ff` 合回。
+- [x] journal（8591293）；（用户）`--no-ff` 合回 `feat/m21-review-engine`（2026-09-09 完成）；task archive 于 2026-09-10。
 
 ## 收口记录（F-6 填，2026-09-09）
 
