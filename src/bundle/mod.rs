@@ -398,7 +398,8 @@ pub fn render_cross_index(idx: &CrossIndex, for_group: usize) -> String {
 
 /// 为单个文件渲染 reviewer 区域 pack 的跨组索引行（M21b 批 B，§10.6「只取本文件相关」）：
 /// 本文件行（带它自己的 → / ← 边）+ 与它有直接 import 边的其他改动文件各一行；边无关文件不列。
-/// 行形态与 [`render_cross_index`] 一致；文件级边数天然少，不动用组版双帽。无 entry 或全无边 → 空串（调用方渲染占位）。
+/// 行形态与 [`render_cross_index`] 一致；双帽与组版同款（条目 200 / 字符 4000——高 fan-in 变更集构造下无界膨胀
+/// 会绕开区域 pack 的证据预算纪律）。无 entry 或全无边 → 空串（调用方渲染占位）。
 pub fn render_cross_index_for_file(idx: &CrossIndex, file: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     if let Some(me) = idx.entries.iter().find(|e| e.path == file) {
@@ -412,8 +413,16 @@ pub fn render_cross_index_for_file(idx: &CrossIndex, file: &str) -> String {
         .filter(|e| e.path != file && (e.forward.iter().any(|p| p == file) || e.backward.iter().any(|p| p == file)))
         .collect();
     cands.sort_by(|a, b| (a.group.is_none(), a.group.unwrap_or(0), &a.path).cmp(&(b.group.is_none(), b.group.unwrap_or(0), &b.path)));
-    for e in cands {
-        lines.push(index_line(e));
+    // 双帽与组版同款（安全评审 S3：高 fan-in 构造可证伪「文件级边数天然少」的假设；本文件行 + 相连行共享帽）
+    let budget = MANIFEST_MAX_CHARS - MANIFEST_SUFFIX_RESERVE;
+    let mut chars = 0usize;
+    for e in cands.iter().take(MANIFEST_MAX_ENTRIES) {
+        let l = index_line(e);
+        if chars + l.len() + 1 > budget || lines.len() >= MANIFEST_MAX_ENTRIES {
+            break;
+        }
+        chars += l.len() + 1;
+        lines.push(l);
     }
     lines.join("\n")
 }

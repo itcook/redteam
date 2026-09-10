@@ -33,6 +33,9 @@ fn safe_read(root: &Path, rel: &str) -> Option<String> {
 }
 
 /// 把 quote 在给定内容中确定性定位到行跨度；空 quote 或未命中返回 None。
+/// 首匹配定位（软换行 quote 锚定的基础件；生产锚定走 `locate_quote_near`——首匹配会把短 quote 锚到
+/// 同文件另一处无辜同文，见 `anchor_suspicions` 教训。保留供 near 实现复用与软换行测试锁。）
+#[allow(dead_code)]
 fn locate_quote(content: &str, quote: &str) -> Option<(u32, u32)> {
     let file_lines: Vec<String> = content.lines().map(normalize_ws).collect();
     let raw_quote: Vec<String> = quote.lines().map(normalize_ws).collect();
@@ -170,7 +173,9 @@ pub fn anchor_review_findings(findings: Vec<Finding>, root: &Path) -> (Vec<Findi
                 continue;
             }
         };
-        match locate_quote(&content, &f.quote) {
+        // near 版（质量评审 🟡3）：finding 自带自报行号 + 短 quote，首匹配会把幽灵 finding 锚到同文件
+        // 另一处无辜同文（scanner 侧 anchor_suspicions 的既有教训）——取最接近自报行号者。
+        match locate_quote_near(&content, &f.quote, f.line_start) {
             Some((ls, le)) => {
                 f.line_start = ls;
                 f.line_end = le;

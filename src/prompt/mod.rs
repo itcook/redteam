@@ -341,9 +341,11 @@ pub fn build_review_prompt(i: &ReviewPromptInput<'_>) -> ScanPrompt {
 
 /// 折叠所有空白（含换行/tab/连续空格）为单空格——威胁模型 B 下台账卡片字段可被攻击者
 /// 仓库内容污染（E11-Q5），单行化后 `\n- [fake] ...` 式伪造条目/结构注入天然失效。
-fn oneline(s: &str) -> String {
+pub(crate) fn oneline(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}/// refute 判例注入渲染（design 2026-07-03 #7②）：按与被验 finding 的相关性排序填帽，
+}
+
+/// refute 判例注入渲染（design 2026-07-03 #7②）：按与被验 finding 的相关性排序填帽，
 /// 替代旧「16hex 文件名伪随机取前 1/4」——同 file 优先、title 相似次之；
 /// 单卡 600 / 总 4000 字符帽（帽内永远是最相关子集，台账体积与 prompt 解耦）。
 /// file/title/quote/reason 均单行化（`oneline`）——卡片来自不可信仓 `.redteam/proj.db`，

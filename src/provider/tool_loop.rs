@@ -369,12 +369,21 @@ impl ChatBackend for FakeChatBackend {
                 .pop_front()
                 .unwrap_or_else(|| Err(ProviderError::Unavailable("no scripted turn".into()))),
         };
-        // 流式旁路模拟：成功轮按 delta_chunk 逐片喂回调，用完放回（repeating 多轮场景每轮可喂）
+        // 流式旁路模拟：成功轮按 delta_chunk 逐片喂回调（字符边界切——真路径喂完整 SSE 行无损，
+        // 字节切会在多字节字符中间产生 U+FFFD），用完放回（repeating 多轮场景每轮可喂）
         if let (Some(sz), Ok(t)) = (self.delta_chunk, &out) {
             let mut cb = <Self as ChatBackend>::on_text_delta(self);
             if let Some(cb) = cb.as_mut() {
-                for piece in t.text.as_bytes().chunks(sz.max(1)) {
-                    cb(&String::from_utf8_lossy(piece));
+                let mut piece = String::new();
+                for ch in t.text.chars() {
+                    piece.push(ch);
+                    if piece.len() >= sz.max(1) {
+                        cb(&piece);
+                        piece.clear();
+                    }
+                }
+                if !piece.is_empty() {
+                    cb(&piece);
                 }
             }
             *self.on_text_delta.lock().unwrap() = cb;

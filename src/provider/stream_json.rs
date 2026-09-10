@@ -64,6 +64,20 @@ impl IncrementalFindings {
         self.done
     }
 
+    /// 流结束（截断 / cell 死亡收尾）时调用：未闭合对象（`depth > 0` 或顶层字符串中）计入 `discarded`
+    /// 并清缓冲——「截断 → 已闭合保留、余下 discard 计数」的兑现点（批 C 在旁路消费结束处调用）。
+    pub fn finalize(&mut self) {
+        if !self.done && (self.depth > 0 || self.in_string) {
+            self.discarded += 1;
+        }
+        self.buf.clear();
+        self.scan_pos = 0;
+        self.depth = 0;
+        self.in_string = false;
+        self.escaped = false;
+        self.obj_start = None;
+    }
+
     /// 推进状态机直到需要更多字节。
     fn pump(&mut self) {
         loop {
@@ -105,9 +119,12 @@ impl IncrementalFindings {
             }
             from = key_at + needle.len();
         }
-        // 未找到：滑窗（保留尾部，防下一段把键劈开）
+        // 未找到：滑窗（保留尾部，防下一段把键劈开；cut 回退到 char boundary——多字节字符中间 drain 会 panic）
         if self.buf.len() > SEEK_WINDOW {
-            let cut = self.buf.len() - SEEK_WINDOW;
+            let mut cut = self.buf.len() - SEEK_WINDOW;
+            while cut > 0 && !self.buf.is_char_boundary(cut) {
+                cut -= 1;
+            }
             self.buf.drain(..cut);
         }
         false
@@ -123,8 +140,20 @@ impl IncrementalFindings {
             let mut i = self.scan_pos;
             while i < bytes.len() {
                 let c = bytes[i];
-                if self.depth == 0 {
+                if self.depth == 0 && self.in_string {
+                    // 顶层裸字符串（契约外畸形条目）：串内 ] 不封数组、串内 { 不开深度——与对象内同款字符串感知
+                    if self.escaped {
+                        self.escaped = false;
+                    } else {
+                        match c {
+                            b'\\' => self.escaped = true,
+                            b'"' => self.in_string = false,
+                            _ => {}
+                        }
+                    }
+                } else if self.depth == 0 {
                     match c {
+                        b'"' => self.in_string = true, // 顶层字符串开（畸形输入；正常 findings 条目皆对象）
                         b'{' => {
                             self.depth = 1;
                             self.obj_start = Some(i);
@@ -240,7 +269,7 @@ mod tests {
         }
     }
 
-    /// JSON 中途截断 → 已闭合对象保留、余下 discard 计数（D10-1：cell 中途死亡已产出项不丢）。
+    /// JSON 中途截断 → 已闭合对象保留、未闭合经 finalize 计 discard（D10-1：cell 中途死亡已产出项不丢）。
     #[test]
     fn truncation_keeps_closed_objects_and_counts_discard() {
         let json = r#"{"findings":[
@@ -249,10 +278,33 @@ mod tests {
             {"severity":"high","title":"t3","body":"trunc"#;
         let mut inc = IncrementalFindings::new();
         feed_all(&mut inc, json, 16);
-        let emitted = inc.take();
-        assert_eq!(emitted.len(), 2, "前两条已闭合保留");
-        assert_eq!(inc.discarded(), 0, "未闭合对象不计数——discarded 只在 feed 结束后由 take 前的消费方读出；这里截断在字符串中间");
-        assert!(!inc.done());
+        assert_eq!(inc.take().len(), 2, "前两条已闭合保留");
+        assert_eq!(inc.discarded(), 0, "finalize 前未闭合不计");
+        inc.finalize();
+        assert_eq!(inc.discarded(), 1, "finalize 把未闭合对象计入 discard");
+        assert!(!inc.done(), "截断流没见到 ]");
+        inc.finalize();
+        assert_eq!(inc.discarded(), 1, "finalize 幂等");
+    }
+
+    /// 顶层裸字符串条目（契约外畸形）：串内 `]` / `{` 不破坏状态机，后续对象仍 emit。
+    #[test]
+    fn top_level_string_entries_do_not_break_state_machine() {
+        let json = r#"{"findings":["see [x] and {y}",{"severity":"low","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"q"}]}"#;
+        let mut inc = IncrementalFindings::new();
+        feed_all(&mut inc, json, 7);
+        assert_eq!(inc.take().len(), 1, "串内 ] 不封数组，真对象照常 emit");
+        assert!(inc.done());
+    }
+
+    /// 滑窗截断落在多字节字符中间不 panic（CJK 前导 > 64KB）。
+    #[test]
+    fn seek_window_drains_on_char_boundary() {
+        let noise = "中文噪声".repeat(20_000); // 120KB，多字节
+        let json = format!(r#"{noise}"findings":[{{"severity":"low","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"q"}}]"#);
+        let mut inc = IncrementalFindings::new();
+        feed_all(&mut inc, &json, 1024);
+        assert_eq!(inc.take().len(), 1, "多字节滑窗不 panic 且仍命中");
     }
 
     /// 非 findings 段 / 思考文本容忍：前导 <think>、散文、needs 数组在后都不干扰。

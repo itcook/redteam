@@ -280,10 +280,10 @@ pub const REPAIR_PROMPT_SCAN: &str = "Your previous response was not valid JSON 
 and do NOT omit any required field (file, line_start, line_end, hint, confidence, quote).";
 
 /// reviewer 契约的 repair 句（M21b 批 B）：同句式，指向 findings 对象；缺 `findings` 键同样走这里。
-pub const REPAIR_PROMPT_REVIEW: &str = "Your previous response was not valid JSON (it may have been truncated or missing the \\
-\"findings\" array). Re-emit ONLY the complete findings JSON object matching the schema: {\"findings\": [...], \\
-\"needs\": [...]}. If space is tight, shorten each finding's body/recommendation, but do NOT drop any finding \\
-and do NOT omit any required field (severity, title, body, file, line_start, line_end, confidence, recommendation, quote).";
+pub const REPAIR_PROMPT_REVIEW: &str = "Your previous response was not valid JSON (it may have been truncated or missing the \
+\"findings\" array). Re-emit ONLY the complete findings JSON object matching the schema: {\"findings\": [...], \
+\"needs\": [...]}. If space is tight, shorten each finding's body/recommendation, but do NOT drop any finding \
+and do NOT omit any required field (severity, title, body, file, line_start, line_end, confidence, recommendation, hard_constraint, quote).";
 
 /// reviewer 契约 parse 的规整统计（M21b 批 B）：与 `ScanParseStats` 同构口径；`dropped_quote` 由
 /// `positioning::anchor_review_findings` 回填（quote 逐字硬约束在定位层，D11 同款），不静默。
@@ -571,6 +571,8 @@ mod tests {
         assert!(parse_review_output("{\"findings\":[{\"file\":\"a\",", "m").is_err());
         assert!(parse_review_output("{\"findings\":[]}", "m").is_ok());
         assert!(REPAIR_PROMPT_REVIEW.contains("findings") && REPAIR_PROMPT_REVIEW.contains("quote"));
+        assert!(!REPAIR_PROMPT_REVIEW.contains("\\n"), "行续接不得混入字面反斜杠");
+        assert!(REPAIR_PROMPT_REVIEW.contains("hard_constraint"), "required 清单含 hard_constraint");
     }
 
     /// 批 B：quote 定位失败丢弃 + 计数（anchor_review_findings，D11 逐字硬约束）。
