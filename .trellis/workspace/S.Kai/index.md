@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 16
+- **Total Sessions**: 18
 - **Last Active**: 2026-09-10
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~428 | Active |
+| `journal-1.md` | ~466 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 18 | 2026-09-10 | M21b 批 A 风险评分器（+ 前置 #1 小分量并池） | `21de550`, `69ff71d`, `56f0397`, `9fc0bbc`, `c7b1b42`, `b5d1ee1`, `1f72af5`, `4156796`, `03f056c`, `3d4cb01`, `840d8ac`, `be6b3b1` | `feat/m21b-risk` |
 | 16 | 2026-09-10 | M21b 批 B reviewer 静态零件 | `081ab70`, `6f235b3`, `039a299`, `ce4ced4`, `f515ed4`, `7b11f16`, `d1c2b61`, `4afa9a5`, `fb45684` | `feat/m21b-review-primitives` |
 | 15 | 2026-09-10 | D13 并发形态 grill 落文档 + Trellis 任务 d13-provider-gate 交付（provider 门唯一闸、429 排队重试、评审修 11 条、真跑核验） | `84dee09`, `f5cb451`, `641b4d3`, `f7bae23`, `3fe0f94`, `4aabec3`, `2c32703` | `feat/m21-review-engine` |
 | 14 | 2026-09-09 | M21a 批 F 硬切与并行：F-1…F-6 实施 + dogfood + code-review 十修（feat/m21a-cutover） | `495c80e`, `4335a23`, `eb0b3ad`, `1cf6003`, `acbc161`, `3af7048`, `3411a0e`, `5e4856f` | `feat/m21a-cutover` |

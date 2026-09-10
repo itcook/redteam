@@ -427,33 +427,40 @@ grill 定 D13（删角色 workers / 无 --workers、provider 门单把 FIFO 不�
 
 [OK] **Completed**
 
-## Session 17: M21b 批 A 风险评分器（+ 前置 #1 小分量并池）
-<!-- trellis-session: v=2 fp=feat-m21b-risk -->
+
+
+## Session 18: M21b 批 A 风险评分器（+ 前置 #1 小分量并池）
+<!-- trellis-session: v=2 fp=3d5c7c1794fda9ca -->
 
 **Date**: 2026-09-10
-**Task**: M21b 批 A 风险评分器
+**Task**: M21b 批 A 风险评分器（+ 前置 #1 小分量并池）
 **Branch**: `feat/m21b-risk`
 
 ### Summary
 
-前置 #1（用户裁选项 1）：小分量（≤3 文件 ∧ est ≤ 预算/4，budget=None 不判）作原子单元与孤立文件同池装箱（`GroupingStats.pooled_small_components`）；PR181 7→4 组、cross_import=0 保持。批 A：`src/risk/` 移植 P0 v4（成区主/涟漪、四类信号常量权重、H0 θ=1.5 ∧ ≥2 类、R、预算三档 4/12/32 帽 48，零旋钮）；阶段 0 接线（RunMeta.risk + `--pack-only` 一行 + resume 沿用）；`redteam-next risk --base/--head/--dismissed/--before` 只读回放子命令（读历史 commit 不依赖工作树）+ `risk_replay.py compare`（θ/R/Jaccard 三判定）；先修 Python 两处已核实缺陷（parse_diff 状态机守卫、e3 anchored 恒真式）。回放门：PR181 R Δ=3.4e-08 / H0 17/17 Jaccard 1.000；oracle B 七 diff 7/7 全绿（R Δ≤4.6e-07）；oracle 命中主裁决 4/4、并集 14/22 ≥ P0 基线；oracle B 导出 `eval/fixtures/oracle-hobby.json`。def 口径统一（bundle 改吃 all_defs/changed_defs）→ PR181 分组实测变化记录在案（4→3 组、28 文件大格；research §6 + followup）。收口 code-review：subagent lane 宿主故障 → `bg_delegate` 双镜片，🔴0/🟡8 全修（含 git argv `--end-of-options`、读守卫、台账只读）/🔵4/💭5；修后门 8 例复跑全绿。`--no-ff` 合回（eaf8bb5）。
+前置 #1（用户裁选项 1）小分量并池：≤3 文件 ∧ est ≤ 预算/4 作原子单元与孤立文件同池（GroupingStats.pooled_small_components）；PR181 7→4 组、cross_import=0 保持。批 A：src/risk/ 移植 P0 v4（成区主/涟漪、四类信号常量权重、H0 θ=1.5 ∧ ≥2 类、R、预算三档 4/12/32 帽 48，零旋钮）；阶段 0 接线 RunMeta.risk + --pack-only 一行 + resume 沿用；redteam-next risk 只读回放子命令（读历史 commit 不依赖工作树）+ risk_replay.py compare（θ/R/Jaccard 三判定）；先修 Python 两处已核实缺陷（parse_diff 状态机守卫、e3 anchored 恒真式）。回放门：PR181 R Δ=3.4e-08 / H0 17/17 Jaccard 1.000；oracle B 七 diff 7/7 全绿（R Δ≤4.6e-07）；oracle 命中主裁决 4/4、并集 14/22 ≥ P0 基线；oracle B 导出 eval/fixtures/oracle-hobby.json。def 口径统一（bundle 改吃 all_defs/changed_defs）→ 分组实测变化记录在案（research §6 + followup）。收口 code-review（subagent lane 宿主故障 → bg_delegate 双镜片）：0 阻塞 / 8 重要全修（含 git argv --end-of-options、读守卫、台账只读）/ 4 建议 / 5 讨论；修后门 8 例复跑全绿。--no-ff 合回（eaf8bb5）。
 
 ### Git Commits
 
 | Hash | Message |
 |------|---------|
 | `21de550` | feat(bundle): 小分量与孤立文件同池装箱——压组数（M21b 前置 #1，D14） |
+| `69ff71d` | chore(task): m21b-risk 规划制品——prd 收敛 / design / implement / jsonl（批 A 脑暴收口） |
 | `56f0397` | feat(risk): 成区——hunk→def 块、padded 兜底、主区/涟漪二梯队（design §3.3，P0 v4） |
 | `9fc0bbc` | feat(risk): 四类信号（路径/结构/外部API/历史）+ 乘子 + 常量权重表（P0 v4 定案） |
 | `c7b1b42` | feat(risk): H0 门槛（θ=1.5 且 ≥2 类）+ R 风险分 + 预算三档 4/12/32 帽 48（design §3.3/§6） |
 | `b5d1ee1` | feat(cli): 阶段 0 风险路由接线——H0/R/tier/预算入 RunMeta 与 --pack-only（design §2） |
 | `1f72af5` | feat(eval): risk compare 子命令 + redteam risk 只读子命令——Rust 实现对拍 Python v4 回归门（D11） |
-| `4156796` | docs(risk): def 口径统一分组回归记录——PR181 groups 4→3/edges 111→152/28 文件大格 |
-| `03f056c` | fix(risk,eval): 批 A 评审修 8 条——(?s) 注释剥离、parse_hunks 状态机守卫、compare θ/Jaccard、git argv --end-of-options×3、读守卫、台账只读、注释勘误、次序与精度 |
+| `4156796` | docs(risk): def 口径统一分组回归记录——PR181 groups 4→3/edges 111→152/28 文件大格（预期内变化，research §6） |
+| `03f056c` | fix(risk,eval): 批 A 评审修 8 条——关键词注释跨行剥离（(?s)）、parse_hunks 状态机守卫、compare θ/Jaccard 判定、git argv --end-of-options×3、工作树读守卫、台账只读打开、标定注释勘误、risk 调用次序与打印精度 |
 | `3d4cb01` | chore(review): 批 A 收口 code-review 制品（0f434df..4156796）——0 阻塞 / 8 重要（全修）/ 4 建议 / 5 讨论 |
-| `eaf8bb5` | merge(m21b-risk): 批 A 风险评分器合回（--no-ff） |
-| `840d8ac` | fix(test): 清理批 B 合并遗留的 2 处 unused import（Origin） |
+| `840d8ac` | fix(test): 清理批 B 合并遗留的 2 处 unused import（Origin）——恢复 clippy 存量口径 |
+| `be6b3b1` | docs(roadmap,plan): 批 A 台账口径勘误——PR181 不带台账，dev 旧 proj.db + --before 为 oracle B 侧口径（P0 §15.1） |
 
 ### Status
 
 [OK] **Completed**
+
+### Next Steps
+
+- 批 C（m21b-deep）前提 A+B 已合回，可开工；m21b-risk 工作树/分支已合并可清理
