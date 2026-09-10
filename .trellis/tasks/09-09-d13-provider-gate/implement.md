@@ -31,10 +31,10 @@
 - [x] `make build`；DeepSeek 单 scanner、`--format json` 跑本仓 dogfood 或 PR181（记录只进 `.next/private/m21a/` 或 `.next/private/d13/`）：`run.warnings` 无排队告警、`queue_wait_ms` ≈ 0、cell 零失败。
 - [x] 临时配置该 provider `maxConcurrency: 2` 再跑：本仓 dogfood 只有 2 格，改用门宽 1 观测——排队告警在场、g1 `queue_wait_ms` 173.5 s、`provider_inflight_peak == 1`；临时 home 在 /tmp，用户配置未动。记录 `.next/private/d13/2026-09-09-d13-provider-gate-real-run-record.md`。
 - [x] `.next/roadmap/followup.md`「`scanners.workers` 形态」行归属列追加「✅ M21a 收口批 <两个 commit 短 sha>」。
-- [ ] Commit：`docs(roadmap): D13 收口批落地记录——followup 行归位、真跑核验数字`
+- [x] Commit：`docs(roadmap,task): D13 收口批落地记录…`（3fe0f94）
 
 ## 4. 评审修
-- [ ] code-review 子 agent（high）审步 1-2 的 diff（SendMessage 钉范围 = 这两个 commit）；修 → 三道门 → Commit：`fix(provider,config): D13 收口批评审修——<条目>`。
+- [x] code-review 子 agent（high，三批 16 条：主 10 / Altitude 6 / Angle B 6，重合去后 11 修 5 延后）→ 修 → 三道门 → Commit `fix(provider,config,cli): D13 收口批评审修——…`（4aabec3）；延后项进 followup「D13 收口批评审延后项」。
 - [ ] `python3 ./.trellis/scripts/task.py finish`；交接写 `~/hobby/redteam/.remember/remember.md`。
 
 ## 验证命令

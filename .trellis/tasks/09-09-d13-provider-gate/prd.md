@@ -82,15 +82,23 @@
 | K10 | RunMeta 新增 `provider_rate_limit`（skip 空），不翻 schema 号 | 与 v4 其余观测字段同款；空时旧消费者零噪音 |
 | K11 | 只动 scanner 路径：`single_shot` / `tool_loop` / `verify.rs` 的 429 与信号量不变 | followup 已裁「队列侧随 M21b」；避免碰 M21b 要重写的件 |
 | K12 | 不开子分支，直接在 `feat/m21-review-engine` 做 | 单 session、无并行批；文档 commit 已在此分支 |
+| K13（评审修） | 429 等待者重试须经准入：`active < 有效门宽` 才预占在途，门满回去等下一次完成；被在途归零广播唤醒者先退避再准入 | code-review 高危：广播后零退避齐发且不受收窄门约束，K6 / K8 同时失效 |
+| K14（评审修） | 只有成功完成才唤醒等待者、才计 completions；Timeout / 5xx 只减在途 | 客户端超时不释放网关容量；失败当完成会让等待者撞门并错误收门 |
+| K15（评审修） | 429 计数按每次 HTTP 调用独立（`nth` 由重试循环传入，策略无计数状态） | 首发与修复轮共用一份额度会让修复轮首个 429 即放弃 |
+| K16（评审修） | `CellRecord.attempts` = 轮次 + 429 重试；`queue_wait_ms` = 门等待 + 429 排队等待 | 兑现「每 cell 门等待可读」，死字段 attempts 复活为真实口径 |
+| K17（评审修） | 排队告警扇出 / resume 共用 `registry::queue_warnings`，按收口时有效门宽；已收窄时不劝「调大」 | 与 429 告警不打架；resume 与扇出口径一致 |
+| K18（评审修） | HTTP 529 归 RateLimited 进排队重试；503 保持 Server（followup 待裁） | 529 = Anthropic 系 overloaded，与 SSE `overloaded_error` 同义 |
+| K19（评审修） | 尝试括号 RAII 守卫：future 被丢弃按 Failed 收尾 | job deadline `select!` 取消不泄漏在途 |
+| K20（评审修） | config 已删键统一 `removed` 表（`risk` / `workers`），`check_keys` 单机制 | 同文件不留两种「已删键」手法 |
 
 ## Acceptance Criteria
 
-- [ ] AC1 `Config::from_json(样例 v10)` 通过；含 `review.scanners.workers` 的旧配置解析成功、warning 含「已删除（D13）」且无「无定义」；`Config::default().review.max_concurrency == 10`；`maxConcurrency: 65536` 出「像是填错」warning；`samples: 0` 报错。
-- [ ] AC2 `run_scan_fanout`：4 格 / 门宽 1 → `inflight_peaks == 1`；门宽 2 → 2；3 格 / 门宽 1 → 告警 `scanner cells 3 on provider p > maxConcurrency 1: 2 cell(s) queued` 且派发序仍 diff 字节降序、结果 plan 序、`queue_wait_ms ≤ duration_ms`。
-- [ ] AC3 registry 三个 429 用例（R3 ①②③）通过；既有共享门 / 未注册用例不变。
-- [ ] AC4 `RunMeta::default()` 序列化不含 `provider_rate_limit`；赋值 round-trip；`redteam-next review --help` 含「无角色级 workers」且不含 `review.scanners.workers`。
-- [ ] AC5 真跑一次（PR181 或本仓 dogfood，DeepSeek 单 scanner，`--format json`）：`run.cells[*].queue_wait_ms` 在门宽 ≥ cell 数时全为 0 附近、`run.warnings` 无排队告警；临时把该 provider `maxConcurrency` 设 2 再跑一次：出现排队告警、被排队格 `queue_wait_ms` > 0、`provider_inflight_peak == 2`；两跑 cell 零失败。429 路径以单测为准（网关无法可靠触发）。
-- [ ] AC6 `cargo test` lib / e2e 全绿，clippy 不高于基线，`make verify` 绿；`git grep -n "workers"` 在 `src/` 只剩注释性历史引用或零命中。
+- [x] AC1 `Config::from_json(样例 v10)` 通过；含 `review.scanners.workers` 的旧配置解析成功、warning 含「已删除（D13）」且无「无定义」；`Config::default().review.max_concurrency == 10`；`maxConcurrency: 65536` 出「像是填错」warning；`samples: 0` 报错。
+- [x] AC2 `run_scan_fanout`：4 格 / 门宽 1 → `inflight_peaks == 1`；门宽 2 → 2；3 格 / 门宽 1 → 告警 `scanner cells 3 on provider p > maxConcurrency 1: 2 cell(s) queued` 且派发序仍 diff 字节降序、结果 plan 序、`queue_wait_ms ≤ duration_ms`。
+- [x] AC3 registry 四个 429 用例（R3 ①②③ + 评审修 ④ 准入 / 失败不算完成 / 预占）通过；既有共享门 / 未注册用例不变。
+- [x] AC4 `RunMeta::default()` 序列化不含 `provider_rate_limit`；赋值 round-trip；`redteam-next review --help` 含「无角色级 workers」且不含 `review.scanners.workers`。
+- [x] AC5（本仓 dogfood 2 格：缺省门宽零排队；门宽 1 → 排队告警 + g1 queue_wait 173.5 s + 峰值 1；记录 `.next/private/d13/`）真跑一次（PR181 或本仓 dogfood，DeepSeek 单 scanner，`--format json`）：`run.cells[*].queue_wait_ms` 在门宽 ≥ cell 数时全为 0 附近、`run.warnings` 无排队告警；临时把该 provider `maxConcurrency` 设 2 再跑一次：出现排队告警、被排队格 `queue_wait_ms` > 0、`provider_inflight_peak == 2`；两跑 cell 零失败。429 路径以单测为准（网关无法可靠触发）。
+- [x] AC6（lib 538 / e2e 17 / clippy 7 / verify 绿）`cargo test` lib / e2e 全绿，clippy 不高于基线，`make verify` 绿；`git grep -n "workers"` 在 `src/` 只剩注释性历史引用或零命中。
 
 ## Out of Scope
 

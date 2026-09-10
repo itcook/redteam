@@ -100,6 +100,21 @@ pub fn inflight_peaks(&self) -> BTreeMap<String, u32>               // 不变
 - `queue_wait_ms` 字段名 / 位置不变，语义收窄为门等待；resume / 旧记录仍 0。
 - 回滚点：两个代码 commit 各自可 revert；配置删键回滚会让专属 warning 消失、缺省回 4。
 
+## 5.1 评审修后的 `GateAttempts`（4aabec3，覆盖 §2.4）
+```
+on_rate_limited(nth, ra):
+    { lock; rate_limited += 1; others = active; shrink_to(min(cap−1, others)); limit = max(4, cap×2); seq0 = completions }
+    if nth > limit { return false }
+    loop {
+        if others == 0 { sleep(ra 或 backoff(nth)) }
+        else { join!(等 completions > seq0 或 active == 0, sleep(ra)); 若因 active == 0 醒 → sleep(ra 或 backoff(nth)) }
+        ra = None
+        { lock; if active < cap { active += 1（预占，attempt_begin 不再加）; return true } ; others = active; seq0 = completions }
+    }
+attempt_end(outcome): active −= 1; outcome == Ok → completions += 1、notify_one；active == 0 → notify_waiters
+retry_classified_with：AttemptGuard RAII（丢弃按 Failed）；nth 本调用内计
+```
+
 ## 6. 取舍
 - 不用 `tokio::sync::Semaphore` + `forget_permits`：它只能忘掉**可用**名额，无法把已发出的名额在释放时丢弃；自管计数 + Notify 二十行以内。
 - 不做 AIMD 加法回升：本轮回升需要「成功 N 次」的判据，网关限流形态未实测，先只降（RunMeta 可见），R9 数据回来再议。

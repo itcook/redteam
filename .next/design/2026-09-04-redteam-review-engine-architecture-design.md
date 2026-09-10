@@ -447,6 +447,12 @@ provider 名、model id 字典序（无语义）。`verifiers` 无任何模型�
   下一个请求完成（每次完成只唤醒一个等待者）或 Retry-After 取晚者再重试；429 重试独立计数，上限 = 当时有效门宽 × 2，不吃 2 次抖动预算；门收窄后
   多出的名额在释放时丢弃不归还（`InflightGate` 自管计数 + Notify）。RunMeta 与 run.warnings 记「provider X：429 × N，门宽 A → B」；每 provider
   每角色在途峰值、每 cell 门等待时长（`queue_wait_ms`）可读；路由到某 provider 的 cell 数 > 其门宽 → 排队告警指向 `maxConcurrency`。
+- **收口批评审修补记**（2026-09-09 code-review，Trellis `09-09-d13-provider-gate` 4aabec3）：撞 429 者的重试须经**准入**（`active <`
+  有效门宽才预占在途；门满则回去等下一次完成，每次成功完成只放一个），被在途归零广播唤醒者先退避再准入——不齐发；只有**成功**
+  完成才唤醒等待者（Timeout / 5xx 不算）；429 重试按每次 HTTP 调用独立计；HTTP 529 与 SSE `overloaded_error` 同归 RateLimited
+  （503 仍按 5xx，见 followup）；`CellRecord.attempts` = 轮次 + 429 重试、`queue_wait_ms` = 门等待 + 429 排队等待；排队告警按收口时的
+  有效门宽，已收窄时说明是收窄所致、不劝「调大」；尝试括号 RAII，取消不泄漏在途。延后的设计层争议（速率型 429 棘轮、时间预算放弃、
+  策略非 Option、503 归类）见 followup「D13 收口批评审延后项」。
 - 同角色即同档：不设 `tier` 字段。
 - 单轮超时：模型 `perTurnTimeoutSecs` > `REDTEAM_PER_TURN_SECS` > `实际生效 max_tokens ÷ 20 + 60s` > 150s〔D12〕。
 - 实测 TPS：DeepSeek v4 flash ~103、GLM 5.3 ~27（含思考）、Kimi K3 ~30。流式 + 显式 max_tokens 硬要求。
