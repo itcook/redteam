@@ -10,6 +10,12 @@ pub(crate) struct Lang {
     defs: &'static [(&'static str, &'static str)],
 }
 
+impl Lang {
+    pub(crate) fn exts(&self) -> &'static [&'static str] {
+        self.exts
+    }
+}
+
 // Rust def 正则：逐条照抄 eval/harness.py DEF_PATTERNS（已验证 119/119 符号锚定）。
 pub(crate) const RUST: Lang = Lang {
     exts: &["rs"],
@@ -320,21 +326,28 @@ pub(crate) struct Hunk {
     pub count: usize,
     pub changed: Vec<usize>,
     pub plus: Vec<(usize, String)>,
+    /// 删除行正文（不含 `-` 前缀），供风险规则结构信号（def 删除 / 签名改）。
+    pub minus: Vec<String>,
 }
 
 /// 按 hunk 拆 diff（唯一的 hunk 游走：`+++` / `---` 头与 `\` 标记跳过，删除点取当前新文件位置；
 /// `hunk_changed_lines` / `hunk_anchors` 由此派生）。
+/// 状态机守卫（2026-09-10 批 A，与 `eval/risk_replay.py` parse_diff 同口径）：`+++ `/`--- ` 只在首个
+/// `@@` 之前当文件头；进入 hunk 后列首 `++ `/`-- ` 是内容行（如 SQL 注释删除行 `--- …`），不再跳过丢弃。
 pub(crate) fn parse_hunks(diff: &str) -> Vec<Hunk> {
     let mut out: Vec<Hunk> = Vec::new();
     let mut new_line = 0usize;
     for raw in diff.lines() {
-        if raw.starts_with("+++ ") || raw.starts_with("--- ") || raw.starts_with('\\') {
+        if raw.starts_with('\\') {
+            continue;
+        }
+        if out.is_empty() && (raw.starts_with("+++ ") || raw.starts_with("--- ")) {
             continue;
         }
         if raw.starts_with("@@") {
             let (c, d) = parse_hunk_new_range(raw).unwrap_or((1, 1));
             new_line = c;
-            out.push(Hunk { start: c.saturating_sub(1), count: d, changed: Vec::new(), plus: Vec::new() });
+            out.push(Hunk { start: c.saturating_sub(1), count: d, changed: Vec::new(), plus: Vec::new(), minus: Vec::new() });
             continue;
         }
         let Some(h) = out.last_mut() else { continue };
@@ -344,7 +357,10 @@ pub(crate) fn parse_hunks(diff: &str) -> Vec<Hunk> {
                 h.plus.push((new_line.saturating_sub(1), raw[1..].to_string()));
                 new_line += 1;
             }
-            Some(b'-') => h.changed.push(new_line.saturating_sub(1)),
+            Some(b'-') => {
+                h.changed.push(new_line.saturating_sub(1));
+                h.minus.push(raw[1..].to_string());
+            }
             _ => new_line += 1,
         }
     }
@@ -623,6 +639,7 @@ mod tests {
         assert_eq!(hs.len(), 2);
         assert_eq!((hs[0].start, hs[0].count), (1, 2));
         assert_eq!(hs[0].plus, vec![(2, "added one".to_string()), (3, "added two".to_string())]);
+        assert_eq!(hs[1].minus, vec!["gone".to_string()]);
         assert_eq!(hs[0].changed, vec![2, 3]);
         assert_eq!((hs[1].start, hs[1].count, hs[1].changed.clone(), hs[1].plus.len()), (10, 0, vec![10], 0));
         // 与 hunk_changed_lines 同源
@@ -645,6 +662,18 @@ mod tests {
     fn rust_test_ranges_item_level_vs_mod_level() {
         let src: Vec<&str> = "#[cfg(test)]\nfn test_wrapper() -> u8 {\n    1\n}\npub fn production_fn() -> u8 { 2 }\n#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\n    fn case_one() {}\n}\n".lines().collect();
         assert_eq!(rust_test_ranges(&src), vec![(1, 3), (7, 9)]);
+    }
+
+    #[test]
+    fn parse_hunks_keeps_dash_content_lines_inside_hunk() {
+        // 状态机守卫：hunk 内列首 `+++ `/`--- ` 是内容行（added 正文 `++ …` / removed 正文 `-- …`），
+        // 不是文件头——旧实现整行跳过，plus/minus 丢行（与 Python parse_diff 已修缺陷同族）。
+        let diff = "@@ -1,2 +1,2 @@\n context\n+++ plus content\n--- minus content\n";
+        let hs = parse_hunks(diff);
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].plus, vec![(1, "++ plus content".to_string())]);
+        assert_eq!(hs[0].minus, vec!["-- minus content".to_string()]);
+        assert_eq!(hs[0].changed, vec![1, 2]);
     }
 
     #[test]

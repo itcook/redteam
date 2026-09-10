@@ -68,6 +68,18 @@ pub fn changed_files(dir: &std::path::Path, base: Option<&str>, branch_scope: bo
     }
 }
 
+/// 收集 `merge-base(base, head)...head` 的逐文件 diff（M21b 批 A `risk` 回放子命令）：
+/// 与 `changed_files` 的 branch 分支同构，但 head 可为任意历史 commit（回放 Oracle B 历史 diff，
+/// 不依赖工作树 checkout）；与 `replay_from_git` 的历史 commit 内容读取配套使用。
+/// `-M` 强开重命名检测 + 整份 diff 按文件切分（与 `eval/risk_replay.py` 的 `git diff -M` 口径一致：
+/// 纯重命名无 hunk → 不成区、不计行；逐路径 diff 会把重命名看成删除+全量新增产生假区）。
+pub fn changed_files_at(dir: &std::path::Path, base: &str, head: &str) -> anyhow::Result<Vec<FileChange>> {
+    let merge_base = git_at(dir, &["merge-base", "--end-of-options", base, head])?.trim().to_string();
+    let range = format!("{merge_base}...{head}");
+    let full = git_at(dir, &["diff", "--no-ext-diff", "-M", "--end-of-options", &range])?;
+    Ok(split_diff_by_file(&full))
+}
+
 /// 指定目录跑 git（M13 增量基建：hermetic 测试可用 tempdir 仓库，不依赖进程 cwd）。
 /// ANSI 关死同 `git()`（color.diff 必须显式 false，命令行 -c 恒优先于文件 config）。
 fn git_at(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
@@ -87,6 +99,12 @@ fn git_at(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
 /// R3 stamp：证据 HEAD（权威时刻 = 证据收集实跑刻，调用方与 changed_files 同刻调用）。
 pub fn head_sha_at(dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(git_at(dir, &["rev-parse", "HEAD"])?.trim().to_string())
+}
+
+/// 任意 rev 的 blob 内容（`git show <rev>:<path>`；M21b 批 A `risk` 回放：读历史 commit 文件，不依赖工作树）。
+/// 文件在该 rev 不存在 / 二进制 / IO 失败 → Err（调用方跳过该文件）。
+pub fn show_blob(dir: &std::path::Path, rev: &str, path: &str) -> anyhow::Result<String> {
+    git_at(dir, &["show", "--end-of-options", &format!("{rev}:{path}")])
 }
 
 /// 谱系守卫（增量守卫①）：sha 是否 HEAD 祖先。rebase/reset/amend 后 false

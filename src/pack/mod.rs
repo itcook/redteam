@@ -208,6 +208,7 @@ fn anchor_hunks(lines: &[&str], hunks: Vec<Hunk>) -> (Vec<Hunk>, bool) {
                 count: h.count,
                 changed: h.changed.iter().map(|&l| sh(l)).collect(),
                 plus: h.plus.into_iter().map(|(l, t)| (sh(l), t)).collect(),
+                minus: h.minus,
             }
         })
         .collect();
@@ -1822,9 +1823,9 @@ mod tests {
         file.extend(["fn beta_fn() {", "    let a1 = compute(1);", "    let a2 = compute(2);", "    let a3 = compute(3);", "    let a4 = compute(4);", "    let a5 = EDITED;", "}"].map(String::from));
         let refs: Vec<&str> = file.iter().map(String::as_str).collect();
         let plus: Vec<(usize, String)> = (0..5).map(|k| (1 + k, format!("    let a{} = compute({});", k + 1, k + 1))).collect();
-        let h = crate::diffsym::Hunk { start: 1, count: 5, changed: (1..6).collect(), plus };
+        let h = crate::diffsym::Hunk { start: 1, count: 5, changed: (1..6).collect(), plus, minus: Vec::new() };
         assert_eq!(anchor_offset(&refs, &h), 100, "4/5 吻合 → 偏移 +100");
-        let braces = crate::diffsym::Hunk { start: 3, count: 1, changed: vec![3], plus: vec![(3, "}".into())] };
+        let braces = crate::diffsym::Hunk { start: 3, count: 1, changed: vec![3], plus: vec![(3, "}".into())], minus: Vec::new() };
         assert_eq!(anchor_offset(&refs, &braces), 0, "低信息 + 行不参与定位");
     }
 }

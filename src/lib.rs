@@ -16,6 +16,7 @@ pub mod procinfo;
 pub mod project;
 pub mod prompt;
 pub mod provider;
+pub mod risk;
 pub mod state;
 pub mod tools;
 pub mod verdict;

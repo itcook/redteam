@@ -13,6 +13,9 @@ src/diffsym/mod.rs（rs / go / ts 三语言）。
          空热区 = 与该 oracle 集合任何条目都无交集的 H0 区间。
   report --pair replay.json:oracle.json:set ... [--dist replay.json ...] [--thetas 1.5,2,2.5,3]
          θ 曲线 + (规模, |H0|, R) 表 + 三档 max_cells 起步值。
+  compare <replay.json> <rust-out.json> [--tol 1e-6] [--show N] [--out FILE]
+         Rust `redteam-next risk` 输出（区级 H0）vs Python v4 回放对拍：报区级 Jaccard 与 R 差；
+         R 差 > 容差即退出码 1——改 θ / 权重必须过此门（D11 定案）。
   selftest
 """
 import argparse
@@ -23,6 +26,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import urllib.parse
 from collections import defaultdict
 
 # ---------------- 语言 def 正则（逐条照抄 src/diffsym/mod.rs） ----------------
@@ -138,7 +142,8 @@ def git(repo, *args, check=True):
 
 
 def show_lines(repo, head, path):
-    r = subprocess.run(["git", "-C", repo, "show", f"{head}:{path}"], capture_output=True, text=True, errors="replace")
+    # `--end-of-options`：head 来自 argv（与 Rust 侧同族防御，挡 `--output=` 类 option 注入）
+    r = subprocess.run(["git", "-C", repo, "show", "--end-of-options", f"{head}:{path}"], capture_output=True, text=True, errors="replace")
     return r.stdout.split("\n") if r.returncode == 0 else None
 
 
@@ -147,14 +152,19 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 def parse_diff(text):
     """unified diff → {path: {"hunks": [{"new_start", "new_count", "added": [(line_no, text)], "removed": [text]}],
-    "adds", "dels", "deleted": bool, "binary": bool}}（path = 新路径）。"""
+    "adds", "dels", "deleted": bool, "binary": bool}}（path = 新路径）。
+
+    状态机守卫（2026-09-10 M21b 前置核实修）：`+++ ` / `--- ` 仅在本文件首个 `@@` 之前当作文件头；
+    进入 hunk 后列首 `++` / `--` 是内容行（新加行正文以 `++ ` 开头 → 行文本 `+++ …`；删除行正文以
+    `-- ` 开头（SQL / Haskell 注释等）→ 行文本 `--- …`），不再误判文件头（旧行为：dels 少计、files 污染）。"""
     files, cur, hunk = {}, None, None
     new_line = 0
     for raw in text.split("\n"):
         if raw.startswith("diff --git "):
             cur, hunk = None, None
             continue
-        if raw.startswith("+++ "):
+        in_hunk = hunk is not None
+        if raw.startswith("+++ ") and not in_hunk:
             p = raw[4:].strip()
             if p == "/dev/null":
                 cur = None
@@ -162,7 +172,7 @@ def parse_diff(text):
             p = p[2:] if p.startswith("b/") else p
             cur = files.setdefault(p, {"hunks": [], "adds": 0, "dels": 0, "deleted": False, "binary": False})
             continue
-        if raw.startswith("--- "):
+        if raw.startswith("--- ") and not in_hunk:
             continue
         if raw.startswith("Binary files") and cur is not None:
             cur["binary"] = True
@@ -324,7 +334,7 @@ class Replayer:
     def fanin(self, name, own_file):
         if name in self._fanin_cache:
             return self._fanin_cache[name]
-        out = git(self.repo, "grep", "-w", "-c", "-e", name, self.head, "--", ".", f":(exclude){own_file}", check=False)
+        out = git(self.repo, "grep", "-w", "-c", "-e", name, "--end-of-options", self.head, "--", ".", f":(exclude){own_file}", check=False)
         n = 0
         for l in out.split("\n"):
             # 形如 <rev>:<path>:<count>
@@ -340,7 +350,7 @@ class Replayer:
     def hist_fix_count(self, path):
         if path in self._hist_cache:
             return self._hist_cache[path]
-        out = git(self.history_repo, "log", "--since=12.months.ago", "--format=%s", self.history_ref, "--", path, check=False)
+        out = git(self.history_repo, "log", "--since=12.months.ago", "--format=%s", "--end-of-options", self.history_ref, "--", path, check=False)
         n = sum(1 for s in out.split("\n") if s and FIX_COMMIT.search(s))
         self._hist_cache[path] = n
         return n
@@ -350,7 +360,7 @@ class Replayer:
             return []
         if self._ledger_cache is None:
             self._ledger_cache = {"upheld": defaultdict(list), "dismissed": defaultdict(list)}
-            con = sqlite3.connect(self.ledger)
+            con = sqlite3.connect("file:" + urllib.parse.quote(str(self.ledger)) + "?mode=ro", uri=True)
             for f, upd in con.execute("select file, updated_at from dismissed"):
                 # dismissed.updated_at 只有日期：按『严格早于作业当天』计，宁漏勿泄
                 if not self.before or upd[:10] < self.before[:10]:
@@ -623,6 +633,65 @@ def cmd_score(a):
             print(f"    miss {m['id']} file_hit={m['file_hit']} {m['topic'] or ''} {[(x['file'].rsplit('/',1)[-1], x['line_start'], x['line_end']) for x in m['anchors']]}")
 
 
+# ---------------- compare（Rust `risk` 输出 vs Python v4 回放的区级对拍，M21b 批 A 回归门） ----------------
+def zone_range(z):
+    r = z.get("ranges")
+    if r:
+        return (r[0][0], r[0][1])
+    return (z.get("start") or 1, z.get("end") or 1)
+
+
+def cmd_compare(a):
+    """Rust `redteam-next risk` JSON vs Python v4 replay JSON：报 H0 区级 Jaccard 与 R 差；
+    R 差 > 容差（默认 1e-6）退出码 1——改 θ / 权重必须过此门（D11）。"""
+    py = json.load(open(a.replay, encoding="utf-8"))
+    rs = json.load(open(a.rust, encoding="utf-8"))
+    py_items = [(z["file"], zone_range(z)) for z in py.get("h0", [])]
+    ru_items = [(z["file"], zone_range(z)) for z in rs.get("hotspots", [])]
+    used, pairs = set(), 0
+    ru_only = []
+    for f2, r2 in ru_items:
+        hit = False
+        for j, (f1, r1) in enumerate(py_items):
+            if j in used or f1 != f2:
+                continue
+            if overlap(r1, r2):
+                used.add(j)
+                pairs += 1
+                hit = True
+                break
+        if not hit:
+            ru_only.append((f2, r2))
+    py_only = [(f, r) for j, (f, r) in enumerate(py_items) if j not in used]
+    union = len(py_items) + len(ru_items) - pairs
+    jaccard = pairs / union if union else 1.0
+    theta_py, theta_ru = py.get("theta"), rs.get("theta")
+    theta_ok = theta_py is not None and theta_ru is not None and abs(theta_py - theta_ru) <= 1e-9
+    r_py, r_ru = py.get("R"), rs.get("r")
+    delta = abs((r_py or 0.0) - (r_ru or 0.0))
+    r_ok = delta <= a.tol
+    jac_ok = jaccard >= a.min_jaccard - 1e-9
+    ok = theta_ok and r_ok and jac_ok
+    result = {"python_theta": theta_py, "rust_theta": theta_ru, "theta_ok": theta_ok,
+              "python_R": r_py, "rust_r": r_ru, "r_delta": delta, "tol": a.tol, "r_ok": r_ok,
+              "python_h0": len(py_items), "rust_hotspots": len(ru_items), "matched": pairs,
+              "jaccard": round(jaccard, 4), "min_jaccard": a.min_jaccard, "jaccard_ok": jac_ok,
+              "rust_only": [{"file": f, "range": list(r)} for f, r in ru_only],
+              "python_only": [{"file": f, "range": list(r)} for f, r in py_only]}
+    if a.out:
+        json.dump(result, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    print(f"θ: python={theta_py} rust={theta_ru}: {'OK' if theta_ok else 'FAIL'}"
+          + ("" if theta_ok else "（两侧 θ 不一致——replay 须与 Rust THETA 同值生成）"))
+    print(f"R: python={r_py} rust={r_ru} Δ={delta:.6g} (tol {a.tol:g}): {'OK' if r_ok else 'FAIL'}")
+    print(f"H0: python={len(py_items)} rust={len(ru_items)} matched={pairs} jaccard={jaccard:.3f} "
+          f"(min {a.min_jaccard:g}): {'OK' if jac_ok else 'FAIL'}")
+    for f, r in ru_only[:a.show]:
+        print(f"  rust-only   {f}:{r[0]}-{r[1]}")
+    for f, r in py_only[:a.show]:
+        print(f"  python-only {f}:{r[0]}-{r[1]}")
+    sys.exit(0 if ok else 1)
+
+
 def cmd_report(a):
     thetas = [float(t) for t in a.thetas.split(",")]
     rows = []
@@ -679,6 +748,13 @@ def selftest():
     assert f["x.go"]["hunks"][0]["added"] == [(2, "c"), (3, "d")] and f["x.go"]["adds"] == 2 and f["x.go"]["dels"] == 1
     d2 = "diff --git a/g.go b/g.go\ndeleted file mode 100644\n--- a/g.go\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n"
     assert parse_diff(d2) == {}
+    # 状态机守卫（2026-09-10 M21b 前置修）：hunk 内列首 `-- ` / `++ ` 内容行不再误判文件头
+    d3 = "diff --git a/s.sql b/s.sql\n--- a/s.sql\n+++ b/s.sql\n@@ -1,3 +1,3 @@\n a\n--- old comment\n+++ new comment\n"
+    f3 = parse_diff(d3)
+    assert list(f3) == ["s.sql"], f3
+    assert f3["s.sql"]["dels"] == 1 and f3["s.sql"]["adds"] == 1, f3
+    assert f3["s.sql"]["hunks"][0]["removed"] == ["-- old comment"], f3
+    assert f3["s.sql"]["hunks"][0]["added"] == [(2, "++ new comment")], f3
     assert match_decl("    const resp = await fetch(u);", "ts") is None and match_decl("export const X = 1;", "ts")
     go3 = "func a() {\n\tx := 1\n}\n\nfunc b() {\n\ty := 2\n}".split("\n")
     assert enclosing_def_start(go3, 1, "go") == 0 and enclosing_def_start(go3, 5, "go") == 4
@@ -734,6 +810,14 @@ def main():
     r.add_argument("--pair", action="append"); r.add_argument("--dist", action="append")
     r.add_argument("--thetas", default="1.5,2,2.5,3")
     r.set_defaults(fn=cmd_report)
+    c = sub.add_parser("compare")
+    c.add_argument("replay", help="Python v4 回放 JSON（replay 子命令产物）")
+    c.add_argument("rust", help="Rust `redteam-next risk` 输出 JSON")
+    c.add_argument("--tol", type=float, default=1e-6, help="R 差容差（默认 1e-6）")
+    c.add_argument("--show", type=int, default=10, help="最多列出的单边未配对区数（默认 10）")
+    c.add_argument("--min-jaccard", type=float, default=1.0, help="区级 Jaccard 下限（默认 1.0：H0 区集须完全对齐）")
+    c.add_argument("--out", help="对拍结果 JSON 落盘路径")
+    c.set_defaults(fn=cmd_compare)
     t = sub.add_parser("selftest")
     t.set_defaults(fn=lambda a: selftest())
     a = ap.parse_args()

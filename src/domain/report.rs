@@ -264,6 +264,18 @@ pub struct RunMeta {
     /// 批 F-5：引用图分组观测（批 C `GroupingStats`，此前只在 `--pack-only` 可见）；旧 JSON / 无分组路径 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grouping: Option<crate::bundle::GroupingStats>,
+    /// M21b 批 A：阶段 0 风险路由（H0 区数 / R / 档位 / 预算格）；旧 JSON None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskMeta>,
+}
+
+/// 阶段 0 风险观测（serde default 兼容旧报告）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RiskMeta {
+    pub hotspots: u32,
+    pub r: f32,
+    pub tier: crate::risk::Tier,
+    pub budget_cells: u32,
 }
 
 /// v4（D13）：某 provider 本轮撞 429 的收敛记录——`hits` 次数、`cap` 配置门宽、`effective_cap` 收敛后门宽（design §12.3）。

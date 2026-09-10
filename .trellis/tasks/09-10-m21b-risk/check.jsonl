@@ -1,0 +1,2 @@
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§3.3 权重/θ/成区规则即 spec——验收逐条对照（常量化、无配置面、D11-3 零旋钮）"}
+{"file": "/Users/weilai/hobby/.worktrees/redteam/m21-review-engine/.next/private/research/2026-09-07-redteam-p0-validation-gate-research.md", "reason": "P0 §15.4 v4 权重表原文、§15.5 oracle B 基线（区间级 0.59/文件级 0.85）、PR181 基线（主裁决 4/4、并集 14/22）——回放门验收数字来源（gitignored，仅本机可读）"}
