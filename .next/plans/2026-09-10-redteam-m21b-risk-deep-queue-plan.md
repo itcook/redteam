@@ -94,7 +94,7 @@ git worktree add ~/hobby/.worktrees/redteam/m21b-review-primitives -b feat/m21b-
   extapi〔有 path 信号的区里外部包符号调用 ≥ 3：Go import / TS import / Rust use 解析排本模块与标准库，1.0〕；历史〔base 祖先
   12 个月 fix·bug·hotfix·revert·regress 提交 ≥ 3 → 0.5、≥ 6 → 1.0；台账 upheld 1.0 / dismissed 0.5，严格早于作业时刻——读
   proj.db `dismissed` 表与 `results` 内 upheld verdicts，带时间守卫；**数据源经 `--dismissed` 指定**，缺省读 `proj-next.db` 自身
-  （M21a 分库裁定：dev 旧库判例卡对 next 不可见）；PR181 出口对拍传 dev 旧 `proj.db` 复现 P0 标定条件〕；乘子〔声明区 ×0.5；测试路径或 `#[cfg(test)]` 之后 ×0.3；
+  （M21a 分库裁定：dev 旧库判例卡对 next 不可见）；**台账口径（2026-09-10 批 A 核实）**：PR181 回放不带台账（P0 §15.1：带则被测作业 upheld 泄漏），dev 旧 `proj.db` + `--before` 为 oracle B 侧口径〕；乘子〔声明区 ×0.5；测试路径或 `#[cfg(test)]` 之后 ×0.3；
   文档 / schema ×0.2〕。全部权重 = `const`，一处一张权重表 doc 注释引 P0 §15.4）。
 - 测试：每类信号合成用例各一；乘器叠加顺序；fan-in 假名过滤（`if` / `err` 类不算）；台账时间守卫（作业后记录不计分）。
 - Commit: `feat(risk): 四类信号（路径/结构/外部API/历史）+ 乘子 + 常量权重表（P0 v4 定案）`
