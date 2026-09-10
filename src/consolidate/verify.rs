@@ -320,7 +320,7 @@ pub async fn verify_findings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Finding, Origin, Severity, VerifyVerdict};
+    use crate::domain::{Finding, Severity, VerifyVerdict};
     use crate::provider::fake::FakeProvider;
     use crate::domain::RawFinding;
     use std::collections::BTreeMap;

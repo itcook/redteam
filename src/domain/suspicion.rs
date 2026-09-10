@@ -137,7 +137,7 @@ pub struct MergedSuspicion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::finding::{NeedKind, Origin, Severity};
+    use crate::domain::finding::{NeedKind, Severity};
 
     fn finding(id: &str) -> Finding {
         crate::domain::finding::fixtures::finding(id, Severity::High, 1, "m")
