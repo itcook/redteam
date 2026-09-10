@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/09-10-m21b-review-primitives/prd.md", "reason": "验收标准逐条：禁真空性质测试、共享头逐字节、流式旁路四断言（emit/截断/逐字节不变/终态一致）、互斥构造期报错、scan_score 不退化"}
+{"file": ".next/plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md", "reason": "Global Constraints 与批 B 各 task 测试清单——check 时的改动文件白名单与铁律 3/4/5 映射核对"}

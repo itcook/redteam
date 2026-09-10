@@ -303,6 +303,54 @@ pub struct ReviewParseStats {
     pub dropped_quote: u32,
 }
 
+/// finding 条目丢弃原因（`regularize_finding`）。
+pub(crate) enum DropReason {
+    BadPath,
+    NoQuote,
+}
+
+/// finding 条目宽容规整（M21b 批 B，`parse_review_output_with_stats` 与 `provider::stream_json::IncrementalFindings`
+/// 共用的单一真相源——旁路与终态字段语义一致）：行号钳 u32 域、severity 非法缺省 Medium、confidence 夹 0..1、
+/// title 截 300；quote 空 / 坏路径 → Err（调用方计数丢弃）。
+pub(crate) fn regularize_finding(o: &serde_json::Map<String, Value>) -> Result<crate::domain::RawFinding, DropReason> {
+    let Some(file) = o.get("file").and_then(Value::as_str).and_then(normalize_rel_path) else {
+        return Err(DropReason::BadPath);
+    };
+    let quote = o.get("quote").and_then(Value::as_str).unwrap_or("");
+    if quote.trim().is_empty() {
+        return Err(DropReason::NoQuote);
+    }
+    let line_start = as_line(o.get("line_start")).unwrap_or(1).clamp(1, u32::MAX as i64) as u32;
+    let line_end = (as_line(o.get("line_end")).unwrap_or(0).clamp(0, u32::MAX as i64) as u32).max(line_start);
+    let severity = o
+        .get("severity")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_value::<crate::domain::Severity>(Value::String(s.trim().to_lowercase())).ok())
+        .unwrap_or(crate::domain::Severity::Medium);
+    let title: String = o.get("title").and_then(Value::as_str).unwrap_or("").trim().chars().take(300).collect();
+    let body: String = o.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let recommendation: String = o.get("recommendation").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let confidence = match o.get("confidence") {
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.5),
+        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.5),
+        _ => 0.5,
+    };
+    let confidence = if confidence.is_finite() { confidence.clamp(0.0, 1.0) as f32 } else { 0.5 };
+    let hard_constraint = o.get("hard_constraint").and_then(Value::as_bool).unwrap_or(false);
+    Ok(crate::domain::RawFinding {
+        severity,
+        title,
+        body,
+        file,
+        line_start,
+        line_end,
+        confidence,
+        recommendation,
+        hard_constraint,
+        quote: quote.to_string(),
+    })
+}
+
 /// reviewer 输出 → `CellOutput::Review` 载荷（design §7 输出契约，与 `reviewer.md` 字段级对齐——铁律 5）。
 /// 顶层必须有 `findings` 数组——缺失即违约（`Parse`，走 `REPAIR_PROMPT_REVIEW`），不当空评审。
 /// `model`：reviewer family 名（`enrich` 写入 `models`；agreement 落地时刻真值由批 C 按队列记录改写）。
@@ -326,45 +374,11 @@ pub fn parse_review_output_with_stats(raw: &str, model: &str) -> Result<(crate::
             stats.dropped_malformed += 1;
             continue;
         };
-        let Some(file) = o.get("file").and_then(Value::as_str).and_then(normalize_rel_path) else {
-            stats.dropped_bad_path += 1;
-            continue;
-        };
-        let quote = o.get("quote").and_then(Value::as_str).unwrap_or("");
-        if quote.trim().is_empty() {
-            stats.dropped_no_quote += 1;
-            continue;
+        match regularize_finding(o) {
+            Ok(raw) => findings.push(crate::orchestrate::enrich(&raw, model)),
+            Err(DropReason::BadPath) => stats.dropped_bad_path += 1,
+            Err(DropReason::NoQuote) => stats.dropped_no_quote += 1,
         }
-        let line_start = as_line(o.get("line_start")).unwrap_or(1).clamp(1, u32::MAX as i64) as u32;
-        let line_end = (as_line(o.get("line_end")).unwrap_or(0).clamp(0, u32::MAX as i64) as u32).max(line_start);
-        let severity = o
-            .get("severity")
-            .and_then(Value::as_str)
-            .and_then(|s| serde_json::from_value::<crate::domain::Severity>(Value::String(s.trim().to_lowercase())).ok())
-            .unwrap_or(crate::domain::Severity::Medium);
-        let title: String = o.get("title").and_then(Value::as_str).unwrap_or("").trim().chars().take(300).collect();
-        let body: String = o.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let recommendation: String = o.get("recommendation").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let confidence = match o.get("confidence") {
-            Some(Value::Number(n)) => n.as_f64().unwrap_or(0.5),
-            Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.5),
-            _ => 0.5,
-        };
-        let confidence = if confidence.is_finite() { confidence.clamp(0.0, 1.0) as f32 } else { 0.5 };
-        let hard_constraint = o.get("hard_constraint").and_then(Value::as_bool).unwrap_or(false);
-        let raw = crate::domain::RawFinding {
-            severity,
-            title,
-            body,
-            file,
-            line_start,
-            line_end,
-            confidence,
-            recommendation,
-            hard_constraint,
-            quote: quote.to_string(),
-        };
-        findings.push(crate::orchestrate::enrich(&raw, model));
     }
     let (needs, needs_dropped, needs_truncated) = parse_needs(&v);
     stats.needs_dropped = needs_dropped;
