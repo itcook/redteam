@@ -304,6 +304,25 @@ pub fn cross_index(
     CrossIndex { entries }
 }
 
+/// 索引行形态（`render_cross_index` 与文件版 [`render_cross_index_for_file`] 共用）：
+/// `path (gN +a/-d) → [imports] ← [imported-by] [delta]`（空段省略；只有路径的分支文件只渲染路径）。
+fn index_line(e: &IndexEntry) -> String {
+    let mut s = match e.group {
+        Some(g) => format!("{} (g{} +{}/-{})", e.path, g + 1, e.adds, e.dels),
+        None => e.path.clone(),
+    };
+    if !e.forward.is_empty() {
+        s.push_str(&format!(" → [{}]", e.forward.join(", ")));
+    }
+    if !e.backward.is_empty() {
+        s.push_str(&format!(" ← [{}]", e.backward.join(", ")));
+    }
+    if e.delta {
+        s.push_str(" [delta]");
+    }
+    s
+}
+
 /// 为第 `for_group` 组渲染 `{{OTHER_CHANGED_FILES}}` 槽内容：本组之外的每个文件一行
 /// `path (gN +a/-d) → [imports] ← [imported-by] [delta]`（空段省略；只有路径的分支文件只渲染路径）。
 /// 排序：与本组有边的在前，其次按组号、路径。双帽（`MANIFEST_MAX_ENTRIES` / `MANIFEST_MAX_CHARS`）
@@ -326,22 +345,7 @@ pub fn render_cross_index(idx: &CrossIndex, for_group: usize) -> String {
     if cands.is_empty() {
         return String::new();
     }
-    let full = |e: &IndexEntry| -> String {
-        let mut s = match e.group {
-            Some(g) => format!("{} (g{} +{}/-{})", e.path, g + 1, e.adds, e.dels),
-            None => e.path.clone(),
-        };
-        if !e.forward.is_empty() {
-            s.push_str(&format!(" → [{}]", e.forward.join(", ")));
-        }
-        if !e.backward.is_empty() {
-            s.push_str(&format!(" ← [{}]", e.backward.join(", ")));
-        }
-        if e.delta {
-            s.push_str(" [delta]");
-        }
-        s
-    };
+    let full = |e: &IndexEntry| -> String { index_line(e) };
     let degraded = |e: &IndexEntry| -> String {
         match e.group {
             Some(g) => format!("{} → see group {}", e.path, g + 1),
@@ -390,6 +394,28 @@ pub fn render_cross_index(idx: &CrossIndex, for_group: usize) -> String {
         }
     }
     format!("\n{}", lines.join("\n"))
+}
+
+/// 为单个文件渲染 reviewer 区域 pack 的跨组索引行（M21b 批 B，§10.6「只取本文件相关」）：
+/// 本文件行（带它自己的 → / ← 边）+ 与它有直接 import 边的其他改动文件各一行；边无关文件不列。
+/// 行形态与 [`render_cross_index`] 一致；文件级边数天然少，不动用组版双帽。无 entry 或全无边 → 空串（调用方渲染占位）。
+pub fn render_cross_index_for_file(idx: &CrossIndex, file: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(me) = idx.entries.iter().find(|e| e.path == file) {
+        if !me.forward.is_empty() || !me.backward.is_empty() {
+            lines.push(index_line(me));
+        }
+    }
+    let mut cands: Vec<&IndexEntry> = idx
+        .entries
+        .iter()
+        .filter(|e| e.path != file && (e.forward.iter().any(|p| p == file) || e.backward.iter().any(|p| p == file)))
+        .collect();
+    cands.sort_by(|a, b| (a.group.is_none(), a.group.unwrap_or(0), &a.path).cmp(&(b.group.is_none(), b.group.unwrap_or(0), &b.path)));
+    for e in cands {
+        lines.push(index_line(e));
+    }
+    lines.join("\n")
 }
 
 /// 每组各渲染一份（与 `dossiers` 等长等序，供 fan-out / 二阶段补查按组取用）。
