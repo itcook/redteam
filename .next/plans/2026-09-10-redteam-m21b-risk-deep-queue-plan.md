@@ -29,10 +29,8 @@
 
 ## 开工前置清单（M21b 前，followup 已记；批 A 开工前完成，产出进 followup / 决策记）
 
-- **分组策略议定**（M21a 出口两未达项 + followup）：PR181 7 组中 4 组是 ≤ 3 文件小强分量→小分量与孤立文件同池装箱 or 组数门槛
-  改「≤ 强分量数 + 1」（用户裁）；拆大格键按每格 **diff 字节**（非 pack 字节）、先切引用计数最低的强边（用户裁：样本太少，保持
-  followup 观测）。
-- **分组预算门（估算字节）与装包（切片字节）口径对齐**：PR181 `--pack-only` 回放（本工作树，数据落 `.next/private/m21b/`）。
+- **分组策略议定**：✅ 已偿（2026-09-10，Trellis `09-10-small-component-pooling`，用户裁选项 1〔D14〕）：小分量（≤3 文件且 est ≤ 预算/4，budget=None 不判）作原子单元与孤立文件同池装箱；PR181 7→4 组、cross_import=0 保持。拆大格键按每格 **diff 字节**（非 pack 字节）仍保持 followup 观测（用户裁：样本太少）。
+- **分组预算门（估算字节）与装包（切片字节）口径对齐**：PR181 `--pack-only` 回放（数据 `.next/private/m21b/pr181-packonly-pooling.txt`）：估算 bytes vs pack_bytes 系统性偏高 1.2–4.8x（保守拆）；两 over_budget 组仍撞 `maxFilesPerGroup`=10 而非字节帽——正式结论随 followup 观测，不改门。
 - **`GroupingStats` 分种计数**：✅ 已偿（2026-09-10，Trellis `09-10-grouping-stats-kinds`）：`cross_import` / `cross_reference` /
   `cross_same_dir` 三键（serde default）、`weak_cut` 删除（真切口径无独立信息量）；「强边不跨组」不变量哨兵测试；PR181 基线
   cross_import=0（复验强边不跨组不变量——恒为零，语义分组增量不在可观测范围，R8 判决另需跨组索引数据）/ cross_reference=2 / cross_same_dir=6、旧 weak_cut=55 虚高

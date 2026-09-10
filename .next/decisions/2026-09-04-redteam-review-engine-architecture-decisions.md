@@ -398,3 +398,13 @@ roadmap P0 ✅、followup 四行归位、M21b / M21c / M21e / M21a 的 `--risk` 
 - reviewer 常态只看一家笔记；agreement 对派发的影响只在积压时体现；两字段数据决定 M21e 是否加 hold。
 - `InflightGate` 从 tokio Semaphore 换自管计数 + Notify；M21a 收口批只动 scanner 路径，队列入口五态、agreement 两字段随 M21b。
 - design v10：§0 / §2 / §4 / §5 / §6 / §7 / §8.1 / §12 / §12.3 / §13 / §14 / §15 / §17 对应改；D2 加勘误；roadmap followup / M21a / M21b / M21c / M21e / README 同步。
+
+## D14 分组策略：小分量与孤立文件同池装箱（2026-09-10，M21b 前置）
+
+- **背景**：PR181 分组 7 组超「≤5」目标；4 组是 ≤3 文件小强分量（同目录文档对、schema+测试对）各自直出，组数随小分量数线性涨，每组一次 scanner 调用。
+- **裁定（用户，2026-09-10 m21b-risk 脑暴，二选一）**：选项 1——小分量（文件数 ≤ 3 且估算字节 ≤ 预算/4）作**原子单元**与孤立文件同池装箱；弃选项 2（组数门槛改「≤ 强分量数 + 1」，等价效果但规则绕、需二次定义强分量）。
+- **不变量**：小分量原子进池不拆散——强边不跨组保持（哨兵测试覆盖）；budget=None 无预算信息不判（保守分量直出）。
+- **零配置旋钮**：阈值常量 `SMALL_COMPONENT_MAX_FILES=3` / `SMALL_COMPONENT_BUDGET_DIV=4`，不加 `[review.grouping]` 键。
+- **观测**：`GroupingStats.pooled_small_components: Option<usize>`（serde default，旧报告 None ≠ 零）。
+- **标定**：PR181 budget=768K，四小分量 est 21–29K（占 3–4%）；回放 7→4 组、cross_import=0 保持、cross_reference=2 / cross_same_dir=6 / over_budget=2 不变；数据 `.next/private/m21b/pr181-packonly-pooling.txt`。
+- **代价（接受）**：不相关文件同格（小分量场景上下文增益本就低）；池格按 10 文件帽切缝新增弱边跨组（进 cross_same_dir 口径）。

@@ -341,7 +341,7 @@ mod tests {
             scanned_coverage: Some(0.5),
             stats: ScanStats { total: 1, cells_ok: 1, ..Default::default() },
         };
-        let r = ReviewReport { schema_version: SCHEMA_VERSION.into(), verdict: Verdict::ScanOnly, stats: Stats::default(), findings: vec![], clusters: vec![], run: RunMeta { grouping: Some(crate::bundle::GroupingStats { gate: crate::bundle::Gate::Grouped, groups: 1, edges: 0, cross_edges: 0, cross_import: Some(0), cross_reference: Some(0), cross_same_dir: Some(0), isolated: 0, over_budget: 0 }), ..Default::default() }, scan: Some(scan.clone()), cells: vec![rec] };
+        let r = ReviewReport { schema_version: SCHEMA_VERSION.into(), verdict: Verdict::ScanOnly, stats: Stats::default(), findings: vec![], clusters: vec![], run: RunMeta { grouping: Some(crate::bundle::GroupingStats { gate: crate::bundle::Gate::Grouped, groups: 1, edges: 0, cross_edges: 0, cross_import: Some(0), cross_reference: Some(0), cross_same_dir: Some(0), pooled_small_components: Some(0), isolated: 0, over_budget: 0 }), ..Default::default() }, scan: Some(scan.clone()), cells: vec![rec] };
         let j = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["verdict"], "scan-only");

@@ -126,6 +126,13 @@ pub enum Gate {
     Grouped,
 }
 
+/// 小分量进池阈值（followup:148 选项 1，2026-09-10 用户裁定）：多文件分量文件数 ≤ 此值且
+/// 估算字节 ≤ 预算/`SMALL_COMPONENT_BUDGET_DIV` 时，与孤立文件同池装箱压组数。
+/// PR181 标定：4 个 2-3 文件小分量 est 21-29K vs budget≈144K（占 15-20%）；
+/// budget = None 无预算信息时不判（保守分量直出）。
+const SMALL_COMPONENT_MAX_FILES: usize = 3;
+const SMALL_COMPONENT_BUDGET_DIV: usize = 4;
+
 impl Gate {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -159,6 +166,11 @@ pub struct GroupingStats {
     /// 端点异组的同目录边数（切缝与装箱分箱两类同源，无法也不必区分）。`None` 同上。
     #[serde(default)]
     pub cross_same_dir: Option<usize>,
+    /// 进孤立池装箱的多文件小分量单元数（≤ `SMALL_COMPONENT_MAX_FILES` 文件且 est ≤ 预算/4，
+    /// 2026-09-10 M21b 前置任务选项 1）。`None` = 旧格式报告未采集（serde default）；
+    /// 本二进制现算恒 `Some`（Single gate 单包路径为 0）。
+    #[serde(default)]
+    pub pooled_small_components: Option<usize>,
     /// 原图无边的文件数。
     pub isolated: usize,
     /// `over_budget` 的组数。
@@ -1189,7 +1201,7 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
     let n = changes.len();
     let empty_stats = |gate: Gate| GroupingStats {
         gate, groups: 0, edges: 0, cross_edges: 0, cross_import: Some(0), cross_reference: Some(0), cross_same_dir: Some(0),
-        isolated: 0, over_budget: 0,
+        pooled_small_components: Some(0), isolated: 0, over_budget: 0,
     };
     if n == 0 {
         return Grouping { bundles: Vec::new(), stats: empty_stats(Gate::Single) };
@@ -1315,22 +1327,39 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
         let bundle = make_bundle(&all, oversize(&all));
         let stats = GroupingStats {
             gate: Gate::Single, groups: 1, edges: edges.len(), cross_edges: 0, cross_import: Some(0),
-            cross_reference: Some(0), cross_same_dir: Some(0), isolated,
+            cross_reference: Some(0), cross_same_dir: Some(0), pooled_small_components: Some(0), isolated,
             over_budget: bundle.over_budget as usize,
         };
         return Grouping { bundles: vec![bundle], stats };
     }
 
     // ---- 分量 → 弱缝切 → 落单回池 ----
+    // 装箱单元 = 孤立/落单单文件 或 多文件小分量（≤ SMALL_COMPONENT_MAX_FILES 文件且 est ≤ 预算/4）：
+    // 小分量与孤立文件同池装箱压组数（followup:148 选项 1，2026-09-10 用户裁定；代价不相关文件同格）。
+    // 小分量原子进池不拆散——强边不跨组不变量保持；budget=None 无预算信息不判（照旧分量直出）。
+    let is_small_component = |ids: &[usize]| -> bool {
+        ids.len() > 1
+            && ids.len() <= SMALL_COMPONENT_MAX_FILES
+            && opts
+                .budget_bytes
+                .map(|b| est(ids) * SMALL_COMPONENT_BUDGET_DIV <= b)
+                .unwrap_or(false)
+    };
     let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut pool: Vec<usize> = Vec::new();
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    let mut pooled_small_components = 0usize;
     for comp in components(n, edges.iter().map(pair)) {
         if comp.len() == 1 {
-            pool.push(comp[0]);
+            units.push(vec![comp[0]]);
             continue;
         }
         if !oversize(&comp) {
-            groups.push(comp);
+            if is_small_component(&comp) {
+                pooled_small_components += 1;
+                units.push(comp);
+            } else {
+                groups.push(comp);
+            }
             continue;
         }
         let set: std::collections::BTreeSet<usize> = comp.iter().copied().collect();
@@ -1350,22 +1379,26 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
         for sub in components(comp.len(), strong_pairs) {
             let sub: Vec<usize> = sub.iter().map(|&k| comp[k]).collect();
             if sub.len() == 1 {
-                pool.push(sub[0]);
+                units.push(vec![sub[0]]);
+            } else if is_small_component(&sub) {
+                pooled_small_components += 1;
+                units.push(sub);
             } else {
                 groups.push(sub);
             }
         }
     }
-    // 孤立 / 落单文件：按（目录，路径）排序后贪心装箱到文件数与预算上限（K6）。
-    pool.sort_by(|&a, &b| (dir_of(&paths[a]), &paths[a]).cmp(&(dir_of(&paths[b]), &paths[b])));
+    // 孤立 / 落单 / 小分量：按单元首文件（目录，路径）排序后贪心装箱到文件数与预算上限（K6）；
+    // 宁降不拆对单元同样成立——单元自身超帽时整装并在 stats 标 over_budget，不拆分量。
+    units.sort_by(|a, b| (dir_of(&paths[a[0]]), &paths[a[0]]).cmp(&(dir_of(&paths[b[0]]), &paths[b[0]])));
     let mut bin: Vec<usize> = Vec::new();
-    for i in pool {
-        let fits = bin.len() < opts.max_files_per_group
-            && opts.budget_bytes.map(|b| est(&bin) + est(&[i]) <= b).unwrap_or(true);
+    for unit in units {
+        let fits = bin.len() + unit.len() <= opts.max_files_per_group
+            && opts.budget_bytes.map(|b| est(&bin) + est(&unit) <= b).unwrap_or(true);
         if !bin.is_empty() && !fits {
             groups.push(std::mem::take(&mut bin));
         }
-        bin.push(i);
+        bin.extend_from_slice(&unit);
     }
     if !bin.is_empty() {
         groups.push(bin);
@@ -1405,6 +1438,7 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
         cross_import: Some(cross_import),
         cross_reference: Some(cross_reference),
         cross_same_dir: Some(cross_same_dir),
+        pooled_small_components: Some(pooled_small_components),
         isolated,
         over_budget: bundles.iter().filter(|b| b.over_budget).count(),
     };
@@ -1695,7 +1729,7 @@ mod tests {
         assert_eq!(g.bundles.len(), 2);
         assert_eq!(paths_of(&g.bundles[0]), vec!["a/1.rs", "a/2.rs"]);
         assert_eq!(paths_of(&g.bundles[1]), vec!["b/1.rs", "b/2.rs"]);
-        assert_eq!(g.stats, GroupingStats { gate: Gate::Grouped, groups: 2, edges: 2, cross_edges: 0, cross_import: Some(0), cross_reference: Some(0), cross_same_dir: Some(0), isolated: 0, over_budget: 0 });
+        assert_eq!(g.stats, GroupingStats { gate: Gate::Grouped, groups: 2, edges: 2, cross_edges: 0, cross_import: Some(0), cross_reference: Some(0), cross_same_dir: Some(0), pooled_small_components: Some(0), isolated: 0, over_budget: 0 });
     }
 
     #[test]
@@ -1887,10 +1921,73 @@ mod tests {
         let stats: GroupingStats = serde_json::from_str(legacy).unwrap();
         assert_eq!((stats.groups, stats.cross_edges), (2, 4));
         assert_eq!((stats.cross_import, stats.cross_reference, stats.cross_same_dir), (None, None, None), "旧报告未采集 ≠ 实测为零");
+        assert_eq!(stats.pooled_small_components, None, "旧报告无池化键，未采集 ≠ 零");
         // 新格式序列化不再含 weak_cut 键；未采集键显式写 null（而非 0）
         let j = serde_json::to_string(&stats).unwrap();
         assert!(!j.contains("weak_cut"), "{j}");
         assert!(j.contains(r#""cross_same_dir":null"#), "{j}");
+    }
+
+    /// followup:148 选项 1（2026-09-10 用户裁定，M21b 前置）：小分量与孤立文件同池装箱压组数；
+    /// 小分量原子进池不拆散，强边不跨组不变量保持。
+    #[test]
+    fn group_pools_small_components_with_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        // 两个 2 文件小强分量（import 对）+ 一个孤立文件，预算充裕 → 同池一格
+        write(dir.path(), "a/x.ts", "import {y} from './y';\n");
+        write(dir.path(), "a/y.ts", "export const y = 1;\n");
+        write(dir.path(), "b/m.ts", "import {n} from './n';\n");
+        write(dir.path(), "b/n.ts", "export const n = 1;\n");
+        write(dir.path(), "z/iso.ts", "export const iso = 1;\n");
+        let changes: Vec<FileChange> = ["a/x.ts", "a/y.ts", "b/m.ts", "b/n.ts", "z/iso.ts"]
+            .iter().map(|p| fc(p, "+x")).collect();
+        let g = group(changes, Some(dir.path()), &open_gate(10, Some(10_000)));
+        assert_eq!(g.stats.pooled_small_components, Some(2));
+        assert_eq!(g.bundles.len(), 1, "两小分量 + 孤立同池一格: {:?}", g.bundles.iter().map(paths_of).collect::<Vec<_>>());
+        assert_eq!(g.stats.cross_import, Some(0), "分量内强边（import）不跨组");
+        // 同场景 budget=None：无预算信息不判小分量 → 照旧分量直出（3 组），池化为零
+        let changes: Vec<FileChange> = ["a/x.ts", "a/y.ts", "b/m.ts", "b/n.ts", "z/iso.ts"]
+            .iter().map(|p| fc(p, "+x")).collect();
+        let g = group(changes, Some(dir.path()), &open_gate(10, None));
+        assert_eq!(g.stats.pooled_small_components, Some(0));
+        assert_eq!(g.bundles.len(), 3, "budget=None 照旧: {:?}", g.bundles.iter().map(paths_of).collect::<Vec<_>>());
+    }
+
+    /// 大分量不进池：文件数超 SMALL_COMPONENT_MAX_FILES 或 est 超预算/4 → 直出成组。
+    #[test]
+    fn group_keeps_large_components_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        // 4 文件同目录分量（超 ≤3 阈值）+ 2 文件 import 对但预算紧（est > budget/4）→ 各自直出
+        for f in ["w/a.ts", "w/b.ts", "w/c.ts", "w/d.ts"] {
+            write(dir.path(), f, "export const v = 1;\n");
+        }
+        write(dir.path(), "t/big.ts", "import {side} from './side';\n");
+        write(dir.path(), "t/side.ts", &format!("export const side = 1;\n{}\n", "// pad".repeat(200)));
+        let changes: Vec<FileChange> = ["w/a.ts", "w/b.ts", "w/c.ts", "w/d.ts", "t/big.ts", "t/side.ts"]
+            .iter().map(|p| fc(p, "+x")).collect();
+        let g = group(changes, Some(dir.path()), &open_gate(10, Some(300)));
+        assert_eq!(g.stats.pooled_small_components, Some(0), "4 文件分量与 est 超限的 2 文件分量均不进池");
+        assert_eq!(g.bundles.len(), 2, "两分量各自成组: {:?}", g.bundles.iter().map(paths_of).collect::<Vec<_>>());
+    }
+
+    /// 池格双帽切分：小分量单元原子性——文件数帽将池切两格，分量不拆散、强边不跨组。
+    #[test]
+    fn group_pool_split_keeps_component_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in ["p1", "p2", "p3", "p4"] {
+            write(dir.path(), &format!("{d}/u.ts"), "import {v} from './v';\n");
+            write(dir.path(), &format!("{d}/v.ts"), "export const v = 1;\n");
+        }
+        let changes: Vec<FileChange> = ["p1/u.ts", "p1/v.ts", "p2/u.ts", "p2/v.ts", "p3/u.ts", "p3/v.ts", "p4/u.ts", "p4/v.ts"]
+            .iter().map(|p| fc(p, "+x")).collect();
+        // max_files_per_group=5：单元推进 [p1(2),p2(2),p3(2),p4(2)] → bin [p1,p2] 切后 [p3,p4]
+        let g = group(changes, Some(dir.path()), &open_gate(5, Some(10_000)));
+        assert_eq!(g.stats.pooled_small_components, Some(4));
+        assert_eq!(g.bundles.len(), 2, "文件数帽切池为两格: {:?}", g.bundles.iter().map(paths_of).collect::<Vec<_>>());
+        assert_eq!(g.stats.cross_import, Some(0), "切池不拆分量：import 强边不跨组");
+        for b in &g.bundles {
+            assert_eq!(b.files.len() % 2, 0, "每格含整数个小分量单元");
+        }
     }
 
     #[test]
