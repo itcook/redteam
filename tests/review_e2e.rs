@@ -528,7 +528,7 @@ fn pack_only_writes_packs_and_reports_bytes() {
 
     let text = render_pack_only(&report);
     assert!(text.contains("cell-1 files=2 bytes=") && text.contains(" est_tokens="), "{text}");
-    assert!(text.contains("grouping gate=single groups=1 edges=") && text.contains(" cross_import=") && text.contains(" cross_same_dir="), "{text}");
+    assert!(text.contains("grouping gate=single groups=1 edges=") && text.contains(" cross_import=") && text.contains(" cross_same_dir=") && text.contains(" pooled_small="), "{text}");
     assert!(text.contains(&format!("packs={}", report.packs_dir)), "{text}");
 
     let packs = std::path::Path::new(&report.packs_dir);
@@ -585,9 +585,14 @@ fn pack_only_two_groups_cross_index_lists_other_group_only() {
     };
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-q", "-b", "main"]);
+    // 每分量 4 文件（超小分量 ≤3 阈值，2026-09-10 前置任务：小分量已与孤立同池，2 文件对会被并格）
     for (rel, body) in [
         ("src/core/a.ts", big("a", "./b")), ("src/core/b.ts", big("b", "./a")),
+        ("src/core/e.ts", "import { a } from './a';\nexport const e_side = 1;\n".into()),
+        ("src/core/f.ts", "import { b } from './b';\nexport const f_side = 1;\n".into()),
         ("src/other/c.ts", big("c", "./d")), ("src/other/d.ts", big("d", "./c")),
+        ("src/other/g.ts", "import { c } from './c';\nexport const g_side = 1;\n".into()),
+        ("src/other/h.ts", "import { d } from './d';\nexport const h_side = 1;\n".into()),
     ] {
         let p = dir.path().join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -601,7 +606,7 @@ fn pack_only_two_groups_cross_index_lists_other_group_only() {
         format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
     };
     let report = run_pack_only(&args, &Config::default(), dir.path()).unwrap();
-    assert_eq!(report.cells.len(), 2, "四文件 / churn ≥ 200 / 两个连通分量 → 两组: {:?}", report.cells);
+    assert_eq!(report.cells.len(), 2, "两个 4 文件连通分量（超小分量阈值）→ 两组: {:?}", report.cells);
     let packs = std::path::Path::new(&report.packs_dir);
     let cell1 = std::fs::read_to_string(packs.join("cell-1.md")).unwrap();
     let cell2 = std::fs::read_to_string(packs.join("cell-2.md")).unwrap();
