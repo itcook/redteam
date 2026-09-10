@@ -13,7 +13,7 @@
 |---|---|---|---|
 | 1 | L4-B 三方契约注入（Rust 先行）：`use` → crate → Cargo.lock 精确版本 → registry 路径 → `pub fn` + 上方 `///`；同名歧义带 crate 标签全给、cap；默认全注入（签名 + doc，函数体按需）；registry 缺失 → 降级「无契约」并披露 | §9.4 B | `src/pack`（callee 注入扩根路径）, `src/diffsym` |
 | 2 | `needs{kind: api}` 联动：深挖 cell 带对应契约 + 函数体 | §9.4 C | `src/orchestrate/queue.rs`, `src/pack` |
-| 3 | 风险信号「关键模块 + 外部 API 密集」接入评分器 | §3.3 | `src/risk` |
+| 3 | 风险信号「关键模块 + 外部 API 密集」校准：extapi 信号 v4 已随 M21b 入 `src/risk`，本项只做与三方契约注入联动的「关键模块」判定与 k 阈值校准（D5） | §3.3, §9.4 | `src/risk` |
 | 4 | 仓库简介入稳定前缀：`.redteam/brief.md`（约 2K token）或复用 `--spec`；段位在系统协议之后、spec 之前；cache 回归 | §10.5 | `src/prompt/mod.rs` |
 | 5 | 切片调优（slice 已在 M21a 默认落地）：按 §10.2 回退信号加二跳选项、校准 `slice_min_bytes`；可选合成 util 文件 LITM 实验（原 E2 形态，挂 `.doc/TODO` 既有条目） | §10.2 | `src/pack/mod.rs` |
 | 6 | `anchor_window = ±N` 确定性后滤：落在改动行 ±N 外的疑点 / finding 降级或丢 | §10.4 | `src/positioning` |

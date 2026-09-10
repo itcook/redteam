@@ -1,9 +1,9 @@
-# M21b 风险路由与深挖队列 · 实施计划（五批 + 出口）
+# M21b 风险路由与深挖队列 · 实施计划（四批 + 出口）
 
-> 状态: 锁定（2026-09-10 派生自 design v10〔D13〕）· 上位 `../roadmap/M21b-risk-deep-queue.md`（范围与验收）· design
+> 状态: 锁定（2026-09-10 派生自 design v10〔D13〕；同日修订：删 aacr 接线批——D7 B4 暂退役、随 M21c smoke 重启点一并做；切点与回放口径对齐 D11）· 上位 `../roadmap/M21b-risk-deep-queue.md`（范围与验收）· design
 > `../design/2026-09-04-redteam-review-engine-architecture-design.md` §2 / §3.3 / §6 / §7 / §8.1 / §10.6-10.7 / §12.3 / §13 ·
 > 决策 D1 勘误, D2, D6, D7, D10, D11, D13 · P0 规则定案 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md` §15.4-15.7
-> **执行形态**：每批一个 Trellis 任务（`m21b-risk` / `m21b-review-primitives` / `m21b-aacr` / `m21b-deep` / `m21b-verifier`）+
+> **执行形态**：每批一个 Trellis 任务（`m21b-risk` / `m21b-review-primitives` / `m21b-deep` / `m21b-verifier`，**仅需 prd，design / implement 开工时 grill 或脑暴产出**）+
 > 一个子分支 `feat/m21b-<批>`（自 `feat/m21-review-engine` 切出，独立工作树）；批内小步提交；批收口用 dev `redteam` 跑 ship 评审，
 > 修完 `--no-ff` 合回 `feat/m21-review-engine`。出口验收在本工作树单 session。
 
@@ -31,10 +31,12 @@
 
 | 波 | 批（子分支） | 前提 | 碰撞点 |
 |---|---|---|---|
-| 1 | **A 风险评分器**（`feat/m21b-risk`）· **B reviewer 静态零件**（`feat/m21b-review-primitives`）· **C aacr 接线**（aacr-bench 仓分支 + 本仓 README） | 无，三批并行 | A 与 B 无文件交集（A: `src/risk/`+`src/cli/mod.rs` 接线段；B: `src/pack/`+`src/prompt/`+`src/provider/parse.rs`+`tool_loop.rs`）。C 不动本仓代码 |
+| 1 | **A 风险评分器**（`feat/m21b-risk`）· **B reviewer 静态零件**（`feat/m21b-review-primitives`） | 无，两批并行 | A 与 B 无文件交集（A: `src/risk/`+`src/cli/mod.rs` 接线段；B: `src/pack/`+`src/prompt/`+`src/provider/parse.rs`+`tool_loop.rs`） |
 | 2 | **D 深挖队列与 reviewer 运行时**（`feat/m21b-deep`） | A、B 合回 | 独占 `src/orchestrate/`、`src/cli/mod.rs` 主流程、`src/state/` |
-| 3 | **E verifier 流式段**（`feat/m21b-verifier`） | D 合回（finding 事件流） | 独占 `src/consolidate/verify.rs`、verifier.md；与 D 约定 `FindingEvent` 接口（D-3 定义） |
-| 4 | 出口验收（本工作树，单 session） | A-E 全合回；C 的 `--preview` 接线跑通放在出口（届时 D 已产 finding） | — |
+| 3 | **E verifier 流式段**（`feat/m21b-verifier`） | D 合回（finding 事件流） | 独占 `src/consolidate/verify.rs`、verifier.md；与 C 约定 `FindingEvent` 接口（C-3 定义） |
+| 4 | 出口验收（本工作树，单 session） | A-D 全合回 | — |
+
+（aacr 接线不在本里程碑：D7 B4 暂退役、重启节点待定，`reviewers/redteam.py` 随 M21c smoke 重启点一并做〔M21c 交付 7〕。）
 
 ```
 git worktree add ~/hobby/.worktrees/redteam/m21b-risk             -b feat/m21b-risk             feat/m21-review-engine
@@ -47,12 +49,12 @@ git worktree add ~/hobby/.worktrees/redteam/m21b-review-primitives -b feat/m21b-
 
 - 每 task：`cargo test` 全绿 + `cargo clippy --all-targets` 零新增 + `make verify` 绿 + commit（简体中文 `type(scope): 摘要——细节`，
   绝不 push）；改动只在 task 列出的文件与其测试；批内发现的新问题记 `.next/roadmap/followup.md`，不顺手修（Critical 除外）。
-- 铁律映射：新编排 pass 三标配（注入互斥 · 证据段预算帽 · 读守卫，B-5）；输出契约与 parse 字段级对齐（B-3 / E-3）；模板改动必跑对应
-  离线回归集（B: PR181 scan_score 不退化；E: verifier 二分类，D10/D9）；机制上线必带观测仪表（D-6）。
+- 铁律映射：新编排 pass 三标配（注入互斥 · 证据段预算帽 · 读守卫，B-5）；输出契约与 parse 字段级对齐（B-3 / D-3）；模板改动必跑对应
+  离线回归集（B: PR181 scan_score 不退化；D: verifier 二分类，D10/D9）；机制上线必带观测仪表（C-6）。
 - 无候补：cell 重试耗尽即失败进 coverage `failed`；reviewer cell 失败 / 预算截断 → 带债 approve（台账化披露，M21c 前先进 RunMeta）。
 - 无角色级 `workers` / 无 `--workers`（D13）：唯一闸 = provider 在途门；派发由门空位驱动。
 - dev 二进制与插件 `bin/redteam` 全程不动；`redteam-next` 不切名。
-- 不做：台账与增量轮激活（M21c）· 三方契约注入（M21d，reviewer pack 留空槽）· 第二家族 scanner（M21e）· 判例变体触发（E-2 预留
+- 不做：台账与增量轮激活（M21c）· 三方契约注入（M21d，reviewer pack 留空槽）· 第二家族 scanner（M21e）· 判例变体触发（D-2 预留
   触发枚举槽，判例数据 M21c 才有）· 候补 / failover。
 - 公司仓内容不进跟踪文件：测试 fixture 只用合成样本或本仓数据；PR181 跑分只落 `.next/private/`。
 
@@ -74,7 +76,7 @@ git worktree add ~/hobby/.worktrees/redteam/m21b-review-primitives -b feat/m21b-
 - Add: `src/risk/signals.rs`（路径 glob〔auth·secur·crypt·payment·billing·config·setting·secret·token·permission·migrat·callback·webhook〕
   1.0；新增行关键词类〔deser / exec_sql / condwrite / timeout / concurrency / destructive / auth / numeric_bounds / error_paths /
   resource_lifecycle〕每类 0.5 封顶 1.5，涟漪区看区体；结构〔签名行被改 1.0 | def 删除 1.0 | 新 def 0.5 | 公开面拓宽 0.5 | fan-in ≥ 5
-  〔`git grep -w` 跨仓、排本文件与测试、名须像符号，复用 E-3 词边界搜索〕1.0 | 区间改动行 ≥ 全 diff Q3 0.5 | 新文件 0.5 | 涟漪 1.0〕；
+  〔`git grep -w` 跨仓、排本文件与测试、名须像符号，复用 M21a 切片批 Task E-3〔文件外片段〕词边界搜索〕1.0 | 区间改动行 ≥ 全 diff Q3 0.5 | 新文件 0.5 | 涟漪 1.0〕；
   extapi〔有 path 信号的区里外部包符号调用 ≥ 3：Go import / TS import / Rust use 解析排本模块与标准库，1.0〕；历史〔base 祖先
   12 个月 fix·bug·hotfix·revert·regress 提交 ≥ 3 → 0.5、≥ 6 → 1.0；台账 upheld 1.0 / dismissed 0.5，严格早于作业时刻——读
   proj.db `dismissed` 表与 `results` 内 upheld verdicts，带时间守卫〕；乘子〔声明区 ×0.5；测试路径或 `#[cfg(test)]` 之后 ×0.3；
@@ -84,7 +86,8 @@ git worktree add ~/hobby/.worktrees/redteam/m21b-review-primitives -b feat/m21b-
 
 ### Task A-3 H0 门槛、R 分与预算三档
 - Add: `src/risk/mod.rs`（`route(changes, root, ledger, git) -> RiskRoute { hotspots: Vec<Hotspot>, r: f32, tier }`：score ≥ θ=1.5
-  **且**命中 ≥ 2 类信号才入 H0（关键词类单独不成区）；R = Σ_{H0} score ÷ (1 + ln(1 + 代码改动行))；切点 0.47 / 3.64 分 low / mid /
+  **且**命中 ≥ 2 类信号才入 H0（关键词类单独不成区）；R = Σ_{H0} score ÷ (1 + ln(1 + 代码改动行))；切点 **0.5 / 3.5**〔D11-4 锁定常量；
+  P0 §15.7 实测三分位 0.47 / 3.64 作回校参考，M21b 出口按截断数 / 台账落入数回校〕分 low / mid /
   high → `max_cells_hint = 4 / 12 / 32`（硬帽 48）；`budget_cells(tier, cfg.max_cells) -> u32`：`Fixed(n)` 直用、`Auto` 查表并
   `min(48)`）。
 - 测试：θ 边界；单类信号不出 H0；R 公式对拍 `risk_replay.py`（同 diff 同 R，容差 1e-6）；三档切点；Fixed 覆盖 Auto；帽 48。
@@ -98,11 +101,14 @@ git worktree add ~/hobby/.worktrees/redteam/m21b-review-primitives -b feat/m21b-
 - Commit: `feat(cli): 阶段 0 风险路由接线——H0/R/tier/预算入 RunMeta 与 --pack-only（design §2）`
 
 ### Task A-5 回放回归门
+- **前置核实**（followup「批 A 重做评审子 agent 提出、未核实项」）：`risk_replay.py` `parse_diff` 疑似把列首 `--` / `++`
+  内容行当文件头、`e3_contract_ab.py:315` `anchored` 疑似恒真式——两条先核实修正，再作回归门。
 - Modify: `eval/risk_replay.py`（加 `compare <replay.json> <rust-out.json>` 子命令：Rust `risk` 输出 vs Python v4 区级对拍，
   报区级 Jaccard 与 R 差；`--help` 用法段）、`src/cli/mod.rs` 或 `src/main.rs`（`redteam-next risk --base <b>` 只读子命令：
   跑阶段 0 风险路由打印 JSON〔供 compare 吃〕；不调 provider——裸终端可回归）。
-- 手动：PR181 + 本仓近期 5 个非 merge 提交回放（在本工作树，数据落 `.next/private/m21b/risk/`）：Rust vs Python 区级一致率、
-  oracle 命中不低于 P0 基线（PR181 主裁决 4/4、并集 14/22）。
+- 回放口径〔D11-3〕：**PR181（私有 fixture，`.next/private/`）+ 本仓 oracle B（入库 fixture；若尚无，本 task 把 P0 §15.5 oracle B
+  的本仓子集导出入 `eval/fixtures/`）**，数字写进 research；`θ 与权重改动必过此门`（在本工作树跑，数据落 `.next/private/m21b/risk/`）：
+  Rust vs Python 区级一致率、oracle 命中不低于 P0 基线（PR181 主裁决 4/4、并集 14/22）。
 - Commit: `feat(eval): risk compare 子命令 + redteam risk 只读子命令——Rust 实现对拍 Python v4 回归门（D11）`
 
 ### Task A-6 收口
@@ -162,34 +168,11 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
 
 ---
 
-## 批 C · aacr 接线（aacr-bench 仓分支 `redteam-adapter`，Trellis `m21b-aacr`）
-
-外部仓工作：`~/codes/aacr-bench`（已克隆 `itcook/aacr-bench`）开本地分支，不 push 上游；本仓只改 `eval/README.md`。
-
-### Task C-1 `reviewers/redteam.py`
-- Add（aacr-bench 仓）: `evaluation/reviewers/redteam.py`（适配器：输入 = 样本 diff + 仓检出；调 `redteam-next review --base <b>
-  --format json`；结果 `findings[]` → aacr 评审条目 `{path, start_line, end_line, content}` 映射；`REDTEAM_NEXT_BIN` 与
-  `AACR_BENCH_DIR` 环境变量；超时与退出码处理）。
-- 测试（aacr-bench 仓内）：合成小 diff + fake 二进制（shell stub）单测映射逻辑。
-- Commit（aacr-bench 仓）: `feat(evaluation): redteam reviewer 适配器——范围评审映射与接线`
-
-### Task C-2 pipeline 挂载 + 本仓 README
-- Modify（aacr-bench 仓）: pipeline 挂 `redteam` 为可选 reviewer（flag 控制，不进默认集）。
-- Modify（本仓）: `eval/README.md`（aacr 用法：`AACR_BENCH_DIR` 指向 fork 检出、`--preview` 单样本接线、`redteam.py` 依赖的
-  `REDTEAM_NEXT_BIN`）。
-- Commit（本仓）: `docs(eval): aacr-bench 接线说明——AACR_BENCH_DIR 与 redteam reviewer 用法`
-- **注**：真跑通 `--preview`（真二进制产 finding）放出口验收（批 D 合回后才有 finding 输出）；本批只验 fake 接线。
-
-### Task C-3 收口
-- 本仓 commit 合回 `feat/m21-review-engine`（只有 README）；aacr-bench 分支留在本地待 M21c smoke。
-
----
-
-## 批 D · 深挖队列与 reviewer 运行时（`feat/m21b-deep`，Trellis `m21b-deep`；前提 A、B 已合回）
+## 批 C · 深挖队列与 reviewer 运行时（`feat/m21b-deep`，Trellis `m21b-deep`；前提 A、B 已合回）
 
 核心编排批。reviewer cell 是 finding 唯一生产者；队列是编排器确定性代码（零 token）；派发由 provider 门空位驱动。
 
-### Task D-1 队列项与入口五态
+### Task C-1 队列项与入口五态
 - Add: `src/orchestrate/queue.rs`（`QueueItem { file, ranges, score, origin: Rule | Scan | Needs, notes: Vec<Suspicion>, agreement,
   state: Pending | InFlight | Settled, ... }`；`enqueue(&mut self, item) -> EnqueueOutcome` 五态：无命中 → 新项 agreement=1；
   排队中 → 并入〔异族 agreement+1、notes 追加、区间取并、重算 score，≥2 标必挖〕；在途 → 只改记录不注入不重挖；本轮已结案 → 并入
@@ -198,7 +181,7 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
 - 测试：五态各一构造用例；agreement 活值重算优先级；同家族不加；跨文件不合并。
 - Commit: `feat(orchestrate): 深挖队列项与入口五态——merge_suspicions 谓词复用、agreement 活值（design §6 规则 2〔D13〕）`
 
-### Task D-2 优先级、预算与必挖集
+### Task C-2 优先级、预算与必挖集
 - Modify: `src/orchestrate/queue.rs`（优先级键：主区 H0 最高 → 涟漪 → 疑点 `confidence × agreement × 类别权重` → needs 中档；
   **非 FIFO、不用置信阈值切**；预算 = A-3 `budget_cells`；必挖集 = 主区 H0 ∪ {agreement ≥ 2} **不截**〔confidence 只进优先级不做
   门〕；保底 = 疑点保留 ⌈max_cells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并披露；graceful drain：到期后在途跑完、未开跑者标
@@ -206,12 +189,12 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
 - 测试：优先级排序快照；必挖不截（0 预算用例）；保底配额；drain 后 skipped 项清单。
 - Commit: `feat(orchestrate): 优先级键+预算+必挖集不截+保底配额+graceful drain（design §6 规则 1/3/4〔D11〕）`
 
-### Task D-3 门驱动派发器与 reviewer cell 运行时
+### Task C-3 门驱动派发器与 reviewer cell 运行时
 - Add: `src/orchestrate/queue.rs` 派发器（tokio mpsc：scanner cell 为 sender、reviewer 为消费者；**单派发器**按 reviewer 条目所在
   provider 门空位弹出最高优先项——`registry.lease()` 天然等待门位，派发循环 = 「取空闲 reviewer 条目 × pop 最高项 × lease」；无
   worker 数〔D13〕；t=0 入队序 scanner 先于 H0〔§12.3 最长链优先〕；scan 来源项不等同组兄弟 cell〔先到先挖、后到并入记录〕）、
   `src/orchestrate/review_shot.rs`（`run_review_shot`：`build_review_prompt` + B-4 `on_text_delta` 挂 `IncrementalFindings` →
-  finding 闭合即 `store.append_partial` 流式落盘 + 发射 `FindingEvent`〔`tokio::mpsc`，批 E 的接口：finding + 落地时刻 agreement +
+  finding 闭合即 `store.append_partial` 流式落盘 + 发射 `FindingEvent`〔`tokio::mpsc`，批 D 的接口：finding + 落地时刻 agreement +
   reviewer family〕→ `parse_review_output` 终判；usage / attempts / queue_wait_ms 对齐 `ScanCall` 口径）。
 - Modify: `src/orchestrate/mod.rs`（`run_code_review` 接线：`run_scan_fanout` 每疑点 / needs 入队〔scan cell 完成回调里〕、
   A-4 的 H0 t=0 入队；reviewer cell 记录 `CellOutput::Review` 落 `cells` 表〔role=reviewer〕）。
@@ -219,7 +202,7 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
   慢模型超时 → 已闭合 finding 保留、cell 记失败。
 - Commit: `feat(orchestrate): 门驱动派发器+reviewer cell 运行时——流式落盘+FindingEvent 发射（design §6 规则 5/§7）`
 
-### Task D-4 barrier 与 reduce 接线
+### Task C-4 barrier 与 reduce 接线
 - Modify: `src/cli/mod.rs`（barrier：scanner 全完 ∧ 队列空 ∧ 在途 0 ∧ 复核在途 0 → reduce：`consolidate::dedup`〔已有〕→ 报告；
   verdict 从 findings 重建〔blocking 判定沿用 `verdict.rs`〕；报告 = findings + 疑点低置信披露〔`deep: skipped(budget)` 项不静默〕；
   scan-only 旧报告形态保留为「无 reviewer 条目时」的退化路径）、`src/domain/report.rs`（`DeepMeta { queue_depth_peak,
@@ -228,7 +211,7 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
   reviewer cell 失败 → 带债 approve + coverage failed。
 - Commit: `feat(cli): barrier 语义+reduce 接线——findings 报告重建、预算截断披露不静默（design §2/§6 规则 6/9）`
 
-### Task D-5 Phase Deep 与 resume 队列快照
+### Task C-5 Phase Deep 与 resume 队列快照
 - Modify: `src/state/mod.rs`（`Phase::Deep` / `Phase::Verify`〔serde lowercase；旧 `Refute` 保留可读，新作业不再打〕；
   checkpoint：`queue_items` 表写队列快照〔item JSON + state〕，每项状态转换时更新）、`src/cli/mod.rs`（`run_resume` 扩展：
   读快照 → Settled 项沿用已落盘 finding〔不双计〕、Pending/InFlight 重跑〔`run_review_shot` 重入〕；scan 记录沿用现有差集重放）。
@@ -236,22 +219,22 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
   scan-only resume 语义。
 - Commit: `feat(state): Phase Deep/Verify+队列快照 checkpoint+resume 读快照重跑（design §17 R14〔D11〕）`
 
-### Task D-6 观测收口
+### Task C-6 观测收口
 - Modify: `src/domain/report.rs` / `src/cli/mod.rs`（RunMeta：队列深度峰值、入队原因分布〔rule/scan/needs〕、去重命中、预算截断数、
-  项等待时长、每 reviewer cell 输出 token〔< `output_max_tokens`/2 的有界性口径〕、复核触发 / 跳过数〔批 E 填 refute 率〕、
+  项等待时长、每 reviewer cell 输出 token〔< `output_max_tokens`/2 的有界性口径〕、复核触发 / 跳过数〔批 D 填 refute 率〕、
   per-provider 每角色在途峰值〔`gate_stats` 已有，按角色分列〕、门等待时长、429 收敛门宽〔已有〕、派发时 / 落地时 agreement）。
 - 测试：RunMeta 快照含 deep 段全字段。
 - Commit: `feat(report): 深挖观测收口——队列/预算/等待/agreement 全链入 RunMeta（design §6 观测面）`
 
-### Task D-7 收口
+### Task C-7 收口
 - 本仓 dogfood：`redteam-next review --base dev`（或最近提交）端到端产 finding（真 provider，配置 reviewers 档）。
 - ship 评审（dev `redteam`）→ 修 → `--no-ff` 合回。
 
 ---
 
-## 批 E · verifier 流式段（`feat/m21b-verifier`，Trellis `m21b-verifier`；前提 D 已合回）
+## 批 D · verifier 流式段（`feat/m21b-verifier`，Trellis `m21b-verifier`；前提 C 已合回）
 
-### Task E-1 `verifier.md` 拆分
+### Task D-1 `verifier.md` 拆分
 - Add: `src/prompt/templates/verifier.md`（从 `adversarial-refute.md` 拆 verifier 角色尾：`analysis` 先于 `verdict` 且「不可撤回」；
   「找出这条 finding 不成立的证据」；输出契约 `REFUTED | UPHELD` + 理由 + analysis；共享头沿用）。
 - Modify: `src/prompt/mod.rs`（`build_verify_prompt`：finding + ±60 快照〔`verify.rs` 的 `source_snippet` 机器〕+ 判例摘要槽〔M21c
@@ -259,7 +242,7 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
 - 测试：共享头字节稳定；analysis 先于 verdict 的段序断言；模板哈希。
 - Commit: `feat(prompt): verifier.md 角色尾拆分——analysis 先于 verdict、怀疑者立场（design §8.1/§10.7）`
 
-### Task E-2 触发集、跳过与 verifier 选择
+### Task D-2 触发集、跳过与 verifier 选择
 - Add: `src/consolidate/verify.rs` 扩展（触发：`severity ≥ block ∧ confidence ≥ floor` + 判例变体槽〔枚举预留，M21c 填〕；
   跳过：两异族 scanner 标记〔finding 区域 agreement ≥ 2，按**落地时刻**值，后涨不回溯〕∧ reviewer 确认；verifier 选择：
   `[[verifiers]]` 有则用；缺省自动异族〔优先 reviewers 档 → scanners 档；`family` 缺省 model_id 首段〕；无异族 → 同族 + warning
@@ -267,21 +250,21 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
 - 测试：触发 / 跳过判定表；异族选择序；全 deepseek 构造 → 同族 + warning；enabled=false。
 - Commit: `feat(consolidate): verifier 触发集+跳过规则+异族自动选择（design §8.1〔D7〕）`
 
-### Task E-3 流式消费与 refute 率
+### Task D-3 流式消费与 refute 率
 - Modify: `src/consolidate/verify.rs`（改 `FindingEvent` 流消费者：finding 落地即入复核流〔与深挖尾部重叠〕，消费循环经
   `registry.lease()` 走同一 provider 门；verdict parse 对齐契约；`REFUTED` → confidence 归零、永不 blocking；`UPHELD` 原样；
-  调用失败 → 保守 upheld + warning；refute 率 = refuted ÷ 触发复核数 → RunMeta `refute_rate`；复核在途计数接入 D-4 barrier）、
+  调用失败 → 保守 upheld + warning；refute 率 = refuted ÷ 触发复核数 → RunMeta `refute_rate`；复核在途计数接入 C-4 barrier）、
   `src/cli/mod.rs`（`Phase::Verify` 打点；复核触发 / 跳过数入 RunMeta）。
 - 测试：Fake e2e——finding 落地 → verifier 消费 → refute 链路；失败保守 upheld；barrier 等复核在途归零。
 - Commit: `feat(consolidate): verifier 流式消费——finding 落地即复核、失败保守 upheld、refute 率入 RunMeta（design §8.1）`
 
-### Task E-4 离线回归集与基线
+### Task D-4 离线回归集与基线
 - Add: `eval/verify_score.py`（读 `eval/fixtures/ledger-{dismissed,upheld}.jsonl` → 逐条构造 finding + 快照 → 调
   `redteam-next verify`〔或 review 内嵌路径的只读出口〕→ 二分类准确率 / 混淆矩阵；`--baseline` 对比）。
 - 手动：跑一次全量 fixtures 记基线数字（真 provider，落 `.next/private/m21b/verify/` + research 引用）；改 verifier.md 必跑。
 - Commit: `chore(eval): verify_score.py——dismissed/upheld 二分类离线回归与基线（design §10.7〔D9〕）`
 
-### Task E-5 收口
+### Task D-5 收口
 - 模板回归：verifier 基线不低于本批首跑；scanner 路径零 diff。
 - ship 评审（dev `redteam`）→ 修 → `--no-ff` 合回。
 
@@ -298,16 +281,15 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
 | 5 | provider 门 | `maxConcurrency = 1` 构造；同 provider reviewer+scanner 门宽 < cell 数构造；PR181 全程 | 同 provider 串行可观测；入队序 scanner 先可观测；无 429/503 或有 429 时门宽收敛、cell 零失败 |
 | 6 | kill → resume | 后台 job 中途 kill | 从队列快照续跑；已落盘 finding 不丢不双计；未闭合对象丢弃计入 warning |
 | 7 | 输出有界性 | PR181 RunMeta 每 reviewer cell 输出 token | 全部 < `output_max_tokens`/2；FINALIZE/REPAIR 三层不触发 |
-| 8 | aacr 接线 | fork 检出 `--preview` 一个样本（真 `redteam-next`） | 跑通不计分，只验接线 |
-| 9 | 回归集 | `eval/risk_replay.py compare`；`eval/verify_score.py`；`eval/scan_score.py` | risk 对拍一致率与 oracle 命中不低于 P0 基线；verifier 二分类基线数字入 research；scanner 不退化 |
-| 10 | 门与文档 | `make verify`；`redteam-next --help` | 绿；含 `risk` 子命令与深挖说明；无 `engine` / `--risk` / `--models` / `--workers` |
+| 8 | 回归集 | `eval/risk_replay.py compare`；`eval/verify_score.py`；`eval/scan_score.py` | risk 对拍一致率与 oracle 命中不低于 P0 基线；verifier 二分类基线数字入 research；scanner 不退化 |
+| 9 | 门与文档 | `make verify`；`redteam-next --help` | 绿；含 `risk` 子命令与深挖说明；无 `engine` / `--risk` / `--models` / `--workers` |
 
 出口通过后：roadmap `M21b-risk-deep-queue.md` 交付项打勾、状态 ✅、README 表更新；三档预算与 refute 率数字写进
 `../private/research/`（或新 research）；主 checkout `.doc/roadmap/done.md` 记 M21b。
 
 ## 风险与回滚
 
-- **派发器是全新并发核心**：D-3 先用 Fake 多轮压测（乱序完成 / 慢 consumer / 429 注入）再接真 provider；死锁退路 = 派发循环超时
+- **派发器是全新并发核心**：C-3 先用 Fake 多轮压测（乱序完成 / 慢 consumer / 429 注入）再接真 provider；死锁退路 = 派发循环超时
   报警 + graceful drain 兜底。
 - 流式旁路（B-4）必须证明「无回调时逐字节不变」，否则 cache 与对拍基线全废——回归锚在 B-4 测试。
 - 慢模型 per-turn 死亡只丢未闭合对象（流式兜底），无旋钮；死亡率高调 `per_turn_timeout_secs`（followup 记录，不加新旋钮）。

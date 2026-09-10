@@ -29,5 +29,5 @@
 
 ## 风险
 
-- 第二家族快档若只有 30 tok/s 级：疑点体量小仍可落窗，但 verify 交叉模型池要保证与 finder 异族（pick_cross_model 语义）。
+- 第二家族快档若只有 30 tok/s 级：疑点体量小仍可落窗，但 verify 交叉模型池要保证与 finder 异族（D7 A4 异族选择语义）。
 - oracle 全集依赖历史 dogfood 数据完整度；先小集跑通再扩。

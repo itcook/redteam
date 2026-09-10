@@ -22,11 +22,11 @@ verifier 流式复核；墙钟由 provider 在途门与预算共同封顶（无�
 | 8 | resume 覆盖队列状态（R14 第二刀）：checkpoint 队列快照；Phase 枚举加 `Scan` / `Deep` / `Verify`（serde lowercase 向后兼容） | — | `src/state/mod.rs`, `src/cli/mod.rs` resume |
 | 9 | barrier 语义：scanner 全完 ∧ 队列空 ∧ 在途 0 ∧ 复核在途 0 → reduce（dedup → 台账 → 报告） | §2 | `src/orchestrate` |
 | 10 | 观测：队列深度、入队原因分布（rule / scan / needs）、去重命中、预算截断数、项等待时长、每 cell 输出 token、复核触发数 / 跳过数 / refute 率、per-provider 每角色在途峰值、门等待时长、429 收敛门宽、派发时 / 落地时 agreement〔D13〕 | §6, §8.1 | RunMeta / phase_history |
-| 11 | 出口顺手：fork `~/codes/aacr-bench` 加 `evaluation/reviewers/redteam.py`（范围评审 → `{path, start_line, end_line, content}` 映射）与 pipeline 分支；本仓 `eval/README` + `AACR_BENCH_DIR` | D7 B1 | fork；本仓 `eval/` |
 
 ## 不做
 
-台账与增量轮激活（M21c）· 三方契约注入（M21d，reviewer pack 预留槽位）· 默认翻转（M21c）· 候补 / failover（不做）。
+台账与增量轮激活（M21c）· 三方契约注入（M21d，reviewer pack 预留槽位）· 默认翻转（M21c）· 候补 / failover（不做）·
+aacr 接线（`reviewers/redteam.py` 等随重启点 M21c smoke 一并做，D7 B4：aacr 暂退役、重启节点待定）。
 
 ## 验收
 
@@ -38,7 +38,7 @@ verifier 流式复核；墙钟由 provider 在途门与预算共同封顶（无�
 - provider 在途门：`maxConcurrency = 1` 时同 provider 请求串行可观测；构造 reviewer 与 scanner 同 provider 且门宽 < cell 数 → 入队序可观测（scanner 先）；PR181 全程无 429 / 503，或有 429 时门宽收敛、cell 零失败（D13）。
 - 后台 job 中途 kill → resume 从队列快照续跑，已落盘 finding（流式持久化）不丢、不双计；未闭合对象丢弃且计入 warning。
 - 每个 reviewer cell 输出 < `output_max_tokens` 的 1/2（有界性验证，FINALIZE / REPAIR 三层不触发）。
-- `reviewers/redteam.py` 能在 fork 的 `--preview` 检出上跑通一个样本（不计分，只验接线）。
+- `reviewers/redteam.py` 等 aacr 接线不在本里程碑（D7 B4 暂退役，随 M21c smoke 重启点一并做）。
 - verifier 离线回归集：对 proj.db 历史 dismissed / upheld findings 的二分类准确率有基线数字并入 research；reviewer 回归 =
   PR181 上 H0 / 疑点 → finding 确认率与其后 refute 率可读。
 
