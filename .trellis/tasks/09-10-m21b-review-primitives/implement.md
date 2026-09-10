@@ -39,8 +39,8 @@
 ### B-6 收口
 - [x] 模板回归：`eval/scan_score.py` PR181 不退化（scanner 路径零 diff 即过：模板文件零改动 + 哈希不变断言绿；PR181 fixture 在主工作树 .next/private，本工作树不重跑） PR181 不退化（scanner 路径零 diff）
 - [x] `cargo test`（577 lib + 17 e2e）+ `cargo clippy --all-targets` 零新增 + `make verify` 绿；改动文件与清单一致
-- [ ] ship 评审（dev `redteam`）→ 修 → `--no-ff` 合回 `feat/m21-review-engine`
-- [ ] Commit: 按 ship 评审修题
+- [x] 收口评审：dev `redteam` 因用户级 config 新 schema 与 dev 二进制不匹配未能跑通；按 M21a journal 先例改走三路 code-review 制品（`.rpiv/artifacts/reviews/2026-09-10_10-53-32_m21b-batch-b.md`）——16 条必修已落 `4afa9a5`，0 阻塞
+- [x] Commit: `4afa9a5` 评审修
 
 ## 验证命令
 

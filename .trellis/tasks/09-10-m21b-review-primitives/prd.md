@@ -21,7 +21,7 @@ reviewer cell 的全部静态零件：`RegionPack` 构造即切片（+爆炸半�
 - [x] 共享头与 scanner prompt 头逐字节相同；模板哈希入册；模板字段名与 parse 一一对应（字段扫描测试）
 - [x] 流式旁路：三 finding 分片 → 三次 emit + 最终聚合一致；截断 → 已闭合保留、余下 discard 计数；无回调 backend 逐字节不变
 - [x] 互斥断言（笔记 + needs 证据并存 → 构造期报错）；读守卫命中用例（untracked + denylist）
-- [ ] 收口：dev `redteam` ship 评审通过 → `--no-ff` 合回
+- [x] 收口：三路 code-review 制品 0 阻塞（dev redteam 配置 schema 错位未能跑通，按 M21a 先例改道）→ `--no-ff` 合回
 
 ## Out of Scope
 

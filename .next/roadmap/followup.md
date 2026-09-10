@@ -189,3 +189,7 @@ coverage `failed` 数。
 - **`read_sse_with_delta` 与 `resp.text()` 等价性**：bytes_stream 聚合 + `from_utf8_lossy`；有效 UTF-8（SSE 恒是）下逐字节相同；无回调时 extract 短路（读取路径只剩字节聚合）。Cargo.toml 因此 +reqwest `stream` feature。
 - **agreement / models 真值**：`parse_review_output_with_stats` 经 `orchestrate::enrich` 填 agreement=1、models=[model]——批 C 按队列记录改写落地时刻 agreement（D13）。
 - **区域 pack 的 spec 段裁定**：spec 走共享头槽（与 scanner 共享头逐字节相同的验收迫使），不进 RegionPack——plan B-1 文本的「+ spec 段」按此解读，避免双份 token。
+- **批 C 接线必须写死**（评审修后仍属调用方契约）：`parse_review_output_with_stats` 后调 `anchor_review_findings`，把 `(dropped, dropped_unreadable)` 回填 `ReviewParseStats.dropped_quote`——plain `parse_review_output` 丢计数；`IncrementalFindings::finalize()` 在旁路消费结束 / cell 死亡处调用（截断余下 discard 计数）。
+- **双 Origin 同名**：`pack::region::Origin`（rule/scan/needs）与 `domain::finding::Origin`（carried/new）serde 都是小写词表——`QueueItem` 导入时改名或互指 doc，勿混队列来源与 finding 出身。
+- **组 pack `prepare_files` symlink 存量暴露**：本批只给 region 装配路径加 canonicalize+读帽；组 pack 路径来自 git diff（非模型可控），M21e 或安全债另记。
+
