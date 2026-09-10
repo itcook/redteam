@@ -139,29 +139,10 @@ pub fn parse_scan_output_with_stats(raw: &str) -> Result<(ScanOutput, ScanParseS
         let confidence = if confidence.is_finite() { confidence.clamp(0.0, 1.0) as f32 } else { 0.5 };
         out.suspicions.push(Suspicion { file, line_start, line_end, hint, category, confidence, quote: quote.to_string() });
     }
-    if let Some(needs) = v.get("needs").and_then(Value::as_array) {
-        for n in needs {
-            // `kind` 大小写宽容（`"Evidence"` 不整条丢；与 category 的 to_uppercase 同宽严，合并后审计 nit）
-            let mut n = n.clone();
-            if let Some(k) = n.get("kind").and_then(Value::as_str).map(|s| s.trim().to_lowercase()) {
-                n["kind"] = Value::String(k);
-            }
-            match serde_json::from_value::<NeedEntry>(n) {
-                Ok(mut e) => match normalize_rel_path(&e.path) {
-                    Some(p) => {
-                        e.path = p;
-                        out.needs.push(e);
-                    }
-                    None => stats.needs_dropped += 1,
-                },
-                Err(_) => stats.needs_dropped += 1,
-            }
-        }
-        if out.needs.len() > NEEDS_CAP {
-            stats.needs_truncated = (out.needs.len() - NEEDS_CAP) as u32;
-            out.needs.truncate(NEEDS_CAP);
-        }
-    }
+    let (needs, needs_dropped, needs_truncated) = parse_needs(&v);
+    stats.needs_dropped += needs_dropped;
+    stats.needs_truncated += needs_truncated;
+    out.needs = needs;
     if let Some(areas) = v.get("scanned_areas").and_then(Value::as_array) {
         for a in areas {
             let Some(ao) = a.as_object() else {
@@ -187,6 +168,35 @@ pub fn parse_scan_output_with_stats(raw: &str) -> Result<(ScanOutput, ScanParseS
 
 /// needs 帽（design §4：cap 5）。
 pub const NEEDS_CAP: usize = 5;
+
+/// needs 数组解析（scan / review 契约同构，M21b 批 B 抽出共用）：`kind` 大小写宽容、`NeedEntry` serde、路径规整、帽 5。
+/// 返回 (needs, dropped, truncated)。
+fn parse_needs(v: &Value) -> (Vec<NeedEntry>, u32, u32) {
+    let mut needs = Vec::new();
+    let mut dropped = 0u32;
+    if let Some(arr) = v.get("needs").and_then(Value::as_array) {
+        for n in arr {
+            // `kind` 大小写宽容（`"Evidence"` 不整条丢；与 category 的 to_uppercase 同宽严，合并后审计 nit）
+            let mut n = n.clone();
+            if let Some(k) = n.get("kind").and_then(Value::as_str).map(|s| s.trim().to_lowercase()) {
+                n["kind"] = Value::String(k);
+            }
+            match serde_json::from_value::<NeedEntry>(n) {
+                Ok(mut e) => match normalize_rel_path(&e.path) {
+                    Some(p) => {
+                        e.path = p;
+                        needs.push(e);
+                    }
+                    None => dropped += 1,
+                },
+                Err(_) => dropped += 1,
+            }
+        }
+    }
+    let truncated = needs.len().saturating_sub(NEEDS_CAP) as u32;
+    needs.truncate(NEEDS_CAP);
+    (needs, dropped, truncated)
+}
 
 /// 仓内相对路径规范化（与 `positioning::safe_read` 同口径，parse 层先挡一道）：非绝对、无 `..` 段；去 `./` 与重复分隔符，
 /// 按 `/` 重组——同一文件在不同 cell 里写法不同（`./src/a.rs` vs `src/a.rs`）时并集 / coverage 对账按串比对不会错开（评审 #9）。
@@ -268,6 +278,99 @@ pub const REPAIR_PROMPT_SCAN: &str = "Your previous response was not valid JSON 
 \"suspicions\" array). Re-emit ONLY the complete suspicions JSON object matching the schema: {\"suspicions\": [...], \
 \"needs\": [...], \"scanned_areas\": [...]}. If space is tight, shorten each suspicion's hint, but do NOT drop any suspicion \
 and do NOT omit any required field (file, line_start, line_end, hint, confidence, quote).";
+
+/// reviewer 契约的 repair 句（M21b 批 B）：同句式，指向 findings 对象；缺 `findings` 键同样走这里。
+pub const REPAIR_PROMPT_REVIEW: &str = "Your previous response was not valid JSON (it may have been truncated or missing the \\
+\"findings\" array). Re-emit ONLY the complete findings JSON object matching the schema: {\"findings\": [...], \\
+\"needs\": [...]}. If space is tight, shorten each finding's body/recommendation, but do NOT drop any finding \\
+and do NOT omit any required field (severity, title, body, file, line_start, line_end, confidence, recommendation, quote).";
+
+/// reviewer 契约 parse 的规整统计（M21b 批 B）：与 `ScanParseStats` 同构口径；`dropped_quote` 由
+/// `positioning::anchor_review_findings` 回填（quote 逐字硬约束在定位层，D11 同款），不静默。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReviewParseStats {
+    /// quote 空白 → 丢（finding 的定位锚，必填）。
+    pub dropped_no_quote: u32,
+    /// file 缺失 / 绝对路径 / 含 `..` → 丢。
+    pub dropped_bad_path: u32,
+    /// 条目不是对象 / 字段形状不可救 → 丢。
+    pub dropped_malformed: u32,
+    /// needs 条目缺 path / reason → 丢。
+    pub needs_dropped: u32,
+    /// needs 超帽（5）被截掉的条数。
+    pub needs_truncated: u32,
+    /// quote 定位失败（不在文件 / 文件不可读）——由 `anchor_review_findings` 回填，parse 层不填。
+    pub dropped_quote: u32,
+}
+
+/// reviewer 输出 → `CellOutput::Review` 载荷（design §7 输出契约，与 `reviewer.md` 字段级对齐——铁律 5）。
+/// 顶层必须有 `findings` 数组——缺失即违约（`Parse`，走 `REPAIR_PROMPT_REVIEW`），不当空评审。
+/// `model`：reviewer family 名（`enrich` 写入 `models`；agreement 落地时刻真值由批 C 按队列记录改写）。
+pub fn parse_review_output(raw: &str, model: &str) -> Result<crate::domain::CellOutput, ProviderError> {
+    parse_review_output_with_stats(raw, model).map(|(o, _)| o)
+}
+
+/// 同上，附规整统计。逐条规整而非整体拒绝（与 scan 同理：一条坏 finding 不作废整格）。
+/// 字段宽容对齐 scan：行号钳 u32 域、confidence 夹 0..1、severity 非法缺省 Medium；空 quote / 坏路径丢弃计数。
+pub fn parse_review_output_with_stats(raw: &str, model: &str) -> Result<(crate::domain::CellOutput, ReviewParseStats), ProviderError> {
+    let v = extract_json_object(raw).ok_or_else(|| {
+        ProviderError::Parse(format!("no JSON object in: {}", raw.chars().take(120).collect::<String>()))
+    })?;
+    let Some(items) = v.get("findings").and_then(Value::as_array) else {
+        return Err(ProviderError::Parse("review output has no \"findings\" array".into()));
+    };
+    let mut stats = ReviewParseStats::default();
+    let mut findings = Vec::new();
+    for it in items {
+        let Some(o) = it.as_object() else {
+            stats.dropped_malformed += 1;
+            continue;
+        };
+        let Some(file) = o.get("file").and_then(Value::as_str).and_then(normalize_rel_path) else {
+            stats.dropped_bad_path += 1;
+            continue;
+        };
+        let quote = o.get("quote").and_then(Value::as_str).unwrap_or("");
+        if quote.trim().is_empty() {
+            stats.dropped_no_quote += 1;
+            continue;
+        }
+        let line_start = as_line(o.get("line_start")).unwrap_or(1).clamp(1, u32::MAX as i64) as u32;
+        let line_end = (as_line(o.get("line_end")).unwrap_or(0).clamp(0, u32::MAX as i64) as u32).max(line_start);
+        let severity = o
+            .get("severity")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_value::<crate::domain::Severity>(Value::String(s.trim().to_lowercase())).ok())
+            .unwrap_or(crate::domain::Severity::Medium);
+        let title: String = o.get("title").and_then(Value::as_str).unwrap_or("").trim().chars().take(300).collect();
+        let body: String = o.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let recommendation: String = o.get("recommendation").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let confidence = match o.get("confidence") {
+            Some(Value::Number(n)) => n.as_f64().unwrap_or(0.5),
+            Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.5),
+            _ => 0.5,
+        };
+        let confidence = if confidence.is_finite() { confidence.clamp(0.0, 1.0) as f32 } else { 0.5 };
+        let hard_constraint = o.get("hard_constraint").and_then(Value::as_bool).unwrap_or(false);
+        let raw = crate::domain::RawFinding {
+            severity,
+            title,
+            body,
+            file,
+            line_start,
+            line_end,
+            confidence,
+            recommendation,
+            hard_constraint,
+            quote: quote.to_string(),
+        };
+        findings.push(crate::orchestrate::enrich(&raw, model));
+    }
+    let (needs, needs_dropped, needs_truncated) = parse_needs(&v);
+    stats.needs_dropped = needs_dropped;
+    stats.needs_truncated = needs_truncated;
+    Ok((crate::domain::CellOutput::Review { findings, needs }, stats))
+}
 
 /// parse 失败诊断化：把 turn.finish_reason 拼进 Parse 错误，区分「截断(length/max_tokens)」
 /// vs 其它形状违约——warnings 里能直接看出根因，而不是裸的 "no schema-valid JSON in: …"。
@@ -413,6 +516,70 @@ mod tests {
     // D1 四锚：200+error 体误分类修复。兼容网关把错误塞进 HTTP 200 body，
     // send_classified 判"成功"、旧逻辑 parse_*_turn 拿不到 content/choices → None → Parse
     // （不可重试，烧格）。error_body_to_provider_error 在 parse 之前先探这层。
+
+    fn review_item(extra: &str) -> String {
+        format!("{{\"severity\":\"high\",\"title\":\"t\",\"body\":\"harm chain\",\"file\":\"src/a.rs\",\"line_start\":3,\"line_end\":4,\"confidence\":0.7,\"recommendation\":\"fix it\",\"quote\":\"let x = 1;\"{extra}}}")
+    }
+
+    /// 批 B AC：围栏 / 前言 / think 块 / 字段宽容（行号钳 / severity 缺省 / confidence 夹）/ 坏条目丢弃计数 /
+    /// needs 帽 / enrich 全字段转换；缺 findings 键 / 截断 → Parse 错。
+    #[test]
+    fn review_parse_regularizes_each_item_and_counts_drops() {
+        let items = [
+            review_item(""),
+            review_item(",\"line_start\":0,\"line_end\":0,\"confidence\":7,\"severity\":\"catastrophic\""),
+            review_item(",\"confidence\":\"abc\",\"title\":\"{}\",\"hard_constraint\":\"yes\""),
+            "{\"file\":\"../etc/passwd\",\"quote\":\"q\"}".to_string(),
+            review_item(",\"quote\":\"   \""),
+            "\"not an object\"".to_string(),
+        ];
+        let needs: Vec<String> = (0..6).map(|i| format!("{{\"path\":\"src/n{i}.rs\",\"reason\":\"r\"}}")).chain(["{\"reason\":\"no path\"}".to_string()]).collect();
+        let raw = format!(
+            "<think>thinking {{ braces }}</think>\nSure! ```json\n{{\"findings\":[{}],\"needs\":[{}]}}\n```",
+            items.join(","), needs.join(",")
+        );
+        let (out, stats) = parse_review_output_with_stats(&raw, "glm-5.3").unwrap();
+        let crate::domain::CellOutput::Review { findings, needs } = out else { panic!("Review 载荷") };
+        assert_eq!(findings.len(), 3, "{stats:?}");
+        let (a, b, c) = (&findings[0], &findings[1], &findings[2]);
+        assert_eq!((a.line_start, a.line_end, a.confidence, a.severity), (3, 4, 0.7, crate::domain::Severity::High));
+        assert_eq!((b.line_start, b.line_end, b.confidence, b.severity), (1, 1, 1.0, crate::domain::Severity::Medium), "行号钳 / 非法 severity 缺省 Medium / confidence 夹");
+        assert!((c.title.chars().count() <= 300) && !c.hard_constraint, "title 截 / 非布尔 hard_constraint 缺省 false");
+        // enrich 全字段：id 生成、models 带 family、agreement=1、origin=New
+        assert!(!a.id.is_empty() && a.models == vec!["glm-5.3".to_string()] && a.agreement == 1);
+        assert_eq!(a.origin, crate::domain::Origin::New);
+        assert_eq!(needs.len(), NEEDS_CAP);
+        assert_eq!((stats.needs_dropped, stats.needs_truncated), (1, 1));
+        assert_eq!((stats.dropped_bad_path, stats.dropped_no_quote, stats.dropped_malformed), (1, 1, 1));
+        // 缺 findings 键 = 违约；截断 = 违约；空 findings 合法
+        let err = parse_review_output("{\"needs\":[]}", "m").unwrap_err().to_string();
+        assert!(err.contains("findings"), "{err}");
+        assert!(parse_review_output("{\"findings\":[{\"file\":\"a\",", "m").is_err());
+        assert!(parse_review_output("{\"findings\":[]}", "m").is_ok());
+        assert!(REPAIR_PROMPT_REVIEW.contains("findings") && REPAIR_PROMPT_REVIEW.contains("quote"));
+    }
+
+    /// 批 B：quote 定位失败丢弃 + 计数（anchor_review_findings，D11 逐字硬约束）。
+    #[test]
+    fn review_parse_quote_not_in_file_dropped_and_counted() {
+        let raw = format!(
+            "{{\"findings\":[{},{{\"severity\":\"low\",\"title\":\"ghost\",\"body\":\"b\",\"file\":\"src/a.rs\",\"line_start\":1,\"line_end\":1,\"confidence\":0.5,\"recommendation\":\"r\",\"quote\":\"THIS QUOTE DOES NOT EXIST\"}}]}}",
+            review_item("")
+        );
+        let (out, mut stats) = parse_review_output_with_stats(&raw, "m").unwrap();
+        let crate::domain::CellOutput::Review { findings, .. } = out else { panic!() };
+        assert_eq!(findings.len(), 2);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "fn a() {\n    let x = 1;\n}\n").unwrap();
+        let (kept, dropped, unreadable) = crate::positioning::anchor_review_findings(findings, tmp.path());
+        assert_eq!(kept.len(), 1, "真 quote 保留并重锚定");
+        assert_eq!((dropped, unreadable), (1, 0), "幻觉 quote 丢弃计数、非读失败");
+        stats.dropped_quote = dropped;
+        assert_eq!(stats.dropped_quote, 1);
+        assert_eq!(kept[0].line_start, 2, "定位改写行号到真实位置");
+    }
+
     #[test]
     fn error_body_openai_rate_limit_is_retryable() {
         let v = json!({"error": {"type": "rate_limit_error", "message": "slow down"}});

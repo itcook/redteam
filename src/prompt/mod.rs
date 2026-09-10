@@ -619,16 +619,7 @@ mod tests {
         assert!(render_precedents(&f, &many).chars().count() <= 4000, "总量帽生效");
     }
 
-    fn finding(title: &str, sev: crate::domain::Severity, agreement: u32, model: &str) -> crate::domain::Finding {
-        use crate::domain::{Finding, Origin};
-        Finding {
-            id: title.into(), severity: sev, title: title.into(), body: "b".into(),
-            file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), models: vec![model.into()],
-            agreement, hard_constraint: false, cluster_id: None, quote: "q".into(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
-        }
-    }
+    use crate::domain::finding::fixtures::finding;
 
     /// E11-Q5：卡片来自不可信仓 `.redteam/proj.db`（威胁模型 B），title/reason 若原样注入，
     /// 攻击者可用换行伪造 `- [fake]` 假判例条目或破坏 prompt 结构（二阶注入）。

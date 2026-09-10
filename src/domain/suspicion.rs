@@ -140,13 +140,7 @@ mod tests {
     use crate::domain::finding::{NeedKind, Origin, Severity};
 
     fn finding(id: &str) -> Finding {
-        Finding {
-            id: id.into(), severity: Severity::High, title: "t".into(), body: "b".into(),
-            file: "a.rs".into(), line_start: 1, line_end: 2, confidence: 0.9,
-            recommendation: "r".into(), models: vec!["m".into()], agreement: 1,
-            hard_constraint: false, quote: "q".into(), previously_dismissed: false,
-            origin: Origin::New, cluster_id: None, verify: None,
-        }
+        crate::domain::finding::fixtures::finding(id, Severity::High, 1, "m")
     }
 
     fn scan() -> CellOutput {

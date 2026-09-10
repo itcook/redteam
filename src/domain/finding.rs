@@ -225,3 +225,39 @@ mod tests {
         assert_eq!(v["origin"], "carried");
     }
 }
+
+/// 测试构造器（M21b 批 B 顺手项，followup 实现债）：verify / prompt / suspicion 三份合一——
+/// 新增字段时只改这里，不再逐处补。`#[cfg(test)]` 保证不进生产二进制。
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+
+    /// 标准测试 finding：`id` 兼作 title（三处旧构造的口径）、a.rs:1-1、quote "q"。
+    pub(crate) fn finding(id: &str, sev: Severity, agreement: u32, model: &str) -> Finding {
+        Finding {
+            id: id.into(),
+            severity: sev,
+            title: id.into(),
+            body: "b".into(),
+            file: "a.rs".into(),
+            line_start: 1,
+            line_end: 1,
+            confidence: 0.9,
+            recommendation: "r".into(),
+            models: vec![model.into()],
+            agreement,
+            hard_constraint: false,
+            quote: "q".into(),
+            previously_dismissed: false,
+            origin: Origin::New,
+            cluster_id: None,
+            verify: None,
+        }
+    }
+
+    /// evidence 类 needs 条目（reviewer needs 二阶段 / parse 帽测试共用；B-5 互斥断言起消费）。
+    #[allow(dead_code)]
+    pub(crate) fn need_evidence(path: &str, lines: &str) -> NeedEntry {
+        NeedEntry { path: path.into(), lines: Some(lines.to_string()), reason: "verify".into(), kind: NeedKind::Evidence }
+    }
+}

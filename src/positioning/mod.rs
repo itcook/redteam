@@ -152,11 +152,23 @@ pub fn anchor_suspicions(root: &Path, mut out: ScanOutput) -> AnchoredScan {
 
 /// 把 quote 确定性定位到真实行；定位失败即丢弃（确定性幻觉过滤，code 线每条 finding 须指向真实代码）。
 pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
+    anchor_review_findings(findings, root).0
+}
+
+/// reviewer finding 的 quote 逐字硬约束（M21b 批 B，design §7〔D11 同款〕）：定位成功改写行号，失败丢弃并计数
+/// （旧 `anchor` 的计数版——丢弃不静默，计数回填 `ReviewParseStats.dropped_quote`）；文件不可读单列。
+/// 返回 (kept, dropped_total, dropped_unreadable)。
+pub fn anchor_review_findings(findings: Vec<Finding>, root: &Path) -> (Vec<Finding>, u32, u32) {
     let mut out = Vec::new();
+    let (mut dropped, mut dropped_unreadable) = (0u32, 0u32);
     for mut f in findings {
         let content = match safe_read(root, &f.file) {
             Some(c) => c,
-            None => continue,
+            None => {
+                dropped += 1;
+                dropped_unreadable += 1;
+                continue;
+            }
         };
         match locate_quote(&content, &f.quote) {
             Some((ls, le)) => {
@@ -164,10 +176,10 @@ pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
                 f.line_end = le;
                 out.push(f);
             }
-            None => continue,
+            None => dropped += 1,
         }
     }
-    out
+    (out, dropped, dropped_unreadable)
 }
 
 #[cfg(test)]
