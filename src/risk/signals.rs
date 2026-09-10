@@ -59,6 +59,10 @@ fn test_path() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| re(TEST_PATH))
 }
+pub(crate) fn is_doc_path(path: &str) -> bool {
+    doc_path().is_match(path)
+}
+
 fn doc_path() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| re(DOC_PATH))
@@ -550,38 +554,54 @@ fn extapi_density(imports: &[Imp], added: &str) -> u32 {
 use std::collections::BTreeSet;
 
 #[cfg(test)]
+pub(crate) struct Stub {
+    pub fanin: BTreeMap<String, u32>,
+    pub hist: BTreeMap<String, u32>,
+    pub upheld: BTreeMap<String, u32>,
+    pub dismissed: BTreeMap<String, u32>,
+    pub new_files: BTreeSet<String>,
+}
+
+#[cfg(test)]
+impl Stub {
+    pub fn empty() -> Self {
+        Self {
+            fanin: BTreeMap::new(),
+            hist: BTreeMap::new(),
+            upheld: BTreeMap::new(),
+            dismissed: BTreeMap::new(),
+            new_files: BTreeSet::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ScoreEnv for Stub {
+    fn fanin(&mut self, name: &str, _own: &str) -> u32 {
+        self.fanin.get(name).copied().unwrap_or(0)
+    }
+    fn hist_fix_count(&mut self, path: &str) -> u32 {
+        self.hist.get(path).copied().unwrap_or(0)
+    }
+    fn ledger_upheld(&self, path: &str) -> u32 {
+        self.upheld.get(path).copied().unwrap_or(0)
+    }
+    fn ledger_dismissed(&self, path: &str) -> u32 {
+        self.dismissed.get(path).copied().unwrap_or(0)
+    }
+    fn is_new_file(&self, path: &str) -> bool {
+        self.new_files.contains(path)
+    }
+    fn go_module(&self) -> Option<&str> {
+        None
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::evidence::git::FileChange;
     use crate::risk::regions;
-
-    struct Stub {
-        fanin: BTreeMap<String, u32>,
-        hist: BTreeMap<String, u32>,
-        upheld: BTreeMap<String, u32>,
-        dismissed: BTreeMap<String, u32>,
-        new_files: BTreeSet<String>,
-    }
-    impl ScoreEnv for Stub {
-        fn fanin(&mut self, name: &str, _own: &str) -> u32 {
-            self.fanin.get(name).copied().unwrap_or(0)
-        }
-        fn hist_fix_count(&mut self, path: &str) -> u32 {
-            self.hist.get(path).copied().unwrap_or(0)
-        }
-        fn ledger_upheld(&self, path: &str) -> u32 {
-            self.upheld.get(path).copied().unwrap_or(0)
-        }
-        fn ledger_dismissed(&self, path: &str) -> u32 {
-            self.dismissed.get(path).copied().unwrap_or(0)
-        }
-        fn is_new_file(&self, path: &str) -> bool {
-            self.new_files.contains(path)
-        }
-        fn go_module(&self) -> Option<&str> {
-            None
-        }
-    }
 
     fn score_one(path: &str, src: &str, diff: &str, env: &mut Stub) -> Region {
         let mut contents = BTreeMap::new();
