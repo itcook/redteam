@@ -69,3 +69,24 @@ python3 eval/risk_replay.py compare .next/private/m21b/risk/pr181-py.json .next/
 python3 eval/risk_replay.py replay . <base> <head> --history-repo . --history-ref <base> \
   --ledger /Users/weilai/hobby/redteam/.redteam/proj.db --before <job created_at> --theta 1.5 --out .next/private/m21b/risk/ob-<tag>-py.json
 ```
+
+## 6. A-1 def 口径统一 → PR181 分组回归（预期内变化，记录在案）
+
+`changed_def_names` 由「hunk 首行锚定」改吃「全改动行 + `all_defs`/`changed_defs`」（followup 实现债，批 A 偿还）
+后，PR181 `--pack-only` 对比并池基线 `pr181-packonly-pooling.txt`：
+
+| 观测 | 基线（并池后） | def 统一后 |
+|---|---|---|
+| groups | 4 | 3 |
+| edges | 111 | 152 |
+| cross_edges / import / reference / same_dir | 8 / 0 / 2 / 6 | 12 / 0 / 2 / 10 |
+| pooled_small_components | 4 | 1 |
+| over_budget 格 | 2（11 + 12 文件） | 1（28 文件） |
+
+- **归因（探针核实）**：新名字集显著更全——全改动行覆盖多 def、且**测试 def 大量入集**
+  （如 `TestDeriveTransferDownloadTimeoutS`：测试文件 → 被测函数成为真实引用边），
+  组件更联通；`ProducerRequestSchema` 一类容器名因「最内层 def」语义被内层名替换（新集为空的个例）。
+- **判定**：属口径统一的预期内代价（改的就是引用边取名集），非缺陷；**强边仍不跨组**（cross_import=0）。
+  大格（28 文件 / est 328K / ladder=15）更需既有「拆大格」followup 杠杆（切分键按每格 diff 字节）。
+- 复现：`redteam-next review --pack-only --base a7c827b70`（PR181 仓）；输出
+  `.next/private/m21b/risk/pr181-packonly-after-defunify.txt`。

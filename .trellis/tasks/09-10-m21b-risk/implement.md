@@ -7,7 +7,7 @@
 ### Task A-1 成区：主区与涟漪区  ✅（56f0397）
 - [x] Add `src/risk/regions.rs`：`regions(changes, files) -> Vec<Region>`（hunk → enclosing def 块，复用 `diffsym` def 块与配平；局部 const 不算 def；无 def → hunk ±10 行 padded 只与 padded 相邻合并；相邻函数各自成区；`kind: Primary | Ripple`，涟漪 = 改动/新增/删除声明名在本文件 ≤4 处引用点的 enclosing def）
 - [x] **def 口径统一**：`bundle::changed_def_names` 改吃 `all_defs`/`changed_defs`（`pack::outside_names` 本即同源）
-- [x] 重跑 PR181 分组回归：与 `pr181-packonly-kinds.txt` 基线零变化（分组只消费 ref_worthy 名集，口径统一未改引用边判据）
+- [x] 重跑 PR181 分组回归（基线 = 并池后 `pr181-packonly-pooling.txt`）：**有实测变化，已记录在案**（groups 4→3、edges 111→152、pooled 4→1、大格 11+12 → 28 文件；归因 = 全改动行/测试 def 入引用边名集；见 research §6）
 - [x] 测试：三语言合成文件（def 块 / 无 def padded / 涟漪 ≤4 / 相邻不并 / 局部 const 不成区，7 测）
 - [x] Commit `feat(risk): 成区——hunk→def 块、padded 兜底、主区/涟漪二梯队（design §3.3，P0 v4）`
 
