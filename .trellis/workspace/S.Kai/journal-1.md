@@ -396,3 +396,33 @@ grill 定 D13（删角色 workers / 无 --workers、provider 门单把 FIFO 不�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 16: M21b 批 B reviewer 静态零件
+<!-- trellis-session: v=2 fp=26cd72759aaf3e5b -->
+
+**Date**: 2026-09-10
+**Task**: M21b 批 B reviewer 静态零件
+**Branch**: `feat/m21b-review-primitives`
+
+### Summary
+
+落地 RegionPack（构造即切片+半径+笔记）、reviewer.md+build_review_prompt、finding parse、IncrementalFindings SSE 旁路、三标配。三路 code-review 16 条必修已修（symlink 逃逸、REPAIR 转义、finalize、Drop guard、near 锚定）；dev redteam ship 因 config schema 错位未跑。--no-ff 合入 feat/m21-review-engine（27bf391）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `081ab70` | feat(pack): reviewer 区域 pack——构造即切片+半径+跨组索引+spec+笔记，契约槽留空（design §7/§10.2） |
+| `6f235b3` | feat(prompt): reviewer.md 角色尾 + build_review_prompt——共享头不变、段序同构、模板哈希（design §10.7〔D9〕） |
+| `039a299` | feat(parse): reviewer finding 契约 parse——字段级对齐 + REPAIR 一轮（铁律 5） |
+| `ce4ced4` | feat(provider): SSE 流式旁路——增量 JSON 解析、finding 对象闭合即落盘回调、未闭合丢弃计数（design §7〔D10〕） |
+| `f515ed4` | feat(pack): reviewer 三标配——注入互斥+证据预算帽+读守卫（铁律 4，second_pass 机器复用） |
+| `7b11f16` | docs(trellis): 批 B 工件勾选——B-1..B-5 完成态与验收记录 |
+| `d1c2b61` | docs(followup): M21b 批 B 接口接缝——批 C 接线零件清单与 on_text_delta take 语义 |
+| `4afa9a5` | fix(review): 批 B 评审修——REPAIR 句转义、截断 finalize、symlink 逃逸、Drop guard、near 锚定、索引双帽 |
+| `fb45684` | chore(review): 批 B code-review 制品（4afa9a5）——0 阻塞 / 16 条合回前必修已修；followup 记批 C 接线与双 Origin |
+
+### Status
+
+[OK] **Completed**
