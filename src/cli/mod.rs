@@ -15,7 +15,7 @@ use std::path::Path;
 
 pub(crate) mod deny;
 mod incremental;
-mod second_pass;
+pub(crate) mod second_pass;
 mod spec;
 mod tail;
 
