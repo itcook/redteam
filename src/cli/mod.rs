@@ -292,11 +292,12 @@ pub async fn run_code_review(
     let t0 = std::time::Instant::now();
 
     let selected = select_files(changes);
-    let risk = stage0_risk(&selected, root, args, cfg, head_sha.as_deref());
     let roles = cfg.active_roles();
     if roles.scanners.is_empty() {
         anyhow::bail!(NO_SCANNER_MSG);
     }
+    // 阶段 0 风险路由：放在 scanner 空校验之后（无 scanner 直接 bail，不空跑 git grep/log 一串子进程）。
+    let risk = stage0_risk(&selected, root, args, cfg, head_sha.as_deref());
     let entries: Vec<ScanEntrySpec> = roles.scanners.iter().map(ScanEntrySpec::from).collect();
     let model_names: Vec<String> = entries.iter().map(|e| e.route_key.clone()).collect();
 
@@ -719,7 +720,7 @@ pub fn render_pack_only(r: &PackOnlyReport) -> String {
     ));
     if let Some(risk) = &r.risk {
         out.push_str(&format!(
-            "risk hotspots={} r={} tier={} budget_cells={}\n",
+            "risk hotspots={} r={:.3} tier={} budget_cells={}\n",
             risk.hotspots, risk.r, risk.tier, risk.budget_cells
         ));
     }

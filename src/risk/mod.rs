@@ -195,7 +195,7 @@ pub fn route_from_git(
 ) -> RiskRoute {
     let mut contents = BTreeMap::new();
     for c in changes {
-        if let Ok(t) = std::fs::read_to_string(root.join(&c.path)) {
+        if let Some(t) = safe_read_in_root(root, &c.path) {
             contents.insert(c.path.clone(), t);
         }
     }
@@ -215,6 +215,28 @@ fn code_lines(changes: &[FileChange]) -> usize {
             a + d
         })
         .sum()
+}
+
+/// 被评仓是 untrusted（威胁模型 B，与 `tools` 读守卫同族）：改动路径只放行「仓内相对、无 `..`、
+/// canonicalize 后仍在仓根、常规文件」，并设读帽——恶意仓可用 git-tracked symlink 指向仓外
+/// （`/dev/zero` 类即无界读）。越界 / 读失败一律跳过（与「head 树无此文件」同路，不成区）。
+const RISK_READ_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+fn safe_read_in_root(root: &Path, rel: &str) -> Option<String> {
+    let p = Path::new(rel);
+    if p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return None;
+    }
+    let root_canon = root.canonicalize().ok()?;
+    let real = root.join(p).canonicalize().ok()?;
+    if !real.starts_with(&root_canon) {
+        return None;
+    }
+    let meta = std::fs::metadata(&real).ok()?;
+    if !meta.is_file() || meta.len() > RISK_READ_MAX_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(&real).ok()
 }
 
 /// 回放接线（`redteam-next risk` 子命令）：读任意历史 commit（`git show <head>:<path>`）而非工作树，

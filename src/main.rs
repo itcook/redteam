@@ -1097,12 +1097,15 @@ fn run_risk(base: &str, head: Option<&str>, dismissed: Option<&str>, before: Opt
         Err(e) => { eprintln!("error: {e}"); return 1; }
     };
     let cfg = load_config_warned();
+    // 与 `cli::stage0_risk` 同口径：只接受存在的文件路径（csv/目录/错路径一律不加台账，
+    // 且只读打开——不存在的路径不会被创建，见 `risk::GitEnv`）。
     let ledger = match dismissed {
-        Some(p) => Some(std::path::PathBuf::from(p)),
+        Some(p) if std::path::Path::new(p).is_file() => Some(std::path::PathBuf::from(p)),
         None => {
             let p = cwd.join(redteam::project::PROJECT_DIR).join(redteam::db::DB_FILE);
             p.is_file().then_some(p)
         }
+        _ => None,
     };
     let route = redteam::risk::replay_from_git(
         &changes, &cwd, base, &head, ledger.as_deref(), before, cfg.review.reviewers.max_cells,
@@ -1537,6 +1540,19 @@ mod tests {
             }
             assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?} 应冲突");
         }
+    }
+
+    /// M21b 批 A：`risk` 子命令解析——`--base` 必填，可选 `--head/--dismissed/--before`。
+    #[test]
+    fn risk_subcommand_parses_and_requires_base() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["redteam", "risk", "--base", "main"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "redteam", "risk", "--base", "a7c827b70", "--head", "215afd77b",
+            "--dismissed", "/tmp/proj.db", "--before", "2026-07-28T03:45:57Z",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["redteam", "risk"]).is_err(), "--base 必填");
     }
 
     /// C1：无 provider 配置的 Config + ReviewArgs → build_registry 返回 Err。

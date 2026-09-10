@@ -26,6 +26,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import urllib.parse
 from collections import defaultdict
 
 # ---------------- 语言 def 正则（逐条照抄 src/diffsym/mod.rs） ----------------
@@ -141,7 +142,8 @@ def git(repo, *args, check=True):
 
 
 def show_lines(repo, head, path):
-    r = subprocess.run(["git", "-C", repo, "show", f"{head}:{path}"], capture_output=True, text=True, errors="replace")
+    # `--end-of-options`：head 来自 argv（与 Rust 侧同族防御，挡 `--output=` 类 option 注入）
+    r = subprocess.run(["git", "-C", repo, "show", "--end-of-options", f"{head}:{path}"], capture_output=True, text=True, errors="replace")
     return r.stdout.split("\n") if r.returncode == 0 else None
 
 
@@ -332,7 +334,7 @@ class Replayer:
     def fanin(self, name, own_file):
         if name in self._fanin_cache:
             return self._fanin_cache[name]
-        out = git(self.repo, "grep", "-w", "-c", "-e", name, self.head, "--", ".", f":(exclude){own_file}", check=False)
+        out = git(self.repo, "grep", "-w", "-c", "-e", name, "--end-of-options", self.head, "--", ".", f":(exclude){own_file}", check=False)
         n = 0
         for l in out.split("\n"):
             # 形如 <rev>:<path>:<count>
@@ -348,7 +350,7 @@ class Replayer:
     def hist_fix_count(self, path):
         if path in self._hist_cache:
             return self._hist_cache[path]
-        out = git(self.history_repo, "log", "--since=12.months.ago", "--format=%s", self.history_ref, "--", path, check=False)
+        out = git(self.history_repo, "log", "--since=12.months.ago", "--format=%s", "--end-of-options", self.history_ref, "--", path, check=False)
         n = sum(1 for s in out.split("\n") if s and FIX_COMMIT.search(s))
         self._hist_cache[path] = n
         return n
@@ -358,7 +360,7 @@ class Replayer:
             return []
         if self._ledger_cache is None:
             self._ledger_cache = {"upheld": defaultdict(list), "dismissed": defaultdict(list)}
-            con = sqlite3.connect(self.ledger)
+            con = sqlite3.connect("file:" + urllib.parse.quote(str(self.ledger)) + "?mode=ro", uri=True)
             for f, upd in con.execute("select file, updated_at from dismissed"):
                 # dismissed.updated_at 只有日期：按『严格早于作业当天』计，宁漏勿泄
                 if not self.before or upd[:10] < self.before[:10]:
@@ -663,17 +665,26 @@ def cmd_compare(a):
     py_only = [(f, r) for j, (f, r) in enumerate(py_items) if j not in used]
     union = len(py_items) + len(ru_items) - pairs
     jaccard = pairs / union if union else 1.0
+    theta_py, theta_ru = py.get("theta"), rs.get("theta")
+    theta_ok = theta_py is not None and theta_ru is not None and abs(theta_py - theta_ru) <= 1e-9
     r_py, r_ru = py.get("R"), rs.get("r")
     delta = abs((r_py or 0.0) - (r_ru or 0.0))
-    ok = delta <= a.tol
-    result = {"python_R": r_py, "rust_r": r_ru, "r_delta": delta, "tol": a.tol, "r_ok": ok,
-              "python_h0": len(py_items), "rust_hotspots": len(ru_items), "matched": pairs, "jaccard": round(jaccard, 4),
+    r_ok = delta <= a.tol
+    jac_ok = jaccard >= a.min_jaccard - 1e-9
+    ok = theta_ok and r_ok and jac_ok
+    result = {"python_theta": theta_py, "rust_theta": theta_ru, "theta_ok": theta_ok,
+              "python_R": r_py, "rust_r": r_ru, "r_delta": delta, "tol": a.tol, "r_ok": r_ok,
+              "python_h0": len(py_items), "rust_hotspots": len(ru_items), "matched": pairs,
+              "jaccard": round(jaccard, 4), "min_jaccard": a.min_jaccard, "jaccard_ok": jac_ok,
               "rust_only": [{"file": f, "range": list(r)} for f, r in ru_only],
               "python_only": [{"file": f, "range": list(r)} for f, r in py_only]}
     if a.out:
         json.dump(result, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-    print(f"R: python={r_py} rust={r_ru} Δ={delta:.6g} (tol {a.tol:g}): {'OK' if ok else 'FAIL'}")
-    print(f"H0: python={len(py_items)} rust={len(ru_items)} matched={pairs} jaccard={jaccard:.3f}")
+    print(f"θ: python={theta_py} rust={theta_ru}: {'OK' if theta_ok else 'FAIL'}"
+          + ("" if theta_ok else "（两侧 θ 不一致——replay 须与 Rust THETA 同值生成）"))
+    print(f"R: python={r_py} rust={r_ru} Δ={delta:.6g} (tol {a.tol:g}): {'OK' if r_ok else 'FAIL'}")
+    print(f"H0: python={len(py_items)} rust={len(ru_items)} matched={pairs} jaccard={jaccard:.3f} "
+          f"(min {a.min_jaccard:g}): {'OK' if jac_ok else 'FAIL'}")
     for f, r in ru_only[:a.show]:
         print(f"  rust-only   {f}:{r[0]}-{r[1]}")
     for f, r in py_only[:a.show]:
@@ -804,6 +815,7 @@ def main():
     c.add_argument("rust", help="Rust `redteam-next risk` 输出 JSON")
     c.add_argument("--tol", type=float, default=1e-6, help="R 差容差（默认 1e-6）")
     c.add_argument("--show", type=int, default=10, help="最多列出的单边未配对区数（默认 10）")
+    c.add_argument("--min-jaccard", type=float, default=1.0, help="区级 Jaccard 下限（默认 1.0：H0 区集须完全对齐）")
     c.add_argument("--out", help="对拍结果 JSON 落盘路径")
     c.set_defaults(fn=cmd_compare)
     t = sub.add_parser("selftest")

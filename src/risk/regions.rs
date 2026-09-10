@@ -164,7 +164,9 @@ fn zones_for_file(path: &str, diff: &str, content: &str) -> Vec<Region> {
     }
     if let Some(d) = defs.as_deref() {
         for h in &hunks {
-            for (_, t) in &h.plus {
+            // 新增行与删除行的声明名同入 changed_names（对照 Python `adefs`/`rdefs`）：
+            // 删除的声明名（如 PR181 `-const sideTransferErrPrefix = …`）仍会从引用点产生涟漪区。
+            for t in h.plus.iter().map(|(_, t)| t).chain(h.minus.iter()) {
                 if let Some((_, n)) = match_decl(t, d) {
                     if ref_worthy(&n) {
                         changed_names.insert(n);
@@ -175,7 +177,7 @@ fn zones_for_file(path: &str, diff: &str, content: &str) -> Vec<Region> {
     }
     if let (Some(d), true) = (defs.as_deref(), !changed_names.is_empty()) {
         let taken: Vec<(usize, usize)> = primary.iter().map(|r| (r.start, r.end)).collect();
-        let mut sat: BTreeMap<(usize, usize), BTreeSet<String>> = BTreeMap::new();
+        let mut sat: BTreeSet<(usize, usize)> = BTreeSet::new();
         for name in &changed_names {
             let sites: Vec<usize> = lines
                 .iter()
@@ -192,15 +194,14 @@ fn zones_for_file(path: &str, diff: &str, content: &str) -> Vec<Region> {
                 if taken.iter().any(|&t| overlap(rng, t)) {
                     continue;
                 }
-                sat.entry(rng).or_default().insert(name.clone());
+                sat.insert(rng);
             }
         }
-        for ((start, end), refs) in sat {
+        for (start, end) in sat {
             let sym = enclosing_decl(&lines, start.saturating_sub(1), d)
                 .and_then(|di| diffsym::match_def(lines[di], d).map(|(_, n)| n))
                 .into_iter()
                 .collect();
-            let _ = refs;
             primary.push(Region {
                 file: path.to_string(),
                 start,
@@ -361,6 +362,19 @@ mod tests {
         let rs = regions(&[fc("src/a.ts", ts_diff)], &contents(&[("src/a.ts", ts)]));
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].symbols, vec!["wrapBody"]);
+    }
+
+    #[test]
+    fn ripple_from_deleted_decl_name_only() {
+        // A-5 修的行为（原无断言）：删除行声明名只经 `changed_names`（minus 扫描）进入涟漪计算——
+        // 删除点所在区（process）不含该名，引用点（caller）应成涟漪区。对照 Python `rdefs`（PR181 真实形态）。
+        let src = "fn keep() { 1 }\nconst OLD_PREFIX: &str = \"x\";\nfn process() { 1 }\nfn caller() { helper(OLD_PREFIX); helper(OLD_PREFIX); }\n";
+        let diff = "@@ -2,1 +2,0 @@\n-const OLD_PREFIX: &str = \"x\";\n";
+        let rs = regions(&[fc("src/a.rs", diff)], &contents(&[("src/a.rs", src)]));
+        let rip: Vec<_> = rs.iter().filter(|r| r.kind == RegionKind::Ripple).collect();
+        assert_eq!(rip.len(), 1, "{rs:?}");
+        assert_eq!(rip[0].symbols, vec!["caller"]);
+        assert_eq!((rip[0].start, rip[0].end), (4, 4));
     }
 
     #[test]

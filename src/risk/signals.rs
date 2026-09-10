@@ -39,7 +39,8 @@ const TEST_PATH: &str = r"(_test\.go$|\.test\.(ts|js|tsx)$|(^|/)tests?/|(^|/)__t
 const DOC_PATH: &str = r"(?i)\.(md|json|ya?ml|toml|txt|lock|svg|csv)$";
 const FIX_COMMIT: &str = r"(?i)\b(fix|bug|hotfix|revert|regress)";
 const CONTROL_FLOW: &str = r"\b(if|for|while|switch|match|return|await|try|catch|select|defer|throw|loop|yield)\b";
-const COMMENT_RE: &str = r"//[^\n]*|#[^\n]*|/\*.*?\*/";
+/// 跨行 `/* … */` 也要剥离（`(?s)`＝Python 参考实现 `re.S`）；`CONTROL_FLOW` 乘子判定依赖此剥离。
+const COMMENT_RE: &str = r"(?s)//[^\n]*|#[^\n]*|/\*.*?\*/";
 
 const NODE_BUILTINS: &[&str] = &[
     "fs", "path", "http", "https", "crypto", "url", "stream", "buffer", "events", "util", "os", "zlib",
@@ -101,7 +102,7 @@ fn keyword_classes() -> &'static [(&'static str, Regex)] {
 #[derive(Clone, Debug)]
 pub struct SignalHit {
     pub kind: SignalKind,
-    #[allow(dead_code)] // A-3 JSON / compare 子命令会带 detail
+    #[allow(dead_code)] // 暂只进内部信号表；M21c/M21d 的 hotspot 明细扩展再落报告
     pub detail: String,
     pub w: f32,
 }
@@ -145,9 +146,9 @@ impl GitEnv {
             load_ledger(db, before, &mut upheld, &mut dismissed);
         }
         let mut new_files = std::collections::BTreeSet::new();
-        if let Ok(out) = git(root, &["ls-tree", "-r", "--name-only", base]) {
+        if let Ok(out) = git(root, &["ls-tree", "-r", "--name-only", "--end-of-options", base]) {
             let base_tree: std::collections::BTreeSet<&str> = out.lines().collect();
-            if let Ok(head_tree) = git(root, &["ls-tree", "-r", "--name-only", head]) {
+            if let Ok(head_tree) = git(root, &["ls-tree", "-r", "--name-only", "--end-of-options", head]) {
                 for p in head_tree.lines() {
                     if !base_tree.contains(p) {
                         new_files.insert(p.to_string());
@@ -155,7 +156,7 @@ impl GitEnv {
                 }
             }
         }
-        let go_module = git(root, &["show", &format!("{head}:go.mod")])
+        let go_module = git(root, &["show", "--end-of-options", &format!("{head}:go.mod")])
             .ok()
             .and_then(|t| {
                 t.lines().find(|l| l.starts_with("module ")).map(|l| l.split_whitespace().nth(1).unwrap_or("").to_string())
@@ -182,7 +183,8 @@ impl ScoreEnv for GitEnv {
             return n;
         }
         let exclude = format!(":(exclude){own_file}");
-        let out = git(&self.root, &["grep", "-w", "-c", "-e", name, &self.head, "--", ".", &exclude]).unwrap_or_default();
+        let out = git(&self.root, &["grep", "-w", "-c", "-e", name, "--end-of-options", &self.head, "--", ".", &exclude])
+            .unwrap_or_default();
         let mut n = 0u32;
         for l in out.lines() {
             let parts: Vec<&str> = l.rsplitn(3, ':').collect();
@@ -206,7 +208,7 @@ impl ScoreEnv for GitEnv {
         }
         let out = git(
             &self.root,
-            &["log", "--since=12.months.ago", "--format=%s", &self.history_ref, "--", path],
+            &["log", "--since=12.months.ago", "--format=%s", "--end-of-options", &self.history_ref, "--", path],
         )
         .unwrap_or_default();
         let n = out.lines().filter(|s| !s.is_empty() && fix_commit().is_match(s)).count() as u32;
@@ -237,7 +239,8 @@ fn git(root: &Path, args: &[&str]) -> Result<String, ()> {
 }
 
 fn load_ledger(db: &Path, before: Option<&str>, upheld: &mut BTreeMap<String, u32>, dismissed: &mut BTreeMap<String, u32>) {
-    let Ok(con) = rusqlite::Connection::open(db) else { return };
+    // 只读打开：`risk` 是只读子命令，缺省 open()（READ_WRITE|CREATE）会为不存在的路径创建空库文件。
+    let Ok(con) = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return };
     if let Ok(mut stmt) = con.prepare("select file, updated_at from dismissed") {
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
         if let Ok(rows) = rows {

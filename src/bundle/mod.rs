@@ -128,7 +128,7 @@ pub enum Gate {
 
 /// 小分量进池阈值（followup:148 选项 1，2026-09-10 用户裁定）：多文件分量文件数 ≤ 此值且
 /// 估算字节 ≤ 预算/`SMALL_COMPONENT_BUDGET_DIV` 时，与孤立文件同池装箱压组数。
-/// PR181 标定：4 个 2-3 文件小分量 est 21-29K vs budget≈144K（占 15-20%）；
+/// PR181 标定：4 个 2-3 文件小分量 est 21-29K vs budget=768K（占 3-4%）；
 /// budget = None 无预算信息时不判（保守分量直出）。
 const SMALL_COMPONENT_MAX_FILES: usize = 3;
 const SMALL_COMPONENT_BUDGET_DIV: usize = 4;
@@ -184,7 +184,8 @@ pub struct Grouping {
 }
 
 /// 改动 def 名（diffsym 支持语言）：吃 `all_defs` / `changed_defs`（全改动行 + 最内层 + 容器排除），
-/// `ref_worthy` 过滤，去重升序。与 `pack::outside_names` 同源（M21b 批 A 口径统一）。
+/// `ref_worthy` 过滤，去重升序。与 `pack::outside_names` 输入同源（`all_defs`/`changed_defs`，M21b 批 A 口径统一）；
+/// pack 侧另有测试 / `#[cfg(test)]` 范围排除（其场景需要），本函数不排除测试 def。
 fn changed_def_names(path: &str, diff: &str, content: &str) -> Vec<String> {
     let Some(lang) = crate::diffsym::lang_for(path) else { return Vec::new() };
     let defs = crate::diffsym::compile_defs(lang);
