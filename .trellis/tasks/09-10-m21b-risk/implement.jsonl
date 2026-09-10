@@ -1,0 +1,2 @@
+{"file": ".next/plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md", "reason": "批 A 节 Task A-1…A-6 文件落点/测试/commit 点全集；Global Constraints（每 task 四绿 + commit 规范 + 改动只碰清单文件）"}
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§3.3 风险路由规则（成区/四类信号/H0/R/零旋钮）、§6 规则 3 预算三档 4/12/32 帽 48——实现对照的第一权威"}
