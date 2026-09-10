@@ -43,7 +43,7 @@
 ### Task A-6 收口
 - [x] `--help` risk 子命令说明；权重表注释引 P0 §15.4 复核
 - [x] 收口评审（core-stable 期不跑 dev `redteam` ship）：code-review 制品 `.rpiv/artifacts/reviews/2026-09-10_13-46-54_range-0f434df-4156796.md`——两镜片（subagent lane 故障 → `bg_delegate` inspect-only），🔴0 / 🟡8 全修（含 3 条安全项：git argv `--end-of-options`、读守卫、台账只读打开）/ 🔵4 / 💭5；修后全量复验（四绿 + PR181/oracle B 门 8 例全绿 + 分组零回归）
-- [ ] `--no-ff` 合回 `feat/m21-review-engine`
+- [x] `--no-ff` 合回 `feat/m21-review-engine`（eaf8bb5；合回后全量四绿，清理批 B 遗留 unused import）
 
 ## 验证命令
 
