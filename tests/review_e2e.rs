@@ -528,7 +528,7 @@ fn pack_only_writes_packs_and_reports_bytes() {
 
     let text = render_pack_only(&report);
     assert!(text.contains("cell-1 files=2 bytes=") && text.contains(" est_tokens="), "{text}");
-    assert!(text.contains("grouping gate=single groups=1 edges="), "{text}");
+    assert!(text.contains("grouping gate=single groups=1 edges=") && text.contains(" cross_import=") && text.contains(" cross_same_dir="), "{text}");
     assert!(text.contains(&format!("packs={}", report.packs_dir)), "{text}");
 
     let packs = std::path::Path::new(&report.packs_dir);

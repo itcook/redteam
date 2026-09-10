@@ -52,7 +52,7 @@
 - [x] `--pack-only` 输出行含分种字段
 - [x] PR181 `--pack-only`（`.next/private/m21b/pr181-packonly-kinds.txt`）：`cross_import=0 cross_reference=2
       cross_same_dir=6`（旧 cross_edges=8 → 75% 是同目录拆的、25% 弱引用；旧 weak_cut=55 为虚高，真切口径 8）；
-      **cross_import=0 即 R8 度量归零——PR181 上确定性分组未切开任何 import 关系，M21e 判 R8 的直接证据**
+      **cross_import=0 复验「强边不跨组」不变量（该值对任意输入恒为零，非 PR181 特有）；语义分组增量（无 import 边的语义关联）不在此度量可观测范围，M21e 判 R8 仍需跨组索引与 dogfood 数据**（2026-09-10 评审 Q5 措辞修正：原文「R8 直接证据」系过度解读）
 - [x] followup 两行 + plan 前置清单 #3 收尾更新
 
 ## Out of Scope

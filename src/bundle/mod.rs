@@ -139,6 +139,8 @@ impl Gate {
 /// 分种口径（2026-09-10，followup 实现债清偿 / M21b 前置 #3）：`cross_edges` 总数保留，分种三键各计其边种；
 /// `weak_cut` 删除——现算法强边不跨组（不变量见测试），跨组边全部是弱边，weak_cut = cross_reference +
 /// cross_same_dir 无独立信息量；R8 触发度量 = `cross_import`（design §3.2 步 6）。
+/// 同日评审修 Q4：三键 `Option<usize>`，`None` = 旧格式报告未采集（serde default），本二进制现算恒 `Some`；
+/// resume 沿用旧报告时保留 `None` 不从总数猜分种；恒等式 `cross_edges == 三键之和` 仅在 `Some` 下成立。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GroupingStats {
     pub gate: Gate,
@@ -148,14 +150,15 @@ pub struct GroupingStats {
     /// 端点异组的边数（分组切错的先验度量）。
     pub cross_edges: usize,
     /// 端点异组的 import 边数（R8 触发度量：跨组 import 多 = 确定性图切开强相关，语义分组才有增量）。
+    /// `None` = 旧格式报告未采集。
     #[serde(default)]
-    pub cross_import: usize,
-    /// 端点异组的引用边数（现算法下全为 count=1 弱引用——强引用不跨组不变量）。
+    pub cross_import: Option<usize>,
+    /// 端点异组的引用边数（现算法下全为 count=1 弱引用——强引用不跨组不变量）。`None` 同上。
     #[serde(default)]
-    pub cross_reference: usize,
-    /// 端点异组的同目录边数（切缝与装箱分箱两类同源，无法也不必区分）。
+    pub cross_reference: Option<usize>,
+    /// 端点异组的同目录边数（切缝与装箱分箱两类同源，无法也不必区分）。`None` 同上。
     #[serde(default)]
-    pub cross_same_dir: usize,
+    pub cross_same_dir: Option<usize>,
     /// 原图无边的文件数。
     pub isolated: usize,
     /// `over_budget` 的组数。
@@ -1185,7 +1188,7 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     let n = changes.len();
     let empty_stats = |gate: Gate| GroupingStats {
-        gate, groups: 0, edges: 0, cross_edges: 0, cross_import: 0, cross_reference: 0, cross_same_dir: 0,
+        gate, groups: 0, edges: 0, cross_edges: 0, cross_import: Some(0), cross_reference: Some(0), cross_same_dir: Some(0),
         isolated: 0, over_budget: 0,
     };
     if n == 0 {
@@ -1311,8 +1314,8 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
         let all: Vec<usize> = (0..n).collect();
         let bundle = make_bundle(&all, oversize(&all));
         let stats = GroupingStats {
-            gate: Gate::Single, groups: 1, edges: edges.len(), cross_edges: 0, cross_import: 0,
-            cross_reference: 0, cross_same_dir: 0, isolated,
+            gate: Gate::Single, groups: 1, edges: edges.len(), cross_edges: 0, cross_import: Some(0),
+            cross_reference: Some(0), cross_same_dir: Some(0), isolated,
             over_budget: bundle.over_budget as usize,
         };
         return Grouping { bundles: vec![bundle], stats };
@@ -1399,9 +1402,9 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
         groups: bundles.len(),
         edges: edges.len(),
         cross_edges,
-        cross_import,
-        cross_reference,
-        cross_same_dir,
+        cross_import: Some(cross_import),
+        cross_reference: Some(cross_reference),
+        cross_same_dir: Some(cross_same_dir),
         isolated,
         over_budget: bundles.iter().filter(|b| b.over_budget).count(),
     };
@@ -1692,7 +1695,7 @@ mod tests {
         assert_eq!(g.bundles.len(), 2);
         assert_eq!(paths_of(&g.bundles[0]), vec!["a/1.rs", "a/2.rs"]);
         assert_eq!(paths_of(&g.bundles[1]), vec!["b/1.rs", "b/2.rs"]);
-        assert_eq!(g.stats, GroupingStats { gate: Gate::Grouped, groups: 2, edges: 2, cross_edges: 0, cross_import: 0, cross_reference: 0, cross_same_dir: 0, isolated: 0, over_budget: 0 });
+        assert_eq!(g.stats, GroupingStats { gate: Gate::Grouped, groups: 2, edges: 2, cross_edges: 0, cross_import: Some(0), cross_reference: Some(0), cross_same_dir: Some(0), isolated: 0, over_budget: 0 });
     }
 
     #[test]
@@ -1766,8 +1769,11 @@ mod tests {
         assert_eq!(paths_of(&g.bundles[1]), vec!["m/c.ts", "m/d.ts"]);
         // 切后真切口径：同目录 C(4,2)=6 条弱边中跨组的只有 2×2=4 条（旧 weak_cut 口径报 6，虚高 2）；
         // 强边（import）不跨组不变量 → cross_import == 0。
-        assert_eq!((g.stats.cross_edges, g.stats.cross_import, g.stats.cross_reference, g.stats.cross_same_dir), (4, 0, 0, 4));
-        assert_eq!(g.stats.cross_edges, g.stats.cross_import + g.stats.cross_reference + g.stats.cross_same_dir, "分种恒等式");
+        assert_eq!((g.stats.cross_edges, g.stats.cross_import, g.stats.cross_reference, g.stats.cross_same_dir), (4, Some(0), Some(0), Some(4)));
+        let (Some(ci), Some(cr), Some(cs)) = (g.stats.cross_import, g.stats.cross_reference, g.stats.cross_same_dir) else {
+            panic!("现算 stats 三键必 Some: {:?}", g.stats);
+        };
+        assert_eq!(g.stats.cross_edges, ci + cr + cs, "分种恒等式");
         assert_eq!(g.stats.over_budget, 0);
         assert!(g.bundles[0].edges.iter().any(|e| e.kind == EdgeKind::SameDir && e.to == "m/c.ts"), "跨组边出现在两端 bundle");
     }
@@ -1818,8 +1824,30 @@ mod tests {
         // {a,b,z} 同目录超 max=2 → 切 3 弱边 → {a,b} 强 + z 落单回池装箱
         assert_eq!(g.bundles.iter().map(paths_of).collect::<Vec<_>>(), vec![vec!["m/a.ts", "m/b.ts"], vec!["m/z.ts"]]);
         // 真切口径：3 条同目录弱边中跨组的只有 a-z、b-z 共 2 条（旧 weak_cut 口径报 3）
-        assert_eq!(g.stats.cross_same_dir, 2);
+        assert_eq!(g.stats.cross_same_dir, Some(2));
         assert_eq!(g.stats.isolated, 0, "z 原图有同目录边，不算孤立");
+    }
+
+    #[test]
+    fn grouping_stats_counts_cross_reference() {
+        // Q1（2026-09-10 评审修）：count=1 弱引用被拆 → 只进 cross_reference——分种三臂的正向非零断言
+        // （此前全树 cross_reference 断言恒 0、哨兵分支 vacuous，PR181 手跑是唯一背书）。
+        let dir = tempfile::tempdir().unwrap();
+        // m/b.ts 改动 def（diff 行 = 内容行，锚定可命中；def 名 ref_worthy）
+        write(dir.path(), "m/b.ts", "export function compute_total(): number { return 1; }\n");
+        // n/f.ts 全文引用 compute_total 一次（count=1 弱引用，跨目录 → 无 SameDir 边）
+        write(dir.path(), "n/f.ts", "const y = compute_total();\n");
+        let changes = vec![
+            fc("m/b.ts", "@@ -1,0 +1,1 @@\n+export function compute_total(): number { return 1; }\n"),
+            fc("n/f.ts", "+const y = compute_total();\n"),
+        ];
+        // max=1：{b,f} 弱引用连通分量超限 → 切弱边 → 双落单装箱各成组 → f→b 跨组
+        let g = group(changes, Some(dir.path()), &open_gate(1, None));
+        assert_eq!(g.bundles.len(), 2);
+        assert_eq!(g.stats.cross_edges, 1);
+        assert_eq!(g.stats.cross_import, Some(0));
+        assert_eq!(g.stats.cross_reference, Some(1), "count=1 引用跨组只进 reference，不进 import/same_dir");
+        assert_eq!(g.stats.cross_same_dir, Some(0));
     }
 
     #[test]
@@ -1838,8 +1866,11 @@ mod tests {
         for opts in [open_gate(10, None), open_gate(2, None), open_gate(1, None)] {
             let g = group(changes.clone(), Some(dir.path()), &opts);
             let s = &g.stats;
-            assert_eq!(s.cross_edges, s.cross_import + s.cross_reference + s.cross_same_dir, "分种恒等式: {s:?}");
-            assert_eq!(s.cross_import, 0, "强边不跨组不变量（import）: {s:?}");
+            let (Some(ci), Some(cr), Some(cs)) = (s.cross_import, s.cross_reference, s.cross_same_dir) else {
+                panic!("现算 stats 三键必 Some: {s:?}");
+            };
+            assert_eq!(s.cross_edges, ci + cr + cs, "分种恒等式: {s:?}");
+            assert_eq!(ci, 0, "强边不跨组不变量（import）: {s:?}");
             let group_of = |p: &str| g.bundles.iter().position(|b| b.files.iter().any(|f| f.path == p)).unwrap();
             for b in &g.bundles {
                 for e in &b.edges {
@@ -1850,15 +1881,16 @@ mod tests {
                 }
             }
         }
-        // 旧格式 JSON（M21a：含 weak_cut 键、无分种键）→ 新结构可读、分种归零（serde default）
+        // 旧格式 JSON（M21a：含 weak_cut 键、无分种键）→ 新结构可读、三键 None = 未采集（Q4：不从
+        // cross_edges 总数猜分种，resume 沿用时保留 None；恒等式仅在 Some 下成立）
         let legacy = r#"{"gate":"grouped","groups":2,"edges":8,"weak_cut":6,"cross_edges":4,"isolated":0,"over_budget":0}"#;
         let stats: GroupingStats = serde_json::from_str(legacy).unwrap();
         assert_eq!((stats.groups, stats.cross_edges), (2, 4));
-        assert_eq!((stats.cross_import, stats.cross_reference, stats.cross_same_dir), (0, 0, 0));
-        // 新格式序列化不再含 weak_cut 键
+        assert_eq!((stats.cross_import, stats.cross_reference, stats.cross_same_dir), (None, None, None), "旧报告未采集 ≠ 实测为零");
+        // 新格式序列化不再含 weak_cut 键；未采集键显式写 null（而非 0）
         let j = serde_json::to_string(&stats).unwrap();
         assert!(!j.contains("weak_cut"), "{j}");
-        assert!(j.contains("cross_same_dir"), "{j}");
+        assert!(j.contains(r#""cross_same_dir":null"#), "{j}");
     }
 
     #[test]

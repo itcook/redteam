@@ -673,9 +673,11 @@ pub fn render_pack_only(r: &PackOnlyReport) -> String {
         out.push_str("cells=0\n");
     }
     let g = &r.grouping;
+    // Q4：三键 Option——Some(n) 印数字，None（旧报告未采集）印 `-`，不从总数猜分种
+    let kind = |v: Option<usize>| v.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
     out.push_str(&format!(
         "grouping gate={} groups={} edges={} cross_edges={} cross_import={} cross_reference={} cross_same_dir={} isolated={} over_budget={}\n",
-        g.gate.as_str(), g.groups, g.edges, g.cross_edges, g.cross_import, g.cross_reference, g.cross_same_dir, g.isolated, g.over_budget
+        g.gate.as_str(), g.groups, g.edges, g.cross_edges, kind(g.cross_import), kind(g.cross_reference), kind(g.cross_same_dir), g.isolated, g.over_budget
     ));
     out.push_str(&format!("packs={}\n", r.packs_dir));
     for w in &r.warnings {
@@ -1867,7 +1869,7 @@ mod resume_tests {
         store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
         let prior = ReviewReport {
             schema_version: "4".into(), verdict: Verdict::Incomplete, stats: Stats::default(), findings: vec![], clusters: vec![],
-            run: RunMeta { head_sha: Some("deadbeef".into()), grouping: Some(crate::bundle::GroupingStats { gate: crate::bundle::Gate::Single, groups: 1, edges: 0, cross_edges: 0, cross_import: 0, cross_reference: 0, cross_same_dir: 0, isolated: 0, over_budget: 0 }), ..Default::default() },
+            run: RunMeta { head_sha: Some("deadbeef".into()), grouping: Some(crate::bundle::GroupingStats { gate: crate::bundle::Gate::Single, groups: 1, edges: 0, cross_edges: 0, cross_import: Some(0), cross_reference: Some(0), cross_same_dir: Some(0), isolated: 0, over_budget: 0 }), ..Default::default() },
             scan: Some(ScanReport { groups: vec![ScanGroup { label: "c.rs".into(), files: vec!["c.rs".into()], cells: vec![], suspicions: 0, pack: Default::default() }], suspicions: vec![], scanned_coverage: Some(0.75), stats: Default::default() }),
             cells: vec![],
         };

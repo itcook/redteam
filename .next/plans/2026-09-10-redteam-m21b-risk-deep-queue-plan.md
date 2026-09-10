@@ -35,7 +35,7 @@
 - **分组预算门（估算字节）与装包（切片字节）口径对齐**：PR181 `--pack-only` 回放（本工作树，数据落 `.next/private/m21b/`）。
 - **`GroupingStats` 分种计数**：✅ 已偿（2026-09-10，Trellis `09-10-grouping-stats-kinds`）：`cross_import` / `cross_reference` /
   `cross_same_dir` 三键（serde default）、`weak_cut` 删除（真切口径无独立信息量）；「强边不跨组」不变量哨兵测试；PR181 基线
-  cross_import=0（R8 度量归零：确定性分组未切开任何 import 关系）/ cross_reference=2 / cross_same_dir=6、旧 weak_cut=55 虚高
+  cross_import=0（复验强边不跨组不变量——恒为零，语义分组增量不在可观测范围，R8 判决另需跨组索引数据）/ cross_reference=2 / cross_same_dir=6、旧 weak_cut=55 虚高
   （真切口径 8）；数据 `.next/private/m21b/pr181-packonly-kinds.txt`。
 - **速率型 429 棘轮与放弃判据**（D13 收口批评审延后项，用户裁）：看 PR181 `provider_rate_limit` 数据后定 Retry-After 速率信号
   不收门 / 最小回升 / 等待总时长 ≤ `perTurnTimeoutSecs`。
