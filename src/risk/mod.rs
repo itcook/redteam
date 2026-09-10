@@ -56,9 +56,13 @@ pub struct Hotspot {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RiskRoute {
     pub hotspots: Vec<Hotspot>,
+    /// 全部已评分区（诊断 / `risk` 回放对拍用；H0 = hotspots 是它的子集）。
+    pub zones: Vec<Hotspot>,
     pub r: f32,
     pub tier: Tier,
     pub budget_cells_hint: u32,
+    /// R 分母的代码改动行数（诊断；`code_lines`）。
+    pub code_lines: usize,
 }
 
 impl RegionKind {
@@ -162,22 +166,21 @@ pub fn route(
 ) -> RiskRoute {
     let mut zones = regions(changes, contents);
     score_regions(&mut zones, contents, env);
+    let to_hotspot = |z: Region| Hotspot {
+        file: z.file,
+        start: z.start,
+        end: z.end,
+        score: z.score,
+        kind: z.kind,
+        signals: z.signals,
+    };
+    let all: Vec<Hotspot> = zones.iter().cloned().map(to_hotspot).collect();
     let h0: Vec<Region> = zones.into_iter().filter(|z| qualifies(z, THETA)).collect();
     let r = r_score(&h0, code_lines);
     let tier = tier_of(r);
     let budget_cells_hint = budget_cells(tier, max_cells);
-    let hotspots = h0
-        .into_iter()
-        .map(|z| Hotspot {
-            file: z.file,
-            start: z.start,
-            end: z.end,
-            score: z.score,
-            kind: z.kind,
-            signals: z.signals,
-        })
-        .collect();
-    RiskRoute { hotspots, r, tier, budget_cells_hint }
+    let hotspots = h0.into_iter().map(to_hotspot).collect();
+    RiskRoute { hotspots, zones: all, r, tier, budget_cells_hint, code_lines }
 }
 
 /// 生产接线：从仓根读全文、构造 GitEnv。
@@ -197,14 +200,42 @@ pub fn route_from_git(
         }
     }
     let mut env = GitEnv::open(root, head, base, base, ledger, before);
-    let code_lines: usize = changes
+    let code_lines = code_lines(changes);
+    route(changes, &contents, &mut env, max_cells, code_lines)
+}
+
+/// R 分母：代码文件增删行（排除文档/schema 路径与**删除文件**——`+++ /dev/null` 的文件在 head
+/// 树不存在、不成区，Python 参考实现同样整体丢弃；含删除文件的删除行会让分母偏高）。
+fn code_lines(changes: &[FileChange]) -> usize {
+    changes
         .iter()
-        .filter(|c| !signals::is_doc_path(&c.path))
+        .filter(|c| !signals::is_doc_path(&c.path) && !c.diff.contains("+++ /dev/null"))
         .map(|c| {
             let (a, d) = crate::bundle::count_plus_minus(&c.diff);
             a + d
         })
-        .sum();
+        .sum()
+}
+
+/// 回放接线（`redteam-next risk` 子命令）：读任意历史 commit（`git show <head>:<path>`）而非工作树，
+/// 与 `eval/risk_replay.py` 的 `replay <repo> <base> <head>` 同语义（对拍回归门，D11）。
+pub fn replay_from_git(
+    changes: &[FileChange],
+    root: &Path,
+    base: &str,
+    head: &str,
+    ledger: Option<&Path>,
+    before: Option<&str>,
+    max_cells: MaxCells,
+) -> RiskRoute {
+    let mut contents = BTreeMap::new();
+    for c in changes {
+        if let Ok(t) = crate::evidence::git::show_blob(root, head, &c.path) {
+            contents.insert(c.path.clone(), t);
+        }
+    }
+    let mut env = GitEnv::open(root, head, base, base, ledger, before);
+    let code_lines = code_lines(changes);
     route(changes, &contents, &mut env, max_cells, code_lines)
 }
 

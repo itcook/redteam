@@ -151,6 +151,24 @@ enum Cmd {
         #[arg(long = "override")]
         override_cmd: Option<String>,
     },
+    /// 风险路由只读回放（M21b 批 A，零 provider / 零副作用）：跑阶段 0（成区 → 四类信号 → H0/R/档位）
+    /// 打印 JSON——供 `eval/risk_replay.py compare` 对拍 Python v4 参考实现（θ 与权重改动必过的回归门，D11）。
+    /// 读 `merge-base(base,head)...head` 与 head commit 内容（不依赖工作树），可回放任意历史 diff。
+    Risk {
+        /// diff 基线（分支名/commit）。
+        #[arg(long)]
+        base: String,
+        /// 被评 head（缺省 HEAD）；回放历史 diff 时传当时的 head commit。
+        #[arg(long)]
+        head: Option<String>,
+        /// 台账 db 覆盖（缺省读项目 `.redteam/proj-next.db`，不存在则不计台账信号；
+        /// 对拍 Oracle B 可指向 dev 旧 `proj.db`）。
+        #[arg(long)]
+        dismissed: Option<String>,
+        /// 时间守卫：只计严格早于该时刻（RFC3339）的台账记录（对拍复现 P0 标定条件）。
+        #[arg(long)]
+        before: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1062,8 +1080,50 @@ async fn main() {
                 }
             }
         }
+        Cmd::Risk { base, head, dismissed, before } => run_risk(&base, head.as_deref(), dismissed.as_deref(), before.as_deref()),
     };
     std::process::exit(code);
+}
+
+/// `risk` 子命令（M21b 批 A）：阶段 0 只读回放，JSON 输出供 `eval/risk_replay.py compare` 对拍。
+/// 零 provider / 零写库；配置加载失败回落空配置（`budgetCells` 信息位，不影响 R 与 H0）。
+fn run_risk(base: &str, head: Option<&str>, dismissed: Option<&str>, before: Option<&str>) -> i32 {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let head = head.map(str::to_string).unwrap_or_else(|| {
+        redteam::evidence::git::head_sha_at(&cwd).unwrap_or_else(|_| "HEAD".into())
+    });
+    let changes = match redteam::evidence::git::changed_files_at(&cwd, base, &head) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    };
+    let cfg = load_config_warned();
+    let ledger = match dismissed {
+        Some(p) => Some(std::path::PathBuf::from(p)),
+        None => {
+            let p = cwd.join(redteam::project::PROJECT_DIR).join(redteam::db::DB_FILE);
+            p.is_file().then_some(p)
+        }
+    };
+    let route = redteam::risk::replay_from_git(
+        &changes, &cwd, base, &head, ledger.as_deref(), before, cfg.review.reviewers.max_cells,
+    );
+    let out = serde_json::json!({
+        "schema": "risk-v1",
+        "repo": cwd.to_string_lossy(),
+        "base": base,
+        "head": head,
+        "theta": redteam::risk::THETA,
+        "r": route.r,
+        "tier": route.tier,
+        "budget_cells": route.budget_cells_hint,
+        "hotspots": route.hotspots,
+        "zones": route.zones,
+        "code_lines": route.code_lines,
+    });
+    match serde_json::to_string_pretty(&out) {
+        Ok(s) => { println!("{s}"); 0 }
+        Err(e) => { eprintln!("error: {e}"); 1 }
+    }
 }
 
 /// provider 级探测（`model list --remote` / setup 后探测）用的协议：provider 层 kind > 任一模型的 kind > openai-compatible。

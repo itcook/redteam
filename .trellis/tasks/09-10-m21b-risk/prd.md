@@ -15,7 +15,7 @@
 ## Requirements
 
 - 成区：hunk → enclosing def 块（无 def → hunk ± 10 行 padded）；主区（含改动行）与涟漪区（改动/新增/删除声明名在本文件 ≤ 4 处引用点的 enclosing def，不跨文件）〔D11-1〕
-- 四类信号与权重 = P0 §15.4 定案常量（path / 结构 / extapi / hist，含乘子），一处权重表注释引 P0；hist 台账经 `--dismissed` 指定（缺省 `proj-next.db` 自身，M21a 分库裁定）带时间守卫，PR181 对拍传 dev 旧 `proj.db` 复现 P0 标定条件；def 口径统一：`bundle::changed_def_names` vs `pack::outside_names` 两套，复用时一并统一 + 重跑分组回归（followup 实现债）
+- 四类信号与权重 = P0 §15.4 定案常量（path / 结构 / extapi / hist，含乘子），一处权重表注释引 P0；hist 台账经 `--dismissed` 指定（缺省 `proj-next.db` 自身，M21a 分库裁定）带时间守卫；**台账口径勘误（A-5 核实，P0 §15.1）**：PR181 回放不带台账（带则被测作业 upheld 泄漏），dev 旧 `proj.db` + `--before` 是 oracle B 侧口径；def 口径统一：`bundle::changed_def_names` vs `pack::outside_names` 两套，复用时一并统一 + 重跑分组回归（followup 实现债）
 - H0：score ≥ θ=1.5 且 ≥ 2 类信号，关键词类单独不成区；R = Σ_{H0} score ÷ (1 + ln(1+代码行))；切点 **0.5 / 3.5**（D11-4 锁定；P0 实测三分位 0.47/3.64 作回校参考）；`budget_cells`：Auto → 4/12/32 min 48、Fixed 直用
 - 接线：`run_code_review` 阶段 0 调用，H0/R/tier/budget 入 RunMeta；`--pack-only` 打印一行；resume 沿用原报告值
 - 回归门：`risk_replay.py compare`（Rust vs Python v4 区级对拍）+ `redteam-next risk` 只读子命令；回放口径 = PR181（私有 fixture）+ 本仓 oracle B（入库 fixture，本批导出），数字进 research；Python 侧 bug 修后先重跑基线记录新数字再对拍

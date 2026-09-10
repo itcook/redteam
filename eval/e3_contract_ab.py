@@ -263,6 +263,7 @@ def cmd_score(a):
         for n, it in enumerate(items, 1):
             path = it.get("file") or ""
             rng = anchor_quote(a.repo, a.head, path, it.get("quote", ""))
+            was_anchored = rng is not None
             if rng is None:
                 unanch += 1
                 try:
@@ -275,7 +276,7 @@ def cmd_score(a):
                 run_hit_ids |= {e["id"] for e in matched}
                 if it.get("confidence") is not None:
                     hit_confs.append(float(it["confidence"]))
-            table.append({"run": r["run"], "n": n, "file": path, "lines": list(rng), "anchored": rng is not None and unanch == unanch,
+            table.append({"run": r["run"], "n": n, "file": path, "lines": list(rng), "anchored": was_anchored,
                           "confidence": it.get("confidence"), "category": it.get("category") or it.get("severity"),
                           "text": (it.get("hint") or it.get("title") or "")[:140],
                           "auto_match": sorted({f"{e['id']}:{e.get('topic') or ''}" for e in matched}), "manual_topic": ""})
