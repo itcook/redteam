@@ -325,15 +325,7 @@ mod tests {
     use crate::domain::RawFinding;
     use std::collections::BTreeMap;
 
-    fn finding(title: &str, sev: Severity, agreement: u32, model: &str) -> Finding {
-        Finding {
-            id: title.into(), severity: sev, title: title.into(), body: "b".into(),
-            file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), models: vec![model.into()],
-            agreement, hard_constraint: false, cluster_id: None, quote: "q".into(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
-        }
-    }
+    use crate::domain::finding::fixtures::finding;
     fn finding_at(file: &str, line_start: u32, line_end: u32) -> Finding {
         let mut f = finding("t", Severity::High, 1, "alpha");
         f.file = file.into();

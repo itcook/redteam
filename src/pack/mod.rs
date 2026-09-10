@@ -19,6 +19,9 @@ use crate::diffsym::{
 };
 use crate::evidence::git::FileChange;
 
+pub mod region;
+pub use region::{Origin, QueueItemSpec, RegionPack, RegionStats};
+
 /// 省略清单条目上限（防大 fan-in 撑爆；超出末尾计数兜底）。
 pub(crate) const OMIT_MAX_ENTRIES: usize = 200;
 /// 文件头（首个 def 之前的注释 / doc / import 行）最多保留行数，其余折叠。
@@ -120,18 +123,25 @@ struct FileCtx<'a> {
 fn prepare_files<'a>(bundle: &'a Bundle, root: &Path) -> Vec<FileCtx<'a>> {
     let mut out = Vec::new();
     for fc in bundle.fill_order() {
-        let content = std::fs::read_to_string(root.join(&fc.path)).unwrap_or_default();
-        if content.is_empty() {
-            continue;
+        if let Some(ctx) = prepare_one(fc, root) {
+            out.push(ctx);
         }
-        let lines: Vec<&str> = content.lines().collect();
-        let n_lines = lines.len();
-        let (hunks, shifted) = anchor_hunks(&lines, parse_hunks(&fc.diff));
-        let diff = if shifted { synth_diff(&hunks) } else { fc.diff.clone() };
-        let defs = lang_for(&fc.path).map(compile_defs);
-        out.push(FileCtx { fc, content, n_lines, defs, hunks, diff });
     }
     out
+}
+
+/// 单文件上下文：一次读取 / def 编译 / hunk 重锚定（组 pack 与 reviewer 区域 pack〔批 B〕共用）。
+fn prepare_one<'a>(fc: &'a FileChange, root: &Path) -> Option<FileCtx<'a>> {
+    let content = std::fs::read_to_string(root.join(&fc.path)).unwrap_or_default();
+    if content.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let n_lines = lines.len();
+    let (hunks, shifted) = anchor_hunks(&lines, parse_hunks(&fc.diff));
+    let diff = if shifted { synth_diff(&hunks) } else { fc.diff.clone() };
+    let defs = lang_for(&fc.path).map(compile_defs);
+    Some(FileCtx { fc, content, n_lines, defs, hunks, diff })
 }
 
 /// hunk 重锚定搜索半径（行）。
@@ -301,8 +311,19 @@ fn slice_file(ctx: &FileCtx<'_>, opts: &PackOpts) -> Option<SliceOut> {
         }
     }
     let expand = merge_ranges(expand);
-    // 保留行：文件头 + 签名。非支持语言无 def，「头」只看文件顶部 HEADER_MAX_LINES 行（评审修 7）；多行 import 组
-    // （Go `import (`、Rust `use x::{`、TS `import {`）按代码内括号配平整组保留（评审修 8；字符串 / 注释里的括号不计）。
+    let (body, folds, folded_lines) = render_slice_body(ctx, &all, &expand);
+    let one_hop = hop.callees.len() + hop.callers.len();
+    let head = format!("{}:1-{n}（切片：核 {} · 一跳 {one_hop} · 折叠 {folds} 段）", ctx.fc.path, changed.len());
+    Some(SliceOut { text: format!("{head}\n{body}\n"), one_hop, folded_lines })
+}
+
+/// 切片渲染机器（组切片 [`slice_file`] 与 reviewer 区域切片〔批 B `pack::region`〕共用，design §10.2 三层同批）：
+/// 保留行 = 文件头（≤ `HEADER_MAX_LINES`）+ 全部 def 签名；其余按外围 def 折叠，顶层胶水 ≤ `GLUE_MAX_LINES` 原样。
+/// 返回 (正文, 折叠段数, 折叠行数)。非支持语言无 def，「头」只看文件顶部 `HEADER_MAX_LINES` 行（评审修 7）；多行 import 组
+/// （Go `import (`、Rust `use x::{`、TS `import {`）按代码内括号配平整组保留（评审修 8；字符串 / 注释里的括号不计）。
+fn render_slice_body(ctx: &FileCtx<'_>, all: &[crate::diffsym::DefRange], expand: &[(usize, usize)]) -> (String, usize, usize) {
+    let lines: Vec<&str> = ctx.content.lines().collect();
+    let n = lines.len();
     let mut keep: BTreeSet<usize> = BTreeSet::new();
     let first_def = all.first().map(|d| d.start).unwrap_or(n);
     let header_limit = if ctx.defs.is_some() { first_def } else { HEADER_MAX_LINES.min(n) };
@@ -327,7 +348,7 @@ fn slice_file(ctx: &FileCtx<'_>, opts: &PackOpts) -> Option<SliceOut> {
             break;
         }
     }
-    for d in &all {
+    for d in all {
         for i in d.start..=sig_end(&lines, d) {
             keep.insert(i);
         }
@@ -391,9 +412,7 @@ fn slice_file(ctx: &FileCtx<'_>, opts: &PackOpts) -> Option<SliceOut> {
         }
         i = j;
     }
-    let one_hop = hop.callees.len() + hop.callers.len();
-    let head = format!("{}:1-{n}（切片：核 {} · 一跳 {one_hop} · 折叠 {folds} 段）", ctx.fc.path, changed.len());
-    Some(SliceOut { text: format!("{head}\n{body}\n"), one_hop, folded_lines })
+    (body, folds, folded_lines)
 }
 
 /// 0 壳段：每个改动文件一块，第一级 = 切片块（slice 档、大文件）或全文块（full 档 / 小文件 / 无可解析 hunk），
@@ -684,7 +703,25 @@ fn outside_section(
     omit: &mut Vec<String>,
     stats: &mut PackStats,
 ) -> String {
-    let names = outside_names(files);
+    outside_render(root, opts, changeset, cap, omit, stats, outside_names(files))
+}
+
+/// 名字集 → 走仓搜索与段渲染（组 pack [`outside_section`] 与 reviewer 区域爆炸半径〔批 B `pack::region`〕共用）：
+/// 一条合成 regex 走仓（gitignore 感知、不跟符号链接、隐藏目录跳过），跳过变更集文件 /
+/// 测试文件 / 凭据类路径 / 非支持语言 / 超大文件；命中按 (path, line) 排序后每名 ≤ K 处调用点、每名首个签名；段字节 ≤ `cap`，
+/// 超帽块进 omit。路径来自 walker 与 git diff、非模型可控，读守卫与 `search_repo` 工具同口径（不逐文件 `git ls-files`）；
+/// denylist 只用凭据判据（扩展名 / `.env` / `id_rsa` / 工具目录），不用敏感词子串（`token_bucket.rs` 是源码，评审修 10）。
+/// 名字边界不用 `\b`（`$` 属 \W，`items$` 永不命中）也不用消耗式字符类（相邻两名会互吃边界）：先按裸 alternation 命中，
+/// 再手工看前后字符是否标识符字节（`word_hits`，复审修 9）。
+fn outside_render(
+    root: &Path,
+    opts: &PackOpts,
+    changeset: &[String],
+    cap: usize,
+    omit: &mut Vec<String>,
+    stats: &mut PackStats,
+    names: OutsideNames,
+) -> String {
     if names.callers_of.is_empty() && names.sig_of.is_empty() {
         return String::new();
     }

@@ -162,6 +162,95 @@ fn sse_error_event(body: &str) -> Option<ProviderError> {
         .find_map(|v| error_body_to_provider_error(&v))
 }
 
+/// 文本 delta 回调（M21b 批 B）。
+pub(crate) type DeltaCb = Box<dyn FnMut(&str) + Send>;
+/// 文本 delta 回调槽类型（M21b 批 B）：take / put-back 形态。
+pub(crate) type TextDeltaSlot = std::sync::Mutex<Option<DeltaCb>>;
+
+/// 回调放回 guard（取消安全，安全评审 #6）：turn 的读取 future 在 await 中被取消（per_turn 超时包装正是取消点）时，
+/// 裸 put-back 永不执行、槽停在 None，同实例后续轮（FINALIZE/REPAIR）旁路静默熄火。guard 持槽的 `Arc` 克隆与回调本体，
+/// 块尾正常 drop 或取消 drop 都执行放回（槽空才放——并发误用同实例时后完成者不抹先放回者）。
+struct DeltaGuard {
+    slot: std::sync::Arc<TextDeltaSlot>,
+    cb: Option<DeltaCb>,
+}
+
+impl Drop for DeltaGuard {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap();
+        if slot.is_none() {
+            *slot = self.cb.take();
+        }
+    }
+}
+
+/// SSE `data:` 行 → 文本 delta 提取（anthropic 方言）：`content_block_delta` 事件的 `text_delta.text`。
+/// 与 `parse_anthropic_stream` 的文本拼接同字段路径——旁路喂出的序即最终聚合序。非文本事件 / 心跳 → None。
+fn anthropic_text_delta(data: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(data).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("content_block_delta") {
+        return None;
+    }
+    let d = &v["delta"];
+    if d.get("type").and_then(Value::as_str) != Some("text_delta") {
+        return None;
+    }
+    d.get("text").and_then(Value::as_str).map(str::to_string)
+}
+
+/// SSE `data:` 行 → 文本 delta 提取（openai 方言）：`choices[0].delta.content`。
+/// 与 `parse_openai_stream` 的文本拼接同字段路径。
+fn openai_text_delta(data: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(data).ok()?;
+    v.get("choices")?.as_array()?.first()?.get("delta")?.get("content")?.as_str().map(str::to_string)
+}
+
+/// 流式读 SSE body（M21b 批 B，D10-1 持久化旁路）：chunk 到达 → 拼行缓冲 → 完整 `data:` 行经方言提取器
+/// 喂 `on_delta`（回调只读）→ 原始字节全量聚合返回。聚合结果与 `resp.text()` 等价——
+/// **无回调（缺省 None）时行为逐字节不变**（cache 三段界与 PR181 对拍基线的锚）。
+/// 中途断流 → 同 `text()` 的 reqwest 错误语义（调用方映射 Unavailable）。
+async fn read_sse_with_delta(
+    resp: reqwest::Response,
+    mut on_delta: Option<&mut (dyn FnMut(&str) + Send + '_)>,
+    extract: fn(&str) -> Option<String>,
+) -> Result<String, reqwest::Error> {
+    use futures::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut line: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        line.extend_from_slice(&chunk);
+        while let Some(pos) = line.iter().position(|&b| b == b'\n') {
+            let rest = line.split_off(pos + 1);
+            let l = std::mem::replace(&mut line, rest);
+            feed_sse_line(&l[..l.len().saturating_sub(1)], &mut on_delta, extract);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    if !line.is_empty() {
+        feed_sse_line(&line, &mut on_delta, extract);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// 一行 SSE：`data:` 前缀 → 方言提取器 → 喂回调（有回调且有文本增量时）。心跳 / 非 JSON 行静默跳过。
+fn feed_sse_line(
+    line: &[u8],
+    on_delta: &mut Option<&mut (dyn FnMut(&str) + Send + '_)>,
+    extract: fn(&str) -> Option<String>,
+) {
+    let l = String::from_utf8_lossy(line);
+    let l = l.trim_end_matches('\r');
+    // trim_start 容忍前导空白（与终态解析 `line.trim().strip_prefix("data:")` 同口径——旁路不得少喂）
+    if let (Some(data), Some(cb)) = (l.trim_start().strip_prefix("data:"), on_delta.as_deref_mut()) {
+        // 无回调（缺省）时 extract 也不跑——读取路径只剩字节聚合，行为逐字节不变
+        if let Some(t) = extract(data.trim()) {
+            cb(&t);
+        }
+    }
+}
+
 /// 累积 Anthropic 流式（SSE）响应为一轮 AssistantTurn：`text_delta` 拼接、按 content_block
 /// index 聚合 tool_use（id/name 由 block_start 首现即取、`input_json_delta.partial_json` 逐片
 /// 拼接后整体 from_str）、usage 取 message_start（input/cache 分列，归一加回合成总输入）与
@@ -340,12 +429,14 @@ pub struct AnthropicBackend {
     output_limit: Option<u64>,
     /// 思考档位参数对（角色条目 `thinkingLevel` → `thinking_params`，批 F-2）；None = 不发。
     thinking: Option<Vec<(&'static str, Value)>>,
+    /// 文本 delta 旁路回调槽（M21b 批 B，D10-1；take / put-back——跨 await 持 `Box`）；None = 行为逐字节不变。
+    on_text_delta: std::sync::Arc<TextDeltaSlot>,
     client: reqwest::Client,
 }
 
 impl AnthropicBackend {
     pub fn new(model: String, base_url: Option<String>, api_key: String) -> Self {
-        AnthropicBackend { model, base_url, api_key, output_limit: None, thinking: None, client: crate::provider::default_http_client() }
+        AnthropicBackend { model, base_url, api_key, output_limit: None, thinking: None, on_text_delta: std::sync::Arc::new(TextDeltaSlot::new(None)), client: crate::provider::default_http_client() }
     }
 
     /// 思考档位参数对注入（`thinking_params` 产物；None = 不发）。
@@ -365,10 +456,21 @@ impl AnthropicBackend {
         self.client = crate::provider::http_client_with_timeout(secs);
         self
     }
+
+    /// 文本 delta 旁路回调注入（M21b 批 B）：`IncrementalFindings::feed` 的闭包形态。
+    pub fn with_text_delta(self, cb: Box<dyn FnMut(&str) + Send>) -> Self {
+        *self.on_text_delta.lock().unwrap() = Some(cb);
+        self
+    }
+
 }
 
 #[async_trait]
 impl ChatBackend for AnthropicBackend {
+    fn on_text_delta(&self) -> Option<Box<dyn FnMut(&str) + Send>> {
+        self.on_text_delta.lock().unwrap().take()
+    }
+
     async fn turn(
         &self,
         messages: &[ChatMessage],
@@ -388,10 +490,13 @@ impl ChatBackend for AnthropicBackend {
         .await?;
         // 读 SSE 全文（随到达消费）：reqwest 持续读 socket → 连接持续活跃，网关/隧道不当空闲
         // reset、不撞 524（与 OpenAiBackend::post 同构）。中途断流 → Unavailable（可重试）。
-        let sse = resp
-            .text()
-            .await
-            .map_err(|e| ProviderError::Unavailable(format!("stream body read failed for {url}: {e}")))?;
+        let sse = {
+            let mut guard = DeltaGuard { slot: self.on_text_delta.clone(), cb: None };
+            guard.cb = self.on_text_delta();
+            let r = read_sse_with_delta(resp, guard.cb.as_deref_mut(), anthropic_text_delta).await;
+            r // guard drop（正常或取消）放回回调
+        }
+        .map_err(|e| ProviderError::Unavailable(format!("stream body read failed for {url}: {e}")))?;
         if sse.trim().is_empty() {
             // 空体（keep-alive/上游放弃）→ 可重试，勿误判 Parse 烧格
             return Err(ProviderError::Unavailable(format!("empty stream body for {url}")));
@@ -660,12 +765,14 @@ pub struct OpenAiBackend {
     output_limit: Option<u64>,
     /// 思考档位参数对（角色条目 `thinkingLevel` → `thinking_params`，批 F-2）；None = 不发。
     thinking: Option<Vec<(&'static str, Value)>>,
+    /// 文本 delta 旁路回调槽（M21b 批 B，D10-1；take / put-back——跨 await 持 `Box`）；None = 行为逐字节不变。
+    on_text_delta: std::sync::Arc<TextDeltaSlot>,
     client: reqwest::Client,
 }
 
 impl OpenAiBackend {
     pub fn new(model: String, base_url: Option<String>, api_key: String) -> Self {
-        OpenAiBackend { model, base_url, api_key, output_limit: None, thinking: None, client: crate::provider::default_http_client() }
+        OpenAiBackend { model, base_url, api_key, output_limit: None, thinking: None, on_text_delta: std::sync::Arc::new(TextDeltaSlot::new(None)), client: crate::provider::default_http_client() }
     }
 
     /// 思考档位参数对注入（`thinking_params` 产物；None = 不发）。
@@ -686,6 +793,13 @@ impl OpenAiBackend {
         self
     }
 
+    /// 文本 delta 旁路回调注入（M21b 批 B）：`IncrementalFindings::feed` 的闭包形态。
+    pub fn with_text_delta(self, cb: Box<dyn FnMut(&str) + Send>) -> Self {
+        *self.on_text_delta.lock().unwrap() = Some(cb);
+        self
+    }
+
+
     /// 共享 HTTP 发送：POST {base}/chat/completions（流式），累积 SSE 解析这一轮输出。
     /// 流式消费的意义：reqwest 随 token 到达读 socket → 连接持续有数据流，隧道/网关不当空闲
     /// reset（非 stream 长思考期连接静默 = 超时/reset 根因）。
@@ -700,11 +814,14 @@ impl OpenAiBackend {
                 .json(body),
         )
         .await?;
-        // 读 SSE 全文（随到达消费）。中途断流 → Unavailable（可重试），与 decode_json 一致。
-        let sse = resp
-            .text()
-            .await
-            .map_err(|e| ProviderError::Unavailable(format!("stream body read failed for {url}: {e}")))?;
+        // 读 SSE 全文（随到达消费；有回调时逐片喂——M21b 批 B 旁路）。中途断流 → Unavailable（可重试），与 decode_json 一致。
+        let sse = {
+            let mut guard = DeltaGuard { slot: self.on_text_delta.clone(), cb: None };
+            guard.cb = self.on_text_delta();
+            let r = read_sse_with_delta(resp, guard.cb.as_deref_mut(), openai_text_delta).await;
+            r // guard drop（正常或取消）放回回调
+        }
+        .map_err(|e| ProviderError::Unavailable(format!("stream body read failed for {url}: {e}")))?;
         if sse.trim().is_empty() {
             // 空体（keep-alive/上游放弃）→ 可重试，勿误判 Parse 烧格
             return Err(ProviderError::Unavailable(format!("empty stream body for {url}")));
@@ -730,6 +847,10 @@ impl OpenAiBackend {
 
 #[async_trait]
 impl ChatBackend for OpenAiBackend {
+    fn on_text_delta(&self) -> Option<Box<dyn FnMut(&str) + Send>> {
+        self.on_text_delta.lock().unwrap().take()
+    }
+
     async fn turn(
         &self,
         messages: &[ChatMessage],
@@ -872,6 +993,47 @@ mod tests {
     use crate::tools::tool_specs;
 
     /// 评审 M2：整请求超时随 per_turn 抬；env 更大时取 env。
+
+    // ----------------------------- 流式旁路（M21b 批 B-4）-----------------------------
+
+    #[test]
+    fn anthropic_text_delta_extracts_only_text_events() {
+        assert_eq!(anthropic_text_delta(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}"#).as_deref(), Some("hel"));
+        assert_eq!(anthropic_text_delta(r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#), None, "工具分片不喂");
+        assert_eq!(anthropic_text_delta(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"x"}}"#), None, "思考不喂");
+        assert_eq!(anthropic_text_delta(r#"{"type":"message_start","message":{}}"#), None);
+        assert_eq!(anthropic_text_delta("event: ping"), None, "非 JSON 跳过");
+    }
+
+    #[test]
+    fn openai_text_delta_extracts_choices_content() {
+        assert_eq!(openai_text_delta(r#"{"choices":[{"delta":{"content":"wor"}}]}"#).as_deref(), Some("wor"));
+        assert_eq!(openai_text_delta(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"x"}}]}}]}"#), None);
+        assert_eq!(openai_text_delta(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#), None);
+        assert_eq!(openai_text_delta(r#"{"usage":{"total_tokens":1}}"#), None, "usage-only 末块无 choices");
+        assert_eq!(openai_text_delta("[DONE]"), None);
+    }
+
+    /// 无回调时 feed_sse_line 不动任何状态（读取路径只剩字节聚合——逐字节不变锚的行为件）。
+    #[test]
+    fn feed_sse_line_without_callback_is_noop() {
+        let mut cb: Option<&mut (dyn FnMut(&str) + Send)> = None;
+        let fed = std::sync::Mutex::new(Vec::<String>::new());
+        // 有回调时按序喂
+        {
+            let mut sink = |t: &str| fed.lock().unwrap().push(t.to_string());
+            let mut c: Option<&mut (dyn FnMut(&str) + Send)> = Some(&mut sink);
+            feed_sse_line(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}", &mut c, anthropic_text_delta);
+            feed_sse_line(b"event: ping", &mut c, anthropic_text_delta);
+            feed_sse_line(b"data: [DONE]", &mut c, anthropic_text_delta);
+            feed_sse_line(b"data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}", &mut c, openai_text_delta);
+        }
+        assert_eq!(*fed.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        // 无回调：同输入静默
+        feed_sse_line(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}", &mut cb, openai_text_delta);
+        assert!(cb.is_none());
+    }
+
     #[test]
     fn http_timeout_covers_per_turn() {
         let _g = crate::config::ENV_LOCK.lock().unwrap();

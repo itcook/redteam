@@ -33,6 +33,9 @@ fn safe_read(root: &Path, rel: &str) -> Option<String> {
 }
 
 /// 把 quote 在给定内容中确定性定位到行跨度；空 quote 或未命中返回 None。
+/// 首匹配定位（软换行 quote 锚定的基础件；生产锚定走 `locate_quote_near`——首匹配会把短 quote 锚到
+/// 同文件另一处无辜同文，见 `anchor_suspicions` 教训。保留供 near 实现复用与软换行测试锁。）
+#[allow(dead_code)]
 fn locate_quote(content: &str, quote: &str) -> Option<(u32, u32)> {
     let file_lines: Vec<String> = content.lines().map(normalize_ws).collect();
     let raw_quote: Vec<String> = quote.lines().map(normalize_ws).collect();
@@ -152,22 +155,36 @@ pub fn anchor_suspicions(root: &Path, mut out: ScanOutput) -> AnchoredScan {
 
 /// 把 quote 确定性定位到真实行；定位失败即丢弃（确定性幻觉过滤，code 线每条 finding 须指向真实代码）。
 pub fn anchor(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
+    anchor_review_findings(findings, root).0
+}
+
+/// reviewer finding 的 quote 逐字硬约束（M21b 批 B，design §7〔D11 同款〕）：定位成功改写行号，失败丢弃并计数
+/// （旧 `anchor` 的计数版——丢弃不静默，计数回填 `ReviewParseStats.dropped_quote`）；文件不可读单列。
+/// 返回 (kept, dropped_total, dropped_unreadable)。
+pub fn anchor_review_findings(findings: Vec<Finding>, root: &Path) -> (Vec<Finding>, u32, u32) {
     let mut out = Vec::new();
+    let (mut dropped, mut dropped_unreadable) = (0u32, 0u32);
     for mut f in findings {
         let content = match safe_read(root, &f.file) {
             Some(c) => c,
-            None => continue,
+            None => {
+                dropped += 1;
+                dropped_unreadable += 1;
+                continue;
+            }
         };
-        match locate_quote(&content, &f.quote) {
+        // near 版（质量评审 🟡3）：finding 自带自报行号 + 短 quote，首匹配会把幽灵 finding 锚到同文件
+        // 另一处无辜同文（scanner 侧 anchor_suspicions 的既有教训）——取最接近自报行号者。
+        match locate_quote_near(&content, &f.quote, f.line_start) {
             Some((ls, le)) => {
                 f.line_start = ls;
                 f.line_end = le;
                 out.push(f);
             }
-            None => continue,
+            None => dropped += 1,
         }
     }
-    out
+    (out, dropped, dropped_unreadable)
 }
 
 #[cfg(test)]

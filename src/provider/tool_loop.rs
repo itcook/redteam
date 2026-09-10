@@ -56,6 +56,14 @@ pub trait ChatBackend: Send + Sync {
     ) -> Result<AssistantTurn, ProviderError> {
         self.turn(messages, &[]).await
     }
+
+    /// 文本 delta 旁路（M21b 批 B，design §7〔D10-1〕）：取出本实例的回调（take 语义——跨 await 持 `Box` 而非
+    /// 非 Send 的 guard），SSE 文本增量逐片喂回调；缺省 None = 行为逐字节不变（cache 与对拍基线的锚）。
+    /// 持有方（批 C `run_review_shot` 的 `IncrementalFindings`）在 per-cell backend 实例上经构造器注入——
+    /// 共享 registry 实例不挂回调，天然无并发互抢。
+    fn on_text_delta(&self) -> Option<crate::provider::backends::DeltaCb> {
+        None
+    }
 }
 
 /// `Arc<T>` 透传：测试与编排层可在把 backend 交给 registry（`Box<dyn ChatBackend>`）后仍持一份句柄观测（批 F-4）。
@@ -66,6 +74,9 @@ impl<T: ChatBackend + ?Sized> ChatBackend for std::sync::Arc<T> {
     }
     async fn turn_final(&self, messages: &[ChatMessage]) -> Result<AssistantTurn, ProviderError> {
         (**self).turn_final(messages).await
+    }
+    fn on_text_delta(&self) -> Option<crate::provider::backends::DeltaCb> {
+        (**self).on_text_delta()
     }
 }
 
@@ -277,6 +288,9 @@ pub struct FakeChatBackend {
     final_calls: std::sync::atomic::AtomicUsize,
     inflight: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
+    /// 逐片 delta 尺寸（Some(n) = 每轮把最终文本按 n 字节片喂 `on_text_delta`，模拟 SSE 到达；None = 不喂）。
+    delta_chunk: Option<usize>,
+    on_text_delta: Mutex<Option<crate::provider::backends::DeltaCb>>,
 }
 
 impl FakeChatBackend {
@@ -292,6 +306,8 @@ impl FakeChatBackend {
             final_calls: std::sync::atomic::AtomicUsize::new(0),
             inflight: std::sync::atomic::AtomicUsize::new(0),
             peak: std::sync::atomic::AtomicUsize::new(0),
+            delta_chunk: None,
+            on_text_delta: Mutex::new(None),
         }
     }
     /// 每轮都回同一 turn（不消耗队列）。
@@ -302,6 +318,16 @@ impl FakeChatBackend {
     }
     pub fn with_delay(mut self, d: std::time::Duration) -> Self {
         self.delay = Some(d);
+        self
+    }
+    /// 逐片吐 delta：每轮把最终文本按 n 字节片喂 `on_text_delta`（流式旁路测试用，M21b 批 B）。
+    pub fn with_delta_chunk(mut self, n: usize) -> Self {
+        self.delta_chunk = Some(n);
+        self
+    }
+    /// 注入文本 delta 回调（`IncrementalFindings::feed` 的闭包形态）。
+    pub fn with_text_delta(mut self, cb: crate::provider::backends::DeltaCb) -> Self {
+        self.on_text_delta = Mutex::new(Some(cb));
         self
     }
     /// 观测到的最大并发轮数（并发上限断言）。
@@ -343,8 +369,32 @@ impl ChatBackend for FakeChatBackend {
                 .pop_front()
                 .unwrap_or_else(|| Err(ProviderError::Unavailable("no scripted turn".into()))),
         };
+        // 流式旁路模拟：成功轮按 delta_chunk 逐片喂回调（字符边界切——真路径喂完整 SSE 行无损，
+        // 字节切会在多字节字符中间产生 U+FFFD），用完放回（repeating 多轮场景每轮可喂）
+        if let (Some(sz), Ok(t)) = (self.delta_chunk, &out) {
+            let mut cb = <Self as ChatBackend>::on_text_delta(self);
+            if let Some(cb) = cb.as_mut() {
+                let mut piece = String::new();
+                for ch in t.text.chars() {
+                    piece.push(ch);
+                    if piece.len() >= sz.max(1) {
+                        cb(&piece);
+                        piece.clear();
+                    }
+                }
+                if !piece.is_empty() {
+                    cb(&piece);
+                }
+            }
+            *self.on_text_delta.lock().unwrap() = cb;
+        }
         self.inflight.fetch_sub(1, SeqCst);
         out
+    }
+
+    /// 流式旁路（M21b 批 B）：take 语义，与真 backend 同契约。
+    fn on_text_delta(&self) -> Option<Box<dyn FnMut(&str) + Send>> {
+        self.on_text_delta.lock().unwrap().take()
     }
 
     /// 覆写仅为计数，行为照旧转发默认实现（不带 tools 调 `turn`）——
@@ -389,6 +439,66 @@ mod tests {
         let ex = ToolExecutor::new(dir.path());
         (dir, ex)
     }
+
+    // ----------------------------- 流式旁路（M21b 批 B-4）-----------------------------
+
+    const THREE_FINDINGS_JSON: &str = r#"{"findings":[
+        {"severity":"high","title":"t1","body":"b1","file":"a.rs","line_start":1,"line_end":2,"confidence":0.9,"recommendation":"r1","quote":"let x = 1;"},
+        {"severity":"low","title":"t2","body":"b2","file":"a.rs","line_start":3,"line_end":3,"confidence":0.5,"recommendation":"r2","quote":"let y = 2;"},
+        {"severity":"medium","title":"t3","body":"b3","file":"b.rs","line_start":7,"line_end":8,"confidence":0.7,"recommendation":"r3","quote":"fn z() {"}
+    ],"needs":[]}"#;
+
+    /// 三 finding 分片到达（fake 逐片 delta）→ IncrementalFindings 三次 emit + 终态 parse 一致（旁路不改契约）。
+    #[tokio::test]
+    async fn fake_streams_deltas_and_emits_closed_findings() {
+        use crate::provider::stream_json::IncrementalFindings;
+        let inc = std::sync::Arc::new(std::sync::Mutex::new(IncrementalFindings::new()));
+        let inc2 = inc.clone();
+        let backend = FakeChatBackend::new(vec![final_turn(THREE_FINDINGS_JSON)])
+            .with_delta_chunk(13)
+            .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
+        let turn = backend.turn_final(&[ChatMessage::User("go".into())]).await.unwrap();
+        assert_eq!(turn.text, THREE_FINDINGS_JSON, "旁路不改 turn 产出");
+        let emitted = inc.lock().unwrap().take();
+        assert_eq!(emitted.len(), 3, "三个对象闭合即三次 emit");
+        assert_eq!(emitted[0].title, "t1");
+        // 终态一致
+        let (out, _) = crate::provider::parse::parse_review_output_with_stats(THREE_FINDINGS_JSON, "m").unwrap();
+        let crate::domain::CellOutput::Review { findings, .. } = out else { panic!() };
+        assert_eq!(findings.len(), 3);
+        for (e, f) in emitted.iter().zip(findings.iter()) {
+            assert_eq!(e.title, f.title);
+        }
+        assert_eq!(inc.lock().unwrap().discarded(), 0);
+    }
+
+    /// 截断流：已闭合对象保留（fake 只吐截断文本——终态 parse 失败但旁路已保住前两个）。
+    #[tokio::test]
+    async fn truncated_stream_keeps_closed_findings() {
+        use crate::provider::stream_json::IncrementalFindings;
+        let truncated = &THREE_FINDINGS_JSON[..THREE_FINDINGS_JSON.len() - 80];
+        let inc = std::sync::Arc::new(std::sync::Mutex::new(IncrementalFindings::new()));
+        let inc2 = inc.clone();
+        let backend = FakeChatBackend::new(vec![final_turn(truncated)])
+            .with_delta_chunk(9)
+            .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
+        let _ = backend.turn_final(&[ChatMessage::User("go".into())]).await;
+        let mut guard = inc.lock().unwrap();
+        let emitted = guard.take();
+        assert!(!emitted.is_empty(), "已闭合对象不丢（cell 中途死亡保险）");
+        assert!(emitted.len() < 3, "末对象未闭合不在 emit");
+    }
+
+    /// 无回调 backend：turn 行为逐字节不变（不挂回调 / 不开分片都不影响产出）。
+    #[tokio::test]
+    async fn no_callback_backend_unchanged() {
+        let b1 = FakeChatBackend::new(vec![final_turn(THREE_FINDINGS_JSON)]);
+        let b2 = FakeChatBackend::new(vec![final_turn(THREE_FINDINGS_JSON)]).with_delta_chunk(16);
+        let t1 = b1.turn_final(&[ChatMessage::User("go".into())]).await.unwrap();
+        let t2 = b2.turn_final(&[ChatMessage::User("go".into())]).await.unwrap();
+        assert_eq!((t1.text, t1.output_tokens), (t2.text, t2.output_tokens), "无回调时逐字节不变");
+    }
+
 
     /// E11-Q6/Q7-a（威胁模型 B）：结构标签中和挡不住散文级"忽略以上规则"式注入——system
     /// 免疫段是主防线，明示被审内容(diffs/sources/dossier/spec)是待分析的不可信数据，

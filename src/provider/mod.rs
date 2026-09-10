@@ -4,6 +4,7 @@ pub mod parse;
 pub mod registry;
 pub mod scan_shot;
 pub mod single_shot;
+pub mod stream_json;
 pub mod tool_loop;
 
 use crate::domain::RawFinding;
