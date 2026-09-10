@@ -24,16 +24,27 @@
 - `shared-head.md` + `scanner.md` 模板、`build_scan_prompt`、模板哈希、anthropic 三段界 cache 断点。
 - `eval/`：`risk_replay.py`（P0 E1 Python 参考实现，v4 规则）、`scan_score.py`、`export_ledger.py`、fixtures
   `ledger-{dismissed,upheld,resolved}.jsonl`（63 / 48 / n）。
-- 保留件：`src/cli/second_pass.rs`（三标配机器）、`src/prompt/templates/adversarial-refute.md`（verifier 底稿）、
+- 保留件：`src/cli/second_pass.rs`（三标配机器 + reviewer needs 二阶段机器）、`src/prompt/templates/adversarial-refute.md`（verifier 底稿）、
   `src/consolidate/verify.rs`（barrier 型 refute，含 ±60 快照 / 骨架中档 / 读帽全套，改造非重写）。
+
+## 开工前置清单（M21b 前，followup 已记；批 A 开工前完成，产出进 followup / 决策记）
+
+- **分组策略议定**（M21a 出口两未达项 + followup）：PR181 7 组中 4 组是 ≤ 3 文件小强分量→小分量与孤立文件同池装箱 or 组数门槛
+  改「≤ 强分量数 + 1」（用户裁）；拆大格键按每格 **diff 字节**（非 pack 字节）、先切引用计数最低的强边（用户裁：样本太少，保持
+  followup 观测）。
+- **分组预算门（估算字节）与装包（切片字节）口径对齐**：PR181 `--pack-only` 回放（本工作树，数据落 `.next/private/m21b/`）。
+- **`GroupingStats` 分种计数**：`cross_edges` 按 import / reference / samedir 分种（R8 触发度量 = 跨组 import 边数）、`weak_cut`
+  只计真切的边。
+- **速率型 429 棘轮与放弃判据**（D13 收口批评审延后项，用户裁）：看 PR181 `provider_rate_limit` 数据后定 Retry-After 速率信号
+  不收门 / 最小回升 / 等待总时长 ≤ `perTurnTimeoutSecs`。
 
 ## 批间依赖与波次
 
 | 波 | 批（子分支） | 前提 | 碰撞点 |
 |---|---|---|---|
 | 1 | **A 风险评分器**（`feat/m21b-risk`）· **B reviewer 静态零件**（`feat/m21b-review-primitives`） | 无，两批并行 | A 与 B 无文件交集（A: `src/risk/`+`src/cli/mod.rs` 接线段；B: `src/pack/`+`src/prompt/`+`src/provider/parse.rs`+`tool_loop.rs`） |
-| 2 | **D 深挖队列与 reviewer 运行时**（`feat/m21b-deep`） | A、B 合回 | 独占 `src/orchestrate/`、`src/cli/mod.rs` 主流程、`src/state/` |
-| 3 | **E verifier 流式段**（`feat/m21b-verifier`） | D 合回（finding 事件流） | 独占 `src/consolidate/verify.rs`、verifier.md；与 C 约定 `FindingEvent` 接口（C-3 定义） |
+| 2 | **C 深挖队列与 reviewer 运行时**（`feat/m21b-deep`） | A、B 合回 | 独占 `src/orchestrate/`、`src/cli/mod.rs` 主流程、`src/state/` |
+| 3 | **D verifier 流式段**（`feat/m21b-verifier`） | C 合回（finding 事件流） | 独占 `src/consolidate/verify.rs`、verifier.md；与 C 约定 `FindingEvent` 接口（C-3 定义） |
 | 4 | 出口验收（本工作树，单 session） | A-D 全合回 | — |
 
 （aacr 接线不在本里程碑：D7 B4 暂退役、重启节点待定，`reviewers/redteam.py` 随 M21c smoke 重启点一并做〔M21c 交付 7〕。）
@@ -69,7 +80,10 @@ git worktree add ~/hobby/.worktrees/redteam/m21b-review-primitives -b feat/m21b-
 - Add: `src/risk/regions.rs`（`regions(changes, files) -> Vec<Region>`：hunk → enclosing def 块〔复用 `diffsym` 的 def 块与配平；
   局部 const 不算 def；无 def → hunk ± 10 行 padded，只与 padded 相邻合并；相邻函数各自成区〕；`kind: Primary | Ripple`：
   涟漪 = 改动 / 新增 / 删除的声明名与 hunk 外围符号在本文件引用点（≤ 4 处，不跨文件）的 enclosing def；区间带 `signals: Vec<SignalKind>`）。
-- 测试：三语言合成文件（def 块 / 无 def padded / 涟漪 ≤4 处 / 相邻不并 / 局部 const 不成区）。
+  **def 口径统一**（followup 实现债）：分组侧 `bundle::changed_def_names`（hunk 首行锚定 + `block_end`、含测试 def）与文件外搜索键
+  `pack::outside_names`（全改动行 + `value_end` + 容器 / 测试排除 + 重锚定）两套——风险规则复用时一并统一（分组侧改吃
+  `all_defs` / `changed_defs`），重跑分组回归。
+- 测试：三语言合成文件（def 块 / 无 def padded / 涟漪 ≤4 处 / 相邻不并 / 局部 const 不成区）；分组回归重跑零变化（或预期内变化记录在案）。
 - Commit: `feat(risk): 成区——hunk→def 块、padded 兜底、主区/涟漪二梯队（design §3.3，P0 v4）`
 
 ### Task A-2 四类信号与评分
