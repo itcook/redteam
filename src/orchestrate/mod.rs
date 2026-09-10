@@ -243,7 +243,7 @@ pub async fn run_scan_fanout(
             };
             let duration_ms = t0.elapsed().as_millis() as u64;
             let (mut record, output) = scan_cell_record(id, &e.route_key, &e.family, e.thinking_pinned, input.root, res, duration_ms, template_hash);
-            record.queue_wait_ms = queue_wait_ms;
+            record.queue_wait_ms += queue_wait_ms; // 门等待 + 429 排队等待（scan_cell_record 已填后者）
             if let Some(s) = sink {
                 s.on_cell(record.clone());
             }
@@ -256,24 +256,9 @@ pub async fn run_scan_fanout(
     cells.sort_by_key(|(pi, _)| *pi);
     let cells: Vec<ScanCellResult> = cells.into_iter().map(|(_, c)| c).collect();
     let mut out = ScanResults::default();
-    // 排队告警（M21a 出口验收；D13 按 provider 计）：路由到同一 provider 的格数 > 其门宽即排队，墙钟 = 排队 + 最长格；
-    // 文案指向唯一的旋钮 providers.<p>.maxConcurrency。未注册条目不计（它们进 failed）。
-    let mut per_provider: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for (_, e, _, _) in &plan {
-        if let Some(p) = registry.provider_of(&e.route_key) {
-            *per_provider.entry(p).or_default() += 1;
-        }
-    }
-    for (p, n) in per_provider {
-        let cap = registry.cap_of(p).unwrap_or(1) as usize;
-        if n > cap {
-            out.warnings.push(format!(
-                "scanner cells {n} on provider {p} > maxConcurrency {cap}: {} cell(s) queued (wall = queue wait + slowest cell; raise providers.{p}.maxConcurrency)",
-                n - cap
-            ));
-        }
-    }
-    // 429 收敛告警（D13）：撞过 429 的 provider 各一条「429 × N，门宽 A → B」。
+    // 排队告警（M21a 出口验收；D13 按 provider 计，扇出与 resume 共用 registry::queue_warnings，用收口时的有效门宽）
+    // + 429 收敛告警（撞过 429 的 provider 各一条「429 × N，门宽 A → B」）。
+    out.warnings.extend(registry.queue_warnings(plan.iter().map(|(_, e, _, _)| e.route_key.as_str())));
     out.warnings.extend(registry.gate_warnings());
     for c in &cells {
         out.usage.0 += c.record.input_tokens;
@@ -293,7 +278,8 @@ pub async fn run_scan_fanout(
 }
 
 /// 单格收口（扇出与 resume 共用，评审修 5）：成功 → `anchor_suspicions`（quote 不在文件即丢，design §4）→ `CellRecord::ok`，parse /
-/// 锚定丢弃计数与零推理观测拼进 `warn`（cell 仍 ok）；失败 → `CellRecord::failed` + 烧掉的 usage 入账。`attempts` 恒 1（无候补）。
+/// 锚定丢弃计数与零推理观测拼进 `warn`（cell 仍 ok）；失败 → `CellRecord::failed` + 烧掉的 usage 入账。`attempts` = HTTP 调用数
+/// （轮次 + 429 排队重试，D13；无候补）；`queue_wait_ms` 先填 429 排队等待，调用方再加门等待。
 #[allow(clippy::too_many_arguments)]
 pub fn scan_cell_record(
     cell_id: &str,
@@ -320,6 +306,8 @@ pub fn scan_cell_record(
             rec.output_tokens = call.output_tokens;
             rec.cached_input_tokens = call.cached_input_tokens;
             rec.iterations = call.iterations;
+            rec.attempts = call.iterations + call.rate_limit_retries;
+            rec.queue_wait_ms = call.rate_limit_wait_ms;
             rec.warn = if notes.is_empty() { None } else { Some(notes.join("; ")) };
             (rec, Some(anchored.output))
         }
@@ -329,11 +317,11 @@ pub fn scan_cell_record(
             rec.input_tokens = i;
             rec.output_tokens = o;
             rec.cached_input_tokens = c;
+            rec.attempts = 1;
             (rec, None)
         }
     };
     record.duration_ms = duration_ms;
-    record.attempts = 1;
     record.template_hash = Some(template_hash);
     (record, output)
 }

@@ -140,6 +140,9 @@ fn classify_status(
     use reqwest::StatusCode as S;
     match status {
         S::TOO_MANY_REQUESTS => ProviderError::RateLimited { retry_after: parse_retry_after(headers) },
+        // 529 = Anthropic 系 overloaded：并发密度限流的另一种写法，与 SSE `overloaded_error` 事件同归 RateLimited
+        // → 进 provider 门的 429 排队重试（D13），不按 5xx 抖动退避烧格。
+        s if s.as_u16() == 529 => ProviderError::RateLimited { retry_after: parse_retry_after(headers) },
         S::UNAUTHORIZED | S::FORBIDDEN => ProviderError::Auth(format!("http {status}")),
         S::REQUEST_TIMEOUT => ProviderError::Timeout(format!("http {status}")),
         s if s.is_server_error() => ProviderError::Server(format!("http {status}")),
@@ -176,14 +179,48 @@ const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 /// 429 排队重试的挂点（design §12.3〔D13〕）：`retry_classified_with` 在每次真正发请求前后回调（provider 门据此计在途峰值、
 /// 发「请求完成」事件），撞 429 / overloaded 时把等待与去留交给策略——不吃 2 次抖动预算。无策略 = 旧行为（429 按 Retry-After /
 /// 指数退避，计入预算）。实现者：`registry::GateAttempts`（provider 在途门）；`single_shot` / `tool_loop` 暂不挂（M21b 接线时再挂）。
+/// 一次 HTTP 尝试的结局（`AttemptPolicy::attempt_end`）：只有 `Ok` 是「网关放出一个槽」的证据；`RateLimited` 与其它失败都不算完成。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttemptOutcome {
+    Ok,
+    RateLimited,
+    Failed,
+}
+
 #[async_trait]
 pub(crate) trait AttemptPolicy: Send + Sync {
     /// 一次 HTTP 尝试开始（在途 + 1）。
     fn attempt_begin(&self);
-    /// 一次 HTTP 尝试结束；`rate_limited` = 本次撞 429（不算「完成」，不唤醒排队者）。
-    fn attempt_end(&self, rate_limited: bool);
-    /// 撞 429 后：返回 true = 已按策略等完、请重试；false = 放弃（超 429 重试上限），错误原样返回给调用方。
-    async fn on_rate_limited(&self, retry_after: Option<std::time::Duration>) -> bool;
+    /// 一次 HTTP 尝试结束（含 future 被丢弃时由守卫按 `Failed` 补记）。
+    fn attempt_end(&self, outcome: AttemptOutcome);
+    /// 撞 429 后：`nth` = 本次 `retry_classified_with` 调用内第几次撞 429（1 起；每次 HTTP 调用独立计数）。
+    /// 返回 true = 已按策略等完、请重试；false = 放弃（超 429 重试上限），错误原样返回给调用方。
+    async fn on_rate_limited(&self, nth: u32, retry_after: Option<std::time::Duration>) -> bool;
+}
+
+/// 尝试括号的 RAII 守卫：future 中途被丢弃（job deadline 的 `select!` 取消）时按 `Failed` 收尾，在途计数不泄漏。
+struct AttemptGuard<'a> {
+    policy: &'a dyn AttemptPolicy,
+    ended: bool,
+}
+
+impl<'a> AttemptGuard<'a> {
+    fn begin(policy: &'a dyn AttemptPolicy) -> Self {
+        policy.attempt_begin();
+        AttemptGuard { policy, ended: false }
+    }
+    fn end(mut self, outcome: AttemptOutcome) {
+        self.ended = true;
+        self.policy.attempt_end(outcome);
+    }
+}
+
+impl Drop for AttemptGuard<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.policy.attempt_end(AttemptOutcome::Failed);
+        }
+    }
 }
 
 /// 通用重试：`op` 产 `Result<T, ProviderError>`；可重试错→退避后重试，不可重试→立即返回。
@@ -197,21 +234,25 @@ where
     Fut: std::future::Future<Output = Result<T, ProviderError>>,
 {
     let mut attempt = 0u32;
+    let mut rate_limited_n = 0u32;
     loop {
-        if let Some(p) = policy {
-            p.attempt_begin();
-        }
+        let guard = policy.map(AttemptGuard::begin);
         let r = op().await;
-        let rate_limited = matches!(&r, Err(e) if matches!(e.inner(), ProviderError::RateLimited { .. }));
-        if let Some(p) = policy {
-            p.attempt_end(rate_limited);
+        let outcome = match &r {
+            Ok(_) => AttemptOutcome::Ok,
+            Err(e) if matches!(e.inner(), ProviderError::RateLimited { .. }) => AttemptOutcome::RateLimited,
+            Err(_) => AttemptOutcome::Failed,
+        };
+        if let Some(g) = guard {
+            g.end(outcome);
         }
         match r {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if rate_limited {
+                if outcome == AttemptOutcome::RateLimited {
                     if let Some(p) = policy {
-                        if p.on_rate_limited(e.retry_after()).await {
+                        rate_limited_n += 1;
+                        if p.on_rate_limited(rate_limited_n, e.retry_after()).await {
                             continue;
                         }
                         return Err(e);
@@ -393,6 +434,7 @@ mod tests {
         use reqwest::header::HeaderMap;
         let h = HeaderMap::new();
         assert!(matches!(classify_status(StatusCode::TOO_MANY_REQUESTS, &h), ProviderError::RateLimited { .. }));
+        assert!(matches!(classify_status(StatusCode::from_u16(529).unwrap(), &h), ProviderError::RateLimited { .. }), "529 overloaded 进 429 排队重试（D13）");
         assert!(matches!(classify_status(StatusCode::UNAUTHORIZED, &h), ProviderError::Auth(_)));
         assert!(matches!(classify_status(StatusCode::FORBIDDEN, &h), ProviderError::Auth(_)));
         assert!(matches!(classify_status(StatusCode::REQUEST_TIMEOUT, &h), ProviderError::Timeout(_)));

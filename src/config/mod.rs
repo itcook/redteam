@@ -700,18 +700,29 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     const PROVIDER: &[&str] = &["kind", "baseUrl", "apiKeyEnv", "maxConcurrency", "models"];
     const MODEL: &[&str] = &["displayName", "kind", "apiKeyEnv", "family", "contextWindow", "maxOutputTokens", "perTurnTimeoutSecs", "reasoning", "roles"];
     const ROLE_ATTRS: &[&str] = &["thinkingLevel"];
-    const REVIEW: &[&str] = &["blockThreshold", "confFloor", "maxConcurrency", "tools", "scanners", "reviewers", "verifiers", "grouping", "pack", "risk"];
-    const REVIEW_SECTIONS: &[(&str, &[&str])] = &[
-        ("scanners", &["samples"]),
-        ("reviewers", &["maxCells", "reenqueue"]),
-        ("verifiers", &["enabled"]),
-        ("grouping", &["minFiles", "bundleLineThreshold", "maxFilesPerGroup", "semantic"]),
-        ("pack", &["body", "anchorWindow", "sliceMinBytes"]),
+    const REVIEW: &[&str] = &["blockThreshold", "confFloor", "maxConcurrency", "tools", "scanners", "reviewers", "verifiers", "grouping", "pack"];
+    /// review 已删键：`risk`（D11 无模式旋钮）。
+    const REVIEW_REMOVED: &[(&str, &str)] = &[("risk", "D11：无模式旋钮")];
+    /// (节名, 已知键, 是否角色节)；角色节的已删键 `workers`（D13）在 shape_guard 里按缺省值拼文案。
+    const REVIEW_SECTIONS: &[(&str, &[&str], bool)] = &[
+        ("scanners", &["samples"], true),
+        ("reviewers", &["maxCells", "reenqueue"], true),
+        ("verifiers", &["enabled"], true),
+        ("grouping", &["minFiles", "bundleLineThreshold", "maxFilesPerGroup", "semantic"], false),
+        ("pack", &["body", "anchorWindow", "sliceMinBytes"], false),
     ];
-    /// 已知层级的键检查：snake_case → 错误（指引 camelCase 拼写）；其余未知 → warning。
+    /// 已知层级的键检查：snake_case → 错误（指引 camelCase 拼写）；`removed`（键 → 为什么没了 / 去哪调）命中 → 专属 warning；
+    /// 其余未知 → 通用 warning。已删键统一走 `removed` 表，不另开分支（评审修：同一文件只留一种「已删键」手法）。
     fn check(errors: &mut Vec<String>, warnings: &mut Vec<String>, path: &str, obj: &serde_json::Map<String, serde_json::Value>, known: &[&str], hint: &str) {
+        check_keys(errors, warnings, path, obj, known, hint, &[]);
+    }
+    fn check_keys(errors: &mut Vec<String>, warnings: &mut Vec<String>, path: &str, obj: &serde_json::Map<String, serde_json::Value>, known: &[&str], hint: &str, removed: &[(&str, &str)]) {
         for k in obj.keys() {
             if known.contains(&k.as_str()) {
+                continue;
+            }
+            if let Some((_, why)) = removed.iter().find(|(rk, _)| rk == k) {
+                warnings.push(format!("{path}.{k} 已删除（{why}），已忽略"));
                 continue;
             }
             if k.contains('_') {
@@ -775,23 +786,14 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
         }
     }
     if let Some(r) = top.get("review").and_then(|r| r.as_object()) {
-        check(&mut errors, &mut warnings, "review", r, REVIEW, "blockThreshold / confFloor / maxConcurrency");
-        if r.contains_key("risk") {
-            warnings.push("review.risk 无定义（D11：无模式旋钮），已忽略".to_string());
-        }
-        for (sec, known) in REVIEW_SECTIONS {
+        check_keys(&mut errors, &mut warnings, "review", r, REVIEW, "blockThreshold / confFloor / maxConcurrency", REVIEW_REMOVED);
+        // D13：角色级 workers 已删——专属提示（并发只看 provider 门、去哪调），不叠加通用「无定义」。
+        let workers_why = format!("D13：并发只看 provider maxConcurrency，缺省 review.maxConcurrency = {}", default_concurrency());
+        let workers_removed = [("workers", workers_why.as_str())];
+        for (sec, known, role_section) in REVIEW_SECTIONS {
             if let Some(so) = r.get(*sec).and_then(|s| s.as_object()) {
-                // D13：角色级 workers 已删——专属提示（去哪调），不叠加通用「无定义」；其余键照旧检查。
-                let so = if matches!(*sec, "scanners" | "reviewers" | "verifiers") && so.contains_key("workers") {
-                    warnings.push(format!(
-                        "review.{sec}.workers 已删除（D13）：并发只看 provider maxConcurrency（缺省 review.maxConcurrency = {}），已忽略",
-                        default_concurrency()
-                    ));
-                    so.iter().filter(|(k, _)| k.as_str() != "workers").map(|(k, v)| (k.clone(), v.clone())).collect::<serde_json::Map<_, _>>()
-                } else {
-                    so.clone()
-                };
-                check(&mut errors, &mut warnings, &format!("review.{sec}"), &so, known, "如 maxCells / minFiles / sliceMinBytes");
+                let removed: &[(&str, &str)] = if *role_section { &workers_removed } else { &[] };
+                check_keys(&mut errors, &mut warnings, &format!("review.{sec}"), so, known, "如 maxCells / minFiles / sliceMinBytes", removed);
             }
         }
     }
@@ -1158,7 +1160,7 @@ mod tests {
         let (cfg, w) = Config::from_json_warned(r#"{"providers":{"p":{"kind":"openai","maxConcurrency":65536,"models":{"m":{"roles":{"scanner":{}}}}}},
             "review":{"maxConcurrency":384000,"scanners":{"workers":4,"samples":1},"reviewers":{"workers":2},"verifiers":{"workers":2,"enabled":true}}}"#).unwrap();
         for sec in ["scanners", "reviewers", "verifiers"] {
-            assert!(w.iter().any(|x| x.contains(&format!("review.{sec}.workers 已删除（D13）"))), "{sec}: {w:?}");
+            assert!(w.iter().any(|x| x.contains(&format!("review.{sec}.workers 已删除（D13")) && x.contains("review.maxConcurrency = 10")), "{sec}: {w:?}");
         }
         assert!(!w.iter().any(|x| x.contains("workers 无定义")), "专属提示不叠加通用 warning: {w:?}");
         assert!(w.iter().any(|x| x.contains("providers.p.maxConcurrency = 65536 像是填错字段")), "{w:?}");

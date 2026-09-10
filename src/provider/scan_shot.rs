@@ -29,6 +29,10 @@ pub struct ScanCall {
     /// 首发解析失败、经 REPAIR 成功时的诊断（finish_reason / 文本长度 / 文本头）；首发即成功为 None。
     /// 出口验收观察：dogfood 某格三跑全走 REPAIR 而直发同 prompt 三次首发皆合法——不落原因无从定位。
     pub repair_note: Option<String>,
+    /// D13：provider 门的 429 排队重试次数（registry `ScanLease::run` 回填；→ `CellRecord.attempts` = 轮次 + 此值）。
+    pub rate_limit_retries: u32,
+    /// D13：429 排队等待总毫秒（registry 回填；→ `CellRecord.queue_wait_ms` 与门等待合计）。
+    pub rate_limit_wait_ms: u64,
 }
 
 fn sum_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -38,16 +42,7 @@ fn sum_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-pub async fn run_scan_shot(
-    backend: &dyn ChatBackend,
-    prompt: &ScanPrompt,
-    per_turn: std::time::Duration,
-    retry_budget: u32,
-) -> Result<ScanCall, ProviderError> {
-    run_scan_shot_with(backend, prompt, per_turn, retry_budget, None).await
-}
-
-/// `run_scan_shot` + 尝试挂点（D13：registry 传 provider 门的 `GateAttempts`——429 排队重试 + 在途峰值）。
+/// 两轮单发 + 尝试挂点（D13：registry 传 provider 门的 `GateAttempts`——429 排队重试 + 在途峰值；`None` = 无门，仅测试）。
 pub(crate) async fn run_scan_shot_with(
     backend: &dyn ChatBackend,
     prompt: &ScanPrompt,
@@ -65,6 +60,7 @@ pub(crate) async fn run_scan_shot_with(
         return Ok(ScanCall {
             output, stats, input_tokens: in_tok, output_tokens: out_tok, cached_input_tokens: cached_tok,
             iterations: 1, finish_reason: turn.finish_reason, reasoning_tokens: reasoning, repair_note: None,
+            rate_limit_retries: 0, rate_limit_wait_ms: 0,
         });
     }
 
@@ -93,6 +89,7 @@ pub(crate) async fn run_scan_shot_with(
         Ok((output, stats)) => Ok(ScanCall {
             output, stats, input_tokens: in_tok, output_tokens: out_tok, cached_input_tokens: cached_tok,
             iterations: 2, finish_reason: repair.finish_reason, reasoning_tokens: reasoning, repair_note: Some(repair_note),
+            rate_limit_retries: 0, rate_limit_wait_ms: 0,
         }),
         Err(_) => Err(diagnostic_parse_error(&repair).attach_usage((in_tok, out_tok, cached_tok))),
     }
@@ -127,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn scan_shot_first_turn_uses_shared_head_blocks_and_never_turn_final() {
         let b = FakeChatBackend::new(vec![turn(SCAN_JSON, Some(0))]);
-        let call = run_scan_shot(&b, &prompt(), Duration::from_secs(5), 0).await.unwrap();
+        let call = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None).await.unwrap();
         assert_eq!(call.iterations, 1);
         assert_eq!(call.output.suspicions.len(), 1);
         assert_eq!(call.output.needs.len(), 1);
@@ -145,7 +142,7 @@ mod tests {
     #[tokio::test]
     async fn scan_shot_repairs_with_scan_prompt_and_accumulates_usage() {
         let b = FakeChatBackend::new(vec![turn("sorry, here is prose", Some(3)), turn(SCAN_JSON, Some(5))]);
-        let call = run_scan_shot(&b, &prompt(), Duration::from_secs(5), 0).await.unwrap();
+        let call = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None).await.unwrap();
         assert_eq!(call.iterations, 2);
         assert_eq!((call.input_tokens, call.output_tokens, call.cached_input_tokens), (20, 8, 4));
         assert_eq!(call.reasoning_tokens, Some(8));
@@ -162,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn scan_shot_second_failure_is_parse_error_with_usage() {
         let b = FakeChatBackend::new(vec![turn("", None), AssistantTurn { finish_reason: Some("length".into()), ..turn("{\"nope\":1}", None) }]);
-        let err = run_scan_shot(&b, &prompt(), Duration::from_secs(5), 0).await.unwrap_err();
+        let err = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None).await.unwrap_err();
         assert!(matches!(err.inner(), ProviderError::Parse(_)), "{err}");
         assert_eq!(err.burned_usage(), (20, 8, 4));
         assert!(err.to_string().contains("length"), "finish_reason 进诊断: {err}");
@@ -174,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn scan_shot_first_turn_error_propagates() {
         let b = FakeChatBackend::new_results(vec![Err(ProviderError::Auth("no key".into()))]);
-        let err = run_scan_shot(&b, &prompt(), Duration::from_secs(5), 0).await.unwrap_err();
+        let err = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None).await.unwrap_err();
         assert!(matches!(err, ProviderError::Auth(_)));
     }
 }

@@ -468,7 +468,8 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
         }
         // 单轮超时（design §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`。
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
-        let cap = em.max_concurrency.unwrap_or(cfg.review.max_concurrency as u32);
+        // usize → u32 饱和而非截断（评审修：误填 2^32 以上的值不会被截成 0 / 小数）。
+        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
         registry.insert_scan(em.name.clone(), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
     }
     Ok(registry)

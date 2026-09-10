@@ -870,20 +870,29 @@ pub async fn run_resume(
     let current_hash = crate::prompt::scan_template_hash();
 
     let mut warnings: Vec<String> = registry.warnings().to_vec();
-    // 差集 cell 并行补跑（join_all 保序）；provider 在途门在 registry 内。
+    // 差集 cell 并行补跑（join_all 保序）；provider 在途门在 registry 内（唯一闸，D13）：门等待记 queue_wait_ms，与扇出同口径。
     let outs = futures::future::join_all(pending.iter().map(|cell| async move {
         let t0 = std::time::Instant::now();
+        let mut queue_wait_ms = 0u64;
         let res = match &cell.scan {
-            Some(p) => registry.scan(&cell.model, p).await,
+            Some(p) => match registry.lease(&cell.model).await {
+                Ok(lease) => {
+                    queue_wait_ms = t0.elapsed().as_millis() as u64;
+                    lease.run(p).await
+                }
+                Err(e) => Err(e),
+            },
             None => Err(crate::provider::ProviderError::Unavailable(
                 "manifest 无 scan prompt（旧格式作业），无法重放；请重新 review".into(),
             )),
         };
-        (cell, res, t0.elapsed())
+        (cell, res, t0.elapsed(), queue_wait_ms)
     }))
     .await;
+    // 排队告警与扇出同口径（D13）：补跑格数 > 该 provider 有效门宽即排队。
+    warnings.extend(registry.queue_warnings(pending.iter().filter(|c| c.scan.is_some()).map(|c| c.model.as_str())));
     let mut hash_mismatch = false;
-    for (cell, outcome, elapsed) in outs {
+    for (cell, outcome, elapsed, queue_wait_ms) in outs {
         if outcome.is_err() {
             if let Err(e) = &outcome {
                 warnings.push(format!("resume cell [{}] model {}: {e}", cell.cell, cell.model));
@@ -899,9 +908,10 @@ pub async fn run_resume(
             None => current_hash.clone(),
         };
         let pinned = entry_of(&cell.model).map(|e| e.thinking_pinned).unwrap_or(false);
-        let (rec, _) = crate::orchestrate::scan_cell_record(
+        let (mut rec, _) = crate::orchestrate::scan_cell_record(
             &cell.cell, &cell.model, &family_of(&cell.model), pinned, cwd, outcome, elapsed.as_millis() as u64, hash,
         );
+        rec.queue_wait_ms += queue_wait_ms;
         if let Err(e) = store.append_partial(job_id, &rec) {
             eprintln!("warn: job {job_id} append_partial 失败（cell {}）: {e}", rec.cell);
         }
