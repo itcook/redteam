@@ -46,7 +46,7 @@
 | `config.json` 未知字段 | `shape_guard` 按已知层级预扫：snake_case / 旧键名（`name`）/ 非法角色 → 错误；其余未知键 → warning（评审 #4）；不开 `deny_unknown_fields`（保向前兼容） | 新增配置字段时同步 `shape_guard` 已知键表（单测兜底）；`serde_json` 键序为字典序（`preserve_order` 未开，手写顺序落盘后丢失，纯观感） |
 | 批 A 首版 TOML → JSON 迁移脚本 | 只在维护者本机跑过一次（`/tmp/rt-migrate-config-json.py`，2026-09-08），不入库 | 无外部用户持有首版 TOML（分支未发布）；`legacy_config_paths_present` 对 `$REDTEAM_HOME/config.toml` 只提示不读即够，不做内置迁移 |
 | `perTurnTimeoutSecs` 是否退役（用户 2026-09-08 提） | 模型层显式单轮超时；批 C 分组 + 批 D 切片落地后单 cell 输入有界，慢模型「结构性需要 1100s+/轮」的前提（2026-09-03 PR181 Kimi 实证）预期消失，缺省链 `REDTEAM_PER_TURN_SECS > maxOutputTokens÷20+60` 加上 HTTP 超时自动罩住（14b7289）应已够用 | M21a 出口 / M21b dogfood 记录每 cell 实际轮时与超时次数；若无模型再需要显式值，M21e 从 schema、`--per-turn-timeout-secs`、`shape_guard` 已知键表一并拆除（旧配置含该键走 warning 不报错） |
-| `GroupingStats.cross_edges` / `weak_cut` 口径（A/B/C 合并核验 2026-09-08） | `cross_edges` 计全部边种（同目录分量一切即被 SameDir 边灌满），`weak_cut` 计超限分量内全部弱边（含留在同一强子分量内、实际未切的）；design §3.2 步 6 的 R8 触发度量是「跨组 **import** 边数」 | F-5 接 RunMeta 前分种计数（import / reference / samedir），`weak_cut` 只计真切的边 |
+| `GroupingStats.cross_edges` / `weak_cut` 口径（A/B/C 合并核验 2026-09-08） | `cross_edges` 计全部边种（同目录分量一切即被 SameDir 边灌满），`weak_cut` 计超限分量内全部弱边（含留在同一强子分量内、实际未切的）；design §3.2 步 6 的 R8 触发度量是「跨组 **import** 边数」 | ✅ 已偿（2026-09-10，Trellis `09-10-grouping-stats-kinds`）：`cross_edges` 分种 `cross_import` / `cross_reference` / `cross_same_dir`（serde default）、`weak_cut` 删除（真切口径 = cross_reference + cross_same_dir 无独立信息量）；「强边不跨组」为不变量哨兵测试；PR181 基线 cross_import=0 / cross_reference=2 / cross_same_dir=6（旧 cross_edges=8、weak_cut=55 虚高） |
 | Rust 仓 `lib.rs` / `main.rs` 超级枢纽 | `mod x;` 边是强边：改 `lib.rs` 一行 `pub mod x;` 即把所有改动顶层模块粘成不可切的强分量 → 单 cell `over_budget`；设计如此（import 强），对 PR181 规模（出口「≤ 5 组」）风险实在 | M21b 前用 `.next/private` 数据回放 `--pack-only` 看组数；超标则议 `mod x;` 边降为弱边或根文件特判 |
 | C 精度缺口：TS 副作用导入 `import './x'`（无 `from`）不解析；弱边只认同父目录，design §3.2 写「同目录 / 同顶层模块」 | 索引与分组少边，不产错边 | M21e 清扫时按 dogfood 数据决定是否回补 |
 | `--pack-only` 的 `est_tokens` 只计 user prompt，不含 system 段 | roadmap 出口「与真实 usage 差 < 20%」对账时会系统性偏低 | ✅ 批 F-4 K15（2026-09-09）：`bytes` = 共享头 system + 四块 user，与真实 scanner 请求同一 `build_scan_prompt`；`cell-n.md` 落盘同形 |
@@ -130,7 +130,7 @@
 | `CellSummary.attempts` 口径 | 字段注释仍写「候补链尝试的 model 数」，scan 路径恒 1（无候补，D7 A3） | M21e 清扫改注释或删字段 |
 | 保留未用的旧件 | `provider/{single_shot,tool_loop,fake}.rs` 的 `ReviewProvider` 表 / `run_single_shot` / `NO_TOOLS_SYSTEM`、`consolidate/{dedup,verify,carry}`、`cli/second_pass` 零件（`allow(dead_code)`）、`orchestrate::enrich / finding_id`、`adversarial-refute.md` | M21b reviewer / verifier 复用；未复用的 M21e 删 |
 | 大 diff 组的单 cell 体量 | 本分支 dogfood diff：cell-3 26 文件 / 466 KB diff / 782 KB prompt（≈ 224K token，16 文件走梯子）——分组预算门按估算字节、装包按切片字节（批 E 延后项已记） | R7 / lib.rs 超级枢纽议题一并看；M21b 前用 PR181 回放 |
-| `GroupingStats` 分种计数 | `RunMeta.grouping` 已接（F-5），`cross_edges` / `weak_cut` 仍按全部边种计（:49） | M21b 前分种 |
+| `GroupingStats` 分种计数 | `RunMeta.grouping` 已接（F-5），`cross_edges` / `weak_cut` 仍按全部边种计（:49） | ✅ 2026-09-10 已偿（`09-10-grouping-stats-kinds`，见上表同行） |
 | Anthropic thinking 注入未按 tools 守卫 | `thinking{enabled}` 与工具往返同发时 Anthropic 要求 `tool_choice` / 交替约束，M21b reviewer 工具循环走 anthropic kind 会 400（评审帽外项，当前 scanner 无工具不可达） | M21b reviewer 接线时在 `build_anthropic_tools_body_ext` 按 tools 非空守卫 |
 | `resolve --help` 文案仍承诺增量轮消费 | `resolve` 子命令 doc「增量轮据此不再携带该 finding」——增量轮 M21c 恢复前无消费者 | M21c 恢复增量轮时一并核文案 |
 | `exit_code(verdict, failed_models_nonempty)` 第二参在 scan 路径恒 false | 五档契约保留 2 档给 M21b（reviewer 失败带债 approve） | M21b 定 failed_models 语义后再定是否收敛签名 |

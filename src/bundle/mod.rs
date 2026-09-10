@@ -136,16 +136,26 @@ impl Gate {
 }
 
 /// 分组观测（M21a 只在 `--pack-only` 打印与 summary.json；RunMeta 接线 F-5）。
+/// 分种口径（2026-09-10，followup 实现债清偿 / M21b 前置 #3）：`cross_edges` 总数保留，分种三键各计其边种；
+/// `weak_cut` 删除——现算法强边不跨组（不变量见测试），跨组边全部是弱边，weak_cut = cross_reference +
+/// cross_same_dir 无独立信息量；R8 触发度量 = `cross_import`（design §3.2 步 6）。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GroupingStats {
     pub gate: Gate,
     pub groups: usize,
     /// 全图边数（import + 引用 + 同目录）。
     pub edges: usize,
-    /// 超限分量里被切掉的弱边数。
-    pub weak_cut: usize,
-    /// 端点异组的边数（分组切错的先验度量，R8）。
+    /// 端点异组的边数（分组切错的先验度量）。
     pub cross_edges: usize,
+    /// 端点异组的 import 边数（R8 触发度量：跨组 import 多 = 确定性图切开强相关，语义分组才有增量）。
+    #[serde(default)]
+    pub cross_import: usize,
+    /// 端点异组的引用边数（现算法下全为 count=1 弱引用——强引用不跨组不变量）。
+    #[serde(default)]
+    pub cross_reference: usize,
+    /// 端点异组的同目录边数（切缝与装箱分箱两类同源，无法也不必区分）。
+    #[serde(default)]
+    pub cross_same_dir: usize,
     /// 原图无边的文件数。
     pub isolated: usize,
     /// `over_budget` 的组数。
@@ -1175,7 +1185,8 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     let n = changes.len();
     let empty_stats = |gate: Gate| GroupingStats {
-        gate, groups: 0, edges: 0, weak_cut: 0, cross_edges: 0, isolated: 0, over_budget: 0,
+        gate, groups: 0, edges: 0, cross_edges: 0, cross_import: 0, cross_reference: 0, cross_same_dir: 0,
+        isolated: 0, over_budget: 0,
     };
     if n == 0 {
         return Grouping { bundles: Vec::new(), stats: empty_stats(Gate::Single) };
@@ -1300,7 +1311,8 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
         let all: Vec<usize> = (0..n).collect();
         let bundle = make_bundle(&all, oversize(&all));
         let stats = GroupingStats {
-            gate: Gate::Single, groups: 1, edges: edges.len(), weak_cut: 0, cross_edges: 0, isolated,
+            gate: Gate::Single, groups: 1, edges: edges.len(), cross_edges: 0, cross_import: 0,
+            cross_reference: 0, cross_same_dir: 0, isolated,
             over_budget: bundle.over_budget as usize,
         };
         return Grouping { bundles: vec![bundle], stats };
@@ -1309,7 +1321,6 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
     // ---- 分量 → 弱缝切 → 落单回池 ----
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut pool: Vec<usize> = Vec::new();
-    let mut weak_cut = 0usize;
     for comp in components(n, edges.iter().map(pair)) {
         if comp.len() == 1 {
             pool.push(comp[0]);
@@ -1327,7 +1338,6 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
                 set.contains(&a) && set.contains(&b)
             })
             .collect();
-        weak_cut += inside.iter().filter(|e| !e.is_strong()).count();
         // 强边子分量：comp 内局部索引做并查集，再映射回全局索引
         let local: BTreeMap<usize, usize> = comp.iter().enumerate().map(|(k, &g)| (g, k)).collect();
         let strong_pairs = inside.iter().filter(|e| e.is_strong()).map(|e| {
@@ -1368,20 +1378,30 @@ pub fn group(mut changes: Vec<FileChange>, root: Option<&Path>, opts: &GroupingO
             group_of[i] = gi;
         }
     }
-    let cross_edges = edges
-        .iter()
-        .filter(|e| {
-            let (a, b) = pair(e);
-            group_of[a] != group_of[b]
-        })
-        .count();
+    let mut cross_edges = 0usize;
+    let mut cross_import = 0usize;
+    let mut cross_reference = 0usize;
+    let mut cross_same_dir = 0usize;
+    for e in edges.iter() {
+        let (a, b) = pair(e);
+        if group_of[a] != group_of[b] {
+            cross_edges += 1;
+            match &e.kind {
+                EdgeKind::Import => cross_import += 1,
+                EdgeKind::Reference { .. } => cross_reference += 1,
+                EdgeKind::SameDir => cross_same_dir += 1,
+            }
+        }
+    }
     let bundles: Vec<Bundle> = groups.iter().map(|g| make_bundle(g, oversize(g))).collect();
     let stats = GroupingStats {
         gate: Gate::Grouped,
         groups: bundles.len(),
         edges: edges.len(),
-        weak_cut,
         cross_edges,
+        cross_import,
+        cross_reference,
+        cross_same_dir,
         isolated,
         over_budget: bundles.iter().filter(|b| b.over_budget).count(),
     };
@@ -1672,7 +1692,7 @@ mod tests {
         assert_eq!(g.bundles.len(), 2);
         assert_eq!(paths_of(&g.bundles[0]), vec!["a/1.rs", "a/2.rs"]);
         assert_eq!(paths_of(&g.bundles[1]), vec!["b/1.rs", "b/2.rs"]);
-        assert_eq!(g.stats, GroupingStats { gate: Gate::Grouped, groups: 2, edges: 2, weak_cut: 0, cross_edges: 0, isolated: 0, over_budget: 0 });
+        assert_eq!(g.stats, GroupingStats { gate: Gate::Grouped, groups: 2, edges: 2, cross_edges: 0, cross_import: 0, cross_reference: 0, cross_same_dir: 0, isolated: 0, over_budget: 0 });
     }
 
     #[test]
@@ -1744,8 +1764,10 @@ mod tests {
         assert_eq!(g.bundles.len(), 2, "{:?}", g.bundles.iter().map(paths_of).collect::<Vec<_>>());
         assert_eq!(paths_of(&g.bundles[0]), vec!["m/a.ts", "m/b.ts"]);
         assert_eq!(paths_of(&g.bundles[1]), vec!["m/c.ts", "m/d.ts"]);
-        assert_eq!(g.stats.weak_cut, 6);
-        assert_eq!(g.stats.cross_edges, 4, "跨组的 4 条同目录边仍是流水线产物");
+        // 切后真切口径：同目录 C(4,2)=6 条弱边中跨组的只有 2×2=4 条（旧 weak_cut 口径报 6，虚高 2）；
+        // 强边（import）不跨组不变量 → cross_import == 0。
+        assert_eq!((g.stats.cross_edges, g.stats.cross_import, g.stats.cross_reference, g.stats.cross_same_dir), (4, 0, 0, 4));
+        assert_eq!(g.stats.cross_edges, g.stats.cross_import + g.stats.cross_reference + g.stats.cross_same_dir, "分种恒等式");
         assert_eq!(g.stats.over_budget, 0);
         assert!(g.bundles[0].edges.iter().any(|e| e.kind == EdgeKind::SameDir && e.to == "m/c.ts"), "跨组边出现在两端 bundle");
     }
@@ -1761,7 +1783,7 @@ mod tests {
         // 强链 a→b→c 超 max=2、无弱边可切 → 不拆、标 over_budget
         assert_eq!(g.bundles.len(), 1);
         assert!(g.bundles[0].over_budget);
-        assert_eq!((g.stats.weak_cut, g.stats.over_budget), (0, 1));
+        assert_eq!((g.stats.cross_edges, g.stats.over_budget), (0, 1));
         // 预算门：文件数够但估算字节超 → 同样 over_budget
         let g = group(changes, Some(dir.path()), &open_gate(10, Some(10)));
         assert_eq!(g.bundles.len(), 1);
@@ -1795,8 +1817,48 @@ mod tests {
         let g = group(changes, Some(dir.path()), &open_gate(2, None));
         // {a,b,z} 同目录超 max=2 → 切 3 弱边 → {a,b} 强 + z 落单回池装箱
         assert_eq!(g.bundles.iter().map(paths_of).collect::<Vec<_>>(), vec![vec!["m/a.ts", "m/b.ts"], vec!["m/z.ts"]]);
-        assert_eq!(g.stats.weak_cut, 3);
+        // 真切口径：3 条同目录弱边中跨组的只有 a-z、b-z 共 2 条（旧 weak_cut 口径报 3）
+        assert_eq!(g.stats.cross_same_dir, 2);
         assert_eq!(g.stats.isolated, 0, "z 原图有同目录边，不算孤立");
+    }
+
+    #[test]
+    fn grouping_stats_kinds_invariant_and_legacy_json() {
+        // 不变量哨兵（2026-09-10 分种口径，M21b 前置 #3）：强边不跨组——任何分组结果下
+        // cross_import == 0 且跨组 Reference 全为 count=1（弱）。前置清单 #1 改分组策略
+        // （如拆大格切强边）时此断言会红，迫使显式确认口径变化。
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "m/a.ts", "import {b} from './b';\n");
+        write(dir.path(), "m/b.ts", "export const b = 1;\n");
+        write(dir.path(), "m/c.ts", "import {d} from './d';\n");
+        write(dir.path(), "m/d.ts", "export const d = 1;\n");
+        write(dir.path(), "n/e.ts", "import {b} from '../m/b';\n");
+        let changes: Vec<FileChange> = ["m/a.ts", "m/b.ts", "m/c.ts", "m/d.ts", "n/e.ts"]
+            .iter().map(|p| fc(p, "+x")).collect();
+        for opts in [open_gate(10, None), open_gate(2, None), open_gate(1, None)] {
+            let g = group(changes.clone(), Some(dir.path()), &opts);
+            let s = &g.stats;
+            assert_eq!(s.cross_edges, s.cross_import + s.cross_reference + s.cross_same_dir, "分种恒等式: {s:?}");
+            assert_eq!(s.cross_import, 0, "强边不跨组不变量（import）: {s:?}");
+            let group_of = |p: &str| g.bundles.iter().position(|b| b.files.iter().any(|f| f.path == p)).unwrap();
+            for b in &g.bundles {
+                for e in &b.edges {
+                    let cross = group_of(&e.from) != group_of(&e.to);
+                    if let (true, EdgeKind::Reference { count }) = (cross, &e.kind) {
+                        assert_eq!(*count, 1, "跨组引用必为弱（count=1）不变量: {e:?}");
+                    }
+                }
+            }
+        }
+        // 旧格式 JSON（M21a：含 weak_cut 键、无分种键）→ 新结构可读、分种归零（serde default）
+        let legacy = r#"{"gate":"grouped","groups":2,"edges":8,"weak_cut":6,"cross_edges":4,"isolated":0,"over_budget":0}"#;
+        let stats: GroupingStats = serde_json::from_str(legacy).unwrap();
+        assert_eq!((stats.groups, stats.cross_edges), (2, 4));
+        assert_eq!((stats.cross_import, stats.cross_reference, stats.cross_same_dir), (0, 0, 0));
+        // 新格式序列化不再含 weak_cut 键
+        let j = serde_json::to_string(&stats).unwrap();
+        assert!(!j.contains("weak_cut"), "{j}");
+        assert!(j.contains("cross_same_dir"), "{j}");
     }
 
     #[test]

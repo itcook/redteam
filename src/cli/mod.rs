@@ -674,8 +674,8 @@ pub fn render_pack_only(r: &PackOnlyReport) -> String {
     }
     let g = &r.grouping;
     out.push_str(&format!(
-        "grouping gate={} groups={} edges={} weak_cut={} cross_edges={} isolated={} over_budget={}\n",
-        g.gate.as_str(), g.groups, g.edges, g.weak_cut, g.cross_edges, g.isolated, g.over_budget
+        "grouping gate={} groups={} edges={} cross_edges={} cross_import={} cross_reference={} cross_same_dir={} isolated={} over_budget={}\n",
+        g.gate.as_str(), g.groups, g.edges, g.cross_edges, g.cross_import, g.cross_reference, g.cross_same_dir, g.isolated, g.over_budget
     ));
     out.push_str(&format!("packs={}\n", r.packs_dir));
     for w in &r.warnings {
@@ -1867,7 +1867,7 @@ mod resume_tests {
         store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
         let prior = ReviewReport {
             schema_version: "4".into(), verdict: Verdict::Incomplete, stats: Stats::default(), findings: vec![], clusters: vec![],
-            run: RunMeta { head_sha: Some("deadbeef".into()), grouping: Some(crate::bundle::GroupingStats { gate: crate::bundle::Gate::Single, groups: 1, edges: 0, weak_cut: 0, cross_edges: 0, isolated: 0, over_budget: 0 }), ..Default::default() },
+            run: RunMeta { head_sha: Some("deadbeef".into()), grouping: Some(crate::bundle::GroupingStats { gate: crate::bundle::Gate::Single, groups: 1, edges: 0, cross_edges: 0, cross_import: 0, cross_reference: 0, cross_same_dir: 0, isolated: 0, over_budget: 0 }), ..Default::default() },
             scan: Some(ScanReport { groups: vec![ScanGroup { label: "c.rs".into(), files: vec!["c.rs".into()], cells: vec![], suspicions: 0, pack: Default::default() }], suspicions: vec![], scanned_coverage: Some(0.75), stats: Default::default() }),
             cells: vec![],
         };
