@@ -7,12 +7,12 @@
 ## Requirements
 
 - 成区：hunk → enclosing def 块（无 def → hunk ± 10 行 padded）；主区（含改动行）与涟漪区（改动/新增/删除声明名在本文件 ≤ 4 处引用点的 enclosing def，不跨文件）〔D11-1〕
-- 四类信号与权重 = P0 §15.4 定案常量（path / 结构 / extapi / hist，含乘子），一处权重表注释引 P0；hist 读 proj.db dismissed/upheld 带时间守卫
+- 四类信号与权重 = P0 §15.4 定案常量（path / 结构 / extapi / hist，含乘子），一处权重表注释引 P0；hist 台账经 `--dismissed` 指定（缺省 `proj-next.db` 自身，M21a 分库裁定）带时间守卫，PR181 对拍传 dev 旧 `proj.db` 复现 P0 标定条件；def 口径统一：`bundle::changed_def_names` vs `pack::outside_names` 两套，复用时一并统一 + 重跑分组回归（followup 实现债）
 - H0：score ≥ θ=1.5 且 ≥ 2 类信号，关键词类单独不成区；R = Σ_{H0} score ÷ (1 + ln(1+代码行))；切点 **0.5 / 3.5**（D11-4 锁定；P0 实测三分位 0.47/3.64 作回校参考）；`budget_cells`：Auto → 4/12/32 min 48、Fixed 直用
 - 接线：`run_code_review` 阶段 0 调用，H0/R/tier/budget 入 RunMeta；`--pack-only` 打印一行；resume 沿用原报告值
 - 回归门：`risk_replay.py compare`（Rust vs Python v4 区级对拍）+ `redteam-next risk` 只读子命令；回放口径 = PR181（私有 fixture）+ 本仓 oracle B（入库 fixture，缺则本批导出），数字进 research
 - 前置核实（followup「批 A 重做评审子 agent 提出、未核实项」）：`risk_replay.py` parse_diff 列首 `--`/`++` 疑似缺陷、`e3_contract_ab.py` `anchored` 恒真式——先核再作门
-- 任务级明细（文件落点/测试/commit 点）：`.next/plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md` §批 A（Task A-1…A-6）
+- 任务级明细（文件落点/测试/commit 点）：`.next/plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md` §批 A（Task A-1…A-6）；另 plan「开工前置清单」（分组策略 / 预算门口径 / GroupingStats 分种 / 429 棘轮）属 M21b 前置事项，不在本批内
 
 ## Acceptance Criteria
 

@@ -8,9 +8,9 @@
 
 - `verifier.md`：从 `adversarial-refute.md` 拆角色尾（共享头沿用）；「找出这条 finding 不成立的证据」；输出契约 `analysis → REFUTED | UPHELD + 理由`，analysis 先于 verdict；模板哈希；`adversarial-refute.md` 随最后引用者消失删除或降级注明
 - `build_verify_prompt`：finding + ±60 快照（复用 `verify.rs` `source_snippet` 机器）+ 判例摘要槽（M21c 空）+ spec
-- 触发集：`severity ≥ block ∧ confidence ≥ floor` + 判例变体槽（枚举预留，判例数据 M21c）；低危不触发
-- 跳过：两异族 scanner 标记（finding 区域 agreement ≥ 2，按**落地时刻**值、后涨不回溯〔D13〕）∧ reviewer 确认；`[review.verifiers] enabled = false` → 全跳过（记录理由）
-- verifier 选择：`[[verifiers]]` 有则用；缺省自动异族（family 缺省 model_id 首段），优先 reviewers 档 → scanners 档；无异族 → 同族 + warning「无异族 verifier」
+- 触发集：`severity ≥ block ∧ confidence ≥ floor` + 判例变体槽（枚举预留，判例数据 M21c）；低危不触发；消费 `--block-threshold` / `--conf-floor` 旗（M21a 无消费者旗，`--help` 文案届時改回）
+- 跳过：两异族 scanner 标记（finding 区域 agreement ≥ 2，按**落地时刻**值、后涨不回溯〔D13〕）∧ reviewer 确认；`review.verifiers.enabled = false` → 全跳过（记录理由）
+- verifier 选择：verifiers 活跃集（拥有 `verifier` 角色的模型，D12 JSON）非空则从中选；缺省自动异族（family 缺省 model_id 首段），优先 reviewers 档 → scanners 档；无异族 → 同族 + warning「无异族 verifier」
 - 流式消费：finding 落地即入复核流（与深挖尾部重叠，不等 barrier）；消费循环经 `registry.lease()` 走同一 provider 门；REFUTED → confidence 归零永不 blocking；UPHELD 原样；调用失败 → 保守 upheld + warning；refute 率 = refuted ÷ 触发复核数 → RunMeta `refute_rate`；`Phase::Verify` 打点
 - 离线回归集〔D9〕：`eval/verify_score.py` 读 ledger fixtures → 逐条构造 finding+快照 → 二分类准确率/混淆矩阵，`--baseline` 对比；固定集锚定按 `head_sha` 树、空 `head_sha` 按 created_at 推断（followup 行 73）；改 verifier.md 必跑
 - 任务级明细：plan §批 D（Task D-1…D-5）

@@ -11,7 +11,7 @@
 
 | # | 项 | design | 落点 |
 |---|---|---|---|
-| 1 | 第二家族 scanner 落地验证：`[[scanners]]` 加异族条目，疑点并集与 agreement 入优先级键（机制 M21a 已有，此处用 PR181 + dogfood 量收益）；疑点合并口径（quote 轻锚 + hint 归一）收口 | §5 | `src/orchestrate`, `src/consolidate/dedup.rs` |
+| 1 | 第二家族 scanner 落地验证：第二家族模型加 `scanner` 角色（JSON `roles`，D12），疑点并集与 agreement 入优先级键（机制 M21a 已有，此处用 PR181 + dogfood 量收益）；疑点合并口径（quote 轻锚 + hint 归一）收口 | §5 | `src/orchestrate`, `src/consolidate/dedup.rs` |
 | 2 | 旧 CLI 面残余清理：`--models` / `--models-all` / `priority` 的文档与错误提示；`resolve_models` 角色驱动版收口 | §15 消亡 | `src/cli/mod.rs` |
 | 3 | **aacr `gate` 三方对照**（D7 重启点）：先 `--pack-only` spike 定规模（R20）；legacy / v2 / ocr 三方；ocr = deepseek-v4-pro 直连 chat-completions 流式、版本钉入元数据；GLM judge、`--eval-rounds 3`、正样本 N=3、负样本 N=1；数字写回 research；Claude D 参照后置 | design §16 | `~/codes/aacr-bench`；本仓 `eval/README` |
 | 4 | 校准收口：R3 分组阈值、R8 semantic grouping 触发阈值（跨组 import 边数）、R9 provider `maxConcurrency` 缺省值（角色 workers 已删〔D13〕）、R12 激活上限 N、同组 hold 是否加（派发时 / 落地时 agreement 数据〔D13〕）；全部落配置默认值 | — | `src/config` + dogfood 数据 |

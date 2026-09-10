@@ -13,7 +13,7 @@
 **scanner 疑点扫描（分组并行）+ 确定性风险路由 + 深挖优先级队列（reviewer 定向消费，预算随风险分）+ 疑点台账跨轮激活 +
 跨家族并行 + verifier 流式复核。** 把「快 vs 好」挪到「钱 vs 质量」轴；慢模型的广度成本是钱与有界墙钟，不是线性时间。
 
-词汇：角色 = scanner / reviewer / verifier（配置 `[[scanners]]` / `[[reviewers]]` / `[[verifiers]]`）；阶段 = 快扫 / 深挖 / 复核。
+词汇：角色 = scanner / reviewer / verifier（配置 = 模型下 `roles.scanner / reviewer / verifier`，`~/.redteam/config.json`〔D12〕）；阶段 = 快扫 / 深挖 / 复核。
 
 ## 铁律（每个里程碑都受约束）
 
