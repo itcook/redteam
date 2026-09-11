@@ -490,6 +490,22 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
         let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
         registry.insert_scan(em.name.clone(), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
     }
+    for em in &roles.reviewers {
+        if registry.has_scan(&em.name) {
+            continue;
+        }
+        let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
+        let backend = match backend_from_config(em, key) {
+            Ok(b) => b,
+            Err(e) => return Err(format!("{e}")),
+        };
+        if let Some(w) = redteam::provider::backends::thinking_warning(em) {
+            registry.push_warning(w);
+        }
+        let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
+        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
+        registry.insert_scan(em.name.clone(), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
+    }
     Ok(registry)
 }
 

@@ -99,6 +99,10 @@ impl DeepQueue {
         &self.items
     }
 
+    pub fn items_mut(&mut self) -> &mut [QueueItem] {
+        &mut self.items
+    }
+
     pub fn get(&self, id: &str) -> Option<&QueueItem> {
         self.items.iter().find(|i| i.id == id)
     }

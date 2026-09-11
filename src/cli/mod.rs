@@ -6,6 +6,7 @@ use crate::bundle::{group, select_files, Bundle, GroupingOpts, GroupingStats};
 use crate::config::{Config, RoleSets};
 use crate::domain::{CacheHit, CellSummary, DossierMeta, NeedsMeta, ReviewReport, RiskMeta, Role, RunMeta, ScanGroup, ScanReport, ScanStats, Stats, Usage, Verdict};
 use crate::evidence::git::FileChange;
+use crate::orchestrate::deep::{run_deep, DeepInput};
 use crate::orchestrate::{run_scan_fanout, scan_cells_from_records, CellSink, ScanCellResult, ScanEntrySpec, ScanFanoutInput, ScanResults};
 use crate::output::Format;
 use crate::provider::registry::ProviderRegistry;
@@ -306,7 +307,7 @@ pub async fn run_code_review(
     // 阶段 0 风险路由：放在 scanner 空校验之后（无 scanner 直接 bail，不空跑 git grep/log 一串子进程）。
     // RiskRoute 留下入队（不从 RiskMeta 反推）；无 reviewer 时丢掉区列表，只把 meta 进报告。
     let (risk, route) = stage0_risk(&selected, root, args, cfg, head_sha.as_deref());
-    let _route = if roles.reviewers.is_empty() { None } else { route };
+    let deep_route = if roles.reviewers.is_empty() { None } else { route };
     let entries: Vec<ScanEntrySpec> = roles.scanners.iter().map(ScanEntrySpec::from).collect();
     let model_names: Vec<String> = entries.iter().map(|e| e.route_key.clone()).collect();
 
@@ -348,11 +349,13 @@ pub async fn run_code_review(
         })
         .collect();
     let scanned_coverage = scanned_coverage(&bundles, &results.cells);
-    Ok(finish_scan_report(ScanFinish {
+    let scan_failed = results.cells.iter().any(|c| !c.record.ok);
+    let scan_cells = results.cells.clone();
+    let (report, code) = finish_scan_report(ScanFinish {
         groups,
         scanned_coverage,
         grouping: Some(stats),
-        risk,
+        risk: risk.clone(),
         dossier_meta: Some(dossier_meta),
         results,
         model_names,
@@ -366,7 +369,78 @@ pub async fn run_code_review(
         test_command: args.test_command.clone().or_else(|| crate::project::infer_test_command(root)),
         job_id: String::new(),
         reused: vec![],
-    }))
+    });
+    if scan_failed || roles.reviewers.is_empty() {
+        return Ok((report, code));
+    }
+    let deep = run_deep(
+        registry,
+        DeepInput {
+            route: deep_route.as_ref(),
+            scan_cells: &scan_cells,
+            bundles: &bundles,
+            root,
+            reviewers: &roles.reviewers,
+            budget_cells: risk.as_ref().map(|r| r.budget_cells).unwrap_or(4),
+            pack: &cfg.review.pack,
+            spec_docs: &spec_section,
+            target_label: &target_label,
+        },
+        &(),
+    ).await;
+    Ok(overlay_deep(report, deep, args, cfg))
+}
+
+fn overlay_deep(
+    mut report: ReviewReport,
+    deep: crate::orchestrate::deep::DeepRun,
+    args: &ReviewArgs,
+    cfg: &Config,
+) -> (ReviewReport, i32) {
+    let findings = deep.findings;
+    let skipped = deep.meta.budget_skipped;
+    let failed = deep.reviewer_failed;
+    report.findings = findings.clone();
+    report.stats = Stats::from_findings(&findings);
+    report.run.deep = Some(deep.meta);
+    report.run.warnings.extend(deep.warnings);
+    if skipped > 0 {
+        report.run.warnings.push(format!(
+            "deep: skipped(budget) {skipped} item(s) — disclosed, not in verdict"
+        ));
+    }
+    let rev_ids: Vec<String> = deep.cells.iter().map(|c| c.cell.clone()).collect();
+    if !rev_ids.is_empty() {
+        report.run.coverage.selected.insert(Role::Reviewer, rev_ids.clone());
+        let ok: Vec<String> = deep.cells.iter().filter(|c| c.ok).map(|c| c.cell.clone()).collect();
+        let bad: Vec<String> = deep.cells.iter().filter(|c| !c.ok).map(|c| c.cell.clone()).collect();
+        if !ok.is_empty() {
+            report.run.coverage.completed.insert(Role::Reviewer, ok);
+        }
+        if !bad.is_empty() {
+            report.run.coverage.failed.insert(Role::Reviewer, bad);
+        }
+    }
+    for rec in &deep.cells {
+        report.run.usage.input_tokens += rec.input_tokens;
+        report.run.usage.output_tokens += rec.output_tokens;
+        report.run.usage.cached_input_tokens += rec.cached_input_tokens;
+        report.run.cells.push(CellSummary::from_record(rec));
+    }
+    report.cells.extend(deep.cells);
+    let h = crate::prompt::template_hashes();
+    report.run.template_hashes.insert("reviewer_tail".into(), h.reviewer_tail.clone());
+    let block = args.block_threshold.as_deref()
+        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+        .unwrap_or(cfg.review.block_threshold);
+    let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
+    let verdict = crate::verdict::compute_verdict(&findings, block, floor);
+    report.verdict = verdict;
+    let debt = failed || skipped > 0;
+    if debt && matches!(verdict, Verdict::Approve) {
+        report.run.warnings.push("reviewer debt: failed cell or budget skip — approve with exit 2".into());
+    }
+    (report, exit_code(verdict, debt))
 }
 
 /// scan-only 报告收口的输入（全量 / resume / partial 三路共用，批 F-3 / F-5）。
@@ -2046,6 +2120,46 @@ mod code_review_tests {
         assert_eq!(report.run.grouping.as_ref().map(|g| g.groups), Some(1));
         assert_eq!(scan.groups.len(), 1);
         assert_eq!((scan.groups[0].cells.len(), scan.groups[0].suspicions), (2, 1));
+    }
+
+    /// 有 reviewer：疑点入队 → Fake 产 finding → Approve + deep 段。
+    #[tokio::test]
+    async fn deep_review_emits_findings_and_approve() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
+        let rev_json = r#"{"findings":[{"severity":"low","title":"t","body":"b","file":"src/a.rs","line_start":2,"line_end":2,"confidence":0.4,"recommendation":"r","quote":"db.write(token);"}],"needs":[]}"#;
+        let mut reg = ProviderRegistry::new();
+        let scan_turn = AssistantTurn { text: scan_json, tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None };
+        let rev_turn = AssistantTurn { text: rev_json.into(), tool_calls: vec![], input_tokens: 2, output_tokens: 3, cached_input_tokens: 0, finish_reason: Some("stop".into()), reasoning_tokens: None };
+        reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(scan_turn)), std::time::Duration::from_secs(5), 0);
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(rev_turn)), std::time::Duration::from_secs(5), 0);
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+        assert_eq!(code, 0, "warnings={:?} verdict={:?}", report.run.warnings, report.verdict);
+        assert_eq!(report.verdict, Verdict::Approve);
+        assert!(!report.findings.is_empty(), "findings={:?}", report.findings);
+        assert!(report.run.deep.is_some());
+        assert!(report.cells.iter().any(|c| c.cell.starts_with("review[")), "cells={:?}", report.cells.iter().map(|c| &c.cell).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn deep_reviewer_failure_is_approve_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
+        let mut reg = ProviderRegistry::new();
+        let scan_turn = AssistantTurn { text: scan_json, tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None };
+        let bad = AssistantTurn { text: "not-json".into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: Some("stop".into()), reasoning_tokens: None };
+        reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(scan_turn)), std::time::Duration::from_secs(5), 0);
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![bad.clone(), bad])), std::time::Duration::from_secs(5), 0);
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+        assert_eq!(report.verdict, Verdict::Approve);
+        assert_eq!(code, 2);
+        assert!(report.run.coverage.failed.get(&Role::Reviewer).is_some());
     }
 
     /// 空变更集：0 cell、warning 可观测、scan-only / 0（不是假绿灯 approve）。

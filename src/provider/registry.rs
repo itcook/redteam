@@ -411,6 +411,19 @@ pub struct ScanLease<'a> {
 }
 
 impl ScanLease<'_> {
+    pub fn backend(&self) -> &dyn ChatBackend {
+        self.entry.backend.as_ref()
+    }
+    pub fn per_turn(&self) -> Duration {
+        self.entry.per_turn
+    }
+    pub fn retry_budget(&self) -> u32 {
+        self.entry.retry_budget
+    }
+    pub(crate) fn gate_attempts(&self) -> GateAttempts<'_> {
+        GateAttempts::new(self.gate)
+    }
+
     pub async fn run(&self, prompt: &ScanPrompt) -> Result<ScanCall, ProviderError> {
         let policy = GateAttempts::new(self.gate);
         run_scan_shot_with(self.entry.backend.as_ref(), prompt, self.entry.per_turn, self.entry.retry_budget, Some(&policy))
