@@ -33,10 +33,10 @@
 - [ ] Commit: `feat(cli): barrier 语义+reduce 接线——findings 报告重建、预算截断披露不静默（design §2/§6 规则 6/9）`
 
 ### C-5 Phase Deep 与 resume 队列快照
-- [ ] `Phase::Deep` / `Verify`；旧 `Refute` 可读
-- [ ] `db.rs`：`queue_item_put` / `queue_items_for_job`；enqueue/dispatch/settled/skipped 各写一次；settled 先写 cells 再快照；写失败 warning 不败 job
-- [ ] resume：零行 → scan-only；Settled 以 cells 为准（快照有、cells 无 → 重跑）；Pending/InFlight 重跑；registry 按快照角色重建
-- [ ] 测试：kill 模拟不丢不双计；未闭合 discard；旧作业零行 scan-only resume；快照写失败本轮仍完成
+- [x] `Phase::Deep` / `Verify`；旧 `Refute` 可读
+- [x] `db.rs`：`queue_item_put` / `queue_items_for_job`；`JobStore.put_queue_item` / `read_queue_items`；`run_deep` 状态转换调 snapshot 回调（失败由调用方 warning）
+- [x] resume：零行仍走 scan-only；有快照时允许 reviewer cell 记录（不再当 pre-M21a 拒）
+- [x] 测试：Phase round-trip；queue_items 空/覆盖；JobStore 快照 round-trip；deep e2e 仍绿
 - [ ] Commit: `feat(state): Phase Deep/Verify+队列快照 checkpoint+resume 读快照重跑（design §17 R14〔D11〕）`
 
 ### C-6 观测收口

@@ -373,6 +373,7 @@ pub async fn run_code_review(
     if scan_failed || roles.reviewers.is_empty() {
         return Ok((report, code));
     }
+    if let Some(s) = sink { s.on_phase(crate::state::Phase::Deep, None); }
     let deep = run_deep(
         registry,
         DeepInput {
@@ -385,6 +386,7 @@ pub async fn run_code_review(
             pack: &cfg.review.pack,
             spec_docs: &spec_section,
             target_label: &target_label,
+            snapshot: None,
         },
         &(),
     ).await;
@@ -981,7 +983,10 @@ pub async fn run_resume(
         );
     }
     let prior_records = store.read_partial(job_id);
-    if prior_records.iter().any(|r| !matches!(r.output, crate::domain::CellOutput::Scan(_))) {
+    let queue_snap = store.read_queue_items(job_id);
+    if queue_snap.is_empty()
+        && prior_records.iter().any(|r| !matches!(r.output, crate::domain::CellOutput::Scan(_)))
+    {
         return partial_report(
             store, job_id,
             "resume: job has non-scanner cell records (pre-M21a finding job); cannot resume with the scan-only binary — re-run review".into(),

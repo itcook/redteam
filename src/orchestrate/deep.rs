@@ -41,6 +41,8 @@ pub struct DeepInput<'a> {
     pub pack: &'a PackCfg,
     pub spec_docs: &'a str,
     pub target_label: &'a str,
+    /// 状态转换时写 queue_items；失败由回调 warning，不败本轮。
+    pub snapshot: Option<&'a dyn Fn(&crate::orchestrate::queue::QueueItem)>,
 }
 
 pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &dyn FindingSink) -> DeepRun {
@@ -57,8 +59,10 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
         }
     }
     enqueue_scan(&mut q, input.scan_cells, &mut meta);
+    snap_all(&q, input.snapshot);
 
     let skipped = q.drain(input.budget_cells);
+    snap_all(&q, input.snapshot);
     meta.budget_skipped = skipped.len() as u32;
     meta.queue_depth_peak = q.items().len() as u32;
 
@@ -83,6 +87,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
         }) else {
             break;
         };
+        snap_one(&item, input.snapshot);
         n += 1;
         let cell_id = format!("review[{n}]@{}", rev.name);
         let t0 = Instant::now();
@@ -145,6 +150,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                 meta.landed_agreement.push(item.agreement);
                 cells.push(rec);
                 q.mark_settled(&item.id, item.agreement);
+                if let Some(it) = q.get(&item.id) { snap_one(it, input.snapshot); }
             }
             Err(e) => {
                 reviewer_failed = true;
@@ -152,6 +158,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                 cells.push(rec);
                 warnings.push(format!("{cell_id} failed: {e}"));
                 q.mark_settled(&item.id, item.agreement);
+                if let Some(it) = q.get(&item.id) { snap_one(it, input.snapshot); }
             }
         }
     }
@@ -211,6 +218,20 @@ fn enqueue_scan(q: &mut DeepQueue, cells: &[ScanCellResult], meta: &mut DeepMeta
             it.agreement = m.agreement.max(1);
             it.families = m.families.clone();
         }
+    }
+}
+
+fn snap_all(q: &DeepQueue, snap: Option<&dyn Fn(&crate::orchestrate::queue::QueueItem)>) {
+    if let Some(f) = snap {
+        for it in q.items() {
+            f(it);
+        }
+    }
+}
+
+fn snap_one(it: &crate::orchestrate::queue::QueueItem, snap: Option<&dyn Fn(&crate::orchestrate::queue::QueueItem)>) {
+    if let Some(f) = snap {
+        f(it);
     }
 }
 
