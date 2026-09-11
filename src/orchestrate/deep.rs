@@ -13,7 +13,7 @@ fn now_ms() -> u64 {
 }
 
 use crate::bundle::{cross_index, Bundle};
-use crate::config::{EffectiveModel, PackCfg};
+use crate::config::{EffectiveModel, PackCfg, ToolsMode};
 use crate::consolidate::scan::merge_suspicions;
 use crate::domain::{DeepMeta, Finding, Role};
 use crate::orchestrate::dispatch::dispatch_one;
@@ -53,6 +53,8 @@ pub struct DeepInput<'a> {
     /// resume 恢复（C-5）：快照项（跳过入队与 drain，未完项重跑）；settled 项的已有 finding 经此并入（不双计）。
     pub restore: Option<&'a [crate::orchestrate::queue::QueueItem]>,
     pub prior_findings: Vec<Finding>,
+    /// `--tools` 档位（R2 二阶段首个消费者）：TwoStage 时 reviewer needs 触发补查轮。
+    pub tools: ToolsMode,
 }
 
 pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &dyn FindingSink) -> DeepRun {
@@ -149,7 +151,32 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
         .await;
         drop(lease);
         match call {
-            Ok(c) => {
+            Ok(mut c) => {
+                // R2 二阶段（`--tools two-stage` 首个消费者，design §11）：needs 非空 → 补查轮。
+                // 注入互斥：带笔记项（origin=scan）不注入 needs 证据（region::build 构造期 Err），计 skipped。
+                let needs_count = c.output.needs().len();
+                if needs_count > 0 {
+                    let eligible = input.tools == ToolsMode::TwoStage && item.spec.notes.is_empty();
+                    if eligible {
+                        meta.needs_two_stage_triggered += 1;
+                        if let Some(c2) = second_stage_round(
+                            registry, &input, rev, &item, &idx, &opts, c.output.findings().to_vec(), c.output.needs(), sink,
+                        )
+                        .await
+                        {
+                            c.input_tokens += c2.input_tokens;
+                            c.output_tokens += c2.output_tokens;
+                            c.cached_input_tokens += c2.cached_input_tokens;
+                            c.iterations += c2.iterations;
+                            c.rate_limit_retries += c2.rate_limit_retries;
+                            c.rate_limit_wait_ms += c2.rate_limit_wait_ms;
+                            c.stats.stream_discarded += c2.stats.stream_discarded;
+                            c.output = c2.output; // 第二轮 = CONFIRM/REVISE 后终判
+                        }
+                    } else {
+                        meta.needs_two_stage_skipped += 1;
+                    }
+                }
                 let got = c.output.findings().to_vec();
                 findings.extend(got.iter().cloned());
                 let mut rec = CellRecord::ok(&cell_id, &rev.name, c.output).with_family(&rev.family);
@@ -198,6 +225,74 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
 
 fn pick_bundle<'a>(bundles: &'a [Bundle], file: &str) -> &'a Bundle {
     bundles.iter().find(|b| b.files.iter().any(|f| f.path == file)).unwrap_or(&bundles[0])
+}
+
+/// R2 二阶段补查轮：needs → 证据段（`second_pass::need_section`，读守卫 + 字节帽）→ 重建 pack
+/// （needs_evidence 槽；与笔记互斥由构造期守卫，调用方已过滤）→ prompt 附加草稿块 → 新租约再跑一轮。
+async fn second_stage_round(
+    registry: &ProviderRegistry,
+    input: &DeepInput<'_>,
+    rev: &EffectiveModel,
+    item: &crate::orchestrate::queue::QueueItem,
+    idx: &crate::bundle::CrossIndex,
+    opts: &PackOpts,
+    draft: Vec<Finding>,
+    needs: &[crate::domain::NeedEntry],
+    sink: &dyn FindingSink,
+) -> Option<super::review_shot::ReviewCall> {
+    let ex = crate::tools::ToolExecutor::new(input.root);
+    let mut w2: Vec<String> = Vec::new();
+    let ev: String = needs
+        .iter()
+        .filter_map(|n| crate::cli::second_pass::need_section(&ex, input.root, n, &mut w2))
+        .collect();
+    if ev.trim().is_empty() {
+        return None;
+    }
+    let pack2 = region::build(
+        &item.spec,
+        pick_bundle(input.bundles, &item.spec.file),
+        input.root,
+        idx,
+        64 * 1024,
+        opts,
+        &ev,
+    )
+    .ok()?;
+    let file_diff = file_diff(input.bundles, &item.spec.file);
+    let mut prompt2 = build_review_prompt(&ReviewPromptInput {
+        target_label: input.target_label,
+        file: &item.spec.file,
+        file_diff: &file_diff,
+        cross_index: &pack2.cross_index,
+        notes: &pack2.notes,
+        dossier: &pack2.evidence,
+        spec_docs: input.spec_docs,
+        repo_brief: "",
+    });
+    prompt2.blocks.push(crate::prompt::PromptBlock {
+        text: crate::cli::second_pass::draft_block(&draft),
+        cache_boundary: false,
+    });
+    let lease = registry.lease(&rev.name).await.ok()?;
+    let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+    let policy = lease.gate_attempts();
+    let r = run_review_shot_with(
+        lease.backend(),
+        &prompt2,
+        lease.per_turn(),
+        lease.retry_budget(),
+        Some(&policy),
+        &rev.name,
+        &rev.family,
+        item.agreement,
+        input.root,
+        inc,
+        sink,
+    )
+    .await;
+    drop(lease);
+    r.ok()
 }
 
 #[cfg(test)]
@@ -261,6 +356,7 @@ mod tests {
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&snap), prior_findings: vec![prior_f],
+                tools: ToolsMode::Off,
             },
             &(),
         )
@@ -269,6 +365,53 @@ mod tests {
         assert!(run.cells[0].ok);
         assert_eq!(run.findings.len(), 1, "重跑产出与 prior 同 id → dedup 不双计");
         assert_eq!(run.meta.budget_skipped, 1, "skipped 保留");
+    }
+
+    /// R2 二阶段（`--tools two-stage`）：needs 非空 → 补查轮（读守卫放行 git-tracked）→ 终判取第二轮。
+    #[tokio::test]
+    async fn two_stage_needs_triggers_second_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() {\n").unwrap();
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        g(&["init", "-q"]);
+        g(&["add", "a.rs"]);
+        g(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        let bundles = vec![Bundle::from_files(vec![FileChange { path: "a.rs".into(), diff: "@@ -1,1 +1,1 @@\n+fn a() {".into() }])];
+        let reviewer = crate::config::EffectiveModel {
+            name: "p/r".into(), display_name: None, id: "r".into(), provider: "p".into(),
+            role: crate::config::Role::Reviewer, kind: crate::config::ProviderKind::Openai,
+            base_url: None, context_window: 100_000, max_output_tokens: None,
+            per_turn_timeout_secs: None, reasoning: false, thinking_level: None,
+            family: "r".into(), max_concurrency: None,
+        };
+        // 第一轮：一条 finding + 一条 needs（指向 git-tracked a.rs → 补查放行）
+        let first = format!(
+            r#"{{"findings":[{{"severity":"low","title":"draft","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.4,"recommendation":"r","quote":"fn a() {{"}}],"needs":[{{"path":"a.rs","reason":"need context"}}]}}"#
+        );
+        // 第二轮（终判）：needs 消化后确认同一条
+        let second = rev_json("fn a() {");
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(&first), turn(&second)])), Duration::from_secs(5), 0);
+        let run = run_deep(
+            &reg,
+            DeepInput {
+                route: None, scan_cells: &[], bundles: &bundles, root,
+                reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
+                pack: &Default::default(), spec_docs: "", target_label: "t",
+                snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::InFlight)]), prior_findings: vec![],
+                tools: ToolsMode::TwoStage,
+            },
+            &(),
+        )
+        .await;
+        assert_eq!(run.meta.needs_two_stage_triggered, 1, "needs 非空触发补查");
+        assert_eq!(run.cells.len(), 1);
+        assert!(run.cells[0].ok);
+        assert_eq!(run.findings.len(), 1, "终判取第二轮 CONFIRM 后同一条");
     }
 }
 

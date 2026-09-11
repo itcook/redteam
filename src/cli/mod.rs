@@ -394,10 +394,16 @@ pub async fn run_code_review(
             snapshot: Some(&snap),
             restore: None,
             prior_findings: vec![],
+            tools: resolve_tools(args, cfg),
         },
         &(),
     ).await;
     Ok(overlay_deep(report, deep, args, cfg))
+}
+
+/// `--tools` 旗覆盖 config `review.tools`（R2 二阶段档位）。
+fn resolve_tools(args: &ReviewArgs, cfg: &Config) -> crate::config::ToolsMode {
+    args.tools.as_deref().and_then(crate::config::ToolsMode::from_flag).unwrap_or(cfg.review.tools)
 }
 
 fn overlay_deep(
@@ -1164,6 +1170,7 @@ pub async fn run_resume(
                     snapshot: Some(&snap2),
                     restore: Some(&queue_snap),
                     prior_findings,
+                    tools: resolve_tools(&args, cfg),
                 },
                 &(),
             )

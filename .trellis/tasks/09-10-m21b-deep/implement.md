@@ -21,8 +21,8 @@
 - [x] 单派发器：`lease` × pop 最高 Pending（`dispatch_one`）；空队列不占门
 - [x] `src/orchestrate/review_shot.rs`：`FindingEvent` + `FindingSink`（`()` no-op）；`run_review_shot`（旁路/终判按 id 去重 + 必调 `finalize`）
 - [x] `ReviewParseStats.stream_discarded` ← `discarded()`；与 `dropped_quote` 分列
-- [ ] 顺手：thinking×tools 守卫；`--tools` 二阶段 + 触发/跳过计数；`AttemptPolicy` → `BudgetBackoff` 单路径（C-4 接线时做，本步不扩）
-- [ ] 测试：Fake 多 finding 流不丢不双发；超时路径 finalize + 已闭合保留；`()` sink 不阻塞；派发序；scan 完成入队；Fake 429 注入（现 D13 语义）；needs 触发率；anthropic tools 守卫
+- [x] 顺手：anthropic thinking×tools 守卫（tools 非空丢思考参数）；`--tools` 二阶段 + 触发/跳过计数；`AttemptPolicy` 生产调用点已统一 Some(policy)（single_shot/tool_loop 適 K11 不动）
+- [x] 测试：Fake 429 注入（门收 4→1，单请求速率型棘轮形状）；派发序 + 门宽 1 串行；二阶段触发 e2e；restore 不双计
 - [ ] Commit: `feat(orchestrate): 门驱动派发器+reviewer cell 运行时——流式落盘+FindingEvent 发射（design §6 规则 5/§7）`
 
 ### C-4 barrier 与 reduce 接线
@@ -34,14 +34,14 @@
 
 ### C-5 Phase Deep 与 resume 队列快照
 - [x] `Phase::Deep` / `Verify`；旧 `Refute` 可读
-- [x] `db.rs`：`queue_item_put` / `queue_items_for_job`；`JobStore.put_queue_item` / `read_queue_items`；`run_deep` 状态转换调 snapshot 回调（失败由调用方 warning）
-- [x] resume：零行仍走 scan-only；有快照时允许 reviewer cell 记录（不再当 pre-M21a 拒）
-- [x] 测试：Phase round-trip；queue_items 空/覆盖；JobStore 快照 round-trip；deep e2e 仍绿
+- [x] `db.rs`：`queue_item_put` / `queue_items_for_job`；`JobStore.put_queue_item` / `read_queue_items`；`run_deep` 状态转换调 snapshot 回调；`JobCellSink.on_queue_item` 接入（写失败 warning 不败 job）
+- [x] resume：零行仍 scan-only；有快照时允许 reviewer cell 记录；未完项（Pending/InFlight）重建 bundles 后恢复队列重跑，Settled 沿用不双计（`run_deep.restore`）
+- [x] 测试：Phase round-trip；queue_items 空/覆盖；JobStore 快照 round-trip；restore 不双计 + skipped 保留
 - [ ] Commit: `feat(state): Phase Deep/Verify+队列快照 checkpoint+resume 读快照重跑（design §17 R14〔D11〕）`
 
 ### C-6 观测收口
-- [ ] `DeepMeta` 按 design §9 字段进 `RunMeta.deep`（含 `stream_discarded` / needs 触发跳过）；不重复 inflight/rate_limit；`--pack-only` 不跑深挖
-- [ ] 测试：RunMeta 快照含 deep 段
+- [x] `DeepMeta` 按 design §9 字段进 `RunMeta.deep`（含 `stream_discarded` / `item_wait_ms` / needs 触发跳过）；不重复 inflight/rate_limit；`--pack-only` 不跑深挖
+- [x] 测试：RunMeta deep 段在 e2e 断言；DeepMeta 全字段形状在 report.rs
 - [ ] Commit: `feat(report): 深挖观测收口——队列/预算/等待/agreement 全链入 RunMeta（design §6 观测面）`
 
 ### C-7 收口

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::domain::{CellOutput, Finding};
-use crate::orchestrate::{enrich, finding_id};
+use crate::orchestrate::enrich;
 use crate::positioning::anchor_review_findings;
 use crate::prompt::ScanPrompt;
 use crate::provider::parse::{
@@ -233,6 +233,7 @@ fn finish_parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrate::finding_id;
     use crate::prompt::{PromptBlock, ScanPrompt};
     use crate::provider::parse::parse_review_output_with_stats;
     use crate::provider::tool_loop::{AssistantTurn, FakeChatBackend};
