@@ -267,6 +267,30 @@ pub struct RunMeta {
     /// M21b 批 A：阶段 0 风险路由（H0 区数 / R / 档位 / 预算格）；旧 JSON None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<RiskMeta>,
+    /// M21b 批 C：深挖观测；无 reviewer / 旧 JSON None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep: Option<DeepMeta>,
+}
+
+/// 深挖观测（design §9）。旧报告不产键。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeepMeta {
+    pub queue_depth_peak: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub enqueue_reasons: BTreeMap<String, u32>,
+    pub dedup_hits: u32,
+    pub budget_skipped: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub item_wait_ms: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_agreement: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landed_agreement: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewer_output_tokens: Vec<u64>,
+    pub needs_two_stage_triggered: u32,
+    pub needs_two_stage_skipped: u32,
+    pub stream_discarded: u32,
 }
 
 /// 阶段 0 风险观测（serde default 兼容旧报告）。

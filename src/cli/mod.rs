@@ -244,7 +244,13 @@ pub(crate) fn grouping_opts(g: &crate::config::GroupingCfg, budget: usize) -> Gr
 }
 
 /// 阶段 0 风险路由（plan_cells 前）。ledger 路径：`--dismissed` 文件覆盖，否则 `.redteam/proj-next.db`（存在才读）。
-fn stage0_risk(selected: &[FileChange], root: &Path, args: &ReviewArgs, cfg: &Config, head: Option<&str>) -> Option<RiskMeta> {
+fn stage0_risk(
+    selected: &[FileChange],
+    root: &Path,
+    args: &ReviewArgs,
+    cfg: &Config,
+    head: Option<&str>,
+) -> (Option<RiskMeta>, Option<crate::risk::RiskRoute>) {
     let head = head.unwrap_or("HEAD");
     let base = args.base.as_deref().unwrap_or("HEAD");
     let ledger = match args.dismissed.as_deref() {
@@ -264,12 +270,13 @@ fn stage0_risk(selected: &[FileChange], root: &Path, args: &ReviewArgs, cfg: &Co
         None,
         cfg.review.reviewers.max_cells,
     );
-    Some(RiskMeta {
+    let meta = RiskMeta {
         hotspots: route.hotspots.len() as u32,
         r: route.r,
         tier: route.tier,
         budget_cells: route.budget_cells_hint,
-    })
+    };
+    (Some(meta), Some(route))
 }
 
 /// scan-only 流水线（M21a 批 F-4 硬切，design §2 / §4 / §5）：证据筛选 → 分组 / 装包 / 跨组索引 → scanner 扇出（组 × 条目 × samples）
@@ -297,7 +304,9 @@ pub async fn run_code_review(
         anyhow::bail!(NO_SCANNER_MSG);
     }
     // 阶段 0 风险路由：放在 scanner 空校验之后（无 scanner 直接 bail，不空跑 git grep/log 一串子进程）。
-    let risk = stage0_risk(&selected, root, args, cfg, head_sha.as_deref());
+    // RiskRoute 留下入队（不从 RiskMeta 反推）；无 reviewer 时丢掉区列表，只把 meta 进报告。
+    let (risk, route) = stage0_risk(&selected, root, args, cfg, head_sha.as_deref());
+    let _route = if roles.reviewers.is_empty() { None } else { route };
     let entries: Vec<ScanEntrySpec> = roles.scanners.iter().map(ScanEntrySpec::from).collect();
     let model_names: Vec<String> = entries.iter().map(|e| e.route_key.clone()).collect();
 
@@ -641,7 +650,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     let roles = cfg.active_roles();
     let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
     let selected = select_files(changes);
-    let risk = stage0_risk(&selected, cwd, args, cfg, head_sha.as_deref());
+    let (risk, _route) = stage0_risk(&selected, cwd, args, cfg, head_sha.as_deref());
     let CellPlan { bundles, dossiers, others, stats, pack_stats, .. } =
         plan_cells(selected, cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
     let focus = args.focus.clone().unwrap_or_default();

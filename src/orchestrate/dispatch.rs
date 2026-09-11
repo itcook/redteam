@@ -3,20 +3,21 @@
 //! 无角色 workers。t=0 入队序由调用方保证 scanner 先于 H0。
 
 use super::queue::{DeepQueue, QueueItem};
-use crate::provider::registry::ProviderRegistry;
+use crate::provider::registry::{ProviderRegistry, ScanLease};
 use crate::provider::ProviderError;
 
 /// 一轮：等一个 reviewer 门位，弹出最高项。队列空 → None（不占门）。
-pub async fn dispatch_one(
+/// 租约必须活过 cell 调用——调用方 drop lease 才放门。
+pub async fn dispatch_one<'a>(
     queue: &mut DeepQueue,
-    registry: &ProviderRegistry,
+    registry: &'a ProviderRegistry,
     reviewer_key: &str,
-) -> Result<Option<QueueItem>, ProviderError> {
+) -> Result<Option<(ScanLease<'a>, QueueItem)>, ProviderError> {
     if queue.pending_count() == 0 {
         return Ok(None);
     }
-    let _lease = registry.lease(reviewer_key).await?;
-    Ok(queue.pop_dispatch())
+    let lease = registry.lease(reviewer_key).await?;
+    Ok(queue.pop_dispatch().map(|item| (lease, item)))
 }
 
 #[cfg(test)]
@@ -81,7 +82,8 @@ mod tests {
             Duration::from_secs(5),
             0,
         );
-        let item = dispatch_one(&mut q, &reg, "p/r").await.unwrap().unwrap();
+        let (lease, item) = dispatch_one(&mut q, &reg, "p/r").await.unwrap().unwrap();
+        drop(lease);
         assert_eq!(item.kind, ItemKind::Primary);
         assert_eq!(item.state, crate::orchestrate::queue::ItemState::InFlight);
         assert_eq!(q.inflight_count(), 1);
@@ -113,7 +115,10 @@ mod tests {
             family: None,
         });
         let reg = ProviderRegistry::new();
-        let err = dispatch_one(&mut q, &reg, "ghost/x").await.unwrap_err();
+        let err = match dispatch_one(&mut q, &reg, "ghost/x").await {
+            Err(e) => e,
+            Ok(_) => panic!("expected unavailable"),
+        };
         assert!(format!("{err:?}").contains("not in registry"));
         assert_eq!(q.pending_count(), 1, "失败不 pop");
     }

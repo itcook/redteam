@@ -26,7 +26,7 @@
 - [ ] Commit: `feat(orchestrate): 门驱动派发器+reviewer cell 运行时——流式落盘+FindingEvent 发射（design §6 规则 5/§7）`
 
 ### C-4 barrier 与 reduce 接线
-- [ ] `stage0_risk` 返回 `(RiskMeta, RiskRoute)`（或等价，区列表不下发 RunMeta）
+- [x] `stage0_risk` 返回 `(RiskMeta, RiskRoute)`（区列表不下发 RunMeta；无 reviewer 丢 route）
 - [ ] barrier：scan 全完 ∧ Pending 空 ∧ InFlight 0 ∧ 复核在途 0（C 恒真）→ dedup → findings 报告
 - [ ] 无 reviewer → scan-only 退化；reviewer 失败 → Approve+2+coverage failed；预算截断 → Approve+2+`budget_skipped`；scanner 失败仍 Incomplete/3
 - [ ] 测试：Fake e2e 2 组 × 2 scanner → reviewer → 报告；退化路径；带债 approve；截断 exit 2
