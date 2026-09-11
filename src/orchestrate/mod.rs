@@ -1,3 +1,5 @@
+pub mod queue;
+
 use crate::bundle::Bundle;
 use crate::domain::{CellOutput, Finding, Origin, RawFinding, Role, ScanOutput};
 use crate::hash::fnv1a64_hex;

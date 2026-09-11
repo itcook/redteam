@@ -6,9 +6,9 @@
 ## Checklist
 
 ### C-1 队列项与入口五态
-- [ ] `src/orchestrate/queue.rs`：`QueueItem`（`spec: QueueItemSpec` + score/agreement/state/kind）；`enqueue` 五态
-- [ ] 合并谓词调用 `same_suspicion`（不要复制）；同家族不加 agreement；跨文件不合并；判例守卫空过
-- [ ] 测试：五态各一；agreement 活值；同家族不加；跨文件不合并
+- [x] `src/orchestrate/queue.rs`：`QueueItem`（`spec: QueueItemSpec` + score/agreement/state/kind）；`enqueue` 五态
+- [x] 合并谓词调用 `same_suspicion`（不要复制）；同家族不加 agreement；跨文件不合并；判例守卫空过
+- [x] 测试：五态各一；agreement 活值；同家族不加；跨文件不合并
 - [ ] Commit: `feat(orchestrate): 深挖队列项与入口五态——merge_suspicions 谓词复用、agreement 活值（design §6 规则 2〔D13〕）`
 
 ### C-2 优先级、预算与必挖集
