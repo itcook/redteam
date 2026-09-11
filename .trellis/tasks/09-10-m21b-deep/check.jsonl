@@ -1,0 +1,2 @@
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§6 五态/必挖/保底/drain、§7 流式旁路、§8.4 reviewer 失败带债 vs scanner Incomplete——验收逐条对照"}
+{"file": ".next/roadmap/followup.md", "reason": "批 B 接线契约（per-cell backend / anchor_review_findings / finalize / 双 Origin）；D13 429 棘轮沿用裁定；exit_code 第二参本批启用"}

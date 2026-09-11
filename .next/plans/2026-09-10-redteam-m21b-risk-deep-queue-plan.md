@@ -35,8 +35,7 @@
   `cross_same_dir` 三键（serde default）、`weak_cut` 删除（真切口径无独立信息量）；「强边不跨组」不变量哨兵测试；PR181 基线
   cross_import=0（复验强边不跨组不变量——恒为零，语义分组增量不在可观测范围，R8 判决另需跨组索引数据）/ cross_reference=2 / cross_same_dir=6、旧 weak_cut=55 虚高
   （真切口径 8）；数据 `.next/private/m21b/pr181-packonly-kinds.txt`。
-- **速率型 429 棘轮与放弃判据**（D13 收口批评审延后项，用户裁）：看 PR181 `provider_rate_limit` 数据后定 Retry-After 速率信号
-  不收门 / 最小回升 / 等待总时长 ≤ `perTurnTimeoutSecs`。
+- **速率型 429 棘轮与放弃判据**：✅ 开工裁定已落（2026-09-10 用户裁，批 C 开工前）——**沿用 D13 现口径开 C**（每次 RateLimited 收门、本轮不回升；放弃 = `max(4, 门宽×2)` 次 + Retry-After 硬夹 30 s）。D13 三跑 / PR181 均无 `provider_rate_limit` 样本，①②③ 与时间预算放弃不现裁；触发 = 真撞到带 Retry-After 的速率型 429（`hits` vs `effective_cap`）。详见 followup「D13 收口批评审延后项」。
 
 ## 批间依赖与波次
 

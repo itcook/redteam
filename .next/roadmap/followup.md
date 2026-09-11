@@ -159,8 +159,8 @@
 
 | 项 | 评审意见 | 归属 |
 |---|---|---|
-| 速率型 429 棘轮 | 收门公式对每次 RateLimited 都执行 `cap ← min(cap−1, others)` 且本轮不回升；RPM / TPM 型 429（网关按速率而非并发限流，本机 deepseek / qwen 即此类）在一个窗口内连撞 N 次门宽降 N，剩余格串行、warnings 还劝「set maxConcurrency ≤ 1」。候选：① Retry-After 在场视为速率信号不收门只等；② 最小回升——连续「门宽」次成功完成后 cap + 1（≤ 配置值）；③ 只在 `others < cap − 1` 时收 | 用户裁（K5「只降不升」是 D13 定案；A5 实测形态是并发密度，先看 PR181 `provider_rate_limit` 数据） |
-| 放弃判据按次数 | `max(4, 门宽 × 2)` 次 × 500 ms 指数 ≈ 7.5 s 后放弃；Retry-After 被 30 s 硬夹（60 s 窗口醒来必再撞）。候选：等待总时长 ≤ 该条目 `per_turn`（已有旋钮）、Retry-After 在预算内不夹，删 RL_RETRY_FLOOR / 30 s 常量 | M21b 前定；与上一行同一批数据 |
+| 速率型 429 棘轮 | 收门公式对每次 RateLimited 都执行 `cap ← min(cap−1, others)` 且本轮不回升；RPM / TPM 型 429（网关按速率而非并发限流，本机 deepseek / qwen 即此类）在一个窗口内连撞 N 次门宽降 N，剩余格串行、warnings 还劝「set maxConcurrency ≤ 1」。候选：① Retry-After 在场视为速率信号不收门只等；② 最小回升——连续「门宽」次成功完成后 cap + 1（≤ 配置值）；③ 只在 `others < cap − 1` 时收 | **2026-09-10 用户裁（批 C 开工前）**：沿用 D13 现口径（只降不升）开批 C；①②③ 不现裁。依据：D13 三跑与 PR181 均未产 `provider_rate_limit`（无 429 样本），无数据拍板等于猜。触发再裁：真撞到带 Retry-After 的速率型 429，用 `hits` vs `effective_cap` 对照窗口是否被拧到 1。C-3 Fake 429 注入测现语义 |
+| 放弃判据按次数 | `max(4, 门宽 × 2)` 次 × 500 ms 指数 ≈ 7.5 s 后放弃；Retry-After 被 30 s 硬夹（60 s 窗口醒来必再撞）。候选：等待总时长 ≤ 该条目 `per_turn`（已有旋钮）、Retry-After 在预算内不夹，删 RL_RETRY_FLOOR / 30 s 常量 | **同上裁**：沿用次数上限 + 30 s 夹；与棘轮同一触发再裁（真 RA 窗口 vs 放弃墙钟） |
 | `AttemptPolicy` 以 `Option` 穿三层 | `timed_turn(_final)_with` / `run_scan_shot_with` 三对平行签名 + 循环体四处 `if let Some`；429 在有 / 无策略两条路径语义不同（7.5 s vs 1.2 s 放弃）。候选：旧退避提成 `BudgetBackoff` 策略，`retry_classified(budget, &dyn AttemptPolicy, op)` 单路径，M21b 6 个调用点各传一个 | M21b 接 reviewer / verifier 时一并改（K11 本批不动 single_shot / tool_loop） |
 | HTTP 503 归类 | 本批 529 归 RateLimited 进排队重试；503 仍归 Server 走 2 次抖动预算。A5 列 503 为并发密度失败形态，但 503 也可能是维护 | 用户裁 |
 | `InflightGate::new` 的 `cap.max(1)` | validate 已挡 0，这里是静默兜底；候选 NonZeroU32 或记 warning | 低优，M21e 清理 |
