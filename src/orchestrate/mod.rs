@@ -24,6 +24,8 @@ pub trait CellSink: Send + Sync {
     fn on_meta(&self, _models: &[String]) {}
     /// 批 F-2：扇出前报本次作业的角色集（`JobState.roles`，status 可见）。默认 no-op。
     fn on_roles(&self, _roles: &[Role]) {}
+    /// M21b 批 C：队列项状态转换写 `queue_items` 快照（后台 job resume 用）。默认 no-op；写失败由实现方 warning。
+    fn on_queue_item(&self, _item: &crate::orchestrate::queue::QueueItem) {}
 }
 
 /// R8.1：quote 去除全部空白（保大小写）——token 序列即身份，免疫 reformat。批 F-3 `consolidate::scan` 复用。

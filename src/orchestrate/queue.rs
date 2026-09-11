@@ -56,6 +56,9 @@ pub struct QueueItem {
     pub landed_agreement: Option<u32>,
     /// 已贡献 agreement 的家族（同家族重复不加）。
     pub families: Vec<String>,
+    /// 入队时刻（epoch ms，观测：item_wait_ms = 派发时刻 − 此值）。None = 旧快照。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enqueued_ms: Option<u64>,
 }
 
 impl QueueItem {
@@ -72,8 +75,16 @@ impl QueueItem {
             dispatch_agreement: 0,
             landed_agreement: None,
             families,
+            enqueued_ms: Some(now_ms()),
         }
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 入队参数。`family` 空 = 无家族（H0 / needs），不参与异族计数。
@@ -93,6 +104,22 @@ pub struct DeepQueue {
 impl DeepQueue {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 快照恢复（C-5 resume）：settled/skipped 保留状态；pending/inflight 重置 pending（未完重跑，
+    /// enqueued_ms 重置避免 wait 虚高）。
+    pub fn restore(mut items: Vec<QueueItem>) -> Self {
+        let now = now_ms();
+        for it in items.iter_mut() {
+            match it.state {
+                ItemState::Pending | ItemState::InFlight => {
+                    it.state = ItemState::Pending;
+                    it.enqueued_ms = Some(now);
+                }
+                ItemState::Settled | ItemState::Skipped => {}
+            }
+        }
+        DeepQueue { items }
     }
 
     pub fn items(&self) -> &[QueueItem] {

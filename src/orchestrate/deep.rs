@@ -5,12 +5,19 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 use crate::bundle::{cross_index, Bundle};
 use crate::config::{EffectiveModel, PackCfg};
 use crate::consolidate::scan::merge_suspicions;
 use crate::domain::{DeepMeta, Finding, Role};
 use crate::orchestrate::dispatch::dispatch_one;
-use crate::orchestrate::queue::{DeepQueue, EnqueueOutcome, EnqueueReq, ItemKind};
+use crate::orchestrate::queue::{DeepQueue, EnqueueOutcome, EnqueueReq, ItemKind, ItemState};
 use crate::orchestrate::review_shot::{run_review_shot_with, FindingSink};
 use crate::pack::region::{self as region, Origin as QueueOrigin, QueueItemSpec};
 use crate::pack::PackOpts;
@@ -43,28 +50,41 @@ pub struct DeepInput<'a> {
     pub target_label: &'a str,
     /// 状态转换时写 queue_items；失败由回调 warning，不败本轮。
     pub snapshot: Option<&'a dyn Fn(&crate::orchestrate::queue::QueueItem)>,
+    /// resume 恢复（C-5）：快照项（跳过入队与 drain，未完项重跑）；settled 项的已有 finding 经此并入（不双计）。
+    pub restore: Option<&'a [crate::orchestrate::queue::QueueItem]>,
+    pub prior_findings: Vec<Finding>,
 }
 
 pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &dyn FindingSink) -> DeepRun {
-    let mut q = DeepQueue::new();
     let mut meta = DeepMeta::default();
     let mut warnings = Vec::new();
+    let prior_findings = input.prior_findings.clone();
 
-    if input.bundles.is_empty() {
-        return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false };
-    }
-    if let Some(route) = input.route {
-        for h in &route.hotspots {
-            enqueue_h0(&mut q, h, &mut meta);
+    let mut q = match input.restore {
+        Some(items) => DeepQueue::restore(items.to_vec()),
+        None => DeepQueue::new(),
+    };
+
+    if input.restore.is_some() {
+        meta.budget_skipped = q.items().iter().filter(|i| i.state == ItemState::Skipped).count() as u32;
+        meta.queue_depth_peak = q.items().len() as u32;
+    } else {
+        if input.bundles.is_empty() {
+            return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false };
         }
-    }
-    enqueue_scan(&mut q, input.scan_cells, &mut meta);
-    snap_all(&q, input.snapshot);
+        if let Some(route) = input.route {
+            for h in &route.hotspots {
+                enqueue_h0(&mut q, h, &mut meta);
+            }
+        }
+        enqueue_scan(&mut q, input.scan_cells, &mut meta);
+        snap_all(&q, input.snapshot);
 
-    let skipped = q.drain(input.budget_cells);
-    snap_all(&q, input.snapshot);
-    meta.budget_skipped = skipped.len() as u32;
-    meta.queue_depth_peak = q.items().len() as u32;
+        let skipped = q.drain(input.budget_cells);
+        snap_all(&q, input.snapshot);
+        meta.budget_skipped = skipped.len() as u32;
+        meta.queue_depth_peak = q.items().len() as u32;
+    }
 
     let Some(rev) = input.reviewers.first() else {
         return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false };
@@ -147,6 +167,9 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                 meta.stream_discarded += c.stats.stream_discarded;
                 meta.reviewer_output_tokens.push(c.output_tokens);
                 meta.dispatch_agreement.push(item.dispatch_agreement);
+                if let Some(en) = item.enqueued_ms {
+                    meta.item_wait_ms.push(now_ms().saturating_sub(en));
+                }
                 meta.landed_agreement.push(item.agreement);
                 cells.push(rec);
                 q.mark_settled(&item.id, item.agreement);
@@ -163,6 +186,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
         }
     }
 
+    findings.extend(prior_findings);
     DeepRun {
         findings: crate::consolidate::dedup(findings),
         cells,
@@ -174,6 +198,78 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
 
 fn pick_bundle<'a>(bundles: &'a [Bundle], file: &str) -> &'a Bundle {
     bundles.iter().find(|b| b.files.iter().any(|f| f.path == file)).unwrap_or(&bundles[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::finding::fixtures;
+    use crate::evidence::git::FileChange;
+    use crate::provider::tool_loop::{AssistantTurn, FakeChatBackend};
+    use std::time::Duration;
+
+    fn rev_json(quote: &str) -> String {
+        format!(
+            r#"{{"findings":[{{"severity":"low","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"{quote}"}}],"needs":[]}}"#
+        )
+    }
+
+    fn turn(text: &str) -> AssistantTurn {
+        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: Some("stop".into()), reasoning_tokens: None }
+    }
+
+    fn snap_item(file: &str, state: ItemState) -> crate::orchestrate::queue::QueueItem {
+        let spec = QueueItemSpec::new(file.into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap();
+        crate::orchestrate::queue::QueueItem {
+            id: format!("{file}:rule:1-2"),
+            spec, score: 1.0, agreement: 1, state, kind: ItemKind::Primary,
+            dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
+        }
+    }
+
+    /// restore 语义（AC3）：pending 重跑、settled 不重跑、重跑项 finding 与 prior 按 id 去重不双计、skipped 保留计数。
+    #[tokio::test]
+    async fn restore_reruns_pending_and_dedups_with_prior() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {\n").unwrap();
+        std::fs::write(dir.path().join("c.rs"), "fn c() {\n").unwrap();
+        let bundles = vec![
+            Bundle::from_files(vec![FileChange { path: "a.rs".into(), diff: "@@ -1,1 +1,1 @@\n+fn a() {".into() }]),
+        ];
+        // prior finding 的 quote 与 Fake 将产出的相同 → 同 id → dedup 不双计
+        let mut prior_f = fixtures::finding("f1", crate::domain::Severity::Low, 1, "p/r");
+        prior_f.quote = "fn a() {".into();
+        let snap = vec![
+            snap_item("a.rs", ItemState::Settled),
+            snap_item("b.rs", ItemState::Skipped),
+            snap_item("c.rs", ItemState::InFlight),
+        ];
+        let reviewer = crate::config::EffectiveModel {
+            name: "p/r".into(), display_name: None, id: "r".into(), provider: "p".into(),
+            role: crate::config::Role::Reviewer, kind: crate::config::ProviderKind::Openai,
+            base_url: None, context_window: 100_000, max_output_tokens: None,
+            per_turn_timeout_secs: None, reasoning: false, thinking_level: None,
+            family: "r".into(), max_concurrency: None,
+        };
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(&rev_json("fn a() {"))])), Duration::from_secs(5), 0);
+        let run = run_deep(
+            &reg,
+            DeepInput {
+                route: None, scan_cells: &[], bundles: &bundles, root: dir.path(),
+                reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
+                pack: &Default::default(), spec_docs: "", target_label: "t",
+                snapshot: None, restore: Some(&snap), prior_findings: vec![prior_f],
+            },
+            &(),
+        )
+        .await;
+        assert_eq!(run.cells.len(), 1, "只重跑 InFlight/c.rs 一项: {:?}", run.cells);
+        assert!(run.cells[0].ok);
+        assert_eq!(run.findings.len(), 1, "重跑产出与 prior 同 id → dedup 不双计");
+        assert_eq!(run.meta.budget_skipped, 1, "skipped 保留");
+    }
 }
 
 fn file_diff(bundles: &[Bundle], file: &str) -> String {

@@ -374,6 +374,11 @@ pub async fn run_code_review(
         return Ok((report, code));
     }
     if let Some(s) = sink { s.on_phase(crate::state::Phase::Deep, None); }
+    let snap = |it: &crate::orchestrate::queue::QueueItem| {
+        if let Some(s) = sink {
+            s.on_queue_item(it);
+        }
+    };
     let deep = run_deep(
         registry,
         DeepInput {
@@ -386,7 +391,9 @@ pub async fn run_code_review(
             pack: &cfg.review.pack,
             spec_docs: &spec_section,
             target_label: &target_label,
-            snapshot: None,
+            snapshot: Some(&snap),
+            restore: None,
+            prior_findings: vec![],
         },
         &(),
     ).await;
@@ -892,6 +899,14 @@ impl CellSink for JobCellSink {
             self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    /// M21b 批 C：队列项状态转换写 `queue_items` 快照（resume 用）。写失败 warning 不败 job（design §7.1）。
+    fn on_queue_item(&self, item: &crate::orchestrate::queue::QueueItem) {
+        if let Err(e) = self.store.put_queue_item(&self.job_id, item) {
+            eprintln!("warn: job {} queue snapshot 失败: {e}", self.job_id);
+            self.ckpt_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// ②级披露拼装（design §4 表②）：计数>0 才追加条目（正常路径 report 逐字节不变，design §6
@@ -1078,7 +1093,7 @@ pub async fn run_resume(
         .map(|sc| sc.groups.iter().map(|g| ScanGroup { label: g.label.clone(), files: g.files.clone(), cells: vec![], suspicions: 0, pack: g.pack.clone() }).collect())
         .unwrap_or_default();
     warnings.extend(registry.gate_warnings()); // D13：补跑期间撞过 429 的 provider 收敛记录
-    let results = ScanResults { cells: scan_cells_from_records(final_records), ..Default::default() };
+    let results = ScanResults { cells: scan_cells_from_records(final_records.clone()), ..Default::default() };
     let (mut report, mut code) = finish_scan_report(ScanFinish {
         groups,
         scanned_coverage: prior.as_ref().and_then(|r| r.scan.as_ref()).and_then(|sc| sc.scanned_coverage),
@@ -1102,6 +1117,61 @@ pub async fn run_resume(
         report.verdict = Verdict::Incomplete;
         report.run.warnings.push(format!("resume: {still_missing} cell(s) still missing after replay"));
         code = exit_code(Verdict::Incomplete, false);
+    }
+    // C-5：深挖快照续跑——scan 补齐 ∧ 有 reviewer ∧ 快照存在未完项时，恢复队列重跑（Settled 沿用不双计）。
+    if still_missing == 0 && !roles.reviewers.is_empty() && !queue_snap.is_empty() {
+        let unfinished = queue_snap.iter().any(|it| matches!(it.state, crate::orchestrate::queue::ItemState::Pending | crate::orchestrate::queue::ItemState::InFlight));
+        if unfinished {
+            let branch_scope = args.scope == "branch";
+            let changes = match crate::evidence::git::changed_files(cwd, args.base.as_deref(), branch_scope) {
+                Ok(c) => c,
+                Err(e) => {
+                    report.run.warnings.push(format!("resume deep: cannot rebuild diff: {e}"));
+                    return (report, code);
+                }
+            };
+            let selected = select_files(changes);
+            let (budget, _spec_section, _) = budget_and_spec(&roles, &args.spec);
+            let CellPlan { bundles, .. } =
+                plan_cells(selected, cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
+            let prior_findings: Vec<crate::domain::Finding> = final_records
+                .iter()
+                .flat_map(|r| r.output.findings().to_vec())
+                .collect();
+            let target_label = if branch_scope {
+                format!("branch {}...HEAD", args.base.as_deref().unwrap_or("?"))
+            } else {
+                "working tree".to_string()
+            };
+            let budget_cells = prior.as_ref().and_then(|r| r.run.risk.clone()).map(|r| r.budget_cells).unwrap_or(4);
+            let snap2 = |it: &crate::orchestrate::queue::QueueItem| {
+                if let Err(e) = store.put_queue_item(job_id, it) {
+                    eprintln!("warn: job {job_id} resume queue snapshot 失败: {e}");
+                }
+            };
+            let deep = run_deep(
+                registry,
+                DeepInput {
+                    route: None,
+                    scan_cells: &[] as &[ScanCellResult],
+                    bundles: &bundles,
+                    root: cwd,
+                    reviewers: &roles.reviewers,
+                    budget_cells,
+                    pack: &cfg.review.pack,
+                    spec_docs: "",
+                    target_label: &target_label,
+                    snapshot: Some(&snap2),
+                    restore: Some(&queue_snap),
+                    prior_findings,
+                },
+                &(),
+            )
+            .await;
+            let over = overlay_deep(report, deep, &args, cfg);
+            report = over.0;
+            code = over.1;
+        }
     }
     // 回写 proj.db：resume 产出的合并报告覆盖扇出原始落盘（否则 result 命令永远返回旧报告）。终态字段不动。
     let json = crate::output::render(&report, crate::output::Format::Json);
