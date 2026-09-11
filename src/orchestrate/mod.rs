@@ -1,4 +1,5 @@
 pub mod queue;
+pub mod review_shot;
 
 use crate::bundle::Bundle;
 use crate::domain::{CellOutput, Finding, Origin, RawFinding, Role, ScanOutput};

@@ -204,6 +204,21 @@ impl DeepQueue {
         self.pending_order().first().map(|&i| &self.items[i])
     }
 
+    /// 取出最高 Pending 并标 InFlight；记下 dispatch_agreement。
+    pub fn pop_dispatch(&mut self) -> Option<QueueItem> {
+        let i = *self.pending_order().first()?;
+        self.items[i].state = ItemState::InFlight;
+        self.items[i].dispatch_agreement = self.items[i].agreement;
+        Some(self.items[i].clone())
+    }
+
+    pub fn mark_settled(&mut self, id: &str, landed_agreement: u32) {
+        if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
+            it.state = ItemState::Settled;
+            it.landed_agreement = Some(landed_agreement);
+        }
+    }
+
     #[cfg(test)]
     fn set_state(&mut self, id: &str, state: ItemState) {
         if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {

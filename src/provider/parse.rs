@@ -301,6 +301,8 @@ pub struct ReviewParseStats {
     pub needs_truncated: u32,
     /// quote 定位失败（不在文件 / 文件不可读）——由 `anchor_review_findings` 回填，parse 层不填。
     pub dropped_quote: u32,
+    /// 旁路未闭合 / 坏形状丢弃（IncrementalFindings::discarded，批 C 回填）。
+    pub stream_discarded: u32,
 }
 
 /// finding 条目丢弃原因（`regularize_finding`）。
