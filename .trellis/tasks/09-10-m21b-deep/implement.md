@@ -18,10 +18,10 @@
 - [ ] Commit: `feat(orchestrate): 优先级键+预算+必挖集不截+保底配额+graceful drain（design §6 规则 1/3/4〔D11〕）`
 
 ### C-3 门驱动派发器与 reviewer cell 运行时
-- [ ] 单派发器：`lease` × pop 最高 Pending；t=0 scanner 先于 H0
-- [ ] `src/orchestrate/review_shot.rs`：`FindingEvent` + `FindingSink`（`()` no-op）；`run_review_shot`（per-cell backend + take 落盘/发射 + 终判按 id 去重补发 + 必调 `finalize`，含超时/取消）
-- [ ] `ReviewParseStats.stream_discarded` ← `discarded()`；与 `dropped_quote` 分列
-- [ ] 顺手：thinking×tools 守卫；`--tools` 二阶段 + 触发/跳过计数；`AttemptPolicy` → `BudgetBackoff` 单路径
+- [x] 单派发器：`lease` × pop 最高 Pending（`dispatch_one`）；空队列不占门
+- [x] `src/orchestrate/review_shot.rs`：`FindingEvent` + `FindingSink`（`()` no-op）；`run_review_shot`（旁路/终判按 id 去重 + 必调 `finalize`）
+- [x] `ReviewParseStats.stream_discarded` ← `discarded()`；与 `dropped_quote` 分列
+- [ ] 顺手：thinking×tools 守卫；`--tools` 二阶段 + 触发/跳过计数；`AttemptPolicy` → `BudgetBackoff` 单路径（C-4 接线时做，本步不扩）
 - [ ] 测试：Fake 多 finding 流不丢不双发；超时路径 finalize + 已闭合保留；`()` sink 不阻塞；派发序；scan 完成入队；Fake 429 注入（现 D13 语义）；needs 触发率；anthropic tools 守卫
 - [ ] Commit: `feat(orchestrate): 门驱动派发器+reviewer cell 运行时——流式落盘+FindingEvent 发射（design §6 规则 5/§7）`
 

@@ -219,6 +219,18 @@ impl DeepQueue {
         }
     }
 
+    pub fn pending_count(&self) -> usize {
+        self.items.iter().filter(|i| i.state == ItemState::Pending).count()
+    }
+
+    pub fn inflight_count(&self) -> usize {
+        self.items.iter().filter(|i| i.state == ItemState::InFlight).count()
+    }
+
+    pub fn empty_for_barrier(&self) -> bool {
+        self.pending_count() == 0 && self.inflight_count() == 0
+    }
+
     #[cfg(test)]
     fn set_state(&mut self, id: &str, state: ItemState) {
         if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
