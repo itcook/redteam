@@ -5,6 +5,11 @@ use crate::consolidate::scan::same_suspicion;
 use crate::domain::Suspicion;
 use crate::pack::region::{Origin as QueueOrigin, QueueItemSpec};
 
+/// L0..L5 类别权重（design 取舍：M21b 中性 1.0，改数字不改公式）。
+pub const CATEGORY_WEIGHT: [f32; 6] = [1.0; 6];
+/// needs 中档分（低于疑点层、高于被截项）。
+const NEEDS_MID_SCORE: f32 = 0.5;
+
 /// 队列项运行时状态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -15,14 +20,14 @@ pub enum ItemState {
     Skipped,
 }
 
-/// 优先级分层（C-2 排序键；本批只记录，不排序）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// 优先级分层（越小越先挖）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemKind {
-    Primary,
-    Ripple,
-    Suspicion,
-    Needs,
+    Primary = 0,
+    Ripple = 1,
+    Suspicion = 2,
+    Needs = 3,
 }
 
 /// 入队结果（五态可观测）。
@@ -137,12 +142,100 @@ impl DeepQueue {
         }
     }
 
+    /// Pending 项按优先级弹出顺序（不改状态）。必挖集排在最前且不被后续 budget 截掉。
+    pub fn pending_order(&self) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.state == ItemState::Pending)
+            .map(|(i, _)| i)
+            .collect();
+        idx.sort_by(|&a, &b| cmp_priority(&self.items[a], &self.items[b]));
+        idx
+    }
+
+    /// 主区 ∪ {agreement ≥ 2}。`max_cells = 0` 时主区仍算必挖。
+    pub fn is_must(&self, it: &QueueItem) -> bool {
+        it.kind == ItemKind::Primary || it.agreement >= 2
+    }
+
+    /// 到期 drain：Pending 非必挖且未进保底的标 skipped。
+    /// 保底 = ⌈max_cells/4⌉ 条 Suspicion；主区吃穿时帽 = 必挖 + 保底。`max_cells = 0` 只留必挖。
+    /// 返回新标 skipped 的 id。
+    pub fn drain(&mut self, max_cells: u32) -> Vec<String> {
+        let pending = self.pending_order();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let must: Vec<usize> = pending.iter().copied().filter(|&i| self.is_must(&self.items[i])).collect();
+        let floor = if max_cells == 0 { 0 } else { max_cells.div_ceil(4) as usize };
+        let mut keep: std::collections::HashSet<usize> = must.iter().copied().collect();
+        let mut reserved = 0usize;
+        for &i in &pending {
+            if reserved >= floor {
+                break;
+            }
+            if self.items[i].kind == ItemKind::Suspicion && keep.insert(i) {
+                reserved += 1;
+            }
+        }
+        if max_cells > 0 {
+            let budget = max_cells as usize;
+            for &i in &pending {
+                if keep.len() >= budget {
+                    break;
+                }
+                keep.insert(i);
+            }
+        }
+        let mut skipped = Vec::new();
+        for i in pending {
+            if !keep.contains(&i) {
+                self.items[i].state = ItemState::Skipped;
+                skipped.push(self.items[i].id.clone());
+            }
+        }
+        skipped
+    }
+
+    /// 弹出最高 Pending（C-3 派发用）；C-2 测试只验证顺序。
+    pub fn peek_highest(&self) -> Option<&QueueItem> {
+        self.pending_order().first().map(|&i| &self.items[i])
+    }
+
     #[cfg(test)]
     fn set_state(&mut self, id: &str, state: ItemState) {
         if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
             it.state = state;
         }
     }
+}
+
+fn category_weight(notes: &[Suspicion]) -> f32 {
+    notes
+        .iter()
+        .filter_map(|n| n.category)
+        .map(|c| CATEGORY_WEIGHT[c as usize])
+        .fold(1.0_f32, f32::max)
+}
+
+fn priority_score(it: &QueueItem) -> f32 {
+    match it.kind {
+        ItemKind::Primary | ItemKind::Ripple => it.score,
+        ItemKind::Suspicion => {
+            let conf = it.spec.notes.iter().map(|n| n.confidence).fold(0.0_f32, f32::max);
+            conf * it.agreement as f32 * category_weight(&it.spec.notes)
+        }
+        ItemKind::Needs => NEEDS_MID_SCORE,
+    }
+}
+
+fn cmp_priority(a: &QueueItem, b: &QueueItem) -> std::cmp::Ordering {
+    a.kind
+        .cmp(&b.kind)
+        .then_with(|| priority_score(b).partial_cmp(&priority_score(a)).unwrap_or(std::cmp::Ordering::Equal))
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 fn item_id(spec: &QueueItemSpec) -> String {
@@ -338,5 +431,70 @@ mod tests {
         let o = q.enqueue(req(spec_scan("a.rs", 40, 42, "unwrap()", "opt"), Some("alpha")));
         assert_eq!(o, EnqueueOutcome::New);
         assert_eq!(q.items().len(), 2);
+    }
+
+    fn req_kind(spec: QueueItemSpec, kind: ItemKind, score: f32, family: Option<&str>) -> EnqueueReq {
+        EnqueueReq { spec, score, kind, family: family.map(str::to_string) }
+    }
+
+    fn spec_needs(file: &str, start: u32, end: u32) -> QueueItemSpec {
+        QueueItemSpec::new(
+            file.into(),
+            vec![(start, end)],
+            QueueOrigin::Needs,
+            vec![sus(file, start, end, "need", "gap")],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pending_order_layers_primary_ripple_suspicion_needs() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req_kind(spec_needs("n.rs", 1, 2), ItemKind::Needs, 9.0, None));
+        q.enqueue(req_kind(spec_scan("s.rs", 1, 2, "a", "h"), ItemKind::Suspicion, 0.1, Some("a")));
+        q.enqueue(req_kind(spec_rule("r.rs", 1, 2), ItemKind::Ripple, 0.2, None));
+        q.enqueue(req_kind(spec_rule("p.rs", 1, 2), ItemKind::Primary, 0.1, None));
+        let kinds: Vec<_> = q.pending_order().into_iter().map(|i| q.items()[i].kind).collect();
+        assert_eq!(kinds, vec![ItemKind::Primary, ItemKind::Ripple, ItemKind::Suspicion, ItemKind::Needs]);
+    }
+
+    #[test]
+    fn drain_zero_budget_keeps_primary() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req_kind(spec_rule("p.rs", 1, 2), ItemKind::Primary, 1.0, None));
+        q.enqueue(req_kind(spec_scan("s.rs", 1, 2, "a", "h"), ItemKind::Suspicion, 1.0, Some("a")));
+        q.enqueue(req_kind(spec_needs("n.rs", 1, 2), ItemKind::Needs, 1.0, None));
+        let skipped = q.drain(0);
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(q.items().iter().filter(|i| i.state == ItemState::Pending).count(), 1);
+        assert_eq!(q.peek_highest().unwrap().kind, ItemKind::Primary);
+    }
+
+    #[test]
+    fn drain_zero_keeps_agreement_two_even_if_not_primary() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req_kind(spec_scan("s.rs", 1, 2, "a", "h"), ItemKind::Suspicion, 1.0, Some("a")));
+        q.enqueue(req_kind(spec_scan("s.rs", 1, 2, "a", "h"), ItemKind::Suspicion, 1.0, Some("b")));
+        q.enqueue(req_kind(spec_needs("n.rs", 1, 2), ItemKind::Needs, 1.0, None));
+        assert_eq!(q.items()[0].agreement, 2);
+        let skipped = q.drain(0);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(q.items().iter().find(|i| i.state == ItemState::Pending).unwrap().agreement, 2);
+    }
+
+    #[test]
+    fn drain_floor_reserves_suspicions_when_primary_fills() {
+        let mut q = DeepQueue::new();
+        for i in 0..4u32 {
+            q.enqueue(req_kind(spec_rule(&format!("p{i}.rs"), 1, 2), ItemKind::Primary, 1.0, None));
+        }
+        q.enqueue(req_kind(spec_scan("s.rs", 1, 2, "a", "h"), ItemKind::Suspicion, 1.0, Some("a")));
+        q.enqueue(req_kind(spec_needs("n.rs", 1, 2), ItemKind::Needs, 1.0, None));
+        // max_cells=4，必挖 4 主区吃穿；保底 ⌈4/4⌉=1 给疑点 → needs skipped，suspicion pending。
+        let skipped = q.drain(4);
+        assert_eq!(skipped.len(), 1);
+        assert!(q.items().iter().any(|i| i.kind == ItemKind::Suspicion && i.state == ItemState::Pending));
+        assert!(q.items().iter().any(|i| i.kind == ItemKind::Needs && i.state == ItemState::Skipped));
+        assert_eq!(q.items().iter().filter(|i| i.kind == ItemKind::Primary && i.state == ItemState::Pending).count(), 4);
     }
 }

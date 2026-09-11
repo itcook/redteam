@@ -12,9 +12,9 @@
 - [ ] Commit: `feat(orchestrate): 深挖队列项与入口五态——merge_suspicions 谓词复用、agreement 活值（design §6 规则 2〔D13〕）`
 
 ### C-2 优先级、预算与必挖集
-- [ ] 优先级键四层；类别权重 const 全 1.0
-- [ ] `budget = RiskRoute.budget_cells_hint`；必挖不截（含 `maxCells = 0`）；保底 ⌈n/4⌉；drain → `skipped(budget)`
-- [ ] 测试：排序快照；0 预算主区仍挖；保底配额；drain 清单
+- [x] 优先级键四层；类别权重 const 全 1.0
+- [x] `budget = RiskRoute.budget_cells_hint`；必挖不截（含 `maxCells = 0`）；保底 ⌈n/4⌉；drain → `skipped(budget)`
+- [x] 测试：排序快照；0 预算主区仍挖；保底配额；drain 清单
 - [ ] Commit: `feat(orchestrate): 优先级键+预算+必挖集不截+保底配额+graceful drain（design §6 规则 1/3/4〔D11〕）`
 
 ### C-3 门驱动派发器与 reviewer cell 运行时
