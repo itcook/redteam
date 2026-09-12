@@ -881,21 +881,53 @@ pub fn backend_from_config(
     em: &crate::config::EffectiveModel,
     api_key: String,
 ) -> Result<Box<dyn ChatBackend>, ProviderError> {
+    backend_from_config_inner(em, api_key, None)
+}
+
+/// 带流式旁路回调的 **per-cell 独占实例**（M21b 批 C，批 B 接缝契约）：registry 里的共享 backend
+/// 不挂回调——挂了并发 cell 会互相抢 delta——所以 reviewer 每格另造一个，回调喂本格的
+/// `IncrementalFindings`。构造失败时调用方退回共享 backend（只是没有旁路，不致命）。
+pub fn backend_from_config_with_delta(
+    em: &crate::config::EffectiveModel,
+    api_key: String,
+    on_text_delta: Box<dyn FnMut(&str) + Send>,
+) -> Result<Box<dyn ChatBackend>, ProviderError> {
+    backend_from_config_inner(em, api_key, Some(on_text_delta))
+}
+
+/// 文本 delta 旁路回调（`IncrementalFindings::feed` 的闭包形态）。
+pub type TextDeltaCb = Box<dyn FnMut(&str) + Send>;
+
+fn backend_from_config_inner(
+    em: &crate::config::EffectiveModel,
+    api_key: String,
+    on_text_delta: Option<TextDeltaCb>,
+) -> Result<Box<dyn ChatBackend>, ProviderError> {
     // 整请求超时罩住单轮（评审 M2）：慢模型 per_turn 1200s 时 reqwest 不再在 300s 先切断。
     let http_secs = crate::provider::http_timeout_for(em.per_turn_secs());
     // 批 F-2：角色条目 thinkingLevel 首个消费者——按 (kind, family) 查表；无映射 → 不发（warning 由 `thinking_warning` 给调用方）。
     let thinking = em.thinking_level.and_then(|l| thinking_params(em.kind, &em.family, &em.id, l, em.max_tokens_effective()));
     match em.kind {
-        ProviderKind::Anthropic => Ok(Box::new(AnthropicBackend::new(
-            em.id.clone(),
-            em.base_url.clone(),
-            api_key,
-        ).with_max_tokens(em.max_output_tokens).with_http_timeout(http_secs).with_thinking(thinking))),
-        ProviderKind::Openai | ProviderKind::OpenaiCompatible => Ok(Box::new(OpenAiBackend::new(
-            em.id.clone(),
-            em.base_url.clone(),
-            api_key,
-        ).with_max_tokens(em.max_output_tokens).with_http_timeout(http_secs).with_thinking(thinking))),
+        ProviderKind::Anthropic => {
+            let b = AnthropicBackend::new(em.id.clone(), em.base_url.clone(), api_key)
+                .with_max_tokens(em.max_output_tokens)
+                .with_http_timeout(http_secs)
+                .with_thinking(thinking);
+            Ok(Box::new(match on_text_delta {
+                Some(cb) => b.with_text_delta(cb),
+                None => b,
+            }))
+        }
+        ProviderKind::Openai | ProviderKind::OpenaiCompatible => {
+            let b = OpenAiBackend::new(em.id.clone(), em.base_url.clone(), api_key)
+                .with_max_tokens(em.max_output_tokens)
+                .with_http_timeout(http_secs)
+                .with_thinking(thinking);
+            Ok(Box::new(match on_text_delta {
+                Some(cb) => b.with_text_delta(cb),
+                None => b,
+            }))
+        }
         ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
     }
 }

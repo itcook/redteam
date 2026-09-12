@@ -336,7 +336,12 @@ pub async fn run_code_review(
             "no reviewable evidence: empty diff for {target_label} (0 cells) — the scan-only report reflects zero reviewed content"
         ));
     }
-    if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
+    let scan_failed_early = results.cells.iter().any(|c| !c.record.ok);
+    // 深挖还要跑就先别报 Finalizing——否则 phase 时间线成了 Scan → Finalizing → Deep（尾段在中间）。
+    let deep_pending = !scan_failed_early && !roles.reviewers.is_empty();
+    if !deep_pending {
+        if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
+    }
     let groups: Vec<ScanGroup> = bundles
         .iter()
         .enumerate()
@@ -379,6 +384,12 @@ pub async fn run_code_review(
             s.on_queue_item(it);
         }
     };
+    let on_cell = |rec: &crate::state::CellRecord| {
+        if let Some(s) = sink {
+            s.on_cell(rec.clone());
+        }
+    };
+    let factory = per_cell_backend_factory(cfg);
     let deep = run_deep(
         registry,
         DeepInput {
@@ -395,10 +406,27 @@ pub async fn run_code_review(
             restore: None,
             prior_findings: vec![],
             tools: resolve_tools(args, cfg),
+            backend_factory: Some(factory.as_ref()),
+            on_cell: Some(&on_cell),
         },
         &(),
     ).await;
-    Ok(overlay_deep(report, deep, args, cfg))
+    if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
+    Ok(overlay_deep(report, code, deep, args, cfg, registry, t0))
+}
+
+/// per-cell backend 工厂（流式旁路的挂点）：按 reviewer 条目取密钥另造实例并挂 delta 回调。
+/// 造不出来（缺密钥 / google 未支持）→ `None`，调用方退回共享 backend（无旁路，不致命）。
+fn per_cell_backend_factory(cfg: &Config) -> Box<crate::orchestrate::deep::PerCellBackend<'_>> {
+    Box::new(move |em, cb| {
+        // 没密钥就别造：造出来也只会 401，而 registry 里的共享 backend（真跑时同一把密钥，
+        // 测试时是 Fake）才是该用的那个。旁路缺席不影响正确性——终态 parse 才是权威。
+        let key = cfg.resolve_key(&em.provider, &em.id)?;
+        if key.is_empty() {
+            return None;
+        }
+        crate::provider::backends::backend_from_config_with_delta(em, key, cb).ok()
+    })
 }
 
 /// `--tools` 旗覆盖 config `review.tools`（R2 二阶段档位）。
@@ -406,15 +434,38 @@ fn resolve_tools(args: &ReviewArgs, cfg: &Config) -> crate::config::ToolsMode {
     args.tools.as_deref().and_then(crate::config::ToolsMode::from_flag).unwrap_or(cfg.review.tools)
 }
 
+#[allow(clippy::too_many_arguments)] // 报告 / 退出码 / 深挖结果 / 两处配置 / registry / 计时——各不同源，收拢 struct 是过度设计
 fn overlay_deep(
     mut report: ReviewReport,
+    scan_code: i32,
     deep: crate::orchestrate::deep::DeepRun,
     args: &ReviewArgs,
     cfg: &Config,
+    registry: &ProviderRegistry,
+    t0: std::time::Instant,
 ) -> (ReviewReport, i32) {
+    // 深挖期的墙钟 / 在途峰值 / 429 收敛只有跑完才知道——scan 收口时的快照必须在这里刷新，
+    // 否则 20 分钟的深挖在报告里查无此事，D13 的 429 披露也断在 scan 段（design §12.3）。
+    report.run.duration_ms = t0.elapsed().as_millis() as u64;
+    report.run.provider_inflight_peak = registry.inflight_peaks();
+    report.run.provider_rate_limit = registry.rate_limit_meta();
+    for w in registry.gate_warnings() {
+        if !report.run.warnings.contains(&w) {
+            report.run.warnings.push(w);
+        }
+    }
     let findings = deep.findings;
     let skipped = deep.meta.budget_skipped;
     let failed = deep.reviewer_failed;
+    // 一格都没挖、没债、也没有往轮挖出来的 finding = 深挖根本没发生（空变更集 / 队列为空）。
+    // 此时绝不能重算 verdict：`compute_verdict([], …)` 会把「没挖」说成 Approve——正是
+    // r1 20260703 的干净树假绿灯。报告保持 scan-only 形态与退出码，deep 观测段照进（可观测 ≠ 改判）。
+    // 注意 findings 非空要走下面的正常收口：resume 全 Settled 时这轮确实 0 格，但成果在。
+    if deep.cells.is_empty() && !failed && skipped == 0 && findings.is_empty() {
+        report.run.deep = Some(deep.meta);
+        report.run.warnings.extend(deep.warnings);
+        return (report, scan_code);
+    }
     report.findings = findings.clone();
     report.stats = Stats::from_findings(&findings);
     report.run.deep = Some(deep.meta);
@@ -1124,16 +1175,34 @@ pub async fn run_resume(
         report.run.warnings.push(format!("resume: {still_missing} cell(s) still missing after replay"));
         code = exit_code(Verdict::Incomplete, false);
     }
-    // C-5：深挖快照续跑——scan 补齐 ∧ 有 reviewer ∧ 快照存在未完项时，恢复队列重跑（Settled 沿用不双计）。
+    // C-5：深挖快照续跑——scan 补齐 ∧ 有 reviewer ∧ 有队列快照即进。
+    // 注意「全 Settled」也必须进：run_deep 会 0 次派发直接把已挖出的 findings 带回报告；
+    // 跳过它 → report.findings 停在 scan-only 的空集 → 尾段 write_result 用一份无 finding 的
+    // 报告覆盖掉上一轮的成果（deep 已跑完才被 kill 的作业就是这样丢结果的）。
     if still_missing == 0 && !roles.reviewers.is_empty() && !queue_snap.is_empty() {
-        let unfinished = queue_snap.iter().any(|it| matches!(it.state, crate::orchestrate::queue::ItemState::Pending | crate::orchestrate::queue::ItemState::InFlight));
-        if unfinished {
+        {
             let branch_scope = args.scope == "branch";
+            // 已落盘 reviewer 格里的 finding——深挖的权威成果，无论后面走哪条路都不能丢。
+            let prior_findings: Vec<crate::domain::Finding> = final_records
+                .iter()
+                .flat_map(|r| r.output.findings().to_vec())
+                .collect();
+            let unfinished = queue_snap.iter().any(|it| {
+                matches!(it.state, crate::orchestrate::queue::ItemState::Pending | crate::orchestrate::queue::ItemState::InFlight)
+            });
             let changes = match crate::evidence::git::changed_files(cwd, args.base.as_deref(), branch_scope) {
                 Ok(c) => c,
                 Err(e) => {
+                    // diff 重建不了 → 未完项没法重跑，但已挖出的 finding 照样进报告（未完 = 带债）。
                     report.run.warnings.push(format!("resume deep: cannot rebuild diff: {e}"));
-                    return (report, code);
+                    let deep = crate::orchestrate::deep::DeepRun {
+                        findings: crate::consolidate::dedup(prior_findings),
+                        cells: vec![],
+                        meta: Default::default(),
+                        warnings: vec![],
+                        reviewer_failed: unfinished,
+                    };
+                    return overlay_deep(report, code, deep, &args, cfg, registry, t0);
                 }
             };
             let selected = select_files(changes);
@@ -1143,10 +1212,6 @@ pub async fn run_resume(
             report.run.warnings.extend(spec_warnings);
             let CellPlan { bundles, .. } =
                 plan_cells(selected, cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
-            let prior_findings: Vec<crate::domain::Finding> = final_records
-                .iter()
-                .flat_map(|r| r.output.findings().to_vec())
-                .collect();
             let target_label = if branch_scope {
                 format!("branch {}...HEAD", args.base.as_deref().unwrap_or("?"))
             } else {
@@ -1158,6 +1223,12 @@ pub async fn run_resume(
                     eprintln!("warn: job {job_id} resume queue snapshot 失败: {e}");
                 }
             };
+            let on_cell2 = |rec: &crate::state::CellRecord| {
+                if let Err(e) = store.append_partial(job_id, rec) {
+                    eprintln!("warn: job {job_id} resume reviewer cell 落盘失败（{}）: {e}", rec.cell);
+                }
+            };
+            let factory = per_cell_backend_factory(cfg);
             let deep = run_deep(
                 registry,
                 DeepInput {
@@ -1174,11 +1245,13 @@ pub async fn run_resume(
                     restore: Some(&queue_snap),
                     prior_findings,
                     tools: resolve_tools(&args, cfg),
+                    backend_factory: Some(factory.as_ref()),
+                    on_cell: Some(&on_cell2),
                 },
                 &(),
             )
             .await;
-            let over = overlay_deep(report, deep, &args, cfg);
+            let over = overlay_deep(report, code, deep, &args, cfg, registry, t0);
             report = over.0;
             code = over.1;
         }
@@ -2030,6 +2103,48 @@ mod resume_tests {
         assert!(store.read_result_md("j").unwrap().contains("scan-only"), "md 快照同步回写");
     }
 
+    /// deep 已跑完才被 kill：队列快照全 Settled、reviewer 格已落盘 → resume 必须把
+    /// 已挖出的 finding 带进报告并回写 proj.db。跳过深挖收口 = 用一份空 findings 的
+    /// scan-only 报告覆盖上一轮成果。
+    #[tokio::test]
+    async fn resume_after_deep_done_keeps_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(ws.join("c.rs"), "marker\n").unwrap();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[input("scan[g1]@p/m#1", "p/m", "P1")]).unwrap();
+        store.append_partial("j", &done_scan("scan[g1]@p/m#1", "p/m", "c.rs")).unwrap();
+        // 已挖完的 reviewer 格（finding 的权威载体）
+        let f = crate::domain::finding::fixtures::finding("f1", crate::domain::Severity::Low, 1, "p/r");
+        let rev_rec = CellRecord::ok(
+            "review[1]@p/r", "p/r",
+            crate::domain::CellOutput::Review { findings: vec![f], needs: vec![] },
+        ).with_family("r");
+        store.append_partial("j", &rev_rec).unwrap();
+        // 全 Settled 队列快照
+        let spec = crate::pack::region::QueueItemSpec::new(
+            "c.rs".into(), vec![(1, 2)], crate::pack::region::Origin::Rule, vec![],
+        ).unwrap();
+        let item = crate::orchestrate::queue::QueueItem {
+            id: "c.rs:rule:1-2".into(), spec, score: 1.0, agreement: 1,
+            state: crate::orchestrate::queue::ItemState::Settled,
+            kind: crate::orchestrate::queue::ItemKind::Primary,
+            dispatch_agreement: 1, landed_agreement: Some(1), families: vec![], enqueued_ms: None,
+        };
+        store.put_queue_item("j", &item).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let (reg, _backend) = recording_registry("p/m", "c.rs");
+
+        let (report, _code) = run_resume("j", &reg, &cfg, ws, &store).await;
+
+        assert_eq!(report.findings.len(), 1, "已挖出的 finding 必须留在报告里: {:?}", report.run.warnings);
+        if let Some(stored) = store.read_result("j") {
+            let stored: ReviewReport = serde_json::from_str(&stored).unwrap();
+            assert_eq!(stored.findings.len(), 1, "回写 proj.db 的报告不得把 finding 清空");
+        }
+    }
+
     /// 同组两条目副本（`scan[g1]@alpha#1` / `scan[g1]@beta#1`）：只完成 alpha → beta 必须被补跑，合并结果 agreement 2、非 Incomplete。
     #[tokio::test]
     async fn resume_missing_entry_copy_is_completed() {
@@ -2258,6 +2373,53 @@ mod code_review_tests {
         assert!(report.cells.is_empty() && report.scan.as_ref().unwrap().suspicions.is_empty());
         assert!(report.run.warnings.iter().any(|w| w.contains("no reviewable evidence")), "{:?}", report.run.warnings);
         assert_eq!(report.scan.as_ref().unwrap().scanned_coverage, None);
+    }
+
+    /// 空变更集 + **配了 reviewer**：深挖一格没挖 → 必须仍是 ScanOnly / 0，不能被
+    /// `compute_verdict([], …)` 改判成 Approve（r1 20260703 干净树假绿灯）。与无 reviewer 同构。
+    #[tokio::test]
+    async fn empty_changes_with_reviewer_stays_scan_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let reg = registry(&[("p/s", r#"{"suspicions":[],"scanned_areas":[]}"#), ("p/r", r#"{"findings":[],"needs":[]}"#)]);
+        let (report, code) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), None, None).await.unwrap();
+        assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0), "warnings={:?}", report.run.warnings);
+        assert!(report.findings.is_empty());
+        assert!(report.run.warnings.iter().any(|w| w.contains("no reviewable evidence")), "{:?}", report.run.warnings);
+        assert!(report.run.deep.is_some(), "深挖观测段照进——可观测 ≠ 改判");
+    }
+
+    /// reviewer cell 必须经 `CellSink::on_cell` 落盘：后台 job 的 `attach_cells` 用
+    /// `read_partial` 全量覆盖 cells，不落盘 = 报告里 coverage 指向一批不存在的格。
+    #[tokio::test]
+    async fn reviewer_cells_reach_the_sink() {
+        use std::sync::Mutex as StdMutex;
+        struct Rec(StdMutex<Vec<String>>);
+        impl crate::orchestrate::CellSink for Rec {
+            fn manifest(&self, _inputs: &[crate::state::CellInput]) {}
+            fn on_cell(&self, rec: crate::state::CellRecord) {
+                self.0.lock().unwrap().push(rec.cell);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
+        let rev_json = r#"{"findings":[{"severity":"low","title":"t","body":"b","file":"src/a.rs","line_start":2,"line_end":2,"confidence":0.4,"recommendation":"r","quote":"db.write(token);"}],"needs":[]}"#;
+        let mut reg = ProviderRegistry::new();
+        let scan_turn = AssistantTurn { text: scan_json, tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None };
+        let rev_turn = AssistantTurn { text: rev_json.into(), tool_calls: vec![], input_tokens: 2, output_tokens: 3, cached_input_tokens: 0, finish_reason: Some("stop".into()), reasoning_tokens: None };
+        reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(scan_turn)), std::time::Duration::from_secs(5), 0);
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(rev_turn)), std::time::Duration::from_secs(5), 0);
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
+        let sink = Rec(StdMutex::new(Vec::new()));
+        let (report, _) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, Some(&sink)).await.unwrap();
+        let seen = sink.0.lock().unwrap();
+        assert!(seen.iter().any(|c| c.starts_with("review[")), "reviewer cell 未落盘: {seen:?}");
+        // 落盘的格与报告里的格同名——attach_cells 覆盖后 coverage 才不会指空。
+        for c in report.run.coverage.selected.get(&Role::Reviewer).into_iter().flatten() {
+            assert!(seen.contains(c), "coverage 里的 {c} 没进 sink: {seen:?}");
+        }
     }
 
     /// 未配置 scanner → 配置错误（Err，不产报告）。

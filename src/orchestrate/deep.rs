@@ -24,10 +24,16 @@ use crate::pack::PackOpts;
 use crate::prompt::{build_review_prompt, review_template_hash, ReviewPromptInput};
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::stream_json::IncrementalFindings;
+use crate::provider::tool_loop::ChatBackend;
 use crate::risk::{Hotspot, RegionKind, RiskRoute};
 use crate::state::CellRecord;
 
 use super::ScanCellResult;
+
+/// per-cell backend 工厂（流式旁路的挂点）：入参 = reviewer 条目 + 本格的 delta 回调，
+/// 出参 = 该格独占的 backend 实例；`None` = 造不出来（缺密钥 / 未支持），调用方退回共享实例。
+pub type PerCellBackend<'a> =
+    dyn Fn(&EffectiveModel, Box<dyn FnMut(&str) + Send>) -> Option<Box<dyn ChatBackend>> + 'a;
 
 pub struct DeepRun {
     pub findings: Vec<Finding>,
@@ -55,6 +61,12 @@ pub struct DeepInput<'a> {
     pub prior_findings: Vec<Finding>,
     /// `--tools` 档位（R2 二阶段首个消费者）：TwoStage 时 reviewer needs 触发补查轮。
     pub tools: ToolsMode,
+    /// per-cell backend 工厂（批 B 接缝契约）：为本格造独占实例并挂流式旁路回调。
+    /// `None` → 退回 registry 共享 backend（无旁路；Fake 测试与无密钥路径）。
+    pub backend_factory: Option<&'a PerCellBackend<'a>>,
+    /// reviewer cell 落盘（后台 job checkpoint —— resume 靠它认已挖过的格与其 findings）。
+    /// `None` → 不落盘（前台一次性跑）。
+    pub on_cell: Option<&'a dyn Fn(&CellRecord)>,
 }
 
 pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &dyn FindingSink) -> DeepRun {
@@ -109,6 +121,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
     let mut cells = Vec::new();
     let mut n = 0u32;
     let mut reviewer_failed = false;
+    let mut bypass_warned = false;
 
     while q.pending_count() > 0 {
         let Some((lease, item)) = (match dispatch_one(&mut q, registry, &rev.name).await {
@@ -146,10 +159,24 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
             repo_brief: "",
         });
         let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+        // 流式旁路要挂在本格独占的 backend 上（共享实例会被并发 cell 抢 delta）。
+        // 工厂缺席 / 造不出来 → 退回共享 backend：这一格没有旁路，但照跑。
+        let inc_feed = inc.clone();
+        let per_cell = input
+            .backend_factory
+            .and_then(|f| f(rev, Box::new(move |s: &str| inc_feed.lock().unwrap().feed(s))));
+        if per_cell.is_none() && input.backend_factory.is_some() && !bypass_warned {
+            bypass_warned = true; // 同一 reviewer 的结果稳定，报一次就够——别按格刷屏
+            warnings.push(format!(
+                "deep: {} 无 per-cell backend（缺密钥 / 构造失败）——流式旁路关闭，stream_discarded 恒 0",
+                rev.name
+            ));
+        }
+        let backend: &dyn ChatBackend = per_cell.as_deref().unwrap_or(lease.backend());
         let policy = lease.gate_attempts();
         let mut ctx = EmitCtx::new(&rev.name, &rev.family, item.agreement, input.root, sink);
         let call = run_review_shot_with(
-            lease.backend(),
+            backend,
             &prompt,
             lease.per_turn(),
             lease.retry_budget(),
@@ -158,6 +185,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
             inc,
         )
         .await;
+        drop(per_cell);
         drop(lease);
         match call {
             Ok(mut c) => {
@@ -210,13 +238,19 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                 // 二者之差即「挖的时候还不知道、挖完才攒够的共识」，观测面按此判读。
                 let landed = live_agreement(&q, &item);
                 meta.landed_agreement.push(landed);
+                // 先落盘 cell（finding 的权威载体）再写队列快照：kill 落在两者之间时，
+                // 快照仍是 InFlight → resume 重跑，宁可重挖一格也不丢 finding（design §7.1）。
+                snap_cell(&rec, input.on_cell);
                 cells.push(rec);
                 q.mark_settled(&item.id, landed);
                 if let Some(it) = q.get(&item.id) { snap_one(it, input.snapshot); }
             }
             Err(e) => {
                 reviewer_failed = true;
-                let rec = CellRecord::failed(&cell_id, &rev.name, Role::Reviewer, format!("{e}"));
+                let mut rec = CellRecord::failed(&cell_id, &rev.name, Role::Reviewer, format!("{e}"));
+                rec = rec.with_family(&rev.family);
+                rec.duration_ms = t0.elapsed().as_millis() as u64;
+                snap_cell(&rec, input.on_cell);
                 cells.push(rec);
                 warnings.push(format!("{cell_id} failed: {e}"));
                 let landed = live_agreement(&q, &item);
@@ -371,6 +405,12 @@ fn snap_one(it: &crate::orchestrate::queue::QueueItem, snap: Option<&dyn Fn(&cra
     }
 }
 
+fn snap_cell(rec: &CellRecord, on_cell: Option<&dyn Fn(&CellRecord)>) {
+    if let Some(f) = on_cell {
+        f(rec);
+    }
+}
+
 fn note_enq(o: EnqueueOutcome, reason: &str, meta: &mut DeepMeta) {
     match o {
         EnqueueOutcome::New => {
@@ -437,6 +477,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("c.rs", ItemState::Pending)]),
                 prior_findings: vec![prior_f], tools: ToolsMode::Off,
+                backend_factory: None, on_cell: None,
             },
             &(),
         )
@@ -461,6 +502,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Settled)]),
                 prior_findings: vec![], tools: ToolsMode::Off,
+                backend_factory: None, on_cell: None,
             },
             &(),
         )
@@ -497,7 +539,7 @@ mod tests {
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&snap), prior_findings: vec![prior_f],
-                tools: ToolsMode::Off,
+                tools: ToolsMode::Off, backend_factory: None, on_cell: None,
             },
             &(),
         )
@@ -536,7 +578,7 @@ mod tests {
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::InFlight)]), prior_findings: vec![],
-                tools: ToolsMode::TwoStage,
+                tools: ToolsMode::TwoStage, backend_factory: None, on_cell: None,
             },
             &(),
         )
