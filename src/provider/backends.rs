@@ -1636,7 +1636,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
     #[test]
     fn anthropic_guard_drops_thinking_when_tools_present() {
         let msgs = vec![ChatMessage::System("sys".into()), ChatMessage::User("go".into())];
-        let tool = crate::tools::ToolSpec { name: "read".into(), description: "d".into(), parameters: serde_json::json!({}) };
+        let tool = crate::tools::ToolSpec { name: "read", description: "d", parameters: serde_json::json!({}) };
         let th = thinking_params(ProviderKind::Anthropic, "claude", "claude-x", ThinkingLevel::Low, MAX_TOKENS).unwrap();
         let with_tools = build_anthropic_tools_body_ext("claude-x", &msgs, &[tool], MAX_TOKENS, Some(&th));
         assert!(with_tools.get("thinking").is_none(), "工具往返与 thinking 同发会 400，守卫丢弃");

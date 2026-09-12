@@ -34,6 +34,50 @@ impl FindingSink for () {
     fn on_finding(&self, _ev: FindingEvent) {}
 }
 
+/// 发射上下文：旁路与终判共用的身份 / 去重面（一处收拢，免两个函数各带 5-6 个同源参数）。
+pub(crate) struct EmitCtx<'a> {
+    model: &'a str,
+    family: &'a str,
+    agreement: u32,
+    root: &'a Path,
+    sink: &'a dyn FindingSink,
+    /// 已发射 finding.id——旁路发过的，终判不补发。
+    emitted: HashSet<String>,
+}
+
+impl<'a> EmitCtx<'a> {
+    pub(crate) fn new(
+        model: &'a str,
+        family: &'a str,
+        agreement: u32,
+        root: &'a Path,
+        sink: &'a dyn FindingSink,
+    ) -> Self {
+        EmitCtx { model, family, agreement, root, sink, emitted: HashSet::new() }
+    }
+
+    /// 首次见到该 id 才发射（旁路 / 终判同一去重面）。
+    fn emit(&mut self, f: &Finding) {
+        if !self.emitted.insert(f.id.clone()) {
+            return;
+        }
+        self.sink.on_finding(FindingEvent {
+            finding: f.clone(),
+            agreement: self.agreement,
+            reviewer_family: self.family.to_string(),
+        });
+    }
+}
+
+/// 两轮累计用量（参数面收拢）。
+#[derive(Clone, Copy, Default)]
+struct TurnUsage {
+    input: u64,
+    output: u64,
+    cached: u64,
+    reasoning: Option<u64>,
+}
+
 /// 一次 reviewer 调用成品（对齐 ScanCall + stream_discarded）。
 #[derive(Clone, Debug)]
 pub struct ReviewCall {
@@ -57,28 +101,26 @@ fn sum_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-fn emit_raw(
-    raws: Vec<crate::domain::RawFinding>,
-    model: &str,
-    family: &str,
-    agreement: u32,
-    emitted: &mut HashSet<String>,
-    sink: &dyn FindingSink,
-    landed: &mut Vec<Finding>,
-) {
+fn emit_raw(raws: Vec<crate::domain::RawFinding>, ctx: &mut EmitCtx) {
     for raw in raws {
-        let mut f = enrich(&raw, model);
-        f.agreement = agreement;
-        f.models = vec![model.to_string()];
-        if emitted.insert(f.id.clone()) {
-            sink.on_finding(FindingEvent {
-                finding: f.clone(),
-                agreement,
-                reviewer_family: family.to_string(),
-            });
-            landed.push(f);
-        }
+        let mut f = enrich(&raw, ctx.model);
+        f.agreement = ctx.agreement;
+        f.models = vec![ctx.model.to_string()];
+        ctx.emit(&f);
     }
+}
+
+/// 轮间旁路：发已闭合对象，**不** finalize——后续轮次还要继续 feed 同一个解析器。
+fn drain_bypass(inc: &Arc<Mutex<IncrementalFindings>>, ctx: &mut EmitCtx) {
+    let raws = inc.lock().unwrap().take();
+    emit_raw(raws, ctx);
+}
+
+/// 错误路径收口（超时 / 网络失败 / 取消）：先发已闭合对象（不丢），再 `finalize`
+/// ——未闭合片段计入 `discarded` 并清缓冲，不静默丢。PRD「必调 finalize」的失败半边。
+fn close_bypass(inc: &Arc<Mutex<IncrementalFindings>>, ctx: &mut EmitCtx) {
+    drain_bypass(inc, ctx);
+    inc.lock().unwrap().finalize();
 }
 
 /// reviewer 两轮单发。`inc` 由调用方挂到 per-cell backend 的 `with_text_delta` 后再传入。
@@ -88,36 +130,31 @@ pub(crate) async fn run_review_shot_with(
     per_turn: std::time::Duration,
     retry_budget: u32,
     policy: Option<&dyn AttemptPolicy>,
-    model: &str,
-    family: &str,
-    agreement: u32,
-    root: &Path,
+    ctx: &mut EmitCtx<'_>,
     inc: Arc<Mutex<IncrementalFindings>>,
-    sink: &dyn FindingSink,
 ) -> Result<ReviewCall, ProviderError> {
     let mut messages = vec![
         ChatMessage::System(prompt.system.clone()),
         ChatMessage::UserBlocks(prompt.blocks.clone()),
     ];
-    let mut emitted = HashSet::new();
-    let mut landed: Vec<Finding> = Vec::new();
 
     let turn = match timed_turn_with(backend, &messages, &[], per_turn, retry_budget, policy).await {
         Ok(t) => t,
         Err(e) => {
-            drain_bypass(&inc, model, family, agreement, &mut emitted, sink, &mut landed);
+            close_bypass(&inc, ctx);
             return Err(e);
         }
     };
-    drain_bypass(&inc, model, family, agreement, &mut emitted, sink, &mut landed);
+    drain_bypass(&inc, ctx);
 
-    let (mut in_tok, mut out_tok, mut cached_tok) = (turn.input_tokens, turn.output_tokens, turn.cached_input_tokens);
-    let mut reasoning = turn.reasoning_tokens;
+    let mut usage = TurnUsage {
+        input: turn.input_tokens,
+        output: turn.output_tokens,
+        cached: turn.cached_input_tokens,
+        reasoning: turn.reasoning_tokens,
+    };
 
-    if let Ok(call) = finish_parse(
-        &turn.text, model, family, agreement, root, &mut emitted, sink, &mut landed, &inc, 1,
-        turn.finish_reason.clone(), None, in_tok, out_tok, cached_tok, reasoning,
-    ) {
+    if let Ok(call) = finish_parse(&turn.text, ctx, &inc, 1, turn.finish_reason.clone(), None, usage) {
         return Ok(call);
     }
 
@@ -132,80 +169,50 @@ pub(crate) async fn run_review_shot_with(
         messages.push(ChatMessage::Assistant { text: turn.text.clone(), tool_calls: vec![] });
     }
     messages.push(ChatMessage::User(REPAIR_PROMPT_REVIEW.to_string()));
-    let repair = timed_turn_final_with(backend, &messages, per_turn, retry_budget, policy)
-        .await
-        .map_err(|e| {
-            drain_bypass(&inc, model, family, agreement, &mut emitted, sink, &mut landed);
-            e.attach_usage((in_tok, out_tok, cached_tok))
-        })?;
-    drain_bypass(&inc, model, family, agreement, &mut emitted, sink, &mut landed);
-    in_tok += repair.input_tokens;
-    out_tok += repair.output_tokens;
-    cached_tok += repair.cached_input_tokens;
-    reasoning = sum_opt(reasoning, repair.reasoning_tokens);
+    let repair = match timed_turn_final_with(backend, &messages, per_turn, retry_budget, policy).await {
+        Ok(r) => r,
+        Err(e) => {
+            close_bypass(&inc, ctx);
+            return Err(e.attach_usage((usage.input, usage.output, usage.cached)));
+        }
+    };
+    drain_bypass(&inc, ctx);
+    usage.input += repair.input_tokens;
+    usage.output += repair.output_tokens;
+    usage.cached += repair.cached_input_tokens;
+    usage.reasoning = sum_opt(usage.reasoning, repair.reasoning_tokens);
 
     match finish_parse(
-        &repair.text, model, family, agreement, root, &mut emitted, sink, &mut landed, &inc, 2,
-        repair.finish_reason.clone(), Some(repair_note), in_tok, out_tok, cached_tok, reasoning,
+        &repair.text, ctx, &inc, 2, repair.finish_reason.clone(), Some(repair_note), usage,
     ) {
         Ok(call) => Ok(call),
         Err(_) => {
             inc.lock().unwrap().finalize();
-            Err(diagnostic_parse_error(&repair).attach_usage((in_tok, out_tok, cached_tok)))
+            Err(diagnostic_parse_error(&repair).attach_usage((usage.input, usage.output, usage.cached)))
         }
     }
 }
 
-fn drain_bypass(
-    inc: &Arc<Mutex<IncrementalFindings>>,
-    model: &str,
-    family: &str,
-    agreement: u32,
-    emitted: &mut HashSet<String>,
-    sink: &dyn FindingSink,
-    landed: &mut Vec<Finding>,
-) {
-    let raws = inc.lock().unwrap().take();
-    emit_raw(raws, model, family, agreement, emitted, sink, landed);
-}
-
 fn finish_parse(
     text: &str,
-    model: &str,
-    family: &str,
-    agreement: u32,
-    root: &Path,
-    emitted: &mut HashSet<String>,
-    sink: &dyn FindingSink,
-    landed: &mut Vec<Finding>,
+    ctx: &mut EmitCtx,
     inc: &Arc<Mutex<IncrementalFindings>>,
     iterations: u32,
     finish_reason: Option<String>,
     repair_note: Option<String>,
-    in_tok: u64,
-    out_tok: u64,
-    cached_tok: u64,
-    reasoning: Option<u64>,
+    usage: TurnUsage,
 ) -> Result<ReviewCall, ProviderError> {
-    let (out, mut stats) = parse_review_output_with_stats(text, model)?;
+    let (out, mut stats) = parse_review_output_with_stats(text, ctx.model)?;
     let CellOutput::Review { findings, needs } = out else {
         return Err(ProviderError::Parse("review parse did not yield Review".into()));
     };
-    let (kept, dropped, dropped_unreadable) = anchor_review_findings(findings, root);
+    let (kept, dropped, dropped_unreadable) = anchor_review_findings(findings, ctx.root);
     stats.dropped_quote = dropped + dropped_unreadable;
 
     let mut final_findings = Vec::new();
     for mut f in kept {
-        f.agreement = agreement;
-        if !emitted.contains(&f.id) {
-            emitted.insert(f.id.clone());
-            sink.on_finding(FindingEvent {
-                finding: f.clone(),
-                agreement,
-                reviewer_family: family.to_string(),
-            });
-            landed.push(f.clone());
-        }
+        f.agreement = ctx.agreement;
+        ctx.emit(&f);
         final_findings.push(f);
     }
 
@@ -218,12 +225,12 @@ fn finish_parse(
     Ok(ReviewCall {
         output: CellOutput::Review { findings: final_findings, needs },
         stats,
-        input_tokens: in_tok,
-        output_tokens: out_tok,
-        cached_input_tokens: cached_tok,
+        input_tokens: usage.input,
+        output_tokens: usage.output,
+        cached_input_tokens: usage.cached,
         iterations,
         finish_reason,
-        reasoning_tokens: reasoning,
+        reasoning_tokens: usage.reasoning,
         repair_note,
         rate_limit_retries: 0,
         rate_limit_wait_ms: 0,
@@ -285,8 +292,9 @@ mod tests {
         let backend = FakeChatBackend::new(vec![turn(TWO)])
             .with_delta_chunk(11)
             .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
+        let mut ctx = EmitCtx::new("m", "alpha", 2, dir.path(), &rec);
         let call = run_review_shot_with(
-            &backend, &prompt(), Duration::from_secs(5), 0, None, "m", "alpha", 2, dir.path(), inc, &rec,
+            &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc,
         )
         .await
         .unwrap();
@@ -307,8 +315,9 @@ mod tests {
         let dir = tmp_file();
         let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
         let backend = FakeChatBackend::new(vec![turn(TWO)]);
+        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &());
         let call = run_review_shot_with(
-            &backend, &prompt(), Duration::from_secs(5), 0, None, "m", "alpha", 1, dir.path(), inc, &(),
+            &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc,
         )
         .await
         .unwrap();
@@ -326,16 +335,58 @@ mod tests {
         let backend = FakeChatBackend::new(vec![turn(truncated), turn(truncated)])
             .with_delta_chunk(8)
             .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
+        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &rec);
         let err = run_review_shot_with(
-            &backend, &prompt(), Duration::from_secs(5), 0, None, "m", "alpha", 1, dir.path(), inc.clone(), &rec,
+            &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc.clone(),
         )
         .await
         .unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("Parse") || msg.contains("parse"), "{msg}");
-        inc.lock().unwrap().finalize();
         assert!(!rec.0.lock().unwrap().is_empty(), "已闭合对象已发射");
-        assert!(inc.lock().unwrap().discarded() >= 1);
+        assert!(inc.lock().unwrap().discarded() >= 1, "两轮都 parse 失败——终态路径已 finalize");
+    }
+
+    /// AC：超时 / 网络失败路径也必调 `finalize`——未闭合片段计入 `discarded`，不静默丢。
+    #[tokio::test]
+    async fn error_path_finalizes_bypass() {
+        let dir = tmp_file();
+        let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+        // 流到一半（对象未闭合）即超时。
+        inc.lock().unwrap().feed(r#"{"findings":[{"severity":"low","title":"half"#);
+        let backend = FakeChatBackend::new_results(vec![Err(ProviderError::Timeout("probe".into()))]);
+        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &());
+        let err = run_review_shot_with(
+            &backend, &prompt(), Duration::from_millis(50), 0, None, &mut ctx, inc.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ProviderError::Timeout(_)), "{err:?}");
+        assert_eq!(inc.lock().unwrap().discarded(), 1, "未闭合片段经 finalize 计数");
+    }
+
+    /// REPAIR 轮失败（第二轮 turn 直接 Err）同样收口——错误半边两条路径都不漏 finalize。
+    #[tokio::test]
+    async fn repair_turn_error_finalizes_bypass() {
+        let dir = tmp_file();
+        let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+        let inc2 = inc.clone();
+        let backend = FakeChatBackend::new_results(vec![
+            Ok(turn(r#"{"findings":[{"severity":"low","title":"half"#)),
+            Err(ProviderError::Timeout("repair".into())),
+        ])
+        .with_delta_chunk(8)
+        .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
+        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &());
+        let err = run_review_shot_with(
+            &backend, &prompt(), Duration::from_millis(50), 0, None, &mut ctx, inc.clone(),
+        )
+        .await
+        .unwrap_err();
+        // REPAIR 轮的错误带首轮用量回传（WithUsage 包一层），断言内层成因。
+        let msg = format!("{err:?}");
+        assert!(msg.contains("Timeout"), "{msg}");
+        assert_eq!(inc.lock().unwrap().discarded(), 1, "REPAIR 轮失败也 finalize");
     }
 
     #[test]

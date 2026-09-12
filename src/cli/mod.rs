@@ -1137,7 +1137,10 @@ pub async fn run_resume(
                 }
             };
             let selected = select_files(changes);
-            let (budget, _spec_section, _) = budget_and_spec(&roles, &args.spec);
+            // spec 段随重跑一起带回：resume 的 reviewer prompt 必须与首跑同构，缺了契约段
+            // 同一 cell 两次判读口径就不一样。
+            let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
+            report.run.warnings.extend(spec_warnings);
             let CellPlan { bundles, .. } =
                 plan_cells(selected, cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
             let prior_findings: Vec<crate::domain::Finding> = final_records
@@ -1165,7 +1168,7 @@ pub async fn run_resume(
                     reviewers: &roles.reviewers,
                     budget_cells,
                     pack: &cfg.review.pack,
-                    spec_docs: "",
+                    spec_docs: &spec_section,
                     target_label: &target_label,
                     snapshot: Some(&snap2),
                     restore: Some(&queue_snap),
@@ -2241,7 +2244,7 @@ mod code_review_tests {
         let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
         assert_eq!(report.verdict, Verdict::Approve);
         assert_eq!(code, 2);
-        assert!(report.run.coverage.failed.get(&Role::Reviewer).is_some());
+        assert!(report.run.coverage.failed.contains_key(&Role::Reviewer));
     }
 
     /// 空变更集：0 cell、warning 可观测、scan-only / 0（不是假绿灯 approve）。
