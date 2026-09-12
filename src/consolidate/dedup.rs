@@ -164,8 +164,8 @@ mod tests {
     /// 两个 agreement 是两根轴，合并时各走各的算法：
     /// `agreement` = 认同这条 finding 的模型数（models.len()）；
     /// `suspicion_agreement` = 区域被几个 scanner 家族标记（区域属性，合并取 max）。
-    /// 批 D 的跳过规则（design §8.1，疑点 ≥ 2）与孤证复核（verify.rs，模型 == 1）因此可以同时成立：
-    /// 一条单模型报出、但落在双家族疑点区的 finding——正是「三方一致 → 免复核」要认的那种。
+    /// M21b 的分派池不双审（design §6 规则 5），模型轴几乎恒 1——批 D 的跳过规则（§8.1 疑点 ≥ 2）
+    /// 必须读区域轴才有区分度。下面第二段正是那种形状：单模型报出、落在双家族疑点区。
     #[test]
     fn two_agreement_axes_merge_independently() {
         let mut a = f("1", "a.rs", 10, 12, "missing auth check", "claude", Severity::High);
@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(out[0].agreement, 2, "两个模型认同 → 模型轴 2");
         assert_eq!(out[0].suspicion_agreement, 3, "区域轴取 max，不随模型数变");
 
-        // 单模型 finding 落在双家族疑点区：模型轴 1（孤证）∧ 区域轴 2（跳过判据成立）。
+        // 单模型 finding 落在双家族疑点区：模型轴 1（M21b 分派池下的常态）∧ 区域轴 2（跳过判据成立）。
         let mut lone = f("3", "b.rs", 5, 5, "unchecked write", "claude", Severity::High);
         lone.suspicion_agreement = 2;
         let out = dedup(vec![lone]);

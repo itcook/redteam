@@ -89,8 +89,10 @@ pub struct Finding {
     pub confidence: f32,
     pub recommendation: String,
     pub models: Vec<String>,
-    /// 认同**这条 finding** 的模型数（`dedup::merge_into` 里 = `models.len()`）——finding 的可信度轴，
-    /// `consolidate::verify` 的孤证复核（`agreement == 1`）建在它上面。
+    /// 认同**这条 finding** 的模型数（`dedup::merge_into` 里 = `models.len()`）。
+    /// 注意 M21b 起这根轴基本是死的：深挖的分派池「每项只由一个模型消费、不双审」（design §6 规则 5），
+    /// 单 reviewer 配置下恒 1——别拿它当共识强度读。旧架构（M20 多模型 fan-out 审同一份代码）才有
+    /// ≥ 2 的产生机制；现存消费者只剩 carry 与旧报告。区域共识看 `suspicion_agreement`。
     pub agreement: u32,
     /// 这条 finding 所在**区域**被几个独立 scanner 家族标记过（深挖队列项落地时刻的 agreement，
     /// 后涨不回溯〔D13〕）——区域可疑度轴，与 `agreement` 不同维度：三个 scanner 都盯过这段，

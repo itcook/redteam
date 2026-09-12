@@ -236,10 +236,24 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
 
 **已拆**（`Finding` 新增字段，serde default + 0 时不序列化，旧报告可读）：
 
-| 轴 | 字段 | 谁写 | 谁读 |
+| 轴 | 字段 | 谁写 | M21b 里谁读 |
 |---|---|---|---|
-| finding 可信度 | `agreement` | `enrich` 起手 1；`dedup::merge_into` = `models.len()` | 孤证复核 `agreement == 1 ∧ severity ≥ block` |
-| 区域可疑度 | `suspicion_agreement` | 深挖 `EmitCtx`（队列项**落地时刻**值，后涨不回溯） | 批 D 跳过规则 `≥ 2 ∧ reviewer 确认` |
+| finding 可信度 | `agreement` | `enrich` 起手 1；`dedup::merge_into` = `models.len()` | **深挖路径上无人读**（见下「轴已失效」）；carry(`carried.agreement = 2`) 与旧报告仍用 |
+| 区域可疑度 | `suspicion_agreement` | 深挖 `EmitCtx`（队列项**落地时刻**值，后涨不回溯） | 批 D 跳过规则 `≥ 2 ∧ reviewer 确认`（design §8.1） |
+
+**`agreement` 轴在 M21b 已无产生机制**（2026-09-12 与维护者确认）：design §6 规则 5 的分派池是
+「每项只由一个模型消费…**不双审**」，多 reviewer 条目是不同 worker 审不同疑点，不是多模型审同一点。
+于是单 reviewer 配置下 `agreement` 恒 1，多 reviewer 也只剩「同一 bug 被分到两格、各自发现、且恰好
+不同模型」这种偶然。对照旧架构（M20 多模型 fan-out 并行审同一份代码）那里 `agreement ≥ 2` 才是强信号。
+
+因此：
+- `consolidate/verify.rs` 现存的 `f.agreement == 1 ∧ severity ≥ block ∧ confidence ≥ floor` 是
+  **M20 遗留规则**，在 M21b 下 `agreement == 1` 恒真、条件形同虚设。design §8.1 的新触发集是
+  `severity ≥ block ∧ confidence ≥ floor`（**不带 agreement**）+ 判例变体命中——plan D-2 本就要重写这段。
+- 批 D 决策点①：`agreement` 保留还是标 legacy。倾向保留不动（schema 稳定，carry / 旧报告仍读）。
+- 批 D 决策点②：§8.1「疑点 agreement ≥ 2 **∧ reviewer 确认**」里的「reviewer 确认」指什么？
+  任何进入复核的 finding 本就是 reviewer 报出来的——若「确认」即指此，跳过条件退化为
+  `suspicion_agreement ≥ 2`；若另有含义（如 confidence 门），design 未写，需批 D 定。
 
 - dedup 合并：`agreement` 按 models 重算，`suspicion_agreement` 取 max（区域属性，非模型属性）。
 - `FindingEvent.suspicion_agreement` 同名同义；scanner / 非深挖路径留 0。
