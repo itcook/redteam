@@ -59,8 +59,9 @@ enum Cmd {
         /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定。M21b 起生效；M21a scan-only 下记录不消费。
         #[arg(long)]
         conf_floor: Option<f32>,
-        /// 工具档位：off | two-stage | on。scanner 恒单发（无工具、needs 只记录不补跑，M21b 深挖队列消费）；本旗对 scanner 无效，
-        /// 留给 M21b reviewer 的工具分层授予（design §11）。缺省读 config [review].tools。
+        /// 工具档位：off | two-stage | on。scanner 恒单发（无工具、needs 只记录不补跑，M21b 深挖队列消费）；本旗对 scanner 无效。
+        /// reviewer：two-stage = needs 触发一轮证据补查（读守卫 + 字节帽，拒绝进 warnings）；
+        /// on 目前等同 two-stage——真工具循环 M21c 才落地，先不让它比 two-stage 弱。缺省读 config [review].tools。
         #[arg(long, value_parser = ["off", "two-stage", "on"])]
         tools: Option<String>,
         /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。

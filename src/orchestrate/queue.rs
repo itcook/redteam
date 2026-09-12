@@ -62,14 +62,14 @@ pub struct QueueItem {
 }
 
 impl QueueItem {
-    fn new(spec: QueueItemSpec, score: f32, kind: ItemKind, family: Option<&str>) -> Self {
+    fn new(spec: QueueItemSpec, score: f32, kind: ItemKind, families: Vec<String>) -> Self {
         let id = item_id(&spec);
-        let families = family.filter(|f| !f.is_empty()).map(|f| vec![f.to_string()]).unwrap_or_default();
+        let families: Vec<String> = dedup_families(families);
         QueueItem {
             id,
             spec,
             score,
-            agreement: 1,
+            agreement: agreement_of(&families),
             state: ItemState::Pending,
             kind,
             dispatch_agreement: 0,
@@ -80,6 +80,22 @@ impl QueueItem {
     }
 }
 
+/// agreement ≡ 贡献家族数（与 `consolidate::scan::merge_suspicions` 同口径）；
+/// 无家族（H0 / needs）记 1——「至少有一个来源提过」。
+fn agreement_of(families: &[String]) -> u32 {
+    (families.len() as u32).max(1)
+}
+
+fn dedup_families(families: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in families.into_iter().filter(|f| !f.is_empty()) {
+        if !out.contains(&f) {
+            out.push(f);
+        }
+    }
+    out
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -87,12 +103,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 入队参数。`family` 空 = 无家族（H0 / needs），不参与异族计数。
+/// 入队参数。`families` 空 = 无家族（H0 / needs），agreement 记 1。
+/// 传全量家族集（而非单个）让 agreement 在队列内部算定——调用方不必在 enqueue 之后
+/// 反查队列改写，那种事后 fixup 会按 (file, quote) 认错项（同文件同 quote 不同行的两条疑点）。
 pub struct EnqueueReq {
     pub spec: QueueItemSpec,
     pub score: f32,
     pub kind: ItemKind,
-    pub family: Option<String>,
+    pub families: Vec<String>,
 }
 
 /// 内存队列（C-1 只含入队；派发/预算 C-2/C-3）。
@@ -140,7 +158,7 @@ impl DeepQueue {
         if let Some(idx) = self.find_merge_idx(&req.spec, &incoming_id) {
             return self.merge_into(idx, req);
         }
-        self.items.push(QueueItem::new(req.spec, req.score, req.kind, req.family.as_deref()));
+        self.items.push(QueueItem::new(req.spec, req.score, req.kind, req.families));
         EnqueueOutcome::New
     }
 
@@ -150,16 +168,12 @@ impl DeepQueue {
 
     fn merge_into(&mut self, idx: usize, req: EnqueueReq) -> EnqueueOutcome {
         let it = &mut self.items[idx];
-        let family_new = match req.family.as_deref() {
-            Some(f) if !f.is_empty() && !it.families.iter().any(|x| x == f) => {
-                it.families.push(f.to_string());
-                true
+        for f in req.families.into_iter().filter(|f| !f.is_empty()) {
+            if !it.families.contains(&f) {
+                it.families.push(f);
             }
-            _ => false,
-        };
-        if family_new {
-            it.agreement = it.agreement.saturating_add(1);
         }
+        it.agreement = agreement_of(&it.families);
         it.spec.ranges = union_ranges(&it.spec.ranges, &req.spec.ranges);
         it.spec.notes = merge_notes(&it.spec.notes, &req.spec.notes);
         if req.score > it.score {
@@ -395,7 +409,7 @@ mod tests {
             spec,
             score: 1.0,
             kind: ItemKind::Suspicion,
-            family: family.map(str::to_string),
+            families: family.map(|f| vec![f.to_string()]).unwrap_or_default(),
         }
     }
 
@@ -482,6 +496,47 @@ mod tests {
         assert_eq!(q.items()[0].agreement, 1, "H0 无家族不加");
     }
 
+    /// 同文件同 quote、不同行的两簇疑点：`same_suspicion` 不认（行不重叠）→ 两个独立项，
+    /// 各自带自己的家族集。旧实现在 enqueue 之后按 (file, quote) 反查改写，会把后一簇的
+    /// 共识写到前一项上、真共识项掉出必挖集（agreement ≥ 2）。
+    #[test]
+    fn same_quote_different_lines_keep_own_agreement() {
+        let mut q = DeepQueue::new();
+        q.enqueue(EnqueueReq {
+            spec: spec_scan("a.rs", 10, 10, "db.write(t);", "h1"),
+            score: 0.5,
+            kind: ItemKind::Suspicion,
+            families: vec!["alpha".into()],
+        });
+        q.enqueue(EnqueueReq {
+            spec: spec_scan("a.rs", 80, 80, "db.write(t);", "h2"),
+            score: 0.5,
+            kind: ItemKind::Suspicion,
+            families: vec!["alpha".into(), "beta".into(), "gamma".into()],
+        });
+        assert_eq!(q.items().len(), 2, "行不重叠不合并");
+        let first = q.items().iter().find(|i| i.spec.ranges == vec![(10, 10)]).unwrap();
+        let second = q.items().iter().find(|i| i.spec.ranges == vec![(80, 80)]).unwrap();
+        assert_eq!(first.agreement, 1, "前一项不该被后一簇改写");
+        assert_eq!(second.agreement, 3, "三家族共识留在自己项上");
+        assert!(q.is_must(second), "agreement ≥ 2 → 必挖集，不被预算截");
+        assert!(!q.is_must(first));
+    }
+
+    /// agreement ≡ 家族数：重复家族不计、空串不计（与 merge_suspicions 同口径）。
+    #[test]
+    fn agreement_equals_distinct_family_count() {
+        let mut q = DeepQueue::new();
+        q.enqueue(EnqueueReq {
+            spec: spec_scan("a.rs", 1, 2, "v[i]", "idx"),
+            score: 0.5,
+            kind: ItemKind::Suspicion,
+            families: vec!["alpha".into(), "alpha".into(), "".into(), "beta".into()],
+        });
+        assert_eq!(q.items()[0].agreement, 2);
+        assert_eq!(q.items()[0].families, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
     #[test]
     fn different_quotes_same_file_do_not_merge() {
         let mut q = DeepQueue::new();
@@ -492,7 +547,7 @@ mod tests {
     }
 
     fn req_kind(spec: QueueItemSpec, kind: ItemKind, score: f32, family: Option<&str>) -> EnqueueReq {
-        EnqueueReq { spec, score, kind, family: family.map(str::to_string) }
+        EnqueueReq { spec, score, kind, families: family.map(|f| vec![f.to_string()]).unwrap_or_default() }
     }
 
     fn spec_needs(file: &str, start: u32, end: u32) -> QueueItemSpec {

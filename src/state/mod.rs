@@ -729,7 +729,7 @@ mod tests {
         assert!(store.read_queue_items("j").is_empty(), "零行 = 旧作业");
         let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap();
         let mut q = crate::orchestrate::queue::DeepQueue::new();
-        q.enqueue(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, family: None });
+        q.enqueue(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, families: vec![] });
         let item = q.items()[0].clone();
         store.put_queue_item("j", &item).unwrap();
         let back = store.read_queue_items("j");

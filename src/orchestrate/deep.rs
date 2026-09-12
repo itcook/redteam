@@ -135,6 +135,11 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
             break;
         };
         snap_one(&item, input.snapshot);
+        // 排队时长在**派发时**定格：放到调用返回后采样量到的是「完成 − 入队」（含模型跑的几分钟），
+        // 那是墙钟不是队列压力；且失败格根本不会 push，分布还带偏。
+        if let Some(en) = item.enqueued_ms {
+            meta.item_wait_ms.push(now_ms().saturating_sub(en));
+        }
         n += 1;
         let cell_id = format!("review[{n}]@{}", rev.name);
         let t0 = Instant::now();
@@ -185,6 +190,9 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
             inc,
         )
         .await;
+        // 门等待与 429 排队只有 policy 知道（`ScanLease::run` 的回填在这条路径上不经过）——
+        // 趁 lease 还活着读出来，否则 attempts / queue_wait_ms 永远是死值 0。
+        let (rl_retries, rl_wait_ms) = (policy.retries(), policy.waited_ms());
         drop(per_cell);
         drop(lease);
         match call {
@@ -193,11 +201,15 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                 // 注入互斥：带笔记项（origin=scan）不注入 needs 证据（region::build 构造期 Err），计 skipped。
                 let needs_count = c.output.needs().len();
                 if needs_count > 0 {
-                    let eligible = input.tools == ToolsMode::TwoStage && item.spec.notes.is_empty();
+                    // `on` 档在 M21b 还没有工具循环（reviewer 单发恒不带 tools），落到这里
+                    // 至少要与 two-stage 等价——否则用户选了 --help 里更高的档反而拿到更少能力。
+                    let tiered = matches!(input.tools, ToolsMode::TwoStage | ToolsMode::On);
+                    let eligible = tiered && item.spec.notes.is_empty();
                     if eligible {
                         meta.needs_two_stage_triggered += 1;
                         if let Some(c2) = second_stage_round(
                             registry, &input, rev, &item, &idx, &opts, c.output.findings().to_vec(), c.output.needs(), sink,
+                            &mut warnings,
                         )
                         .await
                         {
@@ -222,8 +234,9 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                 rec.output_tokens = c.output_tokens;
                 rec.cached_input_tokens = c.cached_input_tokens;
                 rec.iterations = c.iterations;
-                rec.attempts = 1 + c.rate_limit_retries;
-                rec.queue_wait_ms = c.rate_limit_wait_ms;
+                // 与 scanner 同口径（orchestrate/mod.rs）：attempts = 轮次 + 429 重试。
+                rec.attempts = c.iterations + rl_retries + c.rate_limit_retries;
+                rec.queue_wait_ms = rl_wait_ms + c.rate_limit_wait_ms;
                 rec.template_hash = Some(review_template_hash());
                 if c.stats.stream_discarded > 0 {
                     rec.warn = Some(format!("stream discarded {}", c.stats.stream_discarded));
@@ -231,9 +244,6 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                 meta.stream_discarded += c.stats.stream_discarded;
                 meta.reviewer_output_tokens.push(c.output_tokens);
                 meta.dispatch_agreement.push(item.dispatch_agreement);
-                if let Some(en) = item.enqueued_ms {
-                    meta.item_wait_ms.push(now_ms().saturating_sub(en));
-                }
                 // 落地时 agreement 读队列活值（在途期间并入的异族会抬高它）——与派发时值成对，
                 // 二者之差即「挖的时候还不知道、挖完才攒够的共识」，观测面按此判读。
                 let landed = live_agreement(&q, &item);
@@ -247,9 +257,17 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
             }
             Err(e) => {
                 reviewer_failed = true;
+                // 烧掉的 token 照样入账（scanner 同口径）——失败不等于免费，
+                // 不记就成了报告里对不上的黑洞。
+                let (bi, bo, bc) = e.burned_usage();
                 let mut rec = CellRecord::failed(&cell_id, &rev.name, Role::Reviewer, format!("{e}"));
                 rec = rec.with_family(&rev.family);
                 rec.duration_ms = t0.elapsed().as_millis() as u64;
+                rec.input_tokens = bi;
+                rec.output_tokens = bo;
+                rec.cached_input_tokens = bc;
+                rec.attempts = 1 + rl_retries;
+                rec.queue_wait_ms = rl_wait_ms;
                 snap_cell(&rec, input.on_cell);
                 cells.push(rec);
                 warnings.push(format!("{cell_id} failed: {e}"));
@@ -293,6 +311,7 @@ async fn second_stage_round(
     draft: Vec<Finding>,
     needs: &[crate::domain::NeedEntry],
     sink: &dyn FindingSink,
+    warnings: &mut Vec<String>,
 ) -> Option<super::review_shot::ReviewCall> {
     let ex = crate::tools::ToolExecutor::new(input.root);
     let mut w2: Vec<String> = Vec::new();
@@ -300,6 +319,9 @@ async fn second_stage_round(
         .iter()
         .filter_map(|n| crate::cli::second_pass::need_section(&ex, input.root, n, &mut w2))
         .collect();
+    // 读守卫拒绝（denylist / 非 git-tracked）必须进报告——模型伸手要 ~/.ssh/id_rsa 这种事
+    // 只打到 stderr 就等于没披露（second_pass.rs 的 deny_need_read 契约，T46①②）。
+    warnings.append(&mut w2);
     if ev.trim().is_empty() {
         return None;
     }
@@ -360,7 +382,7 @@ fn enqueue_h0(q: &mut DeepQueue, h: &Hotspot, meta: &mut DeepMeta) {
         RegionKind::Primary => ItemKind::Primary,
         RegionKind::Ripple => ItemKind::Ripple,
     };
-    note_enq(q.enqueue(EnqueueReq { spec, score: h.score, kind, family: None }), "rule", meta);
+    note_enq(q.enqueue(EnqueueReq { spec, score: h.score, kind, families: vec![] }), "rule", meta);
 }
 
 fn enqueue_scan(q: &mut DeepQueue, cells: &[ScanCellResult], meta: &mut DeepMeta) {
@@ -374,20 +396,19 @@ fn enqueue_scan(q: &mut DeepQueue, cells: &[ScanCellResult], meta: &mut DeepMeta
         ) else {
             continue;
         };
-        let family = m.families.first().cloned();
-        let quote = s.quote.clone();
-        let file = s.file.clone();
+        // 全量家族随请求进队列，agreement 由队列算定（= 家族数，与 merge_suspicions 同口径）。
+        // 不再 enqueue 之后反查改写——那按 (file, quote) 找项，同文件同 quote 不同行的两条
+        // 疑点会认错人，把后一簇的共识写到前一项上、真共识项反而掉出必挖集。
         note_enq(
-            q.enqueue(EnqueueReq { spec, score: s.confidence, kind: ItemKind::Suspicion, family }),
+            q.enqueue(EnqueueReq {
+                spec,
+                score: s.confidence,
+                kind: ItemKind::Suspicion,
+                families: m.families.clone(),
+            }),
             "scan",
             meta,
         );
-        if let Some(it) = q.items_mut().iter_mut().find(|it| {
-            it.kind == ItemKind::Suspicion && it.spec.file == file && it.spec.notes.iter().any(|n| n.quote == quote)
-        }) {
-            it.agreement = m.agreement.max(1);
-            it.families = m.families.clone();
-        }
     }
 }
 
@@ -457,6 +478,75 @@ mod tests {
             per_turn_timeout_secs: None, reasoning: false, thinking_level: None,
             family: "r".into(), max_concurrency: None,
         }
+    }
+
+    fn one_bundle(dir: &Path) -> Vec<Bundle> {
+        std::fs::write(dir.join("a.rs"), "fn a() {\n").unwrap();
+        vec![Bundle::from_files(vec![FileChange {
+            path: "a.rs".into(),
+            diff: "@@ -1,1 +1,1 @@\n+fn a() {".into(),
+        }])]
+    }
+
+    #[allow(clippy::too_many_arguments)] // 测试夹具：直接映射 DeepInput 的字段面
+    async fn run_one(
+        reg: &crate::provider::registry::ProviderRegistry,
+        root: &Path,
+        bundles: &[Bundle],
+        tools: ToolsMode,
+    ) -> DeepRun {
+        let reviewer = fake_reviewer();
+        run_deep(
+            reg,
+            DeepInput {
+                route: None, scan_cells: &[], bundles, root,
+                reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
+                pack: &Default::default(), spec_docs: "", target_label: "t",
+                snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Pending)]),
+                prior_findings: vec![], tools,
+                backend_factory: None, on_cell: None,
+            },
+            &(),
+        )
+        .await
+    }
+
+    /// REPAIR 轮进 attempts（scanner 同口径 = 轮次 + 429 重试）。旧实现硬编码
+    /// `1 + rate_limit_retries`，而 `rate_limit_retries` 在这条路径上恒 0 → attempts 永远是 1。
+    #[tokio::test]
+    async fn repair_round_counts_into_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = one_bundle(dir.path());
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![
+            turn("not-json"),                 // 首轮 parse 失败 → REPAIR
+            turn(&rev_json("fn a() {")),      // 第二轮好
+        ])), Duration::from_secs(5), 0);
+        let run = run_one(&reg, dir.path(), &bundles, ToolsMode::Off).await;
+        assert_eq!(run.cells.len(), 1);
+        assert_eq!(run.cells[0].iterations, 2, "两轮");
+        assert_eq!(run.cells[0].attempts, 2, "attempts = 轮次 + 429 重试，不是死值 1");
+    }
+
+    /// 失败格烧掉的 token 照样入账（scanner 同口径）+ family 不为空——
+    /// 不记就是报告里对不上的黑洞。
+    #[tokio::test]
+    async fn failed_reviewer_cell_books_burned_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = one_bundle(dir.path());
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![
+            turn("not-json"), turn("still-not-json"),
+        ])), Duration::from_secs(5), 0);
+        let run = run_one(&reg, dir.path(), &bundles, ToolsMode::Off).await;
+        assert!(run.reviewer_failed);
+        assert_eq!(run.cells.len(), 1);
+        assert!(!run.cells[0].ok);
+        assert_eq!(run.cells[0].family, "r", "失败格也带 family");
+        assert!(
+            run.cells[0].input_tokens > 0 || run.cells[0].output_tokens > 0,
+            "两轮烧掉的 token 必须入账: {:?}", run.cells[0]
+        );
     }
 
     /// resume 且重建 diff 落空（改动已提交 / 已切分支）：未完项无 bundle 可 pack ——
@@ -587,5 +677,57 @@ mod tests {
         assert_eq!(run.cells.len(), 1);
         assert!(run.cells[0].ok);
         assert_eq!(run.findings.len(), 1, "终判取第二轮 CONFIRM 后同一条");
+    }
+
+    /// `--tools on`：M21b 还没有工具循环，`on` 至少不能比 `two-stage` 弱——
+    /// 旧实现只认 `== TwoStage`，选了更高档的用户反而只拿到 skipped 计数。
+    #[tokio::test]
+    async fn tools_on_is_not_weaker_than_two_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() {\n").unwrap();
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        g(&["init", "-q"]);
+        g(&["add", "a.rs"]);
+        g(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        let bundles = vec![Bundle::from_files(vec![FileChange { path: "a.rs".into(), diff: "@@ -1,1 +1,1 @@\n+fn a() {".into() }])];
+        let first = r#"{"findings":[],"needs":[{"path":"a.rs","reason":"need context"}]}"#;
+        let second = rev_json("fn a() {");
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(first), turn(&second)])), Duration::from_secs(5), 0);
+        let run = run_one(&reg, root, &bundles, ToolsMode::On).await;
+        assert_eq!(run.meta.needs_two_stage_triggered, 1, "on 档同样触发补查");
+        assert_eq!(run.meta.needs_two_stage_skipped, 0);
+    }
+
+    /// 读守卫拒绝必须进报告 warnings（`deny_need_read` 契约 T46①②）：
+    /// 模型伸手要非 git-tracked 的路径，旧实现把 `w2` 收了又丢，只剩 stderr。
+    #[tokio::test]
+    async fn denied_need_read_is_disclosed_in_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() {\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "secret\n").unwrap();
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        g(&["init", "-q"]);
+        g(&["add", "a.rs"]);
+        g(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        let bundles = vec![Bundle::from_files(vec![FileChange { path: "a.rs".into(), diff: "@@ -1,1 +1,1 @@\n+fn a() {".into() }])];
+        // needs 指向未入库文件 → 守卫拒 → 必须留下 warning
+        let first = r#"{"findings":[],"needs":[{"path":"untracked.txt","reason":"peek"}]}"#;
+        let second = rev_json("fn a() {");
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(first), turn(&second)])), Duration::from_secs(5), 0);
+        let run = run_one(&reg, root, &bundles, ToolsMode::TwoStage).await;
+        assert!(
+            run.warnings.iter().any(|w| w.contains("untracked.txt")),
+            "守卫拒绝未披露: {:?}", run.warnings
+        );
     }
 }

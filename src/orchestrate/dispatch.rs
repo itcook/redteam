@@ -65,13 +65,13 @@ mod tests {
             .unwrap(),
             score: 9.0,
             kind: ItemKind::Suspicion,
-            family: Some("a".into()),
+            families: vec!["a".into()],
         });
         q.enqueue(EnqueueReq {
             spec: spec_rule("p.rs"),
             score: 0.1,
             kind: ItemKind::Primary,
-            family: None,
+            families: vec![],
         });
         let mut reg = ProviderRegistry::new();
         reg.insert_scan(
@@ -112,7 +112,7 @@ mod tests {
             spec: spec_rule("p.rs"),
             score: 1.0,
             kind: ItemKind::Primary,
-            family: None,
+            families: vec![],
         });
         let reg = ProviderRegistry::new();
         let err = match dispatch_one(&mut q, &reg, "ghost/x").await {
@@ -166,12 +166,12 @@ mod tests {
     async fn dispatch_order_and_drain_under_budget() {
         use crate::orchestrate::queue::EnqueueOutcome;
         let mut q = DeepQueue::new();
-        q.enqueue(EnqueueReq { spec: spec_rule("z.rs"), score: 0.1, kind: ItemKind::Primary, family: None });
+        q.enqueue(EnqueueReq { spec: spec_rule("z.rs"), score: 0.1, kind: ItemKind::Primary, families: vec![] });
         q.enqueue(EnqueueReq {
             spec: QueueItemSpec::new("s.rs".into(), vec![(1, 2)], QueueOrigin::Scan, vec![crate::domain::Suspicion {
                 file: "s.rs".into(), line_start: 1, line_end: 2, hint: "h".into(), category: None, confidence: 0.9, quote: "q".into(),
             }]).unwrap(),
-            score: 0.9, kind: ItemKind::Suspicion, family: Some("a".into()),
+            score: 0.9, kind: ItemKind::Suspicion, families: vec!["a".into()],
         });
         let mut reg = ProviderRegistry::new();
         reg.insert_scan("p/r", "p", 1, Box::new(FakeChatBackend::new(vec![turn()])), Duration::from_secs(5), 0);
@@ -185,6 +185,6 @@ mod tests {
         assert_eq!(q.pending_count(), 0);
         q.mark_settled(&i2.id, 1);
         drop(l2);
-        assert_eq!(q.enqueue(EnqueueReq { spec: spec_rule("z.rs"), score: 1.0, kind: ItemKind::Primary, family: None }), EnqueueOutcome::MergedSettled, "已结案沿用");
+        assert_eq!(q.enqueue(EnqueueReq { spec: spec_rule("z.rs"), score: 1.0, kind: ItemKind::Primary, families: vec![] }), EnqueueOutcome::MergedSettled, "已结案沿用");
     }
 }
