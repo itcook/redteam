@@ -195,12 +195,16 @@ coverage `failed` 数。
 - **组 pack `prepare_files` symlink 存量暴露**：本批只给 region 装配路径加 canonicalize+读帽；组 pack 路径来自 git diff（非模型可控），M21e 或安全债另记。
 
 
-## M21b 批 C 核查留债（2026-09-12，Trellis `09-10-m21b-deep`，修 4 条后剩余；批 D 接线前必看）
+## M21b 批 C 核查留债（2026-09-12，Trellis `09-10-m21b-deep`，修 4 条后剩余）
+
+> **已有主（2026-09-12）**：下列前两条（队列项身份、Skipped 复位）由**批 C1 Task C1-1** 承接——
+> 它们正是「当前不可触发、并发一开就真」的那类，必须在并发派发落地前解掉。第三条（`ItemKind::Needs`
+> 无生产路径）仍是纯记账，等 M21c 增量轮决定留删。
 
 - **`merge_into` 改写 `it.id` × 在途项**（`orchestrate/queue.rs`）：合并会 union ranges 后重算 id，而 InFlight 项已按
   旧 id 克隆派发 → 派发期并入会让 `mark_settled(&item.id)` 找不到项、卡在 InFlight，barrier 永不满足。**当前不可触发**
   （单派发器把全部入队放在消费循环前，在途期间队列不变），`live_agreement` 已按查不到退回派发值兜住观测面。
-  批 D 一旦引入在途入队（复核回灌 / 增量轮），必须先把队列项身份与 spec 解耦（id 固定，ranges 可变）。
+  批 C1 的并发派发一开即触发（多格同时在途时入队），Task C1-1 先把队列项身份与 spec 解耦（id 固定，ranges 可变）；批 D 的复核回灌同理。
 - **`merge_into` 命中 Skipped 项返回 `MergedPending` 但不改回 Pending**：并入后 agreement 升到 ≥2（进必挖集）也不会被
   重挖。同样因 drain 在消费循环前、其后无入队而不可触发；解法与上条同源。
 - **`ItemKind::Needs` / `QueueOrigin::Needs` 无生产路径**：needs 改走 cell 内二阶段补查轮（design §11 R2），
