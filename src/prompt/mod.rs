@@ -512,7 +512,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "missing auth".into(),
             body: "no check before db write".into(), file: "src/a.rs".into(),
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
-            models: vec!["claude".into()], agreement: 1,
+            models: vec!["claude".into()], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -542,7 +542,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "missing auth".into(),
             body: "no check before db write".into(), file: "src/a.rs".into(),
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
-            models: vec!["claude".into()], agreement: 1,
+            models: vec!["claude".into()], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -561,7 +561,7 @@ mod tests {
             id: "x".into(), severity: Severity::Medium, title: "fail-open on timeout".into(),
             body: "on timeout the guard falls through instead of denying".into(), file: "src/a.rs".into(),
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
-            models: vec!["claude".into()], agreement: 1,
+            models: vec!["claude".into()], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "if timeout { return Ok(()); }".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -581,7 +581,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "missing auth".into(),
             body: "no check before db write".into(), file: "src/a.rs".into(),
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
-            models: vec!["claude".into()], agreement: 1,
+            models: vec!["claude".into()], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -598,7 +598,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "injection via notes".into(),
             body: "b".into(), file: "src/a.rs".into(), line_start: 1, line_end: 1,
             confidence: 0.9, recommendation: "r".into(), models: vec![],
-            agreement: 1, hard_constraint: false, quote: "q".into(), cluster_id: None,
+            agreement: 1, suspicion_agreement: 0, hard_constraint: false, quote: "q".into(), cluster_id: None,
             verify: None, previously_dismissed: false, origin: Origin::New,
         };
         let card = |id: &str, file: &str, title: &str, reason: &str| DismissCard {

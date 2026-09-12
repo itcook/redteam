@@ -89,7 +89,15 @@ pub struct Finding {
     pub confidence: f32,
     pub recommendation: String,
     pub models: Vec<String>,
+    /// 认同**这条 finding** 的模型数（`dedup::merge_into` 里 = `models.len()`）——finding 的可信度轴，
+    /// `consolidate::verify` 的孤证复核（`agreement == 1`）建在它上面。
     pub agreement: u32,
+    /// 这条 finding 所在**区域**被几个独立 scanner 家族标记过（深挖队列项落地时刻的 agreement，
+    /// 后涨不回溯〔D13〕）——区域可疑度轴，与 `agreement` 不同维度：三个 scanner 都盯过这段，
+    /// 不代表 reviewer 报的这条更可信。批 D 跳过复核的判据（design §8.1：疑点 agreement ≥ 2
+    /// ∧ reviewer 确认 = 三方一致 → 免复核）。0 = 非深挖产出 / 旧报告。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub suspicion_agreement: u32,
     pub hard_constraint: bool,
     /// 逐字引用（positioning 锚定依据，序列化进输出）。
     pub quote: String,
@@ -106,6 +114,7 @@ pub struct Finding {
 }
 
 fn is_false(b: &bool) -> bool { !*b }
+fn is_zero(n: &u32) -> bool { *n == 0 }
 
 /// targeted-verify（S3-b）的判定：upheld=守住反驳（finding 成立）、refuted=被证伪。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,7 +179,7 @@ mod tests {
         let f = Finding {
             id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), models: vec![], agreement: 1,
+            recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -183,7 +192,7 @@ mod tests {
         let mut f = Finding {
             id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), models: vec![], agreement: 1,
+            recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
             previously_dismissed: false, origin: Origin::New,
         };
@@ -246,6 +255,7 @@ pub(crate) mod fixtures {
             recommendation: "r".into(),
             models: vec![model.into()],
             agreement,
+            suspicion_agreement: 0,
             hard_constraint: false,
             quote: "q".into(),
             previously_dismissed: false,

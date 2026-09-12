@@ -342,7 +342,7 @@ mod tests {
     fn f(sev: Severity) -> Finding {
         Finding { id: "x".into(), severity: sev, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
-            recommendation: "r".into(), models: vec![], agreement: 1,
+            recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, quote: "snippet".into(), cluster_id: None, verify: None,
             previously_dismissed: false, origin: Origin::New }
     }

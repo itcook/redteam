@@ -21,7 +21,9 @@ use crate::provider::{timed_turn_final_with, timed_turn_with, AttemptPolicy, Pro
 #[derive(Clone, Debug)]
 pub struct FindingEvent {
     pub finding: Finding,
-    pub agreement: u32,
+    /// 区域被几个 scanner 家族标记过（= `Finding.suspicion_agreement`）——批 D 跳过复核的判据，
+    /// **不是**认同这条 finding 的模型数（那是 `Finding.agreement`）。
+    pub suspicion_agreement: u32,
     pub reviewer_family: String,
 }
 
@@ -38,7 +40,9 @@ impl FindingSink for () {
 pub(crate) struct EmitCtx<'a> {
     model: &'a str,
     family: &'a str,
-    agreement: u32,
+    /// 队列项落地时刻的疑点共识（家族数）——盖到 `Finding.suspicion_agreement`。
+    /// **不碰** `Finding.agreement`：那是认同这条 finding 的模型数，由 `dedup` 算定。
+    suspicion_agreement: u32,
     root: &'a Path,
     sink: &'a dyn FindingSink,
     /// 已发射 finding.id——旁路发过的，终判不补发。
@@ -49,11 +53,11 @@ impl<'a> EmitCtx<'a> {
     pub(crate) fn new(
         model: &'a str,
         family: &'a str,
-        agreement: u32,
+        suspicion_agreement: u32,
         root: &'a Path,
         sink: &'a dyn FindingSink,
     ) -> Self {
-        EmitCtx { model, family, agreement, root, sink, emitted: HashSet::new() }
+        EmitCtx { model, family, suspicion_agreement, root, sink, emitted: HashSet::new() }
     }
 
     /// 首次见到该 id 才发射（旁路 / 终判同一去重面）。
@@ -63,7 +67,7 @@ impl<'a> EmitCtx<'a> {
         }
         self.sink.on_finding(FindingEvent {
             finding: f.clone(),
-            agreement: self.agreement,
+            suspicion_agreement: self.suspicion_agreement,
             reviewer_family: self.family.to_string(),
         });
     }
@@ -104,7 +108,7 @@ fn sum_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 fn emit_raw(raws: Vec<crate::domain::RawFinding>, ctx: &mut EmitCtx) {
     for raw in raws {
         let mut f = enrich(&raw, ctx.model);
-        f.agreement = ctx.agreement;
+        f.suspicion_agreement = ctx.suspicion_agreement;
         f.models = vec![ctx.model.to_string()];
         ctx.emit(&f);
     }
@@ -211,7 +215,7 @@ fn finish_parse(
 
     let mut final_findings = Vec::new();
     for mut f in kept {
-        f.agreement = ctx.agreement;
+        f.suspicion_agreement = ctx.suspicion_agreement;
         ctx.emit(&f);
         final_findings.push(f);
     }
@@ -300,10 +304,13 @@ mod tests {
         .unwrap();
         let events = rec.0.lock().unwrap();
         assert_eq!(events.len(), 2, "两条各发一次");
-        assert!(events.iter().all(|e| e.agreement == 2 && e.reviewer_family == "alpha"));
+        assert!(events.iter().all(|e| e.suspicion_agreement == 2 && e.reviewer_family == "alpha"));
         let CellOutput::Review { findings, .. } = &call.output else { panic!() };
         assert_eq!(findings.len(), 2);
-        assert_eq!(findings[0].agreement, 2);
+        // 队列共识落在 suspicion_agreement；agreement 仍是「认同这条 finding 的模型数」，
+        // 由 enrich 起手 1、dedup 按 models.len() 算定——深挖不得代笔（design §8.1 两条规则各读各的轴）。
+        assert_eq!(findings[0].suspicion_agreement, 2);
+        assert_eq!(findings[0].agreement, 1, "单 reviewer 产出 → 模型数 1，不被疑点共识顶高");
         assert_eq!(call.stats.stream_discarded, 0);
         assert_eq!(call.iterations, 1);
         let ids: HashSet<_> = events.iter().map(|e| e.finding.id.clone()).collect();

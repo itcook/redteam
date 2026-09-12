@@ -388,7 +388,7 @@ fn result_md_three_states() {
             confidence: 0.9,
             recommendation: "validate".into(),
             models: vec!["m".into()],
-            agreement: 1,
+            agreement: 1, suspicion_agreement: 0,
             hard_constraint: false,
             quote: "db.write(token);".into(),
             cluster_id: None,

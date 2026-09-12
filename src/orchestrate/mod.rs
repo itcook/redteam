@@ -64,6 +64,8 @@ pub fn enrich(raw: &RawFinding, model: &str) -> Finding {
         recommendation: raw.recommendation.clone(),
         models: vec![model.to_string()],
         agreement: 1,
+        // 区域疑点共识由深挖侧回填（`EmitCtx`）；scanner / 非深挖路径留 0。
+        suspicion_agreement: 0,
         hard_constraint: raw.hard_constraint,
         quote: raw.quote.clone(),
         previously_dismissed: false,

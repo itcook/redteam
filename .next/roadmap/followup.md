@@ -226,3 +226,23 @@ coverage `failed` 数。
   文档口径：turn 内回传是 **Required**；好消息是缺失通常「degrade gracefully」（静默禁用思考，
   不报错），**被改动过**的块才 400。要真正吃到 interleaved thinking 就得让 ChatMessage 带上
   thinking 块并原样回传（动数据结构 + SSE 解析，M21c）。
+
+## Finding 的两根 agreement 轴（2026-09-12 拆分，批 D 接线必读）
+
+design §7 写「落地的 finding 继承记录当时的 agreement〔D13〕」、§8.1 的跳过规则又说「疑点
+agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与 `dedup::merge_into` 里既有的
+`agreement = models.len()`（认同该 finding 的模型数，`consolidate::verify` 孤证复核的判据）
+撞名。批 C 照 design 字面实现，把队列值盖进 `Finding.agreement`，两种语义挤在一个字段。
+
+**已拆**（`Finding` 新增字段，serde default + 0 时不序列化，旧报告可读）：
+
+| 轴 | 字段 | 谁写 | 谁读 |
+|---|---|---|---|
+| finding 可信度 | `agreement` | `enrich` 起手 1；`dedup::merge_into` = `models.len()` | 孤证复核 `agreement == 1 ∧ severity ≥ block` |
+| 区域可疑度 | `suspicion_agreement` | 深挖 `EmitCtx`（队列项**落地时刻**值，后涨不回溯） | 批 D 跳过规则 `≥ 2 ∧ reviewer 确认` |
+
+- dedup 合并：`agreement` 按 models 重算，`suspicion_agreement` 取 max（区域属性，非模型属性）。
+- `FindingEvent.suspicion_agreement` 同名同义；scanner / 非深挖路径留 0。
+- **批 D 写跳过规则时读 `suspicion_agreement`，不要读 `agreement`**——后者在单 reviewer 配置下
+  恒为 1，用它判跳过等于永不跳过。
+- design §7/§8.1 的行文仍是旧词，读到 `agreement` 需按上表对照（文档不改，避免与历史记录打架）。
