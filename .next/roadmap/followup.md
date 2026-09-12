@@ -206,3 +206,23 @@ coverage `failed` 数。
 - **`ItemKind::Needs` / `QueueOrigin::Needs` 无生产路径**：needs 改走 cell 内二阶段补查轮（design §11 R2），
   队列 Needs 层与 `DeepMeta.enqueue_reasons["needs"]` 恒空。prd 的四层优先级实际只有三层活——保留枚举作 M21c
   增量轮的入队口，或届时删。
+
+## Anthropic thinking 两处真债（2026-09-12 查证官方文档立项；批 C 守卫已按此更正）
+
+批 C 曾加过一版「tools 非空即丢弃 Anthropic 思考参数」的守卫，前提错误已删（官方文档：
+「Thinking works alongside tool use」；两条约束是 tool_choice 强制工具、thinking block 原样回传，
+都与「有没有 tools」无关，而我们的 body 既不设 tool_choice 也不设 temperature/top_p）。
+真正会 400 的是下面两条，**当前 Anthropic body 路径走不到**（三 provider 全 openai kind），
+配 Anthropic 直连前必须先清：
+
+- **`type:"enabled"` 在 Claude 4.7+ 上直接 400**（文档点名 Opus 4.7/4.8、Opus 5、Sonnet 5、
+  Fable 5/5.1、Mythos 5/5.1；4.6 为 deprecated 但仍成功）。而 `thinking_params`
+  （`backends.rs`，anthropic+claude 分支）恒生成 `{"type":"enabled","budget_tokens":N}`
+  ——**单发无工具路径同样中招**，与 tools 无关。出路 = 按 id 判版本后改发
+  `thinking:{type:"adaptive"}` + `output_config:{effort:…}`（M21c 随 effort 档位一起迁）；
+  过渡期至少给一条 warning，别让用户以为思考档生效了。
+- **thinking block 不回传**：`ChatMessage::Assistant{text, tool_calls}` 结构里没有 thinking 字段，
+  SSE 的 `thinking_delta` 直接丢弃，多轮 tool loop 的 assistant 消息因此不带 thinking 块。
+  文档口径：turn 内回传是 **Required**；好消息是缺失通常「degrade gracefully」（静默禁用思考，
+  不报错），**被改动过**的块才 400。要真正吃到 interleaved thinking 就得让 ChatMessage 带上
+  thinking 块并原样回传（动数据结构 + SSE 解析，M21c）。

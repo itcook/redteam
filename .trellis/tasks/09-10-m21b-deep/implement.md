@@ -21,7 +21,9 @@
 - [x] 单派发器：`lease` × pop 最高 Pending（`dispatch_one`）；空队列不占门
 - [x] `src/orchestrate/review_shot.rs`：`FindingEvent` + `FindingSink`（`()` no-op）；`run_review_shot`（旁路/终判按 id 去重 + 必调 `finalize`）
 - [x] `ReviewParseStats.stream_discarded` ← `discarded()`；与 `dropped_quote` 分列
-- [x] 顺手：anthropic thinking×tools 守卫（tools 非空丢思考参数）；`--tools` 二阶段 + 触发/跳过计数；`AttemptPolicy` 生产调用点已统一 Some(policy)（single_shot/tool_loop 適 K11 不动）
+- [x] 顺手：`--tools` 二阶段 + 触发/跳过计数（`on` 档同触发，评审第 2 档修）；`AttemptPolicy` 生产调用点已统一 Some(policy)（single_shot/tool_loop 遵 K11 不动）
+- [x] ~~anthropic thinking×tools 守卫~~ **已撤销**（2026-09-12 查证官方文档：「Thinking works alongside tool use」，前提错误）——
+      守卫在静默关掉用户配的思考档；真 400 源是模型版本（4.7+ 拒 `type:"enabled"`）与 thinking block 不回传，两条记 followup
 - [x] 测试：Fake 429 注入（门收 4→1，单请求速率型棘轮形状）；派发序 + 门宽 1 串行；二阶段触发 e2e；restore 不双计
 - [x] 测试：超时路径 finalize + 已闭合保留（核查补——`b93a7d9` 前首轮/REPAIR 轮 turn 返 Err 均未 finalize，实测 discarded == 0）
 - [ ] Commit: `feat(orchestrate): 门驱动派发器+reviewer cell 运行时——流式落盘+FindingEvent 发射（design §6 规则 5/§7）`

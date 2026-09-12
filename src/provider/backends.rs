@@ -100,9 +100,12 @@ pub(crate) fn build_anthropic_tools_body_ext(
     let mut body = serde_json::Map::new();
     body.insert("model".into(), json!(model));
     body.insert("max_tokens".into(), json!(max_tokens));
-    // thinking×tools 守卫（M21b 批 C 顺手项，followup）：Anthropic thinking{enabled} 与工具往返同发会 400——
-    // tools 非空时丢弃思考参数对（工具循环优先能跑；单发无工具路径不受影响，thinking 照发）。
-    for (k, v) in thinking.unwrap_or(&[]).iter().filter(|_| tools.is_empty()) {
+    // thinking 与 tools 共存：官方文档「Thinking works alongside tool use」，两条约束都不落在本 body——
+    // ① tool_choice 强制工具（any / tool）才与 manual thinking 冲突，我们不设该键（默认 auto）；
+    // ② thinking block 须随 tool_result 原样回传（见 followup：ChatMessage 无 thinking 字段，M21c 债）。
+    // 曾有一版「tools 非空即丢弃思考参数」的守卫（批 C 顺手项），前提是错的：真正会 400 的是
+    // 模型版本（Claude 4.7+ 拒 type:"enabled"）与被改动的 thinking block，两者都不是「有没有 tools」。
+    for (k, v) in thinking.unwrap_or(&[]) {
         body.insert((*k).into(), v.clone());
     }
     // system 为空时省略该键，与 OpenAI 的 tool_calls 省略策略保持对称。
@@ -1664,17 +1667,23 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         assert!(get(Openai, "grok", Low, 32768).is_none() && get(Google, "gemini", Low, 32768).is_none());
     }
 
-    /// thinking×tools 守卫（M21b 批 C）：tools 非空时丢弃思考参数对；tools 空（单发）照发。
+    /// thinking × tools 共存（2026-09-12 按官方文档更正：「Thinking works alongside tool use」）。
+    /// 曾有一版守卫在 tools 非空时丢弃思考参数，前提是错的——Anthropic 的两条约束是
+    /// ① tool_choice 强制工具（我们不设该键）② thinking block 原样回传，都与「有没有 tools」无关。
+    /// 真正的 400 源是模型版本（4.7+ 拒 type:"enabled"）与被改动的 thinking block，见 followup。
     #[test]
-    fn anthropic_guard_drops_thinking_when_tools_present() {
+    fn anthropic_thinking_survives_tools_in_body() {
         let msgs = vec![ChatMessage::System("sys".into()), ChatMessage::User("go".into())];
         let tool = crate::tools::ToolSpec { name: "read", description: "d", parameters: serde_json::json!({}) };
         let th = thinking_params(ProviderKind::Anthropic, "claude", "claude-x", ThinkingLevel::Low, MAX_TOKENS).unwrap();
         let with_tools = build_anthropic_tools_body_ext("claude-x", &msgs, &[tool], MAX_TOKENS, Some(&th));
-        assert!(with_tools.get("thinking").is_none(), "工具往返与 thinking 同发会 400，守卫丢弃");
-        assert!(with_tools["tools"].as_array().unwrap().len() == 1);
+        assert_eq!(with_tools["thinking"]["type"], "enabled", "工具在场不该丢用户配的思考档");
+        assert!(with_tools["thinking"]["budget_tokens"].as_u64().unwrap() >= 1024);
+        assert_eq!(with_tools["tools"].as_array().unwrap().len(), 1);
+        assert!(with_tools.get("tool_choice").is_none(), "不设 tool_choice → 默认 auto，与 thinking 相容");
+        assert!(with_tools.get("temperature").is_none() && with_tools.get("top_p").is_none());
         let no_tools = build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, Some(&th));
-        assert_eq!(no_tools["thinking"]["type"], "enabled", "无工具路径不受影响");
+        assert_eq!(no_tools["thinking"]["type"], "enabled");
     }
 
     /// 批 F-2：参数对进请求体；`None` 与不带参数版逐字节相同（既有 body 测试的基线不受影响）。
