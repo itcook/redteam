@@ -194,3 +194,15 @@ coverage `failed` 数。
 - **双 Origin 同名**：`pack::region::Origin`（rule/scan/needs）与 `domain::finding::Origin`（carried/new）serde 都是小写词表——`QueueItem` 导入时改名或互指 doc，勿混队列来源与 finding 出身。
 - **组 pack `prepare_files` symlink 存量暴露**：本批只给 region 装配路径加 canonicalize+读帽；组 pack 路径来自 git diff（非模型可控），M21e 或安全债另记。
 
+
+## M21b 批 C 核查留债（2026-09-12，Trellis `09-10-m21b-deep`，修 4 条后剩余；批 D 接线前必看）
+
+- **`merge_into` 改写 `it.id` × 在途项**（`orchestrate/queue.rs`）：合并会 union ranges 后重算 id，而 InFlight 项已按
+  旧 id 克隆派发 → 派发期并入会让 `mark_settled(&item.id)` 找不到项、卡在 InFlight，barrier 永不满足。**当前不可触发**
+  （单派发器把全部入队放在消费循环前，在途期间队列不变），`live_agreement` 已按查不到退回派发值兜住观测面。
+  批 D 一旦引入在途入队（复核回灌 / 增量轮），必须先把队列项身份与 spec 解耦（id 固定，ranges 可变）。
+- **`merge_into` 命中 Skipped 项返回 `MergedPending` 但不改回 Pending**：并入后 agreement 升到 ≥2（进必挖集）也不会被
+  重挖。同样因 drain 在消费循环前、其后无入队而不可触发；解法与上条同源。
+- **`ItemKind::Needs` / `QueueOrigin::Needs` 无生产路径**：needs 改走 cell 内二阶段补查轮（design §11 R2），
+  队列 Needs 层与 `DeepMeta.enqueue_reasons["needs"]` 恒空。prd 的四层优先级实际只有三层活——保留枚举作 M21c
+  增量轮的入队口，或届时删。

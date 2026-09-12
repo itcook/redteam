@@ -23,6 +23,7 @@
 - [x] `ReviewParseStats.stream_discarded` ← `discarded()`；与 `dropped_quote` 分列
 - [x] 顺手：anthropic thinking×tools 守卫（tools 非空丢思考参数）；`--tools` 二阶段 + 触发/跳过计数；`AttemptPolicy` 生产调用点已统一 Some(policy)（single_shot/tool_loop 適 K11 不动）
 - [x] 测试：Fake 429 注入（门收 4→1，单请求速率型棘轮形状）；派发序 + 门宽 1 串行；二阶段触发 e2e；restore 不双计
+- [x] 测试：超时路径 finalize + 已闭合保留（核查补——`b93a7d9` 前首轮/REPAIR 轮 turn 返 Err 均未 finalize，实测 discarded == 0）
 - [ ] Commit: `feat(orchestrate): 门驱动派发器+reviewer cell 运行时——流式落盘+FindingEvent 发射（design §6 规则 5/§7）`
 
 ### C-4 barrier 与 reduce 接线
@@ -46,7 +47,9 @@
 
 ### C-7 收口
 - [ ] 本仓 dogfood：`redteam-next review --base <recent>` 真 provider 产 finding
-- [ ] `cargo test` / `clippy --all-targets` 零新增 / `make verify`
+- [x] `cargo test`（lib 639 / e2e 17 / packaging 7 / cli 17）/ `clippy --all-targets` 零新增（7 = 基线逐条一致）/ `make verify` 全绿
+- [x] 自查修 4 条（`b93a7d9`）：resume 空变更集 panic、错误路径漏 finalize、resume 丢 spec 段、landed agreement 死值；
+      余 3 条不可触发项记 `.next/roadmap/followup.md`「批 C 核查留债」
 - [ ] ship 评审（dev `redteam`；config schema 错位则走三路 code-review 如批 B）→ 修 → `--no-ff` 合回
 - [ ] Commit: 评审修（如有）
 
