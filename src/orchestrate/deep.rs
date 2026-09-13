@@ -42,6 +42,8 @@ pub struct DeepRun {
     pub warnings: Vec<String>,
     /// reviewer cell 重试耗尽。
     pub reviewer_failed: bool,
+    /// 往轮已落盘、本轮沿用未重挖的成功格（resume 回填，进 `coverage.reused`；`run_deep` 恒空）。
+    pub reused_cells: Vec<CellRecord>,
 }
 
 pub struct DeepInput<'a> {
@@ -86,7 +88,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                 "deep: 变更集为空（diff 已不可重建），队列未完项无法重跑——带债收口".into(),
             );
         }
-        return DeepRun { findings: prior_findings, cells: vec![], meta, warnings, reviewer_failed: unfinished };
+        return DeepRun { findings: prior_findings, cells: vec![], meta, warnings, reviewer_failed: unfinished, reused_cells: vec![] };
     }
 
     let mut q = match input.restore {
@@ -113,7 +115,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
     }
 
     let Some(rev) = input.reviewers.first() else {
-        return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false };
+        return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false, reused_cells: vec![] };
     };
     let idx = cross_index(input.bundles, &[], None);
     let opts = PackOpts::from(input.pack);
@@ -292,6 +294,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
         meta,
         warnings,
         reviewer_failed,
+        reused_cells: vec![],
     }
 }
 

@@ -312,3 +312,8 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
   meta 四数组 push 时点不一，批 C 串行下只要有失败格就已错位。C1 定案：报告按派发序组装、meta 按派发序对齐。
 - **reviewer 模型去留的数据口径**：批 C dogfood grok-4.6 0 条 vs glm-5.3 13 条（同变更集同 12 格）。C1 定案不引入权重（design「无 priority」），
   C1-5 dogfood 混合池统计每模型每格产出，作为配置去留依据。
+- ✅ **resume / partial 报告把 reviewer 格当失败的 scanner 格（批 C 遗留，C1-1 测试暴露，C1-1 后单独修）**：`run_resume` 收口与
+  `partial_report` 把 cells 表全量喂 scan-only 收口，`scan_cells_from_records` 把非 scanner 记录判失败 → 假 `scan incomplete` 警告、
+  `coverage.failed[Scanner]` 列 reviewer 格；深挖跑完、零 finding、收尾被 kill 的作业 resume 后误判 **Incomplete / exit 3**（应 Approve / 0）。
+  修法：两处按角色拆记录，scanner 格走 scan-only 收口，reviewer 格按自身角色进 coverage——resume 往轮成功且本轮未重挖的记
+  `reused[Reviewer]`（`DeepRun.reused_cells`），partial 记 completed / failed；partial 的「partial: done/total」只数 scanner 格。

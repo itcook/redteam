@@ -461,7 +461,8 @@ fn overlay_deep(
     // 此时绝不能重算 verdict：`compute_verdict([], …)` 会把「没挖」说成 Approve——正是
     // r1 20260703 的干净树假绿灯。报告保持 scan-only 形态与退出码，deep 观测段照进（可观测 ≠ 改判）。
     // 注意 findings 非空要走下面的正常收口：resume 全 Settled 时这轮确实 0 格，但成果在。
-    if deep.cells.is_empty() && !failed && skipped == 0 && findings.is_empty() {
+    // 沿用格（resume 往轮挖过）同样算「深挖发生过」：零 finding 的已完成深挖是 Approve，不是 scan-only。
+    if deep.cells.is_empty() && deep.reused_cells.is_empty() && !failed && skipped == 0 && findings.is_empty() {
         report.run.deep = Some(deep.meta);
         report.run.warnings.extend(deep.warnings);
         return (report, scan_code);
@@ -475,25 +476,8 @@ fn overlay_deep(
             "deep: skipped(budget) {skipped} item(s) — disclosed, not in verdict"
         ));
     }
-    let rev_ids: Vec<String> = deep.cells.iter().map(|c| c.cell.clone()).collect();
-    if !rev_ids.is_empty() {
-        report.run.coverage.selected.insert(Role::Reviewer, rev_ids.clone());
-        let ok: Vec<String> = deep.cells.iter().filter(|c| c.ok).map(|c| c.cell.clone()).collect();
-        let bad: Vec<String> = deep.cells.iter().filter(|c| !c.ok).map(|c| c.cell.clone()).collect();
-        if !ok.is_empty() {
-            report.run.coverage.completed.insert(Role::Reviewer, ok);
-        }
-        if !bad.is_empty() {
-            report.run.coverage.failed.insert(Role::Reviewer, bad);
-        }
-    }
-    for rec in &deep.cells {
-        report.run.usage.input_tokens += rec.input_tokens;
-        report.run.usage.output_tokens += rec.output_tokens;
-        report.run.usage.cached_input_tokens += rec.cached_input_tokens;
-        report.run.cells.push(CellSummary::from_record(rec));
-    }
-    report.cells.extend(deep.cells);
+    fold_role_cells(&mut report, deep.reused_cells, true);
+    fold_role_cells(&mut report, deep.cells, false);
     let h = crate::prompt::template_hashes();
     report.run.template_hashes.insert("reviewer_tail".into(), h.reviewer_tail.clone());
     let block = args.block_threshold.as_deref()
@@ -507,6 +491,28 @@ fn overlay_deep(
         report.run.warnings.push("reviewer debt: failed cell or budget skip — approve with exit 2".into());
     }
     (report, exit_code(verdict, debt))
+}
+
+/// 把 scan-only 收口之外的格（reviewer / verifier）并进报告：coverage 按记录自身角色记（追加、不覆盖同角色已有项）——
+/// selected 全列，`reused` → reused，否则成功 → completed、失败 → failed；usage、`run.cells` 摘要、顶层 `cells` 同步。
+/// scan-only 收口只吃 scanner 格：把别的角色喂进去会被 `scan_cells_from_records` 判成失败的 scanner 格（假 `scan incomplete`）。
+fn fold_role_cells(report: &mut ReviewReport, recs: Vec<CellRecord>, reused: bool) {
+    let cov = &mut report.run.coverage;
+    for rec in &recs {
+        let role = rec.role();
+        cov.selected.entry(role).or_default().push(rec.cell.clone());
+        let bucket = match (reused, rec.ok) {
+            (true, _) => &mut cov.reused,
+            (false, true) => &mut cov.completed,
+            (false, false) => &mut cov.failed,
+        };
+        bucket.entry(role).or_default().push(rec.cell.clone());
+        report.run.usage.input_tokens += rec.input_tokens;
+        report.run.usage.output_tokens += rec.output_tokens;
+        report.run.usage.cached_input_tokens += rec.cached_input_tokens;
+        report.run.cells.push(CellSummary::from_record(rec));
+    }
+    report.cells.extend(recs);
 }
 
 /// scan-only 报告收口的输入（全量 / resume / partial 三路共用，批 F-3 / F-5）。
@@ -988,7 +994,9 @@ pub fn attach_cells(store: &crate::state::JobStore, job_id: &str, report: &mut R
 /// `run.cells` / 顶层 `cells` 一致（评审修 2）。M 取 manifest 行数（若尚未写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
 fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) -> (ReviewReport, i32) {
     let manifest = store.read_manifest(job_id);
-    let records: Vec<CellRecord> = store.read_partial(job_id);
+    // manifest 只列 scanner 格：进度与 scan-only 收口都只数 scanner 记录；深挖期落盘的 reviewer 格按自己的角色另记。
+    let (records, deep_records): (Vec<CellRecord>, Vec<CellRecord>) =
+        store.read_partial(job_id).into_iter().partition(|r| r.role() == Role::Scanner);
     let done = records.iter().filter(|r| r.ok).count();
     let total = manifest.len().max(records.len());
     let results = ScanResults { cells: scan_cells_from_records(records), ..Default::default() };
@@ -1011,6 +1019,7 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
         job_id: job_id.to_string(),
         reused: vec![],
     });
+    fold_role_cells(&mut report, deep_records, false);
     report.verdict = Verdict::Incomplete;
     let code = exit_code(Verdict::Incomplete, false);
     (report, code)
@@ -1130,12 +1139,14 @@ pub async fn run_resume(
         ));
     }
 
-    // 收口：全部记录（已完成 + 新补 + 失败）；组骨架 / 分组观测 / head_sha / 覆盖自报 / dossier 从原报告沿用（resume 不重收集证据）。
-    let final_records = store.read_partial(job_id);
+    // 收口：全部 scanner 记录（已完成 + 新补 + 失败）；组骨架 / 分组观测 / head_sha / 覆盖自报 / dossier 从原报告沿用（resume 不重收集证据）。
+    // scanner 格走 scan-only 收口；深挖落盘的 reviewer 格另记（喂进 scan 收口会被判成失败的 scanner 格 → 假 Incomplete）。
+    let (scan_records, deep_records): (Vec<CellRecord>, Vec<CellRecord>) =
+        store.read_partial(job_id).into_iter().partition(|r| r.role() == Role::Scanner);
     let ok_cells: std::collections::BTreeSet<&str> =
-        final_records.iter().filter(|r| r.ok).map(|r| r.cell.as_str()).collect();
+        scan_records.iter().filter(|r| r.ok).map(|r| r.cell.as_str()).collect();
     let still_missing = manifest.iter().filter(|c| !ok_cells.contains(c.cell.as_str())).count();
-    let reused: Vec<String> = final_records.iter().filter(|r| r.ok && done.contains(&r.cell)).map(|r| r.cell.clone()).collect();
+    let reused: Vec<String> = scan_records.iter().filter(|r| r.ok && done.contains(&r.cell)).map(|r| r.cell.clone()).collect();
     let model_names: Vec<String> = roles.scanners.iter().map(|m| m.name.clone()).collect();
     let ledger = match load_ledger(args.dismissed.as_deref(), args.no_dismissed, cwd) {
         Ok(l) => l,
@@ -1150,7 +1161,7 @@ pub async fn run_resume(
         .map(|sc| sc.groups.iter().map(|g| ScanGroup { label: g.label.clone(), files: g.files.clone(), cells: vec![], suspicions: 0, pack: g.pack.clone() }).collect())
         .unwrap_or_default();
     warnings.extend(registry.gate_warnings()); // D13：补跑期间撞过 429 的 provider 收敛记录
-    let results = ScanResults { cells: scan_cells_from_records(final_records.clone()), ..Default::default() };
+    let results = ScanResults { cells: scan_cells_from_records(scan_records.clone()), ..Default::default() };
     let (mut report, mut code) = finish_scan_report(ScanFinish {
         groups,
         scanned_coverage: prior.as_ref().and_then(|r| r.scan.as_ref()).and_then(|sc| sc.scanned_coverage),
@@ -1181,7 +1192,7 @@ pub async fn run_resume(
     // 报告覆盖掉上一轮的成果（deep 已跑完才被 kill 的作业就是这样丢结果的）。
     if still_missing == 0 && !roles.reviewers.is_empty() && !queue_snap.is_empty() {
         {
-            let reopened = reopen_settled_without_ok_cell(&mut queue_snap, &final_records);
+            let reopened = reopen_settled_without_ok_cell(&mut queue_snap, &deep_records);
             if reopened > 0 {
                 report.run.warnings.push(format!(
                     "resume deep: {reopened} settled item(s) have no successful reviewer cell — re-digging"
@@ -1189,7 +1200,7 @@ pub async fn run_resume(
             }
             let branch_scope = args.scope == "branch";
             // 已落盘 reviewer 格里的 finding——深挖的权威成果，无论后面走哪条路都不能丢。
-            let prior_findings: Vec<crate::domain::Finding> = final_records
+            let prior_findings: Vec<crate::domain::Finding> = deep_records
                 .iter()
                 .flat_map(|r| r.output.findings().to_vec())
                 .collect();
@@ -1207,6 +1218,7 @@ pub async fn run_resume(
                         meta: Default::default(),
                         warnings: vec![],
                         reviewer_failed: unfinished,
+                        reused_cells: deep_records.iter().filter(|r| r.ok).cloned().collect(),
                     };
                     return overlay_deep(report, code, deep, &args, cfg, registry, t0);
                 }
@@ -1257,6 +1269,11 @@ pub async fn run_resume(
                 &(),
             )
             .await;
+            let mut deep = deep;
+            // 沿用 = 往轮的成功格且本轮没重挖（同名格被本轮 upsert 覆盖的以本轮为准）；往轮失败格的项已按
+            // 「Settled 以成功格为准」重开——要么本轮重挖覆盖，要么（换了 reviewer）旧失败格作废、不再报。
+            let redone: std::collections::BTreeSet<&str> = deep.cells.iter().map(|c| c.cell.as_str()).collect();
+            deep.reused_cells = deep_records.iter().filter(|r| r.ok && !redone.contains(r.cell.as_str())).cloned().collect();
             let over = overlay_deep(report, code, deep, &args, cfg, registry, t0);
             report = over.0;
             code = over.1;
@@ -2164,6 +2181,9 @@ mod resume_tests {
         let (report, _code) = run_resume("j", &reg, &cfg, ws, &store).await;
 
         assert_eq!(report.findings.len(), 1, "已挖出的 finding 必须留在报告里: {:?}", report.run.warnings);
+        // diff 重建失败分支（ws 非 git 仓）同样不许把 reviewer 格当失败的 scanner 格
+        assert!(!report.run.coverage.failed.contains_key(&Role::Scanner), "{:?}", report.run.coverage);
+        assert_eq!(report.run.coverage.reused.get(&Role::Reviewer), Some(&vec!["review[c.rs:rule:1-2]@p/r".to_string()]));
         if let Some(stored) = store.read_result("j") {
             let stored: ReviewReport = serde_json::from_str(&stored).unwrap();
             assert_eq!(stored.findings.len(), 1, "回写 proj.db 的报告不得把 finding 清空");
@@ -2256,6 +2276,41 @@ mod resume_tests {
         assert!(carried, "x.rs 的 finding 在 cells 表里必须仍有载体");
     }
 
+    /// resume 收口只把 scanner 格喂 scan-only 收口：批 C 把 cells 表全量喂进去，首跑落盘的 reviewer 格被当成
+    /// 「失败的 scanner 格」→ 假 `scan incomplete` + Incomplete / exit 3。深挖跑完、零 finding、收尾时被 kill 的作业
+    /// resume 后应是 Approve / 0，首跑的 reviewer 格记 `coverage.reused[Reviewer]`（与 scanner 沿用对称）。
+    #[tokio::test]
+    async fn resume_reports_prior_reviewer_cells_as_reused_not_failed_scanners() {
+        use crate::orchestrate::queue::ItemState;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        repo_with_changes(ws, &[("x.rs", "fn x() {\n    x_marker();\n}\n"), ("y.rs", "fn y() {\n    y_marker();\n}\n")]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        scan_done_job(&store);
+        store.put_queue_item("j", &rule_item("x.rs", ItemState::Settled)).unwrap();
+        // y.rs：格已落盘、快照仍 InFlight（kill 窗口）→ 本轮重挖、同名覆盖——报告里只算本轮完成，不再算沿用
+        store.put_queue_item("j", &rule_item("y.rs", ItemState::InFlight)).unwrap();
+        for f in ["x.rs", "y.rs"] {
+            let clean = CellRecord::ok(format!("review[{f}:rule:1-2]@p/r"), "p/r", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] });
+            store.append_partial("j", &clean).unwrap();
+        }
+        let (reg, rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+        let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        assert_eq!(rev.turn_count(), 1, "只重挖在途的 y.rs");
+        assert_eq!((report.verdict, code), (Verdict::Approve, 0), "warnings={:?}", report.run.warnings);
+        assert!(!report.run.warnings.iter().any(|w| w.contains("scan incomplete")), "{:?}", report.run.warnings);
+        let cov = &report.run.coverage;
+        assert!(cov.failed.is_empty(), "{cov:?}");
+        assert_eq!(cov.reused.get(&Role::Scanner), Some(&vec!["scan[g1]@p/m#1".to_string()]));
+        assert_eq!(cov.reused.get(&Role::Reviewer), Some(&vec!["review[x.rs:rule:1-2]@p/r".to_string()]));
+        assert_eq!(cov.completed.get(&Role::Reviewer), Some(&vec!["review[y.rs:rule:1-2]@p/r".to_string()]));
+        assert_eq!(cov.selected.get(&Role::Reviewer).map(Vec::len), Some(2));
+        assert!(!cov.selected.get(&Role::Scanner).into_iter().flatten().any(|c| c.starts_with("review[")), "{cov:?}");
+        assert_eq!(report.cells.len(), 3, "scanner 格 + 沿用 x + 本轮 y，各一条、不重复");
+    }
+
     /// 「Settled 以成功格为准」（C1-1）：快照 Settled 但没有该项的成功 reviewer 格 → resume 重挖。
     /// 无格 = cell 落盘失败而快照写成功（`on_cell` 只 warning）；只有失败格 = 首跑那格失败——
     /// 不重挖的话它的债（exit 2）在 resume 报告里被抹成干净通过。有成功格的项不动。
@@ -2283,8 +2338,11 @@ mod resume_tests {
         let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
 
         assert_eq!(rev.turn_count(), 2, "x.rs（无格）与 y.rs（只有失败格）重挖，z.rs 不动");
-        let dug: Vec<&str> = report.run.coverage.selected.get(&Role::Reviewer).into_iter().flatten().map(String::as_str).collect();
-        assert_eq!(dug, vec!["review[x.rs:rule:1-2]@p/r", "review[y.rs:rule:1-2]@p/r"], "warnings={:?}", report.run.warnings);
+        let cov = &report.run.coverage;
+        let names = |m: &BTreeMap<Role, Vec<String>>| m.get(&Role::Reviewer).cloned().unwrap_or_default();
+        assert_eq!(names(&cov.completed), vec!["review[x.rs:rule:1-2]@p/r", "review[y.rs:rule:1-2]@p/r"], "warnings={:?}", report.run.warnings);
+        assert_eq!(names(&cov.reused), vec!["review[z.rs:rule:1-2]@p/r"], "z.rs 的成功格沿用");
+        assert!(cov.failed.is_empty(), "y.rs 首跑的失败格已被重挖覆盖，不再报失败: {cov:?}");
         assert_eq!(code, 0, "重挖成功 → 首跑失败格的债已还清: {:?}", report.run.warnings);
     }
 
@@ -2632,6 +2690,33 @@ mod code_review_tests {
         assert_eq!(r.scan.as_ref().unwrap().stats.cells_failed, 1);
         assert!(r.run.warnings.iter().any(|w| w.starts_with("partial: 1/2")), "{:?}", r.run.warnings);
         assert_eq!(r.cells.len(), 2);
+    }
+
+    /// 深挖期超时 / 失败的 partial 报告：reviewer 格按自己的角色进 coverage，不冒充失败的 scanner 格
+    /// （否则 warnings 里出现点名 reviewer 格的 `scan incomplete`，失败归因指错阶段）。
+    #[test]
+    fn partial_report_files_reviewer_cells_under_their_own_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::state::JobStore::open(dir.path()).unwrap();
+        let scan = CellRecord::ok("scan[g1]@p/a#1", "p/a", crate::domain::CellOutput::Scan(Default::default()));
+        let mut rev_ok = CellRecord::ok("review[a.rs:rule:1-2]@p/r", "p/r", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] });
+        rev_ok.input_tokens = 5;
+        let rev_bad = CellRecord::failed("review[b.rs:rule:1-2]@p/r", "p/r", Role::Reviewer, "boom");
+        for rec in [&scan, &rev_ok, &rev_bad] {
+            store.append_partial("j", rec).unwrap();
+        }
+        let (r, code) = partial_report(&store, "j", "timed out: deadline exceeded".into());
+        assert_eq!((r.verdict, code), (Verdict::Incomplete, 3));
+        let cov = &r.run.coverage;
+        assert!(!cov.failed.contains_key(&Role::Scanner), "{cov:?}");
+        assert_eq!(cov.completed[&Role::Scanner], vec!["scan[g1]@p/a#1"]);
+        assert_eq!(cov.completed[&Role::Reviewer], vec!["review[a.rs:rule:1-2]@p/r"]);
+        assert_eq!(cov.failed[&Role::Reviewer], vec!["review[b.rs:rule:1-2]@p/r"]);
+        assert!(!r.run.warnings.iter().any(|w| w.contains("scan incomplete")), "{:?}", r.run.warnings);
+        assert!(r.run.warnings.iter().any(|w| w.starts_with("partial: 1/1")), "scan 进度只数 scanner 格: {:?}", r.run.warnings);
+        assert_eq!(r.scan.as_ref().unwrap().stats.cells_failed, 0);
+        assert_eq!(r.run.usage.input_tokens, 5, "reviewer 格的 usage 照样入账");
+        assert_eq!(r.cells.len(), 3);
     }
 
     /// 评审修 9：`thinking_pinned` 只在 (kind, family, id) 真有映射且会发出时为 true。
