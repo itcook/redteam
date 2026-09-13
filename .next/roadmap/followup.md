@@ -216,8 +216,10 @@ coverage `failed` 数。
 批 C 曾加过一版「tools 非空即丢弃 Anthropic 思考参数」的守卫，前提错误已删（官方文档：
 「Thinking works alongside tool use」；两条约束是 tool_choice 强制工具、thinking block 原样回传，
 都与「有没有 tools」无关，而我们的 body 既不设 tool_choice 也不设 temperature/top_p）。
-真正会 400 的是下面两条，**当前 Anthropic body 路径走不到**（三 provider 全 openai kind），
-配 Anthropic 直连前必须先清：
+真正会 400 的是下面两条。**注意这条路径是活的、不是备用**（2026-09-12 dogfood 实证）：`kind` 可在
+**模型级**覆盖 provider 级——实测 provider `agc` 声明 openai，其下 `grok-4.6` / `glm-5.3` 各自声明
+anthropic，reviewer 全程走 anthropic body。此前「三 provider 全 openai kind，此 body 走不到」的判断
+只看了 provider 级，已在代码注释与本条一并订正。因此下面第一条是**当下风险**而非将来时：
 
 - **`type:"enabled"` 在 Claude 4.7+ 上直接 400**（文档点名 Opus 4.7/4.8、Opus 5、Sonnet 5、
   Fable 5/5.1、Mythos 5/5.1；4.6 为 deprecated 但仍成功）。而 `thinking_params`
@@ -225,6 +227,10 @@ coverage `failed` 数。
   ——**单发无工具路径同样中招**，与 tools 无关。出路 = 按 id 判版本后改发
   `thinking:{type:"adaptive"}` + `output_config:{effort:…}`（M21c 随 effort 档位一起迁）；
   过渡期至少给一条 warning，别让用户以为思考档生效了。
+  **当下暴露面**：现配置的两个 anthropic-kind 模型 family 是 grok / glm，不在 thinking 映射表里
+  （`thinking_params` 的 anthropic 分支只认 `claude`）→ 实际不发 thinking 参数、暂不会 400，
+  RunMeta 里能看到「无参数映射，未发送」warning。但只要有人把 claude 模型配成 reviewer/verifier
+  （family=claude 有映射），4.7+ 就会立刻 400——这是**现在就能踩到**的坑，不是配直连才有。
 - **thinking block 不回传**：`ChatMessage::Assistant{text, tool_calls}` 结构里没有 thinking 字段，
   SSE 的 `thinking_delta` 直接丢弃，多轮 tool loop 的 assistant 消息因此不带 thinking 块。
   文档口径：turn 内回传是 **Required**；好消息是缺失通常「degrade gracefully」（静默禁用思考，
@@ -264,3 +270,24 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
 - **批 D 写跳过规则时读 `suspicion_agreement`，不要读 `agreement`**——后者在单 reviewer 配置下
   恒为 1，用它判跳过等于永不跳过。
 - design §7/§8.1 的行文仍是旧词，读到 `agreement` 需按上表对照（文档不改，避免与历史记录打架）。
+
+## 批 C dogfood 自评审未修项（2026-09-12，`redteam-next review --base 674583e`，reviewer = glm-5.3，13 条）
+
+真 provider 跑自己的变更集，reviewer 审的正是本批「两轴拆分」。已修 3 条（[1] 旁路发射跳过 quote 锚定、
+[2] 疑点共识取值时点与文档不符、[4] 两轴测试断言为空——删掉 `max` 行仍绿），下列留账：
+
+- **[3] dedup 合并谓词与队列合并谓词不同源**（medium/0.55）：队列按「同文件 ∧ 行重叠 ∧ quote 主锚」合并，
+  `is_same_bug` 按「同文件 ∧ 行重叠 ∧（标题 Jaccard ≥ 0.5 OR quote 重叠）」。于是两个在队列里**没合并**的项
+  （quote 不同、标题相近）产出的 finding 可能在 dedup 被合并，`suspicion_agreement` 取 max 时就用了另一项的
+  疑点共识——批 D 免复核信号跨项串值。批 D 定跳过规则时决定：dedup 合并 finding 时疑点共识取 max / 取 min /
+  拆开不合并。
+- **疑点共识双轴的表述张力**（[8][9][11][12]）：[11] 戳得准——`suspicion_agreement` 的文档说「三个 scanner 盯过
+  不代表 reviewer 报的这条更可信」，而 design §8.1 恰恰把免复核建在它上面。这是 design 的内在张力，不是注释写错：
+  §8.1 的「∧ reviewer 确认」是把区域可疑度转成 finding 可信度的那一步，批 D 需把「确认」落成可计算条件
+  （见本文件「两根 agreement 轴」决策点②）。
+- **[10] md 报告不展示 `suspicion_agreement`**（low）：JSON 有、Markdown 无。批 D 跳过规则落地后再决定展示形态
+  （纯数字没有解释力，得和「是否免复核」一起出）。
+- **[13] 事件载荷缺不变量断言**（low）：`FindingEvent.suspicion_agreement == ev.finding.suspicion_agreement`
+  无测试钉住。批 C1 处理事件滞后时一并加。
+- 误报：[5]（称 fixtures 模块为本批新建——实为既有）；[6]（称 plan 不在变更集——实在，疑 pack 截断）。
+- **`ReviewCall.finish_reason` 不进 `CellRecord`**：算出来了却没落盘，报告看不出哪格被截断（观测缺失，功能正常）。

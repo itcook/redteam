@@ -286,7 +286,12 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
     `snapshot` / `on_cell` 改 `Arc<dyn Fn + Send + Sync>`，改动面大一圈。仅当 A 被证明不够时才走。
 - barrier 保持 design §2 语义：Pending 空 ∧ InFlight 0（此后 InFlight 真会 > 1）∧ 复核在途 0（批 D 前恒真）。
 - 死锁退路：整体超时 + `drain`（现有 `drain` 可复用）；队列锁（若引入）**绝不跨 await**。
+- **事件侧疑点共识滞后**（批 C dogfood 修 [2] 时留的口子）：`EmitCtx` 跑在 await 里读不到队列，
+  `FindingEvent.suspicion_agreement` 是派发时快照；落盘 finding 由主循环按落地活值回填。串行下两值恒等，
+  **并发后在途并入会让落地值更高、事件值滞后**——而批 D 的跳过规则按事件流判。本 Task 须二选一：
+  事件推迟到回主循环后发射（牺牲一点流式时效），或给 `EmitCtx` 一个可读活值的句柄（`Arc<AtomicU32>` 按项共享）。
 - 测试：门宽 N 时在途上限 = N；乱序完成不错配 cell_id 与 item；慢 consumer 不堵住其余；
+  **派发 ≠ 落地分叉用例**（在途期间并入异族 → 落盘 `suspicion_agreement` = 落地值、`landed_agreement` 同值）；
   429 注入（现 D13 收门语义）下门宽收窄后仍收敛；无死锁（压测带超时）。
 - Commit: `feat(orchestrate): 门驱动并发派发——在途上限随 provider 门、乱序完成不错配（design §6 规则 5）`
 
