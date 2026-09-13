@@ -100,6 +100,11 @@ pub(crate) fn build_anthropic_tools_body_ext(
     let mut body = serde_json::Map::new();
     body.insert("model".into(), json!(model));
     body.insert("max_tokens".into(), json!(max_tokens));
+    // thinking 与 tools 共存：官方文档「Thinking works alongside tool use」，两条约束都不落在本 body——
+    // ① tool_choice 强制工具（any / tool）才与 manual thinking 冲突，我们不设该键（默认 auto）；
+    // ② thinking block 须随 tool_result 原样回传（见 followup：ChatMessage 无 thinking 字段，M21c 债）。
+    // 曾有一版「tools 非空即丢弃思考参数」的守卫（批 C 顺手项），前提是错的：真正会 400 的是
+    // 模型版本（Claude 4.7+ 拒 type:"enabled"）与被改动的 thinking block，两者都不是「有没有 tools」。
     for (k, v) in thinking.unwrap_or(&[]) {
         body.insert((*k).into(), v.clone());
     }
@@ -117,7 +122,9 @@ pub(crate) fn build_anthropic_tools_body_ext(
     // tools→system→messages，断点在 messages 末尾即缓存整个前缀（tools+system+全部历史）。
     // tool-loop append-only 确定性渲染，前缀天然稳定：每轮把断点移到新末尾，命中前一轮写的前缀、
     // 只付增量写入，13 轮对话输入成本理论折减 ~80-90%（5min TTL 覆盖 cell 内轮间隔）。
-    // 当前三 provider 全 openai kind，此 body 走不到；为将来配 Anthropic 直连即生效而备。
+    // 此 body **是活路径**（2026-09-12 dogfood 实证）：kind 可在**模型级**覆盖 provider 级——
+    // 实测配置里 provider `agc` 是 openai kind，其下 `grok-4.6` / `glm-5.3` 却各自声明 anthropic，
+    // reviewer 全程走这里。旧注释「三 provider 全 openai kind，此 body 走不到」是只看了 provider 级的误判。
     // 末块自动断点：末条 message 本身是分块（断点已显式给出）则不再加；其后追加的 Assistant / ToolResults / REPAIR 轮仍拿到
     // 移动尾断点（tool-loop 逐轮增量缓存不因分块会话失效），总数守 Anthropic 上限 4（评审 #12）。
     let placed = explicit_boundaries + usize::from(!system.is_empty() && explicit_boundaries > 0);
@@ -879,21 +886,53 @@ pub fn backend_from_config(
     em: &crate::config::EffectiveModel,
     api_key: String,
 ) -> Result<Box<dyn ChatBackend>, ProviderError> {
+    backend_from_config_inner(em, api_key, None)
+}
+
+/// 带流式旁路回调的 **per-cell 独占实例**（M21b 批 C，批 B 接缝契约）：registry 里的共享 backend
+/// 不挂回调——挂了并发 cell 会互相抢 delta——所以 reviewer 每格另造一个，回调喂本格的
+/// `IncrementalFindings`。构造失败时调用方退回共享 backend（只是没有旁路，不致命）。
+pub fn backend_from_config_with_delta(
+    em: &crate::config::EffectiveModel,
+    api_key: String,
+    on_text_delta: Box<dyn FnMut(&str) + Send>,
+) -> Result<Box<dyn ChatBackend>, ProviderError> {
+    backend_from_config_inner(em, api_key, Some(on_text_delta))
+}
+
+/// 文本 delta 旁路回调（`IncrementalFindings::feed` 的闭包形态）。
+pub type TextDeltaCb = Box<dyn FnMut(&str) + Send>;
+
+fn backend_from_config_inner(
+    em: &crate::config::EffectiveModel,
+    api_key: String,
+    on_text_delta: Option<TextDeltaCb>,
+) -> Result<Box<dyn ChatBackend>, ProviderError> {
     // 整请求超时罩住单轮（评审 M2）：慢模型 per_turn 1200s 时 reqwest 不再在 300s 先切断。
     let http_secs = crate::provider::http_timeout_for(em.per_turn_secs());
     // 批 F-2：角色条目 thinkingLevel 首个消费者——按 (kind, family) 查表；无映射 → 不发（warning 由 `thinking_warning` 给调用方）。
     let thinking = em.thinking_level.and_then(|l| thinking_params(em.kind, &em.family, &em.id, l, em.max_tokens_effective()));
     match em.kind {
-        ProviderKind::Anthropic => Ok(Box::new(AnthropicBackend::new(
-            em.id.clone(),
-            em.base_url.clone(),
-            api_key,
-        ).with_max_tokens(em.max_output_tokens).with_http_timeout(http_secs).with_thinking(thinking))),
-        ProviderKind::Openai | ProviderKind::OpenaiCompatible => Ok(Box::new(OpenAiBackend::new(
-            em.id.clone(),
-            em.base_url.clone(),
-            api_key,
-        ).with_max_tokens(em.max_output_tokens).with_http_timeout(http_secs).with_thinking(thinking))),
+        ProviderKind::Anthropic => {
+            let b = AnthropicBackend::new(em.id.clone(), em.base_url.clone(), api_key)
+                .with_max_tokens(em.max_output_tokens)
+                .with_http_timeout(http_secs)
+                .with_thinking(thinking);
+            Ok(Box::new(match on_text_delta {
+                Some(cb) => b.with_text_delta(cb),
+                None => b,
+            }))
+        }
+        ProviderKind::Openai | ProviderKind::OpenaiCompatible => {
+            let b = OpenAiBackend::new(em.id.clone(), em.base_url.clone(), api_key)
+                .with_max_tokens(em.max_output_tokens)
+                .with_http_timeout(http_secs)
+                .with_thinking(thinking);
+            Ok(Box::new(match on_text_delta {
+                Some(cb) => b.with_text_delta(cb),
+                None => b,
+            }))
+        }
         ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
     }
 }
@@ -1628,6 +1667,25 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         assert!(get(Anthropic, "claude", Low, 2000).is_none(), "夹后 < 1024 → 无法满足 API 约束 → 无映射");
         assert!(get(Anthropic, "glm", Low, 32768).is_none(), "GLM anthropic 形态文档无字段 → 无映射");
         assert!(get(Openai, "grok", Low, 32768).is_none() && get(Google, "gemini", Low, 32768).is_none());
+    }
+
+    /// thinking × tools 共存（2026-09-12 按官方文档更正：「Thinking works alongside tool use」）。
+    /// 曾有一版守卫在 tools 非空时丢弃思考参数，前提是错的——Anthropic 的两条约束是
+    /// ① tool_choice 强制工具（我们不设该键）② thinking block 原样回传，都与「有没有 tools」无关。
+    /// 真正的 400 源是模型版本（4.7+ 拒 type:"enabled"）与被改动的 thinking block，见 followup。
+    #[test]
+    fn anthropic_thinking_survives_tools_in_body() {
+        let msgs = vec![ChatMessage::System("sys".into()), ChatMessage::User("go".into())];
+        let tool = crate::tools::ToolSpec { name: "read", description: "d", parameters: serde_json::json!({}) };
+        let th = thinking_params(ProviderKind::Anthropic, "claude", "claude-x", ThinkingLevel::Low, MAX_TOKENS).unwrap();
+        let with_tools = build_anthropic_tools_body_ext("claude-x", &msgs, &[tool], MAX_TOKENS, Some(&th));
+        assert_eq!(with_tools["thinking"]["type"], "enabled", "工具在场不该丢用户配的思考档");
+        assert!(with_tools["thinking"]["budget_tokens"].as_u64().unwrap() >= 1024);
+        assert_eq!(with_tools["tools"].as_array().unwrap().len(), 1);
+        assert!(with_tools.get("tool_choice").is_none(), "不设 tool_choice → 默认 auto，与 thinking 相容");
+        assert!(with_tools.get("temperature").is_none() && with_tools.get("top_p").is_none());
+        let no_tools = build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, Some(&th));
+        assert_eq!(no_tools["thinking"]["type"], "enabled");
     }
 
     /// 批 F-2：参数对进请求体；`None` 与不带参数版逐字节相同（既有 body 测试的基线不受影响）。

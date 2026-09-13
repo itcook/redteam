@@ -244,7 +244,7 @@ mod tests {
             stats:Stats{high:1,total:1,..Default::default()},
             findings:vec![Finding{ id:"1".into(),severity:Severity::High,title:"boom".into(),body:"b".into(),
                 file:"a.rs".into(),line_start:3,line_end:5,confidence:0.9,recommendation:"fix".into(),
-                models:vec!["claude".into()],agreement:1,hard_constraint:false,
+                models:vec!["claude".into()],agreement:1, suspicion_agreement: 0,hard_constraint:false,
                 quote:"snippet".into(),cluster_id:None,verify:None,previously_dismissed:false,
                 origin:Origin::New}],
             clusters:vec![], run:RunMeta::default() }

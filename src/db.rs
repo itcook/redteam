@@ -507,6 +507,27 @@ impl ProjDb {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// 深挖队列快照（C-5）：INSERT OR REPLACE。写失败由调用方 warning，不败 job。
+    pub fn queue_item_put(&self, job_id: &str, item_id: &str, state: &str, json: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO queue_items (job_id, item_id, state, json) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(job_id, item_id) DO UPDATE SET state=?3, json=?4",
+            params![job_id, item_id, state, json],
+        )?;
+        Ok(())
+    }
+
+    /// 某作业全部队列快照行（item_id, state, json）。零行 = 旧作业 / 无深挖。
+    pub fn queue_items_for_job(&self, job_id: &str) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT item_id, state, json FROM queue_items WHERE job_id=?1 ORDER BY item_id",
+        )?;
+        let rows = stmt.query_map(params![job_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// 评审史 json 列单独原子写（M17-c C-Q4：消除「读另一列再写两列」的双事务窗口——
     /// 旧 result_put 整行覆盖已删，json/md 各自单列 upsert，互不读取对方现值）。
     pub fn result_put_json(&self, job_id: &str, json: &str) -> Result<()> {
@@ -856,6 +877,21 @@ mod guard_tests {
         let again = ProjDb::open(dir.path()).unwrap();
         assert_eq!(user_version(&again.conn), USER_VERSION);
         assert_eq!(again.cell_role("j", "c").unwrap().as_deref(), Some("scanner"));
+    }
+
+    #[test]
+    fn queue_item_put_roundtrip_and_empty_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ProjDb::open(dir.path()).unwrap();
+        assert!(db.queue_items_for_job("j").unwrap().is_empty());
+        db.queue_item_put("j", "a.rs:rule:1-2", "pending", r#"{"id":"a"}"#).unwrap();
+        db.queue_item_put("j", "a.rs:rule:1-2", "settled", r#"{"id":"a","ok":true}"#).unwrap();
+        let rows = db.queue_items_for_job("j").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "a.rs:rule:1-2");
+        assert_eq!(rows[0].1, "settled");
+        assert!(rows[0].2.contains("ok"));
+        assert!(db.queue_items_for_job("other").unwrap().is_empty());
     }
 
     /// 旧库（user_version 0 且有数据）拒开、文案指向导出脚本与库路径、不叫用户删库；库文件一个字节不改（含 journal 模式）。

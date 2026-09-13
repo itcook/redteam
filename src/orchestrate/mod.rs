@@ -1,3 +1,8 @@
+pub mod deep;
+pub mod dispatch;
+pub mod queue;
+pub mod review_shot;
+
 use crate::bundle::Bundle;
 use crate::domain::{CellOutput, Finding, Origin, RawFinding, Role, ScanOutput};
 use crate::hash::fnv1a64_hex;
@@ -19,6 +24,8 @@ pub trait CellSink: Send + Sync {
     fn on_meta(&self, _models: &[String]) {}
     /// 批 F-2：扇出前报本次作业的角色集（`JobState.roles`，status 可见）。默认 no-op。
     fn on_roles(&self, _roles: &[Role]) {}
+    /// M21b 批 C：队列项状态转换写 `queue_items` 快照（后台 job resume 用）。默认 no-op；写失败由实现方 warning。
+    fn on_queue_item(&self, _item: &crate::orchestrate::queue::QueueItem) {}
 }
 
 /// R8.1：quote 去除全部空白（保大小写）——token 序列即身份，免疫 reformat。批 F-3 `consolidate::scan` 复用。
@@ -57,6 +64,8 @@ pub fn enrich(raw: &RawFinding, model: &str) -> Finding {
         recommendation: raw.recommendation.clone(),
         models: vec![model.to_string()],
         agreement: 1,
+        // 区域疑点共识由深挖侧回填（`EmitCtx`）；scanner / 非深挖路径留 0。
+        suspicion_agreement: 0,
         hard_constraint: raw.hard_constraint,
         quote: raw.quote.clone(),
         previously_dismissed: false,

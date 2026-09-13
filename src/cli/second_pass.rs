@@ -66,7 +66,7 @@ pub(crate) fn need_read_allowed(root: &Path, rel: &str) -> Result<(), &'static s
 /// 路径安全走 ToolExecutor 不变量（绝对路径/`..`/symlink 逃逸/不可读 → None、不 panic）+
 /// `need_read_allowed` 守卫（git-tracked ∧ 非 denylist，E11-Q4）；守卫拒则 skip + 披露
 /// （`deny_need_read`：eprintln + 入 `warnings`，T46①②）。
-fn need_section(
+pub(crate) fn need_section(
     ex: &crate::tools::ToolExecutor,
     root: &Path,
     need: &crate::domain::NeedEntry,
@@ -104,7 +104,7 @@ fn need_section(
 
 /// 草稿注入段（design §2.3）：第一趟 findings 以 CONFIRM-or-REVISE 契约随第二趟 prompt 带回；
 /// 空草稿也渲染块（契约「不再声明 needs」对零草稿格同样生效）。
-fn draft_block(drafts: &[Finding]) -> String {
+pub(crate) fn draft_block(drafts: &[Finding]) -> String {
     let mut s = String::from(
         "\n<first_pass_draft>\nYour first pass produced these draft findings. CONFIRM or REVISE each using the\nnewly added evidence — drop a draft ONLY if the evidence refutes it, and do not\nre-declare needs.\n",
     );

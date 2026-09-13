@@ -42,8 +42,10 @@ pub enum Phase {
     Collecting, // worker 起手，收集证据，fanout 前
     Fanout,     // 旧 finding 扇出（F-4 后不再打；旧作业 state 可读）
     Scan,       // 批 F-5：scanner 静态扇出（cell 并发执行中，progress.done 推进）
+    Deep,       // M21b 批 C：深挖队列消费中
+    Verify,     // M21b 批 D：verifier 流式复核（C 先占位，新作业不打 Refute）
     Finalizing, // 尾段：合并 / 报告（progress/last_active 静止）
-    Refute,     // M21b verifier 子阶段：targeted refute（LLM 并发；note 带 targets 数）
+    Refute,     // 旧 verifier 子阶段（serde 仍可读；新作业打 Verify）
 }
 
 /// phase 时间线一格（2026-07-03 grill 定案：finalizing 黑盒可观测）。
@@ -348,6 +350,29 @@ impl JobStore {
             .unwrap_or_default()
     }
 
+    /// 写一条队列快照；失败返回 Err，调用方 warning 不败 job。
+    pub fn put_queue_item(&self, job_id: &str, item: &crate::orchestrate::queue::QueueItem) -> anyhow::Result<()> {
+        let json = serde_json::to_string(item)?;
+        let state = match item.state {
+            crate::orchestrate::queue::ItemState::Pending => "pending",
+            crate::orchestrate::queue::ItemState::InFlight => "inflight",
+            crate::orchestrate::queue::ItemState::Settled => "settled",
+            crate::orchestrate::queue::ItemState::Skipped => "skipped",
+        };
+        self.db.lock().unwrap().queue_item_put(job_id, &item.id, state, &json)
+    }
+
+    /// 读作业队列快照。空 = 旧作业 / 无深挖。
+    pub fn read_queue_items(&self, job_id: &str) -> Vec<crate::orchestrate::queue::QueueItem> {
+        self.db
+            .lock()
+            .unwrap()
+            .queue_items_for_job(job_id)
+            .ok()
+            .map(|rows| rows.into_iter().filter_map(|(_, _, json)| serde_json::from_str(&json).ok()).collect())
+            .unwrap_or_default()
+    }
+
     // ── args / result（语义平移；result 改走单列原子 upsert，M17-c §5）──────
 
     pub fn write_args_raw(&self, id: &str, json: &str) -> anyhow::Result<()> {
@@ -424,6 +449,9 @@ mod tests {
         // 批 F-5：Scan 阶段小写序列化 round-trip；旧 fanout 串仍可读
         assert_eq!(serde_json::to_string(&Phase::Scan).unwrap(), "\"scan\"");
         assert_eq!(serde_json::from_str::<Phase>("\"scan\"").unwrap(), Phase::Scan);
+        assert_eq!(serde_json::to_string(&Phase::Deep).unwrap(), "\"deep\"");
+        assert_eq!(serde_json::from_str::<Phase>("\"verify\"").unwrap(), Phase::Verify);
+        assert_eq!(serde_json::from_str::<Phase>("\"refute\"").unwrap(), Phase::Refute, "旧 refute 仍可读");
     }
 
     #[test]
@@ -690,6 +718,24 @@ mod tests {
         } else {
             CellRecord::failed(cell, "m", crate::domain::Role::Reviewer, "boom")
         }
+    }
+
+    #[test]
+    fn queue_snapshot_roundtrip_empty_is_old_job() {
+        use crate::orchestrate::queue::{EnqueueReq, ItemKind};
+        use crate::pack::region::{Origin as QueueOrigin, QueueItemSpec};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JobStore::open(tmp.path()).unwrap();
+        assert!(store.read_queue_items("j").is_empty(), "零行 = 旧作业");
+        let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap();
+        let mut q = crate::orchestrate::queue::DeepQueue::new();
+        q.enqueue(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, families: vec![] });
+        let item = q.items()[0].clone();
+        store.put_queue_item("j", &item).unwrap();
+        let back = store.read_queue_items("j");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].id, item.id);
+        assert_eq!(back[0].state, item.state);
     }
 
     #[test]

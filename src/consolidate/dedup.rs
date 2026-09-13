@@ -51,6 +51,9 @@ fn merge_into(base: &mut Finding, other: &Finding) {
     if other.confidence > base.confidence { base.confidence = other.confidence; }
     for m in &other.models { if !base.models.contains(m) { base.models.push(m.clone()); } }
     base.agreement = base.models.len() as u32;
+    // 疑点共识是**区域**属性，两条 finding 合并即同一区域：取较大的那份（落地时刻值，
+    // 后涨不回溯〔D13〕；批 D 跳过复核读它）。与上面按模型数算的 agreement 是两个轴。
+    base.suspicion_agreement = base.suspicion_agreement.max(other.suspicion_agreement);
     // rec 跟随 body 同源（body 恒保留 base 的）——「更长 rec 胜」会让合并后 body 讲 A 问题、
     // rec 讲 B 方案的串台（dogfood 20260702 r1 3cf04bba）。唯一例外：base rec 为空时补位
     // （空 rec 比借来的 rec 更糟；dogfood 20260703 r1 c3fe15d9），只填真空、绝不覆盖。
@@ -87,7 +90,7 @@ mod tests {
     fn f(id:&str, file:&str, ls:u32, le:u32, title:&str, model:&str, sev:Severity) -> Finding {
         Finding { id:id.into(), severity:sev, title:title.into(), body:"b".into(), file:file.into(),
             line_start:ls, line_end:le, confidence:0.8, recommendation:"r".into(),
-            models:vec![model.into()], agreement:1,
+            models:vec![model.into()], agreement:1, suspicion_agreement: 0,
             hard_constraint:false, quote:String::new(), cluster_id:None, verify:None,
             previously_dismissed: false, origin: Origin::New }
     }
@@ -156,6 +159,32 @@ mod tests {
         let out = dedup(vec![a, b]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].recommendation, "add guard at entry", "空 rec 由合并方补位");
+    }
+
+    /// 两个 agreement 是两根轴，合并时各走各的算法：
+    /// `agreement` = 认同这条 finding 的模型数（models.len()）；
+    /// `suspicion_agreement` = 区域被几个 scanner 家族标记（区域属性，合并取 max）。
+    /// M21b 的分派池不双审（design §6 规则 5），模型轴几乎恒 1——批 D 的跳过规则（§8.1 疑点 ≥ 2）
+    /// 必须读区域轴才有区分度。下面第二段正是那种形状：单模型报出、落在双家族疑点区。
+    #[test]
+    fn two_agreement_axes_merge_independently() {
+        // base 取小、other 取大：这样「取 max」与「保留 base 原值」输出不同，删掉 merge_into
+        // 那行 max 测试就会红。反过来写（base 3 / other 1）两者都得 3，断言是空的——
+        // 2026-09-12 dogfood 的 reviewer 正是逮到了这个形状（confidence 0.85）。
+        let mut a = f("1", "a.rs", 10, 12, "missing auth check", "claude", Severity::High);
+        a.suspicion_agreement = 1;
+        let mut b = f("2", "a.rs", 11, 13, "Missing auth check", "gpt", Severity::High);
+        b.suspicion_agreement = 3;
+        let out = dedup(vec![a, b]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].agreement, 2, "两个模型认同 → 模型轴 2");
+        assert_eq!(out[0].suspicion_agreement, 3, "区域轴取 max（base 1 < other 3），不随模型数变");
+
+        // 单模型 finding 落在双家族疑点区：模型轴 1（M21b 分派池下的常态）∧ 区域轴 2（跳过判据成立）。
+        let mut lone = f("3", "b.rs", 5, 5, "unchecked write", "claude", Severity::High);
+        lone.suspicion_agreement = 2;
+        let out = dedup(vec![lone]);
+        assert_eq!((out[0].agreement, out[0].suspicion_agreement), (1, 2));
     }
 
     #[test]

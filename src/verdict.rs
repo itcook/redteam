@@ -33,7 +33,7 @@ mod tests {
             confidence: conf,
             recommendation: "r".into(),
             models: vec![],
-            agreement: 1,
+            agreement: 1, suspicion_agreement: 0,
             hard_constraint: hard,
             quote: "snippet".into(),
             cluster_id: None,

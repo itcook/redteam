@@ -1,6 +1,6 @@
 # M21b · 风险路由与深挖队列
 
-> 状态: ⏳（plan 已派生 2026-09-10：`../plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md`，五批 A-E + 出口）· 依赖 M21a ✅ · design §3.3 / §6 / §7 / §8.1 / §12.3 / §13 · 决策 D1 勘误, D2, D6, D7, D13
+> 状态: ⏳（plan `../plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md`：**五批 A / B / C / C1 / D + 出口**——2026-09-10 派生时为四批 A-D〔原五批含 aacr 接线批，同日删〕，2026-09-12 增批 C1 承接交付项 2/3 的门驱动并发与分派池轮转）· 依赖 M21a ✅ · design §3.3 / §6 / §7 / §8.1 / §12.3 / §13 · 决策 D1 勘误, D2, D6, D7, D13
 > 出口：`redteam-next` 端到端产 finding 并流式复核；插件与 ship 仍用 dev `redteam`（切名在 M21c）
 
 ## 目标
