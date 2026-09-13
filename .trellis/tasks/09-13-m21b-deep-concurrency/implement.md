@@ -8,13 +8,13 @@
 ## Checklist
 
 ### C1-1 身份与 resume 完整性
-- [ ] `queue.rs`：`merge_into` 删除 `it.id = item_id(&it.spec)`；id 只在 `new` 时算
-- [ ] `queue.rs`：`find_merge_idx` 返回合并原因（谓词 / id 捷径）；`merge_into` 只在谓词合并时并入家族、重算 agreement，id 捷径合并只并笔记与区间
-- [ ] `queue.rs`：`EnqueueOutcome::MergedSkipped`；Skipped 并入后 `is_must` → Pending（重置 `enqueued_ms`）+ `MergedPending`，否则保持 + `MergedSkipped`
-- [ ] `deep.rs`：`note_enq` 把 `MergedSkipped` 计入 `dedup_hits`；reviewer cell_id 改 `review[{item.id}]@{rev.name}`
-- [ ] `cli/mod.rs` `run_resume`：restore 前对 Settled 项查 `review[{item.id}]@` 前缀 cell，缺失 → Pending；注释写明「kill 窗口内换模型重跑留两条 cell」的接受口径
-- [ ] 测试：在途并入后派发时 id 仍命中；id 对 ranges 扩展稳定；id 捷径合并不抬 agreement / 谓词合并照抬；Skipped 异族并入复位、同家族 `MergedSkipped`；**批 C 覆盖路径 resume 两次不丢 finding**（先写成红，再修绿）；快照 Settled 无 cell → 重挖
-- [ ] Commit: `fix(queue,resume): 队列项与 cell 身份定死——id 不随 ranges 重算、共识只经谓词、Skipped 仅成必挖才复位、cell_id 按队列项且 Settled 以 cells 为准（批 C1 前置，修批 C resume 覆盖丢 finding）`
+- [x] `queue.rs`：`merge_into` 删除 `it.id = item_id(&it.spec)`；id 只在 `new` 时算
+- [x] `queue.rs`：`find_merge_idx` 返回合并原因（谓词 / id 捷径，**谓词命中优先**）；`merge_into` 只在谓词合并时并入家族、重算 agreement，id 捷径合并只并笔记与区间
+- [x] `queue.rs`：`EnqueueOutcome::MergedSkipped`；Skipped 并入后 `is_must` → Pending（重置 `enqueued_ms`）+ `MergedPending`，否则保持 + `MergedSkipped`
+- [x] `deep.rs`：`note_enq` 把 `MergedSkipped` 计入 `dedup_hits`；reviewer cell_id 改 `review[{item.id}]@{rev.name}`
+- [x] `cli/mod.rs` `run_resume`：restore 前对 Settled 项查 `review[{item.id}]@` 前缀的**成功** cell，缺失 → Pending + warning；注释写明「kill 窗口内换模型重跑留两条 cell」的接受口径
+- [x] 测试：在途并入后派发时 id 仍命中；id 对 ranges 扩展稳定；id 捷径合并不抬 agreement / 谓词合并照抬；谓词优先于 id 捷径；Skipped 异族并入复位、同家族 `MergedSkipped`；**批 C 覆盖路径 resume 两次不丢 finding**（先红后绿）；快照 Settled 无成功格 → 重挖（先红后绿；「只认成功格」与「谓词优先」经变异检查确认非空转）
+- [x] Commit: `fix(queue,resume): 队列项与 cell 身份定死——id 不随 ranges 重算、共识只经谓词、Skipped 仅成必挖才复位、cell_id 按队列项且 Settled 以成功格为准（批 C1 前置，修批 C resume 覆盖丢 finding）`
 
 ### C1-2 并发派发循环与二阶段契约
 - [ ] `Cargo.toml`：dev-dependency `tokio = { version = "1", features = ["test-util", "macros", "rt"] }`（虚拟时间）

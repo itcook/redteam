@@ -35,12 +35,14 @@ pub enum ItemKind {
 pub enum EnqueueOutcome {
     /// 无命中 → 新项 agreement = 1。
     New,
-    /// 命中排队中 → 并入（异族 agreement+1 / 同家族只合并）。
+    /// 命中排队中 → 并入（异族 agreement+1 / 同家族只合并）；或命中被截项、并入后成为必挖 → 复位排队。
     MergedPending,
     /// 命中在途 → 只改记录，不重挖。
     MergedInFlight,
     /// 命中本轮已结案 → 并入并沿用结案。
     MergedSettled,
+    /// 命中被预算截掉的项、并入后仍非必挖 → 只改记录，保持截断（不突破 drain 定下的预算）。
+    MergedSkipped,
 }
 
 /// 深挖队列项（静态形状对齐 `QueueItemSpec`，另加运行时字段）。
@@ -155,33 +157,52 @@ impl DeepQueue {
     /// 五态入口。判例守卫空过：调用方把跨轮命中当无命中喂进来即可。
     pub fn enqueue(&mut self, req: EnqueueReq) -> EnqueueOutcome {
         let incoming_id = item_id(&req.spec);
-        if let Some(idx) = self.find_merge_idx(&req.spec, &incoming_id) {
-            return self.merge_into(idx, req);
+        if let Some((idx, by_predicate)) = self.find_merge_idx(&req.spec, &incoming_id) {
+            return self.merge_into(idx, req, by_predicate);
         }
         self.items.push(QueueItem::new(req.spec, req.score, req.kind, req.families));
         EnqueueOutcome::New
     }
 
-    fn find_merge_idx(&self, spec: &QueueItemSpec, incoming_id: &str) -> Option<usize> {
-        self.items.iter().position(|it| same_item(&it.spec, spec) || it.id == incoming_id)
+    /// 合并目标 + 是否经谓词命中。id 相等（`file:origin:ranges` 逐字相同）也合并——保住「一个区间只挖一次」
+    /// 与 id 唯一；但谓词命中优先：同一疑点的共识只该记到谓词认定的那一项上。
+    fn find_merge_idx(&self, spec: &QueueItemSpec, incoming_id: &str) -> Option<(usize, bool)> {
+        if let Some(i) = self.items.iter().position(|it| same_item(&it.spec, spec)) {
+            return Some((i, true));
+        }
+        self.items.iter().position(|it| it.id == incoming_id).map(|i| (i, false))
     }
 
-    fn merge_into(&mut self, idx: usize, req: EnqueueReq) -> EnqueueOutcome {
+    fn merge_into(&mut self, idx: usize, req: EnqueueReq, by_predicate: bool) -> EnqueueOutcome {
         let it = &mut self.items[idx];
-        for f in req.families.into_iter().filter(|f| !f.is_empty()) {
-            if !it.families.contains(&f) {
-                it.families.push(f);
+        // 共识只经谓词（design §2.2）：上游 `merge_suspicions` 已按 `same_suspicion` 组内传递闭包，进队列的同文件
+        // scan 项互不满足谓词——只靠 id 捷径命中的是「上游判为不同疑点、恰好行区间逐字相同」的两条，可能是 quote
+        // 噪声下的同一问题，也可能是同一行上的两个问题。计共识错了是批 D 免复核错放，不计错了只是多复核一次——取后者。
+        if by_predicate {
+            for f in req.families.into_iter().filter(|f| !f.is_empty()) {
+                if !it.families.contains(&f) {
+                    it.families.push(f);
+                }
             }
+            it.agreement = agreement_of(&it.families);
         }
-        it.agreement = agreement_of(&it.families);
         it.spec.ranges = union_ranges(&it.spec.ranges, &req.spec.ranges);
         it.spec.notes = merge_notes(&it.spec.notes, &req.spec.notes);
         if req.score > it.score {
             it.score = req.score;
         }
-        it.id = item_id(&it.spec);
+        // id 不随 ranges 重算（只在 `new` 时定死）：在途项被并入扩了区间，完成时 `mark_settled(派发时 id)`
+        // 仍须命中；快照按 item_id upsert，重算还会把同一项裂成两行、restore 出重复项。
         match it.state {
-            ItemState::Pending | ItemState::Skipped => EnqueueOutcome::MergedPending,
+            ItemState::Pending => EnqueueOutcome::MergedPending,
+            // 被截项并入后成为必挖（异族谓词共识抬到 2）→ 必挖不截（design §6 规则 3）；
+            // 入队时刻重置，免 item_wait_ms 把被截的那段也算成排队。
+            ItemState::Skipped if must_dig(it) => {
+                it.state = ItemState::Pending;
+                it.enqueued_ms = Some(now_ms());
+                EnqueueOutcome::MergedPending
+            }
+            ItemState::Skipped => EnqueueOutcome::MergedSkipped,
             ItemState::InFlight => EnqueueOutcome::MergedInFlight,
             ItemState::Settled => EnqueueOutcome::MergedSettled,
         }
@@ -202,7 +223,7 @@ impl DeepQueue {
 
     /// 主区 ∪ {agreement ≥ 2}。`max_cells = 0` 时主区仍算必挖。
     pub fn is_must(&self, it: &QueueItem) -> bool {
-        it.kind == ItemKind::Primary || it.agreement >= 2
+        must_dig(it)
     }
 
     /// 到期 drain：Pending 非必挖且未进保底的标 skipped。
@@ -282,6 +303,11 @@ impl DeepQueue {
             it.state = state;
         }
     }
+}
+
+/// 必挖集判定（design §6 规则 3）：不依赖队列其余项，合并路径拿着 `&mut` 项也能调。
+fn must_dig(it: &QueueItem) -> bool {
+    it.kind == ItemKind::Primary || it.agreement >= 2
 }
 
 fn category_weight(notes: &[Suspicion]) -> f32 {
@@ -609,5 +635,78 @@ mod tests {
         assert!(q.items().iter().any(|i| i.kind == ItemKind::Suspicion && i.state == ItemState::Pending));
         assert!(q.items().iter().any(|i| i.kind == ItemKind::Needs && i.state == ItemState::Skipped));
         assert_eq!(q.items().iter().filter(|i| i.kind == ItemKind::Primary && i.state == ItemState::Pending).count(), 4);
+    }
+
+    /// id 在 `new` 时定死（批 C1-1）：派发后在途并入扩了区间，完成时拿派发时的 id 仍命中该项。
+    /// 旧实现在合并里按新 ranges 重算 id → `mark_settled(派发时 id)` 落空，项永远 InFlight、barrier 永不满足。
+    #[test]
+    fn id_is_stable_across_inflight_merge() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("a.rs", 3, 5, "v[i]", "idx"), Some("alpha")));
+        let dispatched = q.pop_dispatch().unwrap();
+        assert_eq!(dispatched.id, "a.rs:scan:3-5");
+        let o = q.enqueue(req(spec_scan("a.rs", 4, 9, "v[i]", "idx"), Some("beta")));
+        assert_eq!(o, EnqueueOutcome::MergedInFlight);
+        assert_eq!(q.items()[0].spec.ranges, vec![(3, 9)], "区间照并");
+        assert_eq!(q.items()[0].id, dispatched.id, "id 不随 ranges 重算");
+        q.mark_settled(&dispatched.id, 2);
+        assert_eq!(q.items()[0].state, ItemState::Settled);
+        assert_eq!(q.inflight_count(), 0);
+    }
+
+    /// 共识只经谓词（design §2.2 / Q2）：同区间、quote 不同的两条疑点（上游已判为不同疑点）经 id 捷径
+    /// 合成一次挖掘，但家族不并、agreement 不抬；谓词成立（同 quote、行重叠）的异族才计共识。
+    #[test]
+    fn id_shortcut_merge_does_not_count_consensus() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("a.rs", 3, 5, "v[i]", "idx"), Some("alpha")));
+        let o = q.enqueue(req(spec_scan("a.rs", 3, 5, "unwrap()", "opt"), Some("beta")));
+        assert_eq!(o, EnqueueOutcome::MergedPending, "同区间只挖一次");
+        assert_eq!(q.items().len(), 1);
+        assert_eq!(q.items()[0].agreement, 1, "id 捷径不计共识");
+        assert_eq!(q.items()[0].families, vec!["alpha".to_string()]);
+        assert_eq!(q.items()[0].spec.notes.len(), 2, "笔记照并——reviewer 两条都要看");
+        let o = q.enqueue(req(spec_scan("a.rs", 4, 5, "v[i]", "idx"), Some("gamma")));
+        assert_eq!(o, EnqueueOutcome::MergedPending);
+        assert_eq!(q.items()[0].agreement, 2, "谓词合并照抬");
+        assert_eq!(q.items()[0].families, vec!["alpha".to_string(), "gamma".to_string()]);
+    }
+
+    /// 谓词命中优先于 id 捷径：进来的疑点与 A 区间逐字相同（id 相等）、却与 B 是同一疑点（谓词成立）→
+    /// 并进 B、共识记在 B 上，A 不动。按位置取第一个命中会把它并进 A，B 的真共识落空。
+    #[test]
+    fn predicate_match_wins_over_id_shortcut() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("a.rs", 3, 5, "v[i]", "idx"), Some("alpha")));
+        q.enqueue(req(spec_scan("a.rs", 4, 9, "unwrap()", "opt"), Some("beta")));
+        assert_eq!(q.items().len(), 2);
+        let o = q.enqueue(req(spec_scan("a.rs", 3, 5, "unwrap()", "opt"), Some("gamma")));
+        assert_eq!(o, EnqueueOutcome::MergedPending);
+        assert_eq!(q.items().len(), 2, "id 相等也不另起一项");
+        assert_eq!((q.items()[0].agreement, q.items()[0].spec.notes.len()), (1, 1), "A 不动");
+        assert_eq!(q.items()[1].agreement, 2, "共识记在谓词认定的 B 上");
+    }
+
+    /// Skipped 并入（2026-09-13 裁定）：并入后成为必挖（异族谓词共识抬到 2）→ 复位 Pending、重置入队时刻；
+    /// 仍非必挖（同家族 / id 捷径）→ 保持 Skipped、回 `MergedSkipped`，不突破 drain 定下的预算。
+    #[test]
+    fn skipped_item_resets_only_when_it_becomes_must() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("s.rs", 3, 5, "v[i]", "idx"), Some("alpha")));
+        q.enqueue(req(spec_scan("t.rs", 3, 5, "v[i]", "idx"), Some("alpha")));
+        assert_eq!(q.drain(0).len(), 2, "预算 0 只留必挖 → 两条单家族疑点都截");
+        for it in q.items_mut() {
+            it.enqueued_ms = Some(0);
+        }
+        let o = q.enqueue(req(spec_scan("s.rs", 3, 5, "v[i]", "idx"), Some("alpha")));
+        assert_eq!(o, EnqueueOutcome::MergedSkipped, "同家族并入仍非必挖");
+        assert_eq!(q.items()[0].state, ItemState::Skipped);
+        let o = q.enqueue(req(spec_scan("t.rs", 3, 5, "unwrap()", "opt"), Some("beta")));
+        assert_eq!(o, EnqueueOutcome::MergedSkipped, "id 捷径的异族并入不计共识");
+        assert_eq!((q.items()[1].state, q.items()[1].agreement), (ItemState::Skipped, 1));
+        let o = q.enqueue(req(spec_scan("s.rs", 4, 5, "v[i]", "idx"), Some("beta")));
+        assert_eq!(o, EnqueueOutcome::MergedPending, "谓词的异族并入 → 必挖 → 复位");
+        assert_eq!((q.items()[0].state, q.items()[0].agreement), (ItemState::Pending, 2));
+        assert!(q.items()[0].enqueued_ms.unwrap() > 0, "入队时刻重置");
     }
 }

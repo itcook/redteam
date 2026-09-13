@@ -27,7 +27,8 @@
 
 ### 2.2 共识只经谓词（Q2）
 
-`find_merge_idx` 仍按 `same_item ∨ it.id == incoming_id` 找合并目标——保住「一个区间只挖一次」与 id 唯一性。区分合并原因：
+`find_merge_idx` 仍按 `same_item ∨ it.id == incoming_id` 找合并目标——保住「一个区间只挖一次」与 id 唯一性。
+**谓词命中优先**：先在全队列找 `same_item` 命中项，找不到才退 id 捷径（按位置取第一个命中会把与 B 同疑点、恰与 A 区间逐字相同的入队并进 A，B 的真共识落空）。区分合并原因：
 
 ```text
 merge_into(idx, req, by_predicate: bool):
@@ -56,7 +57,8 @@ merge_into 命中 Skipped:
 
 - cell_id = `review[{item.id}]@{rev.name}`，例 `review[src/deep.rs:rule:120-180]@agc/glm-5.3`。id 已定死在首次 spec，长度有界。
   同项重跑 → `cell_put` upsert 覆盖自身（与 scanner「重试者胜」同语义）。
-- `run_resume` 在 `restore` 之前：对快照里 `state == Settled` 的项，若 `final_records` 中不存在 cell 名以 `review[{item.id}]@` 开头的记录 → 改为 Pending 重挖。
+- `run_resume` 在 `restore` 之前：对快照里 `state == Settled` 的项，若 `final_records` 中不存在 cell 名以 `review[{item.id}]@` 开头的**成功**记录 → 改为 Pending 重挖，并 warning 报数。
+  只有失败格也重挖（实施时细化，与 scanner resume「失败格重跑」同口径）：`overlay_deep` 的债只看本轮 `reviewer_failed`，不重挖则首跑失败格的债在 resume 报告里被抹成干净通过。
 - 残余窗口（注释写明、接受）：kill 恰在「cell 已落盘、快照仍 InFlight」之间，resume 时轮转把该项派给**另一模型** → 留两条 cell；finding 经 dedup 去重，usage 重复计一次。
 
 ## 3. 并发派发（C1-2）
@@ -189,7 +191,7 @@ per-cell backend 已按 reviewer 自己的 `EffectiveModel` 构造，缺的只�
 | 共识只经谓词 | 同区间不同 quote 两条（不同家族） | 合并为一项、agreement 仍 1；quote 重叠两条 → agreement 2 |
 | Skipped 复位 | drain 截单家族项 → 异族 / 同家族分别并入 | `MergedPending`+Pending / `MergedSkipped`+Skipped |
 | resume 两次不丢 | 复现批 C 覆盖路径（首跑 X 落盘、Y 在途 kill → resume ×2） | 第二次 resume 后 Fx 仍在报告与 cells |
-| Settled 以 cells 为准 | 快照 Settled、cells 缺该项 | resume 重挖该项 |
+| Settled 以成功格为准 | 快照 Settled：一项无格、一项只有失败格、一项有成功格 | 前两项重挖、第三项不动；重挖成功 exit 0 |
 | 在途峰值 | 门宽 N、K > N、每格时延 | `gate_stats().peak == N` |
 | 乱序不错配 / 慢格不堵 | 各格不同时延 | findings 对应各自 item；总时长 ≈ 最慢格 |
 | 二阶段持门位 | 门宽 1、首格触发 needs | 首格两轮间门位不释放，第二格在首格结束后才开始 |

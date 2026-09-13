@@ -119,7 +119,6 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
     let opts = PackOpts::from(input.pack);
     let mut findings = Vec::new();
     let mut cells = Vec::new();
-    let mut n = 0u32;
     let mut reviewer_failed = false;
     let mut bypass_warned = false;
 
@@ -140,8 +139,9 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
         if let Some(en) = item.enqueued_ms {
             meta.item_wait_ms.push(now_ms().saturating_sub(en));
         }
-        n += 1;
-        let cell_id = format!("review[{n}]@{}", rev.name);
+        // cell 名按队列项（id 已定死），跨 resume 调用稳定：同项重跑 upsert 覆盖自身（与 scanner「重试者胜」同义），
+        // 不同项永不同名。按本次调用的派发序编号时，resume 挖别的项会同名覆盖首跑的格、丢掉它的 finding。
+        let cell_id = format!("review[{}]@{}", item.id, rev.name);
         let t0 = Instant::now();
         let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &idx, 64 * 1024, &opts, "") {
             Ok(p) => p,
@@ -300,7 +300,7 @@ fn pick_bundle<'a>(bundles: &'a [Bundle], file: &str) -> &'a Bundle {
     bundles.iter().find(|b| b.files.iter().any(|f| f.path == file)).unwrap_or(&bundles[0])
 }
 
-/// 落地时 agreement：按 id 读队列活值。查不到（在途期间并入改写过 id）退回派发时值。
+/// 落地时 agreement：按 id 读队列活值（id 定死、在途并入不改它，恒能查到）；查不到退回派发时值只是防御。
 fn live_agreement(q: &DeepQueue, item: &crate::orchestrate::queue::QueueItem) -> u32 {
     q.get(&item.id).map(|it| it.agreement).unwrap_or(item.agreement)
 }
@@ -444,7 +444,10 @@ fn note_enq(o: EnqueueOutcome, reason: &str, meta: &mut DeepMeta) {
         EnqueueOutcome::New => {
             *meta.enqueue_reasons.entry(reason.into()).or_insert(0) += 1;
         }
-        EnqueueOutcome::MergedPending | EnqueueOutcome::MergedInFlight | EnqueueOutcome::MergedSettled => {
+        EnqueueOutcome::MergedPending
+        | EnqueueOutcome::MergedInFlight
+        | EnqueueOutcome::MergedSettled
+        | EnqueueOutcome::MergedSkipped => {
             meta.dedup_hits += 1;
         }
     }
@@ -550,6 +553,27 @@ mod tests {
         assert_eq!(run.findings[0].suspicion_agreement, 2, "报告里的 finding 带落地值");
         assert_eq!(run.cells[0].output.findings()[0].suspicion_agreement, 2, "落盘 CellRecord 同值");
         assert_eq!(run.findings[0].agreement, 1, "模型轴不受影响");
+    }
+
+    /// reviewer cell_id 按队列项（批 C1-1）：`review[{item.id}]@{reviewer}`——同项重跑 upsert 覆盖自身、
+    /// 不同项永不同名。批 C 按单次调用的派发序编号（每次调用从 1 起），resume 挖别的项时同名覆盖了首跑的格。
+    #[tokio::test]
+    async fn reviewer_cell_id_follows_queue_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = one_bundle(dir.path());
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(&rev_json("fn a() {"))])), Duration::from_secs(5), 0);
+        let run = run_one(&reg, dir.path(), &bundles, ToolsMode::Off).await;
+        let names: Vec<&str> = run.cells.iter().map(|c| c.cell.as_str()).collect();
+        assert_eq!(names, vec!["review[a.rs:rule:1-2]@p/r"]);
+    }
+
+    /// 并进被截项（`MergedSkipped`）同样是一次去重命中：入队没有新增挖掘。
+    #[test]
+    fn merged_skipped_counts_as_dedup_hit() {
+        let mut meta = DeepMeta::default();
+        note_enq(EnqueueOutcome::MergedSkipped, "scan", &mut meta);
+        assert_eq!((meta.dedup_hits, meta.enqueue_reasons.len()), (1, 0));
     }
 
     /// REPAIR 轮进 attempts（scanner 同口径 = 轮次 + 429 重试）。旧实现硬编码
