@@ -48,12 +48,16 @@
 - [ ] Commit: `feat(report): 深挖观测收口——队列/预算/等待/agreement 全链入 RunMeta（design §6 观测面）`
 
 ### C-7 收口
-- [ ] 本仓 dogfood：`redteam-next review --base <recent>` 真 provider 产 finding
+- [x] 本仓 dogfood：`redteam-next review --base 674583e` 真 provider 两轮——grok-4.6 exit 2 / 0 finding
+      （needs 被注入互斥跳过、模型选择不臆断）；glm-5.3 exit 10 / **13 finding**（验收达成）。
+      记录 `.next/private/m21b/2026-09-12-batch-c-dogfood.md`（含串行墙钟基线 91 s / 253 s 每格）
 - [x] `cargo test`（lib 639 / e2e 17 / packaging 7 / cli 17）/ `clippy --all-targets` 零新增（7 = 基线逐条一致）/ `make verify` 全绿
 - [x] 自查修 4 条（`b93a7d9`）：resume 空变更集 panic、错误路径漏 finalize、resume 丢 spec 段、landed agreement 死值；
       余 3 条不可触发项记 `.next/roadmap/followup.md`「批 C 核查留债」
-- [ ] ship 评审（dev `redteam`；config schema 错位则走三路 code-review 如批 B）→ 修 → `--no-ff` 合回
-- [ ] Commit: 评审修（如有）
+- [x] 三路 code-review（M21 期间替代 ship）15 条 → 第 1/2 档修 11 条、thinking×tools 守卫前提证伪撤销、
+      agreement 拆轴；dogfood 自评审 13 条 → 修 3 条（含一条 code-review 漏掉的空断言测试，变异验证）
+- [x] `--no-ff` 合回 `feat/m21-review-engine`（`eac0a60`），主干四绿复验通过
+- [x] 未兑现项另立批 C1（门驱动并发 + 分派池轮转，plan 已写）
 
 ## 验证命令
 

@@ -464,3 +464,64 @@ grill 定 D13（删角色 workers / 无 --workers、provider 门单把 FIFO 不�
 ### Next Steps
 
 - 批 C（m21b-deep）前提 A+B 已合回，可开工；m21b-risk 工作树/分支已合并可清理
+
+
+## Session 19: M21b 批 C 深挖队列与 reviewer 运行时（核查 + 三路评审 + 真 provider dogfood 收口）
+<!-- trellis-session: v=2 fp=0f53710994402f6c -->
+
+**Date**: 2026-09-13
+**Task**: M21b 批 C 深挖队列与 reviewer 运行时（核查 + 三路评审 + 真 provider dogfood 收口）
+**Branch**: `feat/m21b-deep`
+
+### Summary
+
+批 C 实施 9 commit 后核查：C-1..C-6 落地但 C-7 未做、clippy +8、resume 空变更集 panic、错误路径漏 finalize（implement.md 曾把该测试项删掉后打勾）。修 4 条后跑三路 code-review 报 15 条：流式旁路生产从未接线（with_text_delta 只在测试里）、reviewer cell 不落盘（后台 attach_cells 丢格）、resume 丢 finding、空变更集+reviewer 假绿灯、观测快照定格在 scan 段——第 1/2 档修 11 条。第 3 档：thinking×tools 守卫按官方文档证伪撤销（真 400 源是 4.7+ 拒 type:enabled 与 thinking block 不回传，记 followup）；与维护者核对后拆 Finding 两根 agreement 轴（agreement=模型数，M21b 分派池不双审下基本恒 1；suspicion_agreement=区域疑点共识，批 D 免复核判据）。并发派发+多 reviewer 轮转另立批 C1。C-7 真 provider dogfood 两轮（base 674583e）：grok-4.6 exit 2/0 finding（needs 被注入互斥跳过）、glm-5.3 exit 10/13 finding（验收达成）；自评审修 3 条，其中两轴测试断言为空（删 max 行仍绿）是 code-review 漏掉的，已变异验证。一度误判 finish_reason 恒 None 意味流式空转——实为 CellRecord 无该字段，stream_discarded=2 反证旁路是活的，已纠正入记录。--no-ff 合回 eac0a60，主干四绿。
+
+### Main Changes
+
+- src/orchestrate/{queue,dispatch,review_shot,deep}.rs 新增：入口五态、优先级/预算/必挖/保底/drain、per-cell backend 流式旁路、旁路与终判同一锚定门、barrier
+- cli：reduce 接线、带债 exit 2、scan-only 退化、resume 读快照（全 Settled 也收口）、观测在 overlay 刷新、--help 订正为深挖口径
+- domain：Finding.suspicion_agreement 拆轴、CellOutput::findings_mut；state：Phase Deep/Verify + queue_items 快照
+- provider：backend_from_config_with_delta；撤销 thinking×tools 守卫；订正 anthropic body「走不到」误判（模型级 kind 覆盖）
+- docs：plan 立批 C1；followup 记批 C 核查留债/两根 agreement 轴/thinking 两处真债/dogfood 未修项
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c346617` | feat(orchestrate): 深挖队列项与入口五态——merge_suspicions 谓词复用、agreement 活值（design §6 规则 2〔D13〕） |
+| `a2751ce` | feat(orchestrate): 优先级键+预算+必挖集不截+保底配额+graceful drain（design §6 规则 1/3/4〔D11〕） |
+| `d79ff3c` | feat(orchestrate): reviewer cell 运行时——FindingSink no-op、旁路/终判按 id 去重、finalize（design §7） |
+| `c08d229` | feat(orchestrate): 门驱动单派发——lease × pop 最高 Pending，空队列不占门（design §6 规则 5〔D13〕） |
+| `5e06655` | feat(cli): stage0 保留 RiskRoute + DeepMeta 形状；dispatch 租约活过 cell（design §2/§9） |
+| `89984ca` | feat(cli): barrier+reduce 接线——H0/疑点入队、门驱动深挖、findings 报告与带债 exit 2（design §2/§6） |
+| `f1c355d` | feat(state): Phase Deep/Verify + queue_items 快照 API；resume 零行仍 scan-only（design §17 R14〔D11〕） |
+| `0d74e2c` | feat(deep): Fake 429 压测+anthropic thinking×tools 守卫+item_wait_ms+快照接线与 resume 重跑（design §6/§7/§17） |
+| `8b84c9c` | feat(deep): --tools 二阶段补查轮 + RunMeta.deep 观测收口 + 四绿（design §11 R2/§6 观测面） |
+| `b93a7d9` | fix(deep,review_shot): 核查修 4 条——resume 空变更集早退、错误路径必调 finalize、resume 带回 spec 段、agreement 落地活值 |
+| `8041bc7` | docs(followup,task): 批 C 核查账目——四绿口径勘误、留债三条、被降标的 finalize 测试项复位 |
+| `936c209` | fix(deep,cli): 评审第 1 档——流式旁路生产接线、reviewer cell 落盘、resume 不丢 finding、假绿灯与观测快照 |
+| `dff7f9f` | fix(deep,queue): 评审第 2 档——agreement 随请求进队列、等待时长派发时定格、attempts/usage 入账、守卫拒绝披露、on 档不弱于 two-stage |
+| `674583e` | fix(provider): 撤销 thinking×tools 守卫——前提经查证不成立，真 400 源另有其二 |
+| `db054bb` | refactor(domain): 拆开 Finding 的两根 agreement 轴——新增 suspicion_agreement，深挖不再代笔模型数 |
+| `cdd6ea5` | docs(domain,followup): 订正 agreement 轴的口径——M21b 分派池下它已无产生机制 |
+| `f1d3ca3` | docs(plan,roadmap): 新增 M21b 批 C1——门驱动并发派发与 reviewer 分派池轮转 |
+| `86706e8` | fix(deep,review_shot): C-7 dogfood 自评审修 3 条——旁路发射过锚定门、疑点共识取值时点、两轴测试断言为空 |
+| `cfcabf3` | docs(followup,plan): C-7 dogfood 账目——自评审未修项、C1-2 补事件侧滞后与分叉用例、thinking 债改当下时态 |
+| `eac0a60` | merge(m21b-deep): 批 C 深挖队列与 reviewer 运行时合回——入口五态/优先级预算/barrier/Phase Deep+resume/观测 + 两轮评审修 + 真 provider dogfood（design §2/§6/§7/§8.4〔D11/D13〕） |
+
+### Testing
+
+- [OK] lib 651 / e2e 17 / packaging 7 / cli 17 全绿；clippy 7 = 基线；make verify 绿（子分支与合回后主干各复验一次）
+- [OK] 变异验证 3 处：删 max 行 → 两轴测试红；去掉旁路锚定 → 报 [real,ghost]；旧 finalize 测试（探针实测 discarded==0）
+- [OK] 真 provider dogfood 两轮，墙钟 18.3 / 50.7 min（批 C1 串行基线）
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 开批 C1（feat/m21b-deep-concurrency）：C1-1 队列项身份与 spec 解耦 → C1-2 并发派发（先试 FuturesUnordered）→ C1-3 分派池轮转 → C1-4 墙钟门
+- 批 D 可与 C1 并行；唯一碰撞点 run_deep 的 sink 接线；D 写跳过规则读 suspicion_agreement 不读 agreement
+- m21b-deep 工作树已合并可清理（.next/private/m21b/ dogfood 记录需先拷回主干工作树）

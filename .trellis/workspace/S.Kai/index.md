@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 18
-- **Last Active**: 2026-09-10
+- **Total Sessions**: 19
+- **Last Active**: 2026-09-13
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~466 | Active |
+| `journal-1.md` | ~527 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 19 | 2026-09-13 | M21b 批 C 深挖队列与 reviewer 运行时（核查 + 三路评审 + 真 provider dogfood 收口） | `c346617`, `a2751ce`, `d79ff3c`, `c08d229`, `5e06655`, `89984ca`, `f1c355d`, `0d74e2c`, `8b84c9c`, `b93a7d9`, `8041bc7`, `936c209`, `dff7f9f`, `674583e`, `db054bb`, `cdd6ea5`, `f1d3ca3`, `86706e8`, `cfcabf3`, `eac0a60` | `feat/m21b-deep` |
 | 18 | 2026-09-10 | M21b 批 A 风险评分器（+ 前置 #1 小分量并池） | `21de550`, `69ff71d`, `56f0397`, `9fc0bbc`, `c7b1b42`, `b5d1ee1`, `1f72af5`, `4156796`, `03f056c`, `3d4cb01`, `840d8ac`, `be6b3b1` | `feat/m21b-risk` |
 | 16 | 2026-09-10 | M21b 批 B reviewer 静态零件 | `081ab70`, `6f235b3`, `039a299`, `ce4ced4`, `f515ed4`, `7b11f16`, `d1c2b61`, `4afa9a5`, `fb45684` | `feat/m21b-review-primitives` |
 | 15 | 2026-09-10 | D13 并发形态 grill 落文档 + Trellis 任务 d13-provider-gate 交付（provider 门唯一闸、429 排队重试、评审修 11 条、真跑核验） | `84dee09`, `f5cb451`, `641b4d3`, `f7bae23`, `3fe0f94`, `4aabec3`, `2c32703` | `feat/m21-review-engine` |
