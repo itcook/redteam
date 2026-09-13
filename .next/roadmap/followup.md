@@ -197,6 +197,7 @@ coverage `failed` 数。
 
 ## M21b 批 C 核查留债（2026-09-12，Trellis `09-10-m21b-deep`，修 4 条后剩余）
 
+> **已定案（2026-09-13 C1 拷问）**：前两条的处置已钉进 C1 任务 design——id 定死、Skipped 仅成必挖才复位（`MergedSkipped`）。
 > **已有主（2026-09-12）**：下列前两条（队列项身份、Skipped 复位）由**批 C1 Task C1-1** 承接——
 > 它们正是「当前不可触发、并发一开就真」的那类，必须在并发派发落地前解掉。第三条（`ItemKind::Needs`
 > 无生产路径）仍是纯记账，等 M21c 增量轮决定留删。
@@ -291,3 +292,23 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
   无测试钉住。批 C1 处理事件滞后时一并加。
 - 误报：[5]（称 fixtures 模块为本批新建——实为既有）；[6]（称 plan 不在变更集——实在，疑 pack 截断）。
 - **`ReviewCall.finish_reason` 不进 `CellRecord`**：算出来了却没落盘，报告看不出哪格被截断（观测缺失，功能正常）。
+
+## 批 C1 拷问定案带出的账（2026-09-13，`/grilling` Q1–Q10，定案全文在 Trellis 任务 `09-13-m21b-deep-concurrency/design.md` §9）
+
+- **批 C resume 覆盖 cell 丢 finding（主干上活的，C1-1 修）**：`run_deep` 的 `review[{n}]` 每次调用从 1 起、`cell_put` 按 cell 名
+  upsert → resume 的 `review[1]@m` 覆盖首跑同名格（不同队列项）→ 二次 resume 永久丢 finding。批 C C-5 清单的「Settled 以 cells 为准」
+  也未实现。`redteam-next` 在 M21c 切名前不进插件与 ship 循环，故不热修。C1 定案：cell_id = `review[{item.id}]@{model}` + 补齐该校验。
+- **队列 id 捷径造假共识（C1-1 修，批 D 读者注意）**：上游 `merge_suspicions` 已按 `same_suspicion` 组内传递闭包，进队列的同文件
+  scan 项互不满足谓词，生产上 scan 项在队列里的合并**全部**走 `find_merge_idx` 的 id 捷径（行区间逐字相同）并抬 agreement。
+  C1 定案：捷径合并只并笔记与区间，**只有谓词合并才计共识**。→ 批 C 合回后的 `suspicion_agreement` 可能偏高，C1 合回后收紧；
+  若数据显示 quote 噪声（如尾部分号）导致真共识漏判，修 `same_suspicion` 的 quote 归一化，不靠捷径。
+- **二阶段补查四处静默（C1-2 修）**：重新 lease 失败吞掉、第二轮用共享 backend、policy 重试 / 等待未回读、第二轮失败吞掉且 token 不入账；
+  `needs_two_stage_triggered` 虚报。C1 定案：一格持门位到底；第二轮失败 → 保留首轮 finding + warning + 计债；全被读守卫拒 → skipped 不计债。
+- **兼任角色（code-review 批 C 第 12 条）已基本消解**：`RoleAttrs` 只有 `thinking_level`，深挖 per-cell backend 按 reviewer 自己的
+  `EffectiveModel` 构造。残余仅兼任时 reviewer 的 thinking 无映射 warning 被 `continue` 跳过（C1-3 补发）。verifier 接线（批 D）时同样检查。
+- **scanner 与深挖时间重叠 → 批 C2**（plan 已立节）：流式入队、在线预算与保底预留、scanner 先入门的门让位、reviewer 已开挖时的
+  scanner 失败口径。C1 留 `DeepInput.incoming` 通道与「通道关闭」barrier。
+- **报告确定性（C1-2 修）**：dedup 取输入序首个为 base（标题 / 正文 / 建议保留 base），并发完成序会让报告文本逐次漂移；
+  meta 四数组 push 时点不一，批 C 串行下只要有失败格就已错位。C1 定案：报告按派发序组装、meta 按派发序对齐。
+- **reviewer 模型去留的数据口径**：批 C dogfood grok-4.6 0 条 vs glm-5.3 13 条（同变更集同 12 格）。C1 定案不引入权重（design「无 priority」），
+  C1-5 dogfood 混合池统计每模型每格产出，作为配置去留依据。
