@@ -95,8 +95,8 @@ pub struct Finding {
     /// ≥ 2 的产生机制；现存消费者只剩 carry 与旧报告。区域共识看 `suspicion_agreement`。
     pub agreement: u32,
     /// 这条 finding 所在**区域**被几个独立 scanner 家族标记过（深挖队列项落地时刻的 agreement，
-    /// 后涨不回溯〔D13〕）——区域可疑度轴，与 `agreement` 不同维度：三个 scanner 都盯过这段，
-    /// 不代表 reviewer 报的这条更可信。批 D 跳过复核的判据（design §8.1：疑点 agreement ≥ 2
+    /// 后涨不回溯〔D13〕；`run_deep` 回主循环后按队列活值回填——`FindingEvent` 上的同名值是派发时快照）。
+    /// 区域可疑度轴，与 `agreement` 不同维度：三个 scanner 都盯过这段，不代表 reviewer 报的这条更可信。批 D 跳过复核的判据（design §8.1：疑点 agreement ≥ 2
     /// ∧ reviewer 确认 = 三方一致 → 免复核）。0 = 非深挖产出 / 旧报告。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub suspicion_agreement: u32,

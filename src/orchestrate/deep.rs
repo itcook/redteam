@@ -226,6 +226,15 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                         meta.needs_two_stage_skipped += 1;
                     }
                 }
+                // 落地时刻的疑点共识回填到**落盘** finding（design §7「落地的 finding 继承记录当时的
+                // agreement」、§8.1「按落地时刻算、后涨不回溯」）。cell 内的 `EmitCtx` 只能拿派发时
+                // 快照——它跑在 await 里碰不到队列；此处回到主循环读活值，落盘 / 进报告的以此为准。
+                // 串行派发下 cell 运行期间队列冻结，两值恒等；批 C1 并发后在途并入会让落地值更高，
+                // 届时事件侧（FindingEvent）的值可能滞后，见 plan C1-2。
+                let landed = live_agreement(&q, &item);
+                for f in c.output.findings_mut() {
+                    f.suspicion_agreement = landed;
+                }
                 let got = c.output.findings().to_vec();
                 findings.extend(got.iter().cloned());
                 let mut rec = CellRecord::ok(&cell_id, &rev.name, c.output).with_family(&rev.family);
@@ -244,9 +253,7 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
                 meta.stream_discarded += c.stats.stream_discarded;
                 meta.reviewer_output_tokens.push(c.output_tokens);
                 meta.dispatch_agreement.push(item.dispatch_agreement);
-                // 落地时 agreement 读队列活值（在途期间并入的异族会抬高它）——与派发时值成对，
-                // 二者之差即「挖的时候还不知道、挖完才攒够的共识」，观测面按此判读。
-                let landed = live_agreement(&q, &item);
+                // 与派发时值成对（`landed` 上面已读）：二者之差即「挖的时候还不知道、挖完才攒够的共识」。
                 meta.landed_agreement.push(landed);
                 // 先落盘 cell（finding 的权威载体）再写队列快照：kill 落在两者之间时，
                 // 快照仍是 InFlight → resume 重跑，宁可重挖一格也不丢 finding（design §7.1）。
@@ -509,6 +516,40 @@ mod tests {
             &(),
         )
         .await
+    }
+
+    /// 落盘 finding 的 `suspicion_agreement` 与观测面 `landed_agreement` 同源（design §7「落地的 finding
+    /// 继承记录当时的 agreement」）。串行派发下派发值恒等于落地值，所以本用例钉的是**契约**——
+    /// 回填确实写进落盘与报告；批 C1 并发后两值会分叉，届时若有人删掉回填，落盘会退回派发快照、
+    /// 与 `landed_agreement` 对不上。真正的「派发 ≠ 落地」分叉用例由 C1-2 补。
+    #[tokio::test]
+    async fn persisted_findings_carry_landed_suspicion_agreement() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = one_bundle(dir.path());
+        let mut item = snap_item("a.rs", ItemState::Pending);
+        item.agreement = 2;
+        item.families = vec!["alpha".into(), "beta".into()];
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(&rev_json("fn a() {"))])), Duration::from_secs(5), 0);
+        let reviewer = fake_reviewer();
+        let run = run_deep(
+            &reg,
+            DeepInput {
+                route: None, scan_cells: &[], bundles: &bundles, root: dir.path(),
+                reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
+                pack: &Default::default(), spec_docs: "", target_label: "t",
+                snapshot: None, restore: Some(std::slice::from_ref(&item)),
+                prior_findings: vec![], tools: ToolsMode::Off,
+                backend_factory: None, on_cell: None,
+            },
+            &(),
+        )
+        .await;
+        assert_eq!(run.meta.landed_agreement, vec![2]);
+        assert_eq!(run.findings.len(), 1);
+        assert_eq!(run.findings[0].suspicion_agreement, 2, "报告里的 finding 带落地值");
+        assert_eq!(run.cells[0].output.findings()[0].suspicion_agreement, 2, "落盘 CellRecord 同值");
+        assert_eq!(run.findings[0].agreement, 1, "模型轴不受影响");
     }
 
     /// REPAIR 轮进 attempts（scanner 同口径 = 轮次 + 429 重试）。旧实现硬编码

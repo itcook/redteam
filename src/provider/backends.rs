@@ -122,7 +122,9 @@ pub(crate) fn build_anthropic_tools_body_ext(
     // tools→system→messages，断点在 messages 末尾即缓存整个前缀（tools+system+全部历史）。
     // tool-loop append-only 确定性渲染，前缀天然稳定：每轮把断点移到新末尾，命中前一轮写的前缀、
     // 只付增量写入，13 轮对话输入成本理论折减 ~80-90%（5min TTL 覆盖 cell 内轮间隔）。
-    // 当前三 provider 全 openai kind，此 body 走不到；为将来配 Anthropic 直连即生效而备。
+    // 此 body **是活路径**（2026-09-12 dogfood 实证）：kind 可在**模型级**覆盖 provider 级——
+    // 实测配置里 provider `agc` 是 openai kind，其下 `grok-4.6` / `glm-5.3` 却各自声明 anthropic，
+    // reviewer 全程走这里。旧注释「三 provider 全 openai kind，此 body 走不到」是只看了 provider 级的误判。
     // 末块自动断点：末条 message 本身是分块（断点已显式给出）则不再加；其后追加的 Assistant / ToolResults / REPAIR 轮仍拿到
     // 移动尾断点（tool-loop 逐轮增量缓存不因分块会话失效），总数守 Anthropic 上限 4（评审 #12）。
     let placed = explicit_boundaries + usize::from(!system.is_empty() && explicit_boundaries > 0);

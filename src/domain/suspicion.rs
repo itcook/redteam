@@ -105,6 +105,14 @@ impl CellOutput {
         }
     }
 
+    /// reviewer 输出的 findings 可变视图；非 reviewer 形态为空切片（深挖回填落地时刻疑点共识用）。
+    pub fn findings_mut(&mut self) -> &mut [Finding] {
+        match self {
+            CellOutput::Review { findings, .. } => findings,
+            _ => &mut [],
+        }
+    }
+
     pub fn into_findings(self) -> Vec<Finding> {
         match self {
             CellOutput::Review { findings, .. } => findings,

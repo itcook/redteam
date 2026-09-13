@@ -168,14 +168,17 @@ mod tests {
     /// 必须读区域轴才有区分度。下面第二段正是那种形状：单模型报出、落在双家族疑点区。
     #[test]
     fn two_agreement_axes_merge_independently() {
+        // base 取小、other 取大：这样「取 max」与「保留 base 原值」输出不同，删掉 merge_into
+        // 那行 max 测试就会红。反过来写（base 3 / other 1）两者都得 3，断言是空的——
+        // 2026-09-12 dogfood 的 reviewer 正是逮到了这个形状（confidence 0.85）。
         let mut a = f("1", "a.rs", 10, 12, "missing auth check", "claude", Severity::High);
-        a.suspicion_agreement = 3;
+        a.suspicion_agreement = 1;
         let mut b = f("2", "a.rs", 11, 13, "Missing auth check", "gpt", Severity::High);
-        b.suspicion_agreement = 1;
+        b.suspicion_agreement = 3;
         let out = dedup(vec![a, b]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].agreement, 2, "两个模型认同 → 模型轴 2");
-        assert_eq!(out[0].suspicion_agreement, 3, "区域轴取 max，不随模型数变");
+        assert_eq!(out[0].suspicion_agreement, 3, "区域轴取 max（base 1 < other 3），不随模型数变");
 
         // 单模型 finding 落在双家族疑点区：模型轴 1（M21b 分派池下的常态）∧ 区域轴 2（跳过判据成立）。
         let mut lone = f("3", "b.rs", 5, 5, "unchecked write", "claude", Severity::High);

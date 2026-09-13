@@ -26,10 +26,13 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// 发起对抗式评审（M21a：scan-only）：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目
-    /// （× samples）并行扇出 → 疑点并集（agreement = 家族数）→ 疑点索引 + 覆盖自报报告。**不产 finding**
-    /// （深挖 / 复核 / verdict 在 M21b 起）。退出码：0=scan 完成（verdict scan-only）、1=命令自身失败（参数/IO/配置错误）、
-    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口）；2 / 10 在 M21b 深挖落地前不可达。
+    /// 发起对抗式评审：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目（× samples）并行扇出
+    /// → 疑点并集（agreement = 家族数）→ **深挖**（风险 H0 区与 scanner 疑点进同一条优先级队列，reviewer 按
+    /// provider 门空位消费，预算随风险分、必挖集不截）→ dedup → finding 报告与 verdict。**finding 只由深挖产出**；
+    /// 没配 reviewer 角色则退化为 scan-only（疑点索引 + 覆盖自报，不产 finding）。
+    /// 退出码：0=干净 approve 或 scan-only 完成、1=命令自身失败（参数/IO/配置错误）、2=approve 但带债
+    /// （reviewer cell 失败或预算截断，见 run.warnings 与 run.deep.budget_skipped）、
+    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口）、10=reject（finding 达到 --block-threshold）。
     /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
     /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
     /// 自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit 可读；误填超大 maxConcurrency 也能自愈）。
@@ -52,11 +55,11 @@ enum Cmd {
         /// 与 `redteam test-command` 同一推断链）；记入报告 run.test_command。
         #[arg(long)]
         test_command: Option<String>,
-        /// verdict 阻断阈值：low | medium（默认）| high | critical——达到即 reject。M21b 深挖产 finding 后生效；
-        /// M21a scan-only 下记录不消费。
+        /// verdict 阻断阈值：low | medium（默认）| high | critical——finding 达到即 reject（退出码 10）。
+        /// 无 reviewer 的 scan-only 路径无 finding 可判，记录不消费。
         #[arg(long, value_parser = ["low", "medium", "high", "critical"])]
         block_threshold: Option<String>,
-        /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定。M21b 起生效；M21a scan-only 下记录不消费。
+        /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定。无 reviewer 的 scan-only 路径记录不消费。
         #[arg(long)]
         conf_floor: Option<f32>,
         /// 工具档位：off | two-stage | on。scanner 恒单发（无工具、needs 只记录不补跑，M21b 深挖队列消费）；本旗对 scanner 无效。
@@ -75,7 +78,7 @@ enum Cmd {
         #[arg(long)]
         resume: Option<String>,
         /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：
-        /// 项目存在 .redteam/proj-next.db 即自动加载，run.ledger 披露。M21a scan-only 下只披露不消费
+        /// 项目存在 .redteam/proj-next.db 即自动加载，run.ledger 披露。当前只披露不消费
         /// （判例前移进 scanner prompt 与豁免 / refute 裁决在 M21c 疑点台账起）。
         #[arg(long)]
         dismissed: Option<String>,
@@ -609,7 +612,7 @@ async fn main() {
 
             // 批 F-4（评审帽外项）：增量轮在 M21c 恢复前对前台 / 后台都在这里拒收——不能先建 job 再在 worker 里 bail 落成 Failed 作业。
             if args.incremental_from.is_some() {
-                eprintln!("error: --incremental-from（增量轮）在 M21c 疑点台账回流后恢复；M21a scan-only 请跑全量 `review --base <base>`");
+                eprintln!("error: --incremental-from（增量轮）在 M21c 疑点台账回流后恢复；先跑全量 `review --base <base>`");
                 std::process::exit(1);
             }
 

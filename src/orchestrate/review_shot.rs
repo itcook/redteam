@@ -21,8 +21,10 @@ use crate::provider::{timed_turn_final_with, timed_turn_with, AttemptPolicy, Pro
 #[derive(Clone, Debug)]
 pub struct FindingEvent {
     pub finding: Finding,
-    /// 区域被几个 scanner 家族标记过（= `Finding.suspicion_agreement`）——批 D 跳过复核的判据，
-    /// **不是**认同这条 finding 的模型数（那是 `Finding.agreement`）。
+    /// 区域被几个 scanner 家族标记过——批 D 跳过复核的判据，**不是**认同这条 finding 的模型数
+    /// （那是 `Finding.agreement`）。**取值时点 = 派发时快照**：事件在 cell 运行中（旁路）或刚结束
+    /// （终判）发出，那时碰不到队列。串行派发下 cell 运行期间队列冻结，快照恒等于落地值；
+    /// 落盘 finding 另由 `run_deep` 回主循环后按落地活值回填，**两者分叉时以落盘为准**（批 C1 并发后才会分叉）。
     pub suspicion_agreement: u32,
     pub reviewer_family: String,
 }
@@ -40,7 +42,8 @@ impl FindingSink for () {
 pub(crate) struct EmitCtx<'a> {
     model: &'a str,
     family: &'a str,
-    /// 队列项落地时刻的疑点共识（家族数）——盖到 `Finding.suspicion_agreement`。
+    /// 队列项**派发时**的疑点共识（家族数）快照——盖到事件与 cell 内产出的 `Finding.suspicion_agreement`。
+    /// 不是落地值：本上下文跑在 await 里读不到队列；落地值由 `run_deep` 在主循环回填落盘 finding。
     /// **不碰** `Finding.agreement`：那是认同这条 finding 的模型数，由 `dedup` 算定。
     suspicion_agreement: u32,
     root: &'a Path,
@@ -105,11 +108,26 @@ fn sum_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
+/// 旁路发射与终判（`finish_parse`）走**同一道 quote 锚定门**：没锚上的不发。
+/// 旧实现旁路直接 `enrich` 就发——批 C 的 sink 是 no-op 所以无害，但批 D 一接真 sink，
+/// 未经 quote 校验的 finding 会先于终判漏进复核流（终判那边会丢弃，事件却已发出、收不回）。
+/// 锚定只改行号不改 `id`（id 由 enrich 按 quote 算定），所以与终判按 id 去重仍然对得上；
+/// 旁路丢弃的计数不单记——终判 parse 全文时 `dropped_quote` 会把同一批再算一遍。
 fn emit_raw(raws: Vec<crate::domain::RawFinding>, ctx: &mut EmitCtx) {
-    for raw in raws {
-        let mut f = enrich(&raw, ctx.model);
+    if raws.is_empty() {
+        return;
+    }
+    let enriched: Vec<Finding> = raws
+        .iter()
+        .map(|raw| {
+            let mut f = enrich(raw, ctx.model);
+            f.models = vec![ctx.model.to_string()];
+            f
+        })
+        .collect();
+    let (kept, _dropped, _unreadable) = anchor_review_findings(enriched, ctx.root);
+    for mut f in kept {
         f.suspicion_agreement = ctx.suspicion_agreement;
-        f.models = vec![ctx.model.to_string()];
         ctx.emit(&f);
     }
 }
@@ -315,6 +333,40 @@ mod tests {
         assert_eq!(call.iterations, 1);
         let ids: HashSet<_> = events.iter().map(|e| e.finding.id.clone()).collect();
         assert_eq!(ids.len(), 2);
+    }
+
+    /// 旁路发射必须过 quote 锚定门（2026-09-12 dogfood reviewer finding，high）：
+    /// quote 在文件里找不到的「幽灵 finding」一条事件都不能发——终判会丢它，但旁路先发的事件收不回。
+    /// 走真旁路：小块 delta + 回调 feed，`drain_bypass` 先于 `finish_parse` 发射。
+    #[tokio::test]
+    async fn bypass_does_not_emit_unanchored_findings() {
+        let dir = tmp_file(); // a.rs = "fn a() {\nfn b() {\n"
+        let rec = Rec(Mutex::new(Vec::new()));
+        let with_ghost = r#"{"findings":[
+            {"severity":"low","title":"real","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"fn a() {"},
+            {"severity":"high","title":"ghost","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r","quote":"this line is nowhere in the file"}
+        ],"needs":[]}"#;
+        let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+        let inc2 = inc.clone();
+        let backend = FakeChatBackend::new(vec![turn(with_ghost)])
+            .with_delta_chunk(9)
+            .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
+        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &rec);
+        let call = run_review_shot_with(
+            &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc,
+        )
+        .await
+        .unwrap();
+        let events = rec.0.lock().unwrap();
+        assert!(
+            events.iter().all(|e| e.finding.title != "ghost"),
+            "锚不上的 finding 不得经旁路发射: {:?}",
+            events.iter().map(|e| &e.finding.title).collect::<Vec<_>>()
+        );
+        assert_eq!(events.len(), 1, "只发锚得上的那条");
+        let CellOutput::Review { findings, .. } = &call.output else { panic!() };
+        assert_eq!(findings.len(), 1, "终判同样丢弃幽灵");
+        assert_eq!(call.stats.dropped_quote, 1, "丢弃计数由终判记一次，旁路不重复记");
     }
 
     #[tokio::test]
