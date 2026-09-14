@@ -40,10 +40,11 @@
 - [x] Commit: `feat(orchestrate): reviewer 分派池空闲轮转与成员健康——鉴权失败移出池不改派、池空停派保留 Pending、未分到格不再静默（design §6 规则 5、D7 A3）`
 
 ### C1-4 墙钟门与退化零差
-- [ ] 虚拟时间墙钟门：K=12 × 50 ms、门宽和 W=4 → 虚拟总时长 ≈ 3 × 50 ms（容差放宽）
-- [ ] 确认 `item_wait_ms` 并发下为队列等待（派发时定格）；`DeepMeta` 字段集不变
-- [ ] 退化零差：单 reviewer + 门宽 1 与批 C 串行报告同构（cell 序、findings、meta）
-- [ ] Commit: `test(deep): 并发墙钟门（虚拟时间）与单成员退化零差——对照批 C 串行基线`
+- [x] 虚拟时间墙钟门：K=12 × 50 ms、门宽和 W=4 → 虚拟总时长 ≈ 3 × 50 ms（容差放宽）——单成员门宽 4 与跨 provider 两成员 2 + 2 两种形态都测，后者两门各吃 6 格
+- [x] 确认 `item_wait_ms` 并发下为队列等待（派发时定格）：门宽 2、4 格 × 100 ms（真实时间——入队时刻取系统时钟，虚拟时间推不动）→ 先派两格 < 60 ms、后两格 ≥ 90 ms；`DeepMeta` 字段集不变（`git diff eac0a60 -- src/domain/report.rs` 为空）
+- [x] 退化零差：单 reviewer + 门宽 1 与批 C 串行报告同构（cell 序、findings、meta）——基线由批 C 代码（`git archive eac0a60` 导出到 scratchpad、跑同一场景）采得，存 `src/orchestrate/testdata/deep_serial_baseline.json`；比对面含 findings / cells / meta / warnings / 债 / 落盘序 / 队列快照序，归一化计时字段与模板哈希，cell 名按派发序映射回批 C 形态
+- [x] 变异检查：丢第二轮终判 / 去派发快照 / 丢 prior findings（基线比对转红）；完成时刻采样 wait（wait 用例转红）；串行派发（墙钟门与 wait 用例转红）
+- [x] Commit: `test(deep): 并发墙钟门（虚拟时间）与单成员退化零差——对照批 C 串行基线`
 
 ### C1-5 收口
 - [ ] `cargo test` / `clippy --all-targets` 零新增（基线 7）/ `make verify`

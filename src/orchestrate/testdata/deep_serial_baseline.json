@@ -1,0 +1,275 @@
+{
+  "cells": [
+    {
+      "attempts": 1,
+      "cached_input_tokens": 0,
+      "cell": "review[1]@p/r",
+      "duration_ms": 0,
+      "family": "r",
+      "input_tokens": 1,
+      "iterations": 1,
+      "model": "p/r",
+      "ok": true,
+      "output": {
+        "findings": [
+          {
+            "agreement": 1,
+            "body": "b",
+            "confidence": 0.5,
+            "file": "p.rs",
+            "hard_constraint": false,
+            "id": "4fafe7836a95e7f1",
+            "line_end": 1,
+            "line_start": 1,
+            "models": [
+              "p/r"
+            ],
+            "origin": "new",
+            "quote": "fn p() {",
+            "recommendation": "r",
+            "severity": "low",
+            "suspicion_agreement": 1,
+            "title": "issue in p"
+          }
+        ],
+        "needs": [],
+        "role": "reviewer"
+      },
+      "output_tokens": 1,
+      "queue_wait_ms": 0,
+      "tool_use": {
+        "list_files": 0,
+        "read_file": 0,
+        "read_files": 0,
+        "search_repo": 0
+      }
+    },
+    {
+      "attempts": 2,
+      "cached_input_tokens": 0,
+      "cell": "review[2]@p/r",
+      "duration_ms": 0,
+      "family": "r",
+      "input_tokens": 2,
+      "iterations": 2,
+      "model": "p/r",
+      "ok": true,
+      "output": {
+        "findings": [
+          {
+            "agreement": 1,
+            "body": "b",
+            "confidence": 0.5,
+            "file": "r.rs",
+            "hard_constraint": false,
+            "id": "c8feeaf4c7ddb699",
+            "line_end": 1,
+            "line_start": 1,
+            "models": [
+              "p/r"
+            ],
+            "origin": "new",
+            "quote": "fn r() {",
+            "recommendation": "r",
+            "severity": "low",
+            "suspicion_agreement": 1,
+            "title": "confirmed in r"
+          }
+        ],
+        "needs": [],
+        "role": "reviewer"
+      },
+      "output_tokens": 2,
+      "queue_wait_ms": 0,
+      "tool_use": {
+        "list_files": 0,
+        "read_file": 0,
+        "read_files": 0,
+        "search_repo": 0
+      }
+    },
+    {
+      "attempts": 1,
+      "cached_input_tokens": 0,
+      "cell": "review[3]@p/r",
+      "duration_ms": 0,
+      "family": "r",
+      "input_tokens": 1,
+      "iterations": 1,
+      "model": "p/r",
+      "ok": true,
+      "output": {
+        "findings": [
+          {
+            "agreement": 1,
+            "body": "b",
+            "confidence": 0.5,
+            "file": "s.rs",
+            "hard_constraint": false,
+            "id": "0b0b9b8de2b423e8",
+            "line_end": 1,
+            "line_start": 1,
+            "models": [
+              "p/r"
+            ],
+            "origin": "new",
+            "quote": "fn s() {",
+            "recommendation": "r",
+            "severity": "low",
+            "suspicion_agreement": 2,
+            "title": "issue in s"
+          }
+        ],
+        "needs": [],
+        "role": "reviewer"
+      },
+      "output_tokens": 1,
+      "queue_wait_ms": 0,
+      "tool_use": {
+        "list_files": 0,
+        "read_file": 0,
+        "read_files": 0,
+        "search_repo": 0
+      }
+    }
+  ],
+  "findings": [
+    {
+      "agreement": 2,
+      "body": "b",
+      "confidence": 0.8999999761581421,
+      "file": "p.rs",
+      "hard_constraint": false,
+      "id": "4fafe7836a95e7f1",
+      "line_end": 1,
+      "line_start": 1,
+      "models": [
+        "p/r",
+        "p/old"
+      ],
+      "origin": "new",
+      "quote": "fn p() {",
+      "recommendation": "r",
+      "severity": "low",
+      "suspicion_agreement": 1,
+      "title": "issue in p"
+    },
+    {
+      "agreement": 1,
+      "body": "b",
+      "confidence": 0.5,
+      "file": "r.rs",
+      "hard_constraint": false,
+      "id": "c8feeaf4c7ddb699",
+      "line_end": 1,
+      "line_start": 1,
+      "models": [
+        "p/r"
+      ],
+      "origin": "new",
+      "quote": "fn r() {",
+      "recommendation": "r",
+      "severity": "low",
+      "suspicion_agreement": 1,
+      "title": "confirmed in r"
+    },
+    {
+      "agreement": 1,
+      "body": "b",
+      "confidence": 0.5,
+      "file": "s.rs",
+      "hard_constraint": false,
+      "id": "0b0b9b8de2b423e8",
+      "line_end": 1,
+      "line_start": 1,
+      "models": [
+        "p/r"
+      ],
+      "origin": "new",
+      "quote": "fn s() {",
+      "recommendation": "r",
+      "severity": "low",
+      "suspicion_agreement": 2,
+      "title": "issue in s"
+    },
+    {
+      "agreement": 1,
+      "body": "b",
+      "confidence": 0.8999999761581421,
+      "file": "d.rs",
+      "hard_constraint": false,
+      "id": "issue in d",
+      "line_end": 1,
+      "line_start": 1,
+      "models": [
+        "p/r"
+      ],
+      "origin": "new",
+      "quote": "fn d() {",
+      "recommendation": "r",
+      "severity": "medium",
+      "title": "issue in d"
+    }
+  ],
+  "meta": {
+    "budget_skipped": 1,
+    "dedup_hits": 0,
+    "dispatch_agreement": [
+      1,
+      1,
+      2
+    ],
+    "item_wait_ms": [
+      0,
+      0,
+      0
+    ],
+    "landed_agreement": [
+      1,
+      1,
+      2
+    ],
+    "needs_two_stage_skipped": 0,
+    "needs_two_stage_triggered": 1,
+    "queue_depth_peak": 5,
+    "reviewer_output_tokens": [
+      1,
+      2,
+      1
+    ],
+    "stream_discarded": 0
+  },
+  "on_cell": [
+    "review[1]@p/r",
+    "review[2]@p/r",
+    "review[3]@p/r"
+  ],
+  "reviewer_failed": false,
+  "snapshots": [
+    [
+      "p.rs:rule:1-2",
+      "inflight"
+    ],
+    [
+      "p.rs:rule:1-2",
+      "settled"
+    ],
+    [
+      "r.rs:rule:1-2",
+      "inflight"
+    ],
+    [
+      "r.rs:rule:1-2",
+      "settled"
+    ],
+    [
+      "s.rs:scan:1-1",
+      "inflight"
+    ],
+    [
+      "s.rs:scan:1-1",
+      "settled"
+    ]
+  ],
+  "warnings": []
+}

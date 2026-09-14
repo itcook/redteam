@@ -212,7 +212,7 @@ per-cell backend 已按 reviewer 自己的 `EffectiveModel` 构造，缺的只�
 | 池空 | 唯一成员 401 | 剩余项 Pending、exit 2、warning 报数 |
 | 0 格成员 | 两成员、队列 1 项 | warning 点名未分到者 |
 | 墙钟门 | K=12 × 50 ms、W=4 | 虚拟时长 ≈ 3 × 50 ms |
-| 退化零差 | 单 reviewer、门宽 1 | 与批 C 串行报告同构 |
+| 退化零差 | 单 reviewer、门宽 1 | 与批 C 串行报告同构（基线由批 C 代码跑同一场景采得，见 §8） |
 | 429 注入 | Fake 首发 429 | 收门后全部完成、无死锁 |
 
 ## 8. 兼容与回滚
@@ -220,6 +220,9 @@ per-cell backend 已按 reviewer 自己的 `EffectiveModel` 构造，缺的只�
 - schema 不变（v4）；`queue_items` 形态不变；`EnqueueOutcome::MergedSkipped` 仅内部使用。
 - cell_id 形态从 `review[{n}]@` 变为 `review[{item.id}]@`：无生产代码解析该格式；旧作业的 `review[n]@` cell 在 resume 时按 §2.4 找不到 → Settled 项会被重挖一次（一次性成本，不丢数据）。
 - 回滚 = 不合回；合回后 revert 该 merge。退化零差用例是第一道回归哨。
+- 退化零差基线 `src/orchestrate/testdata/deep_serial_baseline.json`：`git archive eac0a60` 导出批 C 源码，在其 `deep.rs` 测试里跑与 C1 同一份场景
+  （`degenerate_serial_scenario`，两边只差 `incoming` 字段与 cell 名映射）写出 JSON。后续批次**有意**改变串行形态（如 C2 / D 改 prompt 链路或 meta 口径）时，
+  审过 diff 再更新该文件——它钉的是「单成员门宽 1 的派发形态」，不是永远冻结的输出。
 
 ## 9. 定案记录（2026-09-13）
 

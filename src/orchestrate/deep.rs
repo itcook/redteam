@@ -1614,4 +1614,177 @@ mod tests {
         assert!(run.reviewer_failed, "池空、项未挖 → 计债");
         assert!(run.warnings.iter().any(|w| w.contains("reviewer pool empty — 2 queued item(s)")), "{:?}", run.warnings);
     }
+
+    // ── 批 C1-4：墙钟门与退化零差 ────────────────────────────────────────────
+
+    /// 墙钟门：K = 12 格 × 50 ms、门宽和 W = 4（单成员门宽 4，或跨 provider 两成员门宽 2 + 2）→ 虚拟总时长 = ceil(K/W) × 50 ms
+    /// = 150 ms（串行 600 ms）。验收的是墙钟，不是质量——多成员只买吞吐与分散限流（prd Goal）。
+    #[tokio::test(start_paused = true)]
+    async fn wall_clock_gate_twelve_cells_over_width_four() {
+        let names: Vec<String> = (0..12).map(|i| format!("f{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let script = || names.iter().map(|n| (*n, 50, vec![found(n)])).collect::<Vec<_>>();
+        let check = |run: &DeepRun, elapsed: Duration, shape: &str| {
+            assert_eq!(run.cells.iter().filter(|c| c.ok).count(), 12, "{shape}: {:?}", run.warnings);
+            assert!(
+                elapsed >= Duration::from_millis(150) && elapsed < Duration::from_millis(200),
+                "{shape}: ceil(12/4) × 50 ms，实测 {elapsed:?}"
+            );
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &names);
+        let items = pending_items(&names);
+
+        let single = Routed::new(script());
+        let reg = routed_registry(&single, 4);
+        let t0 = tokio::time::Instant::now();
+        let run = run_with(plain(&reg, dir.path(), &bundles, &items)).await;
+        check(&run, t0.elapsed(), "单成员门宽 4");
+        assert_eq!(reg.gate_stats()["p"].peak, 4);
+
+        let (pa, qb) = (Routed::new(script()), Routed::new(script()));
+        let reg = pool_registry(&[("p/r", "p", 2, &pa), ("q/s", "q", 2, &qb)]);
+        let members = [member("p/r", "p"), member("q/s", "q")];
+        let t0 = tokio::time::Instant::now();
+        let run = run_with(Run { reviewers: Some(&members), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        check(&run, t0.elapsed(), "两成员门宽 2 + 2");
+        let stats = reg.gate_stats();
+        assert_eq!((stats["p"].peak, stats["q"].peak), (2, 2));
+        assert_eq!((pa.starts().len(), qb.starts().len()), (6, 6), "两门各吃一半");
+    }
+
+    /// `item_wait_ms` 在并发下仍是**队列等待**（派发时刻 − 入队），不是墙钟（完成时刻 − 入队）：门宽 2、4 格 × 100 ms →
+    /// 先派出的两格 ≈ 0、排在一轮之后的两格 ≈ 100 ms；若按完成时刻采样，前两格也会 ≥ 100 ms。
+    /// 真实时间：入队时刻取系统时钟（快照要落 epoch ms），虚拟时间推不动它。
+    #[tokio::test]
+    async fn item_wait_ms_measures_queue_wait_under_concurrency() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c", "d"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let backend = Routed::new(names.iter().map(|n| (*n, 100, vec![found(n)])).collect());
+        let reg = routed_registry(&backend, 2);
+        let items = pending_items(&names);
+        let run = run_with(plain(&reg, dir.path(), &bundles, &items)).await;
+        let w = &run.meta.item_wait_ms;
+        assert_eq!(w.len(), 4, "{:?}", run.warnings);
+        assert!(w[0] < 60 && w[1] < 60, "先派出的两格不排队: {w:?}");
+        assert!(w[2] >= 90 && w[3] >= 90, "后两格排在一轮之后: {w:?}");
+    }
+
+    // ── 退化零差基线（批 C1-4）──────────────────────────────────────────────
+
+    /// 退化零差场景：单 reviewer、门宽 1、restore 形态——主区 / 波及 / 疑点各一项待挖（波及项走二阶段补查），另有一项预算截断、
+    /// 一项已结案；prior findings 含已结案项的一条与主区产出同一 bug 的一条（dedup 合并）。计时字段与模板哈希归一化掉
+    /// （与派发形态无关，随墙钟 / 模板演进漂移）；落盘序（on_cell）与队列快照序一并比。
+    async fn degenerate_serial_scenario() -> serde_json::Value {
+        use crate::orchestrate::queue::QueueItem;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let names = ["p", "r", "s", "k", "d"];
+        for n in names {
+            std::fs::write(root.join(format!("{n}.rs")), format!("fn {n}() {{\n    body();\n}}\n")).unwrap();
+        }
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        g(&["init", "-q"]);
+        g(&["add", "."]);
+        g(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        let bundles = vec![Bundle::from_files(
+            names.iter().map(|n| FileChange { path: format!("{n}.rs"), diff: format!("@@ -1,1 +1,1 @@\n+fn {n}() {{") }).collect(),
+        )];
+        let rule = |file: &str, kind: ItemKind, state: ItemState| QueueItem {
+            id: format!("{file}:rule:1-2"),
+            spec: QueueItemSpec::new(file.into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap(),
+            score: 1.0, agreement: 1, state, kind, dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
+        };
+        let note = crate::domain::Suspicion {
+            file: "s.rs".into(), line_start: 1, line_end: 1, hint: "h".into(), category: None, confidence: 0.5, quote: "fn s() {".into(),
+        };
+        let scan = QueueItem {
+            id: "s.rs:scan:1-1".into(),
+            spec: QueueItemSpec::new("s.rs".into(), vec![(1, 1)], QueueOrigin::Scan, vec![note]).unwrap(),
+            score: 0.5, agreement: 2, state: ItemState::Pending, kind: ItemKind::Suspicion,
+            dispatch_agreement: 0, landed_agreement: None, families: vec!["alpha".into(), "beta".into()], enqueued_ms: None,
+        };
+        let items = vec![
+            rule("r.rs", ItemKind::Ripple, ItemState::Pending),
+            scan,
+            rule("p.rs", ItemKind::Primary, ItemState::Pending),
+            rule("k.rs", ItemKind::Ripple, ItemState::Skipped),
+            rule("d.rs", ItemKind::Primary, ItemState::Settled),
+        ];
+        let finding = |n: &str, title: &str| format!(
+            r#"{{"severity":"low","title":"{title}","body":"b","file":"{n}.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"fn {n}() {{"}}"#
+        );
+        let script = vec![
+            turn(&format!(r#"{{"findings":[{}],"needs":[]}}"#, finding("p", "issue in p"))),
+            turn(&format!(r#"{{"findings":[{}],"needs":[{{"path":"r.rs","reason":"need context"}}]}}"#, finding("r", "draft in r"))),
+            turn(&format!(r#"{{"findings":[{}],"needs":[]}}"#, finding("r", "confirmed in r"))),
+            turn(&format!(r#"{{"findings":[{}],"needs":[]}}"#, finding("s", "issue in s"))),
+        ];
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 1, Box::new(FakeChatBackend::new(script)), Duration::from_secs(5), 0);
+        let mut prior_same = fixtures::finding("issue in p", crate::domain::Severity::Low, 1, "p/old");
+        (prior_same.file, prior_same.quote) = ("p.rs".into(), "fn p() {".into());
+        let mut prior_settled = fixtures::finding("issue in d", crate::domain::Severity::Medium, 1, "p/r");
+        (prior_settled.file, prior_settled.quote) = ("d.rs".into(), "fn d() {".into());
+        let snaps = std::sync::Mutex::new(Vec::new());
+        let snapshot = |it: &QueueItem| snaps.lock().unwrap().push(serde_json::json!([it.id, it.state]));
+        let landed = std::sync::Mutex::new(Vec::new());
+        let on_cell = |rec: &CellRecord| landed.lock().unwrap().push(rec.cell.clone());
+        let reviewer = fake_reviewer();
+        let mut run = run_deep(
+            &reg,
+            DeepInput {
+                route: None, scan_cells: &[], bundles: &bundles, root,
+                reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
+                pack: &Default::default(), spec_docs: "", target_label: "t",
+                snapshot: Some(&snapshot), restore: Some(&items), prior_findings: vec![prior_same, prior_settled],
+                tools: ToolsMode::TwoStage, backend_factory: None, on_cell: Some(&on_cell), incoming: None,
+            },
+            &(),
+        )
+        .await;
+        let mut landed = landed.lock().unwrap().clone();
+        let snaps = snaps.lock().unwrap().clone();
+        // cell 名由派发序（批 C `review[{n}]`）改为按队列项（C1-1 有意改动）：按报告里的派发序映射回 n 再比。
+        let seq_names: BTreeMap<String, String> =
+            run.cells.iter().enumerate().map(|(i, c)| (c.cell.clone(), format!("review[{}]@{}", i + 1, c.model))).collect();
+        for c in run.cells.iter_mut() {
+            c.cell = seq_names[&c.cell].clone();
+        }
+        for name in landed.iter_mut() {
+            *name = seq_names[name.as_str()].clone();
+        }
+        for c in run.cells.iter_mut() {
+            c.duration_ms = 0;
+            c.queue_wait_ms = 0;
+            c.template_hash = None;
+        }
+        for w in run.meta.item_wait_ms.iter_mut() {
+            *w = 0;
+        }
+        serde_json::json!({
+            "findings": run.findings, "cells": run.cells, "meta": run.meta, "warnings": run.warnings,
+            "reviewer_failed": run.reviewer_failed, "on_cell": landed, "snapshots": snaps,
+        })
+    }
+
+    /// 退化零差（C1-4）：单 reviewer + 门宽 1 时并发派发循环退化为串行——报告（findings / cells / meta / warnings / 债）、
+    /// 落盘序与队列快照序与批 C 串行实现同构。基线由批 C 代码（`eac0a60`）跑同一场景采得，不是凭推理写的期望值；
+    /// 与批 C 的有意差异只有 cell 名形态（已按派发序映射回去）。并发改造的第一道回归哨。
+    #[tokio::test]
+    async fn single_member_gate_one_matches_batch_c_serial_baseline() {
+        let got = degenerate_serial_scenario().await;
+        let want: serde_json::Value = serde_json::from_str(include_str!("testdata/deep_serial_baseline.json")).unwrap();
+        assert!(
+            got == want,
+            "与批 C 串行基线不同构\n--- got ---\n{}\n--- want ---\n{}",
+            serde_json::to_string_pretty(&got).unwrap(),
+            serde_json::to_string_pretty(&want).unwrap()
+        );
+    }
 }
