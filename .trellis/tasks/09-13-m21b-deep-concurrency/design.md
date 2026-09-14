@@ -34,9 +34,14 @@
 merge_into(idx, req, by_predicate: bool):
   区间 union、笔记 merge_notes、score 取大          // 两种合并都做
   if by_predicate:                                  // same_item 成立
-      并入 req.families（去重）→ agreement = agreement_of(families)
-  // id 捷径合并：不并家族、agreement 不动
+      并入 req.families（去重）→ agreement = max(agreement, agreement_of(families))
+  else:                                             // id 捷径合并
+      不并家族；agreement = max(agreement, agreement_of(req.families))   // 保请求自身共识
 ```
+
+**评审修（2026-09-14）**：id 捷径合并原定「agreement 不动」，会把上游已合并成多家族共识的入队疑点（必挖）降成 1、掉出必挖集被预算截掉——
+agreement 同时决定必挖集与排序分，不只是批 D 免复核的判据。改为：家族仍不跨疑点并入，agreement 取「已有值」与「请求自身家族数」之大。
+两条路径都取大 → agreement 单调不减（§3.5 `event ≤ landed` 的前提由构造保证）。
 
 理由：上游 `merge_suspicions` 已按 `same_suspicion` 组内传递闭包，进队列的同文件 scan 项必然互不满足谓词，
 id 捷径合并的全是「上游判定为不同疑点、恰好行区间逐字相同」的两条——可能是 quote 噪声下的同一问题，也可能是同一行上的两个问题。

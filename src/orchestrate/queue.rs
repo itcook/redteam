@@ -178,13 +178,18 @@ impl DeepQueue {
         // 共识只经谓词（design §2.2）：上游 `merge_suspicions` 已按 `same_suspicion` 组内传递闭包，进队列的同文件
         // scan 项互不满足谓词——只靠 id 捷径命中的是「上游判为不同疑点、恰好行区间逐字相同」的两条，可能是 quote
         // 噪声下的同一问题，也可能是同一行上的两个问题。计共识错了是批 D 免复核错放，不计错了只是多复核一次——取后者。
+        // 但 id 捷径并入的**请求自身**共识不能丢（评审修）：上游已合并成多家族共识的疑点（必挖）撞上同区间的单家族项，
+        // agreement 同时决定必挖集与排序分，丢了它就可能被预算截掉——家族不跨疑点并，agreement 取大。
+        // 两条路径都取大 → agreement 单调不减（事件侧 `event ≤ landed` 的前提）。
         if by_predicate {
             for f in req.families.into_iter().filter(|f| !f.is_empty()) {
                 if !it.families.contains(&f) {
                     it.families.push(f);
                 }
             }
-            it.agreement = agreement_of(&it.families);
+            it.agreement = it.agreement.max(agreement_of(&it.families));
+        } else {
+            it.agreement = it.agreement.max(agreement_of(&dedup_families(req.families)));
         }
         it.spec.ranges = union_ranges(&it.spec.ranges, &req.spec.ranges);
         it.spec.notes = merge_notes(&it.spec.notes, &req.spec.notes);
@@ -670,6 +675,29 @@ mod tests {
         assert_eq!(o, EnqueueOutcome::MergedPending);
         assert_eq!(q.items()[0].agreement, 2, "谓词合并照抬");
         assert_eq!(q.items()[0].families, vec!["alpha".to_string(), "gamma".to_string()]);
+    }
+
+    /// id 捷径并入不丢**请求自身**的共识（评审修）：上游已合并成多家族共识的疑点（agreement ≥ 2、必挖）撞上同区间的单家族项，
+    /// 家族不跨疑点并入，但项的 agreement 取大——否则它掉出必挖集、排序分减半，可能被预算截掉。
+    #[test]
+    fn id_shortcut_merge_keeps_incoming_consensus() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("a.rs", 3, 5, "v[i]", "idx"), Some("alpha")));
+        let o = q.enqueue(EnqueueReq {
+            spec: spec_scan("a.rs", 3, 5, "unwrap()", "opt"),
+            score: 1.0,
+            kind: ItemKind::Suspicion,
+            families: vec!["beta".into(), "gamma".into()],
+        });
+        assert_eq!(o, EnqueueOutcome::MergedPending);
+        assert_eq!(q.items().len(), 1);
+        assert_eq!(q.items()[0].families, vec!["alpha".to_string()], "家族不跨疑点并入");
+        assert_eq!(q.items()[0].agreement, 2, "请求自身的双家族共识保留");
+        assert!(q.is_must(&q.items()[0]));
+        assert!(q.drain(0).is_empty(), "必挖项不被预算截");
+        // 之后同家族谓词并入重算家族数（仍为 1）也不得把 agreement 拉回去：单调不减（event ≤ landed 的前提）
+        q.enqueue(req(spec_scan("a.rs", 4, 5, "v[i]", "idx"), Some("alpha")));
+        assert_eq!(q.items()[0].agreement, 2, "agreement 单调不减");
     }
 
     /// 谓词命中优先于 id 捷径：进来的疑点与 A 区间逐字相同（id 相等）、却与 B 是同一疑点（谓词成立）→
