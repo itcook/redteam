@@ -393,6 +393,8 @@ struct CellDone<'b> {
     rl_retries: u32,
     rl_wait_ms: u64,
     stage2: Stage2,
+    /// 二阶段失败的原因（`Stage2::Failed` 时有值），写进落盘格的 warn。
+    stage2_error: Option<String>,
     bypass_missing: bool,
     /// 首轮或二阶段返回鉴权失败（穿透 `attach_usage` 包装判定）→ 该成员出局。
     auth_failed: bool,
@@ -425,6 +427,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
     let mut warnings = Vec::new();
     let (first, mut bypass_missing) = shot(env, &lease, &policy, rev, item.agreement, &prompt).await;
     let mut stage2 = Stage2::None;
+    let mut stage2_error = None;
     let mut auth_failed = false;
     let outcome = match first {
         Err(e) => {
@@ -444,6 +447,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                         Round2::NoEvidence => Stage2::Skipped,
                         Round2::PackFailed(e) => {
                             warnings.push(format!("{cell_id}: second-stage pack failed: {e} — keeping first-round findings (debt)"));
+                            stage2_error = Some(format!("second-stage pack failed: {e}"));
                             Stage2::Failed
                         }
                         Round2::Ready(prompt2) => {
@@ -468,6 +472,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                                     c.output_tokens += bo;
                                     c.cached_input_tokens += bc;
                                     warnings.push(format!("{cell_id}: second-stage round failed: {e} — keeping first-round findings (debt)"));
+                                    stage2_error = Some(format!("second-stage round failed: {e}"));
                                     Stage2::Failed
                                 }
                             }
@@ -493,6 +498,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
         rl_retries,
         rl_wait_ms,
         stage2,
+        stage2_error,
         bypass_missing,
         auth_failed,
         warnings,
@@ -534,7 +540,9 @@ fn land(
     snapshot: Option<&dyn Fn(&QueueItem)>,
     on_cell: Option<&dyn Fn(&CellRecord)>,
 ) -> Landed {
-    let CellDone { seq, member, rev, item, cell_id, duration_ms, wait_ms, outcome, rl_retries, rl_wait_ms, stage2, bypass_missing, auth_failed, mut warnings } = done;
+    let CellDone {
+        seq, member, rev, item, cell_id, duration_ms, wait_ms, outcome, rl_retries, rl_wait_ms, stage2, stage2_error, bypass_missing, auth_failed, mut warnings,
+    } = done;
     // 落地时刻的疑点共识回填到**落盘** finding（design §7「落地的 finding 继承记录当时的 agreement」、§8.1「按落地时刻算、
     // 后涨不回溯」）。cell 内的 `EmitCtx` 只能拿派发时快照；在途并入会让落地值更高，事件侧因此滞后（`event ≤ landed`）。
     let landed = live_agreement(q, &item);
@@ -557,6 +565,16 @@ fn land(
             rec.template_hash = Some(review_template_hash());
             if discarded > 0 {
                 rec.warn = Some(format!("stream discarded {discarded}"));
+            }
+            if let Some(reason) = stage2_error {
+                // 二阶段失败（评审修 #2）：首轮 finding 留在格里（报告与 resume 的 prior findings 都从这里取），但格按失败落盘——
+                // 进 coverage.failed、resume 按「Settled 以成功格为准」重挖。落成 ok 形态的话，债只活在本次调用的
+                // reviewer_failed 里，resume 报告会把它抹成干净通过。
+                rec.ok = false;
+                rec.warn = Some(match rec.warn.take() {
+                    Some(w) => format!("{reason} — first-round findings kept; {w}"),
+                    None => format!("{reason} — first-round findings kept"),
+                });
             }
             (rec, discarded)
         }
@@ -1425,6 +1443,10 @@ mod tests {
         assert_eq!(run.findings[0].title, "draft", "保留首轮 finding");
         assert_eq!((run.cells[0].input_tokens, run.cells[0].output_tokens), (1 + 3, 1 + 4), "第二轮烧掉的 token 入账");
         assert!(run.warnings.iter().any(|w| w.contains("second-stage round failed")), "{:?}", run.warnings);
+        // 格按失败落盘（评审修 #2）：进 coverage.failed、resume 按「Settled 以成功格为准」重挖；落成 ok 形态的话债只活在本次调用里
+        assert!(!run.cells[0].ok, "二阶段失败的格不能以 ok 形态落盘");
+        assert_eq!(run.cells[0].output.findings().len(), 1, "失败格仍携带首轮 finding（resume 的 prior findings 载体）");
+        assert!(run.cells[0].warn.as_deref().unwrap_or("").contains("second-stage round failed"), "{:?}", run.cells[0].warn);
     }
 
     /// 429 注入：门收窄后照样全部完成、无死锁（虚拟时间下死锁会撞 timeout 而不是挂住）。
@@ -1548,7 +1570,8 @@ mod tests {
         let run = run_with(Run { reviewers: Some(&members), tools: ToolsMode::TwoStage, ..plain(&reg, dir.path(), &bundles, &items) }).await;
         assert_eq!(pa.starts(), vec!["a".to_string(), "a".to_string()], "第二轮 401 后不再领项");
         assert_eq!(qb.starts(), vec!["b".to_string(), "c".to_string(), "d".to_string()]);
-        assert!(run.cells[0].ok, "第二轮失败保留首轮结果");
+        assert!(!run.cells[0].ok, "第二轮失败按失败格落盘（评审修 #2）");
+        assert!(run.cells[0].warn.as_deref().unwrap_or("").contains("second-stage round failed"), "{:?}", run.cells[0].warn);
         assert!(run.reviewer_failed);
         assert!(run.warnings.contains(&"deep: reviewer p/r auth failed — removed from pool".to_string()), "{:?}", run.warnings);
     }

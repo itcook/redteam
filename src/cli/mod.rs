@@ -1201,7 +1201,13 @@ pub async fn run_resume(
     // 报告覆盖掉上一轮的成果（deep 已跑完才被 kill 的作业就是这样丢结果的）。
     if still_missing == 0 && !roles.reviewers.is_empty() && !queue_snap.is_empty() {
         {
-            let reopened = reopen_settled_without_ok_cell(&mut queue_snap, &deep_records);
+            let (reopened, reconciled) = reconcile_queue_with_cells(&mut queue_snap, &deep_records);
+            // 对账改过状态的项写回快照（下一次 resume 不必再对一遍）；重挖的项派发时 run_deep 会再写。
+            for it in reconciled.iter().filter_map(|id| queue_snap.iter().find(|it| &it.id == id)) {
+                if let Err(e) = store.put_queue_item(job_id, it) {
+                    eprintln!("warn: job {job_id} resume queue snapshot 失败: {e}");
+                }
+            }
             if reopened > 0 {
                 report.run.warnings.push(format!(
                     "resume deep: {reopened} settled item(s) have no successful reviewer cell — re-digging"
@@ -1250,7 +1256,25 @@ pub async fn run_resume(
                     eprintln!("warn: job {job_id} resume queue snapshot 失败: {e}");
                 }
             };
+            // 往轮格里的 finding（按格名）：重挖失败时同名 upsert 会用空输出的失败格覆盖掉它们。
+            let carriers: BTreeMap<&str, &[crate::domain::Finding]> = deep_records
+                .iter()
+                .filter(|r| !r.output.findings().is_empty())
+                .map(|r| (r.cell.as_str(), r.output.findings()))
+                .collect();
             let on_cell2 = |rec: &crate::state::CellRecord| {
+                // 重挖失败不抹掉往轮载体（评审修 #2 连带）：本轮报告靠事先读出的 prior findings 侥幸完整，
+                // 下一次 resume 就永久丢失——失败格照写（债与重挖资格不变），但带上往轮 finding。
+                let carried;
+                let rec = match carriers.get(rec.cell.as_str()) {
+                    Some(fs) if !rec.ok && rec.output.findings().is_empty() => {
+                        let mut r = rec.clone();
+                        r.output = crate::domain::CellOutput::Review { findings: fs.to_vec(), needs: vec![] };
+                        carried = r;
+                        &carried
+                    }
+                    _ => rec,
+                };
                 if let Err(e) = store.append_partial(job_id, rec) {
                     eprintln!("warn: job {job_id} resume reviewer cell 落盘失败（{}）: {e}", rec.cell);
                 }
@@ -1300,23 +1324,33 @@ pub async fn run_resume(
     }
     (report, code)
 }
-/// resume「Settled 以成功格为准」（批 C1-1）：快照说 Settled、cells 表里却没有该项的成功 reviewer 格
-/// （名以 `review[{item.id}]@` 开头）→ 改回 Pending 重挖；返回改回的项数。快照只记状态，格才是 finding 的载体：
-/// - 无格：cell 落盘失败而快照写成功（`on_cell` 只 warning）——不重挖就是静默丢 finding；旧作业的 `review[n]@` 格名也落在这里，重挖一次；
-/// - 只有失败格：首跑那格失败——不重挖，它的债在 resume 报告里被抹成干净通过（scanner resume 同口径：失败格重跑）。
+/// resume 快照对账：队列项状态**双向以成功 reviewer 格为准**（格名以 `review[{item.id}]@` 开头）。快照只记状态，格才是 finding 的载体。
+/// - 有成功格 → Settled（评审修 #4）：kill 落在「格已落盘、快照仍 InFlight / Pending」之间，或快照写失败只 warning——该项已挖完，
+///   不重挖。旧口径会重挖，重挖失败时同名 upsert 把成功格覆盖成失败格，finding 失去载体，下一次 resume 永久丢失。
+/// - Settled 却无成功格 → Pending 重挖（批 C1-1）：无格 = cell 落盘失败而快照写成功（旧作业的 `review[n]@` 格名也落在这里，重挖一次）；
+///   只有失败格 = 首跑那格失败或二阶段失败——不重挖，它的债在 resume 报告里被抹成干净通过（scanner resume 同口径：失败格重跑）。
 ///
-/// 已知残余（接受）：kill 恰在「格已落盘、快照仍 InFlight」之间时 resume 会重挖该项；若换了 reviewer 就留两条格——
-/// finding 经 dedup 去重，usage 重复计一次。
-fn reopen_settled_without_ok_cell(items: &mut [crate::orchestrate::queue::QueueItem], records: &[CellRecord]) -> usize {
+/// 返回（改回 Pending 的项数，状态被改过的项 id）。
+fn reconcile_queue_with_cells(items: &mut [crate::orchestrate::queue::QueueItem], records: &[CellRecord]) -> (usize, Vec<String>) {
+    use crate::orchestrate::queue::ItemState;
     let mut reopened = 0;
-    for it in items.iter_mut().filter(|it| it.state == crate::orchestrate::queue::ItemState::Settled) {
+    let mut changed = Vec::new();
+    for it in items.iter_mut() {
         let prefix = format!("review[{}]@", it.id);
-        if !records.iter().any(|r| r.ok && r.cell.starts_with(&prefix)) {
-            it.state = crate::orchestrate::queue::ItemState::Pending;
-            reopened += 1;
-        }
+        let has_ok = records.iter().any(|r| r.ok && r.cell.starts_with(&prefix));
+        let next = match (has_ok, it.state) {
+            (true, ItemState::Settled) => continue,
+            (true, _) => ItemState::Settled,
+            (false, ItemState::Settled) => {
+                reopened += 1;
+                ItemState::Pending
+            }
+            (false, _) => continue,
+        };
+        it.state = next;
+        changed.push(it.id.clone());
     }
-    reopened
+    (reopened, changed)
 }
 
 /// 落终态部分报告：渲染 json+md、写 result 文件、守卫式把 state 转终态并记录错误原因。
@@ -2286,6 +2320,67 @@ mod resume_tests {
         assert!(carried, "x.rs 的 finding 在 cells 表里必须仍有载体");
     }
 
+    /// 快照状态双向以成功格为准（评审修 #4）：kill 落在「格已落盘、快照仍 InFlight」之间 → 该项已挖完，resume 不重挖。
+    /// 旧口径会重挖；重挖失败时同名 upsert 把往轮成功格覆盖成失败格，finding 失去载体，下一次 resume 永久丢失。
+    #[tokio::test]
+    async fn resume_treats_inflight_item_with_ok_cell_as_settled() {
+        use crate::orchestrate::queue::ItemState;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        repo_with_changes(ws, &[("x.rs", "fn x() {\n    x_marker();\n}\n")]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        scan_done_job(&store);
+        let mut fx = crate::domain::finding::fixtures::finding("x issue", crate::domain::Severity::Low, 1, "p/r");
+        (fx.file, fx.quote, fx.line_start, fx.line_end) = ("x.rs".into(), "x_marker();".into(), 2, 2);
+        let landed = CellRecord::ok("review[x.rs:rule:1-2]@p/r", "p/r", crate::domain::CellOutput::Review { findings: vec![fx], needs: vec![] });
+        store.append_partial("j", &landed).unwrap();
+        store.put_queue_item("j", &rule_item("x.rs", ItemState::InFlight)).unwrap();
+        // reviewer 一调就失败：若被重挖，失败格会同名覆盖掉上面的成功格
+        let (reg, rev) = deep_registry("not-json");
+
+        let (first, code1) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+        let (second, code2) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        assert_eq!(rev.turn_count(), 0, "已有成功格的项不重挖");
+        for (r, code) in [(&first, code1), (&second, code2)] {
+            assert_eq!(r.findings.len(), 1, "{:?}", r.run.warnings);
+            assert_eq!(code, 0, "{:?}", r.run.warnings);
+        }
+        assert!(store.read_partial("j").iter().any(|r| r.ok && r.cell == "review[x.rs:rule:1-2]@p/r"), "成功格原样在库");
+    }
+
+    /// 重挖失败不抹掉往轮载体（评审修 #2 连带）：往轮失败格仍携带 finding（二阶段失败保留的首轮结果）→ resume 重挖又失败，
+    /// 同名 upsert 不得用空输出把它覆盖掉——否则本轮报告靠事先读出的 prior findings 侥幸完整，下一次 resume 丢失。
+    #[tokio::test]
+    async fn failed_redig_keeps_prior_findings_carrier() {
+        use crate::orchestrate::queue::ItemState;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        repo_with_changes(ws, &[("x.rs", "fn x() {\n    x_marker();\n}\n")]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        scan_done_job(&store);
+        let mut fx = crate::domain::finding::fixtures::finding("x issue", crate::domain::Severity::Low, 1, "p/r");
+        (fx.file, fx.quote, fx.line_start, fx.line_end) = ("x.rs".into(), "x_marker();".into(), 2, 2);
+        let mut debt_cell = CellRecord::ok("review[x.rs:rule:1-2]@p/r", "p/r", crate::domain::CellOutput::Review { findings: vec![fx], needs: vec![] });
+        debt_cell.ok = false;
+        debt_cell.warn = Some("second-stage round failed: boom — first-round findings kept".into());
+        store.append_partial("j", &debt_cell).unwrap();
+        store.put_queue_item("j", &rule_item("x.rs", ItemState::Settled)).unwrap();
+        let (reg, rev) = deep_registry("not-json");
+
+        let (first, code1) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+        let (second, code2) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        assert!(rev.turn_count() > 0, "失败格的项要重挖");
+        for (r, code) in [(&first, code1), (&second, code2)] {
+            assert_eq!(r.findings.len(), 1, "往轮 finding 不丢: {:?}", r.run.warnings);
+            assert_eq!(code, 2, "重挖失败仍是债");
+        }
+        let rec = store.read_partial("j").into_iter().find(|r| r.cell == "review[x.rs:rule:1-2]@p/r").unwrap();
+        assert!(!rec.ok);
+        assert_eq!(rec.output.findings().len(), 1, "库里的失败格仍携带往轮 finding");
+    }
+
     /// resume 收口只把 scanner 格喂 scan-only 收口：批 C 把 cells 表全量喂进去，首跑落盘的 reviewer 格被当成
     /// 「失败的 scanner 格」→ 假 `scan incomplete` + Incomplete / exit 3。深挖跑完、零 finding、收尾时被 kill 的作业
     /// resume 后应是 Approve / 0，首跑的 reviewer 格记 `coverage.reused[Reviewer]`（与 scanner 沿用对称）。
@@ -2298,17 +2393,16 @@ mod resume_tests {
         let store = crate::state::JobStore::open(ws).unwrap();
         scan_done_job(&store);
         store.put_queue_item("j", &rule_item("x.rs", ItemState::Settled)).unwrap();
-        // y.rs：格已落盘、快照仍 InFlight（kill 窗口）→ 本轮重挖、同名覆盖——报告里只算本轮完成，不再算沿用
-        store.put_queue_item("j", &rule_item("y.rs", ItemState::InFlight)).unwrap();
-        for f in ["x.rs", "y.rs"] {
-            let clean = CellRecord::ok(format!("review[{f}:rule:1-2]@p/r"), "p/r", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] });
-            store.append_partial("j", &clean).unwrap();
-        }
+        let clean = CellRecord::ok("review[x.rs:rule:1-2]@p/r", "p/r", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] });
+        store.append_partial("j", &clean).unwrap();
+        // y.rs：只有往轮失败格 → 本轮重挖、同名覆盖——报告里只算本轮完成；往轮失败格既不算沿用、也不重复进报告
+        store.put_queue_item("j", &rule_item("y.rs", ItemState::Settled)).unwrap();
+        store.append_partial("j", &CellRecord::failed("review[y.rs:rule:1-2]@p/r", "p/r", Role::Reviewer, "boom")).unwrap();
         let (reg, rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
 
         let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
 
-        assert_eq!(rev.turn_count(), 1, "只重挖在途的 y.rs");
+        assert_eq!(rev.turn_count(), 1, "只重挖只有失败格的 y.rs");
         assert_eq!((report.verdict, code), (Verdict::Approve, 0), "warnings={:?}", report.run.warnings);
         assert!(!report.run.warnings.iter().any(|w| w.contains("scan incomplete")), "{:?}", report.run.warnings);
         let cov = &report.run.coverage;

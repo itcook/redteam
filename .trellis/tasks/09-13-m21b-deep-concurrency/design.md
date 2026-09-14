@@ -64,7 +64,11 @@ merge_into 命中 Skipped:
   同项重跑 → `cell_put` upsert 覆盖自身（与 scanner「重试者胜」同语义）。
 - `run_resume` 在 `restore` 之前：对快照里 `state == Settled` 的项，若 `final_records` 中不存在 cell 名以 `review[{item.id}]@` 开头的**成功**记录 → 改为 Pending 重挖，并 warning 报数。
   只有失败格也重挖（实施时细化，与 scanner resume「失败格重跑」同口径）：`overlay_deep` 的债只看本轮 `reviewer_failed`，不重挖则首跑失败格的债在 resume 报告里被抹成干净通过。
-- 残余窗口（注释写明、接受）：kill 恰在「cell 已落盘、快照仍 InFlight」之间，resume 时轮转把该项派给**另一模型** → 留两条 cell；finding 经 dedup 去重，usage 重复计一次。
+- **评审修（2026-09-14）——对账双向以成功格为准**：有成功格的项一律按 Settled（快照是 InFlight / Pending / Skipped 都算，kill 落在
+  「格已落盘、快照未写」之间或快照写失败只 warning 时出现），不重挖；对账改过的项写回快照。原接受的残余（kill 窗口内重挖、换模型留两条格）随之消除；
+  更要紧的是旧口径重挖失败时同名 upsert 会把成功格覆盖成失败格，finding 失去载体，下一次 resume 永久丢失。
+- **重挖失败不抹掉往轮载体**：resume 的 `on_cell` 落盘时，若新格失败且无 finding、而同名往轮格带 finding（如二阶段失败保留的首轮结果），
+  失败格照写（债与重挖资格不变）但带上往轮 finding。
 
 ## 3. 并发派发（C1-2）
 
@@ -181,11 +185,13 @@ agreement 单调不减 → **`event ≤ landed`**。批 D「≥ 2 免复核」�
 |---|---|---|---|
 | 有 needs 但不合格（tools off / 带笔记互斥） | skipped +1 | 首轮结果 | 否 |
 | 合格，但全部 needs 被读守卫拒 / 不可读 → 无证据，第二轮不发 | skipped +1 | 首轮结果；拒绝原因经 warnings | 否 |
-| 第二轮建 pack 内部错误 | triggered +1 | **保留首轮 finding** + warning | **是** |
-| 第二轮发出，HTTP / parse 失败 | triggered +1 | **保留首轮 finding** + warning；第二轮烧掉的 token 入账 | **是** |
+| 第二轮建 pack 内部错误 | triggered +1 | **保留首轮 finding** + warning；格按失败落盘 | **是** |
+| 第二轮发出，HTTP / parse 失败 | triggered +1 | **保留首轮 finding** + warning；第二轮烧掉的 token 入账；格按失败落盘 | **是** |
 | 第二轮成功 | triggered +1 | 第二轮输出为终判（CONFIRM / REVISE） | 否 |
 
-债经 `DeepRun` 的债标志进 `overlay_deep`（与 reviewer cell 失败同路：Approve + exit 2）。首轮声明 needs = 模型自认判断不完整，静默沿用首轮会成单区域假绿灯。
+债经 `DeepRun` 的债标志进 `overlay_deep`（与 reviewer cell 失败同路：Approve + exit 2）。
+**评审修（2026-09-14）**：二阶段失败的格落成 `ok = false`、`output` 仍携带首轮 finding、warn 写失败原因——进 `coverage.failed`，
+resume 按「Settled 以成功格为准」重挖。原实现落成 ok 形态，债只活在本次调用的 `reviewer_failed` 里，resume 报告会把它抹成干净通过。首轮声明 needs = 模型自认判断不完整，静默沿用首轮会成单区域假绿灯。
 
 ## 6. 兼任角色 warning
 
