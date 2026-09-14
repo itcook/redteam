@@ -153,6 +153,7 @@ agreement 单调不减 → **`event ≤ landed`**。批 D「≥ 2 免复核」�
 
 `pool` = `reviewers` 中未被踢出的成员；`cursor` 记上次成功派发者。`next_lease` 从 `cursor + 1` 起逐个 `try_lease`，第一个拿到的用，`cursor` 置为它；全 `None` → 门全满。
 同 provider 成员共享门宽，轮转只决定空位归属；跨 provider 各门独立，一门满另一门接。每项只交一个成员（不双审）。纯空闲轮转，无权重（design「无 priority、顺序无语义」）。
+游标初值指向末位（首派落 0 号成员，单成员与批 C 同构）；只有真成格才移游标、计格数（派发时 pack 失败不算）。
 
 ### 4.2 成员健康（Q7）
 
@@ -160,11 +161,14 @@ agreement 单调不减 → **`event ≤ landed`**。批 D「≥ 2 免复核」�
 - 已失败的那一格保持失败（coverage failed + 计债），**不改派**——不是候补（D7 A3）。
 - 已在途于该成员的其他格照常跑完（多半也 401 失败），不取消。
 - 超时 / `Server` / `RateLimited` / `Network` / `Unavailable` / `BadRequest` / `Parse` 不踢。
+- 成员未注册（`try_lease` 返回 `Err`）→ 就地出局 + warning（实施补充）：不挡其余成员、本身不计债；池因此变空且剩余 Pending → 按池空计债。
 - 限制（注释写明）：只在「队列项数 > 并发容量」时起作用；小队列 t=0 全部派出，首个 401 回来前坏成员已领走它那份。
 
 ### 4.3 观测
 
-`coverage.selected[Reviewer]` 按实际 cells；`RunMeta.models` 补齐实际参与的 reviewer；配了但 0 格的成员 → warning `"deep: reviewer {name} configured but received 0 cells"`。
+`coverage.selected[Reviewer]` 按实际 cells；`RunMeta.models` 补齐实际参与的 reviewer（本轮格 ∪ resume 沿用格，`model_ids` 同序追加）；配了但 0 格的成员 → warning `"deep: reviewer {name} configured but received 0 cells"`。
+0 格披露只在本轮至少派出一格时给（空队列 / resume 全 Settled 不报）；已出局成员由出局原因披露、不重复报。
+池观测 warnings 按成员序收场给（不随完成序）：出局原因 → 池空剩余数 → 0 格成员 → 无 per-cell backend → 各格 warnings（派发序）。
 
 ## 5. 二阶段补查契约（Q4 / Q5）
 
@@ -182,6 +186,7 @@ agreement 单调不减 → **`event ≤ landed`**。批 D「≥ 2 免复核」�
 
 `build_registry` 中 reviewer 因 `has_scan` 被 `continue` 跳过注册时，仍执行 `thinking_warning(em)` 并 `push_warning`——兼任时两角色只有 `thinking_level` 可能不同，
 per-cell backend 已按 reviewer 自己的 `EffectiveModel` 构造，缺的只是这条披露。
+实施：抽成 `backends::role_thinking_warnings(&RoleSets)`（scanner → reviewer 序、同文案去重），`build_registry` 建表前统一 push；文案带角色名以区分兼任两角色的不同档位。
 
 ## 7. 测试形状
 

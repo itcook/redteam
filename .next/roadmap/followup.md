@@ -304,7 +304,7 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
   若数据显示 quote 噪声（如尾部分号）导致真共识漏判，修 `same_suspicion` 的 quote 归一化，不靠捷径。
 - ✅ **二阶段补查四处静默（C1-2 已修）**：重新 lease 失败吞掉、第二轮用共享 backend、policy 重试 / 等待未回读、第二轮失败吞掉且 token 不入账；
   `needs_two_stage_triggered` 虚报。C1 定案：一格持门位到底；第二轮失败 → 保留首轮 finding + warning + 计债；全被读守卫拒 → skipped 不计债。
-- **兼任角色（code-review 批 C 第 12 条）已基本消解**：`RoleAttrs` 只有 `thinking_level`，深挖 per-cell backend 按 reviewer 自己的
+- ✅ **兼任角色（code-review 批 C 第 12 条）已消解（C1-3 补发 reviewer 档位 warning）**：`RoleAttrs` 只有 `thinking_level`，深挖 per-cell backend 按 reviewer 自己的
   `EffectiveModel` 构造。残余仅兼任时 reviewer 的 thinking 无映射 warning 被 `continue` 跳过（C1-3 补发）。verifier 接线（批 D）时同样检查。
 - **scanner 与深挖时间重叠 → 批 C2**（plan 已立节）：流式入队、在线预算与保底预留、scanner 先入门的门让位、reviewer 已开挖时的
   scanner 失败口径。C1 留 `DeepInput.incoming` 通道与「通道关闭」barrier。

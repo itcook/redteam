@@ -30,12 +30,14 @@
 - [x] Commit: `feat(orchestrate): 门驱动并发派发——FuturesUnordered + 入队通道、一格持门位到底、报告按派发序组装、二阶段失败计债（design §6 规则 5〔D13〕）`
 
 ### C1-3 分派池轮转与成员健康
-- [ ] `deep.rs`：`pool` + 游标轮转 `next_lease`；删除 `reviewers.first()` 单点；每项只交一个成员
-- [ ] `deep.rs`：错误穿透 `attach_usage` 判 `Auth` → 移出池 + warning；已失败格不改派；其余错误类不踢；池空 → 停派、通道未关继续收、剩余 Pending + warning 报数 + 计债
-- [ ] `cli/mod.rs`：`RunMeta.models` 含实际参与 reviewer；配了但 0 格成员 warning
-- [ ] `main.rs`：兼任 scanner 的 reviewer 被 `has_scan` 跳过注册时仍 push `thinking_warning`
-- [ ] 测试：两成员不同 provider 门宽各 1 → 两格并行分落不同模型；一成员 Auth（队列 > 容量）→ 移出、后续全落另一成员；唯一成员 Auth → 剩余 Pending + exit 2；0 格成员 warning；兼任 warning 出现在 `RunMeta.warnings`；单成员行为不变
-- [ ] Commit: `feat(orchestrate): reviewer 分派池空闲轮转与成员健康——鉴权失败移出池不改派、池空停派保留 Pending、未分到格不再静默（design §6 规则 5、D7 A3）`
+- [x] `deep.rs`：`pool` + 游标轮转 `next_lease`；删除 `reviewers.first()` 单点；每项只交一个成员
+- [x] `deep.rs`：错误穿透 `attach_usage` 判 `Auth` → 移出池 + warning；已失败格不改派；其余错误类不踢；池空 → 停派、通道未关继续收、剩余 Pending + warning 报数 + 计债
+- [x] `cli/mod.rs`：`RunMeta.models` 含实际参与 reviewer；配了但 0 格成员 warning
+- [x] `main.rs`：兼任 scanner 的 reviewer 被 `has_scan` 跳过注册时仍 push `thinking_warning`（抽成 `backends::role_thinking_warnings` 纯函数：`build_registry` 读真实密钥不宜直测；文案带角色名）
+- [x] 测试：两成员不同 provider 门宽各 1 → 两格并行分落不同模型；一成员 Auth（队列 > 容量）→ 移出、后续全落另一成员；唯一成员 Auth → 剩余 Pending + exit 2；0 格成员 warning；兼任 warning 出现在 `RunMeta.warnings`；单成员行为不变
+- [x] 补测：同 provider 共享门时两成员交替领项；二阶段第二轮 401 同样出局；未注册成员就地出局不挡其余成员、全员未注册 = 池空计债
+- [x] 变异检查：不踢 / Auth 不穿透包装 / 忽略第二轮 Auth / 游标不前移 / 丢 0 格披露 / 池空不计债 / 空队列也报 0 格——各自对应用例均转红
+- [x] Commit: `feat(orchestrate): reviewer 分派池空闲轮转与成员健康——鉴权失败移出池不改派、池空停派保留 Pending、未分到格不再静默（design §6 规则 5、D7 A3）`
 
 ### C1-4 墙钟门与退化零差
 - [ ] 虚拟时间墙钟门：K=12 × 50 ms、门宽和 W=4 → 虚拟总时长 ≈ 3 × 50 ms（容差放宽）

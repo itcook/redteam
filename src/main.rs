@@ -477,6 +477,10 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
         return Err(redteam::cli::NO_SCANNER_MSG.to_string());
     }
     let mut registry = ProviderRegistry::new();
+    // thinkingLevel 无映射 warnings 按角色条目统一给——兼任 scanner 的 reviewer 下面会被跳过注册，它的档位不能跟着漏报。
+    for w in redteam::provider::backends::role_thinking_warnings(&roles) {
+        registry.push_warning(w);
+    }
     for em in &roles.scanners {
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
         let backend = match backend_from_config(em, key) {
@@ -485,9 +489,6 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
                 return Err(format!("{e}"));
             }
         };
-        if let Some(w) = redteam::provider::backends::thinking_warning(em) {
-            registry.push_warning(w);
-        }
         // 单轮超时（design §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`。
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
         // usize → u32 饱和而非截断（评审修：误填 2^32 以上的值不会被截成 0 / 小数）。
@@ -503,9 +504,6 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
             Ok(b) => b,
             Err(e) => return Err(format!("{e}")),
         };
-        if let Some(w) = redteam::provider::backends::thinking_warning(em) {
-            registry.push_warning(w);
-        }
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
         let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
         registry.insert_scan(em.name.clone(), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);

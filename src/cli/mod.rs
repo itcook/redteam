@@ -477,6 +477,14 @@ fn overlay_deep(
             "deep: skipped(budget) {skipped} item(s) — disclosed, not in verdict"
         ));
     }
+    // RunMeta.models 补齐实际参与的 reviewer（有格才算，含失败格与 resume 沿用格）；model_ids 与之同序追加。
+    let roles = cfg.active_roles();
+    for c in deep.reused_cells.iter().chain(&deep.cells) {
+        if !report.run.models.contains(&c.model) {
+            report.run.model_ids.extend(model_ids_for(std::slice::from_ref(&c.model), &roles));
+            report.run.models.push(c.model.clone());
+        }
+    }
     fold_role_cells(&mut report, deep.reused_cells, true);
     fold_role_cells(&mut report, deep.cells, false);
     let h = crate::prompt::template_hashes();
@@ -2545,6 +2553,7 @@ mod code_review_tests {
         assert!(!report.findings.is_empty(), "findings={:?}", report.findings);
         assert!(report.run.deep.is_some());
         assert!(report.cells.iter().any(|c| c.cell.starts_with("review[")), "cells={:?}", report.cells.iter().map(|c| &c.cell).collect::<Vec<_>>());
+        assert_eq!((report.run.models.clone(), report.run.model_ids.clone()), (vec!["p/s".to_string(), "p/r".to_string()], vec!["s".to_string(), "r".to_string()]), "实际参与的 reviewer 进 RunMeta.models（C1-3）");
     }
 
     #[tokio::test]

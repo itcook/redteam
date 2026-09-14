@@ -120,9 +120,10 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         meta.queue_depth_peak = q.items().len() as u32;
     }
 
-    let Some(rev) = input.reviewers.first() else {
+    if input.reviewers.is_empty() {
         return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false, reused_cells: vec![] };
-    };
+    }
+    let members: &[EffectiveModel] = input.reviewers;
     let mut incoming = input.incoming.take();
     let idx = cross_index(input.bundles, &[], None);
     let opts = PackOpts::from(input.pack);
@@ -134,28 +135,21 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut landed: BTreeMap<u64, Landed> = BTreeMap::new();
     let mut seq = 0u64;
     let mut closed = incoming.is_none();
-    // 派发不可继续（reviewer 未注册）：停派，但通道未关照收、在途照等——剩余项保持 Pending（resume 可续）。
-    let mut blocked = false;
-    // 兜底阻塞 lease 拿到的门位，下一轮填门时先用。
-    let mut parked: Option<ScanLease<'_>> = None;
+    // 分派池空（成员全部出局）= 停派：通道未关照收、在途照等，剩余项保持 Pending（resume 可续）。
+    let mut pool = Pool::new(members.len());
+    // 兜底阻塞 lease 拿到的门位（连同成员下标），下一轮填门时先用。
+    let mut parked: Option<(ScanLease<'_>, usize)> = None;
     let mut reviewer_failed = false;
 
     loop {
-        // ① 填门位
-        while !blocked && q.pending_count() > 0 {
-            let lease = match parked.take() {
-                Some(l) => l,
-                None => match registry.try_lease(&rev.name) {
-                    Ok(Some(l)) => l,
-                    Ok(None) => break, // 门满
-                    Err(e) => {
-                        warnings.push(format!("reviewer lease failed: {e}"));
-                        reviewer_failed = true;
-                        blocked = true;
-                        break;
-                    }
-                },
+        // ① 填门位：池内成员空闲轮转，谁先拿到门位谁消费下一项
+        while !pool.is_empty() && q.pending_count() > 0 {
+            let next = match parked.take() {
+                Some(p) => Some(p),
+                None => pool.next_lease(registry, members),
             };
+            let Some((lease, member)) = next else { break }; // 各门全满
+            let rev = &members[member];
             let Some(item) = q.pop_dispatch() else { break };
             snap_one(&item, input.snapshot);
             // cell 名按队列项（id 已定死），跨 resume 调用稳定：同项重跑 upsert 覆盖自身（与 scanner「重试者胜」同义），
@@ -186,24 +180,26 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                 repo_brief: "",
             });
             seq += 1;
-            running.push(run_cell(&env, Dispatched { seq, rev, lease, item, prompt, cell_id, wait_ms }));
+            pool.assigned(member);
+            running.push(run_cell(&env, Dispatched { seq, member, rev, lease, item, prompt, cell_id, wait_ms }));
         }
 
-        // ② barrier：在途 0 ∧（Pending 0 ∨ 停派）∧ 通道已关（design §2；复核在途批 D 前恒 0）
-        if running.is_empty() && closed && (blocked || q.pending_count() == 0) {
+        // ② barrier：在途 0 ∧（Pending 0 ∨ 池空）∧ 通道已关（design §2；复核在途批 D 前恒 0）
+        if running.is_empty() && closed && (pool.is_empty() || q.pending_count() == 0) {
             break;
         }
-        // 在途 0 ∧ Pending > 0 ∧ 门仍满 = 门被本循环之外的持有者占着（批 C2 起 scanner 与深挖同门）：
-        // 阻塞等一个门位，期间照收通道——不空转、不提前收场。
-        if running.is_empty() && !blocked && q.pending_count() > 0 {
+        // 在途 0 ∧ Pending > 0 ∧ 各门仍满 = 门被本循环之外的持有者占着（批 C2 起 scanner 与深挖同门）：
+        // 同时等每个活跃成员的门位、先到先用，期间照收通道——不空转、不提前收场。
+        if running.is_empty() && !pool.is_empty() && q.pending_count() > 0 {
+            let alive: Vec<usize> = pool.alive().collect();
+            let mut waits: FuturesUnordered<_> = alive
+                .into_iter()
+                .map(|i| async move { (i, registry.lease(&members[i].name).await) })
+                .collect();
             tokio::select! {
-                l = registry.lease(&rev.name) => match l {
-                    Ok(l) => parked = Some(l),
-                    Err(e) => {
-                        warnings.push(format!("reviewer lease failed: {e}"));
-                        reviewer_failed = true;
-                        blocked = true;
-                    }
+                Some((i, l)) = waits.next() => match l {
+                    Ok(l) => parked = Some((l, i)),
+                    Err(e) => pool.remove(i, format!("deep: reviewer {} lease failed: {e} — removed from pool", members[i].name)),
                 },
                 msg = recv(&mut incoming), if !closed => on_arrival(msg, &mut q, &mut meta, &mut closed, input.snapshot),
             }
@@ -215,6 +211,11 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             Some(done) = running.next(), if !running.is_empty() => {
                 let l = land(done, &mut q, input.snapshot, input.on_cell);
                 reviewer_failed |= l.debt;
+                if l.auth_failed {
+                    // 成员健康（C1 §4.2）：鉴权失败不会自愈 → 出局，后续项只交其余成员。这一格保持失败、不改派（D7 A3 无候补）；
+                    // 该成员其他在途格照常跑完。只在「队列项 > 并发容量」时起作用——小队列 t=0 就全派出去了。
+                    pool.remove(l.member, format!("deep: reviewer {} auth failed — removed from pool", members[l.member].name));
+                }
                 landed.insert(l.seq, l);
             }
             msg = recv(&mut incoming), if !closed => on_arrival(msg, &mut q, &mut meta, &mut closed, input.snapshot),
@@ -224,11 +225,23 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     drop(running);
     drop(parked);
 
-    if blocked && q.pending_count() > 0 {
+    // 池观测按成员序披露（完成序不进报告）：出局原因 → 池空剩余 → 未分到格的成员。
+    warnings.extend(pool.removed.iter().flatten().cloned());
+    if pool.is_empty() && q.pending_count() > 0 {
+        reviewer_failed = true;
         warnings.push(format!(
-            "deep: {} queued item(s) not dispatched — left pending for resume",
+            "deep: reviewer pool empty — {} queued item(s) not dispatched, left pending for resume",
             q.pending_count()
         ));
+    }
+    if seq > 0 {
+        // 有格派出去了、某成员却一格没分到——多 reviewer 配置里「白配了」必须可见（批 C dogfood grok-4.6 空转且无声）。
+        // 出局的成员已由出局原因披露，不重复报。
+        for (i, m) in members.iter().enumerate() {
+            if pool.cells[i] == 0 && pool.removed[i].is_none() {
+                warnings.push(format!("deep: reviewer {} configured but received 0 cells", m.name));
+            }
+        }
     }
 
     // 收场：按派发序组装（design C1 §3.4）。持久化已在完成时做完；报告侧的 findings（→ dedup 以输入序首个为 base）、
@@ -282,9 +295,69 @@ struct CellEnv<'b> {
     sink: &'b dyn FindingSink,
 }
 
+/// reviewer 分派池（design §6 规则 5〔D13〕、C1 §4）：活跃成员空闲轮转——谁先拿到门位谁消费下一项，每项只交一个成员（不双审）。
+/// 纯轮转、无权重 / 主次（design「无 priority、顺序字典序无语义」）；不是候补链：成员出局后，它已失败的格不改派（D7 A3）。
+/// 同 provider 的成员共享一道门，轮转只决定空位归谁、不加吞吐；跨 provider 各门独立，一门满另一门接。
+struct Pool {
+    alive: Vec<bool>,
+    /// 上次派发者下标；初值为末位，首派从 0 号起（单成员时与批 C 同构）。
+    cursor: usize,
+    /// 每成员分到的格数（0 格成员收场披露）。
+    cells: Vec<u32>,
+    /// 出局原因（收场按成员序披露）。
+    removed: Vec<Option<String>>,
+}
+
+impl Pool {
+    fn new(n: usize) -> Self {
+        Pool { alive: vec![true; n], cursor: n.saturating_sub(1), cells: vec![0; n], removed: vec![None; n] }
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.alive.iter().any(|&a| a)
+    }
+
+    fn alive(&self) -> impl Iterator<Item = usize> + '_ {
+        self.alive.iter().enumerate().filter(|(_, &a)| a).map(|(i, _)| i)
+    }
+
+    /// 从游标下一位起逐个试取门位，第一个拿到的即用；全满 → `None`。未注册的成员就地出局，不挡其余成员。
+    fn next_lease<'r>(&mut self, registry: &'r ProviderRegistry, members: &[EffectiveModel]) -> Option<(ScanLease<'r>, usize)> {
+        let n = self.alive.len();
+        for step in 1..=n {
+            let i = (self.cursor + step) % n;
+            if !self.alive[i] {
+                continue;
+            }
+            match registry.try_lease(&members[i].name) {
+                Ok(Some(lease)) => return Some((lease, i)),
+                Ok(None) => {}
+                Err(e) => self.remove(i, format!("deep: reviewer {} lease failed: {e} — removed from pool", members[i].name)),
+            }
+        }
+        None
+    }
+
+    /// 成员 `i` 领走一格：游标移到它，下一项从它的下一位起试。
+    fn assigned(&mut self, i: usize) {
+        self.cursor = i;
+        self.cells[i] += 1;
+    }
+
+    /// 出局（幂等：只记首次原因）。
+    fn remove(&mut self, i: usize, reason: String) {
+        if self.alive[i] {
+            self.alive[i] = false;
+            self.removed[i] = Some(reason);
+        }
+    }
+}
+
 /// 主循环交给一格 future 的全部所有权面（门位随 `lease` 进 future，整格结束才归还）。
 struct Dispatched<'b> {
     seq: u64,
+    /// 分派池成员下标（出局判定用）。
+    member: usize,
     rev: &'b EffectiveModel,
     lease: ScanLease<'b>,
     item: QueueItem,
@@ -309,6 +382,7 @@ enum Stage2 {
 /// 一格 future 的产出（未碰队列）。
 struct CellDone<'b> {
     seq: u64,
+    member: usize,
     rev: &'b EffectiveModel,
     item: QueueItem,
     cell_id: String,
@@ -320,12 +394,16 @@ struct CellDone<'b> {
     rl_wait_ms: u64,
     stage2: Stage2,
     bypass_missing: bool,
+    /// 首轮或二阶段返回鉴权失败（穿透 `attach_usage` 包装判定）→ 该成员出局。
+    auth_failed: bool,
     warnings: Vec<String>,
 }
 
 /// 完成时已落盘的一格，按派发序暂存待收场组装。
 struct Landed {
     seq: u64,
+    member: usize,
+    auth_failed: bool,
     rec: CellRecord,
     wait_ms: u64,
     dispatch_agreement: u32,
@@ -341,14 +419,18 @@ struct Landed {
 /// 一格完整执行：首轮 → （needs 合格）二阶段 → 回读 429 观测 → 归还门位。**全程持同一 lease**（design C1 §3.3 / Q4）：
 /// 两轮之间放门会让第二轮与新派发的格抢门——门宽 1 时补查轮排到队尾，墙钟与在途口径都失真。
 async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
-    let Dispatched { seq, rev, lease, item, prompt, cell_id, wait_ms } = d;
+    let Dispatched { seq, member, rev, lease, item, prompt, cell_id, wait_ms } = d;
     let t0 = tokio::time::Instant::now();
     let policy = lease.gate_attempts();
     let mut warnings = Vec::new();
     let (first, mut bypass_missing) = shot(env, &lease, &policy, rev, item.agreement, &prompt).await;
     let mut stage2 = Stage2::None;
+    let mut auth_failed = false;
     let outcome = match first {
-        Err(e) => Err(e),
+        Err(e) => {
+            auth_failed = is_auth(&e);
+            Err(e)
+        }
         Ok(mut c) => {
             let needs = c.output.needs().to_vec();
             if !needs.is_empty() {
@@ -378,6 +460,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                                     Stage2::Sent
                                 }
                                 Err(e) => {
+                                    auth_failed = is_auth(&e);
                                     // 首轮声明 needs = 模型自认判断不完整：静默沿用首轮会成单区域假绿灯 → 保留首轮 finding 但计债；
                                     // 第二轮烧掉的 token 照样入账。
                                     let (bi, bo, bc) = e.burned_usage();
@@ -400,6 +483,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
     drop(lease);
     CellDone {
         seq,
+        member,
         rev,
         item,
         cell_id,
@@ -410,8 +494,14 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
         rl_wait_ms,
         stage2,
         bypass_missing,
+        auth_failed,
         warnings,
     }
+}
+
+/// 鉴权失败（401 / 403）：穿透 `WithUsage` 包装看内层——多轮中途失败的错误带着已烧 usage。
+fn is_auth(e: &ProviderError) -> bool {
+    matches!(e.inner(), ProviderError::Auth(_))
 }
 
 /// 一轮单发：为本轮新造 per-cell backend 与旁路解析器（旁路要挂在本格独占的 backend 上，共享实例会被并发 cell 抢 delta）；
@@ -444,7 +534,7 @@ fn land(
     snapshot: Option<&dyn Fn(&QueueItem)>,
     on_cell: Option<&dyn Fn(&CellRecord)>,
 ) -> Landed {
-    let CellDone { seq, rev, item, cell_id, duration_ms, wait_ms, outcome, rl_retries, rl_wait_ms, stage2, bypass_missing, mut warnings } = done;
+    let CellDone { seq, member, rev, item, cell_id, duration_ms, wait_ms, outcome, rl_retries, rl_wait_ms, stage2, bypass_missing, auth_failed, mut warnings } = done;
     // 落地时刻的疑点共识回填到**落盘** finding（design §7「落地的 finding 继承记录当时的 agreement」、§8.1「按落地时刻算、
     // 后涨不回溯」）。cell 内的 `EmitCtx` 只能拿派发时快照；在途并入会让落地值更高，事件侧因此滞后（`event ≤ landed`）。
     let landed = live_agreement(q, &item);
@@ -494,6 +584,8 @@ fn land(
     }
     Landed {
         seq,
+        member,
+        auth_failed,
         rec,
         wait_ms,
         dispatch_agreement: item.dispatch_agreement,
@@ -1108,18 +1200,21 @@ mod tests {
         tools: ToolsMode,
         incoming: Option<mpsc::Receiver<EnqueueReq>>,
         on_cell: Option<&'a dyn Fn(&CellRecord)>,
+        snapshot: Option<&'a dyn Fn(&QueueItem)>,
         sink: &'a dyn FindingSink,
+        /// `None` = 单成员 `p/r`（`fake_reviewer`）。
+        reviewers: Option<&'a [EffectiveModel]>,
     }
 
     async fn run_with(r: Run<'_>) -> DeepRun {
-        let reviewer = fake_reviewer();
+        let single = [fake_reviewer()];
         run_deep(
             r.reg,
             DeepInput {
                 route: None, scan_cells: &[], bundles: r.bundles, root: r.root,
-                reviewers: std::slice::from_ref(&reviewer), budget_cells: 16,
+                reviewers: r.reviewers.unwrap_or(&single), budget_cells: 16,
                 pack: &Default::default(), spec_docs: "", target_label: "t",
-                snapshot: None, restore: Some(r.items), prior_findings: vec![], tools: r.tools,
+                snapshot: r.snapshot, restore: Some(r.items), prior_findings: vec![], tools: r.tools,
                 backend_factory: None, on_cell: r.on_cell, incoming: r.incoming,
             },
             r.sink,
@@ -1128,7 +1223,7 @@ mod tests {
     }
 
     fn plain<'a>(reg: &'a crate::provider::registry::ProviderRegistry, root: &'a Path, bundles: &'a [Bundle], items: &'a [QueueItem]) -> Run<'a> {
-        Run { reg, root, bundles, items, tools: ToolsMode::Off, incoming: None, on_cell: None, sink: &() }
+        Run { reg, root, bundles, items, tools: ToolsMode::Off, incoming: None, on_cell: None, snapshot: None, sink: &(), reviewers: None }
     }
 
     fn git_commit_all(root: &Path) {
@@ -1350,5 +1445,173 @@ mod tests {
         assert_eq!((st.rate_limited, st.effective_cap), (1, 1), "撞一次 429、门收到 1");
         let a = run.cells.iter().find(|c| c.cell.starts_with("review[a.rs")).unwrap();
         assert_eq!(a.attempts, 2, "attempts = 轮次 1 + 429 重试 1");
+    }
+
+    // ── 批 C1-3：reviewer 分派池 ─────────────────────────────────────────────
+
+    fn member(name: &str, provider: &str) -> EffectiveModel {
+        let id = name.rsplit('/').next().unwrap().to_string();
+        EffectiveModel { name: name.into(), provider: provider.into(), family: id.clone(), id, ..fake_reviewer() }
+    }
+
+    /// (route_key, provider, 门宽, backend) 逐条注册；同 provider 的门按首条门宽建立并共享。
+    fn pool_registry(entries: &[(&str, &str, u32, &Arc<Routed>)]) -> crate::provider::registry::ProviderRegistry {
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        for (key, provider, cap, backend) in entries {
+            reg.insert_scan(*key, provider, *cap, Box::new(Arc::clone(backend)), Duration::from_secs(60), 0);
+        }
+        reg
+    }
+
+    fn placed(run: &DeepRun) -> Vec<(String, String)> {
+        run.cells.iter().map(|c| (c.cell.clone(), c.model.clone())).collect()
+    }
+
+    fn cell_of(file: &str, model: &str) -> (String, String) {
+        (format!("review[{file}:rule:1-2]@{model}"), model.to_string())
+    }
+
+    /// 跨 provider 各门独立（门宽各 1）：两格并行、分落两个成员，每项只交一个成员（不双审）。
+    #[tokio::test(start_paused = true)]
+    async fn pool_members_on_separate_gates_dig_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a", "b"]);
+        let pa = Routed::new(vec![("a", 50, vec![found("a")]), ("b", 50, vec![found("b")])]);
+        let qb = Routed::new(vec![("a", 50, vec![found("a")]), ("b", 50, vec![found("b")])]);
+        let reg = pool_registry(&[("p/r", "p", 1, &pa), ("q/s", "q", 1, &qb)]);
+        let members = [member("p/r", "p"), member("q/s", "q")];
+        let items = pending_items(&["a", "b"]);
+        let t0 = tokio::time::Instant::now();
+        let run = run_with(Run { reviewers: Some(&members), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert!(t0.elapsed() < Duration::from_millis(100), "两门并行：{:?}", t0.elapsed());
+        assert_eq!(placed(&run), vec![cell_of("a.rs", "p/r"), cell_of("b.rs", "q/s")]);
+        assert_eq!((pa.starts(), qb.starts()), (vec!["a".to_string()], vec!["b".to_string()]), "每项只交一个成员");
+        assert!(run.warnings.is_empty(), "{:?}", run.warnings);
+    }
+
+    /// 同 provider 共享一道门：轮转只决定空位归谁——两个成员交替领项（批 C dogfood 的 glm-5.3 + grok-4.6 同在 agc 即此形态）。
+    #[tokio::test(start_paused = true)]
+    async fn pool_members_sharing_a_gate_take_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c", "d"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let script = || names.iter().map(|n| (*n, 20, vec![found(n)])).collect::<Vec<_>>();
+        let (pr, ps) = (Routed::new(script()), Routed::new(script()));
+        let reg = pool_registry(&[("p/r", "p", 8, &pr), ("p/s", "p", 8, &ps)]);
+        let members = [member("p/r", "p"), member("p/s", "p")];
+        let items = pending_items(&names);
+        let run = run_with(Run { reviewers: Some(&members), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(
+            placed(&run),
+            vec![cell_of("a.rs", "p/r"), cell_of("b.rs", "p/s"), cell_of("c.rs", "p/r"), cell_of("d.rs", "p/s")],
+            "空闲轮转交替领项"
+        );
+        assert_eq!(reg.gate_stats()["p"].peak, 4, "共享门宽，不因多成员加吞吐");
+    }
+
+    /// 成员健康（Q7）：成员首格鉴权失败（错误带已烧 usage 的包装也认）→ 出局，其余项只交另一成员；
+    /// 失败的那一格保持失败、计债，不改派。
+    #[tokio::test(start_paused = true)]
+    async fn auth_failure_removes_member_without_reassigning() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c", "d"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let denied = Err(ProviderError::Auth("401".into()).attach_usage((9, 0, 0)));
+        let bad = Routed::new(vec![("a", 10, vec![denied]), ("b", 10, vec![]), ("c", 10, vec![]), ("d", 10, vec![])]);
+        let good = Routed::new(names.iter().map(|n| (*n, 50, vec![found(n)])).collect());
+        let reg = pool_registry(&[("p/r", "p", 1, &bad), ("q/s", "q", 1, &good)]);
+        let members = [member("p/r", "p"), member("q/s", "q")];
+        let items = pending_items(&names);
+        let run = run_with(Run { reviewers: Some(&members), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(bad.starts(), vec!["a".to_string()], "出局后不再领项");
+        assert_eq!(good.starts(), vec!["b".to_string(), "c".to_string(), "d".to_string()], "失败格不改派");
+        assert!(!run.cells[0].ok && run.cells[1..].iter().all(|c| c.ok && c.model == "q/s"), "{:?}", placed(&run));
+        assert!(run.reviewer_failed, "失败格计债");
+        assert!(run.warnings.contains(&"deep: reviewer p/r auth failed — removed from pool".to_string()), "{:?}", run.warnings);
+        assert!(!run.warnings.iter().any(|w| w.contains("received 0 cells")), "出局成员不重复报 0 格: {:?}", run.warnings);
+    }
+
+    /// 二阶段第二轮鉴权失败同样出局（首轮 finding 保留、计债）：它持门位期间别的成员照常领项，出局后空出的门位不再派给它。
+    #[tokio::test(start_paused = true)]
+    async fn second_stage_auth_failure_removes_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c", "d"];
+        let bundles = routed_bundles(dir.path(), &names);
+        git_commit_all(dir.path());
+        let with_needs = Ok(turn(r#"{"findings":[],"needs":[{"path":"a.rs","reason":"need context"}]}"#));
+        let denied = Err(ProviderError::Auth("401".into()));
+        let pa = Routed::new(vec![("a", 50, vec![with_needs, denied]), ("b", 50, vec![]), ("c", 50, vec![]), ("d", 50, vec![])]);
+        let qb = Routed::new(names.iter().map(|n| (*n, 60, vec![found(n)])).collect());
+        let reg = pool_registry(&[("p/r", "p", 1, &pa), ("q/s", "q", 1, &qb)]);
+        let members = [member("p/r", "p"), member("q/s", "q")];
+        let items = pending_items(&names);
+        let run = run_with(Run { reviewers: Some(&members), tools: ToolsMode::TwoStage, ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(pa.starts(), vec!["a".to_string(), "a".to_string()], "第二轮 401 后不再领项");
+        assert_eq!(qb.starts(), vec!["b".to_string(), "c".to_string(), "d".to_string()]);
+        assert!(run.cells[0].ok, "第二轮失败保留首轮结果");
+        assert!(run.reviewer_failed);
+        assert!(run.warnings.contains(&"deep: reviewer p/r auth failed — removed from pool".to_string()), "{:?}", run.warnings);
+    }
+
+    /// 唯一成员出局 = 池空：停派，剩余项保持 Pending（从未派出、resume 可续）、warning 报数、计债（exit 2）。
+    #[tokio::test(start_paused = true)]
+    async fn sole_member_auth_failure_leaves_the_rest_pending_as_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let backend = Routed::new(vec![("a", 10, vec![Err(ProviderError::Auth("401".into()))]), ("b", 10, vec![]), ("c", 10, vec![])]);
+        let reg = routed_registry(&backend, 1);
+        let items = pending_items(&names);
+        let snaps = Mutex::new(Vec::new());
+        let snapshot = |it: &QueueItem| snaps.lock().unwrap().push((it.id.clone(), it.state));
+        let run = run_with(Run { snapshot: Some(&snapshot), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(backend.starts(), vec!["a".to_string()]);
+        assert_eq!(run.cells.len(), 1);
+        assert!(run.reviewer_failed);
+        assert!(
+            run.warnings.iter().any(|w| w == "deep: reviewer pool empty — 2 queued item(s) not dispatched, left pending for resume"),
+            "{:?}", run.warnings
+        );
+        let dispatched: Vec<String> = snaps.lock().unwrap().iter().filter(|(_, st)| *st == ItemState::InFlight).map(|(id, _)| id.clone()).collect();
+        assert_eq!(dispatched, vec!["a.rs:rule:1-2".to_string()], "b / c 从未派出");
+    }
+
+    /// 配了但一格没分到的成员必须可见（批 C dogfood grok-4.6 空转且无声）；一格都没派出时不报（无从谈起）。
+    #[tokio::test(start_paused = true)]
+    async fn member_left_without_cells_is_disclosed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let pr = Routed::new(vec![("a", 10, vec![found("a")])]);
+        let ps = Routed::new(vec![("a", 10, vec![found("a")])]);
+        let reg = pool_registry(&[("p/r", "p", 8, &pr), ("p/s", "p", 8, &ps)]);
+        let members = [member("p/r", "p"), member("p/s", "p")];
+        let items = pending_items(&["a"]);
+        let run = run_with(Run { reviewers: Some(&members), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(placed(&run), vec![cell_of("a.rs", "p/r")]);
+        assert_eq!(run.warnings, vec!["deep: reviewer p/s configured but received 0 cells".to_string()]);
+        let idle = run_with(Run { reviewers: Some(&members), ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+        assert!(idle.warnings.is_empty(), "队列为空不报 0 格: {:?}", idle.warnings);
+    }
+
+    /// 未注册的成员就地出局、不挡其余成员：另一成员照挖完不计债；全员未注册 = 池空、一格未派 → 仍计债（exit 2），不是干净通过。
+    #[tokio::test(start_paused = true)]
+    async fn unregistered_member_leaves_pool_without_blocking_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let good = Routed::new(names.iter().map(|n| (*n, 10, vec![found(n)])).collect());
+        let reg = pool_registry(&[("q/s", "q", 1, &good)]);
+        let items = pending_items(&names);
+        let members = [member("p/ghost", "p"), member("q/s", "q")];
+        let run = run_with(Run { reviewers: Some(&members), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(run.cells.iter().filter(|c| c.ok && c.model == "q/s").count(), 2, "{:?}", run.warnings);
+        assert!(!run.reviewer_failed, "其余成员挖完 → 不计债: {:?}", run.warnings);
+        assert!(run.warnings.iter().any(|w| w.starts_with("deep: reviewer p/ghost lease failed:") && w.ends_with("removed from pool")), "{:?}", run.warnings);
+
+        let ghosts = [member("p/ghost", "p")];
+        let run = run_with(Run { reviewers: Some(&ghosts), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert!(run.cells.is_empty());
+        assert!(run.reviewer_failed, "池空、项未挖 → 计债");
+        assert!(run.warnings.iter().any(|w| w.contains("reviewer pool empty — 2 queued item(s)")), "{:?}", run.warnings);
     }
 }
