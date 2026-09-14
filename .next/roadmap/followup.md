@@ -311,9 +311,29 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
 - ✅ **报告确定性（C1-2 已修）**：dedup 取输入序首个为 base（标题 / 正文 / 建议保留 base），并发完成序会让报告文本逐次漂移；
   meta 四数组 push 时点不一，批 C 串行下只要有失败格就已错位。C1 定案：报告按派发序组装、meta 按派发序对齐。
 - **reviewer 模型去留的数据口径**：批 C dogfood grok-4.6 0 条 vs glm-5.3 13 条（同变更集同 12 格）。C1 定案不引入权重（design「无 priority」），
-  C1-5 dogfood 混合池统计每模型每格产出，作为配置去留依据。
+  C1-5 dogfood 混合池统计每模型每格产出，作为配置去留依据。数据已出，见下节「批 C1 dogfood 带出的账」。
 - ✅ **resume / partial 报告把 reviewer 格当失败的 scanner 格（批 C 遗留，C1-1 测试暴露，C1-1 后单独修）**：`run_resume` 收口与
   `partial_report` 把 cells 表全量喂 scan-only 收口，`scan_cells_from_records` 把非 scanner 记录判失败 → 假 `scan incomplete` 警告、
   `coverage.failed[Scanner]` 列 reviewer 格；深挖跑完、零 finding、收尾被 kill 的作业 resume 后误判 **Incomplete / exit 3**（应 Approve / 0）。
   修法：两处按角色拆记录，scanner 格走 scan-only 收口，reviewer 格按自身角色进 coverage——resume 往轮成功且本轮未重挖的记
   `reused[Reviewer]`（`DeepRun.reused_cells`），partial 记 completed / failed；partial 的「partial: done/total」只数 scanner 格。
+
+## 批 C1 dogfood 带出的账（2026-09-14，C1-5；同批 C 目标 diff `674583e...f1d3ca3`，明细在私有记录）
+
+墙钟门实证：同 diff、同配置，深挖段 48.4 min（批 C glm 串行）→ **7.1 min**（混合池、agc 门 20，总墙钟 11.2 min）/ 16.1 min（门 4）；
+分派池两成员严格交替领项，门收窄与快慢混杂下无死锁。
+
+- **真网关超载有两种表现，D13 只认其一**：12 路并发时 agc 429 × 2，棘轮把门 20 收到 7（两格排队 64 / 78 s 后重试成功，记账正确）；
+  同时 grok-4.6 两格 `truncated anthropic stream: no finish_reason`，`DEFAULT_RETRY_BUDGET` 三次尝试全断 → 失败计债。门 4 与批 C 串行零出现 → 负载所致。
+  D13 只以 429 收门，断流不收门。候选：同 provider 短窗内断流连发视同过载信号参与收门。配置侧 `providers.agc.maxConcurrency ≤ 7`（run.warnings 已提示，用户决定）。
+- **流式旁路跨瞬时重试不复位（批 D 接真 sink 前须处理）**：`timed_turn_with` 内部重试复用同一 backend，delta 回调持续喂同一个 `IncrementalFindings`——
+  断流那次的半截 JSON 与重试输出拼进同一解析器。sink 为 no-op 时无害；接真 sink 后可能发出重试前的草稿对象。修法二选一：每次尝试复位解析器，或旁路只开在首个尝试。
+- **reviewer 格 quote 锚定丢弃数不可见**：`ReviewParseStats.dropped_quote` 算了却不进 `CellRecord`（scanner 格有「N suspicions dropped」warn，reviewer 没有）。
+  直接后果：模型去留数据分不清「零发现」与「quote 全锚不上被静默丢」。小修：`land` 里与 `stream discarded` 并列写进 cell warn。
+- **reviewer 模型去留数据**：grok-4.6 三轮 22 个成功格 **0 条** finding（C1 两轮 needs 也为 0、输出 1–6K token）；glm-5.3 24 格 26 条（cell 内）。
+  混合池无权重，零产出成员直接占掉一半预算格（C1 两轮报告 findings 2 / 8，对比批 C glm 独占 12 格的 13）。先补上条观测再定配置去留。
+- **单文档疑点洪水吃掉深挖预算**：scanner 在一个 roadmap 文档（单独成组、独占 scanner 格）上报 27 / 42 条疑点，C1 两轮 12 格里分别 7 格 / 4 格落在该文档行上。
+  队列优先级 / 预算范畴（per-file 帽、文档类权重，或 C2 在线预算与保底预留一并设计），非 C1。
+- **并发形态下 kill / resume 用例缺口**（dogfood ② glm 对 C1 旧版 plan 的意见之一，部分成立）：C1 resume 用例为单 InFlight；并发 kill 时多项同时 InFlight、
+  部分格已落盘——restore 全部复位 Pending + 「Settled 以成功格为准」理论上覆盖，缺多 InFlight 的端到端用例。C1 评审时顺带补或留 C2。
+

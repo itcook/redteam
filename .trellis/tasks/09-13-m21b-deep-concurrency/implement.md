@@ -48,7 +48,7 @@
 
 ### C1-5 收口
 - [ ] `cargo test` / `clippy --all-targets` 零新增（基线 7）/ `make verify`
-- [ ] `make build` → dogfood 两轮（base `674583e`）：
+- [x] `make build` → dogfood 两轮（base `674583e`，目标与批 C 同为 `f1d3ca3`，临时 detached 工作树）：① 11.2 min（深挖段 7.1 min，429 × 2 门 20→7，grok 2 格断流）② 19.7 min（门 4，全绿）；配置已恢复并 cmp 校验；记入 `.next/private/m21b/2026-09-14-batch-c1-dogfood.md`，账目进 followup
   - ① 当前配置（reviewers = glm-5.3 + grok-4.6，同在 agc 门宽 20）——墙钟对照串行基线 18.3 / 50.7 min；统计每模型每格产出（grok 去留的决策数据）
   - ② 争门轮：跑前 `cp ~/.redteam/config.json ~/.redteam/config.json.bak-<ts>`，`providers.agc.maxConcurrency = 4`，跑完用备份恢复并校验
   - 记入 `.next/private/m21b/`
