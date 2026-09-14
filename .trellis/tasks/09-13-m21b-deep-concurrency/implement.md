@@ -53,6 +53,10 @@
   - ② 争门轮：跑前 `cp ~/.redteam/config.json ~/.redteam/config.json.bak-<ts>`，`providers.agc.maxConcurrency = 4`，跑完用备份恢复并校验
   - 记入 `.next/private/m21b/`
 - [ ] 三路 code-review 或 dogfood 自评审 → 修 → `--no-ff` 合回 `feat/m21-review-engine`
+  - [x] `/code-review`（15 条）→ 分四档；第 1 档已修：#1 id 捷径保请求自身共识（`4e70292`）、#2 二阶段失败按失败格落盘 + #4 对账双向以成功格为准 + 重挖失败保载体（`96b1ad5`）、#3 diff 重建不了时截断数不丢
+  - [ ] 第 2 档（#9 `--help` 与债文案、#7 re-digging 时序、#8 二阶段失败轮次、#10 真实时间用例阈值；可选 reviewer 锚定丢弃观测）
+  - [ ] 第 3 档（#12 cell 名 helper、#13 删 dispatch 死代码、#14 Pool 冗余状态、#15 registry 复用，可选）
+  - [ ] 留 C2 记账：#5 复位后 budget_skipped 不回减、#6 外部放门不唤醒、#11 单 task 内同步 IO 停摆
 - [ ] followup：「批 C 核查留债」前两条与 resume 覆盖 bug 标已解；与批 D 的 sink 接线现状（若 D 先合回则对齐）
 - [ ] Commit: 评审修（如有）+ 归档 / journal
 

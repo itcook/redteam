@@ -89,6 +89,10 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         let unfinished = input.restore.is_some_and(|items| {
             items.iter().any(|i| matches!(i.state, ItemState::Pending | ItemState::InFlight))
         });
+        if let Some(items) = input.restore {
+            // 早退也带上快照里的截断数（评审修 #3）：否则首跑被预算截掉、从没挖过的项既不计债也不披露。
+            meta = restored_meta(items);
+        }
         if unfinished {
             warnings.push(
                 "deep: 变更集为空（diff 已不可重建），队列未完项无法重跑——带债收口".into(),
@@ -102,9 +106,8 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         None => DeepQueue::new(),
     };
 
-    if input.restore.is_some() {
-        meta.budget_skipped = q.items().iter().filter(|i| i.state == ItemState::Skipped).count() as u32;
-        meta.queue_depth_peak = q.items().len() as u32;
+    if let Some(items) = input.restore {
+        meta = restored_meta(items);
     } else {
         if let Some(route) = input.route {
             for h in &route.hotspots {
@@ -645,6 +648,17 @@ async fn recv(rx: &mut Option<mpsc::Receiver<EnqueueReq>>) -> Option<EnqueueReq>
     match rx {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// resume 形态的深挖 meta 起点：截断数与队列深度取自快照（drain 在首跑已做，resume 不重跑）。
+/// resume 的三条路径共用——正常续跑、变更集为空早退、diff 重建报错（`cli::run_resume`）——任何一条漏掉截断数，
+/// 被预算截掉的项就既不计债也不披露。
+pub fn restored_meta(items: &[QueueItem]) -> DeepMeta {
+    DeepMeta {
+        budget_skipped: items.iter().filter(|i| i.state == ItemState::Skipped).count() as u32,
+        queue_depth_peak: items.len() as u32,
+        ..Default::default()
     }
 }
 

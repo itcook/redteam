@@ -1230,7 +1230,8 @@ pub async fn run_resume(
                     let deep = crate::orchestrate::deep::DeepRun {
                         findings: crate::consolidate::dedup(prior_findings),
                         cells: vec![],
-                        meta: Default::default(),
+                        // 截断数取自快照（评审修 #3）：空 meta 会让首跑被预算截掉的项既不计债也不披露。
+                        meta: crate::orchestrate::deep::restored_meta(&queue_snap),
                         warnings: vec![],
                         reviewer_failed: unfinished,
                         reused_cells: deep_records.iter().filter(|r| r.ok).cloned().collect(),
@@ -2379,6 +2380,37 @@ mod resume_tests {
         let rec = store.read_partial("j").into_iter().find(|r| r.cell == "review[x.rs:rule:1-2]@p/r").unwrap();
         assert!(!rec.ok);
         assert_eq!(rec.output.findings().len(), 1, "库里的失败格仍携带往轮 finding");
+    }
+
+    /// resume 时 diff 重建不了（改动已提交 → 变更集为空；或不在 git 仓 → 重建报错），首跑被预算截掉、从没挖过的项必须仍计债并披露（评审修 #3）。
+    /// 旧实现两条路径的深挖 meta 都是空的（`budget_skipped = 0`），往轮沿用格又让报告走正常收口 → Approve / exit 0，截断悄悄消失。
+    #[tokio::test]
+    async fn resume_without_rebuildable_diff_still_discloses_budget_skip() {
+        use crate::orchestrate::queue::ItemState;
+        for committed in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = dir.path();
+            std::fs::write(ws.join("x.rs"), "fn x() {\n    x_marker();\n}\n").unwrap();
+            if committed {
+                git(ws, &["init", "-q"]);
+                git(ws, &["add", "."]);
+                git(ws, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+            }
+            let store = crate::state::JobStore::open(ws).unwrap();
+            scan_done_job(&store);
+            store.put_queue_item("j", &rule_item("x.rs", ItemState::Settled)).unwrap();
+            store.put_queue_item("j", &rule_item("y.rs", ItemState::Skipped)).unwrap();
+            let clean = CellRecord::ok("review[x.rs:rule:1-2]@p/r", "p/r", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] });
+            store.append_partial("j", &clean).unwrap();
+            let (reg, _rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+            let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+            let shape = if committed { "变更集为空" } else { "diff 重建报错" };
+            assert_eq!(code, 2, "{shape}: 截断仍是债: {:?}", report.run.warnings);
+            assert_eq!(report.run.deep.as_ref().map(|d| d.budget_skipped), Some(1), "{shape}");
+            assert!(report.run.warnings.iter().any(|w| w.contains("skipped(budget) 1")), "{shape}: {:?}", report.run.warnings);
+        }
     }
 
     /// resume 收口只把 scanner 格喂 scan-only 收口：批 C 把 cells 表全量喂进去，首跑落盘的 reviewer 格被当成

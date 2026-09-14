@@ -67,6 +67,9 @@ merge_into 命中 Skipped:
 - **评审修（2026-09-14）——对账双向以成功格为准**：有成功格的项一律按 Settled（快照是 InFlight / Pending / Skipped 都算，kill 落在
   「格已落盘、快照未写」之间或快照写失败只 warning 时出现），不重挖；对账改过的项写回快照。原接受的残余（kill 窗口内重挖、换模型留两条格）随之消除；
   更要紧的是旧口径重挖失败时同名 upsert 会把成功格覆盖成失败格，finding 失去载体，下一次 resume 永久丢失。
+- **diff 重建不了时截断数不丢（评审修 #3）**：resume 的正常续跑、变更集为空早退、diff 重建报错三条路径的深挖 meta 统一从快照起算
+  （`deep::restored_meta`：`budget_skipped` = 快照 Skipped 数、`queue_depth_peak` = 快照项数）。原实现后两条是空 meta，往轮沿用格又让报告走正常收口
+  → 首跑被截掉的项既不计债也不披露，报告 Approve / exit 0。
 - **重挖失败不抹掉往轮载体**：resume 的 `on_cell` 落盘时，若新格失败且无 finding、而同名往轮格带 finding（如二阶段失败保留的首轮结果），
   失败格照写（债与重挖资格不变）但带上往轮 finding。
 
