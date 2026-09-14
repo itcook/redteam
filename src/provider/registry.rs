@@ -100,6 +100,18 @@ impl InflightGate {
             notified.await;
         }
     }
+    /// 非阻塞取名额（M21b 批 C1 深挖派发循环）：`held < cap` 即取，否则 `None`。`cap` 是 429 收敛后的有效门宽，天然尊重收门。
+    /// **不感知等门者**：同门若有 `enter()` 阻塞等待者，本调用可能抢在其前——C1 深挖内部没有阻塞等门者（一格持门位到底），
+    /// 与 scanner 共门时的让位公平性归批 C2。
+    fn try_enter(&self) -> Option<GatePermit<'_>> {
+        let mut s = self.lock();
+        if s.held < s.cap {
+            s.held += 1;
+            Some(GatePermit { gate: self })
+        } else {
+            None
+        }
+    }
     #[cfg(test)]
     fn shrink_to(&self, cap: u32) {
         self.lock().shrink_to(cap);
@@ -396,6 +408,15 @@ impl ProviderRegistry {
         Ok(ScanLease { entry, gate, _permit: permit })
     }
 
+    /// 非阻塞版 [`Self::lease`]（深挖门驱动派发：门有空位才弹出队列项，D13）：门满 → `Ok(None)`；未注册 → `Unavailable`（同 `lease`）。
+    pub fn try_lease(&self, route_key: &str) -> Result<Option<ScanLease<'_>>, ProviderError> {
+        let Some(entry) = self.scan.get(route_key) else {
+            return Err(ProviderError::Unavailable(format!("scanner not in registry: {route_key}")));
+        };
+        let gate = self.gates.get(&entry.provider).ok_or_else(|| ProviderError::Unavailable(format!("no inflight gate for provider {}", entry.provider)))?;
+        Ok(gate.try_enter().map(|permit| ScanLease { entry, gate, _permit: permit }))
+    }
+
     /// scanner 调用：过 provider 在途门 → 两轮单发（`lease` + `run`）。
     pub async fn scan(&self, route_key: &str, prompt: &ScanPrompt) -> Result<ScanCall, ProviderError> {
         self.lease(route_key).await?.run(prompt).await
@@ -464,6 +485,22 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), hard_constraint: false, quote: "q".into(),
         }
+    }
+
+    /// 非阻塞取门位：门满回 `None` 不阻塞；429 收门后按有效门宽判；未注册 → `Unavailable`；归还后可再取。
+    #[tokio::test]
+    async fn try_lease_respects_effective_cap_without_blocking() {
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/a", "p", 2, Box::new(FakeChatBackend::new(vec![])), Duration::from_secs(5), 0);
+        let l1 = reg.try_lease("p/a").unwrap().expect("空门可取");
+        let l2 = reg.try_lease("p/a").unwrap().expect("门宽 2");
+        assert!(reg.try_lease("p/a").unwrap().is_none(), "门满返回 None");
+        drop(l1);
+        reg.gates["p"].shrink_to(1);
+        assert!(reg.try_lease("p/a").unwrap().is_none(), "收门到 1 后 held 1 已满");
+        drop(l2);
+        assert!(reg.try_lease("p/a").unwrap().is_some(), "归还后可取");
+        assert!(matches!(reg.try_lease("p/none"), Err(ProviderError::Unavailable(_))));
     }
 
     #[tokio::test]

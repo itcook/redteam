@@ -1,6 +1,7 @@
 //! 门驱动单派发器（M21b 批 C-3，design §6 规则 5〔D13〕）：
 //! `registry.lease(reviewer)` 等到门位 → pop 最高 Pending → 调用方跑 cell。
 //! 无角色 workers。t=0 入队序由调用方保证 scanner 先于 H0。
+//! 批 C1 起 `run_deep` 改为非阻塞 `try_lease` × `pop_dispatch` 的并发填门（见 `deep.rs` 主循环），本函数不再在深挖路径上。
 
 use super::queue::{DeepQueue, QueueItem};
 use crate::provider::registry::{ProviderRegistry, ScanLease};

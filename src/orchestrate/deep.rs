@@ -1,9 +1,12 @@
-//! 深挖循环（M21b 批 C-4）：H0 + 疑点入队 → drain → lease×pop → review_shot → barrier。
+//! 深挖循环（M21b 批 C-4 / C1）：H0 + 疑点入队 → drain → 门驱动并发派发（try_lease×pop → 一格 future）→ barrier → 按派发序组装。
 //! 无 reviewer / scanner 失败时调用方不进本模块（scan-only / Incomplete）。
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+
+use futures::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::mpsc;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -16,13 +19,13 @@ use crate::bundle::{cross_index, Bundle};
 use crate::config::{EffectiveModel, PackCfg, ToolsMode};
 use crate::consolidate::scan::merge_suspicions;
 use crate::domain::{DeepMeta, Finding, Role};
-use crate::orchestrate::dispatch::dispatch_one;
-use crate::orchestrate::queue::{DeepQueue, EnqueueOutcome, EnqueueReq, ItemKind, ItemState};
-use crate::orchestrate::review_shot::{run_review_shot_with, EmitCtx, FindingSink};
+use crate::orchestrate::queue::{DeepQueue, EnqueueOutcome, EnqueueReq, ItemKind, ItemState, QueueItem};
+use crate::orchestrate::review_shot::{run_review_shot_with, EmitCtx, FindingSink, ReviewCall};
 use crate::pack::region::{self as region, Origin as QueueOrigin, QueueItemSpec};
 use crate::pack::PackOpts;
-use crate::prompt::{build_review_prompt, review_template_hash, ReviewPromptInput};
-use crate::provider::registry::ProviderRegistry;
+use crate::prompt::{build_review_prompt, review_template_hash, ReviewPromptInput, ScanPrompt};
+use crate::provider::registry::{GateAttempts, ProviderRegistry, ScanLease};
+use crate::provider::ProviderError;
 use crate::provider::stream_json::IncrementalFindings;
 use crate::provider::tool_loop::ChatBackend;
 use crate::risk::{Hotspot, RegionKind, RiskRoute};
@@ -69,9 +72,12 @@ pub struct DeepInput<'a> {
     /// reviewer cell 落盘（后台 job checkpoint —— resume 靠它认已挖过的格与其 findings）。
     /// `None` → 不落盘（前台一次性跑）。
     pub on_cell: Option<&'a dyn Fn(&CellRecord)>,
+    /// 在途入队通道（批 C2 接 scanner 流式扇出；生产暂传 `None` = 已关闭）。到达项走入口五态，C1 里不过预算。
+    /// barrier 含「通道已关闭」：发送端未全部 drop 前，队列空也不收场。
+    pub incoming: Option<mpsc::Receiver<EnqueueReq>>,
 }
 
-pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &dyn FindingSink) -> DeepRun {
+pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sink: &dyn FindingSink) -> DeepRun {
     let mut meta = DeepMeta::default();
     let mut warnings = Vec::new();
     let prior_findings = input.prior_findings.clone();
@@ -117,175 +123,145 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
     let Some(rev) = input.reviewers.first() else {
         return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false, reused_cells: vec![] };
     };
+    let mut incoming = input.incoming.take();
     let idx = cross_index(input.bundles, &[], None);
     let opts = PackOpts::from(input.pack);
-    let mut findings = Vec::new();
-    let mut cells = Vec::new();
-    let mut reviewer_failed = false;
-    let mut bypass_warned = false;
+    let env = CellEnv { input: &input, idx: &idx, opts: &opts, sink };
 
-    while q.pending_count() > 0 {
-        let Some((lease, item)) = (match dispatch_one(&mut q, registry, &rev.name).await {
-            Ok(x) => x,
-            Err(e) => {
-                warnings.push(format!("reviewer lease failed: {e}"));
-                reviewer_failed = true;
-                break;
-            }
-        }) else {
-            break;
-        };
-        snap_one(&item, input.snapshot);
-        // 排队时长在**派发时**定格：放到调用返回后采样量到的是「完成 − 入队」（含模型跑的几分钟），
-        // 那是墙钟不是队列压力；且失败格根本不会 push，分布还带偏。
-        if let Some(en) = item.enqueued_ms {
-            meta.item_wait_ms.push(now_ms().saturating_sub(en));
-        }
-        // cell 名按队列项（id 已定死），跨 resume 调用稳定：同项重跑 upsert 覆盖自身（与 scanner「重试者胜」同义），
-        // 不同项永不同名。按本次调用的派发序编号时，resume 挖别的项会同名覆盖首跑的格、丢掉它的 finding。
-        let cell_id = format!("review[{}]@{}", item.id, rev.name);
-        let t0 = Instant::now();
-        let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &idx, 64 * 1024, &opts, "") {
-            Ok(p) => p,
-            Err(e) => {
-                warnings.push(format!("{cell_id}: pack {e}"));
-                q.mark_settled(&item.id, item.agreement);
-                drop(lease);
-                continue;
-            }
-        };
-        let file_diff = file_diff(input.bundles, &item.spec.file);
-        let prompt = build_review_prompt(&ReviewPromptInput {
-            target_label: input.target_label,
-            file: &item.spec.file,
-            file_diff: &file_diff,
-            cross_index: &pack.cross_index,
-            notes: &pack.notes,
-            dossier: &pack.evidence,
-            spec_docs: input.spec_docs,
-            repo_brief: "",
-        });
-        let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
-        // 流式旁路要挂在本格独占的 backend 上（共享实例会被并发 cell 抢 delta）。
-        // 工厂缺席 / 造不出来 → 退回共享 backend：这一格没有旁路，但照跑。
-        let inc_feed = inc.clone();
-        let per_cell = input
-            .backend_factory
-            .and_then(|f| f(rev, Box::new(move |s: &str| inc_feed.lock().unwrap().feed(s))));
-        if per_cell.is_none() && input.backend_factory.is_some() && !bypass_warned {
-            bypass_warned = true; // 同一 reviewer 的结果稳定，报一次就够——别按格刷屏
-            warnings.push(format!(
-                "deep: {} 无 per-cell backend（缺密钥 / 构造失败）——流式旁路关闭，stream_discarded 恒 0",
-                rev.name
-            ));
-        }
-        let backend: &dyn ChatBackend = per_cell.as_deref().unwrap_or(lease.backend());
-        let policy = lease.gate_attempts();
-        let mut ctx = EmitCtx::new(&rev.name, &rev.family, item.agreement, input.root, sink);
-        let call = run_review_shot_with(
-            backend,
-            &prompt,
-            lease.per_turn(),
-            lease.retry_budget(),
-            Some(&policy),
-            &mut ctx,
-            inc,
-        )
-        .await;
-        // 门等待与 429 排队只有 policy 知道（`ScanLease::run` 的回填在这条路径上不经过）——
-        // 趁 lease 还活着读出来，否则 attempts / queue_wait_ms 永远是死值 0。
-        let (rl_retries, rl_wait_ms) = (policy.retries(), policy.waited_ms());
-        drop(per_cell);
-        drop(lease);
-        match call {
-            Ok(mut c) => {
-                // R2 二阶段（`--tools two-stage` 首个消费者，design §11）：needs 非空 → 补查轮。
-                // 注入互斥：带笔记项（origin=scan）不注入 needs 证据（region::build 构造期 Err），计 skipped。
-                let needs_count = c.output.needs().len();
-                if needs_count > 0 {
-                    // `on` 档在 M21b 还没有工具循环（reviewer 单发恒不带 tools），落到这里
-                    // 至少要与 two-stage 等价——否则用户选了 --help 里更高的档反而拿到更少能力。
-                    let tiered = matches!(input.tools, ToolsMode::TwoStage | ToolsMode::On);
-                    let eligible = tiered && item.spec.notes.is_empty();
-                    if eligible {
-                        meta.needs_two_stage_triggered += 1;
-                        if let Some(c2) = second_stage_round(
-                            registry, &input, rev, &item, &idx, &opts, c.output.findings().to_vec(), c.output.needs(), sink,
-                            &mut warnings,
-                        )
-                        .await
-                        {
-                            c.input_tokens += c2.input_tokens;
-                            c.output_tokens += c2.output_tokens;
-                            c.cached_input_tokens += c2.cached_input_tokens;
-                            c.iterations += c2.iterations;
-                            c.rate_limit_retries += c2.rate_limit_retries;
-                            c.rate_limit_wait_ms += c2.rate_limit_wait_ms;
-                            c.stats.stream_discarded += c2.stats.stream_discarded;
-                            c.output = c2.output; // 第二轮 = CONFIRM/REVISE 后终判
-                        }
-                    } else {
-                        meta.needs_two_stage_skipped += 1;
+    // 门驱动并发派发（design §6 规则 5〔D13〕）：provider 门有空位才弹出最高 Pending 交出去。
+    // 同 task 内并发（`FuturesUnordered`）：future 只借共享引用跑一格；队列 / meta / cells / 回调只在本循环写。
+    let mut running = FuturesUnordered::new();
+    let mut landed: BTreeMap<u64, Landed> = BTreeMap::new();
+    let mut seq = 0u64;
+    let mut closed = incoming.is_none();
+    // 派发不可继续（reviewer 未注册）：停派，但通道未关照收、在途照等——剩余项保持 Pending（resume 可续）。
+    let mut blocked = false;
+    // 兜底阻塞 lease 拿到的门位，下一轮填门时先用。
+    let mut parked: Option<ScanLease<'_>> = None;
+    let mut reviewer_failed = false;
+
+    loop {
+        // ① 填门位
+        while !blocked && q.pending_count() > 0 {
+            let lease = match parked.take() {
+                Some(l) => l,
+                None => match registry.try_lease(&rev.name) {
+                    Ok(Some(l)) => l,
+                    Ok(None) => break, // 门满
+                    Err(e) => {
+                        warnings.push(format!("reviewer lease failed: {e}"));
+                        reviewer_failed = true;
+                        blocked = true;
+                        break;
                     }
+                },
+            };
+            let Some(item) = q.pop_dispatch() else { break };
+            snap_one(&item, input.snapshot);
+            // cell 名按队列项（id 已定死），跨 resume 调用稳定：同项重跑 upsert 覆盖自身（与 scanner「重试者胜」同义），
+            // 不同项永不同名。按本次调用的派发序编号时，resume 挖别的项会同名覆盖首跑的格、丢掉它的 finding。
+            let cell_id = format!("review[{}]@{}", item.id, rev.name);
+            let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &idx, 64 * 1024, &opts, "") {
+                Ok(p) => p,
+                Err(e) => {
+                    warnings.push(format!("{cell_id}: pack {e}"));
+                    q.mark_settled(&item.id, item.agreement);
+                    if let Some(it) = q.get(&item.id) {
+                        snap_one(it, input.snapshot);
+                    }
+                    continue; // lease 随本轮作用域归还
                 }
-                // 落地时刻的疑点共识回填到**落盘** finding（design §7「落地的 finding 继承记录当时的
-                // agreement」、§8.1「按落地时刻算、后涨不回溯」）。cell 内的 `EmitCtx` 只能拿派发时
-                // 快照——它跑在 await 里碰不到队列；此处回到主循环读活值，落盘 / 进报告的以此为准。
-                // 串行派发下 cell 运行期间队列冻结，两值恒等；批 C1 并发后在途并入会让落地值更高，
-                // 届时事件侧（FindingEvent）的值可能滞后，见 plan C1-2。
-                let landed = live_agreement(&q, &item);
-                for f in c.output.findings_mut() {
-                    f.suspicion_agreement = landed;
-                }
-                let got = c.output.findings().to_vec();
-                findings.extend(got.iter().cloned());
-                let mut rec = CellRecord::ok(&cell_id, &rev.name, c.output).with_family(&rev.family);
-                rec.duration_ms = t0.elapsed().as_millis() as u64;
-                rec.input_tokens = c.input_tokens;
-                rec.output_tokens = c.output_tokens;
-                rec.cached_input_tokens = c.cached_input_tokens;
-                rec.iterations = c.iterations;
-                // 与 scanner 同口径（orchestrate/mod.rs）：attempts = 轮次 + 429 重试。
-                rec.attempts = c.iterations + rl_retries + c.rate_limit_retries;
-                rec.queue_wait_ms = rl_wait_ms + c.rate_limit_wait_ms;
-                rec.template_hash = Some(review_template_hash());
-                if c.stats.stream_discarded > 0 {
-                    rec.warn = Some(format!("stream discarded {}", c.stats.stream_discarded));
-                }
-                meta.stream_discarded += c.stats.stream_discarded;
-                meta.reviewer_output_tokens.push(c.output_tokens);
-                meta.dispatch_agreement.push(item.dispatch_agreement);
-                // 与派发时值成对（`landed` 上面已读）：二者之差即「挖的时候还不知道、挖完才攒够的共识」。
-                meta.landed_agreement.push(landed);
-                // 先落盘 cell（finding 的权威载体）再写队列快照：kill 落在两者之间时，
-                // 快照仍是 InFlight → resume 重跑，宁可重挖一格也不丢 finding（design §7.1）。
-                snap_cell(&rec, input.on_cell);
-                cells.push(rec);
-                q.mark_settled(&item.id, landed);
-                if let Some(it) = q.get(&item.id) { snap_one(it, input.snapshot); }
+            };
+            // 排队时长在**派发时**定格：完成时采样量到的是「完成 − 入队」（含模型跑的几分钟），那是墙钟不是队列压力。
+            let wait_ms = item.enqueued_ms.map_or(0, |en| now_ms().saturating_sub(en));
+            let file_diff = file_diff(input.bundles, &item.spec.file);
+            let prompt = build_review_prompt(&ReviewPromptInput {
+                target_label: input.target_label,
+                file: &item.spec.file,
+                file_diff: &file_diff,
+                cross_index: &pack.cross_index,
+                notes: &pack.notes,
+                dossier: &pack.evidence,
+                spec_docs: input.spec_docs,
+                repo_brief: "",
+            });
+            seq += 1;
+            running.push(run_cell(&env, Dispatched { seq, rev, lease, item, prompt, cell_id, wait_ms }));
+        }
+
+        // ② barrier：在途 0 ∧（Pending 0 ∨ 停派）∧ 通道已关（design §2；复核在途批 D 前恒 0）
+        if running.is_empty() && closed && (blocked || q.pending_count() == 0) {
+            break;
+        }
+        // 在途 0 ∧ Pending > 0 ∧ 门仍满 = 门被本循环之外的持有者占着（批 C2 起 scanner 与深挖同门）：
+        // 阻塞等一个门位，期间照收通道——不空转、不提前收场。
+        if running.is_empty() && !blocked && q.pending_count() > 0 {
+            tokio::select! {
+                l = registry.lease(&rev.name) => match l {
+                    Ok(l) => parked = Some(l),
+                    Err(e) => {
+                        warnings.push(format!("reviewer lease failed: {e}"));
+                        reviewer_failed = true;
+                        blocked = true;
+                    }
+                },
+                msg = recv(&mut incoming), if !closed => on_arrival(msg, &mut q, &mut meta, &mut closed, input.snapshot),
             }
-            Err(e) => {
-                reviewer_failed = true;
-                // 烧掉的 token 照样入账（scanner 同口径）——失败不等于免费，
-                // 不记就成了报告里对不上的黑洞。
-                let (bi, bo, bc) = e.burned_usage();
-                let mut rec = CellRecord::failed(&cell_id, &rev.name, Role::Reviewer, format!("{e}"));
-                rec = rec.with_family(&rev.family);
-                rec.duration_ms = t0.elapsed().as_millis() as u64;
-                rec.input_tokens = bi;
-                rec.output_tokens = bo;
-                rec.cached_input_tokens = bc;
-                rec.attempts = 1 + rl_retries;
-                rec.queue_wait_ms = rl_wait_ms;
-                snap_cell(&rec, input.on_cell);
-                cells.push(rec);
-                warnings.push(format!("{cell_id} failed: {e}"));
-                let landed = live_agreement(&q, &item);
-                q.mark_settled(&item.id, landed);
-                if let Some(it) = q.get(&item.id) { snap_one(it, input.snapshot); }
+            continue;
+        }
+
+        // ③ 等事件：任一格完成（完成即归还门位）或经通道到达一项
+        tokio::select! {
+            Some(done) = running.next(), if !running.is_empty() => {
+                let l = land(done, &mut q, input.snapshot, input.on_cell);
+                reviewer_failed |= l.debt;
+                landed.insert(l.seq, l);
             }
+            msg = recv(&mut incoming), if !closed => on_arrival(msg, &mut q, &mut meta, &mut closed, input.snapshot),
+            else => break,
         }
     }
+    drop(running);
+    drop(parked);
+
+    if blocked && q.pending_count() > 0 {
+        warnings.push(format!(
+            "deep: {} queued item(s) not dispatched — left pending for resume",
+            q.pending_count()
+        ));
+    }
+
+    // 收场：按派发序组装（design C1 §3.4）。持久化已在完成时做完；报告侧的 findings（→ dedup 以输入序首个为 base）、
+    // cells、meta 四数组与每格 warnings 按派发序喂——完成序随网络抖动，按它组装报告文本会逐次漂移、meta 数组互相错位。
+    let mut findings = Vec::new();
+    let mut cells = Vec::new();
+    let mut bypass_missing: Vec<String> = Vec::new();
+    let mut cell_warnings = Vec::new();
+    for l in landed.into_values() {
+        match l.stage2 {
+            Stage2::Skipped => meta.needs_two_stage_skipped += 1,
+            Stage2::Sent | Stage2::Failed => meta.needs_two_stage_triggered += 1,
+            Stage2::None => {}
+        }
+        meta.stream_discarded += l.stream_discarded;
+        if l.bypass_missing && !bypass_missing.contains(&l.rec.model) {
+            bypass_missing.push(l.rec.model.clone());
+        }
+        findings.extend(l.rec.output.findings().iter().cloned());
+        meta.item_wait_ms.push(l.wait_ms);
+        meta.dispatch_agreement.push(l.dispatch_agreement);
+        // 与派发时值成对：二者之差即「挖的时候还不知道、挖完才攒够的共识」。失败格记失败时刻的活值。
+        meta.landed_agreement.push(l.landed);
+        // 失败格记烧掉的 output（CellRecord 已入账）——四数组逐格对齐，不因失败缺位。
+        meta.reviewer_output_tokens.push(l.rec.output_tokens);
+        cell_warnings.extend(l.warnings);
+        cells.push(l.rec);
+    }
+    for name in bypass_missing {
+        // 同一 reviewer 的结果稳定，报一次就够——别按格刷屏
+        warnings.push(format!("deep: {name} 无 per-cell backend（缺密钥 / 构造失败）——流式旁路关闭，stream_discarded 恒 0"));
+    }
+    warnings.extend(cell_warnings);
 
     findings.extend(prior_findings);
     DeepRun {
@@ -298,53 +274,313 @@ pub async fn run_deep(registry: &ProviderRegistry, input: DeepInput<'_>, sink: &
     }
 }
 
+/// 一格 future 借用的共享面（全部活过 `run_deep`；同 task 并发，不要求 `Send` / `'static`）。
+struct CellEnv<'b> {
+    input: &'b DeepInput<'b>,
+    idx: &'b crate::bundle::CrossIndex,
+    opts: &'b PackOpts,
+    sink: &'b dyn FindingSink,
+}
+
+/// 主循环交给一格 future 的全部所有权面（门位随 `lease` 进 future，整格结束才归还）。
+struct Dispatched<'b> {
+    seq: u64,
+    rev: &'b EffectiveModel,
+    lease: ScanLease<'b>,
+    item: QueueItem,
+    prompt: ScanPrompt,
+    cell_id: String,
+    wait_ms: u64,
+}
+
+/// R2 二阶段补查的结局（design C1 §5 契约表）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage2 {
+    /// 首轮无 needs。
+    None,
+    /// 有 needs 但不合格（tools off / 带笔记互斥），或全部 needs 被读守卫拒绝 / 不可读 → 第二轮不发、不计债。
+    Skipped,
+    /// 第二轮发出且成功：第二轮输出为终判。
+    Sent,
+    /// 第二轮建 pack 内部错误，或发出后失败：保留首轮 finding + warning + 计债。
+    Failed,
+}
+
+/// 一格 future 的产出（未碰队列）。
+struct CellDone<'b> {
+    seq: u64,
+    rev: &'b EffectiveModel,
+    item: QueueItem,
+    cell_id: String,
+    duration_ms: u64,
+    wait_ms: u64,
+    outcome: Result<ReviewCall, ProviderError>,
+    /// 两轮合计的 429 重试 / 门等待（同一 policy，两轮结束统一回读）。
+    rl_retries: u32,
+    rl_wait_ms: u64,
+    stage2: Stage2,
+    bypass_missing: bool,
+    warnings: Vec<String>,
+}
+
+/// 完成时已落盘的一格，按派发序暂存待收场组装。
+struct Landed {
+    seq: u64,
+    rec: CellRecord,
+    wait_ms: u64,
+    dispatch_agreement: u32,
+    landed: u32,
+    stage2: Stage2,
+    stream_discarded: u32,
+    bypass_missing: bool,
+    /// 本格计债：cell 失败，或二阶段失败。
+    debt: bool,
+    warnings: Vec<String>,
+}
+
+/// 一格完整执行：首轮 → （needs 合格）二阶段 → 回读 429 观测 → 归还门位。**全程持同一 lease**（design C1 §3.3 / Q4）：
+/// 两轮之间放门会让第二轮与新派发的格抢门——门宽 1 时补查轮排到队尾，墙钟与在途口径都失真。
+async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
+    let Dispatched { seq, rev, lease, item, prompt, cell_id, wait_ms } = d;
+    let t0 = tokio::time::Instant::now();
+    let policy = lease.gate_attempts();
+    let mut warnings = Vec::new();
+    let (first, mut bypass_missing) = shot(env, &lease, &policy, rev, item.agreement, &prompt).await;
+    let mut stage2 = Stage2::None;
+    let outcome = match first {
+        Err(e) => Err(e),
+        Ok(mut c) => {
+            let needs = c.output.needs().to_vec();
+            if !needs.is_empty() {
+                // `on` 档在 M21b 还没有工具循环（reviewer 单发恒不带 tools），落到这里至少与 two-stage 等价。
+                // 注入互斥：带笔记项（origin=scan）不注入 needs 证据（region::build 构造期 Err）→ 不合格。
+                let tiered = matches!(env.input.tools, ToolsMode::TwoStage | ToolsMode::On);
+                stage2 = if !(tiered && item.spec.notes.is_empty()) {
+                    Stage2::Skipped
+                } else {
+                    match second_stage_prompt(env, &item, c.output.findings(), &needs, &mut warnings) {
+                        Round2::NoEvidence => Stage2::Skipped,
+                        Round2::PackFailed(e) => {
+                            warnings.push(format!("{cell_id}: second-stage pack failed: {e} — keeping first-round findings (debt)"));
+                            Stage2::Failed
+                        }
+                        Round2::Ready(prompt2) => {
+                            let (second, missing) = shot(env, &lease, &policy, rev, item.agreement, &prompt2).await;
+                            bypass_missing |= missing;
+                            match second {
+                                Ok(c2) => {
+                                    c.input_tokens += c2.input_tokens;
+                                    c.output_tokens += c2.output_tokens;
+                                    c.cached_input_tokens += c2.cached_input_tokens;
+                                    c.iterations += c2.iterations;
+                                    c.stats.stream_discarded += c2.stats.stream_discarded;
+                                    c.output = c2.output; // 第二轮 = CONFIRM/REVISE 后终判
+                                    Stage2::Sent
+                                }
+                                Err(e) => {
+                                    // 首轮声明 needs = 模型自认判断不完整：静默沿用首轮会成单区域假绿灯 → 保留首轮 finding 但计债；
+                                    // 第二轮烧掉的 token 照样入账。
+                                    let (bi, bo, bc) = e.burned_usage();
+                                    c.input_tokens += bi;
+                                    c.output_tokens += bo;
+                                    c.cached_input_tokens += bc;
+                                    warnings.push(format!("{cell_id}: second-stage round failed: {e} — keeping first-round findings (debt)"));
+                                    Stage2::Failed
+                                }
+                            }
+                        }
+                    }
+                };
+            }
+            Ok(c)
+        }
+    };
+    // 门等待与 429 排队只有 policy 知道（`ScanLease::run` 的回填在这条路径上不经过）——两轮结束、lease 还活着时读出来。
+    let (rl_retries, rl_wait_ms) = (policy.retries(), policy.waited_ms());
+    drop(lease);
+    CellDone {
+        seq,
+        rev,
+        item,
+        cell_id,
+        duration_ms: t0.elapsed().as_millis() as u64,
+        wait_ms,
+        outcome,
+        rl_retries,
+        rl_wait_ms,
+        stage2,
+        bypass_missing,
+        warnings,
+    }
+}
+
+/// 一轮单发：为本轮新造 per-cell backend 与旁路解析器（旁路要挂在本格独占的 backend 上，共享实例会被并发 cell 抢 delta）；
+/// 工厂缺席 / 造不出来 → 退回 lease 的共享 backend（无旁路，照跑）。返回 (结果, 旁路是否缺席)。
+async fn shot(
+    env: &CellEnv<'_>,
+    lease: &ScanLease<'_>,
+    policy: &GateAttempts<'_>,
+    rev: &EffectiveModel,
+    dispatch_agreement: u32,
+    prompt: &ScanPrompt,
+) -> (Result<ReviewCall, ProviderError>, bool) {
+    let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+    let inc_feed = inc.clone();
+    let per_cell = env
+        .input
+        .backend_factory
+        .and_then(|f| f(rev, Box::new(move |s: &str| inc_feed.lock().unwrap().feed(s))));
+    let missing = per_cell.is_none() && env.input.backend_factory.is_some();
+    let backend: &dyn ChatBackend = per_cell.as_deref().unwrap_or(lease.backend());
+    let mut ctx = EmitCtx::new(&rev.name, &rev.family, dispatch_agreement, env.input.root, env.sink);
+    let r = run_review_shot_with(backend, prompt, lease.per_turn(), lease.retry_budget(), Some(policy), &mut ctx, inc).await;
+    (r, missing)
+}
+
+/// 完成时刻（主循环内）：回填落地共识 → 落盘 cell → 队列结案 → 快照。报告侧组装留到收场按派发序做。
+fn land(
+    done: CellDone<'_>,
+    q: &mut DeepQueue,
+    snapshot: Option<&dyn Fn(&QueueItem)>,
+    on_cell: Option<&dyn Fn(&CellRecord)>,
+) -> Landed {
+    let CellDone { seq, rev, item, cell_id, duration_ms, wait_ms, outcome, rl_retries, rl_wait_ms, stage2, bypass_missing, mut warnings } = done;
+    // 落地时刻的疑点共识回填到**落盘** finding（design §7「落地的 finding 继承记录当时的 agreement」、§8.1「按落地时刻算、
+    // 后涨不回溯」）。cell 内的 `EmitCtx` 只能拿派发时快照；在途并入会让落地值更高，事件侧因此滞后（`event ≤ landed`）。
+    let landed = live_agreement(q, &item);
+    let mut debt = stage2 == Stage2::Failed;
+    let (rec, stream_discarded) = match outcome {
+        Ok(mut c) => {
+            for f in c.output.findings_mut() {
+                f.suspicion_agreement = landed;
+            }
+            let discarded = c.stats.stream_discarded;
+            let mut rec = CellRecord::ok(&cell_id, &rev.name, c.output).with_family(&rev.family);
+            rec.duration_ms = duration_ms;
+            rec.input_tokens = c.input_tokens;
+            rec.output_tokens = c.output_tokens;
+            rec.cached_input_tokens = c.cached_input_tokens;
+            rec.iterations = c.iterations;
+            // 与 scanner 同口径（orchestrate/mod.rs）：attempts = 轮次 + 429 重试。
+            rec.attempts = c.iterations + rl_retries;
+            rec.queue_wait_ms = rl_wait_ms;
+            rec.template_hash = Some(review_template_hash());
+            if discarded > 0 {
+                rec.warn = Some(format!("stream discarded {discarded}"));
+            }
+            (rec, discarded)
+        }
+        Err(e) => {
+            debt = true;
+            // 烧掉的 token 照样入账（scanner 同口径）——失败不等于免费，不记就成了报告里对不上的黑洞。
+            let (bi, bo, bc) = e.burned_usage();
+            let mut rec = CellRecord::failed(&cell_id, &rev.name, Role::Reviewer, format!("{e}")).with_family(&rev.family);
+            rec.duration_ms = duration_ms;
+            rec.input_tokens = bi;
+            rec.output_tokens = bo;
+            rec.cached_input_tokens = bc;
+            rec.attempts = 1 + rl_retries;
+            rec.queue_wait_ms = rl_wait_ms;
+            warnings.push(format!("{cell_id} failed: {e}"));
+            (rec, 0)
+        }
+    };
+    // 先落盘 cell（finding 的权威载体）再写队列快照：kill 落在两者之间时，快照仍是 InFlight → resume 重跑，
+    // 宁可重挖一格也不丢 finding（design §7.1）。
+    snap_cell(&rec, on_cell);
+    q.mark_settled(&item.id, landed);
+    if let Some(it) = q.get(&item.id) {
+        snap_one(it, snapshot);
+    }
+    Landed {
+        seq,
+        rec,
+        wait_ms,
+        dispatch_agreement: item.dispatch_agreement,
+        landed,
+        stage2,
+        stream_discarded,
+        bypass_missing,
+        debt,
+        warnings,
+    }
+}
+
+/// 经入队通道到达一项（批 C2 的 scanner 流式扇出接这里）：走入口五态 + 快照 + 入队原因 + 队列深度峰值（运行中取最大）。
+/// C1 里到达项**不过预算**——在线预算与疑点保底预留归 C2。`None` = 发送端全部 drop → 通道关闭。
+fn on_arrival(
+    msg: Option<EnqueueReq>,
+    q: &mut DeepQueue,
+    meta: &mut DeepMeta,
+    closed: &mut bool,
+    snapshot: Option<&dyn Fn(&QueueItem)>,
+) {
+    let Some(req) = msg else {
+        *closed = true;
+        return;
+    };
+    let reason = match req.spec.origin {
+        QueueOrigin::Rule => "rule",
+        QueueOrigin::Scan => "scan",
+        QueueOrigin::Needs => "needs",
+    };
+    note_enq(q.enqueue(req), reason, meta);
+    // 入队不回报受影响项，全量写快照（C1 无生产到达项；C2 流式量大时改为只写受影响项）。
+    snap_all(q, snapshot);
+    meta.queue_depth_peak = meta.queue_depth_peak.max(q.items().len() as u32);
+}
+
+/// 通道收一项；无通道时永不就绪（`select!` 分支另由 `closed` 守卫关掉）。
+async fn recv(rx: &mut Option<mpsc::Receiver<EnqueueReq>>) -> Option<EnqueueReq> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// 调用方保证 `bundles` 非空（`run_deep` 开头已早退）。
 fn pick_bundle<'a>(bundles: &'a [Bundle], file: &str) -> &'a Bundle {
     bundles.iter().find(|b| b.files.iter().any(|f| f.path == file)).unwrap_or(&bundles[0])
 }
 
 /// 落地时 agreement：按 id 读队列活值（id 定死、在途并入不改它，恒能查到）；查不到退回派发时值只是防御。
-fn live_agreement(q: &DeepQueue, item: &crate::orchestrate::queue::QueueItem) -> u32 {
+fn live_agreement(q: &DeepQueue, item: &QueueItem) -> u32 {
     q.get(&item.id).map(|it| it.agreement).unwrap_or(item.agreement)
 }
 
-/// R2 二阶段补查轮：needs → 证据段（`second_pass::need_section`，读守卫 + 字节帽）→ 重建 pack
-/// （needs_evidence 槽；与笔记互斥由构造期守卫，调用方已过滤）→ prompt 附加草稿块 → 新租约再跑一轮。
-#[allow(clippy::too_many_arguments)] // 参数面各异（registry / 输入 / 角色 / 队列项 / 索引 / 草稿 / needs / sink）；收拢 struct 是过度设计
-async fn second_stage_round(
-    registry: &ProviderRegistry,
-    input: &DeepInput<'_>,
-    rev: &EffectiveModel,
-    item: &crate::orchestrate::queue::QueueItem,
-    idx: &crate::bundle::CrossIndex,
-    opts: &PackOpts,
-    draft: Vec<Finding>,
+/// R2 二阶段第二轮的 prompt 准备结局。
+enum Round2 {
+    /// 全部 needs 被读守卫拒绝 / 不可读 → 无证据，第二轮不发。
+    NoEvidence,
+    /// 建 pack 内部错误（首轮已合格过互斥检查，理论不该发生）。
+    PackFailed(String),
+    Ready(ScanPrompt),
+}
+
+/// R2 二阶段补查轮的 prompt：needs → 证据段（`second_pass::need_section`，读守卫 + 字节帽）→ 重建 pack
+/// （needs_evidence 槽；与笔记互斥由构造期守卫，调用方已过滤）→ prompt 附加草稿块。
+fn second_stage_prompt(
+    env: &CellEnv<'_>,
+    item: &QueueItem,
+    draft: &[Finding],
     needs: &[crate::domain::NeedEntry],
-    sink: &dyn FindingSink,
     warnings: &mut Vec<String>,
-) -> Option<super::review_shot::ReviewCall> {
+) -> Round2 {
+    let input = env.input;
     let ex = crate::tools::ToolExecutor::new(input.root);
-    let mut w2: Vec<String> = Vec::new();
-    let ev: String = needs
-        .iter()
-        .filter_map(|n| crate::cli::second_pass::need_section(&ex, input.root, n, &mut w2))
-        .collect();
     // 读守卫拒绝（denylist / 非 git-tracked）必须进报告——模型伸手要 ~/.ssh/id_rsa 这种事
     // 只打到 stderr 就等于没披露（second_pass.rs 的 deny_need_read 契约，T46①②）。
-    warnings.append(&mut w2);
+    let ev: String = needs
+        .iter()
+        .filter_map(|n| crate::cli::second_pass::need_section(&ex, input.root, n, warnings))
+        .collect();
     if ev.trim().is_empty() {
-        return None;
+        return Round2::NoEvidence;
     }
-    let pack2 = region::build(
-        &item.spec,
-        pick_bundle(input.bundles, &item.spec.file),
-        input.root,
-        idx,
-        64 * 1024,
-        opts,
-        &ev,
-    )
-    .ok()?;
+    let pack2 = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, env.idx, 64 * 1024, env.opts, &ev) {
+        Ok(p) => p,
+        Err(e) => return Round2::PackFailed(e),
+    };
     let file_diff = file_diff(input.bundles, &item.spec.file);
     let mut prompt2 = build_review_prompt(&ReviewPromptInput {
         target_label: input.target_label,
@@ -357,25 +593,10 @@ async fn second_stage_round(
         repo_brief: "",
     });
     prompt2.blocks.push(crate::prompt::PromptBlock {
-        text: crate::cli::second_pass::draft_block(&draft),
+        text: crate::cli::second_pass::draft_block(draft),
         cache_boundary: false,
     });
-    let lease = registry.lease(&rev.name).await.ok()?;
-    let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
-    let policy = lease.gate_attempts();
-    let mut ctx = EmitCtx::new(&rev.name, &rev.family, item.agreement, input.root, sink);
-    let r = run_review_shot_with(
-        lease.backend(),
-        &prompt2,
-        lease.per_turn(),
-        lease.retry_budget(),
-        Some(&policy),
-        &mut ctx,
-        inc,
-    )
-    .await;
-    drop(lease);
-    r.ok()
+    Round2::Ready(prompt2)
 }
 
 fn file_diff(bundles: &[Bundle], file: &str) -> String {
@@ -517,7 +738,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Pending)]),
                 prior_findings: vec![], tools,
-                backend_factory: None, on_cell: None,
+                backend_factory: None, on_cell: None, incoming: None,
             },
             &(),
         )
@@ -546,7 +767,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(std::slice::from_ref(&item)),
                 prior_findings: vec![], tools: ToolsMode::Off,
-                backend_factory: None, on_cell: None,
+                backend_factory: None, on_cell: None, incoming: None,
             },
             &(),
         )
@@ -635,7 +856,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("c.rs", ItemState::Pending)]),
                 prior_findings: vec![prior_f], tools: ToolsMode::Off,
-                backend_factory: None, on_cell: None,
+                backend_factory: None, on_cell: None, incoming: None,
             },
             &(),
         )
@@ -660,7 +881,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Settled)]),
                 prior_findings: vec![], tools: ToolsMode::Off,
-                backend_factory: None, on_cell: None,
+                backend_factory: None, on_cell: None, incoming: None,
             },
             &(),
         )
@@ -697,7 +918,7 @@ mod tests {
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&snap), prior_findings: vec![prior_f],
-                tools: ToolsMode::Off, backend_factory: None, on_cell: None,
+                tools: ToolsMode::Off, backend_factory: None, on_cell: None, incoming: None,
             },
             &(),
         )
@@ -736,7 +957,7 @@ mod tests {
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::InFlight)]), prior_findings: vec![],
-                tools: ToolsMode::TwoStage, backend_factory: None, on_cell: None,
+                tools: ToolsMode::TwoStage, backend_factory: None, on_cell: None, incoming: None,
             },
             &(),
         )
@@ -790,12 +1011,344 @@ mod tests {
         // needs 指向未入库文件 → 守卫拒 → 必须留下 warning
         let first = r#"{"findings":[],"needs":[{"path":"untracked.txt","reason":"peek"}]}"#;
         let second = rev_json("fn a() {");
+        let backend = Arc::new(FakeChatBackend::new(vec![turn(first), turn(&second)]));
         let mut reg = crate::provider::registry::ProviderRegistry::new();
-        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(first), turn(&second)])), Duration::from_secs(5), 0);
+        reg.insert_scan("p/r", "p", 8, Box::new(Arc::clone(&backend)), Duration::from_secs(5), 0);
         let run = run_one(&reg, root, &bundles, ToolsMode::TwoStage).await;
         assert!(
             run.warnings.iter().any(|w| w.contains("untracked.txt")),
             "守卫拒绝未披露: {:?}", run.warnings
         );
+        // 契约（C1 §5）：全部 needs 被拒 = 无证据，第二轮不发 → skipped、不计 triggered、不计债
+        assert_eq!(backend.turn_count(), 1, "第二轮不该发出");
+        assert_eq!((run.meta.needs_two_stage_triggered, run.meta.needs_two_stage_skipped), (0, 1));
+        assert!(!run.reviewer_failed, "全被拒不计债: {:?}", run.warnings);
+    }
+
+    // ── 批 C1-2：门驱动并发派发 ────────────────────────────────────────────────
+
+    /// 按 prompt 里的路由标记（`ROUTE_<name>`，只出现在该文件自己的 diff 里）分派的测试 backend：
+    /// 每个路由一条逐轮弹出的脚本 + 固定时延；记录每轮**开始**的路由序，时序断言用。
+    type Script = Vec<Result<AssistantTurn, ProviderError>>;
+    /// 路由名 → (每轮时延, 逐轮弹出的脚本)。
+    type Routes = BTreeMap<String, (Duration, std::collections::VecDeque<Result<AssistantTurn, ProviderError>>)>;
+
+    struct Routed {
+        routes: Mutex<Routes>,
+        starts: Mutex<Vec<String>>,
+    }
+
+    impl Routed {
+        fn new(routes: Vec<(&str, u64, Script)>) -> Arc<Self> {
+            let routes = routes
+                .into_iter()
+                .map(|(k, ms, script)| (k.to_string(), (Duration::from_millis(ms), script.into())))
+                .collect();
+            Arc::new(Routed { routes: Mutex::new(routes), starts: Mutex::new(Vec::new()) })
+        }
+        fn starts(&self) -> Vec<String> {
+            self.starts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChatBackend for Routed {
+        async fn turn(
+            &self,
+            messages: &[crate::provider::tool_loop::ChatMessage],
+            _tools: &[crate::tools::ToolSpec],
+        ) -> Result<AssistantTurn, ProviderError> {
+            let text = format!("{messages:?}");
+            let (key, delay) = {
+                let routes = self.routes.lock().unwrap();
+                let (k, (d, _)) = routes.iter().find(|(k, _)| text.contains(&format!("ROUTE_{k}\\n"))).expect("prompt 里没有路由标记");
+                (k.clone(), *d)
+            };
+            self.starts.lock().unwrap().push(key.clone());
+            tokio::time::sleep(delay).await;
+            let next = self.routes.lock().unwrap().get_mut(&key).unwrap().1.pop_front();
+            next.unwrap_or_else(|| Err(ProviderError::Unavailable(format!("route {key}: no scripted turn"))))
+        }
+    }
+
+    /// 每个名字一个文件 `<n>.rs`（首行 `fn <n>() {`）；diff 里带路由标记。
+    fn routed_bundles(dir: &Path, names: &[&str]) -> Vec<Bundle> {
+        let changes = names
+            .iter()
+            .map(|n| {
+                std::fs::write(dir.join(format!("{n}.rs")), format!("fn {n}() {{\n    body();\n}}\n")).unwrap();
+                FileChange { path: format!("{n}.rs"), diff: format!("@@ -1,1 +1,2 @@\n+fn {n}() {{\n+// ROUTE_{n}\n") }
+            })
+            .collect();
+        vec![Bundle::from_files(changes)]
+    }
+
+    /// 锚得上 `<n>.rs` 首行的一条 finding。
+    fn found(n: &str) -> Result<AssistantTurn, ProviderError> {
+        Ok(turn(&format!(
+            r#"{{"findings":[{{"severity":"low","title":"issue in {n}","body":"b","file":"{n}.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"fn {n}() {{"}}],"needs":[]}}"#
+        )))
+    }
+
+    fn routed_registry(backend: &Arc<Routed>, cap: u32) -> crate::provider::registry::ProviderRegistry {
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", cap, Box::new(Arc::clone(backend)), Duration::from_secs(60), 0);
+        reg
+    }
+
+    fn pending_items(names: &[&str]) -> Vec<QueueItem> {
+        names.iter().map(|n| snap_item(&format!("{n}.rs"), ItemState::Pending)).collect()
+    }
+
+    struct Run<'a> {
+        reg: &'a crate::provider::registry::ProviderRegistry,
+        root: &'a Path,
+        bundles: &'a [Bundle],
+        items: &'a [QueueItem],
+        tools: ToolsMode,
+        incoming: Option<mpsc::Receiver<EnqueueReq>>,
+        on_cell: Option<&'a dyn Fn(&CellRecord)>,
+        sink: &'a dyn FindingSink,
+    }
+
+    async fn run_with(r: Run<'_>) -> DeepRun {
+        let reviewer = fake_reviewer();
+        run_deep(
+            r.reg,
+            DeepInput {
+                route: None, scan_cells: &[], bundles: r.bundles, root: r.root,
+                reviewers: std::slice::from_ref(&reviewer), budget_cells: 16,
+                pack: &Default::default(), spec_docs: "", target_label: "t",
+                snapshot: None, restore: Some(r.items), prior_findings: vec![], tools: r.tools,
+                backend_factory: None, on_cell: r.on_cell, incoming: r.incoming,
+            },
+            r.sink,
+        )
+        .await
+    }
+
+    fn plain<'a>(reg: &'a crate::provider::registry::ProviderRegistry, root: &'a Path, bundles: &'a [Bundle], items: &'a [QueueItem]) -> Run<'a> {
+        Run { reg, root, bundles, items, tools: ToolsMode::Off, incoming: None, on_cell: None, sink: &() }
+    }
+
+    fn git_commit_all(root: &Path) {
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        g(&["init", "-q"]);
+        g(&["add", "."]);
+        g(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+    }
+
+    /// 在途峰值 = 门宽，墙钟 ≈ ceil(K/W) × 单格时延（design §6 规则 5：门有空位就派，不串行）。
+    #[tokio::test(start_paused = true)]
+    async fn inflight_peak_equals_gate_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c", "d", "e"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let backend = Routed::new(names.iter().map(|n| (*n, 50, vec![found(n)])).collect());
+        let reg = routed_registry(&backend, 2);
+        let items = pending_items(&names);
+        let t0 = tokio::time::Instant::now();
+        let run = run_with(plain(&reg, dir.path(), &bundles, &items)).await;
+        let elapsed = t0.elapsed();
+        assert_eq!(reg.gate_stats()["p"].peak, 2, "在途峰值 = 门宽");
+        assert_eq!(run.cells.iter().filter(|c| c.ok).count(), 5, "{:?}", run.warnings);
+        assert!(elapsed >= Duration::from_millis(150) && elapsed < Duration::from_millis(200), "ceil(5/2)×50 ms，实测 {elapsed:?}");
+    }
+
+    /// 乱序完成不错配、慢格不堵：完成序 b→c→a，每格 findings 仍对应自己的文件；报告里的 cells 按派发序（a→b→c）；
+    /// 墙钟 ≈ 最慢格而非三格之和。
+    #[tokio::test(start_paused = true)]
+    async fn out_of_order_completion_lands_on_own_item_and_slow_cell_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let backend = Routed::new(vec![("a", 300, vec![found("a")]), ("b", 10, vec![found("b")]), ("c", 20, vec![found("c")])]);
+        let reg = routed_registry(&backend, 3);
+        let items = pending_items(&names);
+        let landed_order = Mutex::new(Vec::new());
+        let on_cell = |rec: &CellRecord| landed_order.lock().unwrap().push(rec.cell.clone());
+        let t0 = tokio::time::Instant::now();
+        let run = run_with(Run { on_cell: Some(&on_cell), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert!(t0.elapsed() < Duration::from_millis(330), "慢格不堵其余：{:?}", t0.elapsed());
+        let order = landed_order.lock().unwrap().clone();
+        assert_eq!(order, vec!["review[b.rs:rule:1-2]@p/r", "review[c.rs:rule:1-2]@p/r", "review[a.rs:rule:1-2]@p/r"], "完成即落盘");
+        let report_order: Vec<&str> = run.cells.iter().map(|c| c.cell.as_str()).collect();
+        assert_eq!(report_order, vec!["review[a.rs:rule:1-2]@p/r", "review[b.rs:rule:1-2]@p/r", "review[c.rs:rule:1-2]@p/r"], "报告按派发序");
+        for c in &run.cells {
+            let file = c.cell.trim_start_matches("review[").split(':').next().unwrap();
+            let fs = c.output.findings();
+            assert!(fs.len() == 1 && fs[0].file == file, "{} 错配: {fs:?}", c.cell);
+        }
+    }
+
+    /// 二阶段持门位（Q4）：门宽 1 时首格两轮之间不放门——第二格在首格补查轮结束后才开始。
+    #[tokio::test(start_paused = true)]
+    async fn second_stage_round_holds_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a", "b"]);
+        git_commit_all(dir.path());
+        let with_needs = Ok(turn(r#"{"findings":[],"needs":[{"path":"a.rs","reason":"need context"}]}"#));
+        let backend = Routed::new(vec![("a", 50, vec![with_needs, found("a")]), ("b", 50, vec![found("b")])]);
+        let reg = routed_registry(&backend, 1);
+        let items = pending_items(&["a", "b"]);
+        let run = run_with(Run { tools: ToolsMode::TwoStage, ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(backend.starts(), vec!["a", "a", "b"], "补查轮必须紧接首轮，不与新派发的格抢门");
+        assert_eq!(run.meta.needs_two_stage_triggered, 1);
+        assert_eq!(run.cells.iter().filter(|c| c.ok).count(), 2, "{:?}", run.warnings);
+    }
+
+    struct Events(Mutex<Vec<crate::orchestrate::review_shot::FindingEvent>>);
+    impl FindingSink for Events {
+        fn on_finding(&self, ev: crate::orchestrate::review_shot::FindingEvent) {
+            self.0.lock().unwrap().push(ev);
+        }
+    }
+
+    fn scan_item(file: &str, quote: &str, family: &str) -> (QueueItem, QueueItemSpec) {
+        let note = crate::domain::Suspicion {
+            file: file.into(), line_start: 1, line_end: 1, hint: "h".into(),
+            category: None, confidence: 0.5, quote: quote.into(),
+        };
+        let spec = QueueItemSpec::new(file.into(), vec![(1, 1)], QueueOrigin::Scan, vec![note]).unwrap();
+        let item = QueueItem {
+            id: format!("{file}:scan:1-1"), spec: spec.clone(), score: 0.5, agreement: 1, state: ItemState::Pending,
+            kind: ItemKind::Suspicion, dispatch_agreement: 0, landed_agreement: None,
+            families: vec![family.into()], enqueued_ms: None,
+        };
+        (item, spec)
+    }
+
+    /// 经真实通道的在途并入（design C1 §3.5）：派发时共识 1，挖的过程中异族谓词并入抬到 2 →
+    /// 落盘 finding = 落地值 = `landed_agreement` = 2；事件侧是派发快照 1，严格小于落地值（`event ≤ landed`，偏差只会多复核）。
+    #[tokio::test(start_paused = true)]
+    async fn inflight_merge_via_channel_forks_event_below_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let backend = Routed::new(vec![("a", 100, vec![found("a")])]);
+        let reg = routed_registry(&backend, 2);
+        let (item, spec) = scan_item("a.rs", "fn a() {", "alpha");
+        let items = [item];
+        let (tx, rx) = mpsc::channel(4);
+        let events = Events(Mutex::new(Vec::new()));
+        let feed = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.send(EnqueueReq { spec, score: 0.5, kind: ItemKind::Suspicion, families: vec!["beta".into()] }).await.unwrap();
+        };
+        let (run, ()) = tokio::join!(
+            run_with(Run { incoming: Some(rx), sink: &events, ..plain(&reg, dir.path(), &bundles, &items) }),
+            feed,
+        );
+        assert_eq!(run.meta.dedup_hits, 1, "在途并入走五态（MergedInFlight）");
+        assert_eq!((run.meta.dispatch_agreement.clone(), run.meta.landed_agreement.clone()), (vec![1], vec![2]));
+        assert_eq!(run.findings.len(), 1, "{:?}", run.warnings);
+        assert_eq!(run.findings[0].suspicion_agreement, 2, "报告 finding 带落地值");
+        assert_eq!(run.cells[0].output.findings()[0].suspicion_agreement, 2, "落盘 = 落地值");
+        let evs = events.0.lock().unwrap();
+        assert!(!evs.is_empty(), "终判至少发一条事件");
+        assert!(evs.iter().all(|e| e.suspicion_agreement == 1), "事件侧 = 派发快照");
+        assert!(evs.iter().all(|e| e.suspicion_agreement < run.findings[0].suspicion_agreement), "event < landed");
+        assert_eq!(evs[0].finding.suspicion_agreement, evs[0].suspicion_agreement, "事件载荷内外一致");
+    }
+
+    /// 通道未关不收场（barrier 含通道关闭）：队列一开始就空，稍后经通道到达一项 → 照挖；发送端 drop 后才收场。
+    #[tokio::test(start_paused = true)]
+    async fn open_channel_defers_the_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let backend = Routed::new(vec![("a", 10, vec![found("a")])]);
+        let reg = routed_registry(&backend, 2);
+        let (tx, rx) = mpsc::channel(4);
+        let feed = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap();
+            tx.send(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, families: vec![] }).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let t0 = tokio::time::Instant::now();
+        let (run, ()) = tokio::join!(run_with(Run { incoming: Some(rx), ..plain(&reg, dir.path(), &bundles, &[]) }), feed);
+        assert!(t0.elapsed() >= Duration::from_millis(150), "发送端 drop 前不得收场：{:?}", t0.elapsed());
+        assert_eq!(run.cells.len(), 1, "到达项被挖: {:?}", run.warnings);
+        assert_eq!(run.meta.enqueue_reasons.get("rule"), Some(&1));
+        assert_eq!(run.meta.queue_depth_peak, 1, "运行中取最大值");
+    }
+
+    /// 报告确定性（Q6）：同一输入、完成时延完全反过来的两次运行，报告（除计时字段）逐字节一致；
+    /// meta 四数组与 cells 等长且按派发序对齐（失败格也各占一位）。
+    #[tokio::test(start_paused = true)]
+    async fn report_is_deterministic_under_shuffled_completion() {
+        async fn once(delays: [u64; 3]) -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let names = ["a", "b", "c"];
+            let bundles = routed_bundles(dir.path(), &names);
+            let bad = Err(ProviderError::BadRequest("boom".into()).attach_usage((5, 7, 0)));
+            let backend = Routed::new(vec![
+                ("a", delays[0], vec![found("a")]),
+                ("b", delays[1], vec![bad]),
+                ("c", delays[2], vec![found("c")]),
+            ]);
+            let reg = routed_registry(&backend, 3);
+            let items = pending_items(&names);
+            let mut run = run_with(plain(&reg, dir.path(), &bundles, &items)).await;
+            let n = run.cells.len();
+            let m = &run.meta;
+            assert_eq!(
+                (m.item_wait_ms.len(), m.dispatch_agreement.len(), m.landed_agreement.len(), m.reviewer_output_tokens.len()),
+                (n, n, n, n),
+                "meta 四数组逐格对齐"
+            );
+            assert_eq!(m.reviewer_output_tokens, vec![1, 7, 1], "失败格记烧掉的 output、按派发序");
+            for c in run.cells.iter_mut() {
+                c.duration_ms = 0;
+                c.queue_wait_ms = 0;
+            }
+            run.meta.item_wait_ms.clear();
+            serde_json::to_string(&(&run.findings, &run.cells, &run.meta, &run.warnings, run.reviewer_failed)).unwrap()
+        }
+        let forward = once([10, 20, 30]).await;
+        let backward = once([30, 20, 10]).await;
+        assert_eq!(forward, backward);
+    }
+
+    /// 二阶段第二轮失败（Q5）：保留首轮 finding + warning + 计债；第二轮烧掉的 token 入账；triggered 计一次。
+    #[tokio::test(start_paused = true)]
+    async fn second_stage_failure_keeps_first_round_findings_and_books_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        git_commit_all(dir.path());
+        let draft = Ok(turn(r#"{"findings":[{"severity":"low","title":"draft","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.4,"recommendation":"r","quote":"fn a() {"}],"needs":[{"path":"a.rs","reason":"need context"}]}"#));
+        let boom = Err(ProviderError::BadRequest("round 2 down".into()).attach_usage((3, 4, 0)));
+        let backend = Routed::new(vec![("a", 10, vec![draft, boom])]);
+        let reg = routed_registry(&backend, 1);
+        let items = pending_items(&["a"]);
+        let run = run_with(Run { tools: ToolsMode::TwoStage, ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert!(run.reviewer_failed, "第二轮失败计债（exit 2）");
+        assert_eq!(run.meta.needs_two_stage_triggered, 1);
+        assert_eq!(run.findings.len(), 1);
+        assert_eq!(run.findings[0].title, "draft", "保留首轮 finding");
+        assert_eq!((run.cells[0].input_tokens, run.cells[0].output_tokens), (1 + 3, 1 + 4), "第二轮烧掉的 token 入账");
+        assert!(run.warnings.iter().any(|w| w.contains("second-stage round failed")), "{:?}", run.warnings);
+    }
+
+    /// 429 注入：门收窄后照样全部完成、无死锁（虚拟时间下死锁会撞 timeout 而不是挂住）。
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_injection_converges_without_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let limited = Err(ProviderError::RateLimited { retry_after: None });
+        let backend = Routed::new(vec![("a", 50, vec![limited, found("a")]), ("b", 50, vec![found("b")]), ("c", 50, vec![found("c")])]);
+        let reg = routed_registry(&backend, 2);
+        let items = pending_items(&names);
+        let run = tokio::time::timeout(Duration::from_secs(600), run_with(plain(&reg, dir.path(), &bundles, &items)))
+            .await
+            .expect("429 收门后死锁");
+        assert_eq!(run.cells.iter().filter(|c| c.ok).count(), 3, "{:?}", run.warnings);
+        let st = reg.gate_stats()["p"];
+        assert_eq!((st.rate_limited, st.effective_cap), (1, 1), "撞一次 429、门收到 1");
+        let a = run.cells.iter().find(|c| c.cell.starts_with("review[a.rs")).unwrap();
+        assert_eq!(a.attempts, 2, "attempts = 轮次 1 + 429 重试 1");
     }
 }

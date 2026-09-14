@@ -17,16 +17,17 @@
 - [x] Commit: `fix(queue,resume): 队列项与 cell 身份定死——id 不随 ranges 重算、共识只经谓词、Skipped 仅成必挖才复位、cell_id 按队列项且 Settled 以成功格为准（批 C1 前置，修批 C resume 覆盖丢 finding）`
 
 ### C1-2 并发派发循环与二阶段契约
-- [ ] `Cargo.toml`：dev-dependency `tokio = { version = "1", features = ["test-util", "macros", "rt"] }`（虚拟时间）
-- [ ] `registry.rs`：`InflightGate::try_enter` + `ProviderRegistry::try_lease`（尊重 429 收门后的有效 cap；scanner 路径零 diff）
-- [ ] `deep.rs`：`DeepInput.incoming: Option<mpsc::Receiver<EnqueueReq>>`（生产 `None`）；到达项走五态 + 快照 + 入队原因 + `queue_depth_peak` 取运行中最大值；C1 里不过预算（注释写明归 C2）
-- [ ] `deep.rs`：主循环 `FuturesUnordered` + `select!`（完成 / 到达）；barrier = 在途 0 ∧ Pending 0 ∧ 通道关闭；空转兜底阻塞 lease
-- [ ] `deep.rs`：`run_cell` future = 首轮 + 二阶段，**全程持同一 lease**；第二轮新造 per-cell backend + inc、复用同一 policy；两轮结束统一回读重试 / 等待；`second_stage_round` 的 `&mut warnings` 改本地带回
-- [ ] `deep.rs`：二阶段契约——triggered 只计真发出；全被拒 → skipped 不计债；第二轮失败或建 pack 内部错误 → 保留首轮 finding + warning + 计债；第二轮烧掉的 token 入账
-- [ ] `deep.rs`：`on_done` 在完成时回填 landed / `snap_cell` / `mark_settled` / `snap_one`；结果按派发 `seq` 暂存，收场按 seq 组装 findings → dedup、cells、meta 四数组（失败格也各一条）
-- [ ] `review_shot.rs`：`FindingEvent.suspicion_agreement` 注释补 `event ≤ landed` 不变式与安全方向（仅注释）
-- [ ] 测试：在途峰值 = 门宽；乱序不错配；慢格不堵；二阶段持门位（门宽 1 时第二格等首格两轮结束）；429 注入收敛无死锁；**通道并入分叉**（落盘 = 落地 = `landed_agreement`，事件严格 <）；通道未关不收场；**打乱完成时延两次运行报告逐字节一致**；meta 四数组等长对齐；二阶段失败 → 首轮 finding + exit 2 + token 入账；全被拒 → skipped + exit 0
-- [ ] Commit: `feat(orchestrate): 门驱动并发派发——FuturesUnordered + 入队通道、一格持门位到底、报告按派发序组装、二阶段失败计债（design §6 规则 5〔D13〕）`
+- [x] `Cargo.toml`：dev-dependency `tokio = { version = "1", features = ["test-util", "macros", "rt"] }`（虚拟时间）
+- [x] `registry.rs`：`InflightGate::try_enter` + `ProviderRegistry::try_lease`（尊重 429 收门后的有效 cap；scanner 路径零 diff）
+- [x] `deep.rs`：`DeepInput.incoming: Option<mpsc::Receiver<EnqueueReq>>`（生产 `None`）；到达项走五态 + 快照 + 入队原因 + `queue_depth_peak` 取运行中最大值；C1 里不过预算（注释写明归 C2）
+- [x] `deep.rs`：主循环 `FuturesUnordered` + `select!`（完成 / 到达）；barrier = 在途 0 ∧ Pending 0 ∧ 通道关闭；空转兜底阻塞 lease
+- [x] `deep.rs`：`run_cell` future = 首轮 + 二阶段，**全程持同一 lease**；第二轮新造 per-cell backend + inc、复用同一 policy；两轮结束统一回读重试 / 等待；`second_stage_round` 的 `&mut warnings` 改本地带回
+- [x] `deep.rs`：二阶段契约——triggered 只计真发出；全被拒 → skipped 不计债；第二轮失败或建 pack 内部错误 → 保留首轮 finding + warning + 计债；第二轮烧掉的 token 入账
+- [x] `deep.rs`：`on_done` 在完成时回填 landed / `snap_cell` / `mark_settled` / `snap_one`；结果按派发 `seq` 暂存，收场按 seq 组装 findings → dedup、cells、meta 四数组（失败格也各一条）
+- [x] `review_shot.rs`：`FindingEvent.suspicion_agreement` 注释补 `event ≤ landed` 不变式与安全方向（仅注释）
+- [x] 测试：在途峰值 = 门宽；乱序不错配；慢格不堵；二阶段持门位（门宽 1 时第二格等首格两轮结束）；429 注入收敛无死锁；**通道并入分叉**（落盘 = 落地 = `landed_agreement`，事件严格 <）；通道未关不收场；**打乱完成时延两次运行报告逐字节一致**（计时字段 `duration_ms` / `queue_wait_ms` / `item_wait_ms` 置零后比较）；meta 四数组等长对齐；二阶段失败 → 首轮 finding + exit 2 + token 入账；全被拒 → skipped + exit 0
+- [x] 变异检查：串行派发 / 按完成序组装 / 删落地回填 / 忽略通道 / 二阶段失败不计债 / 失败格缺 meta 位 / 二阶段门宽放宽——各自对应用例均转红
+- [x] Commit: `feat(orchestrate): 门驱动并发派发——FuturesUnordered + 入队通道、一格持门位到底、报告按派发序组装、二阶段失败计债（design §6 规则 5〔D13〕）`
 
 ### C1-3 分派池轮转与成员健康
 - [ ] `deep.rs`：`pool` + 游标轮转 `next_lease`；删除 `reviewers.first()` 单点；每项只交一个成员

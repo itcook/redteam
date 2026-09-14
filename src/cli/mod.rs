@@ -408,6 +408,7 @@ pub async fn run_code_review(
             tools: resolve_tools(args, cfg),
             backend_factory: Some(factory.as_ref()),
             on_cell: Some(&on_cell),
+            incoming: None,
         },
         &(),
     ).await;
@@ -1265,6 +1266,7 @@ pub async fn run_resume(
                     tools: resolve_tools(&args, cfg),
                     backend_factory: Some(factory.as_ref()),
                     on_cell: Some(&on_cell2),
+                    incoming: None,
                 },
                 &(),
             )

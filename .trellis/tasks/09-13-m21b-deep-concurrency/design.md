@@ -139,6 +139,8 @@ future 外（`on_done`，完成时刻）：`landed = live_agreement` → 回填�
 | `reviewer_output_tokens` | 两轮合计 output | 烧掉的 output |
 
 C1 无生产在途入队 → 派发序 = 静态优先级序 → 同一输入报告逐字节一致；单 reviewer + 门宽 1 时派发序 = 完成序，与批 C 同构。
+「逐字节一致」不含计时字段（`duration_ms` / `queue_wait_ms` / `item_wait_ms` 本就随墙钟变）。每格 warnings 也按派发序进报告；「无 per-cell backend」按 reviewer 去重、排在各格 warnings 之前。
+派发时 pack 构造失败的项不成格：warning + 结案，不占派发序、不进 meta 四数组（沿用批 C 口径）。
 
 ### 3.5 事件侧疑点共识滞后（裁定：接受）
 

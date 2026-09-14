@@ -23,8 +23,11 @@ pub struct FindingEvent {
     pub finding: Finding,
     /// 区域被几个 scanner 家族标记过——批 D 跳过复核的判据，**不是**认同这条 finding 的模型数
     /// （那是 `Finding.agreement`）。**取值时点 = 派发时快照**：事件在 cell 运行中（旁路）或刚结束
-    /// （终判）发出，那时碰不到队列。串行派发下 cell 运行期间队列冻结，快照恒等于落地值；
-    /// 落盘 finding 另由 `run_deep` 回主循环后按落地活值回填，**两者分叉时以落盘为准**（批 C1 并发后才会分叉）。
+    /// （终判）发出，那时碰不到队列。落盘 finding 另由 `run_deep` 完成时按落地活值回填，**两者分叉时以落盘为准**。
+    ///
+    /// **不变式 `event ≤ landed`**（批 C1 并发派发后，在途并入会让两者分叉）：队列项 `families` 只增不减 →
+    /// agreement 单调不减 → 派发快照不大于落地值。批 D「≥ 2 免复核」读的是较小的事件值，偏差方向只会是
+    /// **多复核**、不会**漏复核**——安全方向，故接受滞后（2026-09-13 裁定）。
     pub suspicion_agreement: u32,
     pub reviewer_family: String,
 }

@@ -40,6 +40,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # 临时索引文件、因此一度升为正式依赖（M15-S2-b）；SCIP 已随 E8-E 安乐死拆除（M16 前清理
 # Task 2），production 侧已无消费者，降回测试专用。
 tempfile = "3"
+# 虚拟时间（`#[tokio::test(start_paused = true)]`）：深挖并发派发的墙钟 / 时序用例（M21b 批 C1）。
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 
 [profile.release]
 strip = true
