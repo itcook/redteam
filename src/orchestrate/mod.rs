@@ -1,5 +1,4 @@
 pub mod deep;
-pub mod dispatch;
 pub mod queue;
 pub mod review_shot;
 

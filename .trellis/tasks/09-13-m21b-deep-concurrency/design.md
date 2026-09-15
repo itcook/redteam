@@ -9,7 +9,7 @@
 | 文件 | 动作 | 内容 |
 |---|---|---|
 | `src/orchestrate/queue.rs` | 修改 | id 定死；共识只经谓词；Skipped 复位 + `EnqueueOutcome::MergedSkipped` |
-| `src/provider/registry.rs` | 修改 | `InflightGate::try_enter` + `ProviderRegistry::try_lease`（只加不改） |
+| `src/provider/registry.rs` | 修改 | `InflightGate::try_enter` + `ProviderRegistry::try_lease`（评审第 3 档后 `enter` 复用 `try_enter`、两种 lease 共用条目与门查找，行为不变） |
 | `src/orchestrate/deep.rs` | 修改 | `FuturesUnordered` 主循环 + 入队通道 `select!`；`run_cell` future（首轮 + 二阶段，持门位）；派发序组装；分派池轮转与踢出；cell_id |
 | `src/cli/mod.rs` | 修改 | resume「Settled 以 cells 为准」；`RunMeta.models` 含实际参与 reviewer；0 格成员 warning |
 | `src/main.rs` | 修改 | 兼任 scanner 的 reviewer 补发 thinkingLevel 无映射 warning |
@@ -237,6 +237,9 @@ per-cell backend 已按 reviewer 自己的 `EffectiveModel` 构造，缺的只�
 ## 8. 兼容与回滚
 
 - schema 不变（v4）；`queue_items` 形态不变；`EnqueueOutcome::MergedSkipped` 仅内部使用。
+- 评审第 3 档（纯整理、行为不变）：`dispatch.rs`（`dispatch_one`，已无调用方）删除，其断言已由 queue / deep / registry 用例覆盖；
+  reviewer cell 名构造与 resume 反解共用 `deep::review_cell_id` / `review_cell_prefix`；`Pool` 在池与否只由 `removed` 一处表达；
+  registry `enter` 复用 `try_enter`、`lease` / `try_lease` 共用查找——scanner 路径代码有改动但行为与报错文案不变，由 registry / orchestrate / e2e 既有用例兜底。
 - cell_id 形态从 `review[{n}]@` 变为 `review[{item.id}]@`：无生产代码解析该格式；旧作业的 `review[n]@` cell 在 resume 时按 §2.4 找不到 → Settled 项会被重挖一次（一次性成本，不丢数据）。
 - 回滚 = 不合回；合回后 revert 该 merge。退化零差用例是第一道回归哨。
 - 退化零差基线 `src/orchestrate/testdata/deep_serial_baseline.json`：`git archive eac0a60` 导出批 C 源码，在其 `deep.rs` 测试里跑与 C1 同一份场景

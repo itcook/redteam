@@ -1340,7 +1340,7 @@ fn reconcile_queue_with_cells(items: &mut [crate::orchestrate::queue::QueueItem]
     let mut reopened = 0;
     let mut changed = Vec::new();
     for it in items.iter_mut() {
-        let prefix = format!("review[{}]@", it.id);
+        let prefix = crate::orchestrate::deep::review_cell_prefix(&it.id);
         let has_ok = records.iter().any(|r| r.ok && r.cell.starts_with(&prefix));
         let next = match (has_ok, it.state) {
             (true, ItemState::Settled) => continue,

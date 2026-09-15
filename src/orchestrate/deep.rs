@@ -158,7 +158,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             snap_one(&item, input.snapshot);
             // cell 名按队列项（id 已定死），跨 resume 调用稳定：同项重跑 upsert 覆盖自身（与 scanner「重试者胜」同义），
             // 不同项永不同名。按本次调用的派发序编号时，resume 挖别的项会同名覆盖首跑的格、丢掉它的 finding。
-            let cell_id = format!("review[{}]@{}", item.id, rev.name);
+            let cell_id = review_cell_id(&item.id, &rev.name);
             let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &idx, 64 * 1024, &opts, "") {
                 Ok(p) => p,
                 Err(e) => {
@@ -303,34 +303,33 @@ struct CellEnv<'b> {
 /// 纯轮转、无权重 / 主次（design「无 priority、顺序字典序无语义」）；不是候补链：成员出局后，它已失败的格不改派（D7 A3）。
 /// 同 provider 的成员共享一道门，轮转只决定空位归谁、不加吞吐；跨 provider 各门独立，一门满另一门接。
 struct Pool {
-    alive: Vec<bool>,
     /// 上次派发者下标；初值为末位，首派从 0 号起（单成员时与批 C 同构）。
     cursor: usize,
     /// 每成员分到的格数（0 格成员收场披露）。
     cells: Vec<u32>,
-    /// 出局原因（收场按成员序披露）。
+    /// 出局原因（收场按成员序披露）；`None` = 仍在池内——在池与否只此一处真相。
     removed: Vec<Option<String>>,
 }
 
 impl Pool {
     fn new(n: usize) -> Self {
-        Pool { alive: vec![true; n], cursor: n.saturating_sub(1), cells: vec![0; n], removed: vec![None; n] }
+        Pool { cursor: n.saturating_sub(1), cells: vec![0; n], removed: vec![None; n] }
     }
 
     fn is_empty(&self) -> bool {
-        !self.alive.iter().any(|&a| a)
+        self.removed.iter().all(Option::is_some)
     }
 
     fn alive(&self) -> impl Iterator<Item = usize> + '_ {
-        self.alive.iter().enumerate().filter(|(_, &a)| a).map(|(i, _)| i)
+        self.removed.iter().enumerate().filter(|(_, r)| r.is_none()).map(|(i, _)| i)
     }
 
     /// 从游标下一位起逐个试取门位，第一个拿到的即用；全满 → `None`。未注册的成员就地出局，不挡其余成员。
     fn next_lease<'r>(&mut self, registry: &'r ProviderRegistry, members: &[EffectiveModel]) -> Option<(ScanLease<'r>, usize)> {
-        let n = self.alive.len();
+        let n = self.removed.len();
         for step in 1..=n {
             let i = (self.cursor + step) % n;
-            if !self.alive[i] {
+            if self.removed[i].is_some() {
                 continue;
             }
             match registry.try_lease(&members[i].name) {
@@ -350,10 +349,7 @@ impl Pool {
 
     /// 出局（幂等：只记首次原因）。
     fn remove(&mut self, i: usize, reason: String) {
-        if self.alive[i] {
-            self.alive[i] = false;
-            self.removed[i] = Some(reason);
-        }
+        self.removed[i].get_or_insert(reason);
     }
 }
 
@@ -671,6 +667,16 @@ async fn recv(rx: &mut Option<mpsc::Receiver<EnqueueReq>>) -> Option<EnqueueReq>
         Some(r) => r.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// reviewer cell 名：`review[{队列项 id}]@{reviewer}`——按队列项定死、跨 resume 稳定（C1-1：按派发序编号时 resume 会同名覆盖别项的格）。
+pub fn review_cell_id(item_id: &str, reviewer: &str) -> String {
+    format!("{}{reviewer}", review_cell_prefix(item_id))
+}
+
+/// 某队列项的 reviewer cell 名前缀（与 [`review_cell_id`] 同源）：resume 对账按它认格，不论哪个 reviewer 挖的。
+pub fn review_cell_prefix(item_id: &str) -> String {
+    format!("review[{item_id}]@")
 }
 
 /// resume 形态的深挖 meta 起点：截断数与队列深度取自快照（drain 在首跑已做，resume 不重跑）。

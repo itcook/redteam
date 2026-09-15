@@ -84,18 +84,15 @@ impl InflightGate {
         let s = *self.lock();
         GateStat { cap: self.cap_initial, effective_cap: s.cap, rate_limited: s.rate_limited, peak: self.peak(), completions: s.completions }
     }
-    /// 取名额：`held < cap` 即取，否则等一次释放再重检。`notified().enable()` 先于条件检查注册，释放发生在两者之间也不丢唤醒。
+    /// 取名额：`held < cap` 即取（[`Self::try_enter`]），否则等一次释放再重检。`notified().enable()` 先于条件检查注册，
+    /// 释放发生在两者之间也不丢唤醒。
     async fn enter(&self) -> GatePermit<'_> {
         loop {
             let notified = self.slot_free.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
-                let mut s = self.lock();
-                if s.held < s.cap {
-                    s.held += 1;
-                    return GatePermit { gate: self };
-                }
+            if let Some(permit) = self.try_enter() {
+                return permit;
             }
             notified.await;
         }
@@ -398,22 +395,25 @@ impl ProviderRegistry {
             .collect()
     }
 
-    /// 过 provider 在途门再拿到条目（唯一闸，D13：无角色级 workers）。未注册 → `Unavailable`（该格入 coverage failed）。
-    pub async fn lease(&self, route_key: &str) -> Result<ScanLease<'_>, ProviderError> {
+    /// 条目与其所属 provider 的在途门（`lease` / `try_lease` 共用）。未注册 → `Unavailable`（该格入 coverage failed）。
+    fn entry_and_gate(&self, route_key: &str) -> Result<(&ScanEntry, &InflightGate), ProviderError> {
         let Some(entry) = self.scan.get(route_key) else {
             return Err(ProviderError::Unavailable(format!("scanner not in registry: {route_key}")));
         };
         let gate = self.gates.get(&entry.provider).ok_or_else(|| ProviderError::Unavailable(format!("no inflight gate for provider {}", entry.provider)))?;
+        Ok((entry, gate))
+    }
+
+    /// 过 provider 在途门再拿到条目（唯一闸，D13：无角色级 workers）。
+    pub async fn lease(&self, route_key: &str) -> Result<ScanLease<'_>, ProviderError> {
+        let (entry, gate) = self.entry_and_gate(route_key)?;
         let permit = gate.enter().await;
         Ok(ScanLease { entry, gate, _permit: permit })
     }
 
     /// 非阻塞版 [`Self::lease`]（深挖门驱动派发：门有空位才弹出队列项，D13）：门满 → `Ok(None)`；未注册 → `Unavailable`（同 `lease`）。
     pub fn try_lease(&self, route_key: &str) -> Result<Option<ScanLease<'_>>, ProviderError> {
-        let Some(entry) = self.scan.get(route_key) else {
-            return Err(ProviderError::Unavailable(format!("scanner not in registry: {route_key}")));
-        };
-        let gate = self.gates.get(&entry.provider).ok_or_else(|| ProviderError::Unavailable(format!("no inflight gate for provider {}", entry.provider)))?;
+        let (entry, gate) = self.entry_and_gate(route_key)?;
         Ok(gate.try_enter().map(|permit| ScanLease { entry, gate, _permit: permit }))
     }
 

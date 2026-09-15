@@ -56,7 +56,7 @@
   - [x] `/code-review`（15 条）→ 分四档；第 1 档已修：#1 id 捷径保请求自身共识（`4e70292`）、#2 二阶段失败按失败格落盘 + #4 对账双向以成功格为准 + 重挖失败保载体（`96b1ad5`）、#3 diff 重建不了时截断数不丢
   - [x] 第 2 档：#9 `--help` 退出码 2 覆盖二阶段失败 / 池空未挖、补多 reviewer 轮转与鉴权出局，债 warning 文案同步；#7 「re-digging」只在真会重挖时披露；
     #8 二阶段第二轮失败轮次记下限 +1；#10 真实时间用例时延 300 ms、阈值 150 / 280 ms；reviewer cell warn 补丢弃计数（parse / needs / 锚定 / 旁路，与 scanner 同口径），二阶段成功时统计取终判轮
-  - [ ] 第 3 档（#12 cell 名 helper、#13 删 dispatch 死代码、#14 Pool 冗余状态、#15 registry 复用，可选）
+  - [x] 第 3 档（纯整理、行为不变）：#12 cell 名 `review_cell_id` / `review_cell_prefix` 共用、#13 删 `dispatch.rs`、#14 `Pool` 去掉 `alive` 冗余、#15 registry `enter` 复用 `try_enter` + lease 共用查找（「scanner not in registry」文案不动，3 处用例依赖）
   - [ ] 留 C2 记账：#5 复位后 budget_skipped 不回减、#6 外部放门不唤醒、#11 单 task 内同步 IO 停摆
 - [ ] followup：「批 C 核查留债」前两条与 resume 覆盖 bug 标已解；与批 D 的 sink 接线现状（若 D 先合回则对齐）
 - [ ] Commit: 评审修（如有）+ 归档 / journal
@@ -74,7 +74,7 @@ make verify
 ## 风险文件与回滚
 
 - 高风险：`deep.rs` 主循环（future 边界划错 → 共享可变状态跨 await；`select!` 分支条件写错 → 通道未关提前收场或死等）；`queue.rs` 合并原因拆分（agreement 口径）；`run_resume` Settled 校验（误判 → 大面积重挖）。
-- `registry.rs` 只加不改；scanner 路径零 diff。
+- `registry.rs` 原定只加不改；评审第 3 档做了行为不变的复用整理（`enter` → `try_enter`、共用查找），scanner 路径由既有 gate / 429 / e2e 用例兜底。
 - 回滚 = 不合回；合回后 revert 该 merge。退化零差用例是第一道回归哨。
 
 ## start 前核对
