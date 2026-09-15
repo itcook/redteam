@@ -1,9 +1,9 @@
-# M21b 风险路由与深挖队列 · 实施计划（六批 + 出口）
+# M21b 风险路由与深挖队列 · 实施计划（七批 + 出口）
 
-> 状态: 锁定（2026-09-10 派生自 design v10〔D13〕；同日修订：删 aacr 接线批——D7 B4 暂退役、随 M21c smoke 重启点一并做；切点与回放口径对齐 D11；**2026-09-12 增批 C1**——批 C 落的是串行单派发器 + 单 reviewer，design §6 规则 5 的门驱动并发与分派池轮转另批补；**2026-09-13 增批 C2**——C1 拷问定案 scanner 与深挖时间重叠另批做）· 上位 `../roadmap/M21b-risk-deep-queue.md`（范围与验收）· design
-> `../design/2026-09-04-redteam-review-engine-architecture-design.md` §2 / §3.3 / §6 / §7 / §8.1 / §10.6-10.7 / §12.3 / §13 ·
-> 决策 D1 勘误, D2, D6, D7, D10, D11, D13 · P0 规则定案 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md` §15.4-15.7
-> **执行形态**：每批一个 Trellis 任务（`m21b-risk` / `m21b-review-primitives` / `m21b-deep` / `m21b-deep-concurrency` / `m21b-deep-streaming` / `m21b-verifier`，**仅需 prd，design / implement 开工时 grill 或脑暴产出**）+
+> 状态: 锁定（2026-09-10 派生自 design v10〔D13〕；同日修订：删 aacr 接线批——D7 B4 暂退役、随 M21c smoke 重启点一并做；切点与回放口径对齐 D11；**2026-09-12 增批 C1**——批 C 落的是串行单派发器 + 单 reviewer，design §6 规则 5 的门驱动并发与分派池轮转另批补；**2026-09-13 增批 C2**——C1 拷问定案 scanner 与深挖时间重叠另批做；**2026-09-15 C2 拷问定案〔D15〕**——C2 节按十问改写（design v11），增批 C3「深挖选项稳定性」承接方差四层与 scanner needs 入队，批序改 C2 → C3 → D）· 上位 `../roadmap/M21b-risk-deep-queue.md`（范围与验收）· design
+> `../design/2026-09-04-redteam-review-engine-architecture-design.md` §2 / §3.3 / §6 / §7 / §8.1 / §8.4 / §10.6-10.7 / §12.3 / §13 / §17 ·
+> 决策 D1 勘误, D2, D6, D7, D10, D11, D13, D14, D15 · P0 规则定案 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md` §15.4-15.7
+> **执行形态**：每批一个 Trellis 任务（`m21b-risk` / `m21b-review-primitives` / `m21b-deep` / `m21b-deep-concurrency` / `m21b-deep-streaming` / `m21b-deep-stability` / `m21b-verifier`，**仅需 prd，design / implement 开工时 grill 或脑暴产出**）+
 > 一个子分支 `feat/m21b-<批>`（自 `feat/m21-review-engine` 切出，独立工作树）；批内小步提交；批收口用 dev `redteam` 跑 ship 评审，
 > 修完 `--no-ff` 合回 `feat/m21-review-engine`。出口验收在本工作树单 session。
 
@@ -43,9 +43,11 @@
 |---|---|---|---|
 | 1 | **A 风险评分器**（`feat/m21b-risk`）· **B reviewer 静态零件**（`feat/m21b-review-primitives`） | 无，两批并行 | A 与 B 无文件交集（A: `src/risk/`+`src/cli/mod.rs` 接线段；B: `src/pack/`+`src/prompt/`+`src/provider/parse.rs`+`tool_loop.rs`） |
 | 2 | **C 深挖队列与 reviewer 运行时**（`feat/m21b-deep`） | A、B 合回 | 独占 `src/orchestrate/`、`src/cli/mod.rs` 主流程、`src/state/` |
-| 3 | **C1 并发派发与 reviewer 轮转**（`feat/m21b-deep-concurrency`）· **D verifier 流式段**（`feat/m21b-verifier`） | 均为 C 合回；两批可并行 | C1 独占 `src/orchestrate/{deep,queue}.rs` + `src/cli/mod.rs` 深挖接线段；D 独占 `src/consolidate/verify.rs`、verifier.md。**唯一碰撞点** = `run_deep` 的 sink 接线（D 要把 `&()` 换成真 mpsc sink，C1 要改派发循环）——先合回者在 followup 记下接口现状，后合者对齐 |
-| 4 | **C2 scanner 与深挖时间重叠**（`feat/m21b-deep-streaming`） | C1 合回 | 独占 `src/orchestrate/mod.rs` scanner 扇出接线 + `deep.rs` 在线预算 + `registry.rs` 门让位；与 D 的碰撞点仍是 `run_deep` 的 sink |
-| 5 | 出口验收（本工作树，单 session） | A-D + C1 + C2 全合回 | — |
+| 3 | **C1 并发派发与 reviewer 轮转**（`feat/m21b-deep-concurrency`） | C 合回 | C1 独占 `src/orchestrate/{deep,queue}.rs` + `src/cli/mod.rs` 深挖接线段（2026-09-14 合回 `80919ad`）。D 原与 C1 同波并行、未开工，2026-09-15 改排 C3 之后 |
+| 4 | **C2 scanner 与深挖时间重叠**（`feat/m21b-deep-streaming`） | C1 合回 | 独占 `src/orchestrate/mod.rs` scanner 扇出接线、`deep.rs` 在线预算 / 收场 drain / 等门挂起、`queue.rs` 到达键与 `drain_with`、`registry.rs` 等门者让位、`run_resume` 离线续跑 |
+| 5 | **C3 深挖选项稳定性**（`feat/m21b-deep-stability`） | C2 合回 | 独占 `queue.rs` 优先级键与入队合并、`pack/region.rs` 笔记渲染、scanner needs 入队接线（范围待 C3 拷问定） |
+| 6 | **D verifier 流式段**（`feat/m21b-verifier`） | C3 合回 | 独占 `src/consolidate/verify.rs`、verifier.md。碰撞点 = `run_deep` 的 sink（`&()` → 真 mpsc sink）与 barrier「复核在途 0」；C2 的等门者机制对 verifier 通用，D 直接复用 |
+| 7 | 出口验收（本工作树，单 session） | A-D + C1 + C2 + C3 全合回 | — |
 
 （aacr 接线不在本里程碑：D7 B4 暂退役、重启节点待定，`reviewers/redteam.py` 随 M21c smoke 重启点一并做〔M21c 交付 7〕。）
 
@@ -303,29 +305,55 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
 design §2 墙钟公式是 `max(最慢 scanner cell, 队列排空) + 最后一条复核`、H0 从阶段 0 直接进队列；§7「H0 项…覆盖它的 scanner 组尚未完成」；
 §6 规则 5「scan 来源项不等同组其他家族 cell 返回」。批 C / C1 仍是 **scan 全完 → 深挖**（墙钟 = 和，不是 max）。
 C1 已留好 `DeepInput.incoming` 入队通道与「通道关闭」barrier，本批把 scanner 扇出接上，并处理重叠带来的**语义**变化
-（不只是派发形态，故单独成批）。**开工前须 grill**：在线预算的保底释放与 scanner 失败口径未定。
-**收益口径**：批 C dogfood 推算 glm 轮 C1 ≈ 10.7 min → C2 ≈ 8.5 min（最长两格 ~505 s 恰为 H0，t=0 开挖），落入 §13 高风险 7–10 min；
-grok 轮无收益（尾巴是最长 scan 格 340 s）。
+（不只是派发形态，故单独成批）。
+**定案**：2026-09-15 C1 现配置基线补跑 + `/grilling` Q1–Q10〔D15〕，design v11；技术设计与小步清单见 Trellis 任务 `design.md` / `implement.md`。
+**收益口径**（现配置基线：glm 单成员 · agc 门 6，同目标 diff 总 20.6 min）：同选中项重放预测 13.7 min（门 6）/ 16.8 min（门 4）；
+原「glm C1 ≈ 10.7 → C2 ≈ 8.5 min」按旧门 20 与混合池推算，作废。
 
-### Task C2-1 流式入队接线
-- H0 在 t=0 入队并可立即派发；`run_scan_fanout` 每个 scan cell 完成即把其疑点经通道入队（入口五态 + `same_item` 共识，C1 定案）；
-  scanner 全完 = 通道关闭。scan 报告的疑点并集仍按组 `merge_suspicions` 生成（报告口径不变）。
+### Task C2-1 队列、门与闭包零件
+- 到达键幂等入队与受影响项回报、`pop_dispatch_where` / `has_eligible`、`drain_with(预算, 保底)`（`drain` 为其特例）；
+  `InflightGate` 等门者计数、首试让位、取消安全；`closure_members`（`merge_suspicions` 输出不变）。
 
-### Task C2-2 在线预算
-- 批 C 的「入队完一次性 drain」在项持续到达时做不到 → 派发计数对预算；必挖不截；疑点保底 ⌈maxCells/4⌉ **为后到疑点预留**
-  （H0 不得吃掉预留格）；预算耗尽后到达的非必挖项 → `skipped(budget)`。待裁：scanner 全完时未用满的保底如何释放。
+### Task C2-2 读守卫预取（D15 Q9）
+- git 跟踪文件集每轮预取一次、读守卫查集合（拒绝口径不变）。
 
-### Task C2-3 门公平（scanner 先入门）
-- 共享 provider 时 scanner 阻塞 `enter()` 与 reviewer 主循环非阻塞 `try_enter()` 同门，后者不感知等待者会插队，违反 design §444
-  「scanner 格先于 H0 项入门」。`InflightGate` 记等待者数，`try_enter` 在有等待者时让位。
+### Task C2-3 深挖主循环（D15 Q1 / Q7 / Q8 / Q9）
+- 扫描期非必挖额度 `K − F`、必挖不限；关闭入口时 `drain_with(K − 已派发, F − 已派发非必挖疑点)`，Skipped 只在此刻判定（C1 评审 #5 假债消解）；
+  等门挂起入 FIFO（修 C1 评审 #6 外部放门不唤醒）；收场按最终优先级序组装；快照只写受影响项；
+  `DeepMeta` 增墙钟分段（收场 / 首次派发 / 排空 / 复核尾部）、扫描期派发数、收场剩余预算、拆簇数、填门阻塞。
 
-### Task C2-4 scanner 失败口径
-- 现为 scanner cell 失败 → Incomplete / exit 3、不进深挖。重叠后 reviewer 可能已产出 finding：报告保留与否、退出码如何定（待裁）。
+### Task C2-4 首跑流式接线与 scanner 失败口径（D15 Q2 / Q5）
+- 格落盘即逐条发疑点（到达键）；显式先 poll 扫描再 `join!`（t=0 scanner 先入门）；收场切 `Deep`；scanner 失败深挖照跑、
+  硬 Incomplete / 3、findings 进报告、warning 报 blocking 数；拆簇对账入 RunMeta。
 
-### Task C2-5 墙钟与收口
-- dogfood 同 base `674583e` 对照 C1；RunMeta 墙钟分段可读（scan 段 / 队列排空 / 复核尾部）；三路评审 → `--no-ff` 合回。
+### Task C2-5 resume 离线续跑（D15 Q6）
+- 补跑缺失 scanner → 疑点幂等入队 → 补跑过则复位 Skipped 按剩余预算重选 → drain → 挖；空快照 + reviewer 同路径（H0 重算），
+  修「扫描期 kill 后 resume 出 scan-only / exit 0」（C1 现存缺口）；多项 InFlight 并发 kill 用例补齐。
 
-## 批 D · verifier 流式段（`feat/m21b-verifier`，Trellis `m21b-verifier`；前提 C 已合回）
+### Task C2-6 收口
+- 四绿；dogfood 一轮同目标 diff、配置与基线一致（agc 门 6），对照基线与重放预测看分段（不硬卡单点门槛）；
+  code-review 审核 → 修 → `--no-ff` 合回；本批私有记录拷回集成工作树。
+
+---
+
+## 批 C3 · 深挖选项稳定性（`feat/m21b-deep-stability`，Trellis `m21b-deep-stability`；前提 C2 已合回）
+
+C1 dogfood 同 diff 两轮 findings 2 vs 8，归因是四层叠加（followup「深挖选项方差过大」）：① scanner 候选集跨轮只重合 39%；
+② confidence 排序 + 预算截断把漂移变成门（且写进 reviewer 笔记）；③ 相邻疑点各占一格、无文件多样性、同分 tie-break 恒偏 `.next/`；
+④ 有效产出格太少（grok 已撤、锚定丢弃已可观测）。C2 现配置基线仍是 12 格里 4 格文档行、与 C1 两轮选中项各重合 4/12。
+C2 拷问〔D15 Q3 / Q4〕定：选项规则改动整体从 C2 剥出另立本批，保证 C2 dogfood 可按墙钟归因；scanner needs 入队（design §6 第三种生产者、
+批 C plan C-3 原文有而未接）一并归此。
+**开工前须 grill**：
+- 替代排序信号（agreement、与 H0 热区关系、文件风险分、代码优先）——改 design §6 规则 1；
+- 规则 2「区间扩到 enclosing def、同文件相邻区间合并」落地：合并后共识口径（比照 id 捷径不计？）、def 扩展与 pack 预算、id 形态、与 M1 逐 cell 到达的交互；
+- 文件多样性（per-file 帽 / 按文件轮转）与同分 tie-break；reviewer 笔记是否去掉 confidence（铁律 8 回归）；scanner samples ≥ 2 的成本；
+- scanner needs 项语义（无触发疑点链接、path 可在 diff 外、装包归属）；若多为 `NeedKind::Api` 再议拆给 M21d。
+**验收口径**：同 diff 至少两跑，量「选中区域重合度」与「findings 重合度」（不只看单轮 findings 数）；对照 C1 ① / ② 与 C2 dogfood
+（`.next/private/m21b/raw/` 汇总与重放脚本复用）。任务清单拷问后派生。
+
+---
+
+## 批 D · verifier 流式段（`feat/m21b-verifier`，Trellis `m21b-verifier`；前提 C3 已合回——2026-09-15 批序定案〔D15〕）
 
 ### Task D-1 `verifier.md` 拆分
 - Add: `src/prompt/templates/verifier.md`（从 `adversarial-refute.md` 拆 verifier 角色尾：`analysis` 先于 `verdict` 且「不可撤回」；
@@ -377,6 +405,8 @@ grok 轮无收益（尾巴是最长 scan 格 340 s）。
 | 7 | 输出有界性 | PR181 RunMeta 每 reviewer cell 输出 token | 全部 < `maxOutputTokens`/2；FINALIZE/REPAIR 三层不触发 |
 | 8 | 回归集 | `eval/risk_replay.py compare`；`eval/verify_score.py`；`eval/scan_score.py` | risk 对拍一致率与 oracle 命中不低于 P0 基线；verifier 二分类基线数字入 research；scanner 不退化 |
 | 9 | 门与文档 | `make verify`；`redteam-next --help` | 绿；含 `risk` 子命令与深挖说明；无 `engine` / `--risk` / `--models` / `--workers` |
+| 10 | 墙钟分段（C2） | PR181 RunMeta `close_ms` / `first_dispatch_ms` / `drain_done_ms` / `verify_tail_ms`、`fill_block_*` | 分段可读；`fill_block_max_ms` ≥ 500 ms 或累计 ≥ 墙钟 1% → 按 followup 挪 `spawn_blocking` |
+| 11 | 深挖选项稳定性（C3） | 同 diff 两跑 | 选中区域重合度 / findings 重合度数字入 research；门槛由 C3 拷问定 |
 
 出口通过后：roadmap `M21b-risk-deep-queue.md` 交付项打勾、状态 ✅、README 表更新；三档预算与 refute 率数字写进
 `../private/research/`（或新 research）；主 checkout `.doc/roadmap/done.md` 记 M21b。

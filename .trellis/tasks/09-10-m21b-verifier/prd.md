@@ -29,3 +29,6 @@
 - design.md / implement.md 不预写：开工时 grill 或脑暴产出（输入 = 本 prd + plan 批 D 节 + design §8.1 / §10.7〔D7/D9〕）。
 - 决策依据：D7 A4（verifier 去留交数据）、D9（角色尾与回归集）、D10-1（流式）、D13（落地时刻 agreement）。
 - M21c 接口：判例摘要槽与判例变体触发是空槽——形状先到位，M21c 填。
+- **前提变更（2026-09-15，D15）**：批序改为 C2 → C3 → D，本批前提由「批 C 合回」改为「批 C3 合回」。开工时按 C1 / C2 / C3 合回后的接口刷新本 prd：
+  `run_deep` 仍传 `&()` sink、barrier 需加「复核在途 0」；C2 的门等门者让位与放门唤醒对 verifier 同门（与 reviewer 同在 agc）直接复用；
+  `FindingEvent.suspicion_agreement` 为派发快照（`event ≤ landed`）；「流式旁路跨瞬时重试不复位」须在接真 sink 前修（followup）。
