@@ -327,12 +327,17 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
 - **真网关超载有两种表现，D13 只认其一**：12 路并发时 agc 429 × 2，棘轮把门 20 收到 7（两格排队 64 / 78 s 后重试成功，记账正确）；
   同时 grok-4.6 两格 `truncated anthropic stream: no finish_reason`，`DEFAULT_RETRY_BUDGET` 三次尝试全断 → 失败计债。门 4 与批 C 串行零出现 → 负载所致。
   D13 只以 429 收门，断流不收门。候选：同 provider 短窗内断流连发视同过载信号参与收门。配置侧 `providers.agc.maxConcurrency ≤ 7`（run.warnings 已提示，用户决定）。
+  ✅ **配置已定（2026-09-15）：agc `maxConcurrency` 20 → 6**。7 不是测出的硬上限——收门公式 `min(门宽 − 1, 我方其余在途)` 的单次读数
+  （某次 429 时我方另有 7 个在途），而同轮开头 12 路同发只拒了 2 个；限流更像按速率 / token 或与其他调用方共用额度。
+  断流从哪一档起出现未知且无自动恢复，取 6 留一格余量；去掉 grok 后 12 格全是 glm 长流，下一轮 dogfood 看 429 / 断流再调。
 - **流式旁路跨瞬时重试不复位（批 D 接真 sink 前须处理）**：`timed_turn_with` 内部重试复用同一 backend，delta 回调持续喂同一个 `IncrementalFindings`——
   断流那次的半截 JSON 与重试输出拼进同一解析器。sink 为 no-op 时无害；接真 sink 后可能发出重试前的草稿对象。修法二选一：每次尝试复位解析器，或旁路只开在首个尝试。
 - ✅ **reviewer 格 quote 锚定丢弃数不可见（C1 评审第 2 档已补：reviewer cell warn 与 scanner 同口径披露丢弃计数）**：`ReviewParseStats.dropped_quote` 算了却不进 `CellRecord`（scanner 格有「N suspicions dropped」warn，reviewer 没有）。
   直接后果：模型去留数据分不清「零发现」与「quote 全锚不上被静默丢」。小修：`land` 里与 `stream discarded` 并列写进 cell warn。
 - **reviewer 模型去留数据**：grok-4.6 三轮 22 个成功格 **0 条** finding（C1 两轮 needs 也为 0、输出 1–6K token）；glm-5.3 24 格 26 条（cell 内）。
   混合池无权重，零产出成员直接占掉一半预算格——这是两轮 findings 偏少、波动大的**放大因素之一，不是主因**（主因见下条「深挖选项方差」）。先补上条观测再定配置去留。
+  ✅ **决定（2026-09-15）：grok-4.6 暂不作 reviewer**——配置删去 reviewer 角色、保留模型条目（加载时提示「未声明任何 roles」），
+  后续再做针对性测试与修复。重测时看 reviewer cell warn 的丢弃计数（C1 评审第 2 档已补），区分「零发现」与「quote 锚不上被丢」。
 - **深挖选项方差过大：scanner confidence 排序 + 预算截断（建议作批 C2 开工前拷问议题）**
   - **现象**：C1 两轮同 diff、同配置，报告 findings **2（格内 3，两格同一问题经 dedup 合并）vs 8**。门宽不影响选项与分配（C1 截断在派发前一次定死、无在途入队；
     两轮都严格按派发序交替分给 glm / grok）。两轮**共同挖到的 6 项产出完全一致**（`review_shot.rs` 规则项 glm 两轮各 1 条，其余 5 项两轮都 0）——
