@@ -330,6 +330,8 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
   ✅ **配置已定（2026-09-15）：agc `maxConcurrency` 20 → 6**。7 不是测出的硬上限——收门公式 `min(门宽 − 1, 我方其余在途)` 的单次读数
   （某次 429 时我方另有 7 个在途），而同轮开头 12 路同发只拒了 2 个；限流更像按速率 / token 或与其他调用方共用额度。
   断流从哪一档起出现未知且无自动恢复，取 6 留一格余量；去掉 grok 后 12 格全是 glm 长流，下一轮 dogfood 看 429 / 断流再调。
+  **门 6 实测（2026-09-15，C2 开工前补跑 C1 基线，同目标 diff）**：深挖 t=0 六格同发仍撞 429 × 2 → 收到 4（run.warnings 建议 ≤ 4），
+  三格排队重试后成功，12/12 成功、**零断流**；总墙钟 20.6 min（scanner 段 6.2 / 深挖段 14.3）。门 6 保持（自动收门兜底、首波排队）还是改 4，待用户定。
 - **流式旁路跨瞬时重试不复位（批 D 接真 sink 前须处理）**：`timed_turn_with` 内部重试复用同一 backend，delta 回调持续喂同一个 `IncrementalFindings`——
   断流那次的半截 JSON 与重试输出拼进同一解析器。sink 为 no-op 时无害；接真 sink 后可能发出重试前的草稿对象。修法二选一：每次尝试复位解析器，或旁路只开在首个尝试。
 - ✅ **reviewer 格 quote 锚定丢弃数不可见（C1 评审第 2 档已补：reviewer cell warn 与 scanner 同口径披露丢弃计数）**：`ReviewParseStats.dropped_quote` 算了却不进 `CellRecord`（scanner 格有「N suspicions dropped」warn，reviewer 没有）。

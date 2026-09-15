@@ -27,7 +27,9 @@
 - **真实配置**（`d23e715` 定）：scanner = deepseek-flash（deepseek 门 16）+ qwen3.8-flash（qwen 门 20）；reviewer = glm-5.3（agc 门 6，兼 verifier 角色，批 D 前不消费）；grok-4.6 无角色。**scanner 与 reviewer 不同门**——门公平与 #6 在真 dogfood 里触发不到，只能构造；批 D 的 verifier 与 reviewer 同在 agc，#6 对 D 更实。
 - **墙钟基线**（目标 diff 同批 C：`f1d3ca3` 状态、`--base 674583e`，budget_cells = 12）：
   - C1 dogfood（混合池 glm + grok）：agc 门 20 总 11.2 min（scanner 段 4.0 / 深挖段 7.1）；门 4 总 19.7 min（3.6 / 16.1）。私有记录 `.next/private/m21b/2026-09-14-batch-c1-dogfood.md`。
-  - **现配置补跑**（HEAD `d23e715` 构建；glm 单成员 · agc 门 6）：（补跑中，结果回填）
+  - **现配置补跑**（2026-09-15，HEAD `d23e715` 构建；glm 单成员 · agc 门 6）：总 **20.6 min**（scanner 段 6.2 = qwen g1 374 s / 深挖段 14.3）；
+    门 6 仍撞 429 × 2 → 收到 4，12/12 成功、零断流；队列 22 项截断 10；findings 6（格内 7）；12 格里 4 格是 roadmap 文档行，与 C1 ① / ② 选中项各重合 4/12。
+    scanner 格完成时刻 58 / 197 / 255 / 374 s。私有记录 `.next/private/m21b/2026-09-15-batch-c1-baseline-current-config.md`（原始报告与重放脚本在同目录 `raw/`）。
 - **批 D 碰撞面**：D 未开工（任务 planning、无分支），本批先行。碰撞点 = `run_deep` 的 `sink`（仍 `&()`）与 barrier「复核在途 0」；「流式旁路跨瞬时重试不复位」归 D 接真 sink 前修。
 - **退化零差基线** `src/orchestrate/testdata/deep_serial_baseline.json` 钉「单成员门宽 1 的派发形态」：本批有意改变时审过 diff 再更新（C1 design §8）。
 
@@ -87,5 +89,5 @@
 ## Technical Notes
 
 - 分支 `feat/m21b-deep-streaming`，工作树 `~/hobby/.worktrees/redteam/m21b-deep-streaming`（自 `feat/m21-review-engine` 切出）。
-- `.next/private/` 不随新工作树：私有 dogfood 记录从集成工作树读、写回集成工作树。
+- `.next/private/` 不随新工作树：C1 及更早的私有记录从集成工作树读；本批私有记录写在本工作树 `.next/private/m21b/`，收口时拷回集成工作树（C1 先例）。
 - 实现形态（scanner 扇出与 `run_deep` 同 task 并发、还是 spawn 后 registry `Arc` 化）留 design 定；C1 的同 task `FuturesUnordered` 借用形态不要求 `Send` / `'static`。
