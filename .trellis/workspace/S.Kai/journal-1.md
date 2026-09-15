@@ -525,3 +525,63 @@ grill 定 D13（删角色 workers / 无 --workers、provider 门单把 FIFO 不�
 - 开批 C1（feat/m21b-deep-concurrency）：C1-1 队列项身份与 spec 解耦 → C1-2 并发派发（先试 FuturesUnordered）→ C1-3 分派池轮转 → C1-4 墙钟门
 - 批 D 可与 C1 并行；唯一碰撞点 run_deep 的 sink 接线；D 写跳过规则读 suspicion_agreement 不读 agreement
 - m21b-deep 工作树已合并可清理（.next/private/m21b/ dogfood 记录需先拷回主干工作树）
+
+
+## Session 20: M21b 批 C1 门驱动并发派发与 reviewer 分派池（身份 / 并发 / 轮转 / 墙钟门 + 真 provider dogfood + 三档评审修）
+<!-- trellis-session: v=2 fp=cf7d71ea56efcc56 -->
+
+**Date**: 2026-09-15
+**Task**: M21b 批 C1 门驱动并发派发与 reviewer 分派池（身份 / 并发 / 轮转 / 墙钟门 + 真 provider dogfood + 三档评审修）
+**Branch**: `feat/m21b-deep-concurrency`
+
+### Summary
+
+批 C1 把批 C 的串行单派发器改成 design §6 规则 5 的门驱动并发与 reviewer 分派池轮转。C1-1 先定死队列项与 cell 身份（id 不随 ranges 重算、共识只经谓词、Skipped 仅成必挖才复位、cell_id 按队列项），先红后绿修掉批 C resume 覆盖丢 finding，测试顺带暴露 resume/partial 收口把 reviewer 格当失败 scanner 格（假 Incomplete）并修。C1-2 FuturesUnordered + select! 并发派发、入队通道为 C2 预留、一格持门位到底、报告按派发序组装、二阶段失败计债；C1-3 分派池空闲轮转与鉴权出局；C1-4 虚拟时间墙钟门与退化零差（基线用 git archive 导出批 C 代码跑同一场景采得，不凭推理写期望）。dogfood 在临时工作树复现批 C 同一目标 diff：深挖段 48.4 → 7.1 min（agc 门 20，429 × 2 收门 20→7、grok 2 格断流）/ 16.1 min（门 4 全绿）。维护者追问两轮 findings 2 vs 8 的成因：逐项对照查实门宽不影响选项与分配，主因是 scanner confidence 跨轮漂移经排序截断决定挖哪些项，离线模拟显示单拿掉 confidence 稳不住（候选集跨轮只重合 39%），归为四层叠加并记为 C2 拷问议题，订正了先前「grok 占半是主因」的归因。/code-review 15 条修 12 条（第 1 档 4、第 2 档 4 + reviewer 格丢弃计数观测、第 3 档 4），3 条留 C2。--no-ff 合回 80919ad，主干四绿。
+
+### Main Changes
+
+- queue：id 定死、共识只经谓词（id 捷径保请求自身共识、agreement 单调不减）、MergedSkipped
+- deep：FuturesUnordered + select! 并发派发、DeepInput.incoming 入队通道、run_cell 首轮 + 二阶段持同一 lease、派发序组装（meta 四数组对齐）、分派池轮转与鉴权出局 / 池空计债、二阶段失败按失败格落盘、reviewer cell warn 丢弃计数、restored_meta、review_cell_id
+- registry：try_enter / try_lease（enter 复用 try_enter、lease 共用查找，scanner 行为与文案不变）；删 dispatch.rs 死代码
+- cli：resume 对账双向以成功格为准 + 重挖失败保往轮载体 + 截断数三路径从快照起算 + re-digging 只在真重挖时披露；resume / partial 收口按角色拆记录；RunMeta.models 含实际参与 reviewer；--help 退出码 2 覆盖新债种
+- backends / main：role_thinking_warnings（兼任 scanner 的 reviewer thinkingLevel 不再漏报，文案带角色）
+- testdata/deep_serial_baseline.json（批 C 代码采得的退化零差基线）；followup 记 dogfood 账目、深挖选项方差归因与 C2 议题、评审留 C2 三条
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `36ee52c` | chore(task): 批 C1 规划制品——prd / design / implement + 两处设计裁定（Skipped 仅成必挖才复位、事件滞后接受并钉 event ≤ landed） |
+| `b615e31` | docs(task,plan,roadmap): 批 C1 拷问定案——十问结论并入 prd/design/implement，新增批 C2（scanner 与深挖时间重叠） |
+| `aaa622d` | fix(queue,resume): 队列项与 cell 身份定死——id 不随 ranges 重算、共识只经谓词、Skipped 仅成必挖才复位、cell_id 按队列项且 Settled 以成功格为准（批 C1 前置，修批 C resume 覆盖丢 finding） |
+| `e132618` | fix(resume,partial): 收口按角色拆 cell 记录——reviewer 格不再冒充失败的 scanner 格（批 C 遗留，C1-1 测试暴露） |
+| `87e9773` | feat(orchestrate): 门驱动并发派发——FuturesUnordered + 入队通道、一格持门位到底、报告按派发序组装、二阶段失败计债（design §6 规则 5〔D13〕） |
+| `83e0c2b` | feat(orchestrate): reviewer 分派池空闲轮转与成员健康——鉴权失败移出池不改派、池空停派保留 Pending、未分到格不再静默（design §6 规则 5、D7 A3） |
+| `1d86e52` | test(deep): 并发墙钟门（虚拟时间）与单成员退化零差——对照批 C 串行基线 |
+| `f01bf8b` | docs(followup,task): C1-5 dogfood 账目——墙钟门实证（深挖段 48.4 → 7.1 min）、网关超载两种表现、旁路跨重试不复位、reviewer 锚定丢弃不可见、grok 零产出与单文档疑点洪水 |
+| `af97bcc` | docs(followup): 深挖选项方差归因——两轮 findings 2 vs 8 主因是 scanner confidence 漂移经排序截断决定挖哪些项（四层叠加 + 离线模拟 + C2 拷问议题），订正 grok 占半为放大因素 |
+| `4e70292` | fix(queue): id 捷径合并保留入队请求自身的共识——多家族疑点撞同区间单家族项不再掉出必挖集（C1 评审第 1 档 #1） |
+| `96b1ad5` | fix(deep,resume): 二阶段失败按失败格落盘、快照对账双向以成功格为准、重挖失败不抹往轮载体——resume 不再抹债、不再丢 finding（C1 评审第 1 档 #2 #4） |
+| `d683bab` | fix(deep,resume): diff 重建不了时截断数不丢——深挖 meta 三条 resume 路径统一从快照起算（C1 评审第 1 档 #3） |
+| `1f098a7` | fix(deep,resume,cli): C1 评审第 2 档——--help 与债文案覆盖新债种、re-digging 只在真重挖时披露、二阶段失败计轮次、reviewer 格披露丢弃计数、真实时间用例留足间距 |
+| `e43dfe8` | refactor(deep,registry): C1 评审第 3 档——cell 名构造与反解共用、删 dispatch 死代码、Pool 在池状态单一真相、registry 取门与查找复用（行为不变） |
+| `0a588c3` | docs(followup,task): 批 C1 收口账目——批 C 核查留债与 resume 覆盖 / 假共识标已解、评审留 C2 三条（复位不回减假债、外部放门不唤醒、单 task 同步 IO 停摆）、批 D 接线注意 |
+| `80919ad` | merge(m21b-deep-concurrency): 批 C1 门驱动并发派发与 reviewer 分派池合回——身份与 resume 完整性 / 并发派发 + 入队通道 / 分派池轮转与成员健康 / 墙钟门与退化零差 + 真 provider dogfood + 评审三档修（design §6 规则 5〔D13〕、D7 A3） |
+
+### Testing
+
+- [OK] [OK] 子分支与合回后主干各复验：lib 683 / e2e 17 / cli 17 / packaging 7；clippy 7 = 基线；make verify 绿
+- [OK] [OK] 新增用例先红后绿（一次就绿的补变异检查），关键改动变异检查 30 余处各自转红；真实时间用例全量并行连跑 3 遍无抖动
+- [OK] [OK] 虚拟时间墙钟门 12 格 × 50 ms / 门宽和 4 = 150 ms；单成员门宽 1 与批 C 串行报告同构（findings / cells / meta / 落盘序 / 快照序）
+- [OK] [OK] 真 provider dogfood 两轮（同批 C 目标 674583e...f1d3ca3），配置改动已从备份恢复并 cmp 校验
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 批 C2 开工前 /grilling：scanner 与深挖时间重叠 + 在线预算，并入深挖选项方差（confidence 排序键与 reviewer 笔记、同文件相邻区间合并、文件多样性、scanner samples）与评审留 C2 三条（复位不回减假债、外部放门不唤醒、单 task 同步 IO）
+- 维护者决定：providers.agc.maxConcurrency ≤ 7；grok-4.6 去留（reviewer 格丢弃计数已可观测，可再跑一轮看 warn）
+- 批 D 接真 sink 前先修流式旁路跨瞬时重试不复位；D 的免复核读 FindingEvent.suspicion_agreement（派发快照，event ≤ landed）
+- m21b-deep-concurrency 工作树已合并可清理（私有 dogfood 记录已拷回主干工作树）
