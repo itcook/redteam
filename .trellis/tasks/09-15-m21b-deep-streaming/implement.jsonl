@@ -1,0 +1,4 @@
+{"file": ".next/plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md", "reason": "批 C2 节 Task C2-1…C2-5（流式入队 / 在线预算 / 门公平 / scanner 失败口径 / 墙钟收口）与第 4 波碰撞点（与批 D 的 run_deep sink）"}
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§2 墙钟公式与 barrier、§6 规则 2-6（入口五态 / 预算保底 / 分派 / 终止）、§7 H0 独立审、§12.3 门单把 FIFO 与 scanner 先入门——实现对照的第一权威"}
+{"file": ".trellis/tasks/archive/2026-09/09-13-m21b-deep-concurrency/design.md", "reason": "C1 定案：§2.2 共识只经谓词、§2.3 Skipped 复位、§3 并发主循环与入队通道、§3.4 报告按派发序组装——流式入队会拿掉其中两条的前提"}
+{"file": ".next/roadmap/followup.md", "reason": "「批 C1 收口带出的账」#5 / #6 / #11 三条 C2 议题；「批 C1 dogfood 带出的账」深挖选项方差四层与多 InFlight kill/resume 用例缺口"}
