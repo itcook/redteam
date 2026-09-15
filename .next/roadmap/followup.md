@@ -197,6 +197,7 @@ coverage `failed` 数。
 
 ## M21b 批 C 核查留债（2026-09-12，Trellis `09-10-m21b-deep`，修 4 条后剩余）
 
+> ✅ **前两条已解（批 C1 C1-1 `aaa622d`，2026-09-14 合回）**：id 在 `new` 时定死、合并不重算；Skipped 仅成必挖才复位（`MergedSkipped`）。
 > **已定案（2026-09-13 C1 拷问）**：前两条的处置已钉进 C1 任务 design——id 定死、Skipped 仅成必挖才复位（`MergedSkipped`）。
 > **已有主（2026-09-12）**：下列前两条（队列项身份、Skipped 复位）由**批 C1 Task C1-1** 承接——
 > 它们正是「当前不可触发、并发一开就真」的那类，必须在并发派发落地前解掉。第三条（`ItemKind::Needs`
@@ -295,10 +296,10 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
 
 ## 批 C1 拷问定案带出的账（2026-09-13，`/grilling` Q1–Q10，定案全文在 Trellis 任务 `09-13-m21b-deep-concurrency/design.md` §9）
 
-- **批 C resume 覆盖 cell 丢 finding（主干上活的，C1-1 修）**：`run_deep` 的 `review[{n}]` 每次调用从 1 起、`cell_put` 按 cell 名
+- ✅ **批 C resume 覆盖 cell 丢 finding（C1-1 `aaa622d` 已修；评审修 `96b1ad5` 补对账双向以成功格为准 + 重挖失败保载体）**：`run_deep` 的 `review[{n}]` 每次调用从 1 起、`cell_put` 按 cell 名
   upsert → resume 的 `review[1]@m` 覆盖首跑同名格（不同队列项）→ 二次 resume 永久丢 finding。批 C C-5 清单的「Settled 以 cells 为准」
   也未实现。`redteam-next` 在 M21c 切名前不进插件与 ship 循环，故不热修。C1 定案：cell_id = `review[{item.id}]@{model}` + 补齐该校验。
-- **队列 id 捷径造假共识（C1-1 修，批 D 读者注意）**：上游 `merge_suspicions` 已按 `same_suspicion` 组内传递闭包，进队列的同文件
+- ✅ **队列 id 捷径造假共识（C1-1 `aaa622d` 已修；评审修 `4e70292`：捷径合并不并家族但保请求自身共识，agreement 单调不减）**：上游 `merge_suspicions` 已按 `same_suspicion` 组内传递闭包，进队列的同文件
   scan 项互不满足谓词，生产上 scan 项在队列里的合并**全部**走 `find_merge_idx` 的 id 捷径（行区间逐字相同）并抬 agreement。
   C1 定案：捷径合并只并笔记与区间，**只有谓词合并才计共识**。→ 批 C 合回后的 `suspicion_agreement` 可能偏高，C1 合回后收紧；
   若数据显示 quote 噪声（如尾部分号）导致真共识漏判，修 `same_suspicion` 的 quote 归一化，不靠捷径。
@@ -358,3 +359,16 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
 - **并发形态下 kill / resume 用例缺口**（dogfood ② glm 对 C1 旧版 plan 的意见之一，部分成立）：C1 resume 用例为单 InFlight；并发 kill 时多项同时 InFlight、
   部分格已落盘——restore 全部复位 Pending + 「Settled 以成功格为准」理论上覆盖，缺多 InFlight 的端到端用例。C1 评审时顺带补或留 C2。
 
+## 批 C1 收口带出的账（2026-09-14，`/code-review` 15 条修 12 条后留 C2；合回 `feat/m21-review-engine`）
+
+- **Skipped 复位后 `budget_skipped` 不回减 → 假债**（评审 #5，C2 议题）：经入队通道并入把 Skipped 项复位成 Pending 并挖掉后，
+  `meta.budget_skipped` 仍按 drain 那一刻计 → `overlay_deep` 仍判债并披露「skipped(budget) N」。与 C1 design §2.3「不回减（drain 时刻披露口径）」
+  的裁定冲突——披露口径与计债口径需拆开定。触发要经入队通道，生产 `incoming = None`，**C2 接上流式入队即真**。
+- **外部持门者放门时主循环不被唤醒**（评审 #6，C2 议题）：主循环只在「在途格完成 / 通道到达」时重试 `try_lease`；门位被深挖以外的持有者释放
+  （C2 起 scanner 与深挖同门）时派发要等下一个在途深挖格完成才补位。探针：门 2、外部先占 1、4 项 × 100 ms → 300 ms（及时补位约 210 ms）。
+  C1 的兜底阻塞 lease 只管「在途为空」的情形。C2 做「等待者感知的门让位」时一并设计唤醒源。
+- **单 task 并发内的同步 IO 让所有在途格停摆**（评审 #11，C2 议题）：`FuturesUnordered` 同 task 并发，而填门循环里 `region::build`
+  每项同步起一次 `git ls-files`（读守卫）并读文件、二阶段 `need_section` 每条 need 同样——阻塞期间其余在途格的流读取与计时器一起停。
+  门宽 20 一次填 20 项即 20 次同步子进程；C2 scanner 与深挖重叠后更频繁。候选：`spawn_blocking`，或按 bundle 预取一次 tracked 文件集。
+- **与批 D 的接线现状**：C1 未改 `run_deep` 的 `sink` 参数类型（仍 `&dyn FindingSink`，生产传 `&()`）；D 接真 sink 时注意
+  `FindingEvent.suspicion_agreement` 是派发快照（`event ≤ landed`，偏差只会多复核），以及旁路跨瞬时重试不复位（上节）须先修。

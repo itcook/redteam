@@ -47,19 +47,19 @@
 - [x] Commit: `test(deep): 并发墙钟门（虚拟时间）与单成员退化零差——对照批 C 串行基线`
 
 ### C1-5 收口
-- [ ] `cargo test` / `clippy --all-targets` 零新增（基线 7）/ `make verify`
+- [x] `cargo test` / `clippy --all-targets` 零新增（基线 7）/ `make verify`（评审三档修完后复验：lib 683、clippy 基线、verify 绿）
 - [x] `make build` → dogfood 两轮（base `674583e`，目标与批 C 同为 `f1d3ca3`，临时 detached 工作树）：① 11.2 min（深挖段 7.1 min，429 × 2 门 20→7，grok 2 格断流）② 19.7 min（门 4，全绿）；配置已恢复并 cmp 校验；记入 `.next/private/m21b/2026-09-14-batch-c1-dogfood.md`，账目进 followup
   - ① 当前配置（reviewers = glm-5.3 + grok-4.6，同在 agc 门宽 20）——墙钟对照串行基线 18.3 / 50.7 min；统计每模型每格产出（grok 去留的决策数据）
   - ② 争门轮：跑前 `cp ~/.redteam/config.json ~/.redteam/config.json.bak-<ts>`，`providers.agc.maxConcurrency = 4`，跑完用备份恢复并校验
   - 记入 `.next/private/m21b/`
-- [ ] 三路 code-review 或 dogfood 自评审 → 修 → `--no-ff` 合回 `feat/m21-review-engine`
+- [x] 三路 code-review 或 dogfood 自评审 → 修 → `--no-ff` 合回 `feat/m21-review-engine`
   - [x] `/code-review`（15 条）→ 分四档；第 1 档已修：#1 id 捷径保请求自身共识（`4e70292`）、#2 二阶段失败按失败格落盘 + #4 对账双向以成功格为准 + 重挖失败保载体（`96b1ad5`）、#3 diff 重建不了时截断数不丢
   - [x] 第 2 档：#9 `--help` 退出码 2 覆盖二阶段失败 / 池空未挖、补多 reviewer 轮转与鉴权出局，债 warning 文案同步；#7 「re-digging」只在真会重挖时披露；
     #8 二阶段第二轮失败轮次记下限 +1；#10 真实时间用例时延 300 ms、阈值 150 / 280 ms；reviewer cell warn 补丢弃计数（parse / needs / 锚定 / 旁路，与 scanner 同口径），二阶段成功时统计取终判轮
   - [x] 第 3 档（纯整理、行为不变）：#12 cell 名 `review_cell_id` / `review_cell_prefix` 共用、#13 删 `dispatch.rs`、#14 `Pool` 去掉 `alive` 冗余、#15 registry `enter` 复用 `try_enter` + lease 共用查找（「scanner not in registry」文案不动，3 处用例依赖）
-  - [ ] 留 C2 记账：#5 复位后 budget_skipped 不回减、#6 外部放门不唤醒、#11 单 task 内同步 IO 停摆
-- [ ] followup：「批 C 核查留债」前两条与 resume 覆盖 bug 标已解；与批 D 的 sink 接线现状（若 D 先合回则对齐）
-- [ ] Commit: 评审修（如有）+ 归档 / journal
+  - [x] 留 C2 记账：#5 复位后 budget_skipped 不回减、#6 外部放门不唤醒、#11 单 task 内同步 IO 停摆（followup「批 C1 收口带出的账」）
+- [x] followup：「批 C 核查留债」前两条与 resume 覆盖 bug 标已解；与批 D 的 sink 接线现状（D 未先合回，记接线注意事项）
+- [x] Commit: 评审修（`4e70292` `96b1ad5` `d683bab` `1f098a7` `e43dfe8`）+ 归档 / journal
 
 ## 验证命令
 
