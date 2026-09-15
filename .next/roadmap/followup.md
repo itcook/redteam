@@ -197,6 +197,8 @@ coverage `failed` 数。
 
 ## M21b 批 C 核查留债（2026-09-12，Trellis `09-10-m21b-deep`，修 4 条后剩余）
 
+> ✅ **前两条已解（批 C1 C1-1 `aaa622d`，2026-09-14 合回）**：id 在 `new` 时定死、合并不重算；Skipped 仅成必挖才复位（`MergedSkipped`）。
+> **已定案（2026-09-13 C1 拷问）**：前两条的处置已钉进 C1 任务 design——id 定死、Skipped 仅成必挖才复位（`MergedSkipped`）。
 > **已有主（2026-09-12）**：下列前两条（队列项身份、Skipped 复位）由**批 C1 Task C1-1** 承接——
 > 它们正是「当前不可触发、并发一开就真」的那类，必须在并发派发落地前解掉。第三条（`ItemKind::Needs`
 > 无生产路径）仍是纯记账，等 M21c 增量轮决定留删。
@@ -287,7 +289,86 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
   （见本文件「两根 agreement 轴」决策点②）。
 - **[10] md 报告不展示 `suspicion_agreement`**（low）：JSON 有、Markdown 无。批 D 跳过规则落地后再决定展示形态
   （纯数字没有解释力，得和「是否免复核」一起出）。
-- **[13] 事件载荷缺不变量断言**（low）：`FindingEvent.suspicion_agreement == ev.finding.suspicion_agreement`
+- ✅ **[13] 事件载荷缺不变量断言**（low；C1-2 通道并入分叉用例已钉）：`FindingEvent.suspicion_agreement == ev.finding.suspicion_agreement`
   无测试钉住。批 C1 处理事件滞后时一并加。
 - 误报：[5]（称 fixtures 模块为本批新建——实为既有）；[6]（称 plan 不在变更集——实在，疑 pack 截断）。
 - **`ReviewCall.finish_reason` 不进 `CellRecord`**：算出来了却没落盘，报告看不出哪格被截断（观测缺失，功能正常）。
+
+## 批 C1 拷问定案带出的账（2026-09-13，`/grilling` Q1–Q10，定案全文在 Trellis 任务 `09-13-m21b-deep-concurrency/design.md` §9）
+
+- ✅ **批 C resume 覆盖 cell 丢 finding（C1-1 `aaa622d` 已修；评审修 `96b1ad5` 补对账双向以成功格为准 + 重挖失败保载体）**：`run_deep` 的 `review[{n}]` 每次调用从 1 起、`cell_put` 按 cell 名
+  upsert → resume 的 `review[1]@m` 覆盖首跑同名格（不同队列项）→ 二次 resume 永久丢 finding。批 C C-5 清单的「Settled 以 cells 为准」
+  也未实现。`redteam-next` 在 M21c 切名前不进插件与 ship 循环，故不热修。C1 定案：cell_id = `review[{item.id}]@{model}` + 补齐该校验。
+- ✅ **队列 id 捷径造假共识（C1-1 `aaa622d` 已修；评审修 `4e70292`：捷径合并不并家族但保请求自身共识，agreement 单调不减）**：上游 `merge_suspicions` 已按 `same_suspicion` 组内传递闭包，进队列的同文件
+  scan 项互不满足谓词，生产上 scan 项在队列里的合并**全部**走 `find_merge_idx` 的 id 捷径（行区间逐字相同）并抬 agreement。
+  C1 定案：捷径合并只并笔记与区间，**只有谓词合并才计共识**。→ 批 C 合回后的 `suspicion_agreement` 可能偏高，C1 合回后收紧；
+  若数据显示 quote 噪声（如尾部分号）导致真共识漏判，修 `same_suspicion` 的 quote 归一化，不靠捷径。
+- ✅ **二阶段补查四处静默（C1-2 已修）**：重新 lease 失败吞掉、第二轮用共享 backend、policy 重试 / 等待未回读、第二轮失败吞掉且 token 不入账；
+  `needs_two_stage_triggered` 虚报。C1 定案：一格持门位到底；第二轮失败 → 保留首轮 finding + warning + 计债；全被读守卫拒 → skipped 不计债。
+- ✅ **兼任角色（code-review 批 C 第 12 条）已消解（C1-3 补发 reviewer 档位 warning）**：`RoleAttrs` 只有 `thinking_level`，深挖 per-cell backend 按 reviewer 自己的
+  `EffectiveModel` 构造。残余仅兼任时 reviewer 的 thinking 无映射 warning 被 `continue` 跳过（C1-3 补发）。verifier 接线（批 D）时同样检查。
+- **scanner 与深挖时间重叠 → 批 C2**（plan 已立节）：流式入队、在线预算与保底预留、scanner 先入门的门让位、reviewer 已开挖时的
+  scanner 失败口径。C1 留 `DeepInput.incoming` 通道与「通道关闭」barrier。
+- ✅ **报告确定性（C1-2 已修）**：dedup 取输入序首个为 base（标题 / 正文 / 建议保留 base），并发完成序会让报告文本逐次漂移；
+  meta 四数组 push 时点不一，批 C 串行下只要有失败格就已错位。C1 定案：报告按派发序组装、meta 按派发序对齐。
+- **reviewer 模型去留的数据口径**：批 C dogfood grok-4.6 0 条 vs glm-5.3 13 条（同变更集同 12 格）。C1 定案不引入权重（design「无 priority」），
+  C1-5 dogfood 混合池统计每模型每格产出，作为配置去留依据。数据已出，见下节「批 C1 dogfood 带出的账」。
+- ✅ **resume / partial 报告把 reviewer 格当失败的 scanner 格（批 C 遗留，C1-1 测试暴露，C1-1 后单独修）**：`run_resume` 收口与
+  `partial_report` 把 cells 表全量喂 scan-only 收口，`scan_cells_from_records` 把非 scanner 记录判失败 → 假 `scan incomplete` 警告、
+  `coverage.failed[Scanner]` 列 reviewer 格；深挖跑完、零 finding、收尾被 kill 的作业 resume 后误判 **Incomplete / exit 3**（应 Approve / 0）。
+  修法：两处按角色拆记录，scanner 格走 scan-only 收口，reviewer 格按自身角色进 coverage——resume 往轮成功且本轮未重挖的记
+  `reused[Reviewer]`（`DeepRun.reused_cells`），partial 记 completed / failed；partial 的「partial: done/total」只数 scanner 格。
+
+## 批 C1 dogfood 带出的账（2026-09-14，C1-5；同批 C 目标 diff `674583e...f1d3ca3`，明细在私有记录）
+
+墙钟门实证：同 diff、同配置，深挖段 48.4 min（批 C glm 串行）→ **7.1 min**（混合池、agc 门 20，总墙钟 11.2 min）/ 16.1 min（门 4）；
+分派池两成员严格交替领项，门收窄与快慢混杂下无死锁。
+
+- **真网关超载有两种表现，D13 只认其一**：12 路并发时 agc 429 × 2，棘轮把门 20 收到 7（两格排队 64 / 78 s 后重试成功，记账正确）；
+  同时 grok-4.6 两格 `truncated anthropic stream: no finish_reason`，`DEFAULT_RETRY_BUDGET` 三次尝试全断 → 失败计债。门 4 与批 C 串行零出现 → 负载所致。
+  D13 只以 429 收门，断流不收门。候选：同 provider 短窗内断流连发视同过载信号参与收门。配置侧 `providers.agc.maxConcurrency ≤ 7`（run.warnings 已提示，用户决定）。
+- **流式旁路跨瞬时重试不复位（批 D 接真 sink 前须处理）**：`timed_turn_with` 内部重试复用同一 backend，delta 回调持续喂同一个 `IncrementalFindings`——
+  断流那次的半截 JSON 与重试输出拼进同一解析器。sink 为 no-op 时无害；接真 sink 后可能发出重试前的草稿对象。修法二选一：每次尝试复位解析器，或旁路只开在首个尝试。
+- ✅ **reviewer 格 quote 锚定丢弃数不可见（C1 评审第 2 档已补：reviewer cell warn 与 scanner 同口径披露丢弃计数）**：`ReviewParseStats.dropped_quote` 算了却不进 `CellRecord`（scanner 格有「N suspicions dropped」warn，reviewer 没有）。
+  直接后果：模型去留数据分不清「零发现」与「quote 全锚不上被静默丢」。小修：`land` 里与 `stream discarded` 并列写进 cell warn。
+- **reviewer 模型去留数据**：grok-4.6 三轮 22 个成功格 **0 条** finding（C1 两轮 needs 也为 0、输出 1–6K token）；glm-5.3 24 格 26 条（cell 内）。
+  混合池无权重，零产出成员直接占掉一半预算格——这是两轮 findings 偏少、波动大的**放大因素之一，不是主因**（主因见下条「深挖选项方差」）。先补上条观测再定配置去留。
+- **深挖选项方差过大：scanner confidence 排序 + 预算截断（建议作批 C2 开工前拷问议题）**
+  - **现象**：C1 两轮同 diff、同配置，报告 findings **2（格内 3，两格同一问题经 dedup 合并）vs 8**。门宽不影响选项与分配（C1 截断在派发前一次定死、无在途入队；
+    两轮都严格按派发序交替分给 glm / grok）。两轮**共同挖到的 6 项产出完全一致**（`review_shot.rs` 规则项 glm 两轮各 1 条，其余 5 项两轮都 0）——
+    差异全在各自独有的 6 项。
+  - **直接原因 = scanner confidence 跨轮漂移**：同一 roadmap 文档的状态行 ① 打 0.63–0.74（高于代码疑点 0.40–0.45）、② 只打 0.50–0.60；预算只取 34 项里的 12 项、
+    分数挤在 0.5–0.7 → ① 10 个疑点位里 8 个是文档行（glm 那一半 4 格文档行合计 1 条），② 降到 5 个，代码项与 plan 文档挤进来（`plan.md:261` 一格 4 条）。
+    疑点总数几乎不变（42 / 41，该文档都是 27 条），变的只是打分。
+  - **confidence 的两处用法都站不住**：
+    ① **排序键**——design §6 规则 1「疑点项 = confidence × agreement × 类别权重」、规则 3「confidence 只进优先级不做门」；但预算截断下排序**就是门**。
+    决策记录 R11 引 E3「flash 级自评置信与命中无关」（命中项 0.25–0.50、均值 0.36），据此删了置信门槛、却留了排序键。
+    ② **喂 reviewer**——`region.rs` `render_notes` 把 `(confidence 0.74)` 写进评审者笔记：已知无信息量的数字当参考，有锚定风险。
+  - **只移除 confidence 稳不住**（离线模拟，两轮报告数据，按「文件:行」算重合）：scanner 疑点位置本身跨轮只重合 **39%**；现行排序选中项重合 **25%**；
+    不看 confidence 的结构化排序（同文件相邻区间合并 + 代码优先 + 按文件轮转）**13–21%**，未更稳——候选集不同，任何排序都选不出同一批。
+    结构化改善的是**分配**：27 条状态行合并成 1 个区域，10 个疑点位里文档区域 ① 8 → 1、② 5 → 0，腾出的格给了代码区域。
+  - **四层叠加与候选对策**：
+    1. scanner 候选集跨轮波动（39%）→ scanner samples ≥ 2（跨样本合并抬 agreement，配置已支持，成本约翻倍）/ 降温
+    2. confidence 排序 + 预算截断把噪声变成门 → 移出排序键与 reviewer 笔记，改用结构化信号（agreement、与 H0 热区 / 文件风险分的关系）
+    3. 相邻疑点各占一格、无文件多样性（单文档 27 / 42 条疑点，独占 scanner 格）→ 同文件相邻区间合并成一项、按文件轮转或 per-file 帽
+    4. 有效产出格太少放大方差（零产出成员占半、单格离群）→ 成员去留 + 锚定丢弃观测（见上两条）
+  - **同分 tie-break 的系统偏向**：`cmp_priority` 同分按 id 字典序，`.next/…` 恒排在 `src/…` 前 → 同分时文档行固定赢代码行
+    （② `review_shot.rs:218` 0.55 输给三个同分 roadmap 行）。design「顺序字典序无语义」实际上有偏向。
+  - **归属与验收口径**：队列优先级 / 预算规则本身，C1 明确不碰；C2 本就要重做在线预算与疑点保底预留，同一张桌子 → 建议并入 C2 开工前拷问。
+    改动的验收指标：同 diff 跑两次，量「选中区域重合度」与「findings 重合度」，不只看单轮 findings 数。
+- **并发形态下 kill / resume 用例缺口**（dogfood ② glm 对 C1 旧版 plan 的意见之一，部分成立）：C1 resume 用例为单 InFlight；并发 kill 时多项同时 InFlight、
+  部分格已落盘——restore 全部复位 Pending + 「Settled 以成功格为准」理论上覆盖，缺多 InFlight 的端到端用例。C1 评审时顺带补或留 C2。
+
+## 批 C1 收口带出的账（2026-09-14，`/code-review` 15 条修 12 条后留 C2；合回 `feat/m21-review-engine`）
+
+- **Skipped 复位后 `budget_skipped` 不回减 → 假债**（评审 #5，C2 议题）：经入队通道并入把 Skipped 项复位成 Pending 并挖掉后，
+  `meta.budget_skipped` 仍按 drain 那一刻计 → `overlay_deep` 仍判债并披露「skipped(budget) N」。与 C1 design §2.3「不回减（drain 时刻披露口径）」
+  的裁定冲突——披露口径与计债口径需拆开定。触发要经入队通道，生产 `incoming = None`，**C2 接上流式入队即真**。
+- **外部持门者放门时主循环不被唤醒**（评审 #6，C2 议题）：主循环只在「在途格完成 / 通道到达」时重试 `try_lease`；门位被深挖以外的持有者释放
+  （C2 起 scanner 与深挖同门）时派发要等下一个在途深挖格完成才补位。探针：门 2、外部先占 1、4 项 × 100 ms → 300 ms（及时补位约 210 ms）。
+  C1 的兜底阻塞 lease 只管「在途为空」的情形。C2 做「等待者感知的门让位」时一并设计唤醒源。
+- **单 task 并发内的同步 IO 让所有在途格停摆**（评审 #11，C2 议题）：`FuturesUnordered` 同 task 并发，而填门循环里 `region::build`
+  每项同步起一次 `git ls-files`（读守卫）并读文件、二阶段 `need_section` 每条 need 同样——阻塞期间其余在途格的流读取与计时器一起停。
+  门宽 20 一次填 20 项即 20 次同步子进程；C2 scanner 与深挖重叠后更频繁。候选：`spawn_blocking`，或按 bundle 预取一次 tracked 文件集。
+- **与批 D 的接线现状**：C1 未改 `run_deep` 的 `sink` 参数类型（仍 `&dyn FindingSink`，生产传 `&()`）；D 接真 sink 时注意
+  `FindingEvent.suspicion_agreement` 是派发快照（`event ≤ landed`，偏差只会多复核），以及旁路跨瞬时重试不复位（上节）须先修。

@@ -944,9 +944,22 @@ pub fn thinking_warning(em: &crate::config::EffectiveModel) -> Option<String> {
         return None;
     }
     Some(format!(
-        "thinkingLevel {} 对 {}（kind {:?}，family {}）无参数映射，未发送；已知映射：anthropic+claude / openai+deepseek·glm·kimi·gpt-5·o 系·gemini·qwen",
-        level.as_str(), em.name, em.kind, em.family
+        "thinkingLevel {} 对 {} {}（kind {:?}，family {}）无参数映射，未发送；已知映射：anthropic+claude / openai+deepseek·glm·kimi·gpt-5·o 系·gemini·qwen",
+        level.as_str(), em.role.as_str(), em.name, em.kind, em.family
     ))
+}
+
+/// 建注册表时的 thinkingLevel 无映射 warnings（scanner → reviewer 序，同文案去重）。兼任 scanner 的 reviewer 在注册表里复用
+/// scanner 条目、不另建 backend，但两角色的 thinkingLevel 可以不同——深挖的 per-cell backend 按 reviewer 自己的条目构造，
+/// 它的无映射档位同样要披露（批 C1-3；此前随 `has_scan` 的跳过一并漏掉）。verifier 待批 D 接线时并入。
+pub fn role_thinking_warnings(roles: &crate::config::RoleSets) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in roles.scanners.iter().chain(&roles.reviewers).filter_map(thinking_warning) {
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
 }
 
 /// 家族串（`EffectiveModel.family`：配置 `family` 或 model id 首段小写，如 `qwen3` / `glm` / `deepseek` / `gpt`）+ model id → 映射表键。
@@ -1721,6 +1734,21 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         assert!(w.contains("thinkingLevel low") && w.contains("grok"), "{w}");
         em.thinking_level = None;
         assert!(thinking_warning(&em).is_none(), "未配档位不告警");
+    }
+
+    /// 兼任 scanner 的 reviewer（C1-3）：注册表复用 scanner 条目，但 reviewer 自己的无映射档位照样披露、带角色名；同文案去重。
+    #[test]
+    fn role_thinking_warnings_cover_dual_role_reviewer() {
+        let cfg = crate::config::Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{
+            "grok-4":{"roles":{"scanner":{"thinkingLevel":"high"},"reviewer":{"thinkingLevel":"low"}}},
+            "deepseek-v4":{"roles":{"scanner":{"thinkingLevel":"low"}}}}}}}"#).unwrap();
+        let ws = role_thinking_warnings(&cfg.active_roles());
+        assert_eq!(ws.len(), 2, "{ws:?}");
+        assert!(ws[0].contains("thinkingLevel high 对 scanner p/grok-4"), "{ws:?}");
+        assert!(ws[1].contains("thinkingLevel low 对 reviewer p/grok-4"), "兼任的 reviewer 档位不再漏报: {ws:?}");
+        let mut roles = cfg.active_roles();
+        roles.reviewers = roles.scanners.clone();
+        assert_eq!(role_thinking_warnings(&roles).len(), 1, "同文案去重");
     }
 
     /// 批 F-2：openai 响应的 reasoning_tokens 进 AssistantTurn（非流式 + 流式）；anthropic 恒 None。

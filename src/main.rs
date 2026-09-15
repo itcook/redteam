@@ -28,10 +28,12 @@ struct Cli {
 enum Cmd {
     /// 发起对抗式评审：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目（× samples）并行扇出
     /// → 疑点并集（agreement = 家族数）→ **深挖**（风险 H0 区与 scanner 疑点进同一条优先级队列，reviewer 按
-    /// provider 门空位消费，预算随风险分、必挖集不截）→ dedup → finding 报告与 verdict。**finding 只由深挖产出**；
+    /// provider 门空位消费，预算随风险分、必挖集不截；配多个 reviewer 条目时按空闲轮转分摊、每项只交一个条目，
+    /// 鉴权失败的条目移出、它已失败的格不改派）→ dedup → finding 报告与 verdict。**finding 只由深挖产出**；
     /// 没配 reviewer 角色则退化为 scan-only（疑点索引 + 覆盖自报，不产 finding）。
     /// 退出码：0=干净 approve 或 scan-only 完成、1=命令自身失败（参数/IO/配置错误）、2=approve 但带债
-    /// （reviewer cell 失败或预算截断，见 run.warnings 与 run.deep.budget_skipped）、
+    /// （reviewer cell 失败——含二阶段补查轮失败、首轮 finding 保留；预算截断；reviewer 条目全部出局致队列项未挖。
+    /// 见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
     /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口）、10=reject（finding 达到 --block-threshold）。
     /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
     /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
@@ -477,6 +479,10 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
         return Err(redteam::cli::NO_SCANNER_MSG.to_string());
     }
     let mut registry = ProviderRegistry::new();
+    // thinkingLevel 无映射 warnings 按角色条目统一给——兼任 scanner 的 reviewer 下面会被跳过注册，它的档位不能跟着漏报。
+    for w in redteam::provider::backends::role_thinking_warnings(&roles) {
+        registry.push_warning(w);
+    }
     for em in &roles.scanners {
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
         let backend = match backend_from_config(em, key) {
@@ -485,9 +491,6 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
                 return Err(format!("{e}"));
             }
         };
-        if let Some(w) = redteam::provider::backends::thinking_warning(em) {
-            registry.push_warning(w);
-        }
         // 单轮超时（design §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`。
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
         // usize → u32 饱和而非截断（评审修：误填 2^32 以上的值不会被截成 0 / 小数）。
@@ -503,9 +506,6 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
             Ok(b) => b,
             Err(e) => return Err(format!("{e}")),
         };
-        if let Some(w) = redteam::provider::backends::thinking_warning(em) {
-            registry.push_warning(w);
-        }
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
         let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
         registry.insert_scan(em.name.clone(), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);

@@ -1,9 +1,9 @@
-# M21b 风险路由与深挖队列 · 实施计划（五批 + 出口）
+# M21b 风险路由与深挖队列 · 实施计划（六批 + 出口）
 
-> 状态: 锁定（2026-09-10 派生自 design v10〔D13〕；同日修订：删 aacr 接线批——D7 B4 暂退役、随 M21c smoke 重启点一并做；切点与回放口径对齐 D11；**2026-09-12 增批 C1**——批 C 落的是串行单派发器 + 单 reviewer，design §6 规则 5 的门驱动并发与分派池轮转另批补）· 上位 `../roadmap/M21b-risk-deep-queue.md`（范围与验收）· design
+> 状态: 锁定（2026-09-10 派生自 design v10〔D13〕；同日修订：删 aacr 接线批——D7 B4 暂退役、随 M21c smoke 重启点一并做；切点与回放口径对齐 D11；**2026-09-12 增批 C1**——批 C 落的是串行单派发器 + 单 reviewer，design §6 规则 5 的门驱动并发与分派池轮转另批补；**2026-09-13 增批 C2**——C1 拷问定案 scanner 与深挖时间重叠另批做）· 上位 `../roadmap/M21b-risk-deep-queue.md`（范围与验收）· design
 > `../design/2026-09-04-redteam-review-engine-architecture-design.md` §2 / §3.3 / §6 / §7 / §8.1 / §10.6-10.7 / §12.3 / §13 ·
 > 决策 D1 勘误, D2, D6, D7, D10, D11, D13 · P0 规则定案 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md` §15.4-15.7
-> **执行形态**：每批一个 Trellis 任务（`m21b-risk` / `m21b-review-primitives` / `m21b-deep` / `m21b-deep-concurrency` / `m21b-verifier`，**仅需 prd，design / implement 开工时 grill 或脑暴产出**）+
+> **执行形态**：每批一个 Trellis 任务（`m21b-risk` / `m21b-review-primitives` / `m21b-deep` / `m21b-deep-concurrency` / `m21b-deep-streaming` / `m21b-verifier`，**仅需 prd，design / implement 开工时 grill 或脑暴产出**）+
 > 一个子分支 `feat/m21b-<批>`（自 `feat/m21-review-engine` 切出，独立工作树）；批内小步提交；批收口用 dev `redteam` 跑 ship 评审，
 > 修完 `--no-ff` 合回 `feat/m21-review-engine`。出口验收在本工作树单 session。
 
@@ -44,7 +44,8 @@
 | 1 | **A 风险评分器**（`feat/m21b-risk`）· **B reviewer 静态零件**（`feat/m21b-review-primitives`） | 无，两批并行 | A 与 B 无文件交集（A: `src/risk/`+`src/cli/mod.rs` 接线段；B: `src/pack/`+`src/prompt/`+`src/provider/parse.rs`+`tool_loop.rs`） |
 | 2 | **C 深挖队列与 reviewer 运行时**（`feat/m21b-deep`） | A、B 合回 | 独占 `src/orchestrate/`、`src/cli/mod.rs` 主流程、`src/state/` |
 | 3 | **C1 并发派发与 reviewer 轮转**（`feat/m21b-deep-concurrency`）· **D verifier 流式段**（`feat/m21b-verifier`） | 均为 C 合回；两批可并行 | C1 独占 `src/orchestrate/{deep,queue}.rs` + `src/cli/mod.rs` 深挖接线段；D 独占 `src/consolidate/verify.rs`、verifier.md。**唯一碰撞点** = `run_deep` 的 sink 接线（D 要把 `&()` 换成真 mpsc sink，C1 要改派发循环）——先合回者在 followup 记下接口现状，后合者对齐 |
-| 4 | 出口验收（本工作树，单 session） | A-D + C1 全合回 | — |
+| 4 | **C2 scanner 与深挖时间重叠**（`feat/m21b-deep-streaming`） | C1 合回 | 独占 `src/orchestrate/mod.rs` scanner 扇出接线 + `deep.rs` 在线预算 + `registry.rs` 门让位；与 D 的碰撞点仍是 `run_deep` 的 sink |
+| 5 | 出口验收（本工作树，单 session） | A-D + C1 + C2 全合回 | — |
 
 （aacr 接线不在本里程碑：D7 B4 暂退役、重启节点待定，`reviewers/redteam.py` 随 M21c smoke 重启点一并做〔M21c 交付 7〕。）
 
@@ -256,67 +257,73 @@ reviewer cell 的全部静态零件：区域 pack、模板、parse、SSE 流式�
 
 ## 批 C1 · 门驱动并发派发与多 reviewer 轮转（`feat/m21b-deep-concurrency`，Trellis `m21b-deep-concurrency`；前提 C 已合回）
 
-批 C 落成的是**串行**单派发器：`while pending > 0 { dispatch_one().await; run_review_shot_with().await; }`，
-且只取 `reviewers.first()`。design §6 规则 5 要的是「provider 有空位时才弹出最高优先项交它」+「活跃 reviewer
-条目构成分派池，按空闲轮转」——两者都未兑现。本批只补这两件事，不动队列语义、pack、prompt、观测字段。
+批 C 落成的是**串行**单派发器且只取 `reviewers.first()`；design §6 规则 5 的「provider 有空位时才弹出最高优先项交它」+
+「活跃 reviewer 条目构成分派池，按空闲轮转」都未兑现。本批补派发形态，并修两处批 C 遗留：resume 覆盖 cell 丢 finding、
+二阶段补查四处静默。**scanner 与深挖的时间重叠不在本批 → 批 C2**；本批为它预留真实入队通道。
+**收益口径**：多 reviewer「买吞吐与分散限流，不双审」，不产生交叉验证价值；验收是**墙钟**不是质量。两个 reviewer 同在
+`agc` 共享门宽 20 时，收益几乎全来自并发（批 C dogfood 推算：grok 18.3 → ≈ 8.0 min、glm 50.7 → ≈ 10.7 min）。
+**定案**：2026-09-13 两轮裁定 + `/grilling` Q1–Q10，全文见 Trellis 任务 `design.md` §9。
 
-**为什么单独成批**：并发会把 followup「批 C 核查留债」里两条「当前不可触发」的队列缺陷变成真缺陷
-（在途入队改写 `it.id` → `mark_settled` 找不到项 → 卡 InFlight → barrier 永不满足），必须先解耦身份再并发，
-放进批 C 收口会把已绿的批次重新拖长。
-**收益口径**：多 reviewer 在 design 里是「买吞吐与分散限流，**不双审**」——不产生交叉验证价值，
-`Finding.agreement` 不因此升高（见 followup「两根 agreement 轴」）。本批的验收是**墙钟**，不是质量。
+### Task C1-1 身份与 resume 完整性（前置）
+- `queue.rs`：id 在 `new` 时定死、`merge_into` 不重算（并发即真的 followup 留债①）；**共识只经谓词**——`find_merge_idx` 仍按
+  `same_item ∨ id 相等` 合并（一个区间只挖一次），但只有 `same_item` 成立才并入家族、抬 agreement（上游已按 `same_suspicion`
+  组内闭包，进队列的 id 捷径合并全是「不同疑点、行区间逐字相同」，计共识会让批 D 免复核错放）；Skipped 并入仅成必挖才复位，
+  否则 `MergedSkipped`（留债②）。
+- reviewer cell_id = `review[{item.id}]@{model}`（批 C 的 `review[{n}]` 每次从 1 起、`cell_put` upsert → resume 覆盖首跑格，
+  二次 resume 永久丢 finding）；resume 补齐批 C C-5 未落地的「Settled 以 cells 为准」。
+- Commit: `fix(queue,resume): 队列项与 cell 身份定死——…（批 C1 前置，修批 C resume 覆盖丢 finding）`
 
-### Task C1-1 队列项身份与 spec 解耦（前置：解 followup 两条留债）
-- Modify: `src/orchestrate/queue.rs`（`QueueItem.id` 在 `new` 时定死、`merge_into` 不再重算——现行实现
-  union ranges 后重算 id，而 InFlight 项已按旧 id 克隆派发；串行下入队全在消费循环前所以不可触发，并发即真）。
-  id 取首次 spec 的 `origin:file:起始区间`，或单调序号 + origin/file 前缀；`spec.ranges` 可变不改 id。
-- Modify: 同文件 `merge_into` 命中 `Skipped` 项的返回（现返回 `MergedPending` 却不改回 Pending；并发下
-  drain 之后仍可能入队）：要么改回 Pending，要么新增 `MergedSkipped` 让调用方裁，二选一并在 design 注一笔。
-- 测试：在途并入后 `mark_settled` 仍命中；id 对 ranges 变化稳定；旧快照（含已入库 id 形态）`restore` 兼容。
-- Commit: `fix(queue): 队列项身份与 spec 解耦——id 定死不随 ranges 重算（并发前置，followup 留债）`
+### Task C1-2 并发派发循环与二阶段契约
+- `registry.rs` 加 `try_enter` / `try_lease`（非阻塞、尊重 429 有效 cap）；`deep.rs` 主循环 `FuturesUnordered` + `select!`
+  （完成 / 入队通道到达）；barrier = 在途 0 ∧ Pending 0 ∧ 通道关闭。`DeepInput.incoming` 生产传 `None`，C1 里到达项不过预算。
+- `run_cell` future = 首轮 + 二阶段，**一格全程持同一门位**（批 C 的释放重排在并发下会被非阻塞填位饿死）。
+- 二阶段契约：triggered 只计真发出；全被读守卫拒 → skipped 不计债；第二轮失败 / 建 pack 内部错误 → **保留首轮 finding + warning + 计债**；
+  第二轮 token 入账、policy 两轮后统一回读。
+- 持久化在完成时做；**报告按派发序组装**（dedup base 不随网络快慢漂移），meta 四数组按派发序严格对齐。
+- 事件侧疑点共识滞后接受：派发快照 ≤ 落地值（单调），批 D 读较小值只会多复核。
+- Commit: `feat(orchestrate): 门驱动并发派发——…（design §6 规则 5〔D13〕）`
 
-### Task C1-2 并发派发循环
-- Modify: `src/orchestrate/deep.rs`（`run_deep` 主循环改并发）。**两条路径，先试第一条**：
-  - **A（建议）`FuturesUnordered` 同 task 内并发**：派发仍在主循环做（拿 lease → `pop_dispatch` → 组 future 入池），
-    future 内部**不碰队列**，完成后回主循环处理结果并更新队列。队列保持 `&mut` 独占，`snapshot` / `on_cell` /
-    `sink` 的借用形态**全部不用改**；cell 是纯 IO 等待，协作式并发足够。
-    填门位与收结果用 `tokio::select!`（一边 `registry.lease(...)`、一边 `running.next()`），
-    或给 registry 加 `try_lease()`（`Semaphore::try_acquire`）做非阻塞试探。
-  - **B（回退）`JoinSet` spawn**：需要 `'static`，`ScanLease<'a>` 借用 registry → registry 要 `Arc` 化，
-    `snapshot` / `on_cell` 改 `Arc<dyn Fn + Send + Sync>`，改动面大一圈。仅当 A 被证明不够时才走。
-- barrier 保持 design §2 语义：Pending 空 ∧ InFlight 0（此后 InFlight 真会 > 1）∧ 复核在途 0（批 D 前恒真）。
-- 死锁退路：整体超时 + `drain`（现有 `drain` 可复用）；队列锁（若引入）**绝不跨 await**。
-- **事件侧疑点共识滞后**（批 C dogfood 修 [2] 时留的口子）：`EmitCtx` 跑在 await 里读不到队列，
-  `FindingEvent.suspicion_agreement` 是派发时快照；落盘 finding 由主循环按落地活值回填。串行下两值恒等，
-  **并发后在途并入会让落地值更高、事件值滞后**——而批 D 的跳过规则按事件流判。本 Task 须二选一：
-  事件推迟到回主循环后发射（牺牲一点流式时效），或给 `EmitCtx` 一个可读活值的句柄（`Arc<AtomicU32>` 按项共享）。
-- 测试：门宽 N 时在途上限 = N；乱序完成不错配 cell_id 与 item；慢 consumer 不堵住其余；
-  **派发 ≠ 落地分叉用例**（在途期间并入异族 → 落盘 `suspicion_agreement` = 落地值、`landed_agreement` 同值）；
-  429 注入（现 D13 收门语义）下门宽收窄后仍收敛；无死锁（压测带超时）。
-- Commit: `feat(orchestrate): 门驱动并发派发——在途上限随 provider 门、乱序完成不错配（design §6 规则 5）`
+### Task C1-3 分派池轮转与成员健康
+- 纯空闲游标轮转（无权重，design「无 priority」）；首次 `Auth` 即移出池、不改派（非候补，D7 A3）；池空停派、剩余 Pending + 计债；
+  `RunMeta.models` 含实际参与者、0 格成员 warning；兼任 scanner 的 reviewer 补发 thinking 无映射 warning。
+- Commit: `feat(orchestrate): reviewer 分派池空闲轮转与成员健康——…（design §6 规则 5、D7 A3）`
 
-### Task C1-3 多 reviewer 分派池轮转
-- Modify: `src/orchestrate/deep.rs`（`reviewers` 全集入池，按空闲轮转——谁先拿到门位谁消费下一项；
-  每项仍只由一个模型消费，**不双审**）。`cell_id` 现为 `review[{n}]@{name}`，并发下 `n` 需保证唯一
-  （原子序号或派发序）。
-- Modify: `src/cli/mod.rs`（`coverage.selected[Reviewer]` 与 `RunMeta.models` 含全部参与条目，不止 first）。
-- 测试：两条目 Fake、门宽各 1 → 两格并行且分别落到不同模型；一条目 provider 满 → 另一条目继续吃单；
-  单条目配置行为与批 C 逐字节同构（退化路径零差）。
-- Commit: `feat(orchestrate): reviewer 分派池按空闲轮转——多条目买吞吐与分散限流（design §6 规则 5）`
-
-### Task C1-4 墙钟验证与观测
-- 观测沿用 C-6 字段（在途峰值走 `gate_stats`，不新增 `DeepMeta` 字段）；确认 `item_wait_ms`（派发时定格）
-  在并发下仍是队列等待而非墙钟。
-- 墙钟门：Fake 构造 K 格 × 固定时延，门宽和 = W → 总时长 ≈ `ceil(K / W) × 单格时延`（放宽容差）；
-  与批 C 串行基线对比记录进 `.next/private/m21b/`。
-- 测试：上述墙钟门 + `RunMeta` 观测字段在并发下不串值。
-- Commit: `test(deep): 并发墙钟门与观测不串值——对照批 C 串行基线`
+### Task C1-4 墙钟门与退化零差
+- 虚拟时间（dev-dep tokio `test-util`）墙钟门 K / W；单 reviewer + 门宽 1 与批 C 同构。
+- Commit: `test(deep): 并发墙钟门（虚拟时间）与单成员退化零差`
 
 ### Task C1-5 收口
-- 本仓 dogfood：`redteam-next review --base <recent>` 多 reviewer 档真 provider 跑通，记墙钟。
-- `cargo test` / `clippy --all-targets` 零新增 / `make verify`；ship 评审或三路 code-review → 修 → `--no-ff` 合回。
+- dogfood 两轮（base `674583e`）：当前配置（墙钟对照 + 每模型每格产出）+ `agc.maxConcurrency = 4` 争门轮（备份恢复）。
+- 四绿；三路 code-review 或 dogfood 自评审 → 修 → `--no-ff` 合回。
 
 ---
+
+## 批 C2 · scanner 与深挖时间重叠（`feat/m21b-deep-streaming`，Trellis `m21b-deep-streaming`；前提 C1 已合回）
+
+design §2 墙钟公式是 `max(最慢 scanner cell, 队列排空) + 最后一条复核`、H0 从阶段 0 直接进队列；§7「H0 项…覆盖它的 scanner 组尚未完成」；
+§6 规则 5「scan 来源项不等同组其他家族 cell 返回」。批 C / C1 仍是 **scan 全完 → 深挖**（墙钟 = 和，不是 max）。
+C1 已留好 `DeepInput.incoming` 入队通道与「通道关闭」barrier，本批把 scanner 扇出接上，并处理重叠带来的**语义**变化
+（不只是派发形态，故单独成批）。**开工前须 grill**：在线预算的保底释放与 scanner 失败口径未定。
+**收益口径**：批 C dogfood 推算 glm 轮 C1 ≈ 10.7 min → C2 ≈ 8.5 min（最长两格 ~505 s 恰为 H0，t=0 开挖），落入 §13 高风险 7–10 min；
+grok 轮无收益（尾巴是最长 scan 格 340 s）。
+
+### Task C2-1 流式入队接线
+- H0 在 t=0 入队并可立即派发；`run_scan_fanout` 每个 scan cell 完成即把其疑点经通道入队（入口五态 + `same_item` 共识，C1 定案）；
+  scanner 全完 = 通道关闭。scan 报告的疑点并集仍按组 `merge_suspicions` 生成（报告口径不变）。
+
+### Task C2-2 在线预算
+- 批 C 的「入队完一次性 drain」在项持续到达时做不到 → 派发计数对预算；必挖不截；疑点保底 ⌈maxCells/4⌉ **为后到疑点预留**
+  （H0 不得吃掉预留格）；预算耗尽后到达的非必挖项 → `skipped(budget)`。待裁：scanner 全完时未用满的保底如何释放。
+
+### Task C2-3 门公平（scanner 先入门）
+- 共享 provider 时 scanner 阻塞 `enter()` 与 reviewer 主循环非阻塞 `try_enter()` 同门，后者不感知等待者会插队，违反 design §444
+  「scanner 格先于 H0 项入门」。`InflightGate` 记等待者数，`try_enter` 在有等待者时让位。
+
+### Task C2-4 scanner 失败口径
+- 现为 scanner cell 失败 → Incomplete / exit 3、不进深挖。重叠后 reviewer 可能已产出 finding：报告保留与否、退出码如何定（待裁）。
+
+### Task C2-5 墙钟与收口
+- dogfood 同 base `674583e` 对照 C1；RunMeta 墙钟分段可读（scan 段 / 队列排空 / 复核尾部）；三路评审 → `--no-ff` 合回。
 
 ## 批 D · verifier 流式段（`feat/m21b-verifier`，Trellis `m21b-verifier`；前提 C 已合回）
 
