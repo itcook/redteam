@@ -497,7 +497,9 @@ fn overlay_deep(
     report.verdict = verdict;
     let debt = failed || skipped > 0;
     if debt && matches!(verdict, Verdict::Approve) {
-        report.run.warnings.push("reviewer debt: failed cell or budget skip — approve with exit 2".into());
+        report.run.warnings.push(
+            "reviewer debt: failed reviewer cell, undispatched queue items, or budget skip — approve with exit 2".into(),
+        );
     }
     (report, exit_code(verdict, debt))
 }
@@ -1208,11 +1210,6 @@ pub async fn run_resume(
                     eprintln!("warn: job {job_id} resume queue snapshot 失败: {e}");
                 }
             }
-            if reopened > 0 {
-                report.run.warnings.push(format!(
-                    "resume deep: {reopened} settled item(s) have no successful reviewer cell — re-digging"
-                ));
-            }
             let branch_scope = args.scope == "branch";
             // 已落盘 reviewer 格里的 finding——深挖的权威成果，无论后面走哪条路都不能丢。
             let prior_findings: Vec<crate::domain::Finding> = deep_records
@@ -1246,6 +1243,12 @@ pub async fn run_resume(
             report.run.warnings.extend(spec_warnings);
             let CellPlan { bundles, .. } =
                 plan_cells(selected, cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
+            // 「re-digging」只在真会重挖时披露（评审第 2 档 #7）：变更集为空时 run_deep 早退、另报「无法重跑」并计债。
+            if reopened > 0 && !bundles.is_empty() {
+                report.run.warnings.push(format!(
+                    "resume deep: {reopened} settled item(s) have no successful reviewer cell — re-digging"
+                ));
+            }
             let target_label = if branch_scope {
                 format!("branch {}...HEAD", args.base.as_deref().unwrap_or("?"))
             } else {
@@ -2413,6 +2416,35 @@ mod resume_tests {
         }
     }
 
+    /// 「re-digging」只在真会重挖时披露（评审第 2 档 #7）：diff 重建不了（变更集为空 / 不在 git 仓）时重开的项跑不了，
+    /// 旧实现照样先推「re-digging」，与同一份报告里的「无法重跑」自相矛盾。
+    #[tokio::test]
+    async fn resume_does_not_claim_re_digging_when_diff_cannot_be_rebuilt() {
+        use crate::orchestrate::queue::ItemState;
+        for committed in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = dir.path();
+            std::fs::write(ws.join("x.rs"), "fn x() {\n    x_marker();\n}\n").unwrap();
+            if committed {
+                git(ws, &["init", "-q"]);
+                git(ws, &["add", "."]);
+                git(ws, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+            }
+            let store = crate::state::JobStore::open(ws).unwrap();
+            scan_done_job(&store);
+            store.put_queue_item("j", &rule_item("x.rs", ItemState::Settled)).unwrap();
+            store.append_partial("j", &CellRecord::failed("review[x.rs:rule:1-2]@p/r", "p/r", Role::Reviewer, "boom")).unwrap();
+            let (reg, rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+            let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+            let shape = if committed { "变更集为空" } else { "diff 重建报错" };
+            assert_eq!(rev.turn_count(), 0, "{shape}: 跑不了");
+            assert_eq!(code, 2, "{shape}: 未完项计债: {:?}", report.run.warnings);
+            assert!(!report.run.warnings.iter().any(|w| w.contains("re-digging")), "{shape}: {:?}", report.run.warnings);
+        }
+    }
+
     /// resume 收口只把 scanner 格喂 scan-only 收口：批 C 把 cells 表全量喂进去，首跑落盘的 reviewer 格被当成
     /// 「失败的 scanner 格」→ 假 `scan incomplete` + Incomplete / exit 3。深挖跑完、零 finding、收尾时被 kill 的作业
     /// resume 后应是 Approve / 0，首跑的 reviewer 格记 `coverage.reused[Reviewer]`（与 scanner 沿用对称）。
@@ -2474,6 +2506,10 @@ mod resume_tests {
         let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
 
         assert_eq!(rev.turn_count(), 2, "x.rs（无格）与 y.rs（只有失败格）重挖，z.rs 不动");
+        assert!(
+            report.run.warnings.iter().any(|w| w == "resume deep: 2 settled item(s) have no successful reviewer cell — re-digging"),
+            "真重挖时照常披露: {:?}", report.run.warnings
+        );
         let cov = &report.run.coverage;
         let names = |m: &BTreeMap<Role, Vec<String>>| m.get(&Role::Reviewer).cloned().unwrap_or_default();
         assert_eq!(names(&cov.completed), vec!["review[x.rs:rule:1-2]@p/r", "review[y.rs:rule:1-2]@p/r"], "warnings={:?}", report.run.warnings);

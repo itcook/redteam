@@ -194,7 +194,12 @@ agreement 单调不减 → **`event ≤ landed`**。批 D「≥ 2 免复核」�
 
 债经 `DeepRun` 的债标志进 `overlay_deep`（与 reviewer cell 失败同路：Approve + exit 2）。
 **评审修（2026-09-14）**：二阶段失败的格落成 `ok = false`、`output` 仍携带首轮 finding、warn 写失败原因——进 `coverage.failed`，
-resume 按「Settled 以成功格为准」重挖。原实现落成 ok 形态，债只活在本次调用的 `reviewer_failed` 里，resume 报告会把它抹成干净通过。首轮声明 needs = 模型自认判断不完整，静默沿用首轮会成单区域假绿灯。
+resume 按「Settled 以成功格为准」重挖。原实现落成 ok 形态，债只活在本次调用的 `reviewer_failed` 里，resume 报告会把它抹成干净通过。
+第二轮发出后失败：`iterations` 记下限 +1（失败轮内是否走过 REPAIR 不可观测），`attempts` 随之计入。二阶段成功：cell 的解析 / 锚定丢弃计数取终判轮
+（首轮草稿被丢的不算这一格的产出丢失），旁路丢弃两轮累加。
+
+**reviewer cell warn（评审第 2 档）**：与 scanner 格同口径披露丢弃——二阶段失败原因、`parse dropped`、`needs dropped / truncated`、
+`N findings dropped: quote not anchored`、`stream discarded N`。原实现只写旁路丢弃，「模型零发现」与「finding 全被锚定门静默丢掉」在报告里分不出来。首轮声明 needs = 模型自认判断不完整，静默沿用首轮会成单区域假绿灯。
 
 ## 6. 兼任角色 warning
 

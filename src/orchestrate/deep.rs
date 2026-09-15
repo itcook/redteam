@@ -24,6 +24,7 @@ use crate::orchestrate::review_shot::{run_review_shot_with, EmitCtx, FindingSink
 use crate::pack::region::{self as region, Origin as QueueOrigin, QueueItemSpec};
 use crate::pack::PackOpts;
 use crate::prompt::{build_review_prompt, review_template_hash, ReviewPromptInput, ScanPrompt};
+use crate::provider::parse::ReviewParseStats;
 use crate::provider::registry::{GateAttempts, ProviderRegistry, ScanLease};
 use crate::provider::ProviderError;
 use crate::provider::stream_json::IncrementalFindings;
@@ -462,7 +463,8 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                                     c.output_tokens += c2.output_tokens;
                                     c.cached_input_tokens += c2.cached_input_tokens;
                                     c.iterations += c2.iterations;
-                                    c.stats.stream_discarded += c2.stats.stream_discarded;
+                                    // 解析 / 锚定丢弃计数取终判那一轮（首轮草稿被丢的不算这一格的产出丢失）；旁路丢弃两轮都真实发生，累加。
+                                    c.stats = ReviewParseStats { stream_discarded: c.stats.stream_discarded + c2.stats.stream_discarded, ..c2.stats };
                                     c.output = c2.output; // 第二轮 = CONFIRM/REVISE 后终判
                                     Stage2::Sent
                                 }
@@ -474,6 +476,8 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                                     c.input_tokens += bi;
                                     c.output_tokens += bo;
                                     c.cached_input_tokens += bc;
+                                    // 第二轮确实发出过：轮次记下限 1（失败轮内是否走过 REPAIR 不可观测），attempts 随之计入。
+                                    c.iterations += 1;
                                     warnings.push(format!("{cell_id}: second-stage round failed: {e} — keeping first-round findings (debt)"));
                                     stage2_error = Some(format!("second-stage round failed: {e}"));
                                     Stage2::Failed
@@ -506,6 +510,31 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
         auth_failed,
         warnings,
     }
+}
+
+/// reviewer cell warn 片段（与 scanner 格 `scan_cell_notes` 同口径，不静默）：二阶段失败原因、parse 层丢弃、needs 丢弃 / 截断、
+/// quote 锚定丢弃、旁路丢弃。丢弃计数不落盘时，「模型零发现」与「finding 全被静默丢掉」在报告里分不出来。
+fn review_cell_notes(st: &ReviewParseStats, stage2_error: Option<&str>) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(reason) = stage2_error {
+        notes.push(format!("{reason} — first-round findings kept"));
+    }
+    if st.dropped_no_quote + st.dropped_bad_path + st.dropped_malformed > 0 {
+        notes.push(format!(
+            "parse dropped: no_quote={} bad_path={} malformed={}",
+            st.dropped_no_quote, st.dropped_bad_path, st.dropped_malformed
+        ));
+    }
+    if st.needs_dropped + st.needs_truncated > 0 {
+        notes.push(format!("needs dropped={} truncated={}", st.needs_dropped, st.needs_truncated));
+    }
+    if st.dropped_quote > 0 {
+        notes.push(format!("{} findings dropped: quote not anchored", st.dropped_quote));
+    }
+    if st.stream_discarded > 0 {
+        notes.push(format!("stream discarded {}", st.stream_discarded));
+    }
+    notes
 }
 
 /// 鉴权失败（401 / 403）：穿透 `WithUsage` 包装看内层——多轮中途失败的错误带着已烧 usage。
@@ -556,6 +585,7 @@ fn land(
                 f.suspicion_agreement = landed;
             }
             let discarded = c.stats.stream_discarded;
+            let notes = review_cell_notes(&c.stats, stage2_error.as_deref());
             let mut rec = CellRecord::ok(&cell_id, &rev.name, c.output).with_family(&rev.family);
             rec.duration_ms = duration_ms;
             rec.input_tokens = c.input_tokens;
@@ -566,19 +596,11 @@ fn land(
             rec.attempts = c.iterations + rl_retries;
             rec.queue_wait_ms = rl_wait_ms;
             rec.template_hash = Some(review_template_hash());
-            if discarded > 0 {
-                rec.warn = Some(format!("stream discarded {discarded}"));
-            }
-            if let Some(reason) = stage2_error {
-                // 二阶段失败（评审修 #2）：首轮 finding 留在格里（报告与 resume 的 prior findings 都从这里取），但格按失败落盘——
-                // 进 coverage.failed、resume 按「Settled 以成功格为准」重挖。落成 ok 形态的话，债只活在本次调用的
-                // reviewer_failed 里，resume 报告会把它抹成干净通过。
-                rec.ok = false;
-                rec.warn = Some(match rec.warn.take() {
-                    Some(w) => format!("{reason} — first-round findings kept; {w}"),
-                    None => format!("{reason} — first-round findings kept"),
-                });
-            }
+            // 二阶段失败（评审修 #2）：首轮 finding 留在格里（报告与 resume 的 prior findings 都从这里取），但格按失败落盘——
+            // 进 coverage.failed、resume 按「Settled 以成功格为准」重挖。落成 ok 形态的话，债只活在本次调用的
+            // reviewer_failed 里，resume 报告会把它抹成干净通过。
+            rec.ok = stage2_error.is_none();
+            rec.warn = (!notes.is_empty()).then(|| notes.join("; "));
             (rec, discarded)
         }
         Err(e) => {
@@ -1461,6 +1483,8 @@ mod tests {
         assert!(!run.cells[0].ok, "二阶段失败的格不能以 ok 形态落盘");
         assert_eq!(run.cells[0].output.findings().len(), 1, "失败格仍携带首轮 finding（resume 的 prior findings 载体）");
         assert!(run.cells[0].warn.as_deref().unwrap_or("").contains("second-stage round failed"), "{:?}", run.cells[0].warn);
+        // 第二轮确实发出过（token 已入账）→ 轮次与尝试数也要算上它（评审修 #8）
+        assert_eq!((run.cells[0].iterations, run.cells[0].attempts), (2, 2), "首轮 1 + 第二轮 1");
     }
 
     /// 429 注入：门收窄后照样全部完成、无死锁（虚拟时间下死锁会撞 timeout 而不是挂住）。
@@ -1691,22 +1715,23 @@ mod tests {
         assert_eq!((pa.starts().len(), qb.starts().len()), (6, 6), "两门各吃一半");
     }
 
-    /// `item_wait_ms` 在并发下仍是**队列等待**（派发时刻 − 入队），不是墙钟（完成时刻 − 入队）：门宽 2、4 格 × 100 ms →
-    /// 先派出的两格 ≈ 0、排在一轮之后的两格 ≈ 100 ms；若按完成时刻采样，前两格也会 ≥ 100 ms。
-    /// 真实时间：入队时刻取系统时钟（快照要落 epoch ms），虚拟时间推不动它。
+    /// `item_wait_ms` 在并发下仍是**队列等待**（派发时刻 − 入队），不是墙钟（完成时刻 − 入队）：门宽 2、4 格 × 300 ms →
+    /// 先派出的两格 ≈ 0、排在一轮之后的两格 ≈ 300 ms；若按完成时刻采样，前两格也会 ≥ 300 ms。
+    /// 真实时间：入队时刻取系统时钟（快照要落 epoch ms），虚拟时间推不动它。阈值与时延留足间距（评审第 2 档 #10）：
+    /// 派发路径每项同步起一次 `git ls-files`（读守卫），全量并行跑测试时进程启动延迟可达数十 ms。
     #[tokio::test]
     async fn item_wait_ms_measures_queue_wait_under_concurrency() {
         let dir = tempfile::tempdir().unwrap();
         let names = ["a", "b", "c", "d"];
         let bundles = routed_bundles(dir.path(), &names);
-        let backend = Routed::new(names.iter().map(|n| (*n, 100, vec![found(n)])).collect());
+        let backend = Routed::new(names.iter().map(|n| (*n, 300, vec![found(n)])).collect());
         let reg = routed_registry(&backend, 2);
         let items = pending_items(&names);
         let run = run_with(plain(&reg, dir.path(), &bundles, &items)).await;
         let w = &run.meta.item_wait_ms;
         assert_eq!(w.len(), 4, "{:?}", run.warnings);
-        assert!(w[0] < 60 && w[1] < 60, "先派出的两格不排队: {w:?}");
-        assert!(w[2] >= 90 && w[3] >= 90, "后两格排在一轮之后: {w:?}");
+        assert!(w[0] < 150 && w[1] < 150, "先派出的两格不排队: {w:?}");
+        assert!(w[2] >= 280 && w[3] >= 280, "后两格排在一轮之后: {w:?}");
     }
 
     // ── 退化零差基线（批 C1-4）──────────────────────────────────────────────
@@ -1823,5 +1848,43 @@ mod tests {
             serde_json::to_string_pretty(&got).unwrap(),
             serde_json::to_string_pretty(&want).unwrap()
         );
+    }
+
+    // ── C1 评审第 2 档 ──────────────────────────────────────────────────────
+
+    /// reviewer 格的丢弃计数进 cell warn（评审第 2 档，与 scanner 格同口径）：parse 层丢弃（quote 空白等）与 quote 锚定丢弃
+    /// 算了却不落盘时，「模型零发现」与「finding 全被静默丢掉」在报告里分不出来（C1 dogfood 里 grok 零产出的结论因此打折）。
+    #[tokio::test]
+    async fn reviewer_cell_warn_discloses_dropped_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = one_bundle(dir.path());
+        let text = r#"{"findings":[
+            {"severity":"low","title":"ghost","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"no such line"},
+            {"severity":"low","title":"blank","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":""},
+            {"severity":"low","title":"real","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"fn a() {"}
+        ],"needs":[]}"#;
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(text)])), Duration::from_secs(5), 0);
+        let run = run_one(&reg, dir.path(), &bundles, ToolsMode::Off).await;
+        assert_eq!(run.findings.len(), 1);
+        let w = run.cells[0].warn.as_deref().unwrap_or("");
+        assert!(w.contains("parse dropped: no_quote=1"), "{w}");
+        assert!(w.contains("1 findings dropped: quote not anchored"), "{w}");
+    }
+
+    /// 二阶段成功时 cell 的解析统计取终判（第二轮）——首轮草稿被锚定门丢掉的不再报成这一格的丢弃。
+    #[tokio::test]
+    async fn two_stage_success_reports_final_round_drop_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        git_commit_all(dir.path());
+        let draft = Ok(turn(r#"{"findings":[{"severity":"low","title":"ghost draft","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.4,"recommendation":"r","quote":"no such line"}],"needs":[{"path":"a.rs","reason":"need context"}]}"#));
+        let backend = Routed::new(vec![("a", 10, vec![draft, found("a")])]);
+        let reg = routed_registry(&backend, 1);
+        let items = pending_items(&["a"]);
+        let run = run_with(Run { tools: ToolsMode::TwoStage, ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(run.meta.needs_two_stage_triggered, 1);
+        assert!(run.cells[0].ok);
+        assert_eq!(run.cells[0].warn, None, "终判干净 → 不报首轮草稿的丢弃");
     }
 }

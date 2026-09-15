@@ -328,7 +328,7 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
   D13 只以 429 收门，断流不收门。候选：同 provider 短窗内断流连发视同过载信号参与收门。配置侧 `providers.agc.maxConcurrency ≤ 7`（run.warnings 已提示，用户决定）。
 - **流式旁路跨瞬时重试不复位（批 D 接真 sink 前须处理）**：`timed_turn_with` 内部重试复用同一 backend，delta 回调持续喂同一个 `IncrementalFindings`——
   断流那次的半截 JSON 与重试输出拼进同一解析器。sink 为 no-op 时无害；接真 sink 后可能发出重试前的草稿对象。修法二选一：每次尝试复位解析器，或旁路只开在首个尝试。
-- **reviewer 格 quote 锚定丢弃数不可见**：`ReviewParseStats.dropped_quote` 算了却不进 `CellRecord`（scanner 格有「N suspicions dropped」warn，reviewer 没有）。
+- ✅ **reviewer 格 quote 锚定丢弃数不可见（C1 评审第 2 档已补：reviewer cell warn 与 scanner 同口径披露丢弃计数）**：`ReviewParseStats.dropped_quote` 算了却不进 `CellRecord`（scanner 格有「N suspicions dropped」warn，reviewer 没有）。
   直接后果：模型去留数据分不清「零发现」与「quote 全锚不上被静默丢」。小修：`land` 里与 `stream discarded` 并列写进 cell warn。
 - **reviewer 模型去留数据**：grok-4.6 三轮 22 个成功格 **0 条** finding（C1 两轮 needs 也为 0、输出 1–6K token）；glm-5.3 24 格 26 条（cell 内）。
   混合池无权重，零产出成员直接占掉一半预算格——这是两轮 findings 偏少、波动大的**放大因素之一，不是主因**（主因见下条「深挖选项方差」）。先补上条观测再定配置去留。
