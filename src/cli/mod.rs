@@ -409,6 +409,7 @@ pub async fn run_code_review(
             backend_factory: Some(factory.as_ref()),
             on_cell: Some(&on_cell),
             incoming: None,
+            reopen_skipped: false,
         },
         &(),
     ).await;
@@ -1232,6 +1233,7 @@ pub async fn run_resume(
                         warnings: vec![],
                         reviewer_failed: unfinished,
                         reused_cells: deep_records.iter().filter(|r| r.ok).cloned().collect(),
+                        items: queue_snap.clone(),
                     };
                     return overlay_deep(report, code, deep, &args, cfg, registry, t0);
                 }
@@ -1303,6 +1305,7 @@ pub async fn run_resume(
                     backend_factory: Some(factory.as_ref()),
                     on_cell: Some(&on_cell2),
                     incoming: None,
+                    reopen_skipped: false,
                 },
                 &(),
             )
@@ -1331,10 +1334,12 @@ pub async fn run_resume(
 /// resume 快照对账：队列项状态**双向以成功 reviewer 格为准**（格名以 `review[{item.id}]@` 开头）。快照只记状态，格才是 finding 的载体。
 /// - 有成功格 → Settled（评审修 #4）：kill 落在「格已落盘、快照仍 InFlight / Pending」之间，或快照写失败只 warning——该项已挖完，
 ///   不重挖。旧口径会重挖，重挖失败时同名 upsert 把成功格覆盖成失败格，finding 失去载体，下一次 resume 永久丢失。
-/// - Settled 却无成功格 → Pending 重挖（批 C1-1）：无格 = cell 落盘失败而快照写成功（旧作业的 `review[n]@` 格名也落在这里，重挖一次）；
+/// - Settled 却无成功格 → InFlight 重挖（批 C1-1）：无格 = cell 落盘失败而快照写成功（旧作业的 `review[n]@` 格名也落在这里，重挖一次）；
 ///   只有失败格 = 首跑那格失败或二阶段失败——不重挖，它的债在 resume 报告里被抹成干净通过（scanner resume 同口径：失败格重跑）。
+///   记 InFlight（= 往轮派发过、未完成）而非 Pending（C2-3）：`run_deep` 把往轮在途项计入已派发、不交给收场 drain——
+///   记成 Pending 会与从没派发过的项一起按剩余预算重选，被截成 Skipped 就既不重挖也不计债。
 ///
-/// 返回（改回 Pending 的项数，状态被改过的项 id）。
+/// 返回（改回待挖的项数，状态被改过的项 id）。
 fn reconcile_queue_with_cells(items: &mut [crate::orchestrate::queue::QueueItem], records: &[CellRecord]) -> (usize, Vec<String>) {
     use crate::orchestrate::queue::ItemState;
     let mut reopened = 0;
@@ -1347,7 +1352,7 @@ fn reconcile_queue_with_cells(items: &mut [crate::orchestrate::queue::QueueItem]
             (true, _) => ItemState::Settled,
             (false, ItemState::Settled) => {
                 reopened += 1;
-                ItemState::Pending
+                ItemState::InFlight
             }
             (false, _) => continue,
         };
@@ -2518,6 +2523,37 @@ mod resume_tests {
         assert_eq!(names(&cov.reused), vec!["review[z.rs:rule:1-2]@p/r"], "z.rs 的成功格沿用");
         assert!(cov.failed.is_empty(), "y.rs 首跑的失败格已被重挖覆盖，不再报失败: {cov:?}");
         assert_eq!(code, 0, "重挖成功 → 首跑失败格的债已还清: {:?}", report.run.warnings);
+    }
+
+    /// 重挖的项不被 resume 收场 drain 截掉（C2-3）：「Settled 却无成功格」是往轮派发过的项，对账成「往轮在途」、占预算位——
+    /// K = 4、两条主区已挖完 + 三条涟漪无成功格时，对账成 Pending 会被剩余 2 格截掉一条（变 Skipped、既不重挖也不计债）。
+    #[tokio::test]
+    async fn resume_redig_is_not_cut_by_close_drain() {
+        use crate::orchestrate::queue::{ItemKind, ItemState};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let names = ["m1", "m2", "r1", "r2", "r3"];
+        let files: Vec<(String, String)> = names.iter().map(|n| (format!("{n}.rs"), format!("fn {n}() {{\n    {n}_marker();\n}}\n"))).collect();
+        repo_with_changes(ws, &files.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect::<Vec<_>>());
+        let store = crate::state::JobStore::open(ws).unwrap();
+        scan_done_job(&store);
+        for n in ["m1", "m2"] {
+            store.put_queue_item("j", &rule_item(&format!("{n}.rs"), ItemState::Settled)).unwrap();
+            let ok = CellRecord::ok(format!("review[{n}.rs:rule:1-2]@p/r"), "p/r", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] });
+            store.append_partial("j", &ok).unwrap();
+        }
+        for n in ["r1", "r2", "r3"] {
+            let mut it = rule_item(&format!("{n}.rs"), ItemState::Settled);
+            it.kind = ItemKind::Ripple;
+            store.put_queue_item("j", &it).unwrap();
+        }
+        let (reg, rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+        let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        assert_eq!(rev.turn_count(), 3, "三条涟漪全部重挖: {:?}", report.run.warnings);
+        assert_eq!(report.run.deep.as_ref().map(|d| d.budget_skipped), Some(0));
+        assert_eq!(code, 0, "{:?}", report.run.warnings);
     }
 
     /// 同组两条目副本（`scan[g1]@alpha#1` / `scan[g1]@beta#1`）：只完成 alpha → beta 必须被补跑，合并结果 agreement 2、非 Incomplete。

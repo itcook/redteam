@@ -124,6 +124,16 @@ pub struct EnqueueReq {
     pub arrival: Option<String>,
 }
 
+impl EnqueueReq {
+    /// scanner 疑点入队请求——首跑流式到达与 resume 回放共用同一形态（C2〔D15〕）：区间 = 疑点行（起始至少第 1 行）、
+    /// 笔记 = 该疑点、分 = confidence、家族 = 产出它的 scan 格家族、到达键 = `{cell_id}#{i}`。区间形状非法 → `None`。
+    pub fn scan(s: &Suspicion, family: &str, arrival: String) -> Option<EnqueueReq> {
+        let start = s.line_start.max(1);
+        let spec = QueueItemSpec::new(s.file.clone(), vec![(start, s.line_end.max(start))], QueueOrigin::Scan, vec![s.clone()]).ok()?;
+        Some(EnqueueReq { spec, score: s.confidence, kind: ItemKind::Suspicion, families: vec![family.to_string()], arrival: Some(arrival) })
+    }
+}
+
 /// 内存队列（C-1 只含入队；派发/预算 C-2/C-3）。
 #[derive(Clone, Debug, Default)]
 pub struct DeepQueue {
@@ -153,6 +163,20 @@ impl DeepQueue {
 
     pub fn items(&self) -> &[QueueItem] {
         &self.items
+    }
+
+    /// 被截项全部复位 Pending（resume 补跑过 scanner 后重选，design §6 RS1〔D15〕）：入队时刻重置，返回复位项下标（调用方写快照）。
+    pub fn reopen_skipped(&mut self) -> Vec<usize> {
+        let now = now_ms();
+        let mut out = Vec::new();
+        for (i, it) in self.items.iter_mut().enumerate() {
+            if it.state == ItemState::Skipped {
+                it.state = ItemState::Pending;
+                it.enqueued_ms = Some(now);
+                out.push(i);
+            }
+        }
+        out
     }
 
     pub fn items_mut(&mut self) -> &mut [QueueItem] {
@@ -268,7 +292,13 @@ impl DeepQueue {
     /// ∪ 按优先级补到留下数 ≥ `budget`；余者标 Skipped，返回其 id。`budget` = 剩余预算（K − 已派发），
     /// `floor` = 保底剩余（⌈K/4⌉ − 已派发的非必挖疑点）。主区吃穿时帽 = 必挖 + 保底。
     pub fn drain_with(&mut self, budget: usize, floor: usize) -> Vec<String> {
-        let pending = self.pending_order();
+        self.drain_among(budget, floor, |_| true)
+    }
+
+    /// 同 [`Self::drain_with`]，只在满足 `candidate` 的 Pending 项里选；其余 Pending 项原样保留、不占 `budget` / `floor`
+    /// ——resume 时往轮已派发未完成的项已被往轮选中，调用方把它们计入已派发（design C2 §6〔D15〕）。
+    pub fn drain_among(&mut self, budget: usize, floor: usize, candidate: impl Fn(&QueueItem) -> bool) -> Vec<String> {
+        let pending: Vec<usize> = self.pending_order().into_iter().filter(|&i| candidate(&self.items[i])).collect();
         if pending.is_empty() {
             return Vec::new();
         }
@@ -350,8 +380,8 @@ impl DeepQueue {
     }
 }
 
-/// 必挖集判定（design §6 规则 3）：不依赖队列其余项，合并路径拿着 `&mut` 项也能调。
-fn must_dig(it: &QueueItem) -> bool {
+/// 必挖集判定（design §6 规则 3）：不依赖队列其余项，合并路径拿着 `&mut` 项也能调；深挖在线额度的可派条件也用它。
+pub(crate) fn must_dig(it: &QueueItem) -> bool {
     it.kind == ItemKind::Primary || it.agreement >= 2
 }
 

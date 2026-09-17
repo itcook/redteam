@@ -30,18 +30,25 @@
 - [x] Commit: `perf(pack,deep): 读守卫改查每轮预取的 git 跟踪文件集——逐项子进程去掉，拒绝口径不变（D15 Q9）`
 
 ### C2-3 深挖主循环：在线额度、收场 drain、等门挂起、组装序、观测
-- [ ] `deep.rs`：`eligible = must ∨ closed ∨ dispatched < K − F`；填门只在 `has_eligible` 时取门位；派发时 pack 失败结案也计 `dispatched`
-- [ ] `deep.rs`：`on_close` 只执行一次（通道收到 None；`incoming: None` 开跑即关闭）→ `drain_with(K − dispatched, F − 已派发非必挖疑点)`，写 Skipped 项快照
-- [ ] `deep.rs`：等门挂起——有可派项而各门无位时为活跃成员建阻塞 lease，跨事件保持、可派项消失即撤销；命中 → `parked`；取代 C1「在途为空才阻塞 lease」
-- [ ] `deep.rs`：`on_arrival` 只写受影响项快照；H0 入队逐项写
-- [ ] `deep.rs`：收场按最终项 `cmp_priority` 排序 `landed` 后组装 findings / cells / meta 四数组 / 每格 warnings；保证注释改写
-- [ ] `deep.rs`：restore 模式参数——`scan_cells` 幂等入队、`reopen_skipped`、`dispatched` / 非必挖疑点初值取 Settled 项；`DeepRun.items` 带回最终队列项
-- [ ] `report.rs`：`DeepMeta` 增 `close_ms` / `first_dispatch_ms` / `drain_done_ms` / `verify_tail_ms` / `scan_phase_dispatched` / `close_budget_remaining` / `queue_split_clusters` / `fill_block_max_ms` / `fill_block_total_ms`（serde default）；填门段与到达处理段计时
-- [ ] 测试（虚拟时间，经 `incoming` 通道喂到达）：扫描期额度（宽门 K = 8 首批 10 条非必挖 → 收场前 ≤ 6）；必挖不截（`maxCells = 0` + 后到抬 agreement 2）；Skipped 只在收场、`budget_skipped` 无回减；
+- [x] `deep.rs`：`eligible = must ∨ closed ∨ dispatched < K − F`；填门只在 `has_eligible` 时取门位；派发时 pack 失败结案也计 `dispatched`
+- [x] `deep.rs`：`on_close` 只执行一次（通道收到 None；`incoming: None` 开跑即关闭）→ `drain_with(K − dispatched, F − 已派发非必挖疑点)`，写 Skipped 项快照
+- [x] `deep.rs`：等门挂起——有可派项而各门无位时为活跃成员建阻塞 lease，跨事件保持、可派项消失即撤销；命中 → `parked`；取代 C1「在途为空才阻塞 lease」
+- [x] `deep.rs`：`on_arrival` 只写受影响项快照；H0 入队逐项写（scan 格回放 `enqueue_scan_cells` 同形逐条入队、逐项写，取代 `merge_suspicions` 预合并 + 全量快照）
+- [x] `deep.rs`：收场按最终项 `cmp_priority` 排序 `landed` 后组装 findings / cells / meta 四数组 / 每格 warnings；保证注释改写（`Landed` 带项 id，不反解 cell 名）
+- [x] `deep.rs`：restore 模式参数——`scan_cells` 幂等入队、`reopen_skipped`、`dispatched` / 非必挖疑点初值取 Settled 项；`DeepRun.items` 带回最终队列项
+  （实施细化：初值取「往轮派发过」= Settled ∪ 快照 InFlight，往轮在途项不参与收场 drain（`DeepQueue::drain_among`）；cli 对账「Settled 无成功格」改记 InFlight——
+  必挖顶出 K 时只数 Settled 会截掉往轮在途项，见 design §6）
+- [x] `report.rs`：`DeepMeta` 增 `close_ms` / `first_dispatch_ms` / `drain_done_ms` / `verify_tail_ms` / `scan_phase_dispatched` / `close_budget_remaining` / `queue_split_clusters` / `fill_block_max_ms` / `fill_block_total_ms`（serde default）；填门段与到达处理段计时
+- [x] 测试（虚拟时间，经 `incoming` 通道喂到达）：扫描期额度（宽门 K = 8 首批 10 条非必挖 → 收场前 ≤ 6）；必挖不截（`maxCells = 0` + 后到抬 agreement 2）；Skipped 只在收场、`budget_skipped` 无回减；
   外部持门者放门及时补位（#6 探针：≈ 210 ms）；共门不插队（测试内以 `registry.lease` 模拟等门 scanner）；报告确定性（固定选中集合、打乱时延两次逐字节一致）；
   快照写入计数（每次到达 ≤ 1 项、重复到达 0 项）；新观测字段可读；**退化零差基线不变**
-- [ ] 变异检查：额度不扣 F / 收场 drain 执行两次 / waits 每事件重建丢排队位 / 按派发序组装 / 到达全量写快照——各自用例转红
-- [ ] Commit: `feat(deep): 在线预算与收场 drain、等门挂起入 FIFO（修外部放门不唤醒）、收场按优先级序组装、快照只写受影响项——C2 深挖主循环（design §6 规则 3 / 6、§12.3〔D15〕）`
+  （另：等门跨到达事件保持排队位；resume 往轮在途占位 run_deep / cli 各一；restore 幂等回放 scan 格与复位 Skipped；`DeepMeta` 旧 JSON 兼容。
+  报告确定性改为「到达序与时延都反过来、门 1 → 派发序不同」；全量并行首跑抓到到达 / 关闭与格完成同一虚拟时刻时 `select!` 随机分支致收场读数抖动 → 用例错开时刻、保证除外项加收场读数。
+  退化基线：新字段先断言确定性读数再归零，基线文件不动）
+- [x] 变异检查：额度不扣 F / 收场 drain 执行两次 / waits 每事件重建丢排队位 / 按派发序组装 / 到达全量写快照——各自用例转红
+  （另六处：退回 C1「在途为空才等门」/ 往轮在途不计入已派发 / 往轮在途参与 drain / 对账改回 Pending / `reopen_skipped` 不生效 / `scan_cells` 不入队。
+  首轮「往轮在途不计入已派发」假绿——用例里 Pending 全是往轮在途、drain 无可截对象 → 补一条从未派发的涟漪后转红；「按派发序组装」以去掉排序（完成序）代替）
+- [x] Commit: `feat(deep): 在线预算与收场 drain、等门挂起入 FIFO（修外部放门不唤醒）、收场按优先级序组装、快照只写受影响项——C2 深挖主循环（design §6 规则 3 / 6、§12.3〔D15〕）`
 
 ### C2-4 首跑流式接线与 scanner 失败口径
 - [ ] `orchestrate/mod.rs`：`run_scan_fanout` 加 `Option<&mpsc::Sender<EnqueueReq>>`；格落盘后逐条发锚定后疑点（到达键 `{cell_id}#{i}`），发送失败忽略

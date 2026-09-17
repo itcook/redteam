@@ -91,6 +91,9 @@ on_close（只执行一次）:
 - `drain(max_cells)` 改为 `drain_with(max_cells, F)` 的特例：C1 路径（开跑即关闭、dispatched = 0）结果逐项不变。
 - 「主区吃穿时帽 = 主区 + 保底」自然成立：主区占满 K → remaining 0，floor = F → 仍留 F 条疑点。
 - Skipped 只在此刻产生；首跑关闭后无到达，`merge_into` 的 Skipped 复位分支首跑不可达（保留，注释写明；resume 复位走 §6 显式路径）。
+- 实施（C2-3）：收场在主循环顶部判定（`closed ∧ !drained`）——首跑在通道关闭后的下一轮、`incoming: None` 时首轮即执行；
+  `scan_phase_dispatched` = 收场时本调用新派发数（开跑即关闭时 0），`close_budget_remaining` = 收场时 `K − dispatched`（resume 含往轮派发计数，§6）。
+  到达 / 关闭与格完成落在同一时刻时 `select!` 随机取分支，这两个读数随之变化——报告确定性保证把它们与计时字段一起除外（§8）。
 
 ## 4. 合并残差对账（Q2 M1）
 
@@ -124,7 +127,8 @@ run_resume:
          reopen_skipped: replayed,                 // 复位 Skipped → Pending（enqueued_ms 重置）
          incoming: None,                           // 开跑即关闭 → §3.2 收场 drain
          …})
-     restore 模式下 dispatched 初值 = Settled 项数；nonmust_susp 初值 = Settled、Suspicion、dispatch_agreement < 2 的项数
+     restore 模式下 dispatched 初值 = 往轮派发过的项数（Settled ∪ 快照 InFlight）；nonmust_susp 初值 = 其中 Suspicion、dispatch_agreement < 2 的项数；
+     快照 InFlight 项不参与收场 drain（实施细化见下）
   verdict：scanner 仍缺失 → Incomplete（F3 同口径，findings 照进）
   budget_cells：原报告 risk 值；无原报告 → 重算 route 的 hint；再无 → 4（现状兜底）
 ```
@@ -132,6 +136,19 @@ run_resume:
 - 修掉 C1 现存缺口：扫描期被 kill（快照为空）且配了 reviewer 的作业，resume 不再出 scan-only / 退出码 0，而是重建 H0 + 疑点入队后深挖。
 - 首跑已在信息完整时收场、kill 在深挖期：不补跑 scanner → 不复位 Skipped；drain 以剩余预算重跑。首跑留下的非必挖项数 ≤ K − 已结案数，
   预期原样保留、不新增 Skipped——以测试钉住（resume ①④ 用例断言 Pending 集合不缩）。
+
+**实施细化（C2-3，2026-09-17）——往轮在途项占位**：上一条「首跑留下的非必挖项数 ≤ K − 已结案数」在必挖把派发数顶出 K 时不成立。
+例：K = 4，扫描期派出三条涟漪（额度 K − F = 3 用满）后两条必挖疑点到达照派、收场保底再派一条疑点（共 6 格），kill 时两条必挖已结案、
+其余在途——resume 若只数 Settled，剩余预算 2 的 drain 会把在途涟漪截掉两条（Pending 集合缩水，被截项既不重挖也不计债）。改为：
+- `run_deep` 开跑时把快照里的 InFlight 项（往轮已派发、未完成）记为「往轮在途」：计入 `dispatched` / `nonmust_susp` 初值；收场 drain 经
+  `DeepQueue::drain_among(budget, floor, candidate)` 只在其余 Pending 里选——往轮在途项恒保留、重派即可（`drain_with` = 全体候选的特例）。
+- cli 对账「Settled 却无成功格」改记 InFlight（原 Pending）：同样是往轮派发过的项，记 Pending 会与从没派发的项一起按剩余预算重选。
+- 论证（无新到达时 resume drain 原样保留）：首跑收场的 keep 集合里，收场后派出的项 + kill 时仍 Pending 的项 = keep 数。
+  drain 要么补位到 keep ≤ 收场剩余预算——此时 kill 时的 Pending ≤ K − kill 时已派发 = resume 剩余预算，全留；
+  要么 keep = 必挖 + 保底疑点、无补位项——必挖恒留（共识单调），未派的保底疑点数 ≤ 收场保底余量 − 收场后派出的保底疑点 = resume 保底余量，全留。
+  扫描期 kill（首跑未收场）时 resume 的 drain 就是这批项的首次收场，以 kill 时的派发计数为准。
+- 用例：`resume_drain_keeps_prior_inflight_items_when_must_overshot_budget`（run_deep 层，含一条从未派发、应被截的涟漪）、
+  `resume_redig_is_not_cut_by_close_drain`（cli 对账层）。
 
 ## 7. 门公平与唤醒（Q7 G1）
 
@@ -188,6 +205,10 @@ loop {
 
 - 取代 C1「在途为空才阻塞 lease」的特例；#6「外部持门者放门不唤醒」随之解决：放门 → FIFO 唤醒深挖的等门 future → 主循环醒来补位。
 - 同 provider 多成员共享一门时 waits 同门多登记，先中者用、其余撤销；成员出局（`try_lease` / `lease` 报错）沿用 C1 就地出局口径。
+- 实施（C2-3）：`waits: Option<FuturesUnordered<阻塞 lease>>` 只在「有可派项 ∧ 本轮填门因无门位停下 ∧ 尚未建」时建；每轮填门后无可派项即撤销
+  `waits` 与 `parked`，池空也撤销。已登记等门后本循环自己的 `try_lease` 同样让位（FIFO 不区分登记者），门位只经 `waits` 命中取得——
+  这是「跨事件保持」保住排队位的前提。`parked` 的成员等门期间出局 → 门位随旧 lease 归还、改取下一成员。
+  填门段计时只在本轮确有派发时记。
 
 ### 7.3 t=0 先后
 
@@ -201,6 +222,8 @@ loop {
 - 保证注释改写：「同一选中集合 + 同样的格输出 → 报告逐字节一致（`duration_ms` / `queue_wait_ms` / `item_wait_ms` 等计时字段除外）」；
   选中集合随到达时序变化是 B / M1 的已知代价（C3）。
 - 退化零差：单成员门宽 1、`incoming: None` 时派发序 = 优先级序，基线文件不变。
+- 实施（C2-3）：`Landed` 直接带所挖项 id 排序，不从 cell 名反解（项查不到属防御，按 id 比）。保证的除外项加上收场时刻读数（§3.2）。
+  基线用例把 C2 新观测字段先断言确定性读数、再与计时一起归零后比对，基线文件保持批 C 原样。
 
 ## 9. 同步 IO（Q9 IO2）
 
@@ -233,6 +256,7 @@ loop {
 | `fill_block_max_ms` / `fill_block_total_ms` | 主循环同步段单次最长 / 累计阻塞 |
 
 `run_deep` 与扫描同时开跑，`close_ms` 即 scanner 段墙钟；`drain_done_ms` 即深挖排空；`verify_tail_ms` 批 D 填。
+实施（C2-3）：`first_dispatch_ms` / `drain_done_ms` 有值时至少记 1（0 = 无派发 / 无格）；`close_ms` 在开跑即关闭（无通道）时为 0；为零不序列化。
 
 ## 11. 测试形状
 
