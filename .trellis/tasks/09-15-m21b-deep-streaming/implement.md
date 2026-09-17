@@ -22,10 +22,12 @@
 - [x] Commit: `feat(queue,registry): C2 零件——到达键幂等入队与受影响项回报、按可派条件弹出、drain_with(预算, 保底)、门等门者计数与首试让位（取消安全）、组内闭包成员导出（D15）`
 
 ### C2-2 读守卫预取（Q9 IO2）
-- [ ] `second_pass.rs`：`TrackedFiles::load(root)`（一次 `git ls-files -z`）+ `need_read_allowed_in(&tracked, root, rel)`；原 `need_read_allowed` 保留给其他调用点
-- [ ] `region.rs` / 二阶段 `need_section`：接收 `&TrackedFiles`；`run_deep` 开跑时建一次
-- [ ] 测试：未跟踪 / denylist / 符号链接逃逸与改动前同样拒绝（沿用 region 与 second_pass 既有用例 + 集合版各一）；`run_deep` 全程只建一次集合
-- [ ] Commit: `perf(pack,deep): 读守卫改查每轮预取的 git 跟踪文件集——逐项子进程去掉，拒绝口径不变（D15 Q9）`
+- [x] `second_pass.rs`：`TrackedFiles::load(root)`（一次 `git ls-files -z`）+ `need_read_allowed_in(&tracked, root, rel)`；原 `need_read_allowed` 保留给其他调用点
+  （实施：`need_read_allowed_in(&tracked, rel)`；原函数改为现取集合的便捷入口、唯一实现，见 design §9）
+- [x] `region.rs` / 二阶段 `need_section`：接收 `&TrackedFiles`；`run_deep` 开跑时建一次
+- [x] 测试：未跟踪 / denylist / 符号链接逃逸与改动前同样拒绝（沿用 region 与 second_pass 既有用例 + 集合版各一）；`run_deep` 全程只建一次集合
+  （等价对照：原子进程实现 × 33 路径 × 三种 root 逐条同结果；变异：去目录前缀 / 尾斜杠不按目录 / `..` 不回退 / 逐项取集合——各自转红）
+- [x] Commit: `perf(pack,deep): 读守卫改查每轮预取的 git 跟踪文件集——逐项子进程去掉，拒绝口径不变（D15 Q9）`
 
 ### C2-3 深挖主循环：在线额度、收场 drain、等门挂起、组装序、观测
 - [ ] `deep.rs`：`eligible = must ∨ closed ∨ dispatched < K − F`；填门只在 `has_eligible` 时取门位；派发时 pack 失败结案也计 `dispatched`

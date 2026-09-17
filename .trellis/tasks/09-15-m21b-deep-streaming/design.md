@@ -207,6 +207,15 @@ loop {
 - 快照：`enqueue` 回报受影响项（新建 / 并入目标；`Duplicate` 不写），`on_arrival` 只写该项；H0 入队逐项写；`drain_with` 回报 Skipped 项；派发 / 结案沿用单项写。
 - 读守卫：`TrackedFiles::load(root)`（一次 `git ls-files -z`）在 `run_deep` 开跑时建，`need_read_allowed_in(&tracked, root, rel)` 取代逐项子进程；
   `region::build` 与二阶段 `need_section` 接收该集合。denylist 与符号链接逃逸检查不变；原函数保留给其他调用点。
+  实施（C2-2）：
+  - 取集合 = `git rev-parse --show-prefix` + `git ls-files -z --full-name -- :/`（整仓跟踪文件；去掉外部 `GIT_LITERAL_PATHSPECS`，否则 `:/` 被当字面路径、列表为空）；
+    非 git 仓 → 全拒「非 git-tracked」，git 不可用 → 全拒「git 不可用（fail-closed）」，文案与原实现相同。
+  - 判定 `need_read_allowed_in(&tracked, rel)`（`root` 已在取集合时用掉）：与 git 字面 pathspec 逐条同口径——空串 / 绝对路径拒；相对 root 前缀解析
+    `.` `..` 重复斜杠（`..` 越出顶层拒）；命中文件本身或含跟踪文件的目录放行；以 `/` `/.` `/..` 结尾只按目录匹配；大小写敏感。
+    rel 不再作为 git 参数，参数 / pathspec 注入无从下手。
+  - 原 `need_read_allowed(root, rel)` 改为「现取集合 + 集合判定」的便捷入口，唯一实现；既有注入 / fail-closed 用例原样验证新口径。
+  - `need_section(ex, tracked, need, warnings)`；`region::build(item, bundle, root, tracked, idx, budget, opts, needs_evidence)`。
+  - 等价性以原子进程实现为对照：33 个路径 × 仓库顶层 / 子目录 / 非 git 目录三种 root 逐条同结果、同拒绝文案（首轮抓到文件尾斜杠一处口径差后修）。
 - 阻塞计时：填门段（`region::build` + prompt 构建 + 快照写）与到达处理段各自以 `std::time::Instant` 计时，记 `fill_block_max_ms` / `fill_block_total_ms`。
 - 挪 `spawn_blocking` 不在本批；触发条件记 followup（PR181 出口验收单次 ≥ 500 ms 或累计 ≥ 墙钟 1%）。
 

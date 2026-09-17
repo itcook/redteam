@@ -131,7 +131,9 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut incoming = input.incoming.take();
     let idx = cross_index(input.bundles, &[], None);
     let opts = PackOpts::from(input.pack);
-    let env = CellEnv { input: &input, idx: &idx, opts: &opts, sink };
+    // 读守卫的跟踪文件集每轮只取一次（C2 Q9〔D15〕）：派发路径每项、二阶段每条 need 都查它。
+    let tracked = crate::cli::second_pass::TrackedFiles::load(input.root);
+    let env = CellEnv { input: &input, idx: &idx, tracked: &tracked, opts: &opts, sink };
 
     // 门驱动并发派发（design §6 规则 5〔D13〕）：provider 门有空位才弹出最高 Pending 交出去。
     // 同 task 内并发（`FuturesUnordered`）：future 只借共享引用跑一格；队列 / meta / cells / 回调只在本循环写。
@@ -159,7 +161,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             // cell 名按队列项（id 已定死），跨 resume 调用稳定：同项重跑 upsert 覆盖自身（与 scanner「重试者胜」同义），
             // 不同项永不同名。按本次调用的派发序编号时，resume 挖别的项会同名覆盖首跑的格、丢掉它的 finding。
             let cell_id = review_cell_id(&item.id, &rev.name);
-            let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &idx, 64 * 1024, &opts, "") {
+            let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &tracked, &idx, 64 * 1024, &opts, "") {
                 Ok(p) => p,
                 Err(e) => {
                     warnings.push(format!("{cell_id}: pack {e}"));
@@ -295,6 +297,8 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
 struct CellEnv<'b> {
     input: &'b DeepInput<'b>,
     idx: &'b crate::bundle::CrossIndex,
+    /// 本轮预取的 git 跟踪文件集（读守卫查它，不逐项起子进程）。
+    tracked: &'b crate::cli::second_pass::TrackedFiles,
     opts: &'b PackOpts,
     sink: &'b dyn FindingSink,
 }
@@ -724,12 +728,12 @@ fn second_stage_prompt(
     // 只打到 stderr 就等于没披露（second_pass.rs 的 deny_need_read 契约，T46①②）。
     let ev: String = needs
         .iter()
-        .filter_map(|n| crate::cli::second_pass::need_section(&ex, input.root, n, warnings))
+        .filter_map(|n| crate::cli::second_pass::need_section(&ex, env.tracked, n, warnings))
         .collect();
     if ev.trim().is_empty() {
         return Round2::NoEvidence;
     }
-    let pack2 = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, env.idx, 64 * 1024, env.opts, &ev) {
+    let pack2 = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, env.tracked, env.idx, 64 * 1024, env.opts, &ev) {
         Ok(p) => p,
         Err(e) => return Round2::PackFailed(e),
     };
@@ -1899,5 +1903,26 @@ mod tests {
         assert_eq!(run.meta.needs_two_stage_triggered, 1);
         assert!(run.cells[0].ok);
         assert_eq!(run.cells[0].warn, None, "终判干净 → 不报首轮草稿的丢弃");
+    }
+
+    // ── C2-2：读守卫预取 ──────────────────────────────────────────────────────
+
+    /// 读守卫的跟踪文件集每轮只取一次（C2 Q9〔D15〕）：3 项派发（每项 region::build 过守卫）+ 一次二阶段补查
+    /// （need 过守卫）全程 `TrackedFiles::load` 恰一次——不再逐项起 `git ls-files` 子进程。
+    #[tokio::test(start_paused = true)]
+    async fn tracked_files_are_loaded_once_per_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c"];
+        let bundles = routed_bundles(dir.path(), &names);
+        git_commit_all(dir.path());
+        let with_needs = Ok(turn(r#"{"findings":[],"needs":[{"path":"b.rs","reason":"need context"}]}"#));
+        let backend = Routed::new(vec![("a", 10, vec![with_needs, found("a")]), ("b", 10, vec![found("b")]), ("c", 10, vec![found("c")])]);
+        let reg = routed_registry(&backend, 3);
+        let items = pending_items(&names);
+        crate::cli::second_pass::TRACKED_LOADS.with(|c| c.set(0));
+        let run = run_with(Run { tools: ToolsMode::TwoStage, ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(run.meta.needs_two_stage_triggered, 1, "{:?}", run.warnings);
+        assert_eq!(run.cells.iter().filter(|c| c.ok).count(), 3, "{:?}", run.warnings);
+        assert_eq!(crate::cli::second_pass::TRACKED_LOADS.with(|c| c.get()), 1, "每轮只取一次跟踪文件集");
     }
 }
