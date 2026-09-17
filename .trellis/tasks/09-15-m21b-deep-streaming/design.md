@@ -157,6 +157,15 @@ run_resume:
 - 用例：`resume_drain_keeps_prior_inflight_items_when_must_overshot_budget`（run_deep 层，含一条从未派发、应被截的涟漪）、
   `resume_redig_is_not_cut_by_close_drain`（cli 对账层）。
 
+**实施（C2-5，2026-09-17）**：
+- `replayed` 在补跑前取（`pending` 非空）；深挖续跑条件只剩「配了 reviewer」。`scan_cells` = 全部 scanner 记录（失败格无输出、不入队）。
+- 阶段 0 路由在「快照为空 ∨ 原报告无 risk 段」时按当前 diff 重算：前者取 route 重建 H0，后者只取预算——首跑在收口前被 kill 就没有原报告，
+  C2-3 起 restore 模式要做收场 drain，缺省 K = 4 会截掉首跑按真实 K 留下的项。预算优先级：原报告 → 重算 → 4；重算的风险段在报告缺时补进 `run.risk`。
+- diff 重建失败时空快照也算「未完」（深挖整段没发生）→ 计债，不落成 scan-only / 0。
+- 既有深挖 resume 用例的夹具 `scan_done_job` 改为零疑点 scanner 格：手写快照没记到达的疑点，按新口径会被当成未挖疑点挖掉。
+- 「只在补跑过 scanner 时复位 Skipped」的门控在快照自洽（resume 的 K 与首跑相同）时与「总是复位」结果等价：复位的项在收场 drain 里原样再被截
+  （§3.2 论证同形）；K 变大时复位项排在首跑留下的项之后、只会多挖，K 变小时截断与复位无关。门控按 D15 保留，变异「总是复位」记为等价变异。
+
 ## 7. 门公平与唤醒（Q7 G1）
 
 ### 7.1 `InflightGate`

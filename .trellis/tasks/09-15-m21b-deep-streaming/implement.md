@@ -68,12 +68,18 @@
 - [x] Commit: `feat(cli,orchestrate): scanner 与深挖时间重叠接线——格完成即入队、显式先 poll 扫描、收场切 Deep、scanner 失败深挖照跑仍硬 Incomplete、拆簇对账（design §2 / §8.4〔D15〕）`
 
 ### C2-5 resume 离线续跑（Q6 RS1）
-- [ ] 先写红用例：配 reviewer、队列快照为空、scanner 部分落盘的作业 resume → 现状出 scan-only / exit 0
-- [ ] `cli/mod.rs` `run_resume`：去掉 `still_missing == 0` 与 `!queue_snap.is_empty()` 两前提；`replayed` = 补跑前有缺失格；空快照时 `stage0_risk` 重算 route；
+- [x] 先写红用例：配 reviewer、队列快照为空、scanner 部分落盘的作业 resume → 现状出 scan-only / exit 0（实测 reviewer 0 次调用）
+- [x] `cli/mod.rs` `run_resume`：去掉 `still_missing == 0` 与 `!queue_snap.is_empty()` 两前提；`replayed` = 补跑前有缺失格；空快照时 `stage0_risk` 重算 route；
   `run_deep` restore 模式传全部成功 scanner 记录（幂等入队）+ `reopen_skipped: replayed`；scanner 仍缺失 → verdict Incomplete（F3 口径）
-- [ ] 测试：① 扫描期 kill（H0 在途 + 部分 scanner 落盘）→ 补跑 → 入队 → drain → 挖、finding 不丢不双计；② 首跑 F3 带 Skipped 收场 → 补跑后 Skipped 复位重选；③ 空快照（上面的红用例转绿）；
+  （另：原报告无 risk 段时预算取重算值并补进 `run.risk`；diff 重建失败 + 空快照计债；`--resume` 帮助补续跑口径。见 design §6「实施（C2-5）」）
+- [x] 测试：① 扫描期 kill（H0 在途 + 部分 scanner 落盘）→ 补跑 → 入队 → drain → 挖、finding 不丢不双计；② 首跑 F3 带 Skipped 收场 → 补跑后 Skipped 复位重选；③ 空快照（上面的红用例转绿）；
   ④ 多项 InFlight 并发 kill、部分格已落盘 → 不丢不双计；深挖期 kill、无需补跑 → Skipped 沿用、Pending 集合不缩；旧快照（无到达键）可 resume
-- [ ] Commit: `fix(resume): 离线续跑——补跑 scanner 后疑点幂等入队、补跑过则复位 Skipped 重选、空快照同路径重建 H0（修扫描期 kill 后 resume 出 scan-only / exit 0）（design §17 R14〔D15〕）`
+  （①④a 各再 resume 一次验幂等；②：K = 4、保底留给新疑点、复位的三条涟漪补到剩余预算、第三条再被截；④b 用首跑 K = 5 的自洽快照、无原报告 → 按缺省 4 会截掉一条；
+  ④c 谓词并入补记到达键、再 resume 不计去重；另加：空快照重建 H0（敏感路径签名变更的 git 仓）、空快照 + diff 重建失败计债、补跑后仍缺格深挖照跑仍 3。
+  既有深挖 resume 用例夹具 `scan_done_job` 改零疑点——手写快照没记到达的疑点按新口径会被挖）
+- [x] 变异检查（8 处）：恢复旧前提 / 补跑不复位 / scanner 记录不入队 / 空快照不重建 H0 / 预算不取重算值 / 重算风险段不进报告 / 空快照 diff 失败不计债——各自转红；
+  「总是复位 Skipped」不转红，为等价变异（快照自洽时复位项被收场 drain 原样截回；论证见 design §6）
+- [x] Commit: `fix(resume): 离线续跑——补跑 scanner 后疑点幂等入队、补跑过则复位 Skipped 重选、空快照同路径重建 H0（修扫描期 kill 后 resume 出 scan-only / exit 0）（design §17 R14〔D15〕）`
 
 ### C2-6 收口
 - [ ] `cargo test` / `clippy --all-targets` 零新增（基线 7）/ `make verify`

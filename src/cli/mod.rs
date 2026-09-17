@@ -1120,6 +1120,8 @@ pub async fn run_resume(
     let done: std::collections::BTreeSet<String> = prior_records.into_iter().filter(|r| r.ok).map(|r| r.cell).collect();
     let pending: Vec<&crate::state::CellInput> =
         manifest.iter().filter(|c| !done.contains(&c.cell)).collect();
+    // 本次要补跑 scanner（不论补跑成败）= 首跑收场时疑点集不全：深挖续跑时被截项复位重选（design C2 §6 RS1〔D15〕）。
+    let replayed = !pending.is_empty();
     let roles = cfg.active_roles();
     let entry_of = |name: &str| -> Option<crate::orchestrate::ScanEntrySpec> {
         roles.scanners.iter().find(|m| m.name == name).map(crate::orchestrate::ScanEntrySpec::from)
@@ -1205,7 +1207,8 @@ pub async fn run_resume(
         .map(|sc| sc.groups.iter().map(|g| ScanGroup { label: g.label.clone(), files: g.files.clone(), cells: vec![], suspicions: 0, pack: g.pack.clone() }).collect())
         .unwrap_or_default();
     warnings.extend(registry.gate_warnings()); // D13：补跑期间撞过 429 的 provider 收敛记录
-    let results = ScanResults { cells: scan_cells_from_records(scan_records.clone()), ..Default::default() };
+    let scan_cells = scan_cells_from_records(scan_records);
+    let results = ScanResults { cells: scan_cells.clone(), ..Default::default() };
     let (mut report, mut code) = finish_scan_report(ScanFinish {
         groups,
         scanned_coverage: prior.as_ref().and_then(|r| r.scan.as_ref()).and_then(|sc| sc.scanned_coverage),
@@ -1230,11 +1233,12 @@ pub async fn run_resume(
         report.run.warnings.push(format!("resume: {still_missing} cell(s) still missing after replay"));
         code = exit_code(Verdict::Incomplete, false);
     }
-    // C-5：深挖快照续跑——scan 补齐 ∧ 有 reviewer ∧ 有队列快照即进。
+    // 深挖离线续跑（design C2 §6 RS1〔D15〕）：配了 reviewer 即进——不要求 scan 补齐（仍缺格时判定已是 Incomplete，深挖照跑、findings 照进，
+    // 与首跑 F3 同口径），也不要求有队列快照（扫描期被 kill 时深挖可能还没入过队：空快照 = 新队列，H0 按当前 diff 重建）。
     // 注意「全 Settled」也必须进：run_deep 会 0 次派发直接把已挖出的 findings 带回报告；
     // 跳过它 → report.findings 停在 scan-only 的空集 → 尾段 write_result 用一份无 finding 的
     // 报告覆盖掉上一轮的成果（deep 已跑完才被 kill 的作业就是这样丢结果的）。
-    if still_missing == 0 && !roles.reviewers.is_empty() && !queue_snap.is_empty() {
+    if !roles.reviewers.is_empty() {
         {
             let (reopened, reconciled) = reconcile_queue_with_cells(&mut queue_snap, &deep_records);
             // 对账改过状态的项写回快照（下一次 resume 不必再对一遍）；重挖的项派发时 run_deep 会再写。
@@ -1249,9 +1253,11 @@ pub async fn run_resume(
                 .iter()
                 .flat_map(|r| r.output.findings().to_vec())
                 .collect();
-            let unfinished = queue_snap.iter().any(|it| {
-                matches!(it.state, crate::orchestrate::queue::ItemState::Pending | crate::orchestrate::queue::ItemState::InFlight)
-            });
+            // 空快照 = 深挖没入过队（扫描期被 kill），整段未完——diff 重建失败时同样计债，不当成「没东西可挖」的干净收口。
+            let unfinished = queue_snap.is_empty()
+                || queue_snap.iter().any(|it| {
+                    matches!(it.state, crate::orchestrate::queue::ItemState::Pending | crate::orchestrate::queue::ItemState::InFlight)
+                });
             let changes = match crate::evidence::git::changed_files(cwd, args.base.as_deref(), branch_scope) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1271,6 +1277,19 @@ pub async fn run_resume(
                 }
             };
             let selected = select_files(changes);
+            // 阶段 0 路由按当前 diff 重算（design C2 §6〔D15〕）：快照为空时 H0 从这里重建；原报告没有 risk 段（首跑在收口前被 kill）时
+            // 预算也取重算值——收场 drain 要用首跑同一个 K，缺省 4 会把首跑留下的项截掉。
+            let prior_risk = prior.as_ref().and_then(|r| r.run.risk.clone());
+            let (risk_now, route_now) = if queue_snap.is_empty() || prior_risk.is_none() {
+                stage0_risk(&selected, cwd, &args, cfg, prior.as_ref().and_then(|r| r.run.head_sha.as_deref()))
+            } else {
+                (None, None)
+            };
+            let budget_cells = prior_risk.as_ref().or(risk_now.as_ref()).map(|r| r.budget_cells).unwrap_or(4);
+            if report.run.risk.is_none() {
+                report.run.risk = risk_now;
+            }
+            let route = if queue_snap.is_empty() { route_now } else { None };
             // spec 段随重跑一起带回：resume 的 reviewer prompt 必须与首跑同构，缺了契约段
             // 同一 cell 两次判读口径就不一样。
             let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
@@ -1288,7 +1307,6 @@ pub async fn run_resume(
             } else {
                 "working tree".to_string()
             };
-            let budget_cells = prior.as_ref().and_then(|r| r.run.risk.clone()).map(|r| r.budget_cells).unwrap_or(4);
             let snap2 = |it: &crate::orchestrate::queue::QueueItem| {
                 if let Err(e) = store.put_queue_item(job_id, it) {
                     eprintln!("warn: job {job_id} resume queue snapshot 失败: {e}");
@@ -1321,8 +1339,9 @@ pub async fn run_resume(
             let deep = run_deep(
                 registry,
                 DeepInput {
-                    route: None,
-                    scan_cells: &[] as &[ScanCellResult],
+                    route: route.as_ref(),
+                    // 全部成功 scanner 格按到达键幂等入队：首跑已到达的疑点跳过，补跑出的新疑点照常入队；旧快照（无到达键）走谓词合并兜底
+                    scan_cells: &scan_cells,
                     bundles: &bundles,
                     root: cwd,
                     reviewers: &roles.reviewers,
@@ -1337,7 +1356,7 @@ pub async fn run_resume(
                     backend_factory: Some(factory.as_ref()),
                     on_cell: Some(&on_cell2),
                     incoming: None,
-                    reopen_skipped: false,
+                    reopen_skipped: replayed,
                 },
                 &(),
             )
@@ -2348,10 +2367,12 @@ mod resume_tests {
         (reg, rev)
     }
 
-    /// scan 段已补齐的作业骨架（manifest 一格且已完成 + args）。
+    /// scan 段已补齐的作业骨架（manifest 一格且已完成、**零疑点** + args）。零疑点是为了与手写的队列快照自洽：C2 起 resume 把全部
+    /// scanner 疑点按到达键幂等入队，快照里没记到达的疑点会被当成未挖的新疑点挖掉（`resume_*` 深挖用例只关心快照里的项）。
     fn scan_done_job(store: &crate::state::JobStore) {
         store.write_manifest("j", &[input("scan[g1]@p/m#1", "p/m", "P1")]).unwrap();
-        store.append_partial("j", &done_scan("scan[g1]@p/m#1", "p/m", "x.rs")).unwrap();
+        let empty = CellRecord::ok("scan[g1]@p/m#1", "p/m", crate::domain::CellOutput::Scan(Default::default()));
+        store.append_partial("j", &empty).unwrap();
         store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
     }
 
@@ -2578,6 +2599,335 @@ mod resume_tests {
         assert_eq!(names(&cov.reused), vec!["review[z.rs:rule:1-2]@p/r"], "z.rs 的成功格沿用");
         assert!(cov.failed.is_empty(), "y.rs 首跑的失败格已被重挖覆盖，不再报失败: {cov:?}");
         assert_eq!(code, 0, "重挖成功 → 首跑失败格的债已还清: {:?}", report.run.warnings);
+    }
+
+    // ── C2-5：resume 离线续跑（design §6 RS1〔D15〕）────────────────────────────
+
+    /// scanner 条目 `p/m`（每格回 `scan_json`）+ reviewer `p/r`（每格回 `review`）；`Arc` 句柄留给测试数调用次数。
+    fn rs_registry(scan_json: &str, review: &str) -> (ProviderRegistry, Arc<FakeChatBackend>, Arc<FakeChatBackend>) {
+        let turn = |text: &str| AssistantTurn {
+            text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: Some("stop".into()), reasoning_tokens: None,
+        };
+        let scan = Arc::new(FakeChatBackend::repeating(turn(scan_json)));
+        let rev = Arc::new(FakeChatBackend::repeating(turn(review)));
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/m", "p", 8, Box::new(Arc::clone(&scan)), std::time::Duration::from_secs(5), 0);
+        reg.insert_scan("p/r", "p", 8, Box::new(Arc::clone(&rev)), std::time::Duration::from_secs(5), 0);
+        (reg, scan, rev)
+    }
+
+    fn susp_json(file: &str, line: u32, quote: &str) -> String {
+        format!(r#"{{"suspicions":[{{"file":"{file}","line_start":{line},"line_end":{line},"hint":"h","confidence":0.6,"quote":"{quote}"}}],"scanned_areas":[]}}"#)
+    }
+
+    /// 首跑已落盘的 scanner 格（疑点已锚定：`file` 第 `line` 行 `quote`）。
+    fn scan_rec(cell: &str, file: &str, line: u32, quote: &str) -> CellRecord {
+        let out = crate::domain::ScanOutput {
+            suspicions: vec![crate::domain::Suspicion { file: file.into(), line_start: line, line_end: line, hint: "h".into(), category: None, confidence: 0.6, quote: quote.into() }],
+            ..Default::default()
+        };
+        CellRecord::ok(cell, "p/m", crate::domain::CellOutput::Scan(out)).with_family("m")
+    }
+
+    /// 修 C1 缺口（design §6 RS1 ③）：扫描期被 kill、队列快照为空（深挖还没入过队）、配了 reviewer 的作业——resume 补跑缺失 scanner 格后
+    /// 必须接着深挖（疑点入队 → 收场 drain → 挖），不能出 scan-only / 退出码 0。
+    #[tokio::test]
+    async fn resume_with_empty_queue_snapshot_still_digs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        repo_with_changes(ws, &[("x.rs", "fn x() {\n    x_marker();\n}\n"), ("y.rs", "fn y() {\n    y_marker();\n}\n")]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[input("scan[g1]@p/m#1", "p/m", "P1"), input("scan[g2]@p/m#1", "p/m", "P2")]).unwrap();
+        store.append_partial("j", &scan_rec("scan[g1]@p/m#1", "x.rs", 2, "x_marker();")).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let (reg, scan, rev) = rs_registry(&susp_json("y.rs", 2, "y_marker();"), r#"{"findings":[],"needs":[]}"#);
+
+        let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        assert_eq!(scan.turn_count(), 1, "只补跑缺失的 g2");
+        assert_eq!(rev.turn_count(), 2, "两条疑点都挖: {:?}", report.run.warnings);
+        assert_eq!((report.verdict, code), (Verdict::Approve, 0), "{:?}", report.run.warnings);
+        assert_eq!(report.run.coverage.completed.get(&Role::Reviewer).map(Vec::len), Some(2));
+        let deep = report.run.deep.as_ref().expect("深挖观测段");
+        assert_eq!((deep.enqueue_reasons.get("scan"), deep.budget_skipped), (Some(&2), 0));
+    }
+
+    fn rs_cfg(max_cells: u32) -> Config {
+        Config::from_json(
+            &r#"{"review":{"reviewers":{"maxCells":MAX}},"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#
+                .replace("MAX", &max_cells.to_string()),
+        )
+        .unwrap()
+    }
+
+    /// 疑点形态的队列快照项（经 `EnqueueReq::scan` 构造：笔记 / 到达键 / id 与首跑同形；家族 `m`、到达键 `{cell}#0`）。
+    fn snap_susp(file: &str, line: u32, quote: &str, cell: &str, state: crate::orchestrate::queue::ItemState) -> crate::orchestrate::queue::QueueItem {
+        use crate::orchestrate::queue::{DeepQueue, EnqueueReq};
+        let s = crate::domain::Suspicion { file: file.into(), line_start: line, line_end: line, hint: "h".into(), category: None, confidence: 0.6, quote: quote.into() };
+        let mut q = DeepQueue::new();
+        q.enqueue(EnqueueReq::scan(&s, "m", crate::consolidate::scan::arrival_key(cell, 0)).unwrap());
+        let mut it = q.items()[0].clone();
+        (it.state, it.dispatch_agreement) = (state, 1);
+        it
+    }
+
+    fn ripple(file: &str, state: crate::orchestrate::queue::ItemState) -> crate::orchestrate::queue::QueueItem {
+        let mut it = rule_item(file, state);
+        it.kind = crate::orchestrate::queue::ItemKind::Ripple;
+        it
+    }
+
+    /// `<name>.rs` 第 2 行 `<name>_marker();` 上的一条 low finding（reviewer 格载体）。
+    fn marker_finding(name: &str) -> crate::domain::Finding {
+        let mut f = crate::domain::finding::fixtures::finding(&format!("{name} issue"), crate::domain::Severity::Low, 1, "p/r");
+        (f.file, f.quote, f.line_start, f.line_end) = (format!("{name}.rs"), format!("{name}_marker();"), 2, 2);
+        f
+    }
+
+    fn review_rec(item_id: &str, findings: Vec<crate::domain::Finding>) -> CellRecord {
+        CellRecord::ok(format!("review[{item_id}]@p/r"), "p/r", crate::domain::CellOutput::Review { findings, needs: vec![] })
+    }
+
+    fn marker_repo(ws: &std::path::Path, names: &[&str]) {
+        let files: Vec<(String, String)> = names.iter().map(|n| (format!("{n}.rs"), format!("fn {n}() {{\n    {n}_marker();\n}}\n"))).collect();
+        repo_with_changes(ws, &files.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect::<Vec<_>>());
+    }
+
+    fn reviewer_names(bucket: &BTreeMap<Role, Vec<String>>) -> Vec<String> {
+        bucket.get(&Role::Reviewer).cloned().unwrap_or_default()
+    }
+
+    /// RS1 ①（design §6）：扫描期被 kill——H0 一项已挖完（格带 finding）、一项在途，g1 的疑点已到达未派，g2 未落盘。resume 补跑 g2 →
+    /// g1 疑点幂等跳过、g2 疑点新入队 → 收场 drain（往轮在途占位）→ 挖在途 H0 与两条疑点；往轮 finding 不丢不双计。再 resume 一次：无事可做、结果不变。
+    #[tokio::test]
+    async fn resume_after_scan_phase_kill_replays_enqueues_and_digs() {
+        use crate::orchestrate::queue::ItemState;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        marker_repo(ws, &["a", "b", "x", "y"]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[input("scan[g1]@p/m#1", "p/m", "P1"), input("scan[g2]@p/m#1", "p/m", "P2")]).unwrap();
+        store.append_partial("j", &scan_rec("scan[g1]@p/m#1", "x.rs", 2, "x_marker();")).unwrap();
+        store.append_partial("j", &review_rec("a.rs:rule:1-2", vec![marker_finding("a")])).unwrap();
+        store.put_queue_item("j", &rule_item("a.rs", ItemState::Settled)).unwrap();
+        store.put_queue_item("j", &rule_item("b.rs", ItemState::InFlight)).unwrap();
+        store.put_queue_item("j", &snap_susp("x.rs", 2, "x_marker();", "scan[g1]@p/m#1", ItemState::Pending)).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let (reg, scan, rev) = rs_registry(&susp_json("y.rs", 2, "y_marker();"), r#"{"findings":[],"needs":[]}"#);
+
+        let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        assert_eq!((scan.turn_count(), rev.turn_count()), (1, 3), "补跑 g2；挖 b + x + y: {:?}", report.run.warnings);
+        assert_eq!((report.verdict, code), (Verdict::Approve, 0), "{:?}", report.run.warnings);
+        assert_eq!(report.findings.iter().map(|f| f.title.as_str()).collect::<Vec<_>>(), ["a issue"], "往轮 finding 不丢不双计");
+        let cov = &report.run.coverage;
+        assert_eq!(reviewer_names(&cov.reused), ["review[a.rs:rule:1-2]@p/r"]);
+        assert_eq!(reviewer_names(&cov.completed).len(), 3);
+        let deep = report.run.deep.as_ref().unwrap();
+        assert_eq!((deep.enqueue_reasons.get("scan"), deep.dedup_hits, deep.budget_skipped), (Some(&1), 0, 0), "g1 疑点幂等跳过、g2 疑点新入队");
+        assert!(store.read_queue_items("j").iter().all(|it| it.state == ItemState::Settled));
+
+        let (again, code2) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+        assert_eq!((scan.turn_count(), rev.turn_count()), (1, 3), "再 resume 无事可做");
+        assert_eq!((again.findings.len(), code2), (1, 0), "{:?}", again.run.warnings);
+    }
+
+    /// RS1 ②：首跑 scanner g2 失败（F3）带 Skipped 收场——resume 补跑 g2 → 被截项复位、与新疑点一起经收场 drain 重选。
+    /// K = 4：已挖 x（必挖）占 1 → 剩余 3、保底 1 留给新疑点 y；复位的三条涟漪按优先级补到 3 → k3 再次被截。
+    #[tokio::test]
+    async fn resume_replay_reopens_skipped_for_reselection() {
+        use crate::orchestrate::queue::ItemState;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        marker_repo(ws, &["x", "y", "k1", "k2", "k3"]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[input("scan[g1]@p/m#1", "p/m", "P1"), input("scan[g2]@p/m#1", "p/m", "P2")]).unwrap();
+        store.append_partial("j", &scan_rec("scan[g1]@p/m#1", "x.rs", 2, "x_marker();")).unwrap();
+        store.append_partial("j", &CellRecord::failed("scan[g2]@p/m#1", "p/m", Role::Scanner, "boom")).unwrap();
+        let mut x = snap_susp("x.rs", 2, "x_marker();", "scan[g1]@p/m#1", ItemState::Settled);
+        (x.agreement, x.dispatch_agreement) = (2, 2);
+        store.append_partial("j", &review_rec(&x.id, vec![])).unwrap();
+        store.put_queue_item("j", &x).unwrap();
+        for k in ["k1.rs", "k2.rs", "k3.rs"] {
+            store.put_queue_item("j", &ripple(k, ItemState::Skipped)).unwrap();
+        }
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let (reg, scan, rev) = rs_registry(&susp_json("y.rs", 2, "y_marker();"), r#"{"findings":[],"needs":[]}"#);
+
+        let (report, code) = run_resume("j", &reg, &rs_cfg(4), ws, &store).await;
+
+        assert_eq!((scan.turn_count(), rev.turn_count()), (1, 3), "{:?}", report.run.warnings);
+        let dug = reviewer_names(&report.run.coverage.completed);
+        assert_eq!(dug, ["review[k1.rs:rule:1-2]@p/r", "review[k2.rs:rule:1-2]@p/r", "review[y.rs:scan:2-2]@p/r"]);
+        assert_eq!(report.run.deep.as_ref().map(|d| d.budget_skipped), Some(1));
+        assert_eq!((report.verdict, code), (Verdict::Approve, 2), "预算截断计债: {:?}", report.run.warnings);
+        let k3 = store.read_queue_items("j").into_iter().find(|it| it.spec.file == "k3.rs").unwrap();
+        assert_eq!(k3.state, ItemState::Skipped);
+    }
+
+    /// RS1 ④a：并发多项在途时被 kill，其中两项的格已落盘（带 finding）、快照仍 InFlight——对账成 Settled 不重挖，
+    /// 只重挖没格的一项；finding 各一条、不丢不双计。再 resume 一次结果不变。
+    #[tokio::test]
+    async fn resume_after_concurrent_inflight_kill_keeps_findings_once() {
+        use crate::orchestrate::queue::ItemState;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        marker_repo(ws, &["a", "b", "c"]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        scan_done_job(&store);
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            store.put_queue_item("j", &rule_item(f, ItemState::InFlight)).unwrap();
+        }
+        store.append_partial("j", &review_rec("a.rs:rule:1-2", vec![marker_finding("a")])).unwrap();
+        store.append_partial("j", &review_rec("b.rs:rule:1-2", vec![marker_finding("b")])).unwrap();
+        let (reg, rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+        for round in 0..2 {
+            let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+            assert_eq!(rev.turn_count(), 1, "round {round}: 只重挖没格的 c.rs");
+            let mut titles: Vec<&str> = report.findings.iter().map(|f| f.title.as_str()).collect();
+            titles.sort();
+            assert_eq!(titles, ["a issue", "b issue"], "round {round}: {:?}", report.run.warnings);
+            assert_eq!((report.verdict, code), (Verdict::Approve, 0), "round {round}: {:?}", report.run.warnings);
+        }
+    }
+
+    /// RS1 ④b：深挖期被 kill、scanner 无需补跑——被截项不复位（沿用、照计债），首跑留下的待挖项一条不少；原报告还没写（收口前被 kill）
+    /// 时预算取重算值（配置 maxCells 5），不是缺省 4。首跑 K = 5（F = 2、额度 3）：x 必挖 + p1、p2 扫描期派出，收场剩余 2 → 疑点 k 占保底、
+    /// p3 补位、p4 被截；kill 时 x、p1 已结案、p2 在途。resume：已派发 3 → 剩余 2 → 挖 p2、p3、k；按缺省 K = 4 算会把 p3 截掉。
+    #[tokio::test]
+    async fn resume_during_deep_without_replay_keeps_skipped_and_pending() {
+        use crate::orchestrate::queue::ItemState;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        marker_repo(ws, &["x", "p1", "p2", "p3", "p4", "k"]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        scan_done_job(&store);
+        store.put_queue_item("j", &rule_item("x.rs", ItemState::Settled)).unwrap();
+        store.append_partial("j", &review_rec("x.rs:rule:1-2", vec![])).unwrap();
+        store.put_queue_item("j", &ripple("p1.rs", ItemState::Settled)).unwrap();
+        store.append_partial("j", &review_rec("p1.rs:rule:1-2", vec![])).unwrap();
+        store.put_queue_item("j", &ripple("p2.rs", ItemState::InFlight)).unwrap();
+        store.put_queue_item("j", &ripple("p3.rs", ItemState::Pending)).unwrap();
+        store.put_queue_item("j", &snap_susp("k.rs", 2, "k_marker();", "scan[g9]@p/m#1", ItemState::Pending)).unwrap();
+        store.put_queue_item("j", &ripple("p4.rs", ItemState::Skipped)).unwrap();
+        let (reg, rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+        let (report, code) = run_resume("j", &reg, &rs_cfg(5), ws, &store).await;
+
+        assert_eq!(rev.turn_count(), 3, "{:?}", report.run.warnings);
+        assert_eq!(
+            reviewer_names(&report.run.coverage.completed),
+            ["review[p2.rs:rule:1-2]@p/r", "review[p3.rs:rule:1-2]@p/r", "review[k.rs:scan:2-2]@p/r"]
+        );
+        assert_eq!(report.run.risk.as_ref().map(|r| r.budget_cells), Some(5), "无原报告：预算取重算值并进报告");
+        assert_eq!(report.run.deep.as_ref().map(|d| d.budget_skipped), Some(1));
+        assert_eq!(code, 2);
+        let p4 = store.read_queue_items("j").into_iter().find(|it| it.spec.file == "p4.rs").unwrap();
+        assert_eq!(p4.state, ItemState::Skipped, "不补跑 scanner 不复位");
+    }
+
+    /// RS1 ④c：旧快照（C1 起的作业，队列项无到达键）可 resume——回放的 scanner 疑点经谓词并入已有项（去重命中、不新增项、不重挖），
+    /// 并补记到达键；再 resume 一次即幂等（不再计去重）。
+    #[tokio::test]
+    async fn resume_old_snapshot_without_arrival_keys() {
+        use crate::orchestrate::queue::ItemState;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        marker_repo(ws, &["x"]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[input("scan[g1]@p/m#1", "p/m", "P1")]).unwrap();
+        store.append_partial("j", &scan_rec("scan[g1]@p/m#1", "x.rs", 2, "x_marker();")).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let mut old = snap_susp("x.rs", 2, "x_marker();", "scan[g1]@p/m#1", ItemState::Settled);
+        old.arrivals.clear();
+        store.append_partial("j", &review_rec(&old.id, vec![marker_finding("x")])).unwrap();
+        store.put_queue_item("j", &old).unwrap();
+        let (reg, rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+        let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+        assert_eq!(rev.turn_count(), 0, "{:?}", report.run.warnings);
+        let deep = report.run.deep.as_ref().unwrap();
+        assert_eq!((deep.dedup_hits, deep.enqueue_reasons.get("scan")), (1, None), "谓词并入、不新增项");
+        assert_eq!((report.findings.len(), code), (1, 0));
+        let items = store.read_queue_items("j");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].arrivals, ["scan[g1]@p/m#1#0"], "补记到达键");
+
+        let (again, _) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+        assert_eq!(again.run.deep.as_ref().map(|d| d.dedup_hits), Some(0), "幂等");
+    }
+
+    /// RS1 + F3：补跑后 scanner 仍缺格——深挖照跑、findings 照进，判定 Incomplete / 3，本可 reject 的 blocking 条数照报。
+    #[tokio::test]
+    async fn resume_with_scanner_still_missing_digs_but_stays_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        marker_repo(ws, &["x", "y"]);
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[input("scan[g1]@p/m#1", "p/m", "P1"), input("scan[g2]@p/m#1", "p/m", "P2")]).unwrap();
+        store.append_partial("j", &scan_rec("scan[g1]@p/m#1", "x.rs", 2, "x_marker();")).unwrap();
+        store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
+        let blocking = r#"{"findings":[{"severity":"high","title":"x blocks","body":"b","file":"x.rs","line_start":2,"line_end":2,"confidence":0.95,"recommendation":"r","quote":"x_marker();"}],"needs":[]}"#;
+        let turn = |text: &str| AssistantTurn {
+            text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: Some("stop".into()), reasoning_tokens: None,
+        };
+        let rev = Arc::new(FakeChatBackend::repeating(turn(blocking)));
+        let mut reg = ProviderRegistry::new();
+        let down = FakeChatBackend::new_results(vec![Err(crate::provider::ProviderError::Unavailable("still down".into()))]);
+        reg.insert_scan("p/m", "p", 8, Box::new(down), std::time::Duration::from_secs(5), 0);
+        reg.insert_scan("p/r", "p", 8, Box::new(Arc::clone(&rev)), std::time::Duration::from_secs(5), 0);
+
+        let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        let w = &report.run.warnings;
+        assert_eq!(rev.turn_count(), 1, "g1 的疑点照挖: {w:?}");
+        assert_eq!((report.verdict, code), (Verdict::Incomplete, 3), "{w:?}");
+        assert_eq!(report.findings.len(), 1);
+        assert!(w.iter().any(|x| x == "resume: 1 cell(s) still missing after replay"), "{w:?}");
+        assert!(w.iter().any(|x| x == "scan incomplete: 1 blocking finding(s) present — a complete review would reject"), "{w:?}");
+    }
+
+    /// RS1 ③ 续：空快照时 H0 按当前 diff 重建（design §6）——扫描期被 kill 在深挖入队之前，resume 仍挖到 H0 区；重算的风险段进报告。
+    #[tokio::test]
+    async fn resume_with_empty_snapshot_rebuilds_h0() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let before = "pub fn check(a: u8) -> bool {\n    if a > 1 {\n        return true;\n    }\n    false\n}\n";
+        let after = "pub fn check(a: u16) -> bool {\n    if a > 1 {\n        return true;\n    }\n    false\n}\n";
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        git(ws, &["init", "-q"]);
+        std::fs::write(ws.join("src/auth.rs"), before).unwrap();
+        git(ws, &["add", "."]);
+        git(ws, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        std::fs::write(ws.join("src/auth.rs"), after).unwrap();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        scan_done_job(&store);
+        let (reg, rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+        let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        let dug = reviewer_names(&report.run.coverage.completed);
+        assert!(!dug.is_empty() && dug.iter().all(|c| c.starts_with("review[src/auth.rs:rule:")), "{dug:?} {:?}", report.run.warnings);
+        assert_eq!(rev.turn_count(), dug.len());
+        assert!(report.run.risk.as_ref().is_some_and(|r| r.hotspots >= 1), "{:?}", report.run.risk);
+        assert_eq!((report.verdict, code), (Verdict::Approve, 0), "{:?}", report.run.warnings);
+    }
+
+    /// 空快照 + diff 重建不了（改动已提交 / 不在 git 仓）：深挖整段没发生——计债（approve / 2），不当成「没东西可挖」的干净 scan-only / 0。
+    #[tokio::test]
+    async fn resume_empty_snapshot_without_diff_is_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        scan_done_job(&store);
+        let (reg, rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+        let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        assert_eq!(rev.turn_count(), 0);
+        assert_eq!((report.verdict, code), (Verdict::Approve, 2), "{:?}", report.run.warnings);
+        assert!(report.run.warnings.iter().any(|w| w.starts_with("resume deep: cannot rebuild diff")), "{:?}", report.run.warnings);
     }
 
     /// 重挖的项不被 resume 收场 drain 截掉（C2-3）：「Settled 却无成功格」是往轮派发过的项，对账成「往轮在途」、占预算位——

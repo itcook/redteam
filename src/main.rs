@@ -79,6 +79,8 @@ enum Cmd {
         format: String,
         /// R2.3：补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
         /// （base 等从该作业落盘的 args.json 里重建；模型集按当前配置的 scanner 重建，M21b 起读队列快照）。
+        /// 配了 reviewer 时接着深挖：补跑出的疑点与已完成 scanner 格的疑点幂等入队（已挖过的不重挖）、快照为空则按当前 diff
+        /// 重建风险 H0 区、补跑过 scanner 则被预算截掉的项重选；补跑后 scanner 仍缺格 → incomplete（深挖照跑）。
         #[arg(long)]
         resume: Option<String>,
         /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：
