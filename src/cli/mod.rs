@@ -2220,6 +2220,7 @@ mod resume_tests {
             state: crate::orchestrate::queue::ItemState::Settled,
             kind: crate::orchestrate::queue::ItemKind::Primary,
             dispatch_agreement: 1, landed_agreement: Some(1), families: vec![], enqueued_ms: None,
+            arrivals: vec![],
         };
         store.put_queue_item("j", &item).unwrap();
         store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
@@ -2263,6 +2264,7 @@ mod resume_tests {
             id: format!("{file}:rule:1-2"), spec, score: 1.0, agreement: 1, state,
             kind: crate::orchestrate::queue::ItemKind::Primary,
             dispatch_agreement: 1, landed_agreement: None, families: vec![], enqueued_ms: None,
+            arrivals: vec![],
         }
     }
 

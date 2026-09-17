@@ -43,6 +43,8 @@ pub enum EnqueueOutcome {
     MergedSettled,
     /// 命中被预算截掉的项、并入后仍非必挖 → 只改记录，保持截断（不突破 drain 定下的预算）。
     MergedSkipped,
+    /// 到达键已记在某项上（同一 scan 格的同一条疑点再次到达：resume 幂等入队 / 收场拆簇对账）→ 不改任何项、不计去重命中。
+    Duplicate,
 }
 
 /// 深挖队列项（静态形状对齐 `QueueItemSpec`，另加运行时字段）。
@@ -61,10 +63,14 @@ pub struct QueueItem {
     /// 入队时刻（epoch ms，观测：item_wait_ms = 派发时刻 − 此值）。None = 旧快照。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enqueued_ms: Option<u64>,
+    /// 并入本项的疑点到达键（`{scan cell_id}#{i}`，C2〔D15〕）：同一条疑点再到达即幂等（`EnqueueOutcome::Duplicate`），
+    /// 收场据此把组内闭包簇映射回队列项做拆簇对账。H0 无到达键；旧快照空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arrivals: Vec<String>,
 }
 
 impl QueueItem {
-    fn new(spec: QueueItemSpec, score: f32, kind: ItemKind, families: Vec<String>) -> Self {
+    fn new(spec: QueueItemSpec, score: f32, kind: ItemKind, families: Vec<String>, arrival: Option<String>) -> Self {
         let id = item_id(&spec);
         let families: Vec<String> = dedup_families(families);
         QueueItem {
@@ -78,6 +84,7 @@ impl QueueItem {
             landed_agreement: None,
             families,
             enqueued_ms: Some(now_ms()),
+            arrivals: arrival.into_iter().collect(),
         }
     }
 }
@@ -113,6 +120,8 @@ pub struct EnqueueReq {
     pub score: f32,
     pub kind: ItemKind,
     pub families: Vec<String>,
+    /// 疑点到达键 `{scan cell_id}#{i}`（i = 该格锚定后疑点下标；落盘输出同序，resume 可复算）。H0 / 测试构造为 `None`。
+    pub arrival: Option<String>,
 }
 
 /// 内存队列（C-1 只含入队；派发/预算 C-2/C-3）。
@@ -156,12 +165,23 @@ impl DeepQueue {
 
     /// 五态入口。判例守卫空过：调用方把跨轮命中当无命中喂进来即可。
     pub fn enqueue(&mut self, req: EnqueueReq) -> EnqueueOutcome {
+        self.enqueue_affected(req).0
+    }
+
+    /// 同 [`Self::enqueue`]，另回报受影响项下标（新建项 / 并入目标；`Duplicate` 为 `None`）——调用方只写这一项的快照（C2 Q9）。
+    /// 到达键先查：已记在某项上即幂等返回，不改项、不计去重命中。
+    pub fn enqueue_affected(&mut self, req: EnqueueReq) -> (EnqueueOutcome, Option<usize>) {
+        if let Some(key) = &req.arrival {
+            if self.items.iter().any(|it| it.arrivals.contains(key)) {
+                return (EnqueueOutcome::Duplicate, None);
+            }
+        }
         let incoming_id = item_id(&req.spec);
         if let Some((idx, by_predicate)) = self.find_merge_idx(&req.spec, &incoming_id) {
-            return self.merge_into(idx, req, by_predicate);
+            return (self.merge_into(idx, req, by_predicate), Some(idx));
         }
-        self.items.push(QueueItem::new(req.spec, req.score, req.kind, req.families));
-        EnqueueOutcome::New
+        self.items.push(QueueItem::new(req.spec, req.score, req.kind, req.families, req.arrival));
+        (EnqueueOutcome::New, Some(self.items.len() - 1))
     }
 
     /// 合并目标 + 是否经谓词命中。id 相等（`file:origin:ranges` 逐字相同）也合并——保住「一个区间只挖一次」
@@ -175,9 +195,11 @@ impl DeepQueue {
 
     fn merge_into(&mut self, idx: usize, req: EnqueueReq, by_predicate: bool) -> EnqueueOutcome {
         let it = &mut self.items[idx];
-        // 共识只经谓词（design §2.2）：上游 `merge_suspicions` 已按 `same_suspicion` 组内传递闭包，进队列的同文件
-        // scan 项互不满足谓词——只靠 id 捷径命中的是「上游判为不同疑点、恰好行区间逐字相同」的两条，可能是 quote
-        // 噪声下的同一问题，也可能是同一行上的两个问题。计共识错了是批 D 免复核错放，不计错了只是多复核一次——取后者。
+        // 共识只经谓词（C1 design §2.2；C2〔D15〕改写前提）：疑点逐 scan 格到达，队列侧逐条把新疑点与已有项的笔记比对，
+        // **不是**组内传递闭包——A、C 先到互不匹配、B 后到两边都匹配时 B 只并入先命中的那项，A 与 C 永远两项。非传递漏合并
+        // 只会少算共识、多复核一次（D15 实测 ≤ 1/19 簇），收场以 `closure_members` 对账、拆簇数进 RunMeta。
+        // 只靠 id 捷径命中的是「谓词不认、恰好行区间逐字相同」的两条，可能是 quote 噪声下的同一问题，也可能是同一行上的
+        // 两个问题：不计共识。计错了是批 D 免复核错放，不计错了只是多复核一次——取后者。
         // 但 id 捷径并入的**请求自身**共识不能丢（评审修）：上游已合并成多家族共识的疑点（必挖）撞上同区间的单家族项，
         // agreement 同时决定必挖集与排序分，丢了它就可能被预算截掉——家族不跨疑点并，agreement 取大。
         // 两条路径都取大 → agreement 单调不减（事件侧 `event ≤ landed` 的前提）。
@@ -191,6 +213,9 @@ impl DeepQueue {
         } else {
             it.agreement = it.agreement.max(agreement_of(&dedup_families(req.families)));
         }
+        if let Some(key) = req.arrival {
+            it.arrivals.push(key); // 调用方已查过不在任何项上
+        }
         it.spec.ranges = union_ranges(&it.spec.ranges, &req.spec.ranges);
         it.spec.notes = merge_notes(&it.spec.notes, &req.spec.notes);
         if req.score > it.score {
@@ -202,6 +227,8 @@ impl DeepQueue {
             ItemState::Pending => EnqueueOutcome::MergedPending,
             // 被截项并入后成为必挖（异族谓词共识抬到 2）→ 必挖不截（design §6 规则 3）；
             // 入队时刻重置，免 item_wait_ms 把被截的那段也算成排队。
+            // C2〔D15〕起 Skipped 只在关闭入口时的收场 drain 产生、之后首跑再无到达——本分支首跑生产不可达；
+            // resume 补跑过 scanner 时的复位走 run_deep 的显式重选路径，不经这里。
             ItemState::Skipped if must_dig(it) => {
                 it.state = ItemState::Pending;
                 it.enqueued_ms = Some(now_ms());
@@ -231,16 +258,21 @@ impl DeepQueue {
         must_dig(it)
     }
 
-    /// 到期 drain：Pending 非必挖且未进保底的标 skipped。
-    /// 保底 = ⌈max_cells/4⌉ 条 Suspicion；主区吃穿时帽 = 必挖 + 保底。`max_cells = 0` 只留必挖。
-    /// 返回新标 skipped 的 id。
+    /// 一次性 drain（开跑即关闭入口）：= `drain_with(max_cells, ⌈max_cells/4⌉)`；`max_cells = 0` 只留必挖。
     pub fn drain(&mut self, max_cells: u32) -> Vec<String> {
+        let floor = if max_cells == 0 { 0 } else { max_cells.div_ceil(4) as usize };
+        self.drain_with(max_cells as usize, floor)
+    }
+
+    /// 收场 drain（C2 在线预算〔D15〕，关闭入口时执行一次）：Pending 中留下必挖全部 ∪ 按优先级前 `floor` 条非必挖疑点
+    /// ∪ 按优先级补到留下数 ≥ `budget`；余者标 Skipped，返回其 id。`budget` = 剩余预算（K − 已派发），
+    /// `floor` = 保底剩余（⌈K/4⌉ − 已派发的非必挖疑点）。主区吃穿时帽 = 必挖 + 保底。
+    pub fn drain_with(&mut self, budget: usize, floor: usize) -> Vec<String> {
         let pending = self.pending_order();
         if pending.is_empty() {
             return Vec::new();
         }
         let must: Vec<usize> = pending.iter().copied().filter(|&i| self.is_must(&self.items[i])).collect();
-        let floor = if max_cells == 0 { 0 } else { max_cells.div_ceil(4) as usize };
         let mut keep: std::collections::HashSet<usize> = must.iter().copied().collect();
         let mut reserved = 0usize;
         for &i in &pending {
@@ -251,14 +283,11 @@ impl DeepQueue {
                 reserved += 1;
             }
         }
-        if max_cells > 0 {
-            let budget = max_cells as usize;
-            for &i in &pending {
-                if keep.len() >= budget {
-                    break;
-                }
-                keep.insert(i);
+        for &i in &pending {
+            if keep.len() >= budget {
+                break;
             }
+            keep.insert(i);
         }
         let mut skipped = Vec::new();
         for i in pending {
@@ -277,10 +306,21 @@ impl DeepQueue {
 
     /// 取出最高 Pending 并标 InFlight；记下 dispatch_agreement。
     pub fn pop_dispatch(&mut self) -> Option<QueueItem> {
-        let i = *self.pending_order().first()?;
+        self.pop_dispatch_where(|_| true)
+    }
+
+    /// 取出满足 `eligible` 的最高 Pending（优先级序不变，跳过不可派项取次高）并标 InFlight——在线额度下
+    /// 非必挖项可能暂不可派（C2 Q1〔D15〕）。
+    pub fn pop_dispatch_where(&mut self, eligible: impl Fn(&QueueItem) -> bool) -> Option<QueueItem> {
+        let i = self.pending_order().into_iter().find(|&i| eligible(&self.items[i]))?;
         self.items[i].state = ItemState::InFlight;
         self.items[i].dispatch_agreement = self.items[i].agreement;
         Some(self.items[i].clone())
+    }
+
+    /// 有无满足 `eligible` 的 Pending 项（填门前先问——无可派项不取门位，免持门空转）。
+    pub fn has_eligible(&self, eligible: impl Fn(&QueueItem) -> bool) -> bool {
+        self.items.iter().any(|it| it.state == ItemState::Pending && eligible(it))
     }
 
     pub fn mark_settled(&mut self, id: &str, landed_agreement: u32) {
@@ -334,7 +374,8 @@ fn priority_score(it: &QueueItem) -> f32 {
     }
 }
 
-fn cmp_priority(a: &QueueItem, b: &QueueItem) -> std::cmp::Ordering {
+/// 优先级全序：种类 → 分数（高在前）→ id。收场按最终项优先级组装报告（C2 Q8）共用。
+pub(crate) fn cmp_priority(a: &QueueItem, b: &QueueItem) -> std::cmp::Ordering {
     a.kind
         .cmp(&b.kind)
         .then_with(|| priority_score(b).partial_cmp(&priority_score(a)).unwrap_or(std::cmp::Ordering::Equal))
@@ -441,6 +482,7 @@ mod tests {
             score: 1.0,
             kind: ItemKind::Suspicion,
             families: family.map(|f| vec![f.to_string()]).unwrap_or_default(),
+            arrival: None,
         }
     }
 
@@ -538,12 +580,14 @@ mod tests {
             score: 0.5,
             kind: ItemKind::Suspicion,
             families: vec!["alpha".into()],
+            arrival: None,
         });
         q.enqueue(EnqueueReq {
             spec: spec_scan("a.rs", 80, 80, "db.write(t);", "h2"),
             score: 0.5,
             kind: ItemKind::Suspicion,
             families: vec!["alpha".into(), "beta".into(), "gamma".into()],
+            arrival: None,
         });
         assert_eq!(q.items().len(), 2, "行不重叠不合并");
         let first = q.items().iter().find(|i| i.spec.ranges == vec![(10, 10)]).unwrap();
@@ -563,6 +607,7 @@ mod tests {
             score: 0.5,
             kind: ItemKind::Suspicion,
             families: vec!["alpha".into(), "alpha".into(), "".into(), "beta".into()],
+            arrival: None,
         });
         assert_eq!(q.items()[0].agreement, 2);
         assert_eq!(q.items()[0].families, vec!["alpha".to_string(), "beta".to_string()]);
@@ -578,7 +623,7 @@ mod tests {
     }
 
     fn req_kind(spec: QueueItemSpec, kind: ItemKind, score: f32, family: Option<&str>) -> EnqueueReq {
-        EnqueueReq { spec, score, kind, families: family.map(|f| vec![f.to_string()]).unwrap_or_default() }
+        EnqueueReq { spec, score, kind, families: family.map(|f| vec![f.to_string()]).unwrap_or_default(), arrival: None }
     }
 
     fn spec_needs(file: &str, start: u32, end: u32) -> QueueItemSpec {
@@ -688,6 +733,7 @@ mod tests {
             score: 1.0,
             kind: ItemKind::Suspicion,
             families: vec!["beta".into(), "gamma".into()],
+            arrival: None,
         });
         assert_eq!(o, EnqueueOutcome::MergedPending);
         assert_eq!(q.items().len(), 1);
@@ -736,5 +782,113 @@ mod tests {
         assert_eq!(o, EnqueueOutcome::MergedPending, "谓词的异族并入 → 必挖 → 复位");
         assert_eq!((q.items()[0].state, q.items()[0].agreement), (ItemState::Pending, 2));
         assert!(q.items()[0].enqueued_ms.unwrap() > 0, "入队时刻重置");
+    }
+
+    // ── C2 零件〔D15〕 ───────────────────────────────────────────────────────
+
+    fn arrived(spec: QueueItemSpec, family: &str, arrival: &str) -> EnqueueReq {
+        EnqueueReq { arrival: Some(arrival.into()), ..req(spec, Some(family)) }
+    }
+
+    /// 到达键幂等：同一条疑点再到达（哪怕家族 / 区间变了）→ `Duplicate`、不回报受影响项、队列零改动。
+    #[test]
+    fn arrival_key_makes_enqueue_idempotent() {
+        let mut q = DeepQueue::new();
+        let (o, idx) = q.enqueue_affected(arrived(spec_scan("a.rs", 3, 5, "v[i]", "idx"), "alpha", "scan[g1]@p/a#1#0"));
+        assert_eq!((o, idx), (EnqueueOutcome::New, Some(0)));
+        let before = q.items().to_vec();
+        let (o, idx) = q.enqueue_affected(arrived(spec_scan("a.rs", 3, 9, "v[i]", "idx"), "beta", "scan[g1]@p/a#1#0"));
+        assert_eq!((o, idx), (EnqueueOutcome::Duplicate, None));
+        assert_eq!(q.items(), before.as_slice(), "重复到达零改动");
+    }
+
+    /// 回报受影响项：新建 → 新项下标；谓词并入 / id 捷径并入 → 目标项下标；并入项追加到达键。
+    #[test]
+    fn enqueue_reports_affected_item_and_records_arrivals() {
+        let mut q = DeepQueue::new();
+        q.enqueue_affected(arrived(spec_scan("a.rs", 3, 5, "v[i]", "idx"), "alpha", "c1#0"));
+        assert_eq!(q.enqueue_affected(arrived(spec_scan("b.rs", 1, 1, "x", "h"), "alpha", "c1#1")), (EnqueueOutcome::New, Some(1)));
+        assert_eq!(q.enqueue_affected(arrived(spec_scan("a.rs", 4, 5, "v[i]", "idx"), "beta", "c2#0")), (EnqueueOutcome::MergedPending, Some(0)));
+        assert_eq!(q.enqueue_affected(arrived(spec_scan("a.rs", 3, 5, "unwrap()", "opt"), "gamma", "c3#0")), (EnqueueOutcome::MergedPending, Some(0)), "id 捷径");
+        assert_eq!(q.items()[0].arrivals, vec!["c1#0".to_string(), "c2#0".to_string(), "c3#0".to_string()]);
+        assert_eq!(q.items()[1].arrivals, vec!["c1#1".to_string()]);
+        let json = serde_json::to_value(&q.items()[0]).unwrap();
+        assert!(json.get("arrivals").is_some());
+        let h0 = QueueItem { arrivals: vec![], ..q.items()[1].clone() };
+        assert!(serde_json::to_value(&h0).unwrap().get("arrivals").is_none(), "空到达键不序列化（旧快照形状）");
+    }
+
+    /// 按可派条件弹出：跳过不可派的更高优先项、取次高；无可派项 → None 且不改状态。
+    #[test]
+    fn pop_dispatch_where_skips_ineligible_items() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req_kind(spec_rule("p.rs", 1, 2), ItemKind::Primary, 1.0, None));
+        q.enqueue(req_kind(spec_rule("r.rs", 1, 2), ItemKind::Ripple, 1.0, None));
+        q.enqueue(req_kind(spec_scan("s.rs", 1, 2, "a", "h"), ItemKind::Suspicion, 1.0, Some("a")));
+        let not_primary = |it: &QueueItem| it.kind != ItemKind::Primary;
+        assert!(q.has_eligible(not_primary));
+        assert_eq!(q.pop_dispatch_where(not_primary).map(|it| it.kind), Some(ItemKind::Ripple), "跳过主区取次高");
+        assert_eq!(q.pop_dispatch_where(not_primary).map(|it| it.kind), Some(ItemKind::Suspicion));
+        assert!(!q.has_eligible(not_primary));
+        assert!(q.pop_dispatch_where(not_primary).is_none());
+        assert_eq!(q.pending_count(), 1, "主区仍 Pending");
+        assert_eq!(q.pop_dispatch().map(|it| it.kind), Some(ItemKind::Primary));
+    }
+
+    fn drain_scenarios() -> Vec<(DeepQueue, u32)> {
+        let mut out = Vec::new();
+        let mut q = DeepQueue::new();
+        q.enqueue(req_kind(spec_rule("p.rs", 1, 2), ItemKind::Primary, 1.0, None));
+        q.enqueue(req_kind(spec_scan("s.rs", 1, 2, "a", "h"), ItemKind::Suspicion, 1.0, Some("a")));
+        q.enqueue(req_kind(spec_needs("n.rs", 1, 2), ItemKind::Needs, 1.0, None));
+        out.push((q.clone(), 0));
+        out.push((q, 2));
+        let mut q = DeepQueue::new();
+        q.enqueue(req_kind(spec_scan("s.rs", 1, 2, "a", "h"), ItemKind::Suspicion, 1.0, Some("a")));
+        q.enqueue(req_kind(spec_scan("s.rs", 1, 2, "a", "h"), ItemKind::Suspicion, 1.0, Some("b")));
+        q.enqueue(req_kind(spec_needs("n.rs", 1, 2), ItemKind::Needs, 1.0, None));
+        out.push((q, 0));
+        let mut q = DeepQueue::new();
+        for i in 0..4u32 {
+            q.enqueue(req_kind(spec_rule(&format!("p{i}.rs"), 1, 2), ItemKind::Primary, 1.0, None));
+        }
+        for i in 0..3u32 {
+            q.enqueue(req_kind(spec_scan(&format!("s{i}.rs"), 1, 2, "a", "h"), ItemKind::Suspicion, 0.5 + i as f32 / 10.0, Some("a")));
+        }
+        q.enqueue(req_kind(spec_needs("n.rs", 1, 2), ItemKind::Needs, 1.0, None));
+        out.push((q.clone(), 4));
+        out.push((q.clone(), 8));
+        out.push((q, 12));
+        out
+    }
+
+    /// `drain(K)` = `drain_with(K, ⌈K/4⌉)`：C1 各场景逐项一致（开跑即关闭、未派发时的收场 drain 就是旧 drain）。
+    #[test]
+    fn drain_with_matches_drain_on_c1_scenarios() {
+        for (q, k) in drain_scenarios() {
+            let (mut a, mut b) = (q.clone(), q);
+            let floor = if k == 0 { 0 } else { k.div_ceil(4) as usize };
+            assert_eq!(a.drain(k), b.drain_with(k as usize, floor), "K = {k}");
+            assert_eq!(a.items(), b.items(), "K = {k}");
+        }
+    }
+
+    /// 收场 drain 的两个参数各自生效：主区吃穿剩余预算（budget 0）时帽 = 必挖 + floor 条疑点；floor 取调用方给的剩余保底，
+    /// 不按预算重算（已派发的非必挖疑点要从保底里扣掉）。
+    #[test]
+    fn drain_with_honors_remaining_budget_and_floor() {
+        let mut q = DeepQueue::new();
+        for i in 0..3u32 {
+            q.enqueue(req_kind(spec_rule(&format!("p{i}.rs"), 1, 2), ItemKind::Primary, 1.0, None));
+            q.enqueue(req_kind(spec_scan(&format!("s{i}.rs"), 1, 2, "a", "h"), ItemKind::Suspicion, 0.5, Some("a")));
+        }
+        let kept = |q: &DeepQueue| q.items().iter().filter(|it| it.state == ItemState::Pending).count();
+        let mut two = q.clone();
+        assert_eq!(two.drain_with(0, 2).len(), 1);
+        assert_eq!(kept(&two), 5, "3 主区 + 2 保底疑点");
+        let mut none = q.clone();
+        assert_eq!(none.drain_with(0, 0).len(), 3, "保底已被已派发疑点用完 → 只留必挖");
+        let mut fill = q;
+        assert_eq!(fill.drain_with(4, 0).len(), 2, "按优先级补到 4");
     }
 }

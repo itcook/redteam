@@ -46,28 +46,34 @@ fn find(parent: &mut [usize], i: usize) -> usize {
     r
 }
 
-/// 合并：按组分桶；桶内所有 (cell, 疑点) 两两按 `same_suspicion` 并查集连通；每簇代表 = confidence 最高者（并列取
-/// (file, line_start, line_end, hint) 最小者）；`families` 排序去重、`cell_ids` / `hints` 按 cell id 序去重；输出按
-/// (group, file, line_start, line_end, hint) 排序。失败格（`output == None`）不参与。
-pub fn merge_suspicions(cells: &[ScanCellResult]) -> Vec<MergedSuspicion> {
+/// 疑点到达键：`{scan cell_id}#{i}`，i = 疑点在该格锚定后 `suspicions` 里的下标（落盘输出同序，resume 可复算）。
+/// 深挖入队（`EnqueueReq.arrival`）与收场拆簇对账（[`closure_members`]）共用这一口径（C2〔D15〕）。
+pub fn arrival_key(cell_id: &str, i: usize) -> String {
+    format!("{cell_id}#{i}")
+}
+
+/// 组内「同一疑点」簇（[`merge_suspicions`] 与 [`closure_members`] 共用同一并查集）：按 cell id 排序后逐格展开疑点，
+/// 按组分桶，桶内两两按 `same_suspicion` 连通；返回 (组, 簇成员 = (格, 该格内疑点下标))，簇按组、根序，成员按展开序。
+/// 失败格（`output == None`）不参与。
+fn suspicion_clusters(cells: &[ScanCellResult]) -> Vec<(usize, Vec<(&ScanCellResult, usize)>)> {
     // 输入按 cell id 排序：两条喂入路径（plan 序 / db 序）同一序；并查集本身与序无关，排序只稳住 hints / cell_ids 的排列。
     let mut ordered: Vec<&ScanCellResult> = cells.iter().filter(|c| c.output.is_some()).collect();
     ordered.sort_by(|a, b| a.cell_id.cmp(&b.cell_id));
-    let mut groups: std::collections::BTreeMap<usize, Vec<(&ScanCellResult, &Suspicion)>> = Default::default();
+    let mut groups: std::collections::BTreeMap<usize, Vec<(&ScanCellResult, usize)>> = Default::default();
     for c in ordered {
         if let Some(out) = &c.output {
-            for s in &out.suspicions {
-                groups.entry(c.group).or_default().push((c, s));
+            for i in 0..out.suspicions.len() {
+                groups.entry(c.group).or_default().push((c, i));
             }
         }
     }
-    let mut out: Vec<MergedSuspicion> = Vec::new();
+    let mut out = Vec::new();
     for (group, items) in groups {
         let n = items.len();
         let mut parent: Vec<usize> = (0..n).collect();
         for i in 0..n {
             for j in (i + 1)..n {
-                if same_suspicion(items[i].1, items[j].1) {
+                if same_suspicion(suspicion_at(items[i]), suspicion_at(items[j])) {
                     let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
                     if ri != rj {
                         parent[rj.max(ri)] = rj.min(ri);
@@ -81,40 +87,57 @@ pub fn merge_suspicions(cells: &[ScanCellResult]) -> Vec<MergedSuspicion> {
             clusters.entry(r).or_default().push(i);
         }
         for members in clusters.into_values() {
-            let best = members
-                .iter()
-                .copied()
-                .min_by(|&a, &b| {
-                    let (sa, sb) = (items[a].1, items[b].1);
-                    sb.confidence
-                        .partial_cmp(&sa.confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| (&sa.file, sa.line_start, sa.line_end, &sa.hint).cmp(&(&sb.file, sb.line_start, sb.line_end, &sb.hint)))
-                })
-                .expect("non-empty cluster");
-            let mut families: Vec<String> = members.iter().map(|&i| items[i].0.family.clone()).collect();
-            families.sort();
-            families.dedup();
-            let mut cell_ids: Vec<String> = Vec::new();
-            let mut hints: Vec<String> = Vec::new();
-            for &i in &members {
-                let (c, s) = items[i];
-                if !cell_ids.contains(&c.cell_id) {
-                    cell_ids.push(c.cell_id.clone());
-                }
-                if !hints.contains(&s.hint) {
-                    hints.push(s.hint.clone());
-                }
-            }
-            out.push(MergedSuspicion {
-                group,
-                suspicion: items[best].1.clone(),
-                agreement: families.len() as u32,
-                families,
-                cell_ids,
-                hints,
-            });
+            out.push((group, members.into_iter().map(|i| items[i]).collect()));
         }
+    }
+    out
+}
+
+/// 簇成员 → 疑点（簇只含成功格，`output` 恒在）。
+fn suspicion_at((c, i): (&ScanCellResult, usize)) -> &Suspicion {
+    &c.output.as_ref().expect("suspicion_clusters skips failed cells").suspicions[i]
+}
+
+/// 组内闭包簇的成员到达键（C2 收场拆簇对账〔D15〕）：与 [`merge_suspicions`] 同簇；队列侧逐条合并若把一簇拆进多项，
+/// 调用方据此计数（`DeepMeta.queue_split_clusters`）。
+pub fn closure_members(cells: &[ScanCellResult]) -> Vec<Vec<String>> {
+    suspicion_clusters(cells)
+        .into_iter()
+        .map(|(_, members)| members.into_iter().map(|(c, i)| arrival_key(&c.cell_id, i)).collect())
+        .collect()
+}
+
+/// 合并：按组分桶；桶内所有 (cell, 疑点) 两两按 `same_suspicion` 并查集连通（[`suspicion_clusters`]）；每簇代表 = confidence 最高者（并列取
+/// (file, line_start, line_end, hint) 最小者）；`families` 排序去重、`cell_ids` / `hints` 按 cell id 序去重；输出按
+/// (group, file, line_start, line_end, hint) 排序。失败格（`output == None`）不参与。
+pub fn merge_suspicions(cells: &[ScanCellResult]) -> Vec<MergedSuspicion> {
+    let mut out: Vec<MergedSuspicion> = Vec::new();
+    for (group, members) in suspicion_clusters(cells) {
+        let items: Vec<(&ScanCellResult, &Suspicion)> = members.iter().map(|&m| (m.0, suspicion_at(m))).collect();
+        let (_, best) = items
+            .iter()
+            .copied()
+            .min_by(|&(_, sa), &(_, sb)| {
+                sb.confidence
+                    .partial_cmp(&sa.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| (&sa.file, sa.line_start, sa.line_end, &sa.hint).cmp(&(&sb.file, sb.line_start, sb.line_end, &sb.hint)))
+            })
+            .expect("non-empty cluster");
+        let mut families: Vec<String> = items.iter().map(|(c, _)| c.family.clone()).collect();
+        families.sort();
+        families.dedup();
+        let mut cell_ids: Vec<String> = Vec::new();
+        let mut hints: Vec<String> = Vec::new();
+        for (c, s) in &items {
+            if !cell_ids.contains(&c.cell_id) {
+                cell_ids.push(c.cell_id.clone());
+            }
+            if !hints.contains(&s.hint) {
+                hints.push(s.hint.clone());
+            }
+        }
+        out.push(MergedSuspicion { group, suspicion: best.clone(), agreement: families.len() as u32, families, cell_ids, hints });
     }
     out.sort_by(|a, b| {
         (a.group, &a.suspicion.file, a.suspicion.line_start, a.suspicion.line_end, &a.suspicion.hint)
@@ -220,5 +243,38 @@ mod tests {
         let k = |v: &Vec<MergedSuspicion>| v.iter().map(|x| (x.group, x.suspicion.file.clone())).collect::<Vec<_>>();
         assert_eq!(k(&m1), k(&m2));
         assert_eq!(k(&m1), vec![(0, "m.rs".into()), (1, "a.rs".into()), (1, "z.rs".into())]);
+    }
+
+    /// C2 拆簇对账〔D15〕：`closure_members` 与 `merge_suspicions` 同簇——链式相似 S1~S2、S1~S3、S2≁S3 同一簇三个到达键，
+    /// 另一处独立疑点单独成簇；失败格不参与；到达键 = `{cell_id}#{该格内下标}`。
+    #[test]
+    fn closure_members_match_merge_suspicions_clusters() {
+        let q3 = "let t = secret();\nlog(token_value);\nreturn t;";
+        let s1 = susp("a.rs", 10, 12, "s1", 0.6, q3);
+        let s2 = susp("a.rs", 14, 14, "s2", 0.9, "log(token_value);  ");
+        let s3 = susp("a.rs", 10, 10, "s3", 0.5, "let t = secret();");
+        let far = susp("a.rs", 90, 90, "far", 0.5, "unrelated_call(x);");
+        let cells = vec![
+            cell("scan[g1]@p/beta#1", 0, "beta", vec![far.clone(), s2]),
+            cell("scan[g1]@p/alpha#1", 0, "alpha", vec![s1]),
+            cell("scan[g1]@p/gamma#1", 0, "gamma", vec![s3]),
+            ScanCellResult { output: None, ..cell("scan[g1]@p/delta#1", 0, "delta", vec![far]) },
+        ];
+        let merged = merge_suspicions(&cells);
+        let mut members = closure_members(&cells);
+        for m in &mut members {
+            m.sort();
+        }
+        members.sort();
+        assert_eq!(
+            members,
+            vec![
+                vec!["scan[g1]@p/alpha#1#0".to_string(), "scan[g1]@p/beta#1#1".to_string(), "scan[g1]@p/gamma#1#0".to_string()],
+                vec!["scan[g1]@p/beta#1#0".to_string()],
+            ]
+        );
+        assert_eq!(merged.len(), members.len(), "簇数一致");
+        let sizes: std::collections::BTreeSet<usize> = merged.iter().map(|m| m.cell_ids.len()).collect();
+        assert_eq!(sizes, [1, 3].into_iter().collect(), "{merged:?}");
     }
 }

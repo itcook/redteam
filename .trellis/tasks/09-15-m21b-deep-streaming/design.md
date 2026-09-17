@@ -52,6 +52,8 @@ run_code_review（配了 reviewer）:
 - `EnqueueReq.arrival: Option<String>` = `{scan cell_id}#{i}`（i = 疑点在该格锚定后 `suspicions` 里的下标；落盘输出同序，resume 可复算）。H0 无到达键。
 - `QueueItem.arrivals: Vec<String>`（`#[serde(default, skip_serializing_if = "Vec::is_empty")]`）：新建项记自身到达键，`merge_into` 追加请求的到达键。
 - 幂等：`enqueue` 先查到达键是否已在某项 `arrivals` 中——在则直接返回 `Duplicate`（不改项、不计 `dedup_hits`）。用途：§4 拆簇对账、§6 resume 幂等入队。
+- 实施（C2-1）：`DeepQueue::enqueue_affected(req) -> (EnqueueOutcome, Option<usize>)` 回报受影响项下标（`enqueue` 只取 outcome）；
+  到达键构造统一为 `consolidate::scan::arrival_key(cell_id, i)`。
 
 ### 2.3 phase
 
@@ -95,7 +97,7 @@ on_close（只执行一次）:
 - 到达照走入口五态，谓词不变（`same_item` + `merge_notes`）。`merge_into` 注释的前提改写为：逐 cell 到达时队列侧逐条比对已有项笔记，
   不是组内传递闭包；非传递漏合并只少算共识、多复核（D15 实测 ≤ 1/19 簇）；id 捷径仍不计共识。
 - `consolidate::scan::closure_members(cells) -> Vec<Vec<String>>`：与 `merge_suspicions` 同一并查集（按组、`same_suspicion`），输出每簇成员到达键；
-  `merge_suspicions` 改为在其上组装、行为与输出逐字节不变。
+  `merge_suspicions` 改为在其上组装、行为与输出逐字节不变。实施（C2-1）：两者共用私有 `suspicion_clusters(cells)`。
 - `split_clusters(cells, items)`：成员到达键映射到所在项 id，一簇成员分落 ≥ 2 项即计 1。`DeepRun` 带回最终队列项（`items`）供 cli 调用。
 
 ## 5. scanner 失败口径（Q5 F3）
@@ -153,6 +155,19 @@ async fn enter(&self) -> GatePermit<'_> {
 - 等门者之间按 `Notify::notify_one` 的先来后到唤醒；放门逻辑（`GatePermit::drop`）不变。
 - 取消安全：等门者被唤醒后未取到就被 drop 时，唤醒必须转交下一位——实现时以测试核实 tokio `Notified` 的转交行为，不成立则由
   `WaiterGuard::drop` 在 `held < cap` 时补一次 `notify_one`。
+
+**实施细化（C2-1，2026-09-17）——票号 FIFO**：上面「`notify_one` 唤醒 + 已登记者 `held < cap` 即取」有插队窗口：放门后唤醒已发给队头、
+队头尚未被 poll 时，新登记的等门者（如深挖等门挂起刚建的阻塞 lease）登记即检、`held < cap` 成立就把门位拿走，队头醒来取不到、重排队尾——
+扫描与深挖同 task `join!`，谁先被 poll 不是契约，§11「放门不插队」会不稳定。改为：
+- `GateState.waiting: VecDeque<票号>`（等门者计数 = 其长度）；`WaiterGuard::register` 发票号入队尾。
+- `try_enter`：`held < cap ∧ waiting 空`；`try_enter_as_waiter(票号)`：`held < cap ∧ 票号是队头` → 出队取门位。
+- 放门 `GatePermit::drop`：有空位且有人排队 → `notify_waiters`（全员醒、只有队头能取）。`notify_one` 不够：非队头者被唤醒后重新登记，
+  Notify 内部唤醒次序会与票号次序漂移，只叫醒一个可能叫醒非队头者、真队头永远等不到。
+- 连锁：队头取后若仍有空位且还有人排队，再 `notify_waiters`（同一刻放出多个名额时后面的人不必等下一次放门）。
+- 取消：`WaiterGuard::drop` 把票号移出队列；它若是队头且有空位，`notify_waiters`（其余等门者可能已被唤醒过、重检后又睡下，
+  放门那次唤醒已被消费；tokio 的转交只对 `notify_one` 的未收通知生效，对 `notify_waiters` 不转交）。
+- 用例以逐 future 独立 waker 标记断言「谁被唤醒」；「放门改回 `notify_one` / 不连锁 / 取消不唤醒 / 不查队头 / `try_enter` 不看排队 /
+  守卫不出队」六处变异各自转红。
 - 429 等待者持名额、走 `completed` 通知，不计入 `waiters`，行为不变。
 - scanner-only 路径没有非阻塞调用者，`enter` 的首试让位只影响「门上已有排队者时新来的 scanner」——即 FIFO 本义。
 

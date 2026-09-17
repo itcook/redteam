@@ -765,7 +765,7 @@ fn enqueue_h0(q: &mut DeepQueue, h: &Hotspot, meta: &mut DeepMeta) {
         RegionKind::Primary => ItemKind::Primary,
         RegionKind::Ripple => ItemKind::Ripple,
     };
-    note_enq(q.enqueue(EnqueueReq { spec, score: h.score, kind, families: vec![] }), "rule", meta);
+    note_enq(q.enqueue(EnqueueReq { spec, score: h.score, kind, families: vec![], arrival: None }), "rule", meta);
 }
 
 fn enqueue_scan(q: &mut DeepQueue, cells: &[ScanCellResult], meta: &mut DeepMeta) {
@@ -788,6 +788,7 @@ fn enqueue_scan(q: &mut DeepQueue, cells: &[ScanCellResult], meta: &mut DeepMeta
                 score: s.confidence,
                 kind: ItemKind::Suspicion,
                 families: m.families.clone(),
+                arrival: None,
             }),
             "scan",
             meta,
@@ -826,6 +827,8 @@ fn note_enq(o: EnqueueOutcome, reason: &str, meta: &mut DeepMeta) {
         | EnqueueOutcome::MergedSkipped => {
             meta.dedup_hits += 1;
         }
+        // 同一条疑点再次到达（resume 幂等入队）：队列没有任何变化，不是去重命中
+        EnqueueOutcome::Duplicate => {}
     }
 }
 
@@ -853,6 +856,7 @@ mod tests {
             id: format!("{file}:rule:1-2"),
             spec, score: 1.0, agreement: 1, state, kind: ItemKind::Primary,
             dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
+            arrivals: vec![],
         }
     }
 
@@ -1372,6 +1376,7 @@ mod tests {
             id: format!("{file}:scan:1-1"), spec: spec.clone(), score: 0.5, agreement: 1, state: ItemState::Pending,
             kind: ItemKind::Suspicion, dispatch_agreement: 0, landed_agreement: None,
             families: vec![family.into()], enqueued_ms: None,
+            arrivals: vec![],
         };
         (item, spec)
     }
@@ -1390,7 +1395,7 @@ mod tests {
         let events = Events(Mutex::new(Vec::new()));
         let feed = async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            tx.send(EnqueueReq { spec, score: 0.5, kind: ItemKind::Suspicion, families: vec!["beta".into()] }).await.unwrap();
+            tx.send(EnqueueReq { spec, score: 0.5, kind: ItemKind::Suspicion, families: vec!["beta".into()], arrival: None }).await.unwrap();
         };
         let (run, ()) = tokio::join!(
             run_with(Run { incoming: Some(rx), sink: &events, ..plain(&reg, dir.path(), &bundles, &items) }),
@@ -1419,7 +1424,7 @@ mod tests {
         let feed = async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap();
-            tx.send(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, families: vec![] }).await.unwrap();
+            tx.send(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, families: vec![], arrival: None }).await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         let t0 = tokio::time::Instant::now();
@@ -1767,6 +1772,7 @@ mod tests {
             id: format!("{file}:rule:1-2"),
             spec: QueueItemSpec::new(file.into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap(),
             score: 1.0, agreement: 1, state, kind, dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
+            arrivals: vec![],
         };
         let note = crate::domain::Suspicion {
             file: "s.rs".into(), line_start: 1, line_end: 1, hint: "h".into(), category: None, confidence: 0.5, quote: "fn s() {".into(),
@@ -1776,6 +1782,7 @@ mod tests {
             spec: QueueItemSpec::new("s.rs".into(), vec![(1, 1)], QueueOrigin::Scan, vec![note]).unwrap(),
             score: 0.5, agreement: 2, state: ItemState::Pending, kind: ItemKind::Suspicion,
             dispatch_agreement: 0, landed_agreement: None, families: vec!["alpha".into(), "beta".into()], enqueued_ms: None,
+            arrivals: vec![],
         };
         let items = vec![
             rule("r.rs", ItemKind::Ripple, ItemState::Pending),

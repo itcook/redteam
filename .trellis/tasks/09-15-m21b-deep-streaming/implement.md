@@ -8,16 +8,18 @@
 ## Checklist
 
 ### C2-1 队列、门与闭包零件（不接线）
-- [ ] `queue.rs`：`EnqueueReq.arrival: Option<String>`、`QueueItem.arrivals`（serde default、空不序列化）；`enqueue` 先查到达键 → `EnqueueOutcome::Duplicate`（不改项、不计 `dedup_hits`）；新建 / 并入回报受影响项
-- [ ] `queue.rs`：`pop_dispatch_where(pred)` / `has_eligible(pred)`（优先级序不变）；`drain_with(budget, floor)`，`drain(K)` = `drain_with(K, ⌈K/4⌉)` 且现有 drain 用例零改动通过
-- [ ] `queue.rs`：`merge_into` 注释前提改写（逐 cell 到达、非传递残差、id 捷径不计共识）；Skipped 复位分支注释「首跑生产不可达」；优先级比较对 deep 可见（`pub(crate)`）
-- [ ] `registry.rs`：`GateState.waiters` + `WaiterGuard`（Drop −1）；`try_enter` = `held < cap ∧ waiters == 0`；`enter` 首试让位、登记后 `try_enter_as_waiter`；`try_lease` 随之让位
-- [ ] `consolidate/scan.rs`：`closure_members(cells)`（同一并查集，输出成员到达键）；`merge_suspicions` 在其上组装，输出逐字节不变
-- [ ] 测试：到达键幂等（重复到达 0 改动）；受影响项回报；`pop_dispatch_where` 跳过不可派项取次高；`drain_with` 与旧 `drain` 在 C1 用例上逐项一致、主区吃穿时帽 = 主区 + 保底；
+- [x] `queue.rs`：`EnqueueReq.arrival: Option<String>`、`QueueItem.arrivals`（serde default、空不序列化）；`enqueue` 先查到达键 → `EnqueueOutcome::Duplicate`（不改项、不计 `dedup_hits`）；新建 / 并入回报受影响项（`enqueue_affected`）
+- [x] `queue.rs`：`pop_dispatch_where(pred)` / `has_eligible(pred)`（优先级序不变）；`drain_with(budget, floor)`，`drain(K)` = `drain_with(K, ⌈K/4⌉)` 且现有 drain 用例零改动通过
+- [x] `queue.rs`：`merge_into` 注释前提改写（逐 cell 到达、非传递残差、id 捷径不计共识）；Skipped 复位分支注释「首跑生产不可达」；优先级比较对 deep 可见（`pub(crate)`）
+- [x] `registry.rs`：`GateState.waiters` + `WaiterGuard`（Drop −1）；`try_enter` = `held < cap ∧ waiters == 0`；`enter` 首试让位、登记后 `try_enter_as_waiter`；`try_lease` 随之让位
+  （实施细化为票号 FIFO：只有队头可取、放门 / 连锁 / 取消队头用 `notify_waiters`——`notify_one` 加登记即检有插队窗口，见 design §7.1）
+- [x] `consolidate/scan.rs`：`closure_members(cells)`（同一并查集，输出成员到达键）；`merge_suspicions` 在其上组装，输出逐字节不变
+- [x] 测试：到达键幂等（重复到达 0 改动）；受影响项回报；`pop_dispatch_where` 跳过不可派项取次高；`drain_with` 与旧 `drain` 在 C1 用例上逐项一致、主区吃穿时帽 = 主区 + 保底；
   门首试在有等门者时让位、登记者被唤醒可取、等门者 FIFO；**取消安全**（被唤醒未取到即 drop → 下一位仍被唤醒、`waiters` 归零；tokio 不转交则 `WaiterGuard` 补 `notify_one`）；429 等待者不受影响；
   `closure_members` 与 `merge_suspicions` 同簇
-- [ ] 变异检查：`try_enter` 不看 `waiters` / `WaiterGuard` 不回退 / `drain_with` floor 不扣 / 幂等键不查——各自用例转红
-- [ ] Commit: `feat(queue,registry): C2 零件——到达键幂等入队与受影响项回报、按可派条件弹出、drain_with(预算, 保底)、门等门者计数与首试让位（取消安全）、组内闭包成员导出（D15）`
+- [x] 变异检查：`try_enter` 不看 `waiters` / `WaiterGuard` 不回退 / `drain_with` floor 不扣 / 幂等键不查——各自用例转红
+  （另加票号 FIFO 四处：不查队头 / 放门 `notify_one` / 取后不连锁 / 取消队头不唤醒——首轮后三处假绿，补逐 future waker 标记用例后转红）
+- [x] Commit: `feat(queue,registry): C2 零件——到达键幂等入队与受影响项回报、按可派条件弹出、drain_with(预算, 保底)、门等门者计数与首试让位（取消安全）、组内闭包成员导出（D15）`
 
 ### C2-2 读守卫预取（Q9 IO2）
 - [ ] `second_pass.rs`：`TrackedFiles::load(root)`（一次 `git ls-files -z`）+ `need_read_allowed_in(&tracked, root, rel)`；原 `need_read_allowed` 保留给其他调用点
