@@ -280,8 +280,10 @@ fn stage0_risk(
     (Some(meta), Some(route))
 }
 
-/// scan-only 流水线（M21a 批 F-4 硬切，design §2 / §4 / §5）：证据筛选 → 分组 / 装包 / 跨组索引 → scanner 扇出（组 × 条目 × samples）
-/// → 疑点并集 + agreement → scan-only 报告。不产 finding；退出码：0 = scan 完成、3 = 任一 scanner cell 失败（Incomplete，design §8.4）。
+/// 评审流水线（design §2 / §4 / §5）：证据筛选 → 阶段 0 风险路由 → 分组 / 装包 / 跨组索引 → scanner 扇出（组 × 条目 × samples）
+/// → 疑点并集 + agreement → scan 报告收口。配了 reviewer 时深挖与扫描同 task 时间重叠（C2〔D15〕：H0 开跑即挖、scan 格完成即入队、
+/// 扫描全部返回即收场），收口后叠加 finding 与 verdict；scanner 有格失败时深挖照跑、判定仍 Incomplete / 3。
+/// 未配 reviewer = scan-only：不产 finding，退出码 0 = scan 完成、3 = 任一 scanner cell 失败（design §8.4）。
 /// `--background` 由 main.rs 在 dispatch 之前分叉（spawn worker）；到达这里即路由 bug。
 pub async fn run_code_review(
     args: &ReviewArgs,
@@ -327,7 +329,64 @@ pub async fn run_code_review(
         target_label: &target_label, bundles: &bundles, dossiers: &dossiers, others: &others,
         user_focus: &focus, spec_docs: &spec_section, root, entries: &entries, samples: cfg.review.scanners.samples,
     };
-    let results = run_scan_fanout(registry, &input, sink).await;
+    let (results, mut deep) = if roles.reviewers.is_empty() {
+        (run_scan_fanout(registry, &input, sink, None).await, None)
+    } else {
+        // scanner 与深挖时间重叠（design C2 §2〔D15〕）：同 task 并发——H0 开跑即挖，scan 格完成即经通道入队；
+        // 扫描全部返回 → 打 `Deep`、drop 发送端 = 关闭入口 → 深挖以剩余预算收场。scanner 有格失败时深挖照跑（F3，见 `overlay_deep`）。
+        let snap = |it: &crate::orchestrate::queue::QueueItem| {
+            if let Some(s) = sink {
+                s.on_queue_item(it);
+            }
+        };
+        let on_cell = |rec: &crate::state::CellRecord| {
+            if let Some(s) = sink {
+                s.on_cell(rec.clone());
+            }
+        };
+        let factory = per_cell_backend_factory(cfg);
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let scan = async move {
+            let r = run_scan_fanout(registry, &input, sink, Some(&tx)).await;
+            if let Some(s) = sink { s.on_phase(crate::state::Phase::Deep, None); }
+            drop(tx);
+            r
+        };
+        let deep = run_deep(
+            registry,
+            DeepInput {
+                route: deep_route.as_ref(),
+                scan_cells: &[],
+                bundles: &bundles,
+                root,
+                reviewers: &roles.reviewers,
+                budget_cells: risk.as_ref().map(|r| r.budget_cells).unwrap_or(4),
+                pack: &cfg.review.pack,
+                spec_docs: &spec_section,
+                target_label: &target_label,
+                snapshot: Some(&snap),
+                restore: None,
+                prior_findings: vec![],
+                tools: resolve_tools(args, cfg),
+                backend_factory: Some(factory.as_ref()),
+                on_cell: Some(&on_cell),
+                incoming: Some(rx),
+                reopen_skipped: false,
+            },
+            &(),
+        );
+        // 显式先 poll 扫描一次（design C2 §7.3）：各 scan 格先占门或登记为等门者，深挖首次填门遇等门者即让位——
+        // t = 0 的先后不依赖 `join!` 的分支轮询序。
+        tokio::pin!(scan);
+        match futures::poll!(scan.as_mut()) {
+            std::task::Poll::Ready(r) => (r, Some(deep.await)),
+            std::task::Poll::Pending => {
+                let (r, d) = tokio::join!(scan, deep);
+                (r, Some(d))
+            }
+        }
+    };
+    if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
     let mut warnings: Vec<String> = registry.warnings().to_vec();
     warnings.extend(spec_warnings);
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
@@ -335,12 +394,6 @@ pub async fn run_code_review(
         warnings.push(format!(
             "no reviewable evidence: empty diff for {target_label} (0 cells) — the scan-only report reflects zero reviewed content"
         ));
-    }
-    let scan_failed_early = results.cells.iter().any(|c| !c.record.ok);
-    // 深挖还要跑就先别报 Finalizing——否则 phase 时间线成了 Scan → Finalizing → Deep（尾段在中间）。
-    let deep_pending = !scan_failed_early && !roles.reviewers.is_empty();
-    if !deep_pending {
-        if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
     }
     let groups: Vec<ScanGroup> = bundles
         .iter()
@@ -354,8 +407,10 @@ pub async fn run_code_review(
         })
         .collect();
     let scanned_coverage = scanned_coverage(&bundles, &results.cells);
-    let scan_failed = results.cells.iter().any(|c| !c.record.ok);
-    let scan_cells = results.cells.clone();
+    if let Some(d) = deep.as_mut() {
+        // 合并残差对账（design C2 §4〔D15〕）：scan 报告的组内闭包簇被队列逐条合并拆进多项的簇数。
+        d.meta.queue_split_clusters = crate::consolidate::scan::split_clusters(&results.cells, &d.items);
+    }
     let (report, code) = finish_scan_report(ScanFinish {
         groups,
         scanned_coverage,
@@ -375,46 +430,10 @@ pub async fn run_code_review(
         job_id: String::new(),
         reused: vec![],
     });
-    if scan_failed || roles.reviewers.is_empty() {
-        return Ok((report, code));
+    match deep {
+        Some(deep) => Ok(overlay_deep(report, code, deep, args, cfg, registry, t0)),
+        None => Ok((report, code)),
     }
-    if let Some(s) = sink { s.on_phase(crate::state::Phase::Deep, None); }
-    let snap = |it: &crate::orchestrate::queue::QueueItem| {
-        if let Some(s) = sink {
-            s.on_queue_item(it);
-        }
-    };
-    let on_cell = |rec: &crate::state::CellRecord| {
-        if let Some(s) = sink {
-            s.on_cell(rec.clone());
-        }
-    };
-    let factory = per_cell_backend_factory(cfg);
-    let deep = run_deep(
-        registry,
-        DeepInput {
-            route: deep_route.as_ref(),
-            scan_cells: &scan_cells,
-            bundles: &bundles,
-            root,
-            reviewers: &roles.reviewers,
-            budget_cells: risk.as_ref().map(|r| r.budget_cells).unwrap_or(4),
-            pack: &cfg.review.pack,
-            spec_docs: &spec_section,
-            target_label: &target_label,
-            snapshot: Some(&snap),
-            restore: None,
-            prior_findings: vec![],
-            tools: resolve_tools(args, cfg),
-            backend_factory: Some(factory.as_ref()),
-            on_cell: Some(&on_cell),
-            incoming: None,
-            reopen_skipped: false,
-        },
-        &(),
-    ).await;
-    if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
-    Ok(overlay_deep(report, code, deep, args, cfg, registry, t0))
 }
 
 /// per-cell backend 工厂（流式旁路的挂点）：按 reviewer 条目取密钥另造实例并挂 delta 回调。
@@ -495,12 +514,25 @@ fn overlay_deep(
         .unwrap_or(cfg.review.block_threshold);
     let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
     let verdict = crate::verdict::compute_verdict(&findings, block, floor);
-    report.verdict = verdict;
     let debt = failed || skipped > 0;
+    const DEBT: &str = "reviewer debt: failed reviewer cell, undispatched queue items, or budget skip";
+    if report.verdict == Verdict::Incomplete {
+        // scanner 有格失败（design C2 §5 F3〔D15〕）：深挖照跑、findings / 观测 / reviewer 格照进，但疑点来源有结构性缺口——
+        // 判定保持 Incomplete / 3（优先于 reject 10 与带债 2）；本可 reject 的 blocking 条数与债另行披露。
+        if verdict == Verdict::Reject {
+            report.run.warnings.push(format!(
+                "scan incomplete: {} blocking finding(s) present — a complete review would reject",
+                crate::verdict::blocking_count(&findings, block, floor)
+            ));
+        }
+        if debt {
+            report.run.warnings.push(DEBT.into());
+        }
+        return (report, exit_code(Verdict::Incomplete, debt));
+    }
+    report.verdict = verdict;
     if debt && matches!(verdict, Verdict::Approve) {
-        report.run.warnings.push(
-            "reviewer debt: failed reviewer cell, undispatched queue items, or budget skip — approve with exit 2".into(),
-        );
+        report.run.warnings.push(format!("{DEBT} — approve with exit 2"));
     }
     (report, exit_code(verdict, debt))
 }
@@ -1668,6 +1700,29 @@ mod job_tests {
         Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap()
     }
 
+    /// 配了 reviewer 的作业阶段时间线（design C2 §2.3〔D15〕）：Collecting → Scan（manifest）→ Deep（扫描全部返回时）→ Finalizing。
+    #[tokio::test]
+    async fn run_job_with_reviewer_phases_scan_deep_finalizing() {
+        let dir = tempfile::tempdir().unwrap();
+        git_staged(dir.path(), "a.rs", "fn main() {\n    let x = 1;\n}\n");
+        let mut registry = scan_registry("p/alpha", r#"{"suspicions":[{"file":"a.rs","line_start":2,"line_end":2,"hint":"t","confidence":0.9,"quote":"let x = 1;"}],"scanned_areas":[]}"#);
+        registry.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(scan_turn(r#"{"findings":[],"needs":[]}"#))), std::time::Duration::from_secs(5), 0);
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = Arc::new(crate::state::JobStore::open(&ws).unwrap());
+        store.put_state_for_test(&JobState::new("j1", 500)).unwrap();
+
+        let code = run_job("j1", &code_args(), &registry, &cfg, dir.path(), 500, Arc::clone(&store)).await;
+
+        let st = store.read_state("j1").unwrap();
+        assert_eq!((st.status, code), (JobStatus::Done, 0));
+        use crate::state::Phase;
+        assert_eq!(st.phase_history.iter().map(|p| p.phase).collect::<Vec<_>>(), [Phase::Collecting, Phase::Scan, Phase::Deep, Phase::Finalizing]);
+        let res = store.read_result("j1").unwrap();
+        assert!(res.contains("\"verdict\": \"approve\"") && res.contains("review[a.rs:"), "{res}");
+    }
+
     #[tokio::test]
     async fn run_job_done_writes_result_and_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -2679,6 +2734,7 @@ mod code_review_tests {
     use crate::evidence::git::FileChange;
     use crate::provider::tool_loop::{AssistantTurn, FakeChatBackend};
     use std::io::Write;
+    use std::time::Duration;
 
     fn write(dir: &std::path::Path, rel: &str, body: &str) {
         let p = dir.join(rel);
@@ -2945,6 +3001,194 @@ mod code_review_tests {
         assert!(!pinned["grok-4"], "无映射家族不算 pinned");
         assert!(!pinned["gpt-5"], "Off 不算 pinned");
         assert!(!pinned["qwen3"], "未配档位不算 pinned");
+    }
+
+    // ── C2-4：scanner 与深挖时间重叠 ─────────────────────────────────────────
+
+    fn turn_of(text: &str) -> AssistantTurn {
+        AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: Some("stop".into()), reasoning_tokens: None }
+    }
+
+    /// 每格落盘与每次阶段转换的虚拟时刻（manifest 按 `JobCellSink` 口径记 `Scan`）。
+    struct Timeline {
+        t0: tokio::time::Instant,
+        cells: std::sync::Mutex<Vec<(String, u64)>>,
+        phases: std::sync::Mutex<Vec<(crate::state::Phase, u64)>>,
+    }
+
+    impl Timeline {
+        fn new() -> Self {
+            Timeline { t0: tokio::time::Instant::now(), cells: Default::default(), phases: Default::default() }
+        }
+        fn now(&self) -> u64 {
+            self.t0.elapsed().as_millis() as u64
+        }
+        fn landed(&self, prefix: &str) -> Vec<u64> {
+            self.cells.lock().unwrap().iter().filter(|(c, _)| c.starts_with(prefix)).map(|(_, t)| *t).collect()
+        }
+    }
+
+    impl crate::orchestrate::CellSink for Timeline {
+        fn manifest(&self, _inputs: &[crate::state::CellInput]) {
+            self.phases.lock().unwrap().push((crate::state::Phase::Scan, self.now()));
+        }
+        fn on_cell(&self, rec: CellRecord) {
+            let t = self.now();
+            self.cells.lock().unwrap().push((rec.cell, t));
+        }
+        fn on_phase(&self, phase: crate::state::Phase, _note: Option<String>) {
+            let t = self.now();
+            self.phases.lock().unwrap().push((phase, t));
+        }
+    }
+
+    /// 带未提交改动的 git 仓（阶段 0 风险路由要读 git 才出 H0 区）：各文件先提交 `before`、再改成 `after`，返回工作树 diff。
+    fn git_changes(root: &Path, files: &[(&str, &str, &str)]) -> Vec<FileChange> {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        for (path, before, _) in files {
+            write(root, path, before);
+        }
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        for (path, _, after) in files {
+            write(root, path, after);
+        }
+        crate::evidence::git::changed_files(root, None, false).unwrap()
+    }
+
+    fn scanner_and_reviewer_cfg() -> Config {
+        Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap()
+    }
+
+    /// 一个 H0 区（敏感路径 + 签名变更、含控制流 → 分数过门槛）+ 一条 scanner 疑点（新增的 `db.write(token);`）的改动。
+    fn h0_and_suspicion_repo(root: &Path) -> Vec<FileChange> {
+        let before = "pub fn check(a: u8) -> bool {\n    if a > 1 {\n        return true;\n    }\n    false\n}\n";
+        let after = "pub fn check(a: u16) -> bool {\n    if a > 1 {\n        return true;\n    }\n    db.write(token);\n    false\n}\n";
+        git_changes(root, &[("src/auth.rs", before, after)])
+    }
+
+    const AUTH_SUSPICION: &str =
+        r#"{"suspicions":[{"file":"src/auth.rs","line_start":5,"line_end":5,"hint":"write","confidence":0.8,"quote":"db.write(token);"}],"scanned_areas":[]}"#;
+
+    /// scanner 与深挖时间重叠（design C2 §2〔D15〕）：scanner 格 1000 ms、reviewer 格 10 ms → H0 区 t = 0 开挖、scanner 返回前就落地；
+    /// 疑点在 scanner 落盘后到达、随即挖掉。阶段 Scan（manifest）→ Deep（扫描返回时）→ Finalizing（深挖排空后）；`close_ms` = scanner 段墙钟。
+    #[tokio::test(start_paused = true)]
+    async fn h0_is_dug_while_scanner_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let changes = h0_and_suspicion_repo(dir.path());
+        let mut reg = ProviderRegistry::new();
+        let slow_scan = FakeChatBackend::repeating(turn_of(AUTH_SUSPICION)).with_delay(Duration::from_millis(1000));
+        let fast_review = FakeChatBackend::repeating(turn_of(r#"{"findings":[],"needs":[]}"#)).with_delay(Duration::from_millis(10));
+        reg.insert_scan("p/s", "p", 8, Box::new(slow_scan), Duration::from_secs(5), 0);
+        reg.insert_scan("p/r", "p", 8, Box::new(fast_review), Duration::from_secs(5), 0);
+        let sink = Timeline::new();
+
+        let (report, code) = run_code_review(&args(), &reg, &scanner_and_reviewer_cfg(), changes, dir.path(), None, Some(&sink)).await.unwrap();
+
+        assert_eq!((report.verdict, code), (Verdict::Approve, 0), "{:?}", report.run.warnings);
+        let deep = report.run.deep.as_ref().unwrap();
+        assert!(deep.enqueue_reasons.get("rule").is_some_and(|&n| n >= 1), "构造前提：有 H0 区 {deep:?}");
+        let h0 = sink.landed("review[src/auth.rs:rule:");
+        assert!(!h0.is_empty() && h0.iter().all(|&t| t < 1000), "H0 格在 scanner 返回前落地: {:?}", sink.cells.lock().unwrap());
+        assert_eq!(sink.landed("scan["), [1000]);
+        assert_eq!(sink.landed("review[src/auth.rs:scan:"), [1010], "疑点到达即挖");
+        assert_eq!((deep.first_dispatch_ms, deep.close_ms, deep.drain_done_ms), (1, 1000, 1010));
+        assert_eq!(deep.scan_phase_dispatched as usize, h0.len() + 1, "收场前派出 H0 格 + 关闭前到达的疑点格");
+        let phases = sink.phases.lock().unwrap().clone();
+        use crate::state::Phase;
+        assert_eq!(phases, [(Phase::Scan, 0), (Phase::Deep, 1000), (Phase::Finalizing, 1010)]);
+    }
+
+    /// 共门 t = 0 先后（design C2 §7.3〔D15〕）：scanner 与 reviewer 同一 provider、门宽 1 → 显式先 poll 扫描，scanner 格先入门；
+    /// H0 等 scanner 放门（100 ms）才开挖。
+    #[tokio::test(start_paused = true)]
+    async fn shared_gate_scanner_enters_before_h0_at_t0() {
+        let dir = tempfile::tempdir().unwrap();
+        let changes = h0_and_suspicion_repo(dir.path());
+        let mut reg = ProviderRegistry::new();
+        let scan = FakeChatBackend::repeating(turn_of(r#"{"suspicions":[],"scanned_areas":[]}"#)).with_delay(Duration::from_millis(100));
+        let review = FakeChatBackend::repeating(turn_of(r#"{"findings":[],"needs":[]}"#)).with_delay(Duration::from_millis(10));
+        reg.insert_scan("p/s", "p", 1, Box::new(scan), Duration::from_secs(5), 0);
+        reg.insert_scan("p/r", "p", 1, Box::new(review), Duration::from_secs(5), 0);
+        let sink = Timeline::new();
+
+        let (report, _) = run_code_review(&args(), &reg, &scanner_and_reviewer_cfg(), changes, dir.path(), None, Some(&sink)).await.unwrap();
+
+        assert_eq!(sink.landed("scan["), [100], "{:?}", report.run.warnings);
+        let h0 = sink.landed("review[src/auth.rs:rule:");
+        assert_eq!(h0.first(), Some(&110), "H0 在 scanner 放门后才入门: {:?}", sink.cells.lock().unwrap());
+    }
+
+    /// scanner 失败口径 F3（design C2 §5〔D15〕）：一个 scanner 条目不可达（格失败）时深挖照跑——reviewer 产出的 blocking finding 进报告，
+    /// 但判定保持 Incomplete / 3（不是 reject 10），warning 报本可 reject 的条数；reviewer 也带债时债照披露、不提「approve with exit 2」。
+    #[tokio::test]
+    async fn scanner_failure_still_digs_but_stays_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        let cfg = Config::from_json(
+            r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"ghost":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#,
+        )
+        .unwrap();
+        let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
+        let blocking = r#"{"findings":[{"severity":"high","title":"token written unvalidated","body":"b","file":"src/a.rs","line_start":2,"line_end":2,"confidence":0.95,"recommendation":"r","quote":"db.write(token);"}],"needs":[]}"#;
+        let changes = || vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
+        let reg_with = |review: FakeChatBackend| {
+            let mut reg = ProviderRegistry::new();
+            reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(turn_of(&scan_json))), Duration::from_secs(5), 0);
+            reg.insert_scan("p/r", "p", 8, Box::new(review), Duration::from_secs(5), 0);
+            reg
+        };
+
+        let reg = reg_with(FakeChatBackend::repeating(turn_of(blocking)));
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes(), dir.path(), None, None).await.unwrap();
+        let w = &report.run.warnings;
+        assert_eq!((report.verdict, code), (Verdict::Incomplete, 3), "{w:?}");
+        assert_eq!(report.findings.len(), 1, "深挖照跑、findings 进报告: {w:?}");
+        assert_eq!(report.run.coverage.failed.get(&Role::Scanner), Some(&vec!["scan[g1]@p/ghost#1".to_string()]));
+        assert_eq!(report.run.coverage.completed.get(&Role::Reviewer).map(Vec::len), Some(1));
+        assert!(w.iter().any(|x| x == "scan incomplete: 1 blocking finding(s) present — a complete review would reject"), "{w:?}");
+        assert!(w.iter().any(|x| x.contains("verdict hard Incomplete")), "scan 段失败披露照旧: {w:?}");
+
+        let bad = turn_of("not-json");
+        let reg = reg_with(FakeChatBackend::new(vec![bad.clone(), bad]));
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes(), dir.path(), None, None).await.unwrap();
+        let w = &report.run.warnings;
+        assert_eq!((report.verdict, code), (Verdict::Incomplete, 3), "带债也不降成 exit 2: {w:?}");
+        assert!(w.iter().any(|x| x == "reviewer debt: failed reviewer cell, undispatched queue items, or budget skip"), "{w:?}");
+        assert!(!w.iter().any(|x| x.contains("approve with exit 2") || x.contains("blocking finding(s) present")), "{w:?}");
+    }
+
+    /// 合并残差对账（design C2 §4〔D15〕）：三家族各报同一 `tick();` 的一处——A 第 1 行、B 第 4 行、C 第 7 行（A~B、B~C、A≁C）。
+    /// 到达序 A、C、B（10 / 20 / 30 ms）→ 队列里 A、C 各成一项、B 只并入 A → `queue_split_clusters` = 1；scan 报告仍是一簇、agreement 3。
+    #[tokio::test(start_paused = true)]
+    async fn arrival_order_split_cluster_is_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "tick();\na1();\na2();\ntick();\nb1();\nb2();\ntick();\n");
+        let cfg = Config::from_json(
+            r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"beta":{"roles":{"scanner":{}}},"gamma":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#,
+        )
+        .unwrap();
+        let at_line = |line: u32| format!(r#"{{"suspicions":[{{"file":"src/a.rs","line_start":{line},"line_end":{line},"hint":"h","confidence":0.5,"quote":"tick();"}}],"scanned_areas":[]}}"#);
+        let mut reg = ProviderRegistry::new();
+        for (key, line, ms) in [("p/alpha", 1, 10), ("p/beta", 7, 20), ("p/gamma", 4, 30)] {
+            let b = FakeChatBackend::repeating(turn_of(&at_line(line))).with_delay(Duration::from_millis(ms));
+            reg.insert_scan(key, "p", 8, Box::new(b), Duration::from_secs(5), 0);
+        }
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(turn_of(r#"{"findings":[],"needs":[]}"#))), Duration::from_secs(5), 0);
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,7 +1,7 @@\n+tick();\n+tick();\n+tick();".into() }];
+
+        let (report, _) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+
+        let scan = report.scan.as_ref().unwrap();
+        assert_eq!(scan.suspicions.len(), 1, "scan 报告疑点并集不变: {:?}", scan.suspicions);
+        assert_eq!(scan.suspicions[0].agreement, 3);
+        let deep = report.run.deep.as_ref().unwrap();
+        assert_eq!((deep.enqueue_reasons.get("scan"), deep.dedup_hits), (Some(&2), 1), "{deep:?}");
+        assert_eq!(deep.queue_split_clusters, 1, "{:?}", report.run.warnings);
     }
 }
 

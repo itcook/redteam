@@ -180,10 +180,12 @@ pub fn scan_cells_from_records(records: Vec<CellRecord>) -> Vec<ScanCellResult> 
 /// scanner 静态扇出（design §2：纯生产者、无候补）：cell = 组 × 条目 × samples；prompt 每组只构造一次（同组各条目 / samples 字节相同 →
 /// 共享头 cache 命中）；并发 = provider 在途门（registry `lease`；唯一闸，无角色级 workers，D13）。单格 = [`scan_cell_record`]
 /// （resume 同款）。needs 只随 cell 落库并计数。
+/// `enqueue`（配了 reviewer 时）= 深挖入队通道的发送端：格落盘后即把该格锚定后的疑点逐条发出（C2 时间重叠〔D15〕）。
 pub async fn run_scan_fanout(
     registry: &ProviderRegistry,
     input: &ScanFanoutInput<'_>,
     sink: Option<&dyn CellSink>,
+    enqueue: Option<&tokio::sync::mpsc::Sender<queue::EnqueueReq>>,
 ) -> ScanResults {
     let prompts: Vec<ScanPrompt> = input
         .bundles
@@ -254,6 +256,15 @@ pub async fn run_scan_fanout(
             record.queue_wait_ms += queue_wait_ms; // 门等待 + 429 排队等待（scan_cell_record 已填后者）
             if let Some(s) = sink {
                 s.on_cell(record.clone());
+            }
+            // 格完成即入深挖队列（design C2 §2〔D15〕）：落盘之后发，到达键 `{cell_id}#{i}` 与 resume 回放同形（交付粒度仍是逐格）；
+            // 门位此时已归还。发送失败 = 深挖侧已不收（如变更集为空早退）——忽略，疑点照进 scan 报告。
+            if let (Some(tx), Some(out)) = (enqueue, &output) {
+                for (i, s) in out.suspicions.iter().enumerate() {
+                    if let Some(req) = queue::EnqueueReq::scan(s, &e.family, crate::consolidate::scan::arrival_key(id, i)) {
+                        let _ = tx.send(req).await;
+                    }
+                }
             }
             (pi, ScanCellResult {
                 cell_id: id.clone(), group: *g, route_key: e.route_key.clone(), family: e.family.clone(), sample: *k, record, output,
@@ -461,6 +472,87 @@ mod scan_tests {
         ScanFanoutInput { target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", root, entries, samples }
     }
 
+    /// 格完成即入队（design C2 §2〔D15〕）：落盘之后逐条发**锚定后**的疑点——到达键 `{cell_id}#{i}`、家族 = 条目家族、行号取锚定值；
+    /// 锚定丢掉的编造疑点不发、失败格不发。接收端已 drop 时发送失败只是忽略，扇出结果不受影响。
+    #[tokio::test]
+    async fn scan_fanout_streams_anchored_suspicions_after_cell_lands() {
+        let repo = repo();
+        let fab = r#",{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"fab","confidence":0.9,"quote":"not in the file"}"#;
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn(&scan_json(fab), None, 300))), Duration::from_secs(5), 0);
+        let b = bundles(1);
+        let entries = vec![entry("p/a", "alpha", false), entry("p/ghost", "ghost", false)];
+        let sink = RecSink::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let fanout = async move {
+            let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&sink), Some(&tx)).await;
+            drop(tx);
+            (res, sink, reg, b, entries, repo)
+        };
+        let recv = async {
+            let mut got = Vec::new();
+            while let Some(req) = rx.recv().await {
+                got.push(req);
+            }
+            got
+        };
+        let ((res, sink, reg, b, entries, repo), got) = tokio::join!(fanout, recv);
+        let keys: Vec<Option<String>> = got.iter().map(|r| r.arrival.clone()).collect();
+        assert_eq!(got.len(), 1, "只发锚定后的真疑点，失败格不发: {keys:?}");
+        assert_eq!(got[0].arrival.as_deref(), Some("scan[g1]@p/a#1#0"));
+        assert_eq!((got[0].families.clone(), got[0].spec.file.clone(), got[0].spec.ranges.clone()), (vec!["alpha".to_string()], "src/a.rs".to_string(), vec![(2, 2)]));
+        assert_eq!(res.failed, vec!["scan[g1]@p/ghost#1"]);
+        assert_eq!(sink.cells.lock().unwrap().len(), 2);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None, Some(&tx)).await;
+        assert_eq!(res.cells.iter().filter(|c| c.record.ok).count(), 1, "接收端已关：发送失败忽略");
+        assert_eq!(res.cells[0].output.as_ref().map(|o| o.suspicions.len()), Some(1));
+    }
+
+    /// 落盘先于入队（resume 以落盘格为准复算到达键——先发后落盘时 kill 落在两者之间，深挖挖过的疑点在 resume 里找不到来源格）：
+    /// 落盘钩子被调用时，通道里不得已有本格的疑点。同 task 协作调度下接收端总在本格落盘后才被 poll，看不出先后——在钩子里 `try_recv` 查。
+    #[tokio::test]
+    async fn scan_fanout_sends_only_after_the_cell_is_persisted() {
+        struct Probe {
+            rx: Mutex<tokio::sync::mpsc::Receiver<crate::orchestrate::queue::EnqueueReq>>,
+            seen: Mutex<Vec<String>>,
+            early: Mutex<Vec<String>>,
+        }
+        impl CellSink for Probe {
+            fn manifest(&self, _inputs: &[CellInput]) {}
+            fn on_cell(&self, rec: CellRecord) {
+                let mut rx = self.rx.lock().unwrap();
+                while let Ok(req) = rx.try_recv() {
+                    let key = req.arrival.unwrap_or_default();
+                    if key.starts_with(&format!("{}#", rec.cell)) {
+                        self.early.lock().unwrap().push(key.clone());
+                    }
+                    self.seen.lock().unwrap().push(key);
+                }
+            }
+        }
+        let repo = repo();
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300))), Duration::from_secs(5), 0);
+        let b = bundles(2);
+        let entries = vec![entry("p/a", "alpha", false)];
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let probe = Probe { rx: Mutex::new(rx), seen: Mutex::new(Vec::new()), early: Mutex::new(Vec::new()) };
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&probe), Some(&tx)).await;
+        drop(tx);
+        let mut rx = probe.rx.into_inner().unwrap();
+        let mut seen = probe.seen.into_inner().unwrap();
+        while let Ok(req) = rx.try_recv() {
+            seen.push(req.arrival.unwrap_or_default());
+        }
+        assert_eq!(res.cells.len(), 2);
+        assert_eq!(probe.early.into_inner().unwrap(), Vec::<String>::new(), "未落盘就入队");
+        seen.sort();
+        assert_eq!(seen, ["scan[g1]@p/a#1#0", "scan[g2]@p/a#1#0"]);
+    }
+
     /// 大格先发：provider 门宽 1 串行化派发，三组 diff 字节 小 / 大 / 中 → 调用序 g2, g3, g1；`res.cells` 仍按 plan 序（g1, g2, g3）。
     #[tokio::test]
     async fn scan_fanout_dispatches_largest_diff_first_but_returns_plan_order() {
@@ -474,7 +566,7 @@ mod scan_tests {
             .map(|(i, (tag, n))| Bundle::from_files(vec![FileChange { path: format!("src/f{i}.rs"), diff: format!("{tag}{}", "x".repeat(*n)) }]))
             .collect();
         let entries = vec![entry("p/a", "alpha", false)];
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
         let ids: Vec<&str> = res.cells.iter().map(|c| c.cell_id.as_str()).collect();
         assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g2]@p/a#1", "scan[g3]@p/a#1"], "结果按 plan 序回收");
         let tag_of = |i: usize| -> &'static str {
@@ -498,7 +590,7 @@ mod scan_tests {
         let others = vec!["src/f1.rs (g2 +1/-0)".to_string(), "src/f0.rs (g1 +1/-0)".to_string()];
         let entries = vec![entry("p/a", "alpha", false), entry("q/b", "beta", false)];
         let sink = RecSink::new();
-        let res = run_scan_fanout(&reg, &input(&b, &dossiers, &others, repo.path(), &entries, 1), Some(&sink)).await;
+        let res = run_scan_fanout(&reg, &input(&b, &dossiers, &others, repo.path(), &entries, 1), Some(&sink), None).await;
         let ids: Vec<&str> = res.cells.iter().map(|c| c.cell_id.as_str()).collect();
         assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g1]@q/b#1", "scan[g2]@p/a#1", "scan[g2]@q/b#1"]);
         assert!(res.cells.iter().all(|c| c.record.ok && c.record.role() == Role::Scanner), "{:?}", res.cells);
@@ -532,7 +624,7 @@ mod scan_tests {
         reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300))), Duration::from_secs(5), 0);
         let b = bundles(1);
         let entries = vec![entry("p/a", "alpha", false)];
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 2), None).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 2), None, None).await;
         let ids: Vec<&str> = res.cells.iter().map(|c| c.cell_id.as_str()).collect();
         assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g1]@p/a#2"]);
         assert_eq!(res.cells[1].sample, 2);
@@ -546,17 +638,17 @@ mod scan_tests {
         let entries = vec![entry("p/a", "alpha", false)];
         let mut reg = ProviderRegistry::new();
         reg.insert_scan("p/a", "p", 1, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)).with_delay(Duration::from_millis(30))), Duration::from_secs(5), 0);
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
         assert_eq!(res.cells.len(), 4);
         assert_eq!(reg.inflight_peaks().get("p"), Some(&1), "门宽 1 封顶");
         assert!(res.warnings.iter().any(|w| w.contains("scanner cells 4 on provider p > maxConcurrency 1: 3 cell(s) queued")), "{:?}", res.warnings);
         let mut reg2 = ProviderRegistry::new();
         reg2.insert_scan("p/a", "p", 2, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)).with_delay(Duration::from_millis(30))), Duration::from_secs(5), 0);
-        let _ = run_scan_fanout(&reg2, &input(&b, &[], &[], repo.path(), &entries, 1), None).await;
+        let _ = run_scan_fanout(&reg2, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
         assert_eq!(reg2.inflight_peaks().get("p"), Some(&2), "门宽 2 封顶");
         let mut reg3 = ProviderRegistry::new();
         reg3.insert_scan("p/a", "p", 4, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300))), Duration::from_secs(5), 0);
-        let res3 = run_scan_fanout(&reg3, &input(&b, &[], &[], repo.path(), &entries, 1), None).await;
+        let res3 = run_scan_fanout(&reg3, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
         assert!(res3.warnings.is_empty(), "门宽 ≥ 格数无排队告警: {:?}", res3.warnings);
     }
 
@@ -570,7 +662,7 @@ mod scan_tests {
         let b = bundles(1);
         let entries = vec![entry("p/a", "alpha", false), entry("p/dead", "alpha", false), entry("ghost/x", "gamma", false)];
         let sink = RecSink::new();
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&sink)).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&sink), None).await;
         assert_eq!(res.failed, vec!["scan[g1]@p/dead#1", "scan[g1]@ghost/x#1"]);
         assert_eq!(res.warnings.len(), 2);
         assert!(res.warnings[0].contains("auth error") && res.warnings[1].contains("scanner not in registry"), "{:?}", res.warnings);
@@ -590,7 +682,7 @@ mod scan_tests {
         reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn(&scan_json(extra), Some(0), 50))), Duration::from_secs(5), 0);
         let b = bundles(1);
         let pinned = vec![entry("p/a", "alpha", true)];
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &pinned, 1), None).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &pinned, 1), None, None).await;
         let rec = &res.cells[0].record;
         assert!(rec.ok);
         let w = rec.warn.as_deref().unwrap();
@@ -599,7 +691,7 @@ mod scan_tests {
         assert_eq!(res.needs_declared, 1);
         // 未钉档位 → 不报零推理；输出长 → 不报
         let unpinned = vec![entry("p/a", "alpha", false)];
-        let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &unpinned, 1), None).await;
+        let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &unpinned, 1), None, None).await;
         assert!(!res2.cells[0].record.warn.as_deref().unwrap().contains("zero reasoning"));
         assert!(!scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 300, 1).iter().any(|n| n.contains("zero reasoning")));
         assert!(scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 10, 1).len() == 1);

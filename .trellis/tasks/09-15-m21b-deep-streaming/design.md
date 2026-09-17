@@ -46,6 +46,9 @@ run_code_review（配了 reviewer）:
   发送失败（接收端已 drop，如 `run_deep` 因变更集为空早退）忽略。交付粒度仍是逐 cell（D13 Q-B）：一格的疑点在该格完成时一起到达。
 - 无死锁：深挖主循环的填门段是同步代码、没有 await；唯一的等待点是 `select!`，其中通道分支在 `!closed` 时恒启用——通道满时扫描侧
   `send` 挂起，深挖侧下一次进 `select!` 即收，容量只影响批次，不会互等。
+- 实施（C2-4）：`run_scan_fanout(registry, input, sink, enqueue: Option<&Sender>)`，发送在 `sink.on_cell` 之后、门位已归还时；
+  首次 poll 即完成（0 格）时直接 `deep.await`，否则 `join!`；两条路径收口前统一打 `Finalizing`。快照 / 落盘回调与 backend 工厂只在配了
+  reviewer 的分支里建。「落盘先于入队」以落盘钩子内 `try_recv` 查通道钉住（同 task 协作调度下接收端总在本格落盘后才被 poll，外部看不出先后）。
 
 ### 2.2 到达键
 
@@ -102,6 +105,7 @@ on_close（只执行一次）:
 - `consolidate::scan::closure_members(cells) -> Vec<Vec<String>>`：与 `merge_suspicions` 同一并查集（按组、`same_suspicion`），输出每簇成员到达键；
   `merge_suspicions` 改为在其上组装、行为与输出逐字节不变。实施（C2-1）：两者共用私有 `suspicion_clusters(cells)`。
 - `split_clusters(cells, items)`：成员到达键映射到所在项 id，一簇成员分落 ≥ 2 项即计 1。`DeepRun` 带回最终队列项（`items`）供 cli 调用。
+  实施（C2-4）：放在 `consolidate::scan`（与 `closure_members` 同处）；成员没进任何项不计；cli 在 `finish_scan_report` 消费 `results` 之前算。
 
 ## 5. scanner 失败口径（Q5 F3）
 
@@ -110,6 +114,9 @@ on_close（只执行一次）:
   退出码 3（优先于 reject 10 与带债 2）；`compute_verdict` 为 Reject 时追加 warning
   `scan incomplete: N blocking finding(s) present — a complete review would reject`；带债 warning 去掉「approve with exit 2」字样。
 - 「深挖根本没发生」的早退分支（0 格、无债、无 finding）不变。
+- 实施（C2-4）：判「scan 收口已为 Incomplete」看 `report.verdict`（不看 `scan_code`），resume 路径（C2-5）同一口径；blocking 条数抽
+  `verdict::blocking_count`（`compute_verdict` 的同一谓词）；Incomplete 时带债 warning 不论本可判 Approve 还是 Reject 都照出（不带退出码字样），
+  正常路径的「— approve with exit 2」不变。
 - `--help` 退出码 3 文案补一句：深挖照跑，findings 仍在报告（blocking 条数见 run.warnings）。
 
 ## 6. resume 离线续跑（Q6 RS1）

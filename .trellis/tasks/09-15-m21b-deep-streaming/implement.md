@@ -51,14 +51,21 @@
 - [x] Commit: `feat(deep): 在线预算与收场 drain、等门挂起入 FIFO（修外部放门不唤醒）、收场按优先级序组装、快照只写受影响项——C2 深挖主循环（design §6 规则 3 / 6、§12.3〔D15〕）`
 
 ### C2-4 首跑流式接线与 scanner 失败口径
-- [ ] `orchestrate/mod.rs`：`run_scan_fanout` 加 `Option<&mpsc::Sender<EnqueueReq>>`；格落盘后逐条发锚定后疑点（到达键 `{cell_id}#{i}`），发送失败忽略
-- [ ] `cli/mod.rs`：配 reviewer 时建通道；扫描 future 末尾打 `Deep` 并 drop 发送端；`futures::poll!` 先 poll 扫描一次再 `join!`；scan 报告照旧由 `finish_scan_report` 出
-- [ ] `cli/mod.rs`：删 `scan_failed` 早退；`overlay_deep` 在 scan Incomplete 时保留 verdict / exit 3、并入 findings 与观测、blocking 数 warning、带债 warning 去掉「approve with exit 2」
-- [ ] `cli/mod.rs`：`split_clusters(&results.cells, &deep.items)` 写 `queue_split_clusters`
-- [ ] `main.rs`：`--help` 退出码 3 补「深挖照跑，findings 仍在报告」；review 总述补「scanner 与深挖时间重叠」
-- [ ] 测试（Fake e2e）：scanner 格慢、H0 快 → H0 在 scanner 返回前完成；共门 cap 1 时 t=0 scanner 先入门；scanner 一格失败 + reviewer 产 blocking → Incomplete / exit 3 + findings + warning；
+- [x] `orchestrate/mod.rs`：`run_scan_fanout` 加 `Option<&mpsc::Sender<EnqueueReq>>`；格落盘后逐条发锚定后疑点（到达键 `{cell_id}#{i}`），发送失败忽略
+- [x] `cli/mod.rs`：配 reviewer 时建通道；扫描 future 末尾打 `Deep` 并 drop 发送端；`futures::poll!` 先 poll 扫描一次再 `join!`；scan 报告照旧由 `finish_scan_report` 出
+  （首次 poll 即完成时直接 `deep.await`）
+- [x] `cli/mod.rs`：删 `scan_failed` 早退；`overlay_deep` 在 scan Incomplete 时保留 verdict / exit 3、并入 findings 与观测、blocking 数 warning、带债 warning 去掉「approve with exit 2」
+  （判 `report.verdict == Incomplete`；`verdict::blocking_count` 与 `compute_verdict` 同谓词）
+- [x] `cli/mod.rs`：`split_clusters(&results.cells, &deep.items)` 写 `queue_split_clusters`（函数放 `consolidate::scan`）
+- [x] `main.rs`：`--help` 退出码 3 补「深挖照跑，findings 仍在报告」；review 总述补「scanner 与深挖时间重叠」
+- [x] 测试（Fake e2e）：scanner 格慢、H0 快 → H0 在 scanner 返回前完成；共门 cap 1 时 t=0 scanner 先入门；scanner 一格失败 + reviewer 产 blocking → Incomplete / exit 3 + findings + warning；
   A、C、B 到达序构造 → `queue_split_clusters == 1` 且 scan 报告疑点并集不变；phase 时间线 Collecting → Scan → Deep → Finalizing；无 reviewer 配置 scan-only 行为不变
-- [ ] Commit: `feat(cli,orchestrate): scanner 与深挖时间重叠接线——格完成即入队、显式先 poll 扫描、收场切 Deep、scanner 失败深挖照跑仍硬 Incomplete、拆簇对账（design §2 / §8.4〔D15〕）`
+  （虚拟时间精确断言：H0 格 < 1000 ms 落地、scanner 1000、疑点格 1010，`first_dispatch_ms` / `close_ms` / `drain_done_ms` = 1 / 1000 / 1010，阶段 Scan@0 → Deep@1000 → Finalizing@1010；
+  H0 夹具须过门槛——敏感路径 + 签名变更 + 含控制流的 git 仓。另：扇出单测两条（只发锚定后疑点 / 失败格不发 / 接收端关闭忽略；落盘先于入队）、
+  `split_clusters` 单测、`blocking_count` 单测、带债 + scanner 失败仍 3 且不提 exit 2、作业级阶段时间线（`run_job`））
+- [x] 变异检查（8 处，全部转红）：去掉显式先 poll（深挖先 poll）/ 首次 poll 即完成时丢深挖 / `Deep` 打在扫描前 / 扫描不入队 / 去掉 F3 分支 / 不写拆簇数 /
+  先发后落盘 / 拆簇阈值 ≥ 1。首轮「先发后落盘」假绿（接收端在外部 poll 看不出先后）→ 改在落盘钩子里 `try_recv` 查后转红
+- [x] Commit: `feat(cli,orchestrate): scanner 与深挖时间重叠接线——格完成即入队、显式先 poll 扫描、收场切 Deep、scanner 失败深挖照跑仍硬 Incomplete、拆簇对账（design §2 / §8.4〔D15〕）`
 
 ### C2-5 resume 离线续跑（Q6 RS1）
 - [ ] 先写红用例：配 reviewer、队列快照为空、scanner 部分落盘的作业 resume → 现状出 scan-only / exit 0

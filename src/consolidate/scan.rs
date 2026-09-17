@@ -107,6 +107,20 @@ pub fn closure_members(cells: &[ScanCellResult]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// 队列拆簇数（C2 收场对账〔D15〕）：一个组内闭包簇的成员（到达键）落进 ≥ 2 个队列项即计 1——逐格到达、队列逐条合并的非传递残差
+/// （A、C 先到互不匹配，B 后到只并入先命中的一项）。成员没进任何项（入队请求构造失败 / 深挖侧早退）不计。
+pub fn split_clusters(cells: &[ScanCellResult], items: &[crate::orchestrate::queue::QueueItem]) -> u32 {
+    let owner: std::collections::HashMap<&str, &str> =
+        items.iter().flat_map(|it| it.arrivals.iter().map(move |k| (k.as_str(), it.id.as_str()))).collect();
+    closure_members(cells)
+        .iter()
+        .filter(|members| {
+            let homes: std::collections::BTreeSet<&str> = members.iter().filter_map(|k| owner.get(k.as_str()).copied()).collect();
+            homes.len() >= 2
+        })
+        .count() as u32
+}
+
 /// 合并：按组分桶；桶内所有 (cell, 疑点) 两两按 `same_suspicion` 并查集连通（[`suspicion_clusters`]）；每簇代表 = confidence 最高者（并列取
 /// (file, line_start, line_end, hint) 最小者）；`families` 排序去重、`cell_ids` / `hints` 按 cell id 序去重；输出按
 /// (group, file, line_start, line_end, hint) 排序。失败格（`output == None`）不参与。
@@ -276,5 +290,39 @@ mod tests {
         assert_eq!(merged.len(), members.len(), "簇数一致");
         let sizes: std::collections::BTreeSet<usize> = merged.iter().map(|m| m.cell_ids.len()).collect();
         assert_eq!(sizes, [1, 3].into_iter().collect(), "{merged:?}");
+    }
+
+    /// 拆簇计数（C2 收场对账〔D15〕）：链 S2~S1~S3（S2≁S3）逐格到达队列——S2、S3 先到各成一项、S1 后到只并入先命中的 S2 项 → 拆 1 簇；
+    /// S1 先到则后两条都并入它 → 0。独立疑点永不计；没进队列的成员不计。
+    #[test]
+    fn split_clusters_counts_clusters_spread_over_queue_items() {
+        use crate::orchestrate::queue::{DeepQueue, EnqueueReq};
+        let q3 = "let t = secret();\nlog(token_value);\nreturn t;";
+        let (s1, s2, s3) = (
+            susp("a.rs", 10, 12, "s1", 0.6, q3),
+            susp("a.rs", 14, 14, "s2", 0.9, "log(token_value);  "),
+            susp("a.rs", 10, 10, "s3", 0.5, "let t = secret();"),
+        );
+        let far = susp("a.rs", 90, 90, "far", 0.5, "unrelated_call(x);");
+        let cells = vec![
+            cell("scan[g1]@p/alpha#1", 0, "alpha", vec![s1]),
+            cell("scan[g1]@p/beta#1", 0, "beta", vec![far, s2]),
+            cell("scan[g1]@p/gamma#1", 0, "gamma", vec![s3]),
+        ];
+        let feed = |order: &[(usize, usize)]| {
+            let mut q = DeepQueue::new();
+            for &(c, i) in order {
+                let cell = &cells[c];
+                let s = &cell.output.as_ref().unwrap().suspicions[i];
+                q.enqueue(EnqueueReq::scan(s, &cell.family, arrival_key(&cell.cell_id, i)).unwrap());
+            }
+            q.items().to_vec()
+        };
+        let late_bridge = feed(&[(1, 0), (1, 1), (2, 0), (0, 0)]);
+        assert_eq!(late_bridge.len(), 3, "far + S2 项 + S3 项");
+        assert_eq!(split_clusters(&cells, &late_bridge), 1);
+        let early_bridge = feed(&[(0, 0), (1, 1), (2, 0), (1, 0)]);
+        assert_eq!(split_clusters(&cells, &early_bridge), 0);
+        assert_eq!(split_clusters(&cells, &late_bridge[..1]), 0, "成员没进任何项不计");
     }
 }

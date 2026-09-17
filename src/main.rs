@@ -29,12 +29,14 @@ enum Cmd {
     /// 发起对抗式评审：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目（× samples）并行扇出
     /// → 疑点并集（agreement = 家族数）→ **深挖**（风险 H0 区与 scanner 疑点进同一条优先级队列，reviewer 按
     /// provider 门空位消费，预算随风险分、必挖集不截；配多个 reviewer 条目时按空闲轮转分摊、每项只交一个条目，
-    /// 鉴权失败的条目移出、它已失败的格不改派）→ dedup → finding 报告与 verdict。**finding 只由深挖产出**；
+    /// 鉴权失败的条目移出、它已失败的格不改派）→ dedup → finding 报告与 verdict。scanner 与深挖时间重叠：H0 区开跑即挖、
+    /// scanner 每格完成即入队（扫描期非必挖项少挖约 1/4 预算，留给后到的疑点），scanner 全部返回后按剩余预算收场。**finding 只由深挖产出**；
     /// 没配 reviewer 角色则退化为 scan-only（疑点索引 + 覆盖自报，不产 finding）。
     /// 退出码：0=干净 approve 或 scan-only 完成、1=命令自身失败（参数/IO/配置错误）、2=approve 但带债
     /// （reviewer cell 失败——含二阶段补查轮失败、首轮 finding 保留；预算截断；reviewer 条目全部出局致队列项未挖。
     /// 见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
-    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口）、10=reject（finding 达到 --block-threshold）。
+    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口；深挖照跑、findings 仍在报告，本可 reject 的 blocking 条数见
+    /// run.warnings）、10=reject（finding 达到 --block-threshold）。
     /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
     /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
     /// 自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit 可读；误填超大 maxConcurrency 也能自愈）。
