@@ -82,10 +82,13 @@
 - [x] Commit: `fix(resume): 离线续跑——补跑 scanner 后疑点幂等入队、补跑过则复位 Skipped 重选、空快照同路径重建 H0（修扫描期 kill 后 resume 出 scan-only / exit 0）（design §17 R14〔D15〕）`
 
 ### C2-6 收口
-- [ ] `cargo test` / `clippy --all-targets` 零新增（基线 7）/ `make verify`
-- [ ] `make build` → dogfood 一轮：临时 detached 工作树检出 `f1d3ca3`、`redteam-next review --base 674583e --format json`；配置与基线一致（agc 门 6，跑前跑后 sha256 校验）
+- [x] `cargo test` / `clippy --all-targets` 零新增（基线 7）/ `make verify`（C2-5 后 729 + 其余测试二进制全绿）
+- [x] `make build` → dogfood 一轮：临时 detached 工作树检出 `f1d3ca3`、`redteam-next review --base 674583e --format json`；配置与基线一致（agc 门 6，跑前跑后 sha256 校验）
   - 用 `.next/private/m21b/raw/analyze_report.py` 汇总、`replay_policies.py` 对照；比基线 20.6 min 与重放预测（门 6 13.7 / 门 4 16.8 min）、各段墙钟、`scan_phase_dispatched`、429 / 断流
   - 记入本工作树 `.next/private/m21b/`；账目进 followup
+  （2026-09-17 09:32:56Z → 09:57:54Z，exit 10，sha256 前后一致。总墙钟 24.9 min：单次 429 把 agc 门 6 收到 2 并保持整轮（基线收到 4）；
+  同门宽重放 C1 形态 34.5 / C2 实测 24.9 min。扫描期派出 3、收场 456 s 剩余 9 截 6、拆簇 1、`fill_block_total_ms` 210、12/12 零断流。
+  分析脚本加 C2 时间线读法与门 2 列；私有记录 `2026-09-17-batch-c2-dogfood.md`；followup 新节「批 C2 dogfood 带出的账」）
 - [ ] code-review 审核（技能只传 effort，起来后 SendMessage 钉范围：只评 `feat/m21-review-engine...HEAD`）→ 分档修 → `--no-ff` 合回 `feat/m21-review-engine`
 - [ ] 本批私有记录（`2026-09-15-batch-c1-baseline-current-config.md`、`raw/`、C2 dogfood 记录）拷回集成工作树 `.next/private/m21b/`
 - [ ] 归档任务 + journal
