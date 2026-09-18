@@ -1,7 +1,6 @@
 //! 二阶段补查零件（design §2.3）：needs 行窗解析、denylist/git-tracked 读守卫、证据段渲染、草稿注入段。
 //! `second_pass_prompt`（第二趟 prompt 构造）随旧 fan-out 在 M21a 批 F-4 删除；scanner 的 needs 只记录不补跑（prd K6），
-//! 本模块留给 M21b reviewer 的 needs 二阶段复用（design R2），故暂 `allow(dead_code)`。
-#![allow(dead_code)]
+//! 本模块的 needs 二阶段由 M21b reviewer 消费（design R2）。模块级 `allow(dead_code)` 已随之去掉（C2 评审 #15）。
 
 use crate::domain::Finding;
 use std::collections::BTreeSet;
@@ -43,7 +42,9 @@ fn deny_need_read(reason: &str, path: &str, warnings: &mut Vec<String>) {
 /// 二阶段补查 needs 读守卫（E11-Q4，dogfood 抓）：needs 是模型声明的路径（"我要读 X 文件"）——
 /// 威胁模型 B（本地审不可信仓）下若不设限即为任意文件读。仅放行「git-tracked ∧ 非 denylist」。
 /// git 判定失败（非 git 仓/git 缺失/命令报错）→ 保守拒（fail-closed，安全侧优先于可用性）。
-/// 单次判定的便捷入口：每次现取跟踪文件集；同一轮要判多条路径时先 [`TrackedFiles::load`] 一次、逐条走 [`need_read_allowed_in`]。
+/// 单次判定的便捷入口（生产已无调用方，留给用例与将来的一次性判定；每次现取跟踪文件集，同一轮多条路径请先
+/// [`TrackedFiles::load`] 一次再逐条走 [`need_read_allowed_in`]）。
+#[cfg(test)]
 pub(crate) fn need_read_allowed(root: &Path, rel: &str) -> Result<(), &'static str> {
     need_read_allowed_in(&TrackedFiles::load(root), rel)
 }
@@ -66,8 +67,9 @@ pub struct TrackedFiles {
 }
 
 enum TrackedState {
-    /// `prefix` = root 相对仓库顶层的前缀（顶层为空，否则以 `/` 结尾）；`files` = 仓库全部跟踪文件（顶层相对路径）。
-    Listed { prefix: String, files: BTreeSet<String> },
+    /// `prefix` = root 相对仓库顶层的前缀（顶层为空，否则以 `/` 结尾）；`files` = 仓库全部跟踪文件（顶层相对路径）；
+    /// `root` 留给非 ASCII 路径回退逐条子进程判定（见 [`git_tracked_literal`]）。
+    Listed { root: std::path::PathBuf, prefix: String, files: BTreeSet<String> },
     NotRepo,
     GitUnavailable,
 }
@@ -79,6 +81,12 @@ thread_local! {
 }
 
 impl TrackedFiles {
+    /// 取集合失败（git 不可用 / 命令报错）→ 本轮读守卫整体 fail-closed，调用方据此发 warning（评审 #13：
+    /// 这类失败原先只体现在逐格的「已拒绝（读守卫）」里，报告层看不见）。非 git 仓不算失败（本就该拒）。
+    pub fn unavailable(&self) -> bool {
+        matches!(self.state, TrackedState::GitUnavailable)
+    }
+
     /// worktree 下必须用 `root`（`current_dir`），不能信进程 cwd——镜像 evidence/git.rs 的 git_at 手法。
     pub fn load(root: &Path) -> Self {
         #[cfg(test)]
@@ -104,7 +112,7 @@ impl TrackedFiles {
                     .filter(|p| !p.is_empty())
                     .map(|p| String::from_utf8_lossy(p).into_owned())
                     .collect();
-                TrackedFiles { state: TrackedState::Listed { prefix, files } }
+                TrackedFiles { state: TrackedState::Listed { root: root.to_path_buf(), prefix, files } }
             }
             Ok(_) => TrackedFiles { state: TrackedState::NotRepo },
             Err(_) => TrackedFiles { state: TrackedState::GitUnavailable },
@@ -116,11 +124,16 @@ impl TrackedFiles {
     /// （`src/foo.rs/` 拒、`src/foo.rs/..` 即 `src` 放行）；大小写敏感。
     fn allows(&self, rel: &str) -> Result<(), &'static str> {
         const UNTRACKED: &str = "非 git-tracked";
-        let (prefix, files) = match &self.state {
-            TrackedState::Listed { prefix, files } => (prefix, files),
+        let (root, prefix, files) = match &self.state {
+            TrackedState::Listed { root, prefix, files } => (root, prefix, files),
             TrackedState::NotRepo => return Err(UNTRACKED),
-            TrackedState::GitUnavailable => return Err("git 不可用（fail-closed）"),
+            TrackedState::GitUnavailable => return Err(GIT_DOWN),
         };
+        // 非 ASCII 路径回退逐条子进程判定（评审 #13）：macOS 的 `core.precomposeunicode` 让 `ls-files` 输出按 NFC 预组合，
+        // 而 need / 疑点里的路径可能是 NFD 拼写——逐字节比集合会与 C2 之前的口径分叉（NFD 索引的仓反向分叉）。这类路径罕见。
+        if !rel.is_ascii() || !prefix.is_ascii() {
+            return git_tracked_literal(root, rel);
+        }
         if rel.is_empty() || rel.starts_with('/') {
             return Err(UNTRACKED);
         }
@@ -145,6 +158,24 @@ impl TrackedFiles {
             (!dir_only && files.contains(&path)) || files.range(dir.clone()..).next().is_some_and(|f| f.starts_with(&dir))
         };
         if hit { Ok(()) } else { Err(UNTRACKED) }
+    }
+}
+
+/// 取跟踪集失败（git 不可用 / 命令报错）的统一文案：整轮读守卫 fail-closed，调用方据此披露。
+pub(crate) const GIT_DOWN: &str = "git 不可用（fail-closed）";
+
+/// 逐条字面 pathspec 判定（C2 之前的实现）：非 ASCII 路径的回退路径，与 `ls-files --error-unmatch` 逐字节同口径。
+fn git_tracked_literal(root: &Path, rel: &str) -> Result<(), &'static str> {
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        // 字面路径：外部若没设这个变量，`:(glob)` 一类 pathspec 魔法会被 git 解释——守卫要按字面名判定。
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .args(["ls-files", "--error-unmatch", "--", rel])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(_) => Err("非 git-tracked"),
+        Err(_) => Err(GIT_DOWN),
     }
 }
 
@@ -208,6 +239,36 @@ pub(crate) fn draft_block(drafts: &[Finding]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 非 ASCII 路径与逐条 git 判定同口径（评审 #13）：macOS 的 `core.precomposeunicode` 让 `ls-files` 输出按 NFC 预组合，
+    /// need 里可能是 NFD 拼写——集合逐字节比会与旧口径分叉，故这类路径回退子进程判定，结果以 git 为准。
+    #[test]
+    fn non_ascii_paths_follow_the_literal_git_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        let nfc = "caf\u{e9}.rs"; // é 单码点
+        let nfd = "cafe\u{301}.rs"; // e + 组合重音
+        std::fs::write(root.join(nfc), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        let tracked = TrackedFiles::load(root);
+        for rel in [nfc, nfd] {
+            let git_says = std::process::Command::new("git")
+                .current_dir(root)
+                .env("GIT_LITERAL_PATHSPECS", "1")
+                .args(["ls-files", "--error-unmatch", "--", rel])
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert_eq!(need_read_allowed_in(&tracked, rel).is_ok(), git_says, "{rel:?} 与 git 判定不一致");
+        }
+    }
 
     #[test]
     fn needs_rejects_untracked_and_sensitive_paths() {

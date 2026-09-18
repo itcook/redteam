@@ -1,6 +1,6 @@
 //! 深挖循环（M21b 批 C-4 / C1 / C2）：H0 + 疑点入队（开跑或经通道在途到达）→ 在线额度下门驱动并发派发（try_lease×pop → 一格 future；
 //! 门满则等门挂起入 FIFO）→ 关闭入口时收场 drain → barrier → 按最终优先级序组装。
-//! 无 reviewer / scanner 失败时调用方不进本模块（scan-only / Incomplete）。
+//! 无 reviewer 时调用方不进本模块（scan-only）；scanner 有格失败照进——F3〔D15〕：深挖照跑，判定仍 Incomplete。
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -78,7 +78,7 @@ pub struct DeepInput<'a> {
     /// reviewer cell 落盘（后台 job checkpoint —— resume 靠它认已挖过的格与其 findings）。
     /// `None` → 不落盘（前台一次性跑）。
     pub on_cell: Option<&'a dyn Fn(&CellRecord)>,
-    /// 在途入队通道（scanner 流式扇出，C2〔D15〕）：到达项走入口五态；通道关闭 = 关闭入口 → 收场 drain。`None` = 开跑即关闭。
+    /// 在途入队通道（scanner 流式扇出，C2〔D15〕）：到达项走入口五态（到达键幂等）；通道关闭 = 关闭入口 → 收场 drain。`None` = 开跑即关闭。
     /// barrier 含「通道已关闭」：发送端未全部 drop 前，队列空也不收场。
     pub incoming: Option<mpsc::Receiver<EnqueueReq>>,
 }
@@ -166,6 +166,10 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let t_load = std::time::Instant::now();
     let tracked = crate::cli::second_pass::TrackedFiles::load(input.root);
     note_block(&mut meta, t_load.elapsed());
+    if tracked.unavailable() {
+        // 整轮读守卫 fail-closed（评审 #13）：逐格只会显示「已拒绝（读守卫）」，报告层得说清是取跟踪集失败
+        warnings.push("deep: 取 git 跟踪文件集失败——本轮证据读取与二阶段 needs 一律按未跟踪拒绝（fail-closed）".into());
+    }
     let env = CellEnv { input: &input, idx: &idx, tracked: &tracked, opts: &opts, sink };
 
     // 门驱动并发派发（design §6 规则 5〔D13〕）：provider 门有空位才弹出最高优先的可派项交出去。
@@ -374,9 +378,10 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     }
 
     // 收场按最终队列项优先级序组装（design C2 §8 D2〔D15〕）：持久化已在完成时做完；报告侧的 findings（→ dedup 以输入序首个为 base）、
-    // cells、meta 四数组与每格 warnings 依此序喂。保证：同一选中集合 + 同样的格输出 → 报告逐字节一致（计时字段与收场时刻读数
-    // `scan_phase_dispatched` / `close_budget_remaining` 除外）——与完成序、派发序、到达序都无关；选中集合本身随到达时序变化是
-    // 在线预算的已知代价（批 C3）。
+    // cells、meta 四数组与每格 warnings 依此序喂。保证：同一选中集合 + 同样的格输出 → 报告逐字节一致，除去三类随时序变的读数：
+    // 计时字段、收场时刻读数（`scan_phase_dispatched` / `close_budget_remaining`）、以及**时刻快照式的共识**
+    // （`dispatch_agreement` / `landed_agreement` 与 finding 的 `suspicion_agreement`：异族并入发生在派发 / 落地之前还是之后随时序变，
+    // 评审 #10）。选中集合本身随到达时序变化是在线预算的已知代价（批 C3：量重合度，不逐字节比）。
     meta.budget_skipped = skipped_now(&q);
     landed.sort_by(|a, b| match (q.get(&a.item_id), q.get(&b.item_id)) {
         (Some(x), Some(y)) => cmp_priority(x, y),
@@ -850,7 +855,7 @@ fn land(
     }
 }
 
-/// 经入队通道到达一项（scanner 流式扇出）：走入口五态 + 入队原因 + 队列深度峰值（运行中取最大）；只写受影响项的快照
+/// 经入队通道到达一项（scanner 流式扇出）：走入口五态（同一到达键再来记 `Duplicate`）+ 入队原因 + 队列深度峰值（运行中取最大）；只写受影响项的快照
 /// （新建项 / 并入目标；重复到达不写，C2 Q9〔D15〕）。可派与否由主循环的在线额度判定。`None` = 发送端全部 drop → 通道关闭。
 fn on_arrival(
     msg: Option<EnqueueReq>,
@@ -2413,6 +2418,8 @@ mod tests {
 
     /// 报告确定性（D2〔D15〕）：同一选中集合、到达序与完成时延都反过来的两次运行（门 1 → 派发序不同），报告（除计时字段）逐字节一致；
     /// meta 四数组与 cells 等长、按最终优先级序对齐（失败格也各占一位）。
+    /// 本构造三项互不并入，故 `dispatch_agreement` / `landed_agreement` 也稳定；它们本身是时刻快照、随并入时序变（评审 #10），
+    /// 不在逐字节保证内。
     #[tokio::test(start_paused = true)]
     async fn report_order_follows_final_priority_not_dispatch_order() {
         async fn once(reverse: bool) -> (serde_json::Value, Vec<String>) {

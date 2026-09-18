@@ -97,7 +97,10 @@
     阻塞计时覆盖落地 / 收场 / 取跟踪集（#11）、作业进度与 resume 拆簇数（#12）、到达键带内容指纹 + H0 到达键与幂等重建（#8）。
     用例 7 条新增 / 改写，变异 8 处全红（首轮「匹配只看渲染笔记」假绿——桥接疑点置信更高时代表替换已覆盖，补低置信桥的场景后转红）；
     私有重放脚本 `merge_semantics.py` 同步新语义，本轮 dogfood 数据拆簇 1 → 0、共识少算 1 → 0
-  - [ ] 第 3 档（低概率 / 文档 / 清理，4 项）：确定性保证措辞（#10）、读守卫 NFD 与加载失败告警（#13）、恒真用例与过期注释清理（#15）、followup 记账
+  - [x] 第 3 档（低概率 / 文档 / 清理，4 项）：确定性保证措辞补时刻快照式共识（#10）；读守卫非 ASCII 路径回退子进程判定、取集合失败发 warning、
+    `need_read_allowed` 降为 test-only 并去掉模块级 `allow(dead_code)`（#13）；恒真的 `drain_with_matches_drain_on_c1_scenarios` 改写死期望
+    + 过期注释（模块头 F3 口径、「入口五态」、`Duplicate` 用途、到达键形态）（#15）；followup 记账（快照批量事务、FIFO 门改 Semaphore、
+    并查集重复计算、读守卫失败不重试、resume 复位门控的等价性）。变异 2 处转红（去掉非 ASCII 回退 / drain 忽略保底）
 - [ ] `--no-ff` 合回 `feat/m21-review-engine`
 - [ ] 本批私有记录（`2026-09-15-batch-c1-baseline-current-config.md`、`raw/`、C2 dogfood 记录）拷回集成工作树 `.next/private/m21b/`
 - [ ] 归档任务 + journal

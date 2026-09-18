@@ -30,7 +30,7 @@ pub enum ItemKind {
     Needs = 3,
 }
 
-/// 入队结果（五态可观测）。
+/// 入队结果：五态可观测 + C2 的到达键幂等 `Duplicate`，共六种。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnqueueOutcome {
     /// 无命中 → 新项 agreement = 1。
@@ -43,7 +43,8 @@ pub enum EnqueueOutcome {
     MergedSettled,
     /// 命中被预算截掉的项、并入后仍非必挖 → 只改记录，保持截断（不突破 drain 定下的预算）。
     MergedSkipped,
-    /// 到达键已记在某项上（同一 scan 格的同一条疑点再次到达：resume 幂等入队 / 收场拆簇对账）→ 不改任何项、不计去重命中。
+    /// 到达键已记在某项上（同一条疑点再次到达：resume 回放 scanner 格、每轮重入队 H0）→ 不改任何项、不计去重命中。
+    /// 收场拆簇对账读的是项上记着的到达键，不经本入口。
     Duplicate,
 }
 
@@ -63,7 +64,7 @@ pub struct QueueItem {
     /// 入队时刻（epoch ms，观测：item_wait_ms = 派发时刻 − 此值）。None = 旧快照。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enqueued_ms: Option<u64>,
-    /// 并入本项的疑点到达键（`{scan cell_id}#{i}`，C2〔D15〕）：同一条疑点再到达即幂等（`EnqueueOutcome::Duplicate`），
+    /// 并入本项的到达键（疑点 `{scan cell_id}#{i}:{内容指纹}`、H0 `rule:{file}:{start}-{end}`，C2〔D15〕）：再到达即幂等（`EnqueueOutcome::Duplicate`），
     /// 收场据此把组内闭包簇映射回队列项做拆簇对账。H0 无到达键；旧快照空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arrivals: Vec<String>,
@@ -969,12 +970,22 @@ mod tests {
     }
 
     /// `drain(K)` = `drain_with(K, ⌈K/4⌉)`：C1 各场景逐项一致（开跑即关闭、未派发时的收场 drain 就是旧 drain）。
+    /// 期望值写死（评审 #15：两边同一公式互比是恒真的，实现改错会一起变）——被截项按 (种类 → 分数 → id) 序，必挖与保底疑点不动。
     #[test]
     fn drain_with_matches_drain_on_c1_scenarios() {
-        for (q, k) in drain_scenarios() {
+        let want: [Vec<&str>; 6] = [
+            vec!["s.rs:scan:1-2", "n.rs:needs:1-2"], // K=0：只留必挖主区
+            vec!["n.rs:needs:1-2"],                  // K=2：保底留下疑点
+            vec!["n.rs:needs:1-2"],                  // K=0、无主区：两族共识的疑点是必挖
+            vec!["s1.rs:scan:1-2", "s2.rs:scan:1-2", "n.rs:needs:1-2"], // K=4：4 条必挖主区 + 保底 1 条疑点
+            vec![],                                  // K=8 / K=12：装得下
+            vec![],
+        ];
+        for ((q, k), want) in drain_scenarios().into_iter().zip(want) {
             let (mut a, mut b) = (q.clone(), q);
             let floor = if k == 0 { 0 } else { k.div_ceil(4) as usize };
-            assert_eq!(a.drain(k), b.drain_with(k as usize, floor), "K = {k}");
+            assert_eq!(a.drain(k), want, "K = {k}");
+            assert_eq!(b.drain_with(k as usize, floor), want, "K = {k}（drain_with 同值）");
             assert_eq!(a.items(), b.items(), "K = {k}");
         }
     }

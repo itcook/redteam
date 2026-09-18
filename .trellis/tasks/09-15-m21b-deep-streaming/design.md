@@ -259,7 +259,9 @@ loop {
 
 - 收场时 `landed` 不再按派发序 `seq` 迭代，而按最终队列项优先级排序：由 cell 名反解项 id（`review_cell_prefix` 同源），取 `q` 中该项的最终状态比 `cmp_priority`
   （种类 → 分数 → id，全序；同一调用同项至多一格）。findings（→ dedup）、cells、meta 四数组、每格 warnings 依此序喂入；`prior_findings` 仍追加在后。
-- 保证注释改写：「同一选中集合 + 同样的格输出 → 报告逐字节一致（`duration_ms` / `queue_wait_ms` / `item_wait_ms` 等计时字段除外）」；
+- 保证注释改写：「同一选中集合 + 同样的格输出 → 报告逐字节一致」，除去三类随时序变的读数：计时字段（`duration_ms` / `queue_wait_ms` / `item_wait_ms` …）、
+  收场时刻读数（`scan_phase_dispatched` / `close_budget_remaining`）、时刻快照式的共识（`dispatch_agreement` / `landed_agreement` 与 finding 的
+  `suspicion_agreement`——异族并入发生在派发 / 落地之前还是之后随时序变，评审第 3 档 #10；C3 量选项稳定性时按重合度比，不逐字节）；
   选中集合随到达时序变化是 B / M1 的已知代价（C3）。
 - 退化零差：单成员门宽 1、`incoming: None` 时派发序 = 优先级序，基线文件不变。
 - 实施（C2-3）：`Landed` 直接带所挖项 id 排序，不从 cell 名反解（项查不到属防御，按 id 比）。保证的除外项加上收场时刻读数（§3.2）。
@@ -277,6 +279,9 @@ loop {
     `.` `..` 重复斜杠（`..` 越出顶层拒）；命中文件本身或含跟踪文件的目录放行；以 `/` `/.` `/..` 结尾只按目录匹配；大小写敏感。
     rel 不再作为 git 参数，参数 / pathspec 注入无从下手。
   - 原 `need_read_allowed(root, rel)` 改为「现取集合 + 集合判定」的便捷入口，唯一实现；既有注入 / fail-closed 用例原样验证新口径。
+    实施（评审第 3 档 #13）：生产已无调用方 → 降为 `#[cfg(test)]`（模块级 `allow(dead_code)` 随之去掉）；
+    **非 ASCII 路径回退逐条子进程判定**（macOS `core.precomposeunicode` 让 `ls-files` 输出按 NFC 预组合，need 里可能是 NFD，逐字节比集合会与旧口径分叉）；
+    取集合失败（git 不可用）时整轮 fail-closed 之外另发一条 run.warnings（原先只体现在逐格的「已拒绝（读守卫）」里）。
   - `need_section(ex, tracked, need, warnings)`；`region::build(item, bundle, root, tracked, idx, budget, opts, needs_evidence)`。
   - 等价性以原子进程实现为对照：33 个路径 × 仓库顶层 / 子目录 / 非 git 目录三种 root 逐条同结果、同拒绝文案（首轮抓到文件尾斜杠一处口径差后修）。
 - 阻塞计时：填门段（`region::build` + prompt 构建 + 快照写）与到达处理段各自以 `std::time::Instant` 计时，记 `fill_block_max_ms` / `fill_block_total_ms`。

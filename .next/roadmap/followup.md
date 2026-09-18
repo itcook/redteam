@@ -413,3 +413,21 @@ agreement ≥ 2 ∧ reviewer 确认 → 免复核」——这个 `agreement` 与
   维持留债，PR181 出口验收再读。
 - **选项方差照旧**（→ 批 C3，见批 C1 dogfood 节「深挖选项方差过大」）：与 C1 基线选中项重合 4/12（两个规则项 + `finding.rs:101` + roadmap `:3`），
   findings 11 vs 6；文档项 3/12。C2 按 D15 未改选项规则，选中集合另随到达时序变——C3 验收仍按「同 diff 跑两次量选中区域 / findings 重合度」。
+
+## 批 C2 收口评审带出的账（2026-09-17 `/code-review` max effort 15 条，分三档全修；明细在 Trellis 任务 `09-15-m21b-deep-streaming/implement.md`）
+
+三类真问题：resume 靠快照状态反推运行态导致三处假绿（补跑出的疑点没挖却 Approve/0、空 diff 回到 scan-only/0、scan-only 作业被事后加的 reviewer 改判并覆盖原结果）；
+主循环每次唤醒只处理一个事件（同格疑点逐条派发、额度按模型输出序消耗、同刻事件随机定序）；等门登记绕过轮转（共门时 0 号成员通吃，C1 交替分派的回归）。
+修法要点：作业状态落深挖队列头（K）、统一「未完」判定（有未挖项 ∨ 有成功 scanner 格的疑点从没到过队列）、每次唤醒排空同刻事件再填门、等门按轮转序登记、
+并入保留成员疑点与最高置信代表、到达键带内容指纹、`budget_skipped` 按最终状态数、阻塞计时补齐落地 / 收场 / 取跟踪集。
+
+- **快照逐项自动提交 → 批量单事务**（评审第 2 档 #11 延伸）：`close_drain` / `reopen_skipped` / `enqueue_scan_cells` 逐项 `put_queue_item`，
+  WAL + `synchronous=FULL` 下逐条比单事务慢数倍；收场截数百项时是主循环上的同步段（现已计入 `fill_block_*`）。候选：`CellSink` 加批量写入口。
+- **手写票号 FIFO 门 → tokio `Semaphore`**（评审帽外）：`InflightGate` 的等门 FIFO 与取消安全是自己实现的（C2-1 六处变异钉住）；
+  `Semaphore` 自带公平队列与 `acquire_owned`，可省掉这套代码。门的 429 收窄、`active` / `completions` 语义要一并迁移，非平凡，留批 D 前评估。
+- **组内闭包并查集 O(S²) 且跑两次**（评审帽外，效率）：`merge_suspicions` 与 `closure_members` 各算一遍 `suspicion_clusters`；
+  本仓量级（≤ 40 疑点）无感，PR181 双家族 r1 111 条也只是毫秒级。真要优化就缓存一次结果。
+- **读守卫取跟踪集失败不重试**（评审第 3 档 #13 残留）：`TrackedFiles::load` 的瞬时失败（fork EAGAIN 等）会让整轮 fail-closed；
+  现已在报告加 warning，但没有重试；真出现再加。非 ASCII 路径已回退逐条子进程判定（macOS `core.precomposeunicode` 的 NFC/NFD 分叉）。
+- **resume 的「只在补跑过 scanner 时复位 Skipped」与「总是复位」结果等价**（第 2 档分析）：快照自洽时复位项会被收场 drain 原样截回；
+  K 变大时总是复位只会多挖，K 变小时截断与复位无关。门控按 D15 保留，C3 做选项稳定性时可一并简化。
