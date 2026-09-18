@@ -4,7 +4,7 @@ use crate::provider::scan_shot::{run_scan_shot_with, ScanCall};
 use crate::provider::tool_loop::ChatBackend;
 use crate::provider::{AttemptOutcome, AttemptPolicy, LensCall, LensRequest, ProviderError, ReviewProvider};
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -18,7 +18,8 @@ pub struct InflightGate {
     /// 配置门宽（不变；`stat().cap`）。
     cap_initial: u32,
     state: Mutex<GateState>,
-    /// 名额释放 → `notify_one`：唤醒一个等门者。等门者先 `enable()` 注册再检条件（tokio 推荐模式），两次释放落在同一窗口也不丢唤醒。
+    /// 名额释放 → `notify_waiters`：唤醒全部等门者，只有排在队头的那位能取（票号 FIFO，C2〔D15〕）。等门者先 `enable()` 注册再检条件
+    /// （tokio 推荐模式），释放落在检查与入睡之间也不丢唤醒。
     slot_free: Notify,
     /// 成功完成 → `notify_one`：每次完成只放一个 429 等待者重试（排队语义，K6）；在途归零 → `notify_waiters`（K8：全员 429 时不互相等死，
     /// 被广播唤醒者先退避再准入）。
@@ -26,7 +27,7 @@ pub struct InflightGate {
     peak: AtomicU32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GateState {
     /// 当前门宽（≤ cap_initial；429 收敛只降不升）。
     cap: u32,
@@ -39,6 +40,10 @@ struct GateState {
     /// 成功完成计数：429 等待者以「计数超过入睡时的值」判断等到的是新完成，而不是 `notify_one` 存下的旧许可；
     /// 与 `active` 同一临界区读写（评审修：seq0 不在锁外读）。
     completions: u64,
+    /// 阻塞等门者的登记票号，按登记先后排队（design §12.3「单把 FIFO」〔D15〕）。非空时非阻塞试取一律让位；
+    /// 只有队头能取——`notify_one` 加「已登记即可取」会让刚登记的新等门者抢走已被唤醒、尚未被 poll 的队头的门位。
+    waiting: VecDeque<u64>,
+    next_ticket: u64,
 }
 
 impl GateState {
@@ -63,7 +68,7 @@ impl InflightGate {
         let cap = cap.max(1);
         InflightGate {
             cap_initial: cap,
-            state: Mutex::new(GateState { cap, held: 0, active: 0, rate_limited: 0, completions: 0 }),
+            state: Mutex::new(GateState { cap, held: 0, active: 0, rate_limited: 0, completions: 0, waiting: VecDeque::new(), next_ticket: 0 }),
             slot_free: Notify::new(),
             completed: Notify::new(),
             peak: AtomicU32::new(0),
@@ -81,33 +86,57 @@ impl InflightGate {
         self.cap_initial
     }
     pub fn stat(&self) -> GateStat {
-        let s = *self.lock();
+        let s = self.lock();
         GateStat { cap: self.cap_initial, effective_cap: s.cap, rate_limited: s.rate_limited, peak: self.peak(), completions: s.completions }
     }
-    /// 取名额：`held < cap` 即取（[`Self::try_enter`]），否则等一次释放再重检。`notified().enable()` 先于条件检查注册，
-    /// 释放发生在两者之间也不丢唤醒。
+    /// 取名额：先非阻塞首试（有人排队就让位）；取不到登记为等门者排进 FIFO，轮到队头且 `held < cap` 才取。
+    /// 取消安全：等门 future 在任何 await 点被 drop，`WaiterGuard` 把票号移出队列；它若是队头则唤醒其余等门者重检。
     async fn enter(&self) -> GatePermit<'_> {
+        if let Some(permit) = self.try_enter() {
+            return permit;
+        }
+        let waiter = WaiterGuard::register(self);
         loop {
             let notified = self.slot_free.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(permit) = self.try_enter() {
+            if let Some(permit) = self.try_enter_as_waiter(waiter.ticket) {
                 return permit;
             }
             notified.await;
         }
     }
-    /// 非阻塞取名额（M21b 批 C1 深挖派发循环）：`held < cap` 即取，否则 `None`。`cap` 是 429 收敛后的有效门宽，天然尊重收门。
-    /// **不感知等门者**：同门若有 `enter()` 阻塞等待者，本调用可能抢在其前——C1 深挖内部没有阻塞等门者（一格持门位到底），
-    /// 与 scanner 共门时的让位公平性归批 C2。
+    /// 非阻塞取名额（深挖派发循环）：`held < cap` 且**无人排队**才取，否则 `None`。`cap` 是 429 收敛后的有效门宽，天然尊重收门。
+    /// 有阻塞等门者时让位（design §12.3：scanner 格先于 H0 项入门；深挖要进 FIFO 就走 `enter`）。
     fn try_enter(&self) -> Option<GatePermit<'_>> {
         let mut s = self.lock();
-        if s.held < s.cap {
+        if s.held < s.cap && s.waiting.is_empty() {
             s.held += 1;
             Some(GatePermit { gate: self })
         } else {
             None
         }
+    }
+    /// 已登记等门者取名额：须是队头且 `held < cap`。取到后若仍有空位且队里还有人，唤醒他们重检（新队头可继续取）——
+    /// 同一刻放出多个名额时，不必等下一次放门。
+    fn try_enter_as_waiter(&self, ticket: u64) -> Option<GatePermit<'_>> {
+        let more = {
+            let mut s = self.lock();
+            if s.held >= s.cap || s.waiting.front() != Some(&ticket) {
+                return None;
+            }
+            s.waiting.pop_front();
+            s.held += 1;
+            s.held < s.cap && !s.waiting.is_empty()
+        };
+        if more {
+            self.slot_free.notify_waiters();
+        }
+        Some(GatePermit { gate: self })
+    }
+    #[cfg(test)]
+    fn waiters(&self) -> usize {
+        self.lock().waiting.len()
     }
     #[cfg(test)]
     fn shrink_to(&self, cap: u32) {
@@ -115,7 +144,7 @@ impl InflightGate {
     }
 }
 
-/// 已发名额：Drop 归还；门已收窄到 `held ≥ cap` 时不唤醒 = 名额丢弃（K6）。
+/// 已发名额：Drop 归还；门已收窄到 `held ≥ cap` 时不唤醒 = 名额丢弃（K6）。有空位时唤醒全部等门者，队头取。
 pub struct GatePermit<'a> {
     gate: &'a InflightGate,
 }
@@ -125,10 +154,45 @@ impl Drop for GatePermit<'_> {
         let wake = {
             let mut s = self.gate.lock();
             s.held = s.held.saturating_sub(1);
-            s.held < s.cap
+            s.held < s.cap && !s.waiting.is_empty()
         };
         if wake {
-            self.gate.slot_free.notify_one();
+            self.gate.slot_free.notify_waiters();
+        }
+    }
+}
+
+/// 阻塞等门登记（C2〔D15〕）：构造即排进 FIFO；Drop 移出队列——取到名额时已由 `try_enter_as_waiter` 出队，这里无事可做；
+/// 被取消（等门 future 被 drop）时出队，若它是队头且有空位，唤醒其余等门者，避免空位无人来取、后来者永久让位。
+struct WaiterGuard<'a> {
+    gate: &'a InflightGate,
+    ticket: u64,
+}
+
+impl<'a> WaiterGuard<'a> {
+    fn register(gate: &'a InflightGate) -> Self {
+        let mut s = gate.lock();
+        let ticket = s.next_ticket;
+        s.next_ticket += 1;
+        s.waiting.push_back(ticket);
+        WaiterGuard { gate, ticket }
+    }
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        let wake = {
+            let mut s = self.gate.lock();
+            match s.waiting.iter().position(|&t| t == self.ticket) {
+                Some(pos) => {
+                    s.waiting.remove(pos);
+                    pos == 0 && s.held < s.cap && !s.waiting.is_empty()
+                }
+                None => false,
+            }
+        };
+        if wake {
+            self.gate.slot_free.notify_waiters();
         }
     }
 }
@@ -682,5 +746,178 @@ mod tests {
         p2.attempt_end(AttemptOutcome::Ok); // 一次成功完成 → 只放一个
         assert_eq!(tokio::time::timeout(Duration::from_millis(200), &mut w3).await.ok(), Some(true));
         assert_eq!((gate.stat().completions, gate.lock().active, p2.retries(), p3.retries()), (1, 1, 1, 1));
+    }
+
+    // ── C2 门 FIFO 让位与取消安全〔D15〕 ─────────────────────────────────────
+
+    /// 非阻塞首试在有人排队时让位（design §12.3：scanner 格先于 H0 入门）：放门后空位留给等门者，`try_enter` 取不到。
+    #[tokio::test]
+    async fn try_enter_yields_to_registered_waiters() {
+        let gate = InflightGate::new(1);
+        let held = gate.try_enter().expect("空门");
+        let mut waiter = Box::pin(gate.enter());
+        assert!(futures::poll!(&mut waiter).is_pending(), "门满 → 登记排队");
+        assert_eq!(gate.waiters(), 1);
+        drop(held);
+        assert!(gate.try_enter().is_none(), "有人排队 → 非阻塞首试让位");
+        let permit = futures::poll!(&mut waiter);
+        assert!(permit.is_ready(), "等门者取到");
+        assert_eq!(gate.waiters(), 0);
+        drop(permit);
+        assert!(gate.try_enter().is_some(), "队空后首试照取");
+    }
+
+    /// 等门者按登记先后取门位：已被唤醒、尚未被 poll 的队头不被后登记者抢——`notify_one` 加「登记即可取」会在这里插队。
+    #[tokio::test]
+    async fn waiters_are_served_in_registration_order() {
+        let gate = InflightGate::new(1);
+        let held = gate.try_enter().expect("空门");
+        let mut first = Box::pin(gate.enter());
+        assert!(futures::poll!(&mut first).is_pending());
+        drop(held); // 空位出现，队头还没被 poll
+        let mut late = Box::pin(gate.enter());
+        assert!(futures::poll!(&mut late).is_pending(), "后登记者不抢队头的门位");
+        let permit = match futures::poll!(&mut first) {
+            std::task::Poll::Ready(p) => p,
+            std::task::Poll::Pending => panic!("队头应取到"),
+        };
+        assert!(futures::poll!(&mut late).is_pending(), "门位被队头占着");
+        drop(permit);
+        assert!(futures::poll!(&mut late).is_ready(), "队头归还后轮到下一位");
+    }
+
+    /// 取消安全：队头被唤醒后没取就被 drop → 下一位**被唤醒**并取到（不是靠别人再 poll 它），排队计数归零。
+    #[tokio::test]
+    async fn cancelled_head_passes_the_turn_to_the_next_waiter() {
+        let gate: &'static InflightGate = Box::leak(Box::new(InflightGate::new(1)));
+        let held = gate.try_enter().expect("空门");
+        let mut head = Box::pin(gate.enter());
+        assert!(futures::poll!(&mut head).is_pending());
+        let next = tokio::spawn(async move { drop(gate.enter().await) });
+        tokio::task::yield_now().await; // 让 next 登记在 head 之后
+        assert_eq!(gate.waiters(), 2);
+        drop(held); // 唤醒排队者，head 未被 poll
+        drop(head); // head 取消
+        tokio::time::timeout(Duration::from_secs(1), next).await.expect("下一位应被唤醒").unwrap();
+        assert_eq!(gate.waiters(), 0);
+        assert!(gate.try_enter().is_some());
+    }
+
+    /// 未被唤醒就取消的等门者同样出队——漏减会让后来的非阻塞试取永久让位（饿死）。
+    #[tokio::test]
+    async fn cancelled_waiter_leaves_the_queue() {
+        let gate = InflightGate::new(1);
+        let held = gate.try_enter().expect("空门");
+        let mut waiter = Box::pin(gate.enter());
+        assert!(futures::poll!(&mut waiter).is_pending());
+        drop(waiter);
+        assert_eq!(gate.waiters(), 0);
+        drop(held);
+        assert!(gate.try_enter().is_some(), "无人排队 → 首试照取");
+    }
+
+    /// 同一刻放出多个名额：队头取后若仍有空位，接着唤醒下一位——不必等下一次放门。
+    #[tokio::test]
+    async fn freed_slots_cascade_through_the_queue() {
+        let gate: &'static InflightGate = Box::leak(Box::new(InflightGate::new(2)));
+        let (a, b) = (gate.try_enter().unwrap(), gate.try_enter().unwrap());
+        let w1 = tokio::spawn(async move { gate.enter().await });
+        let w2 = tokio::spawn(async move { gate.enter().await });
+        tokio::task::yield_now().await;
+        assert_eq!(gate.waiters(), 2);
+        drop(a);
+        drop(b);
+        let (p1, p2) = tokio::time::timeout(Duration::from_secs(1), async { (w1.await.unwrap(), w2.await.unwrap()) })
+            .await
+            .expect("两位等门者都应取到");
+        assert_eq!(gate.waiters(), 0);
+        drop((p1, p2));
+    }
+
+    /// 每个等门 future 挂独立 waker，精确断言「谁被唤醒」——只看 poll 能否取到会被别的唤醒掩盖。
+    struct WakeFlag(std::sync::atomic::AtomicBool);
+    impl futures::task::ArcWake for WakeFlag {
+        fn wake_by_ref(arc: &Arc<Self>) {
+            arc.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl WakeFlag {
+        fn new() -> Arc<Self> {
+            Arc::new(WakeFlag(std::sync::atomic::AtomicBool::new(false)))
+        }
+        /// 读并清零。
+        fn take(&self) -> bool {
+            self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    fn poll_flagged<F: std::future::Future + Unpin>(f: &mut F, flag: &Arc<WakeFlag>) -> std::task::Poll<F::Output> {
+        let waker = futures::task::waker(Arc::clone(flag));
+        std::pin::Pin::new(f).poll(&mut std::task::Context::from_waker(&waker))
+    }
+
+    /// 放门唤醒全部等门者、由队头取：`Notify` 内部的唤醒次序会因非队头者被唤醒后重新登记而与票号次序漂移，
+    /// 只唤醒一个（`notify_one`）可能叫醒非队头者，真队头永远等不到、空位没人取。
+    #[tokio::test]
+    async fn head_is_woken_even_if_notify_order_drifted() {
+        let gate = InflightGate::new(1);
+        let held = gate.try_enter().expect("空门");
+        let flags: Vec<_> = (0..4).map(|_| WakeFlag::new()).collect();
+        let mut w: Vec<_> = (0..4).map(|_| Box::pin(gate.enter())).collect();
+        for i in 0..4 {
+            assert!(poll_flagged(&mut w[i], &flags[i]).is_pending());
+        }
+        drop(held); // 空位：全员被唤醒
+        drop(w.remove(0)); // 队头取消（票号队列 [2, 3, 4]）
+        // 非队头 w4、w3 先重检 → 重新登记在 Notify 队列前部；真队头 w2 取到
+        assert!(poll_flagged(&mut w[2], &flags[3]).is_pending());
+        assert!(poll_flagged(&mut w[1], &flags[2]).is_pending());
+        let permit = match poll_flagged(&mut w[0], &flags[1]) {
+            std::task::Poll::Ready(p) => p,
+            std::task::Poll::Pending => panic!("w2 是队头应取到"),
+        };
+        flags.iter().for_each(|f| {
+            f.take();
+        });
+        drop(permit); // 空位：票号队头是 w3，而 Notify 队列前部是 w4
+        assert!(flags[2].take(), "票号队头 w3 必须被唤醒");
+        assert!(poll_flagged(&mut w[1], &flags[2]).is_ready(), "w3 取到");
+    }
+
+    /// 队头取走一个名额后仍有空位、队里还有人 → 立刻唤醒下一位：同一刻放出多个名额时，后面的人不必等下一次放门。
+    #[tokio::test]
+    async fn taking_head_wakes_next_waiter_when_slots_remain() {
+        let gate = InflightGate::new(2);
+        let (a, b) = (gate.try_enter().unwrap(), gate.try_enter().unwrap());
+        let (f1, f2) = (WakeFlag::new(), WakeFlag::new());
+        let (mut w1, mut w2) = (Box::pin(gate.enter()), Box::pin(gate.enter()));
+        assert!(poll_flagged(&mut w1, &f1).is_pending());
+        assert!(poll_flagged(&mut w2, &f2).is_pending());
+        drop(a);
+        drop(b); // 两个空位、两位等门者都被唤醒过
+        assert!(poll_flagged(&mut w2, &f2).is_pending(), "w2 先重检：不是队头");
+        f2.take();
+        let p1 = poll_flagged(&mut w1, &f1); // 持住：临时值在语句末 drop 会放门并唤醒 w2，掩盖连锁唤醒
+        assert!(p1.is_ready(), "w1 取到一个");
+        assert!(f2.take(), "仍有空位 → w2 被唤醒");
+        assert!(poll_flagged(&mut w2, &f2).is_ready());
+        drop(p1);
+    }
+
+    /// 队头被取消时若有空位，唤醒其余等门者——哪怕他们先前已被唤醒、重检后又睡下（放门的那次唤醒已被消费掉）。
+    #[tokio::test]
+    async fn cancelled_head_wakes_waiters_that_already_rechecked() {
+        let gate = InflightGate::new(1);
+        let held = gate.try_enter().unwrap();
+        let (f1, f2) = (WakeFlag::new(), WakeFlag::new());
+        let (mut w1, mut w2) = (Box::pin(gate.enter()), Box::pin(gate.enter()));
+        assert!(poll_flagged(&mut w1, &f1).is_pending());
+        assert!(poll_flagged(&mut w2, &f2).is_pending());
+        drop(held);
+        assert!(poll_flagged(&mut w2, &f2).is_pending(), "w2 重检：不是队头，睡下");
+        f2.take();
+        drop(w1); // 队头没取就取消
+        assert!(f2.take(), "空位不能没人取：w2 必须被唤醒");
+        assert!(poll_flagged(&mut w2, &f2).is_ready());
+        assert_eq!(gate.waiters(), 0);
     }
 }

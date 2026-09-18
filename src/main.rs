@@ -29,12 +29,14 @@ enum Cmd {
     /// 发起对抗式评审：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目（× samples）并行扇出
     /// → 疑点并集（agreement = 家族数）→ **深挖**（风险 H0 区与 scanner 疑点进同一条优先级队列，reviewer 按
     /// provider 门空位消费，预算随风险分、必挖集不截；配多个 reviewer 条目时按空闲轮转分摊、每项只交一个条目，
-    /// 鉴权失败的条目移出、它已失败的格不改派）→ dedup → finding 报告与 verdict。**finding 只由深挖产出**；
+    /// 鉴权失败的条目移出、它已失败的格不改派）→ dedup → finding 报告与 verdict。scanner 与深挖时间重叠：H0 区开跑即挖、
+    /// scanner 每格完成即入队（扫描期非必挖项少挖约 1/4 预算，留给后到的疑点），scanner 全部返回后按剩余预算收场。**finding 只由深挖产出**；
     /// 没配 reviewer 角色则退化为 scan-only（疑点索引 + 覆盖自报，不产 finding）。
     /// 退出码：0=干净 approve 或 scan-only 完成、1=命令自身失败（参数/IO/配置错误）、2=approve 但带债
     /// （reviewer cell 失败——含二阶段补查轮失败、首轮 finding 保留；预算截断；reviewer 条目全部出局致队列项未挖。
     /// 见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
-    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口）、10=reject（finding 达到 --block-threshold）。
+    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口；深挖照跑、findings 仍在报告，本可 reject 的 blocking 条数见
+    /// run.warnings）、10=reject（finding 达到 --block-threshold）。
     /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
     /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
     /// 自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit 可读；误填超大 maxConcurrency 也能自愈）。
@@ -57,7 +59,8 @@ enum Cmd {
         /// 与 `redteam test-command` 同一推断链）；记入报告 run.test_command。
         #[arg(long)]
         test_command: Option<String>,
-        /// verdict 阻断阈值：low | medium（默认）| high | critical——finding 达到即 reject（退出码 10）。
+        /// verdict 阻断阈值：low | medium（默认）| high | critical——finding 达到即 reject（退出码 10）；
+        /// 但 scanner 有格失败时判定恒为 incomplete（退出码 3 优先于 10），达阈值的 finding 条数只进 run.warnings。
         /// 无 reviewer 的 scan-only 路径无 finding 可判，记录不消费。
         #[arg(long, value_parser = ["low", "medium", "high", "critical"])]
         block_threshold: Option<String>,
@@ -77,6 +80,8 @@ enum Cmd {
         format: String,
         /// R2.3：补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
         /// （base 等从该作业落盘的 args.json 里重建；模型集按当前配置的 scanner 重建，M21b 起读队列快照）。
+        /// 配了 reviewer 时接着深挖：补跑出的疑点与已完成 scanner 格的疑点幂等入队（已挖过的不重挖）、快照为空则按当前 diff
+        /// 重建风险 H0 区、补跑过 scanner 则被预算截掉的项重选；补跑后 scanner 仍缺格 → incomplete（深挖照跑）。
         #[arg(long)]
         resume: Option<String>,
         /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：

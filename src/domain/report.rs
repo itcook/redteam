@@ -291,6 +291,41 @@ pub struct DeepMeta {
     pub needs_two_stage_triggered: u32,
     pub needs_two_stage_skipped: u32,
     pub stream_discarded: u32,
+    // ── C2 时间重叠观测（design v11 §6 / §12.3〔D15〕；为零不序列化，旧报告形状不变）──
+    /// 收场（关闭入口）时刻，自深挖开跑起毫秒；与扫描同时开跑时即 scanner 段墙钟。resume 与开跑即关闭（无入队通道）时 0。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub close_ms: u64,
+    /// 首次派发时刻（无派发 0；有派发至少记 1，H0 在 t = 0 开挖即 1）。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub first_dispatch_ms: u64,
+    /// 最后一格落地时刻（队列排空；无格 0、有格至少 1）。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub drain_done_ms: u64,
+    /// 复核尾部（批 D 前恒 0）。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub verify_tail_ms: u64,
+    /// 收场前派出的格数（扫描期额度 K − F 下，非必挖项受限）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub scan_phase_dispatched: u32,
+    /// 收场时剩余预算 `K − 已派发`（收场 drain 的预算参数）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub close_budget_remaining: u32,
+    /// 组内闭包簇被队列逐条合并拆进多项的簇数（非传递残差，收场对账）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub queue_split_clusters: u32,
+    /// 主循环同步段（填门：pack 构造 + prompt + 快照；到达处理）单次最长 / 累计阻塞毫秒——同 task 并发下它们会让其余在途格停摆。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub fill_block_max_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub fill_block_total_ms: u64,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// 阶段 0 风险观测（serde default 兼容旧报告）。
@@ -351,6 +386,19 @@ mod tests {
         let s = Stats::from_findings(&[f(Severity::High), f(Severity::High), f(Severity::Low)]);
         assert_eq!((s.high, s.low, s.total), (2, 1, 3));
     }
+    /// C2 观测字段为零不产键、旧报告（无这些键）照读（design C2 §12 兼容）。
+    #[test]
+    fn deep_meta_c2_fields_skip_zero_and_default_on_old_json() {
+        let old = r#"{"queue_depth_peak":3,"dedup_hits":0,"budget_skipped":1,"needs_two_stage_triggered":0,"needs_two_stage_skipped":0,"stream_discarded":0}"#;
+        let m: DeepMeta = serde_json::from_str(old).unwrap();
+        assert_eq!((m.queue_depth_peak, m.budget_skipped, m.close_ms, m.scan_phase_dispatched), (3, 1, 0, 0));
+        assert_eq!(serde_json::to_string(&m).unwrap(), old, "全零新字段不改旧形状");
+        let m = DeepMeta { close_ms: 400, scan_phase_dispatched: 6, fill_block_max_ms: 2, ..m };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!((v["close_ms"].as_u64(), v["scan_phase_dispatched"].as_u64(), v["fill_block_max_ms"].as_u64()), (Some(400), Some(6), Some(2)));
+        assert!(v.get("verify_tail_ms").is_none() && v.get("queue_split_clusters").is_none());
+    }
+
     #[test]
     fn verdict_serializes_kebab() {
         assert_eq!(serde_json::to_string(&Verdict::Reject).unwrap(), "\"reject\"");

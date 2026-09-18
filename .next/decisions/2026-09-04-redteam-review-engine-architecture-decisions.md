@@ -408,3 +408,52 @@ roadmap P0 ✅、followup 四行归位、M21b / M21c / M21e / M21a 的 `--risk` 
 - **观测**：`GroupingStats.pooled_small_components: Option<usize>`（serde default，旧报告 None ≠ 零）。
 - **标定**：PR181 budget=768K，四小分量 est 21–29K（占 3–4%）；回放 7→4 组、cross_import=0 保持、cross_reference=2 / cross_same_dir=6 / over_budget=2 不变；数据 `.next/private/m21b/pr181-packonly-pooling.txt`。
 - **代价（接受）**：不相关文件同格（小分量场景上下文增益本就低）；池格按 10 文件帽切缝新增弱边跨组（进 cross_same_dir 口径）。
+
+## D15 scanner 与深挖时间重叠：在线预算、合并残差、失败口径、FIFO 让位、resume 离线续跑（grill，2026-09-15，M21b 批 C2）
+
+**议题**：批 C / C1 仍是 scan 全完 → 深挖（墙钟 = 两段之和），design §2 是 `max(最慢 scanner cell, 队列排空)`。时间重叠改变的是语义：
+预算要在项持续到达时在线算、保底怎么预留与释放、逐 cell 到达后合并不再是组内闭包、reviewer 已开挖后 scanner 失败怎么收、共享门时谁先入门、
+resume 怎么接。开工前 `/grilling` 十问（Trellis `09-15-m21b-deep-streaming`，技术设计见其 `design.md`）。
+
+**事实核定（grill 中查证）**
+- 现状：`run_code_review` 等 scan 全返回；任一 scanner 失败即返回 scan-only（exit 3）；`run_deep` 在派发前 `enqueue_h0` → `enqueue_scan`
+  （按组 `merge_suspicions` 闭包、代表取最高 confidence）→ 一次性 `drain`；生产 `incoming: None`。
+- C1 现配置基线（2026-09-15，同批 C / C1 目标 diff，glm 单成员 · agc 门 6）：总 20.6 min（scanner 段 6.2 / 深挖段 14.3），门 6 仍 429 × 2 → 4、
+  零断流；scanner 格完成 58 / 197 / 255 / 374 s。
+- 策略重放（同选中项、实测格时长，只改可派时刻；模拟器 C1 形态门 6 / 门 4 = 17.7 / 21.6 min，实测 20.6）：等收场 15.8 / 18.3；纯贪心 13.7 / 16.8；
+  贪心 + 收场预留 13.7 / 16.8；贪心 + 组完成才入队 14.4 / 17.6。
+- 同轮 deepseek 两格（58 / 197 s）恰 10 条疑点 = K − 2 个 H0：宽门下纯贪心会在 qwen 返回前把非必挖预算全给 deepseek——偏向是系统性的
+  （偏快家族、偏小组），不只是噪声。
+- 合并残差实测（按 scanner 格完成序重放，队列侧逐条合并 vs 组内闭包）：基线 33 疑点 / 2 多家族簇，拆 0；PR181 双家族 r1 111 / 19，拆 1（少算共识 1 条）；
+  r2 107 / 19，拆 0；必挖项数三份均不变。`merge_notes` 丢弃相似笔记，链式先后到达也形不成闭包。
+- design §8.4「scanner cell 失败 → verdict 硬 Incomplete」；ship.md「部分报告 `verdict: incomplete` → 用部分 findings 照常裁决、不算 approve」。
+- resume 只在「scan 补齐 ∧ 有 reviewer ∧ 队列快照非空」时续挖，隐含前提「快照只在 scan 全完、drain 后才写」——C2 下失效；且现存缺口：扫描期被 kill
+  （快照为空）的作业 resume 出 scan-only、退出码 0。
+- 共门插队：放门 `notify_one` 唤醒的 scanner 尚未被 poll，深挖主循环同步 `try_lease` 抢走门位；主循环唤醒源只有「格完成 / 通道到达」
+  （C1 评审 #6 探针 300 ms vs 及时补位 210 ms）。现配置 scanner 与 reviewer 不同门；批 D verifier 与 reviewer 同在 agc。
+- 同步 IO：读守卫 `git ls-files` 本仓中位 9.4 ms / 次；`region::build` 每项同步走仓搜索；`on_arrival` 每次到达全量写快照（到达 × 项数次 SQLite 写）。
+- scanner needs 从未入队（批 C plan C-3 原文有、followup 无账）；`NeedEntry {path, lines?, reason, kind}` 不指向触发疑点、path 可在 diff 外。
+
+**候选与被否**
+| # | 定案 | 被否 | 依据 |
+|---|---|---|---|
+| Q1 在线预算 | B 贪心 + 收场预留：scanner 未全返回时非必挖项仅在「本轮已派发 < K − F」时可派（F = ⌈K/4⌉），必挖不受限；关闭入口时对剩余预算按 C1 drain 一次选定（保底扣除扫描期已派发的非必挖疑点），Skipped 只在此刻判定 | A 纯贪心（只受 K）；C 等收场（扫描期只派必挖） | 现配置 B 与 A 同速（门位腾出时 scanner 已返回，预留零代价）；宽门下 A 把「凭先到部分信息选项」的系统性偏向放大到整个非必挖预算，B 封顶 K − F；C 放弃扫描期门位（重放 15.8 vs 13.7 min）；复用 F 常量、零旋钮；Skipped 只在收场判定，C1 评审 #5 假债（复位不回减）无从发生 |
+| Q2 到达与合并 | M1 逐 cell 到达、队列逐条合并（design 规则 5 字面）；收场以报告侧闭包对账，拆簇数入 RunMeta；`merge_into` 前提注释改写 | M2 到达时桥接合并（在线并查集）；M3 组内全返回才入队 | 残差实测 ≤ 1/19 簇且必挖项数不变；M2 要两项合一退役 id、改快照、处理在途 / 结案组合，复杂度远超残差；M3 墙钟 13.7 → 14.4 min，且即 D13 Q4 已否的同组 hold（M21e 凭数据定，拆簇数正是那份数据） |
+| Q3 方差四层 | S3 整体另立批 C3（深挖选项稳定性），C2 合回后、出口验收前；C2 不改选项规则 | S1 全并入；S2 只并规则 2 相邻区间合并 + 同分 tie-break；S4 推迟 M21c / M21e | B + M1 已让选中集合随到达时序变，再叠选项规则改动则 C2 dogfood 对照 C1 基线无法归因（铁律 1）；方差验收要同 diff 两跑量重合度，与 C2 墙钟验收不同；规则 2 合并的共识口径、def 扩展、id 形态与 M1 交织，排序键要改 design 规则 1，需自己的拷问 |
+| Q4 scanner needs 入队 | N2 归 C3；缺口记 followup | N1 放 C2；N3 归 M21d；N4 从 design 删除 | 改变候选集，归因理由同 S3；needs 项语义未定义（无触发疑点链接、path 可在 diff 外、装包退 `bundles[0]`），需先设计；`Api` 类若占多数可再拆给 M21d |
+| Q5 scanner 失败 | F3 深挖照跑；verdict 硬 Incomplete / 3（优先于 reject 10 与带债 2）；findings 照常进报告与统计，warning 报 blocking 条数 | F1 立即停、丢深挖成果；F2 reject 优先于 incomplete；F4 停派新项、保留已挖 | §8.4 字面、五档退出码契约不变；与 ship 部分报告先例同口径；scanner 失败多为 provider 故障、resume 未必即时可成，照跑让用户当下拿到能挖的 findings，resume 沿用不浪费 |
+| Q6 resume | RS1 离线续跑：补跑缺失 scanner → 全部成功 scanner 记录的疑点幂等并入快照队列 → 补跑过 scanner 则复位 Skipped 按剩余预算重选，否则沿用 → 深挖；空快照 + reviewer 同路径（H0 按当前 diff 重算），修现存「扫描期 kill → scan-only exit 0」 | RS2 流式续跑（复用扫描期逻辑）；RS3 只续快照 | 恢复路径求正确不求快，只复用幂等入队与 C1 drain；RS2 要从快照恢复已派发数、是否收场等状态，边界多；RS3 下补跑出的疑点永不深挖而 verdict 翻成完整 = 假绿灯 |
+| Q7 共门先后 | G1 §12.3 字面 FIFO：门上有等门者时非阻塞试取让位；有可派项无门位时深挖自身排入 FIFO（兼修 #6）；t=0 poll 序 scanner 先；机制通用于 verifier | G2 角色优先级（scanner > verifier > reviewer）；G3 只修唤醒不管公平 | G2 即调度器，违 §12.3 / D13 Q2；G3 过不了出口验收 #5（入队序 scanner 先可观测）；公平与唤醒同一机制——排进 FIFO 既不插队又能被放门唤醒 |
+| Q8 报告组装序 | D2 收场按队列项最终优先级（`cmp_priority`）组装 findings / cells / meta 四数组；保证改为「同选中集合 + 同格输出 → 逐字节一致（计时字段除外）」 | D1 维持派发序 | 派发序在 C2 随到达 / 放门时刻变，报告文本逐次漂移；优先级序保 C1 本意（高优先项作 dedup 基准），退化零差基线不变；选中集合本身的漂移照实写进保证条件（归 C3） |
+| Q9 同步 IO | IO2 到达只写受影响快照项 + git 跟踪文件集每轮预取；填门循环单次最长 / 累计阻塞入 RunMeta；`spawn_blocking` 待数据（followup 挂触发条件） | IO1 全修（含 `region::build` / `need_section` 挪 `spawn_blocking`）；IO3 全留债只观测 | 快照写是 C2 到达路径新增的平方级放大、改法小；预取省每项一次子进程；挪 `spawn_blocking` 要把 bundle、跨组索引、装包参数改共享所有权，而大仓走仓的真实代价未量——先量再动 |
+| Q10 验收 | Fake + 虚拟时间覆盖 Q1-Q9 各条；RunMeta 新观测（收场 / 首次派发 / 排空时刻、复核尾部、扫描期派发数、收场剩余预算、拆簇数、填门阻塞）；dogfood 一轮同目标 diff、配置与基线一致；`phase` 收场前 Scan、后 Deep | — | 不硬卡单点门槛（同 M21a 出口裁决口径），对照基线 20.6 min 与重放预测 13.7 / 16.8 min 看分段 |
+
+**依据（用户判断，2026-09-15）**：十问均按推荐定；另定 agc `maxConcurrency` 保持 6（门 6 撞 429 由自动收门兜底、首波排队可接受）；
+批序 C2 → C3 → D → 出口验收（D 原与 C1 并行、未开工，改排 C3 之后）。
+
+**代价与残余**
+- 扫描期选项仍凭先到信息（封顶 K − F），选中集合随到达时序变——稳定性归 C3，C2 dogfood 的 findings 仍会不稳。
+- M1 非传递漏合并（实测 ≤ 1/19 簇）；拆簇数攒给 M21e 的同组 hold 决策。
+- scanner 失败时退出码看不出 reject，须读报告（warning 报 blocking 条数）。
+- `region::build` 走仓搜索仍在单 task 同步段，大仓代价待 PR181 出口验收数据。
+- design v11：§6 规则 2 / 3 / 6 与可观测面、§8.4、§12.3、§17 R14 对应改；plan 批 C2 节改写并增批 C3；roadmap M21b / README、followup 同步。

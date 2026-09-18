@@ -6,14 +6,21 @@ pub fn compute_verdict(
     block_threshold: Severity,
     conf_floor: f32,
 ) -> Verdict {
-    let blocking = findings.iter().any(|f| {
-        f.severity >= block_threshold
-            && f.confidence >= conf_floor
-            // 实质修复（carry-to-S4 ①）：被证伪的 finding 永不 blocking，不靠 confidence 数值。
-            && f.verify.as_ref().is_none_or(|v| v.verdict != VerifyVerdict::Refuted)
-            && !f.previously_dismissed // R8.2：人已驳回 → 不 blocking（证据保留）
-    });
-    if blocking { Verdict::Reject } else { Verdict::Approve }
+    if blocking_count(findings, block_threshold, conf_floor) > 0 { Verdict::Reject } else { Verdict::Approve }
+}
+
+/// blocking finding 条数（[`compute_verdict`] 的同一谓词）：scanner 不全时判定保持 Incomplete，本可 reject 的条数另行披露（C2 F3〔D15〕）。
+pub fn blocking_count(findings: &[Finding], block_threshold: Severity, conf_floor: f32) -> usize {
+    findings
+        .iter()
+        .filter(|f| {
+            f.severity >= block_threshold
+                && f.confidence >= conf_floor
+                // 实质修复（carry-to-S4 ①）：被证伪的 finding 永不 blocking，不靠 confidence 数值。
+                && f.verify.as_ref().is_none_or(|v| v.verdict != VerifyVerdict::Refuted)
+                && !f.previously_dismissed // R8.2：人已驳回 → 不 blocking（证据保留）
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -41,6 +48,14 @@ mod tests {
             previously_dismissed: false,
             origin: Origin::New,
         }
+    }
+
+    #[test]
+    fn blocking_count_uses_the_verdict_predicate() {
+        let v = vec![f(Severity::High, 0.9, false), f(Severity::Critical, 0.8, false), f(Severity::High, 0.2, false), f(Severity::Low, 0.9, false)];
+        assert_eq!(blocking_count(&v, Severity::Medium, 0.5), 2);
+        assert_eq!(blocking_count(&v[2..], Severity::Medium, 0.5), 0);
+        assert_eq!(compute_verdict(&v[2..], Severity::Medium, 0.5), Verdict::Approve);
     }
 
     #[test]

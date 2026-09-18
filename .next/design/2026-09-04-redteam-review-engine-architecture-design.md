@@ -1,10 +1,14 @@
-# redteam 评审引擎·风险路由 DAG 架构（M21 · v10）
+# redteam 评审引擎·风险路由 DAG 架构（M21 · v11）
 
 > 状态: **锁定**（**键名勘误 2026-09-10**：正文 TOML / snake_case 配置残留统一为 §12.1 JSON camelCase，无语义变化，不升版；
 > v8，2026-09-07，P0 验证门出口〔D11〕：E1 风险规则 v4 成立、E3 疑点契约成立；§3.3 / §4 / §6 / §12.1 / §16 / §17 按 D11 改；
 > 无 `[review.risk]` / `--risk`；v9 2026-09-08〔D12〕§12 改 JSON + provider → models → roles；**v10 2026-09-09〔D13〕并发形态**：删角色 `workers`、无 `--workers`，
 > 唯一闸 = provider 在途门（单把 FIFO + scanner 先于 H0 的入队序 + 429 排队重试，`review.maxConcurrency` 缺省 10），队列入口五态并入 + 跨轮沿用结案带守卫，
-> scanner 逐 cell 交付、reviewer 逐 finding 落盘定性为持久化旁路；§0 / §2 / §4 / §5 / §6 / §7 / §8.1 / §12 / §13 / §14 / §15 / §17 对应改）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；M21b-e 待产出。
+> scanner 逐 cell 交付、reviewer 逐 finding 落盘定性为持久化旁路；§0 / §2 / §4 / §5 / §6 / §7 / §8.1 / §12 / §13 / §14 / §15 / §17 对应改；
+> **v11 2026-09-15〔D15〕scanner 与深挖时间重叠语义**：在线预算（scanner 未全返回时非必挖项派发数受 maxCells − 保底约束、关闭入口时对剩余预算 drain 一次、
+> Skipped 只在此刻判定）、逐 cell 到达的队列侧合并残差入观测、scanner 失败深挖照跑仍硬 Incomplete、门 FIFO 让位与放门唤醒、resume 离线续跑；
+> §6 规则 2 / 3 / 6、§8.4、§12.3、§17 R14 对应改）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；
+> M21b `../plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md`（2026-09-10）；M21c-e 待产出。
 > v5（2026-09-05 grill〔D7〕：角色命名 scanner / reviewer / verifier；配置节 §12 重写为用户级唯一 TOML；
 > 无候补；verifier 流式化 + 数据判决；provider 在途上限；aacr-bench 退役至 M21c / M21e 重启）。
 > v6（2026-09-05）：scanner 组 pack 默认 `slice`〔D8〕；§10.7 提示词按角色分离〔D9〕；E2 改为 M21a 出口 slice vs full A/B。
@@ -177,15 +181,16 @@ scanned_areas: [{ file, ranges }]                                               
 | # | 规则 | 内容 |
 |---|---|---|
 | 1 | 优先级 | 主区 H0 最高，涟漪区次之〔D11〕。疑点项 = `confidence × agreement × 类别权重`；needs 项取触发疑点分或默认中档。**非 FIFO；不用置信阈值切**。 |
-| 2 | 入队合并 | 区间扩到 enclosing def；同文件重叠/相邻区间合并为一项；跨模型同疑点以 quote 轻锚 + hint 归一合并（谓词复用 M21a `merge_suspicions`：同文件 ∧ 行重叠 ∧ quote 相等或不琐碎重叠）。**入口五态**〔D13〕：无命中 → 新项 agreement = 1；命中排队中项 → 并入（异族 agreement + 1、notes 追加、区间取并、重算 score，≥ 2 即标必挖）；命中在途项 → 只改记录（agreement + 1、hint 附记录），运行中的请求不注入、不重挖；命中本轮已结案 → 同上并沿用结案；命中跨轮判例 → §4 守卫（过 → 沿用结案不入队；不过 → 按无命中入队、带判例笔记）。同家族重复只合并不加 agreement。入口是编排器确定性代码，零 token；派发前再核一次在途 / 已结案。 |
-| 3 | 预算 | `review.reviewers.maxCells = "auto"`（按 R 三档：low 4 / mid 12 / high 32，硬帽 48，起步值）或整数固定〔D11〕。**必挖集** = 主区 H0 ∪ {agreement ≥ 2 的疑点} 不受截断（confidence 只进优先级不做门；保护的是仍在排队的项，已派发项已在挖〔D13〕）；**保底**：每轮为 scanner 疑点保留 ⌈maxCells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并在 RunMeta 披露；涟漪区与其余疑点按优先级吃剩余预算。到期 **graceful drain**：在途跑完，未开跑者落台账。 |
+| 2 | 入队合并 | 区间扩到 enclosing def；同文件重叠/相邻区间合并为一项；跨模型同疑点以 quote 轻锚 + hint 归一合并（谓词复用 M21a `merge_suspicions`：同文件 ∧ 行重叠 ∧ quote 相等或不琐碎重叠）。**入口五态**〔D13〕：无命中 → 新项 agreement = 1；命中排队中项 → 并入（异族 agreement + 1、notes 追加、区间取并、重算 score，≥ 2 即标必挖）；命中在途项 → 只改记录（agreement + 1、hint 附记录），运行中的请求不注入、不重挖；命中本轮已结案 → 同上并沿用结案；命中跨轮判例 → §4 守卫（过 → 沿用结案不入队；不过 → 按无命中入队、带判例笔记）。同家族重复只合并不加 agreement。入口是编排器确定性代码，零 token；派发前再核一次在途 / 已结案。逐 cell 到达时队列侧逐条比对已有项笔记——不是组内传递闭包，漏合并只会少算共识、多复核；收场以报告侧闭包对账，拆簇数入 RunMeta〔D15〕。 |
+| 3 | 预算 | `review.reviewers.maxCells = "auto"`（按 R 三档：low 4 / mid 12 / high 32，硬帽 48，起步值）或整数固定〔D11〕。**必挖集** = 主区 H0 ∪ {agreement ≥ 2 的疑点} 不受截断（confidence 只进优先级不做门；保护的是仍在排队的项，已派发项已在挖〔D13〕）；**保底**：每轮为 scanner 疑点保留 ⌈maxCells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并在 RunMeta 披露；涟漪区与其余疑点按优先级吃剩余预算。到期 **graceful drain**：在途跑完，未开跑者落台账。**在线口径**〔D15〕：scanner 未全部返回时，非必挖项仅在「本轮已派发 < maxCells − 保底」时可派，必挖项不受限；关闭入口即「到期」——对剩余预算（maxCells − 已派发）按上述规则 drain 一次（保底扣除扫描期已派发的非必挖疑点），Skipped 只在此刻判定；resume 补跑过 scanner 则复位 Skipped 重选（§17 R14）。 |
 | 4 | 预算外去向 | **疑点台账**（§8.3）休眠；报告披露为低置信线索；**不进 verdict**。截断不静默。 |
 | 5 | 分派 | 活跃 reviewer 条目构成**分派池**：每项只由一个模型消费，按空闲轮转；多条目买吞吐与分散限流，不双审。派发由 provider 门驱动：某 reviewer 条目所在 provider 有空位时才弹出最高优先项交它，无角色级池大小〔D13〕。scan 来源项**不等**同组其他家族 cell 返回（先到先挖，后到并入记录；是否加同组 hold 由派发时 / 落地时 agreement 数据在 M21e 定〔D13〕）。 |
-| 6 | 终止 | 全部 scanner cell 返回 → 关闭入口 → 队列排空 → 在途归零 → 复核在途归零 → reduce barrier。 |
+| 6 | 终止 | 全部 scanner cell 返回（成功或失败）→ 关闭入口（收场 drain〔D15〕）→ 队列排空 → 在途归零 → 复核在途归零 → reduce barrier。 |
 | 7 | 并发 | 无角色级 `workers`〔D13〕；有效并行 = 各 reviewer 条目所在 provider 的在途门（§12.3）。 |
 | 8 | 终端 | reviewer cell 不再生产。`reenqueue = false` 默认。 |
 
-可观测面（cell/phase 已有框架）：队列深度、入队原因分布、去重命中数、预算截断数、台账落入数、项等待时长、派发时 / 落地时 agreement〔D13〕。
+可观测面（cell/phase 已有框架）：队列深度、入队原因分布、去重命中数、预算截断数、台账落入数、项等待时长、派发时 / 落地时 agreement〔D13〕；
+收场时刻、首次派发时刻、深挖排空时刻、复核尾部、扫描期派发数、收场剩余预算、拆簇数、填门循环阻塞时长〔D15〕。
 实现落点：tokio mpsc + 单派发器（按各 reviewer provider 门空位弹出最高优先项，不设 worker 数〔D13〕），scanner cell 为 sender、reviewer cell 为 receiver，复用现有 cell 抽象；reviewer
 cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 
@@ -245,6 +250,8 @@ dedup（title jaccard + quote 行重叠）→ 判例台账 → 报告 → carry 
 - coverage 五集合（per cell 类型）：selected / completed / reused / failed / waived，不相交并 = 全集。**无候补**，
   cell 重试耗尽即入 `failed`。分级：**scanner cell 失败 → verdict 硬 Incomplete**（疑点集有结构性选择偏差）；
   **reviewer cell 失败 / 预算截断 → 带债 approve**（台账化、RunMeta 披露、warning）；verifier cell 失败 → 保守 upheld。
+- scanner cell 失败不中止深挖〔D15〕：已入队项照常挖完，findings 照常进报告与统计；verdict 与退出码仍为 Incomplete / 3（优先于 reject 与带债），
+  其中 blocking 条数进 warning——与 ship「incomplete 带部分 findings 照常裁决、不算 approve」同口径。
 
 ---
 
@@ -443,6 +450,8 @@ provider 名、model id 字典序（无语义）。`verifiers` 无任何模型�
   缺省 4 < 7 格排队 100-130 s，而跨 provider 全局一把还把两个独立 scanner provider 卡在同一个数上；单次节流的真实需求是跨进程的，旗解决不了）。
 - 门 = 单把 FIFO，不设调度器、不设预留：门饱和时预留只换顺序不换总量，还让 reviewer 用不完整信息提前吃预算；最长链优先 = scanner 格先于 H0 项
   入门（t=0 入队序），reviewer / verifier 项天然后到。真正缩尾巴的杠杆是拆大 scanner 格（followup）。
+  FIFO 对非阻塞取门同样成立〔D15〕：门上已有等门者时非阻塞试取让位、不插队；深挖有可派项而各门无位时自身排入同一 FIFO 等门（放门即唤醒，
+  外部持门者——scanner、verifier——释放后及时补位）；t=0 由 poll 序保证 scanner 先登记。机制按「任意角色等门者」通用，无角色优先级。
 - **429 排队重试**（R16 最小替身）：某 provider 撞 429 / overloaded → 该 provider 门宽 ← max(1, min(门宽 − 1, 此刻仍在跑且已被接受的请求数))，
   本轮不回升——一波 429 内收敛到网关真实上限，错配 `maxConcurrency`（如误填 maxOutputTokens）也能自愈；撞 429 的请求持名额不放，等本 provider
   下一个请求完成（每次完成只唤醒一个等待者）或 Retry-After 取晚者再重试；429 重试独立计数，上限 = 当时有效门宽 × 2，不吃 2 次抖动预算；门收窄后
@@ -550,7 +559,7 @@ ocr 参照 = deepseek-v4-pro 直连 chat-completions 流式，版本钉入元数
 | R11 | 必挖集阈值 `c_hi` | **已裁〔D11〕**：置信不做门；必挖 = 主区 ∪ agreement ≥ 2；疑点保底 ⌈maxCells/4⌉ 格 |
 | R12 | 台账激活上限 N 与停车通道形态 | 镜像 ship AskUser |
 | R13 | （已消：流式持久化无旋钮〔D10〕） | — |
-| R14 | 实现债 | **已裁〔D11〕**：cell 记录 `role` + 角色分叉输出枚举；单独表 = 疑点台账 + 队列快照；coverage 进作业元数据；resume 读快照重跑未完项；schema v4 一次重置〔D10〕 |
+| R14 | 实现债 | **已裁〔D11〕**：cell 记录 `role` + 角色分叉输出枚举；单独表 = 疑点台账 + 队列快照；coverage 进作业元数据；resume 读快照重跑未完项；schema v4 一次重置〔D10〕。**resume 离线续跑〔D15〕**：补跑缺失 scanner cell → 全部成功 scanner 记录的疑点幂等并入快照队列（按到达键去重）→ 本次补跑过 scanner 则复位 Skipped、按剩余预算重新 drain，否则沿用 → 深挖；快照为空但配了 reviewer 走同一路径（H0 按当前 diff 重算）；scanner 仍缺失时深挖照跑、verdict Incomplete（§8.4） |
 | R15 | findings-recall 度量 | aacr 重启后接管；此前 PR181 三方并集 + proj.db upheld 小 oracle |
 | R16 | provider RPM 令牌桶 | 网关按 RPM 计费时再上；并发密度限流已由 429 排队重试（§12.3〔D13〕）兜 |
 | R17 | google 原生后端 | M20 provider 拓展 |

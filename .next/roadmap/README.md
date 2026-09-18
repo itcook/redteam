@@ -1,10 +1,11 @@
 # M21 评审引擎重构 · Roadmap
 
-> 状态: v4（2026-09-09 并发形态 grill〔D13〕：design v10，M21a ✅；v3 2026-09-07 P0 出口〔D11〕；v2 2026-09-05 grill〔D7〕）· 分支 `feat/m21-review-engine`
+> 状态: v4（2026-09-09 并发形态 grill〔D13〕：design v10，M21a ✅；v3 2026-09-07 P0 出口〔D11〕；v2 2026-09-05 grill〔D7〕；
+> 2026-09-15 M21b 批 C2 拷问〔D15〕design 升 v11，M21b plan 增批 C3）· 分支 `feat/m21-review-engine`
 > · 工作树 `~/hobby/.worktrees/redteam/m21-review-engine`
-> 权威框架: `../design/2026-09-04-redteam-review-engine-architecture-design.md`（v10，锁定）
+> 权威框架: `../design/2026-09-04-redteam-review-engine-architecture-design.md`（v11，锁定）
 > 证据 / 决策: `../research/2026-09-04-redteam-review-engine-architecture-research.md`（§14 aacr 事实）·
-> `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D13）· P0 明细 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md`
+> `../decisions/2026-09-04-redteam-review-engine-architecture-decisions.md`（D1-D15）· P0 明细 `../private/research/2026-09-07-redteam-p0-validation-gate-research.md`
 > 2026-09-07 起本目录连同上述文档自主 checkout `.doc/` 迁入分支随行区 `.next/`（`../README.md`）；含公司仓细节者在 `../private/`（gitignored）。
 > 本目录独立于主 checkout `.doc/roadmap/`，只记本次重构；零散 polish 仍走 `.doc/TODO/`。
 
@@ -74,8 +75,9 @@ M21c 与 M21d 可并行（d 只依赖 reviewer cell 存在，不依赖台账）�
 - M20 backlog：R6 执行判（design §9.4 D 层）、google 后端（R17）、RPM 令牌桶（R16）、交互式配置（R19）不在本 roadmap。
 - design 锁定后按规范派生 `../plans/2026-*-redteam-m21{a..e}-*-plan.md`（`.next/plans/`），本目录各里程碑文件是其范围与验收的上位定义。
   已派生：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08，六批 A-F + 出口，波次：A/B/C 并行 → D/E → F → 出口）；
-  M21b `../plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md`（2026-09-10，五批 A-E + 出口，波次：A 风险评分器 / B reviewer 零件 /
-  C aacr 接线并行 → D 深挖队列与 reviewer 运行时 → E verifier 流式段 → 出口；Trellis 任务 `m21b-{risk,review-primitives,aacr,deep,verifier}`）。
+  M21b `../plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md`（2026-09-10 派生，现为七批 + 出口，波次：A 风险评分器 / B reviewer 零件并行 →
+  C 深挖队列与 reviewer 运行时 → C1 并发派发与分派池 → C2 scanner 与深挖时间重叠 → C3 深挖选项稳定性 → D verifier 流式段 → 出口；
+  Trellis 任务 `m21b-{risk,review-primitives,deep,deep-concurrency,deep-streaming,deep-stability,verifier}`；原 aacr 接线批 2026-09-10 删、随 M21c smoke 做）。
 
 ## 状态图例
 
