@@ -59,7 +59,8 @@ enum Cmd {
         /// 与 `redteam test-command` 同一推断链）；记入报告 run.test_command。
         #[arg(long)]
         test_command: Option<String>,
-        /// verdict 阻断阈值：low | medium（默认）| high | critical——finding 达到即 reject（退出码 10）。
+        /// verdict 阻断阈值：low | medium（默认）| high | critical——finding 达到即 reject（退出码 10）；
+        /// 但 scanner 有格失败时判定恒为 incomplete（退出码 3 优先于 10），达阈值的 finding 条数只进 run.warnings。
         /// 无 reviewer 的 scan-only 路径无 finding 可判，记录不消费。
         #[arg(long, value_parser = ["low", "medium", "high", "critical"])]
         block_threshold: Option<String>,

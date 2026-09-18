@@ -89,7 +89,14 @@
   （2026-09-17 09:32:56Z → 09:57:54Z，exit 10，sha256 前后一致。总墙钟 24.9 min：单次 429 把 agc 门 6 收到 2 并保持整轮（基线收到 4）；
   同门宽重放 C1 形态 34.5 / C2 实测 24.9 min。扫描期派出 3、收场 456 s 剩余 9 截 6、拆簇 1、`fill_block_total_ms` 210、12/12 零断流。
   分析脚本加 C2 时间线读法与门 2 列；私有记录 `2026-09-17-batch-c2-dogfood.md`；followup 新节「批 C2 dogfood 带出的账」）
-- [ ] code-review 审核（技能只传 effort，起来后 SendMessage 钉范围：只评 `feat/m21-review-engine...HEAD`）→ 分档修 → `--no-ff` 合回 `feat/m21-review-engine`
+- [x] code-review 审核（2026-09-17，max effort，15 条）→ 分档修：
+  - [x] 第 1 档（假绿 / 回归 / 核心语义，5 项）：resume 队列头 + 统一未完判定（#1 / #2 / #5）、diff 失败分支回写（#7）、
+    主循环每次唤醒排空同刻事件 + `biased`（#4）、等门按轮转序登记且出局成员命中不撤他人排队位（#6）、`--block-threshold` 帮助补 F3（#14）。
+    用例 8 条新增 / 改写，变异 8 处全红
+  - [ ] 第 2 档（语义偏差，5 项）：合并保留成员笔记与最高置信代表（#3）、`budget_skipped` 按最终 Skipped 数（#9）、
+    阻塞计时覆盖落地 / 收场 / 取跟踪集（#11）、作业进度与 resume 拆簇数（#12）、到达键带内容指纹 + H0 到达键与幂等重建（#8）
+  - [ ] 第 3 档（低概率 / 文档 / 清理，4 项）：确定性保证措辞（#10）、读守卫 NFD 与加载失败告警（#13）、恒真用例与过期注释清理（#15）、followup 记账
+- [ ] `--no-ff` 合回 `feat/m21-review-engine`
 - [ ] 本批私有记录（`2026-09-15-batch-c1-baseline-current-config.md`、`raw/`、C2 dogfood 记录）拷回集成工作树 `.next/private/m21b/`
 - [ ] 归档任务 + journal
 

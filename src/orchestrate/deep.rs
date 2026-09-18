@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use tokio::sync::mpsc;
 
 fn now_ms() -> u64 {
@@ -92,16 +93,14 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     // resume 侧同样经此：重建 diff 落空（改动已提交 / 已切分支）而快照仍有未完项时，
     // 披露成带债而不是崩在 pack 上。
     if input.bundles.is_empty() {
-        let unfinished = input.restore.is_some_and(|items| {
-            items.iter().any(|i| matches!(i.state, ItemState::Pending | ItemState::InFlight))
-        });
+        let unfinished = input.restore.is_some_and(|items| unfinished(items, input.scan_cells));
         if let Some(items) = input.restore {
             // 早退也带上快照里的截断数（评审修 #3）：否则首跑被预算截掉、从没挖过的项既不计债也不披露。
             meta = restored_meta(items);
         }
         if unfinished {
             warnings.push(
-                "deep: 变更集为空（diff 已不可重建），队列未完项无法重跑——带债收口".into(),
+                "deep: 变更集为空（改动已提交 / diff 不可重建），未挖的队列项与疑点无法重跑——带债收口".into(),
             );
         }
         let items = input.restore.map(<[QueueItem]>::to_vec).unwrap_or_default();
@@ -261,45 +260,83 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             waits = None;
         } else if any_eligible && no_slot && waits.is_none() {
             waits = Some(
-                pool.alive()
+                pool.alive_rotated()
                     .map(|i| async move { (i, registry.lease(&members[i].name).await) })
                     .collect::<FuturesUnordered<_>>(),
             );
         }
 
-        // ④ 等事件：任一格完成（完成即归还门位）/ 经通道到达一项 / 等门命中
+        // ④ 等事件：任一格完成（完成即归还门位）/ 经通道到达一项 / 等门命中。
+        // 醒来只取一个事件，随后按固定序（完成 → 到达 → 等门命中）把同刻已就绪的其余事件一并排空，再回去填门：
+        // 一格的疑点是一批到达（D13 Q-B 逐 cell 交付），逐条派发会让扫描期额度按模型输出序消耗而不是按优先级；
+        // 同刻就绪的事件若由 `select!` 随机定先后，同一输入同一时序的选中集合也不可复现（`biased` + 排空后二者都定死）。
+        let mut done_now: Vec<CellDone> = Vec::new();
+        let mut hit: Option<(usize, Result<ScanLease<'_>, ProviderError>)> = None;
         tokio::select! {
-            Some(done) = running.next(), if !running.is_empty() => {
-                let l = land(done, &mut q, input.snapshot, input.on_cell);
-                meta.drain_done_ms = t_run.elapsed().as_millis().max(1) as u64;
-                reviewer_failed |= l.debt;
-                if l.auth_failed {
-                    // 成员健康（C1 §4.2）：鉴权失败不会自愈 → 出局，后续项只交其余成员。这一格保持失败、不改派（D7 A3 无候补）；
-                    // 该成员其他在途格照常跑完。只在「队列项 > 并发容量」时起作用——小队列 t=0 就全派出去了。
-                    pool.remove(l.member, format!("deep: reviewer {} auth failed — removed from pool", members[l.member].name));
-                }
-                landed.push(l);
-            }
+            biased;
+            Some(done) = running.next(), if !running.is_empty() => done_now.push(done),
             msg = recv(&mut incoming), if !closed => {
                 let t0 = std::time::Instant::now();
                 on_arrival(msg, &mut q, &mut meta, &mut closed, input.snapshot);
                 note_block(&mut meta, t0.elapsed());
             }
-            Some((i, got)) = next_wait(&mut waits), if waits.is_some() => {
-                match got {
-                    Ok(lease) => {
-                        parked = Some((lease, i));
-                        waits = None; // 其余成员的等门登记撤销（出队并唤醒后面的人）
+            Some(got) = next_wait(&mut waits), if waits.is_some() => hit = Some(got),
+            else => break,
+        }
+        while let Some(Some(done)) = running.next().now_or_never() {
+            done_now.push(done);
+        }
+        for done in done_now {
+            let l = land(done, &mut q, input.snapshot, input.on_cell);
+            meta.drain_done_ms = t_run.elapsed().as_millis().max(1) as u64;
+            reviewer_failed |= l.debt;
+            if l.auth_failed {
+                // 成员健康（C1 §4.2）：鉴权失败不会自愈 → 出局，后续项只交其余成员。这一格保持失败、不改派（D7 A3 无候补）；
+                // 该成员其他在途格照常跑完。只在「队列项 > 并发容量」时起作用——小队列 t=0 就全派出去了。
+                pool.remove(l.member, format!("deep: reviewer {} auth failed — removed from pool", members[l.member].name));
+            }
+            landed.push(l);
+        }
+        let t_arrivals = std::time::Instant::now();
+        let mut drained_arrival = false;
+        while !closed {
+            match incoming.as_mut().map(mpsc::Receiver::try_recv) {
+                Some(Ok(req)) => {
+                    on_arrival(Some(req), &mut q, &mut meta, &mut closed, input.snapshot);
+                    drained_arrival = true;
+                }
+                Some(Err(mpsc::error::TryRecvError::Disconnected)) => {
+                    on_arrival(None, &mut q, &mut meta, &mut closed, input.snapshot);
+                    drained_arrival = true;
+                }
+                _ => break,
+            }
+        }
+        if drained_arrival {
+            note_block(&mut meta, t_arrivals.elapsed());
+        }
+        if hit.is_none() {
+            hit = waits.as_mut().and_then(|w| w.next().now_or_never()).flatten();
+        }
+        if let Some((i, got)) = hit {
+            match got {
+                Ok(lease) if pool.alive().any(|a| a == i) => {
+                    parked = Some((lease, i));
+                    waits = None; // 其余成员的等门登记撤销（出队并唤醒后面的人）
+                }
+                // 等门期间出局的成员命中：门位就地归还，其余成员的排队位保留（撤了要重排到队尾，门位会转给后登记的外部持门者）
+                Ok(_) => {
+                    if waits.as_ref().is_some_and(FuturesUnordered::is_empty) {
+                        waits = None;
                     }
-                    Err(e) => {
-                        pool.remove(i, format!("deep: reviewer {} lease failed: {e} — removed from pool", members[i].name));
-                        if waits.as_ref().is_some_and(FuturesUnordered::is_empty) {
-                            waits = None;
-                        }
+                }
+                Err(e) => {
+                    pool.remove(i, format!("deep: reviewer {} lease failed: {e} — removed from pool", members[i].name));
+                    if waits.as_ref().is_some_and(FuturesUnordered::is_empty) {
+                        waits = None;
                     }
                 }
             }
-            else => break,
         }
     }
     drop(waits);
@@ -373,6 +410,28 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         reused_cells: vec![],
         items: q.items().to_vec(),
     }
+}
+
+/// 队列未完（design C2 §6〔D15〕，评审 #1 / #2）：有没挖完的项，或有成功 scanner 格的疑点从没到过队列——
+/// 补跑出的新疑点、首跑到达丢失（格落盘成功而快照写失败）都落在后者。diff 重建不了 / 变更集为空时据此计债，
+/// 不把「从没挖过」收成干净通过。旧快照（C1 起，项无到达键）只按项状态判：那时疑点是预合并后入队的，到达键无从复算。
+pub fn unfinished(items: &[QueueItem], cells: &[ScanCellResult]) -> bool {
+    if items.iter().any(|it| matches!(it.state, ItemState::Pending | ItemState::InFlight)) {
+        return true;
+    }
+    if !items.is_empty() && items.iter().all(|it| it.arrivals.is_empty()) {
+        return false;
+    }
+    let seen: std::collections::HashSet<&str> =
+        items.iter().flat_map(|it| it.arrivals.iter().map(String::as_str)).collect();
+    cells.iter().any(|c| {
+        c.output.as_ref().is_some_and(|out| {
+            out.suspicions.iter().enumerate().any(|(i, s)| {
+                let key = crate::consolidate::scan::arrival_key(&c.cell_id, i);
+                EnqueueReq::scan(s, &c.family, key.clone()).is_some() && !seen.contains(key.as_str())
+            })
+        })
+    })
 }
 
 /// 收场 drain（design v11 §6 规则 3〔D15〕）：留必挖 ∪ 前 `floor` 条非必挖疑点 ∪ 按优先级补到 `remaining`，余者 Skipped；
@@ -453,6 +512,14 @@ impl Pool {
 
     fn alive(&self) -> impl Iterator<Item = usize> + '_ {
         self.removed.iter().enumerate().filter(|(_, r)| r.is_none()).map(|(i, _)| i)
+    }
+
+    /// 活跃成员按轮转序（游标下一位起，与 [`Self::next_lease`] 同序）：等门登记按此序进门的 FIFO——
+    /// 按成员下标升序登记会让 0 号成员恒拿共门的下一个门位，轮转失效（C1 交替分派的回归）。
+    fn alive_rotated(&self) -> impl Iterator<Item = usize> + '_ {
+        let n = self.removed.len();
+        let cursor = self.cursor;
+        (1..=n).map(move |step| (cursor + step) % n).filter(|&i| self.removed[i].is_none())
     }
 
     /// 从游标下一位起逐个试取门位，第一个拿到的即用；全满 → `None`。未注册的成员就地出局，不挡其余成员。
@@ -2412,6 +2479,54 @@ mod tests {
         let snaps = snaps.lock().unwrap().clone();
         assert_eq!(snaps.len(), 5, "收场只写两个被截项: {snaps:?}");
         assert_eq!(snaps[3..], [("a.rs".to_string(), ItemState::Skipped), ("b.rs".to_string(), ItemState::Skipped)]);
+    }
+
+    /// 同一格的疑点是一批到达（D13 Q-B 逐 cell 交付）：排空后再填门，扫描期额度按优先级消耗，不随模型输出序（评审 #4）。
+    /// K = 3（额度 2）：H0 占 1 格后，同批 [低 0.3, 高 0.9] 只能派一格——派高的；低的留到收场与后到的中 0.7 比优先级，输给它被截。
+    #[tokio::test(start_paused = true)]
+    async fn batched_arrivals_spend_quota_by_priority_not_output_order() {
+        let t0 = tokio::time::Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["p", "lo", "hi", "mid"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let backend = Routed::new(names.iter().map(|n| (*n, 20, vec![found(n)])).collect());
+        let reg = routed_registry(&backend, 8);
+        let (tx, rx) = mpsc::channel(8);
+        let feed = async move {
+            tx.send(rule_req("p", ItemKind::Primary, 1.0)).await.unwrap();
+            tokio::time::sleep_until(at(t0, 10)).await;
+            // 同一格背靠背发出（通道未满不让出执行权 → 深挖侧一次唤醒全收）
+            tx.send(scan_req("lo", 0.3, "alpha", "scan[g1]@p/alpha#1", 0)).await.unwrap();
+            tx.send(scan_req("hi", 0.9, "alpha", "scan[g1]@p/alpha#1", 1)).await.unwrap();
+            tokio::time::sleep_until(at(t0, 50)).await;
+            tx.send(scan_req("mid", 0.7, "alpha", "scan[g1]@p/beta#1", 0)).await.unwrap();
+            tokio::time::sleep_until(at(t0, 100)).await;
+        };
+        let run_fut = run_with(Run { incoming: Some(rx), budget: 3, first_run: true, ..plain(&reg, dir.path(), &bundles, &[]) });
+        let (run, ()) = tokio::join!(run_fut, feed);
+        let mut dug = backend.starts();
+        dug.sort();
+        assert_eq!(dug, ["hi", "mid", "p"], "同批只派高优先的那条: {:?}", run.warnings);
+        let skipped: Vec<&str> = run.items.iter().filter(|it| it.state == ItemState::Skipped).map(|it| it.spec.file.as_str()).collect();
+        assert_eq!(skipped, ["lo.rs"]);
+        assert_eq!((run.meta.scan_phase_dispatched, run.meta.budget_skipped), (2, 1));
+    }
+
+    /// 共门时等门挂起按轮转序登记（评审 #6 回归）：两成员同 provider、门宽 1、4 项 → 交替分派；
+    /// 按成员下标升序登记时门位恒归 0 号，另一成员一格不分。
+    #[tokio::test(start_paused = true)]
+    async fn shared_gate_members_take_turns_through_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c", "d"];
+        let bundles = routed_bundles(dir.path(), &names);
+        let backend = Routed::new(names.iter().map(|n| (*n, 50, vec![found(n)])).collect());
+        let reg = pool_registry(&[("p/r", "p", 1, &backend), ("p/s", "p", 1, &backend)]);
+        let members = [member("p/r", "p"), member("p/s", "p")];
+        let items = pending_items(&names);
+        let run = run_with(Run { reviewers: Some(&members), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        let models: Vec<&str> = run.cells.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(models, ["p/r", "p/s", "p/r", "p/s"], "{:?}", run.warnings);
+        assert!(!run.warnings.iter().any(|w| w.contains("received 0 cells")), "{:?}", run.warnings);
     }
 
     /// restore 模式参数（design C2 §6〔D15〕）：`scan_cells` 按到达键幂等入队（已到达过的疑点不改项、不计去重），新疑点照常入队；

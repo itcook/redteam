@@ -63,6 +63,15 @@ pub struct Progress {
     pub total: u32,
 }
 
+/// 深挖开跑时落的队列头（M21b C2 评审 #1 / #2 / #5）：resume 靠它区分「首跑是 scan-only」与「深挖开过但被 kill」，
+/// 并沿用首跑的预算——被 kill 的作业没有原报告，按当时配置 / 工作树重算 K 会把首跑已选中的项截掉。
+/// 扇出前写（此时 job 仍 Running）；旧作业缺字段 → `None`，resume 退回「有队列快照才续挖」的口径。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepHeader {
+    /// 本作业深挖预算 K（`budget_cells`）。
+    pub budget_cells: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobState {
     pub job_id: String,
@@ -98,6 +107,9 @@ pub struct JobState {
     pub phase_history: Vec<PhaseStamp>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub workspace: Option<String>,
+    /// 深挖队列头（配了 reviewer 的作业在扇出前写；scan-only 作业恒 `None`）。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub deep: Option<DeepHeader>,
 }
 
 impl JobState {
@@ -119,6 +131,7 @@ impl JobState {
             phase: None,
             phase_history: vec![],
             workspace: None,
+            deep: None,
         }
     }
 
@@ -606,12 +619,14 @@ mod tests {
             models: vec!["alpha".into()], roles: vec![],
             pid: Some(4242), pid_start: None, exit_code: None, error: None, result_path: None,
             last_active: 1000, deadline_at: None, phase: None, phase_history: vec![], workspace: None,
+            deep: Some(DeepHeader { budget_cells: 12 }),
         };
         store.put_state_for_test(&st).unwrap();
         let back = store.read_state("job1").unwrap();
         assert_eq!(back.status, JobStatus::Running);
         assert_eq!(back.progress.total, 3);
         assert_eq!(back.pid, Some(4242));
+        assert_eq!(back.deep, Some(DeepHeader { budget_cells: 12 }), "深挖队列头随 state 落盘");
     }
 
     #[test]

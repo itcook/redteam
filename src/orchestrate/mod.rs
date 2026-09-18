@@ -25,6 +25,8 @@ pub trait CellSink: Send + Sync {
     fn on_roles(&self, _roles: &[Role]) {}
     /// M21b 批 C：队列项状态转换写 `queue_items` 快照（后台 job resume 用）。默认 no-op；写失败由实现方 warning。
     fn on_queue_item(&self, _item: &crate::orchestrate::queue::QueueItem) {}
+    /// M21b 批 C2：深挖开跑前落队列头（预算 K），resume 据此判「首跑是不是 scan-only」并沿用同一预算。默认 no-op。
+    fn on_deep_start(&self, _header: crate::state::DeepHeader) {}
 }
 
 /// R8.1：quote 去除全部空白（保大小写）——token 序列即身份，免疫 reformat。批 F-3 `consolidate::scan` 复用。

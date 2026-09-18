@@ -46,6 +46,9 @@ run_code_review（配了 reviewer）:
   发送失败（接收端已 drop，如 `run_deep` 因变更集为空早退）忽略。交付粒度仍是逐 cell（D13 Q-B）：一格的疑点在该格完成时一起到达。
 - 无死锁：深挖主循环的填门段是同步代码、没有 await；唯一的等待点是 `select!`，其中通道分支在 `!closed` 时恒启用——通道满时扫描侧
   `send` 挂起，深挖侧下一次进 `select!` 即收，容量只影响批次，不会互等。
+- 实施（评审第 1 档 #4，2026-09-18）：主循环每次唤醒只取一个事件，随后按固定序（格完成 → 通道 `try_recv` 到空 → 等门命中）
+  排空同刻已就绪的其余事件，再填门；`select!` 加 `biased`。一格的疑点是一批到达，逐条派发会让扫描期额度按模型输出序消耗
+  （实测：同批 [0.3, 0.9] 先派 0.3），同刻就绪的事件由 `select!` 随机定序还会让同一输入的选中集合不可复现。
 - 实施（C2-4）：`run_scan_fanout(registry, input, sink, enqueue: Option<&Sender>)`，发送在 `sink.on_cell` 之后、门位已归还时；
   首次 poll 即完成（0 格）时直接 `deep.await`，否则 `join!`；两条路径收口前统一打 `Finalizing`。快照 / 落盘回调与 backend 工厂只在配了
   reviewer 的分支里建。「落盘先于入队」以落盘钩子内 `try_recv` 查通道钉住（同 task 协作调度下接收端总在本格落盘后才被 poll，外部看不出先后）。
@@ -157,6 +160,17 @@ run_resume:
 - 用例：`resume_drain_keeps_prior_inflight_items_when_must_overshot_budget`（run_deep 层，含一条从未派发、应被截的涟漪）、
   `resume_redig_is_not_cut_by_close_drain`（cli 对账层）。
 
+**实施（评审第 1 档 #1 / #2 / #5 / #7，2026-09-18）——队列头与统一的未完判定**：
+- 快照只记项状态，记不下队列级运行态。新增 `JobState.deep: Option<DeepHeader { budget_cells }>`（serde default，不改 DB schema v4），
+  配了 reviewer 的作业在**扇出前**由 `CellSink::on_deep_start` 落盘。
+- resume 进深挖的条件改为「配了 reviewer **且**（有队列头 ∨ 有队列快照）」：两者都无 = 首跑是 scan-only 作业，事后给配置加 reviewer
+  也不改判它（原实现会整轮深挖并覆盖库内原结果）。
+- 预算优先取队列头，再取原报告 risk，最后才按当前 diff / 配置重算：被 kill 的作业没有原报告，重算的 K 会把首跑已选中的项截掉。
+- 「未完」统一为 `deep::unfinished(items, scan_cells)` = 有 Pending / InFlight 项 ∨ 有成功 scanner 格的疑点从没到过队列（到达键不在任何项上）；
+  `run_deep` 变更集为空的早退与 cli 的 diff 重建失败分支共用它。原实现两处口径不一：前者只看项状态（补跑出的疑点、空快照都被洗成干净通过），
+  后者把空快照一律当未完（无 H0 无疑点的作业被编造假债）。旧快照（项无到达键）只按项状态判。
+- diff 重建失败分支改走带标签块，落到函数尾部统一回写结果（`--resume` 只打印不落库，早 return 会让库里停在旧报告）。
+
 **实施（C2-5，2026-09-17）**：
 - `replayed` 在补跑前取（`pending` 非空）；深挖续跑条件只剩「配了 reviewer」。`scan_cells` = 全部 scanner 记录（失败格无输出、不入队）。
 - 阶段 0 路由在「快照为空 ∨ 原报告无 risk 段」时按当前 diff 重算：前者取 route 重建 H0，后者只取预算——首跑在收口前被 kill 就没有原报告，
@@ -221,6 +235,8 @@ loop {
 
 - 取代 C1「在途为空才阻塞 lease」的特例；#6「外部持门者放门不唤醒」随之解决：放门 → FIFO 唤醒深挖的等门 future → 主循环醒来补位。
 - 同 provider 多成员共享一门时 waits 同门多登记，先中者用、其余撤销；成员出局（`try_lease` / `lease` 报错）沿用 C1 就地出局口径。
+- 实施（评审第 1 档 #6，2026-09-18）：`waits` 按**轮转序**（游标下一位起，与 `next_lease` 同序）登记 FIFO——按成员下标升序登记时
+  共门的下一个门位恒归 0 号成员，C1 的交替分派失效（回归）。等门期间出局的成员命中时只就地归还门位，不撤其余成员的排队位。
 - 实施（C2-3）：`waits: Option<FuturesUnordered<阻塞 lease>>` 只在「有可派项 ∧ 本轮填门因无门位停下 ∧ 尚未建」时建；每轮填门后无可派项即撤销
   `waits` 与 `parked`，池空也撤销。已登记等门后本循环自己的 `try_lease` 同样让位（FIFO 不区分登记者），门位只经 `waits` 命中取得——
   这是「跨事件保持」保住排队位的前提。`parked` 的成员等门期间出局 → 门位随旧 lease 归还、改取下一成员。
