@@ -263,7 +263,7 @@ pub async fn run_scan_fanout(
             // 门位此时已归还。发送失败 = 深挖侧已不收（如变更集为空早退）——忽略，疑点照进 scan 报告。
             if let (Some(tx), Some(out)) = (enqueue, &output) {
                 for (i, s) in out.suspicions.iter().enumerate() {
-                    if let Some(req) = queue::EnqueueReq::scan(s, &e.family, crate::consolidate::scan::arrival_key(id, i)) {
+                    if let Some(req) = queue::EnqueueReq::scan(s, &e.family, crate::consolidate::scan::arrival_key(id, i, s)) {
                         let _ = tx.send(req).await;
                     }
                 }
@@ -501,7 +501,8 @@ mod scan_tests {
         let ((res, sink, reg, b, entries, repo), got) = tokio::join!(fanout, recv);
         let keys: Vec<Option<String>> = got.iter().map(|r| r.arrival.clone()).collect();
         assert_eq!(got.len(), 1, "只发锚定后的真疑点，失败格不发: {keys:?}");
-        assert_eq!(got[0].arrival.as_deref(), Some("scan[g1]@p/a#1#0"));
+        let key = got[0].arrival.clone().unwrap_or_default();
+        assert!(key.starts_with("scan[g1]@p/a#1#0:") && key.len() > "scan[g1]@p/a#1#0:".len(), "到达键带内容指纹: {key}");
         assert_eq!((got[0].families.clone(), got[0].spec.file.clone(), got[0].spec.ranges.clone()), (vec!["alpha".to_string()], "src/a.rs".to_string(), vec![(2, 2)]));
         assert_eq!(res.failed, vec!["scan[g1]@p/ghost#1"]);
         assert_eq!(sink.cells.lock().unwrap().len(), 2);
@@ -552,7 +553,8 @@ mod scan_tests {
         assert_eq!(res.cells.len(), 2);
         assert_eq!(probe.early.into_inner().unwrap(), Vec::<String>::new(), "未落盘就入队");
         seen.sort();
-        assert_eq!(seen, ["scan[g1]@p/a#1#0", "scan[g2]@p/a#1#0"]);
+        let prefixes: Vec<&str> = seen.iter().map(|k| k.split(':').next().unwrap()).collect();
+        assert_eq!(prefixes, ["scan[g1]@p/a#1#0", "scan[g2]@p/a#1#0"]);
     }
 
     /// 大格先发：provider 门宽 1 串行化派发，三组 diff 字节 小 / 大 / 中 → 调用序 g2, g3, g1；`res.cells` 仍按 plan 序（g1, g2, g3）。

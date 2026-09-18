@@ -107,6 +107,14 @@ on_close（只执行一次）:
   不是组内传递闭包；非传递漏合并只少算共识、多复核（D15 实测 ≤ 1/19 簇）；id 捷径仍不计共识。
 - `consolidate::scan::closure_members(cells) -> Vec<Vec<String>>`：与 `merge_suspicions` 同一并查集（按组、`same_suspicion`），输出每簇成员到达键；
   `merge_suspicions` 改为在其上组装、行为与输出逐字节不变。实施（C2-1）：两者共用私有 `suspicion_clusters(cells)`。
+- 实施（评审第 2 档 #3 / #8 / #12，2026-09-18）：
+  - 并入时把请求的疑点累加进 `QueueItem.members`（serde default），`same_item` 与 `priority_score` 都用这份全量——渲染笔记只留代表
+    （相似的取置信更高那条），匹配面不跟着扩大时链式簇会按到达序拆项、代表与优先级被钉在最先到达的变体上。
+    本轮 dogfood 数据按新语义重放：拆簇 1 → **0**、共识少算 1 → **0**。
+  - 到达键 = `{cell_id}#{i}:{内容指纹}`（文件 + 锚定后行区间 + 去空白 quote）：格落盘失败后 resume 重放该格、模型输出变了时，
+    同下标的新疑点不再撞旧键被当成已到达。H0 也记到达键（`rule:{file}:{start}-{end}`），resume 每轮按当前 diff 幂等重入队——
+    首跑那次入队快照写失败的 H0 靠这一步补回。
+  - resume 也算 `queue_split_clusters`（含 diff 重建失败分支），不再用 0 覆盖首跑落库的读数。
 - `split_clusters(cells, items)`：成员到达键映射到所在项 id，一簇成员分落 ≥ 2 项即计 1。`DeepRun` 带回最终队列项（`items`）供 cli 调用。
   实施（C2-4）：放在 `consolidate::scan`（与 `closure_members` 同处）；成员没进任何项不计；cli 在 `finish_scan_report` 消费 `results` 之前算。
 
@@ -272,6 +280,8 @@ loop {
   - `need_section(ex, tracked, need, warnings)`；`region::build(item, bundle, root, tracked, idx, budget, opts, needs_evidence)`。
   - 等价性以原子进程实现为对照：33 个路径 × 仓库顶层 / 子目录 / 非 git 目录三种 root 逐条同结果、同拒绝文案（首轮抓到文件尾斜杠一处口径差后修）。
 - 阻塞计时：填门段（`region::build` + prompt 构建 + 快照写）与到达处理段各自以 `std::time::Instant` 计时，记 `fill_block_max_ms` / `fill_block_total_ms`。
+  实施（评审第 2 档 #11）：覆盖面补齐到取跟踪文件集、开跑入队、落地（落盘 + 结案 + 快照）、收场 drain——漏计它们会让
+  `spawn_blocking` 的触发判断系统性偏乐观（本轮 dogfood 读数 46 / 210 ms 即含这些段）。
 - 挪 `spawn_blocking` 不在本批；触发条件记 followup（PR181 出口验收单次 ≥ 500 ms 或累计 ≥ 墙钟 1%）。
 
 ## 10. `DeepMeta` 新字段（均 serde default）
@@ -288,6 +298,8 @@ loop {
 | `fill_block_max_ms` / `fill_block_total_ms` | 主循环同步段单次最长 / 累计阻塞 |
 
 `run_deep` 与扫描同时开跑，`close_ms` 即 scanner 段墙钟；`drain_done_ms` 即深挖排空；`verify_tail_ms` 批 D 填。
+`budget_skipped` 在收口时按**最终状态**数（评审第 2 档 #9）：resume 回放把被截项并成必挖挖掉后，按 drain 那一刻计会留下假债。
+作业进度（`JobState.progress`）分子只数 scanner 格（#12）：深挖与扫描同时跑，reviewer 格也计会在扫描期显示超分母进度。
 实施（C2-3）：`first_dispatch_ms` / `drain_done_ms` 有值时至少记 1（0 = 无派发 / 无格）；`close_ms` 在开跑即关闭（无通道）时为 0；为零不序列化。
 
 ## 11. 测试形状

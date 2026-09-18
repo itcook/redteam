@@ -135,12 +135,14 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut dispatched = q.items().iter().filter(prior).count();
     let mut nonmust_susp = q.items().iter().filter(prior).filter(|it| counts_against_floor(it)).count();
     let dispatched_before = dispatched;
+    let t_enq = std::time::Instant::now();
     if let Some(route) = input.route {
         for h in &route.hotspots {
             enqueue_h0(&mut q, h, &mut meta, input.snapshot);
         }
     }
     enqueue_scan_cells(&mut q, input.scan_cells, &mut meta, input.snapshot);
+    note_block(&mut meta, t_enq.elapsed());
     meta.queue_depth_peak = meta.queue_depth_peak.max(q.items().len() as u32);
 
     let mut incoming = input.incoming.take();
@@ -152,14 +154,18 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut drained = false;
 
     if input.reviewers.is_empty() {
-        close_drain(&mut q, &mut meta, input.snapshot, &resumed, k.saturating_sub(dispatched), floor_total.saturating_sub(nonmust_susp));
+        close_drain(&mut q, input.snapshot, &resumed, k.saturating_sub(dispatched), floor_total.saturating_sub(nonmust_susp));
+        meta.budget_skipped = skipped_now(&q);
         return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false, reused_cells: vec![], items: q.items().to_vec() };
     }
     let members: &[EffectiveModel] = input.reviewers;
     let idx = cross_index(input.bundles, &[], None);
     let opts = PackOpts::from(input.pack);
-    // 读守卫的跟踪文件集每轮只取一次（C2 Q9〔D15〕）：派发路径每项、二阶段每条 need 都查它。
+    // 读守卫的跟踪文件集每轮只取一次（C2 Q9〔D15〕）：派发路径每项、二阶段每条 need 都查它。整仓 `git ls-files` 是同 task 上的同步段，
+    // 与开跑入队一起计入阻塞观测（评审 #11：漏计会让 `spawn_blocking` 的触发判断系统性偏乐观）。
+    let t_load = std::time::Instant::now();
     let tracked = crate::cli::second_pass::TrackedFiles::load(input.root);
+    note_block(&mut meta, t_load.elapsed());
     let env = CellEnv { input: &input, idx: &idx, tracked: &tracked, opts: &opts, sink };
 
     // 门驱动并发派发（design §6 规则 5〔D13〕）：provider 门有空位才弹出最高优先的可派项交出去。
@@ -180,7 +186,9 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         if closed && !drained {
             drained = true;
             let remaining = k.saturating_sub(dispatched);
-            close_drain(&mut q, &mut meta, input.snapshot, &resumed, remaining, floor_total.saturating_sub(nonmust_susp));
+            let t_close = std::time::Instant::now();
+            close_drain(&mut q, input.snapshot, &resumed, remaining, floor_total.saturating_sub(nonmust_susp));
+            note_block(&mut meta, t_close.elapsed());
             meta.close_budget_remaining = remaining as u32;
             meta.scan_phase_dispatched = (dispatched - dispatched_before) as u32;
             if !restore_mode {
@@ -287,7 +295,10 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             done_now.push(done);
         }
         for done in done_now {
+            // 落地是同步段：回填共识 + 落盘 cell（后台 job 写 SQLite）+ 队列结案 + 快照，期间其余在途格的流读取与计时器一起停
+            let t_land = std::time::Instant::now();
             let l = land(done, &mut q, input.snapshot, input.on_cell);
+            note_block(&mut meta, t_land.elapsed());
             meta.drain_done_ms = t_run.elapsed().as_millis().max(1) as u64;
             reviewer_failed |= l.debt;
             if l.auth_failed {
@@ -366,6 +377,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     // cells、meta 四数组与每格 warnings 依此序喂。保证：同一选中集合 + 同样的格输出 → 报告逐字节一致（计时字段与收场时刻读数
     // `scan_phase_dispatched` / `close_budget_remaining` 除外）——与完成序、派发序、到达序都无关；选中集合本身随到达时序变化是
     // 在线预算的已知代价（批 C3）。
+    meta.budget_skipped = skipped_now(&q);
     landed.sort_by(|a, b| match (q.get(&a.item_id), q.get(&b.item_id)) {
         (Some(x), Some(y)) => cmp_priority(x, y),
         _ => a.item_id.cmp(&b.item_id),
@@ -427,7 +439,7 @@ pub fn unfinished(items: &[QueueItem], cells: &[ScanCellResult]) -> bool {
     cells.iter().any(|c| {
         c.output.as_ref().is_some_and(|out| {
             out.suspicions.iter().enumerate().any(|(i, s)| {
-                let key = crate::consolidate::scan::arrival_key(&c.cell_id, i);
+                let key = crate::consolidate::scan::arrival_key(&c.cell_id, i, s);
                 EnqueueReq::scan(s, &c.family, key.clone()).is_some() && !seen.contains(key.as_str())
             })
         })
@@ -435,10 +447,9 @@ pub fn unfinished(items: &[QueueItem], cells: &[ScanCellResult]) -> bool {
 }
 
 /// 收场 drain（design v11 §6 规则 3〔D15〕）：留必挖 ∪ 前 `floor` 条非必挖疑点 ∪ 按优先级补到 `remaining`，余者 Skipped；
-/// `resumed`（往轮在途项）不参与、恒保留。截断数累加进 `budget_skipped`，只写被截项的快照。
+/// `resumed`（往轮在途项）不参与、恒保留。只写被截项的快照；截断数在收口时按最终状态数（见 `skipped_now`）。
 fn close_drain(
     q: &mut DeepQueue,
-    meta: &mut DeepMeta,
     snapshot: Option<&dyn Fn(&QueueItem)>,
     resumed: &std::collections::HashSet<&str>,
     remaining: usize,
@@ -450,7 +461,12 @@ fn close_drain(
             snap_one(it, snapshot);
         }
     }
-    meta.budget_skipped += skipped.len() as u32;
+}
+
+/// 截断数 = **收口时**仍是 Skipped 的项数（评审 #9）：resume 回放把被截项并成必挖挖掉后，按 drain 那一刻计会留下假债
+/// （披露「skipped(budget) N」并计 exit 2，而那 N 项其实已经挖了）。首跑 Skipped 只在收场产生、其后无复位，两种口径同值。
+fn skipped_now(q: &DeepQueue) -> u32 {
+    q.items().iter().filter(|it| it.state == ItemState::Skipped).count() as u32
 }
 
 /// 在线额度下的可派条件（design v11 §6 规则 3〔D15〕）：必挖不限；入口关闭后（收场 drain 已定选中集合）全部可派；
@@ -464,7 +480,8 @@ fn counts_against_floor(it: &QueueItem) -> bool {
     it.kind == ItemKind::Suspicion && it.dispatch_agreement < 2
 }
 
-/// 主循环同步段计时（design C2 §9〔D15〕）：同 task 并发下这段阻塞期间其余在途格的流读取与计时器一起停。
+/// 主循环同步段计时（design C2 §9〔D15〕，评审 #11 补齐覆盖）：取跟踪文件集、开跑入队、填门（pack + prompt + 快照）、
+/// 到达处理、落地（落盘 + 结案 + 快照）、收场 drain——同 task 并发下这些段阻塞期间其余在途格的流读取与计时器一起停。
 fn note_block(meta: &mut DeepMeta, d: std::time::Duration) {
     let ms = d.as_millis() as u64;
     meta.fill_block_max_ms = meta.fill_block_max_ms.max(ms);
@@ -877,9 +894,9 @@ pub fn review_cell_prefix(item_id: &str) -> String {
     format!("review[{item_id}]@")
 }
 
-/// resume 形态的深挖 meta 起点：截断数与队列深度取自快照（drain 在首跑已做，resume 不重跑）。
-/// resume 的三条路径共用——正常续跑、变更集为空早退、diff 重建报错（`cli::run_resume`）——任何一条漏掉截断数，
-/// 被预算截掉的项就既不计债也不披露。
+/// resume 形态的深挖 meta 起点：截断数与队列深度取自快照。正常续跑会在收口时按最终状态重算截断数（C2〔D15〕起 restore 模式
+/// 同样做收场 drain）；挖不动的两条早退路径——变更集为空、diff 重建报错（`cli::run_resume`）——就以快照读数收口，
+/// 漏掉它被预算截掉的项就既不计债也不披露。
 pub fn restored_meta(items: &[QueueItem]) -> DeepMeta {
     DeepMeta {
         budget_skipped: items.iter().filter(|i| i.state == ItemState::Skipped).count() as u32,
@@ -963,7 +980,10 @@ fn enqueue_h0(q: &mut DeepQueue, h: &Hotspot, meta: &mut DeepMeta, snapshot: Opt
         RegionKind::Primary => ItemKind::Primary,
         RegionKind::Ripple => ItemKind::Ripple,
     };
-    let (outcome, affected) = q.enqueue_affected(EnqueueReq { spec, score: h.score, kind, families: vec![], arrival: None });
+    // H0 也记到达键（评审 #8）：resume 每轮按当前 diff 幂等重建 H0——首跑那次入队快照写失败时它才补得回来，
+    // 已在队列里的则走到达键幂等、不改项也不计去重命中。
+    let arrival = Some(format!("rule:{}:{start}-{end}", h.file));
+    let (outcome, affected) = q.enqueue_affected(EnqueueReq { spec, score: h.score, kind, families: vec![], arrival });
     note_enq(outcome, "rule", meta);
     if let Some(i) = affected {
         snap_one(&q.items()[i], snapshot);
@@ -979,7 +999,7 @@ fn enqueue_scan_cells(q: &mut DeepQueue, cells: &[ScanCellResult], meta: &mut De
     for c in ordered {
         let Some(out) = &c.output else { continue };
         for (i, s) in out.suspicions.iter().enumerate() {
-            let Some(req) = EnqueueReq::scan(s, &c.family, crate::consolidate::scan::arrival_key(&c.cell_id, i)) else {
+            let Some(req) = EnqueueReq::scan(s, &c.family, crate::consolidate::scan::arrival_key(&c.cell_id, i, s)) else {
                 continue;
             };
             let (outcome, affected) = q.enqueue_affected(req);
@@ -1044,7 +1064,7 @@ mod tests {
             id: format!("{file}:rule:1-2"),
             spec, score: 1.0, agreement: 1, state, kind: ItemKind::Primary,
             dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
-            arrivals: vec![],
+            arrivals: vec![], members: vec![],
         }
     }
 
@@ -1573,7 +1593,7 @@ mod tests {
             id: format!("{file}:scan:1-1"), spec: spec.clone(), score: 0.5, agreement: 1, state: ItemState::Pending,
             kind: ItemKind::Suspicion, dispatch_agreement: 0, landed_agreement: None,
             families: vec![family.into()], enqueued_ms: None,
-            arrivals: vec![],
+            arrivals: vec![], members: vec![],
         };
         (item, spec)
     }
@@ -1662,6 +1682,9 @@ mod tests {
                 c.queue_wait_ms = 0;
             }
             run.meta.item_wait_ms.clear();
+            // 计时字段不在确定性保证内（评审 #11 起阻塞观测含落地段，随真实耗时波动）
+            (run.meta.close_ms, run.meta.first_dispatch_ms, run.meta.drain_done_ms) = (0, 0, 0);
+            (run.meta.fill_block_max_ms, run.meta.fill_block_total_ms) = (0, 0);
             serde_json::to_string(&(&run.findings, &run.cells, &run.meta, &run.warnings, run.reviewer_failed)).unwrap()
         }
         let forward = once([10, 20, 30]).await;
@@ -1969,7 +1992,7 @@ mod tests {
             id: format!("{file}:rule:1-2"),
             spec: QueueItemSpec::new(file.into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap(),
             score: 1.0, agreement: 1, state, kind, dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
-            arrivals: vec![],
+            arrivals: vec![], members: vec![],
         };
         let note = crate::domain::Suspicion {
             file: "s.rs".into(), line_start: 1, line_end: 1, hint: "h".into(), category: None, confidence: 0.5, quote: "fn s() {".into(),
@@ -1979,7 +2002,7 @@ mod tests {
             spec: QueueItemSpec::new("s.rs".into(), vec![(1, 1)], QueueOrigin::Scan, vec![note]).unwrap(),
             score: 0.5, agreement: 2, state: ItemState::Pending, kind: ItemKind::Suspicion,
             dispatch_agreement: 0, landed_agreement: None, families: vec!["alpha".into(), "beta".into()], enqueued_ms: None,
-            arrivals: vec![],
+            arrivals: vec![], members: vec![],
         };
         let items = vec![
             rule("r.rs", ItemKind::Ripple, ItemState::Pending),
@@ -2142,7 +2165,7 @@ mod tests {
         };
         QueueItem {
             id, spec, score: 1.0, agreement: 1, state, kind, dispatch_agreement, landed_agreement: None,
-            families: vec![], enqueued_ms: None, arrivals: vec![],
+            families: vec![], enqueued_ms: None, arrivals: vec![], members: vec![],
         }
     }
 
@@ -2180,7 +2203,7 @@ mod tests {
             file: format!("{name}.rs"), line_start: 1, line_end: 1, hint: "h".into(), category: None, confidence,
             quote: format!("fn {name}() {{"),
         };
-        EnqueueReq::scan(&s, family, crate::consolidate::scan::arrival_key(cell, i)).unwrap()
+        EnqueueReq::scan(&s, family, crate::consolidate::scan::arrival_key(cell, i, &s)).unwrap()
     }
 
     /// 经通道到达的 H0 形态项（主区 / 涟漪）。
@@ -2481,6 +2504,49 @@ mod tests {
         assert_eq!(snaps[3..], [("a.rs".to_string(), ItemState::Skipped), ("b.rs".to_string(), ItemState::Skipped)]);
     }
 
+    /// 阻塞观测覆盖落地段（评审 #11）：落盘回调里的同步写（后台 job 是两笔 SQLite 事务）同样让其余在途格停摆，
+    /// `fill_block_*` 漏计它会让 `spawn_blocking` 的触发判断偏乐观。
+    #[tokio::test]
+    async fn block_timing_covers_the_landing_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let backend = Routed::new(vec![("a", 0, vec![found("a")])]);
+        let reg = routed_registry(&backend, 2);
+        let items = pending_items(&["a"]);
+        let on_cell = |_: &CellRecord| std::thread::sleep(Duration::from_millis(50));
+        let run = run_with(Run { on_cell: Some(&on_cell), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        assert_eq!(run.cells.len(), 1, "{:?}", run.warnings);
+        assert!(run.meta.fill_block_max_ms >= 50, "落地段未计入阻塞观测: {:?}", run.meta);
+    }
+
+    /// 回放把被截项并成必挖挖掉后不留假债（评审 #9）：截断数按收口时的最终状态数，不按 drain 那一刻——
+    /// 按 drain 那一刻计会披露「skipped(budget) 1」并计 exit 2，而那一项其实已经挖了。
+    #[tokio::test(start_paused = true)]
+    async fn replayed_merge_reopens_skipped_item_without_leaving_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["k"]);
+        let cell_id = "scan[g1]@p/beta#1";
+        let s = crate::domain::Suspicion {
+            file: "k.rs".into(), line_start: 1, line_end: 1, hint: "另一族的同一处".into(), category: None, confidence: 0.6,
+            quote: "fn k() {".into(),
+        };
+        let out = crate::domain::ScanOutput { suspicions: vec![s], ..Default::default() };
+        let cells = [ScanCellResult {
+            cell_id: cell_id.into(), group: 0, route_key: "p/beta".into(), family: "beta".into(), sample: 1,
+            record: CellRecord::ok(cell_id, "p/beta", crate::domain::CellOutput::Scan(out.clone())),
+            output: Some(out),
+        }];
+        let mut k = item_of("k", ItemKind::Suspicion, ItemState::Skipped, 0);
+        k.families = vec!["alpha".into()];
+        let backend = Routed::new(vec![("k", 10, vec![found("k")])]);
+        let reg = routed_registry(&backend, 4);
+
+        let run = run_with(Run { scan_cells: &cells, budget: 4, ..plain(&reg, dir.path(), &bundles, &[k]) }).await;
+
+        assert_eq!(backend.starts(), ["k"], "异族并入抬到共识 2 → 必挖不截: {:?}", run.warnings);
+        assert_eq!(run.meta.budget_skipped, 0, "复位并挖掉后不留假债");
+    }
+
     /// 同一格的疑点是一批到达（D13 Q-B 逐 cell 交付）：排空后再填门，扫描期额度按优先级消耗，不随模型输出序（评审 #4）。
     /// K = 3（额度 2）：H0 占 1 格后，同批 [低 0.3, 高 0.9] 只能派一格——派高的；低的留到收场与后到的中 0.7 比优先级，输给它被截。
     #[tokio::test(start_paused = true)]
@@ -2548,7 +2614,7 @@ mod tests {
         }];
         // 快照：a 已由首跑流式到达并挖完；k 首跑收场被截
         let mut a = item_of("a", ItemKind::Suspicion, ItemState::Settled, 1);
-        a.arrivals = vec![crate::consolidate::scan::arrival_key(cell_id, 0)];
+        a.arrivals = vec![crate::consolidate::scan::arrival_key(cell_id, 0, &susp("a", 0.5))];
         let items = vec![a, item_of("k", ItemKind::Ripple, ItemState::Skipped, 0)];
         for reopen in [false, true] {
             let backend = Routed::new(vec![("b", 10, vec![found("b")]), ("k", 10, vec![found("k")])]);

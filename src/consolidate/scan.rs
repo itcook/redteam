@@ -46,10 +46,12 @@ fn find(parent: &mut [usize], i: usize) -> usize {
     r
 }
 
-/// 疑点到达键：`{scan cell_id}#{i}`，i = 疑点在该格锚定后 `suspicions` 里的下标（落盘输出同序，resume 可复算）。
-/// 深挖入队（`EnqueueReq.arrival`）与收场拆簇对账（[`closure_members`]）共用这一口径（C2〔D15〕）。
-pub fn arrival_key(cell_id: &str, i: usize) -> String {
-    format!("{cell_id}#{i}")
+/// 疑点到达键：`{scan cell_id}#{i}:{内容指纹}`，i = 疑点在该格锚定后 `suspicions` 里的下标（落盘输出同序，resume 可复算）；
+/// 指纹 = 文件 + 锚定后行区间 + 去空白 quote（评审 #8：格落盘失败后 resume 会重放该格，模型输出变了时同下标的新疑点
+/// 不能撞上旧键被当成已到达）。深挖入队（`EnqueueReq.arrival`）与收场拆簇对账（[`closure_members`]）共用这一口径（C2〔D15〕）。
+pub fn arrival_key(cell_id: &str, i: usize, s: &Suspicion) -> String {
+    let fp = crate::hash::fnv1a64_hex(&[&s.file, &s.line_start.to_string(), &s.line_end.to_string(), &normalize_quote(&s.quote)]);
+    format!("{cell_id}#{i}:{fp}")
 }
 
 /// 组内「同一疑点」簇（[`merge_suspicions`] 与 [`closure_members`] 共用同一并查集）：按 cell id 排序后逐格展开疑点，
@@ -103,7 +105,7 @@ fn suspicion_at((c, i): (&ScanCellResult, usize)) -> &Suspicion {
 pub fn closure_members(cells: &[ScanCellResult]) -> Vec<Vec<String>> {
     suspicion_clusters(cells)
         .into_iter()
-        .map(|(_, members)| members.into_iter().map(|(c, i)| arrival_key(&c.cell_id, i)).collect())
+        .map(|(_, members)| members.into_iter().map(|m| arrival_key(&m.0.cell_id, m.1, suspicion_at(m))).collect())
         .collect()
 }
 
@@ -269,10 +271,10 @@ mod tests {
         let s3 = susp("a.rs", 10, 10, "s3", 0.5, "let t = secret();");
         let far = susp("a.rs", 90, 90, "far", 0.5, "unrelated_call(x);");
         let cells = vec![
-            cell("scan[g1]@p/beta#1", 0, "beta", vec![far.clone(), s2]),
-            cell("scan[g1]@p/alpha#1", 0, "alpha", vec![s1]),
-            cell("scan[g1]@p/gamma#1", 0, "gamma", vec![s3]),
-            ScanCellResult { output: None, ..cell("scan[g1]@p/delta#1", 0, "delta", vec![far]) },
+            cell("scan[g1]@p/beta#1", 0, "beta", vec![far.clone(), s2.clone()]),
+            cell("scan[g1]@p/alpha#1", 0, "alpha", vec![s1.clone()]),
+            cell("scan[g1]@p/gamma#1", 0, "gamma", vec![s3.clone()]),
+            ScanCellResult { output: None, ..cell("scan[g1]@p/delta#1", 0, "delta", vec![far.clone()]) },
         ];
         let merged = merge_suspicions(&cells);
         let mut members = closure_members(&cells);
@@ -283,10 +285,15 @@ mod tests {
         assert_eq!(
             members,
             vec![
-                vec!["scan[g1]@p/alpha#1#0".to_string(), "scan[g1]@p/beta#1#1".to_string(), "scan[g1]@p/gamma#1#0".to_string()],
-                vec!["scan[g1]@p/beta#1#0".to_string()],
+                vec![
+                    arrival_key("scan[g1]@p/alpha#1", 0, &s1),
+                    arrival_key("scan[g1]@p/beta#1", 1, &s2),
+                    arrival_key("scan[g1]@p/gamma#1", 0, &s3),
+                ],
+                vec![arrival_key("scan[g1]@p/beta#1", 0, &far)],
             ]
         );
+        assert!(members[1][0].starts_with("scan[g1]@p/beta#1#0:"), "到达键 = 格 + 下标 + 内容指纹: {members:?}");
         assert_eq!(merged.len(), members.len(), "簇数一致");
         let sizes: std::collections::BTreeSet<usize> = merged.iter().map(|m| m.cell_ids.len()).collect();
         assert_eq!(sizes, [1, 3].into_iter().collect(), "{merged:?}");
@@ -314,7 +321,7 @@ mod tests {
             for &(c, i) in order {
                 let cell = &cells[c];
                 let s = &cell.output.as_ref().unwrap().suspicions[i];
-                q.enqueue(EnqueueReq::scan(s, &cell.family, arrival_key(&cell.cell_id, i)).unwrap());
+                q.enqueue(EnqueueReq::scan(s, &cell.family, arrival_key(&cell.cell_id, i, s)).unwrap());
             }
             q.items().to_vec()
         };

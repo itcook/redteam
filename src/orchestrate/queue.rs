@@ -67,12 +67,18 @@ pub struct QueueItem {
     /// 收场据此把组内闭包簇映射回队列项做拆簇对账。H0 无到达键；旧快照空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arrivals: Vec<String>,
+    /// 到达过本项的全部疑点（C2 评审 #3）：`spec.notes` 只留渲染给 reviewer 的代表（相似的不重复列），
+    /// 匹配面与优先级用这一份全量——桥接疑点若只并入不进匹配面，链式簇会按到达序拆成多项，
+    /// 代表也被钉在最先到的那条上（`priority_score` 取笔记里的最高置信）。H0 / needs 无疑点，空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<Suspicion>,
 }
 
 impl QueueItem {
     fn new(spec: QueueItemSpec, score: f32, kind: ItemKind, families: Vec<String>, arrival: Option<String>) -> Self {
         let id = item_id(&spec);
         let families: Vec<String> = dedup_families(families);
+        let members = spec.notes.clone();
         QueueItem {
             id,
             spec,
@@ -85,6 +91,16 @@ impl QueueItem {
             families,
             enqueued_ms: Some(now_ms()),
             arrivals: arrival.into_iter().collect(),
+            members,
+        }
+    }
+
+    /// 匹配与排序用的疑点全量：到达过的成员（旧快照为空时退回渲染笔记）。
+    pub(crate) fn suspicions(&self) -> &[Suspicion] {
+        if self.members.is_empty() {
+            &self.spec.notes
+        } else {
+            &self.members
         }
     }
 }
@@ -211,7 +227,7 @@ impl DeepQueue {
     /// 合并目标 + 是否经谓词命中。id 相等（`file:origin:ranges` 逐字相同）也合并——保住「一个区间只挖一次」
     /// 与 id 唯一；但谓词命中优先：同一疑点的共识只该记到谓词认定的那一项上。
     fn find_merge_idx(&self, spec: &QueueItemSpec, incoming_id: &str) -> Option<(usize, bool)> {
-        if let Some(i) = self.items.iter().position(|it| same_item(&it.spec, spec)) {
+        if let Some(i) = self.items.iter().position(|it| same_item(it, spec)) {
             return Some((i, true));
         }
         self.items.iter().position(|it| it.id == incoming_id).map(|i| (i, false))
@@ -241,6 +257,11 @@ impl DeepQueue {
             it.arrivals.push(key); // 调用方已查过不在任何项上
         }
         it.spec.ranges = union_ranges(&it.spec.ranges, &req.spec.ranges);
+        for n in &req.spec.notes {
+            if !it.members.iter().any(|m| m == n) {
+                it.members.push(n.clone());
+            }
+        }
         it.spec.notes = merge_notes(&it.spec.notes, &req.spec.notes);
         if req.score > it.score {
             it.score = req.score;
@@ -397,8 +418,9 @@ fn priority_score(it: &QueueItem) -> f32 {
     match it.kind {
         ItemKind::Primary | ItemKind::Ripple => it.score,
         ItemKind::Suspicion => {
-            let conf = it.spec.notes.iter().map(|n| n.confidence).fold(0.0_f32, f32::max);
-            conf * it.agreement as f32 * category_weight(&it.spec.notes)
+            let notes = it.suspicions();
+            let conf = notes.iter().map(|n| n.confidence).fold(0.0_f32, f32::max);
+            conf * it.agreement as f32 * category_weight(notes)
         }
         ItemKind::Needs => NEEDS_MID_SCORE,
     }
@@ -427,15 +449,17 @@ fn item_id(spec: &QueueItemSpec) -> String {
     format!("{}:{}:{}", spec.file, origin, ranges)
 }
 
-fn same_item(a: &QueueItemSpec, b: &QueueItemSpec) -> bool {
-    if a.origin != b.origin {
+/// 同一项谓词：主区按文件 + 区间相交；疑点 / needs 按文件 + 「到达过本项的任一疑点」与请求的任一疑点相似
+/// （成员而非渲染笔记，C2 评审 #3：桥接疑点并入后匹配面要跟着扩大）。
+fn same_item(a: &QueueItem, b: &QueueItemSpec) -> bool {
+    if a.spec.origin != b.origin {
         return false;
     }
-    match a.origin {
-        QueueOrigin::Rule => a.file == b.file && ranges_overlap(&a.ranges, &b.ranges),
+    match a.spec.origin {
+        QueueOrigin::Rule => a.spec.file == b.file && ranges_overlap(&a.spec.ranges, &b.ranges),
         QueueOrigin::Scan | QueueOrigin::Needs => {
-            a.file == b.file
-                && a.notes.iter().any(|na| b.notes.iter().any(|nb| same_suspicion(na, nb)))
+            a.spec.file == b.file
+                && a.suspicions().iter().any(|na| b.notes.iter().any(|nb| same_suspicion(na, nb)))
         }
     }
 }
@@ -465,11 +489,18 @@ fn union_ranges(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
     out
 }
 
+/// 渲染笔记合并：不相似的追加；相似的只留置信更高的那条（C2 评审 #3：代表与优先级不该钉在最先到达的变体上，
+/// reviewer 读到的 hint / quote 同理）。匹配面另由 `QueueItem::members` 保全。
 fn merge_notes(a: &[Suspicion], b: &[Suspicion]) -> Vec<Suspicion> {
     let mut out = a.to_vec();
     for n in b {
-        if !out.iter().any(|x| same_suspicion(x, n)) {
-            out.push(n.clone());
+        match out.iter().position(|x| same_suspicion(x, n)) {
+            Some(i) => {
+                if n.confidence > out[i].confidence {
+                    out[i] = n.clone();
+                }
+            }
+            None => out.push(n.clone()),
         }
     }
     out
@@ -818,6 +849,51 @@ mod tests {
 
     fn arrived(spec: QueueItemSpec, family: &str, arrival: &str) -> EnqueueReq {
         EnqueueReq { arrival: Some(arrival.into()), ..req(spec, Some(family)) }
+    }
+
+    /// 桥接疑点并入后匹配面要跟着扩大（C2 评审 #3）：链 s3 ~ s1 ~ s2（s3 ≁ s2），到达序 s3、s1、s2 ——
+    /// s1 并入 s3 那一项后，s2 与成员 s1 相似即并入同一项；匹配只看渲染笔记时 s1 会被当相似丢掉，s2 另起一项、簇被拆开，
+    /// 而 scan 报告里这是一条 agreement 3 的必挖簇。代表笔记与优先级另取最高置信的变体，不钉在最先到达那条上。
+    #[test]
+    fn predicate_merge_keeps_members_for_matching_and_best_note() {
+        let chain = "let t = secret();\nlog(token_value);\nreturn t;";
+        let (s3, s1, s2) = (
+            spec_scan("a.rs", 10, 10, "let t = secret();", "s3"),
+            QueueItemSpec::new(
+                "a.rs".into(),
+                vec![(10, 12)],
+                QueueOrigin::Scan,
+                vec![Suspicion { confidence: 0.9, ..sus("a.rs", 10, 12, chain, "s1") }],
+            )
+            .unwrap(),
+            spec_scan("a.rs", 14, 14, "log(token_value);  ", "s2"),
+        );
+        let mut q = DeepQueue::new();
+        assert_eq!(q.enqueue(arrived(s3, "alpha", "c1#0")), EnqueueOutcome::New);
+        assert_eq!(q.enqueue(arrived(s1, "beta", "c2#0")), EnqueueOutcome::MergedPending, "s1 ~ s3");
+        assert_eq!(q.enqueue(arrived(s2, "gamma", "c3#0")), EnqueueOutcome::MergedPending, "s2 ~ 成员 s1");
+        assert_eq!(q.items().len(), 1, "一簇一项: {:?}", q.items().iter().map(|it| &it.id).collect::<Vec<_>>());
+        let it = &q.items()[0];
+        assert_eq!((it.agreement, it.members.len()), (3, 3), "三家族共识、成员留全");
+        assert!(must_dig(it), "共识 ≥ 2 → 必挖");
+        let best = it.spec.notes.iter().map(|n| n.confidence).fold(0.0_f32, f32::max);
+        assert_eq!((best, it.spec.notes.len()), (0.9, 1), "代表取最高置信：s1 顶掉 s3，与 s1 相似的 s2 不重复列");
+        assert!((priority_score(it) - 0.9 * 3.0 * category_weight(it.suspicions())).abs() < 1e-6, "优先级用最高置信");
+
+        // 桥接疑点置信更低时代表笔记留不住它（相似的只留高置信那条），匹配面只能靠成员列表
+        let low_bridge = QueueItemSpec::new(
+            "a.rs".into(),
+            vec![(10, 12)],
+            QueueOrigin::Scan,
+            vec![Suspicion { confidence: 0.3, ..sus("a.rs", 10, 12, chain, "s1") }],
+        )
+        .unwrap();
+        let mut q2 = DeepQueue::new();
+        q2.enqueue(arrived(spec_scan("a.rs", 10, 10, "let t = secret();", "s3"), "alpha", "c1#0"));
+        q2.enqueue(arrived(low_bridge, "beta", "c2#0"));
+        q2.enqueue(arrived(spec_scan("a.rs", 14, 14, "log(token_value);  ", "s2"), "gamma", "c3#0"));
+        assert_eq!(q2.items().len(), 1, "低置信的桥也要扩大匹配面: {:?}", q2.items().iter().map(|it| &it.id).collect::<Vec<_>>());
+        assert_eq!(q2.items()[0].spec.notes.len(), 2, "渲染笔记只去相似：s2 与代表 s3 不相似 → 另列");
     }
 
     /// 到达键幂等：同一条疑点再到达（哪怕家族 / 区间变了）→ `Duplicate`、不回报受影响项、队列零改动。
