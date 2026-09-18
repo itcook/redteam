@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 20
-- **Last Active**: 2026-09-15
+- **Total Sessions**: 21
+- **Last Active**: 2026-09-18
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~587 | Active |
+| `journal-1.md` | ~639 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 21 | 2026-09-18 | M21b 批 C2 scanner 与深挖时间重叠（流式入队 / 在线预算与收场 drain / 等门 FIFO / resume 离线续跑 + 真 provider dogfood + 三档评审修） | `8adfcb5`, `e0fed14`, `191f821`, `54ec215`, `29338e8`, `489705a`, `3e4e39e`, `5e4fb00`, `f485e23`, `3038ee7` | `feat/m21b-deep-streaming` |
 | 20 | 2026-09-15 | M21b 批 C1 门驱动并发派发与 reviewer 分派池（身份 / 并发 / 轮转 / 墙钟门 + 真 provider dogfood + 三档评审修） | `36ee52c`, `b615e31`, `aaa622d`, `e132618`, `87e9773`, `83e0c2b`, `1d86e52`, `f01bf8b`, `af97bcc`, `4e70292`, `96b1ad5`, `d683bab`, `1f098a7`, `e43dfe8`, `0a588c3`, `80919ad` | `feat/m21b-deep-concurrency` |
 | 19 | 2026-09-13 | M21b 批 C 深挖队列与 reviewer 运行时（核查 + 三路评审 + 真 provider dogfood 收口） | `c346617`, `a2751ce`, `d79ff3c`, `c08d229`, `5e06655`, `89984ca`, `f1c355d`, `0d74e2c`, `8b84c9c`, `b93a7d9`, `8041bc7`, `936c209`, `dff7f9f`, `674583e`, `db054bb`, `cdd6ea5`, `f1d3ca3`, `86706e8`, `cfcabf3`, `eac0a60` | `feat/m21b-deep` |
 | 18 | 2026-09-10 | M21b 批 A 风险评分器（+ 前置 #1 小分量并池） | `21de550`, `69ff71d`, `56f0397`, `9fc0bbc`, `c7b1b42`, `b5d1ee1`, `1f72af5`, `4156796`, `03f056c`, `3d4cb01`, `840d8ac`, `be6b3b1` | `feat/m21b-risk` |

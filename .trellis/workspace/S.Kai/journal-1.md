@@ -585,3 +585,55 @@ grill 定 D13（删角色 workers / 无 --workers、provider 门单把 FIFO 不�
 - 维护者决定：providers.agc.maxConcurrency ≤ 7；grok-4.6 去留（reviewer 格丢弃计数已可观测，可再跑一轮看 warn）
 - 批 D 接真 sink 前先修流式旁路跨瞬时重试不复位；D 的免复核读 FindingEvent.suspicion_agreement（派发快照，event ≤ landed）
 - m21b-deep-concurrency 工作树已合并可清理（私有 dogfood 记录已拷回主干工作树）
+
+
+## Session 21: M21b 批 C2 scanner 与深挖时间重叠（流式入队 / 在线预算与收场 drain / 等门 FIFO / resume 离线续跑 + 真 provider dogfood + 三档评审修）
+<!-- trellis-session: v=2 fp=3992b214361d382b -->
+
+**Date**: 2026-09-18
+**Task**: M21b 批 C2 scanner 与深挖时间重叠（流式入队 / 在线预算与收场 drain / 等门 FIFO / resume 离线续跑 + 真 provider dogfood + 三档评审修）
+**Branch**: `feat/m21b-deep-streaming`
+
+### Summary
+
+scan 全完才挖改成两段重叠：H0 t=0 开挖、scanner 格完成即入队、扫描期非必挖受 K − F 额度、关闭入口时收场 drain 一次；resume 离线续跑修掉扫描期 kill 后的 scan-only / exit 0；dogfood 同门宽重放省 28%（本轮墙钟慢于基线归因网关单次 429 把门收到 2）；评审 15 条三档全修（三处假绿 + 两处回归）
+
+### Main Changes
+
+- queue：到达键幂等入队（内容指纹）与受影响项回报、pop_dispatch_where / has_eligible、drain_with(预算, 保底) 与 drain_among(排除往轮在途)、并入保留成员疑点与最高置信代表、reopen_skipped
+- deep：在线额度与收场 drain、等门挂起入 FIFO 并按轮转序登记、每次唤醒排空同刻事件再填门、收场按最终优先级序组装、快照只写受影响项、unfinished 统一判定、9 个时间重叠观测字段与阻塞计时覆盖
+- registry：门票号 FIFO、首试让位、取消安全（WaiterGuard）
+- cli / orchestrate：扫描与深挖同 task join（显式先 poll 扫描）、格落盘后逐条发疑点、收场切 Deep、F3 口径（scanner 失败深挖照跑仍 Incomplete）、拆簇对账、resume 队列头与幂等重建 H0、进度只数 scanner 格
+- second_pass / region：读守卫查每轮预取的跟踪文件集，非 ASCII 路径回退子进程判定、取集合失败发 warning
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8adfcb5` | feat(queue,registry): C2 零件——到达键幂等入队与受影响项回报、按可派条件弹出、drain_with(预算, 保底)、门等门者计数与首试让位（取消安全）、组内闭包成员导出（D15） |
+| `e0fed14` | perf(pack,deep): 读守卫改查每轮预取的 git 跟踪文件集——逐项子进程去掉，拒绝口径不变（D15 Q9） |
+| `191f821` | feat(deep): 在线预算与收场 drain、等门挂起入 FIFO（修外部放门不唤醒）、收场按优先级序组装、快照只写受影响项——C2 深挖主循环（design §6 规则 3 / 6、§12.3〔D15〕） |
+| `54ec215` | feat(cli,orchestrate): scanner 与深挖时间重叠接线——格完成即入队、显式先 poll 扫描、收场切 Deep、scanner 失败深挖照跑仍硬 Incomplete、拆簇对账（design §2 / §8.4〔D15〕） |
+| `29338e8` | fix(resume): 离线续跑——补跑 scanner 后疑点幂等入队、补跑过则复位 Skipped 重选、空快照同路径重建 H0（修扫描期 kill 后 resume 出 scan-only / exit 0）（design §17 R14〔D15〕） |
+| `489705a` | docs(followup,task): 批 C2 dogfood 账目——时间重叠端到端跑通、墙钟慢于基线归因网关收门到 2（同门宽重放 C2 省 28%）、收门只降不升留 D13 复议、同步 IO 读数远低于留债触发 |
+| `3e4e39e` | fix(deep,resume,cli): C2 评审第 1 档——resume 落队列头与统一未完判定（修三处假绿）、diff 失败分支回写、主循环排空同刻事件、等门按轮转序登记 |
+| `5e4fb00` | fix(queue,deep,cli): C2 评审第 2 档——并入保留成员疑点与最高置信代表、到达键带内容指纹、截断数按最终状态、阻塞计时与进度口径 |
+| `f485e23` | docs,fix(second_pass,queue,deep): C2 评审第 3 档——非 ASCII 路径回退子进程读守卫、确定性保证补时刻快照式共识、恒真用例改写死期望、过期注释与 followup 记账 |
+| `3038ee7` | merge(m21b-deep-streaming): 批 C2 scanner 与深挖时间重叠合回——流式入队与在线预算 / 等门 FIFO / 收场 drain 与优先级序组装 / resume 离线续跑 + 真 provider dogfood + 评审三档 15 条全修（design §2 / §6 / §7 / §17〔D15〕） |
+
+### Testing
+
+- [OK] 子分支与合回后主干各复验：lib 742 / e2e 17 / cli 17 / packaging 7；clippy 7 = 基线；make verify 绿
+- [OK] 新增 / 改写用例 30 余条（虚拟时间钉到毫秒：H0 在 scanner 返回前落地、共门先后、等门跨事件保持排队位）；变异检查 37 处各自转红，3 处首轮假绿已补用例
+- [OK] 真 provider dogfood 一轮（同目标 diff 674583e...f1d3ca3、同基线配置，跑前跑后 config sha256 一致）：12/12 零断流、exit 10
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 批 C3 深挖选项稳定性：confidence 排序键与 reviewer 笔记、同文件相邻区间合并、文件多样性、scanner samples、scanner needs 入队；验收量选中区域与 findings 重合度
+- D13 复议：收门只降不升——单次 429 把整轮钉在最低读数（agc 三天读数 7 / 4 / 2）；候选加性回升或窗口读数
+- 批 D 接真 sink 前先修流式旁路跨瞬时重试不复位；确定性保证的除外项已含时刻快照式共识（dispatch / landed / suspicion_agreement）
+- m21b-deep-streaming 工作树已合并可清理（私有 dogfood 记录与脚本已拷回主干工作树）
