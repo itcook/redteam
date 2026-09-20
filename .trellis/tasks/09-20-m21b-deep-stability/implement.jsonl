@@ -1,0 +1,5 @@
+{"file": ".next/plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md", "reason": "批 C3 节（第 339 行起）：本批范围与切点——方差四层归因、needs 入队承接、批序 C2 → C3 → D"}
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§6 规则 1 成项 / 规则 2「区间扩到 enclosing def、同文件重叠或相邻合并为一项」（从未实现，本批落）、规则 3 在线预算与收场 drain（C2 已落，改动不得破）、§7 疑点以「一位评审者的笔记」注入且指令是确认或驳回——笔记去 confidence 的权威依据"}
+{"file": ".trellis/tasks/archive/2026-09/09-13-m21b-deep-concurrency/design.md", "reason": "C1 定案 §2.2「共识只经谓词、id 捷径不计共识」与 §2.3 Skipped 复位——本批改写为「结构定项、谓词定共识」并取消 id 捷径，需先对照原意再改"}
+{"file": ".next/private/m21b/2026-09-20-batch-c3-baseline-pair.md", "reason": "改前基线对（逐项 25% / 按文件 57% / findings 19% / 单文件占格 6-of-13、6-of-12）与度量口径 raw/selection_overlap.py；验收三量以此为对照，findings 按 id 口径明确排除"}
+{"file": ".next/decisions/2026-09-04-redteam-review-engine-architecture-decisions.md", "reason": "D7「共识 = 去重家族数、同家族多 samples 计一次」是 peak_agreement 不得膨胀的依据；D15 是 C2 在线口径的决策记录（本批不得动）；D16 节在 C3-4 收口时新增，写前先看全篇体例"}
