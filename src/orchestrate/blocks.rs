@@ -28,6 +28,12 @@ impl Block {
     pub fn is_empty(&self) -> bool {
         self.key.is_empty()
     }
+
+    /// 键是否来自**结构**（def / 标题节）。行带退路不是结构身份：同一段落差一行就可能跨带，
+    /// 调用方据此在行带上仍走 quote 谓词，避免把 C2 认作同一条的疑点拆成两项（评审 #7）。
+    pub fn is_structural(&self) -> bool {
+        self.key.starts_with("def:") || self.key.starts_with("md:")
+    }
 }
 
 /// 文件内容 + 行号 → 稳定块。`line` 为 1-based；越界行按最后一行算。
@@ -43,31 +49,42 @@ pub fn block_of(file: &str, content: &str, line: u32) -> Block {
         let defs = crate::diffsym::compile_defs(lang);
         if let Some(di) = enclosing_decl(&lines, line0, &defs) {
             let end0 = decl_block_end(&lines, di, Some(&defs)).max(di);
-            return Block { start: di as u32 + 1, end: end0 as u32 + 1, key: format!("def:{}", key_hash(lines[di])) };
+            return Block { start: di as u32 + 1, end: end0 as u32 + 1, key: key_of("def", &lines, di) };
         }
     } else if is_markdown(file) {
         if let Some((hi, end0)) = heading_section(&lines, line0) {
-            return Block { start: hi as u32 + 1, end: end0 as u32 + 1, key: format!("md:{}", key_hash(lines[hi])) };
+            return Block { start: hi as u32 + 1, end: end0 as u32 + 1, key: key_of("md", &lines, hi) };
         }
     }
     band_block(ln, len)
 }
 
 /// 固定行带退路：带号 = ⌊(行 − 1) / BAND⌋，块 = 该带（末带按文件尾截断）。
+/// 行号来自模型输出（needs 的 `lines` 不过锚定），近 `u32::MAX` 时加法会溢出——全程饱和运算（评审 #15）。
 fn band_block(line: u32, len: u32) -> Block {
-    let band = (line.max(1) - 1) / BAND;
-    let start = band * BAND + 1;
-    let mut end = start + BAND - 1;
+    let band = line.max(1).saturating_sub(1) / BAND;
+    let start = band.saturating_mul(BAND).saturating_add(1);
+    let mut end = start.saturating_add(BAND - 1);
     if len > 0 {
         end = end.min(len).max(start.min(len));
     }
-    Block { start, end, key: format!("pad:{band}") }
+    Block { start, end: end.max(start), key: format!("pad:{band}") }
 }
 
-/// 身份键取声明行 / 标题行的**去空白**哈希：缩进调整、对齐微调都不改身份，上游插删行也不改。
-fn key_hash(line: &str) -> String {
-    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-    fnv1a64_hex(&[&compact])
+/// 身份键 = 声明行 / 标题行的**去空白**哈希 + 同文同文本的第几处。
+///
+/// 哈希保证位移与缩进不改身份；序号补掉碰撞（评审 #1）：一个文件里可以有多条逐字相同的声明
+/// （本仓 `src/cli/mod.rs:971` 与 `:3457` 都是 `fn on_cell(&self, rec: crate::state::CellRecord) {`，
+/// `impl` 不是 def 模式，两处的 enclosing def 就是这一行）。只按哈希，两个毫不相干的区域会并成一项——
+/// 正是本批要消灭的那种不稳定。序号只数「本行之前有几条同文本的行」，与行号无关，上游插删不改。
+fn key_of(prefix: &str, lines: &[&str], idx: usize) -> String {
+    let norm = compact(lines[idx]);
+    let ord = lines[..idx].iter().filter(|l| compact(l) == norm).count();
+    format!("{prefix}:{}#{ord}", fnv1a64_hex(&[&norm]))
+}
+
+fn compact(line: &str) -> String {
+    line.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 fn is_markdown(file: &str) -> bool {
@@ -190,6 +207,46 @@ mod tests {
         let c = block_of("src/a.rs", TWO_FNS, 999);
         assert_eq!((c.start, c.end), (8, 10), "越界行按最后一行算");
         assert!(!block_of("src/a.rs", TWO_FNS, 0).key.is_empty());
+    }
+
+    /// 同一文件里两条逐字相同的声明必须是两个块（评审 #1：本仓 cli/mod.rs 就有两处同签名的 `fn on_cell`）。
+    #[test]
+    fn identical_decl_lines_get_distinct_keys() {
+        let src = "impl A {\n    fn run(&self) {\n        1\n    }\n}\nimpl B {\n    fn run(&self) {\n        2\n    }\n}\n";
+        let first = block_of("src/a.rs", src, 3);
+        let second = block_of("src/a.rs", src, 8);
+        assert_ne!(first.key, second.key, "{first:?} vs {second:?}");
+        assert_eq!((first.start, first.end), (2, 4));
+        assert_eq!((second.start, second.end), (7, 9));
+        // 序号只数同文本行，位移不改身份
+        let shifted = format!("// 新行\n{src}");
+        assert_eq!(block_of("src/a.rs", &shifted, 9).key, second.key);
+    }
+
+    /// 文档里重复的同名标题同理（`## 验收` 在一份文档里出现多次）。
+    #[test]
+    fn repeated_headings_get_distinct_keys() {
+        let doc = "# 甲\n\n## 验收\n正文 1\n\n# 乙\n\n## 验收\n正文 2\n";
+        assert_ne!(block_of("d.md", doc, 4).key, block_of("d.md", doc, 9).key);
+    }
+
+    /// 行号来自模型输出，近 u32::MAX 不得 panic / 回绕（评审 #15）。
+    #[test]
+    fn huge_line_numbers_saturate() {
+        for line in [u32::MAX, u32::MAX - 2, u32::MAX / 2] {
+            let b = block_of("src/a.rs", "", line);
+            assert!(b.start <= b.end, "{b:?}");
+            let c = block_of("data/x.json", "x\ny\n", line);
+            assert!(c.start <= c.end, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn structural_keys_are_marked() {
+        assert!(block_of("src/a.rs", TWO_FNS, 4).is_structural(), "def 是结构身份");
+        assert!(block_of("d.md", "# 甲\n正文\n", 2).is_structural(), "标题节是结构身份");
+        assert!(!block_of("data/x.json", "{\n}\n", 1).is_structural(), "行带不是");
+        assert!(!Block::default().is_structural());
     }
 
     #[test]

@@ -501,7 +501,10 @@ fn is_eligible(it: &QueueItem, closed: bool, dispatched: usize, quota: usize) ->
 
 /// 占保底位的派发：非必挖的疑点（派发时共识 < 2）。保底 ⌈K/4⌉ 是给疑点的，H0 / 涟漪不占。
 fn counts_against_floor(it: &QueueItem) -> bool {
-    it.kind == ItemKind::Suspicion && it.dispatch_agreement < 2
+    // 与必挖判定同轴（评审 #4）：C3 起 `must_dig` 看项内 `peak_agreement`，而 `dispatch_agreement` 是区域级——
+    // 结构化合并后「一块被两家族碰过但没有一条疑点对上」（agreement 2 / peak 1）是常态，
+    // 按区域轴数会把这种非必挖项当成必挖、保底永远不消耗，收场再整份预留一次 ⌈K/4⌉，实际派发超出 maxCells。
+    it.kind == ItemKind::Suspicion && !must_dig(it)
 }
 
 /// 主循环同步段计时（design C2 §9〔D15〕，评审 #11 补齐覆盖）：取跟踪文件集、开跑入队、填门（pack + prompt + 快照）、
@@ -2726,6 +2729,20 @@ mod tests {
         assert_eq!((it.agreement, it.peak_agreement), (2, 1), "区域级 2 / 必挖轴 1");
     }
 
+    /// 保底位的消耗与必挖判定同轴（评审 #4）：结构化合并后「一块被两家族碰过、但没有一条疑点对上」
+    /// （agreement 2 / peak 1）是常态；按区域轴数会把这种非必挖项当必挖、保底永不消耗，
+    /// 收场再整份预留一次 ⌈K/4⌉ → 实际派发超出 maxCells。
+    #[test]
+    fn floor_counting_uses_the_must_dig_axis() {
+        let mut it = item_of("a", ItemKind::Suspicion, ItemState::Settled, 2);
+        (it.agreement, it.peak_agreement) = (2, 1);
+        assert!(counts_against_floor(&it), "非必挖疑点占着保底位");
+        it.peak_agreement = 2;
+        assert!(!counts_against_floor(&it), "必挖项不占保底位");
+        let h0 = item_of("b", ItemKind::Ripple, ItemState::Settled, 1);
+        assert!(!counts_against_floor(&h0), "保底只留给 scanner 疑点");
+    }
+
     /// scanner needs 只接变更集内的（C3〔D16〕Q8）：`a.rs` 在变更集里 → 入队成 `Needs` 项（无笔记、排在疑点之后）；
     /// `verify.rs` 不在 → 只计 `needs_out_of_diff`，不入队（`pick_bundle` 对不在任何 bundle 的文件会静默退回 bundles[0]，
     /// 产出「文件名是 A、证据是 B」的错配包）。
@@ -2755,13 +2772,13 @@ mod tests {
 
         let run = run_with(Run { scan_cells: &cells, budget: 4, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
 
+        // `a.rs` 的 needs 与该文件的疑点落在同一个 def 块 → 并成一项（评审 #6），到达键两条都记着；
+        // `verify.rs` 不在变更集 → 只计数、不入队。
         let kinds: Vec<(&str, ItemKind)> = run.items.iter().map(|it| (it.spec.file.as_str(), it.kind)).collect();
-        assert_eq!(kinds, [("a.rs", ItemKind::Suspicion), ("a.rs", ItemKind::Needs)], "{:?}", run.items);
-        assert_eq!(run.meta.enqueue_reasons.get("needs"), Some(&1), "入队理由分开记");
+        assert_eq!(kinds, [("a.rs", ItemKind::Suspicion)], "{:?}", run.items);
+        assert_eq!(run.items[0].arrivals.iter().filter(|k| k.starts_with("needs:a.rs:")).count(), 1, "{:?}", run.items[0].arrivals);
         assert_eq!(run.meta.enqueue_reasons.get("needs_out_of_diff"), Some(&1));
         assert_eq!(run.meta.suspicions_arrived, 1, "needs 不计进疑点到达数");
-        let needs_item = run.items.iter().find(|it| it.kind == ItemKind::Needs).unwrap();
-        assert!(needs_item.spec.notes.is_empty(), "needs 项无笔记——走与 H0 同款的区域独立审");
     }
 
     /// 选项观测五量与手算一致（design C3 §7〔D16〕）：三文件四疑点（a.rs 的两条同块并一项）→ 到达 4、疑点项 3、候选文件 3；

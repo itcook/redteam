@@ -2787,7 +2787,10 @@ mod resume_tests {
         store.append_partial("j", &scan_rec("scan[g1]@p/m#1", "x.rs", 2, "x_marker();")).unwrap();
         store.append_partial("j", &CellRecord::failed("scan[g2]@p/m#1", "p/m", Role::Scanner, "boom")).unwrap();
         let mut x = snap_susp("x.rs", 2, "x_marker();", "scan[g1]@p/m#1", ItemState::Settled);
-        (x.agreement, x.dispatch_agreement) = (2, 2);
+        // 往轮那条是「两家族对上同一处」的必挖项：C3〔D16〕起必挖看项内轴，夹具得在项内轴上表达
+        // （只抬区域级 agreement 会让它算成非必挖，往轮就白占了保底位、本轮保底归零）。
+        (x.agreement, x.dispatch_agreement, x.peak_agreement) = (2, 2, 2);
+        x.member_families = vec![vec!["m".into(), "n".into()]];
         store.append_partial("j", &review_rec(&x.id, vec![])).unwrap();
         store.put_queue_item("j", &x).unwrap();
         for k in ["k1.rs", "k2.rs", "k3.rs"] {
