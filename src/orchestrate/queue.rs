@@ -429,6 +429,11 @@ impl DeepQueue {
     }
 
     /// Pending 项按优先级弹出顺序（不改状态）。必挖集排在最前且不被后续 budget 截掉。
+    ///
+    /// C3〔D16〕**每文件保底一格**：尚无格的文件，其最高项提到队首（层内仍按 [`cmp_priority`]）。
+    /// 实测单文件能吃掉 13 格里的 6 格（该文件 34 条疑点占候选集 87%），一份文档就把预算摊完。
+    /// 保底随派发自然失效——该文件有格之后，它的其余项回到常规序。
+    /// 派发（`pop_dispatch_where`）与收场 drain 都读这一个序，两者不得分叉：否则收场留下的与实际挖的对不上。
     pub fn pending_order(&self) -> Vec<usize> {
         let mut idx: Vec<usize> = self
             .items
@@ -438,7 +443,24 @@ impl DeepQueue {
             .map(|(i, _)| i)
             .collect();
         idx.sort_by(|&a, &b| cmp_priority(&self.items[a], &self.items[b]));
-        idx
+        let dispatched: std::collections::HashSet<&str> = self
+            .items
+            .iter()
+            .filter(|it| matches!(it.state, ItemState::InFlight | ItemState::Settled))
+            .map(|it| it.spec.file.as_str())
+            .collect();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let first_slot: Vec<bool> = idx
+            .iter()
+            .map(|&i| {
+                let f = self.items[i].spec.file.as_str();
+                !dispatched.contains(f) && seen.insert(f)
+            })
+            .collect();
+        // 稳定分区：保底项按原序提前，其余保持原序。
+        let mut out: Vec<usize> = idx.iter().zip(&first_slot).filter(|(_, &f)| f).map(|(&i, _)| i).collect();
+        out.extend(idx.iter().zip(&first_slot).filter(|(_, &f)| !f).map(|(&i, _)| i));
+        out
     }
 
     /// 主区 ∪ {agreement ≥ 2}。`max_cells = 0` 时主区仍算必挖。
@@ -561,31 +583,42 @@ fn consensus_axis(it: &QueueItem) -> u32 {
     }
 }
 
-fn category_weight(notes: &[Suspicion]) -> f32 {
-    notes
-        .iter()
-        .filter_map(|n| n.category)
-        .map(|c| CATEGORY_WEIGHT[c as usize])
-        .fold(1.0_f32, f32::max)
-}
-
-fn priority_score(it: &QueueItem) -> f32 {
+/// 项的自评置信：疑点取成员里的最高，H0 / needs 用自身分。
+/// **只做末位裂解**——跨轮不可比（两轮分布整体平移，中位 0.35 vs 0.45），E3 也实证 flash 级自评与命中无关。
+fn confidence_of(it: &QueueItem) -> f32 {
     match it.kind {
         ItemKind::Primary | ItemKind::Ripple => it.score,
-        ItemKind::Suspicion => {
-            let notes = it.suspicions();
-            let conf = notes.iter().map(|n| n.confidence).fold(0.0_f32, f32::max);
-            conf * it.agreement as f32 * category_weight(notes)
-        }
+        ItemKind::Suspicion => it.suspicions().iter().map(|n| n.confidence).fold(0.0_f32, f32::max),
         ItemKind::Needs => NEEDS_MID_SCORE,
     }
 }
 
-/// 优先级全序：种类 → 分数（高在前）→ id。收场按最终项优先级组装报告（C2 Q8）共用。
+/// 文档 = `.next/` / `.doc/` 下的随行文档或 md / txt 类后缀；其余当代码。同分时代码先挖。
+fn is_doc(file: &str) -> bool {
+    if file.starts_with(".next/") || file.starts_with(".doc/") {
+        return true;
+    }
+    let ext = file.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    matches!(ext.as_str(), "md" | "markdown" | "txt" | "rst")
+}
+
+/// 优先级全序（C3〔D16〕分层键，design C3 §4）：种类 → 必挖轴 → 风险档 → 烟量 → 代码优先 → 自评置信 → id。
+///
+/// 取代 C1 的乘积式 `conf × agreement × 类别权重`：类别权重恒 1.0（L0 占比两轮 59% vs 21%，标注自身在漂、不启用）、
+/// agreement 只取 1 / 2，乘积实际退化成「按 confidence 排」，而经预算截断后 confidence 就成了门。
+/// 分层后每一维含义独立可查，同分才落到下一层。
+///
+/// 「每文件保底一格」不在这里——它依赖队列全局状态（该文件是否已有格），由 [`DeepQueue::pending_order`] 在本序之上分层。
+/// 收场组装报告（C2 Q8）用的也是本序：那时所有项都已派发，保底层对谁都不成立。
 pub(crate) fn cmp_priority(a: &QueueItem, b: &QueueItem) -> std::cmp::Ordering {
+    let ord = |x: bool| if x { 0 } else { 1 };
     a.kind
         .cmp(&b.kind)
-        .then_with(|| priority_score(b).partial_cmp(&priority_score(a)).unwrap_or(std::cmp::Ordering::Equal))
+        .then_with(|| consensus_axis(b).cmp(&consensus_axis(a)))
+        .then_with(|| b.risk_band.cmp(&a.risk_band))
+        .then_with(|| b.suspicions().len().cmp(&a.suspicions().len()))
+        .then_with(|| ord(!is_doc(&a.spec.file)).cmp(&ord(!is_doc(&b.spec.file))))
+        .then_with(|| confidence_of(b).partial_cmp(&confidence_of(a)).unwrap_or(std::cmp::Ordering::Equal))
         .then_with(|| a.id.cmp(&b.id))
 }
 
@@ -1051,7 +1084,7 @@ mod tests {
         assert!(must_dig(it), "共识 ≥ 2 → 必挖");
         let best = it.spec.notes.iter().map(|n| n.confidence).fold(0.0_f32, f32::max);
         assert_eq!((best, it.spec.notes.len()), (0.9, 1), "代表取最高置信：s1 顶掉 s3，与 s1 相似的 s2 不重复列");
-        assert!((priority_score(it) - 0.9 * 3.0 * category_weight(it.suspicions())).abs() < 1e-6, "优先级用最高置信");
+        assert!((confidence_of(it) - 0.9).abs() < 1e-6, "末位裂解用成员里的最高置信（C3〔D16〕分层键）");
 
         // 桥接疑点置信更低时代表笔记留不住它（相似的只留高置信那条），匹配面只能靠成员列表
         let low_bridge = QueueItemSpec::new(
@@ -1313,6 +1346,102 @@ mod tests {
 
         assert_eq!(o, EnqueueOutcome::MergedPending);
         assert_eq!(q.items().len(), 1);
+    }
+
+    // ---- C3〔D16〕分层排序键与每文件保底一格 ----
+
+    /// 造一个 Pending 疑点项，逐维可调：文件 / 必挖轴 / 风险档 / 烟量（成员条数）/ 置信。
+    fn item_at(file: &str, line: u32, peak: u32, band: u8, smoke: usize, conf: f32) -> QueueItem {
+        let notes: Vec<Suspicion> = (0..smoke.max(1))
+            .map(|k| Suspicion { confidence: conf, ..sus(file, line + k as u32, line + k as u32, "q", "h") })
+            .collect();
+        let spec = QueueItemSpec::new(file.into(), vec![(line, line)], QueueOrigin::Scan, notes).unwrap();
+        let req = EnqueueReq { spec, score: conf, kind: ItemKind::Suspicion, families: vec!["alpha".into()], arrival: None };
+        let mut it = QueueItem::new(req, blk(&format!("def:{file}:{line}"), line, line), band);
+        it.peak_agreement = peak;
+        it
+    }
+
+    fn order_of(items: Vec<QueueItem>) -> Vec<String> {
+        let q = DeepQueue { items };
+        q.pending_order().into_iter().map(|i| q.items()[i].id.clone()).collect()
+    }
+
+    /// 分层键逐维单变量：高层相同才落到下一层；置信只在前面全平时裂解。
+    #[test]
+    fn layered_key_compares_one_dimension_at_a_time() {
+        // 逐项一个文件：保底层对谁都成立、互相抵消，比的就是分层键本身。
+        let hi_peak = item_at("a1.rs", 10, 2, 0, 1, 0.1);
+        let hi_band = item_at("a2.rs", 20, 1, 3, 1, 0.1);
+        let hi_smoke = item_at("a3.rs", 30, 1, 0, 4, 0.1);
+        let hi_conf = item_at("a4.rs", 40, 1, 0, 1, 0.9);
+        let doc = item_at("notes.md", 50, 1, 0, 1, 0.9);
+        let ids: Vec<String> = [&hi_peak, &hi_band, &hi_smoke, &hi_conf, &doc].iter().map(|it| it.id.clone()).collect();
+
+        let got = order_of(vec![doc.clone(), hi_conf.clone(), hi_smoke.clone(), hi_band.clone(), hi_peak.clone()]);
+
+        assert_eq!(got[0], ids[0], "必挖轴最高的先挖");
+        assert_eq!(got[1], ids[1], "其次风险档");
+        assert_eq!(got[2], ids[2], "再次烟量");
+        assert_eq!(got[3], ids[3], "代码优先于文档（置信相同）");
+        assert_eq!(got[4], ids[4], "文档垫底");
+    }
+
+    /// 置信只做末位裂解：前面各维全平时才看它。
+    #[test]
+    fn confidence_only_breaks_ties() {
+        let low = item_at("a.rs", 10, 1, 1, 1, 0.2);
+        let high = item_at("a.rs", 20, 1, 1, 1, 0.8);
+        let (lo, hi) = (low.id.clone(), high.id.clone());
+        assert_eq!(order_of(vec![low.clone(), high.clone()]), vec![hi.clone(), lo.clone()]);
+
+        // 但前一维（风险档）一分高下，置信就不参与了
+        let low_band_high_conf = QueueItem { risk_band: 0, ..high };
+        let high_band_low_conf = QueueItem { risk_band: 2, ..low };
+        assert_eq!(order_of(vec![low_band_high_conf, high_band_low_conf]), vec![lo, hi]);
+    }
+
+    /// 每文件保底一格：A 文件五个高分项、B 文件一个低分项 → 派发序 A₁ → B₁ → A₂。
+    #[test]
+    fn each_file_gets_a_first_slot() {
+        let mut items: Vec<QueueItem> = (0..5).map(|k| item_at("a.rs", 10 + k * 10, 2, 3, 3, 0.9)).collect();
+        items.push(item_at("b.rs", 10, 1, 0, 1, 0.1));
+        let b_id = items[5].id.clone();
+
+        let got = order_of(items);
+
+        assert_eq!(got[1], b_id, "B 的唯一项插在 A 的第二项之前: {got:?}");
+        assert!(got[0].starts_with("a.rs") && got[2].starts_with("a.rs"));
+    }
+
+    /// 保底随派发自然失效：A 已有一格在途 → A 的其余项回到常规序，不再抢 B 的保底位。
+    #[test]
+    fn first_slot_expires_once_the_file_has_a_cell() {
+        let mut items: Vec<QueueItem> = (0..3).map(|k| item_at("a.rs", 10 + k * 10, 2, 3, 3, 0.9)).collect();
+        items[0].state = ItemState::InFlight;
+        items.push(item_at("b.rs", 10, 1, 0, 1, 0.1));
+        let b_id = items[3].id.clone();
+
+        let got = order_of(items);
+
+        assert_eq!(got[0], b_id, "B 仍有保底位，排在 A 的剩余项之前: {got:?}");
+        assert!(got[1].starts_with("a.rs") && got[2].starts_with("a.rs"));
+    }
+
+    /// 收场 drain 与派发共用一个序：保底项不会「被留下却轮不到派」或反过来。
+    #[test]
+    fn drain_and_dispatch_share_one_order() {
+        let mut items: Vec<QueueItem> = (0..4).map(|k| item_at("a.rs", 10 + k * 10, 1, 3, 3, 0.9)).collect();
+        items.push(item_at("b.rs", 10, 1, 0, 1, 0.1));
+        let mut q = DeepQueue { items };
+        let kept: Vec<String> = q.pending_order().into_iter().take(2).map(|i| q.items()[i].id.clone()).collect();
+
+        q.drain_with(2, 0);
+
+        let alive: Vec<String> = q.items().iter().filter(|it| it.state == ItemState::Pending).map(|it| it.id.clone()).collect();
+        assert_eq!(alive, kept, "留下的正是序里前两名");
+        let first = q.pop_dispatch().unwrap();
+        assert_eq!(first.id, kept[0], "派发也从序首取");
     }
 
     /// 风险档取并入过本项的最高档（同块的到达档位相同；旧快照项被升级时才会变）。

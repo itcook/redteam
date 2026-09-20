@@ -306,12 +306,13 @@ fn render_notes(notes: &[Suspicion]) -> String {
     let mut out = String::from("## 评审者笔记\n");
     for s in notes {
         let oneline = |t: &str| crate::prompt::oneline(&neutralize_structure(t, NOTES_NEUTRALIZE_TAGS));
+        // 不带自评置信（C3〔D16〕Q7）：design §7 的口径是「一位评审者的笔记」+「确认、驳回或补充」，
+        // 括注理由即防锚定——笔记里摆一个 0.82 与此冲突；E3 也实证 flash 级自评与命中无关。
         let line = format!(
-            "- {}:{}-{} (confidence {:.2}): {} — quote: {}",
+            "- {}:{}-{}: {} — quote: {}",
             oneline(&s.file),
             s.line_start,
             s.line_end,
-            s.confidence,
             oneline(&s.hint),
             oneline(&s.quote)
         );
@@ -510,6 +511,8 @@ mod tests {
         assert!(pack.notes.contains("评审者笔记"), "scan 来源渲染笔记段");
         assert!(!pack.notes.contains("</reviewer_notes>"), "笔记的伪造闭合标签被中和");
         assert!(pack.notes.contains("quote:"), "笔记带 quote 锚");
+        // C3〔D16〕Q7：笔记不摆自评置信——design §7 的注入口径是「一位评审者的笔记」，摆个数字就是锚定。
+        assert!(!pack.notes.contains("confidence"), "笔记不含置信数字: {}", pack.notes);
 
         let h0 = QueueItemSpec::new("a.rs".into(), vec![(5, 8)], Origin::Rule, vec![]).unwrap();
         let pack0 = build(&h0, &bundle, &root, &crate::cli::second_pass::TrackedFiles::load(&root), &CrossIndex::default(), 64 * 1024, &PackOpts::default(), "").unwrap();
