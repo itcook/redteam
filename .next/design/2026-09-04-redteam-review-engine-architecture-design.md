@@ -1,4 +1,4 @@
-# redteam 评审引擎·风险路由 DAG 架构（M21 · v11）
+# redteam 评审引擎·风险路由 DAG 架构（M21 · v12）
 
 > 状态: **锁定**（**键名勘误 2026-09-10**：正文 TOML / snake_case 配置残留统一为 §12.1 JSON camelCase，无语义变化，不升版；
 > v8，2026-09-07，P0 验证门出口〔D11〕：E1 风险规则 v4 成立、E3 疑点契约成立；§3.3 / §4 / §6 / §12.1 / §16 / §17 按 D11 改；
@@ -7,7 +7,10 @@
 > scanner 逐 cell 交付、reviewer 逐 finding 落盘定性为持久化旁路；§0 / §2 / §4 / §5 / §6 / §7 / §8.1 / §12 / §13 / §14 / §15 / §17 对应改；
 > **v11 2026-09-15〔D15〕scanner 与深挖时间重叠语义**：在线预算（scanner 未全返回时非必挖项派发数受 maxCells − 保底约束、关闭入口时对剩余预算 drain 一次、
 > Skipped 只在此刻判定）、逐 cell 到达的队列侧合并残差入观测、scanner 失败深挖照跑仍硬 Incomplete、门 FIFO 让位与放门唤醒、resume 离线续跑；
-> §6 规则 2 / 3 / 6、§8.4、§12.3、§17 R14 对应改）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；
+> §6 规则 2 / 3 / 6、§8.4、§12.3、§17 R14 对应改；
+> **v12 2026-09-20〔D16〕深挖选项稳定性**：结构定项（项身份 = 同文件 ∧ 同稳定块：代码取 enclosing def、文档取标题节、其余退行带）、
+> 共识两轴（项内 `peak_agreement` 定必挖、区域级 `agreement` 进排序）、分层排序键接风险档与每文件保底一格、reviewer 笔记去自评置信、
+> scanner needs 接线（仅变更集内）；§6 规则 1 / 2 / 3 与可观测面、§7 对应改）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；
 > M21b `../plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md`（2026-09-10）；M21c-e 待产出。
 > v5（2026-09-05 grill〔D7〕：角色命名 scanner / reviewer / verifier；配置节 §12 重写为用户级唯一 TOML；
 > 无候补；verifier 流式化 + 数据判决；provider 在途上限；aacr-bench 退役至 M21c / M21e 重启）。
@@ -175,14 +178,15 @@ scanned_areas: [{ file, ranges }]                                               
 
 ## 6. 深挖队列（优先级 · 合并 · 预算 · 台账 · 终止）〔D2, D6, D7〕
 
-**队列项** `{file, ranges[], score, origin: rule | scan | needs, notes: suspicion[]}`。
-**生产者三种，同一类型**：规则命中（H0，t=0 入队）· scanner 疑点 · scanner needs。
+**队列项** `{file, ranges[], block, score, origin: rule | scan | needs, notes: suspicion[]}`。
+**生产者三种，同一类型**：规则命中（H0，t=0 入队）· scanner 疑点 · scanner needs（C3 起接线，**只接变更集内**的 `kind = evidence`；
+diff 外只计 `needs_out_of_diff`——`pick_bundle` 对不在任何 bundle 的文件会静默退回 `bundles[0]`，装包归属另议〔D16〕）。
 
 | # | 规则 | 内容 |
 |---|---|---|
-| 1 | 优先级 | 主区 H0 最高，涟漪区次之〔D11〕。疑点项 = `confidence × agreement × 类别权重`；needs 项取触发疑点分或默认中档。**非 FIFO；不用置信阈值切**。 |
-| 2 | 入队合并 | 区间扩到 enclosing def；同文件重叠/相邻区间合并为一项；跨模型同疑点以 quote 轻锚 + hint 归一合并（谓词复用 M21a `merge_suspicions`：同文件 ∧ 行重叠 ∧ quote 相等或不琐碎重叠）。**入口五态**〔D13〕：无命中 → 新项 agreement = 1；命中排队中项 → 并入（异族 agreement + 1、notes 追加、区间取并、重算 score，≥ 2 即标必挖）；命中在途项 → 只改记录（agreement + 1、hint 附记录），运行中的请求不注入、不重挖；命中本轮已结案 → 同上并沿用结案；命中跨轮判例 → §4 守卫（过 → 沿用结案不入队；不过 → 按无命中入队、带判例笔记）。同家族重复只合并不加 agreement。入口是编排器确定性代码，零 token；派发前再核一次在途 / 已结案。逐 cell 到达时队列侧逐条比对已有项笔记——不是组内传递闭包，漏合并只会少算共识、多复核；收场以报告侧闭包对账，拆簇数入 RunMeta〔D15〕。 |
-| 3 | 预算 | `review.reviewers.maxCells = "auto"`（按 R 三档：low 4 / mid 12 / high 32，硬帽 48，起步值）或整数固定〔D11〕。**必挖集** = 主区 H0 ∪ {agreement ≥ 2 的疑点} 不受截断（confidence 只进优先级不做门；保护的是仍在排队的项，已派发项已在挖〔D13〕）；**保底**：每轮为 scanner 疑点保留 ⌈maxCells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并在 RunMeta 披露；涟漪区与其余疑点按优先级吃剩余预算。到期 **graceful drain**：在途跑完，未开跑者落台账。**在线口径**〔D15〕：scanner 未全部返回时，非必挖项仅在「本轮已派发 < maxCells − 保底」时可派，必挖项不受限；关闭入口即「到期」——对剩余预算（maxCells − 已派发）按上述规则 drain 一次（保底扣除扫描期已派发的非必挖疑点），Skipped 只在此刻判定；resume 补跑过 scanner 则复位 Skipped 重选（§17 R14）。 |
+| 1 | 优先级 | **分层键**〔D16〕，自高而低：每文件保底一格 → 种类（主区 H0 > 涟漪 > 疑点 > needs〔D11〕）→ 必挖轴 `peak_agreement` → 所在风险区档（按 θ 粗分四档）→ 项内疑点条数 → 代码优先于文档 → 自评 confidence（**只做末位裂解**）→ id。**非 FIFO；不用置信阈值切**；类别权重保留 1.0 不启用（标注自身在漂：两轮 L0 占比 59% vs 21%）。原乘积式 `confidence × agreement × 类别权重` 因权重恒 1、agreement 只取 1/2，实际退化成「按 confidence 排」，而置信跨轮不可比（两轮中位 0.35 vs 0.45）、经预算截断后等于把它当门用。 |
+| 2 | 入队合并 | **结构定项、谓词定共识**〔D16〕：项身份 = 同文件 ∧ 同**稳定块**——代码取 enclosing def（与 §3.3 H0 成区同一零件）、markdown 取标题节、其余退固定行带；块键取声明 / 标题行的去空白哈希，上游插删行与缩进调整都不改身份，项区间随之取块范围。`same_suspicion`（同文件 ∧ 行重叠 ∧ quote 相等或不琐碎重叠，谓词仍复用 M21a `merge_suspicions`）降为**项内聚簇**依据，产出两轴：`peak_agreement` = 最大簇的家族数（定必挖）、`agreement` = 块被几个家族碰过（进排序）。无块信息（旧快照 / 内容不可读）退回 C1/C2 的 quote 谓词，行为逐字不变。**入口五态**〔D13〕：无命中 → 新项 agreement = 1；命中排队中项 → 并入（异族 agreement + 1、notes 追加、区间取并、重算 score，≥ 2 即标必挖）；命中在途项 → 只改记录（agreement + 1、hint 附记录），运行中的请求不注入、不重挖；命中本轮已结案 → 同上并沿用结案；命中跨轮判例 → §4 守卫（过 → 沿用结案不入队；不过 → 按无命中入队、带判例笔记）。同家族重复只合并不加 agreement。入口是编排器确定性代码，零 token；派发前再核一次在途 / 已结案。逐 cell 到达时队列侧逐条比对已有项笔记——不是组内传递闭包，漏合并只会少算共识、多复核；收场以报告侧闭包对账，拆簇数入 RunMeta〔D15〕。 |
+| 3 | 预算 | `review.reviewers.maxCells = "auto"`（按 R 三档：low 4 / mid 12 / high 32，硬帽 48，起步值）或整数固定〔D11〕。**必挖集** = 主区 H0 ∪ {`peak_agreement` ≥ 2 的疑点}〔D16〕不受截断（按区域级 agreement 判会把必挖集从每轮 4 条撑到 7–9 块、PR181 规模 18/23，`maxCells` 形同虚设）（confidence 只进优先级不做门；保护的是仍在排队的项，已派发项已在挖〔D13〕）；**保底**：每轮为 scanner 疑点保留 ⌈maxCells/4⌉ 格，主区吃穿时帽 = 主区 + 保底并在 RunMeta 披露；涟漪区与其余疑点按优先级吃剩余预算。到期 **graceful drain**：在途跑完，未开跑者落台账。**在线口径**〔D15〕：scanner 未全部返回时，非必挖项仅在「本轮已派发 < maxCells − 保底」时可派，必挖项不受限；关闭入口即「到期」——对剩余预算（maxCells − 已派发）按上述规则 drain 一次（保底扣除扫描期已派发的非必挖疑点），Skipped 只在此刻判定；resume 补跑过 scanner 则复位 Skipped 重选（§17 R14）。 |
 | 4 | 预算外去向 | **疑点台账**（§8.3）休眠；报告披露为低置信线索；**不进 verdict**。截断不静默。 |
 | 5 | 分派 | 活跃 reviewer 条目构成**分派池**：每项只由一个模型消费，按空闲轮转；多条目买吞吐与分散限流，不双审。派发由 provider 门驱动：某 reviewer 条目所在 provider 有空位时才弹出最高优先项交它，无角色级池大小〔D13〕。scan 来源项**不等**同组其他家族 cell 返回（先到先挖，后到并入记录；是否加同组 hold 由派发时 / 落地时 agreement 数据在 M21e 定〔D13〕）。 |
 | 6 | 终止 | 全部 scanner cell 返回（成功或失败）→ 关闭入口（收场 drain〔D15〕）→ 队列排空 → 在途归零 → 复核在途归零 → reduce barrier。 |
@@ -190,7 +194,8 @@ scanned_areas: [{ file, ranges }]                                               
 | 8 | 终端 | reviewer cell 不再生产。`reenqueue = false` 默认。 |
 
 可观测面（cell/phase 已有框架）：队列深度、入队原因分布、去重命中数、预算截断数、台账落入数、项等待时长、派发时 / 落地时 agreement〔D13〕；
-收场时刻、首次派发时刻、深挖排空时刻、复核尾部、扫描期派发数、收场剩余预算、拆簇数、填门循环阻塞时长〔D15〕。
+收场时刻、首次派发时刻、深挖排空时刻、复核尾部、扫描期派发数、收场剩余预算、拆簇数、填门循环阻塞时长〔D15〕；
+疑点到达数、疑点项数（两者之比 = 结构化合并的压缩比）、候选 / 选中文件数、单文件最大占格〔D16〕。
 实现落点：tokio mpsc + 单派发器（按各 reviewer provider 门空位弹出最高优先项，不设 worker 数〔D13〕），scanner cell 为 sender、reviewer cell 为 receiver，复用现有 cell 抽象；reviewer
 cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 
@@ -201,7 +206,8 @@ cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 - **H0 项（origin = rule）**：无笔记，**独立**审。覆盖它的 scanner 组尚未完成；同一区域两模型独立看，reduce 里
   agreement 计数即多样性轴。
 - **疑点项（origin = scan | needs）**：带疑点作「一位评审者的笔记」注入，指令「确认、驳回或补充」，**不是**「验证以下」
-  （防锚定）。在途期间后到的同疑点只并入记录（§6 入口第三态），不注入运行中的请求；落地的 finding 继承记录当时的 agreement〔D13〕。
+  （防锚定）。笔记形如 `file:lines — hint — quote`，**不带自评置信**〔D16〕：括注理由即为防锚定，摆一个 0.82 与此自相矛盾；
+  E3 也实证 flash 级自评与命中无关。needs 项无笔记，走与 H0 同款的区域独立审。在途期间后到的同疑点只并入记录（§6 入口第三态），不注入运行中的请求；落地的 finding 继承记录当时的 agreement〔D13〕。
 - **输入 pack**：热区切片（§10.2）+ 爆炸半径邻居（caller body、callee 签名）+ 跨组索引（§10.6）+ 三方契约（§9.4 B 层，
   `kind = api` 时含函数体）+ spec 段（`--spec` 已有）。确定性代码预装配，**不拿工具自主探查**。
   区域 pack **由构造即切片**，不受 `review.pack.body` 控制（该轴只管 scanner 的组 pack）。
