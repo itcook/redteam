@@ -1,3 +1,4 @@
+pub mod blocks;
 pub mod deep;
 pub mod queue;
 pub mod review_shot;
