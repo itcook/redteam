@@ -249,7 +249,7 @@ impl EnqueueReq {
     }
 
     /// scanner needs 入队请求（C3〔D16〕Q8，design §6 的第三种生产者）：`kind = evidence` 的一条声明成一项——
-    /// 区间取 `lines`（缺失 / 不可解析 → 整文件退块）、无笔记（走与 H0 同款的「区域独立审」）、
+    /// 区间取 `lines`（缺失 / 不可解析 → 文件起头，由块计算兜住，见 [`parse_need_lines`]）、无笔记（走与 H0 同款的「区域独立审」）、
     /// 到达键 `needs:{path}:{lines}:{理由指纹}`（同一条声明重复到达即幂等）。
     /// 家族留空：needs 不是「谁看见了什么」，不参与共识。变更集过滤在调用方（队列不知道 diff）。
     pub fn need(n: &crate::domain::NeedEntry) -> Option<EnqueueReq> {

@@ -338,18 +338,38 @@ C1 已留好 `DeepInput.incoming` 入队通道与「通道关闭」barrier，本
 
 ## 批 C3 · 深挖选项稳定性（`feat/m21b-deep-stability`，Trellis `m21b-deep-stability`；前提 C2 已合回）
 
-C1 dogfood 同 diff 两轮 findings 2 vs 8，归因是四层叠加（followup「深挖选项方差过大」）：① scanner 候选集跨轮只重合 39%；
-② confidence 排序 + 预算截断把漂移变成门（且写进 reviewer 笔记）；③ 相邻疑点各占一格、无文件多样性、同分 tie-break 恒偏 `.next/`；
-④ 有效产出格太少（grok 已撤、锚定丢弃已可观测）。C2 现配置基线仍是 12 格里 4 格文档行、与 C1 两轮选中项各重合 4/12。
-C2 拷问〔D15 Q3 / Q4〕定：选项规则改动整体从 C2 剥出另立本批，保证 C2 dogfood 可按墙钟归因；scanner needs 入队（design §6 第三种生产者、
-批 C plan C-3 原文有而未接）一并归此。
-**开工前须 grill**：
-- 替代排序信号（agreement、与 H0 热区关系、文件风险分、代码优先）——改 design §6 规则 1；
-- 规则 2「区间扩到 enclosing def、同文件相邻区间合并」落地：合并后共识口径（比照 id 捷径不计？）、def 扩展与 pack 预算、id 形态、与 M1 逐 cell 到达的交互；
-- 文件多样性（per-file 帽 / 按文件轮转）与同分 tie-break；reviewer 笔记是否去掉 confidence（铁律 8 回归）；scanner samples ≥ 2 的成本；
-- scanner needs 项语义（无触发疑点链接、path 可在 diff 外、装包归属）；若多为 `NeedKind::Api` 再议拆给 M21d。
-**验收口径**：同 diff 至少两跑，量「选中区域重合度」与「findings 重合度」（不只看单轮 findings 数）；对照 C1 ① / ② 与 C2 dogfood
-（`.next/private/m21b/raw/` 汇总与重放脚本复用）。任务清单拷问后派生。
+同一份 diff 两跑，深挖挖的应当基本是同一批区域；改前实测不是——选中项逐项重合度 **25%**、findings（`file:line`）19%，
+而单文件能独占近半预算（6/13、6/12）。C2 把墙钟砍掉一半（20.6 → 10.7 min）之后，方差成了下一个拦路的东西。
+归因四层（followup「深挖选项方差过大」）：① 候选集跨轮只重合 32%；② confidence 排序经预算截断变成门（且写进 reviewer 笔记）；
+③ 相邻疑点各占一格、无文件多样性；④ 有效产出格少。本批只治**分配**层（②③），候选集源头手段另议。
+**定案**：2026-09-20 `/grilling` Q1–Q12〔D16〕，design v12（§6 规则 1 / 2 / 3 与可观测面、§7 改写）；
+技术设计与小步清单见 Trellis 任务 `design.md` / `implement.md`。
+**主要改动**：项身份从「报告行」改为**稳定块**（代码取 enclosing def、文档取标题节、其余退固定行带，键取声明 / 标题行哈希）；
+共识拆两轴（项内 `peak_agreement` 定必挖、区域级 `agreement` 进排序）；排序改分层键并接阶段 0 已算好的风险分；
+每个候选文件保底一格；reviewer 笔记去掉自评置信；scanner needs 首次接线（仅变更集内）；选项观测五量。
+
+### Task C3-1 稳定块与结构化合并（两轴共识）
+- `risk/regions.rs` 的 `enclosing_decl` / `decl_block_end` 提 `pub(crate)`（**逻辑不动**，`eval/risk_replay.py` 对拍为哨）；
+  新 `orchestrate/blocks.rs`：`block_of(file, content, line) -> Block { start, end, key }`；
+  `queue.rs` 的 `same_item` 改「同文件 ∧ 同块键」、项区间与 id 取块、取消 id 捷径（无块信息的旧路径保留）、项内聚簇算两轴。
+- Commit: `feat(queue,orchestrate): 稳定块与结构化合并——项身份锚到 enclosing def / 文档标题节，共识拆必挖轴与排序轴（design C3 §2 / §3〔D16〕）`
+
+### Task C3-2 分层排序键与文件多样性
+- `cmp_priority` 改分层（种类 → `peak_agreement` → 风险档 → 烟量 → 代码优先 → confidence 末位 → id），删乘积式 `priority_score`；
+  `pending_order` 之上加「每文件保底一格」，drain / 派发 / 收场组装共用同一序；`render_notes` 去 `(confidence x.xx)`。
+- Commit: `feat(queue,pack): 分层排序键接风险分、每文件保底一格、笔记去 confidence——选项不再由自评置信主导（design C3 §4 / §6〔D16〕）`
+
+### Task C3-3 scanner needs 入队与观测
+- `EnqueueReq::need`（`kind = evidence`、到达键 `needs:{path}:{lines}:{理由指纹}`、无笔记无家族），扇出与 resume 回放同形；
+  变更集过滤在深挖侧，diff 外只计 `enqueue_reasons.needs_out_of_diff`；`DeepMeta` 增选项五量。
+- Commit: `feat(orchestrate,deep): scanner needs 首次入队（仅变更集内）与选项观测五量——design §6 第三种生产者接线（D16 Q8 / Q11）`
+
+### Task C3-4 收口
+- 四绿 + clippy 基线 + `make verify` + H0 对拍；`make build` → 同 diff 两跑（门 6、samples 1、`674583e...f1d3ca3`）；
+  判定三量：逐项重合度 ≥ 40%（改前 25%）· 单文件最大占格 ≤ 总格数 1/3（改前 6/13、6/12）· 护栏 findings ≥ 11 且代码格占比 ≥ 68%；
+  落 30%–50% 边界带加跑第三轮取中位数。度量用 `.next/private/m21b/raw/selection_overlap.py`（**findings 按 id 的重合度不作判定依据**）。
+- `samples = 2` 一次性测量轮（不进产品配置，跑完恢复）：量候选集覆盖与文档洪水构成，数据进 followup。
+- 私有记录进 `.next/private/m21b/`，账目进 followup；`/code-review` 分档修；`--no-ff` 合回 `feat/m21-review-engine`。
 
 ---
 
