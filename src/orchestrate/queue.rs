@@ -247,6 +247,38 @@ impl EnqueueReq {
         let spec = QueueItemSpec::new(s.file.clone(), vec![(start, s.line_end.max(start))], QueueOrigin::Scan, vec![s.clone()]).ok()?;
         Some(EnqueueReq { spec, score: s.confidence, kind: ItemKind::Suspicion, families: vec![family.to_string()], arrival: Some(arrival) })
     }
+
+    /// scanner needs 入队请求（C3〔D16〕Q8，design §6 的第三种生产者）：`kind = evidence` 的一条声明成一项——
+    /// 区间取 `lines`（缺失 / 不可解析 → 整文件退块）、无笔记（走与 H0 同款的「区域独立审」）、
+    /// 到达键 `needs:{path}:{lines}:{理由指纹}`（同一条声明重复到达即幂等）。
+    /// 家族留空：needs 不是「谁看见了什么」，不参与共识。变更集过滤在调用方（队列不知道 diff）。
+    pub fn need(n: &crate::domain::NeedEntry) -> Option<EnqueueReq> {
+        if n.kind != crate::domain::NeedKind::Evidence || n.path.is_empty() {
+            return None;
+        }
+        let lines = n.lines.clone().unwrap_or_default();
+        let ranges = parse_need_lines(&lines);
+        let spec = QueueItemSpec::new(n.path.clone(), ranges, QueueOrigin::Needs, vec![]).ok()?;
+        let arrival = format!("needs:{}:{}:{}", n.path, lines, crate::hash::fnv1a64_hex(&[n.reason.as_str()]));
+        Some(EnqueueReq { spec, score: NEEDS_MID_SCORE, kind: ItemKind::Needs, families: vec![], arrival: Some(arrival) })
+    }
+}
+
+/// `"12-40"` → `[(12, 40)]`；空 / 不可解析 / 倒置 → `[(1, 1)]` 即文件起头。
+/// 实施细化（design C3 §5 写的是「缺失 → 整文件退块」）：整文件区间会带着 `u32::MAX` 进 `union_ranges` 与 pack 的切片算术，
+/// 收益却为零——入队即算块，落到的仍是第一个 def / 标题节；内容读不到时退行带也是有界的。
+fn parse_need_lines(lines: &str) -> Vec<(u32, u32)> {
+    let whole = vec![(1, 1)];
+    let Some((a, b)) = lines.split_once('-') else {
+        return match lines.trim().parse::<u32>() {
+            Ok(n) if n >= 1 => vec![(n, n)],
+            _ => whole,
+        };
+    };
+    match (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+        (Ok(s), Ok(e)) if s >= 1 && e >= s => vec![(s, e)],
+        _ => whole,
+    }
 }
 
 /// 一次到达（C3〔D16〕）：入队请求 + 调用方算好的稳定块与风险档。

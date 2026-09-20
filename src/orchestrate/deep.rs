@@ -136,7 +136,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut nonmust_susp = q.items().iter().filter(prior).filter(|it| counts_against_floor(it)).count();
     let dispatched_before = dispatched;
     // 块与风险档上下文（C3〔D16〕）：整轮共用一份文件内容缓存；同步读计入下面的阻塞观测。
-    let mut blocks = BlockCtx::new(input.root, input.route);
+    let mut blocks = BlockCtx::new(input.root, input.route, input.bundles);
     let t_enq = std::time::Instant::now();
     if let Some(route) = input.route {
         for h in &route.hotspots {
@@ -158,6 +158,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     if input.reviewers.is_empty() {
         close_drain(&mut q, input.snapshot, &resumed, k.saturating_sub(dispatched), floor_total.saturating_sub(nonmust_susp));
         meta.budget_skipped = skipped_now(&q);
+        observe_selection(&q, &mut meta);
         return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false, reused_cells: vec![], items: q.items().to_vec() };
     }
     let members: &[EffectiveModel] = input.reviewers;
@@ -385,6 +386,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     // （`dispatch_agreement` / `landed_agreement` 与 finding 的 `suspicion_agreement`：异族并入发生在派发 / 落地之前还是之后随时序变，
     // 评审 #10）。选中集合本身随到达时序变化是在线预算的已知代价（批 C3：量重合度，不逐字节比）。
     meta.budget_skipped = skipped_now(&q);
+    observe_selection(&q, &mut meta);
     landed.sort_by(|a, b| match (q.get(&a.item_id), q.get(&b.item_id)) {
         (Some(x), Some(y)) => cmp_priority(x, y),
         _ => a.item_id.cmp(&b.item_id),
@@ -474,6 +476,21 @@ fn close_drain(
 /// （披露「skipped(budget) N」并计 exit 2，而那 N 项其实已经挖了）。首跑 Skipped 只在收场产生、其后无复位，两种口径同值。
 fn skipped_now(q: &DeepQueue) -> u32 {
     q.items().iter().filter(|it| it.state == ItemState::Skipped).count() as u32
+}
+
+/// 选项观测（design C3 §7〔D16〕）：收场时把队列压成五个标量——合并压缩比、候选与选中的文件面、单文件最大占格。
+/// 逐格数组不落（可从 `DeepRun.items` + scan 报告离线复算）。
+fn observe_selection(q: &DeepQueue, meta: &mut DeepMeta) {
+    let items = q.items();
+    meta.items_from_suspicions = items.iter().filter(|it| it.kind == ItemKind::Suspicion).count() as u32;
+    let files: std::collections::BTreeSet<&str> = items.iter().map(|it| it.spec.file.as_str()).collect();
+    meta.files_candidate = files.len() as u32;
+    let mut per_file: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    for it in items.iter().filter(|it| matches!(it.state, ItemState::InFlight | ItemState::Settled)) {
+        *per_file.entry(it.spec.file.as_str()).or_insert(0) += 1;
+    }
+    meta.files_selected = per_file.len() as u32;
+    meta.max_cells_per_file = per_file.values().copied().max().unwrap_or(0);
 }
 
 /// 在线额度下的可派条件（design v11 §6 规则 3〔D15〕）：必挖不限；入口关闭后（收场 drain 已定选中集合）全部可派；
@@ -876,6 +893,10 @@ fn on_arrival(
         QueueOrigin::Scan => "scan",
         QueueOrigin::Needs => "needs",
     };
+    if !ctx.accepts(&req) {
+        *meta.enqueue_reasons.entry("needs_out_of_diff".into()).or_insert(0) += 1;
+        return;
+    }
     let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
     note_enq(outcome, reason, meta);
     if let Some(i) = affected {
@@ -1023,6 +1044,19 @@ fn enqueue_scan_cells(
                 snap_one(&q.items()[idx], snapshot);
             }
         }
+        // needs 与首跑同形（C3〔D16〕）：疑点之后、变更集内的才入队，到达键幂等 → 重放不重复。
+        for n in &out.needs {
+            let Some(req) = EnqueueReq::need(n) else { continue };
+            if !ctx.accepts(&req) {
+                *meta.enqueue_reasons.entry("needs_out_of_diff".into()).or_insert(0) += 1;
+                continue;
+            }
+            let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
+            note_enq(outcome, "needs", meta);
+            if let Some(idx) = affected {
+                snap_one(&q.items()[idx], snapshot);
+            }
+        }
     }
 }
 
@@ -1032,6 +1066,8 @@ fn enqueue_scan_cells(
 struct BlockCtx<'a> {
     root: &'a Path,
     zones: &'a [Hotspot],
+    /// 本轮变更集（bundles 覆盖的文件）：needs 只接落在里面的（C3〔D16〕Q8）。
+    changed: std::collections::HashSet<&'a str>,
     cache: std::collections::HashMap<String, String>,
 }
 
@@ -1039,8 +1075,19 @@ struct BlockCtx<'a> {
 const MAX_BLOCK_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 impl<'a> BlockCtx<'a> {
-    fn new(root: &'a Path, route: Option<&'a RiskRoute>) -> Self {
-        BlockCtx { root, zones: route.map_or(&[][..], |r| &r.zones), cache: std::collections::HashMap::new() }
+    fn new(root: &'a Path, route: Option<&'a RiskRoute>, bundles: &'a [Bundle]) -> Self {
+        BlockCtx {
+            root,
+            zones: route.map_or(&[][..], |r| &r.zones),
+            changed: bundles.iter().flat_map(|b| b.files.iter()).map(|f| f.path.as_str()).collect(),
+            cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 变更集外的 needs 不入队（C3〔D16〕Q8）：两轮实测约六成 needs 指向 diff 外，而 `pick_bundle` 对不在任何 bundle 的文件
+    /// 会静默退回 `bundles[0]`，产出「文件名是 A、证据是 B」的错配包。装包归属另开批（C4 / M21d），本批只计数。
+    fn accepts(&self, req: &EnqueueReq) -> bool {
+        req.spec.origin != QueueOrigin::Needs || self.changed.contains(req.spec.file.as_str())
     }
 
     fn content(&mut self, file: &str) -> &str {
@@ -1119,6 +1166,10 @@ fn snap_cell(rec: &CellRecord, on_cell: Option<&dyn Fn(&CellRecord)>) {
 }
 
 fn note_enq(o: EnqueueOutcome, reason: &str, meta: &mut DeepMeta) {
+    // 到达并被接受的疑点数（C3〔D16〕观测）：合并进已有项的也算到达，只有到达键重复的不算。
+    if reason == "scan" && o != EnqueueOutcome::Duplicate {
+        meta.suspicions_arrived += 1;
+    }
     match o {
         EnqueueOutcome::New => {
             *meta.enqueue_reasons.entry(reason.into()).or_insert(0) += 1;
@@ -2164,6 +2215,15 @@ mod tests {
         assert_eq!((run.meta.close_budget_remaining, run.meta.scan_phase_dispatched, run.meta.close_ms), (3, 0, 0));
         assert!(run.meta.first_dispatch_ms > 0 && run.meta.drain_done_ms >= run.meta.first_dispatch_ms, "{:?}", run.meta);
         run.meta.close_budget_remaining = 0;
+        // C3-3 新增的选项观测（同上：确定性读数先断言再归零，基线文件保持批 C 原样）。
+        // 快照里 5 个文件各一项（疑点项 1 个），派发 4 项、每文件至多 1 格；restore 模式无疑点到达。
+        assert_eq!(
+            (run.meta.suspicions_arrived, run.meta.items_from_suspicions, run.meta.files_candidate, run.meta.files_selected, run.meta.max_cells_per_file),
+            (0, 1, 5, 4, 1),
+            "{:?}",
+            run.meta
+        );
+        (run.meta.items_from_suspicions, run.meta.files_candidate, run.meta.files_selected, run.meta.max_cells_per_file) = (0, 0, 0, 0);
         (run.meta.first_dispatch_ms, run.meta.drain_done_ms, run.meta.fill_block_max_ms, run.meta.fill_block_total_ms) = (0, 0, 0, 0);
         serde_json::json!({
             "findings": run.findings, "cells": run.cells, "meta": run.meta, "warnings": run.warnings,
@@ -2664,6 +2724,83 @@ mod tests {
         assert!(it.block.key.starts_with("def:"), "{:?}", it.block);
         assert_eq!(it.risk_band, 3, "分 2.0 ≥ θ 1.5");
         assert_eq!((it.agreement, it.peak_agreement), (2, 1), "区域级 2 / 必挖轴 1");
+    }
+
+    /// scanner needs 只接变更集内的（C3〔D16〕Q8）：`a.rs` 在变更集里 → 入队成 `Needs` 项（无笔记、排在疑点之后）；
+    /// `verify.rs` 不在 → 只计 `needs_out_of_diff`，不入队（`pick_bundle` 对不在任何 bundle 的文件会静默退回 bundles[0]，
+    /// 产出「文件名是 A、证据是 B」的错配包）。
+    #[tokio::test(start_paused = true)]
+    async fn needs_enqueue_only_inside_the_changeset() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let need = |path: &str| crate::domain::NeedEntry {
+            path: path.into(), lines: Some("1-3".into()), reason: "要看实现".into(), kind: crate::domain::NeedKind::Evidence,
+        };
+        let out = crate::domain::ScanOutput {
+            suspicions: vec![crate::domain::Suspicion {
+                file: "a.rs".into(), line_start: 2, line_end: 2, hint: "h".into(), category: None, confidence: 0.5,
+                quote: "    body();".into(),
+            }],
+            needs: vec![need("a.rs"), need("verify.rs")],
+            ..Default::default()
+        };
+        let id = "scan[g1]@p/alpha#1";
+        let cells = [ScanCellResult {
+            cell_id: id.into(), group: 0, route_key: "p/alpha".into(), family: "alpha".into(), sample: 1,
+            record: CellRecord::ok(id, "p/alpha", crate::domain::CellOutput::Scan(out.clone())),
+            output: Some(out),
+        }];
+        let backend = Routed::new(vec![("a", 5, vec![found("a")])]);
+        let reg = routed_registry(&backend, 4);
+
+        let run = run_with(Run { scan_cells: &cells, budget: 4, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+
+        let kinds: Vec<(&str, ItemKind)> = run.items.iter().map(|it| (it.spec.file.as_str(), it.kind)).collect();
+        assert_eq!(kinds, [("a.rs", ItemKind::Suspicion), ("a.rs", ItemKind::Needs)], "{:?}", run.items);
+        assert_eq!(run.meta.enqueue_reasons.get("needs"), Some(&1), "入队理由分开记");
+        assert_eq!(run.meta.enqueue_reasons.get("needs_out_of_diff"), Some(&1));
+        assert_eq!(run.meta.suspicions_arrived, 1, "needs 不计进疑点到达数");
+        let needs_item = run.items.iter().find(|it| it.kind == ItemKind::Needs).unwrap();
+        assert!(needs_item.spec.notes.is_empty(), "needs 项无笔记——走与 H0 同款的区域独立审");
+    }
+
+    /// 选项观测五量与手算一致（design C3 §7〔D16〕）：三文件四疑点（a.rs 的两条同块并一项）→ 到达 4、疑点项 3、候选文件 3；
+    /// K = 2 只派两格（每文件至多一格，c.rs 的项被截）→ 选中文件 2、单文件最大占格 1。
+    #[tokio::test(start_paused = true)]
+    async fn selection_observables_match_hand_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a", "b", "c"]);
+        let susp = |file: &str, line: u32, quote: &str, hint: &str| crate::domain::Suspicion {
+            file: file.into(), line_start: line, line_end: line, hint: hint.into(), category: None, confidence: 0.5,
+            quote: quote.into(),
+        };
+        let out = crate::domain::ScanOutput {
+            suspicions: vec![
+                susp("a.rs", 2, "    body();", "一"),
+                susp("a.rs", 3, "}", "二"),
+                susp("b.rs", 2, "    body();", "三"),
+                susp("c.rs", 2, "    body();", "四"),
+            ],
+            ..Default::default()
+        };
+        let id = "scan[g1]@p/alpha#1";
+        let cells = [ScanCellResult {
+            cell_id: id.into(), group: 0, route_key: "p/alpha".into(), family: "alpha".into(), sample: 1,
+            record: CellRecord::ok(id, "p/alpha", crate::domain::CellOutput::Scan(out.clone())),
+            output: Some(out),
+        }];
+        let backend = Routed::new(vec![("a", 5, vec![found("a")]), ("b", 5, vec![found("b")]), ("c", 5, vec![found("c")])]);
+        let reg = routed_registry(&backend, 4);
+
+        let run = run_with(Run { scan_cells: &cells, budget: 2, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+
+        let m = &run.meta;
+        assert_eq!(
+            (m.suspicions_arrived, m.items_from_suspicions, m.files_candidate, m.files_selected, m.max_cells_per_file),
+            (4, 3, 3, 2, 1),
+            "{m:?}"
+        );
+        assert_eq!(m.budget_skipped, 1, "第三个文件的项被预算截掉——候选 3 个文件、选中 2 个");
     }
 
     /// 回放把被截项并成必挖挖掉后不留假债（评审 #9）：截断数按收口时的最终状态数，不按 drain 那一刻——

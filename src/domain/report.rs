@@ -318,6 +318,22 @@ pub struct DeepMeta {
     pub fill_block_max_ms: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub fill_block_total_ms: u64,
+    // ── C3 选项观测（design C3 §7〔D16〕；为零不序列化。逐格数组不加——可由 `DeepRun.items` + scan 报告离线复算）──
+    /// 经通道 / 回放到达并被接受的疑点数（到达键重复的 `Duplicate` 不计）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub suspicions_arrived: u32,
+    /// 收场时 `kind == Suspicion` 的项数；÷ `suspicions_arrived` = 结构化合并的压缩比。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub items_from_suspicions: u32,
+    /// 队列项覆盖的文件数（不分状态）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub files_candidate: u32,
+    /// 派发过的项（InFlight ∪ Settled）覆盖的文件数。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub files_selected: u32,
+    /// 同一文件派发格数的最大值——文件多样性的辅助门槛直接读它。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_cells_per_file: u32,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
@@ -397,6 +413,21 @@ mod tests {
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!((v["close_ms"].as_u64(), v["scan_phase_dispatched"].as_u64(), v["fill_block_max_ms"].as_u64()), (Some(400), Some(6), Some(2)));
         assert!(v.get("verify_tail_ms").is_none() && v.get("queue_split_clusters").is_none());
+    }
+
+    /// C3 选项观测同规矩（design C3 §7〔D16〕）：旧报告缺键照读、全零不产键、非零才出现。
+    #[test]
+    fn deep_meta_c3_selection_fields_default_and_skip_zero() {
+        let old = r#"{"queue_depth_peak":3,"dedup_hits":0,"budget_skipped":1,"needs_two_stage_triggered":0,"needs_two_stage_skipped":0,"stream_discarded":0}"#;
+        let m: DeepMeta = serde_json::from_str(old).unwrap();
+        assert_eq!((m.suspicions_arrived, m.items_from_suspicions, m.files_candidate, m.files_selected, m.max_cells_per_file), (0, 0, 0, 0, 0));
+        assert_eq!(serde_json::to_string(&m).unwrap(), old, "全零新字段不改旧形状");
+        let v = serde_json::to_value(DeepMeta { suspicions_arrived: 40, files_selected: 5, max_cells_per_file: 4, ..m }).unwrap();
+        assert_eq!(
+            (v["suspicions_arrived"].as_u64(), v["files_selected"].as_u64(), v["max_cells_per_file"].as_u64()),
+            (Some(40), Some(5), Some(4))
+        );
+        assert!(v.get("files_candidate").is_none() && v.get("items_from_suspicions").is_none());
     }
 
     #[test]
