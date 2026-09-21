@@ -678,7 +678,9 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
     let t0 = tokio::time::Instant::now();
     let policy = lease.gate_attempts();
     let mut warnings = Vec::new();
-    let (first, mut bypass_missing) = shot(env, &lease, &policy, rev, item.agreement, &prompt).await;
+    // 盖章用**项内**轴与热区（批 D〔D17〕）：§8.1 的跳过规则问的是「这条 finding 所在的那几行被两家族标过吗」，
+    // 不是「这一块里来过两个家族吗」——C3 之后项是整个 def / 标题节，后者太松。
+    let (first, mut bypass_missing) = shot(env, &lease, &policy, rev, item.peak_agreement, item.hot_ranges(), &prompt).await;
     let mut stage2 = Stage2::None;
     let mut stage2_error = None;
     let mut auth_failed = false;
@@ -704,7 +706,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                             Stage2::Failed
                         }
                         Round2::Ready(prompt2) => {
-                            let (second, missing) = shot(env, &lease, &policy, rev, item.agreement, &prompt2).await;
+                            let (second, missing) = shot(env, &lease, &policy, rev, item.peak_agreement, item.hot_ranges(), &prompt2).await;
                             bypass_missing |= missing;
                             match second {
                                 Ok(c2) => {
@@ -798,6 +800,7 @@ async fn shot(
     policy: &GateAttempts<'_>,
     rev: &EffectiveModel,
     dispatch_agreement: u32,
+    hot_ranges: Vec<(u32, u32)>,
     prompt: &ScanPrompt,
 ) -> (Result<ReviewCall, ProviderError>, bool) {
     let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
@@ -808,7 +811,7 @@ async fn shot(
         .and_then(|f| f(rev, Box::new(move |s: &str| inc_feed.lock().unwrap().feed(s))));
     let missing = per_cell.is_none() && env.input.backend_factory.is_some();
     let backend: &dyn ChatBackend = per_cell.as_deref().unwrap_or(lease.backend());
-    let mut ctx = EmitCtx::new(&rev.name, &rev.family, dispatch_agreement, env.input.root, env.sink);
+    let mut ctx = EmitCtx::new(&rev.name, &rev.family, dispatch_agreement, hot_ranges, env.input.root, env.sink);
     let r = run_review_shot_with(backend, prompt, lease.per_turn(), lease.retry_budget(), Some(policy), &mut ctx, inc).await;
     (r, missing)
 }
@@ -826,11 +829,21 @@ fn land(
     // 落地时刻的疑点共识回填到**落盘** finding（design §7「落地的 finding 继承记录当时的 agreement」、§8.1「按落地时刻算、
     // 后涨不回溯」）。cell 内的 `EmitCtx` 只能拿派发时快照；在途并入会让落地值更高，事件侧因此滞后（`event ≤ landed`）。
     let landed = live_agreement(q, &item);
+    // 落盘侧与事件侧同一口径（批 D〔D17〕）：项内轴 + 热区，压不上就盖 0。
+    // `landed` 仍是区域轴——它喂的是队列观测（`landed_agreement`）与 `mark_settled`，语义不变。
+    let (live_peak, live_hot) = q
+        .get(&item.id)
+        .map(|it| (it.peak_agreement, it.hot_ranges()))
+        .unwrap_or_else(|| (item.peak_agreement, item.hot_ranges()));
     let mut debt = stage2 == Stage2::Failed;
     let (rec, stream_discarded) = match outcome {
         Ok(mut c) => {
             for f in c.output.findings_mut() {
-                f.suspicion_agreement = landed;
+                f.suspicion_agreement = if crate::orchestrate::queue::in_hot_ranges(f.line_start, f.line_end, &live_hot) {
+                    live_peak
+                } else {
+                    0
+                };
             }
             let discarded = c.stats.stream_discarded;
             let notes = review_cell_notes(&c.stats, stage2_error.as_deref());
@@ -1314,10 +1327,77 @@ mod tests {
         .await
     }
 
-    /// 落盘 finding 的 `suspicion_agreement` 与观测面 `landed_agreement` 同源（design §7「落地的 finding
-    /// 继承记录当时的 agreement」）。串行派发下派发值恒等于落地值，所以本用例钉的是**契约**——
-    /// 回填确实写进落盘与报告；批 C1 并发后两值会分叉，届时若有人删掉回填，落盘会退回派发快照、
-    /// 与 `landed_agreement` 对不上。真正的「派发 ≠ 落地」分叉用例由 C1-2 补。
+
+    /// 盖章收紧（批 D-2〔D17〕Q2）：同一格产出的两条 finding，压在共识簇行上的照盖、压在别处的盖 0。
+    /// C3 把项放大成整个 def / 标题节之后，按格盖章会把 reviewer 自己新发现的另一处也送进免验集——
+    /// §8.1 的跳过规则要的是「这条 finding 所在的那几行被两家族独立标过」。
+    #[tokio::test]
+    async fn stamp_only_covers_findings_on_the_consensus_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {\n    hot();\n    b();\n    c();\n    d();\n    e();\n    f();\n    g();\n    cold();\n}\n").unwrap();
+        let bundles = vec![Bundle::from_files(vec![FileChange {
+            path: "a.rs".into(),
+            diff: "@@ -1,10 +1,10 @@\n+    hot();\n+    cold();".into(),
+        }])];
+        // 项内：两家族对上第 2 行那条疑点（峰值簇），另有一条只有一个家族提的在第 9 行
+        let sus = |line: u32, quote: &str| crate::domain::Suspicion {
+            file: "a.rs".into(), line_start: line, line_end: line, hint: "h".into(), category: None,
+            confidence: 0.5, quote: quote.into(),
+        };
+        let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 10)], QueueOrigin::Scan, vec![sus(2, "    hot();")]).unwrap();
+        let item = QueueItem {
+            id: "a.rs:scan:1-10".into(), spec, score: 0.5, agreement: 3, state: ItemState::Pending,
+            kind: ItemKind::Suspicion, dispatch_agreement: 0, landed_agreement: None,
+            families: vec!["alpha".into(), "beta".into(), "gamma".into()], enqueued_ms: None, arrivals: vec![],
+            members: vec![sus(2, "    hot();"), sus(9, "    cold();")],
+            member_families: vec![vec!["alpha".into(), "beta".into()], vec!["gamma".into()]],
+            block: Default::default(), peak_agreement: 2, risk_band: 0,
+        };
+        let two = r#"{"findings":[
+            {"severity":"low","title":"on","body":"b","file":"a.rs","line_start":2,"line_end":2,"confidence":0.5,"recommendation":"r","quote":"    hot();"},
+            {"severity":"low","title":"off","body":"b","file":"a.rs","line_start":9,"line_end":9,"confidence":0.5,"recommendation":"r","quote":"    cold();"}
+        ],"needs":[]}"#;
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(two)])), Duration::from_secs(5), 0);
+        let reviewer = fake_reviewer();
+        let events = Events(Mutex::new(Vec::new()));
+
+        let run = run_deep(
+            &reg,
+            DeepInput {
+                route: None, scan_cells: &[], bundles: &bundles, root: dir.path(),
+                reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
+                pack: &Default::default(), spec_docs: "", target_label: "t",
+                snapshot: None, restore: Some(std::slice::from_ref(&item)),
+                prior_findings: vec![], tools: ToolsMode::Off,
+                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false,
+            },
+            &events,
+        )
+        .await;
+
+        // 事件侧（`EmitCtx` 盖的那一份，批 D-3 的复核就读它）与落盘侧同口径
+        let mut ev: Vec<(String, u32)> = events.0.lock().unwrap().iter()
+            .map(|e| (e.finding.title.clone(), e.suspicion_agreement)).collect();
+        ev.sort();
+        assert_eq!(ev, [("off".to_string(), 0), ("on".to_string(), 2)], "事件侧同样只盖压在共识簇上的那条");
+
+        let mut stamps: Vec<(String, u32)> =
+            run.findings.iter().map(|f| (f.title.clone(), f.suspicion_agreement)).collect();
+        stamps.sort();
+        assert_eq!(stamps, [("off".to_string(), 0), ("on".to_string(), 2)], "只有压在共识簇上的那条拿到共识");
+        let persisted: Vec<(String, u32)> = run.cells[0]
+            .output
+            .findings()
+            .iter()
+            .map(|f| (f.title.clone(), f.suspicion_agreement))
+            .collect();
+        assert!(persisted.contains(&("on".to_string(), 2)) && persisted.contains(&("off".to_string(), 0)), "落盘同口径: {persisted:?}");
+    }
+
+    /// 落盘 finding 的 `suspicion_agreement` 回填（design §7「落地的 finding 继承记录当时的 agreement」）。
+    /// 批 D〔D17〕改口径：盖的是**项内**轴（两家族对上的那一簇）且只盖给压在该簇行范围上的 finding——
+    /// 本用例的项有两家族对上同一条疑点（第 1 行），产出的 finding 也在第 1 行，故照盖。
     #[tokio::test]
     async fn persisted_findings_carry_landed_suspicion_agreement() {
         let dir = tempfile::tempdir().unwrap();
@@ -1325,6 +1405,14 @@ mod tests {
         let mut item = snap_item("a.rs", ItemState::Pending);
         item.agreement = 2;
         item.families = vec!["alpha".into(), "beta".into()];
+        // 两家族对上同一处（第 1 行）→ 项内轴 2、热区 [(1,1)]
+        let s = crate::domain::Suspicion {
+            file: "a.rs".into(), line_start: 1, line_end: 1, hint: "h".into(), category: None,
+            confidence: 0.5, quote: "fn a() {".into(),
+        };
+        item.members = vec![s];
+        item.member_families = vec![vec!["alpha".into(), "beta".into()]];
+        item.peak_agreement = 2;
         let mut reg = crate::provider::registry::ProviderRegistry::new();
         reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![turn(&rev_json("fn a() {"))])), Duration::from_secs(5), 0);
         let reviewer = fake_reviewer();
@@ -1794,12 +1882,14 @@ mod tests {
             file: file.into(), line_start: 1, line_end: 1, hint: "h".into(),
             category: None, confidence: 0.5, quote: quote.into(),
         };
-        let spec = QueueItemSpec::new(file.into(), vec![(1, 1)], QueueOrigin::Scan, vec![note]).unwrap();
+        let spec = QueueItemSpec::new(file.into(), vec![(1, 1)], QueueOrigin::Scan, vec![note.clone()]).unwrap();
+        // 与 `QueueItem::new` 同形：成员与逐条家族都在（批 D 的盖章面靠它算热区，空着就一律不盖）。
         let item = QueueItem {
             id: format!("{file}:scan:1-1"), spec: spec.clone(), score: 0.5, agreement: 1, state: ItemState::Pending,
             kind: ItemKind::Suspicion, dispatch_agreement: 0, landed_agreement: None,
             families: vec![family.into()], enqueued_ms: None,
-            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
+            arrivals: vec![], members: vec![note], member_families: vec![vec![family.into()]],
+            block: Default::default(), peak_agreement: 1, risk_band: 0,
         };
         (item, spec)
     }
@@ -1827,7 +1917,7 @@ mod tests {
         assert_eq!(run.meta.dedup_hits, 1, "在途并入走五态（MergedInFlight）");
         assert_eq!((run.meta.dispatch_agreement.clone(), run.meta.landed_agreement.clone()), (vec![1], vec![2]));
         assert_eq!(run.findings.len(), 1, "{:?}", run.warnings);
-        assert_eq!(run.findings[0].suspicion_agreement, 2, "报告 finding 带落地值");
+        assert_eq!(run.findings[0].suspicion_agreement, 2, "报告 finding 带落地值（同一处被两家族对上 → 项内轴 2）");
         assert_eq!(run.cells[0].output.findings()[0].suspicion_agreement, 2, "落盘 = 落地值");
         let evs = events.0.lock().unwrap();
         assert!(!evs.is_empty(), "终判至少发一条事件");
@@ -2284,6 +2374,12 @@ mod tests {
         );
         (run.meta.items_from_suspicions, run.meta.files_candidate, run.meta.files_selected, run.meta.max_cells_per_file) = (0, 0, 0, 0);
         (run.meta.first_dispatch_ms, run.meta.drain_done_ms, run.meta.fill_block_max_ms, run.meta.fill_block_total_ms) = (0, 0, 0, 0);
+        // 批 D-2 改了盖章口径（项内轴 + 热区）：本场景的快照项都没有逐条家族（H0 项根本没有疑点、
+        // 疑点项是旧形态），算不出共识簇 → 一律盖 0，这正是「算不出就不盖、宁可多复核」的兑现。
+        // 同上规矩：确定性读数先断言再归零，基线文件保持批 C 原样。
+        let stamps: Vec<u32> = run.cells.iter().flat_map(|c| c.output.findings().iter().map(|f| f.suspicion_agreement)).collect();
+        assert!(stamps.iter().all(|&v| v == 0), "旧形态快照项算不出热区 → 一律不盖: {stamps:?}");
+        // 盖章值本身不参与基线对照（口径已变、无法用常量还原逐条旧值）：下面的比对两侧都把这个键剥掉。
         serde_json::json!({
             "findings": run.findings, "cells": run.cells, "meta": run.meta, "warnings": run.warnings,
             "reviewer_failed": run.reviewer_failed, "on_cell": landed, "snapshots": snaps,
@@ -2293,10 +2389,27 @@ mod tests {
     /// 退化零差（C1-4）：单 reviewer + 门宽 1 时并发派发循环退化为串行——报告（findings / cells / meta / warnings / 债）、
     /// 落盘序与队列快照序与批 C 串行实现同构。基线由批 C 代码（`eac0a60`）跑同一场景采得，不是凭推理写的期望值；
     /// 与批 C 的有意差异只有 cell 名形态（已按派发序映射回去）。并发改造的第一道回归哨。
+    /// 递归剥掉某个键（基线对照用）：批 D-2 改了 `suspicion_agreement` 的口径，
+    /// 逐条旧值无法用常量还原——该字段的新行为由上面的断言单独钉，基线只比其余部分。
+    fn strip_key(v: &mut serde_json::Value, key: &str) {
+        match v {
+            serde_json::Value::Object(m) => {
+                m.remove(key);
+                for (_, child) in m.iter_mut() {
+                    strip_key(child, key);
+                }
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|c| strip_key(c, key)),
+            _ => {}
+        }
+    }
+
     #[tokio::test]
     async fn single_member_gate_one_matches_batch_c_serial_baseline() {
-        let got = degenerate_serial_scenario().await;
-        let want: serde_json::Value = serde_json::from_str(include_str!("testdata/deep_serial_baseline.json")).unwrap();
+        let mut got = degenerate_serial_scenario().await;
+        let mut want: serde_json::Value = serde_json::from_str(include_str!("testdata/deep_serial_baseline.json")).unwrap();
+        strip_key(&mut got, "suspicion_agreement");
+        strip_key(&mut want, "suspicion_agreement");
         assert!(
             got == want,
             "与批 C 串行基线不同构\n--- got ---\n{}\n--- want ---\n{}",

@@ -45,10 +45,16 @@ impl FindingSink for () {
 pub(crate) struct EmitCtx<'a> {
     model: &'a str,
     family: &'a str,
-    /// 队列项**派发时**的疑点共识（家族数）快照——盖到事件与 cell 内产出的 `Finding.suspicion_agreement`。
+    /// 队列项**派发时**的疑点共识快照——盖到事件与 cell 内产出的 `Finding.suspicion_agreement`。
     /// 不是落地值：本上下文跑在 await 里读不到队列；落地值由 `run_deep` 在主循环回填落盘 finding。
     /// **不碰** `Finding.agreement`：那是认同这条 finding 的模型数，由 `dedup` 算定。
+    ///
+    /// 批 D〔D17〕改为**项内**轴（`peak_agreement`）而非区域级 `agreement`，且只盖给压在 `hot_ranges` 上的 finding：
+    /// §8.1 的跳过规则要的是「这条 finding 所在的那几行被两个家族独立标过」，不是「这一整块里有两个家族来过」。
+    /// C3 把项放大成整个 def / 标题节之后，按格盖章会把 reviewer 自己新发现的另一处也送进免验集。
     suspicion_agreement: u32,
+    /// 达成共识的那一簇疑点覆盖的行区间（`QueueItem::hot_ranges`）；空 = 一律不盖。
+    hot_ranges: Vec<(u32, u32)>,
     root: &'a Path,
     sink: &'a dyn FindingSink,
     /// 已发射 finding.id——旁路发过的，终判不补发。
@@ -60,10 +66,11 @@ impl<'a> EmitCtx<'a> {
         model: &'a str,
         family: &'a str,
         suspicion_agreement: u32,
+        hot_ranges: Vec<(u32, u32)>,
         root: &'a Path,
         sink: &'a dyn FindingSink,
     ) -> Self {
-        EmitCtx { model, family, suspicion_agreement, root, sink, emitted: HashSet::new() }
+        EmitCtx { model, family, suspicion_agreement, hot_ranges, root, sink, emitted: HashSet::new() }
     }
 
     /// 首次见到该 id 才发射（旁路 / 终判同一去重面）。
@@ -71,9 +78,14 @@ impl<'a> EmitCtx<'a> {
         if !self.emitted.insert(f.id.clone()) {
             return;
         }
+        let consensus = if crate::orchestrate::queue::in_hot_ranges(f.line_start, f.line_end, &self.hot_ranges) {
+            self.suspicion_agreement
+        } else {
+            0
+        };
         self.sink.on_finding(FindingEvent {
             finding: f.clone(),
-            suspicion_agreement: self.suspicion_agreement,
+            suspicion_agreement: consensus,
             reviewer_family: self.family.to_string(),
         });
     }
@@ -347,7 +359,7 @@ mod tests {
         ])
         .with_err_partials(vec![half, closed])
         .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &rec);
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], dir.path(), &rec);
 
         let err = run_review_shot_with(
             &backend, &prompt(), Duration::from_secs(5), 1, Some(&NoopPolicy), &mut ctx, inc,
@@ -368,7 +380,7 @@ mod tests {
         let backend = FakeChatBackend::new(vec![turn(TWO)])
             .with_delta_chunk(11)
             .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
-        let mut ctx = EmitCtx::new("m", "alpha", 2, dir.path(), &rec);
+        let mut ctx = EmitCtx::new("m", "alpha", 2, vec![(1, 9)], dir.path(), &rec);
         let call = run_review_shot_with(
             &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc,
         )
@@ -405,7 +417,7 @@ mod tests {
         let backend = FakeChatBackend::new(vec![turn(with_ghost)])
             .with_delta_chunk(9)
             .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &rec);
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], dir.path(), &rec);
         let call = run_review_shot_with(
             &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc,
         )
@@ -428,7 +440,7 @@ mod tests {
         let dir = tmp_file();
         let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
         let backend = FakeChatBackend::new(vec![turn(TWO)]);
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &());
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], dir.path(), &());
         let call = run_review_shot_with(
             &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc,
         )
@@ -448,7 +460,7 @@ mod tests {
         let backend = FakeChatBackend::new(vec![turn(truncated), turn(truncated)])
             .with_delta_chunk(8)
             .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &rec);
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], dir.path(), &rec);
         let err = run_review_shot_with(
             &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc.clone(),
         )
@@ -468,7 +480,7 @@ mod tests {
         // 流到一半（对象未闭合）即超时。
         inc.lock().unwrap().feed(r#"{"findings":[{"severity":"low","title":"half"#);
         let backend = FakeChatBackend::new_results(vec![Err(ProviderError::Timeout("probe".into()))]);
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &());
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], dir.path(), &());
         let err = run_review_shot_with(
             &backend, &prompt(), Duration::from_millis(50), 0, None, &mut ctx, inc.clone(),
         )
@@ -490,7 +502,7 @@ mod tests {
         ])
         .with_delta_chunk(8)
         .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &());
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], dir.path(), &());
         let err = run_review_shot_with(
             &backend, &prompt(), Duration::from_millis(50), 0, None, &mut ctx, inc.clone(),
         )
