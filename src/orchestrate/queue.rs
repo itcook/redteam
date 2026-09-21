@@ -1,12 +1,15 @@
 //! 深挖队列（M21b 批 C-1，design §6 规则 2〔D13〕）：入口五态 + agreement 活值。
 //! 合并谓词复用 `consolidate::scan::same_suspicion`，不复制。跨轮判例守卫本批空过（按无命中入队）。
+//!
+//! C3〔D16〕起**结构定项、谓词定共识**：项身份 = 同文件 ∧ 同稳定块（`orchestrate::blocks`），
+//! `same_suspicion` 降级为项内聚簇依据，产出两轴——`peak_agreement`（最大簇家族数，定必挖）
+//! 与 `agreement`（块被几个家族碰过，进排序）。无块信息（旧快照 / 内容不可读）时退回 C1/C2 的 quote 谓词。
 
 use crate::consolidate::scan::same_suspicion;
 use crate::domain::Suspicion;
+use crate::orchestrate::blocks::Block;
 use crate::pack::region::{Origin as QueueOrigin, QueueItemSpec};
 
-/// L0..L5 类别权重（design 取舍：M21b 中性 1.0，改数字不改公式）。
-pub const CATEGORY_WEIGHT: [f32; 6] = [1.0; 6];
 /// needs 中档分（低于疑点层、高于被截项）。
 const NEEDS_MID_SCORE: f32 = 0.5;
 
@@ -73,14 +76,44 @@ pub struct QueueItem {
     /// 代表也被钉在最先到的那条上（`priority_score` 取笔记里的最高置信）。H0 / needs 无疑点，空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<Suspicion>,
+    /// 与 [`Self::members`] 同下标的家族（该条疑点由哪些家族提出）——项内聚簇算 `peak_agreement` 的输入（C3〔D16〕）。
+    /// 实施细化：`Suspicion` 本身不带家族，项级 `families` 是并集、无法还原到条——故并存这一列。空 = 旧快照 / 无家族。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_families: Vec<Vec<String>>,
+    /// 稳定块（C3〔D16〕）：项身份锚在结构上——同文件同 `block.key` 即同一项，区间取块的行范围。
+    /// 空 = 无块信息（旧快照 / 内容不可读）→ 合并退回 quote 谓词，行为与 C2 一致。
+    #[serde(default, skip_serializing_if = "Block::is_empty")]
+    pub block: Block,
+    /// 必挖轴（C3〔D16〕）：项内按 `same_suspicion` 聚簇后**最大簇**的家族数。
+    /// 0 = 未算（旧快照 / 无疑点）→ 判定退回区域级 `agreement`。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub peak_agreement: u32,
+    /// 所在风险区档（C3-2 排序用，入队时由 `RiskRoute.zones` 算）：3 = 分 ≥ θ · 2 = ≥ θ/2 · 1 = > 0 · 0 = 无区。
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub risk_band: u8,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl QueueItem {
-    fn new(spec: QueueItemSpec, score: f32, kind: ItemKind, families: Vec<String>, arrival: Option<String>) -> Self {
+    fn new(req: EnqueueReq, block: Block, risk_band: u8) -> Self {
+        let EnqueueReq { mut spec, score, kind, families, arrival } = req;
+        // 区间 = 块的行范围（design C3 §2）：项覆盖整个 def / 标题节，id 也随之锚在结构上
+        // （同块的两条疑点算出同一 id——取消 id 捷径后 id 唯一仍成立）。
+        if !block.is_empty() {
+            spec.ranges = vec![(block.start, block.end)];
+        }
         let id = item_id(&spec);
         let families: Vec<String> = dedup_families(families);
         let members = spec.notes.clone();
-        QueueItem {
+        let member_families = vec![families.clone(); members.len()];
+        let mut it = QueueItem {
             id,
             spec,
             score,
@@ -93,7 +126,22 @@ impl QueueItem {
             enqueued_ms: Some(now_ms()),
             arrivals: arrival.into_iter().collect(),
             members,
-        }
+            member_families,
+            block,
+            peak_agreement: 0,
+            risk_band,
+        };
+        it.recompute_peak();
+        it
+    }
+
+    /// 项内聚簇 → 必挖轴（C3〔D16〕）：`same_suspicion` 并查集分簇，取最大簇的**不同家族数**。
+    /// 与 D7 同口径（同家族多 samples 计一次），故不会像区域级共识那样把必挖集撑爆。
+    ///
+    /// **只增不减**（评审 #5）：项内成员只增不删，算出的值本就单调；取 `max` 是为了旧快照——
+    /// 它的 `agreement` 在 `restore` 时被当作必挖轴的下限种进来，新到达一条疑点算出的 1 不得把它降回非必挖。
+    fn recompute_peak(&mut self) {
+        self.peak_agreement = self.peak_agreement.max(peak_agreement(&self.members, &self.member_families));
     }
 
     /// 匹配与排序用的疑点全量：到达过的成员（旧快照为空时退回渲染笔记）。
@@ -108,8 +156,59 @@ impl QueueItem {
 
 /// agreement ≡ 贡献家族数（与 `consolidate::scan::merge_suspicions` 同口径）；
 /// 无家族（H0 / needs）记 1——「至少有一个来源提过」。
+/// C3〔D16〕起语义是**区域级**：这一块被几个家族碰过（排序轴）；必挖改看 `peak_agreement`。
 fn agreement_of(families: &[String]) -> u32 {
     (families.len() as u32).max(1)
+}
+
+/// 项内最大簇的家族数。`members` 与 `fams` 同下标；对不齐或无家族信息 → 0（调用方退回 `agreement`）。
+fn peak_agreement(members: &[Suspicion], fams: &[Vec<String>]) -> u32 {
+    if members.is_empty() || fams.len() != members.len() {
+        return 0;
+    }
+    let n = members.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if same_suspicion(&members[i], &members[j]) {
+                let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
+                if ri != rj {
+                    parent[rj] = ri;
+                }
+            }
+        }
+    }
+    let mut clusters: Vec<(usize, Vec<&str>)> = Vec::new();
+    for (i, fam) in fams.iter().enumerate() {
+        let root = uf_find(&mut parent, i);
+        let slot = match clusters.iter_mut().find(|(r, _)| *r == root) {
+            Some(s) => &mut s.1,
+            None => {
+                clusters.push((root, Vec::new()));
+                &mut clusters.last_mut().unwrap().1
+            }
+        };
+        for f in fam.iter().filter(|f| !f.is_empty()) {
+            if !slot.contains(&f.as_str()) {
+                slot.push(f);
+            }
+        }
+    }
+    clusters.iter().map(|(_, f)| f.len() as u32).max().unwrap_or(0)
+}
+
+fn uf_find(parent: &mut [usize], i: usize) -> usize {
+    let mut r = i;
+    while parent[r] != r {
+        r = parent[r];
+    }
+    let mut c = i;
+    while parent[c] != r {
+        let next = parent[c];
+        parent[c] = r;
+        c = next;
+    }
+    r
 }
 
 fn dedup_families(families: Vec<String>) -> Vec<String> {
@@ -149,6 +248,45 @@ impl EnqueueReq {
         let spec = QueueItemSpec::new(s.file.clone(), vec![(start, s.line_end.max(start))], QueueOrigin::Scan, vec![s.clone()]).ok()?;
         Some(EnqueueReq { spec, score: s.confidence, kind: ItemKind::Suspicion, families: vec![family.to_string()], arrival: Some(arrival) })
     }
+
+    /// scanner needs 入队请求（C3〔D16〕Q8，design §6 的第三种生产者）：`kind = evidence` 的一条声明成一项——
+    /// 区间取 `lines`（解不出行锚 → 不入队，见下）、无笔记（走与 H0 同款的「区域独立审」）、
+    /// 到达键 `needs:{path}:{lines}:{理由指纹}`（同一条声明重复到达即幂等）。
+    /// 家族留空：needs 不是「谁看见了什么」，不参与共识。变更集过滤在调用方（队列不知道 diff）。
+    pub fn need(n: &crate::domain::NeedEntry) -> Option<EnqueueReq> {
+        if n.kind != crate::domain::NeedKind::Evidence || n.path.is_empty() {
+            return None;
+        }
+        // 行锚用与二阶段补查同一份解析（评审 #13）：同一个字段在两条路径上解出两个区间是纯粹的坑。
+        // 解不出行锚的不入队——它会变成「无笔记地审这个文件的开头」，白烧一格。实测三轮 needs 全部带 lines。
+        let (a, b) = crate::cli::second_pass::parse_need_lines(n.lines.as_deref())?;
+        // 路径在入口归一一次（评审）：needs 的 path 直接来自模型、不过 `anchor_suspicions` 那道校验，
+        // `./src/a.rs` 与 `src/a.rs` 必须是同一个文件——否则变更集判定、装包取文件、与疑点并项三处都对不上。
+        let path = norm_path(&n.path);
+        let spec = QueueItemSpec::new(path.clone(), vec![(a, b)], QueueOrigin::Needs, vec![]).ok()?;
+        let arrival = format!("needs:{path}:{a}-{b}:{}", crate::hash::fnv1a64_hex(&[n.reason.as_str()]));
+        Some(EnqueueReq { spec, score: NEEDS_MID_SCORE, kind: ItemKind::Needs, families: vec![], arrival: Some(arrival) })
+    }
+}
+
+/// 仓内相对路径归一：`./a.rs` / `/a.rs` → `a.rs`。
+pub(crate) fn norm_path(p: &str) -> String {
+    p.trim_start_matches("./").trim_start_matches('/').to_string()
+}
+
+/// 一次到达（C3〔D16〕）：入队请求 + 调用方算好的稳定块与风险档。
+/// 块要读文件内容、风险档要看 `RiskRoute`，两者都不是队列该做的事——队列只比键。
+/// 直接喂 `EnqueueReq`（经 `From`）即「无块信息」：旧快照回放与单测构造走这条，合并退回 quote 谓词。
+pub struct Arrival {
+    pub req: EnqueueReq,
+    pub block: Block,
+    pub risk_band: u8,
+}
+
+impl From<EnqueueReq> for Arrival {
+    fn from(req: EnqueueReq) -> Self {
+        Arrival { req, block: Block::default(), risk_band: 0 }
+    }
 }
 
 /// 内存队列（C-1 只含入队；派发/预算 C-2/C-3）。
@@ -167,6 +305,12 @@ impl DeepQueue {
     pub fn restore(mut items: Vec<QueueItem>) -> Self {
         let now = now_ms();
         for it in items.iter_mut() {
+            // 旧快照（C3 之前）没有必挖轴与逐条家族：把往轮的区域级 `agreement` 种成必挖轴下限（评审 #5）。
+            // 不种的话，往轮认定的必挖项在本轮到达一条新疑点后会被算成 peak = 1 而降级、被收场 drain 截掉——
+            // 「更多佐证反而失去保护」。种了之后语义就是「旧项按 C2 口径判必挖」，与不动它时一致。
+            if it.peak_agreement == 0 && it.member_families.is_empty() {
+                it.peak_agreement = it.agreement;
+            }
             match it.state {
                 ItemState::Pending | ItemState::InFlight => {
                     it.state = ItemState::Pending;
@@ -205,37 +349,51 @@ impl DeepQueue {
     }
 
     /// 五态入口。判例守卫空过：调用方把跨轮命中当无命中喂进来即可。
-    pub fn enqueue(&mut self, req: EnqueueReq) -> EnqueueOutcome {
-        self.enqueue_affected(req).0
+    pub fn enqueue(&mut self, arrival: impl Into<Arrival>) -> EnqueueOutcome {
+        self.enqueue_affected(arrival).0
     }
 
     /// 同 [`Self::enqueue`]，另回报受影响项下标（新建项 / 并入目标；`Duplicate` 为 `None`）——调用方只写这一项的快照（C2 Q9）。
     /// 到达键先查：已记在某项上即幂等返回，不改项、不计去重命中。
-    pub fn enqueue_affected(&mut self, req: EnqueueReq) -> (EnqueueOutcome, Option<usize>) {
+    pub fn enqueue_affected(&mut self, arrival: impl Into<Arrival>) -> (EnqueueOutcome, Option<usize>) {
+        let Arrival { req, block, risk_band } = arrival.into();
         if let Some(key) = &req.arrival {
             if self.items.iter().any(|it| it.arrivals.contains(key)) {
                 return (EnqueueOutcome::Duplicate, None);
             }
         }
-        let incoming_id = item_id(&req.spec);
-        if let Some((idx, by_predicate)) = self.find_merge_idx(&req.spec, &incoming_id) {
-            return (self.merge_into(idx, req, by_predicate), Some(idx));
+        let incoming_id = id_for(&req.spec, &block);
+        if let Some((idx, by_predicate)) = self.find_merge_idx(&req.spec, &block, &incoming_id) {
+            return (self.merge_into(idx, req, risk_band, by_predicate), Some(idx));
         }
-        self.items.push(QueueItem::new(req.spec, req.score, req.kind, req.families, req.arrival));
+        self.items.push(QueueItem::new(req, block, risk_band));
         (EnqueueOutcome::New, Some(self.items.len() - 1))
     }
 
-    /// 合并目标 + 是否经谓词命中。id 相等（`file:origin:ranges` 逐字相同）也合并——保住「一个区间只挖一次」
-    /// 与 id 唯一；但谓词命中优先：同一疑点的共识只该记到谓词认定的那一项上。
-    fn find_merge_idx(&self, spec: &QueueItemSpec, incoming_id: &str) -> Option<(usize, bool)> {
-        if let Some(i) = self.items.iter().position(|it| same_item(it, spec)) {
+    /// 合并目标 + 是否经谓词命中。查找序：**结构块优先** → 谓词（quote / 行带）→ id 兜底。
+    ///
+    /// 结构块优先（评审 #9）：`same_item` 对不同候选项用的谓词不同（旧快照项走 quote），线性取首个命中
+    /// 会让一个旧项把本该归给块主人的到达截走，同一个块键裂成两项——恰是本批要消灭的那种分裂。
+    ///
+    /// id 兜底（评审 #10）：id 唯一是快照 upsert（`(job, id)` 主键）、`mark_settled` / `get` 的线性查找、
+    /// cell 命名三处的硬前提。两项同 id 只会静默互相覆盖。同轮内同文件同区间必然算出同一个块键，
+    /// 这条兜底走不到；能走到的只有 resume 后内容变了的情形——那时保 id 唯一比保结构分开更要紧。
+    fn find_merge_idx(&self, spec: &QueueItemSpec, block: &Block, incoming_id: &str) -> Option<(usize, bool)> {
+        // 第一遍只在同样有结构块的项里找（谓词仍是 `same_item`，不另写一份规则——写两份就会互相掩盖，变异检查也照不出来）。
+        if block.is_structural() {
+            if let Some(i) = self.items.iter().position(|it| it.block.is_structural() && same_item(it, spec, block)) {
+                return Some((i, true));
+            }
+        }
+        if let Some(i) = self.items.iter().position(|it| same_item(it, spec, block)) {
             return Some((i, true));
         }
         self.items.iter().position(|it| it.id == incoming_id).map(|i| (i, false))
     }
 
-    fn merge_into(&mut self, idx: usize, req: EnqueueReq, by_predicate: bool) -> EnqueueOutcome {
+    fn merge_into(&mut self, idx: usize, req: EnqueueReq, risk_band: u8, by_predicate: bool) -> EnqueueOutcome {
         let it = &mut self.items[idx];
+        let members_before = it.members.len();
         // 共识只经谓词（C1 design §2.2；C2〔D15〕改写前提）：疑点逐 scan 格到达，队列侧逐条把新疑点与已有项的笔记比对，
         // **不是**组内传递闭包——A、C 先到互不匹配、B 后到两边都匹配时 B 只并入先命中的那项，A 与 C 永远两项。非传递漏合并
         // 只会少算共识、多复核一次（D15 实测 ≤ 1/19 簇），收场以 `closure_members` 对账、拆簇数进 RunMeta。
@@ -244,24 +402,56 @@ impl DeepQueue {
         // 但 id 捷径并入的**请求自身**共识不能丢（评审修）：上游已合并成多家族共识的疑点（必挖）撞上同区间的单家族项，
         // agreement 同时决定必挖集与排序分，丢了它就可能被预算截掉——家族不跨疑点并，agreement 取大。
         // 两条路径都取大 → agreement 单调不减（事件侧 `event ≤ landed` 的前提）。
+        let incoming_families = dedup_families(req.families);
         if by_predicate {
-            for f in req.families.into_iter().filter(|f| !f.is_empty()) {
-                if !it.families.contains(&f) {
-                    it.families.push(f);
+            for f in incoming_families.iter().filter(|f| !f.is_empty()) {
+                if !it.families.contains(f) {
+                    it.families.push(f.clone());
                 }
             }
             it.agreement = it.agreement.max(agreement_of(&it.families));
         } else {
-            it.agreement = it.agreement.max(agreement_of(&dedup_families(req.families)));
+            it.agreement = it.agreement.max(agreement_of(&incoming_families));
         }
         if let Some(key) = req.arrival {
             it.arrivals.push(key); // 调用方已查过不在任何项上
         }
-        it.spec.ranges = union_ranges(&it.spec.ranges, &req.spec.ranges);
+        // 旧快照项（无块）**不就地升级**（评审 #3）：`id` 只在 `new` 时定死、升级会让 id 与 ranges 各说各话
+        // ——cell 名、快照主键、coverage 都报着一个 reviewer 没看过的区间。旧项就按旧语义走到底。
+        it.risk_band = it.risk_band.max(risk_band);
+        // 「区间 = 块」是身份的一部分（design C3 §2）：有块就恒等于块，不并进到达的报告行（评审 #2）。
+        // 否则 quote 跨到块尾外的疑点会把区间撑大，且撑成什么样取决于到达序——同样的输入两种 pack。
+        if it.block.is_empty() {
+            it.spec.ranges = union_ranges(&it.spec.ranges, &req.spec.ranges);
+        }
+        // scan 与 needs 同一身份空间：层级取高的那个（`Needs` 并进疑点项后按疑点派，反之亦然）。
+        it.kind = it.kind.min(req.kind);
+        // 旧快照没有 `member_families`（serde default 空）：先补齐到与 `members` 等长，
+        // 否则下面的 `get_mut` 拿不到槽位、家族被静默丢掉，两列长度永久错开（评审 #14）。
+        if it.member_families.len() < it.members.len() {
+            it.member_families.resize(it.members.len(), Vec::new());
+        }
         for n in &req.spec.notes {
-            if !it.members.iter().any(|m| m == n) {
-                it.members.push(n.clone());
+            // 家族按条记（`member_families` 与 `members` 同下标）：同一条疑点被两个家族提出时，
+            // 家族落在同一槽位——项内聚簇据此算最大簇家族数。
+            match it.members.iter().position(|m| m == n) {
+                Some(i) => {
+                    let slot = &mut it.member_families[i];
+                    for f in incoming_families.iter().filter(|f| !f.is_empty()) {
+                        if !slot.contains(f) {
+                            slot.push(f.clone());
+                        }
+                    }
+                }
+                None => {
+                    it.members.push(n.clone());
+                    it.member_families.push(incoming_families.clone());
+                }
             }
+        }
+        // 只在成员或家族真的动了才重算（评审效率项）：项内聚簇是 O(n²)，纯重复到达没必要再跑一遍。
+        if it.members.len() != members_before || !incoming_families.is_empty() {
+            it.recompute_peak();
         }
         it.spec.notes = merge_notes(&it.spec.notes, &req.spec.notes);
         if req.score > it.score {
@@ -287,6 +477,11 @@ impl DeepQueue {
     }
 
     /// Pending 项按优先级弹出顺序（不改状态）。必挖集排在最前且不被后续 budget 截掉。
+    ///
+    /// C3〔D16〕**每文件保底一格**：尚无格的文件，其最高项提到队首（层内仍按 [`cmp_priority`]）。
+    /// 实测单文件能吃掉 13 格里的 6 格（该文件 34 条疑点占候选集 87%），一份文档就把预算摊完。
+    /// 保底随派发自然失效——该文件有格之后，它的其余项回到常规序。
+    /// 派发（`pop_dispatch_where`）与收场 drain 都读这一个序，两者不得分叉：否则收场留下的与实际挖的对不上。
     pub fn pending_order(&self) -> Vec<usize> {
         let mut idx: Vec<usize> = self
             .items
@@ -296,7 +491,30 @@ impl DeepQueue {
             .map(|(i, _)| i)
             .collect();
         idx.sort_by(|&a, &b| cmp_priority(&self.items[a], &self.items[b]));
-        idx
+        let dispatched: std::collections::HashSet<&str> = self
+            .items
+            .iter()
+            .filter(|it| matches!(it.state, ItemState::InFlight | ItemState::Settled))
+            .map(|it| it.spec.file.as_str())
+            .collect();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // 保底只给 scanner 疑点（评审 #8）：集中度问题全在疑点上；needs 是「预算有余才吃格」的层级，
+        // 让它靠保底插到别的文件的疑点前面，与 design §6「层级 Needs 天然排在疑点之后」冲突。
+        let first_slot: Vec<bool> = idx
+            .iter()
+            .map(|&i| {
+                let it = &self.items[i];
+                let f = it.spec.file.as_str();
+                it.kind == ItemKind::Suspicion && !dispatched.contains(f) && seen.insert(f)
+            })
+            .collect();
+        // 稳定三段分区：H0（主区 / 涟漪）恒在最前——它是 §9 确定性地板，不让位给多样性启发式（评审 #8）；
+        // 其次是各文件的保底疑点；再次是其余项。段内保持 `cmp_priority` 的原序。
+        let h0 = |i: usize| matches!(self.items[i].kind, ItemKind::Primary | ItemKind::Ripple);
+        let mut out: Vec<usize> = idx.iter().copied().filter(|&i| h0(i)).collect();
+        out.extend(idx.iter().zip(&first_slot).filter(|(&i, &f)| !h0(i) && f).map(|(&i, _)| i));
+        out.extend(idx.iter().zip(&first_slot).filter(|(&i, &f)| !h0(i) && !f).map(|(&i, _)| i));
+        out
     }
 
     /// 主区 ∪ {agreement ≥ 2}。`max_cells = 0` 时主区仍算必挖。
@@ -403,35 +621,56 @@ impl DeepQueue {
 }
 
 /// 必挖集判定（design §6 规则 3）：不依赖队列其余项，合并路径拿着 `&mut` 项也能调；深挖在线额度的可派条件也用它。
+///
+/// C3〔D16〕起共识分两轴，必挖只认**项内**最大簇的家族数：结构定项后一块里可能落着好几条互不相关的疑点，
+/// 按区域级家族并集判定会让必挖集从每轮 4 条涨到 7–9 个块（PR181 规模 18/23）——必挖不受预算截断，`maxCells` 就形同虚设。
 pub(crate) fn must_dig(it: &QueueItem) -> bool {
-    it.kind == ItemKind::Primary || it.agreement >= 2
+    it.kind == ItemKind::Primary || consensus_axis(it) >= 2
 }
 
-fn category_weight(notes: &[Suspicion]) -> f32 {
-    notes
-        .iter()
-        .filter_map(|n| n.category)
-        .map(|c| CATEGORY_WEIGHT[c as usize])
-        .fold(1.0_f32, f32::max)
+/// 必挖轴取值：有 `peak_agreement` 用它；0 = 未算（旧快照 / H0 无疑点）→ 退回区域级 `agreement`（C1/C2 行为）。
+fn consensus_axis(it: &QueueItem) -> u32 {
+    if it.peak_agreement > 0 {
+        it.peak_agreement
+    } else {
+        it.agreement
+    }
 }
 
-fn priority_score(it: &QueueItem) -> f32 {
+/// 项的自评置信：疑点取成员里的最高，H0 / needs 用自身分。
+/// **只做末位裂解**——跨轮不可比（两轮分布整体平移，中位 0.35 vs 0.45），E3 也实证 flash 级自评与命中无关。
+fn confidence_of(it: &QueueItem) -> f32 {
     match it.kind {
         ItemKind::Primary | ItemKind::Ripple => it.score,
-        ItemKind::Suspicion => {
-            let notes = it.suspicions();
-            let conf = notes.iter().map(|n| n.confidence).fold(0.0_f32, f32::max);
-            conf * it.agreement as f32 * category_weight(notes)
-        }
+        ItemKind::Suspicion => it.suspicions().iter().map(|n| n.confidence).fold(0.0_f32, f32::max),
         ItemKind::Needs => NEEDS_MID_SCORE,
     }
 }
 
-/// 优先级全序：种类 → 分数（高在前）→ id。收场按最终项优先级组装报告（C2 Q8）共用。
+/// 文档判定复用阶段 0 的单一口径（评审）：`risk::signals::is_doc_path` 正是 R 分母里把文档行剔出 `code_lines`
+/// 的那把尺（`.md/.json/.ya?ml/.toml/.txt/.lock/.svg/.csv`）。自己再写一把只会让「代码格占比」这类读数两处对不上。
+/// 不再按 `.next/` / `.doc/` 前缀判：那是本仓私有目录名，别的仓里 `.next/` 是 Next.js 的构建产物。
+fn is_doc(file: &str) -> bool {
+    crate::risk::signals::is_doc_path(file)
+}
+
+/// 优先级全序（C3〔D16〕分层键，design C3 §4）：种类 → 必挖轴 → 风险档 → 烟量 → 代码优先 → 自评置信 → id。
+///
+/// 取代 C1 的乘积式 `conf × agreement × 类别权重`：类别权重恒 1.0（L0 占比两轮 59% vs 21%，标注自身在漂、不启用）、
+/// agreement 只取 1 / 2，乘积实际退化成「按 confidence 排」，而经预算截断后 confidence 就成了门。
+/// 分层后每一维含义独立可查，同分才落到下一层。
+///
+/// 「每文件保底一格」不在这里——它依赖队列全局状态（该文件是否已有格），由 [`DeepQueue::pending_order`] 在本序之上分层。
+/// 收场组装报告（C2 Q8）用的也是本序：那时所有项都已派发，保底层对谁都不成立。
 pub(crate) fn cmp_priority(a: &QueueItem, b: &QueueItem) -> std::cmp::Ordering {
+    let ord = |x: bool| if x { 0 } else { 1 };
     a.kind
         .cmp(&b.kind)
-        .then_with(|| priority_score(b).partial_cmp(&priority_score(a)).unwrap_or(std::cmp::Ordering::Equal))
+        .then_with(|| consensus_axis(b).cmp(&consensus_axis(a)))
+        .then_with(|| b.risk_band.cmp(&a.risk_band))
+        .then_with(|| b.suspicions().len().cmp(&a.suspicions().len()))
+        .then_with(|| ord(!is_doc(&a.spec.file)).cmp(&ord(!is_doc(&b.spec.file))))
+        .then_with(|| confidence_of(b).partial_cmp(&confidence_of(a)).unwrap_or(std::cmp::Ordering::Equal))
         .then_with(|| a.id.cmp(&b.id))
 }
 
@@ -450,19 +689,40 @@ fn item_id(spec: &QueueItemSpec) -> String {
     format!("{}:{}:{}", spec.file, origin, ranges)
 }
 
-/// 同一项谓词：主区按文件 + 区间相交；疑点 / needs 按文件 + 「到达过本项的任一疑点」与请求的任一疑点相似
-/// （成员而非渲染笔记，C2 评审 #3：桥接疑点并入后匹配面要跟着扩大）。
-fn same_item(a: &QueueItem, b: &QueueItemSpec) -> bool {
-    if a.spec.origin != b.origin {
+/// 到达请求会成为的 id：有块时区间取块（与 [`QueueItem::new`] 一致），否则按请求区间。
+/// 两处算法必须同源——否则 id 捷径拿报告行去比队列里的块 id，永远比不中，唯一性就没人守了。
+fn id_for(spec: &QueueItemSpec, block: &Block) -> String {
+    if block.is_empty() {
+        return item_id(spec);
+    }
+    let mut probe = spec.clone();
+    probe.ranges = vec![(block.start, block.end)];
+    item_id(&probe)
+}
+
+/// 同一项谓词：主区按文件 + 区间相交；疑点 / needs 按**文件 + 稳定块键**（C3〔D16〕结构定项）。
+///
+/// 任一侧无块信息（旧快照 / 内容不可读）→ 退回 C1/C2 的 quote 谓词：文件相同 + 「到达过本项的任一疑点」
+/// 与请求的任一疑点相似（成员而非渲染笔记，C2 评审 #3：桥接疑点并入后匹配面要跟着扩大）。
+fn same_item(a: &QueueItem, b: &QueueItemSpec, b_block: &Block) -> bool {
+    let rule = |o| o == QueueOrigin::Rule;
+    if rule(a.spec.origin) || rule(b.origin) {
+        // 主区身份不变：文件 + 区间相交，与块无关。
+        return rule(a.spec.origin) && rule(b.origin) && a.spec.file == b.file && ranges_overlap(&a.spec.ranges, &b.ranges);
+    }
+    // scan 与 needs 同一身份空间（评审 #6）：needs 只接变更集内的路径，恰是疑点所在的那些文件——
+    // 分开记会把同一块的同一段证据装两次包、挖两遍，还把 `max_cells_per_file` 这个本批自己的门槛顶高。
+    if a.spec.file != b.file {
         return false;
     }
-    match a.spec.origin {
-        QueueOrigin::Rule => a.spec.file == b.file && ranges_overlap(&a.spec.ranges, &b.ranges),
-        QueueOrigin::Scan | QueueOrigin::Needs => {
-            a.spec.file == b.file
-                && a.suspicions().iter().any(|na| b.notes.iter().any(|nb| same_suspicion(na, nb)))
-        }
+    if a.block.is_structural() && b_block.is_structural() {
+        return a.block.key == b_block.key;
     }
+    // 行带 / 无块不是结构身份（评审 #7）：先按 C2 的 quote 谓词判——否则 py / yaml / json 这些
+    // `lang_for` 不覆盖的文件里，差一行跨带的两条同 quote 疑点会从「一项共识 2」裂成「两项各 1」，
+    // 双双掉出必挖集，成了净回退。带号相同仍然算同项（合并收益保留）。
+    a.suspicions().iter().any(|na| b.notes.iter().any(|nb| same_suspicion(na, nb)))
+        || (!a.block.is_empty() && !b_block.is_empty() && a.block.key == b_block.key)
 }
 
 fn ranges_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
@@ -879,7 +1139,7 @@ mod tests {
         assert!(must_dig(it), "共识 ≥ 2 → 必挖");
         let best = it.spec.notes.iter().map(|n| n.confidence).fold(0.0_f32, f32::max);
         assert_eq!((best, it.spec.notes.len()), (0.9, 1), "代表取最高置信：s1 顶掉 s3，与 s1 相似的 s2 不重复列");
-        assert!((priority_score(it) - 0.9 * 3.0 * category_weight(it.suspicions())).abs() < 1e-6, "优先级用最高置信");
+        assert!((confidence_of(it) - 0.9).abs() < 1e-6, "末位裂解用成员里的最高置信（C3〔D16〕分层键）");
 
         // 桥接疑点置信更低时代表笔记留不住它（相似的只留高置信那条），匹配面只能靠成员列表
         let low_bridge = QueueItemSpec::new(
@@ -1007,5 +1267,369 @@ mod tests {
         assert_eq!(none.drain_with(0, 0).len(), 3, "保底已被已派发疑点用完 → 只留必挖");
         let mut fill = q;
         assert_eq!(fill.drain_with(4, 0).len(), 2, "按优先级补到 4");
+    }
+
+    // ---- C3〔D16〕结构定项、谓词定共识 ----
+
+    fn blk(key: &str, start: u32, end: u32) -> Block {
+        Block { start, end, key: key.into() }
+    }
+
+    fn arr(spec: QueueItemSpec, family: Option<&str>, block: Block) -> Arrival {
+        Arrival { req: req(spec, family), block, risk_band: 0 }
+    }
+
+    /// 结构定项：同一 def 块里两条**互不相似**的疑点并成一项——现行 quote 谓词会留两项，正是跨轮对不上的来源。
+    /// 共识两轴分离：区域级 `agreement` = 2（两个家族碰过这块），必挖轴 `peak_agreement` = 1（最大簇只有一个家族）→ **非必挖**。
+    #[test]
+    fn same_block_merges_unrelated_suspicions_but_does_not_make_them_must_dig() {
+        let mut q = DeepQueue::new();
+        let b = blk("def:f1", 10, 40);
+        q.enqueue(arr(spec_scan("a.rs", 12, 12, "let x = take(v);", "空指针"), Some("alpha"), b.clone()));
+        let o = q.enqueue(arr(spec_scan("a.rs", 33, 33, "drop(guard); // 完全无关", "锁顺序"), Some("beta"), b));
+
+        assert_eq!(o, EnqueueOutcome::MergedPending);
+        assert_eq!(q.items().len(), 1, "同块 = 同项");
+        let it = &q.items()[0];
+        assert_eq!((it.agreement, it.peak_agreement), (2, 1), "区域级 2 / 必挖轴 1");
+        assert!(!must_dig(it), "两条不相干的疑点凑不出共识");
+        assert_eq!(it.spec.ranges, vec![(10, 40)], "项的区间 = 块");
+        assert_eq!(it.id, "a.rs:scan:10-40", "id 也锚在块上");
+    }
+
+    /// 必挖轴：同一条疑点被两家族提出（quote 相似）→ 最大簇家族数 2 → 必挖。
+    #[test]
+    fn same_suspicion_from_two_families_lifts_peak_agreement() {
+        let mut q = DeepQueue::new();
+        let b = blk("def:f1", 10, 40);
+        q.enqueue(arr(spec_scan("a.rs", 12, 12, "let x = take(v);", "空指针"), Some("alpha"), b.clone()));
+        q.enqueue(arr(spec_scan("a.rs", 13, 13, "let x = take(v);", "同一处"), Some("beta"), b));
+
+        let it = &q.items()[0];
+        assert_eq!((it.agreement, it.peak_agreement), (2, 2));
+        assert!(must_dig(it));
+    }
+
+    /// 同家族多 samples 不抬必挖轴（D7 口径）：两条相似疑点都来自 alpha → 簇内家族数仍 1。
+    #[test]
+    fn same_family_twice_does_not_lift_peak_agreement() {
+        let mut q = DeepQueue::new();
+        let b = blk("def:f1", 10, 40);
+        q.enqueue(arr(spec_scan("a.rs", 12, 12, "let x = take(v);", "空指针"), Some("alpha"), b.clone()));
+        q.enqueue(arr(spec_scan("a.rs", 13, 13, "let x = take(v);", "还是它"), Some("alpha"), b));
+
+        let it = &q.items()[0];
+        assert_eq!((it.agreement, it.peak_agreement), (1, 1));
+        assert!(!must_dig(it));
+    }
+
+    /// 不同块不并——哪怕 quote 完全相同（现行谓词会并成一项）。
+    #[test]
+    fn different_blocks_stay_separate_even_with_identical_quotes() {
+        let mut q = DeepQueue::new();
+        q.enqueue(arr(spec_scan("a.rs", 12, 12, "tick();", "h"), Some("alpha"), blk("def:f1", 10, 20)));
+        let o = q.enqueue(arr(spec_scan("a.rs", 22, 22, "tick();", "h"), Some("beta"), blk("def:f2", 21, 30)));
+
+        assert_eq!(o, EnqueueOutcome::New);
+        assert_eq!(q.items().len(), 2);
+    }
+
+    /// id 唯一优先于结构分开（评审 #10）：两条疑点算出同一 id（区间取各自的块、恰好一样）但块键不同 →
+    /// 仍并成一项。两项同 id 会在快照 upsert（`(job, id)` 主键）、`mark_settled` 的线性查找与 cell 命名三处静默互相覆盖，
+    /// 那比「两个结构被并成一项」严重得多；同轮内同文件同区间必然同键，这条兜底只在 resume 后内容变了时走到。
+    #[test]
+    fn identical_id_merges_even_when_block_keys_differ() {
+        let mut q = DeepQueue::new();
+        q.enqueue(arr(spec_scan("a.rs", 1, 1, "alpha_line();", "h"), Some("alpha"), blk("def:f1", 5, 9)));
+        let o = q.enqueue(arr(spec_scan("a.rs", 1, 1, "beta_line();", "h2"), Some("beta"), blk("def:f2", 5, 9)));
+
+        assert_eq!(o, EnqueueOutcome::MergedPending);
+        assert_eq!(q.items().len(), 1, "id 唯一");
+        assert_eq!(q.items()[0].id, "a.rs:scan:5-9");
+    }
+
+    /// 结构块优先于旧项的 quote 谓词（评审 #9）：线性取首个命中会让一个无块的旧项把本该归给块主人的到达截走，
+    /// 同一个块键裂成两项——resume 场景里正是本批要消灭的那种分裂。
+    #[test]
+    fn structural_match_wins_over_a_blockless_items_quote_match() {
+        let mut q = DeepQueue::new();
+        // 旧项（无块）：行与 quote 都够得着后面那条桥接到达——不这样构造就测不到「被截走」
+        q.enqueue(req(spec_scan("a.rs", 11, 11, "let x = take(v);", "旧"), Some("alpha")));
+        // 块主人
+        q.enqueue(arr(spec_scan("a.rs", 12, 12, "完全不同的一行();", "新"), Some("beta"), blk("def:f1", 10, 40)));
+        let o = q.enqueue(arr(spec_scan("a.rs", 13, 13, "let x = take(v);", "桥"), Some("gamma"), blk("def:f1", 10, 40)));
+
+        assert_eq!(o, EnqueueOutcome::MergedPending);
+        assert_eq!(q.items().len(), 2, "并进块主人，不是并进旧项: {:?}", q.items().iter().map(|it| &it.id).collect::<Vec<_>>());
+        assert_eq!(q.items()[1].members.len(), 2, "块主人收了桥接那条");
+        assert_eq!(q.items()[0].members.len(), 1, "旧项没被截走");
+    }
+
+    /// 行带不是结构身份（评审 #7）：`lang_for` 不覆盖的语言（py / yaml / json…）里，差一行跨带的两条同 quote 疑点
+    /// 在 C2 是一项共识 2（必挖），按块键硬判会裂成两项各 1、双双掉出必挖集——净回退。行带上仍走 quote 谓词。
+    #[test]
+    fn band_blocks_still_merge_by_quote_across_a_band_boundary() {
+        let mut q = DeepQueue::new();
+        q.enqueue(arr(spec_scan("app.py", 21, 21, "cursor.execute(sql % arg)", "注入"), Some("alpha"), blk("pad:0", 1, 21)));
+        let o = q.enqueue(arr(spec_scan("app.py", 23, 23, "cursor.execute(sql % arg)", "同一处"), Some("beta"), blk("pad:1", 22, 42)));
+
+        assert_eq!(o, EnqueueOutcome::MergedPending, "跨带但同一条疑点");
+        assert_eq!(q.items().len(), 1);
+        assert!(must_dig(&q.items()[0]), "共识 2 仍是必挖");
+    }
+
+    /// H0 恒在最前（评审 #8）：保底是多样性启发式，不得把 §9 确定性地板的主区 / 涟漪挤到后面，
+    /// 也不该让 needs 靠保底插到别的文件的疑点之前。
+    #[test]
+    fn h0_outranks_the_per_file_first_slot() {
+        let mut q = DeepQueue::new();
+        // a.rs 已有一格在途 → a 的其余项不再有保底位
+        let mut dug = item_at("a.rs", 10, 1, 0, 1, 0.9);
+        dug.state = ItemState::InFlight;
+        q.items.push(dug);
+        q.items.push(item_at("a.rs", 20, 1, 0, 1, 0.9));
+        // b.rs 从没挖过：一条 H0 涟漪 + 一条 needs
+        let ripple_spec = spec_rule("b.rs", 1, 9);
+        q.enqueue(req_kind(ripple_spec, ItemKind::Ripple, 0.1, None));
+        let needs_spec = QueueItemSpec::new("c.rs".into(), vec![(1, 9)], QueueOrigin::Needs, vec![]).unwrap();
+        q.enqueue(EnqueueReq { spec: needs_spec, score: 0.5, kind: ItemKind::Needs, families: vec![], arrival: None });
+
+        let order: Vec<&str> = q.pending_order().into_iter().map(|i| q.items()[i].spec.file.as_str()).collect();
+
+        assert_eq!(order[0], "b.rs", "H0 涟漪在最前，哪怕它所在文件也只是「没挖过」: {order:?}");
+        assert_eq!(order[order.len() - 1], "c.rs", "needs 垫底，保底不把它提前: {order:?}");
+    }
+
+    /// 无块信息（内容读不到 / 旧快照回放）→ 合并退回 C1/C2 的 quote 谓词；家族仍按条记，必挖轴照算。
+    #[test]
+    fn missing_block_falls_back_to_quote_predicate() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("a.rs", 3, 5, "let x = take(v);", "h"), Some("alpha")));
+        let o = q.enqueue(req(spec_scan("a.rs", 4, 6, "let x = take(v);", "h2"), Some("beta")));
+
+        assert_eq!(o, EnqueueOutcome::MergedPending);
+        let it = &q.items()[0];
+        assert!(it.block.is_empty());
+        assert_eq!((it.agreement, it.peak_agreement), (2, 2), "同一条疑点两家族 → 必挖轴照样成立");
+        assert_eq!(it.spec.ranges, vec![(3, 6)], "无块 → 区间按 C2 的并集");
+    }
+
+    /// 旧快照项（C2 之前落盘，没有 `member_families` / `peak_agreement` 两个字段）→ 必挖判定退回区域级 `agreement`，
+    /// 行为与 C2 逐字一致；不会因为新轴算不出来就把往轮认定的必挖项降级。
+    #[test]
+    fn legacy_snapshot_item_falls_back_to_region_agreement() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("a.rs", 3, 5, "let x = take(v);", "h"), Some("alpha")));
+        q.enqueue(req(spec_scan("a.rs", 4, 6, "let x = take(v);", "h2"), Some("beta")));
+        let mut snap = q.items().to_vec();
+        snap[0].member_families.clear(); // serde default：旧快照没有这一列
+        snap[0].peak_agreement = 0;
+
+        let mut restored = DeepQueue::restore(snap);
+
+        let it = &restored.items()[0];
+        assert_eq!(it.peak_agreement, 2, "restore 把往轮的区域级 agreement 种成必挖轴下限");
+        assert!(must_dig(it), "行为与 C2 一致");
+
+        // 更多佐证不得把它降回非必挖（评审 #5）：并进来的这条算出的 peak = 1（旧成员没有家族记录）
+        // 不能覆盖种下的 2——否则「更多佐证反而失去必挖保护」。
+        assert_eq!(restored.enqueue(req(spec_scan("a.rs", 4, 6, "let x = take(v);", "新"), Some("gamma"))), EnqueueOutcome::MergedPending);
+        assert_eq!(restored.items().len(), 1);
+        assert!(must_dig(&restored.items()[0]), "peak 只增不减: {:?}", restored.items()[0]);
+    }
+
+    /// 旧快照项的家族列要先补齐再写（评审 #14）：`members` 有、`member_families` 空（serde default）时，
+    /// 按下标写会越界；不补齐则家族被静默丢掉、两列长度永久错开，该项的必挖轴永远算不出来。
+    #[test]
+    fn merging_into_a_legacy_item_aligns_member_families() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("a.rs", 3, 5, "let x = take(v);", "h"), Some("alpha")));
+        q.items[0].member_families.clear(); // 旧快照形态
+        q.items[0].peak_agreement = 0;
+
+        let same = sus("a.rs", 3, 5, "let x = take(v);", "h");
+        let spec = QueueItemSpec::new("a.rs".into(), vec![(3, 5)], QueueOrigin::Scan, vec![same]).unwrap();
+        assert_eq!(q.enqueue(req(spec, Some("beta"))), EnqueueOutcome::MergedPending);
+
+        let it = &q.items()[0];
+        assert_eq!(it.members.len(), 1, "同一条疑点不重复记");
+        assert_eq!(it.member_families, vec![vec!["beta".to_string()]], "补齐后新家族落进同一槽位");
+    }
+
+    /// 旧快照项**不就地升级**（评审 #3）：`id` 只在 `new` 时定死，升级会让 id 与 ranges 各说各话——
+    /// cell 名、快照主键、coverage 都报着一个 reviewer 没看过的区间。旧项按旧语义走到底。
+    #[test]
+    fn legacy_item_keeps_its_own_identity_when_a_blocked_arrival_merges_in() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("a.rs", 3, 5, "let x = take(v);", "h"), Some("alpha")));
+        q.enqueue(arr(spec_scan("a.rs", 4, 6, "let x = take(v);", "h2"), Some("beta"), blk("def:f1", 1, 30)));
+
+        assert_eq!(q.items().len(), 1);
+        let it = &q.items()[0];
+        assert!(it.block.is_empty(), "不升级");
+        assert_eq!(it.spec.ranges, vec![(3, 6)], "区间仍按 C2 的并集");
+        assert_eq!(it.id, "a.rs:scan:3-5", "id 与区间口径一致（都还是旧的）");
+    }
+
+    /// 有块的项，区间恒等于块（评审 #2）：quote 跨到块尾外的疑点不得把区间撑大，
+    /// 撑大与否还取决于到达序——同样的输入会出两种 pack。
+    #[test]
+    fn blocked_item_range_stays_the_block_regardless_of_arrival_order() {
+        let b = blk("def:f1", 10, 40);
+        let inside = || spec_scan("a.rs", 12, 12, "let x = take(v);", "里");
+        let spills = || spec_scan("a.rs", 35, 55, "let x = take(v); // 引到块尾外", "跨");
+        let mut fwd = DeepQueue::new();
+        fwd.enqueue(arr(inside(), Some("alpha"), b.clone()));
+        fwd.enqueue(arr(spills(), Some("beta"), b.clone()));
+        let mut bwd = DeepQueue::new();
+        bwd.enqueue(arr(spills(), Some("beta"), b.clone()));
+        bwd.enqueue(arr(inside(), Some("alpha"), b));
+
+        assert_eq!(fwd.items()[0].spec.ranges, vec![(10, 40)]);
+        assert_eq!(bwd.items()[0].spec.ranges, vec![(10, 40)], "与到达序无关");
+    }
+
+    /// scan 与 needs 落在同一块 → 一项（评审 #6）：分开记等于同一段证据装两次包、挖两遍，
+    /// 还把 `max_cells_per_file` 这个本批自己的门槛顶高。层级取高的那个。
+    #[test]
+    fn needs_and_scan_in_the_same_block_are_one_item() {
+        let b = blk("def:f1", 10, 40);
+        let needs_spec = QueueItemSpec::new("a.rs".into(), vec![(10, 40)], QueueOrigin::Needs, vec![]).unwrap();
+        let needs = EnqueueReq { spec: needs_spec, score: 0.5, kind: ItemKind::Needs, families: vec![], arrival: Some("needs:a.rs:10-40:f".into()) };
+        let mut q = DeepQueue::new();
+        q.enqueue(Arrival { req: needs, block: b.clone(), risk_band: 0 });
+        let o = q.enqueue(arr(spec_scan("a.rs", 12, 12, "q", "h"), Some("alpha"), b));
+
+        assert_eq!(o, EnqueueOutcome::MergedPending);
+        assert_eq!(q.items().len(), 1);
+        assert_eq!(q.items()[0].kind, ItemKind::Suspicion, "层级取高的");
+        assert_eq!(q.items()[0].arrivals, ["needs:a.rs:10-40:f"], "needs 的到达键记在这一项上（疑点侧本用例没带键）");
+        assert_eq!(q.items()[0].spec.notes.len(), 1, "疑点的笔记并了进来");
+    }
+
+    /// 主区（H0）身份口径不变：仍按文件 + 区间相交，块信息不参与。
+    #[test]
+    fn rule_items_still_merge_by_range_overlap() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req_kind(spec_rule("a.rs", 10, 20), ItemKind::Primary, 1.0, None));
+        let o = q.enqueue(req_kind(spec_rule("a.rs", 15, 25), ItemKind::Ripple, 0.9, None));
+
+        assert_eq!(o, EnqueueOutcome::MergedPending);
+        assert_eq!(q.items().len(), 1);
+    }
+
+    /// 文档判定就是阶段 0 那把尺（评审）：`.json` / `.yaml` 在 R 分母里已经不算代码行，排序侧不该另有一套；
+    /// 也不再按 `.next/` 前缀判——那是本仓私有目录名，别的仓里是 Next.js 的构建产物。
+    #[test]
+    fn doc_classification_matches_stage_zero() {
+        assert!(is_doc("docs/x.md") && is_doc("data/x.json") && is_doc("ci/x.yaml"));
+        assert!(!is_doc("src/a.rs") && !is_doc(".next/tool.rs"));
+    }
+
+    // ---- C3〔D16〕分层排序键与每文件保底一格 ----
+
+    /// 造一个 Pending 疑点项，逐维可调：文件 / 必挖轴 / 风险档 / 烟量（成员条数）/ 置信。
+    fn item_at(file: &str, line: u32, peak: u32, band: u8, smoke: usize, conf: f32) -> QueueItem {
+        let notes: Vec<Suspicion> = (0..smoke.max(1))
+            .map(|k| Suspicion { confidence: conf, ..sus(file, line + k as u32, line + k as u32, "q", "h") })
+            .collect();
+        let spec = QueueItemSpec::new(file.into(), vec![(line, line)], QueueOrigin::Scan, notes).unwrap();
+        let req = EnqueueReq { spec, score: conf, kind: ItemKind::Suspicion, families: vec!["alpha".into()], arrival: None };
+        let mut it = QueueItem::new(req, blk(&format!("def:{file}:{line}"), line, line), band);
+        it.peak_agreement = peak;
+        it
+    }
+
+    fn order_of(items: Vec<QueueItem>) -> Vec<String> {
+        let q = DeepQueue { items };
+        q.pending_order().into_iter().map(|i| q.items()[i].id.clone()).collect()
+    }
+
+    /// 分层键逐维单变量：高层相同才落到下一层；置信只在前面全平时裂解。
+    #[test]
+    fn layered_key_compares_one_dimension_at_a_time() {
+        // 逐项一个文件：保底层对谁都成立、互相抵消，比的就是分层键本身。
+        let hi_peak = item_at("a1.rs", 10, 2, 0, 1, 0.1);
+        let hi_band = item_at("a2.rs", 20, 1, 3, 1, 0.1);
+        let hi_smoke = item_at("a3.rs", 30, 1, 0, 4, 0.1);
+        let hi_conf = item_at("a4.rs", 40, 1, 0, 1, 0.9);
+        let doc = item_at("notes.md", 50, 1, 0, 1, 0.9);
+        let ids: Vec<String> = [&hi_peak, &hi_band, &hi_smoke, &hi_conf, &doc].iter().map(|it| it.id.clone()).collect();
+
+        let got = order_of(vec![doc.clone(), hi_conf.clone(), hi_smoke.clone(), hi_band.clone(), hi_peak.clone()]);
+
+        assert_eq!(got[0], ids[0], "必挖轴最高的先挖");
+        assert_eq!(got[1], ids[1], "其次风险档");
+        assert_eq!(got[2], ids[2], "再次烟量");
+        assert_eq!(got[3], ids[3], "代码优先于文档（置信相同）");
+        assert_eq!(got[4], ids[4], "文档垫底");
+    }
+
+    /// 置信只做末位裂解：前面各维全平时才看它。
+    #[test]
+    fn confidence_only_breaks_ties() {
+        let low = item_at("a.rs", 10, 1, 1, 1, 0.2);
+        let high = item_at("a.rs", 20, 1, 1, 1, 0.8);
+        let (lo, hi) = (low.id.clone(), high.id.clone());
+        assert_eq!(order_of(vec![low.clone(), high.clone()]), vec![hi.clone(), lo.clone()]);
+
+        // 但前一维（风险档）一分高下，置信就不参与了
+        let low_band_high_conf = QueueItem { risk_band: 0, ..high };
+        let high_band_low_conf = QueueItem { risk_band: 2, ..low };
+        assert_eq!(order_of(vec![low_band_high_conf, high_band_low_conf]), vec![lo, hi]);
+    }
+
+    /// 每文件保底一格：A 文件五个高分项、B 文件一个低分项 → 派发序 A₁ → B₁ → A₂。
+    #[test]
+    fn each_file_gets_a_first_slot() {
+        let mut items: Vec<QueueItem> = (0..5).map(|k| item_at("a.rs", 10 + k * 10, 2, 3, 3, 0.9)).collect();
+        items.push(item_at("b.rs", 10, 1, 0, 1, 0.1));
+        let b_id = items[5].id.clone();
+
+        let got = order_of(items);
+
+        assert_eq!(got[1], b_id, "B 的唯一项插在 A 的第二项之前: {got:?}");
+        assert!(got[0].starts_with("a.rs") && got[2].starts_with("a.rs"));
+    }
+
+    /// 保底随派发自然失效：A 已有一格在途 → A 的其余项回到常规序，不再抢 B 的保底位。
+    #[test]
+    fn first_slot_expires_once_the_file_has_a_cell() {
+        let mut items: Vec<QueueItem> = (0..3).map(|k| item_at("a.rs", 10 + k * 10, 2, 3, 3, 0.9)).collect();
+        items[0].state = ItemState::InFlight;
+        items.push(item_at("b.rs", 10, 1, 0, 1, 0.1));
+        let b_id = items[3].id.clone();
+
+        let got = order_of(items);
+
+        assert_eq!(got[0], b_id, "B 仍有保底位，排在 A 的剩余项之前: {got:?}");
+        assert!(got[1].starts_with("a.rs") && got[2].starts_with("a.rs"));
+    }
+
+    /// 收场 drain 与派发共用一个序：保底项不会「被留下却轮不到派」或反过来。
+    #[test]
+    fn drain_and_dispatch_share_one_order() {
+        let mut items: Vec<QueueItem> = (0..4).map(|k| item_at("a.rs", 10 + k * 10, 1, 3, 3, 0.9)).collect();
+        items.push(item_at("b.rs", 10, 1, 0, 1, 0.1));
+        let mut q = DeepQueue { items };
+        let kept: Vec<String> = q.pending_order().into_iter().take(2).map(|i| q.items()[i].id.clone()).collect();
+
+        q.drain_with(2, 0);
+
+        let alive: Vec<String> = q.items().iter().filter(|it| it.state == ItemState::Pending).map(|it| it.id.clone()).collect();
+        assert_eq!(alive, kept, "留下的正是序里前两名");
+        let first = q.pop_dispatch().unwrap();
+        assert_eq!(first.id, kept[0], "派发也从序首取");
+    }
+
+    /// 风险档取并入过本项的最高档（同块的到达档位相同；旧快照项被升级时才会变）。
+    #[test]
+    fn risk_band_takes_the_highest_of_merged_arrivals() {
+        let mut q = DeepQueue::new();
+        let b = blk("def:f1", 1, 30);
+        q.enqueue(Arrival { req: req(spec_scan("a.rs", 3, 3, "q", "h"), Some("alpha")), block: b.clone(), risk_band: 1 });
+        q.enqueue(Arrival { req: req(spec_scan("a.rs", 9, 9, "q2", "h2"), Some("beta")), block: b, risk_band: 3 });
+
+        assert_eq!(q.items()[0].risk_band, 3);
     }
 }

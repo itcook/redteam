@@ -15,7 +15,9 @@ const NEED_LINES_WINDOW: usize = 30;
 const NEED_SECTION_BYTE_CAP: usize = 64_000;
 
 /// NeedEntry.lines 解析："a-b"（1-based、a<=b）→ Some((a,b))；缺失/坏格式 → None（整文件语义）。
-fn parse_need_lines(lines: Option<&str>) -> Option<(u32, u32)> {
+/// `NeedEntry.lines` 的唯一解析口径（C3 起深挖入队也用它，评审 #13）：只认 `"a-b"`，
+/// 其余（缺失 / 单个数字 / 倒置 / 非数字）一律 `None` = 无可用行锚。
+pub(crate) fn parse_need_lines(lines: Option<&str>) -> Option<(u32, u32)> {
     let (a, b) = lines?.split_once('-')?;
     let a: u32 = a.trim().parse().ok()?;
     let b: u32 = b.trim().parse().ok()?;

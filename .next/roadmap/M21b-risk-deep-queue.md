@@ -13,7 +13,7 @@ verifier 流式复核；墙钟由 provider 在途门与预算共同封顶（无�
 | # | 项 | design | 落点 |
 |---|---|---|---|
 | 1 | 风险评分器：路径/类别、结构、外部 API、历史四类信号 → H0 + R；无模式旋钮〔D11〕；规则集 = P0 v4 定案（涟漪二梯队、两类信号、常量化），`eval/risk_replay.py` 回放为回归门；可回流；历史信号台账经 `--dismissed` 指定（缺省读 `proj-next.db` 自身，见 followup 分库裁定），**台账口径（2026-09-10 批 A 核实，P0 §15.1）**：PR181 回放不带台账（带则被测作业 upheld 泄漏）；dev 旧 `proj.db` + `--before` 守卫是 oracle B 侧口径，两者与 P0 数字逐位一致 | §3.3 | `src/risk/`（新模块）, `src/cli` |
-| 2 | 深挖优先级队列：键 = H0 最高 / `置信 × agreement × 严重度`；入队合并 = **入口五态**（无命中 / 排队中并入 / 在途只改记录 / 已结案沿用 / 跨轮判例守卫；谓词复用 `merge_suspicions`；design §6 规则 2〔D13〕）；agreement 活值（排队项并入即重算优先级与必挖资格）；预算 `review.reviewers.maxCells = "auto"` = `f(R, 规模)` + **必挖集不截**；graceful drain；终止条件；**分派池**（每项一个 reviewer；派发由 provider 门空位驱动，无角色 `workers`；scan 项不等同组兄弟 cell〔D13〕） | §6 | `src/orchestrate/queue.rs`（新）：tokio mpsc + 门驱动派发器 |
+| 2 | 深挖优先级队列：键 = **分层**（每文件保底一格 → 种类 → 必挖轴 `peak_agreement` → 风险档 → 烟量 → 代码优先 → 置信末位裂解 → id；C3〔D16〕取代原乘积式 `置信 × agreement × 严重度`）；入队合并 = **结构定项**（同文件 ∧ 同稳定块：代码取 enclosing def、文档取标题节，C3〔D16〕）+ **入口五态**（无命中 / 排队中并入 / 在途只改记录 / 已结案沿用 / 跨轮判例守卫；谓词复用 `merge_suspicions`；design §6 规则 2〔D13〕）；agreement 活值（排队项并入即重算优先级与必挖资格）；预算 `review.reviewers.maxCells = "auto"` = `f(R, 规模)` + **必挖集不截**；graceful drain；终止条件；**分派池**（每项一个 reviewer；派发由 provider 门空位驱动，无角色 `workers`；scan 项不等同组兄弟 cell〔D13〕） | §6 | `src/orchestrate/queue.rs`（新）：tokio mpsc + 门驱动派发器 |
 | 3 | provider 在途门接 reviewer / verifier：三角色同门（M21a 收口批已建 `InflightGate` 429 排队重试与 RunMeta 字段）；t=0 入队序 scanner 先于 H0；每角色在途峰值、门等待时长可读 | §12.3〔D13〕 | `src/provider/registry.rs`, `src/orchestrate` |
 | 4 | reviewer cell：区域 pack（由构造即切片 + 爆炸半径 + 跨组索引 + spec）；H0 无笔记 / 疑点带笔记；输出完整 finding；终端不再生产；**流式持久化**（SSE 增量 JSON 解析，`findings` 对象闭合即落盘，无 `submit` 旋钮，D10）；**`templates/reviewer.md` 角色尾**（「确认、驳回或补充」、笔记非事实、H0「独立评审此区域」措辞）+ 模板哈希 | §7, §10.7 | `src/pack/mod.rs`, `src/prompt/templates/reviewer.md`, `src/orchestrate` |
 | 5 | **verifier 流式段**：finding 落地即入复核流；触发集 blocking + 判例变体；跳过 = 两异族 scanner 标记且 reviewer 确认；verifier 选择（verifiers 活跃集〔拥有 `verifier` 角色的模型，D12 JSON〕或自动异族，优先 reviewers 档，无异族 → 同族 + warning）；`review.verifiers.enabled`（触发集消费 `--block-threshold` / `--conf-floor`，M21a 无消费者旗）；**`templates/verifier.md` 角色尾**（`analysis` 先于 verdict、「找出不成立的证据」）；refute 率入 RunMeta；**verifier 离线回归集**：proj.db dismissed（假阳）vs upheld（真）二分类准确率，改模板必跑 | §8.1, §10.7 | `src/consolidate/verify.rs` 改为流消费者, `src/prompt/templates/verifier.md`, `eval/`（回归脚本） |
@@ -21,7 +21,7 @@ verifier 流式复核；墙钟由 provider 在途门与预算共同封顶（无�
 | 7 | 预算外去向（M21c 台账前的过渡）：截断项标 `deep: skipped(budget)` 进 RunMeta 披露，不静默 | §6 规则 4 | RunMeta |
 | 8 | resume 覆盖队列状态（R14 第二刀）：checkpoint 队列快照；Phase 枚举加 `Deep` / `Verify`（`Scan` 已在 M21a F-5；旧 `Fanout` / `Refute` 保留可读，serde lowercase 向后兼容） | — | `src/state/mod.rs`, `src/cli/mod.rs` resume |
 | 9 | barrier 语义：scanner 全完 ∧ 队列空 ∧ 在途 0 ∧ 复核在途 0 → reduce（dedup → 台账 → 报告） | §2 | `src/orchestrate` |
-| 10 | 观测：队列深度、入队原因分布（rule / scan / needs）、去重命中、预算截断数、项等待时长、每 cell 输出 token、复核触发数 / 跳过数 / refute 率、per-provider 每角色在途峰值、门等待时长、429 收敛门宽、派发时 / 落地时 agreement〔D13〕 | §6, §8.1 | RunMeta / phase_history |
+| 10 | 观测：队列深度、入队原因分布（rule / scan / needs）、去重命中、预算截断数、项等待时长、每 cell 输出 token、复核触发数 / 跳过数 / refute 率、per-provider 每角色在途峰值、门等待时长、429 收敛门宽、派发时 / 落地时 agreement〔D13〕、疑点到达数 / 疑点项数 / 候选与选中文件数 / 单文件最大占格〔D16〕 | §6, §8.1 | RunMeta / phase_history |
 
 ## 不做
 

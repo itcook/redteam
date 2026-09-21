@@ -1,3 +1,4 @@
+pub mod blocks;
 pub mod deep;
 pub mod queue;
 pub mod review_shot;
@@ -267,6 +268,13 @@ pub async fn run_scan_fanout(
                         let _ = tx.send(req).await;
                     }
                 }
+                // needs 是 design §6 的第三种生产者（C3〔D16〕Q8）：疑点发完再发，层级 `ItemKind::Needs` 天然排在疑点之后
+                // ——预算有余才吃格。变更集过滤在深挖侧（那里才有 bundles），这里照发。
+                for n in &out.needs {
+                    if let Some(req) = queue::EnqueueReq::need(n) {
+                        let _ = tx.send(req).await;
+                    }
+                }
             }
             (pi, ScanCellResult {
                 cell_id: id.clone(), group: *g, route_key: e.route_key.clone(), family: e.family.clone(), sample: *k, record, output,
@@ -446,7 +454,7 @@ mod scan_tests {
     const REAL: &str = "let t = secret();";
 
     fn scan_json(extra: &str) -> String {
-        format!(r#"{{"suspicions":[{{"file":"src/a.rs","line_start":9,"line_end":9,"hint":"real","confidence":0.7,"quote":"{REAL}"}}{extra}],"needs":[{{"path":"src/b.rs","reason":"r"}}],"scanned_areas":[{{"file":"src/a.rs","ranges":["1-2"]}}]}}"#)
+        format!(r#"{{"suspicions":[{{"file":"src/a.rs","line_start":9,"line_end":9,"hint":"real","confidence":0.7,"quote":"{REAL}"}}{extra}],"needs":[{{"path":"src/b.rs","lines":"3-9","reason":"r"}},{{"path":"src/c.rs","reason":"没有行锚"}}],"scanned_areas":[{{"file":"src/a.rs","ranges":["1-2"]}}]}}"#)
     }
     fn turn(text: &str, reasoning: Option<u64>, out_tok: u64) -> AssistantTurn {
         AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 10, output_tokens: out_tok, cached_input_tokens: 4, finish_reason: None, reasoning_tokens: reasoning }
@@ -500,10 +508,21 @@ mod scan_tests {
         };
         let ((res, sink, reg, b, entries, repo), got) = tokio::join!(fanout, recv);
         let keys: Vec<Option<String>> = got.iter().map(|r| r.arrival.clone()).collect();
-        assert_eq!(got.len(), 1, "只发锚定后的真疑点，失败格不发: {keys:?}");
-        let key = got[0].arrival.clone().unwrap_or_default();
+        let (susp, needs): (Vec<_>, Vec<_>) = got.iter().partition(|r| r.spec.origin == crate::pack::region::Origin::Scan);
+        assert_eq!(susp.len(), 1, "只发锚定后的真疑点，失败格不发: {keys:?}");
+        let key = susp[0].arrival.clone().unwrap_or_default();
         assert!(key.starts_with("scan[g1]@p/a#1#0:") && key.len() > "scan[g1]@p/a#1#0:".len(), "到达键带内容指纹: {key}");
-        assert_eq!((got[0].families.clone(), got[0].spec.file.clone(), got[0].spec.ranges.clone()), (vec!["alpha".to_string()], "src/a.rs".to_string(), vec![(2, 2)]));
+        assert_eq!((susp[0].families.clone(), susp[0].spec.file.clone(), susp[0].spec.ranges.clone()), (vec!["alpha".to_string()], "src/a.rs".to_string(), vec![(2, 2)]));
+        // needs 也入队（C3〔D16〕Q8）：排在本格疑点之后、无笔记、无家族、层级 Needs；到达键 `needs:{path}:{lines}:{理由指纹}`。
+        assert_eq!(needs.len(), 1, "{keys:?}");
+        assert!(got.iter().position(|r| r.spec.origin == crate::pack::region::Origin::Needs).unwrap() > 0, "needs 排在疑点之后");
+        assert_eq!(
+            (needs[0].kind, needs[0].spec.notes.len(), needs[0].families.len(), needs[0].spec.file.clone()),
+            (crate::orchestrate::queue::ItemKind::Needs, 0, 0, "src/b.rs".to_string())
+        );
+        assert!(needs[0].arrival.clone().unwrap_or_default().starts_with("needs:src/b.rs:3-9:"), "{keys:?}");
+        // 解不出行锚的那条不入队（评审 #13）：入了也只是「无笔记地审文件开头」。
+        assert!(!got.iter().any(|r| r.spec.file == "src/c.rs"), "{keys:?}");
         assert_eq!(res.failed, vec!["scan[g1]@p/ghost#1"]);
         assert_eq!(sink.cells.lock().unwrap().len(), 2);
 
@@ -522,14 +541,22 @@ mod scan_tests {
             rx: Mutex<tokio::sync::mpsc::Receiver<crate::orchestrate::queue::EnqueueReq>>,
             seen: Mutex<Vec<String>>,
             early: Mutex<Vec<String>>,
+            calls: Mutex<usize>,
         }
         impl CellSink for Probe {
             fn manifest(&self, _inputs: &[CellInput]) {}
             fn on_cell(&self, rec: CellRecord) {
+                let nth = {
+                    let mut c = self.calls.lock().unwrap();
+                    *c += 1;
+                    *c
+                };
                 let mut rx = self.rx.lock().unwrap();
                 while let Ok(req) = rx.try_recv() {
                     let key = req.arrival.unwrap_or_default();
-                    if key.starts_with(&format!("{}#", rec.cell)) {
+                    // 第一次落盘时通道必须是空的——那时只有本格跑完，它的疑点与 needs 都还没发。
+                    // needs 的到达键不带 cell id（`needs:{path}:…`），只靠前缀比对漏得掉，故按「第几次落盘」兜住。
+                    if nth == 1 || key.starts_with(&format!("{}#", rec.cell)) {
                         self.early.lock().unwrap().push(key.clone());
                     }
                     self.seen.lock().unwrap().push(key);
@@ -542,7 +569,7 @@ mod scan_tests {
         let b = bundles(2);
         let entries = vec![entry("p/a", "alpha", false)];
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let probe = Probe { rx: Mutex::new(rx), seen: Mutex::new(Vec::new()), early: Mutex::new(Vec::new()) };
+        let probe = Probe { rx: Mutex::new(rx), seen: Mutex::new(Vec::new()), early: Mutex::new(Vec::new()), calls: Mutex::new(0) };
         let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&probe), Some(&tx)).await;
         drop(tx);
         let mut rx = probe.rx.into_inner().unwrap();
@@ -554,7 +581,7 @@ mod scan_tests {
         assert_eq!(probe.early.into_inner().unwrap(), Vec::<String>::new(), "未落盘就入队");
         seen.sort();
         let prefixes: Vec<&str> = seen.iter().map(|k| k.split(':').next().unwrap()).collect();
-        assert_eq!(prefixes, ["scan[g1]@p/a#1#0", "scan[g2]@p/a#1#0"]);
+        assert_eq!(prefixes, ["needs", "needs", "scan[g1]@p/a#1#0", "scan[g2]@p/a#1#0"], "两格各发一条疑点 + 一条 needs");
     }
 
     /// 大格先发：provider 门宽 1 串行化派发，三组 diff 字节 小 / 大 / 中 → 调用序 g2, g3, g1；`res.cells` 仍按 plan 序（g1, g2, g3）。
@@ -602,7 +629,7 @@ mod scan_tests {
         assert_eq!(res.cells[2].group, 1);
         assert!(res.failed.is_empty() && res.warnings.is_empty());
         assert_eq!(res.usage, (40, 1200, 16));
-        assert_eq!(res.needs_declared, 4);
+        assert_eq!(res.needs_declared, 8, "每格声明 2 条 needs（一条带行锚、一条不带）× 4 格");
         assert!(res.cells.iter().all(|c| c.record.template_hash.as_deref() == Some(crate::prompt::scan_template_hash().as_str())));
         assert!(res.cells.iter().all(|c| c.record.attempts == 1 && c.record.iterations == 1));
         // 锚定：模型报第 9 行，quote 在第 2 行 → 行号改写
@@ -692,7 +719,7 @@ mod scan_tests {
         let w = rec.warn.as_deref().unwrap();
         assert!(w.contains("parse dropped: no_quote=1") && w.contains("1 suspicions dropped: quote not found") && w.contains("zero reasoning tokens (output 50 tokens)"), "{w}");
         assert_eq!(res.cells[0].output.as_ref().unwrap().suspicions.len(), 1);
-        assert_eq!(res.needs_declared, 1);
+        assert_eq!(res.needs_declared, 2, "声明数按 scanner 报的算，与能否入队无关");
         // 未钉档位 → 不报零推理；输出长 → 不报
         let unpinned = vec![entry("p/a", "alpha", false)];
         let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &unpinned, 1), None, None).await;

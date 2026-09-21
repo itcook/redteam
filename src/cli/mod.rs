@@ -2331,7 +2331,7 @@ mod resume_tests {
             state: crate::orchestrate::queue::ItemState::Settled,
             kind: crate::orchestrate::queue::ItemKind::Primary,
             dispatch_agreement: 1, landed_agreement: Some(1), families: vec![], enqueued_ms: None,
-            arrivals: vec![], members: vec![],
+            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
         };
         store.put_queue_item("j", &item).unwrap();
         store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
@@ -2375,7 +2375,7 @@ mod resume_tests {
             id: format!("{file}:rule:1-2"), spec, score: 1.0, agreement: 1, state,
             kind: crate::orchestrate::queue::ItemKind::Primary,
             dispatch_agreement: 1, landed_agreement: None, families: vec![], enqueued_ms: None,
-            arrivals: vec![], members: vec![],
+            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
         }
     }
 
@@ -2787,7 +2787,10 @@ mod resume_tests {
         store.append_partial("j", &scan_rec("scan[g1]@p/m#1", "x.rs", 2, "x_marker();")).unwrap();
         store.append_partial("j", &CellRecord::failed("scan[g2]@p/m#1", "p/m", Role::Scanner, "boom")).unwrap();
         let mut x = snap_susp("x.rs", 2, "x_marker();", "scan[g1]@p/m#1", ItemState::Settled);
-        (x.agreement, x.dispatch_agreement) = (2, 2);
+        // 往轮那条是「两家族对上同一处」的必挖项：C3〔D16〕起必挖看项内轴，夹具得在项内轴上表达
+        // （只抬区域级 agreement 会让它算成非必挖，往轮就白占了保底位、本轮保底归零）。
+        (x.agreement, x.dispatch_agreement, x.peak_agreement) = (2, 2, 2);
+        x.member_families = vec![vec!["m".into(), "n".into()]];
         store.append_partial("j", &review_rec(&x.id, vec![])).unwrap();
         store.put_queue_item("j", &x).unwrap();
         for k in ["k1.rs", "k2.rs", "k3.rs"] {
@@ -2800,7 +2803,7 @@ mod resume_tests {
 
         assert_eq!((scan.turn_count(), rev.turn_count()), (1, 3), "{:?}", report.run.warnings);
         let dug = reviewer_names(&report.run.coverage.completed);
-        assert_eq!(dug, ["review[k1.rs:rule:1-2]@p/r", "review[k2.rs:rule:1-2]@p/r", "review[y.rs:scan:2-2]@p/r"]);
+        assert_eq!(dug, ["review[k1.rs:rule:1-2]@p/r", "review[k2.rs:rule:1-2]@p/r", "review[y.rs:scan:1-3]@p/r"], "疑点项区间 = 稳定块（C3〔D16〕）：y.rs 第 2 行落在 1-3 行的 def 块内");
         assert_eq!(report.run.deep.as_ref().map(|d| d.budget_skipped), Some(1));
         assert_eq!((report.verdict, code), (Verdict::Approve, 2), "预算截断计债: {:?}", report.run.warnings);
         let k3 = store.read_queue_items("j").into_iter().find(|it| it.spec.file == "k3.rs").unwrap();
@@ -3041,7 +3044,7 @@ mod resume_tests {
         let (report, code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
 
         assert_eq!((scan.turn_count(), rev.turn_count()), (1, 1), "重放该格、挖它的新疑点: {:?}", report.run.warnings);
-        assert_eq!(reviewer_names(&report.run.coverage.completed), ["review[y.rs:scan:2-2]@p/r"]);
+        assert_eq!(reviewer_names(&report.run.coverage.completed), ["review[y.rs:scan:1-3]@p/r"], "疑点项区间 = 稳定块（C3〔D16〕）");
         assert_eq!((report.verdict, code), (Verdict::Approve, 0), "{:?}", report.run.warnings);
     }
 
@@ -3752,24 +3755,30 @@ mod code_review_tests {
         assert!(!w.iter().any(|x| x.contains("approve with exit 2") || x.contains("blocking finding(s) present")), "{w:?}");
     }
 
-    /// 合并残差对账（design C2 §4〔D15〕）：三家族各报同一 `tick();` 的一处——A 第 1 行、B 第 4 行、C 第 7 行（A~B、B~C、A≁C）。
-    /// 到达序 A、C、B（10 / 20 / 30 ms）→ 队列里 A、C 各成一项、B 只并入 A → `queue_split_clusters` = 1；scan 报告仍是一簇、agreement 3。
+    /// 合并残差对账（design C2 §4〔D15〕；C3〔D16〕结构化合并后重写夹具）：三家族各报同一 `tick();` 的一处——
+    /// A 第 2 行、B 第 4 行（同在 `f1` 块内）、C 第 7 行（`f2` 块内），A~B、B~C、A≁C。
+    /// 到达序 A、C、B（10 / 20 / 30 ms）→ 按块并项：A 与 B 同块并成一项、C 另一项 → 闭包簇落在 2 项上 → `queue_split_clusters` = 1；
+    /// scan 报告仍是一簇、agreement 3。（C2 夹具的三条疑点在 C3 落进同一行带，会并成一项、拆簇恒 0——测不到对账。）
+    ///
+    /// 注意**成因已变**：C2 立这个指标量的是「逐条到达的非传递残差」（到达序不同结果不同）；C3 结构化合并之后
+    /// 同块疑点无论到达序都并成一项，非传递残差在同块内构造上不可能，现在它量的是「一个闭包簇跨了两个块」。
+    /// 本用例测的也是后者——两个 def 块各一项。
     #[tokio::test(start_paused = true)]
     async fn arrival_order_split_cluster_is_reconciled() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "src/a.rs", "tick();\na1();\na2();\ntick();\nb1();\nb2();\ntick();\n");
+        write(dir.path(), "src/a.rs", "fn f1() {\n    tick();\n    pad();\n    tick();\n}\nfn f2() {\n    tick();\n}\n");
         let cfg = Config::from_json(
             r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"beta":{"roles":{"scanner":{}}},"gamma":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#,
         )
         .unwrap();
         let at_line = |line: u32| format!(r#"{{"suspicions":[{{"file":"src/a.rs","line_start":{line},"line_end":{line},"hint":"h","confidence":0.5,"quote":"tick();"}}],"scanned_areas":[]}}"#);
         let mut reg = ProviderRegistry::new();
-        for (key, line, ms) in [("p/alpha", 1, 10), ("p/beta", 7, 20), ("p/gamma", 4, 30)] {
+        for (key, line, ms) in [("p/alpha", 2, 10), ("p/beta", 7, 20), ("p/gamma", 4, 30)] {
             let b = FakeChatBackend::repeating(turn_of(&at_line(line))).with_delay(Duration::from_millis(ms));
             reg.insert_scan(key, "p", 8, Box::new(b), Duration::from_secs(5), 0);
         }
         reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(turn_of(r#"{"findings":[],"needs":[]}"#))), Duration::from_secs(5), 0);
-        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,7 +1,7 @@\n+tick();\n+tick();\n+tick();".into() }];
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,8 +1,8 @@\n+    tick();\n+    tick();\n+    tick();".into() }];
 
         let (report, _) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
 

@@ -262,7 +262,9 @@ pub(crate) fn match_decl(line: &str, defs: &[(&'static str, regex::Regex)]) -> O
     Some((kind, name))
 }
 
-fn enclosing_decl(lines: &[&str], line0: usize, defs: &[(&'static str, regex::Regex)]) -> Option<usize> {
+/// 行 → 所属声明的起行（0-based）。C3 起 `orchestrate::blocks` 共用：深挖的稳定块与 H0 成区必须同一口径，
+/// 逻辑不得在两处分叉（`eval/risk_replay.py` 对拍是哨）。
+pub(crate) fn enclosing_decl(lines: &[&str], line0: usize, defs: &[(&'static str, regex::Regex)]) -> Option<usize> {
     if lines.is_empty() {
         return None;
     }
@@ -272,7 +274,8 @@ fn enclosing_decl(lines: &[&str], line0: usize, defs: &[(&'static str, regex::Re
     })
 }
 
-fn decl_block_end(lines: &[&str], i: usize, defs: Option<&[(&'static str, regex::Regex)]>) -> usize {
+/// 声明起行 → 块尾行（0-based，含）。同 [`enclosing_decl`]：C3 起与 `orchestrate::blocks` 共用。
+pub(crate) fn decl_block_end(lines: &[&str], i: usize, defs: Option<&[(&'static str, regex::Regex)]>) -> usize {
     if let Some(d) = defs {
         if let Some(("const", _)) = match_decl(lines[i], d) {
             if !lines[i].contains('{') && !lines[i].trim_end().ends_with('(') {

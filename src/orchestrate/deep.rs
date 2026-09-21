@@ -19,7 +19,7 @@ fn now_ms() -> u64 {
 use crate::bundle::{cross_index, Bundle};
 use crate::config::{EffectiveModel, PackCfg, ToolsMode};
 use crate::domain::{DeepMeta, Finding, Role};
-use crate::orchestrate::queue::{cmp_priority, must_dig, DeepQueue, EnqueueOutcome, EnqueueReq, ItemKind, ItemState, QueueItem};
+use crate::orchestrate::queue::{cmp_priority, must_dig, norm_path, DeepQueue, EnqueueOutcome, EnqueueReq, ItemKind, ItemState, QueueItem};
 use crate::orchestrate::review_shot::{run_review_shot_with, EmitCtx, FindingSink, ReviewCall};
 use crate::pack::region::{self as region, Origin as QueueOrigin, QueueItemSpec};
 use crate::pack::PackOpts;
@@ -104,6 +104,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             );
         }
         let items = input.restore.map(<[QueueItem]>::to_vec).unwrap_or_default();
+        // 早退也带选项观测（评审）：`restored_meta` 已按快照算好五量，否则这一轮的报告里它们凭空为 0。
         return DeepRun { findings: prior_findings, cells: vec![], meta, warnings, reviewer_failed: unfinished, reused_cells: vec![], items };
     }
 
@@ -135,13 +136,23 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut dispatched = q.items().iter().filter(prior).count();
     let mut nonmust_susp = q.items().iter().filter(prior).filter(|it| counts_against_floor(it)).count();
     let dispatched_before = dispatched;
+    // 块与风险档上下文（C3〔D16〕）：整轮共用一份文件内容缓存；同步读计入下面的阻塞观测。
+    let mut blocks = BlockCtx::new(input.root, input.route, input.bundles);
+    // 风险档随本轮的 route 重算（评审）：它是排序输入、不是历史事实——旧快照项本来就没有这个字段，
+    // 而上一轮算出的档在 diff 变了之后也未必还成立。`max` 只在同轮的多次到达之间保证单调。
+    if restore_mode {
+        for it in q.items_mut() {
+            let range = it.spec.ranges.first().copied().unwrap_or((1, 1));
+            it.risk_band = blocks.band_for(&it.spec.file, range);
+        }
+    }
     let t_enq = std::time::Instant::now();
     if let Some(route) = input.route {
         for h in &route.hotspots {
-            enqueue_h0(&mut q, h, &mut meta, input.snapshot);
+            enqueue_h0(&mut q, h, &mut meta, input.snapshot, &mut blocks);
         }
     }
-    enqueue_scan_cells(&mut q, input.scan_cells, &mut meta, input.snapshot);
+    enqueue_scan_cells(&mut q, input.scan_cells, &mut meta, input.snapshot, &mut blocks);
     note_block(&mut meta, t_enq.elapsed());
     meta.queue_depth_peak = meta.queue_depth_peak.max(q.items().len() as u32);
 
@@ -156,6 +167,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     if input.reviewers.is_empty() {
         close_drain(&mut q, input.snapshot, &resumed, k.saturating_sub(dispatched), floor_total.saturating_sub(nonmust_susp));
         meta.budget_skipped = skipped_now(&q);
+        observe_selection(&q, &mut meta);
         return DeepRun { findings: vec![], cells: vec![], meta, warnings, reviewer_failed: false, reused_cells: vec![], items: q.items().to_vec() };
     }
     let members: &[EffectiveModel] = input.reviewers;
@@ -289,7 +301,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             Some(done) = running.next(), if !running.is_empty() => done_now.push(done),
             msg = recv(&mut incoming), if !closed => {
                 let t0 = std::time::Instant::now();
-                on_arrival(msg, &mut q, &mut meta, &mut closed, input.snapshot);
+                on_arrival(msg, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
                 note_block(&mut meta, t0.elapsed());
             }
             Some(got) = next_wait(&mut waits), if waits.is_some() => hit = Some(got),
@@ -317,11 +329,11 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         while !closed {
             match incoming.as_mut().map(mpsc::Receiver::try_recv) {
                 Some(Ok(req)) => {
-                    on_arrival(Some(req), &mut q, &mut meta, &mut closed, input.snapshot);
+                    on_arrival(Some(req), &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
                     drained_arrival = true;
                 }
                 Some(Err(mpsc::error::TryRecvError::Disconnected)) => {
-                    on_arrival(None, &mut q, &mut meta, &mut closed, input.snapshot);
+                    on_arrival(None, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
                     drained_arrival = true;
                 }
                 _ => break,
@@ -383,6 +395,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     // （`dispatch_agreement` / `landed_agreement` 与 finding 的 `suspicion_agreement`：异族并入发生在派发 / 落地之前还是之后随时序变，
     // 评审 #10）。选中集合本身随到达时序变化是在线预算的已知代价（批 C3：量重合度，不逐字节比）。
     meta.budget_skipped = skipped_now(&q);
+    observe_selection(&q, &mut meta);
     landed.sort_by(|a, b| match (q.get(&a.item_id), q.get(&b.item_id)) {
         (Some(x), Some(y)) => cmp_priority(x, y),
         _ => a.item_id.cmp(&b.item_id),
@@ -474,6 +487,24 @@ fn skipped_now(q: &DeepQueue) -> u32 {
     q.items().iter().filter(|it| it.state == ItemState::Skipped).count() as u32
 }
 
+/// 选项观测（design C3 §7〔D16〕）：收场时把队列压成五个标量——合并压缩比、候选与选中的文件面、单文件最大占格。
+/// 逐格数组不落（可从 `DeepRun.items` + scan 报告离线复算）。
+fn observe_selection(q: &DeepQueue, meta: &mut DeepMeta) {
+    observe_selection_items(q.items(), meta);
+}
+
+fn observe_selection_items(items: &[QueueItem], meta: &mut DeepMeta) {
+    meta.items_from_suspicions = items.iter().filter(|it| it.kind == ItemKind::Suspicion).count() as u32;
+    let files: std::collections::BTreeSet<&str> = items.iter().map(|it| it.spec.file.as_str()).collect();
+    meta.files_candidate = files.len() as u32;
+    let mut per_file: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    for it in items.iter().filter(|it| matches!(it.state, ItemState::InFlight | ItemState::Settled)) {
+        *per_file.entry(it.spec.file.as_str()).or_insert(0) += 1;
+    }
+    meta.files_selected = per_file.len() as u32;
+    meta.max_cells_per_file = per_file.values().copied().max().unwrap_or(0);
+}
+
 /// 在线额度下的可派条件（design v11 §6 规则 3〔D15〕）：必挖不限；入口关闭后（收场 drain 已定选中集合）全部可派；
 /// 扫描期非必挖项受 `K − F` 额度——每次判定读现值，填门循环里派一项就少一格。
 fn is_eligible(it: &QueueItem, closed: bool, dispatched: usize, quota: usize) -> bool {
@@ -482,7 +513,10 @@ fn is_eligible(it: &QueueItem, closed: bool, dispatched: usize, quota: usize) ->
 
 /// 占保底位的派发：非必挖的疑点（派发时共识 < 2）。保底 ⌈K/4⌉ 是给疑点的，H0 / 涟漪不占。
 fn counts_against_floor(it: &QueueItem) -> bool {
-    it.kind == ItemKind::Suspicion && it.dispatch_agreement < 2
+    // 与必挖判定同轴（评审 #4）：C3 起 `must_dig` 看项内 `peak_agreement`，而 `dispatch_agreement` 是区域级——
+    // 结构化合并后「一块被两家族碰过但没有一条疑点对上」（agreement 2 / peak 1）是常态，
+    // 按区域轴数会把这种非必挖项当成必挖、保底永远不消耗，收场再整份预留一次 ⌈K/4⌉，实际派发超出 maxCells。
+    it.kind == ItemKind::Suspicion && !must_dig(it)
 }
 
 /// 主循环同步段计时（design C2 §9〔D15〕，评审 #11 补齐覆盖）：取跟踪文件集、开跑入队、填门（pack + prompt + 快照）、
@@ -863,6 +897,7 @@ fn on_arrival(
     meta: &mut DeepMeta,
     closed: &mut bool,
     snapshot: Option<&dyn Fn(&QueueItem)>,
+    ctx: &mut BlockCtx,
 ) {
     let Some(req) = msg else {
         *closed = true;
@@ -873,7 +908,11 @@ fn on_arrival(
         QueueOrigin::Scan => "scan",
         QueueOrigin::Needs => "needs",
     };
-    let (outcome, affected) = q.enqueue_affected(req);
+    if !ctx.accepts(&req) {
+        ctx.note_out_of_diff(&req, meta);
+        return;
+    }
+    let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
     note_enq(outcome, reason, meta);
     if let Some(i) = affected {
         snap_one(&q.items()[i], snapshot);
@@ -903,11 +942,21 @@ pub fn review_cell_prefix(item_id: &str) -> String {
 /// 同样做收场 drain）；挖不动的两条早退路径——变更集为空、diff 重建报错（`cli::run_resume`）——就以快照读数收口，
 /// 漏掉它被预算截掉的项就既不计债也不披露。
 pub fn restored_meta(items: &[QueueItem]) -> DeepMeta {
-    DeepMeta {
+    let mut meta = DeepMeta {
         budget_skipped: items.iter().filter(|i| i.state == ItemState::Skipped).count() as u32,
         queue_depth_peak: items.len() as u32,
         ..Default::default()
-    }
+    };
+    // 疑点到达数从快照重建（评审）：resume 时回放的疑点走到达键幂等、按 `Duplicate` 不计，
+    // 若从 0 起算，`suspicions_arrived / items_from_suspicions` 这个压缩比在 resume 轮就成了 0÷n。
+    // 项上记着的到达键就是往轮收过的疑点，逐项数即可（H0 的 `rule:` 键不算）。
+    meta.suspicions_arrived = items
+        .iter()
+        .flat_map(|it| it.arrivals.iter())
+        .filter(|k| !k.starts_with("rule:") && !k.starts_with("needs:"))
+        .count() as u32;
+    observe_selection_items(items, &mut meta);
+    meta
 }
 
 /// 调用方保证 `bundles` 非空（`run_deep` 开头已早退）。
@@ -975,7 +1024,7 @@ fn file_diff(bundles: &[Bundle], file: &str) -> String {
     bundles.iter().flat_map(|b| b.files.iter()).find(|f| f.path == file).map(|f| f.diff.clone()).unwrap_or_default()
 }
 
-fn enqueue_h0(q: &mut DeepQueue, h: &Hotspot, meta: &mut DeepMeta, snapshot: Option<&dyn Fn(&QueueItem)>) {
+fn enqueue_h0(q: &mut DeepQueue, h: &Hotspot, meta: &mut DeepMeta, snapshot: Option<&dyn Fn(&QueueItem)>, ctx: &mut BlockCtx) {
     let start = (h.start as u32).max(1);
     let end = (h.end as u32).max(start);
     let Ok(spec) = QueueItemSpec::new(h.file.clone(), vec![(start, end)], QueueOrigin::Rule, vec![]) else {
@@ -988,7 +1037,8 @@ fn enqueue_h0(q: &mut DeepQueue, h: &Hotspot, meta: &mut DeepMeta, snapshot: Opt
     // H0 也记到达键（评审 #8）：resume 每轮按当前 diff 幂等重建 H0——首跑那次入队快照写失败时它才补得回来，
     // 已在队列里的则走到达键幂等、不改项也不计去重命中。
     let arrival = Some(format!("rule:{}:{start}-{end}", h.file));
-    let (outcome, affected) = q.enqueue_affected(EnqueueReq { spec, score: h.score, kind, families: vec![], arrival });
+    let req = EnqueueReq { spec, score: h.score, kind, families: vec![], arrival };
+    let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
     note_enq(outcome, "rule", meta);
     if let Some(i) = affected {
         snap_one(&q.items()[i], snapshot);
@@ -998,7 +1048,13 @@ fn enqueue_h0(q: &mut DeepQueue, h: &Hotspot, meta: &mut DeepMeta, snapshot: Opt
 /// 已完成 scan 格的疑点逐格逐条入队（resume 回放 / 未走通道的调用方）：与首跑流式到达同一形态（`EnqueueReq::scan`、
 /// 到达键 `{cell_id}#{i}`）——已经到达过的疑点幂等跳过；格按 cell id 序、格内按疑点下标序，结果与喂入顺序无关。
 /// 失败格（`output == None`）无疑点。只写受影响项的快照。
-fn enqueue_scan_cells(q: &mut DeepQueue, cells: &[ScanCellResult], meta: &mut DeepMeta, snapshot: Option<&dyn Fn(&QueueItem)>) {
+fn enqueue_scan_cells(
+    q: &mut DeepQueue,
+    cells: &[ScanCellResult],
+    meta: &mut DeepMeta,
+    snapshot: Option<&dyn Fn(&QueueItem)>,
+    ctx: &mut BlockCtx,
+) {
     let mut ordered: Vec<&ScanCellResult> = cells.iter().filter(|c| c.output.is_some()).collect();
     ordered.sort_by(|a, b| a.cell_id.cmp(&b.cell_id));
     for c in ordered {
@@ -1007,12 +1063,152 @@ fn enqueue_scan_cells(q: &mut DeepQueue, cells: &[ScanCellResult], meta: &mut De
             let Some(req) = EnqueueReq::scan(s, &c.family, crate::consolidate::scan::arrival_key(&c.cell_id, i, s)) else {
                 continue;
             };
-            let (outcome, affected) = q.enqueue_affected(req);
+            let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
             note_enq(outcome, "scan", meta);
             if let Some(idx) = affected {
                 snap_one(&q.items()[idx], snapshot);
             }
         }
+        // needs 与首跑同形（C3〔D16〕）：疑点之后、变更集内的才入队，到达键幂等 → 重放不重复。
+        for n in &out.needs {
+            let Some(req) = EnqueueReq::need(n) else { continue };
+            if !ctx.accepts(&req) {
+                ctx.note_out_of_diff(&req, meta);
+                continue;
+            }
+            let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
+            note_enq(outcome, "needs", meta);
+            if let Some(idx) = affected {
+                snap_one(&q.items()[idx], snapshot);
+            }
+        }
+    }
+}
+
+/// 块与风险档的入队侧上下文（C3〔D16〕）：稳定块要读文件内容、风险档要查 `RiskRoute.zones`。
+/// 两者都在主循环的同步段里算——内容按文件缓存一次（变更集通常十来个文件），读失败退空内容（`block_of` 退行带）。
+/// 读取限在 `root` 之下并设体积帽：`file` 来自模型输出，不能当可信路径用。
+struct BlockCtx<'a> {
+    root: &'a Path,
+    zones: &'a [Hotspot],
+    /// H0 区（`route.hotspots`）：只有进了 H0 的区才够格拿最高档（评审）——
+    /// 分够 θ 但只有一类信号的区是阶段 0 有意排除在 H0 之外的，不该在排序上压过真 H0。
+    hotspots: &'a [Hotspot],
+    /// 本轮变更集（bundles 覆盖的文件）：needs 只接落在里面的（C3〔D16〕Q8）。
+    changed: std::collections::HashSet<String>,
+    cache: std::collections::HashMap<String, String>,
+    /// 按语言缓存的 def 正则：重编一次约 1.6 ms，占 `block_of` 的九成——主循环同步段上逐条到达都要算块。
+    defs: std::collections::HashMap<String, Vec<(&'static str, regex::Regex)>>,
+    /// 已计过数的变更集外 needs 到达键：同一条声明被多家族 / 多 samples 重复报时只计一次，
+    /// 否则它与入队侧（经到达键幂等）的口径不可比（评审 #13）。
+    counted_out_of_diff: std::collections::HashSet<String>,
+}
+
+/// 算块时读单文件的体积上限：超过即退行带（reviewer 也塞不下这种文件）。
+const MAX_BLOCK_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+impl<'a> BlockCtx<'a> {
+    fn new(root: &'a Path, route: Option<&'a RiskRoute>, bundles: &'a [Bundle]) -> Self {
+        BlockCtx {
+            root,
+            zones: route.map_or(&[][..], |r| &r.zones),
+            hotspots: route.map_or(&[][..], |r| &r.hotspots),
+            changed: bundles.iter().flat_map(|b| b.files.iter()).map(|f| norm_path(&f.path)).collect(),
+            cache: std::collections::HashMap::new(),
+            defs: std::collections::HashMap::new(),
+            counted_out_of_diff: std::collections::HashSet::new(),
+        }
+    }
+
+    /// 变更集外的 needs 不入队（C3〔D16〕Q8）：两轮实测约六成 needs 指向 diff 外，装进来只会白烧一格
+    /// ——`pick_bundle` 找不到该文件时 `region::build` 只会输出一行省略说明，证据段是空的。归属问题另开批（C4 / M21d）。
+    /// 路径先归一（`./src/a.rs` 与 `src/a.rs` 是同一个文件，评审）。
+    fn accepts(&self, req: &EnqueueReq) -> bool {
+        req.spec.origin != QueueOrigin::Needs || self.changed.contains(&norm_path(&req.spec.file))
+    }
+
+    /// 变更集外的 needs 只计一次（按到达键去重）。
+    fn note_out_of_diff(&mut self, req: &EnqueueReq, meta: &mut DeepMeta) {
+        let key = req.arrival.clone().unwrap_or_else(|| req.spec.file.clone());
+        if self.counted_out_of_diff.insert(key) {
+            *meta.enqueue_reasons.entry("needs_out_of_diff".into()).or_insert(0) += 1;
+        }
+    }
+
+    /// 文件内容与该语言的 def 正则各取一次，之后整轮复用。
+    fn prime(&mut self, file: &str) -> String {
+        if !self.cache.contains_key(file) {
+            let text = read_capped(self.root, file);
+            self.cache.insert(file.to_string(), text);
+        }
+        let ext = file.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+        if !self.defs.contains_key(&ext) {
+            if let Some(lang) = crate::diffsym::lang_for(file) {
+                self.defs.insert(ext.clone(), crate::diffsym::compile_defs(lang));
+            }
+        }
+        ext
+    }
+
+    /// 请求 → 到达（带块与风险档）。H0（Rule）按区间相交合并、身份口径不变，只算风险档。
+    fn arrival(&mut self, req: EnqueueReq) -> crate::orchestrate::queue::Arrival {
+        let range = req.spec.ranges.first().copied().unwrap_or((1, 1));
+        if req.spec.origin == QueueOrigin::Rule {
+            let band = self.band_for(&req.spec.file, range);
+            return crate::orchestrate::queue::Arrival { req, block: Default::default(), risk_band: band };
+        }
+        let file = req.spec.file.clone();
+        let ext = self.prime(&file);
+        let block = crate::orchestrate::blocks::block_of_with(
+            &file,
+            self.cache.get(&file).map_or("", String::as_str),
+            range.0,
+            self.defs.get(&ext).map(Vec::as_slice),
+        );
+        let band = self.band_for(&file, (block.start, block.end));
+        crate::orchestrate::queue::Arrival { req, block, risk_band: band }
+    }
+
+    /// 与本项区间重叠的风险区里**分最高**的那个 → 档位；无重叠区 = 0。
+    /// 最高档只给进了 H0 的区：分够 θ 但信号类不足（`MIN_KINDS`）的区是阶段 0 有意排除的，
+    /// 让它与真 H0 同档会把排序压在一个阶段 0 自己都不认的区上（评审）。
+    fn band_for(&self, file: &str, range: (u32, u32)) -> u8 {
+        let overlaps = |z: &&Hotspot| z.file == file && z.start as u32 <= range.1 && range.0 <= z.end as u32;
+        let best = self.zones.iter().filter(overlaps).map(|z| z.score).fold(0.0_f32, f32::max);
+        let band = risk_band_of(best);
+        if band == 3 && !self.hotspots.iter().any(|h| overlaps(&h)) {
+            return 2;
+        }
+        band
+    }
+}
+
+/// 风险分 → 档（design C3 §4）：锚在既有常数 θ 上，不另立阈值。
+fn risk_band_of(score: f32) -> u8 {
+    if score >= crate::risk::THETA {
+        3
+    } else if score >= crate::risk::THETA / 2.0 {
+        2
+    } else if score > 0.0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// 只读本仓内容算块（不发给模型，只取行号与哈希）；体积帽与 `risk` 侧的 4 MiB 不同——
+/// 那边读的是被评文件全文，这边只为定位块，2 MiB 以上的文件退行带即可。
+fn read_capped(root: &Path, rel: &str) -> String {
+    let Ok(real) = root.join(rel).canonicalize() else {
+        return String::new();
+    };
+    let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !real.starts_with(&base) {
+        return String::new();
+    }
+    match std::fs::metadata(&real) {
+        Ok(m) if m.is_file() && m.len() <= MAX_BLOCK_FILE_BYTES => std::fs::read_to_string(&real).unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -1029,6 +1225,10 @@ fn snap_cell(rec: &CellRecord, on_cell: Option<&dyn Fn(&CellRecord)>) {
 }
 
 fn note_enq(o: EnqueueOutcome, reason: &str, meta: &mut DeepMeta) {
+    // 到达并被接受的疑点数（C3〔D16〕观测）：合并进已有项的也算到达，只有到达键重复的不算。
+    if reason == "scan" && o != EnqueueOutcome::Duplicate {
+        meta.suspicions_arrived += 1;
+    }
     match o {
         EnqueueOutcome::New => {
             *meta.enqueue_reasons.entry(reason.into()).or_insert(0) += 1;
@@ -1069,7 +1269,7 @@ mod tests {
             id: format!("{file}:rule:1-2"),
             spec, score: 1.0, agreement: 1, state, kind: ItemKind::Primary,
             dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
-            arrivals: vec![], members: vec![],
+            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
         }
     }
 
@@ -1487,6 +1687,7 @@ mod tests {
         first_run: bool,
         scan_cells: &'a [ScanCellResult],
         reopen_skipped: bool,
+        route: Option<&'a RiskRoute>,
     }
 
     async fn run_with(r: Run<'_>) -> DeepRun {
@@ -1494,7 +1695,7 @@ mod tests {
         run_deep(
             r.reg,
             DeepInput {
-                route: None, scan_cells: r.scan_cells, bundles: r.bundles, root: r.root,
+                route: r.route, scan_cells: r.scan_cells, bundles: r.bundles, root: r.root,
                 reviewers: r.reviewers.unwrap_or(&single), budget_cells: r.budget,
                 pack: &Default::default(), spec_docs: "", target_label: "t",
                 snapshot: r.snapshot, restore: (!r.first_run).then_some(r.items), prior_findings: vec![], tools: r.tools,
@@ -1508,7 +1709,7 @@ mod tests {
     fn plain<'a>(reg: &'a crate::provider::registry::ProviderRegistry, root: &'a Path, bundles: &'a [Bundle], items: &'a [QueueItem]) -> Run<'a> {
         Run {
             reg, root, bundles, items, tools: ToolsMode::Off, incoming: None, on_cell: None, snapshot: None, sink: &(), reviewers: None,
-            budget: 16, first_run: false, scan_cells: &[], reopen_skipped: false,
+            budget: 16, first_run: false, scan_cells: &[], reopen_skipped: false, route: None,
         }
     }
 
@@ -1598,7 +1799,7 @@ mod tests {
             id: format!("{file}:scan:1-1"), spec: spec.clone(), score: 0.5, agreement: 1, state: ItemState::Pending,
             kind: ItemKind::Suspicion, dispatch_agreement: 0, landed_agreement: None,
             families: vec![family.into()], enqueued_ms: None,
-            arrivals: vec![], members: vec![],
+            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
         };
         (item, spec)
     }
@@ -1997,7 +2198,7 @@ mod tests {
             id: format!("{file}:rule:1-2"),
             spec: QueueItemSpec::new(file.into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap(),
             score: 1.0, agreement: 1, state, kind, dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
-            arrivals: vec![], members: vec![],
+            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
         };
         let note = crate::domain::Suspicion {
             file: "s.rs".into(), line_start: 1, line_end: 1, hint: "h".into(), category: None, confidence: 0.5, quote: "fn s() {".into(),
@@ -2007,7 +2208,7 @@ mod tests {
             spec: QueueItemSpec::new("s.rs".into(), vec![(1, 1)], QueueOrigin::Scan, vec![note]).unwrap(),
             score: 0.5, agreement: 2, state: ItemState::Pending, kind: ItemKind::Suspicion,
             dispatch_agreement: 0, landed_agreement: None, families: vec!["alpha".into(), "beta".into()], enqueued_ms: None,
-            arrivals: vec![], members: vec![],
+            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
         };
         let items = vec![
             rule("r.rs", ItemKind::Ripple, ItemState::Pending),
@@ -2073,6 +2274,15 @@ mod tests {
         assert_eq!((run.meta.close_budget_remaining, run.meta.scan_phase_dispatched, run.meta.close_ms), (3, 0, 0));
         assert!(run.meta.first_dispatch_ms > 0 && run.meta.drain_done_ms >= run.meta.first_dispatch_ms, "{:?}", run.meta);
         run.meta.close_budget_remaining = 0;
+        // C3-3 新增的选项观测（同上：确定性读数先断言再归零，基线文件保持批 C 原样）。
+        // 快照里 5 个文件各一项（疑点项 1 个），派发 4 项、每文件至多 1 格；restore 模式无疑点到达。
+        assert_eq!(
+            (run.meta.suspicions_arrived, run.meta.items_from_suspicions, run.meta.files_candidate, run.meta.files_selected, run.meta.max_cells_per_file),
+            (0, 1, 5, 4, 1),
+            "{:?}",
+            run.meta
+        );
+        (run.meta.items_from_suspicions, run.meta.files_candidate, run.meta.files_selected, run.meta.max_cells_per_file) = (0, 0, 0, 0);
         (run.meta.first_dispatch_ms, run.meta.drain_done_ms, run.meta.fill_block_max_ms, run.meta.fill_block_total_ms) = (0, 0, 0, 0);
         serde_json::json!({
             "findings": run.findings, "cells": run.cells, "meta": run.meta, "warnings": run.warnings,
@@ -2168,9 +2378,13 @@ mod tests {
         } else {
             (format!("{file}:rule:1-2"), QueueItemSpec::new(file.clone(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap())
         };
+        // 与 `QueueItem::new` 同形：members = 笔记全量、member_families 同下标（家族未知留空 → 必挖轴退回 agreement）。
+        let members = spec.notes.clone();
+        let member_families = vec![Vec::new(); members.len()];
         QueueItem {
             id, spec, score: 1.0, agreement: 1, state, kind, dispatch_agreement, landed_agreement: None,
-            families: vec![], enqueued_ms: None, arrivals: vec![], members: vec![],
+            families: vec![], enqueued_ms: None, arrivals: vec![], members, member_families,
+            block: Default::default(), peak_agreement: 0, risk_band: 0,
         }
     }
 
@@ -2470,7 +2684,8 @@ mod tests {
         assert_ne!(fwd_starts, bwd_starts, "构造前提：两次派发序不同");
         assert_eq!(forward, backward);
         let cells: Vec<&str> = forward["cells"].as_array().unwrap().iter().map(|c| c["cell"].as_str().unwrap()).collect();
-        assert_eq!(cells, ["review[p.rs:rule:1-2]@p/r", "review[r.rs:rule:1-2]@p/r", "review[s.rs:scan:1-1]@p/r"], "种类 → 分数 → id");
+        // 疑点项的区间 = 稳定块（C3〔D16〕）：夹具里 `s.rs` 第 1 行落在 1-3 行的 def 块内，故 id 是 `scan:1-3` 而非报告行 `scan:1-1`。
+        assert_eq!(cells, ["review[p.rs:rule:1-2]@p/r", "review[r.rs:rule:1-2]@p/r", "review[s.rs:scan:1-3]@p/r"], "种类 → 分数 → id");
     }
 
     /// 快照只写受影响项（Q9 IO2〔D15〕）：新建 1 项、重复到达 0 项、并入只写并入目标；收场只写被截项。
@@ -2526,6 +2741,168 @@ mod tests {
         assert!(run.meta.fill_block_max_ms >= 50, "落地段未计入阻塞观测: {:?}", run.meta);
     }
 
+    /// 入队即算稳定块与风险档（C3〔D16〕接线）：`a.rs` 只有一个 def（1-3 行），两家族各报一条**互不相似**的疑点
+    /// （第 2、3 行）→ 结构定项并成一项、区间取块 1-3、id 随之；与该区重叠的风险区分 2.0 ≥ θ → 档 3。
+    /// 共识两轴：区域级 2（两家族碰过这块）、必挖轴 1（最大簇只有一个家族）。
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_computes_block_and_risk_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]); // a.rs = "fn a() {\n    body();\n}\n"
+        let susp = |line: u32, quote: &str, hint: &str| crate::domain::Suspicion {
+            file: "a.rs".into(), line_start: line, line_end: line, hint: hint.into(), category: None, confidence: 0.5,
+            quote: quote.into(),
+        };
+        let cell = |id: &str, family: &str, s: crate::domain::Suspicion| {
+            let out = crate::domain::ScanOutput { suspicions: vec![s], ..Default::default() };
+            let route_key = format!("p/{family}");
+            ScanCellResult {
+                cell_id: id.into(), group: 0, family: family.into(), sample: 1,
+                record: CellRecord::ok(id, &route_key, crate::domain::CellOutput::Scan(out.clone())),
+                route_key,
+                output: Some(out),
+            }
+        };
+        let cells = [
+            cell("scan[g1]@p/alpha#1", "alpha", susp(2, "    body();", "调用没校验")),
+            cell("scan[g1]@p/beta#1", "beta", susp(3, "}", "结尾漏了收尾")),
+        ];
+        // 该区分 2.0 ≥ θ 但**不在** H0 里（阶段 0 按信号类不足排除）→ 封到第 2 档，不与真 H0 同档。
+        let zone = Hotspot { file: "a.rs".into(), start: 1, end: 3, score: 2.0, kind: RegionKind::Ripple, signals: vec![] };
+        let route = RiskRoute {
+            hotspots: vec![],
+            zones: vec![zone.clone()],
+            r: 1.0, tier: crate::risk::Tier::Mid, budget_cells_hint: 4, code_lines: 3,
+        };
+        let backend = Routed::new(vec![("a", 5, vec![found("a")])]);
+        let reg = routed_registry(&backend, 4);
+
+        let run = run_with(Run { scan_cells: &cells, route: Some(&route), ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+
+        assert_eq!(run.items.len(), 1, "同一 def 块里的两条疑点并成一项: {:?}", run.items);
+        let it = &run.items[0];
+        assert_eq!(it.spec.ranges, vec![(1, 3)], "区间 = def 块");
+        assert_eq!(it.id, "a.rs:scan:1-3");
+        assert!(it.block.key.starts_with("def:"), "{:?}", it.block);
+        assert_eq!(it.risk_band, 2, "分够 θ 但不在 H0 → 封第 2 档");
+        assert_eq!((it.agreement, it.peak_agreement), (2, 1), "区域级 2 / 必挖轴 1");
+
+        // 同一个区进了 H0 → 才拿最高档
+        let h0_route = RiskRoute { hotspots: vec![zone.clone()], zones: vec![zone], ..route };
+        let run2 = run_with(Run { scan_cells: &cells, route: Some(&h0_route), ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+        assert_eq!(run2.items.iter().find(|it| it.kind == ItemKind::Suspicion).unwrap().risk_band, 3);
+    }
+
+    /// 保底位的消耗与必挖判定同轴（评审 #4）：结构化合并后「一块被两家族碰过、但没有一条疑点对上」
+    /// （agreement 2 / peak 1）是常态；按区域轴数会把这种非必挖项当必挖、保底永不消耗，
+    /// 收场再整份预留一次 ⌈K/4⌉ → 实际派发超出 maxCells。
+    #[test]
+    fn floor_counting_uses_the_must_dig_axis() {
+        let mut it = item_of("a", ItemKind::Suspicion, ItemState::Settled, 2);
+        (it.agreement, it.peak_agreement) = (2, 1);
+        assert!(counts_against_floor(&it), "非必挖疑点占着保底位");
+        it.peak_agreement = 2;
+        assert!(!counts_against_floor(&it), "必挖项不占保底位");
+        let h0 = item_of("b", ItemKind::Ripple, ItemState::Settled, 1);
+        assert!(!counts_against_floor(&h0), "保底只留给 scanner 疑点");
+    }
+
+    /// scanner needs 只接变更集内的（C3〔D16〕Q8）：`a.rs` 在变更集里 → 入队成 `Needs` 项（无笔记、排在疑点之后）；
+    /// `verify.rs` 不在 → 只计 `needs_out_of_diff`，不入队（`pick_bundle` 对不在任何 bundle 的文件会静默退回 bundles[0]，
+    /// 产出「文件名是 A、证据是 B」的错配包）。
+    #[tokio::test(start_paused = true)]
+    async fn needs_enqueue_only_inside_the_changeset() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let need = |path: &str, reason: &str| crate::domain::NeedEntry {
+            path: path.into(), lines: Some("1-3".into()), reason: reason.into(), kind: crate::domain::NeedKind::Evidence,
+        };
+        let out = crate::domain::ScanOutput {
+            suspicions: vec![crate::domain::Suspicion {
+                file: "a.rs".into(), line_start: 2, line_end: 2, hint: "h".into(), category: None, confidence: 0.5,
+                quote: "    body();".into(),
+            }],
+            // `./a.rs` 与 `a.rs` 是同一个文件（路径归一，评审）；`verify.rs` 在变更集外，同一条声明重复报只计一次。
+            needs: vec![need("./a.rs", "要看实现"), need("verify.rs", "要看实现"), need("verify.rs", "要看实现")],
+            ..Default::default()
+        };
+        let id = "scan[g1]@p/alpha#1";
+        let cells = [ScanCellResult {
+            cell_id: id.into(), group: 0, route_key: "p/alpha".into(), family: "alpha".into(), sample: 1,
+            record: CellRecord::ok(id, "p/alpha", crate::domain::CellOutput::Scan(out.clone())),
+            output: Some(out),
+        }];
+        let backend = Routed::new(vec![("a", 5, vec![found("a")])]);
+        let reg = routed_registry(&backend, 4);
+
+        let run = run_with(Run { scan_cells: &cells, budget: 4, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+
+        // `a.rs` 的 needs 与该文件的疑点落在同一个 def 块 → 并成一项（评审 #6），到达键两条都记着；
+        // `verify.rs` 不在变更集 → 只计数、不入队。
+        let kinds: Vec<(&str, ItemKind)> = run.items.iter().map(|it| (it.spec.file.as_str(), it.kind)).collect();
+        assert_eq!(kinds, [("a.rs", ItemKind::Suspicion)], "{:?}", run.items);
+        assert_eq!(run.items[0].arrivals.iter().filter(|k| k.starts_with("needs:a.rs:")).count(), 1, "`./a.rs` 归一后与疑点同一项: {:?}", run.items[0].arrivals);
+        assert_eq!(run.meta.enqueue_reasons.get("needs_out_of_diff"), Some(&1), "同一条变更集外声明重复报只计一次");
+        assert_eq!(run.meta.suspicions_arrived, 1, "needs 不计进疑点到达数");
+    }
+
+    /// resume 轮的观测从快照重建（评审）：回放的疑点走到达键幂等、按 `Duplicate` 不计，
+    /// 从 0 起算会让压缩比在 resume 轮变成 0÷n；项上记着的到达键就是往轮收过的疑点。
+    #[test]
+    fn restored_meta_rebuilds_the_selection_observables() {
+        let mut settled = item_of("a", ItemKind::Suspicion, ItemState::Settled, 1);
+        settled.arrivals = vec!["scan[g1]@p/alpha#1#0:aa".into(), "scan[g1]@p/beta#1#0:bb".into()];
+        let mut skipped = item_of("b", ItemKind::Suspicion, ItemState::Skipped, 1);
+        skipped.arrivals = vec!["scan[g1]@p/alpha#1#1:cc".into()];
+        let mut h0 = item_of("c", ItemKind::Primary, ItemState::Settled, 1);
+        h0.arrivals = vec!["rule:c.rs:1-2".into()];
+
+        let meta = restored_meta(&[settled, skipped, h0]);
+
+        assert_eq!(meta.suspicions_arrived, 3, "H0 的 rule: 键不算疑点");
+        assert_eq!((meta.items_from_suspicions, meta.files_candidate), (2, 3));
+        assert_eq!((meta.files_selected, meta.max_cells_per_file), (2, 1), "被截的那项不算选中");
+        assert_eq!(meta.budget_skipped, 1);
+    }
+
+    /// 选项观测五量与手算一致（design C3 §7〔D16〕）：三文件四疑点（a.rs 的两条同块并一项）→ 到达 4、疑点项 3、候选文件 3；
+    /// K = 2 只派两格（每文件至多一格，c.rs 的项被截）→ 选中文件 2、单文件最大占格 1。
+    #[tokio::test(start_paused = true)]
+    async fn selection_observables_match_hand_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a", "b", "c"]);
+        let susp = |file: &str, line: u32, quote: &str, hint: &str| crate::domain::Suspicion {
+            file: file.into(), line_start: line, line_end: line, hint: hint.into(), category: None, confidence: 0.5,
+            quote: quote.into(),
+        };
+        let out = crate::domain::ScanOutput {
+            suspicions: vec![
+                susp("a.rs", 2, "    body();", "一"),
+                susp("a.rs", 3, "}", "二"),
+                susp("b.rs", 2, "    body();", "三"),
+                susp("c.rs", 2, "    body();", "四"),
+            ],
+            ..Default::default()
+        };
+        let id = "scan[g1]@p/alpha#1";
+        let cells = [ScanCellResult {
+            cell_id: id.into(), group: 0, route_key: "p/alpha".into(), family: "alpha".into(), sample: 1,
+            record: CellRecord::ok(id, "p/alpha", crate::domain::CellOutput::Scan(out.clone())),
+            output: Some(out),
+        }];
+        let backend = Routed::new(vec![("a", 5, vec![found("a")]), ("b", 5, vec![found("b")]), ("c", 5, vec![found("c")])]);
+        let reg = routed_registry(&backend, 4);
+
+        let run = run_with(Run { scan_cells: &cells, budget: 2, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+
+        let m = &run.meta;
+        assert_eq!(
+            (m.suspicions_arrived, m.items_from_suspicions, m.files_candidate, m.files_selected, m.max_cells_per_file),
+            (4, 3, 3, 2, 1),
+            "{m:?}"
+        );
+        assert_eq!(m.budget_skipped, 1, "第三个文件的项被预算截掉——候选 3 个文件、选中 2 个");
+    }
+
     /// 回放把被截项并成必挖挖掉后不留假债（评审 #9）：截断数按收口时的最终状态数，不按 drain 那一刻——
     /// 按 drain 那一刻计会披露「skipped(budget) 1」并计 exit 2，而那一项其实已经挖了。
     #[tokio::test(start_paused = true)]
@@ -2545,6 +2922,8 @@ mod tests {
         }];
         let mut k = item_of("k", ItemKind::Suspicion, ItemState::Skipped, 0);
         k.families = vec!["alpha".into()];
+        // C3〔D16〕：必挖轴看项内最大簇的家族数 → 已有那条疑点得记着是谁提的（`QueueItem::new` 本来就这么填）。
+        k.member_families = vec![vec!["alpha".into()]];
         let backend = Routed::new(vec![("k", 10, vec![found("k")])]);
         let reg = routed_registry(&backend, 4);
 
