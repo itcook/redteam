@@ -503,3 +503,27 @@ scan 与 needs 分属两身份空间 → 同一块挖两遍；每文件保底排
   `bundles[0]` 只决定跨文件上下文取哪一组。**过滤本身仍成立**（装不出证据 = 白烧一格），但机制记错了，decisions / design 已改。
 - **本批新引入三个常量**（都带出处注释，改前先看数据）：`MAX_NOTES = 8`（一格最多列几条笔记）、`MAX_BLOCK_LINES = 200`（块区间封顶）、
   风险档的「最高档只给进了 H0 的区」。前两个是「撑爆预算」的止血，不是标定过的最优值。
+
+## 批 D-4 离线基线与开关裁定（2026-09-21；数字与归因在 `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`，原始产物在私有记录）
+
+- **`review.verifiers.enabled` 缺省 `false`**（按预登记阈值执行：误驳 ≤ 5% ∧ 驳回 ≥ 30%）。
+  异族 deepseek-flash 驳回 37.5% / 误驳 12.0%；同族 glm-5.3 驳回 18.8% / 误驳 20.0%。两臂都栽在误驳上。
+  **异族两根轴都优于同族**——D17 的异族选择本批有数支撑，不再只是推测。
+- **样本 111 → 41**（dismissed 16 / upheld 25），计划的「各 111 条」是按 fixtures 行数估的，实际排除：
+  无 quote 41（产品 parse 层本就丢弃这种形状）、oracle 自相矛盾 14（同 id 两边都在）、引用锚不回树 9、无 head_sha 6。
+  后果：**5% 的误驳门槛在 n=25 上等价于「最多错 1 条」**，95%CI 宽到 4–30%。本批是「按预登记规则执行」，
+  不是「统计上证伪」。扩样本靠 M21c 台账回流攒新数据（新卡带 head_sha 与完整 quote，不再有这批锚定损耗）。
+- **误驳 8 条全部是「overstated」一类，没有一条读错代码**（逐条见私有记录）：模型引用同文件的测试名与历史裁决注释
+  论证「这是有意为之」，或论证危害被夸大。这正是 verifier 角色尾授权的三条 REFUTED 理由之一。
+  **假说（未验证）**：REFUTED 收到「事实不成立 / 已有守卫」两条、把 overstated 改成降 severity 而非驳回，
+  误驳可能趋近 0 而驳回率损失有限。**本批不动**——改完口径拿同一份固定集重测就是 p-hacking；
+  要做就先重新预登记阈值再跑（M21c，连同台账判例注入一起）。
+- **复核这一路的输出 token 与深挖同一量级**（41 条产出 336k / 186k output token，单条输出是输入的 1.4–2.4 倍，
+  两个候选模型都开着 reasoning）。这是「默认关」的第二个理由，也说明 M21c 若要默认开，得先有每轮复核上限。
+- **`build_registry` 漏注册 verifier 角色**（D-3 接线漏洞，本批修）：纯 verifier 模型（只配 verifier 角色、不兼任
+  scanner/reviewer）过去拿不到 registry 条目，`lease()` 直接 Unavailable → 每条复核静默落成「保守 upheld」，
+  看起来跑了、其实一次没验。现按 `em.name` 去重注册 scanner∪reviewer∪verifier；同名跨角色 thinkingLevel 不一致时
+  按先到的 backend 跑并留 warning（route_key 带角色前缀仍是 M21c 的活）。
+- **`verify-once` 是隐藏子命令**（`#[command(hide = true)]`）：输入是机器面（台账导出的 finding 行），
+  不进 `--help` 的用户面。它是 `eval/verify_score.py` 的唯一入口——prompt / provider / 判决解析都在产品里，
+  Python 一行不复刻。M21e 若判定它无长期价值，随 dev-time 仪器一并拆。

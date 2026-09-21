@@ -30,6 +30,14 @@
   产品面待接：`review --format json` 今天的 `run.cells` 只有 CellSummary、无 output——F 批需给结果 JSON 加 scanner 输出面（或评分器改读 proj-next.db `cells` 行）。
   基线 = P0 E3 B 臂三跑对 oracle-pr181 union：union_oracle_hit 9 / mean_oracle_hit 5.33 / mean_noise 0.55（人工主题并集 5 见 P0 研究）。
   用法（F 落地后）：`redteam-next review --base <base> --format json > out.json && python3 eval/scan_score.py score out.json --oracle … --repo … --baseline …`。
+- `verify_score.py` — M21b 批 D-4（design §8.1「去留由数据决定」〔D17〕）：verifier 离线基线。
+  `build`（零网络：按 `head_sha` / `updated_at` 锚定历史树 → 物化单文件 → 生成用例，逐条记排除原因）→
+  `run`（逐条调隐藏子命令 `redteam-next verify-once`：**产品同一份** prompt / provider / 判决解析，Python 一行不复刻）→
+  `score`（混淆矩阵 + 驳回率 / 误驳率 + Wilson 区间 + 预登记阈值裁定；`--baseline` 对比）；`selftest` 零网络自检。
+  固定集 = `fixtures/ledger-{dismissed,upheld}.jsonl`（dismissed 期望 REFUTED、upheld 期望 UPHELD）。
+  首轮结论（2026-09-21，41 条可用）：异族 deepseek-flash 驳回 37.5% / 误驳 12.0%、同族 glm-5.3 18.8% / 20.0%，
+  两臂误驳都超 5% 门槛 → `review.verifiers.enabled` 缺省 **false**。方法与归因见
+  `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`。
 - `_oracle.py` — `e3_contract_ab.py score` 与 `scan_score.py` 共用的命中口径（`show_file` / `anchor_quote` / `overlap` / `load_oracle` / `match_entries`）。
 - `export_ledger.py` — M21a 批 B-1（D10-2）：schema v4 一次重置前，把旧 proj.db 的 `dismissed` / `resolved` 全表与 `results` 里
   verify=upheld 的 findings 导出为 `fixtures/ledger-{dismissed,resolved,upheld}.jsonl`（verifier 离线回归集数据；本仓自己的数据，入库）。

@@ -40,6 +40,10 @@ enum Cmd {
     /// 见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
     /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口；深挖照跑、findings 仍在报告，本可 reject 的 blocking 条数见
     /// run.warnings）、10=reject（finding 达到 --block-threshold）。
+    /// 复核（verifier）**缺省关**：开了之后，每条 severity ≥ --block-threshold ∧ confidence ≥ --conf-floor 的 finding 会另派一个
+    /// 异族模型复查，被驳回的不计数、不拦路（记录仍在 findings 里，带 verify 字段）。配 `review.verifiers.enabled = true` 打开，
+    /// 并按需在 `roles` 里给模型配 verifier 角色（没配则自动挑一个异族的 reviewer / scanner）。缺省关的依据：对本仓人裁台账
+    /// 的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 20%（预登记门槛 ≤ 5%），代价是静默少报。
     /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
     /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
     /// 自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit 可读；误填超大 maxConcurrency 也能自愈）。
@@ -164,6 +168,24 @@ enum Cmd {
         /// 覆盖推断（与 `review --test-command` 同义）。
         #[arg(long = "override")]
         override_cmd: Option<String>,
+    },
+    /// 隐藏：复核单发离线跑（M21b 批 D-4，只读仓 / 零写库）——读一条 finding JSON，建**产品同一份**
+    /// 复核 prompt 发一轮，打印判决 JSON；`--dump-prompt` 只打印 prompt 不发请求。
+    /// `eval/verify_score.py` 靠它打离线基线（design §8.1「去留由数据决定」〔D17〕）；
+    /// 输入形态是机器面（台账导出的 finding 行），不进 `--help` 的用户面。
+    #[command(hide = true)]
+    VerifyOnce {
+        /// finding JSON 路径（`-` = stdin）：{file,line_start,line_end,severity,title,body,quote}
+        finding: String,
+        /// 证据树根（缺省当前目录）——历史锚点物化成临时树后指过来。
+        #[arg(long)]
+        root: Option<String>,
+        /// 复核模型 `provider/id`（缺省取配置里 verifier 角色的第一个）。
+        #[arg(long)]
+        verifier: Option<String>,
+        /// 只打印 prompt，不发请求。
+        #[arg(long)]
+        dump_prompt: bool,
     },
     /// 风险路由只读回放（M21b 批 A，零 provider / 零副作用）：跑阶段 0（成区 → 四类信号 → H0/R/档位）
     /// 打印 JSON——供 `eval/risk_replay.py compare` 对拍 Python v4 参考实现（θ 与权重改动必过的回归门，D11）。
@@ -491,7 +513,10 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
     for w in redteam::provider::backends::role_thinking_warnings(&roles) {
         registry.push_warning(w);
     }
+    // 已注册的 route_key → 其 backend 的 thinkingLevel（跨角色同名冲突的告警依据）。
+    let mut registered: std::collections::BTreeMap<String, Option<redteam::config::ThinkingLevel>> = Default::default();
     for em in &roles.scanners {
+        registered.insert(em.name.clone(), em.thinking_level);
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
         let backend = match backend_from_config(em, key) {
             Ok(b) => b,
@@ -505,10 +530,22 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
         let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
         registry.insert_scan(em.name.clone(), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
     }
-    for em in &roles.reviewers {
+    // reviewer 与 verifier 同一套注册逻辑：按 `em.name`（= `provider/id`）去重——同一模型兼任多角色时
+    // 只装一份 backend。批 D〔D17〕：verifier 必须在这里注册，否则 `pick_verifier` 选中一个纯 verifier
+    // 模型时 `registry.lease()` 直接 Unavailable，每条复核都静默落成「保守 upheld」——看起来跑了、其实一次没验。
+    for em in roles.reviewers.iter().chain(roles.verifiers.iter()) {
         if registry.has_scan(&em.name) {
+            // 同名不同档（scanner high / verifier medium 之类）：先到的 backend 生效，档位差异必须可见——
+            // 静默用错档会让离线基线与线上行为对不上。route_key 带角色前缀是 M21c 的活（D13 已记）。
+            if registered.get(&em.name).is_some_and(|prev| *prev != em.thinking_level) {
+                registry.push_warning(format!(
+                    "{} 兼任多角色且 thinkingLevel 不一致（已注册 {:?}、本角色 {:?}）——本轮按已注册档位跑",
+                    em.name, registered[&em.name], em.thinking_level
+                ));
+            }
             continue;
         }
+        registered.insert(em.name.clone(), em.thinking_level);
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
         let backend = match backend_from_config(em, key) {
             Ok(b) => b,
@@ -1109,6 +1146,19 @@ async fn main() {
             }
         }
         Cmd::Risk { base, head, dismissed, before } => run_risk(&base, head.as_deref(), dismissed.as_deref(), before.as_deref()),
+        Cmd::VerifyOnce { finding, root, verifier, dump_prompt } => {
+            let cfg = load_config_warned();
+            redteam::cli::verify_once::run_verify_once(
+                redteam::cli::verify_once::VerifyOnceArgs {
+                    finding: &finding,
+                    root: root.as_deref(),
+                    verifier: verifier.as_deref(),
+                    dump_prompt,
+                },
+                &cfg,
+            )
+            .await
+        }
     };
     std::process::exit(code);
 }
@@ -1583,16 +1633,8 @@ mod tests {
         assert!(Cli::try_parse_from(["redteam", "risk"]).is_err(), "--base 必填");
     }
 
-    /// C1：无 provider 配置的 Config + ReviewArgs → build_registry 返回 Err。
-    #[test]
-    fn build_registry_no_provider_returns_err() {
-        use redteam::cli::ReviewArgs;
-        use redteam::config::Config;
-
-        // 空配置：无 scanner 角色 → 角色集为空 → Err
-        let cfg = Config::default();
-        let cwd = std::path::Path::new(".");
-        let args = ReviewArgs { pack_only: false,
+    fn plain_review_args() -> redteam::cli::ReviewArgs {
+        redteam::cli::ReviewArgs { pack_only: false,
             base: None,
             scope: "working-tree".into(),
             spec: vec![],
@@ -1607,7 +1649,54 @@ mod tests {
             incremental_from: None,
             tools: None,
             test_command: None,
-        };
+        }
+    }
+
+    /// 批 D〔D17〕：**纯 verifier 模型也要进 registry**。漏注册时 `pick_verifier` 选中它，
+    /// 每条复核都会在 `lease()` 上拿到 Unavailable、静默落成「保守 upheld」——看起来跑了、其实一次没验。
+    #[test]
+    fn build_registry_registers_verifier_only_models() {
+        let cfg: redteam::config::Config = serde_json::from_str(
+            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
+                "s":{"roles":{"scanner":{}}},
+                "r":{"roles":{"reviewer":{}}},
+                "v":{"roles":{"verifier":{}}}
+            }}}}"#,
+        )
+        .unwrap();
+        let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new(".")).unwrap();
+        assert!(reg.has_scan("p/s") && reg.has_scan("p/r"), "scanner / reviewer 照旧");
+        assert!(reg.has_scan("p/v"), "纯 verifier 模型必须能 lease，否则复核全程静默保守 upheld");
+    }
+
+    /// 同一模型兼任多角色且 thinkingLevel 不一致：先到的 backend 生效，差异必须留下 warning——
+    /// 静默用错档会让离线基线与线上行为对不上。
+    #[test]
+    fn build_registry_warns_on_cross_role_thinking_level_mismatch() {
+        let cfg: redteam::config::Config = serde_json::from_str(
+            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
+                "m":{"roles":{"scanner":{"thinkingLevel":"high"},"verifier":{"thinkingLevel":"low"}}}
+            }}}}"#,
+        )
+        .unwrap();
+        let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new(".")).unwrap();
+        assert!(reg.has_scan("p/m"));
+        assert!(
+            reg.warnings().iter().any(|w| w.contains("thinkingLevel 不一致")),
+            "档位冲突必须可观测: {:?}",
+            reg.warnings()
+        );
+    }
+
+    /// C1：无 provider 配置的 Config + ReviewArgs → build_registry 返回 Err。
+    #[test]
+    fn build_registry_no_provider_returns_err() {
+        use redteam::config::Config;
+
+        // 空配置：无 scanner 角色 → 角色集为空 → Err
+        let cfg = Config::default();
+        let cwd = std::path::Path::new(".");
+        let args = plain_review_args();
         let result = build_registry(&args, &cfg, cwd);
         assert!(result.is_err(), "无 scanner 时 build_registry 应返回 Err");
         let msg = result.err().unwrap();

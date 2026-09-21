@@ -282,14 +282,17 @@ impl Default for ReviewersCfg {
     fn default() -> Self { ReviewersCfg { max_cells: d_max_cells(), reenqueue: false } }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// `review.verifiers`：流式复核开关。**缺省关**——批 D-4 的离线基线按预登记阈值裁定
+/// （误驳 ≤ 5% ∧ 驳回 ≥ 30% 才默认开）：异族 deepseek-flash 驳回 37.5% / 误驳 12.0%、
+/// 同族 glm-5.3 驳回 18.8% / 误驳 20.0%，两臂的误驳都远超门槛 → 默认关，要开显式写 `"enabled": true`。
+/// 数字与归因见 `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`。
+/// 缺省关 = `bool` 的 `Default`，故直接 derive：serde 缺省与 `Default` 只此一个来源，不会各说各话
+/// （`verifiers_enabled_defaults_off` 钉住两条路径同值）。
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifiersCfg {
-    #[serde(default = "d_true")]
+    #[serde(default)]
     pub enabled: bool,
-}
-impl Default for VerifiersCfg {
-    fn default() -> Self { VerifiersCfg { enabled: true } }
 }
 
 /// `review.grouping`：ocr 双阈值门起步值（4 / 200 / 10，D3）；`semantic` 默认关（R8）。
@@ -327,7 +330,6 @@ impl Default for PackCfg {
 }
 
 fn d_one() -> u32 { 1 }
-fn d_true() -> bool { true }
 fn d_max_cells() -> MaxCells { MaxCells::Auto }
 fn d_min_files() -> u32 { 4 }
 fn d_bundle_lines() -> u32 { 200 }
@@ -1091,6 +1093,18 @@ mod tests {
     "pack": { "body": "slice", "anchorWindow": 30, "sliceMinBytes": 8192 }
   }
 }"#;
+
+    /// 批 D-4：`review.verifiers.enabled` **缺省关**。这是本批唯一的产品面开关，
+    /// 离线基线两臂的误驳率（12% / 20%）都远超预登记的 5% 门槛——翻默认值必须是有意动作，
+    /// 且「写了空 `verifiers` 段」与「整段缺失」必须同一个值（serde default 与 `Default` 不许各说各话）。
+    #[test]
+    fn verifiers_enabled_defaults_off() {
+        assert!(!ReviewConfig::default().verifiers.enabled, "整段缺失 → 关");
+        let empty: Config = serde_json::from_str(r#"{"review":{"verifiers":{}}}"#).unwrap();
+        assert!(!empty.review.verifiers.enabled, "空 verifiers 段 → 同样关");
+        let on: Config = serde_json::from_str(r#"{"review":{"verifiers":{"enabled":true}}}"#).unwrap();
+        assert!(on.review.verifiers.enabled, "显式 true 照样开");
+    }
 
     #[test]
     fn sample_config_parses_and_active_roles_ordered() {
