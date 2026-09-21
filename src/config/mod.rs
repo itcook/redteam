@@ -283,8 +283,9 @@ impl Default for ReviewersCfg {
 }
 
 /// `review.verifiers`：流式复核开关。**缺省关**——批 D-4 的离线基线按预登记阈值裁定
-/// （误驳 ≤ 5% ∧ 驳回 ≥ 30% 才默认开）：异族 deepseek-flash 驳回 37.5% / 误驳 12.0%、
-/// 同族 glm-5.3 驳回 18.8% / 误驳 20.0%，两臂的误驳都远超门槛 → 默认关，要开显式写 `"enabled": true`。
+/// （误驳 ≤ 5% ∧ 驳回 ≥ 30% 才默认开）：异族 deepseek-flash 驳回 31.2% / 误驳 12.0%、
+/// 同族 glm-5.3 驳回 18.8% / 误驳 8.0%，两臂的误驳都超门槛 → 默认关，要开显式写 `"enabled": true`。
+/// （数字为收口修掉「角色尾未 render」后的重跑值；修前那版见 research 的对照表。）
 /// 数字与归因见 `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`。
 /// 缺省关 = `bool` 的 `Default`，故直接 derive：serde 缺省与 `Default` 只此一个来源，不会各说各话
 /// （`verifiers_enabled_defaults_off` 钉住两条路径同值）。

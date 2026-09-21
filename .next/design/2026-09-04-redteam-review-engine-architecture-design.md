@@ -263,8 +263,9 @@ cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 - **判决合并**（`dedup::merge_into`，复核跑在 dedup 之前）：**UPHELD 优先**，base 无判决则继承 other，合并后 REFUTED 则
   confidence 归零。方向与验收门槛一致——误驳（静默删掉真缺陷）比漏驳危险得多。
 - **去留由数据决定**：阈值**跑前预登记**（误驳 ≤ 5% ∧ 驳回 ≥ 30% → 默认开）。2026-09-21 两臂离线基线（本仓人裁台账，各 41 条）：
-  异族 `deepseek-flash` 驳回 37.5% / 误驳 12.0%，同族 `glm-5.3` 18.8% / 20.0% —— 两臂都栽在误驳上 → **默认关**。
-  异族两根轴都优于同族，本节的异族选择自此有数支撑。数字与归因见
+  异族 `deepseek-flash` 驳回 31.2% / 误驳 12.0%，同族 `glm-5.3` 18.8% / 8.0% —— 两臂都栽在误驳上 → **默认关**。
+  数据只支持「**异族驳回更多**」（31% vs 19%）；误驳两臂差 1 条、区间重叠，分不出高下——
+  上面的异族选择依据是**独立性先验**，不是本仓数据。数字与归因见
   `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`；口径与残余见〔D17〕。
 - 提示词 = 共享头 + verifier 角色尾（§10.7）；离线回归集 = proj.db 已 dismissed（已知假阳）与 upheld（已知真）findings，
   评分器 `eval/verify_score.py` + 只读子命令 `verify-once`（产品同一份 prompt / provider / 解析）。

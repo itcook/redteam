@@ -61,7 +61,17 @@
         选中项对 C3 验证轮重合 50%（C3 同二进制三对 50/41/41 的上沿）；退化路径由 803 条单测（全跑 `verify: None`）保证
 - [x] 记入 `.next/private/m21b/2026-09-21-batch-d-dogfood.md` + `raw/`，账目进 followup；decisions 增 D17 节、
       design **v13** §8.1 全节重写 + §2 + §6 可观测面；plan 批 D 节加「实际执行」注记、roadmap 交付项 5 标 ✅
-- [ ] `/code-review` 审核（技能只传 effort，起来后 SendMessage 钉范围：只评 `feat/m21-review-engine...HEAD`）→ 分档修
+- [x] `/code-review max` 审核（只传 effort + SendMessage 钉范围）→ 15 条 + 9 条 runner-up，分三档：
+  - 第 1 档（正确性，全修 `0290798`）：verifier 角色尾没过 render（`{{OUTPUT_LANGUAGE}}` 字面量进了每次调用，含 D-4 基线）/
+        热区盖章不比文件（跨文件白拿共识 → 永久免验）/ 复核快照绕过读守卫 / 没跑成的复核落成 ok 格并被 `known` 固化 /
+        `refute_rate` 分母含没跑成的 / 触发集不吃 CLI 覆盖阈值 / 空变更集早退漏回填往轮判决 / 缓存判定让时序决定验不验
+  - 第 2 档（语义与用户可见，全修 `48073b0`）：事件侧盖章两份值打架 / REFUTED 没归零 confidence /
+        显式声明的 verifier 不查独立性（自己验自己无告警，而 --help 承诺异族）/ verifier 造不出 backend 拒跑整条命令 /
+        md 头条与详情对不上 / eval 零分母判成通过
+  - 第 3 档（记账进 followup）：复核无上限且在门上造成优先级反转 / `verify_refuted` 解释不了头条差 /
+        `(v, None)` 让孤条 REFUTED 盖过免验兄弟 / verifier 格三个观测字段不准 / `SkipCarried` 空话 / `cached` 按条次计
+  - 变异：第 1 档 7 项 + 第 2 档 5 项逐条转红（`.next/private/m21b/risk/mutate_d5{,b}.py`）
+- [x] **模板缺陷牵出的重测**：#4 说明 D-4 那批基线是拿带模板标记的 prompt 跑的 → 修好后按同一预登记阈值重跑两臂
 - [ ] `--no-ff` 合回 `feat/m21-review-engine`；私有记录拷回集成工作树；归档任务 + journal
 
 ## 验证命令

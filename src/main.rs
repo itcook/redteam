@@ -46,8 +46,8 @@ enum Cmd {
     /// 配了 verifier 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦（异族更准，见下）。
     /// 观测在 `run.deep.verify_triggered` / `verify_skipped`（分类：not_triggered·disabled·carried·precedent·consensus·resumed·cached·no_verifier）/
     /// `verify_refuted` / `verify_failed` / `verify_tail_ms` 与顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。
-    /// 缺省关的依据：对本仓人裁台账的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 20%
-    /// （预登记门槛 ≤ 5%；异族那臂两根轴都更好），代价是静默少报。
+    /// 缺省关的依据：对本仓人裁台账的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 8%
+    /// （预登记门槛 ≤ 5%），代价是静默少报；异族那臂驳回更多（31% vs 19%），误驳两臂分不出高下。
     /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
     /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
     /// 自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit 可读；误填超大 maxConcurrency 也能自愈）。

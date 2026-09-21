@@ -231,12 +231,13 @@ pub fn pick_verifier<'a>(
         let n = roles.verifiers.len();
         let picked = &roles.verifiers[rotation % n];
         // 显式声明也要如实告知（收口评审 #11）：轮到的这个若与产出该 finding 的 reviewer 同模型
-        // （自己验自己）或同家族，判决的独立性就打了折——离线基线里同族那臂误驳 20% vs 异族 12%。
-        // 只 warning 不改选：这是用户显式配的，他有权这么配。
+        // （自己验自己）或同家族，判决的独立性就打了折。只 warning 不改选：用户显式配的，他有权这么配。
+        // 注：离线基线只支持「异族驳回更多」（31% vs 19%），误驳两臂分不出高下——
+        // 独立性这条依据是先验，不是本仓数据。
         let warn = if picked.name == reviewer.name {
             Some(format!("verifier {} 与产出该 finding 的 reviewer 是同一个模型——自己验自己，判决不独立", picked.name))
         } else if picked.family == reviewer.family {
-            Some(format!("verifier {} 与 reviewer 同家族（{}）——异族复核更准（离线基线：误驳 12% vs 20%）", picked.name, picked.family))
+            Some(format!("verifier {} 与 reviewer 同家族（{}）——同家族的判决独立性打折", picked.name, picked.family))
         } else {
             None
         };
