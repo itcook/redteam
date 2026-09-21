@@ -256,9 +256,10 @@ pub struct RunMeta {
     /// v4（D13）：每 provider 的 429 收敛记录——只含本轮撞过 429 的 provider；空不序列化（旧消费者零噪音）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_rate_limit: BTreeMap<String, RateLimitMeta>,
-    /// v4：本轮复核的驳回率 = `deep.verify_refuted / deep.verify_triggered`（design §8.1「去留由数据决定」）。
-    /// 分母只含**真发出去验了的**条数：被跳过的（区域共识 / carried / 判例 / 开关关）从没给过 verifier 机会，
-    /// 进分母只会冲淡率。None = 本轮一条都没触发复核（不拿 0 冒充「验了没驳回」）。
+    /// v4：本轮复核的驳回率 = `verify_refuted / (verify_triggered − verify_failed)`（design §8.1「去留由数据决定」）。
+    /// 分母只含**真跑成了的**条数：被跳过的（区域共识 / carried / 判例 / 开关关）从没给过 verifier 机会，
+    /// 没跑成的（provider 挂了 / 判决读不懂）也没给出过证据——两类进分母都只会冲淡率。
+    /// None = 本轮没有任何一条真跑成的复核（不拿 0 冒充「验了没驳回」）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refute_rate: Option<f32>,
     /// ship 循环的测试命令：`--test-command` 覆盖，否则 `project::infer_test_command` 推断；推不出 None
@@ -316,9 +317,15 @@ pub struct DeepMeta {
     /// ——「没触发」与「触发了被免验」必须分得开，否则「复核为什么没跑」无从归因。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub verify_skipped: BTreeMap<String, u32>,
-    /// 被驳回条数（`Stats` 与顶层计数剔除的正是这批，报告头条与 findings 数组长度之差由它解释）。
+    /// 被驳回条数（`Stats` 与 `verdict` 剔除的正是这批）。注意它数的是**本轮 verifier 给出的驳回判决**，
+    /// 不等于「报告里少了几条」：dedup 可能把一条 REFUTED 与一条 UPHELD 并成 upheld（UPHELD 优先），
+    /// resume 沿用往轮判决时也不进这个计数（记 `verify_skipped["resumed"]`）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub verify_refuted: u32,
+    /// 派出去了但**没跑成**的条数（lease 失败 / 调用失败 / 判决读不懂）：判决按保守 upheld 收，
+    /// 但它们不是证据——`refute_rate` 的分母要减掉它们，否则「verifier 全挂」会读成「验了 N 条一条没驳」。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub verify_failed: u32,
     /// 收场前派出的格数（扫描期额度 K − F 下，非必挖项受限）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub scan_phase_dispatched: u32,

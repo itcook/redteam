@@ -31,6 +31,11 @@ const SNIPPET_READ_MAX_BYTES: usize = 512 * 1024;
 #[allow(dead_code)] // D-3 接线前无生产调用方
 const SNIPPET_FULL_FILE_CAP: usize = 64_000;
 #[allow(dead_code)] // D-3 接线前无生产调用方
+/// 读不到证据时的占位符（读守卫拒绝时调用方也用它——同一句话，模型看到的形状一致）。
+pub(crate) fn snippet_unavailable() -> &'static str {
+    SNIPPET_UNAVAILABLE
+}
+
 const SNIPPET_UNAVAILABLE: &str = "(source unavailable — judge from the finding's quote alone and weigh confidence accordingly)";
 
 /// finding 声称位置的工作树快照：内容 ≤64KB、或受支持语言的骨架未命中/超帽，统一走

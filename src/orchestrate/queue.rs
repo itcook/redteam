@@ -223,9 +223,15 @@ fn peak_cluster(members: &[Suspicion], fams: &[Vec<String>]) -> (u32, Vec<(u32, 
 }
 
 /// finding 是否压在「两家族对上的那几行」上（批 D 盖章面的单一判定，事件侧与落盘侧共用）。
+/// **先比文件、再比行**：热区是某个队列项（单文件）内峰值簇的行范围，reviewer 却可以合法地报出别的文件
+/// （跨组索引、二阶段补查）——只比行号的话，`src/b.rs:11` 会因为 `src/a.rs` 的热区含第 10 行而白拿共识盖章，
+/// 从此永久免验（2026-09-21 收口评审 #2）。同源的 `scan::lines_overlap` 第一件事也是比文件。
 /// 行重叠口径复用 `LINE_GAP`（= 3），与 `same_suspicion` 同源——模型报的行号本来就有 ±1 的抖动。
 /// `hot` 为空（旧快照 / 算不出簇）→ 一律不盖：偏差方向是多复核，不是漏复核。
-pub(crate) fn in_hot_ranges(line_start: u32, line_end: u32, hot: &[(u32, u32)]) -> bool {
+pub(crate) fn in_hot_ranges(file: &str, item_file: &str, line_start: u32, line_end: u32, hot: &[(u32, u32)]) -> bool {
+    if file != item_file {
+        return false;
+    }
     let gap = crate::consolidate::dedup::LINE_GAP;
     hot.iter().any(|&(a, b)| line_start <= b.saturating_add(gap) && a <= line_end.saturating_add(gap))
 }
@@ -1566,8 +1572,10 @@ mod tests {
         assert_eq!(it.peak_agreement, 2);
         let hot = it.hot_ranges();
         assert!(hot.iter().all(|&(a, _)| a < 20), "只含峰值簇那两条: {hot:?}");
-        assert!(in_hot_ranges(10, 10, &hot) && in_hot_ranges(11, 11, &hot));
-        assert!(!in_hot_ranges(40, 40, &hot), "单家族那条不进共识面");
+        assert!(in_hot_ranges("a.rs", "a.rs", 10, 10, &hot) && in_hot_ranges("a.rs", "a.rs", 11, 11, &hot));
+        assert!(!in_hot_ranges("a.rs", "a.rs", 40, 40, &hot), "单家族那条不进共识面");
+        // 跨文件：行号落在热区里也不盖——热区是**这个文件**里两家族对上的那几行（收口评审 #2）
+        assert!(!in_hot_ranges("b.rs", "a.rs", 10, 10, &hot), "别的文件的 finding 不进共识面");
     }
 
     /// 算不出簇（旧快照无逐条家族）→ 热区空 → 调用方一律不盖：宁可多复核。
@@ -1577,7 +1585,7 @@ mod tests {
         q.enqueue(req(spec_scan("a.rs", 3, 5, "let x = take(v);", "h"), Some("alpha")));
         q.items[0].member_families.clear();
         assert!(q.items()[0].hot_ranges().is_empty(), "两列长度不齐 → 算不出");
-        assert!(!in_hot_ranges(3, 5, &[]), "空热区什么都不覆盖");
+        assert!(!in_hot_ranges("a.rs", "a.rs", 3, 5, &[]), "空热区什么都不覆盖");
 
         // 另一条算不出的路径：两列长度齐，但家族名是空的（`item_of` 那种旧形态夹具）——
         // 峰值为 0 时热区必须也是空，退成「整文件」等于给所有 finding 白发免验票。

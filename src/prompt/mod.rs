@@ -353,7 +353,12 @@ pub fn build_verify_prompt(i: &VerifyPromptInput<'_>) -> ScanPrompt {
             PromptBlock { text: claim, cache_boundary: false },
             PromptBlock { text: snapshot, cache_boundary: true },
             PromptBlock { text: precedents, cache_boundary: true },
-            PromptBlock { text: VERIFIER_TAIL_TPL.to_string(), cache_boundary: false },
+            // 角色尾**必须过 render**：verifier.md 是三个角色尾里唯一带占位符的（`{{OUTPUT_LANGUAGE}}`），
+            // 原样推进去会把模板标记逐字发给模型（2026-09-21 收口评审实证：D-4 那批离线基线就是这么跑的）。
+            PromptBlock {
+                text: render(VERIFIER_TAIL_TPL, &[("{{OUTPUT_LANGUAGE}}", &output_language())]),
+                cache_boundary: false,
+            },
         ],
     }
 }
@@ -818,12 +823,25 @@ mod tests {
     #[test]
     fn verifier_prompt_block_order_and_empty_slots() {
         let _g = ENV_LOCK.lock().unwrap();
+        // 语言槽要断言就得先把环境定死（否则开发机的 LANG 决定测试结果）。
+        // SAFETY: single-threaded access guaranteed by ENV_LOCK
+        unsafe {
+            std::env::remove_var("LC_ALL");
+            std::env::remove_var("LC_MESSAGES");
+            std::env::set_var("LANG", "zh_CN.UTF-8");
+        }
         let p = build_verify_prompt(&verify_input());
         let texts: Vec<&str> = p.blocks.iter().map(|b| b.text.as_str()).collect();
         assert!(texts[0].contains("<claimed_finding>") && texts[0].contains("claimed title"));
         assert!(texts[1].contains("<source_snapshot>") && texts[1].contains("body();"));
         assert!(texts[2].contains("<dismissal_precedents>") && texts[2].contains("(none"), "判例空槽占位（M21c 填）");
-        assert_eq!(texts[3], VERIFIER_TAIL_TPL, "角色尾恒在最后且逐字节原样");
+        // 角色尾恒在最后，且**占位符已替换**——三个角色尾里只有它带槽，原样推进去等于把模板标记发给模型。
+        assert!(texts[3].starts_with("<verifier>") && texts[3].trim_end().ends_with("</verifier>"), "角色尾恒在最后");
+        assert!(!texts[3].contains("{{"), "不许残留模板占位符: {}", &texts[3][texts[3].len().saturating_sub(300)..]);
+        assert!(
+            texts[3].contains("in Simplified Chinese (简体中文);"),
+            "语言槽按 output_language 填: {}", &texts[3][texts[3].len().saturating_sub(220)..]
+        );
     }
 
     /// 威胁模型 B：被复核的 claim 正文来自模型输出，伪造闭合标签必须中和。

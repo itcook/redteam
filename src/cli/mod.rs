@@ -360,6 +360,7 @@ pub async fn run_code_review(
         };
         // 首跑无往轮判决（resume 才有）。
         let no_known = BTreeMap::new();
+        let thresholds = verdict_thresholds(args, cfg);
         let deep = run_deep(
             registry,
             DeepInput {
@@ -380,8 +381,9 @@ pub async fn run_code_review(
                 verify: Some(crate::orchestrate::deep::VerifyInput {
                     roles: &roles,
                     enabled: cfg.review.verifiers.enabled,
-                    block_threshold: cfg.review.block_threshold,
-                    conf_floor: cfg.review.conf_floor,
+                    // 与 verdict 同一份阈值（收口评审 #9）：旗标覆盖必须同时作用于两处。
+                    block_threshold: thresholds.0,
+                    conf_floor: thresholds.1,
                     precedents: &ledger.cards,
                     known: &no_known,
                 }),
@@ -472,6 +474,19 @@ fn resolve_tools(args: &ReviewArgs, cfg: &Config) -> crate::config::ToolsMode {
 }
 
 #[allow(clippy::too_many_arguments)] // 报告 / 退出码 / 深挖结果 / 两处配置 / registry / 计时——各不同源，收拢 struct 是过度设计
+/// verdict 的两个阈值：`--block-threshold` / `--conf-floor` 覆盖 > 配置（M21a 起这两个旗才有消费者）。
+/// **复核触发集与它同源**（design §8.1：「会让本轮 reject 的那批 finding」正是「值得花一次复核的那批」），
+/// 所以两处必须读同一份解析结果——旗标只作用于 verdict、不作用于触发集的话，
+/// `--conf-floor 0.3` 会让一批 blocking finding 永远不被复核（收口评审 #9）。
+pub(crate) fn verdict_thresholds(args: &ReviewArgs, cfg: &Config) -> (crate::domain::Severity, f32) {
+    let block = args
+        .block_threshold
+        .as_deref()
+        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+        .unwrap_or(cfg.review.block_threshold);
+    (block, args.conf_floor.unwrap_or(cfg.review.conf_floor))
+}
+
 fn overlay_deep(
     mut report: ReviewReport,
     scan_code: i32,
@@ -506,11 +521,12 @@ fn overlay_deep(
     }
     report.findings = findings.clone();
     report.stats = Stats::from_findings(&findings);
-    // 本轮复核的驳回率（design §8.1「去留由数据决定」）：分母是**真发出去验了的**条数，
-    // 不是全部 blocking——被免验跳过的（区域共识 / carried / 判例）从没给过 verifier 机会，
-    // 算进分母只会把率冲淡。没触发过复核 → None（不产键），不拿 0 冒充「验了没驳回」。
-    report.run.refute_rate = (deep.meta.verify_triggered > 0)
-        .then(|| deep.meta.verify_refuted as f32 / deep.meta.verify_triggered as f32);
+    // 本轮复核的驳回率（design §8.1「去留由数据决定」）：分母是**真跑成了的**条数——
+    // 被免验跳过的从没给过 verifier 机会，没跑成的（provider 挂了 / 判决读不懂）也没给出过证据，
+    // 两类算进分母都只会把率冲淡（收口评审 #6：verifier 全挂会读成「验了 N 条一条没驳」）。
+    // 一条都没跑成 → None（不产键），不拿 0 冒充「验了没驳回」。
+    let verified = deep.meta.verify_triggered.saturating_sub(deep.meta.verify_failed);
+    report.run.refute_rate = (verified > 0).then(|| deep.meta.verify_refuted as f32 / verified as f32);
     report.run.deep = Some(deep.meta);
     report.run.warnings.extend(deep.warnings);
     if skipped > 0 {
@@ -530,10 +546,7 @@ fn overlay_deep(
     fold_role_cells(&mut report, deep.cells, false);
     let h = crate::prompt::template_hashes();
     report.run.template_hashes.insert("reviewer_tail".into(), h.reviewer_tail.clone());
-    let block = args.block_threshold.as_deref()
-        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
-        .unwrap_or(cfg.review.block_threshold);
-    let floor = args.conf_floor.unwrap_or(cfg.review.conf_floor);
+    let (block, floor) = verdict_thresholds(args, cfg);
     let verdict = crate::verdict::compute_verdict(&findings, block, floor);
     let debt = failed || skipped > 0;
     const DEBT: &str = "reviewer debt: failed reviewer cell, undispatched queue items, or budget skip";
@@ -1288,9 +1301,20 @@ pub async fn run_resume(
             }
             let branch_scope = args.scope == "branch";
             // 已落盘 reviewer 格里的 finding——深挖的权威成果，无论后面走哪条路都不能丢。
+            // **判决在这里就贴上**（收口评审 #1）：下面「diff 重建不了」那条路会直接 `break 'deep`
+            // 用这批 finding 造报告，走不到 run_deep 的回填；漏贴 = 往轮已被驳回的 finding
+            // 在本轮报告里复活成拦路 blocking，往轮的驳回记录从 JSON 里消失。
+            // 往轮已判过的不重验（〔D17〕Q11）：verifier 格按 finding id 回填。
+            let known = crate::orchestrate::deep::known_verdicts(&deep_records);
             let prior_findings: Vec<crate::domain::Finding> = deep_records
                 .iter()
                 .flat_map(|r| r.output.findings().to_vec())
+                .map(|mut f| {
+                    if let Some(v) = known.get(&f.id) {
+                        f.verify = Some(v.clone());
+                    }
+                    f
+                })
                 .collect();
             // 未完 = 有没挖完的项，或有成功 scanner 格的疑点从没到过队列（补跑出的新疑点、首跑到达丢失）——
             // diff 重建失败时据此计债，不把「从没挖过」收成干净通过（评审 #1）。
@@ -1377,8 +1401,7 @@ pub async fn run_resume(
                 }
             };
             let factory = per_cell_backend_factory(cfg);
-            // 往轮已判过的不重验（〔D17〕Q11）：verifier 格按 finding id 回填。
-            let known = crate::orchestrate::deep::known_verdicts(&deep_records);
+            let thresholds = verdict_thresholds(&args, cfg);
             let deep = run_deep(
                 registry,
                 DeepInput {
@@ -1400,8 +1423,8 @@ pub async fn run_resume(
                     verify: Some(crate::orchestrate::deep::VerifyInput {
                         roles: &roles,
                         enabled: cfg.review.verifiers.enabled,
-                        block_threshold: cfg.review.block_threshold,
-                        conf_floor: cfg.review.conf_floor,
+                        block_threshold: thresholds.0,
+                        conf_floor: thresholds.1,
                         precedents: &ledger.cards,
                         known: &known,
                     }),
@@ -3407,6 +3430,45 @@ mod code_review_tests {
         assert_eq!((scan.groups[0].cells.len(), scan.groups[0].suspicions), (2, 1));
     }
 
+
+    /// 触发集与 verdict 同源，**含 CLI 覆盖**（2026-09-21 收口评审 #9）：`--conf-floor 0.3` 让一条
+    /// 置信 0.4 的 finding 成为 blocking，它就必须同时进复核触发集。两处读不同的阈值时，
+    /// 这条会被 verdict 判成拦路、却永远不被复核——`verify.rs` 里写着的「与 compute_verdict 同源」当场失效。
+    #[tokio::test]
+    async fn cli_threshold_overrides_reach_the_verify_trigger_set() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        let cfg = Config::from_json(
+            r#"{"review":{"verifiers":{"enabled":true}},"providers":{"p":{"kind":"openai","models":{
+                "s":{"roles":{"scanner":{}}},
+                "r":{"roles":{"reviewer":{}}},
+                "v":{"roles":{"verifier":{}}}
+            }}}}"#,
+        )
+        .unwrap();
+        let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
+        // 置信 0.4：配置缺省 floor 0.5 之下、`--conf-floor 0.3` 之上
+        let rev_json = r#"{"findings":[{"severity":"medium","title":"t","body":"b","file":"src/a.rs","line_start":2,"line_end":2,"confidence":0.4,"recommendation":"r","quote":"db.write(token);"}],"needs":[]}"#;
+        let t = |s: &str| AssistantTurn { text: s.into(), tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: Some("stop".into()), reasoning_tokens: None };
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(t(&scan_json))), std::time::Duration::from_secs(5), 0);
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(t(rev_json))), std::time::Duration::from_secs(5), 0);
+        reg.insert_scan("p/v", "p", 8, Box::new(FakeChatBackend::repeating(t(r#"{"analysis":"a","verdict":"UPHELD","reason":"成立"}"#))), std::time::Duration::from_secs(5), 0);
+        let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
+
+        let mut a = args();
+        a.conf_floor = Some(0.3);
+        let (report, code) = run_code_review(&a, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+
+        let deep = report.run.deep.as_ref().expect("有 reviewer → 有 deep 段");
+        assert_eq!(
+            deep.verify_triggered, 1,
+            "0.4 在 --conf-floor 0.3 之上 → 既是 blocking 也该进触发集；skipped={:?}",
+            deep.verify_skipped
+        );
+        assert_eq!((report.verdict, code), (Verdict::Reject, 10), "同一条同时是 blocking");
+    }
+
     /// 有 reviewer：疑点入队 → Fake 产 finding → Approve + deep 段。
     #[tokio::test]
     async fn deep_review_emits_findings_and_approve() {
@@ -3516,12 +3578,13 @@ mod code_review_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
         let reg = ProviderRegistry::new();
-        let deep_with = |triggered: u32, refuted: u32, skipped: u32| crate::orchestrate::deep::DeepRun {
+        let deep_with = |triggered: u32, refuted: u32, skipped: u32, failed: u32| crate::orchestrate::deep::DeepRun {
             findings: vec![],
             cells: vec![crate::state::CellRecord::ok("c", "m", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] })],
             meta: crate::domain::DeepMeta {
                 verify_triggered: triggered,
                 verify_refuted: refuted,
+                verify_failed: failed,
                 verify_skipped: [("consensus".to_string(), skipped)].into_iter().collect(),
                 ..Default::default()
             },
@@ -3529,10 +3592,16 @@ mod code_review_tests {
         };
         let blank = || ReviewReport { run: Default::default(), verdict: Verdict::Approve, stats: Default::default(),
             findings: vec![], scan: None, cells: vec![], clusters: Default::default(), schema_version: Default::default() };
-        let (rep, _) = overlay_deep(blank(), 0, deep_with(4, 1, 9), &args(), &cfg, &reg, std::time::Instant::now());
+        let (rep, _) = overlay_deep(blank(), 0, deep_with(4, 1, 9, 0), &args(), &cfg, &reg, std::time::Instant::now());
         assert_eq!(rep.run.refute_rate, Some(0.25), "4 条进了复核、驳回 1 条 → 25%（跳过的 9 条不进分母）");
-        let (rep2, _) = overlay_deep(blank(), 0, deep_with(0, 0, 9), &args(), &cfg, &reg, std::time::Instant::now());
+        let (rep2, _) = overlay_deep(blank(), 0, deep_with(0, 0, 9, 0), &args(), &cfg, &reg, std::time::Instant::now());
         assert_eq!(rep2.run.refute_rate, None, "一条都没触发复核 → 不产键");
+        // 收口评审 #6：没跑成的（provider 挂了 / 判决读不懂）也不进分母，否则「verifier 全挂」
+        // 会读成「验了 N 条一条没驳」——而这个数正是下次复议「去留」时要读的。
+        let (rep3, _) = overlay_deep(blank(), 0, deep_with(4, 1, 0, 2), &args(), &cfg, &reg, std::time::Instant::now());
+        assert_eq!(rep3.run.refute_rate, Some(0.5), "4 条派出去、2 条没跑成 → 分母是 2");
+        let (rep4, _) = overlay_deep(blank(), 0, deep_with(3, 0, 0, 3), &args(), &cfg, &reg, std::time::Instant::now());
+        assert_eq!(rep4.run.refute_rate, None, "全挂 → 不产键，不拿 0.0 冒充「验了没驳回」");
         drop(dir);
     }
 
