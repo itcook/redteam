@@ -415,6 +415,18 @@ mod tests {
         let s = Stats::from_findings(&[f(Severity::High), f(Severity::High), f(Severity::Low)]);
         assert_eq!((s.high, s.low, s.total), (2, 1, 3));
     }
+    /// 被驳回的不计数（批 D〔D17〕Q9）：`verdict` 已经不认它们，报告头条数字也不该认——
+    /// 两处口径不一致时，用户会看到「2 个 high」却拿到 Approve。记录仍在 `findings` 数组里。
+    #[test]
+    fn stats_exclude_refuted_findings() {
+        let verdict = |v: VerifyVerdict| Some(Verify { verdict: v, model: "p/v".into(), note: String::new() });
+        let mut refuted = f(Severity::High);
+        refuted.verify = verdict(VerifyVerdict::Refuted);
+        let mut upheld = f(Severity::High);
+        upheld.verify = verdict(VerifyVerdict::Upheld);
+        let s = Stats::from_findings(&[refuted, upheld, f(Severity::Low)]);
+        assert_eq!((s.high, s.low, s.total), (1, 1, 2), "驳回的那条既不计 high 也不计 total");
+    }
     /// C2 观测字段为零不产键、旧报告（无这些键）照读（design C2 §12 兼容）。
     #[test]
     fn deep_meta_c2_fields_skip_zero_and_default_on_old_json() {

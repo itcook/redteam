@@ -113,6 +113,36 @@ mod tests {
             hard_constraint:false, quote:String::new(), cluster_id:None, verify:None,
             previously_dismissed: false, origin: Origin::New }
     }
+
+    /// 判决合并三种组合（批 D〔D17〕Q11）：流式复核跑在 dedup **之前**，同一个 bug 被两个格报出来时
+    /// 会各验一次。base 无判决 → 继承 other；一方 UPHELD → UPHELD 胜（误驳会静默删掉真缺陷）；
+    /// 两方都 REFUTED → 保持 refuted 且 confidence 归零（否则 max 会留下「REFUTED + 0.9」的自相矛盾记录）。
+    #[test]
+    fn verify_verdicts_merge_with_upheld_winning() {
+        use crate::domain::{Verify, VerifyVerdict};
+        let verdict = |v: VerifyVerdict, m: &str| Some(Verify { verdict: v, model: m.into(), note: String::new() });
+        let pair = |a: Option<Verify>, b: Option<Verify>| {
+            let mut x = f("1", "a.rs", 10, 12, "missing auth check", "claude", Severity::High);
+            let mut y = f("2", "a.rs", 11, 13, "Missing auth check", "gpt", Severity::High);
+            (x.verify, y.verify) = (a, b);
+            (x.confidence, y.confidence) = (0.9, 0.7);
+            let out = dedup(vec![x, y]);
+            assert_eq!(out.len(), 1, "前提：这两条本来就该并成一条");
+            (out[0].verify.clone(), out[0].confidence)
+        };
+
+        let (v, _) = pair(None, verdict(VerifyVerdict::Refuted, "p/v"));
+        assert_eq!(v.map(|v| v.verdict), Some(VerifyVerdict::Refuted), "base 没判决 → 继承 other 的");
+
+        let (v, conf) = pair(verdict(VerifyVerdict::Refuted, "p/v"), verdict(VerifyVerdict::Upheld, "p/w"));
+        assert_eq!(v.map(|v| (v.verdict, v.model)), Some((VerifyVerdict::Upheld, "p/w".to_string())), "任一 UPHELD 即 UPHELD");
+        assert_eq!(conf, 0.9, "守住的照常取 max");
+
+        let (v, conf) = pair(verdict(VerifyVerdict::Refuted, "p/v"), verdict(VerifyVerdict::Refuted, "p/w"));
+        assert_eq!(v.map(|v| v.verdict), Some(VerifyVerdict::Refuted));
+        assert_eq!(conf, 0.0, "两方都驳回 → confidence 归零，不让 max 把它抬回来");
+    }
+
     #[test]
     fn merges_overlapping_same_title_cross_model() {
         let v = vec![
