@@ -482,7 +482,9 @@ resume 怎么接。开工前 `/grilling` 十问（Trellis `09-15-m21b-deep-strea
 - `samples ≥ 2` 不抬共识（followup 旧括注有误）：`agreement` = 去重家族数，D7 明确「同家族多 samples 计一次」；samples 只扩候选覆盖，
   成本是 scanner token 翻倍（现占全轮 48% in / 40% out），墙钟基本不变。配置无 temperature 旋钮。
 - needs 是最稳的信号：两轮唯一路径 7 vs 8、Jaccard 67%，全部 `kind = evidence` 且全部带 lines；但约六成指向变更集之外，
-  而 `pick_bundle` 对不在任何 bundle 的文件静默退回 `bundles[0]`，会产出「文件名是 A、证据是 B」的错配包。
+  而不在变更集的文件装不出证据：`region::build` 在 bundle 里找不到该文件时只输出一行「队列项文件不在变更集或工作树缺失」的省略说明，
+  整格就是白烧（**2026-09-21 评审更正**：原记「`pick_bundle` 退回 `bundles[0]` 会产出文件名 A、证据 B 的错配包」不成立——
+  `bundles[0]` 只决定跨文件上下文取哪一组，该文件自身的切片根本不会渲染）。
 - 类别标注本身在漂：L0 占比两轮 59% vs 21%。
 
 **候选与被否**
@@ -495,7 +497,7 @@ resume 怎么接。开工前 `/grilling` 十问（Trellis `09-15-m21b-deep-strea
 | Q5 排序键 | 分层键（保底 → 种类 → peak → 风险档 → 烟量 → 代码优先 → confidence 末位 → id），类别权重维持 1.0 不启用 | 继续乘积式；启用类别权重 | 乘积式已退化成 confidence 排序；分层后每维含义独立可查。风险档锚在既有 θ = 1.5 上，不另立阈值 |
 | Q6 文件多样性 | D 每文件保底一格 + `max_cells_per_file` 可观测 | A 不管；B per-file 硬帽；C 按文件轮转 | 保底只让出第一轮、热点文件的第 2/3 项仍按价值排；硬帽与轮转都会在「问题真的都在一个文件」时伤覆盖 |
 | Q7 笔记 confidence | A 去掉数字，基线重采 | 保留；改成分档词 | §7 明写笔记注入是防锚定设计，摆个 0.82 与此自相矛盾；E3 实证自评与命中无关 |
-| Q8 scanner needs | B 只接变更集内；diff 外只计数，装包归属记账 C4 / M21d | A 全接；C 继续不接 | needs 路径 Jaccard 67% 是全轮最稳信号，值得接；但 diff 外的会撞 `pick_bundle` 的静默兜底、产出错配包 |
+| Q8 scanner needs | B 只接变更集内；diff 外只计数，装包归属记账 C4 / M21d | A 全接；C 继续不接 | needs 路径 Jaccard 67% 是全轮最稳信号，值得接；但 diff 外的文件装不出证据（`region::build` 只出一行省略说明），入队即白烧一格——见「代价与残余」的更正 |
 | Q9 验收门槛 | B 三量：逐项重合度 ≥ 40% + 单文件最大占格 ≤ 总格数 1/3 + 护栏；落 30%–50% 边界带加跑第三轮取中位数 | A 只看重合度；C 加权综合分 | 单指标会被候选集波动带偏；辅助门槛直接对应多样性机制且不受候选集影响；边界带避免一轮定生死 |
 | Q10 合并谓词 | B 结构定项、谓词定共识；取消 id 捷径 | A 保留 C1 的「共识只经谓词、id 捷径不计共识」 | 块键已覆盖「同区间」的情形；共识改由项内聚簇算，`by_predicate` 这条特例失去存在理由 |
 | Q11 观测 | B 五个标量（`suspicions_arrived` / `items_from_suspicions` / `files_candidate` / `files_selected` / `max_cells_per_file`）+ `enqueue_reasons` 增 `needs` / `needs_out_of_diff` | A 不加；C 加逐格数组 | 三量判定要能直接读数；逐格数组可由 `DeepRun.items` + scan 报告离线复算，不占 schema |

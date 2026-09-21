@@ -52,7 +52,13 @@
 - [x] samples = 2 一次性测量轮（跑完已还原、指纹校验）：候选位置 50 ≈ 两轮并集、token 翻倍、墙钟 +2～3 min；
   与三轮 samples 1 的选中项重合度 50 / 50 / 60% **高于** samples 1 彼此的 50 / 41 / 41% —— 数据进 followup
 - [x] 记入本工作树 `.next/private/m21b/2026-09-20-batch-c3-dogfood.md`（改后三轮 + 测量轮 + 对照），账目进 followup；decisions 增 D16 节、design 升 v12（§6 规则 1 / 2 / 3 与可观测面、§7）
-- [ ] code-review 审核（技能只传 effort，起来后 SendMessage 钉范围：只评 `feat/m21-review-engine...HEAD`）→ 分档修
+- [x] code-review 审核（max effort，15 条 + 10 条超帽项）→ 分三档全修：
+  - 第 1 档 10 条真错（块键碰撞 / 行带拆共识 / 区间被到达撑大 / 旧项升级错位 / 保底轴不一致 / 必挖轴被降级 /
+    scan 与 needs 重挖 / H0 让位 / 同 id 共存 / 行号溢出）：`8878434`
+  - 第 2 档 7 条口径与浪费（笔记与块区间封顶 / needs 行锚口径归一 / 路径归一 / 外部计数去重 / 文档分类归一 /
+    风险档接 H0 / defs 整轮缓存 + `--help` 同步）：`a75d8ee`
+  - 第 3 档：死常量清理、resume 轮观测从快照重建、风险档随 route 重算、拆簇指标成因更正、D16 失实理由更正，其余记账进 followup
+  - 变异检查 20 处逐条转红（脚本 `.next/private/m21b/raw/mutate_c3_tier1.py`）
 - [ ] `--no-ff` 合回 `feat/m21-review-engine`；私有记录拷回集成工作树；归档任务 + journal
 
 ## 验证命令

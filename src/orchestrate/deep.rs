@@ -104,6 +104,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             );
         }
         let items = input.restore.map(<[QueueItem]>::to_vec).unwrap_or_default();
+        // 早退也带选项观测（评审）：`restored_meta` 已按快照算好五量，否则这一轮的报告里它们凭空为 0。
         return DeepRun { findings: prior_findings, cells: vec![], meta, warnings, reviewer_failed: unfinished, reused_cells: vec![], items };
     }
 
@@ -137,6 +138,14 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let dispatched_before = dispatched;
     // 块与风险档上下文（C3〔D16〕）：整轮共用一份文件内容缓存；同步读计入下面的阻塞观测。
     let mut blocks = BlockCtx::new(input.root, input.route, input.bundles);
+    // 风险档随本轮的 route 重算（评审）：它是排序输入、不是历史事实——旧快照项本来就没有这个字段，
+    // 而上一轮算出的档在 diff 变了之后也未必还成立。`max` 只在同轮的多次到达之间保证单调。
+    if restore_mode {
+        for it in q.items_mut() {
+            let range = it.spec.ranges.first().copied().unwrap_or((1, 1));
+            it.risk_band = blocks.band_for(&it.spec.file, range);
+        }
+    }
     let t_enq = std::time::Instant::now();
     if let Some(route) = input.route {
         for h in &route.hotspots {
@@ -481,7 +490,10 @@ fn skipped_now(q: &DeepQueue) -> u32 {
 /// 选项观测（design C3 §7〔D16〕）：收场时把队列压成五个标量——合并压缩比、候选与选中的文件面、单文件最大占格。
 /// 逐格数组不落（可从 `DeepRun.items` + scan 报告离线复算）。
 fn observe_selection(q: &DeepQueue, meta: &mut DeepMeta) {
-    let items = q.items();
+    observe_selection_items(q.items(), meta);
+}
+
+fn observe_selection_items(items: &[QueueItem], meta: &mut DeepMeta) {
     meta.items_from_suspicions = items.iter().filter(|it| it.kind == ItemKind::Suspicion).count() as u32;
     let files: std::collections::BTreeSet<&str> = items.iter().map(|it| it.spec.file.as_str()).collect();
     meta.files_candidate = files.len() as u32;
@@ -930,11 +942,21 @@ pub fn review_cell_prefix(item_id: &str) -> String {
 /// 同样做收场 drain）；挖不动的两条早退路径——变更集为空、diff 重建报错（`cli::run_resume`）——就以快照读数收口，
 /// 漏掉它被预算截掉的项就既不计债也不披露。
 pub fn restored_meta(items: &[QueueItem]) -> DeepMeta {
-    DeepMeta {
+    let mut meta = DeepMeta {
         budget_skipped: items.iter().filter(|i| i.state == ItemState::Skipped).count() as u32,
         queue_depth_peak: items.len() as u32,
         ..Default::default()
-    }
+    };
+    // 疑点到达数从快照重建（评审）：resume 时回放的疑点走到达键幂等、按 `Duplicate` 不计，
+    // 若从 0 起算，`suspicions_arrived / items_from_suspicions` 这个压缩比在 resume 轮就成了 0÷n。
+    // 项上记着的到达键就是往轮收过的疑点，逐项数即可（H0 的 `rule:` 键不算）。
+    meta.suspicions_arrived = items
+        .iter()
+        .flat_map(|it| it.arrivals.iter())
+        .filter(|k| !k.starts_with("rule:") && !k.starts_with("needs:"))
+        .count() as u32;
+    observe_selection_items(items, &mut meta);
+    meta
 }
 
 /// 调用方保证 `bundles` 非空（`run_deep` 开头已早退）。
@@ -2821,6 +2843,25 @@ mod tests {
         assert_eq!(run.items[0].arrivals.iter().filter(|k| k.starts_with("needs:a.rs:")).count(), 1, "`./a.rs` 归一后与疑点同一项: {:?}", run.items[0].arrivals);
         assert_eq!(run.meta.enqueue_reasons.get("needs_out_of_diff"), Some(&1), "同一条变更集外声明重复报只计一次");
         assert_eq!(run.meta.suspicions_arrived, 1, "needs 不计进疑点到达数");
+    }
+
+    /// resume 轮的观测从快照重建（评审）：回放的疑点走到达键幂等、按 `Duplicate` 不计，
+    /// 从 0 起算会让压缩比在 resume 轮变成 0÷n；项上记着的到达键就是往轮收过的疑点。
+    #[test]
+    fn restored_meta_rebuilds_the_selection_observables() {
+        let mut settled = item_of("a", ItemKind::Suspicion, ItemState::Settled, 1);
+        settled.arrivals = vec!["scan[g1]@p/alpha#1#0:aa".into(), "scan[g1]@p/beta#1#0:bb".into()];
+        let mut skipped = item_of("b", ItemKind::Suspicion, ItemState::Skipped, 1);
+        skipped.arrivals = vec!["scan[g1]@p/alpha#1#1:cc".into()];
+        let mut h0 = item_of("c", ItemKind::Primary, ItemState::Settled, 1);
+        h0.arrivals = vec!["rule:c.rs:1-2".into()];
+
+        let meta = restored_meta(&[settled, skipped, h0]);
+
+        assert_eq!(meta.suspicions_arrived, 3, "H0 的 rule: 键不算疑点");
+        assert_eq!((meta.items_from_suspicions, meta.files_candidate), (2, 3));
+        assert_eq!((meta.files_selected, meta.max_cells_per_file), (2, 1), "被截的那项不算选中");
+        assert_eq!(meta.budget_skipped, 1);
     }
 
     /// 选项观测五量与手算一致（design C3 §7〔D16〕）：三文件四疑点（a.rs 的两条同块并一项）→ 到达 4、疑点项 3、候选文件 3；

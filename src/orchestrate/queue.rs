@@ -10,8 +10,6 @@ use crate::domain::Suspicion;
 use crate::orchestrate::blocks::Block;
 use crate::pack::region::{Origin as QueueOrigin, QueueItemSpec};
 
-/// L0..L5 类别权重（design 取舍：M21b 中性 1.0，改数字不改公式）。
-pub const CATEGORY_WEIGHT: [f32; 6] = [1.0; 6];
 /// needs 中档分（低于疑点层、高于被截项）。
 const NEEDS_MID_SCORE: f32 = 0.5;
 

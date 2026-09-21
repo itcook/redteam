@@ -3759,6 +3759,10 @@ mod code_review_tests {
     /// A 第 2 行、B 第 4 行（同在 `f1` 块内）、C 第 7 行（`f2` 块内），A~B、B~C、A≁C。
     /// 到达序 A、C、B（10 / 20 / 30 ms）→ 按块并项：A 与 B 同块并成一项、C 另一项 → 闭包簇落在 2 项上 → `queue_split_clusters` = 1；
     /// scan 报告仍是一簇、agreement 3。（C2 夹具的三条疑点在 C3 落进同一行带，会并成一项、拆簇恒 0——测不到对账。）
+    ///
+    /// 注意**成因已变**：C2 立这个指标量的是「逐条到达的非传递残差」（到达序不同结果不同）；C3 结构化合并之后
+    /// 同块疑点无论到达序都并成一项，非传递残差在同块内构造上不可能，现在它量的是「一个闭包簇跨了两个块」。
+    /// 本用例测的也是后者——两个 def 块各一项。
     #[tokio::test(start_paused = true)]
     async fn arrival_order_split_cluster_is_reconciled() {
         let dir = tempfile::tempdir().unwrap();

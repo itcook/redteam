@@ -180,7 +180,8 @@ scanned_areas: [{ file, ranges }]                                               
 
 **队列项** `{file, ranges[], block, score, origin: rule | scan | needs, notes: suspicion[]}`。
 **生产者三种，同一类型**：规则命中（H0，t=0 入队）· scanner 疑点 · scanner needs（C3 起接线，**只接变更集内**的 `kind = evidence`；
-diff 外只计 `needs_out_of_diff`——`pick_bundle` 对不在任何 bundle 的文件会静默退回 `bundles[0]`，装包归属另议〔D16〕）。
+diff 外只计 `needs_out_of_diff`——不在变更集的文件装不出证据（§7 的区域 pack 只会输出一行省略说明），入队即白烧一格；
+装包归属另议〔D16〕）。
 
 | # | 规则 | 内容 |
 |---|---|---|
