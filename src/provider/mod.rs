@@ -199,6 +199,43 @@ pub(crate) trait AttemptPolicy: Send + Sync {
     async fn on_rate_limited(&self, nth: u32, retry_after: Option<std::time::Duration>) -> bool;
 }
 
+/// 流式旁路的尝试复位（M21b 批 D-1，followup「接真 sink 前须处理」）：`timed_turn_with` 的重试复用同一
+/// backend 与同一 `IncrementalFindings`——断流那次的半截 JSON 会与重试输出拼进同一解析器，
+/// sink 是 no-op 时无害，接真 sink（批 D 的 verifier）后就会发出重试前的草稿对象。
+///
+/// 本包装在**每次尝试开始**复位解析状态（已闭合对象与丢弃计数保留），其余回调纯委托给内层策略。
+/// 只在有内层策略时安装：`policy = None` 的路径（单测 / 无门）不能凭空多出一个 `on_rate_limited` 实现，
+/// 那会把 `retry_classified_with` 里「无策略 → 走通用退避并受 budget 约束」的分支改掉。
+pub(crate) struct ResetOnAttempt<'a> {
+    inner: &'a dyn AttemptPolicy,
+    inc: std::sync::Arc<std::sync::Mutex<crate::provider::stream_json::IncrementalFindings>>,
+}
+
+impl<'a> ResetOnAttempt<'a> {
+    pub(crate) fn new(
+        inner: &'a dyn AttemptPolicy,
+        inc: std::sync::Arc<std::sync::Mutex<crate::provider::stream_json::IncrementalFindings>>,
+    ) -> Self {
+        ResetOnAttempt { inner, inc }
+    }
+}
+
+#[async_trait]
+impl AttemptPolicy for ResetOnAttempt<'_> {
+    fn attempt_begin(&self) {
+        if let Ok(mut inc) = self.inc.lock() {
+            inc.reset_for_attempt();
+        }
+        self.inner.attempt_begin();
+    }
+    fn attempt_end(&self, outcome: AttemptOutcome) {
+        self.inner.attempt_end(outcome);
+    }
+    async fn on_rate_limited(&self, nth: u32, retry_after: Option<std::time::Duration>) -> bool {
+        self.inner.on_rate_limited(nth, retry_after).await
+    }
+}
+
 /// 尝试括号的 RAII 守卫：future 中途被丢弃（job deadline 的 `select!` 取消）时按 `Failed` 收尾，在途计数不泄漏。
 struct AttemptGuard<'a> {
     policy: &'a dyn AttemptPolicy,

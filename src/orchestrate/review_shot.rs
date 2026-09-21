@@ -163,6 +163,15 @@ pub(crate) async fn run_review_shot_with(
         ChatMessage::UserBlocks(prompt.blocks.clone()),
     ];
 
+    // 每次 HTTP 尝试开始复位旁路解析器（批 D-1）：重试复用同一 backend 与同一 `inc`，
+    // 不复位则断流那次的半截 JSON 会与重试输出拼成一个四不像对象发给 sink。
+    // 只在有内层策略时包装——`None` 的语义（通用退避 + budget 约束）不能被凭空多出的 `on_rate_limited` 改掉。
+    let reset_guard = policy.map(|p| crate::provider::ResetOnAttempt::new(p, inc.clone()));
+    let policy: Option<&dyn AttemptPolicy> = match &reset_guard {
+        Some(g) => Some(g),
+        None => None,
+    };
+
     let turn = match timed_turn_with(backend, &messages, &[], per_turn, retry_budget, policy).await {
         Ok(t) => t,
         Err(e) => {
@@ -306,6 +315,48 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn a() {\nfn b() {\n").unwrap();
         d
+    }
+
+    /// 无门场景的最小策略（`ResetOnAttempt` 只在有内层策略时安装，故本用例要有一个）。
+    struct NoopPolicy;
+    #[async_trait::async_trait]
+    impl AttemptPolicy for NoopPolicy {
+        fn attempt_begin(&self) {}
+        fn attempt_end(&self, _o: crate::provider::AttemptOutcome) {}
+        async fn on_rate_limited(&self, _n: u32, _a: Option<Duration>) -> bool {
+            false
+        }
+    }
+
+    /// 断流重试后旁路仍然有效（批 D-1，followup「接真 sink 前须处理」）：
+    /// 首试流到一半断了、重试轮流出一条**完整**对象后整格失败——这正是 D10 立旁路要保住的场景
+    /// （格中途死亡，已闭合对象不丢）。不复位时半截对象会把重试轮的流整个吞进去、永不闭合，
+    /// 旁路无声作废（实测 `emitted=[]`、`discarded=0`），sink 一条都收不到。
+    #[tokio::test]
+    async fn bypass_still_delivers_after_a_cut_stream_retry() {
+        let dir = tmp_file();
+        let rec = Rec(Mutex::new(Vec::new()));
+        let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+        let inc2 = inc.clone();
+        let half = r#"{"findings":[{"severity":"high","title":"draft","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r","quote":"fn a() {"#;
+        // 重试轮：一条完整对象（数组未闭合——格就死在这儿）
+        let closed = r#"{"findings":[{"severity":"medium","title":"t9","body":"b9","file":"a.rs","line_start":2,"line_end":2,"confidence":0.7,"recommendation":"r9","quote":"fn b() {"},"#;
+        let backend = FakeChatBackend::new_results(vec![
+            Err(crate::provider::ProviderError::Unavailable("cut 1".into())),
+            Err(crate::provider::ProviderError::Unavailable("cut 2".into())),
+        ])
+        .with_err_partials(vec![half, closed])
+        .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
+        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &rec);
+
+        let err = run_review_shot_with(
+            &backend, &prompt(), Duration::from_secs(5), 1, Some(&NoopPolicy), &mut ctx, inc,
+        )
+        .await;
+
+        assert!(err.is_err(), "两轮都失败，格作废");
+        let titles: Vec<String> = rec.0.lock().unwrap().iter().map(|e| e.finding.title.clone()).collect();
+        assert_eq!(titles, ["t9"], "重试轮已闭合的那条经旁路留下来了（不复位时这里是空）");
     }
 
     #[tokio::test]
