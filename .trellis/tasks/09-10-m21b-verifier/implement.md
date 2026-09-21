@@ -52,11 +52,15 @@
 - [ ] Commit: `chore(eval,config): verify_score.py 与两轮离线基线——按预登记阈值裁定 verifiers.enabled 默认值（design §8.1「去留由数据决定」）`
 
 ### D-5 收口
-- [ ] `cargo test` / `clippy --all-targets` 零新增（基线 7）/ `make verify` / `eval/risk_replay.py` H0 对拍
-- [ ] `make build` → dogfood 一轮（同 C3 口径：临时工作树检出 `f1d3ca3`、`--base 674583e`、门 6、samples 1）
-  - 护栏：格内 findings ≥ 11（C3 口径）；复核四量（`refute_rate` / 触发 / 跳过 / `verify_tail_ms`）落私有记录
-  - scanner 与深挖路径零行为 diff（退化零差基线同构）
-- [ ] 记入 `.next/private/m21b/`，账目进 followup；decisions 增 D17 节、design §8.1 / §2 与可观测面同步改写
+- [x] `cargo test` 803 + 17 / `clippy --all-targets` 3（本分支基线，非 7）/ `make verify` 绿 /
+      `risk_replay.py` H0 对拍 jaccard 1.0、R 差 2e-8（**须显式 `--theta 1.5`**：Python 侧缺省 2.0，不传两侧 θ 不一致会假红）
+- [x] `make build` → dogfood 一轮（同 C3 口径，复核临时开；跑完还原配置并校验指纹）
+  - [x] 护栏过：格内 findings **22** ≥ 11；复核四量 `refute_rate` 0.2 / 触发 5 / 跳过 consensus 1 + not_triggered 16 /
+        `verify_tail_ms` 3.5 min，且 **5+1+16 = 22 = 格内 findings**（同分母）
+  - [x] 深挖路径零行为 diff：格数 / 选项五量 / `enqueue_reasons` / 阻塞 / 拆簇全部落在 C3 三轮散布内，
+        选中项对 C3 验证轮重合 50%（C3 同二进制三对 50/41/41 的上沿）；退化路径由 803 条单测（全跑 `verify: None`）保证
+- [x] 记入 `.next/private/m21b/2026-09-21-batch-d-dogfood.md` + `raw/`，账目进 followup；decisions 增 D17 节、
+      design **v13** §8.1 全节重写 + §2 + §6 可观测面；plan 批 D 节加「实际执行」注记、roadmap 交付项 5 标 ✅
 - [ ] `/code-review` 审核（技能只传 effort，起来后 SendMessage 钉范围：只评 `feat/m21-review-engine...HEAD`）→ 分档修
 - [ ] `--no-ff` 合回 `feat/m21-review-engine`；私有记录拷回集成工作树；归档任务 + journal
 

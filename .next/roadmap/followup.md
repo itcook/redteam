@@ -527,3 +527,24 @@ scan 与 needs 分属两身份空间 → 同一块挖两遍；每文件保底排
 - **`verify-once` 是隐藏子命令**（`#[command(hide = true)]`）：输入是机器面（台账导出的 finding 行），
   不进 `--help` 的用户面。它是 `eval/verify_score.py` 的唯一入口——prompt / provider / 判决解析都在产品里，
   Python 一行不复刻。M21e 若判定它无长期价值，随 dev-time 仪器一并拆。
+
+## 批 D dogfood 与收口（2026-09-21，复核开；明细与原始产物在私有记录 `2026-09-21-batch-d-dogfood.md`）
+
+- **复核四量全部可读且自洽**：`refute_rate` 0.2（1/5）、触发 5、驳回 1、跳过 `consensus` 1 + `not_triggered` 16、
+  `verify_tail_ms` 3.5 min。**5 + 1 + 16 = 22 = 格内 findings 总数**——触发与跳过同分母（收口时把缓存判定前移到分类之前才成立）。
+  计数剔除也看得见：报告 `findings` 20 条、`stats.total` 19，差的正是被驳回那条（它仍带 `verify` 字段留在数组里）。
+- **深挖路径零行为 diff**：reviewer 格 12/12、选项五量 26/15/8/7/3（最大占格 25%）、`enqueue_reasons` 构成、阻塞 36/200 ms、
+  拆簇 0，全部落在 C3 三轮散布内；选中项对 C3 验证轮重合 50%，在 C3 同二进制三对（50/41/41）的上沿。
+  格内 findings 22（护栏 ≥ 11）。复核只在尾部加了 3.5 min 与 5 次调用。
+- **复核成本占比**：输出 token 10.6%、输入 6.8%（5 条：单条 in 3.2–6.2k / out 3.6–12.8k）。与 D-4 离线基线同形。
+- **唯一被驳的那条又是「by design / overstated」家族**（`#[serde(default)]` 是 additive-optional）——与 D-4 八条误驳同形。
+  本轮无人裁 oracle，无法判定真驳还是误驳，记给 M21c 判例台账回流时对账。
+- **「自己验自己」没有单独告警**：`pick_verifier` 对**显式声明**的 verifiers 不查是否与 reviewer 同模型（只有自动挑选那条路查家族）。
+  本轮配置里 glm-5.3 同时是 reviewer 与 verifier，它驳掉了自己产出的 finding；虽然 warning 里能看出来
+  （`refuted a finding from review[...]@同一模型`），但没有一句「你把产出者配成了复核者」。D-4 的数据说同族是更弱的一臂
+  → M21c 补一句 warning（本批收口不改行为）。
+- **本批修的两条自查项**（都在收口阶段自己发现、变异转红）：① 本轮按 finding id 缓存复核——Q11 定的「按 id 缓存」
+  D-3 只实现了跨轮那半（resume 的 `known`），本轮内同一条被两个格各报一次会各派一次复核；② 缓存判定前移到分类之前，
+  否则跳过类按「格 × finding」计、触发按 id 计，两者不同分母。
+- **`refute_rate` 此前是个空字段**（只有声明与 round-trip 测试，没有生产者）——收口时接上，定义收紧为
+  `verify_refuted / verify_triggered`：分母只含真发出去验了的，被免验的从没给过 verifier 机会。
