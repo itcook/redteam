@@ -343,6 +343,13 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             }
             if let Some(vin) = input.verify.as_ref() {
                 for f in l.rec.output.findings() {
+                    // 本轮按 finding id 缓存（〔D17〕Q11）：同一条被两个格各报一次（dedup 在收场才跑）时只算一次——
+                    // 复核不重派（白烧一次调用，两次结论不同还要靠 UPHELD 优先收拾），分类也不重复计。
+                    // 放在 `decide` 之前，四个计数才是同一个分母：触发 + Σ跳过 = 本轮见过的**不同** finding 数。
+                    if !verify_seen.insert(f.id.clone()) {
+                        *meta.verify_skipped.entry("cached".into()).or_default() += 1;
+                        continue;
+                    }
                     let d = crate::consolidate::verify::decide(f, vin.precedents, vin.block_threshold, vin.conf_floor, vin.enabled);
                     if !d.is_verify() {
                         *meta.verify_skipped.entry(d.reason().to_string()).or_default() += 1;
@@ -353,13 +360,6 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                     if let Some(v) = vin.known.get(&f.id) {
                         verdicts.insert(f.id.clone(), v.clone());
                         *meta.verify_skipped.entry("resumed".into()).or_default() += 1;
-                        continue;
-                    }
-                    // 本轮按 finding id 缓存（〔D17〕Q11）：同一条被两个格各报一次（dedup 在收场才跑）时
-                    // 只验一次——重复验既是白烧一次调用，两次结论不同还要靠 dedup 的 UPHELD 优先去收拾。
-                    // 这个集合同时挡住「在途的」和「已回来的」：插不进去 = 已经有人在验或验过了。
-                    if !verify_seen.insert(f.id.clone()) {
-                        *meta.verify_skipped.entry("cached".into()).or_default() += 1;
                         continue;
                     }
                     match crate::consolidate::verify::pick_verifier(vin.roles, &members[l.member].family, verify_rotation) {
