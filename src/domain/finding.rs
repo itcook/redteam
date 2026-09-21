@@ -123,6 +123,14 @@ fn is_zero(n: &u32) -> bool { *n == 0 }
 #[serde(rename_all = "lowercase")]
 pub enum VerifyVerdict { Upheld, Refuted }
 
+impl Finding {
+    /// 是否已被 verifier 驳回（批 D〔D17〕）：`verdict` 与 `Stats` 两处都靠它排除，
+    /// 判定只此一份——散在各处写 `matches!(v.verdict, Refuted)` 迟早漂。
+    pub fn is_refuted(&self) -> bool {
+        self.verify.as_ref().is_some_and(|v| v.verdict == VerifyVerdict::Refuted)
+    }
+}
+
 /// 一条 finding 的 verify 结果（refute pass 产出）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Verify {

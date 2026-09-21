@@ -38,9 +38,11 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// 被驳回的不计数（批 D〔D17〕Q9）：`verdict` 已经不认它们（confidence 归零、永不 blocking），
+    /// 报告头条数字也不该认——两处口径必须一致。记录仍留在 `findings` 数组里（带 `refuted` 标注）供审计与 M21c 台账回流。
     pub fn from_findings(fs: &[Finding]) -> Self {
         let mut s = Stats::default();
-        for f in fs {
+        for f in fs.iter().filter(|f| !f.is_refuted()) {
             match f.severity {
                 Severity::Critical => s.critical += 1,
                 Severity::High => s.high += 1,
@@ -304,6 +306,17 @@ pub struct DeepMeta {
     /// 复核尾部（批 D 前恒 0）。
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub verify_tail_ms: u64,
+    // ── 批 D-3 复核观测（design §8.1〔D17〕）：判决在深挖循环里产生，故与 verify_tail_ms 同层；为零不序列化 ──
+    /// 进了复核的 finding 数（触发且未被跳过）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub verify_triggered: u32,
+    /// 跳过分布：`not_triggered` / `disabled` / `carried` / `precedent` / `consensus`
+    /// ——「没触发」与「触发了被免验」必须分得开，否则「复核为什么没跑」无从归因。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub verify_skipped: BTreeMap<String, u32>,
+    /// 被驳回条数（`Stats` 与顶层计数剔除的正是这批，报告头条与 findings 数组长度之差由它解释）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub verify_refuted: u32,
     /// 收场前派出的格数（扫描期额度 K − F 下，非必挖项受限）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub scan_phase_dispatched: u32,

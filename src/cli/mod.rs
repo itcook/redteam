@@ -357,6 +357,8 @@ pub async fn run_code_review(
             drop(tx);
             r
         };
+        // 首跑无往轮判决（resume 才有）。
+        let no_known = BTreeMap::new();
         let deep = run_deep(
             registry,
             DeepInput {
@@ -374,6 +376,14 @@ pub async fn run_code_review(
                 prior_findings: vec![],
                 tools: resolve_tools(args, cfg),
                 backend_factory: Some(factory.as_ref()),
+                verify: Some(crate::orchestrate::deep::VerifyInput {
+                    roles: &roles,
+                    enabled: cfg.review.verifiers.enabled,
+                    block_threshold: cfg.review.block_threshold,
+                    conf_floor: cfg.review.conf_floor,
+                    precedents: &ledger.cards,
+                    known: &no_known,
+                }),
                 on_cell: Some(&on_cell),
                 incoming: Some(rx),
                 reopen_skipped: false,
@@ -1361,6 +1371,8 @@ pub async fn run_resume(
                 }
             };
             let factory = per_cell_backend_factory(cfg);
+            // 往轮已判过的不重验（〔D17〕Q11）：verifier 格按 finding id 回填。
+            let known = crate::orchestrate::deep::known_verdicts(&deep_records);
             let deep = run_deep(
                 registry,
                 DeepInput {
@@ -1379,6 +1391,14 @@ pub async fn run_resume(
                     prior_findings,
                     tools: resolve_tools(&args, cfg),
                     backend_factory: Some(factory.as_ref()),
+                    verify: Some(crate::orchestrate::deep::VerifyInput {
+                        roles: &roles,
+                        enabled: cfg.review.verifiers.enabled,
+                        block_threshold: cfg.review.block_threshold,
+                        conf_floor: cfg.review.conf_floor,
+                        precedents: &ledger.cards,
+                        known: &known,
+                    }),
                     on_cell: Some(&on_cell2),
                     incoming: None,
                     reopen_skipped: replayed,

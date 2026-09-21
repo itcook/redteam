@@ -1,4 +1,4 @@
-use crate::domain::Finding;
+use crate::domain::{Finding, VerifyVerdict};
 use std::collections::BTreeSet;
 
 pub const LINE_GAP: u32 = 3;
@@ -61,6 +61,25 @@ fn merge_into(base: &mut Finding, other: &Finding) {
         base.recommendation = other.recommendation.clone();
     }
     base.hard_constraint = base.hard_constraint || other.hard_constraint;
+    // 判决合并（批 D〔D17〕Q11）：流式复核发生在 dedup **之前**，同一个 bug 被两个格报出来时会各验一次。
+    // 原本这里完全不碰 `verify`——base 的判决直接胜出、other 的被静默丢，且 confidence 取 max 会与
+    // 「refuted 归零」打架（可能留下「verdict 写着 REFUTED、confidence 却是 0.7」的自相矛盾记录）。
+    // **UPHELD 优先**：方向与验收门槛一致——误驳（静默删掉真缺陷）比漏驳危险得多。
+    base.verify = match (base.verify.take(), other.verify.clone()) {
+        (None, v) | (v, None) => v,
+        (Some(a), Some(b)) => {
+            if a.verdict == VerifyVerdict::Upheld {
+                Some(a)
+            } else if b.verdict == VerifyVerdict::Upheld {
+                Some(b)
+            } else {
+                Some(a)
+            }
+        }
+    };
+    if base.is_refuted() {
+        base.confidence = 0.0; // 与「refuted → confidence 归零」统一，不让上面的 max 把它抬回来
+    }
 }
 
 /// under-merge：仅当 file 同 + 行重叠 + 标题相似 三者皆成立才合并。
