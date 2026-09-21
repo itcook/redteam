@@ -298,13 +298,26 @@ pub fn build(
     Ok(RegionPack { evidence, cross_index, notes, stats })
 }
 
+/// 一格最多列几条笔记（评审 #11）。C3 起项身份是「整个 def / 标题节」，同一块里互不相关的疑点都会并进来，
+/// 条数无上限；而笔记段既不计进 `region::build` 的证据预算、也不进省略账，撑大了既看不见也截不掉。
+/// reviewer 的指令是「逐条确认、驳回或补充」——列十几条只会摊薄注意力。超出的按条数披露，不静默丢。
+const MAX_NOTES: usize = 8;
+
 /// 笔记段（design §7）：疑点渲染为「一位评审者的笔记」——非事实、防锚定；全部字段过结构中和（威胁模型 B）。
 fn render_notes(notes: &[Suspicion]) -> String {
     if notes.is_empty() {
         return String::new();
     }
+    // 超帽时留自评置信最高的几条（置信只做**取舍**，不进正文——正文里摆数字才是锚定，见 Q7）。
+    let mut shown: Vec<&Suspicion> = notes.iter().collect();
+    let omitted = notes.len().saturating_sub(MAX_NOTES);
+    if omitted > 0 {
+        shown.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        shown.truncate(MAX_NOTES);
+        shown.sort_by_key(|s| (s.line_start, s.line_end));
+    }
     let mut out = String::from("## 评审者笔记\n");
-    for s in notes {
+    for s in shown {
         let oneline = |t: &str| crate::prompt::oneline(&neutralize_structure(t, NOTES_NEUTRALIZE_TAGS));
         // 不带自评置信（C3〔D16〕Q7）：design §7 的口径是「一位评审者的笔记」+「确认、驳回或补充」，
         // 括注理由即防锚定——笔记里摆一个 0.82 与此冲突；E3 也实证 flash 级自评与命中无关。
@@ -318,6 +331,9 @@ fn render_notes(notes: &[Suspicion]) -> String {
         );
         out.push_str(&line);
         out.push('\n');
+    }
+    if omitted > 0 {
+        out.push_str(&format!("- （同一区域另有 {omitted} 条笔记未列出）\n"));
     }
     out
 }
@@ -513,6 +529,23 @@ mod tests {
         assert!(pack.notes.contains("quote:"), "笔记带 quote 锚");
         // C3〔D16〕Q7：笔记不摆自评置信——design §7 的注入口径是「一位评审者的笔记」，摆个数字就是锚定。
         assert!(!pack.notes.contains("confidence"), "笔记不含置信数字: {}", pack.notes);
+    }
+
+    /// 笔记条数封顶并披露（评审 #11）：C3 起同一块里互不相关的疑点都会并进来，笔记段既不计证据预算也不进省略账。
+    #[test]
+    fn notes_are_capped_and_the_remainder_is_disclosed() {
+        let (_tmp, root) = tmpdir(&[("a.rs", TWO_DEFS)]);
+        let bundle = bundle_of("a.rs", "@@ -6,2 +6,2 @@\n-x\n+y\n");
+        let many: Vec<Suspicion> = (0..12)
+            .map(|k| Suspicion { confidence: 0.1 * k as f32, ..note(&format!("第 {k} 条"), "helper();") })
+            .collect();
+        let item = QueueItemSpec::new("a.rs".into(), vec![(5, 8)], Origin::Scan, many).unwrap();
+        let pack = build(&item, &bundle, &root, &crate::cli::second_pass::TrackedFiles::load(&root), &CrossIndex::default(), 64 * 1024, &PackOpts::default(), "").unwrap();
+
+        assert_eq!(pack.notes.lines().filter(|l| l.starts_with("- ")).count(), 9, "8 条笔记 + 1 行披露: {}", pack.notes);
+        assert!(pack.notes.contains("另有 4 条笔记未列出"), "{}", pack.notes);
+        assert!(pack.notes.contains("第 11 条") && !pack.notes.contains("第 0 条"), "留下的是置信最高的几条: {}", pack.notes);
+        assert_eq!(pack.stats.notes, 12, "统计仍按全量记");
 
         let h0 = QueueItemSpec::new("a.rs".into(), vec![(5, 8)], Origin::Rule, vec![]).unwrap();
         let pack0 = build(&h0, &bundle, &root, &crate::cli::second_pass::TrackedFiles::load(&root), &CrossIndex::default(), 64 * 1024, &PackOpts::default(), "").unwrap();

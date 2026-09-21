@@ -9,6 +9,10 @@ use crate::risk::regions::{decl_block_end, enclosing_decl};
 
 /// 退路块半径（与 `risk::regions::NO_DEF_PAD` 同值）：无 def / 无标题时 ±PAD 行。
 const PAD: u32 = 10;
+/// 块区间的行数上限（评审 #12）：标题节与 def 都可能很长——一份只有一个 `# 标题` 的 CHANGELOG
+/// 会让整份文件成为一项，`region::build` 无条件渲染切片、把 64KB 证据预算顶穿且不进省略账。
+/// 只截**区间**不改**键**：身份仍是标题行 / 声明行，跨轮稳定性不受影响。
+const MAX_BLOCK_LINES: u32 = 200;
 /// 退路块按固定行带量化（带宽 = 2·PAD + 1）：键只认带号、不认报告行——
 /// 若键跟着行走，同一段里差一行的两条疑点就各成一项，跨轮必然对不上（本批要治的正是这个）。
 const BAND: u32 = PAD * 2 + 1;
@@ -37,7 +41,14 @@ impl Block {
 }
 
 /// 文件内容 + 行号 → 稳定块。`line` 为 1-based；越界行按最后一行算。
+/// 每次调用都会重编该语言的 def 正则（~1.6 ms）——逐条到达都算块的调用方走 [`block_of_with`] 传缓存。
 pub fn block_of(file: &str, content: &str, line: u32) -> Block {
+    block_of_with(file, content, line, None)
+}
+
+/// 同 [`block_of`]，但由调用方提供已编译的 def 正则（`None` = 本函数自己编）。
+/// 主循环的同步段上逐条到达都要算块，重编正则占了 `block_of` 98% 的时间（评审效率项）。
+pub fn block_of_with(file: &str, content: &str, line: u32, defs: Option<&[(&'static str, regex::Regex)]>) -> Block {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         return band_block(line.max(1), 0);
@@ -46,17 +57,29 @@ pub fn block_of(file: &str, content: &str, line: u32) -> Block {
     let ln = line.clamp(1, len);
     let line0 = (ln - 1) as usize;
     if let Some(lang) = crate::diffsym::lang_for(file) {
-        let defs = crate::diffsym::compile_defs(lang);
-        if let Some(di) = enclosing_decl(&lines, line0, &defs) {
-            let end0 = decl_block_end(&lines, di, Some(&defs)).max(di);
-            return Block { start: di as u32 + 1, end: end0 as u32 + 1, key: key_of("def", &lines, di) };
+        let owned;
+        let defs = match defs {
+            Some(d) => d,
+            None => {
+                owned = crate::diffsym::compile_defs(lang);
+                &owned
+            }
+        };
+        if let Some(di) = enclosing_decl(&lines, line0, defs) {
+            let end0 = decl_block_end(&lines, di, Some(defs)).max(di);
+            return capped(di as u32 + 1, end0 as u32 + 1, key_of("def", &lines, di));
         }
     } else if is_markdown(file) {
         if let Some((hi, end0)) = heading_section(&lines, line0) {
-            return Block { start: hi as u32 + 1, end: end0 as u32 + 1, key: key_of("md", &lines, hi) };
+            return capped(hi as u32 + 1, end0 as u32 + 1, key_of("md", &lines, hi));
         }
     }
     band_block(ln, len)
+}
+
+/// 区间封顶（键不变，见 [`MAX_BLOCK_LINES`]）。
+fn capped(start: u32, end: u32, key: String) -> Block {
+    Block { start, end: end.min(start.saturating_add(MAX_BLOCK_LINES - 1)), key }
 }
 
 /// 固定行带退路：带号 = ⌊(行 − 1) / BAND⌋，块 = 该带（末带按文件尾截断）。
@@ -238,6 +261,29 @@ mod tests {
             assert!(b.start <= b.end, "{b:?}");
             let c = block_of("data/x.json", "x\ny\n", line);
             assert!(c.start <= c.end, "{c:?}");
+        }
+    }
+
+    /// 区间封顶但身份不变（评审 #12）：一份只有一个标题的长文档不得把整份文件变成一项的区间。
+    #[test]
+    fn long_sections_are_capped_but_keep_their_key() {
+        let doc = format!("# 只有一个标题\n{}", "正文\n".repeat(500));
+        let head = block_of("CHANGELOG.md", &doc, 2);
+        let deep = block_of("CHANGELOG.md", &doc, 400);
+        assert_eq!((head.start, head.end), (1, MAX_BLOCK_LINES), "区间封顶");
+        assert_eq!(head.key, deep.key, "同一节仍是同一身份");
+        let long_fn = format!("fn big() {{\n{}}}\n", "    step();\n".repeat(400));
+        let b = block_of("src/a.rs", &long_fn, 100);
+        assert_eq!((b.start, b.end), (1, MAX_BLOCK_LINES), "def 同样封顶");
+    }
+
+    /// 传入已编译的 defs 与自己编的结果逐字一致（效率项只动性能，不动语义）。
+    #[test]
+    fn precompiled_defs_match_self_compiled() {
+        let lang = crate::diffsym::lang_for("src/a.rs").unwrap();
+        let defs = crate::diffsym::compile_defs(lang);
+        for line in [1, 4, 9] {
+            assert_eq!(block_of_with("src/a.rs", TWO_FNS, line, Some(&defs)), block_of("src/a.rs", TWO_FNS, line));
         }
     }
 

@@ -252,36 +252,28 @@ impl EnqueueReq {
     }
 
     /// scanner needs 入队请求（C3〔D16〕Q8，design §6 的第三种生产者）：`kind = evidence` 的一条声明成一项——
-    /// 区间取 `lines`（缺失 / 不可解析 → 文件起头，由块计算兜住，见 [`parse_need_lines`]）、无笔记（走与 H0 同款的「区域独立审」）、
+    /// 区间取 `lines`（解不出行锚 → 不入队，见下）、无笔记（走与 H0 同款的「区域独立审」）、
     /// 到达键 `needs:{path}:{lines}:{理由指纹}`（同一条声明重复到达即幂等）。
     /// 家族留空：needs 不是「谁看见了什么」，不参与共识。变更集过滤在调用方（队列不知道 diff）。
     pub fn need(n: &crate::domain::NeedEntry) -> Option<EnqueueReq> {
         if n.kind != crate::domain::NeedKind::Evidence || n.path.is_empty() {
             return None;
         }
-        let lines = n.lines.clone().unwrap_or_default();
-        let ranges = parse_need_lines(&lines);
-        let spec = QueueItemSpec::new(n.path.clone(), ranges, QueueOrigin::Needs, vec![]).ok()?;
-        let arrival = format!("needs:{}:{}:{}", n.path, lines, crate::hash::fnv1a64_hex(&[n.reason.as_str()]));
+        // 行锚用与二阶段补查同一份解析（评审 #13）：同一个字段在两条路径上解出两个区间是纯粹的坑。
+        // 解不出行锚的不入队——它会变成「无笔记地审这个文件的开头」，白烧一格。实测三轮 needs 全部带 lines。
+        let (a, b) = crate::cli::second_pass::parse_need_lines(n.lines.as_deref())?;
+        // 路径在入口归一一次（评审）：needs 的 path 直接来自模型、不过 `anchor_suspicions` 那道校验，
+        // `./src/a.rs` 与 `src/a.rs` 必须是同一个文件——否则变更集判定、装包取文件、与疑点并项三处都对不上。
+        let path = norm_path(&n.path);
+        let spec = QueueItemSpec::new(path.clone(), vec![(a, b)], QueueOrigin::Needs, vec![]).ok()?;
+        let arrival = format!("needs:{path}:{a}-{b}:{}", crate::hash::fnv1a64_hex(&[n.reason.as_str()]));
         Some(EnqueueReq { spec, score: NEEDS_MID_SCORE, kind: ItemKind::Needs, families: vec![], arrival: Some(arrival) })
     }
 }
 
-/// `"12-40"` → `[(12, 40)]`；空 / 不可解析 / 倒置 → `[(1, 1)]` 即文件起头。
-/// 实施细化（design C3 §5 写的是「缺失 → 整文件退块」）：整文件区间会带着 `u32::MAX` 进 `union_ranges` 与 pack 的切片算术，
-/// 收益却为零——入队即算块，落到的仍是第一个 def / 标题节；内容读不到时退行带也是有界的。
-fn parse_need_lines(lines: &str) -> Vec<(u32, u32)> {
-    let whole = vec![(1, 1)];
-    let Some((a, b)) = lines.split_once('-') else {
-        return match lines.trim().parse::<u32>() {
-            Ok(n) if n >= 1 => vec![(n, n)],
-            _ => whole,
-        };
-    };
-    match (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
-        (Ok(s), Ok(e)) if s >= 1 && e >= s => vec![(s, e)],
-        _ => whole,
-    }
+/// 仓内相对路径归一：`./a.rs` / `/a.rs` → `a.rs`。
+pub(crate) fn norm_path(p: &str) -> String {
+    p.trim_start_matches("./").trim_start_matches('/').to_string()
 }
 
 /// 一次到达（C3〔D16〕）：入队请求 + 调用方算好的稳定块与风险档。
@@ -403,6 +395,7 @@ impl DeepQueue {
 
     fn merge_into(&mut self, idx: usize, req: EnqueueReq, risk_band: u8, by_predicate: bool) -> EnqueueOutcome {
         let it = &mut self.items[idx];
+        let members_before = it.members.len();
         // 共识只经谓词（C1 design §2.2；C2〔D15〕改写前提）：疑点逐 scan 格到达，队列侧逐条把新疑点与已有项的笔记比对，
         // **不是**组内传递闭包——A、C 先到互不匹配、B 后到两边都匹配时 B 只并入先命中的那项，A 与 C 永远两项。非传递漏合并
         // 只会少算共识、多复核一次（D15 实测 ≤ 1/19 簇），收场以 `closure_members` 对账、拆簇数进 RunMeta。
@@ -458,7 +451,10 @@ impl DeepQueue {
                 }
             }
         }
-        it.recompute_peak();
+        // 只在成员或家族真的动了才重算（评审效率项）：项内聚簇是 O(n²)，纯重复到达没必要再跑一遍。
+        if it.members.len() != members_before || !incoming_families.is_empty() {
+            it.recompute_peak();
+        }
         it.spec.notes = merge_notes(&it.spec.notes, &req.spec.notes);
         if req.score > it.score {
             it.score = req.score;
@@ -653,13 +649,11 @@ fn confidence_of(it: &QueueItem) -> f32 {
     }
 }
 
-/// 文档 = `.next/` / `.doc/` 下的随行文档或 md / txt 类后缀；其余当代码。同分时代码先挖。
+/// 文档判定复用阶段 0 的单一口径（评审）：`risk::signals::is_doc_path` 正是 R 分母里把文档行剔出 `code_lines`
+/// 的那把尺（`.md/.json/.ya?ml/.toml/.txt/.lock/.svg/.csv`）。自己再写一把只会让「代码格占比」这类读数两处对不上。
+/// 不再按 `.next/` / `.doc/` 前缀判：那是本仓私有目录名，别的仓里 `.next/` 是 Next.js 的构建产物。
 fn is_doc(file: &str) -> bool {
-    if file.starts_with(".next/") || file.starts_with(".doc/") {
-        return true;
-    }
-    let ext = file.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
-    matches!(ext.as_str(), "md" | "markdown" | "txt" | "rst")
+    crate::risk::signals::is_doc_path(file)
 }
 
 /// 优先级全序（C3〔D16〕分层键，design C3 §4）：种类 → 必挖轴 → 风险档 → 烟量 → 代码优先 → 自评置信 → id。
@@ -1524,6 +1518,14 @@ mod tests {
 
         assert_eq!(o, EnqueueOutcome::MergedPending);
         assert_eq!(q.items().len(), 1);
+    }
+
+    /// 文档判定就是阶段 0 那把尺（评审）：`.json` / `.yaml` 在 R 分母里已经不算代码行，排序侧不该另有一套；
+    /// 也不再按 `.next/` 前缀判——那是本仓私有目录名，别的仓里是 Next.js 的构建产物。
+    #[test]
+    fn doc_classification_matches_stage_zero() {
+        assert!(is_doc("docs/x.md") && is_doc("data/x.json") && is_doc("ci/x.yaml"));
+        assert!(!is_doc("src/a.rs") && !is_doc(".next/tool.rs"));
     }
 
     // ---- C3〔D16〕分层排序键与每文件保底一格 ----

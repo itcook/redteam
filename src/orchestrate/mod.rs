@@ -454,7 +454,7 @@ mod scan_tests {
     const REAL: &str = "let t = secret();";
 
     fn scan_json(extra: &str) -> String {
-        format!(r#"{{"suspicions":[{{"file":"src/a.rs","line_start":9,"line_end":9,"hint":"real","confidence":0.7,"quote":"{REAL}"}}{extra}],"needs":[{{"path":"src/b.rs","reason":"r"}}],"scanned_areas":[{{"file":"src/a.rs","ranges":["1-2"]}}]}}"#)
+        format!(r#"{{"suspicions":[{{"file":"src/a.rs","line_start":9,"line_end":9,"hint":"real","confidence":0.7,"quote":"{REAL}"}}{extra}],"needs":[{{"path":"src/b.rs","lines":"3-9","reason":"r"}},{{"path":"src/c.rs","reason":"没有行锚"}}],"scanned_areas":[{{"file":"src/a.rs","ranges":["1-2"]}}]}}"#)
     }
     fn turn(text: &str, reasoning: Option<u64>, out_tok: u64) -> AssistantTurn {
         AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 10, output_tokens: out_tok, cached_input_tokens: 4, finish_reason: None, reasoning_tokens: reasoning }
@@ -520,7 +520,9 @@ mod scan_tests {
             (needs[0].kind, needs[0].spec.notes.len(), needs[0].families.len(), needs[0].spec.file.clone()),
             (crate::orchestrate::queue::ItemKind::Needs, 0, 0, "src/b.rs".to_string())
         );
-        assert!(needs[0].arrival.clone().unwrap_or_default().starts_with("needs:src/b.rs:"), "{keys:?}");
+        assert!(needs[0].arrival.clone().unwrap_or_default().starts_with("needs:src/b.rs:3-9:"), "{keys:?}");
+        // 解不出行锚的那条不入队（评审 #13）：入了也只是「无笔记地审文件开头」。
+        assert!(!got.iter().any(|r| r.spec.file == "src/c.rs"), "{keys:?}");
         assert_eq!(res.failed, vec!["scan[g1]@p/ghost#1"]);
         assert_eq!(sink.cells.lock().unwrap().len(), 2);
 
@@ -627,7 +629,7 @@ mod scan_tests {
         assert_eq!(res.cells[2].group, 1);
         assert!(res.failed.is_empty() && res.warnings.is_empty());
         assert_eq!(res.usage, (40, 1200, 16));
-        assert_eq!(res.needs_declared, 4);
+        assert_eq!(res.needs_declared, 8, "每格声明 2 条 needs（一条带行锚、一条不带）× 4 格");
         assert!(res.cells.iter().all(|c| c.record.template_hash.as_deref() == Some(crate::prompt::scan_template_hash().as_str())));
         assert!(res.cells.iter().all(|c| c.record.attempts == 1 && c.record.iterations == 1));
         // 锚定：模型报第 9 行，quote 在第 2 行 → 行号改写
@@ -717,7 +719,7 @@ mod scan_tests {
         let w = rec.warn.as_deref().unwrap();
         assert!(w.contains("parse dropped: no_quote=1") && w.contains("1 suspicions dropped: quote not found") && w.contains("zero reasoning tokens (output 50 tokens)"), "{w}");
         assert_eq!(res.cells[0].output.as_ref().unwrap().suspicions.len(), 1);
-        assert_eq!(res.needs_declared, 1);
+        assert_eq!(res.needs_declared, 2, "声明数按 scanner 报的算，与能否入队无关");
         // 未钉档位 → 不报零推理；输出长 → 不报
         let unpinned = vec![entry("p/a", "alpha", false)];
         let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &unpinned, 1), None, None).await;

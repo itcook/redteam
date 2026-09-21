@@ -27,9 +27,12 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// 发起对抗式评审：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目（× samples）并行扇出
-    /// → 疑点并集（agreement = 家族数）→ **深挖**（风险 H0 区与 scanner 疑点进同一条优先级队列，reviewer 按
-    /// provider 门空位消费，预算随风险分、必挖集不截；配多个 reviewer 条目时按空闲轮转分摊、每项只交一个条目，
-    /// 鉴权失败的条目移出、它已失败的格不改派）→ dedup → finding 报告与 verdict。scanner 与深挖时间重叠：H0 区开跑即挖、
+    /// → 疑点并集（agreement = 家族数）→ **深挖**（风险 H0 区、scanner 疑点与 scanner needs〔只接变更集内、带行锚的〕
+    /// 进同一条优先级队列，reviewer 按 provider 门空位消费，预算随风险分、必挖集不截；配多个 reviewer 条目时按空闲轮转分摊、
+    /// 每项只交一个条目，鉴权失败的条目移出、它已失败的格不改派）→ dedup → finding 报告与 verdict。
+    /// 队列项的身份是**代码结构**而非报告行：疑点落在哪个 def（文档落在哪个标题节）就成那一项，格名里的区间即该块，
+    /// 同块的多条疑点并成一格；派发按分层序——H0 最先，然后每个候选文件先保底一格，其余按〔项内共识 → 风险档 → 疑点条数
+    /// → 代码优先 → 自评置信〕排，自评置信只做同分裂解。scanner 与深挖时间重叠：H0 区开跑即挖、
     /// scanner 每格完成即入队（扫描期非必挖项少挖约 1/4 预算，留给后到的疑点），scanner 全部返回后按剩余预算收场。**finding 只由深挖产出**；
     /// 没配 reviewer 角色则退化为 scan-only（疑点索引 + 覆盖自报，不产 finding）。
     /// 退出码：0=干净 approve 或 scan-only 完成、1=命令自身失败（参数/IO/配置错误）、2=approve 但带债

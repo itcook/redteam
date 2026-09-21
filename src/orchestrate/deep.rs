@@ -19,7 +19,7 @@ fn now_ms() -> u64 {
 use crate::bundle::{cross_index, Bundle};
 use crate::config::{EffectiveModel, PackCfg, ToolsMode};
 use crate::domain::{DeepMeta, Finding, Role};
-use crate::orchestrate::queue::{cmp_priority, must_dig, DeepQueue, EnqueueOutcome, EnqueueReq, ItemKind, ItemState, QueueItem};
+use crate::orchestrate::queue::{cmp_priority, must_dig, norm_path, DeepQueue, EnqueueOutcome, EnqueueReq, ItemKind, ItemState, QueueItem};
 use crate::orchestrate::review_shot::{run_review_shot_with, EmitCtx, FindingSink, ReviewCall};
 use crate::pack::region::{self as region, Origin as QueueOrigin, QueueItemSpec};
 use crate::pack::PackOpts;
@@ -897,7 +897,7 @@ fn on_arrival(
         QueueOrigin::Needs => "needs",
     };
     if !ctx.accepts(&req) {
-        *meta.enqueue_reasons.entry("needs_out_of_diff".into()).or_insert(0) += 1;
+        ctx.note_out_of_diff(&req, meta);
         return;
     }
     let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
@@ -1051,7 +1051,7 @@ fn enqueue_scan_cells(
         for n in &out.needs {
             let Some(req) = EnqueueReq::need(n) else { continue };
             if !ctx.accepts(&req) {
-                *meta.enqueue_reasons.entry("needs_out_of_diff".into()).or_insert(0) += 1;
+                ctx.note_out_of_diff(&req, meta);
                 continue;
             }
             let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
@@ -1069,9 +1069,17 @@ fn enqueue_scan_cells(
 struct BlockCtx<'a> {
     root: &'a Path,
     zones: &'a [Hotspot],
+    /// H0 区（`route.hotspots`）：只有进了 H0 的区才够格拿最高档（评审）——
+    /// 分够 θ 但只有一类信号的区是阶段 0 有意排除在 H0 之外的，不该在排序上压过真 H0。
+    hotspots: &'a [Hotspot],
     /// 本轮变更集（bundles 覆盖的文件）：needs 只接落在里面的（C3〔D16〕Q8）。
-    changed: std::collections::HashSet<&'a str>,
+    changed: std::collections::HashSet<String>,
     cache: std::collections::HashMap<String, String>,
+    /// 按语言缓存的 def 正则：重编一次约 1.6 ms，占 `block_of` 的九成——主循环同步段上逐条到达都要算块。
+    defs: std::collections::HashMap<String, Vec<(&'static str, regex::Regex)>>,
+    /// 已计过数的变更集外 needs 到达键：同一条声明被多家族 / 多 samples 重复报时只计一次，
+    /// 否则它与入队侧（经到达键幂等）的口径不可比（评审 #13）。
+    counted_out_of_diff: std::collections::HashSet<String>,
 }
 
 /// 算块时读单文件的体积上限：超过即退行带（reviewer 也塞不下这种文件）。
@@ -1082,23 +1090,42 @@ impl<'a> BlockCtx<'a> {
         BlockCtx {
             root,
             zones: route.map_or(&[][..], |r| &r.zones),
-            changed: bundles.iter().flat_map(|b| b.files.iter()).map(|f| f.path.as_str()).collect(),
+            hotspots: route.map_or(&[][..], |r| &r.hotspots),
+            changed: bundles.iter().flat_map(|b| b.files.iter()).map(|f| norm_path(&f.path)).collect(),
             cache: std::collections::HashMap::new(),
+            defs: std::collections::HashMap::new(),
+            counted_out_of_diff: std::collections::HashSet::new(),
         }
     }
 
-    /// 变更集外的 needs 不入队（C3〔D16〕Q8）：两轮实测约六成 needs 指向 diff 外，而 `pick_bundle` 对不在任何 bundle 的文件
-    /// 会静默退回 `bundles[0]`，产出「文件名是 A、证据是 B」的错配包。装包归属另开批（C4 / M21d），本批只计数。
+    /// 变更集外的 needs 不入队（C3〔D16〕Q8）：两轮实测约六成 needs 指向 diff 外，装进来只会白烧一格
+    /// ——`pick_bundle` 找不到该文件时 `region::build` 只会输出一行省略说明，证据段是空的。归属问题另开批（C4 / M21d）。
+    /// 路径先归一（`./src/a.rs` 与 `src/a.rs` 是同一个文件，评审）。
     fn accepts(&self, req: &EnqueueReq) -> bool {
-        req.spec.origin != QueueOrigin::Needs || self.changed.contains(req.spec.file.as_str())
+        req.spec.origin != QueueOrigin::Needs || self.changed.contains(&norm_path(&req.spec.file))
     }
 
-    fn content(&mut self, file: &str) -> &str {
+    /// 变更集外的 needs 只计一次（按到达键去重）。
+    fn note_out_of_diff(&mut self, req: &EnqueueReq, meta: &mut DeepMeta) {
+        let key = req.arrival.clone().unwrap_or_else(|| req.spec.file.clone());
+        if self.counted_out_of_diff.insert(key) {
+            *meta.enqueue_reasons.entry("needs_out_of_diff".into()).or_insert(0) += 1;
+        }
+    }
+
+    /// 文件内容与该语言的 def 正则各取一次，之后整轮复用。
+    fn prime(&mut self, file: &str) -> String {
         if !self.cache.contains_key(file) {
             let text = read_capped(self.root, file);
             self.cache.insert(file.to_string(), text);
         }
-        &self.cache[file]
+        let ext = file.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+        if !self.defs.contains_key(&ext) {
+            if let Some(lang) = crate::diffsym::lang_for(file) {
+                self.defs.insert(ext.clone(), crate::diffsym::compile_defs(lang));
+            }
+        }
+        ext
     }
 
     /// 请求 → 到达（带块与风险档）。H0（Rule）按区间相交合并、身份口径不变，只算风险档。
@@ -1109,23 +1136,28 @@ impl<'a> BlockCtx<'a> {
             return crate::orchestrate::queue::Arrival { req, block: Default::default(), risk_band: band };
         }
         let file = req.spec.file.clone();
-        let block = {
-            let content = self.content(&file);
-            crate::orchestrate::blocks::block_of(&file, content, range.0)
-        };
+        let ext = self.prime(&file);
+        let block = crate::orchestrate::blocks::block_of_with(
+            &file,
+            self.cache.get(&file).map_or("", String::as_str),
+            range.0,
+            self.defs.get(&ext).map(Vec::as_slice),
+        );
         let band = self.band_for(&file, (block.start, block.end));
         crate::orchestrate::queue::Arrival { req, block, risk_band: band }
     }
 
     /// 与本项区间重叠的风险区里**分最高**的那个 → 档位；无重叠区 = 0。
+    /// 最高档只给进了 H0 的区：分够 θ 但信号类不足（`MIN_KINDS`）的区是阶段 0 有意排除的，
+    /// 让它与真 H0 同档会把排序压在一个阶段 0 自己都不认的区上（评审）。
     fn band_for(&self, file: &str, range: (u32, u32)) -> u8 {
-        let best = self
-            .zones
-            .iter()
-            .filter(|z| z.file == file && z.start as u32 <= range.1 && range.0 <= z.end as u32)
-            .map(|z| z.score)
-            .fold(0.0_f32, f32::max);
-        risk_band_of(best)
+        let overlaps = |z: &&Hotspot| z.file == file && z.start as u32 <= range.1 && range.0 <= z.end as u32;
+        let best = self.zones.iter().filter(overlaps).map(|z| z.score).fold(0.0_f32, f32::max);
+        let band = risk_band_of(best);
+        if band == 3 && !self.hotspots.iter().any(|h| overlaps(&h)) {
+            return 2;
+        }
+        band
     }
 }
 
@@ -1142,6 +1174,8 @@ fn risk_band_of(score: f32) -> u8 {
     }
 }
 
+/// 只读本仓内容算块（不发给模型，只取行号与哈希）；体积帽与 `risk` 侧的 4 MiB 不同——
+/// 那边读的是被评文件全文，这边只为定位块，2 MiB 以上的文件退行带即可。
 fn read_capped(root: &Path, rel: &str) -> String {
     let Ok(real) = root.join(rel).canonicalize() else {
         return String::new();
@@ -2710,9 +2744,11 @@ mod tests {
             cell("scan[g1]@p/alpha#1", "alpha", susp(2, "    body();", "调用没校验")),
             cell("scan[g1]@p/beta#1", "beta", susp(3, "}", "结尾漏了收尾")),
         ];
+        // 该区分 2.0 ≥ θ 但**不在** H0 里（阶段 0 按信号类不足排除）→ 封到第 2 档，不与真 H0 同档。
+        let zone = Hotspot { file: "a.rs".into(), start: 1, end: 3, score: 2.0, kind: RegionKind::Ripple, signals: vec![] };
         let route = RiskRoute {
             hotspots: vec![],
-            zones: vec![Hotspot { file: "a.rs".into(), start: 1, end: 3, score: 2.0, kind: RegionKind::Ripple, signals: vec![] }],
+            zones: vec![zone.clone()],
             r: 1.0, tier: crate::risk::Tier::Mid, budget_cells_hint: 4, code_lines: 3,
         };
         let backend = Routed::new(vec![("a", 5, vec![found("a")])]);
@@ -2725,8 +2761,13 @@ mod tests {
         assert_eq!(it.spec.ranges, vec![(1, 3)], "区间 = def 块");
         assert_eq!(it.id, "a.rs:scan:1-3");
         assert!(it.block.key.starts_with("def:"), "{:?}", it.block);
-        assert_eq!(it.risk_band, 3, "分 2.0 ≥ θ 1.5");
+        assert_eq!(it.risk_band, 2, "分够 θ 但不在 H0 → 封第 2 档");
         assert_eq!((it.agreement, it.peak_agreement), (2, 1), "区域级 2 / 必挖轴 1");
+
+        // 同一个区进了 H0 → 才拿最高档
+        let h0_route = RiskRoute { hotspots: vec![zone.clone()], zones: vec![zone], ..route };
+        let run2 = run_with(Run { scan_cells: &cells, route: Some(&h0_route), ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+        assert_eq!(run2.items.iter().find(|it| it.kind == ItemKind::Suspicion).unwrap().risk_band, 3);
     }
 
     /// 保底位的消耗与必挖判定同轴（评审 #4）：结构化合并后「一块被两家族碰过、但没有一条疑点对上」
@@ -2750,15 +2791,16 @@ mod tests {
     async fn needs_enqueue_only_inside_the_changeset() {
         let dir = tempfile::tempdir().unwrap();
         let bundles = routed_bundles(dir.path(), &["a"]);
-        let need = |path: &str| crate::domain::NeedEntry {
-            path: path.into(), lines: Some("1-3".into()), reason: "要看实现".into(), kind: crate::domain::NeedKind::Evidence,
+        let need = |path: &str, reason: &str| crate::domain::NeedEntry {
+            path: path.into(), lines: Some("1-3".into()), reason: reason.into(), kind: crate::domain::NeedKind::Evidence,
         };
         let out = crate::domain::ScanOutput {
             suspicions: vec![crate::domain::Suspicion {
                 file: "a.rs".into(), line_start: 2, line_end: 2, hint: "h".into(), category: None, confidence: 0.5,
                 quote: "    body();".into(),
             }],
-            needs: vec![need("a.rs"), need("verify.rs")],
+            // `./a.rs` 与 `a.rs` 是同一个文件（路径归一，评审）；`verify.rs` 在变更集外，同一条声明重复报只计一次。
+            needs: vec![need("./a.rs", "要看实现"), need("verify.rs", "要看实现"), need("verify.rs", "要看实现")],
             ..Default::default()
         };
         let id = "scan[g1]@p/alpha#1";
@@ -2776,8 +2818,8 @@ mod tests {
         // `verify.rs` 不在变更集 → 只计数、不入队。
         let kinds: Vec<(&str, ItemKind)> = run.items.iter().map(|it| (it.spec.file.as_str(), it.kind)).collect();
         assert_eq!(kinds, [("a.rs", ItemKind::Suspicion)], "{:?}", run.items);
-        assert_eq!(run.items[0].arrivals.iter().filter(|k| k.starts_with("needs:a.rs:")).count(), 1, "{:?}", run.items[0].arrivals);
-        assert_eq!(run.meta.enqueue_reasons.get("needs_out_of_diff"), Some(&1));
+        assert_eq!(run.items[0].arrivals.iter().filter(|k| k.starts_with("needs:a.rs:")).count(), 1, "`./a.rs` 归一后与疑点同一项: {:?}", run.items[0].arrivals);
+        assert_eq!(run.meta.enqueue_reasons.get("needs_out_of_diff"), Some(&1), "同一条变更集外声明重复报只计一次");
         assert_eq!(run.meta.suspicions_arrived, 1, "needs 不计进疑点到达数");
     }
 
