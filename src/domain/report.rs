@@ -256,7 +256,9 @@ pub struct RunMeta {
     /// v4（D13）：每 provider 的 429 收敛记录——只含本轮撞过 429 的 provider；空不序列化（旧消费者零噪音）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_rate_limit: BTreeMap<String, RateLimitMeta>,
-    /// v4：本轮 blocking finding 的 refute 率（design §8.1「去留由数据决定」，M21b 填）。None = 无 verifier 段。
+    /// v4：本轮复核的驳回率 = `deep.verify_refuted / deep.verify_triggered`（design §8.1「去留由数据决定」）。
+    /// 分母只含**真发出去验了的**条数：被跳过的（区域共识 / carried / 判例 / 开关关）从没给过 verifier 机会，
+    /// 进分母只会冲淡率。None = 本轮一条都没触发复核（不拿 0 冒充「验了没驳回」）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refute_rate: Option<f32>,
     /// ship 循环的测试命令：`--test-command` 覆盖，否则 `project::infer_test_command` 推断；推不出 None

@@ -506,6 +506,11 @@ fn overlay_deep(
     }
     report.findings = findings.clone();
     report.stats = Stats::from_findings(&findings);
+    // 本轮复核的驳回率（design §8.1「去留由数据决定」）：分母是**真发出去验了的**条数，
+    // 不是全部 blocking——被免验跳过的（区域共识 / carried / 判例）从没给过 verifier 机会，
+    // 算进分母只会把率冲淡。没触发过复核 → None（不产键），不拿 0 冒充「验了没驳回」。
+    report.run.refute_rate = (deep.meta.verify_triggered > 0)
+        .then(|| deep.meta.verify_refuted as f32 / deep.meta.verify_triggered as f32);
     report.run.deep = Some(deep.meta);
     report.run.warnings.extend(deep.warnings);
     if skipped > 0 {
@@ -3501,6 +3506,34 @@ mod code_review_tests {
         for c in report.run.coverage.selected.get(&Role::Reviewer).into_iter().flatten() {
             assert!(seen.contains(c), "coverage 里的 {c} 没进 sink: {seen:?}");
         }
+    }
+
+    /// `refute_rate` 的分母是**真发出去验了的**条数，不是全部 blocking（批 D-5）：
+    /// 被免验跳过的从没给过 verifier 机会，算进分母只会把率冲淡；一条都没触发 → 不产这个键
+    /// （拿 0 冒充「验了没驳回」会让「去留由数据决定」读到假数据）。
+    #[test]
+    fn refute_rate_counts_only_what_was_actually_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let reg = ProviderRegistry::new();
+        let deep_with = |triggered: u32, refuted: u32, skipped: u32| crate::orchestrate::deep::DeepRun {
+            findings: vec![],
+            cells: vec![crate::state::CellRecord::ok("c", "m", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] })],
+            meta: crate::domain::DeepMeta {
+                verify_triggered: triggered,
+                verify_refuted: refuted,
+                verify_skipped: [("consensus".to_string(), skipped)].into_iter().collect(),
+                ..Default::default()
+            },
+            warnings: vec![], reviewer_failed: false, reused_cells: vec![], items: vec![],
+        };
+        let blank = || ReviewReport { run: Default::default(), verdict: Verdict::Approve, stats: Default::default(),
+            findings: vec![], scan: None, cells: vec![], clusters: Default::default(), schema_version: Default::default() };
+        let (rep, _) = overlay_deep(blank(), 0, deep_with(4, 1, 9), &args(), &cfg, &reg, std::time::Instant::now());
+        assert_eq!(rep.run.refute_rate, Some(0.25), "4 条进了复核、驳回 1 条 → 25%（跳过的 9 条不进分母）");
+        let (rep2, _) = overlay_deep(blank(), 0, deep_with(0, 0, 9), &args(), &cfg, &reg, std::time::Instant::now());
+        assert_eq!(rep2.run.refute_rate, None, "一条都没触发复核 → 不产键");
+        drop(dir);
     }
 
     /// 未配置 scanner → 配置错误（Err，不产报告）。

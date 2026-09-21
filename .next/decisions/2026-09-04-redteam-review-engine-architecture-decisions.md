@@ -523,3 +523,79 @@ resume 怎么接。开工前 `/grilling` 十问（Trellis `09-15-m21b-deep-strea
 - 变更集外 needs 的装包归属与读守卫口径 → C4 / M21d。
 - 类别权重仍空置（标注自身在漂），启用与否攒给 M21e。
 - design v11：§6 规则 1 / 2 / 3 与可观测面、§7 对应改；plan 批 C3 节与 roadmap / followup 同步。
+
+## D17 verifier 流式复核：盖章收紧、触发与跳过、逐条格记录、开关由数据裁定（grill，2026-09-21，M21b 批 D）
+
+**议题**：§8.1 的 verifier 段自 D7 A4 起就挂着「去留由数据决定」，但一直没接线也没数据。批 D 要么把它接进深挖主循环并拿
+本仓人裁台账给出去留判据，要么承认它不该存在。开工前 `/grilling` 十一问（Trellis `09-10-m21b-verifier`，技术设计见其 `design.md` §12）。
+
+**事实核定（grill 中查证）**
+- 旧的 `verify_findings` 是**批式**入口：深挖全部收场后再挑 finding 复核。C2 把流式旁路做进 reviewer 之后，这个形状与主循环的
+  barrier / 计时都对不上——复核要么白等队列排空，要么根本进不了 `verify_tail_ms` 这类观测。
+- `EmitCtx` 盖的是队列项**派发时**的家族数，盖给该 cell 的每一条 finding。C3 把项放大成整个 def / 标题节之后，
+  同块里 reviewer 自己新发现的 finding 也跟着拿 `≥ 2` —— 等于白送免验。§8.1 要的是「**这条** finding 所在的那几行被两个家族独立标过」。
+- 免验必须读 `suspicion_agreement`（区域轴）而不是 `agreement`（模型轴）：后者在单 reviewer 配置下恒 1（D13「每项只交一个条目、不双审」），
+  拿它当依据等于永不免验。followup「两根 agreement 轴」整节即为此立。
+- 流式旁路的 `IncrementalFindings` 跨瞬时重试不复位：首试断在半截 JSON、重试重发时旧片段还在缓冲里，拼出来的是两次输出的缝合体。
+  实测该 bypass 在失败轮是**完全静默**（`emitted=[]`、`discarded=0`），不是 followup 旧记的「可能吐草稿对象」。
+- `dedup::merge_into` 根本不碰 `verify`：流式复核跑在 dedup **之前**，同一个 bug 被两个格报出来时会各验一次，
+  base 的判决直接胜出、other 的被静默丢；且 confidence 取 max 会与「refuted 归零」打架，可能留下「REFUTED + 0.7」的自相矛盾记录。
+- 本仓固定集（`export_ledger.py` 从 schema v4 重置前的旧库导出）：dismissed 63 行 / upheld 48 行，但 **41 行没有 quote**
+  （产品 parse 层本就丢这种形状）、14 行 oracle 自相矛盾（同 id 两边都在）、9 行引用锚不回它自己记的树、6 行无 `head_sha`。
+- `build_registry` 只注册 scanner 与 reviewer：纯 verifier 模型拿不到 registry 条目，`lease()` 必然 Unavailable
+  → 每条复核静默落成「保守 upheld」。**这个洞在 D-4 建离线基线时才暴露**——接线测试用的是自建 registry，测不到它。
+
+**候选与被否**
+| # | 定案 | 被否 | 依据 |
+|---|---|---|---|
+| Q1 交付边界 | 照 plan D-1…D-5，含离线基线与开关裁定 | 只接线、去留留给 M21c | 接了不量 = 又一个没人敢开的开关；量的成本（两臂各 41 条）比再开一个里程碑低得多 |
+| Q2「reviewer 确认」的可计算定义 | **盖章收紧**：finding 行范围压在 peak 簇的成员行上才盖 `suspicion_agreement`，否则盖 0 | 维持按格盖；改成「同块即算」 | C3 放大项之后按格盖等于白送免验；§8.1 的字面要求就是「这条 finding 所在的那几行」 |
+| Q3 流式旁路跨重试 | `attempt_begin` 复位解析器（委托型 `ResetOnAttempt`，`timed_turn_with` 签名不动），落 D-1 第一步 | 复位放 `attempt_end`；不复位只记账 | 后面每一步都在真 sink 上跑，缝合体会污染所有后续观测。`attempt_end` 与 `attempt_begin` 语义等价（已证），故不额外立测试 |
+| Q4 区域轴合并 | 维持 `max` | 改成家族并集 / 取新值 | 并集要重算家族集合、与 D13「落地时刻快照、后涨不回溯」冲突；本批不动共识算法 |
+| Q5 基线 verifier | 异族（`deepseek/deepseek-flash`）与同族（`agc/glm-5.3`）各跑一轮对照 | 只跑异族；跑三家 | 异族选择是 §8.1 的既有定论但从无数据；两臂即可证伪，三家只加成本 |
+| Q6 验收门槛 | **预登记**：误驳 ≤ 5% ∧ 驳回 ≥ 30% → `verifiers.enabled` 默认开，否则默认关 | 跑完看数再定；只看驳回率 | 跑完再定阈值 = 拿结果反推门槛；误驳会**静默删掉一条已被人确认的真缺陷**，比漏驳贵得多，故两条门一严一宽 |
+| Q7 落盘粒度 | 每条 finding 一条 verifier 格记录（`verify[<id>]@<model>`），resume 按 finding id 回填 | 一轮一条汇总记录 | 汇总记录没法回答「这条验过没有」，resume 只能整批重验——同一条两次复核可能给出不同结论，重验会让 resume 前后判决翻转 |
+| Q8 接线形态 | 挂进深挖主循环（第二个 `FuturesUnordered`），复用等门 FIFO；barrier 增「复核在途 0」 | 收场后批式跑；独立 task | 批式就是旧 `verify_findings` 的形状，墙钟串行叠加；独立 task 要另开一套门与计时 |
+| Q9 计数口径 | refuted **留记录、剔计数**：`Stats` 与 `verdict` 都不认它，`findings` 数组里照留（带 `verify` 字段） | 直接删掉 refuted 条目；只改 verdict 不改 Stats | 删掉 = 审计断链、M21c 台账无从回流；只改一处会让报告头条数字与 verdict 打架 |
+| Q10 拆分 | 五步（旁路复位并进 D-1） | 四步（复位单独一批） | 复位是后面每步的地基，单独成批只多一次合回 |
+| Q11 判决合并 | **UPHELD 优先** + 按 finding id 缓存；合并后 REFUTED 则 confidence 归零 | base 胜出；REFUTED 优先 | 方向与 Q6 门槛一致——误驳比漏驳危险；归零是为了不让 `max` 留下自相矛盾的记录 |
+
+**实施细化（design 未及，实现时定）**
+- 复核与格**分两个 `FuturesUnordered`**，不塞进一个 enum：两种活，分开之后 barrier 条件、计时、排空各自说得清，且格的那条路一行没动。
+- 失败一律**保守 upheld** 并带 warning（lease 失败 / 调用失败 / 判决读不懂）；**不设 repair 轮**——契约只有三个字段，
+  读不懂多半是模型没守约而非格式抖动，再发一轮的期望收益不抵一次调用。
+- 判决回填**两处**：落地格内的 finding 与 `prior_findings`（resume 用）。漏了后者，已被驳回的会在 resume 报告里复活成拦路 blocking。
+- 三个计数（`verify_triggered` / `verify_skipped` / `verify_refuted`）挂 **`DeepMeta`** 而非 `RunMeta`（plan 原写 RunMeta）：
+  判决产生在深挖循环里，与 `verify_tail_ms` 同层才好归因。`refute_rate` 仍在 RunMeta 顶层，定义收紧为
+  `verify_refuted / verify_triggered`——分母只含真发出去验了的，被免验的从没给过 verifier 机会，进分母只会冲淡率。
+- 跳过分类要能区分「没触发」与「触发了被免验」：`not_triggered` / `disabled` / `carried` / `precedent` / `consensus` / `resumed` / `no_verifier`。
+- **`Phase::Verify` 打点不做**（plan 原列）：复核与深挖在时间上交织、不构成独立阶段，打点会让 `status` 说谎；
+  尾部时长由 `verify_tail_ms`（队列排空 → 复核归零）披露。
+- 离线基线的链路**不在 Python 复刻任何产品逻辑**：prompt / provider（两种请求形状 + thinkingLevel）/ 判决解析全走隐藏子命令
+  `verify-once`，`eval/verify_score.py` 只管锚定、物化、并发、评分。复刻一份，测的就不是产品了。
+- 固定集按**锚点树**取证据：`upheld` 用行里的 `head_sha`，`dismissed` 只有 `updated_at` → 取该日 `dev` 上的末次提交。
+  不是细节：HEAD 树里 22 条带引用的 dismissed 只有 7 条还能定位，按日锚定后 21 条能定位。
+
+**结果与裁定（2026-09-21，两臂各 41 条）**
+| 臂 | 驳回率（dismissed 被驳，n=16） | 误驳率（upheld 被驳，n=25） | 预登记裁定 |
+|---|---|---|---|
+| 异族 `deepseek/deepseek-flash` | **37.5%** ✅ ≥30% | **12.0%** ❌ >5% | 不通过 |
+| 同族 `agc/glm-5.3` | 18.8% ❌ | 20.0% ❌ | 不通过 |
+
+→ **`review.verifiers.enabled` 缺省 `false`**。要开显式写 `"enabled": true`；接线、观测、落盘全部保留在场。
+**附带结论：异族两根轴都优于同族**——§8.1 的异族选择自此有数支撑，不再只是推测。
+
+**代价与残余**
+- **样本 111 → 41**（dismissed 16 / upheld 25）：`5%` 的误驳门槛在 n=25 上等价于「最多错 1 条」，95%CI 宽到 4–30%。
+  本批是**按预登记规则执行**，不是统计上证伪。扩样本靠 M21c 台账回流（新卡带 `head_sha` 与完整 quote，不再有这批锚定损耗）。
+- **误驳 8 条全是「overstated」一类，没有一条读错代码**：模型引用同文件的测试名与历史裁决注释论证「这是有意为之」，
+  或论证危害被夸大——而这正是 verifier 角色尾授权的三条 REFUTED 理由之一（false positive / already guarded / **overstated**）。
+  成功驳回的那批则集中在「路径不可达」「守卫已经在了」「没有危害链」。
+  **假说（未验证）**：REFUTED 收到前两条、overstated 改成降 severity 而非驳回，误驳可能趋近 0 而驳回率损失有限。
+  **本批不动**——改完口径拿同一份固定集重测就是 p-hacking；要做就先重新预登记再跑（M21c）。
+- **复核的输出 token 与深挖同一量级**（41 条产出 336k / 186k output token，单条输出是输入的 1.4–2.4 倍，两个候选都开着 reasoning）。
+  这是「默认关」的第二个理由；M21c 若要默认开，得先有每轮复核上限（本批实测 4–7 条/轮，当时数据不支持立旋钮）。
+- **往轮没验完的 finding 本轮不补验**（格成功、复核被 kill）：项已 Settled、不重挖，没有格就没有派发点。方向保守
+  （没判决 = 照拦），留 M21c 判例台账一并处理。
+- 判例摘要槽、判例变体触发、`agreement` 轴 legacy 化、md 展示 `suspicion_agreement`、verifier 工具循环：全部不在本批。
+- design v13：§8.1 全节与 §2 barrier、§11 可观测面按上表改；plan 批 D 节与 roadmap / followup 同步。
