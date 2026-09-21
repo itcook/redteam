@@ -41,10 +41,13 @@
 - [x] Commit: `feat(orchestrate,consolidate): verifier 流式消费——落地即复核、逐条格记录、barrier 增复核在途、判决合并 UPHELD 优先（design §8.1 / §2〔D17〕）`
 
 ### D-4 离线基线与开关裁定
-- [ ] `eval/verify_score.py`（新）：读 `eval/fixtures/ledger-{dismissed,upheld}.jsonl` → 构造 finding + 快照 → `build_verify_prompt` → 单发 →
+- [x] `eval/verify_score.py`（新）：读 `eval/fixtures/ledger-{dismissed,upheld}.jsonl` → 构造 finding + 快照 → `build_verify_prompt` → 单发 →
       混淆矩阵 + 误驳率 + 驳回率；`--baseline` 对比；零第三方依赖（照 `eval/harness.py` 纪律）
-- [ ] 跑两轮：异族 `deepseek/deepseek-flash`、同族 `agc/glm-5.3`，各 111 条（跑前跑后校验 config sha256）
-- [ ] **按预登记阈值裁定**：误驳率 ≤ 5% ∧ 驳回率 ≥ 30% → `verifiers.enabled` 默认 `true`，否则默认 `false`；结果写死进配置默认值与 `--help`
+- [x] 跑两轮：异族 `deepseek/deepseek-flash`、同族 `agc/glm-5.3`（config sha256 跑前跑后一致）。
+      **各 41 条不是 111**：固定集 111 行里，无 quote 41（产品 parse 层本就丢这种形状）、oracle 自相矛盾 14、
+      引用锚不回记录的树 9、无 head_sha 6 —— 逐条排除可审计（`cases.json`）
+- [x] **按预登记阈值裁定**：两臂都没过（异族 37.5%/12.0%、同族 18.8%/20.0%）→ `verifiers.enabled` 缺省 **false**，
+      已写死进配置默认值（serde 缺省与 `Default` 同源 + 用例钉住）与 `review --help`
 - [ ] 数字落 `.next/private/m21b/verify/` + followup；research 引用
 - [ ] Commit: `chore(eval,config): verify_score.py 与两轮离线基线——按预登记阈值裁定 verifiers.enabled 默认值（design §8.1「去留由数据决定」）`
 
