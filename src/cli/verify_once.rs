@@ -106,6 +106,10 @@ pub async fn run_verify_once(a: VerifyOnceArgs<'_>, cfg: &Config) -> i32 {
     };
     let f = claim_to_finding(claim);
     let root = std::path::Path::new(a.root.unwrap_or("."));
+    // 与生产路径的**两处有意差异**（收口评审 runner-up，别当成漂移）：
+    // ① 这里不过 `need_read_allowed_in` 读守卫——`--root` 是评测脚本按 git 对象现物化的单文件树，
+    //    路径由维护者的固定集给定、不是模型在线输出，而那棵树根本不是 git 仓（守卫会一律拒）；
+    // ② `spec_docs` 恒空：离线基线不注入 spec，两臂同条件可比优先。
     let source_context = crate::consolidate::verify::source_snippet(root, &f);
     let prompt = crate::prompt::build_verify_prompt(&crate::prompt::VerifyPromptInput {
         file: &f.file,

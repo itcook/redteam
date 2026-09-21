@@ -223,12 +223,24 @@ pub fn decide(
 /// 返回 `None` = 一个可用模型都没有（调用方按「无 verifier」跳过并 warning）。
 pub fn pick_verifier<'a>(
     roles: &'a RoleSets,
-    reviewer_family: &str,
+    reviewer: &EffectiveModel,
     rotation: usize,
 ) -> Option<(&'a EffectiveModel, Option<String>)> {
+    let reviewer_family = reviewer.family.as_str();
     if !roles.verifiers.is_empty() {
         let n = roles.verifiers.len();
-        return Some((&roles.verifiers[rotation % n], None));
+        let picked = &roles.verifiers[rotation % n];
+        // 显式声明也要如实告知（收口评审 #11）：轮到的这个若与产出该 finding 的 reviewer 同模型
+        // （自己验自己）或同家族，判决的独立性就打了折——离线基线里同族那臂误驳 20% vs 异族 12%。
+        // 只 warning 不改选：这是用户显式配的，他有权这么配。
+        let warn = if picked.name == reviewer.name {
+            Some(format!("verifier {} 与产出该 finding 的 reviewer 是同一个模型——自己验自己，判决不独立", picked.name))
+        } else if picked.family == reviewer.family {
+            Some(format!("verifier {} 与 reviewer 同家族（{}）——异族复核更准（离线基线：误驳 12% vs 20%）", picked.name, picked.family))
+        } else {
+            None
+        };
+        return Some((picked, warn));
     }
     let cross = roles
         .reviewers
@@ -460,9 +472,33 @@ mod tests {
             reviewers: vec![model("p/r", "glm")],
             verifiers: vec![model("p/v1", "kimi"), model("p/v2", "qwen")],
         };
-        let names: Vec<&str> = (0..4).map(|i| pick_verifier(&roles, "glm", i).unwrap().0.name.as_str()).collect();
+        let rev = model("p/r", "glm");
+        let names: Vec<&str> = (0..4).map(|i| pick_verifier(&roles, &rev, i).unwrap().0.name.as_str()).collect();
         assert_eq!(names, ["p/v1", "p/v2", "p/v1", "p/v2"]);
-        assert!(pick_verifier(&roles, "glm", 0).unwrap().1.is_none(), "显式声明不报 warning");
+        assert!(pick_verifier(&roles, &rev, 0).unwrap().1.is_none(), "显式声明的异族 verifier 不报 warning");
+    }
+
+    /// 显式声明的 verifier 也要查独立性（收口评审 #11）：轮到的那个与产出该 finding 的 reviewer
+    /// 同模型（自己验自己）或同家族时，照用但留 warning——离线基线里同族那臂误驳 20% vs 异族 12%，
+    /// 用户有权这么配，但不能不知道自己配了什么。
+    #[test]
+    fn declared_verifier_that_is_the_reviewer_itself_warns() {
+        let same = RoleSets {
+            scanners: vec![],
+            reviewers: vec![model("p/r", "glm")],
+            verifiers: vec![model("p/r", "glm")], // 现配置就是这个形状：一个模型兼两角色
+        };
+        let (m, warn) = pick_verifier(&same, &model("p/r", "glm"), 0).unwrap();
+        assert_eq!(m.name, "p/r");
+        assert!(warn.as_deref().is_some_and(|w| w.contains("同一个模型")), "自己验自己必须可观测: {warn:?}");
+
+        let kin = RoleSets {
+            scanners: vec![],
+            reviewers: vec![model("p/r", "glm")],
+            verifiers: vec![model("p/r2", "glm")], // 不同模型、同家族
+        };
+        let (_, warn) = pick_verifier(&kin, &model("p/r", "glm"), 0).unwrap();
+        assert!(warn.as_deref().is_some_and(|w| w.contains("同家族")), "同族也要说一声: {warn:?}");
     }
 
     /// 未声明 verifiers → 自动异族，优先 reviewers 档再 scanners 档。
@@ -473,14 +509,14 @@ mod tests {
             reviewers: vec![model("p/r", "glm"), model("p/r2", "kimi")],
             verifiers: vec![],
         };
-        assert_eq!(pick_verifier(&roles, "glm", 0).unwrap().0.name, "p/r2", "异族 reviewer 优先");
+        assert_eq!(pick_verifier(&roles, &model("p/r", "glm"), 0).unwrap().0.name, "p/r2", "异族 reviewer 优先");
 
         let only_scanner_cross = RoleSets {
             scanners: vec![model("p/s", "deepseek")],
             reviewers: vec![model("p/r", "glm")],
             verifiers: vec![],
         };
-        assert_eq!(pick_verifier(&only_scanner_cross, "glm", 0).unwrap().0.name, "p/s", "没有异族 reviewer 就取 scanner 档");
+        assert_eq!(pick_verifier(&only_scanner_cross, &model("p/r", "glm"), 0).unwrap().0.name, "p/s", "没有异族 reviewer 就取 scanner 档");
     }
 
     /// 一个异族都没有 → 同族复核 + warning（§8.1 明写；现配置 glm 既是 reviewer 又是 verifier，正是这条路）。
@@ -491,9 +527,9 @@ mod tests {
             reviewers: vec![model("p/r", "glm")],
             verifiers: vec![],
         };
-        let (m, warn) = pick_verifier(&roles, "glm", 0).unwrap();
+        let (m, warn) = pick_verifier(&roles, &model("p/r", "glm"), 0).unwrap();
         assert_eq!(m.name, "p/r");
         assert!(warn.unwrap().contains("no cross-family verifier"), "同族复核必须可观测");
-        assert!(pick_verifier(&RoleSets::default(), "glm", 0).is_none(), "一个模型都没有 → None");
+        assert!(pick_verifier(&RoleSets::default(), &model("p/r", "glm"), 0).is_none(), "一个模型都没有 → None");
     }
 }

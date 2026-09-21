@@ -77,8 +77,9 @@ def locate(text, quote):
 
 
 def cmd_build(a):
-    rows_d = [json.loads(l) for l in open(os.path.join(a.fixtures, "ledger-dismissed.jsonl"))]
-    rows_u = [json.loads(l) for l in open(os.path.join(a.fixtures, "ledger-upheld.jsonl"))]
+    # 固定集含中文：读也钉死 utf-8（写侧本来就是），别靠 locale
+    rows_d = [json.loads(l) for l in open(os.path.join(a.fixtures, "ledger-dismissed.jsonl"), encoding="utf-8")]
+    rows_u = [json.loads(l) for l in open(os.path.join(a.fixtures, "ledger-upheld.jsonl"), encoding="utf-8")]
 
     # oracle 自相矛盾的 id（两边都有）：同一条既被人裁误报又被人确认，两边都不要。
     both = {r["id"] for r in rows_d} & {r["id"] for r in rows_u}
@@ -177,7 +178,7 @@ def one_case(binpath, case, verifier, timeout):
 
 
 def cmd_run(a):
-    meta = json.load(open(os.path.join(a.cases, "cases.json")))
+    meta = json.load(open(os.path.join(a.cases, "cases.json"), encoding="utf-8"))
     cases = meta["cases"]
     if a.limit:
         cases = cases[: a.limit]
@@ -234,14 +235,17 @@ def rates(t):
     nu = t["upheld"]["refuted"] + t["upheld"]["upheld"]
     refute = t["dismissed"]["refuted"] / nd if nd else 0.0
     false_refute = t["upheld"]["refuted"] / nu if nu else 0.0
+    # 两边都得有样本才谈得上「过」：任一臂空集时 0/0 会被算成 0.0，于是「零证据」读成「零误驳」，
+    # 把预登记的门判成通过。空集 = 判不了，不是判过。
+    ok = None if nd == 0 or nu == 0 else (false_refute <= MAX_FALSE_REFUTE and refute >= MIN_REFUTE)
     return {"n_dismissed": nd, "n_upheld": nu, "refute_rate": refute, "false_refute_rate": false_refute,
             "refute_ci": wilson(t["dismissed"]["refuted"], nd),
             "false_refute_ci": wilson(t["upheld"]["refuted"], nu),
-            "pass": false_refute <= MAX_FALSE_REFUTE and refute >= MIN_REFUTE}
+            "pass": ok}
 
 
 def cmd_score(a):
-    payload = json.load(open(a.run))
+    payload = json.load(open(a.run, encoding="utf-8"))
     t = tally(payload["results"])
     r = rates(t)
     print(f"模型 {payload.get('verifier')} · 模板 {payload.get('template_hash')} · 跑于 {payload.get('ran_at')}")
@@ -251,9 +255,10 @@ def cmd_score(a):
     print(f"  调用失败 {t['failed']} · 判决读不懂（按保守 upheld 计） {t['unparsed']}")
     print(f"驳回率  {r['refute_rate']:.1%}  (n={r['n_dismissed']}, 95%CI {r['refute_ci'][0]:.1%}–{r['refute_ci'][1]:.1%})  门槛 ≥ {MIN_REFUTE:.0%}")
     print(f"误驳率  {r['false_refute_rate']:.1%}  (n={r['n_upheld']}, 95%CI {r['false_refute_ci'][0]:.1%}–{r['false_refute_ci'][1]:.1%})  门槛 ≤ {MAX_FALSE_REFUTE:.0%}")
-    print(f"预登记裁定：verifiers.enabled 默认 {'true' if r['pass'] else 'false'}")
+    verdict = {True: "true", False: "false", None: "判不了（有一臂是空集）"}[r["pass"]]
+    print(f"预登记裁定：verifiers.enabled 默认 {verdict}")
     if a.baseline:
-        b = rates(tally(json.load(open(a.baseline))["results"]))
+        b = rates(tally(json.load(open(a.baseline, encoding="utf-8"))["results"]))
         print(f"对比基线：驳回 {b['refute_rate']:.1%} → {r['refute_rate']:.1%} · "
               f"误驳 {b['false_refute_rate']:.1%} → {r['false_refute_rate']:.1%}")
     if a.out:
@@ -280,6 +285,10 @@ def cmd_selftest(_a):
     assert (r["n_dismissed"], r["n_upheld"]) == (3, 2), r
     assert abs(r["refute_rate"] - 1 / 3) < 1e-9 and abs(r["false_refute_rate"] - 0.5) < 1e-9, r
     assert r["pass"] is False, "误驳 50% 必须判不通过"
+
+    # 空集不算通过：0/0 被算成 0.0 会把「零证据」读成「零误驳」
+    empty = {"dismissed": {"refuted": 0, "upheld": 0}, "upheld": {"refuted": 0, "upheld": 19}, "failed": 3, "unparsed": 0}
+    assert rates(empty)["pass"] is None, "有一臂是空集 → 判不了，不是判过"
 
     # 阈值边界：误驳恰好 5%、驳回恰好 30% → 通过（预登记口径是 ≤ / ≥）
     ok = {"dismissed": {"refuted": 3, "upheld": 7}, "upheld": {"refuted": 1, "upheld": 19}, "failed": 0, "unparsed": 0}

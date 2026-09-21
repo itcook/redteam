@@ -370,7 +370,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                         *meta.verify_skipped.entry("cached".into()).or_default() += 1;
                         continue;
                     }
-                    match crate::consolidate::verify::pick_verifier(vin.roles, &members[l.member].family, verify_rotation) {
+                    match crate::consolidate::verify::pick_verifier(vin.roles, &members[l.member], verify_rotation) {
                         Some((m, warn)) => {
                             verify_rotation += 1;
                             meta.verify_triggered += 1;
@@ -526,7 +526,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         if !verdicts.is_empty() {
             for f in l.rec.output.findings_mut() {
                 if let Some(v) = verdicts.get(&f.id) {
-                    f.verify = Some(v.clone());
+                    f.set_verdict(v.clone());
                 }
             }
         }
@@ -789,7 +789,7 @@ fn apply_known(fs: &mut [Finding], known: &std::collections::BTreeMap<String, cr
     }
     for f in fs.iter_mut() {
         if let Some(v) = known.get(&f.id) {
-            f.verify = Some(v.clone());
+            f.set_verdict(v.clone());
         }
     }
 }
@@ -1708,6 +1708,12 @@ mod tests {
             ev,
             [("elsewhere".to_string(), 0), ("off".to_string(), 0), ("on".to_string(), 2)],
             "事件侧同样只盖压在共识簇上的那条；**别的文件**即使行号落在热区里也盖 0"
+        );
+        // 收口评审 #14：事件里 `finding.suspicion_agreement` 与事件字段必须是同一个值——
+        // `decide` 读的是 Finding 上那份，两份打架时收紧就白做了。
+        assert!(
+            events.0.lock().unwrap().iter().all(|e| e.finding.suspicion_agreement == e.suspicion_agreement),
+            "Finding 上的盖章与事件字段同源"
         );
 
         let mut stamps: Vec<(String, u32)> =
@@ -3534,6 +3540,9 @@ mod tests {
         assert_eq!(v.verdict, crate::domain::VerifyVerdict::Refuted);
         assert_eq!((v.model.as_str(), v.note.as_str()), ("p/v", "引用与文件对不上"));
         assert_eq!((run.meta.verify_triggered, run.meta.verify_refuted), (1, 1));
+        // 收口评审 #7：判决落地即归零 confidence——没有合并伙伴的被驳回 finding 也不能留下
+        // 「verdict=refuted、confidence=0.9」这种自相矛盾的记录（下游按 confidence 排序 / 过滤会各拿各的答案）。
+        assert_eq!(f.confidence, 0.0, "REFUTED → confidence 归零");
         let vc = run.cells.iter().find(|c| c.cell.starts_with("verify[")).expect("复核单独落一格");
         assert_eq!(vc.cell, format!("verify[{}]@p/v", f.id));
         assert_eq!((vc.model.as_str(), vc.family.as_str()), ("p/v", "v"));

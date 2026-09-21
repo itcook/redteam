@@ -951,10 +951,10 @@ pub fn thinking_warning(em: &crate::config::EffectiveModel) -> Option<String> {
 
 /// 建注册表时的 thinkingLevel 无映射 warnings（scanner → reviewer 序，同文案去重）。兼任 scanner 的 reviewer 在注册表里复用
 /// scanner 条目、不另建 backend，但两角色的 thinkingLevel 可以不同——深挖的 per-cell backend 按 reviewer 自己的条目构造，
-/// 它的无映射档位同样要披露（批 C1-3；此前随 `has_scan` 的跳过一并漏掉）。verifier 待批 D 接线时并入。
+/// 它的无映射档位同样要披露（批 C1-3；此前随 `has_scan` 的跳过一并漏掉）。verifier 已于批 D-5 并入（收口评审 runner-up）。
 pub fn role_thinking_warnings(roles: &crate::config::RoleSets) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for w in roles.scanners.iter().chain(&roles.reviewers).filter_map(thinking_warning) {
+    for w in roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers).filter_map(thinking_warning) {
         if !out.contains(&w) {
             out.push(w);
         }

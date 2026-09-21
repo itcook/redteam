@@ -129,6 +129,18 @@ impl Finding {
     pub fn is_refuted(&self) -> bool {
         self.verify.as_ref().is_some_and(|v| v.verdict == VerifyVerdict::Refuted)
     }
+
+    /// 贴判决（**唯一入口**）：REFUTED 同时把 confidence 归零。
+    /// 收口评审 #7：归零此前只写在 `dedup::merge_into` 里，于是「没有合并伙伴」的被驳回 finding
+    /// 会序列化成 `{"verify":{"verdict":"refuted"},"confidence":0.9}` ——正是 dedup 注释说要避免的
+    /// 自相矛盾记录；同一逻辑状态给出两个答案，取决于有几个格碰巧报了它。
+    pub fn set_verdict(&mut self, v: Verify) {
+        let refuted = v.verdict == VerifyVerdict::Refuted;
+        self.verify = Some(v);
+        if refuted {
+            self.confidence = 0.0;
+        }
+    }
 }
 
 /// 一条 finding 的 verify 结果（refute pass 产出）。

@@ -77,19 +77,31 @@ impl<'a> EmitCtx<'a> {
         EmitCtx { model, family, suspicion_agreement, hot_ranges, item_file, root, sink, emitted: HashSet::new() }
     }
 
+    /// 这条 finding 该盖多少共识（热区门控的**单一出口**）：压在峰值簇那几行上才盖，否则 0。
+    /// 收口评审 #14：`Finding.suspicion_agreement` 曾在调用点直接写 `ctx.suspicion_agreement`（没过门控），
+    /// 与同一事件里 `FindingEvent.suspicion_agreement` 打架——而 `decide` 读的是 Finding 上那份。
+    fn consensus_for(&self, f: &Finding) -> u32 {
+        if crate::orchestrate::queue::in_hot_ranges(&f.file, self.item_file, f.line_start, f.line_end, &self.hot_ranges) {
+            self.suspicion_agreement
+        } else {
+            0
+        }
+    }
+
+    /// 盖章 + 发射：两件事必须一起做，否则 Finding 与事件两份值会各说各话。
+    fn stamp_and_emit(&mut self, f: &mut Finding) {
+        f.suspicion_agreement = self.consensus_for(f);
+        self.emit(f);
+    }
+
     /// 首次见到该 id 才发射（旁路 / 终判同一去重面）。
     fn emit(&mut self, f: &Finding) {
         if !self.emitted.insert(f.id.clone()) {
             return;
         }
-        let consensus = if crate::orchestrate::queue::in_hot_ranges(&f.file, self.item_file, f.line_start, f.line_end, &self.hot_ranges) {
-            self.suspicion_agreement
-        } else {
-            0
-        };
         self.sink.on_finding(FindingEvent {
             finding: f.clone(),
-            suspicion_agreement: consensus,
+            suspicion_agreement: f.suspicion_agreement,
             reviewer_family: self.family.to_string(),
         });
     }
@@ -146,8 +158,7 @@ fn emit_raw(raws: Vec<crate::domain::RawFinding>, ctx: &mut EmitCtx) {
         .collect();
     let (kept, _dropped, _unreadable) = anchor_review_findings(enriched, ctx.root);
     for mut f in kept {
-        f.suspicion_agreement = ctx.suspicion_agreement;
-        ctx.emit(&f);
+        ctx.stamp_and_emit(&mut f);
     }
 }
 
@@ -261,8 +272,7 @@ fn finish_parse(
 
     let mut final_findings = Vec::new();
     for mut f in kept {
-        f.suspicion_agreement = ctx.suspicion_agreement;
-        ctx.emit(&f);
+        ctx.stamp_and_emit(&mut f);
         final_findings.push(f);
     }
 

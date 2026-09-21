@@ -63,7 +63,17 @@ fn render_md(r: &ReviewReport) -> String {
         s.push_str(&format!("# {repo} Redteam Review #{}\n\n## Summary\n\n", r.run.job_id));
     }
     s.push_str(&format!("- Verdict: {verdict}\n\n"));
-    s.push_str(&format!("- Findings: {}\n", r.stats.total));
+    // 被驳回的不计入头条（`Stats` 与 verdict 同口径），但它们**仍列在下面的 Finding Details 里**——
+    // 只写一个过滤后的数字，会让用户读到「Findings: 0」正上方挂着一条 high（收口评审 #10）。
+    let refuted = r.findings.iter().filter(|f| f.is_refuted()).count();
+    if refuted > 0 {
+        s.push_str(&format!(
+            "- Findings: {} (+{refuted} refuted by verifier — listed below, excluded from counts and verdict)\n",
+            r.stats.total
+        ));
+    } else {
+        s.push_str(&format!("- Findings: {}\n", r.stats.total));
+    }
     if r.stats.total > 0 {
         s.push('\n');
         s.push_str("  | Severity   | Count |\n  | ---------- | ----- |\n");
@@ -249,6 +259,21 @@ mod tests {
                 origin:Origin::New}],
             clusters:vec![], run:RunMeta::default() }
     }
+
+    /// 被驳回的 finding 不计入头条、但仍列在详情里——头条必须把这件事说出来（收口评审 #10）。
+    /// 旧行为：`- Findings: 0` 正下方挂着 `### F1: …  Severity: 🟠 high`。
+    #[test]
+    fn md_headline_discloses_refuted_findings_that_are_still_listed() {
+        let mut r = report();
+        r.findings[0].set_verdict(Verify {
+            verdict: VerifyVerdict::Refuted, model: "p/v".into(), note: "已有守卫".into(),
+        });
+        r.stats = Stats::from_findings(&r.findings);
+        let md = render_md(&r);
+        assert!(md.contains("- Findings: 0 (+1 refuted by verifier"), "头条要说清: {}", &md[..md.len().min(400)]);
+        assert!(md.contains("### F1: boom"), "详情照列——审计不断链");
+    }
+
     /// 批 F-3 AC3：scan-only md——verdict 行、组表、失败 cell、按组疑点（类别 / 置信 / agreement / 家族 / hint / quote 首行）、覆盖自报。
     #[test]
     fn scan_only_md_renders_groups_suspicions_and_coverage() {

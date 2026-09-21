@@ -40,10 +40,14 @@ enum Cmd {
     /// 见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
     /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口；深挖照跑、findings 仍在报告，本可 reject 的 blocking 条数见
     /// run.warnings）、10=reject（finding 达到 --block-threshold）。
-    /// 复核（verifier）**缺省关**：开了之后，每条 severity ≥ --block-threshold ∧ confidence ≥ --conf-floor 的 finding 会另派一个
-    /// 异族模型复查，被驳回的不计数、不拦路（记录仍在 findings 里，带 verify 字段）。配 `review.verifiers.enabled = true` 打开，
-    /// 并按需在 `roles` 里给模型配 verifier 角色（没配则自动挑一个异族的 reviewer / scanner）。缺省关的依据：对本仓人裁台账
-    /// 的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 20%（预登记门槛 ≤ 5%），代价是静默少报。
+    /// 复核（verifier）**缺省关**：开了之后，每条 severity ≥ --block-threshold ∧ confidence ≥ --conf-floor 的 finding
+    /// 会再派一个模型复查，被驳回的不计数、不拦路（记录仍在 findings 里，带 verify 字段）。
+    /// 配 `review.verifiers.enabled = true` 打开：没给模型配 verifier 角色时**自动挑一个异族**的 reviewer / scanner；
+    /// 配了 verifier 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦（异族更准，见下）。
+    /// 观测在 `run.deep.verify_triggered` / `verify_skipped`（分类：not_triggered·disabled·carried·precedent·consensus·resumed·cached·no_verifier）/
+    /// `verify_refuted` / `verify_failed` / `verify_tail_ms` 与顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。
+    /// 缺省关的依据：对本仓人裁台账的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 20%
+    /// （预登记门槛 ≤ 5%；异族那臂两根轴都更好），代价是静默少报。
     /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
     /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
     /// 自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit 可读；误填超大 maxConcurrency 也能自愈）。
@@ -533,7 +537,12 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
     // reviewer 与 verifier 同一套注册逻辑：按 `em.name`（= `provider/id`）去重——同一模型兼任多角色时
     // 只装一份 backend。批 D〔D17〕：verifier 必须在这里注册，否则 `pick_verifier` 选中一个纯 verifier
     // 模型时 `registry.lease()` 直接 Unavailable，每条复核都静默落成「保守 upheld」——看起来跑了、其实一次没验。
-    for em in roles.reviewers.iter().chain(roles.verifiers.iter()) {
+    for (em, role) in roles
+        .reviewers
+        .iter()
+        .map(|m| (m, redteam::config::Role::Reviewer))
+        .chain(roles.verifiers.iter().map(|m| (m, redteam::config::Role::Verifier)))
+    {
         if registry.has_scan(&em.name) {
             // 同名不同档（scanner high / verifier medium 之类）：先到的 backend 生效，档位差异必须可见——
             // 静默用错档会让离线基线与线上行为对不上。route_key 带角色前缀是 M21c 的活（D13 已记）。
@@ -549,6 +558,13 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
         let backend = match backend_from_config(em, key) {
             Ok(b) => b,
+            // reviewer 造不出 = 本轮的活干不了，硬 Err 照旧；**verifier 造不出只是这一路没得用**
+            // （复核缺省还关着），不该让整条 review 命令拒跑（收口评审 #8：
+            // 预置一个 kind=google 的 verifier 模型，整个 review 会以 "google not yet supported" 退出）。
+            Err(e) if role == redteam::config::Role::Verifier => {
+                registry.push_warning(format!("verifier {} 不可用（{e}）——本轮复核将跳过它", em.name));
+                continue;
+            }
             Err(e) => return Err(format!("{e}")),
         };
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
@@ -1667,6 +1683,28 @@ mod tests {
         let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new(".")).unwrap();
         assert!(reg.has_scan("p/s") && reg.has_scan("p/r"), "scanner / reviewer 照旧");
         assert!(reg.has_scan("p/v"), "纯 verifier 模型必须能 lease，否则复核全程静默保守 upheld");
+    }
+
+    /// 批 D-5（收口评审 #8）：verifier 模型造不出 backend **不该拒跑整条命令**——复核缺省还关着，
+    /// 而 `kind: "google"` 一类尚不支持的 provider 在 backend 构造处返回 Err。
+    /// reviewer 造不出仍是硬 Err（本轮的活真干不了）。
+    #[test]
+    fn build_registry_skips_unusable_verifier_instead_of_failing_the_run() {
+        let cfg: redteam::config::Config = serde_json::from_str(
+            r#"{"providers":{
+                "p":{"kind":"openai","baseUrl":"https://x","models":{"s":{"roles":{"scanner":{}}}}},
+                "g":{"kind":"google","baseUrl":"https://y","models":{"v":{"roles":{"verifier":{}}}}}
+            }}"#,
+        )
+        .unwrap();
+        let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new("."))
+            .expect("verifier 造不出 backend 不该让整条 review 拒跑");
+        assert!(reg.has_scan("p/s") && !reg.has_scan("g/v"));
+        assert!(
+            reg.warnings().iter().any(|w| w.contains("verifier g/v 不可用")),
+            "跳过要可观测: {:?}",
+            reg.warnings()
+        );
     }
 
     /// 同一模型兼任多角色且 thinkingLevel 不一致：先到的 backend 生效，差异必须留下 warning——

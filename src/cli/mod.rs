@@ -526,6 +526,7 @@ fn overlay_deep(
     // 两类算进分母都只会把率冲淡（收口评审 #6：verifier 全挂会读成「验了 N 条一条没驳」）。
     // 一条都没跑成 → None（不产键），不拿 0 冒充「验了没驳回」。
     let verified = deep.meta.verify_triggered.saturating_sub(deep.meta.verify_failed);
+    let verify_ran = deep.meta.verify_triggered > 0;
     report.run.refute_rate = (verified > 0).then(|| deep.meta.verify_refuted as f32 / verified as f32);
     report.run.deep = Some(deep.meta);
     report.run.warnings.extend(deep.warnings);
@@ -546,6 +547,10 @@ fn overlay_deep(
     fold_role_cells(&mut report, deep.cells, false);
     let h = crate::prompt::template_hashes();
     report.run.template_hashes.insert("reviewer_tail".into(), h.reviewer_tail.clone());
+    // 复核真跑过才记它的模板哈希（prompt 漂移登记表；没跑过就记等于给报告塞噪音）。
+    if verify_ran {
+        report.run.template_hashes.insert("verifier_tail".into(), h.verifier_tail.clone());
+    }
     let (block, floor) = verdict_thresholds(args, cfg);
     let verdict = crate::verdict::compute_verdict(&findings, block, floor);
     let debt = failed || skipped > 0;
@@ -1311,7 +1316,7 @@ pub async fn run_resume(
                 .flat_map(|r| r.output.findings().to_vec())
                 .map(|mut f| {
                     if let Some(v) = known.get(&f.id) {
-                        f.verify = Some(v.clone());
+                        f.set_verdict(v.clone());
                     }
                     f
                 })
