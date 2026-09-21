@@ -8,35 +8,37 @@
 ## Checklist
 
 ### D-1 旁路复位 + verifier 角色尾
-- [ ] `provider/mod.rs`：委托型 `ResetOnAttempt`（`attempt_begin` 复位 `IncrementalFindings`，其余纯委托）；`timed_turn_with` 签名不动
-- [ ] `review_shot.rs`：reviewer 格把 `GateAttempts` 包一层再传下去
-- [ ] `templates/verifier.md`（新）：角色尾——「找出这条 finding 不成立的证据」、`analysis` 先于 `verdict` 且不可撤回、契约 `REFUTED | UPHELD` + 一句理由；共享头沿用
-- [ ] `prompt/mod.rs`：`build_verify_prompt`（finding + `source_snippet` ±60 + 判例摘要空槽 + spec）、`verifier_template_hash()`；
+- [x] `provider/mod.rs`：委托型 `ResetOnAttempt`（`attempt_begin` 复位 `IncrementalFindings`，其余纯委托）；`timed_turn_with` 签名不动
+- [x] `review_shot.rs`：reviewer 格把 `GateAttempts` 包一层再传下去
+- [x] `templates/verifier.md`（新）：角色尾——「找出这条 finding 不成立的证据」、`analysis` 先于 `verdict` 且不可撤回、契约 `REFUTED | UPHELD` + 一句理由；共享头沿用
+- [x] `prompt/mod.rs`：`build_verify_prompt`（finding + `source_snippet` ±60 + 判例摘要空槽 + spec）、`verifier_template_hash()`；
       `adversarial-refute.md` 降级为历史注记（最后引用者消失）
-- [ ] 测试：首试断流半截 JSON + 重试完整输出 → 不拼接、不发草稿；共享头字节稳定；`analysis` 段序在 `verdict` 之前；模板哈希稳定
-- [ ] 变异检查：不复位解析器 / 复位放在 `attempt_end` / analysis 与 verdict 段序调换——各自转红
-- [ ] Commit: `fix(provider,prompt): 流式旁路跨重试复位 + verifier.md 角色尾拆分——analysis 先于 verdict（design §8.1 / §10.7〔D17〕）`
+- [x] 测试：首试断流半截 JSON + 重试完整输出 → 不拼接、不发草稿；共享头字节稳定；`analysis` 段序在 `verdict` 之前；模板哈希稳定
+- [x] 变异检查：不复位解析器 / 复位放在 `attempt_end` / analysis 与 verdict 段序调换——各自转红
+- [x] Commit: `fix(provider,prompt): 流式旁路跨重试复位 + verifier.md 角色尾拆分——analysis 先于 verdict（design §8.1 / §10.7〔D17〕）`
 
 ### D-2 触发集、跳过与异族选择（纯判定层，零 provider 调用）
-- [ ] `review_shot.rs`：`EmitCtx` 带 `hot_ranges`（peak 簇成员疑点的行范围并集），`emit` 只对重叠的 finding 盖 `suspicion_agreement`，其余盖 0
-- [ ] `deep.rs`：派发时把 peak 簇行范围算出来传进 `EmitCtx`（`QueueItem.members` + `member_families` 现成）
-- [ ] `verify.rs` 重写判定层：触发（`severity ≥ block ∧ confidence ≥ floor` + 判例变体空槽）、跳过（agreement ≥ 2 / carried / 台账空槽 /
+- [x] `review_shot.rs`：`EmitCtx` 带 `hot_ranges`（peak 簇成员疑点的行范围并集），`emit` 只对重叠的 finding 盖 `suspicion_agreement`，其余盖 0
+- [x] `deep.rs`：派发时把 peak 簇行范围算出来传进 `EmitCtx`（`QueueItem.members` + `member_families` 现成）
+- [x] `verify.rs` 重写判定层：触发（`severity ≥ block ∧ confidence ≥ floor` + 判例变体空槽）、跳过（agreement ≥ 2 / carried / 台账空槽 /
       `enabled = false`）、`pick_verifier`（verifiers 活跃集轮转 → 自动异族 → 同族 + warning）；删批式 `verify_findings`
-- [ ] 测试：盖章收紧（同格两条 finding 一盖 2 一盖 0）；触发判定表与 `compute_verdict` 的 blocking 集合逐条一致；
+- [x] 测试：盖章收紧（同格两条 finding 一盖 2 一盖 0）；触发判定表与 `compute_verdict` 的 blocking 集合逐条一致；
       跳过三类各自命中且 `skipped_reason` 分类正确；异族选择序；全同族 → 同族 + warning；`enabled=false` → 全跳过
-- [ ] 变异检查：盖章不看行范围 / 跳过读 `agreement` 而非 `suspicion_agreement` / 异族选择忽略 family / enabled 不生效——各自转红
-- [ ] Commit: `feat(consolidate,orchestrate): verifier 触发集与跳过规则——区域共识盖章收紧到 peak 簇行范围、异族选择（design §8.1〔D17〕）`
+- [x] 变异检查：盖章不看行范围 / 跳过读 `agreement` 而非 `suspicion_agreement` / 异族选择忽略 family / enabled 不生效——各自转红
+- [x] Commit: `feat(consolidate,orchestrate): verifier 触发集与跳过规则——区域共识盖章收紧到 peak 簇行范围、异族选择（design §8.1〔D17〕）`
 
 ### D-3 流式消费接线
-- [ ] `deep.rs`：复核 future 进主循环 `FuturesUnordered`（`registry.lease()` 走同门，复用 C2 等门 FIFO）；
-      `empty_for_barrier` 增「复核在途 0」；`verify_tail_ms` = 队列排空 → 复核归零；`Phase::Verify` 打点
-- [ ] 落盘：cell id `verify[<finding id>]@<model>`、`CellOutput::Verify` 单条 `VerifyEntry`；resume 按 finding id 回填、已复核不重跑
-- [ ] `dedup.rs`：`merge_into` 补 verify 合并——任一 UPHELD 即 UPHELD、base 无判决继承 other、合并后 REFUTED 则 confidence 归零
-- [ ] `report.rs`：`Stats` 与顶层计数剔除 refuted；RunMeta 增 `verify_triggered` / `verify_skipped` / `verify_refuted`（serde default、为零不序列化）
-- [ ] 测试：Fake e2e 链路（落地 → 复核 → REFUTED → 归零不 blocking）；调用失败 → 保守 upheld + warning；
+- [x] `deep.rs`：复核 future 进主循环 `FuturesUnordered`（`registry.lease()` 走同门，复用 C2 等门 FIFO）；
+      barrier 增「复核在途 0」；`verify_tail_ms` = 队列排空 → 复核归零。
+      **`Phase::Verify` 打点不做**：复核与深挖交织、不是独立阶段，打点会让 `status` 说谎；尾部时长由 `verify_tail_ms` 披露（D-5 记进 design）
+- [x] 落盘：cell id `verify[<finding id>]@<model>`、`CellOutput::Verify` 单条 `VerifyEntry`；resume 按 finding id 回填、已复核不重跑
+- [x] `dedup.rs`：`merge_into` 补 verify 合并——任一 UPHELD 即 UPHELD、base 无判决继承 other、合并后 REFUTED 则 confidence 归零
+- [x] `report.rs`：`Stats` 与顶层计数剔除 refuted；三个计数改挂 **`DeepMeta`**（与 `verify_tail_ms` 同层：判决在深挖循环里产生；serde default、为零不序列化）
+- [x] 测试：Fake e2e 链路（落地 → 复核 → REFUTED → 归零不 blocking）；调用失败 → 保守 upheld + warning；
       barrier 等复核归零；resume 零新调用；判决合并三种组合；计数剔除（数组 3 条、stats 2 条）；退化零差与 C3 基线同构
-- [ ] 变异检查：barrier 不等复核 / 判决合并 base 胜出 / REFUTED 不归零 confidence / 计数不剔除 / resume 重复复核——各自转红
-- [ ] Commit: `feat(orchestrate,consolidate): verifier 流式消费——落地即复核、逐条格记录、barrier 增复核在途、判决合并 UPHELD 优先（design §8.1 / §2〔D17〕）`
+- [x] 变异检查：13 项全红（barrier 不等 / 跳过不拦 / known 不查 / 落地格与往轮两处回填 / 往轮判决不并入 / 复核格不入账 /
+      驳回不计数 / 尾部记成整轮墙钟 / 读不懂倒向 refuted / 合并 base 胜出 / REFUTED 不归零 confidence / 计数不剔除）
+- [x] Commit: `feat(orchestrate,consolidate): verifier 流式消费——落地即复核、逐条格记录、barrier 增复核在途、判决合并 UPHELD 优先（design §8.1 / §2〔D17〕）`
 
 ### D-4 离线基线与开关裁定
 - [ ] `eval/verify_score.py`（新）：读 `eval/fixtures/ledger-{dismissed,upheld}.jsonl` → 构造 finding + 快照 → `build_verify_prompt` → 单发 →
@@ -75,5 +77,5 @@ python3 eval/verify_score.py --fixtures eval/fixtures --verifier deepseek/deepse
 
 - [x] 批 C3 已合回（`2a454d6`）并归档；集成分支四绿、clippy 7、`make verify` 绿
 - [x] `/grilling` Q1–Q11 定案已落 prd 与 design §12
-- [ ] `implement.jsonl` / `check.jsonl` 各 ≥ 1 条真条目（开工时补）
+- [x] `implement.jsonl` / `check.jsonl` 各 ≥ 1 条真条目（开工时补）
 - [ ] decisions D17 节与 design §8.1 / §2 的改写（D-5 收口时一并落）
