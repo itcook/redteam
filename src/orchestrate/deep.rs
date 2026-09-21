@@ -195,6 +195,8 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut verify_rotation = 0usize;
     // finding id → 判决：收场统一回填（判决可能在该格早已落地之后才回来）。
     let mut verdicts: std::collections::BTreeMap<String, crate::domain::Verify> = Default::default();
+    // 本轮已派过复核的 finding id（在途 + 已回来）。
+    let mut verify_seen: std::collections::BTreeSet<String> = Default::default();
     let mut verify_cells: Vec<CellRecord> = Vec::new();
     let mut verify_warnings: Vec<String> = Vec::new();
     // 复核归零时刻（`verify_tail_ms` 的右端）；无复核则恒 0。
@@ -351,6 +353,13 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                     if let Some(v) = vin.known.get(&f.id) {
                         verdicts.insert(f.id.clone(), v.clone());
                         *meta.verify_skipped.entry("resumed".into()).or_default() += 1;
+                        continue;
+                    }
+                    // 本轮按 finding id 缓存（〔D17〕Q11）：同一条被两个格各报一次（dedup 在收场才跑）时
+                    // 只验一次——重复验既是白烧一次调用，两次结论不同还要靠 dedup 的 UPHELD 优先去收拾。
+                    // 这个集合同时挡住「在途的」和「已回来的」：插不进去 = 已经有人在验或验过了。
+                    if !verify_seen.insert(f.id.clone()) {
+                        *meta.verify_skipped.entry("cached".into()).or_default() += 1;
                         continue;
                     }
                     match crate::consolidate::verify::pick_verifier(vin.roles, &members[l.member].family, verify_rotation) {
@@ -3473,6 +3482,49 @@ mod tests {
         );
         // reviewer 侧逐格四数组不被复核格挤歪
         assert_eq!((run.meta.item_wait_ms.len(), run.meta.landed_agreement.len()), (1, 1));
+    }
+
+
+    /// 本轮按 finding id 缓存（〔D17〕Q11）：同一条 finding 被两个格各报一次（dedup 在收场才跑）时只验一次。
+    /// verifier 脚本只有一轮——真发两次，第二次就会落成 upheld + warning，判决与计数都能看出来。
+    #[tokio::test]
+    async fn the_same_finding_from_two_cells_is_verified_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {\n    hot();\n}\n").unwrap();
+        let bundles = vec![Bundle::from_files(vec![FileChange {
+            path: "a.rs".into(),
+            diff: "@@ -1,3 +1,3 @@\n+fn a() {\n+    hot();".into(),
+        }])];
+        // 两项（同文件不同块）→ 两格，两格吐同一条 finding（同 file/title/quote → 同 id）
+        let same = blocking_cell("fn a() {");
+        let reg = verify_reg(
+            vec![turn(&same), turn(&same)],
+            FakeChatBackend::new(vec![turn(&verdict_json("REFUTED"))]),
+        );
+        let roles = verify_roles();
+        let known = Default::default();
+        let items = vec![snap_item("a.rs", ItemState::Pending), {
+            let mut it = snap_item("a.rs", ItemState::Pending);
+            it.id = "a.rs:rule:3-4".into();
+            it
+        }];
+        let run = run_with(Run {
+            verify: Some(vin(&roles, &known)),
+            budget: 2,
+            ..plain(&reg, dir.path(), &bundles, &items)
+        })
+        .await;
+
+        assert_eq!(run.cells.iter().filter(|c| c.output.role() == Role::Reviewer).count(), 2, "两格都跑了");
+        assert_eq!(run.findings.len(), 1, "dedup 收成一条");
+        assert_eq!(run.meta.verify_triggered, 1, "同一 id 只派一次复核");
+        assert_eq!(run.meta.verify_skipped.get("cached"), Some(&1), "{:?}", run.meta.verify_skipped);
+        assert_eq!(run.cells.iter().filter(|c| c.cell.starts_with("verify[")).count(), 1, "只落一格复核");
+        assert_eq!(
+            run.findings[0].verify.as_ref().map(|v| v.verdict.clone()),
+            Some(crate::domain::VerifyVerdict::Refuted),
+            "判决照样落到合并后的那条上"
+        );
     }
 
     /// 免验不发请求（§8.1 跳过规则）：区域共识盖了章的 finding 连 verifier 都不碰。

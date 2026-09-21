@@ -247,6 +247,8 @@ cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
   后者在「每项只交一个 reviewer」下恒 1（§6 规则 5、D13），拿它当依据等于永不免验。
 - **流式**：finding 一落地即复核，与深挖尾部重叠；复核 future 与 reviewer 格挂**同一个主循环、两个 `FuturesUnordered`**，
   共用 provider 门与等门 FIFO（§2 barrier 因此增「复核在途 0」）。跳过规则按 finding **落地时刻**的 agreement 算，后涨不回溯〔D13〕。
+  **本轮按 finding id 缓存**：同一条被两个格各报一次（dedup 在收场才跑）时只验一次，在途的也算——重复验既白烧调用，
+  两次结论不同还要靠下面的 UPHELD 优先去收拾。
 - **verifier 选择**：verifiers 活跃集（拥有 `verifier` 角色的模型）非空则从中轮转选；缺省自动：**家族 ≠ 该 finding 的 reviewer 家族**
   （`family` 缺省取 `model_id` 首段，条目可覆盖），优先 reviewers 档，其次 scanners 档；一个异族都没有 → 同族复核并在 RunMeta 与报告
   warning「无异族 verifier」。**三个角色的模型都必须进 registry**——纯 verifier 模型漏注册时 `lease()` 必然失败、
