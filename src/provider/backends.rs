@@ -944,7 +944,7 @@ pub fn thinking_warning(em: &crate::config::EffectiveModel) -> Option<String> {
         return None;
     }
     Some(format!(
-        "thinkingLevel {} 对 {} {}（kind {:?}，family {}）无参数映射，未发送；已知映射：anthropic+claude / openai+deepseek·glm·kimi·gpt-5·o 系·gemini·qwen",
+        "thinkingLevel {} 对 {} {}（kind {:?}，family {}）无参数映射，未发送；已知映射：anthropic+claude·glm / openai+deepseek·glm·kimi·gpt-5·o 系·gemini·qwen",
         level.as_str(), em.role.as_str(), em.name, em.kind, em.family
     ))
 }
@@ -1000,6 +1000,25 @@ pub(crate) fn thinking_params(
         ProviderKind::Anthropic => match class {
             "claude" => {
                 let budget: u64 = match level { Off => return Some(vec![]), Low => 2048, Medium => 8192, High => 16384 };
+                let budget = budget.min(max_tokens.saturating_sub(1024));
+                if budget < 1024 {
+                    return None;
+                }
+                Some(vec![("thinking", json!({ "type": "enabled", "budget_tokens": budget }))])
+            }
+            // GLM 走 anthropic 格式（网关把 glm-5.x 挂在 /v1/messages 上，配置里以模型级 `kind` 覆盖）：
+            // 形态同 claude 的 `thinking{enabled, budget_tokens}`——2026-09-22 探针实测网关接受（200、响应带 thinking 块）。
+            // 语义与下面 openai 的 glm 分支同口径：GLM-5.x **不可关闭**（不带参数也在按模型默认档思考，
+            // 回空 = 「按默认档」而非「关」），故 Off 按 Low 发；GLM-4.x 及未知版本 Off 真关。
+            // 注意 anthropic 口径下 `max_tokens` **含**思考 token：预算照 claude 分支夹到 `max_tokens − 1024`。
+            "glm" => {
+                let v5 = lid.starts_with("glm-5") || lid.starts_with("glm5") || family.trim().to_ascii_lowercase().starts_with("glm-5");
+                let budget: u64 = match level {
+                    Off if !v5 => return Some(vec![("thinking", json!({ "type": "disabled" }))]),
+                    Off | Low => 2048,
+                    Medium => 8192,
+                    High => 16384,
+                };
                 let budget = budget.min(max_tokens.saturating_sub(1024));
                 if budget < 1024 {
                     return None;
@@ -1678,7 +1697,23 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         assert_eq!(pairs(get(Anthropic, "claude", High, 4096)).unwrap(), r#"{"thinking":{"budget_tokens":3072,"type":"enabled"}}"#, "budget 夹到 max_tokens − 1024");
         assert_eq!(pairs(get(Anthropic, "claude", Off, 32768)).unwrap(), "{}");
         assert!(get(Anthropic, "claude", Low, 2000).is_none(), "夹后 < 1024 → 无法满足 API 约束 → 无映射");
-        assert!(get(Anthropic, "glm", Low, 32768).is_none(), "GLM anthropic 形态文档无字段 → 无映射");
+        // M21b 出口验收 D1（2026-09-22）：GLM 走 anthropic 格式也有映射了。此前按「文档无字段」判无映射，
+        // 但探针实测 glm-5.3 不带参数也在思考、网关接受 `thinking{enabled, budget_tokens}`——
+        // 「无映射」实际等于「用户配的档位被静默丢掉、只剩默认档」。
+        assert_eq!(pairs(get_id(Anthropic, "glm", "glm-5.3", High, 32768)).unwrap(), r#"{"thinking":{"budget_tokens":16384,"type":"enabled"}}"#);
+        assert_eq!(pairs(get_id(Anthropic, "glm", "glm-5.3", Medium, 32768)).unwrap(), r#"{"thinking":{"budget_tokens":8192,"type":"enabled"}}"#);
+        assert_eq!(
+            pairs(get_id(Anthropic, "glm", "glm-5.3", Off, 32768)).unwrap(),
+            r#"{"thinking":{"budget_tokens":2048,"type":"enabled"}}"#,
+            "GLM-5 不可关：Off → Low 预算（与 openai 分支同口径）"
+        );
+        assert_eq!(pairs(get_id(Anthropic, "glm", "glm-4.6", Off, 32768)).unwrap(), r#"{"thinking":{"type":"disabled"}}"#, "GLM-4.x Off 真关");
+        assert_eq!(
+            pairs(get_id(Anthropic, "glm", "glm-5.3", High, 8192)).unwrap(),
+            r#"{"thinking":{"budget_tokens":7168,"type":"enabled"}}"#,
+            "预算夹到 max_tokens − 1024（anthropic 的 max_tokens 含思考 token）"
+        );
+        assert!(get_id(Anthropic, "glm", "glm-5.3", Low, 1500).is_none(), "夹后 < 1024 → 满足不了 API 约束 → 无映射");
         assert!(get(Openai, "grok", Low, 32768).is_none() && get(Google, "gemini", Low, 32768).is_none());
     }
 
@@ -1737,6 +1772,22 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
     }
 
     /// 兼任 scanner 的 reviewer（C1-3）：注册表复用 scanner 条目，但 reviewer 自己的无映射档位照样披露、带角色名；同文案去重。
+    /// M21b 出口验收 D1：照真实配置的形状——provider 声明 openai、glm-5.3 在**模型级**覆盖成 anthropic、
+    /// 兼 reviewer 与 verifier 且都配 high——补映射之后不该再有「无参数映射，未发送」。
+    /// 修之前这条 warning 每轮都在报告里，而实际上 glm-5.3 一直按默认档思考、用户配的 high 被静默丢掉。
+    #[test]
+    fn anthropic_kind_glm_now_has_a_thinking_mapping() {
+        let cfg = crate::config::Config::from_json(r#"{"providers":{"agc":{"kind":"openai","models":{
+            "glm-5.3":{"kind":"anthropic","maxOutputTokens":32768,
+                "roles":{"reviewer":{"thinkingLevel":"high"},"verifier":{"thinkingLevel":"high"}}}}}}}"#).unwrap();
+        let roles = cfg.active_roles();
+        assert_eq!(roles.reviewers[0].kind, crate::config::ProviderKind::Anthropic, "前提：模型级 kind 覆盖生效");
+        assert!(role_thinking_warnings(&roles).is_empty(), "{:?}", role_thinking_warnings(&roles));
+        let em = &roles.reviewers[0];
+        let p = thinking_params(em.kind, &em.family, &em.id, em.thinking_level.unwrap(), em.max_tokens_effective()).unwrap();
+        assert_eq!(p[0].1, json!({ "type": "enabled", "budget_tokens": 16384 }), "high → 16384（上限 32768 − 1024 之内）");
+    }
+
     #[test]
     fn role_thinking_warnings_cover_dual_role_reviewer() {
         let cfg = crate::config::Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{

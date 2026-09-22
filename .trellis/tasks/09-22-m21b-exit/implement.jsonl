@@ -1,0 +1,3 @@
+{"file": "src/provider/backends.rs", "reason": "D1：thinking_params 增 (Anthropic, glm) 分支；对照既有 claude 分支的预算夹紧与 openai glm 分支的「GLM-5 不可关」口径"}
+{"file": "src/state/mod.rs", "reason": "D3：CellRecord 增单轮最大输出字段（serde default，旧库可读）"}
+{"file": "eval/_oracle.py", "reason": "D5：finding_score 复用 anchor_quote / overlap / load_oracle / match_entries，口径与 scan_score 同源"}
