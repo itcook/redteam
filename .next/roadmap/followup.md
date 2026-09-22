@@ -579,3 +579,15 @@ D-4 那批基线两臂皆然。修好后按同一预登记阈值、同一固定�
 配置默认值注释、`--help`、design §8.1、roadmap、research 的数字已全域同步。
 **`template_hash` 分辨不出这类 bug**：它哈希模板源文件，模板一个字没变，坏的是装配那一步——
 prompt 漂移登记表挡不住「装配漏了一步」，M21c 若要防，得哈希**渲染后的** prompt 骨架。
+
+## `provider_inflight_peak` 单看解读不了（2026-09-22，批 D dogfood 读数时暴露）
+
+报告里有 `run.provider_inflight_peak`（观测到的每 provider 在途峰值），**却没有对应的门宽**——
+于是「peak 6」到底是「门满了、后面在排队」还是「门 20 只用了 6、绰绰有余」，读报告的人分不出来。
+本批 dogfood 的 `{agc: 6, deepseek: 2, qwen: 2}` 正是两种情况各占一半（agc 门 6 满、deepseek 门 16 / qwen 门 20 闲），
+连写记录的人都把它当成门宽记了一遍，用户读到才发现。
+
+`ProviderRegistry::cap_of()` 早就有，但**没有生产消费者**（只有一个单测在用）——把它填进报告即可。
+两种形态选一：① 另加 `provider_gate_cap: BTreeMap<String, u32>`；② 把 peak 改成 `{peak, cap}` 对（破坏旧消费者）。
+倾向 ①。真正要回答的问题是「这一轮有没有被门卡住」，与之配套的还有 `item_wait_ms`（本轮两项各等 6.7 min）——
+门宽一旦进报告，「等门 6.7 min」就能一眼归因到 agc 门 6，而不必翻配置。归 M21c 或 M21e 的可观测面批次。
