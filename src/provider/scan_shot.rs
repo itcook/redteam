@@ -8,7 +8,7 @@
 
 use crate::domain::ScanOutput;
 use crate::prompt::ScanPrompt;
-use crate::provider::parse::{diagnostic_parse_error, parse_scan_output_with_stats, ScanParseStats, REPAIR_PROMPT_SCAN};
+use crate::provider::parse::{diagnostic_parse_error, dump_parse_failure, parse_scan_output_with_stats, ScanParseStats, REPAIR_PROMPT_SCAN};
 use crate::provider::tool_loop::{ChatBackend, ChatMessage};
 use crate::provider::{timed_turn_final_with, timed_turn_with, AttemptPolicy, ProviderError};
 
@@ -66,6 +66,7 @@ pub(crate) async fn run_scan_shot_with(
 
     // 首发 parse 失败：把模型的原话作为 assistant 轮回灌（模型能看见自己写了什么；anthropic 要求角色交替），再补
     // REPAIR_PROMPT_SCAN + turn_final。本轮若失败（超时 / 网络），把首发已烧的 usage 附着到错误上（T25 口径）。
+    dump_parse_failure("scan t1", &turn.text);
     let head: String = turn.text.trim().chars().take(80).collect();
     let repair_note = format!(
         "first turn parse failed (finish={}, text_len={}, head={:?}); repaired",
@@ -91,7 +92,10 @@ pub(crate) async fn run_scan_shot_with(
             iterations: 2, finish_reason: repair.finish_reason, reasoning_tokens: reasoning, repair_note: Some(repair_note),
             rate_limit_retries: 0, rate_limit_wait_ms: 0,
         }),
-        Err(_) => Err(diagnostic_parse_error(&repair).attach_usage((in_tok, out_tok, cached_tok))),
+        Err(_) => {
+            dump_parse_failure("scan t2", &repair.text);
+            Err(diagnostic_parse_error(&repair).attach_usage((in_tok, out_tok, cached_tok)))
+        }
     }
 }
 
