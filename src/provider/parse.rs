@@ -392,10 +392,63 @@ pub fn parse_review_output_with_stats(raw: &str, model: &str) -> Result<(crate::
 /// vs 其它形状违约——warnings 里能直接看出根因，而不是裸的 "no schema-valid JSON in: …"。
 pub(crate) fn diagnostic_parse_error(turn: &AssistantTurn) -> ProviderError {
     ProviderError::Parse(format!(
-        "final JSON parse failed (finish_reason={}): {}",
+        "final JSON parse failed (finish_reason={}; {}): {}",
         turn.finish_reason.as_deref().unwrap_or("unknown"),
+        json_error_detail(&turn.text),
         turn.text.chars().take(120).collect::<String>()
     ))
+}
+
+/// 解析失败的**根因**（M21b 出口验收金丝雀：3 格首轮 + 修复轮连败，原诊断只留文本头 120 字，
+/// serde 报了什么、在哪、全文多长全丢了，定不了案）。与 `extract_json_object` 同一套前处理
+/// （`</think>` 切除 + 围栏剥离），从首个 `{` 起交给 serde 严格解析，报错误原因、行列、
+/// 全文字符数，外加出错位置前后各 40 字符的片段（`{:?}` 转义，裸 tab / 换行 / `\x` 一眼可见）。
+/// 能解析（形状违约，如缺 findings）时如实说「JSON 本身合法」——根因不在语法。
+pub(crate) fn json_error_detail(raw: &str) -> String {
+    let chars = raw.chars().count();
+    let body = match raw.rfind("</think>") {
+        Some(i) => &raw[i + "</think>".len()..],
+        None => raw,
+    };
+    let body = body.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let Some(start) = body.find('{') else {
+        return format!("len={chars} chars, no '{{' found");
+    };
+    let body = &body[start..];
+    match serde_json::from_str::<Value>(body) {
+        Ok(_) => format!("len={chars} chars, JSON itself is valid"),
+        Err(e) => {
+            // serde 的行列都从 1 起；列按字节计——换算成 body 内字节偏移后取就近的字符边界
+            let line_off: usize = body.split_inclusive('\n').take(e.line().saturating_sub(1)).map(str::len).sum();
+            let mut at = (line_off + e.column().saturating_sub(1)).min(body.len());
+            while !body.is_char_boundary(at) {
+                at -= 1;
+            }
+            let before: String = body[..at].chars().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
+            let after: String = body[at..].chars().take(40).collect();
+            format!("len={chars} chars, serde: {e}; near {before:?} ⟪here⟫ {after:?}")
+        }
+    }
+}
+
+/// dev-time 仪器（M21b 出口验收，发布前拆除——CLAUDE.md「dev-time 临时仪器」例外）：设了
+/// `REDTEAM_DUMP_DIR` 才把**解析失败那一轮**的模型原文整段落盘，不设零行为。不写被评审仓库
+/// ——那可能是别人的仓，调用方自己选一个本地目录。`label` 标明是哪一格、第几轮。
+pub(crate) fn dump_parse_failure(label: &str, text: &str) {
+    if let Some(dir) = std::env::var_os("REDTEAM_DUMP_DIR") {
+        if let Err(e) = dump_to(Path::new(&dir), label, text) {
+            eprintln!("warn: REDTEAM_DUMP_DIR 落盘失败（{label}）: {e}");
+        }
+    }
+}
+
+fn dump_to(dir: &Path, label: &str, text: &str) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let safe: String = label.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.@".contains(c) { c } else { '_' }).collect();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let path = dir.join(format!("{nanos}-{safe}.txt"));
+    std::fs::write(&path, format!("# {label}\n# {}\n{text}", json_error_detail(text)))?;
+    Ok(path)
 }
 
 /// verifier 输出解析（M21b 批 D，与 `templates/verifier.md` 的 output_contract 成对）：
@@ -524,6 +577,52 @@ mod tests {
     #[test]
     fn parse_garbage_errors() {
         assert!(parse_lens_output("no json here").is_err());
+    }
+
+    /// 出口验收诊断：非法转义（Go 源码 `"\x00"` 逐字抄进 quote）——报原因、行号，片段指到出错处。
+    /// 行号按首个 `{` 起算，围栏剥掉后第 3 行；片段要落在 `\d` 附近而不是整段开头（行偏移换算对不对）。
+    #[test]
+    fn json_error_detail_names_cause_line_and_excerpt() {
+        let raw = format!("```json\n{{\n  \"a\": \"{}\",\n  \"quote\": \"canonical := x\\d + y\"\n}}\n```", "f".repeat(80));
+        let raw = raw.as_str();
+        let d = json_error_detail(raw);
+        assert!(d.contains(&format!("len={} chars", raw.chars().count())), "{d}");
+        assert!(d.contains("invalid escape") && d.contains("line 3"), "{d}");
+        let near = d.split_once("near ").map(|(_, n)| n).unwrap_or("");
+        assert!(near.contains("canonical := x"), "片段应落在出错处附近: {d}");
+        assert!(!near.contains("\\\"a\\\""), "片段不该退回到整段开头: {d}");
+    }
+
+    #[test]
+    fn json_error_detail_flags_raw_control_char_and_valid_json() {
+        let d = json_error_detail("{\"quote\": \"\tif x {\"}");
+        assert!(d.contains("control character"), "{d}");
+        assert!(d.contains("\\t"), "片段用 {{:?}} 转义，裸 tab 显形: {d}");
+        let v = json_error_detail("<think>{x}</think>{\"findings\": 1}");
+        assert!(v.contains("JSON itself is valid"), "{v}");
+        assert!(json_error_detail("no braces").contains("no '{' found"));
+    }
+
+    #[test]
+    fn diagnostic_parse_error_carries_the_detail() {
+        let turn = AssistantTurn {
+            text: "{\"q\": \"\\x00\"}".into(), tool_calls: vec![], input_tokens: 0, output_tokens: 0,
+            cached_input_tokens: 0, finish_reason: Some("end_turn".into()), reasoning_tokens: None,
+        };
+        let msg = diagnostic_parse_error(&turn).to_string();
+        assert!(msg.contains("finish_reason=end_turn") && msg.contains("invalid escape"), "{msg}");
+    }
+
+    #[test]
+    fn dump_to_writes_full_text_with_detail_and_safe_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text = format!("{{\"quote\": \"{}\\x00\"}}", "a".repeat(500));
+        let p = dump_to(&tmp.path().join("sub"), "review[svc/a.go:rule:1-9]@agc/glm-5.3 t2", &text).unwrap();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with("-review_svc_a.go_rule_1-9_@agc_glm-5.3_t2.txt"), "{name}");
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("invalid escape"), "头部带根因");
+        assert!(body.ends_with(&text), "原文整段、不截断");
     }
 
     /// 回归：思考型模型（MiniMax-M3/DeepSeek-R1）收尾轮 <think> 块含裸 '{' → 剥到 </think> 后再解析。

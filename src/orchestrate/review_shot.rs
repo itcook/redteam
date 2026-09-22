@@ -11,7 +11,7 @@ use crate::orchestrate::enrich;
 use crate::positioning::anchor_review_findings;
 use crate::prompt::ScanPrompt;
 use crate::provider::parse::{
-    diagnostic_parse_error, parse_review_output_with_stats, ReviewParseStats, REPAIR_PROMPT_REVIEW,
+    diagnostic_parse_error, dump_parse_failure, parse_review_output_with_stats, ReviewParseStats, REPAIR_PROMPT_REVIEW,
 };
 use crate::provider::stream_json::IncrementalFindings;
 use crate::provider::tool_loop::{ChatBackend, ChatMessage};
@@ -225,6 +225,7 @@ pub(crate) async fn run_review_shot_with(
         return Ok(call);
     }
 
+    dump_parse_failure(&format!("review {} {} t1", ctx.item_file, ctx.model), &turn.text);
     let head: String = turn.text.trim().chars().take(80).collect();
     let repair_note = format!(
         "first turn parse failed (finish={}, text_len={}, head={:?}); repaired",
@@ -255,6 +256,7 @@ pub(crate) async fn run_review_shot_with(
     ) {
         Ok(call) => Ok(call),
         Err(_) => {
+            dump_parse_failure(&format!("review {} {} t2", ctx.item_file, ctx.model), &repair.text);
             inc.lock().unwrap().finalize();
             Err(diagnostic_parse_error(&repair).attach_usage((usage.input, usage.output, usage.cached)))
         }
@@ -391,6 +393,40 @@ mod tests {
         assert!(err.is_err(), "两轮都失败，格作废");
         let titles: Vec<String> = rec.0.lock().unwrap().iter().map(|e| e.finding.title.clone()).collect();
         assert_eq!(titles, ["t9"], "重试轮已闭合的那条经旁路留下来了（不复位时这里是空）");
+    }
+
+    /// 出口验收诊断接线：首轮、修复轮都解析失败 → 两轮原文各落一份（t1 / t2），且整段不截断。
+    /// 进程级环境变量：并行的其他用例若恰好也解析失败会写进同一目录——按本用例独有的 model 名筛，互不干扰；
+    /// 先 remove_var 再让 tempdir 析构，窗口只有本用例的几毫秒。
+    #[tokio::test]
+    async fn parse_failures_of_both_turns_are_dumped_when_dir_is_set() {
+        let dump = tempfile::tempdir().unwrap();
+        // SAFETY: 只有 dump_parse_failure 读它；并行用例的影响见上
+        unsafe { std::env::set_var("REDTEAM_DUMP_DIR", dump.path()); }
+        let dir = tmp_file();
+        let rec = Rec(Mutex::new(Vec::new()));
+        let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+        let bad1 = format!("{{\"findings\":[{{\"quote\":\"{}\\x00\"}}]}}", "q".repeat(300));
+        let bad2 = "{\"findings\": oops}";
+        let backend = FakeChatBackend::new(vec![turn(&bad1), turn(bad2)]);
+        let mut ctx = EmitCtx::new("dump-probe-model", "alpha", 1, vec![], "svc/a.go", dir.path(), &rec);
+        let err = run_review_shot_with(&backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc).await;
+        unsafe { std::env::remove_var("REDTEAM_DUMP_DIR"); }
+
+        assert!(err.unwrap_err().to_string().contains("serde:"), "终判错误带 serde 根因");
+        let mut mine: Vec<(String, String)> = std::fs::read_dir(dump.path())
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                let name = p.file_name()?.to_string_lossy().into_owned();
+                name.contains("dump-probe-model").then(|| (name, std::fs::read_to_string(&p).unwrap()))
+            })
+            .collect();
+        mine.sort();
+        assert_eq!(mine.len(), 2, "t1 + t2 各一份: {:?}", mine.iter().map(|m| &m.0).collect::<Vec<_>>());
+        assert!(mine.iter().any(|(n, b)| n.ends_with("_t1.txt") && b.ends_with(&bad1)), "首轮原文整段落盘");
+        assert!(mine.iter().any(|(n, b)| n.ends_with("_t2.txt") && b.ends_with(bad2)), "修复轮原文落盘");
+        assert!(mine.iter().all(|(n, _)| n.contains("svc_a.go")), "标签带队列项文件");
     }
 
     #[tokio::test]
