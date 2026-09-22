@@ -429,6 +429,25 @@ mod tests {
         assert!(mine.iter().all(|(n, _)| n.contains("svc_a.go")), "标签带队列项文件");
     }
 
+    /// 出口验收金丝雀定案的端到端：首轮 quote 含裸 tab → 不走修复轮、首轮即成，且逐字锚定到 tab 缩进的源码行。
+    #[tokio::test]
+    async fn raw_tab_quote_parses_first_turn_and_anchors_to_tabbed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.go"), "func a() {\n\tx := 1\n\treturn\n}\n").unwrap();
+        let rec = Rec(Mutex::new(Vec::new()));
+        let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+        let text = "{\"findings\":[{\"severity\":\"high\",\"title\":\"t\",\"body\":\"b\",\"file\":\"a.go\",\"line_start\":2,\
+                    \"line_end\":3,\"confidence\":0.7,\"recommendation\":\"r\",\"quote\":\"\tx := 1\\n\treturn\"}],\"needs\":[]}";
+        let backend = FakeChatBackend::new(vec![turn(text)]);
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![], "a.go", dir.path(), &rec);
+        let call = run_review_shot_with(&backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc).await.unwrap();
+        assert_eq!(call.iterations, 1, "首轮即成，不烧修复轮");
+        let CellOutput::Review { findings, .. } = &call.output else { panic!() };
+        assert_eq!(findings.len(), 1, "锚定保留（quote 解出的真 tab 与源码逐字一致）");
+        assert_eq!((findings[0].line_start, findings[0].line_end), (2, 3));
+        assert_eq!(call.stats.dropped_quote, 0);
+    }
+
     #[tokio::test]
     async fn stream_then_final_does_not_double_emit() {
         let dir = tmp_file();

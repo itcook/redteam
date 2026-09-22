@@ -7,7 +7,7 @@
 
 use crate::domain::RawFinding;
 
-use super::parse::{regularize_finding, DropReason};
+use super::parse::{escape_raw_controls_in_strings, regularize_finding, DropReason};
 
 /// seek 阶段滑窗：`"findings"` 键最长 10 字节——窗口外的旧文本不可能再参与匹配，丢弃防长 think 撑爆内存。
 const SEEK_WINDOW: usize = 64 * 1024;
@@ -229,7 +229,11 @@ impl IncrementalFindings {
     /// 对象闭合：切片 → JSON 解析 → 规整 → emit；失败丢弃计数。
     fn close_object(&mut self, start: usize, end: usize) {
         let slice = &self.buf[start..end];
-        match serde_json::from_str::<serde_json::Value>(slice) {
+        // 与终态 parse 同一套宽容：串内裸控制字符（glm 抄 Go 源码的 tab）转义后再试，旁路不因此丢条目
+        let parsed = serde_json::from_str::<serde_json::Value>(slice).or_else(|e| {
+            escape_raw_controls_in_strings(slice).map_or(Err(e), |fixed| serde_json::from_str(&fixed))
+        });
+        match parsed {
             Ok(v) => match v.as_object() {
                 Some(o) => match regularize_finding(o) {
                     Ok(f) => self.emitted.push(f),
@@ -288,6 +292,19 @@ mod tests {
         for piece in text.as_bytes().chunks(chunk) {
             inc.feed(&String::from_utf8_lossy(piece));
         }
+    }
+
+    /// 旁路与终态同一套宽容：quote 里的裸 tab 不让已闭合对象被丢弃计数（出口验收金丝雀）。
+    #[test]
+    fn raw_tab_in_quote_is_emitted_not_discarded() {
+        let text = "{\"findings\":[{\"severity\":\"high\",\"title\":\"t\",\"body\":\"b\",\"file\":\"a.go\",\"line_start\":1,\
+                    \"line_end\":1,\"confidence\":0.7,\"recommendation\":\"r\",\"quote\":\"\tx := 1\"}]}";
+        let mut inc = IncrementalFindings::new();
+        feed_all(&mut inc, text, 7);
+        let got = inc.take();
+        assert_eq!(got.len(), 1, "discarded={}", inc.discarded());
+        assert_eq!(got[0].quote, "\tx := 1");
+        assert_eq!(inc.discarded(), 0);
     }
 
     /// 三 finding 分片到达 → 三次 emit；与终态 parse_review_output 聚合一致（旁路不改契约）。

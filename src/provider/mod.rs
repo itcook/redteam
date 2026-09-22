@@ -162,7 +162,12 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
         .map(std::time::Duration::from_secs)
 }
 
-pub const DEFAULT_RETRY_BUDGET: u32 = 2; // 首发 + 2 重试（bin 侧 build_registry 装 scan 条目也用它，批 F-2）
+/// 首发 + 4 重试（bin 侧 build_registry 装 scan / reviewer / verifier 条目都用它，批 F-2）。
+/// M21b 出口验收金丝雀：原 2 次重试 + 0.4 / 0.8 s 退避，一阵持续数秒的网关 503 一次打掉 11 格（每格 5–6 s 就放弃）；
+/// 抬到 4 并配 `backoff_for` 的瞬断长退避，能扛约一分钟的抖动。超时另封顶 `TIMEOUT_RETRY_CAP`。
+pub const DEFAULT_RETRY_BUDGET: u32 = 4;
+/// 超时类重试封顶：每次超时已经烧掉一整个 per-turn（最长 150 s+），不跟着预算放大。
+const TIMEOUT_RETRY_CAP: u32 = 2;
 /// 单轮默认最长等待；tool_loop 与 single_shot 共用（原各私有一份，Task 2 评审 Minor 收敛）。
 pub(crate) const PER_TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
 /// 单轮最长等待时间，env `REDTEAM_PER_TURN_SECS` 可覆盖——大上下文 bundle（40+ 文件）
@@ -176,6 +181,23 @@ pub fn per_turn_deadline() -> std::time::Duration {
 const RETRY_BACKOFF_BASE_MS: u64 = 200;
 const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
 const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+/// 网关瞬断（5xx / 断网 / 不可用）的退避：2 → 4 → 8 → 16 s，封顶 30 s。
+const TRANSIENT_BACKOFF_BASE_MS: u64 = 2_000;
+const TRANSIENT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 第 `attempt` 次失败（0 起）后等多久再发。服务端给了 `Retry-After` 就听它的（封顶）；
+/// 网关瞬断走长退避——短退避在一阵故障里几秒就把预算烧光；超时等其余错误维持原短退避（超时本身已等够久）。
+fn backoff_for(e: &ProviderError, attempt: u32) -> std::time::Duration {
+    if let Some(d) = e.retry_after() {
+        return d.min(RETRY_AFTER_CAP);
+    }
+    match e.inner() {
+        ProviderError::Server(_) | ProviderError::Network(_) | ProviderError::Unavailable(_) => {
+            std::time::Duration::from_millis(TRANSIENT_BACKOFF_BASE_MS.saturating_mul(1 << attempt.min(16))).min(TRANSIENT_BACKOFF_CAP)
+        }
+        _ => std::time::Duration::from_millis(RETRY_BACKOFF_BASE_MS << (attempt + 1).min(16)).min(RETRY_BACKOFF_CAP),
+    }
+}
 
 /// 429 排队重试的挂点（design §12.3〔D13〕）：`retry_classified_with` 在每次真正发请求前后回调（provider 门据此计在途峰值、
 /// 发「请求完成」事件），撞 429 / overloaded 时把等待与去留交给策略——不吃 2 次抖动预算。无策略 = 旧行为（429 按 Retry-After /
@@ -296,16 +318,14 @@ where
                         return Err(e);
                     }
                 }
-                if attempt >= budget || !e.is_retryable() {
+                let limit = if matches!(e.inner(), ProviderError::Timeout(_)) { budget.min(TIMEOUT_RETRY_CAP) } else { budget };
+                if attempt >= limit || !e.is_retryable() {
                     return Err(e);
                 }
-                let wait = match e.retry_after() {
-                    Some(d) => d.min(RETRY_AFTER_CAP),
-                    None => std::time::Duration::from_millis(RETRY_BACKOFF_BASE_MS << (attempt + 1))
-                        .min(RETRY_BACKOFF_CAP),
-                };
+                let wait = backoff_for(&e, attempt);
                 attempt += 1;
-                tokio::time::sleep(wait).await;
+                // 单测构建里退避缩千倍：大量用例用假后端喂 5xx，真等 2 s 起步会把全量拖慢；时长本身由 `backoff_for` 的纯函数用例钉住
+                tokio::time::sleep(if cfg!(test) { wait / 1000 } else { wait }).await;
             }
         }
     }
@@ -555,5 +575,44 @@ mod tests {
         }).await;
         assert!(matches!(r, Err(ProviderError::Network(_))));
         assert_eq!(calls.get(), 3); // budget+1
+    }
+
+    /// 出口验收（503 成片）：瞬断走 2 s 起步翻倍、封顶 30 s；超时等其余错误维持短退避；Retry-After 优先。
+    #[test]
+    fn backoff_for_transient_is_long_and_capped() {
+        use std::time::Duration as D;
+        let s = ProviderError::Server("503".into());
+        let got: Vec<D> = (0..6).map(|a| super::backoff_for(&s, a)).collect();
+        assert_eq!(got, [D::from_secs(2), D::from_secs(4), D::from_secs(8), D::from_secs(16), D::from_secs(30), D::from_secs(30)]);
+        assert_eq!(super::backoff_for(&ProviderError::Network("x".into()), 0), D::from_secs(2));
+        assert_eq!(super::backoff_for(&ProviderError::Unavailable("x".into()), 1), D::from_secs(4));
+        let wrapped = ProviderError::Server("503".into()).attach_usage((1, 1, 0));
+        assert_eq!(super::backoff_for(&wrapped, 0), D::from_secs(2), "带 usage 的包装也按内层分类");
+        assert_eq!(super::backoff_for(&ProviderError::Timeout("t".into()), 0), D::from_millis(400), "超时维持原短退避");
+        assert_eq!(super::backoff_for(&ProviderError::Timeout("t".into()), 9), D::from_secs(5));
+        let ra = ProviderError::RateLimited { retry_after: Some(D::from_secs(90)) };
+        assert_eq!(super::backoff_for(&ra, 0), D::from_secs(30), "Retry-After 优先且封顶");
+        // 预算 4 下累计等待 ≈ 30 s（再加 4 次请求本身），能扛住一阵持续数秒到半分钟的 503
+        assert_eq!((0..super::DEFAULT_RETRY_BUDGET).map(|a| super::backoff_for(&s, a)).sum::<D>(), D::from_secs(30));
+    }
+
+    /// 超时不随预算放大：预算 4 时仍只重试 2 次（每次超时已烧掉一整个 per-turn）；5xx 用满 4 次。
+    #[tokio::test]
+    async fn timeout_retries_are_capped_but_transient_uses_full_budget() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let r: Result<u32, ProviderError> = super::retry_classified_with(super::DEFAULT_RETRY_BUDGET, None, || {
+            calls.set(calls.get() + 1);
+            async move { Err::<u32, _>(ProviderError::Timeout("turn".into())) }
+        }).await;
+        assert!(matches!(r, Err(ProviderError::Timeout(_))));
+        assert_eq!(calls.get(), 1 + super::TIMEOUT_RETRY_CAP);
+        calls.set(0);
+        let r: Result<u32, ProviderError> = super::retry_classified_with(super::DEFAULT_RETRY_BUDGET, None, || {
+            calls.set(calls.get() + 1);
+            async move { Err::<u32, _>(ProviderError::Server("503".into())) }
+        }).await;
+        assert!(r.is_err());
+        assert_eq!(calls.get(), 1 + super::DEFAULT_RETRY_BUDGET);
     }
 }
