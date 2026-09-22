@@ -144,6 +144,12 @@ impl QueueItem {
         self.peak_agreement = self.peak_agreement.max(peak_agreement(&self.members, &self.member_families));
     }
 
+    /// 达成必挖轴峰值的那些疑点的行区间（批 D 的盖章面）：finding 压在这些行上才算「两家族对上的那一处」。
+    /// 旧快照（无逐条家族）算不出簇 → 空，调用方一律不盖——偏差方向是多复核，不是漏复核。
+    pub fn hot_ranges(&self) -> Vec<(u32, u32)> {
+        peak_cluster(&self.members, &self.member_families).1
+    }
+
     /// 匹配与排序用的疑点全量：到达过的成员（旧快照为空时退回渲染笔记）。
     pub(crate) fn suspicions(&self) -> &[Suspicion] {
         if self.members.is_empty() {
@@ -163,8 +169,18 @@ fn agreement_of(families: &[String]) -> u32 {
 
 /// 项内最大簇的家族数。`members` 与 `fams` 同下标；对不齐或无家族信息 → 0（调用方退回 `agreement`）。
 fn peak_agreement(members: &[Suspicion], fams: &[Vec<String>]) -> u32 {
+    peak_cluster(members, fams).0
+}
+
+/// 项内聚簇的完整产物（C3 算轴、批 D 还要簇的行范围）：
+/// `.0` = 最大簇的家族数（必挖轴）；`.1` = **达成该峰值的簇**覆盖的行区间。
+///
+/// 批 D 用后者收紧盖章：只有落在「≥2 家族真正对上的那几行」上的 finding 才配拿区域共识，
+/// 同块里 reviewer 自己新发现的另一处不该白拿免验（C3 把项放大成整个 def 之后这个口子尤其大）。
+/// 并列峰值的簇全算——并列意味着同等佐证，没有理由只认其中一个。
+fn peak_cluster(members: &[Suspicion], fams: &[Vec<String>]) -> (u32, Vec<(u32, u32)>) {
     if members.is_empty() || fams.len() != members.len() {
-        return 0;
+        return (0, Vec::new());
     }
     let n = members.len();
     let mut parent: Vec<usize> = (0..n).collect();
@@ -194,7 +210,30 @@ fn peak_agreement(members: &[Suspicion], fams: &[Vec<String>]) -> u32 {
             }
         }
     }
-    clusters.iter().map(|(_, f)| f.len() as u32).max().unwrap_or(0)
+    let peak = clusters.iter().map(|(_, f)| f.len() as u32).max().unwrap_or(0);
+    if peak == 0 {
+        return (0, Vec::new());
+    }
+    let hot: Vec<usize> = clusters.iter().filter(|(_, f)| f.len() as u32 == peak).map(|(r, _)| *r).collect();
+    let ranges = (0..n)
+        .filter(|&i| hot.contains(&uf_find(&mut parent, i)))
+        .map(|i| (members[i].line_start.max(1), members[i].line_end.max(members[i].line_start.max(1))))
+        .collect();
+    (peak, ranges)
+}
+
+/// finding 是否压在「两家族对上的那几行」上（批 D 盖章面的单一判定，事件侧与落盘侧共用）。
+/// **先比文件、再比行**：热区是某个队列项（单文件）内峰值簇的行范围，reviewer 却可以合法地报出别的文件
+/// （跨组索引、二阶段补查）——只比行号的话，`src/b.rs:11` 会因为 `src/a.rs` 的热区含第 10 行而白拿共识盖章，
+/// 从此永久免验（2026-09-21 收口评审 #2）。同源的 `scan::lines_overlap` 第一件事也是比文件。
+/// 行重叠口径复用 `LINE_GAP`（= 3），与 `same_suspicion` 同源——模型报的行号本来就有 ±1 的抖动。
+/// `hot` 为空（旧快照 / 算不出簇）→ 一律不盖：偏差方向是多复核，不是漏复核。
+pub(crate) fn in_hot_ranges(file: &str, item_file: &str, line_start: u32, line_end: u32, hot: &[(u32, u32)]) -> bool {
+    if file != item_file {
+        return false;
+    }
+    let gap = crate::consolidate::dedup::LINE_GAP;
+    hot.iter().any(|&(a, b)| line_start <= b.saturating_add(gap) && a <= line_end.saturating_add(gap))
 }
 
 fn uf_find(parent: &mut [usize], i: usize) -> usize {
@@ -1516,6 +1555,44 @@ mod tests {
 
         assert_eq!(o, EnqueueOutcome::MergedPending);
         assert_eq!(q.items().len(), 1);
+    }
+
+    /// 热区只覆盖**峰值簇**（批 D-2〔D17〕）：同项里另有单家族的疑点时，它那几行不算共识面——
+    /// 否则「一个家族随口提过」也会让压在那儿的 finding 免验。
+    #[test]
+    fn hot_ranges_cover_only_the_peak_cluster() {
+        let mut q = DeepQueue::new();
+        let b = blk("def:f1", 1, 60);
+        // 第 10 行那条被 alpha / beta 都提（峰值簇），第 40 行那条只有 gamma 提
+        q.enqueue(arr(spec_scan("a.rs", 10, 10, "let x = take(v);", "甲"), Some("alpha"), b.clone()));
+        q.enqueue(arr(spec_scan("a.rs", 11, 11, "let x = take(v);", "乙"), Some("beta"), b.clone()));
+        q.enqueue(arr(spec_scan("a.rs", 40, 40, "完全不同的一行();", "丙"), Some("gamma"), b));
+
+        let it = &q.items()[0];
+        assert_eq!(it.peak_agreement, 2);
+        let hot = it.hot_ranges();
+        assert!(hot.iter().all(|&(a, _)| a < 20), "只含峰值簇那两条: {hot:?}");
+        assert!(in_hot_ranges("a.rs", "a.rs", 10, 10, &hot) && in_hot_ranges("a.rs", "a.rs", 11, 11, &hot));
+        assert!(!in_hot_ranges("a.rs", "a.rs", 40, 40, &hot), "单家族那条不进共识面");
+        // 跨文件：行号落在热区里也不盖——热区是**这个文件**里两家族对上的那几行（收口评审 #2）
+        assert!(!in_hot_ranges("b.rs", "a.rs", 10, 10, &hot), "别的文件的 finding 不进共识面");
+    }
+
+    /// 算不出簇（旧快照无逐条家族）→ 热区空 → 调用方一律不盖：宁可多复核。
+    #[test]
+    fn hot_ranges_empty_without_per_member_families() {
+        let mut q = DeepQueue::new();
+        q.enqueue(req(spec_scan("a.rs", 3, 5, "let x = take(v);", "h"), Some("alpha")));
+        q.items[0].member_families.clear();
+        assert!(q.items()[0].hot_ranges().is_empty(), "两列长度不齐 → 算不出");
+        assert!(!in_hot_ranges("a.rs", "a.rs", 3, 5, &[]), "空热区什么都不覆盖");
+
+        // 另一条算不出的路径：两列长度齐，但家族名是空的（`item_of` 那种旧形态夹具）——
+        // 峰值为 0 时热区必须也是空，退成「整文件」等于给所有 finding 白发免验票。
+        // 注意断的是**现算**的 `hot_ranges()`：`peak_agreement` 是入队时算好的存储字段（单调不减），
+        // 手工改 `member_families` 不会动它——两者本就不是一回事。
+        q.items[0].member_families = vec![Vec::new()];
+        assert!(q.items()[0].hot_ranges().is_empty(), "峰值 0 → 热区空，不得退成整文件");
     }
 
     /// 文档判定就是阶段 0 那把尺（评审）：`.json` / `.yaml` 在 R 分母里已经不算代码行，排序侧不该另有一套；

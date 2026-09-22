@@ -1,4 +1,4 @@
-use crate::domain::{Finding, Severity, Verdict, VerifyVerdict};
+use crate::domain::{Finding, Severity, Verdict};
 
 /// reject 当存在 finding severity ≥ block_threshold 且 confidence ≥ conf_floor。
 pub fn compute_verdict(
@@ -17,7 +17,7 @@ pub fn blocking_count(findings: &[Finding], block_threshold: Severity, conf_floo
             f.severity >= block_threshold
                 && f.confidence >= conf_floor
                 // 实质修复（carry-to-S4 ①）：被证伪的 finding 永不 blocking，不靠 confidence 数值。
-                && f.verify.as_ref().is_none_or(|v| v.verdict != VerifyVerdict::Refuted)
+                && !f.is_refuted()
                 && !f.previously_dismissed // R8.2：人已驳回 → 不 blocking（证据保留）
         })
         .count()

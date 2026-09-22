@@ -1,0 +1,4 @@
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "逐条对照 §8.1：触发集是否只认 severity ≥ block ∧ confidence ≥ floor、跳过三条是否都落地且分类可读、异族选择的优先序与「无异族 → 同族 + warning」、REFUTED 归零永不 blocking、失败保守 upheld；§2 的 barrier 是否真等复核在途归零"}
+{"file": ".trellis/tasks/09-10-m21b-verifier/design.md", "reason": "本批自己的定案表（§12 Q1–Q11）与十二条测试形状：盖章收紧、判决合并 UPHELD 优先、计数剔除、逐条格记录与 resume 不重验、预登记阈值——每条都该有用例或明确留债"}
+{"file": ".next/roadmap/followup.md", "reason": "本批账目：旁路复位那条前置债是否结清；「Finding 的两根 agreement 轴」里的两个批 D 决策点是否都有答案并写回；C3 留的四条账有没有被顺手带坏"}
+{"file": ".trellis/tasks/archive/2026-09/09-20-m21b-deep-stability/implement.md", "reason": "C3 的语义基线：结构定项与两轴共识、分层排序、每文件保底一格、needs 入队——本批只加复核一路，这些必须零行为 diff（退化零差基线同构是哨）"}

@@ -1,4 +1,4 @@
-# redteam 评审引擎·风险路由 DAG 架构（M21 · v12）
+# redteam 评审引擎·风险路由 DAG 架构（M21 · v13）
 
 > 状态: **锁定**（**键名勘误 2026-09-10**：正文 TOML / snake_case 配置残留统一为 §12.1 JSON camelCase，无语义变化，不升版；
 > v8，2026-09-07，P0 验证门出口〔D11〕：E1 风险规则 v4 成立、E3 疑点契约成立；§3.3 / §4 / §6 / §12.1 / §16 / §17 按 D11 改；
@@ -10,7 +10,11 @@
 > §6 规则 2 / 3 / 6、§8.4、§12.3、§17 R14 对应改；
 > **v12 2026-09-20〔D16〕深挖选项稳定性**：结构定项（项身份 = 同文件 ∧ 同稳定块：代码取 enclosing def、文档取标题节、其余退行带）、
 > 共识两轴（项内 `peak_agreement` 定必挖、区域级 `agreement` 进排序）、分层排序键接风险档与每文件保底一格、reviewer 笔记去自评置信、
-> scanner needs 接线（仅变更集内）；§6 规则 1 / 2 / 3 与可观测面、§7 对应改）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；
+> scanner needs 接线（仅变更集内）；§6 规则 1 / 2 / 3 与可观测面、§7 对应改；
+> **v13 2026-09-21〔D17〕verifier 流式复核接线与开关裁定**：复核挂进深挖主循环（两个 `FuturesUnordered`、共用门与等门 FIFO、
+> barrier 等复核归零、不打 `Phase::Verify`）、免验盖章收紧到 peak 簇行范围、逐条 verifier 格记录 + resume 不重验、
+> 判决合并 UPHELD 优先、refuted 留记录剔计数；离线基线两臂按预登记阈值裁定 `verifiers.enabled` **缺省关**；
+> §2 / §8.1 / §6 可观测面对应改）· 派生 plan：M21a `../plans/2026-09-07-redteam-m21a-scan-foundation-plan.md`（2026-09-08）；
 > M21b `../plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md`（2026-09-10）；M21c-e 待产出。
 > v5（2026-09-05 grill〔D7〕：角色命名 scanner / reviewer / verifier；配置节 §12 重写为用户级唯一 TOML；
 > 无候补；verifier 流式化 + 数据判决；provider 在途上限；aacr-bench 退役至 M21c / M21e 重启）。
@@ -76,7 +80,9 @@
 ```
 
 **墙钟 = max(最慢 scanner cell, 队列排空) + 最后一条复核；队列排空 ≈ ceil(K / reviewer 各 provider 门宽之和) × 单项时长，K 由预算封顶〔D13〕。**
-复核与深挖尾部重叠，不再是独立阶段。
+复核与深挖尾部重叠，不再是独立阶段——故**不打 `Phase::Verify`**（会让 `status` 说谎），尾部时长由
+`verify_tail_ms`（队列排空 → 复核归零）披露〔D17〕。实现上复核与格是同一主循环里的两个 `FuturesUnordered`，
+共用 provider 门与等门 FIFO。
 
 原则：scanner 是静态 fan-out、纯生产者；reviewer 是动态队列消费者池；verifier 是 finding 流的消费者；barrier 只为
 dedup 与报告。LLM 在每个节点只做「声明」（疑点 / needs / finding / 判决），所有「完成」（排序、预算、分派、合并、截断）
@@ -196,7 +202,10 @@ diff 外只计 `needs_out_of_diff`——不在变更集的文件装不出证据�
 
 可观测面（cell/phase 已有框架）：队列深度、入队原因分布、去重命中数、预算截断数、台账落入数、项等待时长、派发时 / 落地时 agreement〔D13〕；
 收场时刻、首次派发时刻、深挖排空时刻、复核尾部、扫描期派发数、收场剩余预算、拆簇数、填门循环阻塞时长〔D15〕；
-疑点到达数、疑点项数（两者之比 = 结构化合并的压缩比）、候选 / 选中文件数、单文件最大占格〔D16〕。
+疑点到达数、疑点项数（两者之比 = 结构化合并的压缩比）、候选 / 选中文件数、单文件最大占格〔D16〕；
+复核触发数、跳过分布（`not_triggered` / `disabled` / `carried` / `precedent` / `consensus` / `resumed` / `no_verifier`）、
+被驳回条数与 `refute_rate = 驳回 / 触发`（分母只含真发出去验了的）〔D17〕——前三项与 `verify_tail_ms` 同挂 `meta.deep`，
+判决产生在深挖循环里；`refute_rate` 在 RunMeta 顶层，没触发过复核则不产键。
 实现落点：tokio mpsc + 单派发器（按各 reviewer provider 门空位弹出最高优先项，不设 worker 数〔D13〕），scanner cell 为 sender、reviewer cell 为 receiver，复用现有 cell 抽象；reviewer
 cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 
@@ -226,20 +235,40 @@ cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
 
 ## 8. 复核 · reduce · 台账 · 增量轮 · coverage
 
-### 8.1 verifier 流式复核（怀疑者立场）〔D7〕
-- **触发集**：`severity ≥ block ∧ confidence ≥ floor` 的 finding（blocking）、以及命中判例变体的 finding。低危不触发。
-- **跳过**：该 finding 的区域被**两个不同家族的 scanner** 独立标记（疑点 agreement ≥ 2）且由 reviewer 确认——三方一致才
-  免验；carried 项（出生轮已复核）；精确 id 已在台账者。
-- **流式**：finding 一落地即复核，与深挖尾部重叠；跳过规则所需的 agreement 与判例匹配均可单条计算，不需 barrier。跳过规则按 finding **落地时刻**的
-  agreement 算，后涨不回溯〔D13〕。
-- **verifier 选择**：verifiers 活跃集（拥有 `verifier` 角色的模型）非空则从中选；缺省自动：**家族 ≠ 该 finding 的 reviewer 家族**（`family` 缺省取
-  `model_id` 首段，条目可覆盖），优先 reviewers 档，其次 scanners 档；一个异族都没有 → 同族复核并在 RunMeta 与报告
-  warning「无异族 verifier」。
+### 8.1 verifier 流式复核（怀疑者立场）〔D7, D17〕
+- **缺省关**（`review.verifiers.enabled = false`，〔D17〕Q6 按预登记阈值裁定）：接线、观测、落盘全部在场，要开显式写 `"enabled": true`。
+  裁定依据见本节末「去留由数据决定」。
+- **触发集**：`severity ≥ block ∧ confidence ≥ floor` 的 finding（= `verdict::blocking_count` 同一谓词）、以及命中判例变体的
+  finding（M21c 空槽）。低危不触发。
+- **跳过**（四类，各自记账）：① 该 finding **所在的那几行**被两个不同家族的 scanner 独立标记（`suspicion_agreement ≥ 2`）；
+  ② carried 项（出生轮已复核）；③ 精确 id 已在台账（M21c 空槽）；④ 开关关。
+  「所在的那几行」= 队列项内 **peak 簇**（家族数最大的那一簇）成员疑点的行范围并集〔D17〕Q2：C3 起项 = 整个 def / 标题节，
+  按格盖章会把 reviewer 自己新发现的另一处也送进免验集。读的是**区域轴** `suspicion_agreement`，不是模型轴 `agreement`——
+  后者在「每项只交一个 reviewer」下恒 1（§6 规则 5、D13），拿它当依据等于永不免验。
+- **流式**：finding 一落地即复核，与深挖尾部重叠；复核 future 与 reviewer 格挂**同一个主循环、两个 `FuturesUnordered`**，
+  共用 provider 门与等门 FIFO（§2 barrier 因此增「复核在途 0」）。跳过规则按 finding **落地时刻**的 agreement 算，后涨不回溯〔D13〕。
+  **本轮按 finding id 缓存**：同一条被两个格各报一次（dedup 在收场才跑）时只算一次，在途的也算——重复验既白烧调用，
+  两次结论不同还要靠下面的 UPHELD 优先去收拾。判定发生在触发 / 跳过分类**之前**，故四个计数同分母：
+  触发 + Σ跳过 = 本轮见过的**不同** finding 数。
+- **verifier 选择**：verifiers 活跃集（拥有 `verifier` 角色的模型）非空则从中轮转选；缺省自动：**家族 ≠ 该 finding 的 reviewer 家族**
+  （`family` 缺省取 `model_id` 首段，条目可覆盖），优先 reviewers 档，其次 scanners 档；一个异族都没有 → 同族复核并在 RunMeta 与报告
+  warning「无异族 verifier」。**三个角色的模型都必须进 registry**——纯 verifier 模型漏注册时 `lease()` 必然失败、
+  每条复核静默落成保守 upheld（D-4 实测暴露）。
 - **动作**：finding + ±60 行快照（骨架中档）+ 相关判例 + spec 段 → `REFUTED | UPHELD` 加一句理由；prompt 字段序
-  **analysis 先于 verdict**。refuted → confidence 归零、永不 blocking；upheld → 原样；调用失败 → 保守 upheld + warning。
-- **去留由数据决定**：`review.verifiers.enabled = true`；RunMeta 记每轮 blocking finding 的 refute 率；dogfood 数轮后
-  refute 率接近零则关默认（铁律 1）。
-- 提示词 = 共享头 + verifier 角色尾（§10.7）；离线回归集 = proj.db 已 dismissed（已知假阳）与 upheld（已知真）findings。
+  **analysis 先于 verdict**。refuted → 不计数、永不 blocking（记录仍在 `findings` 数组里，带 `verify` 字段，供审计与台账回流）；
+  upheld → 原样；调用失败 / 判决读不懂 → **保守 upheld + warning**，不设 repair 轮（契约只三个字段，读不懂多半是没守约）。
+- **落盘与 resume**：每条 finding 一条 verifier 格（cell id `verify[<finding id>]@<model>`，`CellOutput::Verify` 单条
+  `VerifyEntry`）。resume 按 finding id 回填**已有判决、不重验**——同一条两次复核可能给出不同结论，重验会让 resume 前后判决翻转。
+  已知缺口：往轮**没验完**的（格成功、复核被 kill）本轮不补验（项已 Settled、无派发点），方向保守 = 没判决照拦。
+- **判决合并**（`dedup::merge_into`，复核跑在 dedup 之前）：**UPHELD 优先**，base 无判决则继承 other，合并后 REFUTED 则
+  confidence 归零。方向与验收门槛一致——误驳（静默删掉真缺陷）比漏驳危险得多。
+- **去留由数据决定**：阈值**跑前预登记**（误驳 ≤ 5% ∧ 驳回 ≥ 30% → 默认开）。2026-09-21 两臂离线基线（本仓人裁台账，各 41 条）：
+  异族 `deepseek-flash` 驳回 31.2% / 误驳 12.0%，同族 `glm-5.3` 18.8% / 8.0% —— 两臂都栽在误驳上 → **默认关**。
+  数据只支持「**异族驳回更多**」（31% vs 19%）；误驳两臂差 1 条、区间重叠，分不出高下——
+  上面的异族选择依据是**独立性先验**，不是本仓数据。数字与归因见
+  `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`；口径与残余见〔D17〕。
+- 提示词 = 共享头 + verifier 角色尾（§10.7）；离线回归集 = proj.db 已 dismissed（已知假阳）与 upheld（已知真）findings，
+  评分器 `eval/verify_score.py` + 只读子命令 `verify-once`（产品同一份 prompt / provider / 解析）。
 
 ### 8.2 reduce（已有零件，零改动）
 dedup（title jaccard + quote 行重叠）→ 判例台账 → 报告 → carry 重锚定进增量轮。层② positioning 砍编造照旧。

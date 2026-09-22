@@ -375,6 +375,15 @@ C1 已留好 `DeepInput.incoming` 入队通道与「通道关闭」barrier，本
 
 ## 批 D · verifier 流式段（`feat/m21b-verifier`，Trellis `m21b-verifier`；前提 C3 已合回——2026-09-15 批序定案〔D15〕）
 
+> **实际执行（2026-09-21，`/grilling` 十一问〔D17〕后）**：下面的 D-1…D-5 是拷问前的原始拆法，**权威版以
+> decisions D17 + design v13 §8.1 为准**，逐步清单见 Trellis 任务 `09-10-m21b-verifier/implement.md`。主要出入：
+> ① 旁路复位（`attempt_begin`）并进 D-1，它是后面每一步的地基；② D-2 增「盖章收紧到 peak 簇行范围」（C3 放大项之后
+> 按格盖章等于白送免验）；③ D-3 的接线是深挖主循环里的第二个 `FuturesUnordered`，**不打 `Phase::Verify`**
+> （复核与深挖交织、不构成独立阶段），三个计数挂 `DeepMeta` 而非 RunMeta，`refute_rate` 定义收紧为 驳回 ÷ 触发；
+> ④ D-4 的调用出口是只读子命令 `verify-once`（产品同一份 prompt / provider / 解析），固定集 111 行里可用 41 条
+> （四类排除逐条可审计），按**预登记**阈值裁定 `verifiers.enabled` **缺省关**；⑤ D-5 的评审用 `/code-review` 而非 ship
+> （M21 期间既定）。
+
 ### Task D-1 `verifier.md` 拆分
 - Add: `src/prompt/templates/verifier.md`（从 `adversarial-refute.md` 拆 verifier 角色尾：`analysis` 先于 `verdict` 且「不可撤回」；
   「找出这条 finding 不成立的证据」；输出契约 `REFUTED | UPHELD` + 理由 + analysis；共享头沿用）。

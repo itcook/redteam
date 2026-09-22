@@ -38,9 +38,11 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// 被驳回的不计数（批 D〔D17〕Q9）：`verdict` 已经不认它们（confidence 归零、永不 blocking），
+    /// 报告头条数字也不该认——两处口径必须一致。记录仍留在 `findings` 数组里（带 `refuted` 标注）供审计与 M21c 台账回流。
     pub fn from_findings(fs: &[Finding]) -> Self {
         let mut s = Stats::default();
-        for f in fs {
+        for f in fs.iter().filter(|f| !f.is_refuted()) {
             match f.severity {
                 Severity::Critical => s.critical += 1,
                 Severity::High => s.high += 1,
@@ -254,7 +256,10 @@ pub struct RunMeta {
     /// v4（D13）：每 provider 的 429 收敛记录——只含本轮撞过 429 的 provider；空不序列化（旧消费者零噪音）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_rate_limit: BTreeMap<String, RateLimitMeta>,
-    /// v4：本轮 blocking finding 的 refute 率（design §8.1「去留由数据决定」，M21b 填）。None = 无 verifier 段。
+    /// v4：本轮复核的驳回率 = `verify_refuted / (verify_triggered − verify_failed)`（design §8.1「去留由数据决定」）。
+    /// 分母只含**真跑成了的**条数：被跳过的（区域共识 / carried / 判例 / 开关关）从没给过 verifier 机会，
+    /// 没跑成的（provider 挂了 / 判决读不懂）也没给出过证据——两类进分母都只会冲淡率。
+    /// None = 本轮没有任何一条真跑成的复核（不拿 0 冒充「验了没驳回」）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refute_rate: Option<f32>,
     /// ship 循环的测试命令：`--test-command` 覆盖，否则 `project::infer_test_command` 推断；推不出 None
@@ -304,6 +309,23 @@ pub struct DeepMeta {
     /// 复核尾部（批 D 前恒 0）。
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub verify_tail_ms: u64,
+    // ── 批 D-3 复核观测（design §8.1〔D17〕）：判决在深挖循环里产生，故与 verify_tail_ms 同层；为零不序列化 ──
+    /// 进了复核的 finding 数（触发且未被跳过）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub verify_triggered: u32,
+    /// 跳过分布：`not_triggered` / `disabled` / `carried` / `precedent` / `consensus`
+    /// ——「没触发」与「触发了被免验」必须分得开，否则「复核为什么没跑」无从归因。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub verify_skipped: BTreeMap<String, u32>,
+    /// 被驳回条数（`Stats` 与 `verdict` 剔除的正是这批）。注意它数的是**本轮 verifier 给出的驳回判决**，
+    /// 不等于「报告里少了几条」：dedup 可能把一条 REFUTED 与一条 UPHELD 并成 upheld（UPHELD 优先），
+    /// resume 沿用往轮判决时也不进这个计数（记 `verify_skipped["resumed"]`）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub verify_refuted: u32,
+    /// 派出去了但**没跑成**的条数（lease 失败 / 调用失败 / 判决读不懂）：判决按保守 upheld 收，
+    /// 但它们不是证据——`refute_rate` 的分母要减掉它们，否则「verifier 全挂」会读成「验了 N 条一条没驳」。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub verify_failed: u32,
     /// 收场前派出的格数（扫描期额度 K − F 下，非必挖项受限）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub scan_phase_dispatched: u32,
@@ -401,6 +423,18 @@ mod tests {
     fn stats_counts_by_severity() {
         let s = Stats::from_findings(&[f(Severity::High), f(Severity::High), f(Severity::Low)]);
         assert_eq!((s.high, s.low, s.total), (2, 1, 3));
+    }
+    /// 被驳回的不计数（批 D〔D17〕Q9）：`verdict` 已经不认它们，报告头条数字也不该认——
+    /// 两处口径不一致时，用户会看到「2 个 high」却拿到 Approve。记录仍在 `findings` 数组里。
+    #[test]
+    fn stats_exclude_refuted_findings() {
+        let verdict = |v: VerifyVerdict| Some(Verify { verdict: v, model: "p/v".into(), note: String::new() });
+        let mut refuted = f(Severity::High);
+        refuted.verify = verdict(VerifyVerdict::Refuted);
+        let mut upheld = f(Severity::High);
+        upheld.verify = verdict(VerifyVerdict::Upheld);
+        let s = Stats::from_findings(&[refuted, upheld, f(Severity::Low)]);
+        assert_eq!((s.high, s.low, s.total), (1, 1, 2), "驳回的那条既不计 high 也不计 total");
     }
     /// C2 观测字段为零不产键、旧报告（无这些键）照读（design C2 §12 兼容）。
     #[test]

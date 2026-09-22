@@ -1,26 +1,41 @@
+//! verifier 判定层（M21b 批 D-2，design §8.1〔D17〕）：**零 provider 调用**——
+//! 谁该被复核（触发集）、谁可以免验（跳过四类）、交给谁复核（异族选择）。
+//! 真正的调用与流式消费在批 D-3 接进深挖主循环。
+//!
+//! 批 D 之前这里是 pre-M21 的批式 refute（`verify_findings(&dyn ReviewProvider, …)`），
+//! 在 M21 路径上从未接线（只剩 `pub use` 与自测在引用）——本批按新架构重写，
+//! 只留下仍成立的两个零件：现场快照 `source_snippet` 与判例机械预筛 `matches_precedent`。
+
+use crate::config::{EffectiveModel, RoleSets};
 use crate::consolidate::dedup::{quote_overlap, title_jaccard};
 use crate::db::DismissCard;
-use crate::domain::{Finding, Severity, Verify, VerifyVerdict};
+use crate::domain::{Finding, Severity};
 use crate::diffsym::{compile_defs, lang_for};
 use crate::pack::skeleton_of;
-use crate::prompt::{build_refute_prompt, render_precedents};
-use crate::provider::{LensRequest, ReviewProvider};
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 /// refute 现场源码段窗口半径（行）与字节帽（design Task 2，E7：refute 复审零 pack 裸奔重读
 /// 全文件，解剖实测 14 调用/趟——注入声称位置的快照给它一个起点，不代替它自行验证）。
+#[allow(dead_code)] // D-3 接线前无生产调用方
 const SNIPPET_WINDOW: usize = 60;
+#[allow(dead_code)] // D-3 接线前无生产调用方
 const SNIPPET_BYTE_CAP: usize = 24_000;
 /// 读入帽：与本仓读路径基线对齐（tools::read_one=64KB / do_read_files=128KB /
 /// positioning::safe_read=512KB，I2/T2）——对抗式威胁模型含「恶意 PR 塞大文件」，
 /// refute 这条新读路径不得重开无界读的口子。
+#[allow(dead_code)] // D-3 接线前无生产调用方
 const SNIPPET_READ_MAX_BYTES: usize = 512 * 1024;
 /// 骨架中档触发帽（Task 6, E8-F；T48 后语义变化——表2-4，M18批2）：内容 > 64KB 且语言
 /// 受支持时先试骨架；64KB 帽以下与骨架未命中/超帽的情形统一走下方 ±60 行窗（不再对
 /// ≤64KB 文件整篇回退，line_start/end 全路径都被用上）。
+#[allow(dead_code)] // D-3 接线前无生产调用方
 const SNIPPET_FULL_FILE_CAP: usize = 64_000;
+#[allow(dead_code)] // D-3 接线前无生产调用方
+/// 读不到证据时的占位符（读守卫拒绝时调用方也用它——同一句话，模型看到的形状一致）。
+pub(crate) fn snippet_unavailable() -> &'static str {
+    SNIPPET_UNAVAILABLE
+}
+
 const SNIPPET_UNAVAILABLE: &str = "(source unavailable — judge from the finding's quote alone and weigh confidence accordingly)";
 
 /// finding 声称位置的工作树快照：内容 ≤64KB、或受支持语言的骨架未命中/超帽，统一走
@@ -30,6 +45,7 @@ const SNIPPET_UNAVAILABLE: &str = "(source unavailable — judge from the findin
 /// M18 表2-4）→ clamp 到 `[1,n]` 且头部注记，不再占位吞证据；文件读不到 / 为空 / 命中读帽
 /// 且窗口伸进未读部分 → 仍统一占位——skeptic 不得被喂假装"已验证"的空内容，占位显式
 /// 指示它自行用工具读。
+#[allow(dead_code)] // D-3 把它接进复核 prompt 前，只有自测在用
 pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
     // 有界读取（镜像 tools::read_one 的 I2/T2 模式）：最多 512KB+1 字节进内存，
     // +1 用于区分「文件恰好帽长」与「命中帽被截」。非 UTF-8（含帽边界劈开多字节字符）→ 占位。
@@ -114,29 +130,11 @@ pub(crate) fn source_snippet(root: &Path, f: &Finding) -> String {
     out
 }
 
-/// T43 层①：refute structured-output parse 失败（repair 重试后仍失败）的前缀嗅探。
-/// provider 的 Parse 错误携带原始输出前 120 字符（diagnostic_parse_error）——refute 契约的
-/// verdict 前缀（REFUTED/UPHELD）在头部，JSON 包装失败通常不吞语义。只嗅 strip 包装后的
-/// 头部前缀，不做全文词搜——refute 散文里 "would be REFUTED if" 会误判。嗅不出 → None，
-/// 交层③兜底（保守 Upheld 保 blocking 力：假 approve 吞真问题是 r1 20260703 老事故方向）。
-fn sniff_refute_verdict(parse_msg: &str) -> Option<VerifyVerdict> {
-    // diagnostic 格式 "…(finish_reason=…): <原文>"——固定前缀先于原文出现，取第一个 "): " 之后。
-    let raw = &parse_msg[parse_msg.find("): ")? + 3..];
-    let stripped = raw.trim_start_matches(['*', '#', '`', '"', '\'', ' ', '\n']);
-    let lower: String = stripped.chars().take(24).collect::<String>().to_lowercase();
-    if lower.starts_with("refuted") {
-        Some(VerifyVerdict::Refuted)
-    } else if lower.starts_with("upheld") || lower.starts_with("claim upheld") {
-        Some(VerifyVerdict::Upheld)
-    } else {
-        None
-    }
-}
-
 /// 机械预筛（design 2026-07-03 #3）：finding 是否疑似某活跃判例的主题变体。
 /// 召回优先（阈值宽）、精判交 refute（判例注入的 skeptic 终审）——机械匹配对
 /// 换措辞天然半盲，它只负责把候选送进 refute，不做终审。
 /// 精确 id 命中不算（那是 mark_dismissed 豁免的职责，refute 纯浪费）。
+#[allow(dead_code)] // 判例变体触发是 M21c 的空槽，届时由 `decide` 调用
 fn matches_precedent(f: &Finding, c: &DismissCard) -> bool {
     if f.id == c.id {
         return false;
@@ -145,185 +143,127 @@ fn matches_precedent(f: &Finding, c: &DismissCard) -> bool {
     (f.file == c.file && t >= 0.25) || t >= 0.5 || quote_overlap(&f.quote, &c.quote) >= 0.5
 }
 
-/// 选交叉 model：第一个不在 finding.models 里的；没有则退化用 models[0]（自审）。
-fn pick_cross_model<'a>(models: &'a [String], finding_models: &[String]) -> Option<&'a str> {
-    models
-        .iter()
-        .find(|m| !finding_models.contains(m))
-        .or_else(|| models.first())
-        .map(|s| s.as_str())
+/// 一条 finding 的复核决定（进 RunMeta 的跳过分布——「没触发」与「触发了被免验」必须分得开）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyDecision {
+    /// 该验。
+    Verify,
+    /// 低危 / 低置信：`verdict` 层本就不认它，复核它纯烧 token 无裁决增益。
+    SkipNotTriggered,
+    /// `review.verifiers.enabled = false`（全局关）。
+    SkipDisabled,
+    /// carried：出生轮已复核过。
+    SkipCarried,
+    /// 精确 id 已在驳回台账——那是豁免的职责，再验纯浪费。
+    SkipPrecedent,
+    /// 两个家族的 scanner 独立标记了这条 finding 所在的那几行，且 reviewer 产出了它（§8.1 三方一致）。
+    SkipConsensus,
 }
 
-/// 对单条孤证做 refute：选交叉 model → build_refute_prompt → provider.run。
-/// 返回 (Verify, 可选 warning, usage)：空 findings=Upheld、非空=Refuted；调用失败=保守 Upheld
-/// 且携带 warning——验证层静默失效必须可观测（dogfood 20260703 r1：4/6 refute 失败零告警）。
-/// usage=(input,output,cached)：无模型/调用失败时为 (0,0,0)（T03：refute 趟 token 曾被丢弃，未入任何账）。
-async fn refute_one(
-    provider: &dyn ReviewProvider, finding: &Finding, models: &[String], root: &Path,
-    precedents: &[DismissCard], spec_docs: &str,
-) -> (Verify, Option<String>, (u64, u64, u64)) {
-    let model = match pick_cross_model(models, &finding.models) {
-        Some(m) => m.to_string(),
-        None => return (
-            Verify { verdict: VerifyVerdict::Upheld, model: String::new(), note: "no model".into() },
-            None,
-            (0, 0, 0),
-        ),
-    };
-    let notes = render_precedents(finding, precedents);
-    let ctx = source_snippet(root, finding);
-    let prompt = build_refute_prompt(finding, &notes, &ctx, spec_docs);
-    match provider.run(LensRequest { route_key: model.clone(), prompt }).await {
-        Ok(call) => {
-            let (verdict, note, contract_warn) = classify_refute(&call.findings);
-            let warn = contract_warn.map(|w| format!("refute [{}] model {model}: {w}", finding.id));
-            let usage = (call.input_tokens, call.output_tokens, call.cached_input_tokens);
-            (Verify { verdict, model, note }, warn, usage)
+impl VerifyDecision {
+    /// RunMeta 里的分类键（跳过原因分布）。
+    pub fn reason(self) -> &'static str {
+        match self {
+            VerifyDecision::Verify => "verify",
+            VerifyDecision::SkipNotTriggered => "not_triggered",
+            VerifyDecision::SkipDisabled => "disabled",
+            VerifyDecision::SkipCarried => "carried",
+            VerifyDecision::SkipPrecedent => "precedent",
+            VerifyDecision::SkipConsensus => "consensus",
         }
-        // 保守：refute 调用失败不冤枉 finding（保留其 blocking 力），但失败必须进 warnings。
-        // T43 层①：Parse 失败先嗅原文头部 verdict 前缀（层② repair 重试已由 tool_loop 内建——
-        // 覆盖 FINALIZE 收尾轮与 toolless 默认路径首轮直出两条 parse 失败分支，Fix 4：final-review）。
-        Err(e) => {
-            // T25 附带修复：`ProviderError::WithUsage` 包装后 `&e` 直接按变体分派会漏判——
-            // 用 `.inner()` 见穿包装取内层真实变体，嗅探逻辑不受影响。
-            let sniffed = match e.inner() {
-                crate::provider::ProviderError::Parse(msg) => sniff_refute_verdict(msg),
-                _ => None,
-            };
-            match sniffed {
-                Some(verdict) => {
-                    let warn = format!("refute [{}] model {model}: parse failed, verdict sniffed from raw prefix: {e}", finding.id);
-                    (Verify { verdict, model, note: "sniffed from unparsed refute output".into() }, Some(warn), (0, 0, 0))
-                }
-                None => {
-                    let warn = format!("refute [{}] model {model}: {e}", finding.id);
-                    (Verify { verdict: VerifyVerdict::Upheld, model, note: "refute unavailable".into() }, Some(warn), (0, 0, 0))
-                }
-            }
-        }
+    }
+    pub fn is_verify(self) -> bool {
+        self == VerifyDecision::Verify
     }
 }
 
-/// targeted refute 目标集（单一真相源：verify_findings 执行与 phase 打点的 targets 数共用，
-/// 防两处筛选逻辑漂移）。层③：孤证 blocking 或预筛命中判例变体；精确 id 在台账者除外。
-/// M13：origin=carried 不进 targets——出生轮已过孤证 refute 与判例预筛。
-/// `floor`（表2-3，M18批2/decisions Q4）：仅孤证 blocking 分支加 `confidence >= floor`——
-/// 低于 floor 的孤证在 verdict 层本就永不 blocking（`verdict::compute_verdict` 的 conf_floor
-/// 语义），refute 复核它纯烧 LLM 无裁决增益。判例预筛分支**有意不门**：变体压制语义（跨轮
-/// 一致驳回）+ refuted 标记披露价值 + 命中率低成本可控。floor=0 时与现状全等（零默认行为变化）。
-pub fn refute_targets(
-    findings: &[Finding],
+/// 触发集与跳过规则的单一真相源（design §8.1）。
+///
+/// **触发** = `severity ≥ block_threshold ∧ confidence ≥ floor`——与 `verdict::compute_verdict` 同源：
+/// 「会让本轮 reject 的那批 finding」正是「值得花一次复核的那批」。判例变体触发是 M21c 的空槽。
+///
+/// **跳过**按固定序判，因为分类要能解释清楚：先看是否根本没触发（那不算被跳过），
+/// 再看全局开关，然后是 carried / 台账精确命中，最后才是区域共识。
+///
+/// 区域共识读的是 `suspicion_agreement`（**批 D-2 起是项内轴 + 热区收紧后的值**，见 `EmitCtx`），
+/// 不是 `agreement`——后者是「几个模型认同这条 finding」，单 reviewer 配置下恒为 1，拿它当免验依据等于永不免验。
+///
+/// 与 pre-M21 的 refute 层①有意不同：那时「模型轴 agreement ≥ 2」也免验；§8.1 没有这一条，本批不带进来
+/// （M21b 一项只交一个 reviewer，模型轴 ≥ 2 只在 dedup 合并跨格同一 bug 时出现，稀少且不属于 §8.1 的三方一致）。
+pub fn decide(
+    f: &Finding,
     precedents: &[DismissCard],
     block_threshold: Severity,
     floor: f32,
-) -> Vec<usize> {
-    let exact_ids: std::collections::HashSet<&str> = precedents.iter().map(|c| c.id.as_str()).collect();
-    findings
+    enabled: bool,
+) -> VerifyDecision {
+    if f.severity < block_threshold || f.confidence < floor {
+        return VerifyDecision::SkipNotTriggered;
+    }
+    if !enabled {
+        return VerifyDecision::SkipDisabled;
+    }
+    if f.origin == crate::domain::Origin::Carried {
+        return VerifyDecision::SkipCarried;
+    }
+    if precedents.iter().any(|c| c.id == f.id) {
+        return VerifyDecision::SkipPrecedent;
+    }
+    if f.suspicion_agreement >= 2 {
+        return VerifyDecision::SkipConsensus;
+    }
+    VerifyDecision::Verify
+}
+
+/// 选 verifier（design §8.1）：verifiers 活跃集非空 → 从中轮转；否则自动异族
+/// （family ≠ 该 finding 的 reviewer 家族，优先 reviewers 档 → scanners 档）；
+/// 一个异族都没有 → 同族复核 + warning。
+///
+/// `rotation` = 轮转游标（调用方按已派复核数递增），与 reviewer 分派池同款——多个 verifier 时摊开，不全压一个。
+/// 返回 `None` = 一个可用模型都没有（调用方按「无 verifier」跳过并 warning）。
+pub fn pick_verifier<'a>(
+    roles: &'a RoleSets,
+    reviewer: &EffectiveModel,
+    rotation: usize,
+) -> Option<(&'a EffectiveModel, Option<String>)> {
+    let reviewer_family = reviewer.family.as_str();
+    if !roles.verifiers.is_empty() {
+        let n = roles.verifiers.len();
+        let picked = &roles.verifiers[rotation % n];
+        // 显式声明也要如实告知（收口评审 #11）：轮到的这个若与产出该 finding 的 reviewer 同模型
+        // （自己验自己）或同家族，判决的独立性就打了折。只 warning 不改选：用户显式配的，他有权这么配。
+        // 注：离线基线只支持「异族驳回更多」（31% vs 19%），误驳两臂分不出高下——
+        // 独立性这条依据是先验，不是本仓数据。
+        let warn = if picked.name == reviewer.name {
+            Some(format!("verifier {} 与产出该 finding 的 reviewer 是同一个模型——自己验自己，判决不独立", picked.name))
+        } else if picked.family == reviewer.family {
+            Some(format!("verifier {} 与 reviewer 同家族（{}）——同家族的判决独立性打折", picked.name, picked.family))
+        } else {
+            None
+        };
+        return Some((picked, warn));
+    }
+    let cross = roles
+        .reviewers
         .iter()
-        .enumerate()
-        .filter(|(_, f)| f.origin != crate::domain::Origin::Carried)
-        .filter(|(_, f)| !exact_ids.contains(f.id.as_str()))
-        .filter(|(_, f)| {
-            (f.agreement == 1 && f.severity >= block_threshold && f.confidence >= floor)
-                || precedents.iter().any(|c| matches_precedent(f, c))
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// refute 输出 → verdict：语义前缀优先，非空性只是违约 fallback（附 warning）。
-/// r1 20260703 实证：六字段必填契约后，守约模型想表达 upheld 也会输出 finding
-/// （title "Claim upheld: …"），按「非空即 refuted」会静默吞掉真问题。
-fn classify_refute(
-    findings: &[crate::domain::RawFinding],
-) -> (VerifyVerdict, String, Option<&'static str>) {
-    let Some(first) = findings.first() else {
-        return (VerifyVerdict::Upheld, String::new(), None);
-    };
-    let title = first.title.trim();
-    let lower = title.to_lowercase();
-    if lower.starts_with("refuted") {
-        // 剥机器信号前缀，note 保留纯理由（"refuted" 为 ASCII，字节切片安全）。
-        let note = title["refuted".len()..].trim_start_matches([':', '：', ' ']).to_string();
-        (VerifyVerdict::Refuted, note, None)
-    } else if lower.starts_with("upheld") || lower.starts_with("claim upheld") {
-        (VerifyVerdict::Upheld, title.to_string(), None)
-    } else {
-        // 违约输出：无 verdict 前缀。沿用旧启发式（非空=refuted）保住变体压制力，但漂移必须可观测。
-        (
-            VerifyVerdict::Refuted,
-            title.to_string(),
-            Some("verdict prefix missing in refute output; non-empty treated as refuted (contract drift)"),
-        )
+        .chain(roles.scanners.iter())
+        .find(|m| m.family != reviewer_family);
+    if let Some(m) = cross {
+        return Some((m, None));
     }
-}
-
-/// 三层 targeted-verify（S3-b）+ 判例预筛扩面（design 2026-07-03 #3）。
-/// 层①：agreement>=2 跳过（多模型已互证）。层②：引用存在性由 positioning 已砍编造。
-/// 层③：孤证 blocking（agreement==1 && severity>=block_threshold && confidence>=floor）
-/// **或预筛命中判例变体**（后者无视 agreement/severity/floor——review 不再注入勿再报后，
-/// 变体可能多模型同报/低严出现；decisions Q4）。目标集委托 `refute_targets`（单一真相源）。
-/// 精确 id 已在台账者不 refute（mark_dismissed 将豁免，烧 LLM 纯浪费）。
-/// refuted → verify=Refuted 且 confidence=0.0（降下 floor，不翻 verdict）；upheld → verify=Upheld。
-/// Semaphore 限 max_concurrency。
-/// `precedents`：活跃判例卡——refute prompt 按相关性渲染注入，skeptic 见过往人裁，
-/// 主题变体（换文件/措辞/锚点）跨轮一致地被 refute（dogfood 20260702 最高信号缺陷）。
-/// 返回第三元素 = refute 趟累计 usage（input,output,cached）；无 targets 时为 (0,0,0)
-/// （T03：调用方须把此值折进总账，refute 趟此前从未入过任何账）。
-/// `root`：finding.file 的解析基点——喂 `source_snippet`（Task 2），读不到时 snippet 自行退化占位。
-/// `spec_docs`：--spec 参照段（Task 4，承 dogfood F2）——透传给 refute prompt，skeptic 据设计
-/// 文档把「像 bug 实为设计明确允许」的误报驳回；空串走既有占位（refute 行为不变）。
-#[allow(clippy::too_many_arguments)] // 与 refute_one/build_refute_prompt 同源的参数面；收拢 struct 是过度设计
-pub async fn verify_findings(
-    mut findings: Vec<Finding>,
-    provider: &dyn ReviewProvider,
-    models: &[String],
-    block_threshold: Severity,
-    floor: f32,
-    max_concurrency: usize,
-    root: &Path,
-    precedents: &[DismissCard],
-    spec_docs: &str,
-) -> (Vec<Finding>, Vec<String>, (u64, u64, u64)) {
-    let targets = refute_targets(&findings, precedents, block_threshold, floor);
-    if targets.is_empty() {
-        return (findings, Vec::new(), (0, 0, 0));
-    }
-    let sem = Arc::new(Semaphore::new(max_concurrency.max(1)));
-    let results = futures::future::join_all(targets.iter().map(|&i| {
-        let sem = sem.clone();
-        let f = &findings[i];
-        async move {
-            let _permit = sem.acquire().await.expect("semaphore not closed");
-            refute_one(provider, f, models, root, precedents, spec_docs).await
-        }
-    }))
-    .await;
-    let mut warnings = Vec::new();
-    let mut usage = (0u64, 0u64, 0u64);
-    for (&i, (v, warn, u)) in targets.iter().zip(results) {
-        if v.verdict == VerifyVerdict::Refuted {
-            // 证伪 → 降 confidence 到 0（作为信号，md 渲染/排序可用）。
-            // verdict 的实质排除已落在 compute_verdict（显式 verify==Refuted 不 blocking），
-            // 不再依赖该 confidence 数值——故退化配置 conf_floor=0 下亦安全。
-            findings[i].confidence = 0.0;
-        }
-        findings[i].verify = Some(v);
-        warnings.extend(warn);
-        usage.0 += u.0;
-        usage.1 += u.1;
-        usage.2 += u.2;
-    }
-    (findings, warnings, usage)
+    // 无异族：同族复核，但必须可观测——§8.1 明写「一个异族都没有 → 同族 + warning」。
+    let same = roles.reviewers.iter().chain(roles.scanners.iter()).next()?;
+    let warn = format!(
+        "no cross-family verifier available (all models are family {reviewer_family}); verified by same family {}",
+        same.name
+    );
+    Some((same, Some(warn)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Finding, Severity, VerifyVerdict};
-    use crate::provider::fake::FakeProvider;
-    use crate::domain::RawFinding;
-    use std::collections::BTreeMap;
+    use crate::domain::{Finding, Severity};
 
     use crate::domain::finding::fixtures::finding;
     fn finding_at(file: &str, line_start: u32, line_end: u32) -> Finding {
@@ -333,12 +273,6 @@ mod tests {
         f.line_end = line_end;
         f
     }
-    fn rawf(title: &str) -> RawFinding {
-        RawFinding { severity: Severity::High, title: title.into(), body: "b".into(), file: "a.rs".into(),
-            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
-            hard_constraint: false, quote: "q".into() }
-    }
-
     #[test]
     fn source_snippet_windows_and_clamps() {
         let tmp = tempfile::tempdir().unwrap();
@@ -463,222 +397,140 @@ mod tests {
         assert!(s.contains("（现场快照）"), "超帽回落 ±60 快照: {s}");
     }
 
-    #[test]
-    fn classify_refute_prefix_semantics() {
-        // 空 → upheld（原契约不变）
-        let (v, note, w) = classify_refute(&[]);
-        assert_eq!((v, note.as_str(), w), (VerifyVerdict::Upheld, "", None));
-        // REFUTED 前缀 → refuted，note 剥前缀
-        let (v, note, w) = classify_refute(&[rawf("REFUTED: guard exists at L10")]);
-        assert_eq!(v, VerifyVerdict::Refuted);
-        assert_eq!(note, "guard exists at L10");
-        assert!(w.is_none());
-        // upheld 语义前缀 → upheld（r1 12bbeb4c 型误杀不再发生）
-        let (v, _, w) = classify_refute(&[rawf("Claim upheld: body interpolated raw")]);
-        assert_eq!(v, VerifyVerdict::Upheld);
-        assert!(w.is_none());
-        // 无前缀违约 → fallback refuted + contract-drift warning
-        let (v, note, w) = classify_refute(&[rawf("actually guarded above")]);
-        assert_eq!(v, VerifyVerdict::Refuted);
-        assert_eq!(note, "actually guarded above");
-        assert!(w.unwrap().contains("contract drift"));
+    // ── 判定层（批 D-2〔D17〕）：旧批式路径里仍成立的契约逐条移植过来 ──────────────────────────
+
+    fn blocking(conf: f32) -> Finding {
+        let mut f = finding("t", Severity::High, 1, "alpha");
+        f.confidence = conf;
+        f
     }
 
-    #[tokio::test]
-    async fn lone_blocking_refuted_drops_confidence_and_marks() {
-        // skeptic 返回非空（找到反驳）→ refuted；confidence 降 0
-        let provider = FakeProvider::with("beta", vec![rawf("actually guarded above")]);
-        let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
-        assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted);
-        assert_eq!(out[0].verify.as_ref().unwrap().model, "beta", "交叉选了非 alpha 的 model");
-        assert_eq!(out[0].confidence, 0.0, "refuted 降 confidence 下 floor");
-    }
-
-    #[tokio::test]
-    async fn lone_blocking_upheld_keeps_confidence() {
-        // skeptic 返回空（守不住反驳）→ upheld；confidence 不动
-        let provider = FakeProvider::with("beta", vec![]);
-        let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
-        assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld);
-        assert_eq!(out[0].confidence, 0.9);
-    }
-
-    #[tokio::test]
-    async fn refute_usage_sums_across_targets() {
-        // T03：refute 趟 usage 曾被 refute_one 丢弃，run.usage 从未见过这笔账。
-        // 两条孤证都进 targets → 两次 provider.run 各记 100/20/5 → 累计应为 200/40/10。
-        let provider = FakeProvider::with_tokens("beta", vec![rawf("actually guarded")], (100, 20, 5));
-        let f1 = finding("missing auth 1", Severity::High, 1, "alpha");
-        let f2 = finding("missing auth 2", Severity::High, 1, "alpha");
-        let (_out, _w, usage) = verify_findings(
-            vec![f1, f2], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "",
-        ).await;
-        assert_eq!(usage, (200, 40, 10), "两次 refute 调用的 token 须累加，不能被丢弃");
-    }
-
-    #[tokio::test]
-    async fn no_targets_yields_zero_usage() {
-        // 无 refute target（低于 block_threshold）→ 未发生任何 provider.run 调用 → usage 为 (0,0,0)。
-        let provider = FakeProvider::with_tokens("beta", vec![rawf("x")], (100, 20, 5));
-        let f = finding("minor", Severity::Low, 1, "alpha");
-        let (_out, _w, usage) = verify_findings(
-            vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "",
-        ).await;
-        assert_eq!(usage, (0, 0, 0));
-    }
-
-    #[tokio::test]
-    async fn consensus_finding_is_skipped() {
-        // agreement>=2（层①）→ 不 refute，verify 留 None
-        let provider = FakeProvider::with("beta", vec![rawf("x")]);
-        let f = finding("agreed bug", Severity::Critical, 2, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
-        assert!(out[0].verify.is_none());
-        assert_eq!(out[0].confidence, 0.9);
-    }
-
-    #[tokio::test]
-    async fn below_block_threshold_is_skipped() {
-        // severity < block_threshold → 不 refute
-        let provider = FakeProvider::with("beta", vec![rawf("x")]);
-        let f = finding("minor", Severity::Low, 1, "alpha");
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
-        assert!(out[0].verify.is_none());
-    }
-
-    fn card(id: &str, file: &str, title: &str) -> DismissCard {
-        DismissCard {
-            id: id.into(), status: "dismissed".into(), title: title.into(), file: file.into(),
-            quote: "ledger quote".into(), severity: "high".into(), reason: "既往误报".into(),
-            round: "r1".into(), updated_at: String::new(),
+    fn model(name: &str, family: &str) -> EffectiveModel {
+        EffectiveModel {
+            name: name.into(), display_name: None, id: name.rsplit('/').next().unwrap().into(),
+            provider: name.split('/').next().unwrap().into(),
+            role: crate::config::Role::Verifier, kind: crate::config::ProviderKind::Openai,
+            base_url: None, context_window: 100_000, max_output_tokens: None,
+            per_turn_timeout_secs: None, reasoning: false, thinking_level: None,
+            family: family.into(), max_concurrency: None,
         }
     }
 
-    #[tokio::test]
-    async fn precedent_prescreen_forces_refute_despite_consensus() {
-        // agreement=2 本该层① 跳过，但预筛命中判例变体（同 file + title 相似）→ 强制进 refute
-        let provider = FakeProvider::with("beta", vec![rawf("same theme as precedent")]);
-        let mut f = finding("prompt injection via ledger notes", Severity::Medium, 2, "alpha");
-        f.models = vec!["alpha".into(), "gamma".into()];
-        let cards = vec![card("ffffffffffffffff", "a.rs", "prompt injection via dismissed notes")];
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::High, 0.0, 4, Path::new("."), &cards, "").await;
-        assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted,
-            "预筛命中 → 无视 agreement/severity 进 refute");
-    }
-
-    #[tokio::test]
-    async fn exact_ledger_id_skips_refute() {
-        // 精确 id 已在台账 → mark_dismissed 将豁免，refute 纯浪费 → 跳过
-        let provider = FakeProvider::with("beta", vec![rawf("would refute")]);
-        let f = finding("missing auth", Severity::High, 1, "alpha");
-        let cards = vec![card(&f.id.clone(), "a.rs", "missing auth")];
-        let (out, _w, _u) = verify_findings(vec![f], &provider, &["alpha".into(), "beta".into()], Severity::Medium, 0.0, 4, Path::new("."), &cards, "").await;
-        assert!(out[0].verify.is_none(), "台账精确命中不烧 refute");
-    }
-
-    #[tokio::test]
-    async fn refute_failure_is_conservatively_upheld() {
-        // provider 对所选 model 无 script → 调用失败 → 保守 upheld（保留 finding 的 blocking 力）
-        let provider = FakeProvider::with("alpha", vec![]); // 只有 alpha，单 model
-        let f = finding("missing auth", Severity::High, 1, "alpha");
-        // models 只有 alpha → 退化自审 alpha；但 FakeProvider 有 alpha script(空) → upheld
-        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
-        assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld);
-        assert!(w.is_empty(), "成功 upheld 无 warning");
-
-        // 真失败：所选 model 无 script → 保守 upheld + warning 上浮（验证层失效可观测）
-        let provider2 = FakeProvider { scripted: BTreeMap::new(), tokens: (0, 0, 0) };
-        let f2 = finding("missing auth", Severity::High, 1, "ghost");
-        let (out2, w2, _u2) = verify_findings(vec![f2], &provider2, &["ghost".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
-        assert_eq!(out2[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Upheld, "调用失败保守 upheld");
-        assert_eq!(out2[0].confidence, 0.9, "upheld 不降 confidence");
-        assert_eq!(w2.len(), 1, "refute 失败必须产出 warning");
-        assert!(w2[0].starts_with("refute [") && w2[0].contains("model ghost"), "warning 带 finding id 与 model: {}", w2[0]);
-    }
-
+    /// 触发集与 `verdict` 同源：低于 block_threshold 或低于 conf_floor 的一律不触发——
+    /// 它们在裁决层本就永不 blocking，复核纯烧 token。
     #[test]
-    fn carried_findings_never_enter_refute_targets() {
-        use crate::domain::Origin;
-        // 决议 5：携带项出生轮已过孤证 refute + 判例预筛，重复烧 LLM 纯浪费；
-        // 台账精确 id 豁免（mark_dismissed）每轮照常、免费，不受影响。
-        let mut carried = finding("lone blocking", Severity::High, 1, "alpha");
-        carried.origin = Origin::Carried;
-        let fresh = finding("new lone blocking", Severity::High, 1, "alpha");
-        let cards = vec![card("ffffffffffffffff", "a.rs", "lone blocking")]; // 判例变体也不打 carried
-        let targets = refute_targets(&[carried, fresh], &cards, Severity::Medium, 0.0);
-        assert_eq!(targets, vec![1], "只有 origin=new 的孤证进 targets（carried 双路径均剔除）");
+    fn trigger_set_matches_the_verdict_blocking_predicate() {
+        let low_sev = finding("t", Severity::Low, 1, "alpha");
+        assert_eq!(decide(&low_sev, &[], Severity::Medium, 0.5, true), VerifyDecision::SkipNotTriggered);
+        assert_eq!(decide(&blocking(0.4), &[], Severity::Medium, 0.5, true), VerifyDecision::SkipNotTriggered, "低于 floor 不触发");
+        assert_eq!(decide(&blocking(0.5), &[], Severity::Medium, 0.5, true), VerifyDecision::Verify, "正好到 floor 就触发");
+        assert_eq!(decide(&blocking(0.9), &[], Severity::Medium, 0.5, true), VerifyDecision::Verify);
     }
 
-    // ---- refute conf_floor 门（表2-3，M18批2/decisions Q4）----
-
+    /// 跳过四类各自命中，且分类可读（「没触发」与「触发了被免验」在 RunMeta 里必须分得开）。
     #[test]
-    fn refute_targets_conf_floor_excludes_low_confidence_lone_blocking() {
-        // 高 severity 但低于 floor 的孤证：verdict 层本就永不 blocking，refute 复核纯烧 LLM。
-        let mut low = finding("lone blocking low conf", Severity::High, 1, "alpha");
-        low.confidence = 0.2;
-        let targets = refute_targets(&[low], &[], Severity::Medium, 0.5);
-        assert!(targets.is_empty(), "低于 floor 的孤证 blocking 不应进 refute targets");
+    fn skip_reasons_are_classified() {
+        let f = blocking(0.9);
+        assert_eq!(decide(&f, &[], Severity::Medium, 0.5, false).reason(), "disabled");
+
+        let mut carried = blocking(0.9);
+        carried.origin = crate::domain::Origin::Carried;
+        assert_eq!(decide(&carried, &[], Severity::Medium, 0.5, true).reason(), "carried");
+
+        let card = DismissCard {
+            id: f.id.clone(), status: "dismissed".into(), title: f.title.clone(), file: f.file.clone(),
+            quote: f.quote.clone(), severity: "high".into(), reason: "人裁".into(),
+            round: String::new(), updated_at: String::new(),
+        };
+        assert_eq!(decide(&f, std::slice::from_ref(&card), Severity::Medium, 0.5, true).reason(), "precedent");
+
+        let mut consensus = blocking(0.9);
+        consensus.suspicion_agreement = 2;
+        assert_eq!(decide(&consensus, &[], Severity::Medium, 0.5, true).reason(), "consensus");
+        assert!(!decide(&consensus, &[], Severity::Medium, 0.5, true).is_verify());
     }
 
+    /// 免验读的是**区域**轴，不是模型轴：单 reviewer 配置下 `agreement` 恒为 1，
+    /// 拿它当免验依据等于永不免验；反过来模型轴高也不该免验（§8.1 要的是两家族 scanner 标记）。
     #[test]
-    fn refute_targets_conf_floor_admits_high_confidence_lone_blocking() {
-        // 高 severity 且不低于 floor 的孤证：照常进 targets（floor 门不误伤正常孤证）。
-        let mut high = finding("lone blocking high conf", Severity::High, 1, "alpha");
-        high.confidence = 0.9;
-        let targets = refute_targets(&[high], &[], Severity::Medium, 0.5);
-        assert_eq!(targets, vec![0], "不低于 floor 的孤证 blocking 正常进 refute targets");
+    fn consensus_skip_reads_the_suspicion_axis_not_the_model_axis() {
+        let mut model_axis = blocking(0.9);
+        model_axis.agreement = 3;
+        model_axis.suspicion_agreement = 1;
+        assert_eq!(decide(&model_axis, &[], Severity::Medium, 0.5, true), VerifyDecision::Verify, "模型轴高也照验");
+
+        let mut region_axis = blocking(0.9);
+        region_axis.agreement = 1;
+        region_axis.suspicion_agreement = 2;
+        assert_eq!(decide(&region_axis, &[], Severity::Medium, 0.5, true), VerifyDecision::SkipConsensus);
     }
 
+    /// verifiers 活跃集非空 → 从中轮转（多个 verifier 摊开，不全压一个）。
     #[test]
-    fn refute_targets_precedent_prescreen_ignores_conf_floor() {
-        // 判例预筛分支有意不门 floor（decisions Q4）：即便置信度低于 floor，命中判例变体
-        // 仍强制进 refute——变体压制语义（跨轮一致驳回）+ refuted 标记披露价值。
-        let mut f = finding("prompt injection via ledger notes", Severity::Medium, 2, "alpha");
-        f.confidence = 0.1;
-        f.models = vec!["alpha".into(), "gamma".into()];
-        let cards = vec![card("ffffffffffffffff", "a.rs", "prompt injection via dismissed notes")];
-        let targets = refute_targets(&[f], &cards, Severity::High, 0.5);
-        assert_eq!(targets, vec![0], "判例预筛命中不受 conf_floor 门控，无视低置信度");
+    fn declared_verifiers_win_and_rotate() {
+        let roles = RoleSets {
+            scanners: vec![model("p/s", "deepseek")],
+            reviewers: vec![model("p/r", "glm")],
+            verifiers: vec![model("p/v1", "kimi"), model("p/v2", "qwen")],
+        };
+        let rev = model("p/r", "glm");
+        let names: Vec<&str> = (0..4).map(|i| pick_verifier(&roles, &rev, i).unwrap().0.name.as_str()).collect();
+        assert_eq!(names, ["p/v1", "p/v2", "p/v1", "p/v2"]);
+        assert!(pick_verifier(&roles, &rev, 0).unwrap().1.is_none(), "显式声明的异族 verifier 不报 warning");
     }
 
+    /// 显式声明的 verifier 也要查独立性（收口评审 #11）：轮到的那个与产出该 finding 的 reviewer
+    /// 同模型（自己验自己）或同家族时，照用但留 warning——离线基线里同族那臂误驳 20% vs 异族 12%，
+    /// 用户有权这么配，但不能不知道自己配了什么。
     #[test]
-    fn sniff_refute_verdict_prefix_semantics_only() {
-        // T43 层①：markdown 包装的 verdict 前缀可救回
-        let m = "structured-output parse failed: final JSON parse failed (finish_reason=stop): **REFUTED: The claim is false because…";
-        assert_eq!(sniff_refute_verdict(m), Some(VerifyVerdict::Refuted));
-        let u = "structured-output parse failed: final JSON parse failed (finish_reason=stop): Claim upheld: the guard is missing";
-        assert_eq!(sniff_refute_verdict(u), Some(VerifyVerdict::Upheld));
-        // 截断 JSON 头 → 嗅不出，交兜底
-        let j = r#"structured-output parse failed: final JSON parse failed (finish_reason=stop): {"findings": ["#;
-        assert_eq!(sniff_refute_verdict(j), None);
-        // 只嗅头部前缀：正文提及 REFUTED 不得误判（"would be REFUTED if…"）
-        let mid = "structured-output parse failed: final JSON parse failed (finish_reason=stop): The claim would be REFUTED if callers pass empty vec";
-        assert_eq!(sniff_refute_verdict(mid), None);
+    fn declared_verifier_that_is_the_reviewer_itself_warns() {
+        let same = RoleSets {
+            scanners: vec![],
+            reviewers: vec![model("p/r", "glm")],
+            verifiers: vec![model("p/r", "glm")], // 现配置就是这个形状：一个模型兼两角色
+        };
+        let (m, warn) = pick_verifier(&same, &model("p/r", "glm"), 0).unwrap();
+        assert_eq!(m.name, "p/r");
+        assert!(warn.as_deref().is_some_and(|w| w.contains("同一个模型")), "自己验自己必须可观测: {warn:?}");
+
+        let kin = RoleSets {
+            scanners: vec![],
+            reviewers: vec![model("p/r", "glm")],
+            verifiers: vec![model("p/r2", "glm")], // 不同模型、同家族
+        };
+        let (_, warn) = pick_verifier(&kin, &model("p/r", "glm"), 0).unwrap();
+        assert!(warn.as_deref().is_some_and(|w| w.contains("同家族")), "同族也要说一声: {warn:?}");
     }
 
-    /// 恒返 Parse 错误的 provider——模拟 repair 后仍 parse 失败、但原文头部带 verdict 前缀。
-    struct ParseErrProvider(String);
-    #[async_trait::async_trait]
-    impl crate::provider::ReviewProvider for ParseErrProvider {
-        async fn run(&self, _req: crate::provider::LensRequest)
-            -> Result<crate::provider::LensCall, crate::provider::ProviderError> {
-            Err(crate::provider::ProviderError::Parse(self.0.clone()))
-        }
+    /// 未声明 verifiers → 自动异族，优先 reviewers 档再 scanners 档。
+    #[test]
+    fn auto_pick_prefers_a_cross_family_reviewer_then_scanner() {
+        let roles = RoleSets {
+            scanners: vec![model("p/s", "deepseek")],
+            reviewers: vec![model("p/r", "glm"), model("p/r2", "kimi")],
+            verifiers: vec![],
+        };
+        assert_eq!(pick_verifier(&roles, &model("p/r", "glm"), 0).unwrap().0.name, "p/r2", "异族 reviewer 优先");
+
+        let only_scanner_cross = RoleSets {
+            scanners: vec![model("p/s", "deepseek")],
+            reviewers: vec![model("p/r", "glm")],
+            verifiers: vec![],
+        };
+        assert_eq!(pick_verifier(&only_scanner_cross, &model("p/r", "glm"), 0).unwrap().0.name, "p/s", "没有异族 reviewer 就取 scanner 档");
     }
 
-    #[tokio::test]
-    async fn refute_parse_failure_sniffs_refuted_prefix() {
-        // T43 实证场景（粒度 A/B 两跑）：refute 意图 REFUTED 但 JSON 包装失败 → 现状按原 conf 存活
-        // → verdict 假 reject。嗅探后应判 Refuted、confidence 归零，并留 warning 可观测。
-        let provider = ParseErrProvider(
-            "structured-output parse failed: final JSON parse failed (finish_reason=stop): **REFUTED: trailing text".into());
-        let f = finding("missing auth", Severity::High, 1, "alpha");
-        let (out, w, _u) = verify_findings(vec![f], &provider, &["alpha".into()], Severity::Medium, 0.0, 4, Path::new("."), &[], "").await;
-        assert_eq!(out[0].verify.as_ref().unwrap().verdict, VerifyVerdict::Refuted, "嗅探救回 REFUTED 语义");
-        assert_eq!(out[0].confidence, 0.0, "refuted 照常降 conf 下 floor");
-        assert_eq!(w.len(), 1, "嗅探路径仍必须产出 warning（可观测）");
-        assert!(w[0].contains("sniffed"), "warning 注明嗅探来源: {}", w[0]);
+    /// 一个异族都没有 → 同族复核 + warning（§8.1 明写；现配置 glm 既是 reviewer 又是 verifier，正是这条路）。
+    #[test]
+    fn all_same_family_falls_back_with_a_warning() {
+        let roles = RoleSets {
+            scanners: vec![model("p/s", "glm")],
+            reviewers: vec![model("p/r", "glm")],
+            verifiers: vec![],
+        };
+        let (m, warn) = pick_verifier(&roles, &model("p/r", "glm"), 0).unwrap();
+        assert_eq!(m.name, "p/r");
+        assert!(warn.unwrap().contains("no cross-family verifier"), "同族复核必须可观测");
+        assert!(pick_verifier(&RoleSets::default(), &model("p/r", "glm"), 0).is_none(), "一个模型都没有 → None");
     }
 }

@@ -1,0 +1,5 @@
+{"file": ".next/design/2026-09-04-redteam-review-engine-architecture-design.md", "reason": "§8.1 verifier 流式复核的全部定论（触发集 / 跳过三条 / 异族选择 / 动作与失败保守 upheld / 去留由数据决定）、§2 墙钟公式里「复核与深挖尾部重叠」、§10.7 角色尾分离——实现对照的第一权威"}
+{"file": ".next/plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md", "reason": "批 D 节（第 376 行起）Task D-1…D-5 的原始范围；注意 D-5 的「ship 评审」措辞已作废（M21 期间改用 /code-review），其余照旧"}
+{"file": ".trellis/tasks/archive/2026-09/09-20-m21b-deep-stability/design.md", "reason": "C3 定案：稳定块与两轴共识（peak_agreement / agreement 各管什么）、分层排序键——本批的盖章收紧要取「peak 簇的成员行范围」，得先看懂这两轴怎么算出来的"}
+{"file": ".next/roadmap/followup.md", "reason": "「Finding 的两根 agreement 轴」整节标着「批 D 接线必读」（跳过规则必须读 suspicion_agreement 而非 agreement）；「流式旁路跨瞬时重试不复位」是本批 D-1 要还的前置债；批 C3 收口评审带出的账里有四条留账"}
+{"file": ".next/decisions/2026-09-04-redteam-review-engine-architecture-decisions.md", "reason": "D7 A4（verifier 去留交数据）、D9（角色尾与离线回归集）、D10-1（流式定性为持久化旁路）、D13（落地时刻 agreement、event ≤ landed）；D17 节在 D-5 收口时新增，写前先看全篇体例"}

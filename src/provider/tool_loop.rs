@@ -290,6 +290,8 @@ pub struct FakeChatBackend {
     peak: std::sync::atomic::AtomicUsize,
     /// 逐片 delta 尺寸（Some(n) = 每轮把最终文本按 n 字节片喂 `on_text_delta`，模拟 SSE 到达；None = 不喂）。
     delta_chunk: Option<usize>,
+    /// 失败轮在返回错误前喂出的半截文本（模拟「流到一半断了」），逐轮取一段。
+    err_partials: Mutex<VecDeque<String>>,
     on_text_delta: Mutex<Option<crate::provider::backends::DeltaCb>>,
 }
 
@@ -307,6 +309,7 @@ impl FakeChatBackend {
             inflight: std::sync::atomic::AtomicUsize::new(0),
             peak: std::sync::atomic::AtomicUsize::new(0),
             delta_chunk: None,
+            err_partials: Mutex::new(VecDeque::new()),
             on_text_delta: Mutex::new(None),
         }
     }
@@ -329,6 +332,16 @@ impl FakeChatBackend {
     pub fn with_text_delta(mut self, cb: crate::provider::backends::DeltaCb) -> Self {
         self.on_text_delta = Mutex::new(Some(cb));
         self
+    }
+    /// 失败轮的半截流（M21b 批 D-1）：脚本轮为 `Err` 时，先把这段文本喂给 delta 回调再返回错误——
+    /// 真路径上「流到一半断了」正是这个形状，不模拟出来就测不到旁路跨重试的拼接。
+    /// 逐轮取一段（队列形态）：多次失败时每轮可以断在不同位置。
+    pub fn with_err_partials(mut self, texts: Vec<&str>) -> Self {
+        self.err_partials = Mutex::new(texts.into_iter().map(String::from).collect());
+        self
+    }
+    pub fn with_err_partial(self, text: &str) -> Self {
+        self.with_err_partials(vec![text])
     }
     /// 观测到的最大并发轮数（并发上限断言）。
     pub fn peak_inflight(&self) -> usize {
@@ -369,6 +382,17 @@ impl ChatBackend for FakeChatBackend {
                 .pop_front()
                 .unwrap_or_else(|| Err(ProviderError::Unavailable("no scripted turn".into()))),
         };
+        // 失败轮的半截流：先喂再返回错误（批 D-1）——真路径上断流就是这个次序。
+        if out.is_err() {
+            let partial = self.err_partials.lock().unwrap().pop_front();
+            if let Some(partial) = partial {
+                let mut cb = <Self as ChatBackend>::on_text_delta(self);
+                if let Some(cb) = cb.as_mut() {
+                    cb(&partial);
+                }
+                *self.on_text_delta.lock().unwrap() = cb; // 放回，重试轮还要用
+            }
+        }
         // 流式旁路模拟：成功轮按 delta_chunk 逐片喂回调（字符边界切——真路径喂完整 SSE 行无损，
         // 字节切会在多字节字符中间产生 U+FFFD），用完放回（repeating 多轮场景每轮可喂）
         if let (Some(sz), Ok(t)) = (self.delta_chunk, &out) {

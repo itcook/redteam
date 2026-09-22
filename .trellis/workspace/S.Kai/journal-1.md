@@ -681,3 +681,36 @@ scan 全完才挖改成两段重叠：H0 t=0 开挖、scanner 格完成即入队
 ### Status
 
 [OK] **Completed**
+
+
+## Session 23: M21b 批 D：verifier 流式复核接线、离线基线裁定与收口评审
+<!-- trellis-session: v=2 fp=7d2bd451550b884c -->
+
+**Date**: 2026-09-21
+**Task**: M21b 批 D：verifier 流式复核接线、离线基线裁定与收口评审
+**Branch**: `feat/m21b-verifier`
+
+### Summary
+
+批 D 五步全做完并收口：D-1 旁路跨重试复位 + verifier.md 角色尾；D-2 触发集/跳过/异族选择 + 盖章收紧到 peak 簇行范围；D-3 复核挂进深挖主循环（第二个 FuturesUnordered、barrier 等复核归零、verify_tail_ms、逐条 verifier 格、resume 不重验、判决合并 UPHELD 优先、refuted 剔计数）；D-4 verify-once 隐藏子命令 + eval/verify_score.py，两臂离线基线按预登记阈值裁定 verifiers.enabled 缺省 false，顺带修 build_registry 漏注册 verifier；D-5 dogfood（复核四量自洽、深挖零行为 diff）+ /code-review max 15 条分三档（1/2 档全修、12 项变异转红）+ 因模板未 render 重跑两臂（裁定不变、撤回异族附带结论）。design v13 §8.1 重写、decisions 增 D17。未合回。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `369517a` | fix(provider,prompt): 流式旁路跨重试复位 + verifier.md 角色尾拆分——analysis 先于 verdict（design §8.1 / §10.7〔D17〕） |
+| `8517784` | feat(consolidate,orchestrate): verifier 触发集与跳过规则——区域共识盖章收紧到 peak 簇行范围、异族选择（design §8.1〔D17〕） |
+| `fd04420` | feat(orchestrate,cli): 复核挂进深挖主循环——逐条一格落盘、barrier 等归零、resume 不重验（design §8.1 / §2〔D17〕） |
+| `7f0f567` | test(consolidate,domain): 判决合并三组合与计数剔除补测（design §8.1〔D17〕Q9 / Q11） |
+| `6821535` | chore(eval,config): verifier 离线基线两臂——按预登记阈值裁定 verifiers.enabled 缺省 false（design §8.1「去留由数据决定」〔D17〕） |
+| `16f2d72` | docs(design,decisions): D17 决策节 + design v13 §8.1/§2/可观测面改写；refute_rate 接上唯一生产者 |
+| `5647a81` | fix(orchestrate): 本轮按 finding id 缓存复核——同一条被两个格各报一次时只验一次（design §8.1〔D17〕Q11） |
+| `de0cd73` | fix(orchestrate): 缓存判定前移到分类之前——四个复核计数同分母（design §8.1〔D17〕） |
+| `4f9cd0e` | chore(task): 批 D dogfood 记账——复核四量自洽、深挖路径零行为 diff |
+| `0290798` | fix(prompt,orchestrate,cli): 收口评审第 1 档七条——模板未 render / 跨文件盖章 / 复核读守卫 / 失败复核固化 / 阈值脱钩 / 早退漏回填 / 时序决定验不验 |
+| `48073b0` | fix(orchestrate,cli,output): 收口评审第 2 档六条——盖章单一出口、判决归零、同模型复核告警、verifier 不拒跑、md 头条对账 |
+| `cefc2f2` | docs(research,decisions,config): 修好 prompt 后重跑两臂——裁定不变，撤回「异族两根轴都更优」 |
+
+### Status
+
+[OK] **Completed**

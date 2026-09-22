@@ -45,10 +45,19 @@ impl FindingSink for () {
 pub(crate) struct EmitCtx<'a> {
     model: &'a str,
     family: &'a str,
-    /// 队列项**派发时**的疑点共识（家族数）快照——盖到事件与 cell 内产出的 `Finding.suspicion_agreement`。
+    /// 队列项**派发时**的疑点共识快照——盖到事件与 cell 内产出的 `Finding.suspicion_agreement`。
     /// 不是落地值：本上下文跑在 await 里读不到队列；落地值由 `run_deep` 在主循环回填落盘 finding。
     /// **不碰** `Finding.agreement`：那是认同这条 finding 的模型数，由 `dedup` 算定。
+    ///
+    /// 批 D〔D17〕改为**项内**轴（`peak_agreement`）而非区域级 `agreement`，且只盖给压在 `hot_ranges` 上的 finding：
+    /// §8.1 的跳过规则要的是「这条 finding 所在的那几行被两个家族独立标过」，不是「这一整块里有两个家族来过」。
+    /// C3 把项放大成整个 def / 标题节之后，按格盖章会把 reviewer 自己新发现的另一处也送进免验集。
     suspicion_agreement: u32,
+    /// 达成共识的那一簇疑点覆盖的行区间（`QueueItem::hot_ranges`）；空 = 一律不盖。
+    hot_ranges: Vec<(u32, u32)>,
+    /// 本队列项的文件——热区是**这个文件**里的行区间。reviewer 可以合法地报出别的文件
+    /// （跨组索引 / 二阶段补查），只比行号会让它白拿共识盖章（收口评审 #2）。
+    item_file: &'a str,
     root: &'a Path,
     sink: &'a dyn FindingSink,
     /// 已发射 finding.id——旁路发过的，终判不补发。
@@ -60,10 +69,29 @@ impl<'a> EmitCtx<'a> {
         model: &'a str,
         family: &'a str,
         suspicion_agreement: u32,
+        hot_ranges: Vec<(u32, u32)>,
+        item_file: &'a str,
         root: &'a Path,
         sink: &'a dyn FindingSink,
     ) -> Self {
-        EmitCtx { model, family, suspicion_agreement, root, sink, emitted: HashSet::new() }
+        EmitCtx { model, family, suspicion_agreement, hot_ranges, item_file, root, sink, emitted: HashSet::new() }
+    }
+
+    /// 这条 finding 该盖多少共识（热区门控的**单一出口**）：压在峰值簇那几行上才盖，否则 0。
+    /// 收口评审 #14：`Finding.suspicion_agreement` 曾在调用点直接写 `ctx.suspicion_agreement`（没过门控），
+    /// 与同一事件里 `FindingEvent.suspicion_agreement` 打架——而 `decide` 读的是 Finding 上那份。
+    fn consensus_for(&self, f: &Finding) -> u32 {
+        if crate::orchestrate::queue::in_hot_ranges(&f.file, self.item_file, f.line_start, f.line_end, &self.hot_ranges) {
+            self.suspicion_agreement
+        } else {
+            0
+        }
+    }
+
+    /// 盖章 + 发射：两件事必须一起做，否则 Finding 与事件两份值会各说各话。
+    fn stamp_and_emit(&mut self, f: &mut Finding) {
+        f.suspicion_agreement = self.consensus_for(f);
+        self.emit(f);
     }
 
     /// 首次见到该 id 才发射（旁路 / 终判同一去重面）。
@@ -73,7 +101,7 @@ impl<'a> EmitCtx<'a> {
         }
         self.sink.on_finding(FindingEvent {
             finding: f.clone(),
-            suspicion_agreement: self.suspicion_agreement,
+            suspicion_agreement: f.suspicion_agreement,
             reviewer_family: self.family.to_string(),
         });
     }
@@ -130,8 +158,7 @@ fn emit_raw(raws: Vec<crate::domain::RawFinding>, ctx: &mut EmitCtx) {
         .collect();
     let (kept, _dropped, _unreadable) = anchor_review_findings(enriched, ctx.root);
     for mut f in kept {
-        f.suspicion_agreement = ctx.suspicion_agreement;
-        ctx.emit(&f);
+        ctx.stamp_and_emit(&mut f);
     }
 }
 
@@ -162,6 +189,15 @@ pub(crate) async fn run_review_shot_with(
         ChatMessage::System(prompt.system.clone()),
         ChatMessage::UserBlocks(prompt.blocks.clone()),
     ];
+
+    // 每次 HTTP 尝试开始复位旁路解析器（批 D-1）：重试复用同一 backend 与同一 `inc`，
+    // 不复位则断流那次的半截 JSON 会与重试输出拼成一个四不像对象发给 sink。
+    // 只在有内层策略时包装——`None` 的语义（通用退避 + budget 约束）不能被凭空多出的 `on_rate_limited` 改掉。
+    let reset_guard = policy.map(|p| crate::provider::ResetOnAttempt::new(p, inc.clone()));
+    let policy: Option<&dyn AttemptPolicy> = match &reset_guard {
+        Some(g) => Some(g),
+        None => None,
+    };
 
     let turn = match timed_turn_with(backend, &messages, &[], per_turn, retry_budget, policy).await {
         Ok(t) => t,
@@ -236,8 +272,7 @@ fn finish_parse(
 
     let mut final_findings = Vec::new();
     for mut f in kept {
-        f.suspicion_agreement = ctx.suspicion_agreement;
-        ctx.emit(&f);
+        ctx.stamp_and_emit(&mut f);
         final_findings.push(f);
     }
 
@@ -308,6 +343,48 @@ mod tests {
         d
     }
 
+    /// 无门场景的最小策略（`ResetOnAttempt` 只在有内层策略时安装，故本用例要有一个）。
+    struct NoopPolicy;
+    #[async_trait::async_trait]
+    impl AttemptPolicy for NoopPolicy {
+        fn attempt_begin(&self) {}
+        fn attempt_end(&self, _o: crate::provider::AttemptOutcome) {}
+        async fn on_rate_limited(&self, _n: u32, _a: Option<Duration>) -> bool {
+            false
+        }
+    }
+
+    /// 断流重试后旁路仍然有效（批 D-1，followup「接真 sink 前须处理」）：
+    /// 首试流到一半断了、重试轮流出一条**完整**对象后整格失败——这正是 D10 立旁路要保住的场景
+    /// （格中途死亡，已闭合对象不丢）。不复位时半截对象会把重试轮的流整个吞进去、永不闭合，
+    /// 旁路无声作废（实测 `emitted=[]`、`discarded=0`），sink 一条都收不到。
+    #[tokio::test]
+    async fn bypass_still_delivers_after_a_cut_stream_retry() {
+        let dir = tmp_file();
+        let rec = Rec(Mutex::new(Vec::new()));
+        let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+        let inc2 = inc.clone();
+        let half = r#"{"findings":[{"severity":"high","title":"draft","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r","quote":"fn a() {"#;
+        // 重试轮：一条完整对象（数组未闭合——格就死在这儿）
+        let closed = r#"{"findings":[{"severity":"medium","title":"t9","body":"b9","file":"a.rs","line_start":2,"line_end":2,"confidence":0.7,"recommendation":"r9","quote":"fn b() {"},"#;
+        let backend = FakeChatBackend::new_results(vec![
+            Err(crate::provider::ProviderError::Unavailable("cut 1".into())),
+            Err(crate::provider::ProviderError::Unavailable("cut 2".into())),
+        ])
+        .with_err_partials(vec![half, closed])
+        .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], "a.rs", dir.path(), &rec);
+
+        let err = run_review_shot_with(
+            &backend, &prompt(), Duration::from_secs(5), 1, Some(&NoopPolicy), &mut ctx, inc,
+        )
+        .await;
+
+        assert!(err.is_err(), "两轮都失败，格作废");
+        let titles: Vec<String> = rec.0.lock().unwrap().iter().map(|e| e.finding.title.clone()).collect();
+        assert_eq!(titles, ["t9"], "重试轮已闭合的那条经旁路留下来了（不复位时这里是空）");
+    }
+
     #[tokio::test]
     async fn stream_then_final_does_not_double_emit() {
         let dir = tmp_file();
@@ -317,7 +394,7 @@ mod tests {
         let backend = FakeChatBackend::new(vec![turn(TWO)])
             .with_delta_chunk(11)
             .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
-        let mut ctx = EmitCtx::new("m", "alpha", 2, dir.path(), &rec);
+        let mut ctx = EmitCtx::new("m", "alpha", 2, vec![(1, 9)], "a.rs", dir.path(), &rec);
         let call = run_review_shot_with(
             &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc,
         )
@@ -354,7 +431,7 @@ mod tests {
         let backend = FakeChatBackend::new(vec![turn(with_ghost)])
             .with_delta_chunk(9)
             .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &rec);
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], "a.rs", dir.path(), &rec);
         let call = run_review_shot_with(
             &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc,
         )
@@ -377,7 +454,7 @@ mod tests {
         let dir = tmp_file();
         let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
         let backend = FakeChatBackend::new(vec![turn(TWO)]);
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &());
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], "a.rs", dir.path(), &());
         let call = run_review_shot_with(
             &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc,
         )
@@ -397,7 +474,7 @@ mod tests {
         let backend = FakeChatBackend::new(vec![turn(truncated), turn(truncated)])
             .with_delta_chunk(8)
             .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &rec);
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], "a.rs", dir.path(), &rec);
         let err = run_review_shot_with(
             &backend, &prompt(), Duration::from_secs(5), 0, None, &mut ctx, inc.clone(),
         )
@@ -417,7 +494,7 @@ mod tests {
         // 流到一半（对象未闭合）即超时。
         inc.lock().unwrap().feed(r#"{"findings":[{"severity":"low","title":"half"#);
         let backend = FakeChatBackend::new_results(vec![Err(ProviderError::Timeout("probe".into()))]);
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &());
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], "a.rs", dir.path(), &());
         let err = run_review_shot_with(
             &backend, &prompt(), Duration::from_millis(50), 0, None, &mut ctx, inc.clone(),
         )
@@ -439,7 +516,7 @@ mod tests {
         ])
         .with_delta_chunk(8)
         .with_text_delta(Box::new(move |s: &str| inc2.lock().unwrap().feed(s)));
-        let mut ctx = EmitCtx::new("m", "alpha", 1, dir.path(), &());
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], "a.rs", dir.path(), &());
         let err = run_review_shot_with(
             &backend, &prompt(), Duration::from_millis(50), 0, None, &mut ctx, inc.clone(),
         )

@@ -78,6 +78,18 @@ impl IncrementalFindings {
         self.obj_start = None;
     }
 
+    /// 一次 HTTP 尝试开始时复位（M21b 批 D-1）：重试复用同一个解析器，断流那次的半截 JSON 必须丢掉——
+    /// 否则它会与重试轮的输出拼成一个四不像对象，接真 sink 后就发出去了。
+    ///
+    /// **保留 `emitted` 与 `discarded`**：已闭合的对象是 D10 立旁路的全部价值（格中途死亡也不丢），
+    /// 重复对象由 `EmitCtx` 的 id 去重挡住；丢弃计数是跨尝试累计的观测量。
+    /// 比 [`Self::finalize`] 多清 `in_array` / `done`：新一轮的流从头开始，得重走 seek 阶段。
+    pub fn reset_for_attempt(&mut self) {
+        self.finalize();
+        self.in_array = false;
+        self.done = false;
+    }
+
     /// 推进状态机直到需要更多字节。
     fn pump(&mut self) {
         loop {
@@ -234,6 +246,43 @@ impl IncrementalFindings {
 mod tests {
     use super::*;
     use crate::domain::Severity;
+
+    /// 尝试复位（批 D-1）：半截对象丢掉、不与重试轮拼接；已闭合对象与丢弃计数保留。
+    #[test]
+    fn reset_for_attempt_drops_the_half_object_but_keeps_what_closed() {
+        let mut inc = IncrementalFindings::new();
+        // 首试：一条完整的 + 一条只到一半就断了。**不先 take**——真路径上重试之间没有 drain，
+        // 已闭合对象就躺在队列里跨复位，这正是 D10 立旁路的全部价值（格中途死亡也不丢）。
+        inc.feed(r#"{"findings":[{"severity":"low","title":"done","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"q"},{"severity":"high","title":"half"#);
+
+        inc.reset_for_attempt();
+        assert_eq!(inc.discarded(), 1, "半截的计入丢弃");
+        let kept = inc.take();
+        assert_eq!(kept.len(), 1, "首试已闭合的那条跨复位保留: {kept:?}");
+        assert_eq!(kept[0].title, "done");
+
+        // 重试轮：从头一个完整的流
+        inc.feed(r#"{"findings":[{"severity":"medium","title":"retry","body":"b","file":"a.rs","line_start":2,"line_end":2,"confidence":0.6,"recommendation":"r","quote":"q2"}]}"#);
+        let out = inc.take();
+        assert_eq!(out.len(), 1, "重试轮的对象照常发出: {out:?}");
+        assert_eq!(out[0].title, "retry");
+        assert_eq!(out[0].severity, Severity::Medium, "没有与半截的 high 拼在一起");
+        assert_eq!(inc.discarded(), 1, "丢弃计数跨尝试累计、不被复位清零");
+    }
+
+    /// 不复位时的退化形状（本用例钉住「为什么要复位」）：半截与重试输出拼在一起，
+    /// 解析器还停在首试的数组里，重试轮的 `{"findings":[` 被当成数组内文本。
+    #[test]
+    fn without_reset_the_retry_stream_is_concatenated() {
+        let mut inc = IncrementalFindings::new();
+        inc.feed(r#"{"findings":[{"severity":"high","title":"half"#);
+        inc.feed(r#"{"findings":[{"severity":"medium","title":"retry","body":"b","file":"a.rs","line_start":2,"line_end":2,"confidence":0.6,"recommendation":"r","quote":"q2"}]}"#);
+        let out = inc.take();
+        assert!(
+            out.first().is_none_or(|f| f.title != "retry"),
+            "不复位时拿不到干净的重试对象（拼接或错位），故必须复位: {out:?}"
+        );
+    }
 
     fn feed_all(inc: &mut IncrementalFindings, text: &str, chunk: usize) {
         for piece in text.as_bytes().chunks(chunk) {
