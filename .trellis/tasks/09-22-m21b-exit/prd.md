@@ -9,13 +9,13 @@
 
 | # | 项 | 状态 | 证据 / 还差什么 |
 |---|---|---|---|
-| 1 | PR181 端到端 ×3 | ⏳ **待跑** | 门槛：findings 命中 oracle ≥ 6（「GLM 单发 6 条」= P0 dev 作业里 GLM 的 6 条）；墙钟分段可读。**缺 findings 评分器**（见 D5） |
-| 2 | dev 对照 | ⏳ **待定**（D4） | P0 已有 dev 作业（GLM + Kimi，39.5 min，8 findings，其中 GLM 6 条进 oracle） |
+| 1 | PR181 端到端 ×3 | ⏳ **待跑**（D6：金丝雀 1 + 2） | 门槛改按主题（D4）：**≥ 6 主题**；墙钟分段可读。评分器见 D5 |
+| 2 | dev 对照 | ⏳ 复用 P0（D4） | 门槛：**主题数 ≥ 8**（dev = 8 / 12）；另报留出集 T9–T12 命中 |
 | 3 | 预算与必挖 | ✅ 单测 | `must_items_are_never_cut_even_with_zero_budget`（K = 0 时主区照挖、其余收场 Skipped 且进 RunMeta）、`drain_zero_budget_keeps_primary` |
-| 4 | verifier | ⏳ **待跑 + 待定口径**（D2） | 判定层单测已覆盖「全同族 → 同族 + warning」（`all_same_family_falls_back_with_a_warning`）；「复核尾部 ≤ 1 min」本仓 dogfood 实测 3.5 min（glm 自己验自己） |
+| 4 | verifier | ⏳ **待跑**（D2：临时开复核、只用 deepseek） | 判定层单测已覆盖「全同族 → 同族 + warning」（`all_same_family_falls_back_with_a_warning`）；「复核尾部 ≤ 1 min」本仓 dogfood 实测 3.5 min（glm 自己验自己） |
 | 5 | provider 门 | ✅ 单测 + 部分实测 | `inflight_peak_equals_gate_width`、`shared_gate_scanner_enters_before_h0_at_t0`、`shared_gate_release_goes_to_waiting_scanner_first`、`second_stage_round_holds_the_gate`（门宽 1）；PR181 两轮 scan-only 零 429 / 503；端到端那轮再确认一次 |
 | 6 | kill → resume | ⏳ **待跑** | resume 单测大量（`resume_tests`）；真 provider、后台 job、中途 kill 这一条还没真跑过 |
-| 7 | 输出有界性 | ⚠️ **现有数据已不过 + 待定口径**（D3） | 本仓 dogfood 12 个 reviewer 格里 6 格 > `maxOutputTokens/2`（16384）：单轮 16.6k / 17.2k，两轮（二阶段）20.4k–55.6k；FINALIZE / REPAIR 零触发 |
+| 7 | 输出有界性 | ⏳ 硬门 = 零截断（D3）；单轮最大输出只记录 | 本仓 dogfood 12 个 reviewer 格里 6 格 > `maxOutputTokens/2`（16384）：单轮 16.6k / 17.2k，两轮（二阶段）20.4k–55.6k；FINALIZE / REPAIR 零触发 |
 | 8 | 回归集 | ✅ 三项全过 | **risk 对拍**（PR181，θ = 1.5，不带台账）：H0 17 / 17、jaccard 1.000、R 差 2e-7；**verify_score**：D-4 两臂基线已入 research；**scan_score**（PR181 两轮 scan-only 对 oracle 全并集 22 条）：均值命中 **11.0**、并集 **12**、噪音 0.835（P0 E3 B 臂 5.33 / 9 / 0.55；M21a 单 DeepSeek slice 9.33 / 16 / 0.843——噪音持平 M21a，其随条数涨的成因 M21a 已记） |
 | 9 | 门与文档 | ✅ | `make verify` 绿；`--help` 有 `risk` 子命令、`review --help` 有深挖说明；无 `--engine` / `--risk` / `--models` / `--workers` |
 | 10 | 墙钟分段 | ⏳ 取自第 1 项 | 分段字段已齐（`close_ms` / `first_dispatch_ms` / `drain_done_ms` / `verify_tail_ms` / `fill_block_*`）；本仓 dogfood 阻塞 max 36 ms、累计 200 ms，远低于挪 `spawn_blocking` 的线 |
@@ -75,3 +75,41 @@ followup 记未过项的处置。若 D1 / D3 / D5 需要改代码，开小分支
 High 16384、夹到 `max_tokens − 1024`；GLM-5 不可关，Off 按 Low 发（与 openai 分支同口径）。同时作用于 verifier 角色。
 （探针：第一次 403 `error code: 1010` 是 Cloudflare 按 Python urllib 的 UA 拦截，换 UA 即通，与请求内容无关；
 产品 reqwest 不带 UA，一直正常。）
+
+**D2 · 临时开复核 + 只用 deepseek 当 verifier**（用户裁）。验收几轮临时改配置：`review.verifiers.enabled = true`，
+verifier 角色**只给** `deepseek/deepseek-flash`（同时摘掉 glm 的 verifier 角色，否则声明集轮转会让 glm 验一半）。
+依据：第 4 项另两个子项（「blocking 全有复核记录或跳过理由」「refute 率可读」）要求复核真开着；D1 之后 glm 按 high
+思考，当 verifier 尾部只会比 dogfood 的 3.5 min 更长。「全 deepseek 构造 → 同族 + warning」为纯判定逻辑，按单测判
+（`all_same_family_falls_back_with_a_warning` + `declared_verifier_that_is_the_reviewer_itself_warns`）。跑前备份、跑后还原并校验指纹。
+
+**D3 · 硬门 = 零截断；单轮最大输出只记录**（用户裁）。硬门：FINALIZE / REPAIR 零触发、无 `max_tokens` 截断。
+另给 cell 记录加「单轮最大输出 token」字段作观测量（与 D1 同分支）。依据：anthropic 口径下 `max_tokens` **含思考 token**，
+D1 的 High 预算 16384 = glm 上限 32768 的一半——「单轮 < cap/2」按构造不过，它是在思考参数被消费之前定的规矩；
+真正要防的是截断。若出现截断，拿到数据后再定：调高 glm 的 `maxOutputTokens`，还是把 High 档预算降到 cap/4。
+
+**D4 · 复用 P0 结果，按主题口径比**（用户裁）。查证：oracle 22 条里 **9 条（glm 6 + kimi 3）就是 P0 dev 作业自己的产出**，
+按条目比 = dev 自评必得 9/9；dev 当年的原始 job 库随旧 PR181 工作树一并删除，条目级原始输出已不可得。
+P0 研究 §15.2 现成有 12 主题 × 5 来源的人工对齐表：**dev（GLM + Kimi）覆盖 8 / 12 主题**（GLM T1–T6、Kimi T1 / T7 / T8）；
+T9–T12 只有 rpiv / ocr 找到，dev 一个未碰——作**留出集**，完全去掉自评。
+门槛改写：第 1 项「≥ GLM 单发 6 条」→「**≥ 6 主题**」（GLM 的 6 条恰对应 T1–T6，含义不变）；
+第 2 项「命中 ≥ dev」→「**主题数 ≥ 8**」，另报留出集 T9–T12 上的命中数。
+
+**D5 · 自动候选 + 人工确认表**（用户裁）。新写 `eval/finding_score.py`（复用 `_oracle.py`；目标仓 / oracle / head
+全走参数，脚本本身不含公司仓内容，可入库）：quote 去空白定位 head 树 → 区间命中 oracle 条目 → 按 `topic` 映射到 12 主题
+→ 生成确认表。我逐条给「算 / 不算 + 一句理由」，用户终审。未落在任何 oracle 区间的 finding 单列「oracle 外」，不计分，
+供看 oracle 有没有漏掉真问题。纯自动被否：会把「同区域不同主张」（T3 那种）算成命中，与 P0 口径不一致。
+
+**D6 · 先 1 轮金丝雀，过了再跑 2 轮**（用户裁）。第 1 轮验 D1 思考映射、D3 新字段、D5 评分器在 PR181 上端到端正常；
+出现截断（D3 硬门）就先停、处理完再继续，不白烧后两轮。过了再跑：第 2 轮前台完整跑；第 3 轮后台 job，深挖中途 kill
+再 resume，兼做第 6 项。墙钟（第 10 项）取第 1、2 轮；findings（第 1 / 2 项）三轮都计。估算：单轮 30–40 min、
+输入 / 输出各约 100 万 token 量级。
+
+## 执行顺序（定案后）
+
+1. **小分支 `feat/m21b-exit`**：D1 `(Anthropic, glm)` 思考映射 + D3「单轮最大输出」字段 + D5 `eval/finding_score.py`（含 selftest）；
+   单测 + 变异，`/code-review` 后合回集成分支。
+2. **金丝雀**（D6 第 1 轮）：临时配置（D2）→ PR181 前台完整跑 → 查截断 / 字段 / 评分器 → 还原配置。
+3. **第 2、3 轮**（第 3 轮兼 kill → resume）。
+4. **评分与判定**：finding_score 出确认表 → 我逐条给理由 → 用户终审 → 十一项逐条判定。
+5. **收口**：roadmap 交付项打勾、状态 ✅、README 表；research 写三档预算与 refute 率；followup 记未过项处置；
+   明细与原始报告只进 `.next/private/m21b/`。
