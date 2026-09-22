@@ -24,6 +24,50 @@ pub(crate) fn extract_json_object(raw: &str) -> Option<Value> {
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
+    if let Some(v) = extract_from(trimmed) {
+        return Some(v);
+    }
+    // 宽容重试（M21b 出口验收金丝雀定案）：glm 抄 Go 源码进 `quote` 时把换行转义成 `\n`、却把 tab 原样写成
+    // 裸字符（每格 9–22 处），严格 JSON 拒收；修复轮原样复读同一段，两轮连败、整格作废。只在严格解析失败后、
+    // 只转义**字符串内部**的裸控制字符（结构位置的换行 / 缩进不动），转义后的 `\t` 解出来仍是源码里那个 tab，
+    // quote 逐字锚定不受影响。其余语法错（尾逗号、非法转义）不在此列——交给修复轮。
+    escape_raw_controls_in_strings(trimmed).and_then(|fixed| extract_from(&fixed))
+}
+
+/// 串内裸控制字符（U+0000–U+001F）→ JSON 转义；与下面的配平扫描同一套串感知。没有可改的返回 `None`。
+pub(crate) fn escape_raw_controls_in_strings(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut changed = false;
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            } else if (c as u32) < 0x20 {
+                changed = true;
+                match c {
+                    '\t' => out.push_str("\\t"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    _ => out.push_str(&format!("\\u{:04x}", c as u32)),
+                }
+                continue;
+            }
+        } else if c == '"' {
+            in_string = true;
+        }
+        out.push(c);
+    }
+    changed.then_some(out)
+}
+
+/// 整体解析 → 字符串感知配平扫描（`extract_json_object` 的核心，严格 / 宽容两遍共用）。
+fn extract_from(trimmed: &str) -> Option<Value> {
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
         if v.is_object() {
             return Some(v);
@@ -660,6 +704,34 @@ mod tests {
     // D1 四锚：200+error 体误分类修复。兼容网关把错误塞进 HTTP 200 body，
     // send_classified 判"成功"、旧逻辑 parse_*_turn 拿不到 content/choices → None → Parse
     // （不可重试，烧格）。error_body_to_provider_error 在 parse 之前先探这层。
+
+    /// 出口验收金丝雀定案：glm 抄 Go 源码进 quote 时换行转义成 `\n`、tab 却写成裸字符 → 严格 JSON 拒收、修复轮复读。
+    /// 宽容重试只转义**串内**控制字符：解出来的 quote 仍含真 tab（逐字锚定不受影响），结构位置的换行 / 缩进不动。
+    #[test]
+    fn raw_tab_inside_quote_is_tolerated_and_decodes_to_a_real_tab() {
+        let raw = "```json\n{\n\t\"findings\": [{\"severity\":\"high\",\"title\":\"t\",\"body\":\"b\",\"file\":\"svc/a.go\",\
+                   \"line_start\":2,\"line_end\":3,\"confidence\":0.7,\"recommendation\":\"r\",\
+                   \"quote\":\"\t\tconnect := d.Timeout\\n\t\tidle := d.Idle\"}]\n}\n```";
+        assert!(serde_json::from_str::<Value>(raw.trim_start_matches("```json").trim_end_matches("```")).is_err(), "前提：严格解析确实失败");
+        let (out, _) = parse_review_output_with_stats(raw, "m").expect("宽容重试应救回");
+        let crate::domain::CellOutput::Review { findings, .. } = out else { panic!() };
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].quote, "\t\tconnect := d.Timeout\n\t\tidle := d.Idle");
+    }
+
+    #[test]
+    fn escape_raw_controls_only_touches_string_interiors() {
+        // 结构位置的换行 / tab 原样；串内（含已转义引号之后）的 tab / 回车 / 其他控制字符转义
+        let s = "{\n\t\"a\": \"x\\\"\ty\",\n\t\"b\": \"\r\u{1}\"\n}";
+        let fixed = escape_raw_controls_in_strings(s).unwrap();
+        assert_eq!(fixed, "{\n\t\"a\": \"x\\\"\\ty\",\n\t\"b\": \"\\r\\u0001\"\n}");
+        let v: Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["a"], "x\"\ty");
+        assert_eq!(escape_raw_controls_in_strings("{\n\t\"a\": \"ok\\t\"\n}"), None, "没有可改的返回 None");
+        // 不过度宽容：尾逗号 / 非法转义这类语法错不救，交给修复轮
+        assert!(extract_json_object("{\"a\": \"\tx\",}").is_none());
+        assert!(extract_json_object("{\"a\": \"\\x00\"}").is_none());
+    }
 
     fn review_item(extra: &str) -> String {
         format!("{{\"severity\":\"high\",\"title\":\"t\",\"body\":\"harm chain\",\"file\":\"src/a.rs\",\"line_start\":3,\"line_end\":4,\"confidence\":0.7,\"recommendation\":\"fix it\",\"quote\":\"let x = 1;\"{extra}}}")
