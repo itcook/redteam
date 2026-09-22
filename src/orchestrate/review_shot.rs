@@ -114,6 +114,9 @@ struct TurnUsage {
     output: u64,
     cached: u64,
     reasoning: Option<u64>,
+    /// 这次单发里**单轮**最大的输出（首轮与 repair 轮取 max）——`output` 是两轮之和，
+    /// 拿它对比每轮都生效的 `max_tokens` 没有意义（M21b 出口验收 D3）。
+    max_turn: u64,
 }
 
 /// 一次 reviewer 调用成品（对齐 ScanCall + stream_discarded）。
@@ -125,6 +128,8 @@ pub struct ReviewCall {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub iterations: u32,
+    /// 单轮最大输出 token（首轮 / repair 轮 / 二阶段轮取 max；见 `TurnUsage::max_turn`）。
+    pub max_turn_output_tokens: u64,
     pub finish_reason: Option<String>,
     pub reasoning_tokens: Option<u64>,
     pub repair_note: Option<String>,
@@ -213,6 +218,7 @@ pub(crate) async fn run_review_shot_with(
         output: turn.output_tokens,
         cached: turn.cached_input_tokens,
         reasoning: turn.reasoning_tokens,
+        max_turn: turn.output_tokens,
     };
 
     if let Ok(call) = finish_parse(&turn.text, ctx, &inc, 1, turn.finish_reason.clone(), None, usage) {
@@ -242,6 +248,7 @@ pub(crate) async fn run_review_shot_with(
     usage.output += repair.output_tokens;
     usage.cached += repair.cached_input_tokens;
     usage.reasoning = sum_opt(usage.reasoning, repair.reasoning_tokens);
+    usage.max_turn = usage.max_turn.max(repair.output_tokens);
 
     match finish_parse(
         &repair.text, ctx, &inc, 2, repair.finish_reason.clone(), Some(repair_note), usage,
@@ -289,6 +296,7 @@ fn finish_parse(
         output_tokens: usage.output,
         cached_input_tokens: usage.cached,
         iterations,
+        max_turn_output_tokens: usage.max_turn,
         finish_reason,
         reasoning_tokens: usage.reasoning,
         repair_note,
@@ -505,6 +513,26 @@ mod tests {
     }
 
     /// REPAIR 轮失败（第二轮 turn 直接 Err）同样收口——错误半边两条路径都不漏 finalize。
+    /// M21b 出口验收 D3：`max_turn_output_tokens` 是**单轮**最大、`output_tokens` 是两轮之和。
+    /// 输出上限逐轮生效，拿两轮之和去比上限会把「两轮都很安全」误判成「撞帽」（dogfood 里 55.6k 那格就是这么来的）。
+    #[tokio::test]
+    async fn max_turn_output_is_the_largest_single_turn_not_the_sum() {
+        let dir = tmp_file();
+        let inc = Arc::new(Mutex::new(IncrementalFindings::new()));
+        let mut bad = turn(r#"{"findings":[{"severity":"low","title":"half"#); // 首轮截断成半截 JSON → 走 repair
+        bad.output_tokens = 300;
+        let mut good = turn(TWO);
+        good.output_tokens = 120;
+        let backend = FakeChatBackend::new_results(vec![Ok(bad), Ok(good)]);
+        let mut ctx = EmitCtx::new("m", "alpha", 1, vec![(1, 9)], "a.rs", dir.path(), &());
+        let call = run_review_shot_with(&backend, &prompt(), Duration::from_millis(50), 0, None, &mut ctx, inc)
+            .await
+            .unwrap();
+        assert_eq!(call.iterations, 2, "前提：走了 repair");
+        assert_eq!(call.output_tokens, 420, "总量 = 两轮之和");
+        assert_eq!(call.max_turn_output_tokens, 300, "单轮最大 = 首轮那 300，不是 420");
+    }
+
     #[tokio::test]
     async fn repair_turn_error_finalizes_bypass() {
         let dir = tmp_file();

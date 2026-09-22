@@ -12,7 +12,7 @@
   "assignee": "S.Kai",
   "createdAt": "2026-09-22",
   "completedAt": null,
-  "branch": null,
+  "branch": "feat/m21b-exit",
   "base_branch": "feat/m21-review-engine",
   "worktree_path": null,
   "commit": null,

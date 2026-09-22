@@ -201,6 +201,11 @@ pub struct CellRecord {
     /// 0＝失败/未观测（旧记录、整链失败、resume 格）。
     #[serde(default)]
     pub iterations: u32,
+    /// **单轮**最大输出 token（M21b 出口验收 D3）：`output_tokens` 是多轮之和（首轮 + repair / 二阶段），
+    /// 而输出上限 `max_tokens` 是逐轮生效的——判「离撞帽还有多远」只能看单轮。anthropic 口径下含思考 token。
+    /// 0 = 未观测（旧记录、scanner 格暂不填、失败格）。`record_json` 整条存，加字段无需迁移。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub max_turn_output_tokens: u64,
     /// 工具调用构成（延迟诊断仪器：模型有没有用 read_files 批量、每轮读多少、撞顶时新读 vs 空转）。
     /// serde default——旧记录/单发路径/整链失败为零值。
     #[serde(default)]
@@ -210,13 +215,17 @@ pub struct CellRecord {
     pub template_hash: Option<String>,
 }
 
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
 impl CellRecord {
     /// 便捷构造：ok=true, warn=None, family 空（运行学字段与 family 由调用方按需回填）。
     pub fn ok(cell: impl Into<String>, model: impl Into<String>, output: crate::domain::CellOutput) -> Self {
         Self {
             cell: cell.into(), model: model.into(), family: String::new(), ok: true, output, warn: None,
             duration_ms: 0, queue_wait_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0,
-            tool_use: Default::default(), template_hash: None,
+            max_turn_output_tokens: 0, tool_use: Default::default(), template_hash: None,
         }
     }
 

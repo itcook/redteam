@@ -410,6 +410,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             rec.input_tokens = input_tokens;
             rec.output_tokens = output_tokens;
             rec.cached_input_tokens = cached_input_tokens;
+            rec.max_turn_output_tokens = output_tokens; // 复核恒单轮（不设 repair 轮）
             rec.attempts = 1;
             // 没真跑成的按失败落盘（与 reviewer 的 `rec.ok = stage2_error.is_none()` 同一手法）：
             // 进 coverage.failed、md 不再渲染成「异族模型查过、结论成立」，resume 也会重验。
@@ -1028,6 +1029,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                                     c.output_tokens += c2.output_tokens;
                                     c.cached_input_tokens += c2.cached_input_tokens;
                                     c.iterations += c2.iterations;
+                                    c.max_turn_output_tokens = c.max_turn_output_tokens.max(c2.max_turn_output_tokens);
                                     // 解析 / 锚定丢弃计数取终判那一轮（首轮草稿被丢的不算这一格的产出丢失）；旁路丢弃两轮都真实发生，累加。
                                     c.stats = ReviewParseStats { stream_discarded: c.stats.stream_discarded + c2.stats.stream_discarded, ..c2.stats };
                                     c.output = c2.output; // 第二轮 = CONFIRM/REVISE 后终判
@@ -1041,6 +1043,10 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                                     c.input_tokens += bi;
                                     c.output_tokens += bo;
                                     c.cached_input_tokens += bc;
+                                    // 失败轮的 `bo` **不进**单轮 max：repair 解析失败时它是「首轮 + repair 轮」之和
+                                    // （`attach_usage` 只带出累加值），当成单轮会把两轮都安全的格误判成撞帽——
+                                    // 那正是 D3 要消除的误判（出口验收评审 #1）。失败轮内的逐轮大小不可观测，
+                                    // 与上面「是否走过 REPAIR 不可观测」同理；失败本身已经作为债与 warning 露出来了。
                                     // 第二轮确实发出过：轮次记下限 1（失败轮内是否走过 REPAIR 不可观测），attempts 随之计入。
                                     c.iterations += 1;
                                     warnings.push(format!("{cell_id}: second-stage round failed: {e} — keeping first-round findings (debt)"));
@@ -1174,6 +1180,7 @@ fn land(
             rec.output_tokens = c.output_tokens;
             rec.cached_input_tokens = c.cached_input_tokens;
             rec.iterations = c.iterations;
+            rec.max_turn_output_tokens = c.max_turn_output_tokens;
             // 与 scanner 同口径（orchestrate/mod.rs）：attempts = 轮次 + 429 重试。
             rec.attempts = c.iterations + rl_retries;
             rec.queue_wait_ms = rl_wait_ms;
@@ -2752,6 +2759,10 @@ mod tests {
         let mut want: serde_json::Value = serde_json::from_str(include_str!("testdata/deep_serial_baseline.json")).unwrap();
         strip_key(&mut got, "suspicion_agreement");
         strip_key(&mut want, "suspicion_agreement");
+        // 批 C 之后新增的纯观测字段照同一惯例剔掉（golden 保持批 C 原貌）：它只记数、不改任何行为——
+        // M21b 出口验收 D3 的「单轮最大输出」。
+        strip_key(&mut got, "max_turn_output_tokens");
+        strip_key(&mut want, "max_turn_output_tokens");
         assert!(
             got == want,
             "与批 C 串行基线不同构\n--- got ---\n{}\n--- want ---\n{}",
@@ -3741,6 +3752,75 @@ mod tests {
             "往轮判决必须跟着回来，否则它在本轮又成了 blocking"
         );
         assert!(f.is_refuted(), "`Stats` 与 verdict 都靠这个判定剔除它");
+    }
+
+
+    /// M21b 出口验收 D3：两阶段的格，单轮最大输出**跨阶段取 max**、并落进持久化的 cell 记录。
+    /// 输出上限逐轮生效——dogfood 里 55.6k 那格是两阶段之和，单看它会误判成「撞了 32768 的帽」。
+    #[tokio::test]
+    async fn two_stage_cell_records_the_largest_single_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() {\n").unwrap();
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        g(&["init", "-q"]);
+        g(&["add", "a.rs"]);
+        g(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        let bundles = vec![Bundle::from_files(vec![FileChange { path: "a.rs".into(), diff: "@@ -1,1 +1,1 @@\n+fn a() {".into() }])];
+        let mut first = turn(r#"{"findings":[],"needs":[{"path":"a.rs","reason":"need context"}]}"#);
+        // 二阶段那一轮更大：只有这样，「合并时不取 max」才会让结果停在首阶段的值、被用例抓到
+        first.output_tokens = 200;
+        let second_json = rev_json("fn a() {");
+        let mut second = turn(&second_json);
+        second.output_tokens = 500;
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![first, second])), Duration::from_secs(5), 0);
+        let run = run_one(&reg, root, &bundles, ToolsMode::On).await;
+
+        assert_eq!(run.meta.needs_two_stage_triggered, 1, "前提：走了二阶段");
+        let rec = run.cells.iter().find(|c| c.cell.starts_with("review[")).unwrap();
+        assert_eq!(rec.output_tokens, 700, "总量 = 两阶段之和");
+        assert_eq!(rec.max_turn_output_tokens, 500, "单轮最大 = 二阶段那 500（跨阶段取 max，不是停在首阶段的 200）");
+        let j = serde_json::to_value(rec).unwrap();
+        assert_eq!(j["max_turn_output_tokens"], 500, "进了持久化的 record_json");
+    }
+
+
+    /// 出口验收评审 #1：二阶段**失败**（repair 也解析不出）时，烧掉的输出是「首轮 + repair 轮」之和——
+    /// 不能当成一轮取进 `max_turn_output_tokens`，否则两轮都安全的格会被误判成撞帽（D3 要消除的正是这个）。
+    /// 总量照样入账（失败不等于免费）。
+    #[tokio::test]
+    async fn failed_second_stage_burned_sum_is_not_read_as_one_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() {\n").unwrap();
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        g(&["init", "-q"]);
+        g(&["add", "a.rs"]);
+        g(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        let bundles = vec![Bundle::from_files(vec![FileChange { path: "a.rs".into(), diff: "@@ -1,1 +1,1 @@\n+fn a() {".into() }])];
+        let mut first = turn(r#"{"findings":[],"needs":[{"path":"a.rs","reason":"need context"}]}"#);
+        first.output_tokens = 200;
+        // 二阶段：首轮半截 JSON → repair 仍半截 → 整格二阶段失败，烧掉 300 + 300
+        let mut bad1 = turn(r#"{"findings":[{"severity":"low","title":"half"#);
+        bad1.output_tokens = 300;
+        let mut bad2 = turn(r#"{"findings":[{"severity":"low","title":"still half"#);
+        bad2.output_tokens = 300;
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![first, bad1, bad2])), Duration::from_secs(5), 0);
+        let run = run_one(&reg, root, &bundles, ToolsMode::On).await;
+
+        assert_eq!(run.meta.needs_two_stage_triggered, 1, "前提：走了二阶段");
+        let rec = run.cells.iter().find(|c| c.cell.starts_with("review[")).unwrap();
+        assert!(!rec.ok, "前提：二阶段失败 → 格按失败落盘");
+        assert_eq!(rec.output_tokens, 800, "烧掉的照样入账：200 + 300 + 300");
+        assert_eq!(rec.max_turn_output_tokens, 200, "600 是两轮之和、不是一轮——不进单轮 max");
     }
 
     /// 免验不发请求（§8.1 跳过规则）：区域共识盖了章的 finding 连 verifier 都不碰。
