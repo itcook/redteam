@@ -62,3 +62,16 @@ plan 写 ×3。PR181 tier high、`budget_cells = 32`：单轮预计 30–60 min�
 
 roadmap `M21b-risk-deep-queue.md` 交付项打勾、状态 ✅、README 表更新；三档预算与 refute 率数字写进 research；
 followup 记未过项的处置。若 D1 / D3 / D5 需要改代码，开小分支 `feat/m21b-exit`，走 `/code-review` 后合回。
+
+## 定案记录（2026-09-22，逐条过）
+
+**D1 · 先补映射再跑**（用户裁）。查证事实：① glm-5.3 **不带任何参数也在思考**（探针：anthropic 格式不带 `thinking`
+→ 响应里有 `thinking` 块）——此前「reviewer 一直在思考关下跑」的说法**有误**，实为「按模型默认档思考」；
+「无参数映射，未发送」那条 warning 说的是参数没发，不是思考关了。② 网关对 anthropic 格式的
+`thinking{type:"enabled", budget_tokens}` 与 openai 格式的 `thinking + reasoning_effort` 都接受（200）。
+③ P0 的 dev 基线（GLM 6 条）来自 9-04 构建的 dev 二进制，那时完全不消费 `thinkingLevel`——同为默认档。
+已知代价（接受）：思考 token 计入 `output_tokens` → 第 7 项更难过；与 dev 基线不再同思考档。
+实现：`thinking_params` 增 `(Anthropic, glm)` 分支，形态照探针 B——`budget_tokens` 按档 Low 2048 / Medium 8192 /
+High 16384、夹到 `max_tokens − 1024`；GLM-5 不可关，Off 按 Low 发（与 openai 分支同口径）。同时作用于 verifier 角色。
+（探针：第一次 403 `error code: 1010` 是 Cloudflare 按 Python urllib 的 UA 拦截，换 UA 即通，与请求内容无关；
+产品 reqwest 不带 UA，一直正常。）
