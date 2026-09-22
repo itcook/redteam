@@ -53,12 +53,18 @@ def cmd_candidates(a):
     for ri, path in enumerate(a.reports, start=1):
         for f in load_findings(path):
             file = f.get("file") or ""
-            rng = anchor_quote(a.repo, head, file, f.get("quote") or "")
-            anchored = rng is not None
-            if not anchored:
-                # E3 口径：定位失败按自报行号计（并标 unanchored），与 scan_score 同源
-                rng = (int(f.get("line_start") or 0), int(f.get("line_end") or f.get("line_start") or 0))
-            hits = match_entries(entries, file, rng) if rng[0] > 0 else []
+            # 行号来源（出口验收评审 #3）：**优先采信报告里的行号**——产品落盘前已经用 `locate_quote_near`
+            # 按自报行号就近锚定、并改写了 line_start / line_end；而 `anchor_quote` 取的是去空白后
+            # 「文件里第一次出现」，`return Ok(());` 这类重复短句会被挪到文件更早的别处，候选主题随之错位。
+            # 只有报告没给行号时才退回按 quote 定位（scan_score 的 E3 口径）。
+            ls, le = int(f.get("line_start") or 0), int(f.get("line_end") or f.get("line_start") or 0)
+            if ls > 0:
+                rng, lines_from = (ls, max(le, ls)), "report"
+            else:
+                q = anchor_quote(a.repo, head, file, f.get("quote") or "")
+                rng, lines_from = (q, "quote") if q else ((0, 0), None)
+            anchored = lines_from is not None
+            hits = match_entries(entries, file, rng) if anchored else []
             topics = sorted({e.get("topic") or "?" for e in hits})
             rows.append({
                 "key": finding_key(ri, f),
@@ -67,6 +73,7 @@ def cmd_candidates(a):
                 "file": file,
                 "lines": list(rng),
                 "anchored": anchored,
+                "lines_from": lines_from,
                 "severity": f.get("severity"),
                 "title": f.get("title"),
                 "refuted": bool((f.get("verify") or {}).get("verdict") == "refuted"),
@@ -92,17 +99,37 @@ def cmd_candidates(a):
 
 def judge(confirm, min_topics, baseline, holdout):
     """确认表 → 主题覆盖。只认人工填了 `hit` 的；被 verifier 驳回的另计（它们不计入报告头条，但若命中的是真缺陷就是误驳）。"""
-    runs = sorted({r["run"] for r in confirm["rows"]})
+    # 轮次按**传入的报告数**定（出口验收评审 #2）：只从 rows 推会让零产出的那一轮整个消失，
+    # 「每轮 ≥ N 主题」于是只在有产出的轮上判——恰恰漏掉最该拦的那一轮。
+    runs = list(range(1, len(confirm.get("reports") or []) + 1)) or sorted({r["run"] for r in confirm["rows"]})
     per_run, per_run_refuted = {i: set() for i in runs}, {i: set() for i in runs}
     pending = 0
+    bad = []
     for r in confirm["rows"]:
+        verdicts = r.get("verdict") or {}
+        hits_in_row = []
         for c in r["candidates"]:
-            v = (r.get("verdict") or {}).get(c["topic"])
+            v = verdicts.get(c["topic"])
             if not v:
                 pending += 1
                 continue
-            if v.get("verdict") == "hit":
-                (per_run_refuted if r["refuted"] else per_run)[r["run"]].add(c["topic"])
+            # 值只认 hit / miss（评审 #5）：写成 "Hit" / "yes"、或只填了 reason 没填 verdict，
+            # 旧逻辑会静默算成 miss——覆盖数偏低，还不触发「还有未填」的提示。
+            val = v.get("verdict") if isinstance(v, dict) else None
+            if val not in ("hit", "miss"):
+                bad.append(f"{r['key']} / {c['topic']}: verdict = {val!r}（只认 hit / miss）")
+                continue
+            if val == "hit":
+                hits_in_row.append(c["topic"])
+        # 一条 finding 至多命名一个缺陷机制（评审 #4）：宽范围的 finding 可能跨过几个 oracle 条目、
+        # 带出几个候选主题，但人工确认时要挑定它说的是哪一个——同时标两个 hit 会让一条 finding 撑起两个主题。
+        if len(hits_in_row) > 1:
+            bad.append(f"{r['key']}: 一条 finding 标了 {len(hits_in_row)} 个 hit {hits_in_row}——至多一个")
+            continue
+        for t in hits_in_row:
+            (per_run_refuted if r["refuted"] else per_run)[r["run"]].add(t)
+    if bad:
+        raise ValueError("确认表有 " + str(len(bad)) + " 处要改：\n  " + "\n  ".join(bad))
     union = set().union(*per_run.values()) if per_run else set()
     res = {
         "pending": pending,
@@ -146,7 +173,10 @@ def _expand(prefixes, topics):
 def cmd_judge(a):
     confirm = json.load(open(a.confirm, encoding="utf-8"))
     topics = confirm.get("topics") or []
-    res = judge(confirm, a.min_topics, _expand(_topic_list(a.baseline_topics), topics), _expand(_topic_list(a.holdout), topics))
+    try:
+        res = judge(confirm, a.min_topics, _expand(_topic_list(a.baseline_topics), topics), _expand(_topic_list(a.holdout), topics))
+    except ValueError as e:
+        raise SystemExit(str(e))
     if res["pending"]:
         print(f"⚠ 还有 {res['pending']} 个候选没填 verdict——以下只算已确认的")
     for i, c in res["per_run_counts"].items():
@@ -185,11 +215,13 @@ def cmd_selftest(_a):
         opath = os.path.join(d, "oracle.json")
         json.dump(oracle, open(opath, "w", encoding="utf-8"))
         rep = {"findings": [
-            {"id": "f1", "file": "src/a.rs", "line_start": 99, "line_end": 99, "title": "leak", "quote": "let token=secret();"},
+            {"id": "f1", "file": "src/a.rs", "line_start": 0, "line_end": 0, "title": "leak", "quote": "let token=secret();"},
             {"id": "f2", "file": "src/a.rs", "line_start": 5, "line_end": 5, "title": "write", "quote": "not in file"},
             {"id": "f3", "file": "src/a.rs", "line_start": 9, "line_end": 9, "title": "noise", "quote": "noise();"},
             {"id": "f4", "file": "src/a.rs", "line_start": 7, "line_end": 7, "title": "tests", "quote": "y();",
              "verify": {"verdict": "refuted", "model": "v", "note": "n"}},
+            # 重复短句：报告行号（第 8 行 z();…）优先于 quote 的「第一次出现」——这里 quote 在第 6 行也出现
+            {"id": "f5", "file": "src/a.rs", "line_start": 8, "line_end": 8, "title": "dup", "quote": "x();"},
         ]}
         rpath = os.path.join(d, "rep.json")
         json.dump(rep, open(rpath, "w", encoding="utf-8"))
@@ -198,19 +230,35 @@ def cmd_selftest(_a):
         assert cmd_candidates(ns) == 0
         c = json.load(open(cpath, encoding="utf-8"))
         rows = {r["id"]: r for r in c["rows"]}
-        assert rows["f1"]["anchored"] and rows["f1"]["lines"] == [2, 2], rows["f1"]
+        assert rows["f1"]["lines"] == [2, 2] and rows["f1"]["lines_from"] == "quote", "报告无行号 → 退回 quote 定位"
         assert [x["topic"] for x in rows["f1"]["candidates"]] == ["T1-leak"], rows["f1"]
-        assert not rows["f2"]["anchored"] and [x["topic"] for x in rows["f2"]["candidates"]] == ["T2-write"], "未锚定按自报行号"
+        assert rows["f2"]["lines_from"] == "report" and [x["topic"] for x in rows["f2"]["candidates"]] == ["T2-write"], "报告行号优先"
+        assert rows["f5"]["lines"] == [8, 8] and [x["topic"] for x in rows["f5"]["candidates"]] == ["T9-tests"], \
+            "重复短句按报告行号（第 8 行），不被 quote 的第一次出现（第 6 行）挪走"
         assert rows["f3"]["outside"] and not rows["f3"]["candidates"], "oracle 外单列"
         assert rows["f4"]["refuted"] and [x["topic"] for x in rows["f4"]["candidates"]] == ["T9-tests"], rows["f4"]
 
         # 未填 verdict → 什么都不算
         r0 = judge(c, 2, None, None)
-        assert r0["pending"] == 3 and r0["union_count"] == 0, r0
+        assert r0["pending"] == 4 and r0["union_count"] == 0, r0
+        # verdict 值写错 → 报错而不是静默算 miss（评审 #5）
+        rows["f1"]["verdict"] = {"T1-leak": {"verdict": "Hit"}}
+        try:
+            judge(c, 2, None, None)
+            raise AssertionError("错值该报错")
+        except ValueError as e:
+            assert "只认 hit / miss" in str(e), e
+        rows["f1"]["verdict"] = {"T1-leak": {"reason": "忘了填 verdict"}}
+        try:
+            judge(c, 2, None, None)
+            raise AssertionError("缺 verdict 字段该报错")
+        except ValueError:
+            pass
         # 人工：f1 算、f2 不算（同区域不同主张）、f4 算但被驳回
         rows["f1"]["verdict"] = {"T1-leak": {"verdict": "hit", "reason": "同一机制"}}
         rows["f2"]["verdict"] = {"T2-write": {"verdict": "miss", "reason": "同区域不同主张"}}
         rows["f4"]["verdict"] = {"T9-tests": {"verdict": "hit", "reason": "同一机制"}}
+        rows["f5"]["verdict"] = {"T9-tests": {"verdict": "miss", "reason": "不同机制"}}
         r1 = judge(c, 2, ["T1-leak", "T2-write"], ["T9-tests"])
         assert r1["pending"] == 0 and r1["union"] == ["T1-leak"], r1
         assert r1["each_run_passes_min"] is False and r1["union_ge_baseline"] is False, r1
@@ -218,6 +266,31 @@ def cmd_selftest(_a):
         assert r1["refuted_real_topics"] == {"1": ["T9-tests"]}, "被驳回的真主题不计入覆盖、但要单列"
         assert r1["holdout_hit"] == [], "驳回掉的不算留出集命中"
         assert _expand(["T1", "T9"], c["topics"]) == ["T1-leak", "T9-tests"], "主题简写展开"
+
+        # 一条 finding 标两个 hit → 报错（评审 #4）
+        wide = json.loads(json.dumps(c))
+        wr = next(r for r in wide["rows"] if r["id"] == "f1")
+        wr["candidates"].append({"topic": "T2-write", "oracle": []})
+        wr["verdict"] = {"T1-leak": {"verdict": "hit"}, "T2-write": {"verdict": "hit"}}
+        try:
+            judge(wide, 2, None, None)
+            raise AssertionError("一行两个 hit 该报错")
+        except ValueError as e:
+            assert "至多一个" in str(e), e
+
+        # 零产出的那一轮不能消失（评审 #2）：传 2 份报告、第 2 份没有 finding
+        zpath = os.path.join(d, "zero.json")
+        json.dump({"findings": []}, open(zpath, "w", encoding="utf-8"))
+        c2path = os.path.join(d, "confirm2.json")
+        assert cmd_candidates(argparse.Namespace(reports=[rpath, zpath], oracle=opath, repo=repo, head=None,
+                                                  set="union", out=c2path)) == 0
+        c2 = json.load(open(c2path, encoding="utf-8"))
+        for r in c2["rows"]:
+            for cand in r["candidates"]:
+                r["verdict"][cand["topic"]] = {"verdict": "hit" if r["id"] == "f1" else "miss"}
+        r2 = judge(c2, 1, None, None)
+        assert r2["per_run_counts"] == {"1": 1, "2": 0}, r2
+        assert r2["each_run_passes_min"] is False, "零产出那轮 0 个主题，门槛必须判不过"
     print("selftest ok: candidates（命中 / 未锚定 / oracle 外 / 驳回）+ judge（待填 / 门槛 / 基线 / 留出集 / 误驳侧证）")
     return 0
 
