@@ -18,7 +18,7 @@
 | 4 | 仓库简介入稳定前缀：`.redteam/brief.md`（约 2K token）或复用 `--spec`；段位在系统协议之后、spec 之前；cache 回归 | §10.5 | `src/prompt/mod.rs` |
 | 5 | 切片调优（slice 已在 M21a 默认落地）：按 §10.2 回退信号加二跳选项、校准 `slice_min_bytes`；可选合成 util 文件 LITM 实验（原 E2 形态，挂 `.doc/TODO` 既有条目） | §10.2 | `src/pack/mod.rs` |
 | 6 | `anchor_window = ±N` 确定性后滤：落在改动行 ±N 外的疑点 / finding 降级或丢 | §10.4 | `src/positioning` |
-| 7 | **拆大组 / 大格**（2026-09-22 用户裁上调，原挂「aacr-bench 重启后再看」）：切分键 = 每格 diff 字节，先切引用计数最低的强边、切开的边进跨组索引；验收按「最慢 scanner 格墙钟」与 `close_ms / 总墙钟`，不按组数。依据：批 D dogfood 里 scanner 段占墙钟 55%、`close_ms` ≡ 最慢那一格、而 provider 门在途峰值只有 2（门宽 16 / 20）——拆格是把串行生成换成并行，在门这边零代价。明细与反事实表见 followup 同名条目 | §3.2, §10.2 | `src/bundle`（`group` 切分）, `src/pack` |
+| 7 | **拆大组 / 大格**（2026-09-22 用户裁上调，原挂「aacr-bench 重启后再看」）：切分键 = 每格 diff 字节，先切引用计数最低的强边、切开的边进跨组索引；验收按「最慢 scanner 格墙钟」与 `close_ms / 总墙钟`，不按组数。依据：批 D dogfood 里 scanner 段占墙钟 55%、`close_ms` ≡ 最慢那一格、而 provider 门在途峰值只有 2（门宽 16 / 20）——拆格是把串行生成换成并行，在门这边零代价。明细与反事实表见 followup 同名条目；**改前基线（2026-09-22）：PR181 最慢 scanner 格 ≈ 285s，现实目标约减半**（拆后关键路径换到 deepseek 在中等组上的 ≈ 140s，deepseek 输出对 diff 强亚线性） | §3.2, §10.2 | `src/bundle`（`group` 切分）, `src/pack` |
 
 ## 不做
 
