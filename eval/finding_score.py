@@ -64,7 +64,14 @@ def cmd_candidates(a):
                 q = anchor_quote(a.repo, head, file, f.get("quote") or "")
                 rng, lines_from = (q, "quote") if q else ((0, 0), None)
             anchored = lines_from is not None
-            hits = match_entries(entries, file, rng) if anchored else []
+            # 行容差（2026-09-23 尸检定案）：候选表是**给人判**的，召回优先、精度由人工确认那一步保证。
+            # 严格区间重叠会把「同一缺陷、锚点偏几行」的 finding 静默丢掉——实测 T10 就是这么丢的：
+            # 四轮报告都有「checkpoint 把所有 mismatch 塌成一个不可区分的 collision」这条，
+            # 与 oracle 的「checkpoint 元数据可诊断性」是同一机制，只因锚点差 10–15 行而从未进过确认表。
+            # 近旁命中标 `match: "near"`，人工确认时自己判是不是同一个机制。
+            exact_hits = match_entries(entries, file, rng) if anchored else []
+            hits = match_entries(entries, file, (max(1, rng[0] - a.tolerance), rng[1] + a.tolerance)) if anchored else []
+            exact_ids = {e["id"] for e in exact_hits}
             topics = sorted({e.get("topic") or "?" for e in hits})
             rows.append({
                 "key": finding_key(ri, f),
@@ -79,8 +86,13 @@ def cmd_candidates(a):
                 "refuted": bool((f.get("verify") or {}).get("verdict") == "refuted"),
                 # 每个候选主题配上 oracle 里那几条的标题，确认时对着读机制
                 "candidates": [
-                    {"topic": t, "oracle": [{"id": e["id"], "source": e.get("source"), "title": e.get("title")}
-                                            for e in hits if (e.get("topic") or "?") == t]}
+                    {"topic": t,
+                     # 该主题下是否有**严格重叠**的条目；全是近旁则标 near（确认时更该逐条读机制）
+                     "match": "exact" if any(e["id"] in exact_ids for e in hits if (e.get("topic") or "?") == t) else "near",
+                     "oracle": [{"id": e["id"], "source": e.get("source"), "title": e.get("title"),
+                                 "match": "exact" if e["id"] in exact_ids else "near",
+                                 "lines": [e["anchors"][0]["line_start"], e["anchors"][0]["line_end"]] if e.get("anchors") else None}
+                                for e in hits if (e.get("topic") or "?") == t]}
                     for t in topics
                 ],
                 "outside": not hits,
@@ -92,8 +104,9 @@ def cmd_candidates(a):
     with open(a.out, "w", encoding="utf-8") as fh:
         json.dump(out, fh, ensure_ascii=False, indent=1)
     n_cand = sum(1 for r in rows if not r["outside"])
-    print(f"findings {len(rows)}（{len(a.reports)} 轮）· 有候选主题 {n_cand} · oracle 外 {len(rows) - n_cand} "
-          f"· 未锚定 {sum(1 for r in rows if not r['anchored'])} → {a.out}")
+    n_near = sum(1 for r in rows for c in r["candidates"] if c["match"] == "near")
+    print(f"findings {len(rows)}（{len(a.reports)} 轮）· 有候选主题 {n_cand}（其中近旁命中 {n_near} 个主题槽，容差 ±{a.tolerance} 行）"
+          f"· oracle 外 {len(rows) - n_cand} · 未锚定 {sum(1 for r in rows if not r['anchored'])} → {a.out}")
     return 0
 
 
@@ -226,7 +239,8 @@ def cmd_selftest(_a):
         rpath = os.path.join(d, "rep.json")
         json.dump(rep, open(rpath, "w", encoding="utf-8"))
         cpath = os.path.join(d, "confirm.json")
-        ns = argparse.Namespace(reports=[rpath], oracle=opath, repo=repo, head=None, set="union", out=cpath)
+        # 既有断言测的是「行号来源」等严格口径，显式钉 tolerance=0（合成仓只有 9 行，±10 会让所有条目互相命中）
+        ns = argparse.Namespace(reports=[rpath], oracle=opath, repo=repo, head=None, set="union", out=cpath, tolerance=0)
         assert cmd_candidates(ns) == 0
         c = json.load(open(cpath, encoding="utf-8"))
         rows = {r["id"]: r for r in c["rows"]}
@@ -235,6 +249,26 @@ def cmd_selftest(_a):
         assert rows["f2"]["lines_from"] == "report" and [x["topic"] for x in rows["f2"]["candidates"]] == ["T2-write"], "报告行号优先"
         assert rows["f5"]["lines"] == [8, 8] and [x["topic"] for x in rows["f5"]["candidates"]] == ["T9-tests"], \
             "重复短句按报告行号（第 8 行），不被 quote 的第一次出现（第 6 行）挪走"
+        assert all(c["match"] == "exact" for r in c["rows"] for c in r["candidates"]), "tolerance=0 下只可能有严格命中"
+
+        # 行容差（2026-09-23 尸检定案）：锚点偏几行的同机制 finding 要进候选表、并标 near，交人工判
+        near_rep = {"findings": [
+            {"id": "n1", "file": "src/a.rs", "line_start": 9, "line_end": 9, "title": "near leak", "quote": "noise();"},
+        ]}
+        npath = os.path.join(d, "near.json")
+        json.dump(near_rep, open(npath, "w", encoding="utf-8"))
+        ncpath = os.path.join(d, "near-confirm.json")
+        strict = argparse.Namespace(reports=[npath], oracle=opath, repo=repo, head=None, set="union", out=ncpath, tolerance=0)
+        assert cmd_candidates(strict) == 0
+        assert json.load(open(ncpath, encoding="utf-8"))["rows"][0]["outside"], "严格口径下第 9 行不碰任何条目"
+        loose = argparse.Namespace(reports=[npath], oracle=opath, repo=repo, head=None, set="union", out=ncpath, tolerance=3)
+        assert cmd_candidates(loose) == 0
+        nr = json.load(open(ncpath, encoding="utf-8"))["rows"][0]
+        assert not nr["outside"], "±3 行内的条目该进候选"
+        assert [x["topic"] for x in nr["candidates"]] == ["T9-tests"], nr["candidates"]
+        assert nr["candidates"][0]["match"] == "near", "全是近旁 → 标 near"
+        assert [o["match"] for o in nr["candidates"][0]["oracle"]] == ["near"], "条目级也要标 near（人工逐条读机制时要知道哪条是近旁）"
+        assert nr["candidates"][0]["oracle"][0]["lines"] == [7, 8], "候选里带上 oracle 锚点行，人工确认时对得上"
         assert rows["f3"]["outside"] and not rows["f3"]["candidates"], "oracle 外单列"
         assert rows["f4"]["refuted"] and [x["topic"] for x in rows["f4"]["candidates"]] == ["T9-tests"], rows["f4"]
 
@@ -283,7 +317,7 @@ def cmd_selftest(_a):
         json.dump({"findings": []}, open(zpath, "w", encoding="utf-8"))
         c2path = os.path.join(d, "confirm2.json")
         assert cmd_candidates(argparse.Namespace(reports=[rpath, zpath], oracle=opath, repo=repo, head=None,
-                                                  set="union", out=c2path)) == 0
+                                                  set="union", out=c2path, tolerance=0)) == 0
         c2 = json.load(open(c2path, encoding="utf-8"))
         for r in c2["rows"]:
             for cand in r["candidates"]:
@@ -291,11 +325,15 @@ def cmd_selftest(_a):
         r2 = judge(c2, 1, None, None)
         assert r2["per_run_counts"] == {"1": 1, "2": 0}, r2
         assert r2["each_run_passes_min"] is False, "零产出那轮 0 个主题，门槛必须判不过"
+
+        # 容差默认值端到端接线（命令行不给 --tolerance 时必须是 ±10，不是严格口径）
+        parsed = build_parser().parse_args(["candidates", rpath, "--oracle", opath, "--repo", repo, "--out", cpath])
+        assert parsed.tolerance == 10, f"默认容差应为 10，实际 {parsed.tolerance}"
     print("selftest ok: candidates（命中 / 未锚定 / oracle 外 / 驳回）+ judge（待填 / 门槛 / 基线 / 留出集 / 误驳侧证）")
     return 0
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -305,6 +343,8 @@ def main():
     c.add_argument("--repo", required=True, help="被评仓（取 head 树内容做 quote 定位）")
     c.add_argument("--head", help="缺省取 oracle 里的 head")
     c.add_argument("--set", default="union")
+    c.add_argument("--tolerance", type=int, default=10,
+                   help="候选匹配的行容差（默认 ±10）：召回优先、精度交给人工确认；0 = 严格重叠（旧口径）")
     c.add_argument("--out", required=True)
     c.set_defaults(fn=cmd_candidates)
 
@@ -318,8 +358,11 @@ def main():
 
     s = sub.add_parser("selftest", help="合成仓自检")
     s.set_defaults(fn=cmd_selftest)
+    return ap
 
-    a = ap.parse_args()
+
+def main():
+    a = build_parser().parse_args()
     sys.exit(a.fn(a))
 
 
