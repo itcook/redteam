@@ -690,3 +690,13 @@ deepseek 的输出则随规模走（5k / 32–39k）。推论：拆大组对 qwe
 ② **第 2 项「主题 ≥ 8」未达，作为 M21c 的入口条件**：定稿配置三轮候选主题并集 6（T1–T5、T9），dev 基线 8。
 缺口不在扫描召回、也不在预算（见 D18 第 3 / 4 条），而在深挖的「转化」：scanner 疑点已覆盖到 T6 / T10 / T11 的 oracle 区域，
 findings 却没有对应主题，同轮 65 条 findings 里 55 条在 oracle 之外。M21c 判例前移 / M21d 上下文深化落地后按同一口径复测。
+
+**收口评审两条未修项（2026-09-23，`/code-review high` 的 #3 / #5）**：
+① **5xx 拿不到 `Retry-After`**：`classify_status` 只给 429 / 529 挂 `retry_after`，5xx 走 `Server(format!("http {status}"))`
+把头丢了，于是 `backoff_for` 的 `Retry-After` 分支对瞬断类不可达——网关回 `503 + Retry-After: 60` 时仍按 2→4→8→16 s 走完预算。
+本次只把注释里的过度承诺改掉；要真兑现得给 `Server` / `Unavailable` 加 `retry_after` 字段（改 `ProviderError` 形状，
+牵动全部构造与 match 点）→ M21c。收益上界有限：`RETRY_AFTER_CAP` 与 `TRANSIENT_BACKOFF_CAP` 都是 30 s，只影响前几次尝试。
+② **`cfg!(test)` 缩退避只覆盖 lib 单测**：`tests/*.rs` 链接的是不带 `cfg(test)` 的 lib，那里为假。当前集成测试没有喂 5xx 的用例，
+是陷阱不是现症——将来有人在 `tests/` 里加瞬断重试用例，单条要真睡 2+4+8+16 s 且从代码上看不出原因。
+评审建议改 `#[tokio::test(start_paused = true)]` + `tokio::time::pause()`：生产路径零分叉、也覆盖集成测试，
+代价是要确认所有调用方都在 tokio 运行时内（实际都在）。M21c 随重试路径其它改动一并换。
