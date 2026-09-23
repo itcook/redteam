@@ -671,3 +671,11 @@ deepseek 的输出则随规模走（5k / 32–39k）。推论：拆大组对 qwe
 档位跟着先注册的角色（scanner）走。附带缺陷：`build_registry` 那条 warning 写「本轮按已注册档位跑」，对 reviewer 是**错的**
 （reviewer 按自己的档跑）。修法：warning 限定到真正共享 backend 的角色；verifier 也走 per-cell backend，
 或 route_key 带角色前缀（M21c 已记的活）。
+
+**resume 报告丢失深挖账目（2026-09-23 出口验收第 6 项实测）**：后台 job 深挖中途被 SIGKILL → `--resume` 续跑后，
+报告里 `deep.verify_triggered` / `verify_refuted` / `verify_tail_ms` / `close_ms` / `budget_cells` 与顶层 `refute_rate`
+**全为空**，而 `cells` 里 24 个 verify 格的记录俱在、`coverage.reused` 也如实标了复用；`budget_skipped` 与
+`items_from_suspicions` 倒是有。`result <job>` 取回的持久化报告同样为空 → 不是打印路径的问题，是**续跑没有从
+cell 记录重建这些计数**（原进程死时它们只在内存里）。后果：崩溃续跑后「复核到底跑没跑、驳回几条、尾部多久」
+在报告里查不到，出口验收第 4 / 6 项若按报告字段判会误判成「一次没验」。修法：resume 收口时按 cells 里的
+verify 记录重建复核四量与 `close_ms`（口径与正常路径同源），或显式把这些字段标成「续跑不可重建」而非静默 null。
