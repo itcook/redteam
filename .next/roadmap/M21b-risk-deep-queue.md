@@ -1,7 +1,9 @@
 # M21b · 风险路由与深挖队列
 
 > 状态: ⏳（plan `../plans/2026-09-10-redteam-m21b-risk-deep-queue-plan.md`：**七批 A / B / C / C1 / C2 / C3 / D + 出口**，批序 A·B → C → C1 → C2 → C3 → D → 出口——2026-09-10 派生时为四批 A-D〔原五批含 aacr 接线批，同日删〕，2026-09-12 增批 C1 承接交付项 2/3 的门驱动并发与分派池轮转，2026-09-13 C1 拷问定案增批 C2 承接 design §2 的 scanner 与深挖时间重叠，2026-09-15 C2 拷问定案〔D15〕增批 C3「深挖选项稳定性」承接交付项 2 的选项方差与 scanner needs 入队、D 改排 C3 之后）· 依赖 M21a ✅ · design v13 §3.3 / §6 / §7 / §8.1 / §8.4 / §12.3 / §13 / §17 · 决策 D1 勘误, D2, D6, D7, D13, D15, D16, D17
-> 出口：`redteam-next` 端到端产 finding 并流式复核；插件与 ship 仍用 dev `redteam`（切名在 M21c）
+> 出口：**✅ 已交付（2026-09-23 出口验收〔D18〕）**——`redteam-next` 端到端产 finding 并流式复核；定稿配置三轮 + 预算对照一轮，
+> 机械面全过（失败格 / 截断 / 解析失败三轮皆 0；kill → resume 复用不重挖），**覆盖面记账**：三轮候选主题并集 6（第 2 项门槛 8 未达），
+> 缺口定位在深挖「转化」环节 → 转 M21c / M21d。插件与 ship 仍用 dev `redteam`（切名在 M21c）
 
 ## 目标
 
@@ -32,12 +34,14 @@ aacr 接线（`reviewers/redteam.py` 等随重启点 M21c smoke 一并做，D7 B
 
 - PR181：findings oracle 命中 ≥ GLM 单发 6 条；墙钟分段可读——scan 段对齐 M21a 实测（大格先发 189-251 s）+ 深挖 ceil(K / reviewer 门宽和) + 复核尾部 ≤ 1 min；总账参考 design §13（低 5-8 / 高 7-10 min），超标先看最长格与门宽（M21a 出口裁决：不硬卡单点门槛）。
 - 对照（R6 销案〔D11〕）：dev 旧二进制与 `redteam-next` 并排跑 PR181，比 P0 oracle 22 条的命中数；预算截断数 / 台账落入数 / 保底格使用数入 RunMeta，供三档起步值回校。
+  **✅ 回校结案〔D18〕：维持 `auto`（high 32）不抬**——`maxCells = 64` 使截断 25 → 2、findings 55 → 65，但墙钟 +53%、token +66%、oracle 主题覆盖不升反降（6 → 5）。
 - 预算截断项 100% 出现在 RunMeta；必挖集从不被截（构造用例：`maxCells = 0` 时 H0 仍被挖）。
 - verifier：blocking finding 全部有复核记录或跳过理由；构造「scanners / reviewers 全 deepseek」配置 → 同族复核 + 「无异族
   verifier」warning；refute 率在 RunMeta 可读；复核尾部对总墙钟贡献 ≤ 1 min。
 - provider 在途门：`maxConcurrency = 1` 时同 provider 请求串行可观测；构造 reviewer 与 scanner 同 provider 且门宽 < cell 数 → 入队序可观测（scanner 先）；PR181 全程无 429 / 503，或有 429 时门宽收敛、cell 零失败（D13）。
 - 后台 job 中途 kill → resume 从队列快照续跑，已落盘 finding（流式持久化）不丢、不双计；未闭合对象丢弃且计入 warning。
-- 每个 reviewer cell 输出 < `maxOutputTokens` 的 1/2（有界性验证，FINALIZE / REPAIR 三层不触发）。
+- 有界性：**硬门改按意图〔D18〕= 无 `max_tokens` 截断**（三轮皆 0）；REPAIR 触发改为可观测量（三轮共 2 次，根因均在模型侧：
+  空响应、值缺开头引号，皆被修复轮救回）。原「输出 < `maxOutputTokens` 的 1/2」降为观测量——单轮最大 93.8k / 帽 384k。
 - `reviewers/redteam.py` 等 aacr 接线不在本里程碑（D7 B4 暂退役，随 M21c smoke 重启点一并做）。
 - verifier 离线回归集：对 proj.db 历史 dismissed / upheld findings 的二分类准确率有基线数字并入 research；reviewer 回归 =
   PR181 上 H0 / 疑点 → finding 确认率与其后 refute 率可读。
