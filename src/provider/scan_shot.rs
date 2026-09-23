@@ -49,6 +49,8 @@ pub(crate) async fn run_scan_shot_with(
     per_turn: std::time::Duration,
     retry_budget: u32,
     policy: Option<&dyn AttemptPolicy>,
+    // dump 标签用的模型身份串（收口评审 #7）
+    model: &str,
 ) -> Result<ScanCall, ProviderError> {
     let mut messages = vec![ChatMessage::System(prompt.system.clone()), ChatMessage::UserBlocks(prompt.blocks.clone())];
 
@@ -66,7 +68,7 @@ pub(crate) async fn run_scan_shot_with(
 
     // 首发 parse 失败：把模型的原话作为 assistant 轮回灌（模型能看见自己写了什么；anthropic 要求角色交替），再补
     // REPAIR_PROMPT_SCAN + turn_final。本轮若失败（超时 / 网络），把首发已烧的 usage 附着到错误上（T25 口径）。
-    dump_parse_failure("scan t1", &turn.text);
+    dump_parse_failure(&format!("scan {model} t1"), &turn.text);
     let head: String = turn.text.trim().chars().take(80).collect();
     let repair_note = format!(
         "first turn parse failed (finish={}, text_len={}, head={:?}); repaired",
@@ -93,7 +95,7 @@ pub(crate) async fn run_scan_shot_with(
             rate_limit_retries: 0, rate_limit_wait_ms: 0,
         }),
         Err(_) => {
-            dump_parse_failure("scan t2", &repair.text);
+            dump_parse_failure(&format!("scan {model} t2"), &repair.text);
             Err(diagnostic_parse_error(&repair).attach_usage((in_tok, out_tok, cached_tok)))
         }
     }
@@ -125,10 +127,35 @@ mod tests {
     }
 
     /// 首发即成功：system = 共享头（非 NO_TOOLS_SYSTEM）、user 是分块、不调 turn_final、iterations 1。
+    /// 收口评审 #7：scan 侧落盘标签要带模型身份——多家族并发时只靠纳秒前缀无法归属产物。
+    // ENV_LOCK 是**测试专用**的 env 串行器（仓内约定，见 config::ENV_LOCK 的用法）：
+    // 跨 await 持它是刻意的——保护窗口必须覆盖到读 env 的那段异步调用，否则别的用例的 set_var 仍构成竞争。
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn scan_dump_labels_carry_the_model() {
+        let _g = crate::config::ENV_LOCK.lock().unwrap();
+        let dump = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK 串行化（仓内既定约定）
+        unsafe { std::env::set_var("REDTEAM_DUMP_DIR", dump.path()); }
+        let b = FakeChatBackend::new(vec![turn("not json", None), turn("still not json", None)]);
+        let err = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None, "qwen/qwen3.8-flash").await;
+        unsafe { std::env::remove_var("REDTEAM_DUMP_DIR"); }
+
+        assert!(err.is_err());
+        let mut names: Vec<String> = std::fs::read_dir(dump.path()).unwrap()
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains("qwen"))
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "首轮 + 修复轮各一份: {names:?}");
+        assert!(names[0].ends_with("-scan_qwen_qwen3.8-flash_t1.txt"), "{names:?}");
+        assert!(names[1].ends_with("-scan_qwen_qwen3.8-flash_t2.txt"), "{names:?}");
+    }
+
     #[tokio::test]
     async fn scan_shot_first_turn_uses_shared_head_blocks_and_never_turn_final() {
         let b = FakeChatBackend::new(vec![turn(SCAN_JSON, Some(0))]);
-        let call = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None).await.unwrap();
+        let call = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None, "p/m").await.unwrap();
         assert_eq!(call.iterations, 1);
         assert_eq!(call.output.suspicions.len(), 1);
         assert_eq!(call.output.needs.len(), 1);
@@ -146,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn scan_shot_repairs_with_scan_prompt_and_accumulates_usage() {
         let b = FakeChatBackend::new(vec![turn("sorry, here is prose", Some(3)), turn(SCAN_JSON, Some(5))]);
-        let call = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None).await.unwrap();
+        let call = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None, "p/m").await.unwrap();
         assert_eq!(call.iterations, 2);
         assert_eq!((call.input_tokens, call.output_tokens, call.cached_input_tokens), (20, 8, 4));
         assert_eq!(call.reasoning_tokens, Some(8));
@@ -163,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn scan_shot_second_failure_is_parse_error_with_usage() {
         let b = FakeChatBackend::new(vec![turn("", None), AssistantTurn { finish_reason: Some("length".into()), ..turn("{\"nope\":1}", None) }]);
-        let err = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None).await.unwrap_err();
+        let err = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None, "p/m").await.unwrap_err();
         assert!(matches!(err.inner(), ProviderError::Parse(_)), "{err}");
         assert_eq!(err.burned_usage(), (20, 8, 4));
         assert!(err.to_string().contains("length"), "finish_reason 进诊断: {err}");
@@ -175,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn scan_shot_first_turn_error_propagates() {
         let b = FakeChatBackend::new_results(vec![Err(ProviderError::Auth("no key".into()))]);
-        let err = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None).await.unwrap_err();
+        let err = run_scan_shot_with(&b, &prompt(), Duration::from_secs(5), 0, None, "p/m").await.unwrap_err();
         assert!(matches!(err, ProviderError::Auth(_)));
     }
 }

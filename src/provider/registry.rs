@@ -336,6 +336,9 @@ struct ScanEntry {
     per_turn: Duration,
     retry_budget: u32,
     provider: String,
+    /// = route_key（`provider/id`）；只为 dump 标签留身份（收口评审 #7：scan 侧标签原是常量，
+    /// 多家族并发时落盘产物无法归属，而这个仪器存在的唯一目的就是定案）。
+    route_key: String,
 }
 
 /// 按 route_key 路由的注册表（通用基建）。
@@ -375,7 +378,11 @@ impl ProviderRegistry {
         retry_budget: u32,
     ) {
         self.gates.entry(provider.to_string()).or_insert_with(|| Arc::new(InflightGate::new(cap)));
-        self.scan.insert(route_key.into(), ScanEntry { backend, per_turn, retry_budget, provider: provider.to_string() });
+        let route_key = route_key.into();
+        self.scan.insert(
+            route_key.clone(),
+            ScanEntry { backend, per_turn, retry_budget, provider: provider.to_string(), route_key },
+        );
     }
     pub fn scan_len(&self) -> usize {
         self.scan.len()
@@ -511,7 +518,10 @@ impl ScanLease<'_> {
 
     pub async fn run(&self, prompt: &ScanPrompt) -> Result<ScanCall, ProviderError> {
         let policy = GateAttempts::new(self.gate);
-        run_scan_shot_with(self.entry.backend.as_ref(), prompt, self.entry.per_turn, self.entry.retry_budget, Some(&policy))
+        run_scan_shot_with(
+            self.entry.backend.as_ref(), prompt, self.entry.per_turn, self.entry.retry_budget, Some(&policy),
+            &self.entry.route_key,
+        )
             .await
             .map(|mut call| {
                 call.rate_limit_retries = policy.retries();
