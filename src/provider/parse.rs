@@ -31,7 +31,11 @@ pub(crate) fn extract_json_object(raw: &str) -> Option<Value> {
     // 裸字符（每格 9–22 处），严格 JSON 拒收；修复轮原样复读同一段，两轮连败、整格作废。只在严格解析失败后、
     // 只转义**字符串内部**的裸控制字符（结构位置的换行 / 缩进不动），转义后的 `\t` 解出来仍是源码里那个 tab，
     // quote 逐字锚定不受影响。其余语法错（尾逗号、非法转义）不在此列——交给修复轮。
-    escape_raw_controls_in_strings(trimmed).and_then(|fixed| extract_from(&fixed))
+    // 起点必须与配平扫描一致（`find('{')`，收口评审 #2）：从第 0 个字符起扫，JSON 前的散文里
+    // 只要有奇数个 `"`，进入 JSON 体后串态全程反相——真正的串内 tab 落在「串外」不被转义，
+    // 结构位置的换行反倒被转义掉，救援静默失效。模型加一句带引号的前言就复现。
+    let body = &trimmed[trimmed.find('{')?..];
+    escape_raw_controls_in_strings(body).and_then(|fixed| extract_from(&fixed))
 }
 
 /// 串内裸控制字符（U+0000–U+001F）→ JSON 转义；与下面的配平扫描同一套串感知。没有可改的返回 `None`。
@@ -73,9 +77,14 @@ fn extract_from(trimmed: &str) -> Option<Value> {
             return Some(v);
         }
     }
-    // 从首个 '{' 到匹配的 '}' 扫描，字符串感知（跳过串内的 '{'/'}'，
-    // 正确处理 '\"' 转义）——findings.body/quote 常引用半行代码含不配平括号
-    // （如 "match x {" 未闭合），裸计数会数错深度、抠出非法 JSON。
+    let cand = balanced_candidate(trimmed)?;
+    serde_json::from_str::<Value>(cand).ok().filter(Value::is_object)
+}
+
+/// 从首个 '{' 到与之配平的 '}' 的切片，字符串感知（跳过串内的 '{'/'}'，正确处理 '\"' 转义）
+/// ——findings.body/quote 常引用半行代码含不配平括号（如 "match x {" 未闭合），裸计数会数错深度。
+/// 不做解析，`extract_from` 与 `json_error_detail` 共用同一段候选（收口评审 #1）。
+fn balanced_candidate(trimmed: &str) -> Option<&str> {
     let start = trimmed.find('{')?;
     let mut depth = 0i32;
     let mut in_string = false;
@@ -97,8 +106,7 @@ fn extract_from(trimmed: &str) -> Option<Value> {
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    let cand = &trimmed[start..start + i + 1];
-                    return serde_json::from_str::<Value>(cand).ok().filter(Value::is_object);
+                    return Some(&trimmed[start..start + i + 1]);
                 }
             }
             _ => {}
@@ -450,6 +458,12 @@ pub(crate) fn diagnostic_parse_error(turn: &AssistantTurn) -> ProviderError {
 /// 能解析（形状违约，如缺 findings）时如实说「JSON 本身合法」——根因不在语法。
 pub(crate) fn json_error_detail(raw: &str) -> String {
     let chars = raw.chars().count();
+    // 先走**与提取器同一条路径**（收口评审 #1）：提取器会配平截断、也会对串内控制字符宽容重试，
+    // 直接把剩余全文丢给 serde 会报一个早已被绕过的语法错（`trailing characters`、被救回的裸 tab），
+    // 把人引向错误根因——而出口验收正是拿这条诊断定案的。
+    if extract_json_object(raw).is_some() {
+        return format!("len={chars} chars, JSON 可提取 → 根因在 schema 而非语法");
+    }
     let body = match raw.rfind("</think>") {
         Some(i) => &raw[i + "</think>".len()..],
         None => raw,
@@ -458,9 +472,13 @@ pub(crate) fn json_error_detail(raw: &str) -> String {
     let Some(start) = body.find('{') else {
         return format!("len={chars} chars, no '{{' found");
     };
+    // 评审 #1 还建议「报配平候选而非剩余全文」——复核后**未采纳**：提取成功即在上面提前返回，
+    // 而候选恒为剩余全文的前缀，serde 的首个错误必定落在同一处，两者报文逐字相同（变异检查假绿证实）。
+    // 不留无用例可钉的改动。
     let body = &body[start..];
     match serde_json::from_str::<Value>(body) {
-        Ok(_) => format!("len={chars} chars, JSON itself is valid"),
+        // 防御分支：候选能解析却没被提取器接受（`balanced_candidate` 从 '{' 起、成功解析必是对象，理论上够不到）
+        Ok(_) => format!("len={chars} chars, 候选可解析但未被提取器接受"),
         Err(e) => {
             // serde 的行列都从 1 起；列按字节计——换算成 body 内字节偏移后取就近的字符边界
             let line_off: usize = body.split_inclusive('\n').take(e.line().saturating_sub(1)).map(str::len).sum();
@@ -637,13 +655,32 @@ mod tests {
         assert!(!near.contains("\\\"a\\\""), "片段不该退回到整段开头: {d}");
     }
 
+    /// 收口评审 #2：JSON 前的散文含**奇数个**引号时，宽容那一遍若从第 0 字符起扫，串态全程反相 →
+    /// 真正的串内 tab 不被转义、结构换行反被转义，救援静默失效（模型加一句带引号的前言就复现）。
     #[test]
-    fn json_error_detail_flags_raw_control_char_and_valid_json() {
+    fn rescue_survives_prose_with_an_unbalanced_quote() {
+        let json = "{\"findings\":[{\"severity\":\"high\",\"title\":\"t\",\"body\":\"b\",\"file\":\"a.go\",\
+                    \"line_start\":1,\"line_end\":1,\"confidence\":0.7,\"recommendation\":\"r\",\"quote\":\"\tx := 1\"}]}";
+        assert!(extract_json_object(json).is_some(), "前提：裸 JSON 能救回");
+        for prose in ["Here is the \"answer:\n", "我看了下，\"pipe.ts\" 里有问题：\n", "Note: it's tricky\n"] {
+            let v = extract_json_object(&format!("{prose}{json}")).expect(prose);
+            assert_eq!(v["findings"][0]["quote"], "\tx := 1", "quote 解出来仍是真 tab: {prose}");
+        }
+    }
+
+    /// 诊断与提取器同源（收口评审 #1）：提取器能救回 / 能配平抠出的，诊断就不该指一个已被绕过的语法错。
+    #[test]
+    fn json_error_detail_defers_to_the_extractor() {
+        // 裸 tab 本身现在会被宽容救回 → 根因不在语法
         let d = json_error_detail("{\"quote\": \"\tif x {\"}");
-        assert!(d.contains("control character"), "{d}");
-        assert!(d.contains("\\t"), "片段用 {{:?}} 转义，裸 tab 显形: {d}");
-        let v = json_error_detail("<think>{x}</think>{\"findings\": 1}");
-        assert!(v.contains("JSON itself is valid"), "{v}");
+        assert!(d.contains("根因在 schema"), "{d}");
+        // 提取器抠得出对象、只是 schema 违约（缺 findings）→ 同样不报语法错
+        let v = json_error_detail("<think>{x}</think>{\"findings\": 1}\nHope this helps!");
+        assert!(v.contains("根因在 schema"), "{v}");
+        // 真救不回来的（尾逗号 + 裸 tab）→ 报 serde 根因，且片段落在控制字符上
+        let bad = json_error_detail("{\"quote\": \"\tif x\",}");
+        assert!(bad.contains("control character"), "{bad}");
+        assert!(bad.contains("\\t"), "片段用 {{:?}} 转义，裸 tab 显形: {bad}");
         assert!(json_error_detail("no braces").contains("no '{' found"));
     }
 

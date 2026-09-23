@@ -396,12 +396,17 @@ mod tests {
     }
 
     /// 出口验收诊断接线：首轮、修复轮都解析失败 → 两轮原文各落一份（t1 / t2），且整段不截断。
-    /// 进程级环境变量：并行的其他用例若恰好也解析失败会写进同一目录——按本用例独有的 model 名筛，互不干扰；
-    /// 先 remove_var 再让 tempdir 析构，窗口只有本用例的几毫秒。
+    /// 进程级环境变量：持 `ENV_LOCK` 串行化；并行的其他用例若恰好也解析失败会写进同一目录——
+    /// 按本用例独有的 model 名筛，互不干扰；先 remove_var 再让 tempdir 析构，窗口只有本用例的几毫秒。
+    // ENV_LOCK 是**测试专用**的 env 串行器（仓内约定，见 config::ENV_LOCK 的用法）：
+    // 跨 await 持它是刻意的——保护窗口必须覆盖到读 env 的那段异步调用，否则别的用例的 set_var 仍构成竞争。
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn parse_failures_of_both_turns_are_dumped_when_dir_is_set() {
+        let _g = crate::config::ENV_LOCK.lock().unwrap();
         let dump = tempfile::tempdir().unwrap();
-        // SAFETY: 只有 dump_parse_failure 读它；并行用例的影响见上
+        // SAFETY: ENV_LOCK 串行化（仓内既定约定；set_var 与**任意**线程的 env 访问都是竞争，
+        // 不只是读同一个键——收口评审 #4）
         unsafe { std::env::set_var("REDTEAM_DUMP_DIR", dump.path()); }
         let dir = tmp_file();
         let rec = Rec(Mutex::new(Vec::new()));
