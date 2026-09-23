@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 23
-- **Last Active**: 2026-09-21
+- **Total Sessions**: 24
+- **Last Active**: 2026-09-23
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~716 | Active |
+| `journal-1.md` | ~746 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 24 | 2026-09-23 | M21b 出口验收收口：解析宽容 + 网关退避 + 三轮验收 + D18 裁决 | `2bd3ab7`, `122fd9b`, `d2a08b1`, `0849ee7`, `ddf9e45`, `ed83cb7`, `9912f64`, `e54d916`, `ae532e2` | `feat/m21-review-engine` |
 | 23 | 2026-09-21 | M21b 批 D：verifier 流式复核接线、离线基线裁定与收口评审 | `369517a`, `8517784`, `fd04420`, `7f0f567`, `6821535`, `16f2d72`, `5647a81`, `de0cd73`, `4f9cd0e`, `0290798`, `48073b0`, `cefc2f2` | `feat/m21b-verifier` |
 | 22 | 2026-09-21 | M21b 批 C3：深挖选项稳定性（结构定项 / 两轴共识 / 分层排序与保底一格 / needs 入队）+ 三档评审全修 | `8fbeb64`, `17cc832`, `023b5c5`, `c81aa67`, `9d45a9c`, `56649a7`, `4a12bb5`, `5e25424`, `8878434`, `a75d8ee`, `cece0eb`, `bbc4fa1` | `feat/m21b-deep-stability` |
 | 21 | 2026-09-18 | M21b 批 C2 scanner 与深挖时间重叠（流式入队 / 在线预算与收场 drain / 等门 FIFO / resume 离线续跑 + 真 provider dogfood + 三档评审修） | `8adfcb5`, `e0fed14`, `191f821`, `54ec215`, `29338e8`, `489705a`, `3e4e39e`, `5e4fb00`, `f485e23`, `3038ee7` | `feat/m21b-deep-streaming` |

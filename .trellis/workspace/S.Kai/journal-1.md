@@ -714,3 +714,33 @@ scan 全完才挖改成两段重叠：H0 t=0 开挖、scanner 格完成即入队
 ### Status
 
 [OK] **Completed**
+
+
+## Session 24: M21b 出口验收收口：解析宽容 + 网关退避 + 三轮验收 + D18 裁决
+<!-- trellis-session: v=2 fp=38973f13659aaa23 -->
+
+**Date**: 2026-09-23
+**Task**: M21b 出口验收收口：解析宽容 + 网关退避 + 三轮验收 + D18 裁决
+**Branch**: `feat/m21-review-engine`
+
+### Summary
+
+金丝雀暴露两处真因并修掉：glm 把 Go 源码 tab 原样写进 quote 致严格 JSON 失败（串内控制字符宽容重试，终态与旁路同源），网关成片 503 打掉 11 格（瞬断退避 2→30s、预算 4、超时封顶 2）；诊断常开带 serde 根因 + REDTEAM_DUMP_DIR 原文落盘（dev 仪器，发布前拆）。定稿双 reviewer 配置（deepseek 加入 reviewer，墙钟 25.3→12.9 min、失败格清零）后跑三轮验收：机械面全过（失败格/截断/解析失败 0；kill→resume 复用不重挖），覆盖面并集 6 主题未达 8。D11 预算挂账结案：maxCells 64 使截断 25→2 但主题覆盖 6→5、墙钟+53%/token+66% → 维持 auto。scan 墙钟真因是慢家族的恒定输出（与组大小无关）→ 撤销 M21d 交付项 7 的墙钟前提。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2bd3ab7` | feat(provider): 解析失败诊断带 serde 根因 + REDTEAM_DUMP_DIR 原文落盘（出口验收金丝雀定案用） |
+| `122fd9b` | merge(m21b-exit): 解析失败诊断带根因 + 原文落盘仪器（金丝雀定案前置） |
+| `d2a08b1` | fix(provider): 串内裸控制字符宽容重试 + 网关瞬断长退避（出口验收金丝雀两处定案） |
+| `0849ee7` | merge(m21b-exit): 串内控制字符宽容 + 网关瞬断长退避（金丝雀重跑前置） |
+| `ddf9e45` | docs(roadmap): scan 墙钟真因是慢家族的恒定输出——拆大组的墙钟前提作废 |
+| `ed83cb7` | docs(followup): resume 续跑后复核与墙钟分段账目全空（cell 记录尚在、未重建） |
+| `9912f64` | docs(followup): 订正 resume 账目条目——不是全丢，是复用格不入账（两次续跑对照） |
+| `e54d916` | docs(decisions,roadmap): D18 M21b 出口裁决——硬门改按意图、主题门槛判并集、D11 预算回校结案 |
+| `ae532e2` | docs(task): M21b 出口验收结果总表（十一项判定 + 产物索引） |
+
+### Status
+
+[OK] **Completed**
