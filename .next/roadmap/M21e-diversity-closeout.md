@@ -22,6 +22,9 @@
 ## 验收
 
 - 第二家族 scanner 开：PR181 疑点 oracle 覆盖 ≥ 单家族 + 增量可观测；墙钟不增；input 增量 ≈ 条目数倍。
+- aacr `smoke`（**从 M21c 项 7 移入，D19-2**）：fork 上 5 个 rs / go / ts 正样本，legacy 与 v2 各 N=1，取 Line-P / Line-R；
+  `reviewers/redteam.py` 适配器与 pipeline 挂载随本项接线。移入理由：外部仓、D7 B4 已暂退役、重启点待定，
+  不拿一个没在跑的外部基准卡住切名；跨语言召回这条轴在此之前**没有外部对照**（已知缺口）。
 - aacr `gate` 跑通，给出 legacy / v2 / ocr 的 Precision / Recall / Noise / 墙钟 / token 对照（写回 research）；
   v2 Recall ≥ legacy，Noise ≤ ocr 的 1.5× 视为收官门通过。
 - `make verify` 绿；`--help` 与代码同权（新旋钮全覆盖，旧旋钮零残留）。
