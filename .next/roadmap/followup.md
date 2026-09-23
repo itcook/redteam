@@ -651,3 +651,23 @@ deepseek（≈ 140s），PR181 扇出段的现实预期是**约减半**（≈ 28
 出错处前后 40 字符）——这个**保留**；② 设了 `REDTEAM_DUMP_DIR` 才把解析失败那一轮的模型原文整段落盘（reviewer 标签带
 队列项文件 + 模型 + t1/t2，scanner 只标 `scan t1/t2`）——这是临时仪器，定案后拆（或升成正式开关写进 `--help`）。
 scanner 两处落盘调用无用例覆盖：环境变量是进程级的，第二个 set/remove 同一变量的并行用例会互相抢，只给 reviewer 留了一条。
+
+**scan 段墙钟的真因：慢家族的「恒定输出」，不是组大小（2026-09-23 三轮同配置实测，推翻拆大组的墙钟前提）**：
+scan 墙钟 ≡ 最慢 scanner 格 ≡ 该格「输出 token ÷ 该模型吐字速率」——耗时与输出量相关系数 0.94（qwen）/ 1.00（deepseek），
+与输入 diff 字节只有 0.58 / 0.70。两家的速率差 4 倍：deepseek-flash 263 tok/s、qwen3.8-flash 64 tok/s。
+**qwen 每格输出恒在 11–23k token、与组大小无关**（2 文件 1.9KB 的小组也写 11–16k，28 文件 110KB 的大组写 16–23k），
+deepseek 的输出则随规模走（5k / 32–39k）。推论：拆大组对 qwen 这类模型**零墙钟收益且成本随子组数线性涨**
+（它会对每个子组各写一遍 15–20k），只有对 deepseek 这类「输出 ∝ 输入」的模型才降（155s → 约 45s）——而它不在关键路径上。
+→ M21d 交付项 7 已改为不挂墙钟验收。真正的 scan 墙钟旋钮按优先级：① 换掉慢家族或其网关（同输出量除以 4）；
+② 给慢家族配 `maxOutputTokens` 上限（封到 12k ≈ 190s，收益有限且有截断风险）；③ 去掉它（墙钟降到约 150s，
+但 oracle 命中 11 → 6、并失去跨家族共识——不划算）。
+**顺带的方法论账**：同配置三轮的疑点数 65 / 83 / 69、共识 20 / 14 / 20、最慢格 309 / 287 / 337 s——
+**单轮之间的抖动就有这个量级**，此前所有「单轮 vs 单轮」的档位比较（deepseek medium vs high 等）只能当弱信号，
+要下结论至少三轮同配置。
+
+**角色级 thinkingLevel 半生效（2026-09-23 查证）**：design decisions §4「thinking_level 是角色属性（同模型两档消费）」
+在 **reviewer 上已生效**——深挖每格走 `per_cell_backend_factory`（`src/cli/mod.rs`），按 reviewer 自己的 `EffectiveModel`
+另造 backend，registry 的共享实例只是造不出来时的兜底；**verifier 上未生效**——`run_verify` 用 `lease.backend()`，
+档位跟着先注册的角色（scanner）走。附带缺陷：`build_registry` 那条 warning 写「本轮按已注册档位跑」，对 reviewer 是**错的**
+（reviewer 按自己的档跑）。修法：warning 限定到真正共享 backend 的角色；verifier 也走 per-cell backend，
+或 route_key 带角色前缀（M21c 已记的活）。
