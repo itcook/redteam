@@ -580,17 +580,21 @@ fn overlay_deep(
 }
 
 /// 把 scan-only 收口之外的格（reviewer / verifier）并进报告：coverage 按记录自身角色记（追加、不覆盖同角色已有项）——
-/// selected 全列，`reused` → reused，否则成功 → completed、失败 → failed；usage、`run.cells` 摘要、顶层 `cells` 同步。
+/// selected 全列，然后**失败优先**分桶：失败 → failed，成功且沿用 → reused，成功且本轮跑 → completed；
+/// usage、`run.cells` 摘要、顶层 `cells` 同步。
+///
+/// 「失败优先」是批 A 统一的口径：原先这里是「复用优先」（`(reused, _)` 一律进 reused），
+/// 而 scanner 侧收口是失败优先——同一个「失败的复用格」在两处会落进不同的桶，且 reviewer 侧会把失败**静默记成复用**。
 /// scan-only 收口只吃 scanner 格：把别的角色喂进去会被 `scan_cells_from_records` 判成失败的 scanner 格（假 `scan incomplete`）。
 fn fold_role_cells(report: &mut ReviewReport, recs: Vec<CellRecord>, reused: bool) {
     let cov = &mut report.run.coverage;
     for rec in &recs {
         let role = rec.role();
         cov.selected.entry(role).or_default().push(rec.cell.clone());
-        let bucket = match (reused, rec.ok) {
-            (true, _) => &mut cov.reused,
-            (false, true) => &mut cov.completed,
-            (false, false) => &mut cov.failed,
+        let bucket = match (rec.ok, reused) {
+            (false, _) => &mut cov.failed,
+            (true, true) => &mut cov.reused,
+            (true, false) => &mut cov.completed,
         };
         bucket.entry(role).or_default().push(rec.cell.clone());
         report.run.usage.input_tokens += rec.input_tokens;
@@ -599,6 +603,9 @@ fn fold_role_cells(report: &mut ReviewReport, recs: Vec<CellRecord>, reused: boo
         report.run.cells.push(CellSummary::from_record(rec));
     }
     report.cells.extend(recs);
+    if let Err(e) = report.run.coverage.check_partition() {
+        report.run.warnings.push(format!("coverage 划分不变式被破坏（design §8.4）：{e}"));
+    }
 }
 
 /// scan-only 报告收口的输入（全量 / resume / partial 三路共用，批 F-3 / F-5）。
@@ -705,6 +712,11 @@ pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
     let template_hashes: BTreeMap<String, String> = [("shared_head", &h.shared_head), ("scanner_tail", &h.scanner_tail)]
         .into_iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
     let mut warnings = f.warnings;
+    // 五集合划分自检（design §8.4，M21c 批 A）：破了不该静默——它意味着某个格被漏分类或重复分类，
+    // 而 coverage 正是 verdict 分级（scanner 失败 → 硬 Incomplete / 深挖失败 → 带债 approve）的依据。
+    if let Err(e) = coverage.check_partition() {
+        warnings.push(format!("coverage 划分不变式被破坏（design §8.4）：{e}"));
+    }
     warnings.extend(f.results.warnings.iter().cloned());
     let verdict = if failed.is_empty() { Verdict::ScanOnly } else {
         warnings.push(format!(
@@ -4101,6 +4113,14 @@ mod tests {
         assert_eq!((r.run.cells[0].role.as_str(), r.run.cells[0].cached_input_tokens), ("scanner", 50));
         assert_eq!(r.cells.len(), 3);
         assert!(r.run.failed_models.is_empty() && r.findings.is_empty());
+        // 账目自相矛盾要留痕（M21c 批 A）：同一个 cell id 既有成功记录又有失败记录
+        // → 它会同时落进 completed 与 failed，coverage 不再是划分，warnings 必须看得见（coverage 是 verdict 分级的依据）。
+        let mut dup_cells = cells.clone();
+        dup_cells.push(mk("scan[g1]@p/x#1", 0, "alpha", false, vec![], 0, 0, 0));
+        let (dup, _) = finish_scan_report(base(dup_cells, vec![]));
+        let w = dup.run.warnings.join(" | ");
+        assert!(w.contains("划分不变式被破坏") && w.contains("scan[g1]@p/x#1"), "{w}");
+
         // 一 cell 失败 → Incomplete / 3 + coverage.failed + warning；失败格烧掉的 usage 入账
         let mut failing = cells;
         failing.push(mk("scan[g2]@p/y#1", 1, "beta", false, vec![], 0, 3, 0));
@@ -4186,6 +4206,49 @@ mod tests {
     }
     /// `--dismissed <dev 库>` 是**纯读**语义（收口评审 #2）：拿旧 schema 库做对拍基线时，
     /// 不得把它就地迁成 v4——那会清空评审史、让 dev 二进制再也写不了它，回退路径本身被毁。
+    /// 分桶口径统一为**失败优先**（M21c 批 A）：`resume` 沿用的那批里若混进失败格，
+    /// 必须进 `failed` 而不是 `reused`——原先 reviewer 侧是「复用优先」，会把失败**静默记成复用**，
+    /// 而 coverage 正是 verdict 分级的依据（深挖失败 → 带债 approve）。同时不变式必须仍成立。
+    #[test]
+    fn folded_failed_reused_cell_goes_to_failed_not_reused() {
+        use crate::domain::Role;
+        let mut report = ReviewReport {
+            run: Default::default(), verdict: Verdict::Approve, stats: Default::default(),
+            findings: vec![], scan: None, cells: vec![], clusters: Default::default(), schema_version: Default::default(),
+        };
+        let ok_reused = CellRecord::ok("review[a.rs:rule:1-2]@m", "m", crate::domain::CellOutput::empty(Role::Reviewer));
+        let bad_reused = CellRecord::failed("review[b.rs:rule:3-4]@m", "m", Role::Reviewer, "boom");
+        fold_role_cells(&mut report, vec![ok_reused, bad_reused], true);
+
+        let cov = &report.run.coverage;
+        let names = |m: &std::collections::BTreeMap<Role, Vec<String>>| -> Vec<String> {
+            m.get(&Role::Reviewer).cloned().unwrap_or_default()
+        };
+        assert_eq!(names(&cov.reused), ["review[a.rs:rule:1-2]@m"], "只有成功的沿用格算 reused");
+        assert_eq!(names(&cov.failed), ["review[b.rs:rule:3-4]@m"], "失败优先：失败的沿用格进 failed");
+        assert_eq!(names(&cov.selected).len(), 2, "selected 全列");
+        assert!(cov.check_partition().is_ok(), "{:?}", cov.check_partition());
+        assert!(!report.run.warnings.iter().any(|w| w.contains("划分不变式")), "不该报不变式破坏");
+    }
+
+    /// 不变式破坏要**留痕**而不是静默（M21c 批 A）：同一个格被并入两次（一次当沿用、一次当本轮），
+    /// 它会同时落进 reused 与 completed —— coverage 是 verdict 分级的依据，这种账目错必须在 warnings 里看得见。
+    #[test]
+    fn coverage_violation_is_recorded_as_a_warning() {
+        use crate::domain::Role;
+        let mut report = ReviewReport {
+            run: Default::default(), verdict: Verdict::Approve, stats: Default::default(),
+            findings: vec![], scan: None, cells: vec![], clusters: Default::default(), schema_version: Default::default(),
+        };
+        let rec = || CellRecord::ok("review[a.rs:rule:1-2]@m", "m", crate::domain::CellOutput::empty(Role::Reviewer));
+        fold_role_cells(&mut report, vec![rec()], true);
+        assert!(report.run.warnings.is_empty(), "第一次并入是自洽的");
+        fold_role_cells(&mut report, vec![rec()], false);
+        let w = report.run.warnings.join(" | ");
+        assert!(w.contains("划分不变式被破坏") && w.contains("review[a.rs:rule:1-2]@m"), "{w}");
+        assert!(w.contains("reused") && w.contains("completed"), "要说清是哪两个桶: {w}");
+    }
+
     #[test]
     fn load_ledger_db_override_never_migrates_the_target() {
         let tmp = tempfile::tempdir().unwrap();
