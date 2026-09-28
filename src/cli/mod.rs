@@ -1533,6 +1533,17 @@ pub async fn run_resume(
             deep.reused_cells = deep_records.iter().filter(|r| r.ok && !redone.contains(r.cell.as_str())).cloned().collect();
             // 拆簇对账与首跑同口径（评审 #12）：resume 不算就会用 0 覆盖首跑落库的读数
             deep.meta.queue_split_clusters = crate::consolidate::scan::split_clusters(&scan_cells, &deep.items);
+            // 复核账把**复用格**也算进来（M21c 批 A-4，M21b 第 6 项实测的债）：
+            // 原先 meta 只统计本轮新验的，于是崩溃续跑后报告里「复核触发 0 / 驳回 0」——
+            // 极端情况（杀在复核尾部、续跑无事可做）整组计数全空，出口验收若按报告字段判会误判成「一次没验」。
+            crate::orchestrate::deep::fold_reused_verify(&mut deep.meta, &deep.reused_cells);
+            // 不可重建的照实说，别静默留 null：`close_ms` 是首跑扇出关闭的时刻、`budget_cells` 是首跑的预算档，
+            // 两者都不在 cell 记录里，续跑重算只会得到本轮的数、与首跑语义不同。
+            if deep.meta.close_ms == 0 {
+                report.run.warnings.push(
+                    "resume: deep.close_ms / budget_cells 属首跑时刻量，cell 记录里没有、续跑不可重建（复核与 findings 账已按复用格补齐）".into(),
+                );
+            }
             let over = overlay_deep(report, code, deep, &args, cfg, registry, t0);
             report = over.0;
             code = over.1;
@@ -2600,8 +2611,16 @@ mod resume_tests {
         scan_done_job(&store);
         let mut fx = crate::domain::finding::fixtures::finding("x issue", crate::domain::Severity::Low, 1, "p/r");
         (fx.file, fx.quote, fx.line_start, fx.line_end) = ("x.rs".into(), "x_marker();".into(), 2, 2);
+        let fid = fx.id.clone();
         let landed = CellRecord::ok("review[x.rs:rule:1-2]@p/r", "p/r", crate::domain::CellOutput::Review { findings: vec![fx], needs: vec![] });
         store.append_partial("j", &landed).unwrap();
+        // 往轮已复核过这条 finding（A-4：复用格的复核账要并回 meta，否则续跑报告里「复核触发 0」）
+        store.append_partial("j", &CellRecord::ok(
+            format!("verify[{fid}]@p/v"), "p/v",
+            crate::domain::CellOutput::Verify { verdicts: vec![crate::domain::VerifyEntry {
+                id: fid.clone(), verdict: crate::domain::VerifyVerdict::Upheld, note: "看过了".into(),
+            }] },
+        )).unwrap();
         store.put_queue_item("j", &rule_item("x.rs", ItemState::InFlight)).unwrap();
         // reviewer 一调就失败：若被重挖，失败格会同名覆盖掉上面的成功格
         let (reg, rev) = deep_registry("not-json");
@@ -2610,6 +2629,14 @@ mod resume_tests {
         let (second, code2) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
 
         assert_eq!(rev.turn_count(), 0, "已有成功格的项不重挖");
+        // A-4：往轮的 verify 格是「复用」的，它的账必须并回 meta——否则续跑报告里「复核触发 0 / 驳回 0」，
+        // 按报告字段判会误判成「一次没验」（M21b 出口验收第 6 项实测）。不可重建的那些要照实说。
+        for r in [&first, &second] {
+            let deep = r.run.deep.as_ref().expect("续跑有深挖段");
+            assert_eq!(deep.verify_triggered, 1, "复用的复核格要计入触发数: {deep:?}");
+            assert!(r.run.warnings.iter().any(|w| w.contains("close_ms") && w.contains("不可重建")),
+                    "不可重建的字段要照实说: {:?}", r.run.warnings);
+        }
         for (r, code) in [(&first, code1), (&second, code2)] {
             assert_eq!(r.findings.len(), 1, "{:?}", r.run.warnings);
             assert_eq!(code, 0, "{:?}", r.run.warnings);
