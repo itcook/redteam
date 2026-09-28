@@ -6,7 +6,7 @@
   scan_score.py selftest
 
 <input> 三种形态自动识别：
-  1. redteam-next 结果 JSON：{"cells": [{"output": {"role": "scanner", "suspicions": [...]}, ...}]}——全部 scanner cell 的疑点合为一次运行；
+  1. redteam 结果 JSON：{"cells": [{"output": {"role": "scanner", "suspicions": [...]}, ...}]}——全部 scanner cell 的疑点合为一次运行；
   2. E3 run JSON：{"run": n, "items": [...]}（`e3_contract_ab.py run` 产出）；目录则取其中全部 run-*.json；
   3. 裸 ScanOutput：{"suspicions": [...]}。
 口径 = E3 B 臂（`_oracle.py`，比产品宽：去全部空白子串定位、定位失败按自报行号计命中并计 unanchored）→ 与 oracle 条目 anchors
@@ -164,7 +164,7 @@ def cmd_selftest(_a):
         assert r["noise"] == round(1 / 3, 3), r
         assert table[0]["lines"] == [2, 2] and table[0]["anchored"], table[0]
         assert table[1]["lines"] == [5, 5] and not table[1]["anchored"], table[1]
-        # redteam-next 结果形态
+        # redteam 结果形态
         res = {"cells": [{"output": {"role": "scanner", "suspicions": run["suspicions"][:1]}}, {"output": {"role": "reviewer", "findings": []}}]}
         rpath2 = os.path.join(d, "result.json")
         json.dump(res, open(rpath2, "w"))

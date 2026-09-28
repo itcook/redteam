@@ -140,9 +140,19 @@ const LEDGER_COLUMNS: &[(&str, &[&str])] = &[
     ("resolved_history", &["seq", "id", "round", "reason", "at"]),
 ];
 
-/// 评审史表：迁移时丢弃（D10-2「一次重置」的原意保留在这三张上——它们与 job/cell 形态强绑定，
-/// v4 的 `cells` 多了 `role` 列，硬迁只会把半截形状带进新库）。丢之前整库已备份。
-const HISTORY_TABLES: &[&str] = &["jobs", "cells", "results"];
+/// 本次打开对库做什么（`plan()` 的产物）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupPlan {
+    /// 空文件 / 无表：建表。
+    Fresh,
+    /// 已是 v4（或 `.dump` 恢复丢版本号）：只补缺表与版本号，不碰数据。
+    TopUp,
+    /// 旧形状但零数据：丢表重建。
+    RebuildEmpty,
+    /// 旧形状且有数据：一次性迁移。`keep_ledger` = 台账表在场且同构（在场就必同构，否则 `plan` 已拒开）；
+    /// 不在场说明数据都在评审史里，无账可带。
+    Migrate { keep_ledger: bool },
+}
 
 /// 旧库一次性迁移的结果（2026-09-28 裁：带走台账、丢评审史）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,9 +191,14 @@ impl ProjDb {
         let wrote = Self::needs_setup(&conn)?;
         let mut legacy_migration = None;
         if wrote {
-            // 备份必须在事务**之前**：`VACUUM INTO` 不能在事务内跑，而且要的就是「动手之前」的一致快照。
-            // 只在真要迁移时备份（空旧库走原来的丢表重建、零数据零风险，不留垃圾文件）。
-            let backup = if Self::legacy_migration_pending(&conn)? { Some(Self::backup_legacy(&conn, path)?) } else { None };
+            // 备份必须在事务**之前**（`VACUUM INTO` 不能在事务内跑），但**只为真要迁移的库做**——
+            // 收口评审 #1：原先用一个比守卫宽松的判据决定备份，于是「陌生表 / 台账不同构」被拒开的库
+            // 也会先被复制一份（误传给 `--dismissed` 的业务库 = 未经同意的全量复制 + 无上限磁盘占用）。
+            // 现在事务外与事务内用**同一个** `plan()`，它含全部守卫。
+            let backup = match Self::plan(&conn, path)? {
+                SetupPlan::Migrate { .. } => Some(Self::backup_legacy(&conn, path)?),
+                _ => None,
+            };
             conn.execute_batch("BEGIN IMMEDIATE")?;
             match Self::setup_schema(&conn, path, backup) {
                 Ok(m) => legacy_migration = m,
@@ -210,6 +225,19 @@ impl ProjDb {
             eprintln!("warning: {} 只读打开，无法切换 journal_mode=WAL（{e}），继续以只读方式使用", path.display());
         }
         Ok(Self { conn, legacy_migration })
+    }
+
+    /// **只读**打开（`--dismissed <db路径>` 这类「只想读一份台账」的入口，收口评审 #2）：
+    /// 不建表、不迁移、不切 WAL、不创建文件。旧 schema 库照样能读——台账四表与 v4 逐列相同，
+    /// `active_cards` / `active_ids` 的 SQL 只碰 `dismissed`。
+    ///
+    /// 为什么必须有这条路：`open_at` 现在带一次性迁移，而「拿 dev 库做对拍基线」正是回退路径依赖的场景——
+    /// 用读的姿势把基线就地迁成 v4（评审史清空、dev 二进制再也写不了它）会把回退路径本身毁掉。
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open db read-only {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self { conn, legacy_migration: None })
     }
 
     /// 本次打开是否做了旧库一次性迁移（做了则含保住 / 丢弃的账与备份路径）。
@@ -270,34 +298,86 @@ impl ProjDb {
         Ok(rows)
     }
 
-    /// 版本 < v4、有表、`cells` 无 role 列、且**有数据**——即将走一次性迁移或拒开的那条路。
-    /// 备份只为这条路做（判断只读，可在事务外跑）。
-    fn legacy_migration_pending(conn: &Connection) -> Result<bool> {
+    /// 本次打开该怎么处置这个库——**所有守卫集中在这里**，事务外（决定要不要备份）与事务内（权威执行）
+    /// 用的是同一套判据（收口评审 #1 / #5：两处口径不一致会让被拒开的库也留下一份全量副本）。
+    fn plan(conn: &Connection, path: &Path) -> Result<SetupPlan> {
         let version = Self::user_version(conn)?;
         let have = Self::table_names(conn)?;
-        if version >= USER_VERSION || have.is_empty() {
-            return Ok(false);
+        anyhow::ensure!(
+            version <= USER_VERSION,
+            "`{p}` 是 schema v{version} 的库，高于本二进制支持的 v{USER_VERSION}：请用更新的 redteam 打开，本版本不降级",
+            p = path.display()
+        );
+        if have.is_empty() {
+            return Ok(SetupPlan::Fresh);
         }
-        if have.iter().any(|t| t == "cells") && Self::has_column(conn, "cells", "role")? {
-            return Ok(false); // `.dump` 恢复丢版本号的 v4 库，只补版本号
+        // 陌生表在任何版本号下都拒开（含 user_version 恰为 4 的业务库——修补批 X-1）
+        let foreign: Vec<&str> = have.iter().map(String::as_str).filter(|t| !TABLES.contains(t)).collect();
+        anyhow::ensure!(
+            foreign.is_empty(),
+            "`{p}` 不是 redteam 项目库（含陌生表 {foreign:?}），拒绝改写",
+            p = path.display()
+        );
+        if version == USER_VERSION || (have.iter().any(|t| t == "cells") && Self::has_column(conn, "cells", "role")?) {
+            // v4（或 `.dump` 恢复丢了版本号的 v4 库）：只补缺表 / 版本号
+            return Ok(SetupPlan::TopUp);
         }
-        Ok(Self::total_rows(conn, &have)? > 0)
+        if Self::total_rows(conn, &have)? == 0 {
+            return Ok(SetupPlan::RebuildEmpty); // 零数据零风险（如 dev 二进制 init 出的空库）
+        }
+        // 有数据的旧库：台账在场就必须与 v4 同构，否则拒开（宁可让人先导出，也不静默丢卡）
+        let ledger_present = LEDGER_COLUMNS.iter().any(|(t, _)| have.iter().any(|h| h == t));
+        if ledger_present {
+            anyhow::ensure!(
+                Self::ledger_tables_match_v4(conn, &have)?,
+                "`{p}` 是 schema v{version}（< v{USER_VERSION}）的旧库，且**台账表与 v{USER_VERSION} 不同构**\
+                 （期望 {want:?}）：不改写它，也不带账迁移——宁可让你先导出，也不静默丢卡。\
+                 用 `python3 eval/export_ledger.py --db '{p}'` 导出 dismissed / resolved / upheld 固定集\
+                 （jobs / cells / results 评审史不导出）",
+                p = path.display(),
+                want = LEDGER_COLUMNS.iter().map(|(t, _)| *t).collect::<Vec<_>>()
+            );
+        }
+        Ok(SetupPlan::Migrate { keep_ledger: ledger_present })
     }
 
     /// 迁移前的整库一致快照：`<stem>-legacy-<YYYYMMDD>.db`（`VACUUM INTO`，含 WAL 里未落盘的部分）。
-    /// 已存在则复用、绝不覆盖——同一天第二次打开不该把第一次的快照冲掉。
+    ///
+    /// 两条健壮性（收口评审 #4）：
+    /// - **先写 `.part` 再 rename**——`VACUUM INTO` 跑到一半进程被杀会留下截断文件，不 rename 就不会被当成快照；
+    /// - **复用前校验**——同名文件存在不等于「有备份」（它可能是上次的残片，或根本不是库）：
+    ///   过 `quick_check` 且能读出表名才复用，否则另起名 `-2`、`-3`…，绝不覆盖别人的文件。
     fn backup_legacy(conn: &Connection, path: &Path) -> Result<std::path::PathBuf> {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "proj".into());
         // 日期取自 sqlite（仓内一律如此，不引 chrono）
         let day: String = conn.query_row("SELECT strftime('%Y%m%d','now')", [], |r| r.get(0))?;
-        let dest = path.with_file_name(format!("{stem}-legacy-{day}.db"));
-        if dest.exists() {
-            return Ok(dest);
+        let mut dest = path.with_file_name(format!("{stem}-legacy-{day}.db"));
+        for n in 2..100 {
+            if !dest.exists() {
+                break;
+            }
+            if Self::is_usable_snapshot(&dest) {
+                return Ok(dest);
+            }
+            dest = path.with_file_name(format!("{stem}-legacy-{day}-{n}.db"));
         }
+        anyhow::ensure!(!dest.exists(), "备份旧库：`{}` 一带的名字都被占且都不是可用快照", dest.display());
+        let part = dest.with_extension("db.part");
+        let _ = std::fs::remove_file(&part); // 上次的残片
         // 路径进 SQL 用参数绑定，避免目录名里的单引号把语句劈开
-        conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])
-            .with_context(|| format!("备份旧库到 {}", dest.display()))?;
+        conn.execute("VACUUM INTO ?1", [part.to_string_lossy().as_ref()])
+            .with_context(|| format!("备份旧库到 {}", part.display()))?;
+        std::fs::rename(&part, &dest).with_context(|| format!("快照改名 {} → {}", part.display(), dest.display()))?;
         Ok(dest)
+    }
+
+    /// 这个文件是不是一份能用的快照：打得开、`quick_check` 过、至少有一张表。
+    fn is_usable_snapshot(p: &Path) -> bool {
+        let Ok(c) = Connection::open_with_flags(p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+            return false;
+        };
+        let ok = c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)).map(|v| v == "ok").unwrap_or(false);
+        ok && Self::table_names(&c).map(|t| !t.is_empty()).unwrap_or(false)
     }
 
     /// 是否需要写库：版本不是 v4，或 v4 表不全。
@@ -309,77 +389,52 @@ impl ProjDb {
         Ok(!TABLES.iter().all(|t| have.iter().any(|h| h == t)))
     }
 
-    /// schema 守卫 + 建表 + 版本号。在事务内调用；返回本次是否做了旧库一次性迁移。分支：
-    /// - 版本高于本二进制 → 拒开（不降级）；
-    /// - 含陌生表（不是 redteam 项目库，如误传给 `--dismissed` 的业务库）→ 拒开、不改写；
-    /// - 版本 < v4 但 `cells` 已有 `role` 列（`.dump` 恢复丢 user_version 的 v4 库）→ 视为 v4，只补版本号；
-    /// - 版本 < v4、有数据、**台账四表与 v4 同构** → **一次性迁移**（2026-09-28 裁，改 D10-2「不写迁移」）：
-    ///   台账留下、评审史丢弃、缺的表由建表语句补；动手前整库已快照（`backup_legacy`）；
-    /// - 版本 < v4、有数据、台账表不同构 → 拒开、不改写，提示导出固定集（宁可让人先导出，也不静默丢卡）；
-    /// - 版本 < v4 且全空（如 dev 二进制 `init` 出的空库）→ 丢表重建（零数据零风险）；
-    /// - 全新文件 → 建表。
+    /// 建表 + 版本号 + 旧库一次性迁移。**在事务内调用**：这里重跑 `plan()` 取权威结论
+    /// （事务外那次只用来决定要不要备份；两次之间库可能被别的进程改过）。
+    /// 迁移 = 保住台账四表、**丢弃其余所有在场表**、缺表由 `SCHEMA_SQL` 补、版本号置 v4。
+    /// 为什么丢「其余所有」而不只是 jobs/cells/results（收口评审 #3）：`queue_items` / `suspicions`
+    /// 也在 `TABLES` 里（不算陌生表），旧库若带着它们的半成品形状，`CREATE TABLE IF NOT EXISTS` 补不上缺的列，
+    /// 库却被盖上 v4 戳记——此后 `queue_item_put` 永久失败，而守卫再也不触发，进入不可自愈的坏态。
     fn setup_schema(conn: &Connection, path: &Path, backup: Option<std::path::PathBuf>) -> Result<Option<LegacyMigration>> {
         let version = Self::user_version(conn)?;
         let have = Self::table_names(conn)?;
-        anyhow::ensure!(
-            version <= USER_VERSION,
-            "`{p}` 是 schema v{version} 的库，高于本二进制支持的 v{USER_VERSION}：请用更新的 redteam 打开，本版本不降级",
-            p = path.display()
-        );
-        // 陌生表在任何版本号下都拒开（含 user_version 恰为 4 的业务库——修补批 X-1：原只在 < v4 分支内查，
-        // 版本相等而表不全的陌生库会被建入 redteam 表并切 WAL）。
-        if !have.is_empty() {
-            let foreign: Vec<&str> = have.iter().map(String::as_str).filter(|t| !TABLES.contains(t)).collect();
-            anyhow::ensure!(
-                foreign.is_empty(),
-                "`{p}` 不是 redteam 项目库（含陌生表 {foreign:?}），拒绝改写",
-                p = path.display()
-            );
-        }
+        let plan = Self::plan(conn, path)?;
         let mut migration = None;
-        if version < USER_VERSION && !have.is_empty() {
-            let already_v4 = have.iter().any(|t| t == "cells") && Self::has_column(conn, "cells", "role")?;
-            if !already_v4 {
-                let rows = Self::total_rows(conn, &have)?;
-                if rows > 0 && Self::ledger_tables_match_v4(conn, &have)? {
-                    // 一次性迁移：台账四表原样留下，评审史丢弃，缺的表交给下面的建表语句
-                    let count = |t: &str| -> Result<i64> {
-                        if have.iter().any(|h| h == t) {
-                            Ok(conn.query_row(&format!("SELECT count(*) FROM \"{t}\""), [], |r| r.get(0))?)
-                        } else {
-                            Ok(0)
-                        }
-                    };
-                    let (dismissed, resolved) = (count("dismissed")?, count("resolved")?);
-                    let mut dropped = Vec::new();
-                    for t in HISTORY_TABLES {
-                        if have.iter().any(|h| h == t) {
-                            conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{t}\""))?;
-                            dropped.push((*t).to_string());
-                        }
-                    }
-                    migration = Some(LegacyMigration {
-                        dismissed,
-                        resolved,
-                        dropped,
-                        // 备份由 open_at 在事务外做；缺席只可能是调用方没走那条路（测试直调），不阻断迁移
-                        backup: backup.unwrap_or_default(),
-                    });
+        match plan {
+            SetupPlan::Fresh | SetupPlan::TopUp => {}
+            SetupPlan::RebuildEmpty => {
+                for t in &have {
+                    conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{t}\""))?;
                 }
-                anyhow::ensure!(
-                    rows == 0 || migration.is_some(),
-                    "`{p}` 是 schema v{version}（< v{USER_VERSION}）的旧库，且**台账表与 v{USER_VERSION} 不同构**\
-                     （期望 {want:?}）：不改写它，也不带账迁移——宁可让你先导出，也不静默丢卡。\
-                     用 `python3 eval/export_ledger.py --db '{p}'` 导出 dismissed / resolved / upheld 固定集\
-                     （jobs / cells / results 评审史不导出）",
-                    want = LEDGER_COLUMNS.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
-                    p = path.display()
-                );
-                if migration.is_none() {
-                    for t in &have {
-                        conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{t}\""))?;
+            }
+            SetupPlan::Migrate { keep_ledger } => {
+                // 备份是迁移的**硬前置**（收口评审 #5）：事务外判「不迁移」而事务内判「要迁移」的竞态下
+                // （别的写者刚插入第一行），原实现会 `unwrap_or_default()` 吞掉缺席的备份、无快照就 DROP 评审史。
+                let backup = backup.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`{p}` 需要一次性迁移，但本次打开没有拿到迁移前快照（多半是另一个进程刚写入了这个旧库）：\
+                         不做无备份的迁移，请重跑一次",
+                        p = path.display()
+                    )
+                })?;
+                let keep: &[&str] = if keep_ledger { &["dismissed", "dismissed_history", "resolved", "resolved_history"] } else { &[] };
+                let count = |t: &str| -> Result<i64> {
+                    if keep.contains(&t) && have.iter().any(|h| h == t) {
+                        Ok(conn.query_row(&format!("SELECT count(*) FROM \"{t}\""), [], |r| r.get(0))?)
+                    } else {
+                        Ok(0)
                     }
+                };
+                let (dismissed, resolved) = (count("dismissed")?, count("resolved")?);
+                let mut dropped = Vec::new();
+                for t in &have {
+                    if keep.contains(&t.as_str()) {
+                        continue;
+                    }
+                    conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{t}\""))?;
+                    dropped.push(t.clone());
                 }
+                migration = Some(LegacyMigration { dismissed, resolved, dropped, backup });
             }
         }
         conn.execute_batch(SCHEMA_SQL)?;
@@ -1066,7 +1121,7 @@ mod guard_tests {
         let db = ProjDb::open_at(&path).expect("同构旧库应带账迁移而不是拒开");
         let m = db.legacy_migration().expect("应报告迁移事实").clone();
         assert_eq!((m.dismissed, m.resolved), (1, 1), "卡数如实上报");
-        assert_eq!(m.dropped, ["jobs", "cells", "results"], "只丢评审史三表");
+        assert_eq!(m.dropped, ["cells", "jobs", "results"], "台账之外的表全丢（这里恰好只有评审史三张）");
         assert!(m.backup.is_file(), "迁移前整库快照: {:?}", m.backup);
 
         // 台账还在、且能按 v4 的接口读出来
@@ -1095,10 +1150,9 @@ mod guard_tests {
         assert_eq!(std::fs::metadata(&m.backup).unwrap().len(), before, "快照不被覆盖");
     }
 
-    /// 同名快照已在（同一天第二次迁移 / 用户手工放的同名文件）→ 复用、**绝不覆盖**。
-    /// 注意这条必须真踩到备份分支：库是同构旧库、这次确实要迁移（幂等那条用例第二次打开已是 v4，走不到这里）。
+    /// 同名文件已在但**不是可用快照**（残片 / 根本不是库）→ 不复用、不覆盖，另起名（收口评审 #4）。
     #[test]
-    fn existing_backup_is_never_overwritten() {
+    fn unusable_existing_backup_is_not_reused_nor_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proj.db");
         old_shape_db_isomorphic(&path);
@@ -1110,11 +1164,116 @@ mod guard_tests {
         let dest = dir.path().join(format!("proj-legacy-{day}.db"));
         std::fs::write(&dest, b"sentinel-not-a-db").unwrap();
 
-        let db = ProjDb::open_at(&path).expect("快照已存在不该阻断迁移");
-        let m = db.legacy_migration().expect("仍应迁移");
-        assert_eq!(m.backup, dest);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"sentinel-not-a-db", "已有快照一个字节都不该动");
+        let db = ProjDb::open_at(&path).expect("同名文件不该阻断迁移");
+        let m = db.legacy_migration().expect("仍应迁移").clone();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"sentinel-not-a-db", "别人的同名文件一个字节都不该动");
+        assert_eq!(m.backup, dir.path().join(format!("proj-legacy-{day}-2.db")), "另起名: {:?}", m.backup);
+        assert!(ProjDb::is_usable_snapshot(&m.backup), "新快照必须是能用的库");
         assert_eq!(db.active_ids().unwrap().len(), 1, "台账照常带过来");
+        // 同一天再来一次（先造回旧库）：这次 -2 是可用快照 → 复用它，不再新建 -3
+        drop(db);
+        std::fs::remove_file(&path).unwrap();
+        old_shape_db_isomorphic(&path);
+        let again = ProjDb::open_at(&path).unwrap();
+        assert_eq!(again.legacy_migration().unwrap().backup, m.backup, "可用快照复用、不递增");
+    }
+
+    /// 被拒开的库**不留快照文件**（收口评审 #1：原先备份判据比守卫宽松，
+    /// 误传给 `--dismissed` 的业务库会被无声复制一份全量副本）。
+    #[test]
+    fn refused_dbs_leave_no_snapshot() {
+        for (name, build) in [
+            ("陌生表", (|p: &Path| {
+                let c = Connection::open(p).unwrap();
+                c.execute_batch("CREATE TABLE customers (id TEXT); INSERT INTO customers VALUES ('x');").unwrap();
+            }) as fn(&Path)),
+            ("台账不同构", |p: &Path| old_shape_db(p, true)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("proj.db");
+            build(&path);
+            assert!(ProjDb::open_at(&path).is_err(), "{name}: 该拒开");
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+                .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+                .filter(|n| n.contains("legacy") || n.ends_with(".part")).collect();
+            assert!(leftovers.is_empty(), "{name}: 拒开却留下了副本 {leftovers:?}");
+        }
+    }
+
+    /// 迁移丢弃**台账以外的全部表**，`queue_items` / `suspicions` 的半成品形状不会被盖上 v4 戳记
+    /// （收口评审 #3：它们在 TABLES 里不算陌生表，`CREATE TABLE IF NOT EXISTS` 又补不上缺的列，
+    /// 库会进入「queue_item_put 永久失败、守卫再也不触发」的不可自愈坏态）。
+    #[test]
+    fn migration_drops_halfbaked_v4_tables_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.db");
+        old_shape_db_isomorphic(&path);
+        let c = Connection::open(&path).unwrap();
+        // 少了 state 列、也没有复合主键的 queue_items
+        c.execute_batch("CREATE TABLE queue_items (job_id TEXT NOT NULL, item_id TEXT NOT NULL, json TEXT NOT NULL);
+                         INSERT INTO queue_items VALUES ('j','i','{}');").unwrap();
+        drop(c);
+
+        let db = ProjDb::open_at(&path).expect("同构旧库仍应迁移");
+        assert!(db.legacy_migration().unwrap().dropped.iter().any(|t| t == "queue_items"), "半成品新表也该丢");
+        assert_eq!(ProjDb::columns(&db.conn, "queue_items").unwrap(), ["job_id", "item_id", "state", "json"]);
+        db.queue_item_put("j", "i", "pending", "{}").expect("重建后写得进去");
+        assert_eq!(db.active_ids().unwrap().len(), 1, "台账仍然带过来");
+    }
+
+    /// 有数据但台账表全缺席（数据都在评审史里）→ 照样迁移、无账可带，且**仍然备份**。
+    #[test]
+    fn old_db_without_ledger_tables_migrates_with_nothing_to_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE jobs (job_id TEXT PRIMARY KEY, status TEXT NOT NULL);
+                         INSERT INTO jobs VALUES ('j1','done');").unwrap();
+        drop(c);
+        let db = ProjDb::open_at(&path).unwrap();
+        let m = db.legacy_migration().expect("有数据就该走迁移");
+        assert_eq!((m.dismissed, m.resolved), (0, 0), "无账可带");
+        assert!(m.backup.is_file(), "仍要有快照");
+        assert_eq!(user_version(&db.conn), USER_VERSION);
+    }
+
+    /// 无快照就不迁移（收口评审 #5）：事务外判「不迁移」而事务内判「要迁移」的竞态下，
+    /// 原实现 `unwrap_or_default()` 会吞掉缺席的备份、无快照直接 DROP 评审史。
+    #[test]
+    fn migration_refuses_without_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.db");
+        old_shape_db_isomorphic(&path);
+        let conn = Connection::open(&path).unwrap();
+        let err = ProjDb::setup_schema(&conn, &path, None).unwrap_err().to_string();
+        assert!(err.contains("没有拿到迁移前快照") && err.contains("请重跑"), "{err}");
+        // 库没被动过：评审史还在、版本号还是 0
+        assert_eq!(conn.query_row("SELECT count(*) FROM results", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(user_version(&conn), 0);
+    }
+
+    /// 只读入口不改库（收口评审 #2）：`--dismissed <dev 库>` 读得出台账，且库一个字节不变。
+    #[test]
+    fn read_only_open_reads_legacy_ledger_without_touching_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        old_shape_db_isomorphic(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        let db = ProjDb::open_read_only(&path).unwrap();
+        assert_eq!(db.active_ids().unwrap().len(), 1, "旧库的台账读得出来");
+        assert_eq!(db.active_cards().unwrap()[0].reason, "误报");
+        assert!(db.legacy_migration().is_none(), "只读不迁移");
+        drop(db);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before, "库一个字节都不该变");
+        let c = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&c), 0, "版本号不该被写成 4");
+        assert_eq!(c.query_row("SELECT count(*) FROM results", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "评审史还在");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains("legacy-")).collect();
+        assert!(leftovers.is_empty(), "只读不该留快照: {leftovers:?}");
     }
 
     /// 空旧库不触发迁移、也不留快照文件（零数据零风险，走原来的丢表重建）。

@@ -13,12 +13,13 @@ gen:
 # 直接覆盖 launcher（bin/redteam）指向的那个文件——插件与 ship 循环从此跑新引擎。
 # 二进制入库（marketplace 分发要它），所以 build 后工作树会有 5MB 级 diff，按仓内惯例单独提交（`build: 重建二进制`）。
 # 回退到 M21 之前的 dev 二进制：`git show feebc92:plugins/redteam/bin/darwin/aarch64/redteam > $(BIN) && chmod +x $(BIN)`。
-# launcher 已入库带执行位，不再 chmod。
+# 先 cp 到 .new 再 mv 覆盖（收口评审 #6）：`rm` 与 `cp` 之间 cp 失败会让插件里一个二进制都没有，
+# 且 mv 是原子替换、不会写正在运行的那个 inode。launcher 已入库带执行位，不再 chmod。
 build:
 	cargo build --release --target $(TARGET)
 	mkdir -p $(dir $(BIN))
-	rm -f $(BIN)
-	cp target/$(TARGET)/release/redteam $(BIN)
+	cp target/$(TARGET)/release/redteam $(BIN).new
+	mv -f $(BIN).new $(BIN)
 
 # build-dev-baseline（说明，非目标）：插件里的 dev 二进制 plugins/redteam/bin/darwin/aarch64/redteam 来自 `dev` 分支
 # （最后重建于 feebc92，2026-09-04）并入库；它是 M21 对照基线（design 铁律 6），本分支不重建、不覆盖。需要重建时

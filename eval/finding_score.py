@@ -33,7 +33,7 @@ from _oracle import anchor_quote, load_oracle, match_entries  # noqa: E402
 
 
 def load_findings(path):
-    """redteam-next / dev 的结果 JSON：顶层 `findings[]`。缺字段的条目照收（锚定时自然落空）。"""
+    """redteam / dev 的结果 JSON：顶层 `findings[]`。缺字段的条目照收（锚定时自然落空）。"""
     r = json.load(open(path, encoding="utf-8"))
     return r.get("findings") or []
 

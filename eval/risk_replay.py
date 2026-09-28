@@ -14,7 +14,7 @@ src/diffsym/mod.rs（rs / go / ts 三语言）。
   report --pair replay.json:oracle.json:set ... [--dist replay.json ...] [--thetas 1.5,2,2.5,3]
          θ 曲线 + (规模, |H0|, R) 表 + 三档 max_cells 起步值。
   compare <replay.json> <rust-out.json> [--tol 1e-6] [--show N] [--out FILE]
-         Rust `redteam-next risk` 输出（区级 H0）vs Python v4 回放对拍：报区级 Jaccard 与 R 差；
+         Rust `redteam risk` 输出（区级 H0）vs Python v4 回放对拍：报区级 Jaccard 与 R 差；
          R 差 > 容差即退出码 1——改 θ / 权重必须过此门（D11 定案）。
   selftest
 """
@@ -642,7 +642,7 @@ def zone_range(z):
 
 
 def cmd_compare(a):
-    """Rust `redteam-next risk` JSON vs Python v4 replay JSON：报 H0 区级 Jaccard 与 R 差；
+    """Rust `redteam risk` JSON vs Python v4 replay JSON：报 H0 区级 Jaccard 与 R 差；
     R 差 > 容差（默认 1e-6）退出码 1——改 θ / 权重必须过此门（D11）。"""
     py = json.load(open(a.replay, encoding="utf-8"))
     rs = json.load(open(a.rust, encoding="utf-8"))
@@ -812,7 +812,7 @@ def main():
     r.set_defaults(fn=cmd_report)
     c = sub.add_parser("compare")
     c.add_argument("replay", help="Python v4 回放 JSON（replay 子命令产物）")
-    c.add_argument("rust", help="Rust `redteam-next risk` 输出 JSON")
+    c.add_argument("rust", help="Rust `redteam risk` 输出 JSON")
     c.add_argument("--tol", type=float, default=1e-6, help="R 差容差（默认 1e-6）")
     c.add_argument("--show", type=int, default=10, help="最多列出的单边未配对区数（默认 10）")
     c.add_argument("--min-jaccard", type=float, default=1.0, help="区级 Jaccard 下限（默认 1.0：H0 区集须完全对齐）")

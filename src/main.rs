@@ -166,7 +166,7 @@ enum Cmd {
         #[command(subcommand)]
         action: ResolveCmd,
     },
-    /// 幂等创建项目级 .redteam/ 骨架（.gitignore、rounds/、proj-next.db；配置在用户级 ~/.redteam/config.json，项目层无配置文件）。
+    /// 幂等创建项目级 .redteam/ 骨架（.gitignore、rounds/、proj.db；配置在用户级 ~/.redteam/config.json，项目层无配置文件）。
     Init,
     /// 打印生效的测试命令（ship 循环第 2 步用）：--override > Cargo.toml→`cargo test` > package.json 有
     /// scripts.test→`npm test` > Makefile 有 test 目标→`make test` > go.mod→`go test ./...`；推不出 →
