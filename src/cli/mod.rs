@@ -431,6 +431,8 @@ pub async fn run_code_review(
     if let Some(d) = deep.as_mut() {
         // 合并残差对账（design C2 §4〔D15〕）：scan 报告的组内闭包簇被队列逐条合并拆进多项的簇数。
         d.meta.queue_split_clusters = crate::consolidate::scan::split_clusters(&results.cells, &d.items);
+        // 疑点落账（M21c 批 A，design §8.2）：本轮被预算截断的疑点进跨轮台账，供下轮 delta 激活（批 C）。
+        persist_dormant_suspicions(root, &d.items, head_sha.as_deref().unwrap_or(""), &mut warnings);
     }
     let (report, code) = finish_scan_report(ScanFinish {
         groups,
@@ -1102,6 +1104,39 @@ pub fn attach_cells(store: &crate::state::JobStore, job_id: &str, report: &mut R
     report.cells = records;
 }
 /// R2.2：失败/超时时从 proj.db 的 cell checkpoint 组一份 `incomplete` 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。
+/// 疑点落账（M21c 批 A）：把本轮**没挖成**的疑点 upsert 进项目库的跨轮台账。
+///
+/// 三条边界：
+/// - **不建库**：项目没 `init` 过就跳过（与 `load_ledger` 的 zero-config 同口径，评审不该有建库副作用）；
+/// - **不败评审**：写失败只记 warning（与队列快照同口径，design §7.1）——台账是增益，不该让一轮评审失败；
+/// - 轮次标识用 `head_sha`：前台裸跑没有 job_id，而台账要的本就是「第一次/最近一次见到它是哪个 HEAD」。
+fn persist_dormant_suspicions(cwd: &Path, items: &[crate::orchestrate::queue::QueueItem], round: &str, warnings: &mut Vec<String>) {
+    let rows = crate::orchestrate::ledger::rows_from_skipped(items, round);
+    if rows.is_empty() {
+        return;
+    }
+    let p = cwd.join(crate::project::PROJECT_DIR).join(crate::db::DB_FILE);
+    if !p.exists() {
+        return;
+    }
+    let db = match crate::db::ProjDb::open_at(&p) {
+        Ok(db) => db,
+        Err(e) => {
+            warnings.push(format!("疑点台账未落账（打不开项目库 {}）：{e}", p.display()));
+            return;
+        }
+    };
+    let mut failed = 0usize;
+    for row in &rows {
+        if db.suspicion_upsert(row).is_err() {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        warnings.push(format!("疑点台账落账部分失败：{failed}/{} 行未写入", rows.len()));
+    }
+}
+
 /// 全部落盘记录（含失败格）都进收口：失败格进 coverage.failed / cells_failed、烧掉的 usage 入账，与随后 `attach_cells` 回填的
 /// `run.cells` / 顶层 `cells` 一致（评审修 2）。M 取 manifest 行数（若尚未写出 manifest 就已失败，退化用已完成数兜底，不出现 "N/0"）。
 fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) -> (ReviewReport, i32) {
@@ -4233,6 +4268,37 @@ mod tests {
 
     /// 不变式破坏要**留痕**而不是静默（M21c 批 A）：同一个格被并入两次（一次当沿用、一次当本轮），
     /// 它会同时落进 reused 与 completed —— coverage 是 verdict 分级的依据，这种账目错必须在 warnings 里看得见。
+    /// 落账的两条边界（M21c 批 A）：**不建库**（项目没 init 过就跳过，评审不该有建库副作用，
+    /// 与 `load_ledger` 的 zero-config 同口径）；库在就写得进去，且没有可落的行时一个字节都不碰。
+    #[test]
+    fn persist_dormant_suspicions_never_creates_the_db() {
+        use crate::orchestrate::queue::QueueItem;
+        let skipped: QueueItem = serde_json::from_value(serde_json::json!({
+            "id": "a.rs:scan:1-9", "score": 1.0, "agreement": 1, "state": "skipped", "kind": "suspicion",
+            "dispatch_agreement": 1, "landed_agreement": null, "families": ["alpha"],
+            "spec": { "file": "a.rs", "ranges": [[1, 9]], "origin": "scan",
+                      "notes": [{"file":"a.rs","line_start":3,"line_end":3,"hint":"空指针","confidence":0.6,"quote":"let x = take(v);"}] },
+            "members": [{"file":"a.rs","line_start":3,"line_end":3,"hint":"空指针","confidence":0.6,"quote":"let x = take(v);"}],
+        })).unwrap();
+
+        // 没 init 过：不建 .redteam/、不建库、不报 warning
+        let tmp = tempfile::tempdir().unwrap();
+        let mut warnings = vec![];
+        persist_dormant_suspicions(tmp.path(), std::slice::from_ref(&skipped), "sha1", &mut warnings);
+        assert!(!tmp.path().join(".redteam").exists(), "评审不得建库");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // init 过：落得进去
+        let tmp2 = tempfile::tempdir().unwrap();
+        crate::project::init_project(tmp2.path()).unwrap();
+        persist_dormant_suspicions(tmp2.path(), std::slice::from_ref(&skipped), "sha1", &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let db = crate::db::ProjDb::open(tmp2.path()).unwrap();
+        let rows = db.suspicions_for_files(&["a.rs".into()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].status.as_str(), rows[0].last_job.as_str()), ("dormant", "sha1"));
+    }
+
     #[test]
     fn coverage_violation_is_recorded_as_a_warning() {
         use crate::domain::Role;

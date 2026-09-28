@@ -167,6 +167,25 @@ pub struct LegacyMigration {
     pub backup: std::path::PathBuf,
 }
 
+/// 疑点台账行（`suspicions` 表，M21c 批 A）：跨轮累积的**休眠疑点**——本轮因预算截断没挖成的那些。
+/// 身份 = 文件 + quote 归一（与 finding id 同一套 `normalize_quote`，行号无关、免疫 reformat），
+/// 所以同一处疑点跨轮只有一行。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuspicionRow {
+    pub id: String,
+    pub file: String,
+    pub quote_norm: String,
+    pub hint: String,
+    /// `dormant` = 休眠（本批只产这一种）；`activated` / `promoted` 留给批 C 的增量激活。
+    pub status: String,
+    pub first_job: String,
+    pub last_job: String,
+    /// 被 delta 激活过几次（批 C 的活锁守卫据此封顶）。本批恒 0。
+    pub activations: i64,
+    /// 明细 JSON：行区间、confidence、category、来源、落账原因、所属队列项。
+    pub json: String,
+}
+
 pub struct ProjDb {
     conn: Connection,
     legacy_migration: Option<LegacyMigration>,
@@ -533,6 +552,39 @@ impl ProjDb {
     }
 
     /// 豁免 id 集（活跃状态卡；withdrawn/stale 视同无卡）。
+    /// 疑点落账（M21c 批 A，design §8.2）：**幂等 upsert**——同一处疑点跨轮只有一行。
+    /// 新行写全量、`activations = 0`；已有行只更新 `last_job` / `hint` / `json`，
+    /// **不动** `first_job`（第一次见到它的那轮）、`activations` 与 `status`（激活与晋升是批 C 的事，不能被落账覆盖回 dormant）。
+    pub fn suspicion_upsert(&self, row: &SuspicionRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO suspicions (id,file,quote_norm,hint,status,first_job,last_job,activations,json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(id) DO UPDATE SET last_job=excluded.last_job, hint=excluded.hint, json=excluded.json",
+            rusqlite::params![row.id, row.file, row.quote_norm, row.hint, row.status,
+                              row.first_job, row.last_job, row.activations, row.json],
+        )?;
+        Ok(())
+    }
+
+    /// 按文件取休眠疑点（A-2 披露 / 批 C 增量激活的入口）。`files` 空 → 空结果（不退化成全表）。
+    pub fn suspicions_for_files(&self, files: &[String]) -> Result<Vec<SuspicionRow>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ph = (1..=files.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id,file,quote_norm,hint,status,first_job,last_job,activations,json
+             FROM suspicions WHERE file IN ({ph}) ORDER BY file, id"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(files.iter()), |r| {
+            Ok(SuspicionRow {
+                id: r.get(0)?, file: r.get(1)?, quote_norm: r.get(2)?, hint: r.get(3)?, status: r.get(4)?,
+                first_job: r.get(5)?, last_job: r.get(6)?, activations: r.get(7)?, json: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn active_ids(&self) -> Result<HashSet<String>> {
         let mut stmt = self
             .conn
@@ -1289,6 +1341,36 @@ mod guard_tests {
             .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
             .filter(|n| n.contains("legacy")).collect();
         assert!(leftovers.is_empty(), "空库不该留快照: {leftovers:?}");
+    }
+
+    /// 疑点台账 upsert 幂等（M21c 批 A）：同一处疑点跨轮只有一行，
+    /// 第二轮只更新 `last_job` / `hint` / `json`，**不动** `first_job` / `activations` / `status`
+    /// ——否则批 C 的激活计数与晋升状态会被下一轮落账悄悄抹回 dormant。
+    #[test]
+    fn suspicion_upsert_is_idempotent_and_keeps_activation_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ProjDb::open(dir.path()).unwrap();
+        let row = |job: &str, hint: &str| SuspicionRow {
+            id: "abc123".into(), file: "a.rs".into(), quote_norm: "letx=1;".into(), hint: hint.into(),
+            status: "dormant".into(), first_job: job.into(), last_job: job.into(), activations: 0,
+            json: format!("{{\"round\":\"{job}\"}}"),
+        };
+        db.suspicion_upsert(&row("sha1", "第一轮说法")).unwrap();
+        // 模拟批 C：这条被激活过一次并晋升
+        db.conn.execute("UPDATE suspicions SET activations=2, status='activated' WHERE id='abc123'", []).unwrap();
+
+        db.suspicion_upsert(&row("sha2", "第二轮说法")).unwrap();
+        let got = db.suspicions_for_files(&["a.rs".into()]).unwrap();
+        assert_eq!(got.len(), 1, "跨轮只有一行");
+        let r = &got[0];
+        assert_eq!((r.first_job.as_str(), r.last_job.as_str()), ("sha1", "sha2"), "first 不动、last 更新");
+        assert_eq!((r.activations, r.status.as_str()), (2, "activated"), "激活状态不被落账覆盖");
+        assert_eq!(r.hint, "第二轮说法", "hint / json 取最新");
+        assert!(r.json.contains("sha2"));
+
+        // 按文件查：不匹配的文件与空入参都不返回（空入参不得退化成全表）
+        assert!(db.suspicions_for_files(&["b.rs".into()]).unwrap().is_empty());
+        assert!(db.suspicions_for_files(&[]).unwrap().is_empty());
     }
 
     /// 旧库有数据、**且台账表与 v4 不同构**（这里 dismissed 只有 3 列）→ 拒开：文案指向导出脚本与库路径、
