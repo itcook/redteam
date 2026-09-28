@@ -51,6 +51,9 @@ enum Cmd {
     /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
     /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
     /// 自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit 可读；误填超大 maxConcurrency 也能自愈）。
+    /// **诊断**：置 `REDTEAM_DUMP_DIR=<目录>` 时，凡是解析失败的那一轮（scanner / reviewer 的首轮与修复轮）
+    /// 会把模型原文整段落盘到该目录，文件名带队列项文件、模型与轮次；不置则零行为。报错本身恒带 serde 根因
+    /// （原因 / 行列 / 全文字符数 / 出错处前后片段），原文落盘是给「报错看不出为什么」的场合用的。
     Review {
         /// diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]
