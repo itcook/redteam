@@ -306,6 +306,8 @@ pub async fn run_code_review(
     let t0 = std::time::Instant::now();
 
     let selected = select_files(changes);
+    // 变更文件路径（A-2 披露用）：`selected` 随后被 `plan_cells` 消费掉，先留一份
+    let changed_files: Vec<String> = selected.iter().map(|c| c.path.clone()).collect();
     let roles = cfg.active_roles();
     if roles.scanners.is_empty() {
         anyhow::bail!(NO_SCANNER_MSG);
@@ -434,6 +436,8 @@ pub async fn run_code_review(
         // 疑点落账（M21c 批 A，design §8.2）：本轮被预算截断的疑点进跨轮台账，供下轮 delta 激活（批 C）。
         persist_dormant_suspicions(root, &d.items, head_sha.as_deref().unwrap_or(""), &mut warnings);
     }
+    // 披露本轮变更文件上的休眠线索（A-2）：只读、不进 verdict。落账之后读，所以本轮刚截断的也会出现。
+    let dormant_leads = read_dormant_leads(root, &changed_files);
     let (report, code) = finish_scan_report(ScanFinish {
         groups,
         scanned_coverage,
@@ -451,12 +455,39 @@ pub async fn run_code_review(
         duration_ms: t0.elapsed().as_millis() as u64,
         test_command: args.test_command.clone().or_else(|| crate::project::infer_test_command(root)),
         job_id: String::new(),
+        dormant_leads,
         reused: vec![],
     });
     match deep {
         Some(deep) => Ok(overlay_deep(report, code, deep, args, cfg, registry, t0)),
         None => Ok((report, code)),
     }
+}
+
+/// 读本轮变更文件上的休眠疑点（M21c 批 A，A-2）：**只读、零副作用**——库不在就空，读失败也空（不打扰评审）。
+/// 这是披露面，不是判定面：它们没被深挖过、没有危害链论证，当 finding 用会把「没挖」误读成「有问题」。
+fn read_dormant_leads(cwd: &Path, changed_files: &[String]) -> Vec<crate::domain::DormantLead> {
+    if changed_files.is_empty() {
+        return vec![];
+    }
+    let p = cwd.join(crate::project::PROJECT_DIR).join(crate::db::DB_FILE);
+    if !p.exists() {
+        return vec![];
+    }
+    let Ok(db) = crate::db::ProjDb::open_read_only(&p) else { return vec![] };
+    let Ok(rows) = db.suspicions_for_files(changed_files) else { return vec![] };
+    rows.into_iter()
+        .filter(|r| r.status == "dormant")
+        .map(|r| {
+            let line = serde_json::from_str::<serde_json::Value>(&r.json)
+                .ok()
+                .and_then(|j| j.get("line_start").and_then(|v| v.as_u64()))
+                .unwrap_or(0) as u32;
+            crate::domain::DormantLead {
+                file: r.file, line, hint: r.hint, first_round: r.first_job, activations: r.activations,
+            }
+        })
+        .collect()
 }
 
 /// per-cell backend 工厂（流式旁路的挂点）：按 reviewer 条目取密钥另造实例并挂 delta 回调。
@@ -630,6 +661,8 @@ pub(crate) struct ScanFinish<'a> {
     pub duration_ms: u64,
     pub test_command: Option<String>,
     pub job_id: String,
+    /// 休眠疑点线索（M21c 批 A，A-2）：只披露、不进 verdict。
+    pub dormant_leads: Vec<crate::domain::DormantLead>,
     /// resume 沿用上次已完成的 cell（coverage `reused`）。
     pub reused: Vec<String>,
 }
@@ -740,6 +773,7 @@ pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
         warnings,
         failed_models: vec![],
         ledger: f.ledger_meta,
+        dormant_leads: f.dormant_leads,
         head_sha: f.head_sha,
         dossier: f.dossier_meta,
         needs: NeedsMeta { triggered_cells: triggered, declared: needs_declared },
@@ -1164,6 +1198,7 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
         duration_ms: 0,
         test_command: None,
         job_id: job_id.to_string(),
+        dormant_leads: vec![], // partial / resume 收口没有本轮变更集上下文，不披露（A-2）
         reused: vec![],
     });
     fold_role_cells(&mut report, deep_records, false);
@@ -1329,6 +1364,7 @@ pub async fn run_resume(
         duration_ms: t0.elapsed().as_millis() as u64,
         test_command: args.test_command.clone().or_else(|| crate::project::infer_test_command(cwd)),
         job_id: job_id.to_string(),
+        dormant_leads: vec![], // resume 收口没有本轮变更集上下文，不披露（A-2）
         reused,
     });
     if still_missing > 0 {
@@ -4120,6 +4156,9 @@ mod tests {
             model_names: vec!["p/x".into(), "p/y".into()], roles: Some(&roles), warnings: vec![],
             inflight_peak: [("p".to_string(), 2u32)].into_iter().collect(), rate_limit: BTreeMap::new(), ledger_meta: None, head_sha: None,
             duration_ms: 7, test_command: None, job_id: "j".into(), reused,
+            dormant_leads: vec![crate::domain::DormantLead {
+                file: "a.rs".into(), line: 42, hint: "历史截断项".into(), first_round: "sha0".into(), activations: 1,
+            }],
         };
         let (r, code) = finish_scan_report(base(cells.clone(), vec!["scan[g1]@p/y#1".into()]));
         assert_eq!((r.verdict, code), (Verdict::ScanOnly, 0));
@@ -4129,6 +4168,10 @@ mod tests {
         assert_eq!((scan.stats.total, scan.stats.agreement_ge2, scan.stats.needs_declared, scan.stats.cells_ok, scan.stats.cells_failed), (2, 1, 2, 3, 0));
         assert_eq!((scan.stats.by_category.get("L1"), scan.stats.by_category.get("L3")), (Some(&1), Some(&1)));
         assert_eq!(scan.scanned_coverage, Some(0.5));
+        // 休眠线索进报告但不改判定（A-2）：verdict / code 与上面的断言一致，findings 仍为空
+        assert_eq!(r.run.dormant_leads.len(), 1, "披露段要进报告");
+        assert_eq!((r.run.dormant_leads[0].file.as_str(), r.run.dormant_leads[0].line), ("a.rs", 42));
+        assert!(r.findings.is_empty(), "线索不是 finding");
         let cov = &r.run.coverage;
         assert_eq!(cov.selected[&Role::Scanner].len(), 3);
         assert_eq!(cov.completed[&Role::Scanner], vec!["scan[g1]@p/x#1", "scan[g2]@p/x#1"]);
@@ -4268,6 +4311,35 @@ mod tests {
 
     /// 不变式破坏要**留痕**而不是静默（M21c 批 A）：同一个格被并入两次（一次当沿用、一次当本轮），
     /// 它会同时落进 reused 与 completed —— coverage 是 verdict 分级的依据，这种账目错必须在 warnings 里看得见。
+    /// 休眠线索只披露、不判定（M21c 批 A，A-2）：台账里落在本轮变更文件上的历史截断项进 `run.dormant_leads`，
+    /// 但 **verdict / 退出码 / findings 一个都不动**——它们没被深挖过，当 finding 用会把「没挖」误读成「有问题」。
+    #[test]
+    fn dormant_leads_are_disclosure_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::project::init_project(tmp.path()).unwrap();
+        let db = crate::db::ProjDb::open(tmp.path()).unwrap();
+        let row = |id: &str, file: &str, status: &str| crate::db::SuspicionRow {
+            id: id.into(), file: file.into(), quote_norm: "letx=1;".into(), hint: "可疑的边界".into(),
+            status: status.into(), first_job: "sha0".into(), last_job: "sha1".into(), activations: 1,
+            json: r#"{"line_start":42}"#.into(),
+        };
+        db.suspicion_upsert(&row("s1", "a.rs", "dormant")).unwrap();
+        db.suspicion_upsert(&row("s2", "other.rs", "dormant")).unwrap();   // 不在本轮变更集
+        db.suspicion_upsert(&row("s3", "a.rs", "promoted")).unwrap();      // 已晋升，不再是线索
+        drop(db);
+
+        let leads = read_dormant_leads(tmp.path(), &["a.rs".into()]);
+        assert_eq!(leads.len(), 1, "只披露本轮变更文件上、仍处 dormant 的那条: {leads:?}");
+        assert_eq!((leads[0].file.as_str(), leads[0].line, leads[0].activations), ("a.rs", 42, 1));
+        assert_eq!(leads[0].first_round, "sha0", "首次见到它的那轮");
+
+        // 零副作用：没 init 过的目录、空变更集都返回空且不建库
+        let bare = tempfile::tempdir().unwrap();
+        assert!(read_dormant_leads(bare.path(), &["a.rs".into()]).is_empty());
+        assert!(!bare.path().join(".redteam").exists(), "披露不得建库");
+        assert!(read_dormant_leads(tmp.path(), &[]).is_empty(), "空变更集不该退化成全表");
+    }
+
     /// 落账的两条边界（M21c 批 A）：**不建库**（项目没 init 过就跳过，评审不该有建库副作用，
     /// 与 `load_ledger` 的 zero-config 同口径）；库在就写得进去，且没有可落的行时一个字节都不碰。
     #[test]

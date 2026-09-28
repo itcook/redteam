@@ -147,6 +147,19 @@ impl Coverage {
     }
 }
 
+/// 一条休眠疑点线索（`RunMeta::dormant_leads`）：台账里的历史截断项，落在本轮变更文件上。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct DormantLead {
+    pub file: String,
+    /// 落账那轮的行号——**仅供定位参考**：台账的身份是 quote 归一，行号会随后续改动漂移。
+    pub line: u32,
+    pub hint: String,
+    /// 第一次见到它的那轮 head_sha。
+    pub first_round: String,
+    /// 被 delta 激活过几次（批 C 起才会非 0）。
+    pub activations: i64,
+}
+
 /// 单 cell 的输入缓存命中率（cached_input ÷ input；D10-3 段序翻转与 anthropic 三段界断点的观测面，F-5 填）。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CacheHit {
@@ -251,6 +264,11 @@ pub struct RunMeta {
     /// 台账自动加载披露——zero-config 下 verdict 受台账影响必须可见（design 2026-07-03 #6）。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ledger: Option<LedgerMeta>,
+    /// 休眠疑点线索（M21c 批 A，design §8.2）：疑点台账里落在**本轮变更文件**上的历史截断项。
+    /// **只披露、不进 verdict**——它们没被深挖过，没有危害链论证，当 finding 用会把「没挖」误读成「有问题」。
+    /// 批 C 的增量激活会让其中被 delta 碰到的那些重新入队，那时它们才有机会成为 finding。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub dormant_leads: Vec<DormantLead>,
     /// R3 stamp：证据收集实跑刻的 rev-parse HEAD（code 模式全路径回填；doc 为 None）。
     /// 增量轮以上轮此值为 delta base。serde default 兼容 v2。
     #[serde(skip_serializing_if = "Option::is_none", default)]
