@@ -239,7 +239,7 @@ fn safe_read_in_root(root: &Path, rel: &str) -> Option<String> {
     std::fs::read_to_string(&real).ok()
 }
 
-/// 回放接线（`redteam-next risk` 子命令）：读任意历史 commit（`git show <head>:<path>`）而非工作树，
+/// 回放接线（`redteam risk` 子命令）：读任意历史 commit（`git show <head>:<path>`）而非工作树，
 /// 与 `eval/risk_replay.py` 的 `replay <repo> <base> <head>` 同语义（对拍回归门，D11）。
 pub fn replay_from_git(
     changes: &[FileChange],

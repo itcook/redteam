@@ -11,11 +11,11 @@ use std::path::Path;
 // args_override_self：同名 flag 重复时后者胜（而非报错）——ship 等编排方把自己管理的
 // flag 追加在用户参数之后即权威生效，无需依赖 prompt 层把用户重复参数「摘干净」
 // （r5 dogfood 1c72b790：LLM 摘参不可靠，机制化消灭「重复即崩」类）。
-#[command(name = "redteam-next", version, about = "redteam-next（M21 重构分支产物）：模型无关的对抗式代码评审器——scanner 疑点扫描地基；插件与 ship 循环仍用 dev `redteam`，M21c 切名", args_override_self = true,
+#[command(name = "redteam", version, about = "redteam：模型无关的对抗式代码评审器——风险路由 → 疑点扫描 → 深挖 → 流式复核", args_override_self = true,
     after_help = "快速上手：\n  \
-    1. redteam-next init                                              # 项目内建 .redteam/ 骨架（状态与内容，无配置）\n  \
-    2. redteam-next model setup --provider X --model <id> --role scanner # 给至少一个模型配 scanner 角色（key 见 --key-store）\n  \
-    3. redteam-next review --base main                                # 评审当前分支相对 main 的改动\n  \
+    1. redteam init                                              # 项目内建 .redteam/ 骨架（状态与内容，无配置）\n  \
+    2. redteam model setup --provider X --model <id> --role scanner # 给至少一个模型配 scanner 角色（key 见 --key-store）\n  \
+    3. redteam review --base main                                # 评审当前分支相对 main 的改动\n  \
     配置：~/.redteam/config.json + secrets.json（REDTEAM_HOME 可覆盖；用户级唯一，无项目层；严格 JSON、无注释）。\n  \
     后台跑：review --background 得 job id → status <id> 看进度 → result <id> 取报告。")]
 struct Cli {
@@ -96,7 +96,7 @@ enum Cmd {
         #[arg(long)]
         resume: Option<String>,
         /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：
-        /// 项目存在 .redteam/proj-next.db 即自动加载，run.ledger 披露。当前只披露不消费
+        /// 项目存在 .redteam/proj.db 即自动加载，run.ledger 披露。当前只披露不消费
         /// （判例前移进 scanner prompt 与豁免 / refute 裁决在 M21c 疑点台账起）。
         #[arg(long)]
         dismissed: Option<String>,
@@ -126,7 +126,7 @@ enum Cmd {
         #[arg(long)]
         cells: bool,
     },
-    /// 取回作业的评审结果（持久存储于 .redteam/proj-next.db，永不过期、可重复取）。
+    /// 取回作业的评审结果（持久存储于 .redteam/proj.db，永不过期、可重复取）。
     /// 任一终态可取（failed/timed_out 有部分报告也放行）；未终态是命令自身失败，退出码 1。
     Result {
         /// 作业 id（review --background 的输出）。
@@ -151,12 +151,12 @@ enum Cmd {
         #[command(subcommand)]
         action: ModelCmd,
     },
-    /// 驳回判例台账（.redteam/proj-next.db）：建卡/查卡/状态迁移/锚失效回收。
+    /// 驳回判例台账（.redteam/proj.db）：建卡/查卡/状态迁移/锚失效回收。
     Dismiss {
         #[command(subcommand)]
         action: DismissCmd,
     },
-    /// 销案判例台账（.redteam/proj-next.db 独立表，不混 dismissed——已修复≠误报，不进豁免/预筛）：
+    /// 销案判例台账（.redteam/proj.db 独立表，不混 dismissed——已修复≠误报，不进豁免/预筛）：
     /// 建卡/查卡。增量轮（review --incremental-from）据此不再携带该 finding；quote 未随修复
     /// 消失的会注入下轮「顺带验证」防假修复。
     Resolve {
@@ -201,7 +201,7 @@ enum Cmd {
         /// 被评 head（缺省 HEAD）；回放历史 diff 时传当时的 head commit。
         #[arg(long)]
         head: Option<String>,
-        /// 台账 db 覆盖（缺省读项目 `.redteam/proj-next.db`，不存在则不计台账信号；
+        /// 台账 db 覆盖（缺省读项目 `.redteam/proj.db`，不存在则不计台账信号；
         /// 对拍 Oracle B 可指向 dev 旧 `proj.db`）。
         #[arg(long)]
         dismissed: Option<String>,

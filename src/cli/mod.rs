@@ -28,7 +28,7 @@ use spec::{render_spec_section_capped, SPEC_BUDGET_BYTES};
 use tail::model_ids_for;
 
 /// scanners 为空时的配置错误文案（`build_registry` 与 `run_code_review` 共用）。
-pub const NO_SCANNER_MSG: &str = "未配置 scanner：在 ~/.redteam/config.json（REDTEAM_HOME 可覆盖）给至少一个模型加 roles.scanner，见 `redteam-next model setup --help`";
+pub const NO_SCANNER_MSG: &str = "未配置 scanner：在 ~/.redteam/config.json（REDTEAM_HOME 可覆盖）给至少一个模型加 roles.scanner，见 `redteam model setup --help`";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReviewArgs {
@@ -245,7 +245,7 @@ pub(crate) fn grouping_opts(g: &crate::config::GroupingCfg, budget: usize) -> Gr
     }
 }
 
-/// 阶段 0 风险路由（plan_cells 前）。ledger 路径：`--dismissed` 文件覆盖，否则 `.redteam/proj-next.db`（存在才读）。
+/// 阶段 0 风险路由（plan_cells 前）。ledger 路径：`--dismissed` 文件覆盖，否则 `.redteam/proj.db`（存在才读）。
 fn stage0_risk(
     selected: &[FileChange],
     root: &Path,
@@ -1157,7 +1157,7 @@ pub async fn run_resume(
     if args.incremental_from.is_some() {
         return partial_report(
             store, job_id,
-            "resume: incremental jobs cannot be resumed; re-run `redteam-next review --incremental-from <prior-job>`".into(),
+            "resume: incremental jobs cannot be resumed; re-run `redteam review --incremental-from <prior-job>`".into(),
         );
     }
     let prior_records = store.read_partial(job_id);

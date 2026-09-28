@@ -30,5 +30,3 @@ __pycache__/
 # --- 分支随行文档区的私有分区：含公司仓（PR181）细节，远端公开仓永不入库 ---
 .next/private/
 
-# --- M21 分支产物（D10）：make build 放置的 redteam-next 不入库；插件 dev `redteam` 与 launcher 仍入库 ---
-plugins/redteam/bin/**/redteam-next

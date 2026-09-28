@@ -8,9 +8,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// 库文件名（挂在项目 `.redteam/` 下）。M21a-b 并行期与 dev 二进制的 `proj.db` **分库**（用户裁定 2026-09-08：
-/// dev `redteam` 与 `redteam-next` 在同一仓 dogfood，v4 的 `cells.role NOT NULL` 会让 dev 的 checkpoint 写失败、
+/// M21c 切名前 dev `redteam` 与分支产物在同一仓 dogfood，v4 的 `cells.role NOT NULL` 会让 dev 的 checkpoint 写失败、
 /// 旧库又被 v4 守卫拒开——两者不能共用一个文件）；M21c 切名时定回 `proj.db` 与切换程序（followup）。
-pub const DB_FILE: &str = "proj-next.db";
+pub const DB_FILE: &str = "proj.db";
 
 /// schema 版本（`PRAGMA user_version`）。v4 = M21 一次重置（D10-2）：cells 带 role 列、疑点台账与队列快照表壳。
 /// 低于此版本且有数据的库**拒开不迁移**（守卫见 `setup_schema`）。
