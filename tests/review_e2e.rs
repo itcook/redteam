@@ -117,7 +117,7 @@ async fn unreachable_scanner_cell_makes_scan_incomplete_exit_three() {
 /// 评审帽外项：`--incremental-from` 与 `--background` 同给 → 命令层直接退 1，不建 job（否则 worker 内 bail 落成 Failed 作业）。
 #[test]
 fn incremental_from_background_is_rejected_before_spawning_job() {
-    let bin = env!("CARGO_BIN_EXE_redteam-next");
+    let bin = env!("CARGO_BIN_EXE_redteam");
     let dir = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();
@@ -245,7 +245,7 @@ fn worker_panic_hook_lands_failed_and_seals() {
     store.create_job(job_id, 0).unwrap();
 
     // spawn 真二进制，设 REDTEAM_TEST_PANIC=1
-    let bin = env!("CARGO_BIN_EXE_redteam-next");
+    let bin = env!("CARGO_BIN_EXE_redteam");
     let status = std::process::Command::new(bin)
         .arg("worker")
         .arg("--job-id")
@@ -287,7 +287,7 @@ fn worker_panic_hook_lands_failed_and_seals() {
 /// （main.rs 显式 `process::exit(1)`，五档契约：命令自身失败）。
 #[test]
 fn exit_code_one_on_invalid_conf_floor() {
-    let bin = env!("CARGO_BIN_EXE_redteam-next");
+    let bin = env!("CARGO_BIN_EXE_redteam");
     let dir = tempfile::tempdir().unwrap();
     let status = std::process::Command::new(bin)
         .args(["review", "--conf-floor", "5.0"])
@@ -332,7 +332,7 @@ fn result_md_three_states() {
 
     let dir = tempfile::tempdir().unwrap();
     let store = JobStore::open(dir.path()).unwrap();
-    let bin = env!("CARGO_BIN_EXE_redteam-next");
+    let bin = env!("CARGO_BIN_EXE_redteam");
 
     fn spawn_result_md(bin: &str, dir: &std::path::Path, job_id: &str) -> std::process::Output {
         std::process::Command::new(bin)
@@ -443,7 +443,7 @@ async fn dismissed_ledger_is_loaded_and_disclosed_in_scan_only() {
     let id = finding_id(file, quote, title, 1, 1);
 
     // ① `dismiss add`：登记一条人裁驳回判例。
-    let bin = env!("CARGO_BIN_EXE_redteam-next");
+    let bin = env!("CARGO_BIN_EXE_redteam");
     let add_out = std::process::Command::new(bin)
         .args([
             "dismiss", "add", &id,
@@ -458,7 +458,7 @@ async fn dismissed_ledger_is_loaded_and_disclosed_in_scan_only() {
         .expect("spawn dismiss add 失败");
     assert!(add_out.status.success(), "dismiss add 应成功: {add_out:?}");
 
-    // ② 同仓跑 scan 评审：root 下 `.redteam/proj-next.db` 已由上一步建出——zero-config 自动加载（无需 --dismissed）。
+    // ② 同仓跑 scan 评审：root 下 `.redteam/proj.db` 已由上一步建出——zero-config 自动加载（无需 --dismissed）。
     let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let reg = scan_registry(&[("p/m", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"unvalidated write","confidence":0.9,"quote":"db.write(token);"}],"scanned_areas":[]}"#)]);
     let changes = vec![FileChange { path: file.into(), diff: "+    db.write(token);".into() }];
@@ -477,7 +477,7 @@ async fn dismissed_ledger_is_loaded_and_disclosed_in_scan_only() {
 /// 子命令均退 1；--help 属正常展示退 0（DisplayHelp 分支不被误伤）。
 #[test]
 fn clap_parse_error_exits_1_help_exits_0() {
-    let bin = env!("CARGO_BIN_EXE_redteam-next");
+    let bin = env!("CARGO_BIN_EXE_redteam");
     let run = |args: &[&str]| {
         std::process::Command::new(bin)
             .args(args)
@@ -625,7 +625,7 @@ fn pack_only_two_groups_cross_index_lists_other_group_only() {
 /// 修补批 X-3 / X-5：真二进制 `review --pack-only` 退出码 0，且不读 `secrets.json`（坏 secrets 不产 warning）。
 #[test]
 fn pack_only_binary_exits_zero_without_reading_secrets() {
-    let bin = env!("CARGO_BIN_EXE_redteam-next");
+    let bin = env!("CARGO_BIN_EXE_redteam");
     let dir = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();

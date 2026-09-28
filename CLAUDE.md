@@ -23,15 +23,17 @@ prompt 只做裁决/编排等模型本职(例外:dev-time 临时仪器如 feedba
   checkout `.doc/` 迁入,`.next/README.md` 为索引)为准——`.next/roadmap/`(README + P0 + M21a-e + followup)、
   `.next/design/2026-09-04-redteam-review-engine-architecture-design.md`(v8 锁定)及同名 decisions(D1-D11)/ research;
   **`.next/private/`(gitignored,只在本工作树磁盘)**放含公司仓细节的 PR181 评审记录、P0 明细研究与原始数据——远端是公开仓,**永不入库**。
-  `.doc/` 其余 design/plan 为历史,读到冲突以前者为准。分支硬切旧编排(无 `engine` 旗),对照基线 = `dev` 二进制;
-  切名前分支产物名 `redteam-next`。
+  `.doc/` 其余 design/plan 为历史,读到冲突以前者为准。分支硬切旧编排(无 `engine` 旗),对照基线 = `dev` 二进制。
+  **2026-09-28 M21c 批 0 已切名〔D19-1〕**:产物就叫 `redteam`、覆盖入库的 dev 二进制,插件与 ship 循环从此跑新引擎;
+  临时名 `redteam-next` 退役;回退取 `git show feebc92:plugins/redteam/bin/darwin/aarch64/redteam`(见 README)。
 - 挑活先读 `.doc/roadmap/summary.md`(项目级总览:五支柱账目+里程碑表;明细在同目录 done.md/followup.md);
   零散项在 `.doc/TODO/summary.md`(编号 T01+ 总览表,明细同目录)。注:`.doc/` 是
   维护者私有工作区(gitignored,不随仓分发)——外部克隆者没有这些文件,以 `redteam --help` 为准。
-- `make build` 编译并放置 **分支产物 `redteam-next`**(`plugins/redteam/bin/darwin/aarch64/redteam-next`,gitignored;绝不覆盖同目录入库的 dev `redteam`,M21c 切名前插件与 ship 循环一直用 dev);`make gen` 从 `plugins/redteam/commands/`(真相源)重生成
+- `make build` 编译并放置 `plugins/redteam/bin/darwin/aarch64/redteam`(**入库**,直接覆盖 launcher 指向的那个文件——
+  切名后这就是插件与 ship 循环跑的引擎;build 后工作树会有 5MB 级 diff,按仓内惯例单独提交 `build: 重建二进制`);`make gen` 从 `plugins/redteam/commands/`(真相源)重生成
   codex-skills;`make verify` 防漂移——它先重新 gen 再要求零 diff,故 commands 与镜像不同步时**任何时刻**跑都会红
   (含已入库的漂移);唯一假红:本批 commands 改动尚未 commit 时,gen 产物与 HEAD 有合法差异。
-- 密钥在 `~/.redteam/secrets.json`(M21a〔D12〕起:配置 `~/.redteam/config.json` 用户级唯一、无项目层、严格 JSON;dev 二进制仍读旧 `~/.config/redteam/`),永不入仓、永不入主配置。
+- 密钥在 `~/.redteam/secrets.json`(M21a〔D12〕起:配置 `~/.redteam/config.json` 用户级唯一、无项目层、严格 JSON;回退用的 dev 二进制读旧 `~/.config/redteam/`),永不入仓、永不入主配置。
 
 ## 文档规范(.doc,2026-07-07 定)
 

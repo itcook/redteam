@@ -5,14 +5,14 @@
   - `dismissed` = 人读后判定的误报 → **期望 REFUTED**（驳回率的分母）
   - `upheld`    = 人确认的真缺陷   → **期望 UPHELD**（误驳率的分母）
 
-三步：`build`（零网络，锚定 + 物化 + 生成用例）→ `run`（逐条调 `redteam-next verify-once`）→
+三步：`build`（零网络，锚定 + 物化 + 生成用例）→ `run`（逐条调 `redteam verify-once`）→
 `score`（混淆矩阵 + 两率 + 预登记阈值裁定）。prompt / provider / 判决解析全在产品二进制里，
 本脚本一行都不复刻——复刻一份，测的就不是产品了。零第三方依赖（照 harness.py 纪律）。
 
 用法：
   python3 eval/verify_score.py build --repo . --out eval/out/verify-cases
   python3 eval/verify_score.py run eval/out/verify-cases --verifier deepseek/deepseek-flash \
-      --bin ./target/release/redteam-next --out eval/out/verify-deepseek.json
+      --bin ./target/release/redteam --out eval/out/verify-deepseek.json
   python3 eval/verify_score.py score eval/out/verify-deepseek.json [--baseline prev.json]
   python3 eval/verify_score.py selftest
 """
@@ -312,9 +312,9 @@ def main():
     b.add_argument("--out", default="eval/out/verify-cases")
     b.set_defaults(fn=cmd_build)
 
-    r = sub.add_parser("run", help="逐条过 `redteam-next verify-once`")
+    r = sub.add_parser("run", help="逐条过 `redteam verify-once`")
     r.add_argument("cases", help="build 的产物目录")
-    r.add_argument("--bin", default="./target/release/redteam-next")
+    r.add_argument("--bin", default="./target/release/redteam")
     r.add_argument("--verifier", required=True, help="provider/id")
     r.add_argument("--parallel", type=int, default=4)
     r.add_argument("--timeout", type=int, default=900)

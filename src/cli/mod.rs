@@ -28,7 +28,7 @@ use spec::{render_spec_section_capped, SPEC_BUDGET_BYTES};
 use tail::model_ids_for;
 
 /// scanners 为空时的配置错误文案（`build_registry` 与 `run_code_review` 共用）。
-pub const NO_SCANNER_MSG: &str = "未配置 scanner：在 ~/.redteam/config.json（REDTEAM_HOME 可覆盖）给至少一个模型加 roles.scanner，见 `redteam-next model setup --help`";
+pub const NO_SCANNER_MSG: &str = "未配置 scanner：在 ~/.redteam/config.json（REDTEAM_HOME 可覆盖）给至少一个模型加 roles.scanner，见 `redteam model setup --help`";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReviewArgs {
@@ -90,8 +90,11 @@ pub(crate) fn load_ledger(
     if no_dismissed {
         return Ok(Ledger::default());
     }
+    // **只读**打开（收口评审 #2）：台账加载是纯读语义，而 `open_at` 现在带一次性迁移——
+    // 用读的姿势把「拿来做对拍基线的 dev 库」就地迁成 v4（评审史清空、dev 二进制再也写不了它），
+    // 会把 README 里承诺的回退路径本身毁掉。项目库自身的建库 / 迁移由 `init` 与写入口负责。
     let from_db = |path: &Path, source: String| -> anyhow::Result<Ledger> {
-        let db = crate::db::ProjDb::open_at(path)?;
+        let db = crate::db::ProjDb::open_read_only(path)?;
         let cards = db.active_cards()?;
         let ids = db.active_ids()?;
         let loaded = cards.len();
@@ -245,7 +248,7 @@ pub(crate) fn grouping_opts(g: &crate::config::GroupingCfg, budget: usize) -> Gr
     }
 }
 
-/// 阶段 0 风险路由（plan_cells 前）。ledger 路径：`--dismissed` 文件覆盖，否则 `.redteam/proj-next.db`（存在才读）。
+/// 阶段 0 风险路由（plan_cells 前）。ledger 路径：`--dismissed` 文件覆盖，否则 `.redteam/proj.db`（存在才读）。
 fn stage0_risk(
     selected: &[FileChange],
     root: &Path,
@@ -1157,7 +1160,7 @@ pub async fn run_resume(
     if args.incremental_from.is_some() {
         return partial_report(
             store, job_id,
-            "resume: incremental jobs cannot be resumed; re-run `redteam-next review --incremental-from <prior-job>`".into(),
+            "resume: incremental jobs cannot be resumed; re-run `redteam review --incremental-from <prior-job>`".into(),
         );
     }
     let prior_records = store.read_partial(job_id);
@@ -4181,6 +4184,38 @@ mod tests {
         assert!(l2.ids.is_empty() && l2.meta.is_none());
         assert!(!tmp.path().join(".redteam").exists(), "自动加载不得建 .redteam/");
     }
+    /// `--dismissed <dev 库>` 是**纯读**语义（收口评审 #2）：拿旧 schema 库做对拍基线时，
+    /// 不得把它就地迁成 v4——那会清空评审史、让 dev 二进制再也写不了它，回退路径本身被毁。
+    #[test]
+    fn load_ledger_db_override_never_migrates_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dbp = tmp.path().join("legacy.db");
+        // dev 形状：台账四表与 v4 同构（所以 open_at 会「带账迁移」它）+ 评审史有数据
+        let c = rusqlite::Connection::open(&dbp).unwrap();
+        c.execute_batch(
+            "CREATE TABLE dismissed (id TEXT PRIMARY KEY, status TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+               file TEXT NOT NULL DEFAULT '', quote TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT '',
+               reason TEXT NOT NULL, round TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
+             CREATE TABLE results (job_id TEXT PRIMARY KEY, json TEXT NOT NULL);
+             INSERT INTO dismissed (id,status,reason) VALUES ('a1b2c3d4e5f60718','dismissed','误报');
+             INSERT INTO results VALUES ('j1','{}');",
+        ).unwrap();
+        drop(c);
+        let before = std::fs::read(&dbp).unwrap();
+
+        let l = load_ledger(Some(dbp.to_str().unwrap()), false, tmp.path()).unwrap();
+        assert_eq!(l.ids.len(), 1, "旧库的台账照样读得出来");
+
+        assert_eq!(std::fs::read(&dbp).unwrap(), before, "对拍基线一个字节都不该变");
+        let c = rusqlite::Connection::open(&dbp).unwrap();
+        assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 0, "不该被写成 v4");
+        assert_eq!(c.query_row("SELECT count(*) FROM results", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "评审史不该被清");
+        let snaps: Vec<_> = std::fs::read_dir(tmp.path()).unwrap()
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains("legacy-")).collect();
+        assert!(snaps.is_empty(), "只读路径不该留快照: {snaps:?}");
+    }
+
     #[test]
     fn load_ledger_csv_db_and_retired_dir() {
         let tmp = tempfile::tempdir().unwrap();

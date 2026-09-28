@@ -10,7 +10,7 @@ disable-model-invocation: true
 
 用户参数：$ARGUMENTS
 - `--max-rounds <N>`（本命令专属，可选）：预算护栏；未给则**无轮数上限**——目标是 approve。
-- 其余参数**原样透传**给 `redteam review`（--base/--scope/--spec/--models 等）。
+- 其余参数**原样透传**给 `redteam review`（--base/--scope/--spec/--focus 等；模型集由 `~/.redteam/config.json` 的角色定，没有 `--models` 这类旗）。
   透传前先摘除上述专属参数。redteam 开启 `args_override_self`（同名 flag 重复后者胜），
   ship 管理的 `--background` 追加在用户参数之后即权威生效；唯一需连值摘除的是
   `--resume <值>`（它切同步补跑、打印全报告而非 job id，破坏循环）。凡摘除不得静默。
@@ -25,10 +25,11 @@ disable-model-invocation: true
    `.redteam/rounds/<YYYYMMDD>/<HHmmss>/`（两层：日期目录下再分秒级会话目录，本地时间）。
    后文 `rounds/<session>/` 均指代此两层路径，不逐处展开。
 2. 先跑项目测试命令，红树即停（先修好基线，不拿坏基线喂评审）。
-   **测试命令探测**（本会话缓存结论）：`.redteam/config.toml` 的 `test_command` >
-   `Cargo.toml`→`cargo test` > `package.json` 有 `scripts.test`→`npm test` >
-   `Makefile` 有 test 目标→`make test` > 项目 CLAUDE.md/记忆约定 > 都推断不出 →
-   AskUserQuestion 一次并把答案记入 session.md；明确无测试的项目跳过测试步。
+   **测试命令**（本会话缓存结论）：调 `${CLAUDE_PLUGIN_ROOT}/bin/redteam test-command` 取——
+   推断链在二进制里（`--override` > `Cargo.toml`→`cargo test` > `package.json` 有 `scripts.test`→`npm test` >
+   `Makefile` 有 test 目标→`make test` > `go.mod`→`go test ./...`），与 `review --test-command` 同源。
+   退出码 2 = 推不出 → 先看项目 CLAUDE.md/记忆约定，仍无则 AskUserQuestion 一次并把答案记入 session.md；
+   明确无测试的项目跳过测试步。
 
 ## 0.1 跨轮状态重建（铁律：不信会话记忆）
 跨轮判定一律**从盘上重建**，不依赖本次对话上下文里记住的轮次/id 状态——长会话
