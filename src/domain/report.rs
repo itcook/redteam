@@ -352,6 +352,13 @@ pub struct DeepMeta {
     pub needs_two_stage_triggered: u32,
     pub needs_two_stage_skipped: u32,
     pub stream_discarded: u32,
+    /// L4-B（M21d 批 A-4）：`needs{kind:api}` 命中而注入深挖 cell 的契约块数（含函数体）。
+    /// 按**派发**计：二阶段补查会用同一队列项再装一次包，那是同一批契约，不重复计。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub api_contracts: u32,
+    /// 同上，但定位不到而降级的 crate 数（registry 在 CI / 他人机器缺失时必须看得见是降级了）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub api_contract_misses: u32,
     // ── C2 时间重叠观测（design v11 §6 / §12.3〔D15〕；为零不序列化，旧报告形状不变）──
     /// 收场（关闭入口）时刻，自深挖开跑起毫秒；与扫描同时开跑时即 scanner 段墙钟。resume 与开跑即关闭（无入队通道）时 0。
     #[serde(default, skip_serializing_if = "is_zero_u64")]

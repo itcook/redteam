@@ -258,7 +258,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             // cell 名按队列项（id 已定死），跨 resume 调用稳定：同项重跑 upsert 覆盖自身（与 scanner「重试者胜」同义），
             // 不同项永不同名。按本次调用的派发序编号时，resume 挖别的项会同名覆盖首跑的格、丢掉它的 finding。
             let cell_id = review_cell_id(&item.id, &rev.name);
-            let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &tracked, &idx, 64 * 1024, &opts, "") {
+            let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &tracked, &idx, 64 * 1024, &opts, "", &api_needs_for(&input, &item.spec.file)) {
                 Ok(p) => p,
                 Err(e) => {
                     // 派发时 pack 构造失败：就地结案，仍占一个派发位（与 C1「占 keep 位」同口径）
@@ -270,6 +270,9 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                     continue; // lease 随本轮作用域归还
                 }
             };
+            // L4-B（A-4）：本格注入了多少三方契约 / 有多少因 registry 缺失降级——只在派发处计一次。
+            meta.api_contracts += pack.stats.contracts as u32;
+            meta.api_contract_misses += pack.stats.contract_misses as u32;
             // 排队时长在**派发时**定格：完成时采样量到的是「完成 − 入队」（含模型跑的几分钟），那是墙钟不是队列压力。
             let wait_ms = item.enqueued_ms.map_or(0, |en| now_ms().saturating_sub(en));
             let file_diff = file_diff(input.bundles, &item.spec.file);
@@ -1337,6 +1340,22 @@ enum Round2 {
 
 /// R2 二阶段补查轮的 prompt：needs → 证据段（`second_pass::need_section`，读守卫 + 字节帽）→ 重建 pack
 /// （needs_evidence 槽；与笔记互斥由构造期守卫，调用方已过滤）→ prompt 附加草稿块。
+/// 本文件上的 `needs{kind: api}` 声明（A-4，design §9.4 C）：scanner 说「这个三方 callee 的契约得核」，
+/// 深挖这一格就把契约连函数体带上。按文件取——声明与疑点同格产出，`path` 即调用点所在文件。
+///
+/// 取自 scan 格输出而非队列项：api 声明不是「去审这个区域」（那是 `kind: evidence`），
+/// 它是**给某格的附加材料**，没有自己的区域，入队只会白烧一格。
+fn api_needs_for(input: &DeepInput<'_>, file: &str) -> Vec<crate::domain::NeedEntry> {
+    input
+        .scan_cells
+        .iter()
+        .filter_map(|c| c.output.as_ref())
+        .flat_map(|o| o.needs.iter())
+        .filter(|n| n.kind == crate::domain::NeedKind::Api && crate::orchestrate::queue::norm_path(&n.path) == file)
+        .cloned()
+        .collect()
+}
+
 fn second_stage_prompt(
     env: &CellEnv<'_>,
     item: &QueueItem,
@@ -1355,7 +1374,7 @@ fn second_stage_prompt(
     if ev.trim().is_empty() {
         return Round2::NoEvidence;
     }
-    let pack2 = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, env.tracked, env.idx, 64 * 1024, env.opts, &ev) {
+    let pack2 = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, env.tracked, env.idx, 64 * 1024, env.opts, &ev, &api_needs_for(input, &item.spec.file)) {
         Ok(p) => p,
         Err(e) => return Round2::PackFailed(e),
     };
@@ -3286,6 +3305,66 @@ mod tests {
         assert!(!counts_against_floor(&it), "必挖项不占保底位");
         let h0 = item_of("b", ItemKind::Ripple, ItemState::Settled, 1);
         assert!(!counts_against_floor(&h0), "保底只留给 scanner 疑点");
+    }
+
+    /// A-4 跨层接线：scanner 的 `needs{kind: api}` → 深挖 cell 的 pack 里真的有契约 + 函数体，
+    /// 且注入量记进 `RunMeta`。走真实 registry（临时仓复制本仓 Cargo.lock），registry 缺失时跳过。
+    /// 单测在 region 层已绿——这条测的是**接起来通不通**（M21c 批 A 两次栽在这上面）。
+    #[tokio::test]
+    async fn api_needs_reach_the_dig_cell_and_the_meta() {
+        if crate::pack::contracts::registry_root().is_none_or(|r| !r.exists()) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let body = "fn decode(s: &str) {\n    let v: serde_json::Value = serde_json::from_str(s).unwrap();\n}\n";
+        std::fs::write(root.join("a.rs"), body).unwrap();
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        git_commit_all(root);
+        let bundles = vec![Bundle::from_files(vec![FileChange {
+            path: "a.rs".into(),
+            diff: "@@ -1,2 +1,2 @@\n+    let v: serde_json::Value = serde_json::from_str(s).unwrap();\n".into(),
+        }])];
+        let out2 = || crate::domain::ScanOutput {
+            suspicions: vec![crate::domain::Suspicion {
+                file: "a.rs".into(), line_start: 2, line_end: 2, hint: "反序列化没判边界".into(), category: None, confidence: 0.6,
+                quote: "    let v: serde_json::Value = serde_json::from_str(s).unwrap();".into(),
+            }],
+            needs: vec![crate::domain::NeedEntry {
+                path: "a.rs".into(), lines: Some("2-2".into()), reason: "from_str 出错时返回什么".into(),
+                kind: crate::domain::NeedKind::Api,
+            }],
+            ..Default::default()
+        };
+        let out = out2();
+        let id = "scan[g1]@p/alpha#1";
+        let cells = [ScanCellResult {
+            cell_id: id.into(), group: 0, route_key: "p/alpha".into(), family: "alpha".into(), sample: 1,
+            record: CellRecord::ok(id, "p/alpha", crate::domain::CellOutput::Scan(out.clone())),
+            output: Some(out),
+        }];
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        let rev = r#"{"findings":[{"severity":"low","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"fn decode(s: &str) {"}],"needs":[]}"#;
+        reg.insert_scan("p/r", "p", 4, Box::new(FakeChatBackend::new(vec![turn(rev)])), Duration::from_secs(5), 0);
+
+        let run = run_with(Run { scan_cells: &cells, budget: 4, ..plain(&reg, root, &bundles, &[]) }).await;
+
+        assert_eq!(run.cells.len(), 1, "一项一格: {:?}", run.items);
+        assert!(run.meta.api_contracts > 0, "api 声明在场却没注入契约（接线断了）: {:?}", run.meta);
+        assert_eq!(run.meta.api_contract_misses, 0, "本机有 registry、serde_json 必然在: {:?}", run.meta);
+
+        // 声明**指向别的文件**时不该落到这一格：`path` 是调用点所在文件，张冠李戴等于给错契约
+        let mut stray = out2();
+        stray.needs[0].path = "other.rs".into();
+        let cells2 = [ScanCellResult {
+            cell_id: id.into(), group: 0, route_key: "p/alpha".into(), family: "alpha".into(), sample: 1,
+            record: CellRecord::ok(id, "p/alpha", crate::domain::CellOutput::Scan(stray.clone())),
+            output: Some(stray),
+        }];
+        let mut reg2 = crate::provider::registry::ProviderRegistry::new();
+        reg2.insert_scan("p/r", "p", 4, Box::new(FakeChatBackend::new(vec![turn(rev)])), Duration::from_secs(5), 0);
+        let run2 = run_with(Run { scan_cells: &cells2, budget: 4, ..plain(&reg2, root, &bundles, &[]) }).await;
+        assert_eq!(run2.meta.api_contracts, 0, "别的文件的 api 声明不该落到这一格: {:?}", run2.meta);
     }
 
     /// scanner needs 只接变更集内的（C3〔D16〕Q8）：`a.rs` 在变更集里 → 入队成 `Needs` 项（无笔记、排在疑点之后）；

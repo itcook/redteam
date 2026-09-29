@@ -226,10 +226,15 @@ fn render_scan_md(r: &ReviewReport, s: &mut String) {
     let (inj, miss, spill) = scan.groups.iter().fold((0, 0, 0), |(a, b, c), g| {
         (a + g.pack.contracts, b + g.pack.contract_misses, c + g.pack.contract_spilled)
     });
-    if inj + miss + spill > 0 {
+    // 深挖侧的 `needs{kind:api}` 注入（A-4）并在同一行：它由 scanner 的声明触发，和扫描账放一起才读得懂。
+    let (api, api_miss) = r.run.deep.as_ref().map_or((0, 0), |d| (d.api_contracts as usize, d.api_contract_misses as usize));
+    if inj + miss + spill + api + api_miss > 0 {
         s.push_str(&format!(
             "- Third-party contracts: {inj} blocks injected · {miss} crates not located (degraded, not blocking) · {spill} over cap\n"
         ));
+        if api + api_miss > 0 {
+            s.push_str(&format!("  - on needs{{api}} (with bodies, into dig cells): {api} injected · {api_miss} not located\n"));
+        }
     }
     if !scan.groups.is_empty() {
         s.push_str("\n  | Group | Files | Cells | Suspicions | Pack |\n  | --- | --- | --- | --- | --- |\n");
@@ -338,7 +343,15 @@ mod tests {
         );
         assert!(md.contains("· outside 0 · contracts 3 |"), "组表也要给每组的注入数: {md}");
 
+        // 深挖侧的 needs{api} 注入（A-4）并在同一行——它由 scanner 的声明触发
+        r.run.deep = Some(crate::domain::DeepMeta { api_contracts: 2, api_contract_misses: 1, ..Default::default() });
+        assert!(
+            render_md(&r).contains("  - on needs{api} (with bodies, into dig cells): 2 injected · 1 not located"),
+            "深挖侧注入也要走 md: {}", render_md(&r)
+        );
+
         r.scan.as_mut().unwrap().groups.iter_mut().for_each(|g| g.pack = pack(0, 0, 0));
+        r.run.deep = None;
         assert!(!render_md(&r).contains("Third-party contracts"), "全零不占版面（多数仓不是 Rust）");
     }
 

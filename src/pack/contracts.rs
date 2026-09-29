@@ -284,6 +284,19 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 /// 避免同一件事在两处各有一套行为。坐标带 crate 标签与**锁定版本**——模型据此判断「这份签名属于哪个版本」，
 /// 而版本正是 L4-B 存在的理由。
 pub fn render_contract(crate_dir: &Path, hit: &ContractHit, version: &str) -> Option<String> {
+    render(crate_dir, hit, version, None)
+}
+
+/// 带函数体的契约块（A-4：`needs{kind:api}` 命中时才给——design §9.4 C「reviewer cell 带契约 + 函数体」）。
+///
+/// 体超过 `max_body_lines` 行 → 退回签名 + doc 并注明省略了多少行：模型要的是「这个 callee 到底怎么处理
+/// 边界」，一屏看得完才有用；几百行的体只会把区域 pack 挤掉，那正是 A-3 立的规矩。
+pub fn render_contract_with_body(crate_dir: &Path, hit: &ContractHit, version: &str, max_body_lines: usize) -> Option<String> {
+    render(crate_dir, hit, version, Some(max_body_lines))
+}
+
+/// `body = None` → 签名 + doc；`Some(max)` → 再带函数体（超 max 行退回签名并注明）。
+fn render(crate_dir: &Path, hit: &ContractHit, version: &str, body: Option<usize>) -> Option<String> {
     let text = std::fs::read_to_string(crate_dir.join(&hit.rel)).ok()?;
     let lines: Vec<&str> = text.lines().collect();
     let l = hit.line.checked_sub(1)?;
@@ -296,7 +309,20 @@ pub fn render_contract(crate_dir: &Path, hit: &ContractHit, version: &str) -> Op
         name: hit.name.clone(),
         kind: "",
     };
-    let end = super::sig_end(&lines, &d);
+    let sig = super::sig_end(&lines, &d);
+    let (end, note) = match body {
+        None => (sig, String::new()),
+        Some(max) => {
+            let b = crate::diffsym::block_end(&lines, l);
+            if b > sig && b - l < max {
+                (b, String::new())
+            } else if b > sig {
+                (sig, format!("…（函数体 {} 行，超过 {max} 行上限，未注入）\n", b - sig))
+            } else {
+                (sig, String::new()) // 单行体 / 定位不到块尾：签名里已经包含
+            }
+        }
+    };
     let mut start = l;
     while start > 0 && l - start < super::OUTSIDE_DOC_MAX_LINES && crate::diffsym::is_comment_line(lines[start - 1].trim_start()) {
         start -= 1;
@@ -307,8 +333,9 @@ pub fn render_contract(crate_dir: &Path, hit: &ContractHit, version: &str) -> Op
         Some(ty) => format!("{ty}::{}", hit.name),
         None => format!("{}::{}", hit.krate, hit.name),
     };
+    let label = if body.is_some() && note.is_empty() && end > sig { "三方契约 + 函数体" } else { "三方契约" };
     Some(format!(
-        "{krate} {version} — {rel}:{}-{}（三方契约：{qualified}）\n{}\n\n",
+        "{krate} {version} — {rel}:{}-{}（{label}：{qualified}）\n{}\n{note}\n",
         start + 1,
         end + 1,
         lines[start..=end].join("\n"),
@@ -337,55 +364,103 @@ pub fn contract_targets(
     local_mods: &BTreeSet<String>,
     known: &BTreeSet<String>,
 ) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (path, content) in sources {
+        if !path.ends_with(".rs") {
+            continue;
+        }
+        merge_targets(&mut out, contract_targets_at(content, &[], local_mods, known));
+    }
+    out
+}
+
+/// 同上，但**只看文件里的这几段区间**（1-based 含端点；空 = 整文件）——A-4 的 `needs{kind:api}` 就落在
+/// 某个调用点上，只该问那一处的 callee，而不是把整文件的三方调用都拖进深挖 cell。
+///
+/// `use` 语句永远在文件头、不在区间内，所以 crate 集仍从**全文**算；区间只用来筛「问哪些名字」。
+pub fn contract_targets_at(
+    content: &str,
+    ranges: &[(u32, u32)],
+    local_mods: &BTreeSet<String>,
+    known: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<String>> {
     // `krate::fn(` —— 直接的自由函数调用
     let qualified = regex::Regex::new(r"\b([a-z][a-z0-9_]*)::([a-z_][a-z0-9_]*)\s*[(<]").expect("static regex");
     // `krate::Type::method(` —— Rust 里更常见的形态（`regex::Regex::new`、`serde_json::Value::from`）。
     // 取**方法名**去搜（类型名搜不到 `pub fn`）；搜出来的同名方法可能属别的类型，但块里会披露 owner
     // （`RegexSet::new` vs `Regex::new` 一眼可辨），这比完全不给强。
     let assoc = regex::Regex::new(r"\b([a-z][a-z0-9_]*)::([A-Z][A-Za-z0-9_]*)::([a-z_][a-z0-9_]*)\s*[(<]").expect("static regex");
+    let externals = external_crates(content, local_mods);
+    let lines: Vec<&str> = content.lines().collect();
+    let region: String = if ranges.is_empty() {
+        content.to_string()
+    } else {
+        let mut v: Vec<&str> = Vec::new();
+        for &(a, b) in ranges {
+            let (lo, hi) = ((a.max(1) - 1) as usize, (b.max(1) - 1) as usize);
+            v.extend(lines.iter().take(hi + 1).skip(lo).copied());
+        }
+        v.join("\n")
+    };
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (path, content) in sources {
-        if !path.ends_with(".rs") {
+    // ① use 引入的末端名——限定了区间时只收**区间里真的出现过**的那些
+    for (head, tail) in use_tails(content) {
+        if externals.contains(&head) && (ranges.is_empty() || word_appears(&region, &tail)) {
+            out.entry(head).or_default().insert(tail);
+        }
+    }
+    let callable = |k: &str| {
+        !local_mods.contains(k)
+            && !matches!(k, "std" | "core" | "alloc" | "crate" | "super" | "self")
+            && (externals.contains(k) || known.contains(&normalize_crate(k)))
+    };
+    // ② 限定调用 `krate::name(` / `krate::name::<T>(`
+    for c in qualified.captures_iter(&region) {
+        let (k, n) = (&c[1], &c[2]);
+        if callable(k) {
+            out.entry(k.to_string()).or_default().insert(n.to_string());
+        }
+    }
+    // ③ 限定关联调用 `krate::Type::method(`
+    for c in assoc.captures_iter(&region) {
+        let (k, n) = (&c[1], &c[3]);
+        if callable(k) {
+            out.entry(k.to_string()).or_default().insert(n.to_string());
+        }
+    }
+    out
+}
+
+fn merge_targets(into: &mut BTreeMap<String, BTreeSet<String>>, more: BTreeMap<String, BTreeSet<String>>) {
+    for (k, names) in more {
+        into.entry(k).or_default().extend(names);
+    }
+}
+
+/// `use a::b::{c, d as e};` → `[(a, b), (a, c), (a, d), (a, e)]`（头 + 各末端 token，别名也收）。
+fn use_tails(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        let t = t.strip_prefix("pub").map(str::trim_start).unwrap_or(t);
+        let t = if t.starts_with('(') { t.split_once(')').map(|(_, r)| r.trim_start()).unwrap_or(t) } else { t };
+        let Some(rest) = t.strip_prefix("use ") else { continue };
+        let head = rest.trim_start().split(|c: char| !(c.is_alphanumeric() || c == '_')).find(|s| !s.is_empty()).unwrap_or("");
+        if head.is_empty() {
             continue;
         }
-        let externals = external_crates(content, local_mods);
-        // ① use 引入的末端名
-        for line in content.lines() {
-            let t = line.trim();
-            let t = t.strip_prefix("pub").map(str::trim_start).unwrap_or(t);
-            let t = if t.starts_with('(') { t.split_once(')').map(|(_, r)| r.trim_start()).unwrap_or(t) } else { t };
-            let Some(rest) = t.strip_prefix("use ") else { continue };
-            let head = rest.trim_start().split(|c: char| !(c.is_alphanumeric() || c == '_')).find(|s| !s.is_empty()).unwrap_or("");
-            if !externals.contains(head) {
-                continue;
-            }
-            for tok in rest.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|s| !s.is_empty()).skip(1) {
-                if tok != "as" && tok != head {
-                    out.entry(head.to_string()).or_default().insert(tok.to_string());
-                }
-            }
-        }
-        // ② 限定调用 `krate::name(` / `krate::name::<T>(`
-        let callable = |k: &str| {
-            !local_mods.contains(k)
-                && !matches!(k, "std" | "core" | "alloc" | "crate" | "super" | "self")
-                && (externals.contains(k) || known.contains(&normalize_crate(k)))
-        };
-        for c in qualified.captures_iter(content) {
-            let (k, n) = (&c[1], &c[2]);
-            if callable(k) {
-                out.entry(k.to_string()).or_default().insert(n.to_string());
-            }
-        }
-        // ③ 限定关联调用 `krate::Type::method(`
-        for c in assoc.captures_iter(content) {
-            let (k, n) = (&c[1], &c[3]);
-            if callable(k) {
-                out.entry(k.to_string()).or_default().insert(n.to_string());
+        for tok in rest.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|s| !s.is_empty()).skip(1) {
+            if tok != "as" && tok != head {
+                out.push((head.to_string(), tok.to_string()));
             }
         }
     }
     out
+}
+
+/// `name` 是否以**完整标识符**出现在文本里（`from_str` 不该被 `parse_from_string` 命中）。
+fn word_appears(text: &str, name: &str) -> bool {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == name)
 }
 
 /// 本 crate 的顶层模块名（`src/` 下的目录与 `.rs` 文件名）。
@@ -449,22 +524,63 @@ pub fn contracts_section_in(
     local_mods: &BTreeSet<String>,
     cap: usize,
 ) -> ContractSection {
-    let mut out = ContractSection::default();
-    if cap == 0 {
-        return out;
-    }
-    let Ok(lock) = std::fs::read_to_string(repo_root.join("Cargo.lock")) else {
-        // 不是 Cargo 工作区（或 lock 没提交）——安静降级，不是错误
-        return out;
-    };
+    let Some((locked, known)) = lock_of(repo_root) else { return ContractSection::default() };
+    assemble(registry_src, &locked, &contract_targets(sources, local_mods, &known), cap, None)
+}
+
+/// `needs{kind: api}` 的契约段（A-4，design §9.4 C）：只看**声明命中的那几段区间**，并带函数体。
+///
+/// 与 [`contracts_section`] 的区别只有这两条——定位链、预算帽、降级披露全走同一套。
+pub fn api_contracts_section(
+    repo_root: &Path,
+    content: &str,
+    ranges: &[(u32, u32)],
+    local_mods: &BTreeSet<String>,
+    cap: usize,
+    max_body_lines: usize,
+) -> ContractSection {
+    let Some(reg) = registry_root() else { return ContractSection::default() };
+    api_contracts_section_in(repo_root, &reg, content, ranges, local_mods, cap, max_body_lines)
+}
+
+/// 同上，registry 根由调用方给（测试用；`CARGO_HOME` 是进程级全局）。
+#[allow(clippy::too_many_arguments)] // 仓根 / registry / 源文 / 区间 / 本地模块 / 帽 / 体上限各不同源
+pub fn api_contracts_section_in(
+    repo_root: &Path,
+    registry_src: &Path,
+    content: &str,
+    ranges: &[(u32, u32)],
+    local_mods: &BTreeSet<String>,
+    cap: usize,
+    max_body_lines: usize,
+) -> ContractSection {
+    let Some((locked, known)) = lock_of(repo_root) else { return ContractSection::default() };
+    let targets = contract_targets_at(content, ranges, local_mods, &known);
+    assemble(registry_src, &locked, &targets, cap, Some(max_body_lines))
+}
+
+/// `Cargo.lock` → (包名 → 版本, 归一包名集)。读不到 = 不是 Cargo 工作区，安静降级（不是错误）。
+fn lock_of(repo_root: &Path) -> Option<(BTreeMap<String, String>, BTreeSet<String>)> {
+    let lock = std::fs::read_to_string(repo_root.join("Cargo.lock")).ok()?;
     let locked = locked_versions(&lock);
-    let known: BTreeSet<String> = locked.keys().map(|k| normalize_crate(k)).collect();
-    let targets = contract_targets(sources, local_mods, &known);
-    if targets.is_empty() {
+    let known = locked.keys().map(|k| normalize_crate(k)).collect();
+    Some((locked, known))
+}
+
+/// 定位 → 抽取 → 渲染，总字节受 `cap` 硬帽。`body = Some(n)` 时带函数体（A-4）。
+fn assemble(
+    registry_src: &Path,
+    locked: &BTreeMap<String, String>,
+    targets: &BTreeMap<String, BTreeSet<String>>,
+    cap: usize,
+    body: Option<usize>,
+) -> ContractSection {
+    let mut out = ContractSection::default();
+    if cap == 0 || targets.is_empty() {
         return out;
     }
     let names: BTreeSet<String> = targets.keys().cloned().collect();
-    let (found, misses) = locate_all(registry_src, &locked, &names);
+    let (found, misses) = locate_all(registry_src, locked, &names);
     out.misses = misses;
     for (krate, dir) in &found {
         let Some(want) = targets.get(krate) else { continue };
@@ -474,7 +590,11 @@ pub fn contracts_section_in(
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
         for hit in find_contracts(dir, krate, want, HITS_PER_NAME * 4) {
-            let Some(block) = render_contract(dir, &hit, &version) else { continue };
+            let block = match body {
+                None => render_contract(dir, &hit, &version),
+                Some(max) => render_contract_with_body(dir, &hit, &version, max),
+            };
+            let Some(block) = block else { continue };
             if out.text.len() + block.len() > cap {
                 out.spilled += 1;
                 continue;
@@ -765,6 +885,40 @@ fn f(s: &str) -> Value {
         assert_eq!((one.blocks, one.spilled), (1, 1), "{}", one.text);
         assert!(one.text.len() < big.text.len(), "帽是硬的: {} 字节", one.text.len());
         assert_eq!(contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 0).blocks, 0);
+    }
+
+    /// A-4：`needs{kind:api}` 段——**只问声明命中的区间**，并带函数体；体太长退回签名并注明。
+    #[test]
+    fn api_section_scopes_to_ranges_and_carries_the_body() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\n").unwrap();
+        let reg = d.path().join("registry/src");
+        let long_body = (0..80).map(|i| format!("    let x{i} = {i};\n")).collect::<String>();
+        fake_crate(
+            &reg.join("index-x/kit-2.1.0"),
+            &[("lib.rs", &format!(
+                "/// 造一个东西。\npub fn make(a: u8) -> u8 {{\n    let secret = a + 1;\n    secret\n}}\n\n/// 很长的那个。\npub fn huge(a: u8) -> u8 {{\n{long_body}    a\n}}\n"
+            ))],
+        );
+        let src = "use kit::make;\nfn f() {\n    kit::make(1);\n}\nfn g() {\n    kit::huge(2);\n}\n";
+
+        // 只问第 3 行那一处调用 → 只给 make，不给 g() 里的 huge
+        let scoped = api_contracts_section_in(&repo, &reg, src, &[(3, 3)], &BTreeSet::new(), 8192, 60);
+        assert_eq!(scoped.blocks, 1, "{}", scoped.text);
+        assert!(scoped.text.contains("三方契约 + 函数体：kit::make"), "{}", scoped.text);
+        assert!(scoped.text.contains("let secret = a + 1;"), "A-4 要的是连函数体: {}", scoped.text);
+        assert!(!scoped.text.contains("huge"), "区间外的调用不该被拖进来: {}", scoped.text);
+
+        // 体超上限 → 退回签名 + doc，并说清省了多少行（几百行的体只会把区域切片挤掉）
+        let huge = api_contracts_section_in(&repo, &reg, src, &[(6, 6)], &BTreeSet::new(), 8192, 10);
+        assert_eq!(huge.blocks, 1, "{}", huge.text);
+        assert!(huge.text.contains("pub fn huge") && !huge.text.contains("let x40"), "{}", huge.text);
+        assert!(huge.text.contains("超过 10 行上限，未注入"), "退回要说明白: {}", huge.text);
+
+        // 帽同样是硬的
+        assert_eq!(api_contracts_section_in(&repo, &reg, src, &[(3, 3)], &BTreeSet::new(), 0, 60).blocks, 0);
     }
 
     /// 三条降级路径：非 Cargo 工作区 / 包没锁 / 锁了没解包——一律空段 + 可披露原因，不 panic。
