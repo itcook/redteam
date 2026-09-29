@@ -102,7 +102,7 @@ pub(crate) fn load_ledger(
     };
     match dismissed {
         None => {
-            let p = cwd.join(crate::project::PROJECT_DIR).join(crate::db::DB_FILE);
+            let p = crate::db::project_db_path(cwd);
             if !p.exists() {
                 return Ok(Ledger::default());
             }
@@ -261,7 +261,7 @@ fn stage0_risk(
     let ledger = match args.dismissed.as_deref() {
         Some(p) if Path::new(p).is_file() => Some(Path::new(p).to_path_buf()),
         None if !args.no_dismissed => {
-            let p = root.join(crate::project::PROJECT_DIR).join(crate::db::DB_FILE);
+            let p = crate::db::project_db_path(root);
             p.exists().then_some(p)
         }
         _ => None,
@@ -470,7 +470,7 @@ fn read_dormant_leads(cwd: &Path, changed_files: &[String]) -> Vec<crate::domain
     if changed_files.is_empty() {
         return vec![];
     }
-    let p = cwd.join(crate::project::PROJECT_DIR).join(crate::db::DB_FILE);
+    let p = crate::db::project_db_path(cwd);
     if !p.exists() {
         return vec![];
     }
@@ -1149,7 +1149,7 @@ fn persist_dormant_suspicions(cwd: &Path, items: &[crate::orchestrate::queue::Qu
     if rows.is_empty() {
         return;
     }
-    let p = cwd.join(crate::project::PROJECT_DIR).join(crate::db::DB_FILE);
+    let p = crate::db::project_db_path(cwd);
     if !p.exists() {
         return;
     }
@@ -4338,6 +4338,37 @@ mod tests {
 
     /// 不变式破坏要**留痕**而不是静默（M21c 批 A）：同一个格被并入两次（一次当沿用、一次当本轮），
     /// 它会同时落进 reused 与 completed —— coverage 是 verdict 分级的依据，这种账目错必须在 warnings 里看得见。
+    /// 真实落账 / 披露路径要接管 M21 分支期的库（A-5 回归门实跑暴露的缺口）：
+    /// 接管一度只挂在 `ProjDb::open()` 上，而这两条路走的是显式路径——于是 PR181 上跑完
+    /// 「库没接管、台账一行没落、dormant_leads 为 0」，而两边的单测各自都是绿的。
+    #[test]
+    fn ledger_paths_adopt_the_branch_era_db() {
+        use crate::orchestrate::queue::QueueItem;
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join(crate::project::PROJECT_DIR);
+        std::fs::create_dir_all(&rt).unwrap();
+        // 只有分支期库（M21 期间跑过 redteam-next 的项目就长这样），没有 proj.db
+        drop(crate::db::ProjDb::open_at(&rt.join("proj-next.db")).unwrap());
+        assert!(!rt.join("proj.db").exists());
+
+        let skipped: QueueItem = serde_json::from_value(serde_json::json!({
+            "id": "a.rs:scan:1-9", "score": 1.0, "agreement": 1, "state": "skipped", "kind": "suspicion",
+            "dispatch_agreement": 1, "landed_agreement": null, "families": ["alpha"],
+            "spec": { "file": "a.rs", "ranges": [[1, 9]], "origin": "scan",
+                      "notes": [{"file":"a.rs","line_start":3,"line_end":3,"hint":"可疑","confidence":0.6,"quote":"let x = take(v);"}] },
+            "members": [{"file":"a.rs","line_start":3,"line_end":3,"hint":"可疑","confidence":0.6,"quote":"let x = take(v);"}],
+        })).unwrap();
+
+        let mut warnings = vec![];
+        persist_dormant_suspicions(tmp.path(), std::slice::from_ref(&skipped), "sha1", &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(rt.join("proj.db").is_file() && !rt.join("proj-next.db").exists(), "落账路径要接管分支期库");
+
+        let leads = read_dormant_leads(tmp.path(), &["a.rs".into()]);
+        assert_eq!(leads.len(), 1, "披露路径读得到刚落的账: {leads:?}");
+        assert_eq!(leads[0].hint, "可疑");
+    }
+
     /// 休眠线索只披露、不判定（M21c 批 A，A-2）：台账里落在本轮变更文件上的历史截断项进 `run.dormant_leads`，
     /// 但 **verdict / 退出码 / findings 一个都不动**——它们没被深挖过，当 finding 用会把「没挖」误读成「有问题」。
     #[test]

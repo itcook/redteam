@@ -196,6 +196,17 @@ pub struct ProjDb {
 /// 那些库会变成孤儿——作业历史、resume、`result` 全都取不回。开项目库时顺手改名即可无缝继承（两者都是 v4）。
 const BRANCH_ERA_DB_FILE: &str = "proj-next.db";
 
+/// 项目库路径的**单一入口**（M21c 批 A）：`<root>/.redteam/proj.db`，解析时顺手接管 M21 分支期的库名。
+///
+/// 为什么要收成一个函数：接管一度只挂在 `ProjDb::open()` 上，而真实调用点（台账加载、落账、披露）
+/// 走的都是 `open_at(显式路径)` —— 单测各自绿、接起来不通，PR181 上实跑才暴露（库一行没接管、台账一行没落）。
+/// **只解析不创建**：调用方按自己的语义决定「不存在就跳过」还是「建库」。
+pub fn project_db_path(root: &Path) -> std::path::PathBuf {
+    let dir = root.join(crate::project::PROJECT_DIR);
+    ProjDb::adopt_branch_era_db(&dir);
+    dir.join(DB_FILE)
+}
+
 impl ProjDb {
     /// 打开项目库（`<root>/.redteam/proj.db`）；目录/库/表缺失即自动创建（幂等）。
     ///
@@ -204,8 +215,7 @@ impl ProjDb {
     pub fn open(root: &Path) -> Result<Self> {
         let dir = root.join(crate::project::PROJECT_DIR);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Self::adopt_branch_era_db(&dir);
-        Self::open_at(&dir.join(DB_FILE))
+        Self::open_at(&project_db_path(root))
     }
 
     /// M21 分支期库（`proj-next.db`）→ 正式库名。目标已存在就什么都不做（两个库并存时不猜哪个是对的）。
