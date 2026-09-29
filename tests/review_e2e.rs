@@ -649,6 +649,93 @@ fn pack_only_binary_exits_zero_without_reading_secrets() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("cell-1 files=1 bytes="), "{}", String::from_utf8_lossy(&out.stdout));
 }
 
+/// brief 与 spec 同进 system，**预算也要同待遇**：不扣的话，小窗 scanner 上 8KB 的 brief
+/// 能吃掉三分之一的壳预算，溢出表现是 provider 报错或静默截断，不是可披露的降级
+/// （2026-09-29 `/code-review` 指出）。仪表报的 `budget_bytes` 要跟真实那条路一致。
+#[test]
+fn the_repo_brief_is_charged_against_the_pack_budget() {
+    let bin = env!("CARGO_BIN_EXE_redteam");
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
+    git(&["add", "-A"]);
+    let home = tempfile::tempdir().unwrap();
+    let budget = || -> usize {
+        let out = std::process::Command::new(bin)
+            .current_dir(dir.path())
+            .env("REDTEAM_HOME", home.path())
+            .args(["review", "--pack-only"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        let packs = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("packs=").map(str::to_string))
+            .expect("packs 行");
+        let sum: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(std::path::Path::new(&packs).join("summary.json")).unwrap()).unwrap();
+        sum["budget_bytes"].as_u64().unwrap() as usize
+    };
+
+    let before = budget();
+    let body = "简介".repeat(500); // 1500 字节（每个汉字 3 字节）
+    std::fs::create_dir_all(dir.path().join(".redteam")).unwrap();
+    std::fs::write(dir.path().join(".redteam/brief.md"), &body).unwrap();
+    let after = budget();
+
+    assert_eq!(before - after, body.len(), "brief 占的字节要从 pack 预算里扣掉");
+}
+
+/// 老项目的 `.gitignore` 升级要挂在**真实路径**上：存量用户早就 init 过、不会专门再跑一次 init，
+/// 不升级就等于 brief.md 的修复到不了他们手上（2026-09-29 `/code-review` 指出）。
+#[test]
+fn a_legacy_gitignore_is_upgraded_by_review_not_only_by_init() {
+    let bin = env!("CARGO_BIN_EXE_redteam");
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
+    git(&["add", "-A"]);
+    // 老项目形态：init 过、`.gitignore` 是光秃秃一个 `*`
+    std::fs::create_dir_all(dir.path().join(".redteam")).unwrap();
+    std::fs::write(dir.path().join(".redteam/.gitignore"), "*\n").unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let out = std::process::Command::new(bin)
+        .current_dir(dir.path())
+        .env("REDTEAM_HOME", home.path())
+        .args(["review", "--pack-only"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".redteam/.gitignore")).unwrap(),
+        "*\n!.gitignore\n!brief.md\n",
+        "跑一次评审就该把老项目的 .gitignore 升级掉"
+    );
+
+    // 用户改过的不碰
+    std::fs::write(dir.path().join(".redteam/.gitignore"), "*\n!mine.txt\n").unwrap();
+    let out2 = std::process::Command::new(bin)
+        .current_dir(dir.path())
+        .env("REDTEAM_HOME", home.path())
+        .args(["review", "--pack-only"])
+        .output()
+        .unwrap();
+    assert_eq!(out2.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(dir.path().join(".redteam/.gitignore")).unwrap(), "*\n!mine.txt\n");
+}
+
 /// M21d 批 B-1（design §10.5）：`.redteam/brief.md` 进**稳定前缀**里的 `<repo_brief>` 段；
 /// 没有它时 prompt 与今日逐字节一致。走真实二进制 + 真实落盘 prompt，钉的是跨层接线。
 #[test]

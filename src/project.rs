@@ -9,6 +9,20 @@ pub const PROJECT_DIR: &str = ".redteam";
 /// 要随仓分发：团队与 CI 都得读得到，否则写了 brief 也只有本机那一份（M21d 批 B-1 实测发现）。
 pub(crate) const GITIGNORE_BODY: &str = "*\n!.gitignore\n!brief.md\n";
 
+/// 老项目的 `.gitignore` 升级（原封不动的旧默认 `*` → 放行 brief.md）。
+///
+/// **不能只挂在 `redteam init` 上**：存量用户早就 init 过了，不会专门再跑一次，于是
+/// `.redteam/brief.md` 照旧被吞掉——他们本机 brief 生效、团队与 CI 读不到，正是这条修复要治的病
+/// （2026-09-29 `/code-review` 指出）。`review` / `--pack-only` 写 `.redteam/` 时一并调用。
+/// 用户改过的一律不碰（只认原封不动的旧默认这一种形态）。
+pub fn upgrade_legacy_gitignore(root: &Path) -> bool {
+    let gi = root.join(PROJECT_DIR).join(".gitignore");
+    if std::fs::read_to_string(&gi).map(|c| c.trim() == "*").unwrap_or(false) {
+        return std::fs::write(&gi, GITIGNORE_BODY).is_ok();
+    }
+    false
+}
+
 /// 幂等创建 `.redteam/` 骨架（`.gitignore` / `rounds/` / `db::DB_FILE`），返回本次新建的条目；已存在的一律不动。
 /// 项目层 `config.toml` 已退场（M21a 批 A，D7 A8：配置用户级唯一，项目目录只放状态与内容）；
 /// dismissed/ 目录已随台账机器化退役（design 2026-07-03：台账/评审史统一 proj.db）。
@@ -24,10 +38,7 @@ pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
     if !gi.exists() {
         std::fs::write(&gi, GITIGNORE_BODY)?;
         created.push(format!("{PROJECT_DIR}/.gitignore"));
-    } else if std::fs::read_to_string(&gi).map(|c| c.trim() == "*").unwrap_or(false) {
-        // 老项目（M21d 批 B-1 之前建的）整目录忽略，brief.md 会被吞掉。只升级「原封不动的旧默认」
-        // 这一种形态——用户改过的一律不碰。
-        std::fs::write(&gi, GITIGNORE_BODY)?;
+    } else if upgrade_legacy_gitignore(root) {
         created.push(format!("{PROJECT_DIR}/.gitignore（升级：brief.md 不再被忽略）"));
     }
     let db_path = dir.join(crate::db::DB_FILE);

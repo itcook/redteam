@@ -694,7 +694,8 @@ impl Config {
             ("review.maxConcurrency", r.max_concurrency as u64),
             ("review.scanners.samples", r.scanners.samples as u64),
             ("review.pack.anchorWindow", r.pack.anchor_window as u64),
-            ("review.pack.findingWindow", r.pack.finding_window as u64),
+            // `findingWindow` **不在这张表里**：它的 0 是合法的「关掉观测」（装包半径的 0 才非法）。
+            // 塞进来会让文档承诺的退路设不上——两个键语义相反，连校验都不该共用（批 B 裁定 1 的同一条理由）。
             ("review.grouping.minFiles", r.grouping.min_files as u64),
             ("review.grouping.maxFilesPerGroup", r.grouping.max_files_per_group as u64),
         ] {
@@ -1163,6 +1164,16 @@ mod tests {
         assert_eq!(cfg.review.pack.body, PackBody::Slice, "D8：slice 默认");
         assert_eq!(cfg.review.max_concurrency, 10, "D13：缺省 10，provider 门是唯一闸");
         assert!(Config::from_json("  \n").unwrap().providers.is_empty(), "空白 = 空配置");
+    }
+
+    /// `findingWindow` 的 0 是**合法的「关掉观测」**（装包半径 `anchorWindow` 的 0 才非法）——
+    /// 两个键语义相反，连校验都不该共用（2026-09-29 `/code-review` 抓到：文档承诺的退路设不上）。
+    #[test]
+    fn finding_window_zero_is_allowed_but_anchor_window_zero_is_not() {
+        let c = Config::from_json(r#"{"review":{"pack":{"findingWindow":0}}}"#).unwrap();
+        assert_eq!(c.review.pack.finding_window, 0, "0 = 关掉窗口后滤，要设得上");
+        let err = Config::from_json(r#"{"review":{"pack":{"anchorWindow":0}}}"#).unwrap_err().to_string();
+        assert!(err.contains("review.pack.anchorWindow 必须 ≥ 1"), "装包半径的 0 仍非法: {err}");
     }
 
     #[test]

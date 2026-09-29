@@ -77,8 +77,10 @@ fn render_md(r: &ReviewReport) -> String {
     // 改动行窗口后滤（design §10.4，M21d 批 B-2）：默认**只披露不判定**——说清是哪种，
     // 否则读者无从知道这几条到底算没算进上面的数（M21c 的休眠线索同款措辞纪律）。
     if r.run.findings_outside_window > 0 {
+        // 口径与正上方 refuted 那行对齐：enforce 时 `Stats::from_findings` 吃的是过滤后的集合，
+        // **计数也排除了**，只说「排除出裁决」会让读者把 `Findings: N` 读成含这几条。
         let how = if r.run.finding_window_enforced {
-            "excluded from the verdict"
+            "excluded from counts and verdict"
         } else {
             "disclosed only — still counted above"
         };
@@ -213,7 +215,7 @@ fn render_md(r: &ReviewReport) -> String {
                 // 哪几条落在窗外要**逐条**说，不能只给聚合数：读 md 的人否则得拿每条的行号
                 // 去跟 diff 手工比对（批 B dogfood 抓到，与休眠线索 / L4-B 契约同款教训）。
                 if f.outside_window {
-                    let how = if r.run.finding_window_enforced { "excluded from verdict" } else { "still counted" };
+                    let how = if r.run.finding_window_enforced { "excluded from counts and verdict" } else { "still counted" };
                     s.push_str(&format!(
                         "| Window     | anchored outside the changed-line window (±{}) — {how} |\n",
                         r.run.finding_window
@@ -352,7 +354,7 @@ mod tests {
         );
 
         r.run.finding_window_enforced = true;
-        assert!(render_md(&r).contains("(excluded from the verdict)"), "开了 enforce 要改口径");
+        assert!(render_md(&r).contains("(excluded from counts and verdict)"), "开了 enforce 要改口径——计数也排除了");
 
         // 逐条标记：只给聚合数的话，读 md 的人得拿每条行号去跟 diff 手工比对
         r.run.finding_window_enforced = false;
@@ -360,7 +362,7 @@ mod tests {
         let md = render_md(&r);
         assert!(md.contains("| Window     | anchored outside the changed-line window (±30) — still counted |"), "{md}");
         r.run.finding_window_enforced = true;
-        assert!(render_md(&r).contains("— excluded from verdict |"), "开了 enforce 逐条也要改口径");
+        assert!(render_md(&r).contains("— excluded from counts and verdict |"), "开了 enforce 逐条也要改口径");
         r.findings[0].outside_window = false;
 
         r.run.findings_outside_window = 0;

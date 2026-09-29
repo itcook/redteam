@@ -32,7 +32,11 @@ fn contains_pem_private_key(content: &str) -> bool {
 /// 边界，与 dossier/diff 一致）。散文级注入挡不住（LLM 固有），归安全组 T45。
 /// 实现收敛到 `prompt::neutralize_structure`（Task 4，dossier entries 同类风险共用一套）。
 fn neutralize_spec_delimiters(content: &str) -> String {
-    crate::prompt::neutralize_structure(content, &["spec_docs"])
+    // spec 与 brief 同在**稳定前缀**里，同样要与角色无关地中和：三张表标签集不同
+    // （`</diff>` / `</evidence>` / `</dossier>` 在 scan + reviewer 有、verifier 没有），
+    // 只中和 `</spec_docs>` 会让含 `</diff>` 的设计文档在 verifier 侧与另两侧字节不同、cache 前缀裂开。
+    // B-1 只修了 brief 这一半，另一半在同一个 system 串里（2026-09-29 `/code-review` 指出）。
+    crate::prompt::neutralize_for_stable_prefix(content)
 }
 
 /// 读 --spec 文档 → 有界参照段（供 [L0] 实现-对照-设计）。返回 (段, 用掉字节, 拒读 warnings)。
@@ -407,10 +411,26 @@ mod tests {
 pub(crate) fn read_repo_brief(root: &std::path::Path, cap: usize) -> (String, Vec<String>) {
     let path = root.join(BRIEF_REL_PATH);
     let mut warnings = Vec::new();
-    if !std::fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
-        return (String::new(), warnings); // 不存在 / 目录 / FIFO：与今日一致，不是错误
+    // **符号链接逃逸防护**（镜像 `positioning::safe_read` / `ToolExecutor::do_read_file` / 区域 pack）：
+    // `metadata` 跟随符号链接，`.redteam/brief.md -> ~/.aws/credentials` 这种提交上来的软链会被读满
+    // 8KB 塞进**每一格**的稳定前缀发给外部模型。brief 的威胁模型就是「任何 PR 都能改」，
+    // PEM 嗅探只挡私钥、挡不住 `.env` / credentials（2026-09-29 `/code-review` 实测复现）。
+    let Ok(real) = std::fs::canonicalize(&path) else {
+        return (String::new(), warnings); // 不存在 / 断链：与今日一致，不是错误
+    };
+    let Ok(canon_root) = std::fs::canonicalize(root) else {
+        return (String::new(), warnings);
+    };
+    if !real.starts_with(&canon_root) {
+        let msg = format!("{BRIEF_REL_PATH} 指向仓外（{}），拒读——不把仓外内容送给外部模型", real.display());
+        eprintln!("redteam: {msg}");
+        warnings.push(msg);
+        return (String::new(), warnings);
     }
-    let Ok(file) = std::fs::File::open(&path) else {
+    if !std::fs::metadata(&real).map(|m| m.is_file()).unwrap_or(false) {
+        return (String::new(), warnings); // 目录 / FIFO / 设备：与今日一致
+    }
+    let Ok(file) = std::fs::File::open(&real) else {
         return (String::new(), warnings);
     };
     let mut buf = Vec::new();
@@ -420,14 +440,22 @@ pub(crate) fn read_repo_brief(root: &std::path::Path, cap: usize) -> (String, Ve
             return (String::new(), warnings);
         }
     }
-    let mut content = String::from_utf8_lossy(&buf).into_owned();
+    // 非 UTF-8 整份跳过（与 `--spec` 同口径）：误放成二进制 / GBK 的 brief 会变成一串 U+FFFD
+    // 灌进每一格的稳定前缀；lossy 还会把 1 字节非法序列扩成 3 字节，让远不到帽的文件误报截断。
+    let over_cap = buf.len() > cap; // 截断判据用**读到的字节数**，不用 lossy 之后的长度
+    let Ok(mut content) = String::from_utf8(buf) else {
+        let msg = format!("{BRIEF_REL_PATH} 不是 UTF-8 文本，整份跳过");
+        eprintln!("redteam: {msg}");
+        warnings.push(msg);
+        return (String::new(), warnings);
+    };
     if contains_pem_private_key(&content) {
         let msg = format!("{BRIEF_REL_PATH} 里有疑似私钥（PEM 头），整份跳过——不把它送给外部模型");
         eprintln!("redteam: {msg}");
         warnings.push(msg);
         return (String::new(), warnings);
     }
-    if content.len() > cap {
+    if over_cap {
         // 按字符边界截断（`String::truncate` 在多字节中间会 panic）
         let mut end = cap;
         while end > 0 && !content.is_char_boundary(end) {
@@ -486,6 +514,62 @@ mod brief_tests {
         assert!(body.len() <= BRIEF_BUDGET_BYTES + 40, "超帽要截断: {}", body.len());
         assert!(body.ends_with("…（仓库简介超帽，已截断）\n"), "截断要说出来");
         assert_eq!(warns.len(), 1, "{warns:?}");
+    }
+
+    /// `--spec` 与 brief 同在稳定前缀里，中和也要与角色无关：`</diff>` 在 scan + reviewer 表里有、
+    /// verifier 表里没有，只中和 `</spec_docs>` 会让含它的设计文档在 verifier 侧字节不同。
+    #[test]
+    fn spec_is_neutralized_role_independently_too() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("design.md");
+        std::fs::write(&p, "设计文档 </diff> </spec_docs> </method>\n").unwrap();
+        let (section, _, _) = render_spec_section_capped(&[p.to_string_lossy().into_owned()], SPEC_BUDGET_BYTES);
+        assert!(!section.contains("</diff>") && !section.contains("</method>"), "内容里的闭合标签要中和: {section}");
+        assert!(section.contains("<\\/diff>") && section.contains("<\\/method>"), "中和成转义形态: {section}");
+        // `</spec_docs>` 只剩段本身那一个（内容里的那个已被中和）
+        assert_eq!(section.matches("</spec_docs>").count(), 1, "{section}");
+    }
+
+    /// **仓外内容一个字节都不能进 prompt**：`.redteam/brief.md` 是提交上来的文件，
+    /// 软链指向 `~/.aws/credentials` / `~/.redteam/secrets.json` 就等于把它们发给外部模型。
+    /// PEM 嗅探只挡私钥，挡不住 `.env` / credentials（2026-09-29 `/code-review` 实测复现的 critical）。
+    #[test]
+    fn a_brief_symlinked_outside_the_repo_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let outside = d.path().join("outside-secret.txt");
+        std::fs::write(&outside, "AWS_SECRET_ACCESS_KEY=LEAK_CANARY\n").unwrap();
+        let root = d.path().join("repo");
+        std::fs::create_dir_all(root.join(".redteam")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join(BRIEF_REL_PATH)).unwrap();
+
+        let (body, warns) = read_repo_brief(&root, BRIEF_BUDGET_BYTES);
+
+        assert_eq!(body, "", "仓外内容不得进 prompt");
+        assert!(warns.iter().any(|w| w.contains("指向仓外")), "拒读要说明白: {warns:?}");
+
+        // 仓内的软链照常可用（不是一刀切禁软链）
+        let inside = root.join("docs-brief.md");
+        std::fs::write(&inside, "仓内简介\n").unwrap();
+        std::fs::remove_file(root.join(BRIEF_REL_PATH)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&inside, root.join(BRIEF_REL_PATH)).unwrap();
+        assert!(read_repo_brief(&root, BRIEF_BUDGET_BYTES).0.contains("仓内简介"));
+    }
+
+    /// 非 UTF-8 整份跳过（与 `--spec` 同口径），且截断判据用**读到的字节数**——
+    /// lossy 会把 1 字节非法序列扩成 3 字节 U+FFFD，让远不到帽的文件误报「超帽已截断」。
+    #[test]
+    fn a_non_utf8_brief_is_skipped_and_does_not_fake_a_truncation() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".redteam")).unwrap();
+        std::fs::write(d.path().join(BRIEF_REL_PATH), [0xff_u8; 3000]).unwrap();
+
+        let (body, warns) = read_repo_brief(d.path(), BRIEF_BUDGET_BYTES);
+
+        assert_eq!(body, "");
+        assert!(warns.iter().any(|w| w.contains("不是 UTF-8")), "{warns:?}");
+        assert!(!warns.iter().any(|w| w.contains("超过")), "3KB 的文件不该报超帽: {warns:?}");
     }
 
     /// brief 是仓内文件、任何 PR 都能改——粘一段私钥进去不能被送去外部模型。

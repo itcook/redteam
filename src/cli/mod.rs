@@ -330,8 +330,14 @@ pub async fn run_code_review(
     let (budget, spec_section, mut spec_warnings) = budget_and_spec(&roles, &args.spec);
     // 仓库简介（M21d 批 B-1，design §10.5）：每轮读一次、scanner / reviewer / verifier 共用同一份
     // ——稳定前缀两边逐字节相同才有 cache 可言。缺失 = 空串 = 与今日一致。
-    let (repo_brief, brief_warnings) = spec::read_repo_brief(root, spec::BRIEF_BUDGET_BYTES);
+    // 老项目的 `.gitignore` 升级也挂在这条真实路径上（见 `upgrade_legacy_gitignore` 的注释）。
+    crate::project::upgrade_legacy_gitignore(root);
+    let (repo_brief, brief_warnings) = spec::read_repo_brief(root, spec::BRIEF_BUDGET_BYTES.min(budget / 4));
     spec_warnings.extend(brief_warnings);
+    // brief 与 spec 同进 system，预算待遇也要同：不扣的话，小窗 scanner 上 8KB 的 brief
+    // 能吃掉三分之一的壳预算，溢出表现是 provider 报错或静默截断，不是可披露的降级
+    //（2026-09-29 `/code-review` 指出）。帽同时按 budget/4 夹紧，别让它一个人吃穿小模型的窗。
+    let budget = budget.saturating_sub(repo_brief.len());
     // 分组 / 装包 / 跨组索引（plan_cells：与 --pack-only 同源）。门未过 → 单包。
     let CellPlan { bundles, dossiers, others, dossier_meta, stats, pack_stats } =
         plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
@@ -465,7 +471,7 @@ pub async fn run_code_review(
         reused: vec![],
     });
     match deep {
-        Some(deep) => Ok(overlay_deep(report, code, deep, args, cfg, registry, &bundles, t0)),
+        Some(deep) => Ok(overlay_deep(report, code, deep, args, cfg, registry, Some(&bundles), t0)),
         None => Ok((report, code)),
     }
 }
@@ -537,7 +543,9 @@ fn overlay_deep(
     args: &ReviewArgs,
     cfg: &Config,
     registry: &ProviderRegistry,
-    bundles: &[crate::bundle::Bundle],
+    // 本轮变更集；`None` = **diff 重建不了**（git 挂了）——那条路没有可比的基准，
+    // 窗口后滤既不重算也不复位，往轮报告里的标记与披露要原样留住。
+    bundles: Option<&[crate::bundle::Bundle]>,
     t0: std::time::Instant,
 ) -> (ReviewReport, i32) {
     // 深挖期的墙钟 / 在途峰值 / 429 收敛只有跑完才知道——scan 收口时的快照必须在这里刷新，
@@ -554,7 +562,13 @@ fn overlay_deep(
     // 确定性后滤（design §10.4，M21d 批 B-2）：标记锚点落在改动行 ±N 外的 finding。
     // **默认只观测**——`findingWindowEnforce` 才降级（把它们移出 findings、只留披露）〔批 B 裁定 2〕。
     let window = cfg.review.pack.finding_window;
-    let outside = crate::positioning::mark_outside_window(&mut findings, bundles, window);
+    let outside = match bundles {
+        Some(bs) => crate::positioning::mark_outside_window(&mut findings, bs, window),
+        // 没有变更集就没有基准：重算只会把往轮的标记**全部复位**（`mark_outside_window` 每轮先清零），
+        // 于是 enforce 下一次无关的 git 失败就能把 Approve 翻成 Reject，默认档下往轮的披露则静默消失
+        // （2026-09-29 `/code-review` 抓到）。改为沿用既有标记。
+        None => findings.iter().filter(|f| f.outside_window).count() as u32,
+    };
     report.run.finding_window = window;
     report.run.findings_outside_window = outside;
     // enforce = **不计入 verdict 与计数**，但条目照留在报告里（与 refuted 同款：列出、不拦路）。
@@ -957,8 +971,13 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     // 角色集为空（无配置）时按 128K 窗保守缺省，不报错——仪表无 provider 也能跑。
     let roles = cfg.active_roles();
     let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
-    let (repo_brief, brief_warnings) = spec::read_repo_brief(cwd, spec::BRIEF_BUDGET_BYTES);
+    // 老项目的 `.gitignore` 升级（已 init 过的仓不会专门再跑一次 init）；未 init 的下面那行补新 body。
+    crate::project::upgrade_legacy_gitignore(cwd);
+    let (repo_brief, brief_warnings) = spec::read_repo_brief(cwd, spec::BRIEF_BUDGET_BYTES.min(budget / 4));
     warnings.extend(brief_warnings);
+    // 与真实评审同口径：brief 进的是同一个 system，预算也一起扣——仪表报的数要跟真实那条路一致，
+    // 否则它就不再是「量的是真实会发出的 prompt」（2026-09-29 `/code-review` 指出 brief 不扣预算）。
+    let budget = budget.saturating_sub(repo_brief.len());
     let selected = select_files(changes);
     let (risk, _route) = stage0_risk(&selected, cwd, args, cfg, head_sha.as_deref());
     let CellPlan { bundles, dossiers, others, stats, pack_stats, .. } =
@@ -969,7 +988,8 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     let project_dir = cwd.join(crate::project::PROJECT_DIR);
     let packs_dir = project_dir.join("packs").join(&job_id);
     std::fs::create_dir_all(&packs_dir)?;
-    // 未 init 的项目：只补 `.redteam/.gitignore`（镜像 init_project 的 `*`），不建库、不建 rounds。
+    // 未 init 的项目：只补 `.redteam/.gitignore`（镜像 init_project），不建库、不建 rounds。
+    // 已 init 的老项目顺手升级——存量用户不会专门再跑一次 `init`，不升级就等于 brief.md 修复没到他们手上。
     let gitignore = project_dir.join(".gitignore");
     if !gitignore.exists() {
         std::fs::write(&gitignore, crate::project::GITIGNORE_BODY)?;
@@ -1482,9 +1502,9 @@ pub async fn run_resume(
                     crate::orchestrate::deep::fold_reused_verify(&mut deep.meta, &deep.reused_cells);
                     // 落账同理（收口评审 #9）：首跑崩在深挖收场之后、进程退出之前时，那批截断疑点从没被落过账。
                     persist_dormant_suspicions(cwd, &deep.items, &round_id, &mut report.run.warnings);
-                    // 这条早退路径（全 Settled、没新东西可挖）还没装包，没有变更集可比
-                    // → 传空，窗口后滤自然不判（与「文件不在变更集就不判」同一条语义）。
-                    let over = overlay_deep(report, code, deep, &args, cfg, registry, &[], t0);
+                    // 这条是**「diff 重建不了」**（`changed_files` 报错）那条路：没有变更集可比，
+                    // 窗口后滤不重算也不复位，往轮的标记与披露原样留住。
+                    let over = overlay_deep(report, code, deep, &args, cfg, registry, None, t0);
                     (report, code) = over;
                     break 'deep;
                 }
@@ -1608,7 +1628,7 @@ pub async fn run_resume(
                     "resume: deep.close_ms / budget_cells 属首跑时刻量，cell 记录里没有、续跑不可重建（复核与 findings 账已按复用格补齐）".into(),
                 );
             }
-            let over = overlay_deep(report, code, deep, &args, cfg, registry, &bundles, t0);
+            let over = overlay_deep(report, code, deep, &args, cfg, registry, Some(&bundles), t0);
             report = over.0;
             code = over.1;
         }
@@ -3898,7 +3918,7 @@ mod code_review_tests {
 
         // ① 默认：只观测——两条都还在，verdict 与 stats 不变
         let cfg = Config::default();
-        let (rep, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg, &reg, &bundles, std::time::Instant::now());
+        let (rep, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg, &reg, Some(&bundles), std::time::Instant::now());
         assert_eq!(rep.run.findings_outside_window, 1, "远的那条要被数出来");
         assert_eq!(rep.run.finding_window, 30);
         assert!(!rep.run.finding_window_enforced);
@@ -3910,7 +3930,7 @@ mod code_review_tests {
         // ② 打开 enforce：窗外那条移出 findings（verdict 谓词零改动，自然不含它）
         let mut cfg2 = Config::default();
         cfg2.review.pack.finding_window_enforce = true;
-        let (rep2, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg2, &reg, &bundles, std::time::Instant::now());
+        let (rep2, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg2, &reg, Some(&bundles), std::time::Instant::now());
         assert_eq!(rep2.run.findings_outside_window, 1);
         assert!(rep2.run.finding_window_enforced);
         assert_eq!(rep2.findings.len(), 2, "**条目照留**——resume 会把报告写回持久 result，删条目等于抹掉往次的成果");
@@ -3918,9 +3938,17 @@ mod code_review_tests {
         assert!(rep2.findings.iter().any(|f| f.outside_window), "标记留着，md 逐条标得出来");
         assert_eq!(rep2.verdict, Verdict::Approve, "唯一的 high 在窗外 → 开了 enforce 就不拦路");
 
-        // ③ 没有变更集（resume 早退路径传 &[]）→ 一条都不判，行为与今日一致
-        let (rep3, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg, &reg, &[], std::time::Instant::now());
+        // ③ 变更集为空（文件都不在变更集）→ 一条都不判
+        let (rep3, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg, &reg, Some(&[]), std::time::Instant::now());
         assert_eq!((rep3.run.findings_outside_window, rep3.findings.len()), (0, 2));
+
+        // ④ diff 重建不了（git 挂了）→ **不重算也不复位**：往轮报告里的标记原样留住。
+        // 重算会把标记全部清零，于是 enforce 下一次无关的 git 失败就能把 Approve 翻成 Reject。
+        let mut carried = deep();
+        carried.findings[1].outside_window = true; // 往轮报告里已标过
+        let (rep4, _) = overlay_deep(blank(), 0, carried, &args(), &cfg, &reg, None, std::time::Instant::now());
+        assert_eq!(rep4.run.findings_outside_window, 1, "沿用往轮标记，不清零");
+        assert!(rep4.findings.iter().any(|f| f.outside_window), "标记要留住");
     }
 
     /// `refute_rate` 的分母是**真发出去验了的**条数，不是全部 blocking（批 D-5）：
@@ -3945,15 +3973,15 @@ mod code_review_tests {
         };
         let blank = || ReviewReport { run: Default::default(), verdict: Verdict::Approve, stats: Default::default(),
             findings: vec![], scan: None, cells: vec![], clusters: Default::default(), schema_version: Default::default() };
-        let (rep, _) = overlay_deep(blank(), 0, deep_with(4, 1, 9, 0), &args(), &cfg, &reg, &[], std::time::Instant::now());
+        let (rep, _) = overlay_deep(blank(), 0, deep_with(4, 1, 9, 0), &args(), &cfg, &reg, Some(&[]), std::time::Instant::now());
         assert_eq!(rep.run.refute_rate, Some(0.25), "4 条进了复核、驳回 1 条 → 25%（跳过的 9 条不进分母）");
-        let (rep2, _) = overlay_deep(blank(), 0, deep_with(0, 0, 9, 0), &args(), &cfg, &reg, &[], std::time::Instant::now());
+        let (rep2, _) = overlay_deep(blank(), 0, deep_with(0, 0, 9, 0), &args(), &cfg, &reg, Some(&[]), std::time::Instant::now());
         assert_eq!(rep2.run.refute_rate, None, "一条都没触发复核 → 不产键");
         // 收口评审 #6：没跑成的（provider 挂了 / 判决读不懂）也不进分母，否则「verifier 全挂」
         // 会读成「验了 N 条一条没驳」——而这个数正是下次复议「去留」时要读的。
-        let (rep3, _) = overlay_deep(blank(), 0, deep_with(4, 1, 0, 2), &args(), &cfg, &reg, &[], std::time::Instant::now());
+        let (rep3, _) = overlay_deep(blank(), 0, deep_with(4, 1, 0, 2), &args(), &cfg, &reg, Some(&[]), std::time::Instant::now());
         assert_eq!(rep3.run.refute_rate, Some(0.5), "4 条派出去、2 条没跑成 → 分母是 2");
-        let (rep4, _) = overlay_deep(blank(), 0, deep_with(3, 0, 0, 3), &args(), &cfg, &reg, &[], std::time::Instant::now());
+        let (rep4, _) = overlay_deep(blank(), 0, deep_with(3, 0, 0, 3), &args(), &cfg, &reg, Some(&[]), std::time::Instant::now());
         assert_eq!(rep4.run.refute_rate, None, "全挂 → 不产键，不拿 0.0 冒充「验了没驳回」");
         drop(dir);
     }
