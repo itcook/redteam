@@ -540,7 +540,7 @@ fn pack_only_writes_packs_and_reports_bytes() {
     assert_eq!(summary["cells"][0]["bytes"], c.bytes);
     assert_eq!(summary["grouping"]["gate"], "single");
     assert_eq!(summary["job_id"], report.job_id);
-    assert_eq!(std::fs::read_to_string(dir.path().join(".redteam/.gitignore")).unwrap(), "*\n", "未 init 项目补 .gitignore");
+    assert_eq!(std::fs::read_to_string(dir.path().join(".redteam/.gitignore")).unwrap(), "*\n!.gitignore\n!brief.md\n", "未 init 项目补 .gitignore");
     assert!(!dir.path().join(".redteam/proj.db").exists(), "不建库");
 }
 

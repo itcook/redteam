@@ -4,7 +4,10 @@ use std::path::Path;
 
 pub const PROJECT_DIR: &str = ".redteam";
 
-pub(crate) const GITIGNORE_BODY: &str = "*\n";
+/// `.redteam/` 默认整目录忽略（里面是状态：proj.db、packs/、rounds/），
+/// **但 `brief.md` 例外**——它是内容不是状态（design §10.5「内容非配置」），
+/// 要随仓分发：团队与 CI 都得读得到，否则写了 brief 也只有本机那一份（M21d 批 B-1 实测发现）。
+pub(crate) const GITIGNORE_BODY: &str = "*\n!.gitignore\n!brief.md\n";
 
 /// 幂等创建 `.redteam/` 骨架（`.gitignore` / `rounds/` / `db::DB_FILE`），返回本次新建的条目；已存在的一律不动。
 /// 项目层 `config.toml` 已退场（M21a 批 A，D7 A8：配置用户级唯一，项目目录只放状态与内容）；
@@ -21,6 +24,11 @@ pub fn init_project(root: &Path) -> anyhow::Result<Vec<String>> {
     if !gi.exists() {
         std::fs::write(&gi, GITIGNORE_BODY)?;
         created.push(format!("{PROJECT_DIR}/.gitignore"));
+    } else if std::fs::read_to_string(&gi).map(|c| c.trim() == "*").unwrap_or(false) {
+        // 老项目（M21d 批 B-1 之前建的）整目录忽略，brief.md 会被吞掉。只升级「原封不动的旧默认」
+        // 这一种形态——用户改过的一律不碰。
+        std::fs::write(&gi, GITIGNORE_BODY)?;
+        created.push(format!("{PROJECT_DIR}/.gitignore（升级：brief.md 不再被忽略）"));
     }
     let db_path = dir.join(crate::db::DB_FILE);
     if !db_path.exists() {
@@ -100,9 +108,34 @@ mod tests {
         assert!(tmp.path().join(".redteam/rounds").is_dir());
         assert!(tmp.path().join(".redteam").join(crate::db::DB_FILE).is_file(), "init 建库（M21a-b 并行期文件名见 db::DB_FILE）");
         assert!(!tmp.path().join(".redteam/dismissed").exists(), "dismissed/ 目录已退役");
-        assert_eq!(std::fs::read_to_string(tmp.path().join(".redteam/.gitignore")).unwrap(), "*\n");
+        // `brief.md` 要随仓分发（design §10.5「内容非配置」）——整目录忽略会让写了 brief 的人
+        // 只在本机有那一份，团队与 CI 都读不到（M21d 批 B-1 实测发现）。
+        let gi = std::fs::read_to_string(tmp.path().join(".redteam/.gitignore")).unwrap();
+        assert_eq!(gi, "*\n!.gitignore\n!brief.md\n");
         // 二跑：全部已存在 → 零创建
         assert!(init_project(tmp.path()).unwrap().is_empty());
+    }
+
+    /// 老项目（批 B-1 之前建的）`.gitignore` 是光秃秃一个 `*`，brief.md 会被吞掉 → 升级它；
+    /// **用户改过的一律不碰**（只认原封不动的旧默认这一种形态）。
+    #[test]
+    fn init_upgrades_only_the_untouched_legacy_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".redteam")).unwrap();
+        std::fs::write(tmp.path().join(".redteam/.gitignore"), "*\n").unwrap();
+        let created = init_project(tmp.path()).unwrap();
+        assert!(created.iter().any(|c| c.contains("brief.md 不再被忽略")), "{created:?}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".redteam/.gitignore")).unwrap(),
+            "*\n!.gitignore\n!brief.md\n"
+        );
+
+        // 用户自定义的不动
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp2.path().join(".redteam")).unwrap();
+        std::fs::write(tmp2.path().join(".redteam/.gitignore"), "*\n!mine.txt\n").unwrap();
+        init_project(tmp2.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(tmp2.path().join(".redteam/.gitignore")).unwrap(), "*\n!mine.txt\n");
     }
 
     #[test]
