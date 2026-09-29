@@ -143,6 +143,9 @@ fn contract_slot(
             contracts::LocateMiss::NotVendored { krate, version } => {
                 format!("{krate} {version} — needs{{api}} 契约未注入（registry 无解包目录，`cargo fetch` 后重跑）")
             }
+            contracts::LocateMiss::WalkTruncated { krate, scanned } => {
+                format!("{krate} — 源码超过 {scanned} 个文件，后面的没搜（needs{{api}} 契约可能缺块）")
+            }
         });
     }
     if sec.spilled > 0 {
@@ -744,7 +747,7 @@ mod tests {
             return;
         }
         let (_tmp, root) = tmpdir(&[("src/a.rs", "use nosuchkit::thing;\npub fn f() { thing(); }\n")]);
-        std::fs::write(root.join("Cargo.lock"), "[[package]]\nname = \"nosuchkit\"\nversion = \"9.9.9\"\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "[[package]]\nname = \"nosuchkit\"\nversion = \"9.9.9\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
         let bundle = bundle_of("src/a.rs", "@@ -2,1 +2,1 @@\n+pub fn f() { thing(); }\n");
         let item = QueueItemSpec::new("src/a.rs".into(), vec![(1, 2)], Origin::Rule, vec![]).unwrap();
         let tracked = crate::cli::second_pass::TrackedFiles::load(&root);

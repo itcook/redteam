@@ -100,10 +100,12 @@ pub fn crate_src_dir(registry_src: &Path, crate_name: &str, version: &str) -> Op
         let Ok(entries) = std::fs::read_dir(idx.path()) else { continue };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            // 目录名 = `<包名>-<版本>`，而包名自身可含 `-`（`grep-regex`）→ 按**最后一个** `-` 拆，
-            // 只对包名那半边做归一（整体归一会把版本号里的分隔符也吃掉）。
-            let Some((pkg, ver)) = name.rsplit_once('-') else { continue };
-            if ver == version && normalize_crate(pkg) == want {
+            // 目录名 = `<包名>-<版本>`，两边都可能含 `-`（包名 `grep-regex`、版本 `1.0.0-beta.1`）。
+            // 拿**已知的版本**去切后缀，不猜最后一个连字符——猜法会把 `serde-1.0.0-beta.1` 拆成
+            // (`serde-1.0.0`, `beta.1`)，预发布 / build metadata 的包于是永远匹配不上、全被误报成未解包
+            // （2026-09-29 本仓 dogfood 抓到）。
+            let Some(pkg) = name.strip_suffix(&format!("-{version}")) else { continue };
+            if normalize_crate(pkg) == want {
                 return Some(e.path());
             }
         }
@@ -118,6 +120,10 @@ pub enum LocateMiss {
     NotLocked(String),
     /// 锁到了版本，但 registry 里没有解包目录（没 `cargo fetch` 过 / 换了机器 / 用的是 git 或 path 依赖）
     NotVendored { krate: String, version: String },
+    /// crate 源文件数超过 [`CRATE_WALK_MAX_FILES`]，后面的没走——**这条必须说出来**：
+    /// 大 crate（`syn` / `aws-sdk-*`）的契约会因此整块消失，静默截断看起来和「这个库没有这个函数」一样
+    /// （2026-09-29 本仓 dogfood 抓到）。
+    WalkTruncated { krate: String, scanned: usize },
 }
 
 /// 一批 crate 名 → 各自的源目录；定位不到的进 `misses`（调用方据此降级并披露）。
@@ -143,6 +149,48 @@ pub fn locate_all(
         }
     }
     (found, misses)
+}
+
+/// `Cargo.lock` 里**不是 registry 来源**的包（归一名）：workspace 成员与 path 依赖没有 `source` 行，
+/// git 依赖是 `source = "git+…"`——两者都不在 `registry/src` 下。
+///
+/// 把它们留在目标里，省略清单就会被「registry 无解包目录」刷满，真降级被淹掉
+/// （2026-09-29 本仓 dogfood：`drop_own_package` 只挡住了根包名这一种）。
+pub fn non_registry_packages(lock_text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let (mut name, mut registry, mut in_pkg) = (None::<String>, false, false);
+    let val = |line: &str| line.split_once('=').map(|(_, v)| v.trim().trim_matches('"').to_string());
+    let flush = |name: &mut Option<String>, registry: &mut bool, out: &mut BTreeSet<String>| {
+        if let Some(n) = name.take() {
+            if !*registry {
+                out.insert(normalize_crate(&n));
+            }
+        }
+        *registry = false;
+    };
+    for line in lock_text.lines() {
+        let t = line.trim();
+        if t == "[[package]]" {
+            flush(&mut name, &mut registry, &mut out);
+            in_pkg = true;
+            continue;
+        }
+        if t.starts_with('[') {
+            flush(&mut name, &mut registry, &mut out);
+            in_pkg = false;
+            continue;
+        }
+        if !in_pkg {
+            continue;
+        }
+        if t.starts_with("name") {
+            name = val(t);
+        } else if t.starts_with("source") {
+            registry = val(t).is_some_and(|v| v.starts_with("registry+"));
+        }
+    }
+    flush(&mut name, &mut registry, &mut out);
+    out
 }
 
 /// 一条三方契约的位置（A-2）。渲染成文本块的活交给 [`render_contract`]。
@@ -177,20 +225,22 @@ const HITS_PER_NAME: usize = 2;
 ///
 /// 认这些形态：`pub fn` / `pub async fn` / `pub const fn` / `pub unsafe fn` / `pub extern "C" fn`
 /// / `pub(crate) fn` 之类的受限可见性也认（它对本仓不可见，但同名判断用不着那么精确，宁可多给一点上下文）。
-pub fn find_contracts(crate_dir: &Path, krate: &str, names: &BTreeSet<String>, cap: usize) -> Vec<ContractHit> {
+pub fn find_contracts(crate_dir: &Path, krate: &str, names: &BTreeSet<String>, cap: usize) -> CrateScan {
+    let mut scan = CrateScan::default();
     if names.is_empty() || cap == 0 {
-        return Vec::new();
+        return scan;
     }
     let alt = names.iter().map(|n| regex::escape(n)).collect::<Vec<_>>().join("|");
     let Ok(re) = regex::Regex::new(&format!(
         r#"^\s*pub(?:\s*\([^)]*\))?\s+(?:(?:async|const|unsafe|extern\s+"[^"]*")\s+)*fn\s+({alt})\b"#
     )) else {
-        return Vec::new();
+        return scan;
     };
     let src = crate_dir.join("src");
     let mut files: Vec<PathBuf> = Vec::new();
     collect_rs(&src, &mut files);
     files.sort();
+    scan.walk_truncated = files.len() > CRATE_WALK_MAX_FILES;
     let mut all: Vec<(bool, ContractHit)> = Vec::new();
     for f in files.iter().take(CRATE_WALK_MAX_FILES) {
         if std::fs::metadata(f).map(|m| m.len() > CRATE_FILE_MAX_BYTES).unwrap_or(true) {
@@ -244,19 +294,25 @@ pub fn find_contracts(crate_dir: &Path, krate: &str, names: &BTreeSet<String>, c
     all.sort_by(|(at, a), (bt, b)| (rank(a, *at), &a.rel, a.line).cmp(&(rank(b, *bt), &b.rel, b.line)));
     let all: Vec<ContractHit> = all.into_iter().map(|(_, h)| h).collect();
     let mut per_name = BTreeMap::<String, usize>::new();
-    let mut out = Vec::new();
     for h in all {
         let n = per_name.entry(h.name.clone()).or_default();
         if *n >= HITS_PER_NAME {
             continue;
         }
         *n += 1;
-        out.push(h);
-        if out.len() >= cap {
+        scan.hits.push(h);
+        if scan.hits.len() >= cap {
             break;
         }
     }
-    out
+    scan
+}
+
+/// 一个 crate 的抽取结果：命中 + 是否因文件数上限而截断（截断要能披露，见 [`LocateMiss::WalkTruncated`]）。
+#[derive(Debug, Default)]
+pub struct CrateScan {
+    pub hits: Vec<ContractHit>,
+    pub walk_truncated: bool,
 }
 
 /// `impl Foo`/`impl<'a> Foo<'a>`/`impl Trait for Foo` → 被实现的类型名（后者取 `for` 之后的）。
@@ -265,14 +321,36 @@ fn impl_type_of(t: &str) -> Option<String> {
     if !rest.starts_with([' ', '<']) {
         return None; // `implementation_detail()` 之类
     }
-    let rest = rest.rsplit(" for ").next().unwrap_or(rest);
-    rest.trim_start_matches(|c: char| c == '<' || c == '\'' || c.is_alphanumeric() || c == '_' || c == ',' || c == ' ')
-        .strip_prefix('>')
-        .map(str::trim_start)
-        .unwrap_or(rest.trim_start())
+    // dogfood 报「where 子句会骗过 rsplit(" for ")」——实测**不会**：HRTB 写作 `for<'a>`（紧跟 `<`），
+    // 命中不了 `" for "` 这个两侧带空格的模式。故不加截断防线（加了也钉不住，按仓内规矩不留假防御）。
+    let rest = rest.rsplit(" for ").next().unwrap_or(rest).trim_start();
+    // `impl<'a, T: Into<String>> Foo<T>` —— 头上的泛型参数列表要**配平**跳过；
+    // 按第一个 `>` 截会停在嵌套里，把 `String` 当成 owner（修 where 时实测发现的第二个口子）。
+    skip_generic_params(rest)
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .find(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// 串首若是 `<…>` 泛型参数列表就跳过它（按尖括号配平），否则原样返回。
+fn skip_generic_params(s: &str) -> &str {
+    if !s.starts_with('<') {
+        return s;
+    }
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return s[i + c.len_utf8()..].trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    s
 }
 
 /// 递归收 `.rs`（不跟符号链接；目录序由调用方排序保证确定性）。
@@ -571,9 +649,9 @@ pub fn contracts_section_in(
     local_mods: &BTreeSet<String>,
     cap: usize,
 ) -> ContractSection {
-    let Some((locked, known)) = lock_of(repo_root) else { return ContractSection::default() };
+    let Some((locked, known, local)) = lock_of(repo_root) else { return ContractSection::default() };
     let mut targets = contract_targets(sources, local_mods, &known);
-    drop_own_package(repo_root, &mut targets);
+    drop_local_packages(&local, &mut targets);
     assemble(registry_src, &locked, &targets, cap, None)
 }
 
@@ -603,28 +681,36 @@ pub fn api_contracts_section_in(
     cap: usize,
     max_body_lines: usize,
 ) -> ContractSection {
-    let Some((locked, known)) = lock_of(repo_root) else { return ContractSection::default() };
+    let Some((locked, known, local)) = lock_of(repo_root) else { return ContractSection::default() };
     let mut targets = contract_targets_at(content, ranges, local_mods, &known);
-    drop_own_package(repo_root, &mut targets);
+    drop_local_packages(&local, &mut targets);
     assemble(registry_src, &locked, &targets, cap, Some(max_body_lines))
 }
 
-/// `Cargo.lock` → (包名 → 版本, 归一包名集)。读不到 = 不是 Cargo 工作区，安静降级（不是错误）。
+/// `Cargo.lock` 读出来的三件套：registry 包的 `名 → 版本`、它们的归一名集（`known`）、本地包集。
+type Locked = (BTreeMap<String, String>, BTreeSet<String>, BTreeSet<String>);
+
+/// `Cargo.lock` → (包名 → 版本, 归一包名集, 本地包集)。读不到 = 不是 Cargo 工作区，安静降级（不是错误）。
 ///
 /// **本仓自己的包名要剔掉**：集成测试里的 `redteam::pack::…` 是本 crate，不是三方——留着它只会在
 /// 省略清单里刷一条「registry 无解包目录」（2026-09-29 自评审实测）。
-fn lock_of(repo_root: &Path) -> Option<(BTreeMap<String, String>, BTreeSet<String>)> {
+fn lock_of(repo_root: &Path) -> Option<Locked> {
     let lock = std::fs::read_to_string(repo_root.join("Cargo.lock")).ok()?;
-    let locked = locked_versions(&lock);
+    let mut locked = locked_versions(&lock);
+    // 本地包 = 本仓包名 ∪ lock 里非 registry 来源的包（workspace 成员 / path / git）
+    let mut local = non_registry_packages(&lock);
+    if let Some(own) = root_package_name(repo_root) {
+        local.insert(normalize_crate(&own));
+    }
+    locked.retain(|k, _| !local.contains(&normalize_crate(k)));
     let known = locked.keys().map(|k| normalize_crate(k)).collect();
-    Some((locked, known))
+    Some((locked, known, local))
 }
 
-/// 从目标里剔掉本仓自己的包（集成测试写 `redteam::pack::…`，那是本 crate 不是三方）。
-fn drop_own_package(repo_root: &Path, targets: &mut BTreeMap<String, BTreeSet<String>>) {
-    if let Some(own) = root_package_name(repo_root) {
-        targets.retain(|k, _| normalize_crate(k) != normalize_crate(&own));
-    }
+/// 从目标里剔掉本地包：集成测试写 `use redteam::pack::…`（本 crate）、workspace 兄弟包、path / git 依赖
+/// ——它们都不在 `registry/src` 下，留着只会把省略清单刷满假降级。
+fn drop_local_packages(local: &BTreeSet<String>, targets: &mut BTreeMap<String, BTreeSet<String>>) {
+    targets.retain(|k, _| !local.contains(&normalize_crate(k)));
 }
 
 /// `Cargo.toml` 的 `[package] name`（工作区根无 `[package]` 时 None）。
@@ -668,7 +754,11 @@ fn assemble(
             .find(|(k, _)| normalize_crate(k) == normalize_crate(krate))
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-        for hit in find_contracts(dir, krate, want, HITS_PER_NAME * 4) {
+        let scan = find_contracts(dir, krate, want, HITS_PER_NAME * 4);
+        if scan.walk_truncated {
+            out.misses.push(LocateMiss::WalkTruncated { krate: krate.clone(), scanned: CRATE_WALK_MAX_FILES });
+        }
+        for hit in scan.hits {
             let block = match body {
                 None => render_contract(dir, &hit, &version),
                 Some(max) => render_contract_with_body(dir, &hit, &version, max),
@@ -818,7 +908,7 @@ version = "9.9.9"
         std::fs::write(d.path().join("tests/it.rs"), "pub fn get() {}\n").unwrap();
 
         let names = set(&["get", "get2", "fetch", "size", "raw", "ffi", "private_get", "nosuch"]);
-        let hits = find_contracts(d.path(), "k", &names, 50);
+        let hits = find_contracts(d.path(), "k", &names, 50).hits;
         let got: BTreeSet<String> = hits.iter().map(|h| h.name.clone()).collect();
         assert_eq!(got, set(&["get", "get2", "fetch", "size", "raw", "ffi"]), "{hits:?}");
         assert!(!hits.iter().any(|h| h.rel.contains("tests")), "tests/ 不是公开契约面: {hits:?}");
@@ -854,7 +944,7 @@ version = "9.9.9"
                        pub fn from_str<T>(s: &str) -> Result<T, ()> { Err(()) }\n"),
         ]);
 
-        let hits = find_contracts(d.path(), "sj", &set(&["from_str"]), 50);
+        let hits = find_contracts(d.path(), "sj", &set(&["from_str"]), 50).hits;
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[0].owner, None, "自由函数必须排第一: {hits:?}");
         assert_eq!(hits[1].owner.as_deref(), Some("Deserializer"), "impl 方法要认出归属: {hits:?}");
@@ -881,7 +971,7 @@ version = "9.9.9"
             ],
         );
 
-        let hits = find_contracts(d.path(), "k", &set(&["new", "WalkBuilder"]), 50);
+        let hits = find_contracts(d.path(), "k", &set(&["new", "WalkBuilder"]), 50).hits;
 
         assert_eq!(
             hits.first().map(|h| (h.owner.clone(), h.rel.clone())),
@@ -889,7 +979,7 @@ version = "9.9.9"
             "被点名的 owner 要排第一: {hits:?}"
         );
         // 没点名类型时退回原序（路径序），行为不变
-        let plain = find_contracts(d.path(), "k", &set(&["new"]), 50);
+        let plain = find_contracts(d.path(), "k", &set(&["new"]), 50).hits;
         assert_eq!(plain.first().map(|h| h.rel.clone()), Some("src/aaa.rs".into()), "{plain:?}");
     }
 
@@ -901,14 +991,14 @@ version = "9.9.9"
             ("m1.rs", "pub fn a() {}\n"),
             ("m2.rs", "pub fn a() {}\n"),
         ]);
-        assert_eq!(find_contracts(d.path(), "k", &set(&["a", "b", "c"]), 2).len(), 2, "cap 封顶");
+        assert_eq!(find_contracts(d.path(), "k", &set(&["a", "b", "c"]), 2).hits.len(), 2, "cap 封顶");
         // 同名三处、cap 充足 → 每名仍只取 HITS_PER_NAME 处（否则一个大 crate 里的同名函数能刷满整段预算）
-        let many = find_contracts(d.path(), "k", &set(&["a"]), 50);
+        let many = find_contracts(d.path(), "k", &set(&["a"]), 50).hits;
         assert_eq!(many.len(), HITS_PER_NAME, "每名封顶: {many:?}");
-        assert!(find_contracts(d.path(), "k", &BTreeSet::new(), 50).is_empty(), "没有引用名 → 不走仓");
-        assert!(find_contracts(d.path(), "k", &set(&["a"]), 0).is_empty(), "cap 0 → 不走仓");
+        assert!(find_contracts(d.path(), "k", &BTreeSet::new(), 50).hits.is_empty(), "没有引用名 → 不走仓");
+        assert!(find_contracts(d.path(), "k", &set(&["a"]), 0).hits.is_empty(), "cap 0 → 不走仓");
         // 源目录不存在（git / path 依赖被误当 registry 包）→ 空，不 panic
-        assert!(find_contracts(Path::new("/nonexistent"), "k", &set(&["a"]), 50).is_empty());
+        assert!(find_contracts(Path::new("/nonexistent"), "k", &set(&["a"]), 50).hits.is_empty());
     }
 
     #[test]
@@ -991,7 +1081,7 @@ fn f(s: &str) -> Value {
         let d = tempfile::tempdir().unwrap();
         let repo = d.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
         let reg = d.path().join("registry/src");
         let kit = reg.join("index-x/kit-2.1.0");
         fake_crate(&kit, &[(
@@ -1014,6 +1104,88 @@ fn f(s: &str) -> Value {
         assert_eq!(contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 0).blocks, 0);
     }
 
+    /// impl 头取 owner：`where` 子句里的 `for<'a>` 会把 `rsplit(" for ")` 骗过去。
+    #[test]
+    fn impl_owner_survives_where_clauses() {
+        assert_eq!(impl_type_of("impl Foo {").as_deref(), Some("Foo"));
+        assert_eq!(impl_type_of("impl<'a> Deserializer<'a> {").as_deref(), Some("Deserializer"));
+        assert_eq!(impl_type_of("impl Display for Widget {").as_deref(), Some("Widget"));
+        assert_eq!(
+            impl_type_of("impl<T> Handler for Router<T> where T: for<'a> Fn(&'a str) {").as_deref(),
+            Some("Router"),
+            "where 里的 HRTB 写作 `for<'a>`、不带空格，命中不了 `\" for \"`"
+        );
+        assert_eq!(impl_type_of("impl<T> Table<T> where T: Copy {").as_deref(), Some("Table"));
+        assert_eq!(impl_type_of("implementation_detail() {"), None, "不是 impl 头");
+        assert_eq!(
+            impl_type_of("impl<T: Into<String>, U> Pair<T, U> {").as_deref(),
+            Some("Pair"),
+            "头上的泛型参数列表要**配平**跳过：按第一个 `>` 截会停在 `Into<String>` 里，于是把参数 `U` 当 owner"
+        );
+        assert_eq!(impl_type_of("impl<'a, T: Into<String>> Cache<'a, T> {").as_deref(), Some("Cache"));
+    }
+
+    /// 源码文件数超上限 → 截断要能披露：静默截断看起来和「这个库没有这个函数」一模一样。
+    #[test]
+    fn a_truncated_crate_walk_is_disclosed() {
+        let d = tempfile::tempdir().unwrap();
+        let files: Vec<(String, String)> = (0..CRATE_WALK_MAX_FILES + 5)
+            .map(|i| (format!("m{i:04}.rs"), format!("pub fn f{i}() {{\n    1;\n}}\n")))
+            .collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        fake_crate(d.path(), &refs);
+
+        let scan = find_contracts(d.path(), "k", &set(&["f0000"]), 50);
+        assert!(scan.walk_truncated, "超过 {CRATE_WALK_MAX_FILES} 个文件要标出截断");
+
+        let small = find_contracts(d.path(), "k", &BTreeSet::new(), 0);
+        assert!(!small.walk_truncated, "空入参早退时不谎报截断");
+    }
+
+    /// 非 registry 来源的包不是可定位的三方（dogfood 抓到：只挡根包名不够）——
+    /// workspace 成员与 path 依赖没有 `source` 行，git 依赖是 `source = "git+…"`，两者都不在 registry 下。
+    #[test]
+    fn non_registry_sources_are_local_packages() {
+        let lock = r#"
+[[package]]
+name = "sibling-crate"
+version = "0.1.0"
+dependencies = ["anyhow"]
+
+[[package]]
+name = "anyhow"
+version = "1.0.99"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "forked-dep"
+version = "0.3.0"
+source = "git+https://example.invalid/forked-dep?branch=main#abc123"
+
+[metadata]
+name = "not-a-package"
+"#;
+        let local = non_registry_packages(lock);
+        assert!(local.contains("sibling_crate"), "workspace / path 成员无 source: {local:?}");
+        assert!(local.contains("forked_dep"), "git 依赖不在 registry/src 下: {local:?}");
+        assert!(!local.contains("anyhow"), "registry 包不该被当本地: {local:?}");
+        assert_eq!(local.len(), 2, "{local:?}");
+    }
+
+    /// 版本号自己带连字符（预发布 / build metadata）时也要定位得到——按最后一个 `-` 猜会全军覆没。
+    #[test]
+    fn hyphenated_versions_still_locate() {
+        let d = tempfile::tempdir().unwrap();
+        let reg = d.path().join("registry/src");
+        let idx = reg.join("index-x");
+        std::fs::create_dir_all(idx.join("grep-regex-0.1.13-beta.1+build.7")).unwrap();
+        std::fs::create_dir_all(idx.join("serde-1.0.0")).unwrap();
+
+        assert!(crate_src_dir(&reg, "grep_regex", "0.1.13-beta.1+build.7").is_some(), "预发布版本要能定位");
+        assert!(crate_src_dir(&reg, "serde", "1.0.0").is_some());
+        assert!(crate_src_dir(&reg, "serde", "2.0.0").is_none(), "版本不等仍不得命中");
+    }
+
     /// 本仓自己的包不是三方：`redteam::pack::…`（集成测试的写法）不该进目标、更不该在省略清单里
     /// 刷一条「registry 无解包目录」。
     #[test]
@@ -1022,7 +1194,7 @@ fn f(s: &str) -> Value {
         let repo = d.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"redteam\"\nversion = \"0.1.0\"\n\n[dependencies]\nkit = \"2\"\n").unwrap();
-        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"redteam\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"redteam\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
         let reg = d.path().join("registry/src");
         std::fs::create_dir_all(reg.join("index-x")).unwrap();
         // 两类本仓符号：包名 `redteam`（集成测试 `use redteam::…`）、同文件声明的子模块 `helper`
@@ -1042,7 +1214,7 @@ fn f(s: &str) -> Value {
         let d = tempfile::tempdir().unwrap();
         let repo = d.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
         let reg = d.path().join("registry/src");
         let long_body = (0..80).map(|i| format!("    let x{i} = {i};\n")).collect::<String>();
         fake_crate(
@@ -1083,12 +1255,12 @@ fn f(s: &str) -> Value {
         let no_lock = contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 4096);
         assert!(no_lock.text.is_empty() && no_lock.misses.is_empty(), "没 Cargo.lock 不是错误，安静降级");
 
-        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"other\"\nversion = \"1.0.0\"\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"other\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
         let not_locked = contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 4096);
         assert_eq!(not_locked.misses, vec![LocateMiss::NotLocked("kit".into())]);
         assert_eq!(not_locked.blocks, 0);
 
-        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
         let not_vendored = contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 4096);
         assert_eq!(not_vendored.misses, vec![LocateMiss::NotVendored { krate: "kit".into(), version: "2.1.0".into() }]);
         assert!(not_vendored.text.is_empty());
@@ -1134,7 +1306,7 @@ mod live_probe {
         // 抽一条真实契约看看形状（本仓确实调了 serde_json::from_str / to_string）
         if let Some(dir) = found.get("serde_json") {
             let names: BTreeSet<String> = ["from_str", "to_string", "from_value"].iter().map(|s| s.to_string()).collect();
-            let hits = find_contracts(dir, "serde_json", &names, 20);
+            let hits = find_contracts(dir, "serde_json", &names, 20).hits;
             println!("serde_json 命中 {} 条: {:?}", hits.len(),
                      hits.iter().map(|h| format!("{}:{}", h.rel, h.name)).collect::<Vec<_>>());
             if let Some(h) = hits.first() {

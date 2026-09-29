@@ -258,7 +258,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             // cell 名按队列项（id 已定死），跨 resume 调用稳定：同项重跑 upsert 覆盖自身（与 scanner「重试者胜」同义），
             // 不同项永不同名。按本次调用的派发序编号时，resume 挖别的项会同名覆盖首跑的格、丢掉它的 finding。
             let cell_id = review_cell_id(&item.id, &rev.name);
-            let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &tracked, &idx, 64 * 1024, &opts, "", &api_needs_for(&input, &item.spec.file)) {
+            let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &tracked, &idx, 64 * 1024, &opts, "", &api_needs_for(&input, &item.spec)) {
                 Ok(p) => p,
                 Err(e) => {
                     // 派发时 pack 构造失败：就地结案，仍占一个派发位（与 C1「占 keep 位」同口径）
@@ -1338,24 +1338,37 @@ enum Round2 {
     Ready(ScanPrompt),
 }
 
-/// R2 二阶段补查轮的 prompt：needs → 证据段（`second_pass::need_section`，读守卫 + 字节帽）→ 重建 pack
-/// （needs_evidence 槽；与笔记互斥由构造期守卫，调用方已过滤）→ prompt 附加草稿块。
-/// 本文件上的 `needs{kind: api}` 声明（A-4，design §9.4 C）：scanner 说「这个三方 callee 的契约得核」，
-/// 深挖这一格就把契约连函数体带上。按文件取——声明与疑点同格产出，`path` 即调用点所在文件。
+/// **这一项**该带哪些 `needs{kind: api}` 声明（A-4，design §9.4 C）：scanner 说「这个三方 callee 的契约得核」，
+/// 深挖这一格就把契约连函数体带上。
 ///
 /// 取自 scan 格输出而非队列项：api 声明不是「去审这个区域」（那是 `kind: evidence`），
 /// 它是**给某格的附加材料**，没有自己的区域，入队只会白烧一格。
-fn api_needs_for(input: &DeepInput<'_>, file: &str) -> Vec<crate::domain::NeedEntry> {
-    input
-        .scan_cells
-        .iter()
-        .filter_map(|c| c.output.as_ref())
-        .flat_map(|o| o.needs.iter())
-        .filter(|n| n.kind == crate::domain::NeedKind::Api && crate::orchestrate::queue::norm_path(&n.path) == file)
-        .cloned()
-        .collect()
+///
+/// 三道筛：同文件、**行锚与本项区间相交**、同一条声明只算一次。
+/// 只按文件发会把同文件另一头的调用点契约塞给不相干的格——同一文件常被切成好几项，
+/// 每项各有自己的区域；而同一条声明会被多个 scan 格各报一次（2026-09-29 本仓 dogfood 抓到）。
+/// 无行锚的声明保留（`contract_slot` 会退回本项区间）。
+fn api_needs_for(input: &DeepInput<'_>, spec: &QueueItemSpec) -> Vec<crate::domain::NeedEntry> {
+    let mut out: Vec<crate::domain::NeedEntry> = Vec::new();
+    for n in input.scan_cells.iter().filter_map(|c| c.output.as_ref()).flat_map(|o| o.needs.iter()) {
+        if n.kind != crate::domain::NeedKind::Api || crate::orchestrate::queue::norm_path(&n.path) != spec.file {
+            continue;
+        }
+        if let Some((a, b)) = crate::cli::second_pass::parse_need_lines(n.lines.as_deref()) {
+            if !spec.ranges.iter().any(|&(lo, hi)| a <= hi && b >= lo) {
+                continue;
+            }
+        }
+        if out.iter().any(|m| m.path == n.path && m.lines == n.lines && m.reason == n.reason) {
+            continue;
+        }
+        out.push(n.clone());
+    }
+    out
 }
 
+/// R2 二阶段补查轮的 prompt：needs → 证据段（`second_pass::need_section`，读守卫 + 字节帽）→ 重建 pack
+/// （needs_evidence 槽；与笔记互斥由构造期守卫，调用方已过滤）→ prompt 附加草稿块。
 fn second_stage_prompt(
     env: &CellEnv<'_>,
     item: &QueueItem,
@@ -1374,7 +1387,7 @@ fn second_stage_prompt(
     if ev.trim().is_empty() {
         return Round2::NoEvidence;
     }
-    let pack2 = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, env.tracked, env.idx, 64 * 1024, env.opts, &ev, &api_needs_for(input, &item.spec.file)) {
+    let pack2 = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, env.tracked, env.idx, 64 * 1024, env.opts, &ev, &api_needs_for(input, &item.spec)) {
         Ok(p) => p,
         Err(e) => return Round2::PackFailed(e),
     };
@@ -3305,6 +3318,47 @@ mod tests {
         assert!(!counts_against_floor(&it), "必挖项不占保底位");
         let h0 = item_of("b", ItemKind::Ripple, ItemState::Settled, 1);
         assert!(!counts_against_floor(&h0), "保底只留给 scanner 疑点");
+    }
+
+    /// 三道筛（dogfood 抓到的 high）：同文件、**行锚与本项区间相交**、同一条声明只算一次。
+    /// 只按文件发会把同文件另一头的调用点契约塞给不相干的格，而同一条声明会被多个 scan 格各报一次。
+    #[test]
+    fn api_needs_for_intersects_ranges_and_dedups() {
+        let need = |path: &str, lines: Option<&str>, reason: &str| crate::domain::NeedEntry {
+            path: path.into(), lines: lines.map(str::to_string), reason: reason.into(), kind: crate::domain::NeedKind::Api,
+        };
+        let out = crate::domain::ScanOutput {
+            needs: vec![
+                need("a.rs", Some("2-2"), "命中本项区间"),
+                need("a.rs", Some("2-2"), "命中本项区间"), // 另一格重复报同一条
+                need("a.rs", Some("9-9"), "同文件但落在别的项上"),
+                need("b.rs", Some("2-2"), "别的文件"),
+                need("a.rs", None, "无行锚 → 退回本项区间"),
+                crate::domain::NeedEntry {
+                    path: "a.rs".into(), lines: Some("2-2".into()), reason: "evidence 不是 api".into(),
+                    kind: crate::domain::NeedKind::Evidence,
+                },
+            ],
+            ..Default::default()
+        };
+        let id = "scan[g1]@p/alpha#1";
+        let cells = [ScanCellResult {
+            cell_id: id.into(), group: 0, route_key: "p/alpha".into(), family: "alpha".into(), sample: 1,
+            record: CellRecord::ok(id, "p/alpha", crate::domain::CellOutput::Scan(out.clone())),
+            output: Some(out),
+        }];
+        let input = DeepInput {
+            route: None, scan_cells: &cells, bundles: &[], root: Path::new("."),
+            reviewers: &[], budget_cells: 0, pack: &Default::default(), spec_docs: "", target_label: "t",
+            snapshot: None, restore: None, prior_findings: vec![], tools: ToolsMode::Off,
+            backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+        };
+        let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 3)], QueueOrigin::Rule, vec![]).unwrap();
+
+        let got = api_needs_for(&input, &spec);
+
+        let reasons: Vec<&str> = got.iter().map(|n| n.reason.as_str()).collect();
+        assert_eq!(reasons, ["命中本项区间", "无行锚 → 退回本项区间"], "{reasons:?}");
     }
 
     /// A-4 跨层接线：scanner 的 `needs{kind: api}` → 深挖 cell 的 pack 里真的有契约 + 函数体，

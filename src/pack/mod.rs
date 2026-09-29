@@ -96,6 +96,10 @@ pub struct PackStats {
     /// 超帽没进去的契约块数（仓内上下文优先，三方契约用剩下的额度）。
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub contract_spilled: usize,
+    /// 帽被仓内上下文吃光、整段没注入。这件事只写进 pack 正文的省略清单就等于没披露——
+    /// 报告与 md 读的是统计（dogfood 抓到：PR181 的大组正是这种，md 上一片空白）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub contract_budget_skipped: bool,
 }
 
 fn is_zero_usize(v: &usize) -> bool {
@@ -955,6 +959,7 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
         let cap = outside_cap.saturating_sub(outside.len());
         if cap < OUTSIDE_MIN_CAP {
             omit.push(format!("三方契约：预算不足（帽 {cap} 字节 < {OUTSIDE_MIN_CAP}），未注入"));
+            stats.contract_budget_skipped = true;
             String::new()
         } else {
             let sources: Vec<(&str, &str)> = files.iter().map(|c| (c.fc.path.as_str(), c.content.as_str())).collect();
@@ -967,6 +972,9 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
                     contracts::LocateMiss::NotLocked(k) => format!("{k} — 三方契约未注入（Cargo.lock 里没有这个包）"),
                     contracts::LocateMiss::NotVendored { krate, version } => {
                         format!("{krate} {version} — 三方契约未注入（registry 无解包目录，`cargo fetch` 后重跑）")
+                    }
+                    contracts::LocateMiss::WalkTruncated { krate, scanned } => {
+                        format!("{krate} — 源码超过 {scanned} 个文件，后面的没搜（三方契约可能缺块）")
                     }
                 });
             }
@@ -1579,7 +1587,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("Cargo.lock"), "[[package]]\nname = \"nosuchkit\"\nversion = \"9.9.9\"\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "[[package]]\nname = \"nosuchkit\"\nversion = \"9.9.9\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
         std::fs::write(root.join("src/a.rs"), "use nosuchkit::thing;\npub fn f() { thing(); }\n").unwrap();
         let b = Bundle::from_files(vec![FileChange {
             path: "src/a.rs".into(),
@@ -1612,6 +1620,9 @@ mod tests {
         assert!(tight.text.contains("## 文件外片段"), "仓内上下文必须先拿到帽: {}", tight.text);
         assert_eq!(tight.stats.contracts, 0, "帽已被仓内上下文吃光，契约不该挤进来");
         assert!(tight.text.contains("三方契约：预算不足"), "降级要说得出原因: {}", tight.text);
+        assert!(tight.stats.contract_budget_skipped, "跳过要**记账**——只写进 pack 正文的省略清单，md 与报告上就看不见");
+        let rich = pack_bundle(&b, tmp.path(), 1_000_000, 0, &PackOpts::default(), &changeset);
+        assert!(!rich.stats.contract_budget_skipped, "帽够时不该标跳过");
     }
 
     /// 临时仓：core.rs（改动，compute_total 引用本文件未定义的 parse_widget）+ user.rs（caller）+ lib_defs.rs（callee 定义带 doc）
