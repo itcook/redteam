@@ -39,7 +39,7 @@ RunMeta 新增：注入的契约块数、input 增量、registry 缺失的降级
 ### Task A-4 `needs{kind: api}` 联动
 scanner 提出 `needs{kind:api}` 时，深挖 cell 带对应契约 **+ 函数体**。
 
-### Task A-5 验收 ✅（三项过、一项改判）
+### Task A-5 验收 ✅（两项过、一项改判〔D21〕、外加回归与三处自查修复）
 - ✅ 本仓自评审：批 A 范围注入 **21 块 / 1 miss**；`CARGO_HOME=/nonexistent` 对照 **0 注入、全部计 miss、pack 照出、退出码 0**；
   input 增量 +1.9% 字节 / +1.5% est_tokens（A-4 提交那一段的同范围对照）。
 - ⚠️ 「版本相关 API 误用」**改判**〔D21〕：靶子（`tempfile::tempdir` 的 TempDir drop）在**有契约 / 无契约两轮都被抓到**
