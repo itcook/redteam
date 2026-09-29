@@ -191,12 +191,40 @@ pub struct ProjDb {
     legacy_migration: Option<LegacyMigration>,
 }
 
+/// M21 分支期的库名。切名（M21c 批 0）前，分支产物 `redteam-next` 用的是这个独立文件名，
+/// 于是每个在那期间跑过它的项目都留下一个 `proj-next.db`。切名后二进制只认 `proj.db`，
+/// 那些库会变成孤儿——作业历史、resume、`result` 全都取不回。开项目库时顺手改名即可无缝继承（两者都是 v4）。
+const BRANCH_ERA_DB_FILE: &str = "proj-next.db";
+
 impl ProjDb {
     /// 打开项目库（`<root>/.redteam/proj.db`）；目录/库/表缺失即自动创建（幂等）。
+    ///
+    /// 开库前先做一次 M21 分支期库名的接管（见 [`BRANCH_ERA_DB_FILE`]）：只在**目标不存在**时改名，
+    /// 绝不覆盖已有库；`-wal` / `-shm` 一并搬（留着会让 sqlite 认错日志）。失败只 warning，不挡开库。
     pub fn open(root: &Path) -> Result<Self> {
         let dir = root.join(crate::project::PROJECT_DIR);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Self::adopt_branch_era_db(&dir);
         Self::open_at(&dir.join(DB_FILE))
+    }
+
+    /// M21 分支期库（`proj-next.db`）→ 正式库名。目标已存在就什么都不做（两个库并存时不猜哪个是对的）。
+    fn adopt_branch_era_db(dir: &Path) {
+        let (old, new) = (dir.join(BRANCH_ERA_DB_FILE), dir.join(DB_FILE));
+        if new.exists() || !old.exists() {
+            return;
+        }
+        if let Err(e) = std::fs::rename(&old, &new) {
+            eprintln!("warning: M21 分支期库 {} 改名失败（{e}）：作业历史暂取不回，手工改名即可", old.display());
+            return;
+        }
+        for suffix in ["-wal", "-shm"] {
+            let (o, n) = (dir.join(format!("{BRANCH_ERA_DB_FILE}{suffix}")), dir.join(format!("{DB_FILE}{suffix}")));
+            if o.exists() {
+                let _ = std::fs::rename(&o, &n);
+            }
+        }
+        eprintln!("note: 已接管 M21 分支期库 {} → {}（作业历史与台账随之继承）", old.display(), new.display());
     }
 
     /// 按显式路径打开（`--dismissed <db路径>` 覆盖场景）。
@@ -1341,6 +1369,45 @@ mod guard_tests {
             .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
             .filter(|n| n.contains("legacy")).collect();
         assert!(leftovers.is_empty(), "空库不该留快照: {leftovers:?}");
+    }
+
+    /// M21 分支期库名接管（M21c 批 A 补批 0 的漏）：切名后二进制只认 `proj.db`，
+    /// 而 M21 期间跑过 `redteam-next` 的项目留下的是 `proj-next.db`——不接管就成孤儿，
+    /// 作业历史、resume、`result` 全取不回。只在**目标不存在**时改名，绝不覆盖已有库。
+    #[test]
+    fn branch_era_db_is_adopted_but_never_overwrites() {
+        // ① 只有分支期库 → 改名接管，历史跟着过来
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path().join(crate::project::PROJECT_DIR);
+        std::fs::create_dir_all(&rt).unwrap();
+        {
+            let db = ProjDb::open_at(&rt.join("proj-next.db")).unwrap();
+            db.cell_put("j1", "scan[g1]@m", "scanner", r#"{"role":"scanner"}"#).unwrap();
+        }
+        std::fs::write(rt.join("proj-next.db-wal"), b"wal").unwrap();
+        let db = ProjDb::open(dir.path()).unwrap();
+        assert_eq!(db.cell_role("j1", "scan[g1]@m").unwrap().as_deref(), Some("scanner"), "作业历史继承");
+        assert!(rt.join("proj.db").is_file() && !rt.join("proj-next.db").exists(), "改名而不是复制");
+        assert!(rt.join("proj.db-wal").is_file() && !rt.join("proj-next.db-wal").exists(), "-wal 一并搬");
+
+        // ② 两个库都在 → 一个都不动（并存时不猜哪个是对的）
+        let dir2 = tempfile::tempdir().unwrap();
+        let rt2 = dir2.path().join(crate::project::PROJECT_DIR);
+        std::fs::create_dir_all(&rt2).unwrap();
+        {
+            let old = ProjDb::open_at(&rt2.join("proj-next.db")).unwrap();
+            old.cell_put("old", "c", "scanner", "{}").unwrap();
+            let new = ProjDb::open_at(&rt2.join("proj.db")).unwrap();
+            new.cell_put("new", "c", "scanner", "{}").unwrap();
+        }
+        let db2 = ProjDb::open(dir2.path()).unwrap();
+        assert!(rt2.join("proj-next.db").is_file(), "已有正式库时不得接管");
+        assert!(db2.cell_role("new", "c").unwrap().is_some() && db2.cell_role("old", "c").unwrap().is_none());
+
+        // ③ 都不在 → 正常新建，无副作用
+        let dir3 = tempfile::tempdir().unwrap();
+        ProjDb::open(dir3.path()).unwrap();
+        assert!(dir3.path().join(crate::project::PROJECT_DIR).join("proj.db").is_file());
     }
 
     /// 疑点台账 upsert 幂等（M21c 批 A）：同一处疑点跨轮只有一行，

@@ -54,6 +54,10 @@ git show feebc92:plugins/redteam/bin/darwin/aarch64/redteam > plugins/redteam/bi
 chmod +x plugins/redteam/bin/darwin/aarch64/redteam
 ```
 
+M21 重构期间（2026-09-05 ~ 09-28）跑过分支产物的项目，库名是 `.redteam/proj-next.db`。
+新引擎开项目库时会**自动接管**它（改名为 `proj.db`，连同 `-wal` / `-shm`），作业历史与台账随之继承；
+两个库都在时一个都不动——那种情况得你自己决定留哪个。
+
 注意两版的项目库不互通：新引擎用 schema v4 的 `.redteam/proj.db`，dev 版读不了。
 新引擎首次打开旧库时会**一次性迁移**（台账带走、评审史丢弃），动手前自动留一份整库快照 `proj-legacy-<日期>.db`
 ——回退到 dev 版时把那份快照改回 `proj.db` 即可。
