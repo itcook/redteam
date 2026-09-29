@@ -230,8 +230,18 @@ pub fn find_contracts(crate_dir: &Path, krate: &str, names: &BTreeSet<String>, c
             ));
         }
     }
-    // 顶层自由函数优先（同名时它才是 `krate::name` 指的那个），其余按路径 / 行号保持确定性
-    all.sort_by(|(at, a), (bt, b)| (!at, &a.rel, a.line).cmp(&(!bt, &b.rel, b.line)));
+    // 排序三档（2026-09-29 本仓自评审探针实测）：
+    // ① **被点名的类型**的方法最优先——`ignore::WalkBuilder::new(…)` 要的是 `WalkBuilder::new`，
+    //    而 `ignore` 里一堆 `new`：按路径序只会给到 `Gitignore::new` / `IgnoreBuilder::new`，
+    //    owner 虽有披露，「给对的那一条」却落空（A-2 的立项承诺）；
+    // ② 顶层自由函数（同名时它才是 `krate::name` 指的那个，如 `serde_json::from_str`）；
+    // ③ 其余 impl 方法。档内按路径 / 行号保持确定性。
+    let rank = |h: &ContractHit, top: bool| match &h.owner {
+        Some(ty) if names.contains(ty) => 0u8,
+        _ if top => 1,
+        _ => 2,
+    };
+    all.sort_by(|(at, a), (bt, b)| (rank(a, *at), &a.rel, a.line).cmp(&(rank(b, *bt), &b.rel, b.line)));
     let all: Vec<ContractHit> = all.into_iter().map(|(_, h)| h).collect();
     let mut per_name = BTreeMap::<String, usize>::new();
     let mut out = Vec::new();
@@ -421,11 +431,15 @@ pub fn contract_targets_at(
             out.entry(k.to_string()).or_default().insert(n.to_string());
         }
     }
-    // ③ 限定关联调用 `krate::Type::method(`
+    // ③ 限定关联调用 `krate::Type::method(`：方法名 + **类型名**都记。
+    // 类型名自己搜不到 `pub fn`（零副作用），但它让 `find_contracts` 认得出「这个 owner 是被点名的」，
+    // 从而把 `WalkBuilder::new` 排在同 crate 其它 `new` 前面（2026-09-29 本仓自评审探针实测）。
     for c in assoc.captures_iter(&region) {
-        let (k, n) = (&c[1], &c[3]);
+        let (k, ty, n) = (&c[1], &c[2], &c[3]);
         if callable(k) {
-            out.entry(k.to_string()).or_default().insert(n.to_string());
+            let e = out.entry(k.to_string()).or_default();
+            e.insert(n.to_string());
+            e.insert(ty.to_string());
         }
     }
     out
@@ -786,6 +800,34 @@ version = "9.9.9"
         assert!(meth.contains("（三方契约：Deserializer::from_str）"), "同名歧义要一眼可辨: {meth}");
     }
 
+    /// 被点名的类型的方法优先（2026-09-29 本仓自评审探针实测）：`krate::Type::method(` 里 `Type` 也进了
+    /// 目标集，`find_contracts` 据此把 `Type::method` 排在同 crate 其它同名方法前面——否则按路径序
+    /// 只会给到别的类型的 `new`，owner 虽有披露，「给对的那一条」却落空。
+    #[test]
+    fn the_named_owners_method_outranks_other_same_named_methods() {
+        let d = tempfile::tempdir().unwrap();
+        fake_crate(
+            d.path(),
+            &[
+                // 路径序在前、且同名——没有 owner 优先就是它们占满 HITS_PER_NAME
+                ("aaa.rs", "pub struct Other;\nimpl Other {\n    pub fn new(x: u8) -> Self { Other }\n}\n"),
+                ("bbb.rs", "pub struct Another;\nimpl Another {\n    pub fn new(x: u8) -> Self { Another }\n}\n"),
+                ("zzz.rs", "pub struct WalkBuilder;\nimpl WalkBuilder {\n    pub fn new(p: &str) -> Self { WalkBuilder }\n}\n"),
+            ],
+        );
+
+        let hits = find_contracts(d.path(), "k", &set(&["new", "WalkBuilder"]), 50);
+
+        assert_eq!(
+            hits.first().map(|h| (h.owner.clone(), h.rel.clone())),
+            Some((Some("WalkBuilder".into()), "src/zzz.rs".into())),
+            "被点名的 owner 要排第一: {hits:?}"
+        );
+        // 没点名类型时退回原序（路径序），行为不变
+        let plain = find_contracts(d.path(), "k", &set(&["new"]), 50);
+        assert_eq!(plain.first().map(|h| h.rel.clone()), Some("src/aaa.rs".into()), "{plain:?}");
+    }
+
     #[test]
     fn find_contracts_respects_caps_and_empty_inputs() {
         let d = tempfile::tempdir().unwrap();
@@ -824,7 +866,10 @@ fn f(s: &str) -> Value {
 
         assert_eq!(got["serde_json"], set(&["Value", "from_str", "to_string_pretty"]));
         assert_eq!(got["anyhow"], set(&["Context", "bail"]));
-        assert_eq!(got["regex"], set(&["new"]), "`regex::Regex::new` 没写 use，靠 Cargo.lock 认；取**方法名**去搜");
+        assert_eq!(
+            got["regex"], set(&["Regex", "new"]),
+            "`regex::Regex::new` 没写 use，靠 Cargo.lock 认；方法名去搜、类型名留着给 owner 排序"
+        );
         assert_eq!(got["tokio"], set(&["spawn"]));
         assert!(!got.contains_key("nosuchthing"), "不在 lock 里的限定路径不该当 crate: {:?}", got.keys().collect::<Vec<_>>());
         assert!(!got.contains_key("mymod"), "本仓模块不该去 registry 空转: {:?}", got.keys().collect::<Vec<_>>());
