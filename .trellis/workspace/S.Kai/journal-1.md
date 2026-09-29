@@ -774,3 +774,32 @@ L4-B 三方契约注入落地：use → Cargo.lock 精确版本 → registry 源
 ### Status
 
 [OK] **Completed**
+
+
+## Session 26: M21d 批 B：稳定前缀与确定性后滤（B-1/B-2 + dogfood 3 条 + code-review 8 条）
+<!-- trellis-session: v=2 fp=2d8704aa7b49ad13 -->
+
+**Date**: 2026-09-29
+**Task**: M21d 批 B：稳定前缀与确定性后滤（B-1/B-2 + dogfood 3 条 + code-review 8 条）
+**Branch**: `feat/m21d-prefix-anchor`
+
+### Summary
+
+B-1 仓库简介入稳定前缀：.redteam/brief.md 读进 <repo_brief> 槽，与 --spec 共用防线（非常规文件拒读、有界读、PEM 嗅探、符号链接逃逸检查），中和改为按三表并集做——各角色中和表标签集不同，不统一会让 scanner 与 reviewer 的稳定前缀分叉。B-2 改动行窗口后滤：新键 review.pack.findingWindow（默认 30，0=关），默认只观测（恒标记 + RunMeta 计数 + md 逐条披露），findingWindowEnforce 打开才不计入 verdict 与计数、条目照留。开工调研改了两处范围理解：B-1 的槽位段序中和表本就在模板里、B-2 的 anchorWindow 键已被装包半径占用。检查链照例递进：单测与变异 → dogfood 3 条 → code-review 8 条，其中一条是 critical——brief 用 metadata 跟随符号链接、无逃逸检查，软链指向 ~/.aws/credentials 就把它塞进每一格发给外部模型，已实测复现并修复；仓内三处早有 canonicalize 不变式，只有这条新读路径漏了，是本项目第五次栽在「同一件事不在两处各有一套」。观测副产品：needs{kind:api} 真实触发率为 0（A-4 首跑路径修好后第一次观测）、窗外 finding 2/41、文档类 finding 三轮实测占比 63%/29%/14% 且全部零 high。四条 followup：needs_policy 措辞、不变式机制化、code-review 与 redteam 的同范围对照设计、文档类 finding 的独立视角与预算隔离。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `14c8f8f` | feat(cli,orchestrate): B-1 仓库简介入稳定前缀 |
+| `a465b34` | feat(config,positioning,cli,output): B-2 改动行窗口后滤——先只观测 |
+| `368a53e` | fix(project): brief.md 不再被 .redteam/.gitignore 吞掉 + 本仓写一份 |
+| `355d05c` | fix(prompt,cli,output): 批 B dogfood 三条——前缀分叉、持久产物丢 finding、窗外不逐条标 |
+| `755b791` | fix(cli,config,prompt,output,project): code-review 八条——brief 符号链接逃逸（critical）等 |
+| `3fb3ddd` | docs(roadmap): 批 B followup 三条——needs{api} 触发率 0、不变式机制化、code-review 对照设计 |
+| `7b5107a` | docs(roadmap): followup——文档类 finding 占比过高的三轮实测与方案候选 |
+| `b4821c2` | docs(plan,decisions): 修 dogfood 对文档的两条有效意见 |
+
+### Status
+
+[OK] **Completed**
