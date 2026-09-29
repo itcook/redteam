@@ -322,12 +322,30 @@ pub struct PackCfg {
     pub body: PackBody,
     #[serde(default = "d_anchor_window")]
     pub anchor_window: u32,
+    /// finding 判定半径（design §10.4，M21d 批 B-2）：锚点离最近改动行超过 N 行即「窗外」。
+    /// **与 `anchorWindow` 是两回事**——那个是装包的禁真空窗半径，调参方向相反（装包半径大一点更安全，
+    /// 判定半径大一点更宽松），共用一个键会让调任一方都要跑两套回归〔批 B 开工裁定 1〕。
+    /// 0 = 连观测都关。
+    #[serde(default = "d_finding_window")]
+    pub finding_window: u32,
+    /// 窗外 finding 是否**降级**（移出 findings、只进披露）。默认 false = 只观测不改产出
+    /// 〔批 B 开工裁定 2：先拿真实分布再定阈值；直接丢 = 静默少报〕。
+    #[serde(default)]
+    pub finding_window_enforce: bool,
     /// 文件 ≤ 此字节数不切片直接全文（design §10.2）。
     #[serde(default = "d_slice_min_bytes")]
     pub slice_min_bytes: u64,
 }
 impl Default for PackCfg {
-    fn default() -> Self { PackCfg { body: d_pack_body(), anchor_window: d_anchor_window(), slice_min_bytes: d_slice_min_bytes() } }
+    fn default() -> Self {
+        PackCfg {
+            body: d_pack_body(),
+            anchor_window: d_anchor_window(),
+            finding_window: d_finding_window(),
+            finding_window_enforce: false,
+            slice_min_bytes: d_slice_min_bytes(),
+        }
+    }
 }
 
 fn d_one() -> u32 { 1 }
@@ -337,6 +355,7 @@ fn d_bundle_lines() -> u32 { 200 }
 fn d_max_files() -> u32 { 10 }
 fn d_pack_body() -> PackBody { PackBody::Slice }
 fn d_anchor_window() -> u32 { 30 }
+fn d_finding_window() -> u32 { 30 }
 fn d_slice_min_bytes() -> u64 { 8192 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -675,6 +694,7 @@ impl Config {
             ("review.maxConcurrency", r.max_concurrency as u64),
             ("review.scanners.samples", r.scanners.samples as u64),
             ("review.pack.anchorWindow", r.pack.anchor_window as u64),
+            ("review.pack.findingWindow", r.pack.finding_window as u64),
             ("review.grouping.minFiles", r.grouping.min_files as u64),
             ("review.grouping.maxFilesPerGroup", r.grouping.max_files_per_group as u64),
         ] {
@@ -712,7 +732,7 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
         ("reviewers", &["maxCells", "reenqueue"], true),
         ("verifiers", &["enabled"], true),
         ("grouping", &["minFiles", "bundleLineThreshold", "maxFilesPerGroup", "semantic"], false),
-        ("pack", &["body", "anchorWindow", "sliceMinBytes"], false),
+        ("pack", &["body", "anchorWindow", "findingWindow", "findingWindowEnforce", "sliceMinBytes"], false),
     ];
     /// 已知层级的键检查：snake_case → 错误（指引 camelCase 拼写）；`removed`（键 → 为什么没了 / 去哪调）命中 → 专属 warning；
     /// 其余未知 → 通用 warning。已删键统一走 `removed` 表，不另开分支（评审修：同一文件只留一种「已删键」手法）。
@@ -1091,7 +1111,7 @@ mod tests {
     "reviewers": { "maxCells": "auto", "reenqueue": false },
     "verifiers": { "enabled": true },
     "grouping": { "minFiles": 4, "bundleLineThreshold": 200, "maxFilesPerGroup": 10, "semantic": false },
-    "pack": { "body": "slice", "anchorWindow": 30, "sliceMinBytes": 8192 }
+    "pack": { "body": "slice", "anchorWindow": 30, "findingWindow": 30, "findingWindowEnforce": false, "sliceMinBytes": 8192 }
   }
 }"#;
 

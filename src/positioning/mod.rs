@@ -199,7 +199,7 @@ mod tests {
             file: file.into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), models: vec!["m".into()],
             agreement: 1, suspicion_agreement: 0, hard_constraint: false, cluster_id: None, quote: quote.into(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
+            previously_dismissed: false, origin: Origin::New, outside_window: false,
         }
     }
 
@@ -366,5 +366,107 @@ mod tests {
         write(dir.path(), "a.rs", "if x {\n    bad();\n}\nmid\nif x {\n    bad();\n}\n");
         // 两处同型块（首行 1 与 5），old_line=6 → 就近选 5，跨度 3 行
         assert_eq!(anchor_near(dir.path(), "a.rs", "if x {\n    bad();\n}", 6), Some((5, 7)));
+    }
+}
+
+/// finding 锚点到最近改动行的距离后滤（design §10.4，M21d 批 B-2）。
+///
+/// 只标记、不删——`review.pack.findingWindowEnforce` 才决定要不要降级〔批 B 开工裁定 2〕。
+/// 返回标记条数。`window == 0` = 关（一条都不标）。
+///
+/// 三种不标的情形，各有理由：
+/// - **carried**：跨轮沿用的锚点本就会漂，拿它判「离改动多远」没有意义（plan 明写不误伤）；
+/// - **文件不在变更集**：needs 补查会把变更集外的文件带进评审，那里根本没有「改动行」可比；
+/// - **该文件的 diff 解不出改动行**（新增文件的 `/dev/null` diff 等）：没有基准就不判。
+pub fn mark_outside_window(findings: &mut [Finding], bundles: &[crate::bundle::Bundle], window: u32) -> u32 {
+    if window == 0 {
+        return 0;
+    }
+    let mut changed: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+    for b in bundles {
+        for fc in &b.files {
+            let lines = crate::diffsym::hunk_changed_lines(&fc.diff);
+            if !lines.is_empty() {
+                changed.entry(fc.path.as_str()).or_default().extend(lines);
+            }
+        }
+    }
+    let mut marked = 0;
+    for f in findings.iter_mut() {
+        f.outside_window = false;
+        if f.origin == crate::domain::Origin::Carried {
+            continue;
+        }
+        let Some(lines) = changed.get(f.file.as_str()) else { continue };
+        // `hunk_changed_lines` 给的是 0-based 行号，finding 是 1-based
+        let (lo, hi) = (f.line_start.saturating_sub(1) as usize, f.line_end.saturating_sub(1) as usize);
+        let near = lines.iter().any(|&l| {
+            let d = if l < lo { lo - l } else { l.saturating_sub(hi) };
+            d <= window as usize
+        });
+        if !near {
+            f.outside_window = true;
+            marked += 1;
+        }
+    }
+    marked
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::domain::{Origin, Severity};
+
+    fn f(file: &str, line: u32, origin: Origin) -> Finding {
+        Finding {
+            id: format!("{file}:{line}"), severity: Severity::Medium, title: "t".into(), body: "b".into(),
+            file: file.into(), line_start: line, line_end: line, confidence: 0.8, recommendation: "r".into(),
+            models: vec![], agreement: 1, suspicion_agreement: 0, hard_constraint: false,
+            quote: String::new(), cluster_id: None, verify: None, previously_dismissed: false,
+            origin, outside_window: false,
+        }
+    }
+
+    fn bundle(path: &str, diff: &str) -> crate::bundle::Bundle {
+        crate::bundle::Bundle::from_files(vec![crate::evidence::git::FileChange { path: path.into(), diff: diff.into() }])
+    }
+
+    /// 窗口后滤只标记不删；三种「不判」的情形各有理由（carried / 变更集外 / 窗口关）。
+    #[test]
+    fn marks_only_what_it_can_judge() {
+        // diff 改的是第 10 行（hunk 头 1-based，`hunk_changed_lines` 给 0-based）
+        let bs = [bundle("a.rs", "@@ -10,1 +10,1 @@\n+changed\n")];
+        let mut fs = vec![
+            f("a.rs", 10, Origin::New),  // 正中改动行
+            f("a.rs", 35, Origin::New),  // 距 25 行，窗内（±30）
+            f("a.rs", 60, Origin::New),  // 距 50 行，窗外
+            f("a.rs", 60, Origin::Carried), // 同样远，但跨轮沿用 → 锚点本就会漂，不判
+            f("other.rs", 60, Origin::New), // 不在变更集 → 没有基准，不判
+        ];
+
+        let n = mark_outside_window(&mut fs, &bs, 30);
+
+        assert_eq!(n, 1, "{:?}", fs.iter().map(|x| (x.id.clone(), x.outside_window)).collect::<Vec<_>>());
+        assert_eq!(
+            fs.iter().map(|x| x.outside_window).collect::<Vec<_>>(),
+            [false, false, true, false, false]
+        );
+
+        // window = 0 → 整条后滤关掉
+        let mut fs2 = vec![f("a.rs", 999, Origin::New)];
+        assert_eq!(mark_outside_window(&mut fs2, &bs, 0), 0);
+        assert!(!fs2[0].outside_window);
+    }
+
+    /// 重复调用要幂等（收口可能跑两次：首跑与 resume 走同一个收口函数）。
+    #[test]
+    fn marking_is_idempotent_and_resets() {
+        let bs = [bundle("a.rs", "@@ -10,1 +10,1 @@\n+changed\n")];
+        let mut fs = vec![f("a.rs", 60, Origin::New)];
+        assert_eq!(mark_outside_window(&mut fs, &bs, 30), 1);
+        assert_eq!(mark_outside_window(&mut fs, &bs, 30), 1, "重复标记不翻倍");
+        // 窗口调宽 → 标记要被**清掉**，不能留着上一轮的结论
+        assert_eq!(mark_outside_window(&mut fs, &bs, 100), 0);
+        assert!(!fs[0].outside_window, "放宽后要复位");
     }
 }

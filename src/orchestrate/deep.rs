@@ -4004,7 +4004,7 @@ mod tests {
             id: "F1".into(), severity: crate::domain::Severity::High, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             models: vec!["p/r".into()], agreement: 1, suspicion_agreement: 0, hard_constraint: false,
-            quote: "fn a() {".into(), previously_dismissed: false, origin: crate::domain::Origin::New,
+            quote: "fn a() {".into(), previously_dismissed: false, origin: crate::domain::Origin::New, outside_window: false,
             cluster_id: None, verify: None,
         };
         let known: std::collections::BTreeMap<String, crate::domain::Verify> = [(
@@ -4229,7 +4229,7 @@ mod tests {
             id: "F1".into(), severity: crate::domain::Severity::High, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             models: vec!["p/r".into()], agreement: 1, suspicion_agreement: 0, hard_constraint: false,
-            quote: "fn a() {".into(), previously_dismissed: false, origin: crate::domain::Origin::New,
+            quote: "fn a() {".into(), previously_dismissed: false, origin: crate::domain::Origin::New, outside_window: false,
             cluster_id: None, verify: None,
         };
         let known: std::collections::BTreeMap<String, crate::domain::Verify> = [(

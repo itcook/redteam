@@ -52,6 +52,7 @@ fn claim_to_finding(c: Claim) -> Finding {
         quote: c.quote,
         previously_dismissed: false,
         origin: Origin::New,
+        outside_window: false,
         cluster_id: None,
         verify: None,
     }

@@ -109,6 +109,11 @@ pub struct Finding {
     /// M13：出身标记（schema v3 显式序列化；反序列化缺省 New）。
     #[serde(default)]
     pub origin: Origin,
+    /// 锚点落在改动行 ±`review.pack.findingWindow` 之外（design §10.4，M21d 批 B-2）。
+    /// **只是观测**：默认不改 verdict、不改 findings 集合；`findingWindowEnforce` 打开才降级。
+    /// `carried` 项恒 false——跨轮沿用的锚点本就会漂，拿它判「离改动多远」没有意义。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside_window: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,7 +208,7 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
+            previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(v["quote"], "snippet");
@@ -216,7 +221,7 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
+            previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         // None → 不出现
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
@@ -282,6 +287,7 @@ pub(crate) mod fixtures {
             quote: "q".into(),
             previously_dismissed: false,
             origin: Origin::New,
+            outside_window: false,
             cluster_id: None,
             verify: None,
         }

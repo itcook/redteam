@@ -249,6 +249,15 @@ pub struct ScanReport {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RunMeta {
     pub job_id: String,
+    /// finding 判定半径（design §10.4，M21d 批 B-2）：0 = 关。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub finding_window: u32,
+    /// 锚点落在改动行 ±`finding_window` 外的 finding 条数（**观测**：默认不改 verdict）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub findings_outside_window: u32,
+    /// 上者是否真的被降级（`findingWindowEnforce` 打开时才 true）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub finding_window_enforced: bool,
     pub models: Vec<String>,
     /// 与 `models`（provider 名）同序的 model id（config 的 providers.*.model）——
     /// 人读报告显示 model 名而非 provider 名（rN.md 模板,2026-07-03）。
@@ -485,7 +494,7 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, quote: "snippet".into(), cluster_id: None, verify: None,
-            previously_dismissed: false, origin: Origin::New }
+            previously_dismissed: false, origin: Origin::New, outside_window: false }
     }
     #[test]
     fn stats_counts_by_severity() {

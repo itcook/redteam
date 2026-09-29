@@ -111,7 +111,7 @@ mod tests {
             line_start:ls, line_end:le, confidence:0.8, recommendation:"r".into(),
             models:vec![model.into()], agreement:1, suspicion_agreement: 0,
             hard_constraint:false, quote:String::new(), cluster_id:None, verify:None,
-            previously_dismissed: false, origin: Origin::New }
+            previously_dismissed: false, origin: Origin::New, outside_window: false }
     }
 
     /// 判决合并三种组合（批 D〔D17〕Q11）：流式复核跑在 dedup **之前**，同一个 bug 被两个格报出来时

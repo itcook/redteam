@@ -465,7 +465,7 @@ pub async fn run_code_review(
         reused: vec![],
     });
     match deep {
-        Some(deep) => Ok(overlay_deep(report, code, deep, args, cfg, registry, t0)),
+        Some(deep) => Ok(overlay_deep(report, code, deep, args, cfg, registry, &bundles, t0)),
         None => Ok((report, code)),
     }
 }
@@ -529,6 +529,7 @@ pub(crate) fn verdict_thresholds(args: &ReviewArgs, cfg: &Config) -> (crate::dom
     (block, args.conf_floor.unwrap_or(cfg.review.conf_floor))
 }
 
+#[allow(clippy::too_many_arguments)] // 报告 / 退出码 / 深挖结果 / 旗标 / 配置 / registry / 变更集 / 计时各不同源
 fn overlay_deep(
     mut report: ReviewReport,
     scan_code: i32,
@@ -536,6 +537,7 @@ fn overlay_deep(
     args: &ReviewArgs,
     cfg: &Config,
     registry: &ProviderRegistry,
+    bundles: &[crate::bundle::Bundle],
     t0: std::time::Instant,
 ) -> (ReviewReport, i32) {
     // 深挖期的墙钟 / 在途峰值 / 429 收敛只有跑完才知道——scan 收口时的快照必须在这里刷新，
@@ -548,7 +550,17 @@ fn overlay_deep(
             report.run.warnings.push(w);
         }
     }
-    let findings = deep.findings;
+    let mut findings = deep.findings;
+    // 确定性后滤（design §10.4，M21d 批 B-2）：标记锚点落在改动行 ±N 外的 finding。
+    // **默认只观测**——`findingWindowEnforce` 才降级（把它们移出 findings、只留披露）〔批 B 裁定 2〕。
+    let window = cfg.review.pack.finding_window;
+    let outside = crate::positioning::mark_outside_window(&mut findings, bundles, window);
+    report.run.finding_window = window;
+    report.run.findings_outside_window = outside;
+    if cfg.review.pack.finding_window_enforce && outside > 0 {
+        report.run.finding_window_enforced = true;
+        findings.retain(|f| !f.outside_window);
+    }
     let skipped = deep.meta.budget_skipped;
     let failed = deep.reviewer_failed;
     // 一格都没挖、没债、也没有往轮挖出来的 finding = 深挖根本没发生（空变更集 / 队列为空）。
@@ -1465,7 +1477,9 @@ pub async fn run_resume(
                     crate::orchestrate::deep::fold_reused_verify(&mut deep.meta, &deep.reused_cells);
                     // 落账同理（收口评审 #9）：首跑崩在深挖收场之后、进程退出之前时，那批截断疑点从没被落过账。
                     persist_dormant_suspicions(cwd, &deep.items, &round_id, &mut report.run.warnings);
-                    let over = overlay_deep(report, code, deep, &args, cfg, registry, t0);
+                    // 这条早退路径（全 Settled、没新东西可挖）还没装包，没有变更集可比
+                    // → 传空，窗口后滤自然不判（与「文件不在变更集就不判」同一条语义）。
+                    let over = overlay_deep(report, code, deep, &args, cfg, registry, &[], t0);
                     (report, code) = over;
                     break 'deep;
                 }
@@ -1589,7 +1603,7 @@ pub async fn run_resume(
                     "resume: deep.close_ms / budget_cells 属首跑时刻量，cell 记录里没有、续跑不可重建（复核与 findings 账已按复用格补齐）".into(),
                 );
             }
-            let over = overlay_deep(report, code, deep, &args, cfg, registry, t0);
+            let over = overlay_deep(report, code, deep, &args, cfg, registry, &bundles, t0);
             report = over.0;
             code = over.1;
         }
@@ -3850,6 +3864,53 @@ mod code_review_tests {
         }
     }
 
+    /// B-2 收口接线（design §10.4）：窗外 finding **默认只计数不改产出**，
+    /// `findingWindowEnforce` 打开才移出 findings。两条都走真实收口函数。
+    #[test]
+    fn findings_outside_the_changed_line_window_are_counted_then_optionally_dropped() {
+        let reg = ProviderRegistry::new();
+        let mk = |file: &str, line: u32| crate::domain::Finding {
+            id: format!("{file}:{line}"), severity: crate::domain::Severity::Medium, title: "t".into(),
+            body: "b".into(), file: file.into(), line_start: line, line_end: line, confidence: 0.8,
+            recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
+            hard_constraint: false, quote: String::new(), cluster_id: None, verify: None,
+            previously_dismissed: false, origin: crate::domain::Origin::New, outside_window: false,
+        };
+        let deep = || crate::orchestrate::deep::DeepRun {
+            findings: vec![mk("a.rs", 10), mk("a.rs", 300)], // 一条正中改动行、一条远在 300 行
+            cells: vec![crate::state::CellRecord::ok("c", "m", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] })],
+            meta: Default::default(), warnings: vec![], reviewer_failed: false, reused_cells: vec![], items: vec![],
+        };
+        let blank = || ReviewReport { run: Default::default(), verdict: Verdict::Approve, stats: Default::default(),
+            findings: vec![], scan: None, cells: vec![], clusters: Default::default(), schema_version: Default::default() };
+        let bundles = [crate::bundle::Bundle::from_files(vec![crate::evidence::git::FileChange {
+            path: "a.rs".into(), diff: "@@ -10,1 +10,1 @@\n+changed\n".into(),
+        }])];
+
+        // ① 默认：只观测——两条都还在，verdict 与 stats 不变
+        let cfg = Config::default();
+        let (rep, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg, &reg, &bundles, std::time::Instant::now());
+        assert_eq!(rep.run.findings_outside_window, 1, "远的那条要被数出来");
+        assert_eq!(rep.run.finding_window, 30);
+        assert!(!rep.run.finding_window_enforced);
+        assert_eq!(rep.findings.len(), 2, "默认不改 findings 集合");
+        assert_eq!(rep.stats.total, 2, "也不改计数");
+        assert!(rep.findings.iter().any(|f| f.outside_window), "标记要留在 finding 上");
+
+        // ② 打开 enforce：窗外那条移出 findings（verdict 谓词零改动，自然不含它）
+        let mut cfg2 = Config::default();
+        cfg2.review.pack.finding_window_enforce = true;
+        let (rep2, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg2, &reg, &bundles, std::time::Instant::now());
+        assert_eq!(rep2.run.findings_outside_window, 1);
+        assert!(rep2.run.finding_window_enforced);
+        assert_eq!(rep2.findings.len(), 1, "开了才降级");
+        assert_eq!(rep2.findings[0].line_start, 10);
+
+        // ③ 没有变更集（resume 早退路径传 &[]）→ 一条都不判，行为与今日一致
+        let (rep3, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg, &reg, &[], std::time::Instant::now());
+        assert_eq!((rep3.run.findings_outside_window, rep3.findings.len()), (0, 2));
+    }
+
     /// `refute_rate` 的分母是**真发出去验了的**条数，不是全部 blocking（批 D-5）：
     /// 被免验跳过的从没给过 verifier 机会，算进分母只会把率冲淡；一条都没触发 → 不产这个键
     /// （拿 0 冒充「验了没驳回」会让「去留由数据决定」读到假数据）。
@@ -3872,15 +3933,15 @@ mod code_review_tests {
         };
         let blank = || ReviewReport { run: Default::default(), verdict: Verdict::Approve, stats: Default::default(),
             findings: vec![], scan: None, cells: vec![], clusters: Default::default(), schema_version: Default::default() };
-        let (rep, _) = overlay_deep(blank(), 0, deep_with(4, 1, 9, 0), &args(), &cfg, &reg, std::time::Instant::now());
+        let (rep, _) = overlay_deep(blank(), 0, deep_with(4, 1, 9, 0), &args(), &cfg, &reg, &[], std::time::Instant::now());
         assert_eq!(rep.run.refute_rate, Some(0.25), "4 条进了复核、驳回 1 条 → 25%（跳过的 9 条不进分母）");
-        let (rep2, _) = overlay_deep(blank(), 0, deep_with(0, 0, 9, 0), &args(), &cfg, &reg, std::time::Instant::now());
+        let (rep2, _) = overlay_deep(blank(), 0, deep_with(0, 0, 9, 0), &args(), &cfg, &reg, &[], std::time::Instant::now());
         assert_eq!(rep2.run.refute_rate, None, "一条都没触发复核 → 不产键");
         // 收口评审 #6：没跑成的（provider 挂了 / 判决读不懂）也不进分母，否则「verifier 全挂」
         // 会读成「验了 N 条一条没驳」——而这个数正是下次复议「去留」时要读的。
-        let (rep3, _) = overlay_deep(blank(), 0, deep_with(4, 1, 0, 2), &args(), &cfg, &reg, std::time::Instant::now());
+        let (rep3, _) = overlay_deep(blank(), 0, deep_with(4, 1, 0, 2), &args(), &cfg, &reg, &[], std::time::Instant::now());
         assert_eq!(rep3.run.refute_rate, Some(0.5), "4 条派出去、2 条没跑成 → 分母是 2");
-        let (rep4, _) = overlay_deep(blank(), 0, deep_with(3, 0, 0, 3), &args(), &cfg, &reg, std::time::Instant::now());
+        let (rep4, _) = overlay_deep(blank(), 0, deep_with(3, 0, 0, 3), &args(), &cfg, &reg, &[], std::time::Instant::now());
         assert_eq!(rep4.run.refute_rate, None, "全挂 → 不产键，不拿 0.0 冒充「验了没驳回」");
         drop(dir);
     }

@@ -75,6 +75,7 @@ pub fn enrich(raw: &RawFinding, model: &str) -> Finding {
         cluster_id: None,
         verify: None,
         origin: Origin::New,
+        outside_window: false,
     }
 }
 

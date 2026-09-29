@@ -609,7 +609,7 @@ mod tests {
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
             models: vec!["claude".into()], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
+            previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         let p = build_refute_prompt(&f, "", "", "");
         assert!(!p.contains("{{"), "no residual placeholders");
@@ -639,7 +639,7 @@ mod tests {
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
             models: vec!["claude".into()], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
+            previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         let p = build_refute_prompt(&f, "", "src/a.rs:40-162（现场快照）\nfn x() {}", "");
         assert!(p.contains("Source at the claimed location"), "段标题在场");
@@ -658,7 +658,7 @@ mod tests {
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
             models: vec!["claude".into()], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "if timeout { return Ok(()); }".into(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
+            previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         let p = build_refute_prompt(&f, "", "", "<spec_docs>…DESIGN D8: fail-open is intentional on timeout…</spec_docs>");
         assert!(p.contains("<spec_docs>…DESIGN D8: fail-open is intentional on timeout…</spec_docs>"), "spec 段原样注入: {p}");
@@ -678,7 +678,7 @@ mod tests {
             line_start: 12, line_end: 14, confidence: 0.9, recommendation: "add check".into(),
             models: vec!["claude".into()], agreement: 1, suspicion_agreement: 0,
             hard_constraint: false, cluster_id: None, quote: "db.write(token)".into(), verify: None,
-            previously_dismissed: false, origin: Origin::New,
+            previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         let p = build_refute_prompt(&f, "", "", "");
         assert!(p.contains("(none)"), "空 spec 渲染占位: {p}");
@@ -694,7 +694,7 @@ mod tests {
             body: "b".into(), file: "src/a.rs".into(), line_start: 1, line_end: 1,
             confidence: 0.9, recommendation: "r".into(), models: vec![],
             agreement: 1, suspicion_agreement: 0, hard_constraint: false, quote: "q".into(), cluster_id: None,
-            verify: None, previously_dismissed: false, origin: Origin::New,
+            verify: None, previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         let card = |id: &str, file: &str, title: &str, reason: &str| DismissCard {
             id: id.into(), status: "dismissed".into(), title: title.into(), file: file.into(),

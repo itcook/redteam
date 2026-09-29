@@ -394,7 +394,7 @@ fn result_md_three_states() {
             cluster_id: None,
             verify: None,
             previously_dismissed: false,
-            origin: Origin::New,
+            origin: Origin::New, outside_window: false,
         }],
         clusters: vec![],
         run: RunMeta { job_id: id_b.into(), models: vec!["m".into()], ..Default::default() },

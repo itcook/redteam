@@ -47,6 +47,7 @@ mod tests {
             verify: None,
             previously_dismissed: false,
             origin: Origin::New,
+            outside_window: false,
         }
     }
 

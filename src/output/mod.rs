@@ -74,6 +74,19 @@ fn render_md(r: &ReviewReport) -> String {
     } else {
         s.push_str(&format!("- Findings: {}\n", r.stats.total));
     }
+    // 改动行窗口后滤（design §10.4，M21d 批 B-2）：默认**只披露不判定**——说清是哪种，
+    // 否则读者无从知道这几条到底算没算进上面的数（M21c 的休眠线索同款措辞纪律）。
+    if r.run.findings_outside_window > 0 {
+        let how = if r.run.finding_window_enforced {
+            "excluded from the verdict"
+        } else {
+            "disclosed only — still counted above"
+        };
+        s.push_str(&format!(
+            "- Findings anchored outside the changed-line window (±{}): {} ({how})\n",
+            r.run.finding_window, r.run.findings_outside_window
+        ));
+    }
     if r.stats.total > 0 {
         s.push('\n');
         s.push_str("  | Severity   | Count |\n  | ---------- | ----- |\n");
@@ -292,7 +305,7 @@ mod tests {
                 file:"a.rs".into(),line_start:3,line_end:5,confidence:0.9,recommendation:"fix".into(),
                 models:vec!["claude".into()],agreement:1, suspicion_agreement: 0,hard_constraint:false,
                 quote:"snippet".into(),cluster_id:None,verify:None,previously_dismissed:false,
-                origin:Origin::New}],
+                origin:Origin::New, outside_window: false}],
             clusters:vec![], run:RunMeta::default() }
     }
 
@@ -314,6 +327,26 @@ mod tests {
         // 没有线索时一个字都不多写
         r.run.dormant_leads.clear();
         assert!(!render_md(&r).contains("Dormant"), "空则不渲染");
+    }
+
+    /// B-2：窗外 finding 的披露要说清**算没算进上面的数**——默认只披露、仍计入；
+    /// 开了 enforce 才是排除。措辞含糊等于没披露（M21c 休眠线索同款纪律）。
+    #[test]
+    fn md_says_whether_outside_window_findings_count() {
+        let mut r = report();
+        r.run.finding_window = 30;
+        r.run.findings_outside_window = 2;
+        let md = render_md(&r);
+        assert!(
+            md.contains("- Findings anchored outside the changed-line window (±30): 2 (disclosed only — still counted above)"),
+            "默认要说「仍计入」: {md}"
+        );
+
+        r.run.finding_window_enforced = true;
+        assert!(render_md(&r).contains("(excluded from the verdict)"), "开了 enforce 要改口径");
+
+        r.run.findings_outside_window = 0;
+        assert!(!render_md(&r).contains("outside the changed-line window"), "零条不占版面");
     }
 
     /// 被驳回的 finding 不计入头条、但仍列在详情里——头条必须把这件事说出来（收口评审 #10）。
