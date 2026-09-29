@@ -797,6 +797,22 @@ fn apply_known(fs: &mut [Finding], known: &std::collections::BTreeMap<String, cr
 
 /// 从已落盘的 verifier 格重建「这条已判过」的映射（resume 用）。同一 finding 若有多条记录，
 /// 按读入序后来居上——重挖只会追加新判决，不会把旧的改写成别的结论。
+/// 把**复用格**（往轮已落盘、本轮没重挖）的复核账并回 meta（M21c 批 A-4）。
+///
+/// 为什么需要：`run_deep` 的 meta 只统计本轮真派出去的格，而崩溃续跑时往轮的 verify 格是「复用」的——
+/// 不并回来，报告里就是「复核触发 0 / 驳回 0」，极端情况（杀在复核尾部、续跑无事可做）整组计数全空，
+/// 按报告字段判会误判成「一次没验」（M21b 出口验收第 6 项实测）。
+///
+/// 只数**成功的** verify 格：失败的复核按设计保守 upheld，没产生判决，不该计入触发数。
+pub fn fold_reused_verify(meta: &mut crate::domain::DeepMeta, reused: &[CellRecord]) {
+    for rec in reused.iter().filter(|r| r.ok) {
+        if let crate::domain::CellOutput::Verify { verdicts } = &rec.output {
+            meta.verify_triggered += verdicts.len() as u32;
+            meta.verify_refuted += verdicts.iter().filter(|v| v.verdict == crate::domain::VerifyVerdict::Refuted).count() as u32;
+        }
+    }
+}
+
 pub fn known_verdicts(cells: &[CellRecord]) -> std::collections::BTreeMap<String, crate::domain::Verify> {
     let mut out = std::collections::BTreeMap::new();
     for rec in cells.iter().filter(|r| r.ok) {
@@ -3970,6 +3986,34 @@ mod tests {
 
         let f = run.findings.iter().find(|f| f.id == "F1").expect("往轮 finding 照进报告");
         assert_eq!(f.verify.as_ref().map(|v| v.verdict.clone()), Some(crate::domain::VerifyVerdict::Refuted));
+    }
+
+    /// 复用格的复核账要并回 meta（M21c 批 A-4，M21b 第 6 项实测的债）：
+    /// 崩溃续跑时往轮的 verify 格是「复用」的，不并回来报告里就是「复核触发 0 / 驳回 0」。
+    /// 失败的复用格不计——它没产生判决（按设计保守 upheld）。
+    #[test]
+    fn reused_verify_cells_fold_into_the_meta() {
+        use crate::domain::{CellOutput, VerifyEntry, VerifyVerdict};
+        let verify = |cell: &str, ok: bool, vs: Vec<(&str, VerifyVerdict)>| {
+            let out = CellOutput::Verify {
+                verdicts: vs.into_iter().map(|(id, v)| VerifyEntry { id: id.into(), verdict: v, note: String::new() }).collect(),
+            };
+            let mut rec = CellRecord::ok(cell, "p/v", out);
+            rec.ok = ok;
+            rec
+        };
+        let mut meta = crate::domain::DeepMeta { verify_triggered: 2, verify_refuted: 1, ..Default::default() };
+        fold_reused_verify(&mut meta, &[
+            verify("verify[a]@p/v", true, vec![("f1", VerifyVerdict::Upheld), ("f2", VerifyVerdict::Refuted)]),
+            verify("verify[b]@p/v", false, vec![("f3", VerifyVerdict::Refuted)]), // 失败格不计
+            CellRecord::ok("review[x]@p/r", "p/r", CellOutput::empty(crate::domain::Role::Reviewer)), // 非复核格不计
+        ]);
+        assert_eq!((meta.verify_triggered, meta.verify_refuted), (4, 2), "本轮 2/1 + 复用成功格 2/1");
+
+        // 没有复用格时不动账
+        let mut m2 = crate::domain::DeepMeta { verify_triggered: 3, verify_refuted: 0, ..Default::default() };
+        fold_reused_verify(&mut m2, &[]);
+        assert_eq!((m2.verify_triggered, m2.verify_refuted), (3, 0));
     }
 
 }

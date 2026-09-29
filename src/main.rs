@@ -1199,7 +1199,7 @@ fn run_risk(base: &str, head: Option<&str>, dismissed: Option<&str>, before: Opt
     let ledger = match dismissed {
         Some(p) if std::path::Path::new(p).is_file() => Some(std::path::PathBuf::from(p)),
         None => {
-            let p = cwd.join(redteam::project::PROJECT_DIR).join(redteam::db::DB_FILE);
+            let p = redteam::db::project_db_path(&cwd);
             p.is_file().then_some(p)
         }
         _ => None,

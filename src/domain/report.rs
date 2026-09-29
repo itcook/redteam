@@ -107,6 +107,57 @@ impl Coverage {
         self.selected.is_empty() && self.completed.is_empty() && self.reused.is_empty()
             && self.failed.is_empty() && self.waived.is_empty()
     }
+
+    /// 五集合的划分不变式（design §8.4「不相交并 = 全集」的可执行版，M21c 批 A）：
+    /// **每个角色**的 `selected` = `completed` ⊎ `reused` ⊎ `failed` ⊎ `waived`——后四者两两不相交、并集恰是 selected。
+    ///
+    /// 口径澄清（批 A 调研）：五集合是 **per cell** 的。**预算截断的队列项没有 cell**，
+    /// 它的去处是「台账化 + `deep.budget_skipped` 披露 + warning」，**不进 waived**；
+    /// `waived` 留给「本该派却被规则豁免」的格（批 B 的判例豁免：dismissed 变体不入队 / upheld carry 不重挖），
+    /// 在那之前恒空。误把截断项塞进 waived 会让 selected ≠ 并集，本函数就是拦这个的。
+    ///
+    /// 返回人读的破坏说明（`Ok(())` = 成立）；调用方按场景决定是 warning 还是断言。
+    pub fn check_partition(&self) -> Result<(), String> {
+        use std::collections::BTreeSet;
+        let roles: BTreeSet<Role> = self.selected.keys().chain(self.completed.keys()).chain(self.reused.keys())
+            .chain(self.failed.keys()).chain(self.waived.keys()).copied().collect();
+        for role in roles {
+            let get = |m: &BTreeMap<Role, Vec<String>>| -> Vec<String> { m.get(&role).cloned().unwrap_or_default() };
+            let (sel, parts) = (get(&self.selected), [("completed", get(&self.completed)), ("reused", get(&self.reused)),
+                                                     ("failed", get(&self.failed)), ("waived", get(&self.waived))]);
+            let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+            for (name, items) in &parts {
+                for it in items {
+                    if let Some(prev) = seen.insert(it.clone(), name) {
+                        return Err(format!("{role:?}: `{it}` 同时在 {prev} 与 {name}（四子集必须两两不相交）"));
+                    }
+                }
+            }
+            let sel_set: BTreeSet<&String> = sel.iter().collect();
+            let part_set: BTreeSet<&String> = seen.keys().collect();
+            if sel_set != part_set {
+                let missing: Vec<&&String> = sel_set.difference(&part_set).collect();
+                let extra: Vec<&&String> = part_set.difference(&sel_set).collect();
+                return Err(format!(
+                    "{role:?}: selected 与四子集之并不等——selected 里没被分类的 {missing:?}；不在 selected 却被分类的 {extra:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 一条休眠疑点线索（`RunMeta::dormant_leads`）：台账里的历史截断项，落在本轮变更文件上。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct DormantLead {
+    pub file: String,
+    /// 落账那轮的行号——**仅供定位参考**：台账的身份是 quote 归一，行号会随后续改动漂移。
+    pub line: u32,
+    pub hint: String,
+    /// 第一次见到它的那轮 head_sha。
+    pub first_round: String,
+    /// 被 delta 激活过几次（批 C 起才会非 0）。
+    pub activations: i64,
 }
 
 /// 单 cell 的输入缓存命中率（cached_input ÷ input；D10-3 段序翻转与 anthropic 三段界断点的观测面，F-5 填）。
@@ -213,6 +264,11 @@ pub struct RunMeta {
     /// 台账自动加载披露——zero-config 下 verdict 受台账影响必须可见（design 2026-07-03 #6）。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ledger: Option<LedgerMeta>,
+    /// 休眠疑点线索（M21c 批 A，design §8.2）：疑点台账里落在**本轮变更文件**上的历史截断项。
+    /// **只披露、不进 verdict**——它们没被深挖过，没有危害链论证，当 finding 用会把「没挖」误读成「有问题」。
+    /// 批 C 的增量激活会让其中被 delta 碰到的那些重新入队，那时它们才有机会成为 finding。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub dormant_leads: Vec<DormantLead>,
     /// R3 stamp：证据收集实跑刻的 rev-parse HEAD（code 模式全路径回填；doc 为 None）。
     /// 增量轮以上轮此值为 delta base。serde default 兼容 v2。
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -521,6 +577,51 @@ mod tests {
         assert!(!r.run.incremental);
         assert!(r.run.resolved.is_empty() && r.run.carried_dropped.is_empty());
         assert!(r.stats.new.is_none());
+    }
+
+    /// 五集合划分不变式（design §8.4，M21c 批 A）：selected = completed ⊎ reused ⊎ failed ⊎ waived，
+    /// 后四者两两不相交；破坏时报出**是哪个格、在哪两个桶**，而不是一句「不成立」。
+    #[test]
+    fn coverage_partition_invariant() {
+        let mk = |role: Role, sel: &[&str], c: &[&str], r: &[&str], f: &[&str], w: &[&str]| {
+            let mut cov = Coverage::default();
+            let put = |m: &mut BTreeMap<Role, Vec<String>>, v: &[&str]| {
+                if !v.is_empty() {
+                    m.insert(role, v.iter().map(|s| (*s).to_string()).collect());
+                }
+            };
+            put(&mut cov.selected, sel);
+            put(&mut cov.completed, c);
+            put(&mut cov.reused, r);
+            put(&mut cov.failed, f);
+            put(&mut cov.waived, w);
+            cov
+        };
+        // 成立：四子集恰好划分 selected（含空桶）
+        assert!(mk(Role::Scanner, &["a", "b", "c"], &["a"], &["b"], &["c"], &[]).check_partition().is_ok());
+        assert!(Coverage::default().check_partition().is_ok(), "空 coverage 平凡成立");
+        // 多角色互不干扰
+        let mut two = mk(Role::Scanner, &["a"], &["a"], &[], &[], &[]);
+        two.selected.insert(Role::Reviewer, vec!["r1".into()]);
+        two.failed.insert(Role::Reviewer, vec!["r1".into()]);
+        assert!(two.check_partition().is_ok());
+
+        // 破坏一：同一个格进了两个桶
+        let e = mk(Role::Scanner, &["a"], &["a"], &["a"], &[], &[]).check_partition().unwrap_err();
+        assert!(e.contains("`a`") && e.contains("completed") && e.contains("reused"), "{e}");
+        // 破坏二：selected 里有格没被分类（漏分类——典型症状是失败格被忘了记）
+        let e = mk(Role::Scanner, &["a", "b"], &["a"], &[], &[], &[]).check_partition().unwrap_err();
+        assert!(e.contains("没被分类") && e.contains("b"), "{e}");
+        // 破坏三之二：某角色**整个**不在 selected 里，却出现在别的桶——只遍历 selected 的键会漏掉它
+        let mut orphan = Coverage::default();
+        orphan.selected.insert(Role::Scanner, vec!["a".into()]);
+        orphan.completed.insert(Role::Scanner, vec!["a".into()]);
+        orphan.failed.insert(Role::Reviewer, vec!["r-ghost".into()]);
+        let e = orphan.check_partition().unwrap_err();
+        assert!(e.contains("Reviewer") && e.contains("r-ghost"), "{e}");
+        // 破坏三：分类里有 selected 之外的格（典型症状是把「没有 cell 的预算截断项」塞进 waived）
+        let e = mk(Role::Reviewer, &["a"], &["a"], &[], &[], &["item:1-2"]).check_partition().unwrap_err();
+        assert!(e.contains("不在 selected") && e.contains("item:1-2"), "{e}");
     }
 
     #[test]
