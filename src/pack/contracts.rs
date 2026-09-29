@@ -415,9 +415,20 @@ pub fn contract_targets_at(
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // ① use 引入的末端名——限定了区间时只收**区间里真的出现过**的那些
     for (head, tail) in use_tails(content) {
-        if externals.contains(&head) && (ranges.is_empty() || word_appears(&region, &tail)) {
-            out.entry(head).or_default().insert(tail);
+        if !externals.contains(&head) || (!ranges.is_empty() && !word_appears(&region, &tail)) {
+            continue;
         }
+        // `use ignore::WalkBuilder;` + `WalkBuilder::new(…)` 是 Rust 的主流写法，而类型名搜不到 `pub fn`：
+        // 只收末端名等于什么都没问到（2026-09-29 探针实测）。引进来的若是类型，就去区域里找它的关联调用，
+        // 把**方法名**也记上——与 `krate::Type::method(` 同款，owner 排序据此认得出是被点名的那个。
+        if tail.starts_with(char::is_uppercase) {
+            if let Ok(re) = regex::Regex::new(&format!(r"\b{}::([a-z_][a-z0-9_]*)\s*[(<]", regex::escape(&tail))) {
+                for c in re.captures_iter(&region) {
+                    out.entry(head.clone()).or_default().insert(c[1].to_string());
+                }
+            }
+        }
+        out.entry(head).or_default().insert(tail);
     }
     let callable = |k: &str| {
         !local_mods.contains(k)
@@ -876,6 +887,23 @@ fn f(s: &str) -> Value {
         // `v.get("k")` 是方法调用、不带 crate 限定——**不能**把它算进任何 crate：
         // `get` / `new` / `len` 这类名字在任何 crate 里都命中一片，注入的噪音会把仓内上下文挤掉
         assert!(got.values().all(|n| !n.contains("get")), "无限定的方法名混进来了: {got:?}");
+    }
+
+    /// `use krate::Type;` 之后按裸类型名调（Rust 主流写法）也要能抽出目标——只收末端名等于什么都没问到。
+    #[test]
+    fn use_of_a_type_picks_up_its_associated_calls() {
+        let rs = "use ignore::WalkBuilder;\nuse serde_json::Value;\nfn f(p: &str) -> usize {\n    let v = Value::Null;\n    WalkBuilder::new(p).hidden(false).build().count() + v.is_null() as usize\n}\n";
+
+        let got = contract_targets_at(rs, &[], &BTreeSet::new(), &set(&["ignore", "serde_json"]));
+
+        assert_eq!(got["ignore"], set(&["WalkBuilder", "new"]), "类型名 + 它的**关联**调用都要进");
+        assert_eq!(got["serde_json"], set(&["Value"]), "`Value::Null` 是常量不是调用，只留类型名: {got:?}");
+        // 已知边界：`.hidden(false)` / `.build()` 是**实例方法**，没有类型推断就无从归属到某个 crate。
+        // 硬凑（看见 `.hidden(` 就去 ignore 里搜）会把 `new` / `get` / `build` 这类名字在每个 crate 里
+        // 都命中一片——正是本函数开头拒绝的那条路。builder 的默认值（`hidden` 默认开）因此进不了契约段。
+        assert!(!got["ignore"].contains("hidden") && !got["ignore"].contains("build"), "{got:?}");
+        // 区间之外的不收（与 ① 同款）：第 3-4 行没提 WalkBuilder
+        assert_eq!(contract_targets_at(rs, &[(3, 4)], &BTreeSet::new(), &set(&["ignore"])).get("ignore"), None);
     }
 
     #[test]
