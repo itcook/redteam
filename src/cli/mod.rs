@@ -637,7 +637,12 @@ fn fold_role_cells(report: &mut ReviewReport, recs: Vec<CellRecord>, reused: boo
     }
     report.cells.extend(recs);
     if let Err(e) = report.run.coverage.check_partition() {
-        report.run.warnings.push(format!("coverage 划分不变式被破坏（design §8.4）：{e}"));
+        // 去重（收口评审 #8）：`fold_role_cells` 每轮被调两次（reused / 本轮），每次都查**整份** coverage，
+        // scanner 那部分已经在 `finish_scan_report` 查过一遍 → 同一条破坏会逐字重复三次，稀释其他 warning。
+        let w = format!("coverage 划分不变式被破坏（design §8.4）：{e}");
+        if !report.run.warnings.contains(&w) {
+            report.run.warnings.push(w);
+        }
     }
 }
 
@@ -1145,12 +1150,27 @@ pub fn attach_cells(store: &crate::state::JobStore, job_id: &str, report: &mut R
 /// - **不败评审**：写失败只记 warning（与队列快照同口径，design §7.1）——台账是增益，不该让一轮评审失败；
 /// - 轮次标识用 `head_sha`：前台裸跑没有 job_id，而台账要的本就是「第一次/最近一次见到它是哪个 HEAD」。
 fn persist_dormant_suspicions(cwd: &Path, items: &[crate::orchestrate::queue::QueueItem], round: &str, warnings: &mut Vec<String>) {
+    // 没有轮次标识就别落账（收口评审 #7）：`first_job` 一旦以空串钉死就永远不再更新，
+    // 批 C 按轮次判增量时会把这些行当成合法轮次参与比较。与「不建库」同一档边界。
+    if round.is_empty() {
+        return;
+    }
     let rows = crate::orchestrate::ledger::rows_from_skipped(items, round);
     if rows.is_empty() {
         return;
     }
     let p = crate::db::project_db_path(cwd);
     if !p.exists() {
+        return;
+    }
+    // 旧 schema 库不在这里迁移（收口评审 #3）：`open_at` 会触发整库快照 + 丢弃评审史，
+    // 而这条路只是「顺手记一笔台账」——何况它是否触发还取决于「本轮恰好有没有截断项」这种
+    // 与库无关的偶然条件，用户无从预期。迁移交给 `init` / `dismiss` 这些显式写入口。
+    if !crate::db::ProjDb::is_current_version(&p) {
+        warnings.push(format!(
+            "疑点台账未落账：`{}` 还是旧 schema 库——跑一次 `redteam init` 或任一台账命令完成升级后再落",
+            p.display()
+        ));
         return;
     }
     let db = match crate::db::ProjDb::open_at(&p) {
@@ -1383,6 +1403,8 @@ pub async fn run_resume(
     if !roles.reviewers.is_empty() && (deep_header.is_some() || !queue_snap.is_empty()) {
         // 带标签块：diff 重建失败时也要走到函数尾部回写结果（`--resume` 只打印不落库，早 return 会让库里停在旧报告）。
         'deep: {
+            // 轮次标识（落账用）：resume 评审的仍是首跑那份代码，沿用首跑的 head_sha；缺失则空串 = 不落账
+            let round_id = report.run.head_sha.clone().unwrap_or_default();
             let (reopened, reconciled) = reconcile_queue_with_cells(&mut queue_snap, &deep_records);
             // 对账改过状态的项写回快照（下一次 resume 不必再对一遍）；重挖的项派发时 run_deep 会再写。
             for it in reconciled.iter().filter_map(|id| queue_snap.iter().find(|it| &it.id == id)) {
@@ -1415,7 +1437,7 @@ pub async fn run_resume(
                 Err(e) => {
                     // diff 重建不了 → 未完项没法重跑，但已挖出的 finding 照样进报告（未完 = 带债）。
                     report.run.warnings.push(format!("resume deep: cannot rebuild diff: {e}"));
-                    let deep = crate::orchestrate::deep::DeepRun {
+                    let mut deep = crate::orchestrate::deep::DeepRun {
                         findings: crate::consolidate::dedup(prior_findings),
                         cells: vec![],
                         // 截断数取自快照（评审修 #3）：空 meta 会让首跑被预算截掉的项既不计债也不披露。
@@ -1428,6 +1450,12 @@ pub async fn run_resume(
                         reused_cells: deep_records.iter().filter(|r| r.ok).cloned().collect(),
                         items: queue_snap.clone(),
                     };
+                    // 这条路也要并复用账（收口评审 #1）：`restored_meta` 只填截断 / 队列深度 / 疑点数，复核四量恒 0。
+                    // 而上面的 `prior_findings` 已按 `known` 回填了判决——不并的话，同一份报告里会出现
+                    // 「某 finding verdict=Refuted」而 `verify_triggered == 0`，正是出口验收第 6 项要杜绝的那种误判。
+                    crate::orchestrate::deep::fold_reused_verify(&mut deep.meta, &deep.reused_cells);
+                    // 落账同理（收口评审 #9）：首跑崩在深挖收场之后、进程退出之前时，那批截断疑点从没被落过账。
+                    persist_dormant_suspicions(cwd, &deep.items, &round_id, &mut report.run.warnings);
                     let over = overlay_deep(report, code, deep, &args, cfg, registry, t0);
                     (report, code) = over;
                     break 'deep;
@@ -1537,6 +1565,9 @@ pub async fn run_resume(
             // 原先 meta 只统计本轮新验的，于是崩溃续跑后报告里「复核触发 0 / 驳回 0」——
             // 极端情况（杀在复核尾部、续跑无事可做）整组计数全空，出口验收若按报告字段判会误判成「一次没验」。
             crate::orchestrate::deep::fold_reused_verify(&mut deep.meta, &deep.reused_cells);
+            // resume 也要落账（收口评审 #9）：`persist_dormant_suspicions` 原先只挂在 `run_code_review` 上，
+            // 崩在深挖中途的作业续跑后再次产出的 Skipped 项就永远进不了跨轮台账。
+            persist_dormant_suspicions(cwd, &deep.items, &round_id, &mut report.run.warnings);
             // 不可重建的照实说，别静默留 null：`close_ms` 是首跑扇出关闭的时刻、`budget_cells` 是首跑的预算档，
             // 两者都不在 cell 记录里，续跑重算只会得到本轮的数、与首跑语义不同。
             if deep.meta.close_ms == 0 {
@@ -2705,6 +2736,123 @@ mod resume_tests {
             assert_eq!(report.run.deep.as_ref().map(|d| d.budget_skipped), Some(1), "{shape}");
             assert!(report.run.warnings.iter().any(|w| w.contains("skipped(budget) 1")), "{shape}: {:?}", report.run.warnings);
         }
+    }
+
+    /// resume 的**主**收口路径（diff 重建成功）也要落账（收口评审 #9）：首跑崩在深挖中途，
+    /// 续跑重跑深挖后再次产出的 Skipped 项若不落账，这批疑点就永远进不了跨轮台账、批 C 也无从激活。
+    #[tokio::test]
+    async fn resume_main_path_records_skipped_items_into_the_ledger() {
+        use crate::orchestrate::queue::{ItemKind, ItemState, QueueItem};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        repo_with_changes(ws, &[("x.rs", "fn x() {\n    x_marker();\n}\n")]);
+        let head = String::from_utf8(std::process::Command::new("git").args(["-C", ws.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output().unwrap().stdout).unwrap().trim().to_string();
+        let store = crate::state::JobStore::open(ws).unwrap();
+        scan_done_job(&store);
+        // 首跑报告带 head_sha（落账的轮次标识从这里取）
+        let prior = ReviewReport {
+            run: RunMeta { job_id: "j".into(), head_sha: Some(head.clone()), ..Default::default() },
+            verdict: Verdict::ScanOnly, stats: Default::default(), findings: vec![], scan: None,
+            cells: vec![], clusters: Default::default(), schema_version: Default::default(),
+        };
+        store.write_result("j", &serde_json::to_string(&prior).unwrap()).unwrap();
+        // 快照里留一个**带疑点的**截断项：scanner 格已齐 → 本轮不 replay → 它保持 Skipped 到收场
+        let sus = crate::domain::Suspicion {
+            file: "z.rs".into(), line_start: 9, line_end: 9, hint: "首跑就被截掉的".into(),
+            category: None, confidence: 0.5, quote: "let z = risky();".into(),
+        };
+        store.put_queue_item("j", &QueueItem {
+            id: "z.rs:scan:1-9".into(),
+            spec: crate::pack::region::QueueItemSpec::new("z.rs".into(), vec![(1, 9)],
+                crate::pack::region::Origin::Scan, vec![sus.clone()]).unwrap(),
+            score: 1.0, agreement: 1, state: ItemState::Skipped, kind: ItemKind::Suspicion,
+            dispatch_agreement: 1, landed_agreement: None, families: vec!["alpha".into()], enqueued_ms: None,
+            arrivals: vec![], members: vec![sus], member_families: vec![vec!["alpha".into()]],
+            block: Default::default(), peak_agreement: 0, risk_band: 0,
+        }).unwrap();
+        let (reg, _rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+        let (report, _code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        assert!(!report.run.warnings.iter().any(|w| w.contains("cannot rebuild diff")),
+                "前提：走的是主路径 {:?}", report.run.warnings);
+        let db = crate::db::ProjDb::open(ws).unwrap();
+        let rows = db.suspicions_for_files(&["z.rs".into()]).unwrap();
+        assert_eq!(rows.len(), 1, "主路径也要落账: {:?}", report.run.warnings);
+        assert_eq!((rows[0].hint.as_str(), rows[0].last_job.as_str()), ("首跑就被截掉的", head.as_str()));
+    }
+
+    /// resume 的**第二条**收口路径（diff 重建不了）同样要并复用复核账、同样要落账（收口评审 #1 / #9）。
+    /// 原先 A-4 只补了「diff 重建成功」那条：另一条用 `restored_meta` 造 meta，复核四量恒 0，
+    /// 于是报告里会出现「某 finding verdict=Refuted」而 `verify_triggered == 0` —— 正是出口验收第 6 项
+    /// 要杜绝的「按报告字段判会误判成一次没验」。落账同理：首跑崩在深挖收场之后时那批截断疑点从没落过账。
+    #[tokio::test]
+    async fn resume_without_rebuildable_diff_still_folds_verify_and_records_ledger() {
+        use crate::orchestrate::queue::{ItemKind, ItemState, QueueItem};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        // 提交掉改动 → 变更集为空 → 走「diff 重建不了」那条路；同时保证有 head_sha（落账的轮次标识）
+        std::fs::write(ws.join("x.rs"), "fn x() {\n    x_marker();\n}\n").unwrap();
+        git(ws, &["init", "-q"]);
+        git(ws, &["add", "."]);
+        git(ws, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        let head = String::from_utf8(std::process::Command::new("git").args(["-C", ws.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output().unwrap().stdout).unwrap().trim().to_string();
+
+        let store = crate::state::JobStore::open(ws).unwrap();
+        store.write_manifest("j", &[input("scan[g1]@p/m#1", "p/m", "P1")]).unwrap();
+        store.append_partial("j", &CellRecord::ok("scan[g1]@p/m#1", "p/m", crate::domain::CellOutput::Scan(Default::default()))).unwrap();
+        // base 指向不可达的 ref（rebase / shallow clone / 分支被删后的真实形态）→ `changed_files` 报错，
+        // 走「diff 重建不了」那条收口路；同时仓里仍有 HEAD，所以落账拿得到轮次标识。
+        let mut a = args();
+        a.base = Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into());
+        a.scope = "branch".into();
+        store.write_args_raw("j", &serde_json::to_string(&a).unwrap()).unwrap();
+        // 首跑的报告带 head_sha（resume 从这里取轮次标识）
+        let mut prior = ReviewReport {
+            run: RunMeta { head_sha: Some(head.clone()), ..Default::default() }, verdict: Verdict::ScanOnly,
+            stats: Default::default(), findings: vec![], scan: None, cells: vec![], clusters: Default::default(),
+            schema_version: Default::default(),
+        };
+        prior.run.job_id = "j".into();
+        store.write_result("j", &serde_json::to_string(&prior).unwrap()).unwrap();
+
+        // 往轮：一个已挖完的格（带 finding）+ 一个复核格（判决 Upheld）+ 一个**带疑点**的截断项
+        let mut fx = crate::domain::finding::fixtures::finding("x issue", crate::domain::Severity::Low, 1, "p/r");
+        (fx.file, fx.quote, fx.line_start, fx.line_end) = ("x.rs".into(), "x_marker();".into(), 2, 2);
+        let fid = fx.id.clone();
+        store.append_partial("j", &CellRecord::ok("review[x.rs:rule:1-2]@p/r", "p/r",
+            crate::domain::CellOutput::Review { findings: vec![fx], needs: vec![] })).unwrap();
+        store.append_partial("j", &CellRecord::ok(format!("verify[{fid}]@p/v"), "p/v",
+            crate::domain::CellOutput::Verify { verdicts: vec![crate::domain::VerifyEntry {
+                id: fid.clone(), verdict: crate::domain::VerifyVerdict::Upheld, note: "看过了".into() }] })).unwrap();
+        store.put_queue_item("j", &rule_item("x.rs", ItemState::Settled)).unwrap();
+        let sus = crate::domain::Suspicion {
+            file: "y.rs".into(), line_start: 5, line_end: 5, hint: "被截断的疑点".into(),
+            category: None, confidence: 0.6, quote: "let y = risky();".into(),
+        };
+        store.put_queue_item("j", &QueueItem {
+            id: "y.rs:scan:1-9".into(),
+            spec: crate::pack::region::QueueItemSpec::new("y.rs".into(), vec![(1, 9)],
+                crate::pack::region::Origin::Scan, vec![sus.clone()]).unwrap(),
+            score: 1.0, agreement: 1, state: ItemState::Skipped, kind: ItemKind::Suspicion,
+            dispatch_agreement: 1, landed_agreement: None, families: vec!["alpha".into()], enqueued_ms: None,
+            arrivals: vec![], members: vec![sus], member_families: vec![vec!["alpha".into()]],
+            block: Default::default(), peak_agreement: 0, risk_band: 0,
+        }).unwrap();
+        let (reg, _rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
+
+        let (report, _code) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
+
+        assert!(report.run.warnings.iter().any(|w| w.starts_with("resume deep: cannot rebuild diff")),
+                "前提：确实走了第二条路 {:?}", report.run.warnings);
+        let deep = report.run.deep.as_ref().expect("有深挖段");
+        assert_eq!(deep.verify_triggered, 1, "复用的复核格要计入，否则 refute_rate 与判决自相矛盾: {deep:?}");
+        let db = crate::db::ProjDb::open(ws).unwrap();
+        let rows = db.suspicions_for_files(&["y.rs".into()]).unwrap();
+        assert_eq!(rows.len(), 1, "被截断的疑点要进跨轮台账");
+        assert_eq!((rows[0].hint.as_str(), rows[0].first_job.as_str()), ("被截断的疑点", head.as_str()));
     }
 
     /// 「re-digging」只在真会重挖时披露（评审第 2 档 #7）：diff 重建不了（变更集为空 / 不在 git 仓）时重开的项跑不了，
@@ -4338,6 +4486,55 @@ mod tests {
 
     /// 不变式破坏要**留痕**而不是静默（M21c 批 A）：同一个格被并入两次（一次当沿用、一次当本轮），
     /// 它会同时落进 reused 与 completed —— coverage 是 verdict 分级的依据，这种账目错必须在 warnings 里看得见。
+    /// 落账不得把破坏性迁移拉进前台评审（收口评审 #3）：旧 schema 库上只记 warning、跳过落账，
+    /// 库一个字节不动——否则「跑一次自认为只读的 review」会触发整库快照 + 丢弃评审史，
+    /// 而它是否触发还取决于「本轮恰好有没有截断项」这种与库无关的偶然条件。
+    /// 同时：没有轮次标识（非 git / 无 commit）也跳过（#7）——`first_job` 一旦以空串钉死就永不更新。
+    #[test]
+    fn persist_skips_legacy_db_and_empty_round() {
+        use crate::orchestrate::queue::QueueItem;
+        let skipped: QueueItem = serde_json::from_value(serde_json::json!({
+            "id": "a.rs:scan:1-9", "score": 1.0, "agreement": 1, "state": "skipped", "kind": "suspicion",
+            "dispatch_agreement": 1, "landed_agreement": null, "families": ["alpha"],
+            "spec": { "file": "a.rs", "ranges": [[1, 9]], "origin": "scan",
+                      "notes": [{"file":"a.rs","line_start":3,"line_end":3,"hint":"可疑","confidence":0.6,"quote":"let x = take(v);"}] },
+            "members": [{"file":"a.rs","line_start":3,"line_end":3,"hint":"可疑","confidence":0.6,"quote":"let x = take(v);"}],
+        })).unwrap();
+
+        // ① 旧 schema 库：跳过 + warning，库不动
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join(crate::project::PROJECT_DIR);
+        std::fs::create_dir_all(&rt).unwrap();
+        let legacy = rt.join("proj.db");
+        let c = rusqlite::Connection::open(&legacy).unwrap();
+        c.execute_batch(
+            "CREATE TABLE dismissed (id TEXT PRIMARY KEY, status TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+               file TEXT NOT NULL DEFAULT '', quote TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT '',
+               reason TEXT NOT NULL, round TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
+             CREATE TABLE results (job_id TEXT PRIMARY KEY, json TEXT NOT NULL);
+             INSERT INTO results VALUES ('j1','{}');",
+        ).unwrap();
+        drop(c);
+        let before = std::fs::read(&legacy).unwrap();
+        let mut warnings = vec![];
+        persist_dormant_suspicions(tmp.path(), std::slice::from_ref(&skipped), "sha1", &mut warnings);
+        assert!(warnings.iter().any(|w| w.contains("旧 schema")), "{warnings:?}");
+        assert_eq!(std::fs::read(&legacy).unwrap(), before, "旧库一个字节都不该动");
+        let snaps: Vec<_> = std::fs::read_dir(&rt).unwrap()
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains("legacy-")).collect();
+        assert!(snaps.is_empty(), "不该触发整库快照: {snaps:?}");
+
+        // ② 没有轮次标识：静默跳过（不是错误，不该打扰评审）
+        let tmp2 = tempfile::tempdir().unwrap();
+        crate::project::init_project(tmp2.path()).unwrap();
+        let mut w2 = vec![];
+        persist_dormant_suspicions(tmp2.path(), std::slice::from_ref(&skipped), "", &mut w2);
+        assert!(w2.is_empty(), "{w2:?}");
+        let db = crate::db::ProjDb::open(tmp2.path()).unwrap();
+        assert!(db.suspicions_for_files(&["a.rs".into()]).unwrap().is_empty(), "空轮次不落账");
+    }
+
     /// 真实落账 / 披露路径要接管 M21 分支期的库（A-5 回归门实跑暴露的缺口）：
     /// 接管一度只挂在 `ProjDb::open()` 上，而这两条路走的是显式路径——于是 PR181 上跑完
     /// 「库没接管、台账一行没落、dormant_leads 为 0」，而两边的单测各自都是绿的。
@@ -4443,6 +4640,13 @@ mod tests {
         let w = report.run.warnings.join(" | ");
         assert!(w.contains("划分不变式被破坏") && w.contains("review[a.rs:rule:1-2]@m"), "{w}");
         assert!(w.contains("reused") && w.contains("completed"), "要说清是哪两个桶: {w}");
+        // 同一条破坏只说一次（收口评审 #8）：`fold_role_cells` 每轮被调两次、每次都查**整份** coverage，
+        // scanner 那部分还在 `finish_scan_report` 查过一遍 → 不去重就会逐字重复三遍，稀释其他 warning。
+        // 这里并入一个**不引入新破坏**的格：旧破坏仍会被检出，但不该再播报一遍。
+        let before = report.run.warnings.clone();
+        fold_role_cells(&mut report, vec![CellRecord::ok("review[b.rs:rule:9-9]@m", "m",
+            crate::domain::CellOutput::empty(Role::Reviewer))], false);
+        assert_eq!(report.run.warnings, before, "旧破坏被重复播报了: {:?}", report.run.warnings);
     }
 
     #[test]

@@ -219,20 +219,43 @@ impl ProjDb {
     }
 
     /// M21 分支期库（`proj-next.db`）→ 正式库名。目标已存在就什么都不做（两个库并存时不猜哪个是对的）。
+    ///
+    /// **顺序是 `-wal` / `-shm` 先、主库最后**（收口评审 #2）：反过来的话，主库改完名而 `-wal` 搬失败
+    /// （只读目录 / 磁盘满 / ACL）或此刻崩溃，sqlite 打开新名时找不到配套 WAL，只能读到最后一次 checkpoint
+    /// ——上次被 kill 那轮未落盘的 cell 记录连同 resume 资格一起**静默消失**，而函数还会打印「接管成功」。
+    /// 按现在的顺序，附属文件搬不动就整体放弃（已搬的搬回去），库停在原名 = 「未接管」，可重试、无损失。
     fn adopt_branch_era_db(dir: &Path) {
         let (old, new) = (dir.join(BRANCH_ERA_DB_FILE), dir.join(DB_FILE));
         if new.exists() || !old.exists() {
             return;
         }
+        let side = |base: &str, suffix: &str| dir.join(format!("{base}{suffix}"));
+        let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        for suffix in ["-wal", "-shm"] {
+            let (o, n) = (side(BRANCH_ERA_DB_FILE, suffix), side(DB_FILE, suffix));
+            if !o.exists() {
+                continue;
+            }
+            if let Err(e) = std::fs::rename(&o, &n) {
+                eprintln!("warning: M21 分支期库的 {suffix} 搬不动（{e}）：整体放弃接管以免丢 WAL 里未落盘的记录，可重试");
+                for (from, to) in moved.iter().rev() {
+                    let _ = std::fs::rename(to, from); // 搬回去，回到「未接管」
+                }
+                return;
+            }
+            moved.push((o, n));
+        }
         if let Err(e) = std::fs::rename(&old, &new) {
+            // 主库搬不动 → 附属文件也搬回去，别留下「有 wal 没库」的半途状态
+            for (from, to) in moved.iter().rev() {
+                let _ = std::fs::rename(to, from);
+            }
+            // 并发下另一个进程可能刚好接管完（此时 new 已在）——那不是错误，别叫用户去做多余的手工操作
+            if new.exists() {
+                return;
+            }
             eprintln!("warning: M21 分支期库 {} 改名失败（{e}）：作业历史暂取不回，手工改名即可", old.display());
             return;
-        }
-        for suffix in ["-wal", "-shm"] {
-            let (o, n) = (dir.join(format!("{BRANCH_ERA_DB_FILE}{suffix}")), dir.join(format!("{DB_FILE}{suffix}")));
-            if o.exists() {
-                let _ = std::fs::rename(&o, &n);
-            }
         }
         eprintln!("note: 已接管 M21 分支期库 {} → {}（作业历史与台账随之继承）", old.display(), new.display());
     }
@@ -590,6 +613,18 @@ impl ProjDb {
     }
 
     /// 豁免 id 集（活跃状态卡；withdrawn/stale 视同无卡）。
+    /// 这个库是不是已经是 v4（可以直接写）。**只读探测、零副作用**：库不在 / 打不开 / 版本不符都返回 false。
+    ///
+    /// 给「写之前先看一眼」的调用方用（收口评审 #3）：`open_at` 带一次性迁移，对一条自认为只是
+    /// 「顺手记一笔」的路径来说，触发整库快照 + 丢弃评审史的后果太重——尤其当它是否触发还取决于
+    /// 「本轮恰好有没有截断项」这种与库无关的偶然条件。
+    pub fn is_current_version(path: &Path) -> bool {
+        let Ok(conn) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+            return false;
+        };
+        Self::user_version(&conn).map(|v| v == USER_VERSION).unwrap_or(false)
+    }
+
     /// 疑点落账（M21c 批 A，design §8.2）：**幂等 upsert**——同一处疑点跨轮只有一行。
     /// 新行写全量、`activations = 0`；已有行只更新 `last_job` / `hint` / `json`，
     /// **不动** `first_job`（第一次见到它的那轮）、`activations` 与 `status`（激活与晋升是批 C 的事，不能被落账覆盖回 dormant）。
@@ -1418,6 +1453,45 @@ mod guard_tests {
         let dir3 = tempfile::tempdir().unwrap();
         ProjDb::open(dir3.path()).unwrap();
         assert!(dir3.path().join(crate::project::PROJECT_DIR).join("proj.db").is_file());
+    }
+
+    /// 接管顺序：`-wal` / `-shm` 先搬、主库最后（收口评审 #2）。反过来的话主库改完名而 WAL 搬失败，
+    /// sqlite 找不到配套 WAL，只能读到最后一次 checkpoint——上次被 kill 那轮未落盘的记录静默消失，
+    /// 而函数还会打印「接管成功」。附属文件搬不动就整体放弃（已搬的搬回去），停在「未接管」可重试。
+    #[test]
+    fn adoption_moves_sidecars_first_and_rolls_back_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path().join(crate::project::PROJECT_DIR);
+        std::fs::create_dir_all(&rt).unwrap();
+        drop(ProjDb::open_at(&rt.join("proj-next.db")).unwrap());
+        std::fs::write(rt.join("proj-next.db-wal"), b"wal-bytes").unwrap();
+        // 目标 -wal 先被一个**目录**占住 → rename 必失败，触发回滚
+        std::fs::create_dir(rt.join("proj.db-wal")).unwrap();
+
+        ProjDb::adopt_branch_era_db(&rt);
+
+        assert!(rt.join("proj-next.db").is_file(), "主库必须停在原名（未接管）");
+        assert!(!rt.join("proj.db").exists(), "不得留下「有 wal 没库」的半途状态");
+        assert_eq!(std::fs::read(rt.join("proj-next.db-wal")).unwrap(), b"wal-bytes", "WAL 要被搬回原处");
+    }
+
+    /// `is_current_version`：只读探测、零副作用——库不在 / 旧 schema / 打不开都返回 false，且不建库不改库。
+    #[test]
+    fn is_current_version_is_a_read_only_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.db");
+        assert!(!ProjDb::is_current_version(&missing));
+        assert!(!missing.exists(), "探测不得建库");
+
+        let old = dir.path().join("old.db");
+        old_shape_db_isomorphic(&old);
+        let before = std::fs::read(&old).unwrap();
+        assert!(!ProjDb::is_current_version(&old), "旧 schema → false");
+        assert_eq!(std::fs::read(&old).unwrap(), before, "探测不得改库（尤其不得触发迁移）");
+
+        let fresh = dir.path().join("fresh.db");
+        drop(ProjDb::open_at(&fresh).unwrap());
+        assert!(ProjDb::is_current_version(&fresh));
     }
 
     /// 疑点台账 upsert 幂等（M21c 批 A）：同一处疑点跨轮只有一行，

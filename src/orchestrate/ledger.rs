@@ -12,8 +12,11 @@ pub const REASON_BUDGET: &str = "budget";
 
 /// 把队列项里**没挖成**的那些提炼成台账行（每条疑点一行）。
 ///
-/// 只落**带疑点的项**（scanner / needs 来源）：H0 规则项每轮都会由规则重新产生，不需要跨轮记忆，
-/// 且它没有 quote 锚、进不了以 quote 为身份的台账。
+/// 只落**带疑点的项**——实际就是 scanner 疑点来源的项（收口评审 #6 订正）：
+/// `QueueItem.members` 只有 scan 项非空，H0 规则项与 needs 补查项都是空的（见 `queue.rs` 的字段注释），
+/// 所以后两类不会落账。H0 每轮由规则重新产生、不需要跨轮记忆，这是设计意图；
+/// **needs 项落不了账是已知缺口**——被截断的二阶段补查项进不了台账，批 C 的 delta 激活也就捞不回它们，
+/// 要捞得给它一条独立于 quote 的身份（记 followup，别让批 C 按错误前提实现）。
 /// 同一处疑点在一轮里可能由多个家族重复提出 → 按 id 去重，保留第一条（`members` 是到达序）。
 pub fn rows_from_skipped(items: &[QueueItem], job_id: &str) -> Vec<SuspicionRow> {
     let mut out: Vec<SuspicionRow> = Vec::new();

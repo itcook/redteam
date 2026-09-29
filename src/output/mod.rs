@@ -114,6 +114,17 @@ fn render_md(r: &ReviewReport) -> String {
     if let Some(l) = &r.run.ledger {
         s.push_str(&format!("  | Ledger        | {} card(s) from {} |\n", l.loaded, l.source));
     }
+    // 休眠疑点线索（M21c 批 A，A-2）：只披露、不进 verdict。**必须进 md**——ship 循环与裸终端读的都是 md
+    // （`redteam result <job> --format md`），只落 JSON 等于这个功能对主消费路径不存在（收口评审 #4）。
+    if !r.run.dormant_leads.is_empty() {
+        s.push_str(&format!("\n- Dormant leads ({}) — 台账里落在本轮变更文件上的历史截断项；**未经深挖、不进裁决**\n\n", r.run.dormant_leads.len()));
+        s.push_str("  | File:Line | Hint | First seen | Activations |\n");
+        s.push_str("  | --- | --- | --- | --- |\n");
+        for l in &r.run.dormant_leads {
+            let short = l.first_round.chars().take(9).collect::<String>();
+            s.push_str(&format!("  | {}:{} | {} | {} | {} |\n", l.file, l.line, l.hint, short, l.activations));
+        }
+    }
     // T55（cell 级可观测）：per-model 运行摘要——耗时/轮次（>1=有 repair/多轮）/用量一眼可见，
     // 不必再手查 proj.db。旧报告无此数据（serde default 空）不渲染。
     if !r.run.cells.is_empty() {
@@ -258,6 +269,26 @@ mod tests {
                 quote:"snippet".into(),cluster_id:None,verify:None,previously_dismissed:false,
                 origin:Origin::New}],
             clusters:vec![], run:RunMeta::default() }
+    }
+
+    /// 休眠线索必须进 md（M21c 批 A，收口评审 #4）：ship 循环与裸终端读的都是 md
+    /// （`redteam result <job> --format md`），只落 JSON 等于这个功能对主消费路径不存在。
+    /// 同时措辞要说清它**未经深挖、不进裁决**，免得被当成 finding 读。
+    #[test]
+    fn md_renders_dormant_leads_as_disclosure() {
+        let mut r = report();
+        r.run.dormant_leads = vec![
+            DormantLead { file: "a.rs".into(), line: 42, hint: "边界没校验".into(), first_round: "4317c8afce0".into(), activations: 2 },
+            DormantLead { file: "b.ts".into(), line: 7, hint: "超时不可调".into(), first_round: "4317c8afce0".into(), activations: 0 },
+        ];
+        let md = render_md(&r);
+        assert!(md.contains("Dormant leads (2)"), "要有披露段: {md}");
+        assert!(md.contains("未经深挖") && md.contains("不进裁决"), "措辞要挡住「当 finding 读」: {md}");
+        assert!(md.contains("a.rs:42") && md.contains("边界没校验") && md.contains("4317c8afc"), "{md}");
+        assert!(md.contains("b.ts:7"), "{md}");
+        // 没有线索时一个字都不多写
+        r.run.dormant_leads.clear();
+        assert!(!render_md(&r).contains("Dormant"), "空则不渲染");
     }
 
     /// 被驳回的 finding 不计入头条、但仍列在详情里——头条必须把这件事说出来（收口评审 #10）。
