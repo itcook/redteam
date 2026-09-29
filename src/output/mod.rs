@@ -221,12 +221,23 @@ fn render_scan_md(r: &ReviewReport, s: &mut String) {
         "- Groups: {} · Cells: {} ok / {} failed · Suspicions: {} (agreement ≥ 2: {}) · Changed-line coverage: {cov} · Needs declared: {}\n",
         scan.groups.len(), scan.stats.cells_ok, scan.stats.cells_failed, scan.stats.total, scan.stats.agreement_ge2, scan.stats.needs_declared
     ));
+    // L4-B 三方契约（M21d 批 A）：注入量与**降级原因**都要走 md——ship 与裸终端读的是 md，
+    // 只进 JSON 等于对主消费路径不存在（M21c 批 A 收口评审 #4 的同款教训）。全零则不占版面。
+    let (inj, miss, spill) = scan.groups.iter().fold((0, 0, 0), |(a, b, c), g| {
+        (a + g.pack.contracts, b + g.pack.contract_misses, c + g.pack.contract_spilled)
+    });
+    if inj + miss + spill > 0 {
+        s.push_str(&format!(
+            "- Third-party contracts: {inj} blocks injected · {miss} crates not located (degraded, not blocking) · {spill} over cap\n"
+        ));
+    }
     if !scan.groups.is_empty() {
         s.push_str("\n  | Group | Files | Cells | Suspicions | Pack |\n  | --- | --- | --- | --- | --- |\n");
         for (i, g) in scan.groups.iter().enumerate() {
             s.push_str(&format!(
-                "  | g{} `{}` | {} | {} | {} | {} · sliced {} · folded {} · outside {} |\n",
-                i + 1, g.label, g.files.len(), g.cells.len(), g.suspicions, g.pack.body, g.pack.sliced, g.pack.folded_lines, g.pack.outside_sites
+                "  | g{} `{}` | {} | {} | {} | {} · sliced {} · folded {} · outside {} · contracts {} |\n",
+                i + 1, g.label, g.files.len(), g.cells.len(), g.suspicions, g.pack.body, g.pack.sliced, g.pack.folded_lines,
+                g.pack.outside_sites, g.pack.contracts
             ));
         }
     }
@@ -305,6 +316,32 @@ mod tests {
         assert!(md.contains("### F1: boom"), "详情照列——审计不断链");
     }
 
+    /// L4-B 三方契约（M21d 批 A）：注入量与降级原因必须走 **md**——ship 与裸终端读的是 md，
+    /// 只进 JSON 等于对主消费路径不存在（M21c 批 A 收口评审 #4 同款）。
+    #[test]
+    fn scan_md_discloses_third_party_contract_injection_and_degradation() {
+        let mut r = report();
+        let pack = |c: usize, m: usize, sp: usize| crate::pack::PackStats {
+            body: "slice".into(), contracts: c, contract_misses: m, contract_spilled: sp, ..Default::default()
+        };
+        r.scan = Some(ScanReport {
+            groups: vec![
+                ScanGroup { label: "src/a.rs".into(), files: vec!["src/a.rs".into()], cells: vec![], suspicions: 0, pack: pack(3, 1, 0) },
+                ScanGroup { label: "src/b.rs".into(), files: vec!["src/b.rs".into()], cells: vec![], suspicions: 0, pack: pack(2, 0, 4) },
+            ],
+            suspicions: vec![], stats: Default::default(), scanned_coverage: None,
+        });
+        let md = render_md(&r);
+        assert!(
+            md.contains("- Third-party contracts: 5 blocks injected · 1 crates not located (degraded, not blocking) · 4 over cap"),
+            "注入量与降级原因要跨组合计后披露: {md}"
+        );
+        assert!(md.contains("· outside 0 · contracts 3 |"), "组表也要给每组的注入数: {md}");
+
+        r.scan.as_mut().unwrap().groups.iter_mut().for_each(|g| g.pack = pack(0, 0, 0));
+        assert!(!render_md(&r).contains("Third-party contracts"), "全零不占版面（多数仓不是 Rust）");
+    }
+
     /// 批 F-3 AC3：scan-only md——verdict 行、组表、失败 cell、按组疑点（类别 / 置信 / agreement / 家族 / hint / quote 首行）、覆盖自报。
     #[test]
     fn scan_only_md_renders_groups_suspicions_and_coverage() {
@@ -331,7 +368,7 @@ mod tests {
             "- Verdict: 🔎 scan-only",
             "## Scan",
             "- Groups: 2 · Cells: 3 ok / 1 failed · Suspicions: 3 (agreement ≥ 2: 1) · Changed-line coverage: 75% · Needs declared: 2",
-            "| g1 `src/a.rs` | 1 | 2 | 2 | slice · sliced 1 · folded 30 · outside 0 |",
+            "| g1 `src/a.rs` | 1 | 2 | 2 | slice · sliced 1 · folded 30 · outside 0 · contracts 0 |",
             "- Failed cells: scan[g2]@q/b#1",
             "#### g1",
             "- `src/a.rs:3-3` [L1] conf 0.80 · agreement 2 (alpha, beta) — leak / secret logged",

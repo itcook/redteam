@@ -997,9 +997,10 @@ pub fn render_pack_only(r: &PackOnlyReport) -> String {
     for c in &r.cells {
         let p = &c.pack;
         out.push_str(&format!(
-            "cell-{} files={} bytes={} est_tokens={} pack_bytes={} diff_bytes={} over_budget={} body={} sliced={} small={} ladder={} folded_lines={} outside_sites={} outside_sigs={}\n",
+            "cell-{} files={} bytes={} est_tokens={} pack_bytes={} diff_bytes={} over_budget={} body={} sliced={} small={} ladder={} folded_lines={} outside_sites={} outside_sigs={} contracts={} contract_misses={} contract_spilled={}\n",
             c.cell, c.files, c.bytes, c.est_tokens, c.pack_bytes, c.diff_bytes, c.over_budget,
-            p.body, p.sliced, p.small_full, p.ladder, p.folded_lines, p.outside_sites, p.outside_sigs
+            p.body, p.sliced, p.small_full, p.ladder, p.folded_lines, p.outside_sites, p.outside_sigs,
+            p.contracts, p.contract_misses, p.contract_spilled
         ));
     }
     if r.cells.is_empty() {

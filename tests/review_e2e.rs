@@ -698,7 +698,7 @@ fn pack_only_slices_large_file_and_reports_shape() {
     assert!(cell_slice.contains("## 文件外片段\n") && cell_slice.contains("src/user.rs:1-4（调用点：changed_target）"), "{cell_slice}");
     assert!(!cell_slice.contains("let u7 = 7;"), "无关体折叠: {cell_slice}");
     let text = render_pack_only(&slice);
-    assert!(text.contains(" body=slice sliced=1 small=0 ladder=0 folded_lines=") && text.contains(" outside_sites=1 outside_sigs=0"), "{text}");
+    assert!(text.contains(" body=slice sliced=1 small=0 ladder=0 folded_lines=") && text.contains(" outside_sites=1 outside_sigs=0 contracts=0 contract_misses=0 contract_spilled=0"), "{text}");
     let summary: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(packs.join("summary.json")).unwrap()).unwrap();
     assert_eq!(summary["cells"][0]["pack"]["body"], "slice");
     assert_eq!(summary["cells"][0]["pack"]["sliced"], 1);

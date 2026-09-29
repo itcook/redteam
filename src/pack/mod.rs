@@ -87,6 +87,19 @@ pub struct PackStats {
     pub outside_sites: usize,
     pub outside_sigs: usize,
     pub outside_bytes: usize,
+    /// L4-B 三方契约（M21d 批 A）：注入的契约块数。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub contracts: usize,
+    /// 定位不到而降级的 crate 数（registry 在 CI / 他人机器缺失时必须看得见是降级了，roadmap 风险节）。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub contract_misses: usize,
+    /// 超帽没进去的契约块数（仓内上下文优先，三方契约用剩下的额度）。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub contract_spilled: usize,
+}
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
 }
 
 /// `pack_bundle` 产物：正文 + 形态统计。
@@ -929,9 +942,43 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
     // 0 壳：改动源文（切片 / 全文 + 梯子；overflow → omit）
     let bodies = body_section_ctx(&files, remaining, &mut omit, opts, &mut stats);
     // 文件外片段（仅 slice 档）：帽 = min(0 壳后剩余, 组预算 / 8)
+    let outside_cap = remaining.saturating_sub(bodies.len()).min(budget / OUTSIDE_BUDGET_SHARE);
     let outside = if opts.body == PackBody::Slice {
-        let cap = remaining.saturating_sub(bodies.len()).min(budget / OUTSIDE_BUDGET_SHARE);
-        outside_section(&files, root, opts, changeset, cap, &mut omit, &mut stats)
+        outside_section(&files, root, opts, changeset, outside_cap, &mut omit, &mut stats)
+    } else {
+        String::new()
+    };
+    // L4-B 三方契约（M21d 批 A，design §9.4 B）：**与文件外片段共享同一份帽**，且排在它之后拿剩下的——
+    // 仓内的调用点与签名更贴近本次改动，三方契约不得把它们挤掉。
+    // 非 Cargo 工作区 / Cargo.lock 缺失 / registry 没解包 → 安静降级，只把原因记进 omit 与统计（roadmap 风险节）。
+    let contracts = if opts.body == PackBody::Slice {
+        let cap = outside_cap.saturating_sub(outside.len());
+        if cap < OUTSIDE_MIN_CAP {
+            omit.push(format!("三方契约：预算不足（帽 {cap} 字节 < {OUTSIDE_MIN_CAP}），未注入"));
+            String::new()
+        } else {
+            let sources: Vec<(&str, &str)> = files.iter().map(|c| (c.fc.path.as_str(), c.content.as_str())).collect();
+            let sec = contracts::contracts_section(root, &sources, &contracts::local_module_names(root), cap);
+            stats.contracts = sec.blocks;
+            stats.contract_misses = sec.misses.len();
+            stats.contract_spilled = sec.spilled;
+            for miss in sec.misses.iter().take(OUTSIDE_SPILL_LIST_MAX) {
+                omit.push(match miss {
+                    contracts::LocateMiss::NotLocked(k) => format!("{k} — 三方契约未注入（Cargo.lock 里没有这个包）"),
+                    contracts::LocateMiss::NotVendored { krate, version } => {
+                        format!("{krate} {version} — 三方契约未注入（registry 无解包目录，`cargo fetch` 后重跑）")
+                    }
+                });
+            }
+            if sec.spilled > 0 {
+                omit.push(format!("… 三方契约超帽 +{}", sec.spilled));
+            }
+            if sec.text.is_empty() {
+                String::new()
+            } else {
+                format!("## 三方契约（依赖库签名 + doc）\n{}", sec.text)
+            }
+        }
     } else {
         String::new()
     };
@@ -943,6 +990,9 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
     }
     if !outside.is_empty() {
         sections.push(outside);
+    }
+    if !contracts.is_empty() {
+        sections.push(contracts);
     }
     if !omit.is_empty() {
         let total = omit.len();
@@ -1462,6 +1512,107 @@ mod tests {
     }
 
     // ---- 批 E E-3：文件外片段 ----
+
+    /// 跨层接线（A-3）：`pack_bundle` → `contracts_section` → **本机真实 registry**。
+    /// M21c 批 A 连续两次栽在「各自绿、接起来不通」，所以这条不用假 registry：临时仓复制本仓
+    /// `Cargo.lock`（版本与本机解包目录天然一致），源文按路径调 `serde_json`。registry 缺失时跳过。
+    #[test]
+    fn contracts_reach_pack_text_through_the_real_chain() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let Some(reg) = contracts::registry_root() else { return };
+        if !reg.exists() {
+            return; // 没 registry 的机器：降级路径由下一条用例覆盖
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        let body = "use serde_json::Value;\n\npub fn decode(s: &str) -> Value {\n    let v: Value = serde_json::from_str(s).unwrap();\n    v\n}\n";
+        std::fs::write(root.join("src/a.rs"), body).unwrap();
+        let b = Bundle::from_files(vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -1,1 +1,1 @@\n+    let v: Value = serde_json::from_str(s).unwrap();\n".into(),
+        }]);
+
+        let p = pack_bundle(&b, root, 1_000_000, 0, &PackOpts::default(), &["src/a.rs".to_string()]);
+
+        assert!(p.stats.contracts > 0, "真实链路上一块契约都没注入: {}", p.text);
+        assert!(p.text.contains("## 三方契约（依赖库签名 + doc）"), "{}", p.text);
+        assert!(p.text.contains("pub fn from_str"), "调的是 serde_json::from_str，契约就该是它: {}", p.text);
+        let ver = crate::pack::contracts::locked_versions(&std::fs::read_to_string(root.join("Cargo.lock")).unwrap());
+        let ver = ver.get("serde_json").cloned().unwrap();
+        assert!(p.text.contains(&format!("serde_json {ver}")), "坐标要带**锁定版本**（L4-B 的理由就在版本上）: {}", p.text);
+    }
+
+    /// 降级（A-3 / roadmap 风险节）：不是 Cargo 工作区 → 无契约段、统计为 0、其余段照旧，不阻塞评审。
+    #[test]
+    fn missing_cargo_lock_degrades_without_blocking_the_pack() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let body = "use serde_json::Value;\npub fn decode(s: &str) -> Value { serde_json::from_str(s).unwrap() }\n";
+        std::fs::write(root.join("src/a.rs"), body).unwrap();
+        let b = Bundle::from_files(vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -1,1 +1,1 @@\n+pub fn decode(s: &str) -> Value { serde_json::from_str(s).unwrap() }\n".into(),
+        }]);
+
+        let p = pack_bundle(&b, root, 1_000_000, 0, &PackOpts::default(), &["src/a.rs".to_string()]);
+
+        assert_eq!((p.stats.contracts, p.stats.contract_misses, p.stats.contract_spilled), (0, 0, 0));
+        assert!(!p.text.contains("## 三方契约"), "{}", p.text);
+        assert!(p.text.contains("pub fn decode"), "正文照旧: {}", p.text);
+    }
+
+    /// 定位失败要**能被看见**（roadmap 风险节：registry 在 CI / 他人机器缺失 → 降级不阻塞，但要披露原因）。
+    /// 用一个永远不会存在的包名，使断言不依赖本机 registry 里有什么。
+    #[test]
+    fn unlocatable_crate_is_disclosed_in_the_omission_list() {
+        use crate::bundle::Bundle;
+        use crate::evidence::git::FileChange;
+        if contracts::registry_root().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.lock"), "[[package]]\nname = \"nosuchkit\"\nversion = \"9.9.9\"\n").unwrap();
+        std::fs::write(root.join("src/a.rs"), "use nosuchkit::thing;\npub fn f() { thing(); }\n").unwrap();
+        let b = Bundle::from_files(vec![FileChange {
+            path: "src/a.rs".into(),
+            diff: "@@ -1,1 +1,1 @@\n+pub fn f() { thing(); }\n".into(),
+        }]);
+
+        let p = pack_bundle(&b, root, 1_000_000, 0, &PackOpts::default(), &["src/a.rs".to_string()]);
+
+        assert_eq!((p.stats.contracts, p.stats.contract_misses), (0, 1), "{:?}", p.stats);
+        assert!(
+            p.text.contains("nosuchkit 9.9.9 — 三方契约未注入（registry 无解包目录"),
+            "降级了就要说是哪个包、哪个版本、为什么: {}",
+            p.text
+        );
+    }
+
+    /// 预算优先级（A-3 的立项条件）：三方契约与文件外片段**共享同一份帽**，且排在它之后——
+    /// 帽被仓内上下文吃光时，契约整段不注入，只留一行可披露的原因。
+    #[test]
+    fn contracts_never_crowd_out_in_repo_context() {
+        let (tmp, b, changeset) = outside_repo();
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"), tmp.path().join("Cargo.lock")).unwrap();
+        for i in 1..=5 {
+            let pad = "x".repeat(100);
+            std::fs::write(tmp.path().join(format!("src/u{i}.rs")), format!("fn use_{i}() {{ let padding_{i} = \"{pad}\"; compute_total(&[{i}]); }}\n")).unwrap();
+        }
+
+        let tight = pack_bundle(&b, tmp.path(), 2_400, 0, &PackOpts::default(), &changeset);
+
+        assert!(tight.text.contains("## 文件外片段"), "仓内上下文必须先拿到帽: {}", tight.text);
+        assert_eq!(tight.stats.contracts, 0, "帽已被仓内上下文吃光，契约不该挤进来");
+        assert!(tight.text.contains("三方契约：预算不足"), "降级要说得出原因: {}", tight.text);
+    }
 
     /// 临时仓：core.rs（改动，compute_total 引用本文件未定义的 parse_widget）+ user.rs（caller）+ lib_defs.rs（callee 定义带 doc）
     /// + 应被跳过的：tests/it.rs、scripts/run.py（非支持语言）、id_rsa.rs（凭据基名）、变更集内的 sibling.rs。

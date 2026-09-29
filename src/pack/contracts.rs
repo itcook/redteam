@@ -317,6 +317,175 @@ pub fn render_contract(crate_dir: &Path, hit: &ContractHit, version: &str) -> Op
     ))
 }
 
+/// 从一批 Rust 源里抽「**要查哪个 crate 的哪些名字**」（A-3）。
+///
+/// 两个来源，并集：
+/// - `use serde_json::Value;` / `use serde::{Serialize, Deserialize};` → 引入的末端名（多是类型，`pub fn` 搜不到，
+///   但成本为零、且 `use foo::bar_fn` 这种直接引入函数的写法很常见）；
+/// - `serde_json::from_str(…)` 这种**限定调用** → `(crate, name)`，这是主要来源：路径调用不写 `use`，
+///   只看 `use` 会漏掉绝大多数真正被调的三方函数。
+///
+/// 不用「文件里所有标识符」去搜：`new` / `get` / `len` 这类名字在任何 crate 里都命中一片，
+/// 注入的噪音会把仓内上下文挤掉，而 L4-B 的价值恰恰在于**给对的那一条**。
+///
+/// `known` = `Cargo.lock` 里的包名（归一后）。2018 版**不写 `use` 也能按路径调**
+/// （`serde_json::to_string(&x)`），所以限定调用不能只认 `use` 引进来的 crate；但也不能谁都认——
+/// 拿 `known` 兜底：能按路径调的必然是依赖，必然在 lock 里。`use` 那条路不过 `known`，
+/// 因为「显式 use 了却定位不到」本身就是值得披露的降级原因。
+pub fn contract_targets(
+    sources: &[(&str, &str)],
+    local_mods: &BTreeSet<String>,
+    known: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    // `krate::fn(` —— 直接的自由函数调用
+    let qualified = regex::Regex::new(r"\b([a-z][a-z0-9_]*)::([a-z_][a-z0-9_]*)\s*[(<]").expect("static regex");
+    // `krate::Type::method(` —— Rust 里更常见的形态（`regex::Regex::new`、`serde_json::Value::from`）。
+    // 取**方法名**去搜（类型名搜不到 `pub fn`）；搜出来的同名方法可能属别的类型，但块里会披露 owner
+    // （`RegexSet::new` vs `Regex::new` 一眼可辨），这比完全不给强。
+    let assoc = regex::Regex::new(r"\b([a-z][a-z0-9_]*)::([A-Z][A-Za-z0-9_]*)::([a-z_][a-z0-9_]*)\s*[(<]").expect("static regex");
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (path, content) in sources {
+        if !path.ends_with(".rs") {
+            continue;
+        }
+        let externals = external_crates(content, local_mods);
+        // ① use 引入的末端名
+        for line in content.lines() {
+            let t = line.trim();
+            let t = t.strip_prefix("pub").map(str::trim_start).unwrap_or(t);
+            let t = if t.starts_with('(') { t.split_once(')').map(|(_, r)| r.trim_start()).unwrap_or(t) } else { t };
+            let Some(rest) = t.strip_prefix("use ") else { continue };
+            let head = rest.trim_start().split(|c: char| !(c.is_alphanumeric() || c == '_')).find(|s| !s.is_empty()).unwrap_or("");
+            if !externals.contains(head) {
+                continue;
+            }
+            for tok in rest.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|s| !s.is_empty()).skip(1) {
+                if tok != "as" && tok != head {
+                    out.entry(head.to_string()).or_default().insert(tok.to_string());
+                }
+            }
+        }
+        // ② 限定调用 `krate::name(` / `krate::name::<T>(`
+        let callable = |k: &str| {
+            !local_mods.contains(k)
+                && !matches!(k, "std" | "core" | "alloc" | "crate" | "super" | "self")
+                && (externals.contains(k) || known.contains(&normalize_crate(k)))
+        };
+        for c in qualified.captures_iter(content) {
+            let (k, n) = (&c[1], &c[2]);
+            if callable(k) {
+                out.entry(k.to_string()).or_default().insert(n.to_string());
+            }
+        }
+        // ③ 限定关联调用 `krate::Type::method(`
+        for c in assoc.captures_iter(content) {
+            let (k, n) = (&c[1], &c[3]);
+            if callable(k) {
+                out.entry(k.to_string()).or_default().insert(n.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 本 crate 的顶层模块名（`src/` 下的目录与 `.rs` 文件名）。
+///
+/// 2018 版里 `use foo::bar` 的 `foo` 既可能是三方 crate，也可能是本 crate 的顶层模块
+/// （`mod foo;` 之后可以直接 `use foo::…`）。把它们排除掉，否则会拿着本仓的模块名去 registry 里空转。
+pub fn local_module_names(repo_root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(repo_root.join("src")) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        let name = match e.file_type() {
+            Ok(t) if t.is_dir() => p.file_name().and_then(|n| n.to_str()).map(str::to_string),
+            Ok(t) if t.is_file() && p.extension().is_some_and(|x| x == "rs") => {
+                p.file_stem().and_then(|n| n.to_str()).map(str::to_string)
+            }
+            _ => None,
+        };
+        match name.as_deref() {
+            None | Some("main") | Some("lib") | Some("mod") => {}
+            Some(n) => {
+                out.insert(n.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 一段可注入的三方契约文本 + 它的账（A-3）。
+#[derive(Debug, Default)]
+pub struct ContractSection {
+    /// 渲染好的块（已按 `cap` 截断）。
+    pub text: String,
+    /// 实际注入的契约块数。
+    pub blocks: usize,
+    /// 定位不到的原因（进 omit / RunMeta 披露——registry 在 CI / 他人机器缺失时必须看得见是降级了）。
+    pub misses: Vec<LocateMiss>,
+    /// 因为超帽没能进去的块数。
+    pub spilled: usize,
+}
+
+/// 组装三方契约段：定位 → 抽取 → 渲染，总字节受 `cap` 封顶。
+///
+/// `cap` 由调用方给**仓内上下文用剩的额度**——三方契约不得挤掉仓内的调用点与签名（它们更贴近本次改动）。
+pub fn contracts_section(
+    repo_root: &Path,
+    sources: &[(&str, &str)],
+    local_mods: &BTreeSet<String>,
+    cap: usize,
+) -> ContractSection {
+    let Some(reg) = registry_root() else { return ContractSection::default() };
+    contracts_section_in(repo_root, &reg, sources, local_mods, cap)
+}
+
+/// 同上，但 registry 根由调用方给——`CARGO_HOME` 是进程级全局，测试里改它会互相打架，
+/// 所以把「从哪儿找」这件事留在边界上（[`contracts_section`] 是唯一读环境的那层）。
+pub fn contracts_section_in(
+    repo_root: &Path,
+    registry_src: &Path,
+    sources: &[(&str, &str)],
+    local_mods: &BTreeSet<String>,
+    cap: usize,
+) -> ContractSection {
+    let mut out = ContractSection::default();
+    if cap == 0 {
+        return out;
+    }
+    let Ok(lock) = std::fs::read_to_string(repo_root.join("Cargo.lock")) else {
+        // 不是 Cargo 工作区（或 lock 没提交）——安静降级，不是错误
+        return out;
+    };
+    let locked = locked_versions(&lock);
+    let known: BTreeSet<String> = locked.keys().map(|k| normalize_crate(k)).collect();
+    let targets = contract_targets(sources, local_mods, &known);
+    if targets.is_empty() {
+        return out;
+    }
+    let names: BTreeSet<String> = targets.keys().cloned().collect();
+    let (found, misses) = locate_all(registry_src, &locked, &names);
+    out.misses = misses;
+    for (krate, dir) in &found {
+        let Some(want) = targets.get(krate) else { continue };
+        let version = locked
+            .iter()
+            .find(|(k, _)| normalize_crate(k) == normalize_crate(krate))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        for hit in find_contracts(dir, krate, want, HITS_PER_NAME * 4) {
+            let Some(block) = render_contract(dir, &hit, &version) else { continue };
+            if out.text.len() + block.len() > cap {
+                out.spilled += 1;
+                continue;
+            }
+            out.text.push_str(&block);
+            out.blocks += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +682,113 @@ version = "9.9.9"
         assert!(find_contracts(d.path(), "k", &set(&["a"]), 0).is_empty(), "cap 0 → 不走仓");
         // 源目录不存在（git / path 依赖被误当 registry 包）→ 空，不 panic
         assert!(find_contracts(Path::new("/nonexistent"), "k", &set(&["a"]), 50).is_empty());
+    }
+
+    #[test]
+    fn contract_targets_takes_use_tails_and_qualified_calls() {
+        let rs = r#"
+use serde_json::Value;
+use anyhow::{Context, bail};
+use mymod::helper;
+fn f(s: &str) -> Value {
+    let v = serde_json::from_str(s).unwrap();
+    let t = serde_json::to_string_pretty(&v).unwrap();
+    let r = regex::Regex::new("x").unwrap();
+    let n = tokio::spawn(async {});
+    let g = v.get("k");              // 无 crate 限定 → 不该被当成目标
+    mymod::local_fn(t, r, n, g);     // 本仓模块 → 不该进
+    nosuchthing::do_it();            // 既没 use、也不在 lock 里 → 不该进（否则 misses 全是垃圾）
+}
+"#;
+        let got = contract_targets(&[("src/a.rs", rs)], &set(&["mymod"]), &set(&["regex", "tokio", "mymod"]));
+
+        assert_eq!(got["serde_json"], set(&["Value", "from_str", "to_string_pretty"]));
+        assert_eq!(got["anyhow"], set(&["Context", "bail"]));
+        assert_eq!(got["regex"], set(&["new"]), "`regex::Regex::new` 没写 use，靠 Cargo.lock 认；取**方法名**去搜");
+        assert_eq!(got["tokio"], set(&["spawn"]));
+        assert!(!got.contains_key("nosuchthing"), "不在 lock 里的限定路径不该当 crate: {:?}", got.keys().collect::<Vec<_>>());
+        assert!(!got.contains_key("mymod"), "本仓模块不该去 registry 空转: {:?}", got.keys().collect::<Vec<_>>());
+        // `v.get("k")` 是方法调用、不带 crate 限定——**不能**把它算进任何 crate：
+        // `get` / `new` / `len` 这类名字在任何 crate 里都命中一片，注入的噪音会把仓内上下文挤掉
+        assert!(got.values().all(|n| !n.contains("get")), "无限定的方法名混进来了: {got:?}");
+    }
+
+    #[test]
+    fn contract_targets_skips_non_rust_sources() {
+        let ts = "import { x } from 'serde_json';\nserde_json::from_str(s);\n";
+        assert!(
+            contract_targets(&[("src/a.ts", ts)], &BTreeSet::new(), &set(&["serde_json"])).is_empty(),
+            "非 .rs 不走 Rust 定位链（Go / TS 是已知缺口）"
+        );
+    }
+
+    #[test]
+    fn local_module_names_reads_src_layout() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src/pack")).unwrap();
+        std::fs::write(d.path().join("src/lib.rs"), "").unwrap();
+        std::fs::write(d.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(d.path().join("src/domain.rs"), "").unwrap();
+        std::fs::write(d.path().join("src/notes.md"), "").unwrap();
+        std::fs::write(d.path().join("src/pack/mod.rs"), "").unwrap();
+
+        let got = local_module_names(d.path());
+
+        assert_eq!(got, set(&["domain", "pack"]), "顶层模块 = 目录 + .rs 文件名，排除 lib/main/mod 与非 .rs");
+        assert!(local_module_names(Path::new("/nonexistent")).is_empty(), "没有 src/ → 空，不 panic");
+    }
+
+    /// 组装段：定位 → 抽取 → 渲染，且 **cap 是硬帽**（超出的记 spilled，不进文本）。
+    #[test]
+    fn contracts_section_renders_within_cap_and_counts_spill() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\n").unwrap();
+        let reg = d.path().join("registry/src");
+        let kit = reg.join("index-x/kit-2.1.0");
+        fake_crate(&kit, &[(
+            "lib.rs",
+            "/// 造一个东西。\npub fn make(a: u8) -> u8 {\n    let secret = a + 1;\n    secret\n}\n\n/// 拆一个东西。\npub fn take(a: u8) -> u8 {\n    a\n}\n",
+        )]);
+        let src = "use kit::make;\nfn f() { kit::take(1); make(2); }\n";
+
+        let big = contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 4096);
+        assert_eq!((big.blocks, big.spilled), (2, 0), "两个名字都该抽到: {}", big.text);
+        assert!(big.text.contains("kit 2.1.0"), "坐标要带锁定版本（L4-B 的理由就在版本上）: {}", big.text);
+        assert!(big.text.contains("pub fn make") && big.text.contains("拆一个东西"), "签名 + 上方 doc: {}", big.text);
+        assert!(!big.text.contains("let secret"), "函数体默认不带（design §9.4 B）: {}", big.text);
+        assert!(big.misses.is_empty(), "{:?}", big.misses);
+
+        // 帽只放得下一块 → 另一块计 spilled，且**文本不得超帽**
+        let one = contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), big.text.len() - 1);
+        assert_eq!((one.blocks, one.spilled), (1, 1), "{}", one.text);
+        assert!(one.text.len() < big.text.len(), "帽是硬的: {} 字节", one.text.len());
+        assert_eq!(contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 0).blocks, 0);
+    }
+
+    /// 三条降级路径：非 Cargo 工作区 / 包没锁 / 锁了没解包——一律空段 + 可披露原因，不 panic。
+    #[test]
+    fn contracts_section_degrades_without_lock_or_registry() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let reg = d.path().join("registry/src");
+        std::fs::create_dir_all(reg.join("index-x")).unwrap();
+        let src = "use kit::make;\nfn f() { kit::take(1); }\n";
+
+        let no_lock = contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 4096);
+        assert!(no_lock.text.is_empty() && no_lock.misses.is_empty(), "没 Cargo.lock 不是错误，安静降级");
+
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"other\"\nversion = \"1.0.0\"\n").unwrap();
+        let not_locked = contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 4096);
+        assert_eq!(not_locked.misses, vec![LocateMiss::NotLocked("kit".into())]);
+        assert_eq!(not_locked.blocks, 0);
+
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\n").unwrap();
+        let not_vendored = contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 4096);
+        assert_eq!(not_vendored.misses, vec![LocateMiss::NotVendored { krate: "kit".into(), version: "2.1.0".into() }]);
+        assert!(not_vendored.text.is_empty());
     }
 
     /// registry 根不存在（CI / 他人机器）→ 不 panic、不阻塞，全部计入 misses。
