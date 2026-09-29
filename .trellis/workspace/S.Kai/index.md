@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 24
-- **Last Active**: 2026-09-23
+- **Total Sessions**: 25
+- **Last Active**: 2026-09-29
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~746 | Active |
+| `journal-1.md` | ~776 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 25 | 2026-09-29 | M21d 批 A：L4-B 三方契约注入（A-1..A-5 + dogfood + code-review 收口） | `02472c9`, `7ff4f99`, `abbd4cb`, `f634085`, `c997614`, `b588b0e`, `7bc0f0c`, `cdb996b`, `ac68be1` | `feat/m21d-contracts` |
 | 24 | 2026-09-23 | M21b 出口验收收口：解析宽容 + 网关退避 + 三轮验收 + D18 裁决 | `2bd3ab7`, `122fd9b`, `d2a08b1`, `0849ee7`, `ddf9e45`, `ed83cb7`, `9912f64`, `e54d916`, `ae532e2` | `feat/m21-review-engine` |
 | 23 | 2026-09-21 | M21b 批 D：verifier 流式复核接线、离线基线裁定与收口评审 | `369517a`, `8517784`, `fd04420`, `7f0f567`, `6821535`, `16f2d72`, `5647a81`, `de0cd73`, `4f9cd0e`, `0290798`, `48073b0`, `cefc2f2` | `feat/m21b-verifier` |
 | 22 | 2026-09-21 | M21b 批 C3：深挖选项稳定性（结构定项 / 两轴共识 / 分层排序与保底一格 / needs 入队）+ 三档评审全修 | `8fbeb64`, `17cc832`, `023b5c5`, `c81aa67`, `9d45a9c`, `56649a7`, `4a12bb5`, `5e25424`, `8878434`, `a75d8ee`, `cece0eb`, `bbc4fa1` | `feat/m21b-deep-stability` |

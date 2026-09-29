@@ -744,3 +744,33 @@ scan 全完才挖改成两段重叠：H0 t=0 开挖、scanner 格完成即入队
 ### Status
 
 [OK] **Completed**
+
+
+## Session 25: M21d 批 A：L4-B 三方契约注入（A-1..A-5 + dogfood + code-review 收口）
+<!-- trellis-session: v=2 fp=6ab303118db961c4 -->
+
+**Date**: 2026-09-29
+**Task**: M21d 批 A：L4-B 三方契约注入（A-1..A-5 + dogfood + code-review 收口）
+**Branch**: `feat/m21d-contracts`
+
+### Summary
+
+L4-B 三方契约注入落地：use → Cargo.lock 精确版本 → registry 源目录的定位链，pub fn 签名 + doc 抽取（自由函数优先、同名歧义带归属），契约段与文件外片段共享同一份预算帽（三方契约不得挤掉仓内上下文），needs{kind:api} 联动让深挖 cell 带契约 + 函数体。验收分五层递进，每层都抓到下一层照不到的东西：单测 + 变异 38 条 → pack-only 确定性验收（本仓注入 21 块、CARGO_HOME 缺失时 0 注入且不阻塞、PR181 零 Rust 注入恒 0）→ 真实靶子 + 反事实对照（发现名气大的 API 上模型先验已够，L4-B 口径据此改述为「注入」而非「抓到」，记 D21）→ PR181 全量回归（verdict 一致、findings 在带内、失败格 0）→ dogfood 8 条 → code-review 7 条。两条 high 都在最后一层才浮出来：A-4 在首跑路径上整个不生效（scan_cells 恒空，两条用例都只构造了 resume 形态——第三次栽在「各自绿、接起来不通」），以及同名多版本只留最后一个（本仓 lock 有 14 组重名，thiserror 1 与 2 并存，会给出标着错版本号的签名）。合计 895 lib 测试绿、变异 55 条全红、clippy 基线不变、make verify 绿。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `02472c9` | feat(pack): L4-B 定位链——use → Cargo.lock 精确版本 → registry 源目录 |
+| `7ff4f99` | feat(pack): L4-B 契约抽取——pub fn 签名 + doc，自由函数优先、同名歧义带归属 |
+| `abbd4cb` | feat(pack): L4-B 注入与观测——共享文件外片段的帽，md 披露注入数与降级原因 |
+| `f634085` | feat(pack,deep): L4-B needs{api} 联动——深挖 cell 带契约 + 函数体 |
+| `c997614` | fix(pack): 契约排序——被点名的类型的方法优先（A-5 自评审探针实测） |
+| `b588b0e` | feat(pack): 契约目标补 `use krate::Type;` + `Type::method(` 形态 |
+| `7bc0f0c` | fix(pack): 省略清单去假 miss——本仓包名与同文件子模块不是三方 |
+| `cdb996b` | fix(pack,deep,output): dogfood 八条——api 声明三道筛、版本切分、本地包判定、md 双门 |
+| `ac68be1` | fix(orchestrate,pack,output): code-review 七条——A-4 首跑路径失效、同名多版本、降级披露补齐 |
+
+### Status
+
+[OK] **Completed**
