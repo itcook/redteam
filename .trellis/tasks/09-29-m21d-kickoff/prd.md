@@ -48,8 +48,8 @@ M21c 开工时我写过「尸检指向覆盖缺口的药是 M21d 的三方契约
 **警惕「各自绿、接起来不通」**：M21c 批 A 连续两次栽在这上面（接管挂错层、resume 第二条出口漏挂），
 新增跨层接线一律配一条**集成级**用例。
 
-## 本任务产出
+## 本任务产出（已完成）
 
-1. 上面两条校正 → 写进 decisions（D20）与 roadmap M21d。
-2. `.next/plans/2026-09-29-redteam-m21d-context-depth-plan.md`（锁定）：按批次展开到 Task 粒度。
-3. 开批 A 的 Trellis 任务。
+1. ✅ 两条校正 → decisions **D20**（三条定案 + 方法论账）、roadmap M21d 状态头与验收（`87dfe52`）。
+2. ✅ plan `.next/plans/2026-09-29-redteam-m21d-context-depth-plan.md`（锁定，三批到 Task 粒度）。
+3. 下一步：开批 A `m21d-contracts`（L4-B 定位链 → 契约抽取 → 注入与观测 → needs 联动 → 本仓验收）。
