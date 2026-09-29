@@ -649,6 +649,64 @@ fn pack_only_binary_exits_zero_without_reading_secrets() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("cell-1 files=1 bytes="), "{}", String::from_utf8_lossy(&out.stdout));
 }
 
+/// M21d 批 B-1（design §10.5）：`.redteam/brief.md` 进**稳定前缀**里的 `<repo_brief>` 段；
+/// 没有它时 prompt 与今日逐字节一致。走真实二进制 + 真实落盘 prompt，钉的是跨层接线。
+#[test]
+fn repo_brief_enters_the_stable_prefix_and_is_absent_without_the_file() {
+    let bin = env!("CARGO_BIN_EXE_redteam");
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "pub fn alpha_marker() {}\n").unwrap();
+    git(&["add", "-A"]);
+    let home = tempfile::tempdir().unwrap();
+    let run = || {
+        let out = std::process::Command::new(bin)
+            .current_dir(dir.path())
+            .env("REDTEAM_HOME", home.path())
+            .args(["review", "--pack-only"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let packs = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("packs=").map(str::to_string))
+            .expect("packs 目录行");
+        (std::fs::read_to_string(std::path::Path::new(&packs).join("cell-1.md")).unwrap(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    // ① 没有 brief：今日形态（空槽占位），不多不少
+    let (without, _) = run();
+    assert!(without.contains("<repo_brief>\n(none)\n</repo_brief>"), "缺失时是空槽占位: {}", &without[..without.len().min(600)]);
+
+    // ② 有 brief：内容进稳定前缀，且位置在 spec_docs 之前（design §10.3 段序）
+    std::fs::create_dir_all(dir.path().join(".redteam")).unwrap();
+    std::fs::write(dir.path().join(".redteam/brief.md"), "本仓是一个对抗式代码评审器，BRIEF_MARKER_7F。\n").unwrap();
+    let (with, _) = run();
+    assert!(with.contains("BRIEF_MARKER_7F"), "brief 没进 prompt");
+    let (b, sp) = (with.find("BRIEF_MARKER_7F").unwrap(), with.find("<spec_docs>").unwrap());
+    assert!(b < sp, "仓库简介要排在 spec 之前（design §10.3 段序）");
+    // 除 brief 段外，其余前缀逐字节不变——cache 前缀的稳定性就是这条
+    assert_eq!(
+        with.replace("本仓是一个对抗式代码评审器，BRIEF_MARKER_7F。\n", "(none)\n").replace("\n(none)\n\n", "\n(none)\n"),
+        without.replace("\n(none)\n\n", "\n(none)\n"),
+        "brief 之外的前缀不该有任何变化"
+    );
+
+    // ③ brief 里粘了私钥 → 整份跳过 + 披露（它是仓内文件，任何 PR 都能改）
+    std::fs::write(
+        dir.path().join(".redteam/brief.md"),
+        "简介\n-----BEGIN OPENSSH PRIVATE KEY-----\nZm9v\n-----END OPENSSH PRIVATE KEY-----\n",
+    ).unwrap();
+    let (guarded, stderr) = run();
+    assert!(!guarded.contains("PRIVATE KEY"), "私钥不能进 prompt");
+    assert!(stderr.contains("疑似私钥"), "要说清为什么没注入: {stderr}");
+}
+
 /// M21a 批 E（K1 / K13 / K14）：`Config::default()` 即 slice——> 8K 的改动文件走切片、他文件调用点进文件外片段、
 /// summary.json / stdout 报装包形态；`review.pack.body = "full"` 回到整文件且无文件外片段（对照臂）。
 #[test]

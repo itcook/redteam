@@ -110,6 +110,9 @@ pub struct ScanFanoutInput<'a> {
     pub others: &'a [String],
     pub user_focus: &'a str,
     pub spec_docs: &'a str,
+    /// 仓库简介（M21d 批 B-1，design §10.5）：进**稳定前缀**，每格都带、按不可信证据注入。
+    /// 空 = 没有 `.redteam/brief.md`，行为与今日逐字节一致。
+    pub repo_brief: &'a str,
     pub root: &'a std::path::Path,
     pub entries: &'a [ScanEntrySpec],
     pub samples: u32,
@@ -204,7 +207,7 @@ pub async fn run_scan_fanout(
                 precedents: "",
                 dossier: input.dossiers.get(g).map(String::as_str).unwrap_or(""),
                 spec_docs: input.spec_docs,
-                repo_brief: "",
+                repo_brief: input.repo_brief,
             })
         })
         .collect();
@@ -485,7 +488,44 @@ mod scan_tests {
         fn on_roles(&self, roles: &[Role]) { self.roles.lock().unwrap().extend_from_slice(roles); }
     }
     fn input<'a>(bundles: &'a [Bundle], dossiers: &'a [String], others: &'a [String], root: &'a std::path::Path, entries: &'a [ScanEntrySpec], samples: u32) -> ScanFanoutInput<'a> {
-        ScanFanoutInput { target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", root, entries, samples }
+        ScanFanoutInput { target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", repo_brief: "", root, entries, samples }
+    }
+
+    /// B-1 接线（M21d）：仓库简介要进**真实扇出**的 scanner 前缀。
+    /// `--pack-only` 那条路是另一套 prompt 构造——只测它等于没测这条（变异实测：改这里，pack-only 的
+    /// e2e 照绿）。缺失时是空槽占位，与今日逐字节一致。
+    #[tokio::test]
+    async fn repo_brief_reaches_the_scanner_prompt_on_the_real_fanout() {
+        let repo = repo();
+        let b = bundles(1);
+        let entries = vec![entry("p/a", "alpha", false)];
+        let backend = std::sync::Arc::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)));
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/a", "p", 8, Box::new(std::sync::Arc::clone(&backend)), Duration::from_secs(5), 0);
+        let flat = |b: &FakeChatBackend| -> String {
+            use crate::provider::tool_loop::ChatMessage as M;
+            b.messages_at(0)
+                .iter()
+                .map(|m| match m {
+                    M::System(t) | M::User(t) => t.clone(),
+                    M::UserBlocks(bs) => bs.iter().map(|x| x.text.clone()).collect::<Vec<_>>().join("\n"),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut with = input(&b, &[], &[], repo.path(), &entries, 1);
+        with.repo_brief = "本仓简介 BRIEF_MARKER_3A";
+        let _ = run_scan_fanout(&reg, &with, None, None).await;
+        assert!(flat(&backend).contains("BRIEF_MARKER_3A"), "brief 没进真实扇出的 scanner prompt");
+
+        let backend2 = std::sync::Arc::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)));
+        let mut reg2 = ProviderRegistry::new();
+        reg2.insert_scan("p/a", "p", 8, Box::new(std::sync::Arc::clone(&backend2)), Duration::from_secs(5), 0);
+        let _ = run_scan_fanout(&reg2, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
+        let w2 = flat(&backend2);
+        assert!(!w2.contains("BRIEF_MARKER_3A") && w2.contains("(none)"), "缺失时是空槽占位");
     }
 
     /// 格完成即入队（design C2 §2〔D15〕）：落盘之后逐条发**锚定后**的疑点——到达键 `{cell_id}#{i}`、家族 = 条目家族、行号取锚定值；

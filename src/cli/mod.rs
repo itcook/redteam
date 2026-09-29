@@ -327,13 +327,18 @@ pub async fn run_code_review(
     };
     if let Some(s) = sink { s.on_meta(&model_names); }
     // --spec 参照段（D2）：从 pack 预算里扣掉它占用的字节。
-    let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
+    let (budget, spec_section, mut spec_warnings) = budget_and_spec(&roles, &args.spec);
+    // 仓库简介（M21d 批 B-1，design §10.5）：每轮读一次、scanner / reviewer / verifier 共用同一份
+    // ——稳定前缀两边逐字节相同才有 cache 可言。缺失 = 空串 = 与今日一致。
+    let (repo_brief, brief_warnings) = spec::read_repo_brief(root, spec::BRIEF_BUDGET_BYTES);
+    spec_warnings.extend(brief_warnings);
     // 分组 / 装包 / 跨组索引（plan_cells：与 --pack-only 同源）。门未过 → 单包。
     let CellPlan { bundles, dossiers, others, dossier_meta, stats, pack_stats } =
         plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
     let input = ScanFanoutInput {
         target_label: &target_label, bundles: &bundles, dossiers: &dossiers, others: &others,
-        user_focus: &focus, spec_docs: &spec_section, root, entries: &entries, samples: cfg.review.scanners.samples,
+        user_focus: &focus, spec_docs: &spec_section, repo_brief: &repo_brief, root,
+        entries: &entries, samples: cfg.review.scanners.samples,
     };
     let (results, mut deep) = if roles.reviewers.is_empty() {
         (run_scan_fanout(registry, &input, sink, None).await, None)
@@ -377,6 +382,7 @@ pub async fn run_code_review(
                 budget_cells,
                 pack: &cfg.review.pack,
                 spec_docs: &spec_section,
+                repo_brief: &repo_brief,
                 target_label: &target_label,
                 snapshot: Some(&snap),
                 restore: None,
@@ -934,6 +940,8 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     // 角色集为空（无配置）时按 128K 窗保守缺省，不报错——仪表无 provider 也能跑。
     let roles = cfg.active_roles();
     let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
+    let (repo_brief, brief_warnings) = spec::read_repo_brief(cwd, spec::BRIEF_BUDGET_BYTES);
+    warnings.extend(brief_warnings);
     let selected = select_files(changes);
     let (risk, _route) = stage0_risk(&selected, cwd, args, cfg, head_sha.as_deref());
     let CellPlan { bundles, dossiers, others, stats, pack_stats, .. } =
@@ -955,7 +963,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
         let other = others.get(i).map(String::as_str).unwrap_or("");
         let sp = crate::prompt::build_scan_prompt(&crate::prompt::ScanPromptInput {
             target_label: &target, bundle: b, user_focus: &focus, cross_index: other, precedents: "",
-            dossier, spec_docs: &spec_section, repo_brief: "",
+            dossier, spec_docs: &spec_section, repo_brief: &repo_brief,
         });
         // 落盘形态 = system + 四块（openai kind 的 flatten 口径）；字节含 system 段（followup「--pack-only 口径切到 scan prompt」）。
         let prompt = format!("{}\n\n{}", sp.system, sp.flatten());
@@ -1477,7 +1485,11 @@ pub async fn run_resume(
 
             // spec 段随重跑一起带回：resume 的 reviewer prompt 必须与首跑同构，缺了契约段
             // 同一 cell 两次判读口径就不一样。
-            let (budget, spec_section, spec_warnings) = budget_and_spec(&roles, &args.spec);
+            let (budget, spec_section, mut spec_warnings) = budget_and_spec(&roles, &args.spec);
+            // 仓库简介（M21d 批 B-1，design §10.5）：每轮读一次、scanner / reviewer / verifier 共用同一份
+            // ——稳定前缀两边逐字节相同才有 cache 可言。缺失 = 空串 = 与今日一致。
+            let (repo_brief, brief_warnings) = spec::read_repo_brief(cwd, spec::BRIEF_BUDGET_BYTES);
+            spec_warnings.extend(brief_warnings);
             report.run.warnings.extend(spec_warnings);
             let CellPlan { bundles, .. } =
                 plan_cells(selected, cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
@@ -1534,6 +1546,7 @@ pub async fn run_resume(
                     budget_cells,
                     pack: &cfg.review.pack,
                     spec_docs: &spec_section,
+                    repo_brief: &repo_brief,
                     target_label: &target_label,
                     snapshot: Some(&snap2),
                     restore: Some(&queue_snap),

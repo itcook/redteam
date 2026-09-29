@@ -1,8 +1,16 @@
-//! --spec 参照文档处理（D2）：预算帽、敏感路径/PEM 内容嗅探、结构定界符中和、
-//! 有界读渲染（`render_spec_section`/`render_spec_section_capped`）。
+//! 注入外部文档的防线（D2）：预算帽、敏感路径/PEM 内容嗅探、结构定界符中和、有界读渲染。
+//! 两个入口共用这一套：`--spec` 参照文档（`render_spec_section_capped`）与仓库简介
+//! （`read_repo_brief`，M21d 批 B-1 / design §10.5）——同一件事不在两处各有一套。
 
 /// --spec 参照文档总帽——超则截断+标记（D2）。
 pub(crate) const SPEC_BUDGET_BYTES: usize = 64_000;
+
+/// 仓库简介总帽（design §10.5「约 2K token」≈ 8KB）。它进的是**稳定前缀**，吃的是每一格的
+/// cache 区，所以帽比 spec 紧得多。
+pub(crate) const BRIEF_BUDGET_BYTES: usize = 8_000;
+
+/// 仓库简介的仓内路径（`redteam init` 不建它——有则用、无则与今日逐字节一致）。
+pub(crate) const BRIEF_REL_PATH: &str = ".redteam/brief.md";
 
 /// D4 守卫：拒绝把密钥/凭据类文件注入送外部模型。命中=skip+warn。
 /// 路径遍历信用户（user-arg），但内容敏感度不信任（防 secret exfil）。
@@ -382,5 +390,97 @@ mod tests {
         assert!(section.contains("DESIGN: still readable"));
         assert!(!section.contains("does-not-exist"));
         assert!(used > 0);
+    }
+}
+
+/// 读 `.redteam/brief.md` → 稳定前缀里的仓库简介（design §10.5，M21d 批 B-1）。
+/// 返回 (内容, warnings)；缺失 / 不可读 / 空文件 → 空串，**行为与今日逐字节一致**。
+///
+/// 与 `--spec` 共用同一套防线，理由各不相同但风险同族：
+/// - **非常规文件拒读**：`.redteam/brief.md` 被换成 FIFO 会让评审永久阻塞；
+/// - **有界读**：它在稳定前缀里、每格都带，巨文件会吃穿小模型的输入窗；
+/// - **PEM 私钥内容嗅探**：brief 是仓内文件、任何 PR 都能改，粘一段私钥进去就会被送去外部模型
+///   （`--spec` 那条路早就防了这一手，这条路一样要防）。
+///
+/// 结构中和不在这里：`repo_brief` 已在 `prompt::neutralize_structure` 的标签表里，
+/// 与 dossier / notes 同批处理（design §10.5「按不可信证据注入」）。
+pub(crate) fn read_repo_brief(root: &std::path::Path, cap: usize) -> (String, Vec<String>) {
+    let path = root.join(BRIEF_REL_PATH);
+    let mut warnings = Vec::new();
+    if !std::fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
+        return (String::new(), warnings); // 不存在 / 目录 / FIFO：与今日一致，不是错误
+    }
+    let Ok(file) = std::fs::File::open(&path) else {
+        return (String::new(), warnings);
+    };
+    let mut buf = Vec::new();
+    {
+        use std::io::Read;
+        if file.take(cap as u64 + 1).read_to_end(&mut buf).is_err() {
+            return (String::new(), warnings);
+        }
+    }
+    let mut content = String::from_utf8_lossy(&buf).into_owned();
+    if contains_pem_private_key(&content) {
+        let msg = format!("{BRIEF_REL_PATH} 里有疑似私钥（PEM 头），整份跳过——不把它送给外部模型");
+        eprintln!("redteam: {msg}");
+        warnings.push(msg);
+        return (String::new(), warnings);
+    }
+    if content.len() > cap {
+        // 按字符边界截断（`String::truncate` 在多字节中间会 panic）
+        let mut end = cap;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
+        let msg = format!("{BRIEF_REL_PATH} 超过 {cap} 字节，已截断（它在稳定前缀里、每格都带）");
+        eprintln!("redteam: {msg}");
+        warnings.push(msg);
+        content.push_str("\n…（仓库简介超帽，已截断）\n");
+    }
+    (content, warnings)
+}
+
+#[cfg(test)]
+mod brief_tests {
+    use super::*;
+
+    fn write(root: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(root.join(".redteam")).unwrap();
+        std::fs::write(root.join(BRIEF_REL_PATH), body).unwrap();
+    }
+
+    #[test]
+    fn missing_brief_is_not_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(read_repo_brief(d.path(), BRIEF_BUDGET_BYTES), (String::new(), vec![]));
+        // 目录占位 / 非常规文件也按缺失处理，不阻塞
+        std::fs::create_dir_all(d.path().join(BRIEF_REL_PATH)).unwrap();
+        assert_eq!(read_repo_brief(d.path(), BRIEF_BUDGET_BYTES).0, "");
+    }
+
+    #[test]
+    fn brief_is_read_and_capped() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "本仓是一个模型无关的对抗式代码评审器。");
+        let (body, warns) = read_repo_brief(d.path(), BRIEF_BUDGET_BYTES);
+        assert!(body.contains("对抗式代码评审器") && warns.is_empty());
+
+        write(d.path(), &"简介内容".repeat(4000)); // 远超 8KB
+        let (body, warns) = read_repo_brief(d.path(), BRIEF_BUDGET_BYTES);
+        assert!(body.len() <= BRIEF_BUDGET_BYTES + 40, "超帽要截断: {}", body.len());
+        assert!(body.ends_with("…（仓库简介超帽，已截断）\n"), "截断要说出来");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+    }
+
+    /// brief 是仓内文件、任何 PR 都能改——粘一段私钥进去不能被送去外部模型。
+    #[test]
+    fn a_brief_with_a_private_key_is_skipped_whole() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "简介\n-----BEGIN OPENSSH PRIVATE KEY-----\nZm9v\n-----END OPENSSH PRIVATE KEY-----\n");
+        let (body, warns) = read_repo_brief(d.path(), BRIEF_BUDGET_BYTES);
+        assert_eq!(body, "", "整份跳过，不做「删掉那几行」的部分注入");
+        assert!(warns.iter().any(|w| w.contains("疑似私钥")), "{warns:?}");
     }
 }

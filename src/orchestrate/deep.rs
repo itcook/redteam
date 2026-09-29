@@ -61,6 +61,8 @@ pub struct DeepInput<'a> {
     pub budget_cells: u32,
     pub pack: &'a PackCfg,
     pub spec_docs: &'a str,
+    /// 仓库简介（M21d 批 B-1）：与 scanner 同一份，保证稳定前缀两边逐字节相同。
+    pub repo_brief: &'a str,
     pub target_label: &'a str,
     /// 状态转换时写 queue_items；失败由回调 warning，不败本轮。
     pub snapshot: Option<&'a dyn Fn(&crate::orchestrate::queue::QueueItem)>,
@@ -289,7 +291,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                 notes: &pack.notes,
                 dossier: &pack.evidence,
                 spec_docs: input.spec_docs,
-                repo_brief: "",
+                repo_brief: input.repo_brief,
             });
             pool.assigned(member);
             running.push(run_cell(&env, Dispatched { member, rev, lease, item, prompt, cell_id, wait_ms, api_needs }));
@@ -928,7 +930,7 @@ async fn run_verify<'b>(env: &CellEnv<'b>, job: VerifyJob<'b>) -> VerifyDone {
         // 判例摘要是 M21c 台账的空槽（形状已到位）。
         precedents: "",
         spec_docs: env.input.spec_docs,
-        repo_brief: "",
+        repo_brief: env.input.repo_brief,
     });
     let policy = lease.gate_attempts();
     let messages = vec![
@@ -1439,7 +1441,7 @@ fn second_stage_prompt(
         notes: &pack2.notes,
         dossier: &pack2.evidence,
         spec_docs: input.spec_docs,
-        repo_brief: "",
+        repo_brief: input.repo_brief,
     });
     prompt2.blocks.push(crate::prompt::PromptBlock {
         text: crate::cli::second_pass::draft_block(draft),
@@ -1732,7 +1734,7 @@ mod tests {
             DeepInput {
                 route: None, scan_cells: &[], bundles, root,
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
-                pack: &Default::default(), spec_docs: "", target_label: "t",
+                pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Pending)]),
                 prior_findings: vec![], tools,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
@@ -1785,7 +1787,7 @@ mod tests {
             DeepInput {
                 route: None, scan_cells: &[], bundles: &bundles, root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
-                pack: &Default::default(), spec_docs: "", target_label: "t",
+                pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(std::slice::from_ref(&item)),
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
@@ -1853,7 +1855,7 @@ mod tests {
             DeepInput {
                 route: None, scan_cells: &[], bundles: &bundles, root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
-                pack: &Default::default(), spec_docs: "", target_label: "t",
+                pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(std::slice::from_ref(&item)),
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
@@ -1942,7 +1944,7 @@ mod tests {
             DeepInput {
                 route: None, scan_cells: &[], bundles: &[], root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
-                pack: &Default::default(), spec_docs: "", target_label: "t",
+                pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("c.rs", ItemState::Pending)]),
                 prior_findings: vec![prior_f], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
@@ -1967,7 +1969,7 @@ mod tests {
             DeepInput {
                 route: None, scan_cells: &[], bundles: &[], root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
-                pack: &Default::default(), spec_docs: "", target_label: "t",
+                pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Settled)]),
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
@@ -2005,7 +2007,7 @@ mod tests {
             DeepInput {
                 route: None, scan_cells: &[], bundles: &bundles, root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
-                pack: &Default::default(), spec_docs: "", target_label: "t",
+                pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&snap), prior_findings: vec![prior_f],
                 tools: ToolsMode::Off, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
             },
@@ -2044,7 +2046,7 @@ mod tests {
             DeepInput {
                 route: None, scan_cells: &[], bundles: &bundles, root,
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
-                pack: &Default::default(), spec_docs: "", target_label: "t",
+                pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::InFlight)]), prior_findings: vec![],
                 tools: ToolsMode::TwoStage, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
             },
@@ -2206,6 +2208,7 @@ mod tests {
         /// `true` = 首跑形态（`restore: None`，`items` 不用）；`false` = restore 模式、`items` 为快照。
         first_run: bool,
         scan_cells: &'a [ScanCellResult],
+        repo_brief: &'a str,
         reopen_skipped: bool,
         route: Option<&'a RiskRoute>,
         /// `None` = 不复核（多数用例）；复核段用例自带 `VerifyInput`。
@@ -2221,7 +2224,7 @@ mod tests {
             DeepInput {
                 route: r.route, scan_cells: r.scan_cells, bundles: r.bundles, root: r.root,
                 reviewers: r.reviewers.unwrap_or(&single), budget_cells: r.budget,
-                pack: &Default::default(), spec_docs: "", target_label: "t",
+                pack: &Default::default(), spec_docs: "", repo_brief: r.repo_brief, target_label: "t",
                 snapshot: r.snapshot, restore: (!r.first_run).then_some(r.items), prior_findings: r.prior, tools: r.tools,
                 backend_factory: None, on_cell: r.on_cell, incoming: r.incoming, reopen_skipped: r.reopen_skipped, verify: r.verify,
             },
@@ -2233,7 +2236,7 @@ mod tests {
     fn plain<'a>(reg: &'a crate::provider::registry::ProviderRegistry, root: &'a Path, bundles: &'a [Bundle], items: &'a [QueueItem]) -> Run<'a> {
         Run {
             reg, root, bundles, items, tools: ToolsMode::Off, incoming: None, on_cell: None, snapshot: None, sink: &(), reviewers: None,
-            budget: 16, first_run: false, scan_cells: &[], reopen_skipped: false, route: None, verify: None, prior: vec![],
+            budget: 16, first_run: false, scan_cells: &[], repo_brief: "", reopen_skipped: false, route: None, verify: None, prior: vec![],
         }
     }
 
@@ -2768,7 +2771,7 @@ mod tests {
             DeepInput {
                 route: None, scan_cells: &[], bundles: &bundles, root,
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
-                pack: &Default::default(), spec_docs: "", target_label: "t",
+                pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: Some(&snapshot), restore: Some(&items), prior_findings: vec![prior_same, prior_settled],
                 tools: ToolsMode::TwoStage, backend_factory: None, on_cell: Some(&on_cell), incoming: None, reopen_skipped: false, verify: None,
             },
@@ -3388,7 +3391,7 @@ mod tests {
         }];
         let input = DeepInput {
             route: None, scan_cells: &cells, bundles: &[], root: Path::new("."),
-            reviewers: &[], budget_cells: 0, pack: &Default::default(), spec_docs: "", target_label: "t",
+            reviewers: &[], budget_cells: 0, pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
             snapshot: None, restore: None, prior_findings: vec![], tools: ToolsMode::Off,
             backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
         };
@@ -3398,6 +3401,49 @@ mod tests {
 
         let reasons: Vec<&str> = got.iter().map(|n| n.reason.as_str()).collect();
         assert_eq!(reasons, ["命中本项区间", "无行锚 → 退回本项区间"], "{reasons:?}");
+    }
+
+    /// 把一轮消息拍平成文本（system + user 各形态），用于断言 prompt 内容。
+    fn flatten_msgs(msgs: &[crate::provider::tool_loop::ChatMessage]) -> String {
+        use crate::provider::tool_loop::ChatMessage as M;
+        msgs.iter()
+            .map(|m| match m {
+                M::System(t) | M::User(t) => t.clone(),
+                M::UserBlocks(bs) => bs.iter().map(|b| b.text.clone()).collect::<Vec<_>>().join("\n"),
+                M::Assistant { text, .. } => text.clone(),
+                M::ToolResults(_) => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// B-1 接线：仓库简介要进 **reviewer** 的稳定前缀，不只是 scanner 的（两条路各有一套 prompt 构造，
+    /// 只测一边等于没测——批 A 刚在「首跑 / resume 两条形态」上栽过一次）。
+    #[tokio::test]
+    async fn repo_brief_reaches_the_reviewer_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let backend = std::sync::Arc::new(FakeChatBackend::repeating(turn(&rev_json("fn a() {"))));
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 4, Box::new(std::sync::Arc::clone(&backend)), Duration::from_secs(5), 0);
+
+        let run = run_with(Run {
+            repo_brief: "本仓的一句话简介 BRIEF_MARKER_9C",
+            items: &pending_items(&["a"]),
+            ..plain(&reg, dir.path(), &bundles, &[])
+        })
+        .await;
+
+        assert_eq!(run.cells.len(), 1, "{:?}", run.cells);
+        let whole = flatten_msgs(&backend.messages_at(0));
+        assert!(whole.contains("BRIEF_MARKER_9C"), "brief 没进 reviewer prompt");
+        // 没有 brief 时不该凭空冒出来
+        let backend2 = std::sync::Arc::new(FakeChatBackend::repeating(turn(&rev_json("fn a() {"))));
+        let mut reg2 = crate::provider::registry::ProviderRegistry::new();
+        reg2.insert_scan("p/r", "p", 4, Box::new(std::sync::Arc::clone(&backend2)), Duration::from_secs(5), 0);
+        let _ = run_with(Run { items: &pending_items(&["a"]), ..plain(&reg2, dir.path(), &bundles, &[]) }).await;
+        let whole2 = flatten_msgs(&backend2.messages_at(0));
+        assert!(!whole2.contains("BRIEF_MARKER_9C") && whole2.contains("(none)"), "缺失时是空槽占位");
     }
 
     /// **首跑形态**的 A-4 接线（`/code-review` 2026-09-29 抓到的 high）：首跑 `scan_cells` 恒空
