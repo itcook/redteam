@@ -19,6 +19,7 @@ use crate::diffsym::{
 };
 use crate::evidence::git::FileChange;
 
+pub mod contracts;
 pub mod region;
 pub use region::{Origin, QueueItemSpec, RegionPack, RegionStats};
 
