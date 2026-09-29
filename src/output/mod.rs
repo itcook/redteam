@@ -74,6 +74,12 @@ fn render_md(r: &ReviewReport) -> String {
     } else {
         s.push_str(&format!("- Findings: {}\n", r.stats.total));
     }
+    if r.run.doc_findings > 0 && r.stats.total > r.run.doc_findings {
+        s.push_str(&format!(
+            "- Of which documentation / spec: {} (listed separately below)\n",
+            r.run.doc_findings
+        ));
+    }
     // 改动行窗口后滤（design §10.4，M21d 批 B-2）：默认**只披露不判定**——说清是哪种，
     // 否则读者无从知道这几条到底算没算进上面的数（M21c 的休眠线索同款措辞纪律）。
     if r.run.findings_outside_window > 0 {
@@ -188,9 +194,22 @@ fn render_md(r: &ReviewReport) -> String {
     }
     if !r.findings.is_empty() {
         s.push_str("\n## Finding Details\n");
+        // 代码在前、文档在后，各自分区（批 C0）：两类的判读方式不同——代码 finding 问「这次改动会不会坏」，
+        // 文档 finding 问「说的和做的一不一致」。混在一张列表里，读者得逐条看路径才分得清。
+        // **只改呈现**：verdict 与 stats 一个字不动（与 B-2 同一条纪律）。口径仍是 `is_doc_path`。
+        let is_doc = |f: &&crate::domain::Finding| crate::risk::signals::is_doc_path(&f.file);
+        let (docs, codes): (Vec<&crate::domain::Finding>, Vec<&crate::domain::Finding>) = r.findings.iter().partition(is_doc);
+        let split = !docs.is_empty() && !codes.is_empty();
         let mut idx = 0;
+        for (lane, items) in [("代码", &codes), ("文档 / 规范", &docs)] {
+            if items.is_empty() {
+                continue;
+            }
+            if split {
+                s.push_str(&format!("\n### —— {lane}（{} 条）——\n", items.len()));
+            }
         for sev in [Severity::Critical, Severity::High, Severity::Medium, Severity::Low] {
-            for f in r.findings.iter().filter(|f| f.severity == sev) {
+            for f in items.iter().copied().filter(|f| f.severity == sev) {
                 idx += 1;
                 s.push_str(&format!("\n### F{idx}: {}\n\n", f.title));
                 s.push_str(&format!("Severity: {} {}\n\n", sev_emoji(sev), sev.as_str()));
@@ -224,6 +243,7 @@ fn render_md(r: &ReviewReport) -> String {
                 // rec 多行时后续行补 `> ` 前缀，防止脱出引用块。
                 s.push_str(&format!("\n> **Recommendation**\n>\n> {}\n", f.recommendation.replace('\n', "\n> ")));
             }
+        }
         }
     }
     if !r.clusters.is_empty() {
@@ -338,6 +358,38 @@ mod tests {
         // 没有线索时一个字都不多写
         r.run.dormant_leads.clear();
         assert!(!render_md(&r).contains("Dormant"), "空则不渲染");
+    }
+
+    /// 批 C0：Finding Details 按**代码 / 文档**分区，摘要给一行「其中文档 N 条」。
+    /// 两类的判读方式不同（代码问「这次改动会不会坏」、文档问「说的和做的一不一致」），
+    /// 混在一张列表里读者得逐条看路径才分得清。**只改呈现**：verdict 与 stats 一个字不动。
+    #[test]
+    fn finding_details_split_code_and_docs() {
+        let mut r = report();
+        let base = r.findings[0].clone();
+        r.findings = vec![
+            crate::domain::Finding { file: "src/a.rs".into(), title: "code one".into(), ..base.clone() },
+            crate::domain::Finding { id: "d1".into(), file: "README.md".into(), title: "doc one".into(), ..base.clone() },
+            crate::domain::Finding { id: "d2".into(), file: "t/check.jsonl".into(), title: "doc two".into(), ..base },
+        ];
+        r.stats = Stats::from_findings(&r.findings);
+        r.run.doc_findings = 2;
+
+        let md = render_md(&r);
+
+        assert!(md.contains("- Of which documentation / spec: 2 (listed separately below)"), "摘要要给一行: {md}");
+        assert!(md.contains("### —— 代码（1 条）——") && md.contains("### —— 文档 / 规范（2 条）——"), "{md}");
+        let (code_at, doc_at) = (md.find("代码（1 条）").unwrap(), md.find("文档 / 规范（2 条）").unwrap());
+        assert!(code_at < doc_at, "代码在前");
+        assert!(md.find("code one").unwrap() < doc_at, "代码 finding 要落在代码区");
+        assert_eq!(r.stats.total, 3, "分区不改 stats");
+
+        // 只有一类时不加分区噪音
+        r.findings.retain(|f| f.file.ends_with(".rs"));
+        r.run.doc_findings = 0;
+        r.stats = Stats::from_findings(&r.findings);
+        let md2 = render_md(&r);
+        assert!(!md2.contains("——") && !md2.contains("Of which documentation"), "单一类别不分区: {md2}");
     }
 
     /// B-2：窗外 finding 的披露要说清**算没算进上面的数**——默认只披露、仍计入；

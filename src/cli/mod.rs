@@ -592,6 +592,14 @@ fn overlay_deep(
         report.run.warnings.extend(deep.warnings);
         return (report, scan_code);
     }
+    // 文档 / 代码分池观测（批 C0）：口径复用 `risk::signals::is_doc_path`（全仓唯一一把尺，
+    // 风险路由的 R 分母与深挖排序都用它）。只观测，不改 verdict 与 stats。
+    report.run.doc_findings = findings.iter().filter(|f| crate::risk::signals::is_doc_path(&f.file)).count() as u32;
+    report.run.doc_dug_items = deep
+        .items
+        .iter()
+        .filter(|it| it.state == crate::orchestrate::queue::ItemState::Settled && crate::risk::signals::is_doc_path(&it.spec.file))
+        .count() as u32;
     report.findings = findings.clone();
     report.stats = Stats::from_findings(&counted);
     // 本轮复核的驳回率（design §8.1「去留由数据决定」）：分母是**真跑成了的**条数——
@@ -3887,6 +3895,46 @@ mod code_review_tests {
         for c in report.run.coverage.selected.get(&Role::Reviewer).into_iter().flatten() {
             assert!(seen.contains(c), "coverage 里的 {c} 没进 sink: {seen:?}");
         }
+    }
+
+    /// 批 C0 观测：文档 / 代码的 finding 与已挖项分布要进 RunMeta——「代码优先」提层的效果就看这两个数。
+    /// 口径复用 `risk::signals::is_doc_path`（全仓唯一一把尺）。
+    #[test]
+    fn doc_and_code_split_is_recorded_in_run_meta() {
+        let reg = ProviderRegistry::new();
+        let mk = |file: &str| crate::domain::Finding {
+            id: file.into(), severity: crate::domain::Severity::Low, title: "t".into(), body: "b".into(),
+            file: file.into(), line_start: 1, line_end: 1, confidence: 0.5, recommendation: "r".into(),
+            models: vec![], agreement: 1, suspicion_agreement: 0, hard_constraint: false,
+            quote: String::new(), cluster_id: None, verify: None, previously_dismissed: false,
+            origin: crate::domain::Origin::New, outside_window: false,
+        };
+        use crate::orchestrate::queue::ItemState;
+        let item = |file: &str, state| {
+            let spec = crate::pack::region::QueueItemSpec::new(file.into(), vec![(1, 2)], crate::pack::region::Origin::Rule, vec![]).unwrap();
+            crate::orchestrate::queue::QueueItem {
+                id: format!("{file}:rule:1-2"), spec, score: 1.0, agreement: 1, state,
+                kind: crate::orchestrate::queue::ItemKind::Primary,
+                dispatch_agreement: 1, landed_agreement: None, families: vec![], enqueued_ms: None,
+                arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(),
+                peak_agreement: 0, risk_band: 0,
+            }
+        };
+        let deep = crate::orchestrate::deep::DeepRun {
+            findings: vec![mk("src/a.rs"), mk("README.md"), mk("t/check.jsonl")],
+            cells: vec![crate::state::CellRecord::ok("c", "m", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] })],
+            meta: Default::default(), warnings: vec![], reviewer_failed: false, reused_cells: vec![],
+            // 已挖：a.rs 与 README.md；docs.md 只是 pending，不该计入
+            items: vec![item("src/a.rs", ItemState::Settled), item("README.md", ItemState::Settled), item("docs.md", ItemState::Pending)],
+        };
+        let blank = ReviewReport { run: Default::default(), verdict: Verdict::Approve, stats: Default::default(),
+            findings: vec![], scan: None, cells: vec![], clusters: Default::default(), schema_version: Default::default() };
+
+        let (rep, _) = overlay_deep(blank, 0, deep, &args(), &Config::default(), &reg, Some(&[]), std::time::Instant::now());
+
+        assert_eq!(rep.run.doc_findings, 2, "README.md 与 check.jsonl 都算文档（jsonl 是批 C0 补的口径）");
+        assert_eq!(rep.run.doc_dug_items, 1, "只数**已挖**（Settled）的文档项");
+        assert_eq!(rep.stats.total, 3, "观测不改计数");
     }
 
     /// B-2 收口接线（design §10.4）：窗外 finding **默认只计数不改产出**，

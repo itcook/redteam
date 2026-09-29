@@ -36,7 +36,9 @@ pub const EXTAPI_K: u32 = 3;
 
 const PATH_SENSITIVE: &str = r"(?i)(auth|secur|crypt|payment|billing|config|setting|secret|token|permission|migrat|callback|webhook)";
 const TEST_PATH: &str = r"(_test\.go$|\.test\.(ts|js|tsx)$|(^|/)tests?/|(^|/)__tests__/|_spec\.)";
-const DOC_PATH: &str = r"(?i)\.(md|json|ya?ml|toml|txt|lock|svg|csv)$";
+// `jsonl` 要单列：`\.json$` 匹配不到它，于是 `.trellis` 的 check.jsonl / implement.jsonl
+// 被当成代码参与「代码优先」排序（2026-09-29 批 C0 实测缺口）。
+const DOC_PATH: &str = r"(?i)\.(md|jsonl|json|ya?ml|toml|txt|lock|svg|csv)$";
 const FIX_COMMIT: &str = r"(?i)\b(fix|bug|hotfix|revert|regress)";
 const CONTROL_FLOW: &str = r"\b(if|for|while|switch|match|return|await|try|catch|select|defer|throw|loop|yield)\b";
 /// 跨行 `/* … */` 也要剥离（`(?s)`＝Python 参考实现 `re.S`）；`CONTROL_FLOW` 乘子判定依赖此剥离。

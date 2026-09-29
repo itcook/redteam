@@ -712,7 +712,12 @@ fn is_doc(file: &str) -> bool {
     crate::risk::signals::is_doc_path(file)
 }
 
-/// 优先级全序（C3〔D16〕分层键，design C3 §4）：种类 → 必挖轴 → 风险档 → 烟量 → 代码优先 → 自评置信 → id。
+/// 优先级全序（C3〔D16〕分层键，design C3 §4）：种类 → 必挖轴 → 风险档 → **代码优先** → 烟量 → 自评置信 → id。
+///
+/// **代码优先在 2026-09-29（批 C0）从「烟量之后」提到「烟量之前」**：原先文档项只要疑点条数更多就在
+/// 烟量层直接胜出，代码优先根本轮不到生效——批 A dogfood 实测文档疑点 33 条 vs 代码 15 条，
+/// 16 个 reviewer 格里 10 个（63%）花在文档上。前三层（种类 / 必挖轴 / 风险档）不动：
+/// 那是 D16 定的语义，文档项若真有高共识高风险，它就该排前面。
 ///
 /// 取代 C1 的乘积式 `conf × agreement × 类别权重`：类别权重恒 1.0（L0 占比两轮 59% vs 21%，标注自身在漂、不启用）、
 /// agreement 只取 1 / 2，乘积实际退化成「按 confidence 排」，而经预算截断后 confidence 就成了门。
@@ -726,8 +731,8 @@ pub(crate) fn cmp_priority(a: &QueueItem, b: &QueueItem) -> std::cmp::Ordering {
         .cmp(&b.kind)
         .then_with(|| consensus_axis(b).cmp(&consensus_axis(a)))
         .then_with(|| b.risk_band.cmp(&a.risk_band))
-        .then_with(|| b.suspicions().len().cmp(&a.suspicions().len()))
         .then_with(|| ord(!is_doc(&a.spec.file)).cmp(&ord(!is_doc(&b.spec.file))))
+        .then_with(|| b.suspicions().len().cmp(&a.suspicions().len()))
         .then_with(|| confidence_of(b).partial_cmp(&confidence_of(a)).unwrap_or(std::cmp::Ordering::Equal))
         .then_with(|| a.id.cmp(&b.id))
 }
@@ -854,6 +859,45 @@ mod tests {
 
     fn spec_rule(file: &str, start: u32, end: u32) -> QueueItemSpec {
         QueueItemSpec::new(file.into(), vec![(start, end)], QueueOrigin::Rule, vec![]).unwrap()
+    }
+
+    /// **代码优先排在烟量之前**（批 C0，2026-09-29）：同等共识轴与风险档下，代码项恒先于文档项，
+    /// **不论文档项的疑点条数多出多少**。原先代码优先在烟量之后，于是文档项靠「疑点多」直接胜出——
+    /// 批 A dogfood 实测 16 个 reviewer 格里 10 个花在文档上。
+    #[test]
+    fn code_outranks_docs_even_when_docs_have_more_smoke() {
+        // 文档项：3 条疑点；代码项：1 条。两者共识轴与风险档相同。
+        let doc_spec = QueueItemSpec::new(
+            "README.md".into(),
+            vec![(1, 9)],
+            QueueOrigin::Scan,
+            vec![sus("README.md", 1, 1, "a", "h"), sus("README.md", 3, 3, "b", "h"), sus("README.md", 5, 5, "c", "h")],
+        )
+        .unwrap();
+        let code_spec = spec_scan("src/a.rs", 1, 3, "let x = 1;", "h");
+        let mut q = DeepQueue::new();
+        q.enqueue(req(doc_spec, Some("alpha")));
+        q.enqueue(req(code_spec, Some("alpha")));
+        let (doc, code) = (q.items()[0].clone(), q.items()[1].clone());
+        assert!(doc.spec.file.ends_with(".md") && code.spec.file.ends_with(".rs"), "{:?}", q.items());
+        assert!(doc.suspicions().len() > code.suspicions().len(), "文档项烟量更大才测得出层序");
+
+        assert_eq!(cmp_priority(&code, &doc), std::cmp::Ordering::Less, "代码项要排在文档项前面");
+        assert_eq!(cmp_priority(&doc, &code), std::cmp::Ordering::Greater);
+
+        // `.jsonl` 也算文档（`\.json$` 匹配不到它——批 C0 实测缺口）
+        let jsonl = QueueItemSpec::new(
+            "t/check.jsonl".into(),
+            vec![(1, 9)],
+            QueueOrigin::Scan,
+            vec![sus("t/check.jsonl", 1, 1, "a", "h"), sus("t/check.jsonl", 3, 3, "b", "h"), sus("t/check.jsonl", 5, 5, "c", "h")],
+        )
+        .unwrap();
+        let mut q2 = DeepQueue::new();
+        q2.enqueue(req(jsonl, Some("alpha")));
+        q2.enqueue(req(spec_scan("src/a.rs", 1, 3, "let x = 1;", "h"), Some("alpha")));
+        let (j, c2) = (q2.items()[0].clone(), q2.items()[1].clone());
+        assert_eq!(cmp_priority(&c2, &j), std::cmp::Ordering::Less, "jsonl 要被当成文档");
     }
 
     fn req(spec: QueueItemSpec, family: Option<&str>) -> EnqueueReq {

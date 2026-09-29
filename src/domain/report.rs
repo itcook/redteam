@@ -249,6 +249,12 @@ pub struct ScanReport {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RunMeta {
     pub job_id: String,
+    /// 文档类 finding 条数 / 已挖的文档类队列项数（M21d 批 C0）：
+    /// 文档与代码在同一个预算池里竞争，占比要能直接读出来——「代码优先」提层的效果就看这两个数。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub doc_findings: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub doc_dug_items: u32,
     /// finding 判定半径（design §10.4，M21d 批 B-2）：0 = 关。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub finding_window: u32,
