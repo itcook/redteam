@@ -18,9 +18,10 @@
 3. registry / brief 缺失一律**降级不阻塞**并披露进 RunMeta；私有数据只落 `.next/private/`。
 4. `make verify` 绿；改代码走小分支、合回前过 `/code-review`。
 
-## 批 A · L4-B 三方契约注入（`feat/m21d-contracts`）
+## 批 A · L4-B 三方契约注入（`feat/m21d-contracts`）✅ 2026-09-29
 
 > 验收对象 = **本仓自评审**（Rust 单 crate、16 直接依赖、registry 在本机）。
+> 记录 `.next/private/m21d/2026-09-29-batchA-contracts-record.md`；边界与受益面改述见 **D21**。
 
 ### Task A-1 Rust 定位链（纯函数，离线可测）
 `use` 语句 → crate 名 → `Cargo.lock` 精确版本 → `~/.cargo/registry/src/<index>/<crate>-<ver>/`。
@@ -38,10 +39,16 @@ RunMeta 新增：注入的契约块数、input 增量、registry 缺失的降级
 ### Task A-4 `needs{kind: api}` 联动
 scanner 提出 `needs{kind:api}` 时，深挖 cell 带对应契约 **+ 函数体**。
 
-### Task A-5 验收
-- 本仓自评审一轮：契约注入数 > 0、input 增量可观测、registry 缺失时降级不阻塞（构造 `CARGO_HOME=/nonexistent` 跑一轮）。
-- 构造一例**版本相关 API 误用**（Cargo.lock 的版本与模型的参数知识不一致）→ 深挖能抓到。
-- PR181 回归：verdict / findings 不劣化（它零 Rust，注入数应为 0——**这本身就是一条断言**）。
+### Task A-5 验收 ✅（三项过、一项改判）
+- ✅ 本仓自评审：批 A 范围注入 **21 块 / 1 miss**；`CARGO_HOME=/nonexistent` 对照 **0 注入、全部计 miss、pack 照出、退出码 0**；
+  input 增量 +1.9% 字节 / +1.5% est_tokens（A-4 提交那一段的同范围对照）。
+- ⚠️ 「版本相关 API 误用」**改判**〔D21〕：靶子（`tempfile::tempdir` 的 TempDir drop）在**有契约 / 无契约两轮都被抓到**
+  （critical · conf 0.98 · agreement 2）→ 名气大的 API 上模型先验已够，这条验收测不出注入的功劳。
+  签名级漂移归编译门；L4-B 的正面证明改挂「先验薄的靶子」followup。
+- ✅ PR181 回归的注入面：三组 **contracts=0 / misses=0 / spilled=0**（零 Rust 一个字节都不多，也不产生垃圾 miss）。
+  verdict / findings 那轮**未跑**（用户裁定本批只跑靶子），挂 followup。
+- 验收反过来抓到三处自身缺陷并已修：同名方法给错归属（`c997614`）、`use krate::Type;` 形态抽不出目标（`b588b0e`）、
+  省略清单刷假 miss（`7bc0f0c`）——**都是单测照不到、只有真实仓库数据才暴露的**。
 
 ## 批 B · 稳定前缀与确定性后滤（`feat/m21d-prefix-anchor`）
 
