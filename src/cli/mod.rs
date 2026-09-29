@@ -557,10 +557,15 @@ fn overlay_deep(
     let outside = crate::positioning::mark_outside_window(&mut findings, bundles, window);
     report.run.finding_window = window;
     report.run.findings_outside_window = outside;
-    if cfg.review.pack.finding_window_enforce && outside > 0 {
-        report.run.finding_window_enforced = true;
-        findings.retain(|f| !f.outside_window);
-    }
+    // enforce = **不计入 verdict 与计数**，但条目照留在报告里（与 refuted 同款：列出、不拦路）。
+    // 早先写成「移出 findings」，那会让 resume 把往次挖出的 finding 从持久 result 里抹掉——
+    // resume 按当前工作树重建 diff，部分提交 / amend / rebase 之后往次的锚点就可能落到窗外
+    // （2026-09-29 批 B dogfood 抓到）。这些往轮项 `origin` 是 `New`（`Carried` 只属 M13 增量轮），
+    // 跳过 carried 那条防线接不住它们。
+    let enforce = cfg.review.pack.finding_window_enforce && outside > 0;
+    report.run.finding_window_enforced = enforce;
+    let counted: Vec<crate::domain::Finding> =
+        if enforce { findings.iter().filter(|f| !f.outside_window).cloned().collect() } else { findings.clone() };
     let skipped = deep.meta.budget_skipped;
     let failed = deep.reviewer_failed;
     // 一格都没挖、没债、也没有往轮挖出来的 finding = 深挖根本没发生（空变更集 / 队列为空）。
@@ -574,7 +579,7 @@ fn overlay_deep(
         return (report, scan_code);
     }
     report.findings = findings.clone();
-    report.stats = Stats::from_findings(&findings);
+    report.stats = Stats::from_findings(&counted);
     // 本轮复核的驳回率（design §8.1「去留由数据决定」）：分母是**真跑成了的**条数——
     // 被免验跳过的从没给过 verifier 机会，没跑成的（provider 挂了 / 判决读不懂）也没给出过证据，
     // 两类算进分母都只会把率冲淡（收口评审 #6：verifier 全挂会读成「验了 N 条一条没驳」）。
@@ -606,7 +611,7 @@ fn overlay_deep(
         report.run.template_hashes.insert("verifier_tail".into(), h.verifier_tail.clone());
     }
     let (block, floor) = verdict_thresholds(args, cfg);
-    let verdict = crate::verdict::compute_verdict(&findings, block, floor);
+    let verdict = crate::verdict::compute_verdict(&counted, block, floor);
     let debt = failed || skipped > 0;
     const DEBT: &str = "reviewer debt: failed reviewer cell, undispatched queue items, or budget skip";
     if report.verdict == Verdict::Incomplete {
@@ -615,7 +620,7 @@ fn overlay_deep(
         if verdict == Verdict::Reject {
             report.run.warnings.push(format!(
                 "scan incomplete: {} blocking finding(s) present — a complete review would reject",
-                crate::verdict::blocking_count(&findings, block, floor)
+                crate::verdict::blocking_count(&counted, block, floor)
             ));
         }
         if debt {
@@ -3877,7 +3882,11 @@ mod code_review_tests {
             previously_dismissed: false, origin: crate::domain::Origin::New, outside_window: false,
         };
         let deep = || crate::orchestrate::deep::DeepRun {
-            findings: vec![mk("a.rs", 10), mk("a.rs", 300)], // 一条正中改动行、一条远在 300 行
+            // 窗外那条是 high（达阻断阈值）、窗内那条 low → enforce 与否直接改 verdict
+            findings: vec![
+                crate::domain::Finding { severity: crate::domain::Severity::Low, ..mk("a.rs", 10) },
+                crate::domain::Finding { severity: crate::domain::Severity::High, ..mk("a.rs", 300) },
+            ],
             cells: vec![crate::state::CellRecord::ok("c", "m", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] })],
             meta: Default::default(), warnings: vec![], reviewer_failed: false, reused_cells: vec![], items: vec![],
         };
@@ -3895,6 +3904,7 @@ mod code_review_tests {
         assert!(!rep.run.finding_window_enforced);
         assert_eq!(rep.findings.len(), 2, "默认不改 findings 集合");
         assert_eq!(rep.stats.total, 2, "也不改计数");
+        assert_eq!(rep.verdict, Verdict::Reject, "默认那条 high 照样拦路");
         assert!(rep.findings.iter().any(|f| f.outside_window), "标记要留在 finding 上");
 
         // ② 打开 enforce：窗外那条移出 findings（verdict 谓词零改动，自然不含它）
@@ -3903,8 +3913,10 @@ mod code_review_tests {
         let (rep2, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg2, &reg, &bundles, std::time::Instant::now());
         assert_eq!(rep2.run.findings_outside_window, 1);
         assert!(rep2.run.finding_window_enforced);
-        assert_eq!(rep2.findings.len(), 1, "开了才降级");
-        assert_eq!(rep2.findings[0].line_start, 10);
+        assert_eq!(rep2.findings.len(), 2, "**条目照留**——resume 会把报告写回持久 result，删条目等于抹掉往次的成果");
+        assert_eq!(rep2.stats.total, 1, "但不计入计数");
+        assert!(rep2.findings.iter().any(|f| f.outside_window), "标记留着，md 逐条标得出来");
+        assert_eq!(rep2.verdict, Verdict::Approve, "唯一的 high 在窗外 → 开了 enforce 就不拦路");
 
         // ③ 没有变更集（resume 早退路径传 &[]）→ 一条都不判，行为与今日一致
         let (rep3, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg, &reg, &[], std::time::Instant::now());

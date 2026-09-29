@@ -210,6 +210,15 @@ fn render_md(r: &ReviewReport) -> String {
                 if f.previously_dismissed {
                     s.push_str("| Dismissed  | previously dismissed (exempt from verdict) |\n");
                 }
+                // 哪几条落在窗外要**逐条**说，不能只给聚合数：读 md 的人否则得拿每条的行号
+                // 去跟 diff 手工比对（批 B dogfood 抓到，与休眠线索 / L4-B 契约同款教训）。
+                if f.outside_window {
+                    let how = if r.run.finding_window_enforced { "excluded from verdict" } else { "still counted" };
+                    s.push_str(&format!(
+                        "| Window     | anchored outside the changed-line window (±{}) — {how} |\n",
+                        r.run.finding_window
+                    ));
+                }
                 // rec 多行时后续行补 `> ` 前缀，防止脱出引用块。
                 s.push_str(&format!("\n> **Recommendation**\n>\n> {}\n", f.recommendation.replace('\n', "\n> ")));
             }
@@ -345,7 +354,17 @@ mod tests {
         r.run.finding_window_enforced = true;
         assert!(render_md(&r).contains("(excluded from the verdict)"), "开了 enforce 要改口径");
 
+        // 逐条标记：只给聚合数的话，读 md 的人得拿每条行号去跟 diff 手工比对
+        r.run.finding_window_enforced = false;
+        r.findings[0].outside_window = true;
+        let md = render_md(&r);
+        assert!(md.contains("| Window     | anchored outside the changed-line window (±30) — still counted |"), "{md}");
+        r.run.finding_window_enforced = true;
+        assert!(render_md(&r).contains("— excluded from verdict |"), "开了 enforce 逐条也要改口径");
+        r.findings[0].outside_window = false;
+
         r.run.findings_outside_window = 0;
+        r.run.finding_window_enforced = false;
         assert!(!render_md(&r).contains("outside the changed-line window"), "零条不占版面");
     }
 

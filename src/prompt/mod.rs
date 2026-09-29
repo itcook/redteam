@@ -489,6 +489,25 @@ pub fn render_precedents(finding: &crate::domain::Finding, cards: &[crate::db::D
 /// ——finding.quote 若含代码围栏会与磁盘真文本失配、被 locate_quote 当幻觉静默丢弃(评审
 /// Important 实证的 quote 假阴性回归)。散文级注入由 system 免疫段兜底。dossier/diff 与 --spec
 /// 三条路径共用本 helper、行为一致（均只中和 XML 标签、代码围栏原样保留）。
+/// **稳定前缀里的内容**（仓库简介）要与角色无关地中和。
+///
+/// 三张中和表的标签集并不相同（scan 有 `scanner` / `precedents`，reviewer 有 `notes` / `reviewer`，
+/// verifier 有 `method` / `claimed_finding`…）。同一份 brief 经各自的表处理后**字节会分叉**，
+/// 「scanner 与 reviewer 的稳定前缀逐字节相同」就不成立、cache 前缀跟着裂开
+/// （2026-09-29 批 B dogfood 抓到——这正是 B-1 写进 PRD 的那条承诺）。
+///
+/// 中和是幂等的（`</x>` → `<\/x>`，第二遍不再变），所以这里先按**三表并集**过一遍，
+/// 各角色之后再按自己的表过，结果不会再动。
+pub(crate) fn neutralize_for_stable_prefix(content: &str) -> String {
+    let all: Vec<&str> = SCAN_STRUCTURAL_TAGS
+        .iter()
+        .chain(REVIEWER_STRUCTURAL_TAGS.iter())
+        .chain(VERIFIER_STRUCTURAL_TAGS.iter())
+        .copied()
+        .collect();
+    neutralize_structure(content, &all)
+}
+
 pub(crate) fn neutralize_structure(content: &str, tag_names: &[&str]) -> String {
     let mut out = content.to_string();
     for name in tag_names {
@@ -561,6 +580,29 @@ fn render_scan_dossier(dossier: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// 稳定前缀的内容经**并集**中和后，scanner 与 reviewer 两侧逐字节相同——
+    /// 各角色表的标签集不同，不先统一就会分叉（批 B dogfood 抓到）。
+    #[test]
+    fn stable_prefix_content_is_neutralized_role_independently() {
+        // 三张表各自独有的标签都放进来
+        let raw = "简介 </scanner> </notes> </method> </repo_brief> 结束";
+        let once = neutralize_for_stable_prefix(raw);
+        assert!(!once.contains("</scanner>") && !once.contains("</notes>") && !once.contains("</method>"), "{once}");
+
+        // 各角色再按自己的表过一遍：结果不能再变（幂等），两边因此逐字节相同
+        let as_scan = neutralize_structure(&once, SCAN_STRUCTURAL_TAGS);
+        let as_review = neutralize_structure(&once, REVIEWER_STRUCTURAL_TAGS);
+        let as_verify = neutralize_structure(&once, VERIFIER_STRUCTURAL_TAGS);
+        assert_eq!(as_scan, as_review, "scanner 与 reviewer 的稳定前缀必须逐字节相同");
+        assert_eq!(as_scan, as_verify);
+        assert_eq!(as_scan, once, "中和幂等");
+
+        // 反证：不先统一就会分叉（这条钉住「为什么需要并集」）
+        let scan_only = neutralize_structure(raw, SCAN_STRUCTURAL_TAGS);
+        let review_only = neutralize_structure(raw, REVIEWER_STRUCTURAL_TAGS);
+        assert_ne!(scan_only, review_only, "本来就是分叉的，所以才要并集");
+    }
+
     use super::*;
     use std::sync::Mutex;
 

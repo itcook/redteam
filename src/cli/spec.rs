@@ -439,7 +439,9 @@ pub(crate) fn read_repo_brief(root: &std::path::Path, cap: usize) -> (String, Ve
         warnings.push(msg);
         content.push_str("\n…（仓库简介超帽，已截断）\n");
     }
-    (content, warnings)
+    // 与角色无关地中和（见 `neutralize_for_stable_prefix`）：各角色的中和表标签集不同，
+    // 不先统一过一遍，同一份 brief 在 scanner 与 reviewer 侧会被中和成不同字节、稳定前缀分叉。
+    (crate::prompt::neutralize_for_stable_prefix(&content), warnings)
 }
 
 #[cfg(test)]
@@ -458,6 +460,18 @@ mod brief_tests {
         // 目录占位 / 非常规文件也按缺失处理，不阻塞
         std::fs::create_dir_all(d.path().join(BRIEF_REL_PATH)).unwrap();
         assert_eq!(read_repo_brief(d.path(), BRIEF_BUDGET_BYTES).0, "");
+    }
+
+    /// brief 读出来就该是**与角色无关**中和过的：各角色中和表标签集不同，不先统一，
+    /// 同一份 brief 在 scanner 与 reviewer 侧会被中和成不同字节、稳定前缀分叉（批 B dogfood 抓到）。
+    #[test]
+    fn brief_is_neutralized_role_independently_at_read_time() {
+        let d = tempfile::tempdir().unwrap();
+        // `</notes>` 只在 reviewer 表里、`</scanner>` 只在 scan 表里
+        write(d.path(), "简介 </notes> 与 </scanner> 与 </repo_brief>\n");
+        let (body, _) = read_repo_brief(d.path(), BRIEF_BUDGET_BYTES);
+        assert!(!body.contains("</notes>") && !body.contains("</scanner>") && !body.contains("</repo_brief>"), "{body}");
+        assert!(body.contains("<\\/notes>"), "中和成转义形态: {body}");
     }
 
     #[test]
