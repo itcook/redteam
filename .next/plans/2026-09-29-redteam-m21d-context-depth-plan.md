@@ -45,8 +45,8 @@ scanner 提出 `needs{kind:api}` 时，深挖 cell 带对应契约 **+ 函数体
 - ⚠️ 「版本相关 API 误用」**改判**〔D21〕：靶子（`tempfile::tempdir` 的 TempDir drop）在**有契约 / 无契约两轮都被抓到**
   （critical · conf 0.98 · agreement 2）→ 名气大的 API 上模型先验已够，这条验收测不出注入的功劳。
   签名级漂移归编译门；L4-B 的正面证明改挂「先验薄的靶子」followup。
-- ✅ PR181 回归的注入面：三组 **contracts=0 / misses=0 / spilled=0**（零 Rust 一个字节都不多，也不产生垃圾 miss）。
-  verdict / findings 那轮**未跑**（用户裁定本批只跑靶子），挂 followup。
+- ✅ PR181 回归：注入面三组 **contracts=0 / misses=0 / spilled=0**（零 Rust 一个字节都不多，也不产生垃圾 miss）；
+  全量一轮（2026-09-29）**verdict 一致 reject、findings 在基线带内、失败格 0**，判据满足。
 - 验收反过来抓到三处自身缺陷并已修：同名方法给错归属（`c997614`）、`use krate::Type;` 形态抽不出目标（`b588b0e`）、
   省略清单刷假 miss（`7bc0f0c`）——**都是单测照不到、只有真实仓库数据才暴露的**。
 

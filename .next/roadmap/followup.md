@@ -723,9 +723,9 @@ M21b 三轮是 64，输出 26 k 而非暴涨，于是最慢格 868 s（M21b 443�
 名气大的 API 上模型先验已够用〔D21〕。要证收益得换**先验薄**的靶子：小众 / 新版本 / 私有 registry 的 crate，
 其 doc 写明的前置条件模型没见过。做法固定为「同一缺陷 × 有契约 / 无契约两轮对照」。
 
-**PR181 的 verdict / findings 回归那一轮未跑（2026-09-29）**：批 A 只跑了注入面的确定性回归（pack-only：三组全零）。
-verdict / findings 不劣化这条要一轮全量（上一轮 14 min / 54 findings）——用户裁定本批只跑靶子，挂着。
-合批 B 或下次 dogfood 时补，判据沿用 M21c 批 A 的「verdict 一致、findings 在 ±10 带内、失败格 0」。
+~~**PR181 的 verdict / findings 回归那一轮未跑**~~ → **2026-09-29 已跑，通过**：verdict 一致（reject）、
+findings 在基线带内、失败格 0；零 Rust 仓的注入面恒零（契约 0 / miss 0 / 超帽 0、`api_contracts` 0），
+md 的契约段按条件不渲染。明细表在 `.next/private/m21d/2026-09-29-batchA-contracts-record.md`。
 
 **契约块的 doc 截断没有省略号标记（2026-09-29）**：`OUTSIDE_DOC_MAX_LINES`(10) 从签名往上截，
 块可能以 `///` 或半句话开头（实测 `serde_json::from_str` 就是）。与仓内文件外片段同一套口径（批 E 起如此），
