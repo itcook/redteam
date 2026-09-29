@@ -400,7 +400,11 @@ pub fn contract_targets_at(
     // 取**方法名**去搜（类型名搜不到 `pub fn`）；搜出来的同名方法可能属别的类型，但块里会披露 owner
     // （`RegexSet::new` vs `Regex::new` 一眼可辨），这比完全不给强。
     let assoc = regex::Regex::new(r"\b([a-z][a-z0-9_]*)::([A-Z][A-Za-z0-9_]*)::([a-z_][a-z0-9_]*)\s*[(<]").expect("static regex");
-    let externals = external_crates(content, local_mods);
+    // `use crate::pack::region::{self as region, …}` 的 `region`、`mod region;` 之后的 `pub use region::X`
+    // 都是**本仓符号**，不是三方 crate——`local_mods`（`src/` 顶层）照不到嵌套模块与别名，得从本文件的
+    // use / mod 语句认（2026-09-29 自评审实测：省略清单里刷出 region / incremental / spec / tail 四条假 miss）。
+    let locals: BTreeSet<String> = local_mods.union(&local_mod_decls(content)).cloned().collect();
+    let externals = external_crates(content, &locals);
     let lines: Vec<&str> = content.lines().collect();
     let region: String = if ranges.is_empty() {
         content.to_string()
@@ -431,7 +435,7 @@ pub fn contract_targets_at(
         out.entry(head).or_default().insert(tail);
     }
     let callable = |k: &str| {
-        !local_mods.contains(k)
+        !locals.contains(k)
             && !matches!(k, "std" | "core" | "alloc" | "crate" | "super" | "self")
             && (externals.contains(k) || known.contains(&normalize_crate(k)))
     };
@@ -478,6 +482,24 @@ fn use_tails(content: &str) -> Vec<(String, String)> {
             if tok != "as" && tok != head {
                 out.push((head.to_string(), tok.to_string()));
             }
+        }
+    }
+    out
+}
+
+/// 本文件声明的子模块（`mod region;`）——同文件里的 `pub use region::X` / `region::build(` 都是本仓符号。
+/// `local_mods`（`src/` 顶层目录）照不到它们：自评审实测省略清单因此刷出 region / incremental / spec / tail
+/// 四条假 miss。`use crate::…` 那条路不必管：它的头就是 `crate`，`external_crates` 本来就跳过。
+fn local_mod_decls(content: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in content.lines() {
+        let t = line.trim();
+        let t = t.strip_prefix("pub").map(str::trim_start).unwrap_or(t);
+        let t = if t.starts_with('(') { t.split_once(')').map(|(_, r)| r.trim_start()).unwrap_or(t) } else { t };
+        let Some(rest) = t.strip_prefix("mod ") else { continue };
+        let name = rest.trim_end_matches([';', ' ', '{']).trim();
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            out.insert(name.to_string());
         }
     }
     out
@@ -550,7 +572,9 @@ pub fn contracts_section_in(
     cap: usize,
 ) -> ContractSection {
     let Some((locked, known)) = lock_of(repo_root) else { return ContractSection::default() };
-    assemble(registry_src, &locked, &contract_targets(sources, local_mods, &known), cap, None)
+    let mut targets = contract_targets(sources, local_mods, &known);
+    drop_own_package(repo_root, &mut targets);
+    assemble(registry_src, &locked, &targets, cap, None)
 }
 
 /// `needs{kind: api}` 的契约段（A-4，design §9.4 C）：只看**声明命中的那几段区间**，并带函数体。
@@ -580,16 +604,46 @@ pub fn api_contracts_section_in(
     max_body_lines: usize,
 ) -> ContractSection {
     let Some((locked, known)) = lock_of(repo_root) else { return ContractSection::default() };
-    let targets = contract_targets_at(content, ranges, local_mods, &known);
+    let mut targets = contract_targets_at(content, ranges, local_mods, &known);
+    drop_own_package(repo_root, &mut targets);
     assemble(registry_src, &locked, &targets, cap, Some(max_body_lines))
 }
 
 /// `Cargo.lock` → (包名 → 版本, 归一包名集)。读不到 = 不是 Cargo 工作区，安静降级（不是错误）。
+///
+/// **本仓自己的包名要剔掉**：集成测试里的 `redteam::pack::…` 是本 crate，不是三方——留着它只会在
+/// 省略清单里刷一条「registry 无解包目录」（2026-09-29 自评审实测）。
 fn lock_of(repo_root: &Path) -> Option<(BTreeMap<String, String>, BTreeSet<String>)> {
     let lock = std::fs::read_to_string(repo_root.join("Cargo.lock")).ok()?;
     let locked = locked_versions(&lock);
     let known = locked.keys().map(|k| normalize_crate(k)).collect();
     Some((locked, known))
+}
+
+/// 从目标里剔掉本仓自己的包（集成测试写 `redteam::pack::…`，那是本 crate 不是三方）。
+fn drop_own_package(repo_root: &Path, targets: &mut BTreeMap<String, BTreeSet<String>>) {
+    if let Some(own) = root_package_name(repo_root) {
+        targets.retain(|k, _| normalize_crate(k) != normalize_crate(&own));
+    }
+}
+
+/// `Cargo.toml` 的 `[package] name`（工作区根无 `[package]` 时 None）。
+fn root_package_name(repo_root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(repo_root.join("Cargo.toml")).ok()?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+            continue;
+        }
+        if in_package {
+            if let Some(v) = t.strip_prefix("name").map(str::trim_start).and_then(|r| r.strip_prefix('=')) {
+                return Some(v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
 }
 
 /// 定位 → 抽取 → 渲染，总字节受 `cap` 硬帽。`body = Some(n)` 时带函数体（A-4）。
@@ -958,6 +1012,28 @@ fn f(s: &str) -> Value {
         assert_eq!((one.blocks, one.spilled), (1, 1), "{}", one.text);
         assert!(one.text.len() < big.text.len(), "帽是硬的: {} 字节", one.text.len());
         assert_eq!(contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 0).blocks, 0);
+    }
+
+    /// 本仓自己的包不是三方：`redteam::pack::…`（集成测试的写法）不该进目标、更不该在省略清单里
+    /// 刷一条「registry 无解包目录」。
+    #[test]
+    fn the_repos_own_package_is_not_a_third_party_target() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"redteam\"\nversion = \"0.1.0\"\n\n[dependencies]\nkit = \"2\"\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "[[package]]\nname = \"redteam\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\n").unwrap();
+        let reg = d.path().join("registry/src");
+        std::fs::create_dir_all(reg.join("index-x")).unwrap();
+        // 两类本仓符号：包名 `redteam`（集成测试 `use redteam::…`）、同文件声明的子模块 `helper`
+        let own = "use redteam::pack::Packed;\nfn t() { kit::make(1); }\n";
+        let submod = "mod helper;\npub use helper::Thing;\nfn u() { helper::run(1); }\n";
+
+        let sec = contracts_section_in(&repo, &reg, &[("tests/e2e.rs", own), ("src/lib.rs", submod)], &BTreeSet::new(), 4096);
+
+        assert_eq!(sec.misses, vec![LocateMiss::NotVendored { krate: "kit".into(), version: "2.1.0".into() }],
+                   "只该报三方那条——本仓包名与子模块都不是三方: {:?}", sec.misses);
+        assert_eq!(root_package_name(&repo).as_deref(), Some("redteam"));
     }
 
     /// A-4：`needs{kind:api}` 段——**只问声明命中的区间**，并带函数体；体太长退回签名并注明。
