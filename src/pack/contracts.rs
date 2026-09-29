@@ -120,6 +120,11 @@ pub enum LocateMiss {
     NotLocked(String),
     /// 锁到了版本，但 registry 里没有解包目录（没 `cargo fetch` 过 / 换了机器 / 用的是 git 或 path 依赖）
     NotVendored { krate: String, version: String },
+    /// `Cargo.lock` 里同名包有多个版本（本仓就有 14 组，如 `thiserror` 1 与 2 并存），
+    /// 单靠包名定不出该用哪个——**宁可不给**：给错大版本的签名比不给更糟（design §9.4 B 立项理由的反面）。
+    AmbiguousVersion { krate: String, versions: Vec<String> },
+    /// 同一 crate 要的名字太多、命中数触到上限，后面的没取——与走查截断同类，静默就看不出缺块。
+    HitCapReached { krate: String, cap: usize },
     /// crate 源文件数超过 [`CRATE_WALK_MAX_FILES`]，后面的没走——**这条必须说出来**：
     /// 大 crate（`syn` / `aws-sdk-*`）的契约会因此整块消失，静默截断看起来和「这个库没有这个函数」一样
     /// （2026-09-29 本仓 dogfood 抓到）。
@@ -302,6 +307,7 @@ pub fn find_contracts(crate_dir: &Path, krate: &str, names: &BTreeSet<String>, c
         *n += 1;
         scan.hits.push(h);
         if scan.hits.len() >= cap {
+            scan.hit_cap_reached = true;
             break;
         }
     }
@@ -313,6 +319,8 @@ pub fn find_contracts(crate_dir: &Path, krate: &str, names: &BTreeSet<String>, c
 pub struct CrateScan {
     pub hits: Vec<ContractHit>,
     pub walk_truncated: bool,
+    /// 命中数触到 `cap`，后面的名字没取（与 `walk_truncated` 同类的静默截断，另一根轴）。
+    pub hit_cap_reached: bool,
 }
 
 /// `impl Foo`/`impl<'a> Foo<'a>`/`impl Trait for Foo` → 被实现的类型名（后者取 `for` 之后的）。
@@ -402,7 +410,14 @@ fn render(crate_dir: &Path, hit: &ContractHit, version: &str, body: Option<usize
         None => (sig, String::new()),
         Some(max) => {
             let b = crate::diffsym::block_end(&lines, l);
-            if b > sig && b - l < max {
+            // `block_end` 是行级花括号计数，不认字符串与注释：体里一个 `let c = '}';` 就能让它提前归零。
+            // 于是**截断的函数体会被标成完整的**，模型照着半截的错误处理推理——正是「比不给更糟」
+            // （2026-09-29 `/code-review` 抓到）。收尾行必须真的像块尾：`}` 打头且缩进不深于签名行。
+            let indent = |i: usize| lines[i].len() - lines[i].trim_start().len();
+            let looks_closed = lines[b].trim_start().starts_with('}') && indent(b) <= indent(l);
+            if b > sig && !looks_closed {
+                (sig, "…（函数体末尾定位不可靠，未注入）\n".to_string())
+            } else if b > sig && b - l < max {
                 (b, String::new())
             } else if b > sig {
                 (sig, format!("…（函数体 {} 行，超过 {max} 行上限，未注入）\n", b - sig))
@@ -625,6 +640,8 @@ pub struct ContractSection {
     pub misses: Vec<LocateMiss>,
     /// 因为超帽没能进去的块数。
     pub spilled: usize,
+    /// 帽根本不够、整段没注入（调用方置位；这是降级，要能被看见）。
+    pub budget_skipped: bool,
 }
 
 /// 组装三方契约段：定位 → 抽取 → 渲染，总字节受 `cap` 封顶。
@@ -649,10 +666,10 @@ pub fn contracts_section_in(
     local_mods: &BTreeSet<String>,
     cap: usize,
 ) -> ContractSection {
-    let Some((locked, known, local)) = lock_of(repo_root) else { return ContractSection::default() };
-    let mut targets = contract_targets(sources, local_mods, &known);
-    drop_local_packages(&local, &mut targets);
-    assemble(registry_src, &locked, &targets, cap, None)
+    let Some(lock) = lock_of(repo_root) else { return ContractSection::default() };
+    let mut targets = contract_targets(sources, local_mods, &lock.known);
+    drop_local_packages(&lock.local, &mut targets);
+    assemble(registry_src, &lock, &targets, cap, None)
 }
 
 /// `needs{kind: api}` 的契约段（A-4，design §9.4 C）：只看**声明命中的那几段区间**，并带函数体。
@@ -681,30 +698,76 @@ pub fn api_contracts_section_in(
     cap: usize,
     max_body_lines: usize,
 ) -> ContractSection {
-    let Some((locked, known, local)) = lock_of(repo_root) else { return ContractSection::default() };
-    let mut targets = contract_targets_at(content, ranges, local_mods, &known);
-    drop_local_packages(&local, &mut targets);
-    assemble(registry_src, &locked, &targets, cap, Some(max_body_lines))
+    let Some(lock) = lock_of(repo_root) else { return ContractSection::default() };
+    let mut targets = contract_targets_at(content, ranges, local_mods, &lock.known);
+    drop_local_packages(&lock.local, &mut targets);
+    assemble(registry_src, &lock, &targets, cap, Some(max_body_lines))
 }
 
-/// `Cargo.lock` 读出来的三件套：registry 包的 `名 → 版本`、它们的归一名集（`known`）、本地包集。
-type Locked = (BTreeMap<String, String>, BTreeSet<String>, BTreeSet<String>);
+/// `Cargo.lock` 读出来的事实。
+struct LockFacts {
+    /// registry 来源、且版本唯一的包：`名 → 版本`。
+    versions: BTreeMap<String, String>,
+    /// 上者的归一名集（限定调用的兜底判据）。
+    known: BTreeSet<String>,
+    /// 本地包（本仓包名 ∪ 非 registry 来源）——不是可定位的三方。
+    local: BTreeSet<String>,
+    /// 同名多版本：归一名 → 各版本。单靠包名定不出该用哪个，故不注入、只披露。
+    ambiguous: BTreeMap<String, Vec<String>>,
+}
 
-/// `Cargo.lock` → (包名 → 版本, 归一包名集, 本地包集)。读不到 = 不是 Cargo 工作区，安静降级（不是错误）。
+/// `Cargo.lock` → [`LockFacts`]。读不到 = 不是 Cargo 工作区，安静降级（不是错误）。
 ///
-/// **本仓自己的包名要剔掉**：集成测试里的 `redteam::pack::…` 是本 crate，不是三方——留着它只会在
-/// 省略清单里刷一条「registry 无解包目录」（2026-09-29 自评审实测）。
-fn lock_of(repo_root: &Path) -> Option<Locked> {
+/// **本仓自己的包名要剔掉**：集成测试里的 `use redteam::…` 是本 crate，不是三方。
+fn lock_of(repo_root: &Path) -> Option<LockFacts> {
     let lock = std::fs::read_to_string(repo_root.join("Cargo.lock")).ok()?;
-    let mut locked = locked_versions(&lock);
+    let mut all = locked_versions_all(&lock);
     // 本地包 = 本仓包名 ∪ lock 里非 registry 来源的包（workspace 成员 / path / git）
     let mut local = non_registry_packages(&lock);
     if let Some(own) = root_package_name(repo_root) {
         local.insert(normalize_crate(&own));
     }
-    locked.retain(|k, _| !local.contains(&normalize_crate(k)));
-    let known = locked.keys().map(|k| normalize_crate(k)).collect();
-    Some((locked, known, local))
+    all.retain(|k, _| !local.contains(&normalize_crate(k)));
+    // 同名多版本（本仓 lock 就有 14 组，`thiserror` 1 与 2 并存）：按名取版本只会拿到「最后出现的那个」，
+    // 于是 1.x 的调用点被配上 2.x 的签名、还标着 2.x 的版本号——**正是 L4-B 要防的事情的反面**，
+    // 而且静默（2026-09-29 `/code-review` 抓到）。单靠包名定不出该用哪个，故宁可不给、只披露。
+    let ambiguous: BTreeMap<String, Vec<String>> =
+        all.iter().filter(|(_, v)| v.len() > 1).map(|(k, v)| (normalize_crate(k), v.clone())).collect();
+    let versions: BTreeMap<String, String> =
+        all.into_iter().filter(|(_, v)| v.len() == 1).map(|(k, v)| (k, v[0].clone())).collect();
+    // `known` 要含**歧义包**：限定调用得先认出 `kit::make(…)` 里的 kit 是个三方包，
+    // 才谈得上「它有两个版本、定不出用哪个」这条披露；把它从 known 里摘掉等于静默回潮。
+    let known = versions.keys().map(|k| normalize_crate(k)).chain(ambiguous.keys().cloned()).collect();
+    Some(LockFacts { versions, known, local, ambiguous })
+}
+
+/// `Cargo.lock` → 包名 → **全部**版本（同名多版本要看得见，见 [`LockFacts::ambiguous`]）。
+fn locked_versions_all(lock_text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let (mut name, mut in_pkg) = (None::<String>, false);
+    let val = |line: &str| line.split_once('=').map(|(_, v)| v.trim().trim_matches('"').to_string());
+    for line in lock_text.lines() {
+        let t = line.trim();
+        if t == "[[package]]" {
+            (name, in_pkg) = (None, true);
+            continue;
+        }
+        if t.starts_with('[') {
+            in_pkg = false;
+            continue;
+        }
+        if !in_pkg {
+            continue;
+        }
+        if t.starts_with("name") {
+            name = val(t);
+        } else if t.starts_with("version") {
+            if let (Some(n), Some(v)) = (name.take(), val(t)) {
+                out.entry(n).or_default().push(v);
+            }
+        }
+    }
+    out
 }
 
 /// 从目标里剔掉本地包：集成测试写 `use redteam::pack::…`（本 crate）、workspace 兄弟包、path / git 依赖
@@ -735,7 +798,7 @@ fn root_package_name(repo_root: &Path) -> Option<String> {
 /// 定位 → 抽取 → 渲染，总字节受 `cap` 硬帽。`body = Some(n)` 时带函数体（A-4）。
 fn assemble(
     registry_src: &Path,
-    locked: &BTreeMap<String, String>,
+    lock: &LockFacts,
     targets: &BTreeMap<String, BTreeSet<String>>,
     cap: usize,
     body: Option<usize>,
@@ -744,9 +807,16 @@ fn assemble(
     if cap == 0 || targets.is_empty() {
         return out;
     }
-    let names: BTreeSet<String> = targets.keys().cloned().collect();
+    let locked = &lock.versions;
+    // 同名多版本的先摘出来：给错大版本比不给更糟，且 `locate_all` 只会报一句「没这个包」，说不清原因
+    let (ambiguous, names): (BTreeSet<String>, BTreeSet<String>) =
+        targets.keys().cloned().partition(|k| lock.ambiguous.contains_key(&normalize_crate(k)));
+    for k in &ambiguous {
+        let versions = lock.ambiguous.get(&normalize_crate(k)).cloned().unwrap_or_default();
+        out.misses.push(LocateMiss::AmbiguousVersion { krate: k.clone(), versions });
+    }
     let (found, misses) = locate_all(registry_src, locked, &names);
-    out.misses = misses;
+    out.misses.extend(misses);
     for (krate, dir) in &found {
         let Some(want) = targets.get(krate) else { continue };
         let version = locked
@@ -757,6 +827,9 @@ fn assemble(
         let scan = find_contracts(dir, krate, want, HITS_PER_NAME * 4);
         if scan.walk_truncated {
             out.misses.push(LocateMiss::WalkTruncated { krate: krate.clone(), scanned: CRATE_WALK_MAX_FILES });
+        }
+        if scan.hit_cap_reached {
+            out.misses.push(LocateMiss::HitCapReached { krate: krate.clone(), cap: HITS_PER_NAME * 4 });
         }
         for hit in scan.hits {
             let block = match body {
@@ -1140,6 +1213,73 @@ fn f(s: &str) -> Value {
 
         let small = find_contracts(d.path(), "k", &BTreeSet::new(), 0);
         assert!(!small.walk_truncated, "空入参早退时不谎报截断");
+    }
+
+    /// 同名多版本 → 不注入、只披露（给错大版本的签名比不给更糟）。
+    #[test]
+    fn same_name_two_versions_is_disclosed_not_guessed() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let pkg = |n: &str, v: &str| {
+            format!("[[package]]\nname = \"{n}\"\nversion = \"{v}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n")
+        };
+        std::fs::write(repo.join("Cargo.lock"), format!("{}{}{}", pkg("kit", "1.0.0"), pkg("kit", "2.1.0"), pkg("solo", "3.0.0"))).unwrap();
+        let reg = d.path().join("registry/src");
+        fake_crate(&reg.join("index-x/kit-2.1.0"), &[("lib.rs", "pub fn make(a: u8) -> u8 {\n    a\n}\n")]);
+        fake_crate(&reg.join("index-x/solo-3.0.0"), &[("lib.rs", "pub fn run(a: u8) -> u8 {\n    a\n}\n")]);
+        let src = "fn f() { kit::make(1); solo::run(2); }\n";
+
+        let sec = contracts_section_in(&repo, &reg, &[("src/a.rs", src)], &BTreeSet::new(), 8192);
+
+        assert!(!sec.text.contains("kit 2.1.0"), "锁里 kit 有两个版本，不该挑一个给: {}", sec.text);
+        assert!(sec.text.contains("solo 3.0.0"), "版本唯一的照常注入: {}", sec.text);
+        assert!(
+            sec.misses.iter().any(|m| matches!(m, LocateMiss::AmbiguousVersion { krate, versions }
+                if krate == "kit" && versions.len() == 2)),
+            "歧义要披露: {:?}", sec.misses
+        );
+    }
+
+    /// 要的名字太多、命中触顶 → 后面的没取，这同样要披露（与走查截断同类，另一根轴）。
+    #[test]
+    fn hitting_the_per_crate_cap_is_disclosed() {
+        let d = tempfile::tempdir().unwrap();
+        // 10 个顶层 pub fn，命中上限 HITS_PER_NAME * 4 = 8
+        let body: String = (0..10).map(|i| format!("pub fn f{i}(a: u8) -> u8 {{\n    a\n}}\n\n")).collect();
+        fake_crate(d.path(), &[("lib.rs", body.as_str())]);
+        let names: BTreeSet<String> = (0..10).map(|i| format!("f{i}")).collect();
+
+        let scan = find_contracts(d.path(), "k", &names, HITS_PER_NAME * 4);
+
+        assert_eq!(scan.hits.len(), HITS_PER_NAME * 4);
+        assert!(scan.hit_cap_reached, "触顶要标出来，否则和「这个库没有这些函数」一样");
+        assert!(!find_contracts(d.path(), "k", &set(&["f0"]), HITS_PER_NAME * 4).hit_cap_reached, "没触顶不谎报");
+    }
+
+    /// 体里的 `}` 出现在字符串 / 注释里 → `block_end` 提前归零；截断的体不得被标成完整的。
+    #[test]
+    fn an_unreliable_body_end_falls_back_to_the_signature() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("Cargo.lock"),
+            "[[package]]\nname = \"kit\"\nversion = \"2.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        ).unwrap();
+        let reg = d.path().join("registry/src");
+        // 第二行的字符串里有一个裸 `}`，行级计数在那里就归零了
+        fake_crate(
+            &reg.join("index-x/kit-2.1.0"),
+            &[("lib.rs", "pub fn make(a: u8) -> u8 {\n    let brace = \"}\";\n    if a > 0 {\n        return 1;\n    }\n    a\n}\n")],
+        );
+
+        let sec = api_contracts_section_in(&repo, &reg, "fn f() { kit::make(1); }\n", &[(1, 1)], &BTreeSet::new(), 8192, 60);
+
+        assert_eq!(sec.blocks, 1, "{}", sec.text);
+        assert!(sec.text.contains("函数体末尾定位不可靠"), "要说明白为什么没给体: {}", sec.text);
+        assert!(!sec.text.contains("return 1;"), "半截的体不能当完整的给: {}", sec.text);
+        assert!(!sec.text.contains("三方契约 + 函数体"), "标签也不能说带了体: {}", sec.text);
     }
 
     /// 非 registry 来源的包不是可定位的三方（dogfood 抓到：只挡根包名不够）——

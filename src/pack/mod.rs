@@ -957,7 +957,13 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
     // 非 Cargo 工作区 / Cargo.lock 缺失 / registry 没解包 → 安静降级，只把原因记进 omit 与统计（roadmap 风险节）。
     let contracts = if opts.body == PackBody::Slice {
         let cap = outside_cap.saturating_sub(outside.len());
-        if cap < OUTSIDE_MIN_CAP {
+        // 先判「这个仓有没有可能注入」：非 Cargo 工作区 / 没有 Rust 源文的组，谈不上「预算不足」——
+        // 报了只会在零 Rust 仓（PR181 那类）刷出误导性的「N group(s) skipped injection」
+        // （2026-09-29 `/code-review` 抓到；与 `outside_render` 的空名集短路同构）。
+        let injectable = root.join("Cargo.lock").exists() && files.iter().any(|c| c.fc.path.ends_with(".rs"));
+        if !injectable {
+            String::new()
+        } else if cap < OUTSIDE_MIN_CAP {
             omit.push(format!("三方契约：预算不足（帽 {cap} 字节 < {OUTSIDE_MIN_CAP}），未注入"));
             stats.contract_budget_skipped = true;
             String::new()
@@ -975,6 +981,12 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
                     }
                     contracts::LocateMiss::WalkTruncated { krate, scanned } => {
                         format!("{krate} — 源码超过 {scanned} 个文件，后面的没搜（三方契约可能缺块）")
+                    }
+                    contracts::LocateMiss::AmbiguousVersion { krate, versions } => {
+                        format!("{krate} — 三方契约未注入（Cargo.lock 里同名多版本：{}，定不出该用哪个）", versions.join(" / "))
+                    }
+                    contracts::LocateMiss::HitCapReached { krate, cap } => {
+                        format!("{krate} — 命中数触到上限 {cap}，后面的名字没取（三方契约可能缺块）")
                     }
                 });
             }
@@ -1573,6 +1585,23 @@ mod tests {
         assert_eq!((p.stats.contracts, p.stats.contract_misses, p.stats.contract_spilled), (0, 0, 0));
         assert!(!p.text.contains("## 三方契约"), "{}", p.text);
         assert!(p.text.contains("pub fn decode"), "正文照旧: {}", p.text);
+    }
+
+    /// 非 Cargo 工作区不该报「预算不足」：那类仓（PR181：15 `.ts` + 10 `.go`、零 Rust）本来就谈不上注入，
+    /// 报了只会在 md 上刷出误导性的「N group(s) skipped injection」（2026-09-29 `/code-review` 抓到）。
+    #[test]
+    fn a_non_cargo_repo_never_reports_a_contract_budget_skip() {
+        let (tmp, b, changeset) = outside_repo(); // 没有 Cargo.lock
+        for i in 1..=5 {
+            let pad = "x".repeat(100);
+            std::fs::write(tmp.path().join(format!("src/u{i}.rs")), format!("fn use_{i}() {{ let padding_{i} = \"{pad}\"; compute_total(&[{i}]); }}\n")).unwrap();
+        }
+
+        let tight = pack_bundle(&b, tmp.path(), 2_400, 0, &PackOpts::default(), &changeset);
+
+        assert!(tight.text.contains("## 文件外片段"), "仓内上下文照常: {}", tight.text);
+        assert!(!tight.stats.contract_budget_skipped, "非 Cargo 仓不该记「跳过注入」");
+        assert!(!tight.text.contains("三方契约：预算不足"), "{}", tight.text);
     }
 
     /// 定位失败要**能被看见**（roadmap 风险节：registry 在 CI / 他人机器缺失 → 降级不阻塞，但要披露原因）。

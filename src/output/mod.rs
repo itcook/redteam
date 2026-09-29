@@ -227,7 +227,9 @@ fn render_scan_md(r: &ReviewReport, s: &mut String) {
         (a + g.pack.contracts, b + g.pack.contract_misses, c + g.pack.contract_spilled, d + usize::from(g.pack.contract_budget_skipped))
     });
     // 深挖侧的 `needs{kind:api}` 注入（A-4）并在同一行：它由 scanner 的声明触发，和扫描账放一起才读得懂。
-    let (api, api_miss) = r.run.deep.as_ref().map_or((0, 0), |d| (d.api_contracts as usize, d.api_contract_misses as usize));
+    let (api, api_miss, api_spill, api_skip) = r.run.deep.as_ref().map_or((0, 0, 0, 0), |d| {
+        (d.api_contracts as usize, d.api_contract_misses as usize, d.api_contract_spilled as usize, d.api_contract_budget_skipped as usize)
+    });
     // 两族计数**各管各的行**：合用一个门会印出「0 blocks injected · 0 crates not located」的自相矛盾标题，
     // 正下方挂着非零的 needs{api} 子行（scan 侧因预算不足没注入、深挖侧注入了，是真实组合——dogfood 抓到）。
     if inj + miss + spill + skipped > 0 {
@@ -238,8 +240,10 @@ fn render_scan_md(r: &ReviewReport, s: &mut String) {
             s.push_str(&format!("  - {skipped} group(s) skipped injection: in-repo context used up the shared cap\n"));
         }
     }
-    if api + api_miss > 0 {
-        s.push_str(&format!("- Third-party contracts on needs{{api}} (with bodies, into dig cells): {api} injected · {api_miss} not located\n"));
+    if api + api_miss + api_spill + api_skip > 0 {
+        s.push_str(&format!(
+            "- Third-party contracts on needs{{api}} (with bodies, into dig cells): {api} injected · {api_miss} not located · {api_spill} over cap · {api_skip} cell(s) skipped (cap used up)\n"
+        ));
     }
     if !scan.groups.is_empty() {
         s.push_str("\n  | Group | Files | Cells | Suspicions | Pack |\n  | --- | --- | --- | --- | --- |\n");

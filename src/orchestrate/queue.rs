@@ -313,6 +313,25 @@ pub(crate) fn norm_path(p: &str) -> String {
     p.trim_start_matches("./").trim_start_matches('/').to_string()
 }
 
+/// 流式通道上的一条消息（C2〔D15〕的扩展）。
+///
+/// 为什么不是只发 `EnqueueReq`：`needs{kind: api}` 不产生队列项（它没有自己的区域，入队只会白烧一格），
+/// 但深挖装包要用它。首跑时 scan 与 deep 并行、`DeepInput::scan_cells` 恒空，api 声明只能走这条通道
+/// ——不走就等于 A-4 在正常评审里整个不生效（2026-09-29 `/code-review` 抓到，dogfood 那轮的
+/// `api_contracts = 0` 与「本轮没有 api 声明」不可区分）。
+pub enum DeepMsg {
+    /// 一个待入队项（scanner 疑点 / H0 / needs{evidence}）。
+    Item(Box<EnqueueReq>),
+    /// scanner 的 `needs{kind: api}` 声明：不入队，只作为深挖装包的附加材料（A-4）。
+    ApiNeed(crate::domain::NeedEntry),
+}
+
+impl From<EnqueueReq> for DeepMsg {
+    fn from(r: EnqueueReq) -> Self {
+        DeepMsg::Item(Box::new(r))
+    }
+}
+
 /// 一次到达（C3〔D16〕）：入队请求 + 调用方算好的稳定块与风险档。
 /// 块要读文件内容、风险档要看 `RiskRoute`，两者都不是队列该做的事——队列只比键。
 /// 直接喂 `EnqueueReq`（经 `From`）即「无块信息」：旧快照回放与单测构造走这条，合并退回 quote 谓词。

@@ -82,7 +82,7 @@ pub struct DeepInput<'a> {
     pub verify: Option<VerifyInput<'a>>,
     /// 在途入队通道（scanner 流式扇出，C2〔D15〕）：到达项走入口五态（到达键幂等）；通道关闭 = 关闭入口 → 收场 drain。`None` = 开跑即关闭。
     /// barrier 含「通道已关闭」：发送端未全部 drop 前，队列空也不收场。
-    pub incoming: Option<mpsc::Receiver<EnqueueReq>>,
+    pub incoming: Option<mpsc::Receiver<crate::orchestrate::queue::DeepMsg>>,
 }
 
 pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sink: &dyn FindingSink) -> DeepRun {
@@ -165,6 +165,8 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     meta.queue_depth_peak = meta.queue_depth_peak.max(q.items().len() as u32);
 
     let mut incoming = input.incoming.take();
+    // 流式到达的 `needs{kind: api}`（A-4）：首跑时 `input.scan_cells` 恒空，api 声明只能从这里来。
+    let mut streamed_api_needs: Vec<crate::domain::NeedEntry> = Vec::new();
     let k = input.budget_cells as usize;
     let floor_total = if k == 0 { 0 } else { k.div_ceil(4) };
     // 扫描期非必挖额度 K − F：保底 F 格留给后到的疑点（H0 / 涟漪不得吃掉）。
@@ -258,7 +260,8 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             // cell 名按队列项（id 已定死），跨 resume 调用稳定：同项重跑 upsert 覆盖自身（与 scanner「重试者胜」同义），
             // 不同项永不同名。按本次调用的派发序编号时，resume 挖别的项会同名覆盖首跑的格、丢掉它的 finding。
             let cell_id = review_cell_id(&item.id, &rev.name);
-            let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &tracked, &idx, 64 * 1024, &opts, "", &api_needs_for(&input, &item.spec)) {
+            let api_needs = api_needs_for(&input, &streamed_api_needs, &item.spec);
+            let pack = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, &tracked, &idx, 64 * 1024, &opts, "", &api_needs) {
                 Ok(p) => p,
                 Err(e) => {
                     // 派发时 pack 构造失败：就地结案，仍占一个派发位（与 C1「占 keep 位」同口径）
@@ -273,6 +276,8 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             // L4-B（A-4）：本格注入了多少三方契约 / 有多少因 registry 缺失降级——只在派发处计一次。
             meta.api_contracts += pack.stats.contracts as u32;
             meta.api_contract_misses += pack.stats.contract_misses as u32;
+            meta.api_contract_spilled += pack.stats.contract_spilled as u32;
+            meta.api_contract_budget_skipped += u32::from(pack.stats.contract_budget_skipped);
             // 排队时长在**派发时**定格：完成时采样量到的是「完成 − 入队」（含模型跑的几分钟），那是墙钟不是队列压力。
             let wait_ms = item.enqueued_ms.map_or(0, |en| now_ms().saturating_sub(en));
             let file_diff = file_diff(input.bundles, &item.spec.file);
@@ -287,7 +292,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                 repo_brief: "",
             });
             pool.assigned(member);
-            running.push(run_cell(&env, Dispatched { member, rev, lease, item, prompt, cell_id, wait_ms }));
+            running.push(run_cell(&env, Dispatched { member, rev, lease, item, prompt, cell_id, wait_ms, api_needs }));
         }
         if dispatched > before {
             note_block(&mut meta, fill_t0.elapsed());
@@ -326,7 +331,9 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             Some(v) = verifying.next(), if !verifying.is_empty() => verify_now.push(v),
             msg = recv(&mut incoming), if !closed => {
                 let t0 = std::time::Instant::now();
-                on_arrival(msg, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
+                if let Some(req) = absorb(msg, &mut streamed_api_needs) {
+                    on_arrival(req, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
+                }
                 note_block(&mut meta, t0.elapsed());
             }
             Some(got) = next_wait(&mut waits), if waits.is_some() => hit = Some(got),
@@ -434,8 +441,10 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         let mut drained_arrival = false;
         while !closed {
             match incoming.as_mut().map(mpsc::Receiver::try_recv) {
-                Some(Ok(req)) => {
-                    on_arrival(Some(req), &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
+                Some(Ok(msg)) => {
+                    if let Some(req) = absorb(Some(msg), &mut streamed_api_needs) {
+                        on_arrival(req, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
+                    }
                     drained_arrival = true;
                 }
                 Some(Err(mpsc::error::TryRecvError::Disconnected)) => {
@@ -755,6 +764,9 @@ struct Dispatched<'b> {
     prompt: ScanPrompt,
     cell_id: String,
     wait_ms: u64,
+    /// 本项该带的 `needs{kind: api}`（A-4）：派发时算一次，二阶段补查重建 pack 时复用同一份
+    /// ——流式到达的那些只在 `run_deep` 的局部池里，cell 任务借不到。
+    api_needs: Vec<crate::domain::NeedEntry>,
 }
 
 /// R2 二阶段补查的结局（design C1 §5 契约表）。
@@ -1008,7 +1020,7 @@ struct Landed {
 /// 一格完整执行：首轮 → （needs 合格）二阶段 → 回读 429 观测 → 归还门位。**全程持同一 lease**（design C1 §3.3 / Q4）：
 /// 两轮之间放门会让第二轮与新派发的格抢门——门宽 1 时补查轮排到队尾，墙钟与在途口径都失真。
 async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
-    let Dispatched { member, rev, lease, item, prompt, cell_id, wait_ms } = d;
+    let Dispatched { member, rev, lease, item, prompt, cell_id, wait_ms, api_needs } = d;
     let t0 = tokio::time::Instant::now();
     let policy = lease.gate_attempts();
     let mut warnings = Vec::new();
@@ -1032,7 +1044,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                 stage2 = if !(tiered && item.spec.notes.is_empty()) {
                     Stage2::Skipped
                 } else {
-                    match second_stage_prompt(env, &item, c.output.findings(), &needs, &mut warnings) {
+                    match second_stage_prompt(env, &item, c.output.findings(), &needs, &api_needs, &mut warnings) {
                         Round2::NoEvidence => Stage2::Skipped,
                         Round2::PackFailed(e) => {
                             warnings.push(format!("{cell_id}: second-stage pack failed: {e} — keeping first-round findings (debt)"));
@@ -1281,7 +1293,26 @@ fn on_arrival(
 }
 
 /// 通道收一项；无通道时永不就绪（`select!` 分支另由 `closed` 守卫关掉）。
-async fn recv(rx: &mut Option<mpsc::Receiver<EnqueueReq>>) -> Option<EnqueueReq> {
+/// 通道消息分流：`ApiNeed` 吸收进本轮的附加材料池并返回 `None`（它不是队列项）；其余原样交给
+/// [`on_arrival`]（`None` = 通道关闭）。
+///
+/// **两条接收路径（select 与收场 drain）共用这一个函数**：分头写过一版，变异「deep 侧不收 api 声明」
+/// 照绿——因为只改得动其中一条（2026-09-29 `/code-review` 后的变异检查发现）。
+fn absorb(
+    msg: Option<crate::orchestrate::queue::DeepMsg>,
+    streamed: &mut Vec<crate::domain::NeedEntry>,
+) -> Option<Option<EnqueueReq>> {
+    match msg {
+        Some(crate::orchestrate::queue::DeepMsg::ApiNeed(n)) => {
+            streamed.push(n);
+            None
+        }
+        Some(crate::orchestrate::queue::DeepMsg::Item(r)) => Some(Some(*r)),
+        None => Some(None),
+    }
+}
+
+async fn recv(rx: &mut Option<mpsc::Receiver<crate::orchestrate::queue::DeepMsg>>) -> Option<crate::orchestrate::queue::DeepMsg> {
     match rx {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
@@ -1348,9 +1379,15 @@ enum Round2 {
 /// 只按文件发会把同文件另一头的调用点契约塞给不相干的格——同一文件常被切成好几项，
 /// 每项各有自己的区域；而同一条声明会被多个 scan 格各报一次（2026-09-29 本仓 dogfood 抓到）。
 /// 无行锚的声明保留（`contract_slot` 会退回本项区间）。
-fn api_needs_for(input: &DeepInput<'_>, spec: &QueueItemSpec) -> Vec<crate::domain::NeedEntry> {
+fn api_needs_for(
+    input: &DeepInput<'_>,
+    streamed: &[crate::domain::NeedEntry],
+    spec: &QueueItemSpec,
+) -> Vec<crate::domain::NeedEntry> {
     let mut out: Vec<crate::domain::NeedEntry> = Vec::new();
-    for n in input.scan_cells.iter().filter_map(|c| c.output.as_ref()).flat_map(|o| o.needs.iter()) {
+    // 两个来源：首跑走流式通道（那时 `scan_cells` 恒空），resume 走回放的格输出。并集 + 去重。
+    let from_cells = input.scan_cells.iter().filter_map(|c| c.output.as_ref()).flat_map(|o| o.needs.iter());
+    for n in streamed.iter().chain(from_cells) {
         if n.kind != crate::domain::NeedKind::Api || crate::orchestrate::queue::norm_path(&n.path) != spec.file {
             continue;
         }
@@ -1369,11 +1406,13 @@ fn api_needs_for(input: &DeepInput<'_>, spec: &QueueItemSpec) -> Vec<crate::doma
 
 /// R2 二阶段补查轮的 prompt：needs → 证据段（`second_pass::need_section`，读守卫 + 字节帽）→ 重建 pack
 /// （needs_evidence 槽；与笔记互斥由构造期守卫，调用方已过滤）→ prompt 附加草稿块。
+#[allow(clippy::too_many_arguments)] // env / 项 / 草稿 / needs / api 声明 / 告警各不同源
 fn second_stage_prompt(
     env: &CellEnv<'_>,
     item: &QueueItem,
     draft: &[Finding],
     needs: &[crate::domain::NeedEntry],
+    api_needs: &[crate::domain::NeedEntry],
     warnings: &mut Vec<String>,
 ) -> Round2 {
     let input = env.input;
@@ -1387,7 +1426,7 @@ fn second_stage_prompt(
     if ev.trim().is_empty() {
         return Round2::NoEvidence;
     }
-    let pack2 = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, env.tracked, env.idx, 64 * 1024, env.opts, &ev, &api_needs_for(input, &item.spec)) {
+    let pack2 = match region::build(&item.spec, pick_bundle(input.bundles, &item.spec.file), input.root, env.tracked, env.idx, 64 * 1024, env.opts, &ev, api_needs) {
         Ok(p) => p,
         Err(e) => return Round2::PackFailed(e),
     };
@@ -2156,7 +2195,7 @@ mod tests {
         bundles: &'a [Bundle],
         items: &'a [QueueItem],
         tools: ToolsMode,
-        incoming: Option<mpsc::Receiver<EnqueueReq>>,
+        incoming: Option<mpsc::Receiver<crate::orchestrate::queue::DeepMsg>>,
         on_cell: Option<&'a dyn Fn(&CellRecord)>,
         snapshot: Option<&'a dyn Fn(&QueueItem)>,
         sink: &'a dyn FindingSink,
@@ -2305,7 +2344,7 @@ mod tests {
         let events = Events(Mutex::new(Vec::new()));
         let feed = async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            tx.send(EnqueueReq { spec, score: 0.5, kind: ItemKind::Suspicion, families: vec!["beta".into()], arrival: None }).await.unwrap();
+            tx.send(EnqueueReq { spec, score: 0.5, kind: ItemKind::Suspicion, families: vec!["beta".into()], arrival: None }.into()).await.unwrap();
         };
         let (run, ()) = tokio::join!(
             run_with(Run { incoming: Some(rx), sink: &events, ..plain(&reg, dir.path(), &bundles, &items) }),
@@ -2334,7 +2373,7 @@ mod tests {
         let feed = async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap();
-            tx.send(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, families: vec![], arrival: None }).await.unwrap();
+            tx.send(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, families: vec![], arrival: None }.into()).await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         let t0 = tokio::time::Instant::now();
@@ -2967,7 +3006,7 @@ mod tests {
         let feed = async move {
             // 分数降序到达：先到先派的 6 条恰是前 6，收场补的是其余里最高的 2 条（s6、s7）
             for (i, n) in sent.iter().enumerate() {
-                tx.send(scan_req(n, 0.9 - i as f32 * 0.05, "alpha", "scan[g1]@p/a#1", i)).await.unwrap();
+                tx.send(scan_req(n, 0.9 - i as f32 * 0.05, "alpha", "scan[g1]@p/a#1", i).into()).await.unwrap();
             }
             tokio::time::sleep_until(at(t0, 50)).await;
             assert_eq!(probe.starts().len(), 6, "扫描期非必挖只派 K − F");
@@ -2997,12 +3036,12 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let probe = Arc::clone(&backend);
         let feed = async move {
-            tx.send(rule_req("p", ItemKind::Primary, 1.0)).await.unwrap();
-            tx.send(scan_req("a", 0.5, "alpha", "scan[g1]@p/alpha#1", 0)).await.unwrap();
-            tx.send(scan_req("b", 0.9, "alpha", "scan[g1]@p/alpha#1", 1)).await.unwrap();
+            tx.send(rule_req("p", ItemKind::Primary, 1.0).into()).await.unwrap();
+            tx.send(scan_req("a", 0.5, "alpha", "scan[g1]@p/alpha#1", 0).into()).await.unwrap();
+            tx.send(scan_req("b", 0.9, "alpha", "scan[g1]@p/alpha#1", 1).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 40)).await;
             assert_eq!(probe.starts(), ["p"], "K = 0：非必挖疑点扫描期不可派");
-            tx.send(scan_req("a", 0.5, "beta", "scan[g1]@p/beta#1", 0)).await.unwrap();
+            tx.send(scan_req("a", 0.5, "beta", "scan[g1]@p/beta#1", 0).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 100)).await;
         };
         let run_fut = run_with(Run { incoming: Some(rx), budget: 0, first_run: true, ..plain(&reg, dir.path(), &bundles, &[]) });
@@ -3029,12 +3068,12 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let feed = async move {
             for n in ["r1", "r2", "r3"] {
-                tx.send(rule_req(n, ItemKind::Ripple, 1.0)).await.unwrap();
+                tx.send(rule_req(n, ItemKind::Ripple, 1.0).into()).await.unwrap();
             }
             tokio::time::sleep_until(at(t0, 20)).await;
-            tx.send(rule_req("r4", ItemKind::Ripple, 1.0)).await.unwrap();
+            tx.send(rule_req("r4", ItemKind::Ripple, 1.0).into()).await.unwrap();
             for (i, n) in ["s1", "s2", "s3"].iter().enumerate() {
-                tx.send(scan_req(n, 0.9 - i as f32 * 0.1, "alpha", "scan[g1]@p/alpha#1", i)).await.unwrap();
+                tx.send(scan_req(n, 0.9 - i as f32 * 0.1, "alpha", "scan[g1]@p/alpha#1", i).into()).await.unwrap();
             }
             tokio::time::sleep_until(at(t0, 200)).await;
         };
@@ -3087,9 +3126,9 @@ mod tests {
         let on_cell = |rec: &CellRecord| landed.lock().unwrap().push((rec.cell.clone(), t0.elapsed()));
         let (tx, rx) = mpsc::channel(4);
         let feed = async move {
-            tx.send(rule_req("a", ItemKind::Primary, 1.0)).await.unwrap();
+            tx.send(rule_req("a", ItemKind::Primary, 1.0).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 20)).await;
-            tx.send(rule_req("b", ItemKind::Primary, 1.0)).await.unwrap();
+            tx.send(rule_req("b", ItemKind::Primary, 1.0).into()).await.unwrap();
         };
         let scanner = async {
             tokio::time::sleep_until(at(t0, 10)).await;
@@ -3121,9 +3160,9 @@ mod tests {
         let on_cell = |rec: &CellRecord| landed.lock().unwrap().push((rec.cell.clone(), t0.elapsed()));
         let (tx, rx) = mpsc::channel(4);
         let feed = async move {
-            tx.send(rule_req("a", ItemKind::Primary, 2.0)).await.unwrap();
+            tx.send(rule_req("a", ItemKind::Primary, 2.0).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 20)).await;
-            tx.send(rule_req("c", ItemKind::Primary, 1.0)).await.unwrap();
+            tx.send(rule_req("c", ItemKind::Primary, 1.0).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 100)).await;
             drop(hold);
         };
@@ -3177,7 +3216,7 @@ mod tests {
                 // 收场读数会随之抖动）
                 for (i, req) in reqs.into_iter().enumerate() {
                     tokio::time::sleep_until(at(t0, i as u64)).await;
-                    tx.send(req).await.unwrap();
+                    tx.send(req.into()).await.unwrap();
                 }
             };
             let run_fut = run_with(Run { incoming: Some(rx), first_run: true, ..plain(&reg, dir.path(), &bundles, &[]) });
@@ -3217,16 +3256,16 @@ mod tests {
         let probe = Arc::clone(&snaps);
         let feed = async move {
             let writes = || probe.lock().unwrap().len();
-            tx.send(scan_req("a", 0.5, "alpha", "scan[g1]@p/alpha#1", 0)).await.unwrap();
+            tx.send(scan_req("a", 0.5, "alpha", "scan[g1]@p/alpha#1", 0).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 1)).await;
             assert_eq!(writes(), 1, "新建项写一次");
-            tx.send(scan_req("a", 0.5, "alpha", "scan[g1]@p/alpha#1", 0)).await.unwrap();
+            tx.send(scan_req("a", 0.5, "alpha", "scan[g1]@p/alpha#1", 0).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 2)).await;
             assert_eq!(writes(), 1, "重复到达（同到达键）不写");
-            tx.send(scan_req("a", 0.5, "alpha", "scan[g1]@p/alpha#2", 0)).await.unwrap();
+            tx.send(scan_req("a", 0.5, "alpha", "scan[g1]@p/alpha#2", 0).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 3)).await;
             assert_eq!(writes(), 2, "并入只写并入目标（同族不抬共识、仍不可派）");
-            tx.send(scan_req("b", 0.4, "alpha", "scan[g1]@p/alpha#1", 1)).await.unwrap();
+            tx.send(scan_req("b", 0.4, "alpha", "scan[g1]@p/alpha#1", 1).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 4)).await;
             assert_eq!(writes(), 3);
         };
@@ -3355,10 +3394,57 @@ mod tests {
         };
         let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 3)], QueueOrigin::Rule, vec![]).unwrap();
 
-        let got = api_needs_for(&input, &spec);
+        let got = api_needs_for(&input, &[], &spec);
 
         let reasons: Vec<&str> = got.iter().map(|n| n.reason.as_str()).collect();
         assert_eq!(reasons, ["命中本项区间", "无行锚 → 退回本项区间"], "{reasons:?}");
+    }
+
+    /// **首跑形态**的 A-4 接线（`/code-review` 2026-09-29 抓到的 high）：首跑 `scan_cells` 恒空
+    /// （scan 与 deep 并行），api 声明只能走流式通道。原来的两条用例都只构造了 resume 形态，
+    /// 于是「api_contracts = 0」与「接线断了」不可区分——正是本项目第三次踩「各自绿、接起来不通」。
+    #[tokio::test]
+    async fn api_needs_reach_the_dig_cell_on_the_first_run_path() {
+        if crate::pack::contracts::registry_root().is_none_or(|r| !r.exists()) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let body = "fn decode(s: &str) {\n    let v: serde_json::Value = serde_json::from_str(s).unwrap();\n}\n";
+        std::fs::write(root.join("a.rs"), body).unwrap();
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        git_commit_all(root);
+        let bundles = vec![Bundle::from_files(vec![FileChange {
+            path: "a.rs".into(),
+            diff: "@@ -1,2 +1,2 @@\n+    let v: serde_json::Value = serde_json::from_str(s).unwrap();\n".into(),
+        }])];
+        let sus = crate::domain::Suspicion {
+            file: "a.rs".into(), line_start: 2, line_end: 2, hint: "反序列化没判边界".into(), category: None, confidence: 0.6,
+            quote: "    let v: serde_json::Value = serde_json::from_str(s).unwrap();".into(),
+        };
+        let api = crate::domain::NeedEntry {
+            path: "a.rs".into(), lines: Some("2-2".into()), reason: "from_str 出错时返回什么".into(),
+            kind: crate::domain::NeedKind::Api,
+        };
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        let rev = r#"{"findings":[{"severity":"low","title":"t","body":"b","file":"a.rs","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r","quote":"fn decode(s: &str) {"}],"needs":[]}"#;
+        reg.insert_scan("p/r", "p", 4, Box::new(FakeChatBackend::new(vec![turn(rev)])), Duration::from_secs(5), 0);
+
+        // 首跑：scan_cells 空，疑点与 api 声明都从通道来（与 `run_scan_fanout` 的发送顺序同形）
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let feed = async move {
+            let req = EnqueueReq::scan(&sus, "alpha", "scan[g1]@p/a#1#0".into()).unwrap();
+            tx.send(req.into()).await.unwrap();
+            tx.send(crate::orchestrate::queue::DeepMsg::ApiNeed(api)).await.unwrap();
+            drop(tx);
+        };
+        let run_fut = run_with(Run {
+            incoming: Some(rx), budget: 4, first_run: true, ..plain(&reg, root, &bundles, &[])
+        });
+        let (run, ()) = tokio::join!(run_fut, feed);
+
+        assert_eq!(run.cells.len(), 1, "一项一格: {:?}", run.items);
+        assert!(run.meta.api_contracts > 0, "首跑路径上 api 声明没到深挖（scan_cells 那时恒空）: {:?}", run.meta);
     }
 
     /// A-4 跨层接线：scanner 的 `needs{kind: api}` → 深挖 cell 的 pack 里真的有契约 + 函数体，
@@ -3560,13 +3646,13 @@ mod tests {
         let reg = routed_registry(&backend, 8);
         let (tx, rx) = mpsc::channel(8);
         let feed = async move {
-            tx.send(rule_req("p", ItemKind::Primary, 1.0)).await.unwrap();
+            tx.send(rule_req("p", ItemKind::Primary, 1.0).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 10)).await;
             // 同一格背靠背发出（通道未满不让出执行权 → 深挖侧一次唤醒全收）
-            tx.send(scan_req("lo", 0.3, "alpha", "scan[g1]@p/alpha#1", 0)).await.unwrap();
-            tx.send(scan_req("hi", 0.9, "alpha", "scan[g1]@p/alpha#1", 1)).await.unwrap();
+            tx.send(scan_req("lo", 0.3, "alpha", "scan[g1]@p/alpha#1", 0).into()).await.unwrap();
+            tx.send(scan_req("hi", 0.9, "alpha", "scan[g1]@p/alpha#1", 1).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 50)).await;
-            tx.send(scan_req("mid", 0.7, "alpha", "scan[g1]@p/beta#1", 0)).await.unwrap();
+            tx.send(scan_req("mid", 0.7, "alpha", "scan[g1]@p/beta#1", 0).into()).await.unwrap();
             tokio::time::sleep_until(at(t0, 100)).await;
         };
         let run_fut = run_with(Run { incoming: Some(rx), budget: 3, first_run: true, ..plain(&reg, dir.path(), &bundles, &[]) });

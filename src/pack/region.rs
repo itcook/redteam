@@ -80,6 +80,12 @@ pub struct RegionStats {
     /// 定位不到而降级的 crate 数（registry 缺失时必须看得见是降级了）。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub contract_misses: usize,
+    /// 超帽没进去的契约块数。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub contract_spilled: usize,
+    /// 有 api 声明、但帽不够整段没注入（与组 pack 的 `contract_budget_skipped` 同义）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub contract_budget_skipped: bool,
     /// 省略清单条数。
     pub omitted: usize,
     /// 证据块字节数（切片 + 半径 + 清单）。
@@ -118,16 +124,26 @@ fn contract_slot(
     omit: &mut Vec<String>,
 ) -> crate::pack::contracts::ContractSection {
     use crate::pack::contracts;
-    let empty = contracts::ContractSection::default();
-    if api_needs.is_empty() || cap == 0 || !item.file.ends_with(".rs") {
+    let mut empty = contracts::ContractSection::default();
+    if api_needs.is_empty() || !item.file.ends_with(".rs") {
+        return empty; // 没声明 / 非 Rust：不是降级，一个字节都不占
+    }
+    // 有声明却放不下：这是**降级**，要能被看见（组 pack 那条路早就这么做了；深挖这条原来是静默的
+    // ——2026-09-29 `/code-review` 抓到）。帽的地板与组 pack 同口径。
+    if cap < super::OUTSIDE_MIN_CAP {
+        omit.push(format!("needs{{api}} 契约：预算不足（帽 {cap} 字节 < {}），未注入", super::OUTSIDE_MIN_CAP));
+        empty.budget_skipped = true;
         return empty;
     }
     // 行锚用与二阶段补查同一份解析（同一个字段在两条路径上解出两个区间是纯粹的坑）；
     // 声明不带行锚 → 退回本项区间（它至少是模型正在看的那几行）。
+    // 带行锚的用行锚；**只要有一条不带行锚**，本项区间也并进来——`api_needs_for` 特意保留了无锚声明
+    // （注释写着「退回本项区间」），而这里原来只在「一条锚都没有」时才退回：两层语义对不上，
+    // 无锚声明在有锚声明在场时等于被静默丢掉（2026-09-29 `/code-review` 抓到）。
     let mut ranges: Vec<(u32, u32)> =
         api_needs.iter().filter_map(|n| crate::cli::second_pass::parse_need_lines(n.lines.as_deref())).collect();
-    if ranges.is_empty() {
-        ranges = item.ranges.clone();
+    if ranges.len() < api_needs.len() {
+        ranges.extend(item.ranges.iter().copied());
     }
     let sec = contracts::api_contracts_section(
         root,
@@ -145,6 +161,12 @@ fn contract_slot(
             }
             contracts::LocateMiss::WalkTruncated { krate, scanned } => {
                 format!("{krate} — 源码超过 {scanned} 个文件，后面的没搜（needs{{api}} 契约可能缺块）")
+            }
+            contracts::LocateMiss::AmbiguousVersion { krate, versions } => {
+                format!("{krate} — needs{{api}} 契约未注入（Cargo.lock 里同名多版本：{}，定不出该用哪个）", versions.join(" / "))
+            }
+            contracts::LocateMiss::HitCapReached { krate, cap } => {
+                format!("{krate} — 命中数触到上限 {cap}，后面的名字没取（needs{{api}} 契约可能缺块）")
             }
         });
     }
@@ -322,6 +344,8 @@ pub fn build(
         let sec = contract_slot(root, &ctx.content, item, api_needs, cap.saturating_sub(radius_len), &mut omit);
         stats.contracts = sec.blocks;
         stats.contract_misses = sec.misses.len();
+        stats.contract_spilled = sec.spilled;
+        stats.contract_budget_skipped = sec.budget_skipped;
         if !sec.text.is_empty() {
             sections.push(format!("## 三方契约（needs: api，含函数体）\n{}", sec.text));
         }
@@ -738,6 +762,47 @@ mod tests {
         let tight = run(8 * (rich.stats.outside_bytes + 50));
         assert!(tight.stats.outside_bytes > 0, "半径先拿帽: {:?}", tight.stats);
         assert_eq!(tight.stats.contracts, 0, "契约不得挤掉半径邻居: {:?}", tight.stats);
+    }
+
+    /// 无行锚的声明要能让**本项区间**参与：`api_needs_for` 特意保留它们并注明「退回本项区间」，
+    /// 而这里原来只在「一条锚都没有」时才退回——两层语义对不上（2026-09-29 `/code-review` 抓到）。
+    #[test]
+    fn an_anchorless_api_need_still_brings_in_the_item_range() {
+        if crate::pack::contracts::registry_root().is_none_or(|r| !r.exists()) {
+            return;
+        }
+        let body = "pub fn decode(s: &str) {\n    let _v: serde_json::Value = serde_json::from_str(s).unwrap();\n}\n\nfn unrelated() {\n    let _x = 1;\n}\n";
+        let (_tmp, root) = tmpdir(&[("src/a.rs", body)]);
+        std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        let bundle = bundle_of("src/a.rs", "@@ -2,1 +2,1 @@\n+    let _v: serde_json::Value = serde_json::from_str(s).unwrap();\n");
+        let item = QueueItemSpec::new("src/a.rs".into(), vec![(1, 3)], Origin::Rule, vec![]).unwrap();
+        let tracked = crate::cli::second_pass::TrackedFiles::load(&root);
+        // 一条带锚但指向没有三方调用的第 6 行，一条不带锚
+        let needs = [api_need("src/a.rs", Some("6-6")), api_need("src/a.rs", None)];
+
+        let pack = build(&item, &bundle, &root, &tracked, &CrossIndex::default(), 64 * 1024, &PackOpts::default(), "", &needs).unwrap();
+
+        assert!(pack.stats.contracts > 0, "无锚声明该让本项区间（1-3 行的 from_str）参与: {}", pack.evidence);
+        assert!(pack.evidence.contains("pub fn from_str"), "{}", pack.evidence);
+    }
+
+    /// 深挖侧「有声明但帽不够」也是降级，要记账 + 披露（组 pack 那条路早就这么做了）。
+    #[test]
+    fn api_contract_budget_skip_is_recorded_on_the_deep_path() {
+        let body = "pub fn decode(s: &str) {\n    let _v: serde_json::Value = serde_json::from_str(s).unwrap();\n}\n";
+        let (_tmp, root) = tmpdir(&[("src/a.rs", body)]);
+        std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+        let bundle = bundle_of("src/a.rs", "@@ -2,1 +2,1 @@\n+    let _v: serde_json::Value = serde_json::from_str(s).unwrap();\n");
+        let item = QueueItemSpec::new("src/a.rs".into(), vec![(1, 3)], Origin::Rule, vec![]).unwrap();
+        let tracked = crate::cli::second_pass::TrackedFiles::load(&root);
+        let needs = [api_need("src/a.rs", Some("2-2"))];
+
+        // budget / 8 < OUTSIDE_MIN_CAP(256) → 帽根本不够
+        let pack = build(&item, &bundle, &root, &tracked, &CrossIndex::default(), 800, &PackOpts::default(), "", &needs).unwrap();
+
+        assert_eq!(pack.stats.contracts, 0);
+        assert!(pack.stats.contract_budget_skipped, "帽不够整段没注入 = 降级，要记账: {:?}", pack.stats);
+        assert!(pack.evidence.contains("needs{api} 契约：预算不足"), "{}", pack.evidence);
     }
 
     /// 定位不到（包不在 registry）→ 降级不阻塞：区域切片照常，原因进省略清单。

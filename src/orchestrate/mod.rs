@@ -189,7 +189,7 @@ pub async fn run_scan_fanout(
     registry: &ProviderRegistry,
     input: &ScanFanoutInput<'_>,
     sink: Option<&dyn CellSink>,
-    enqueue: Option<&tokio::sync::mpsc::Sender<queue::EnqueueReq>>,
+    enqueue: Option<&tokio::sync::mpsc::Sender<queue::DeepMsg>>,
 ) -> ScanResults {
     let prompts: Vec<ScanPrompt> = input
         .bundles
@@ -266,14 +266,19 @@ pub async fn run_scan_fanout(
             if let (Some(tx), Some(out)) = (enqueue, &output) {
                 for (i, s) in out.suspicions.iter().enumerate() {
                     if let Some(req) = queue::EnqueueReq::scan(s, &e.family, crate::consolidate::scan::arrival_key(id, i, s)) {
-                        let _ = tx.send(req).await;
+                        let _ = tx.send(req.into()).await;
                     }
                 }
                 // needs 是 design §6 的第三种生产者（C3〔D16〕Q8）：疑点发完再发，层级 `ItemKind::Needs` 天然排在疑点之后
                 // ——预算有余才吃格。变更集过滤在深挖侧（那里才有 bundles），这里照发。
                 for n in &out.needs {
                     if let Some(req) = queue::EnqueueReq::need(n) {
-                        let _ = tx.send(req).await;
+                        let _ = tx.send(req.into()).await;
+                    }
+                    // `needs{kind: api}` 不入队（没有自己的区域），但深挖装包要用——**首跑只有这条路**：
+                    // 那时 `DeepInput::scan_cells` 恒空（scan 与 deep 并行），不发就等于 A-4 不生效。
+                    if n.kind == crate::domain::NeedKind::Api && !n.path.is_empty() {
+                        let _ = tx.send(queue::DeepMsg::ApiNeed(n.clone())).await;
                     }
                 }
             }
@@ -455,7 +460,7 @@ mod scan_tests {
     const REAL: &str = "let t = secret();";
 
     fn scan_json(extra: &str) -> String {
-        format!(r#"{{"suspicions":[{{"file":"src/a.rs","line_start":9,"line_end":9,"hint":"real","confidence":0.7,"quote":"{REAL}"}}{extra}],"needs":[{{"path":"src/b.rs","lines":"3-9","reason":"r"}},{{"path":"src/c.rs","reason":"没有行锚"}}],"scanned_areas":[{{"file":"src/a.rs","ranges":["1-2"]}}]}}"#)
+        format!(r#"{{"suspicions":[{{"file":"src/a.rs","line_start":9,"line_end":9,"hint":"real","confidence":0.7,"quote":"{REAL}"}}{extra}],"needs":[{{"path":"src/b.rs","lines":"3-9","reason":"r"}},{{"path":"src/c.rs","reason":"没有行锚"}},{{"path":"src/a.rs","lines":"1-2","reason":"契约要核","kind":"api"}}],"scanned_areas":[{{"file":"src/a.rs","ranges":["1-2"]}}]}}"#)
     }
     fn turn(text: &str, reasoning: Option<u64>, out_tok: u64) -> AssistantTurn {
         AssistantTurn { text: text.into(), tool_calls: vec![], input_tokens: 10, output_tokens: out_tok, cached_input_tokens: 4, finish_reason: None, reasoning_tokens: reasoning }
@@ -502,8 +507,12 @@ mod scan_tests {
         };
         let recv = async {
             let mut got = Vec::new();
-            while let Some(req) = rx.recv().await {
-                got.push(req);
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    queue::DeepMsg::Item(req) => got.push(*req),
+                    // api 声明不入队（A-4）：这条用例只看入队面，另有专测
+                    queue::DeepMsg::ApiNeed(_) => {}
+                }
             }
             got
         };
@@ -539,7 +548,7 @@ mod scan_tests {
     #[tokio::test]
     async fn scan_fanout_sends_only_after_the_cell_is_persisted() {
         struct Probe {
-            rx: Mutex<tokio::sync::mpsc::Receiver<crate::orchestrate::queue::EnqueueReq>>,
+            rx: Mutex<tokio::sync::mpsc::Receiver<crate::orchestrate::queue::DeepMsg>>,
             seen: Mutex<Vec<String>>,
             early: Mutex<Vec<String>>,
             calls: Mutex<usize>,
@@ -553,8 +562,11 @@ mod scan_tests {
                     *c
                 };
                 let mut rx = self.rx.lock().unwrap();
-                while let Ok(req) = rx.try_recv() {
-                    let key = req.arrival.unwrap_or_default();
+                while let Ok(msg) = rx.try_recv() {
+                    let key = match msg {
+                        queue::DeepMsg::Item(req) => req.arrival.unwrap_or_default(),
+                        queue::DeepMsg::ApiNeed(n) => format!("api:{}", n.path),
+                    };
                     // 第一次落盘时通道必须是空的——那时只有本格跑完，它的疑点与 needs 都还没发。
                     // needs 的到达键不带 cell id（`needs:{path}:…`），只靠前缀比对漏得掉，故按「第几次落盘」兜住。
                     if nth == 1 || key.starts_with(&format!("{}#", rec.cell)) {
@@ -575,14 +587,24 @@ mod scan_tests {
         drop(tx);
         let mut rx = probe.rx.into_inner().unwrap();
         let mut seen = probe.seen.into_inner().unwrap();
-        while let Ok(req) = rx.try_recv() {
-            seen.push(req.arrival.unwrap_or_default());
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                queue::DeepMsg::Item(req) => seen.push(req.arrival.unwrap_or_default()),
+                // api 声明与入队项同走一条通道但不是队列项（A-4）——这条用例只看入队面
+                queue::DeepMsg::ApiNeed(n) => seen.push(format!("api:{}", n.path)),
+            }
         }
         assert_eq!(res.cells.len(), 2);
         assert_eq!(probe.early.into_inner().unwrap(), Vec::<String>::new(), "未落盘就入队");
         seen.sort();
         let prefixes: Vec<&str> = seen.iter().map(|k| k.split(':').next().unwrap()).collect();
-        assert_eq!(prefixes, ["needs", "needs", "scan[g1]@p/a#1#0", "scan[g2]@p/a#1#0"], "两格各发一条疑点 + 一条 needs");
+        // `needs{kind:api}` 不入队（没有自己的区域），但**必须上通道**——首跑时深挖拿不到 scan_cells，
+        // 不发就等于 A-4 在正常评审里整个不生效（2026-09-29 `/code-review` 抓到的 high）。
+        assert_eq!(
+            prefixes,
+            ["api", "api", "needs", "needs", "scan[g1]@p/a#1#0", "scan[g2]@p/a#1#0"],
+            "两格各发：一条疑点 + 一条 evidence needs（入队）+ 一条 api 声明（不入队，走 DeepMsg::ApiNeed）"
+        );
     }
 
     /// 大格先发：provider 门宽 1 串行化派发，三组 diff 字节 小 / 大 / 中 → 调用序 g2, g3, g1；`res.cells` 仍按 plan 序（g1, g2, g3）。
@@ -630,7 +652,7 @@ mod scan_tests {
         assert_eq!(res.cells[2].group, 1);
         assert!(res.failed.is_empty() && res.warnings.is_empty());
         assert_eq!(res.usage, (40, 1200, 16));
-        assert_eq!(res.needs_declared, 8, "每格声明 2 条 needs（一条带行锚、一条不带）× 4 格");
+        assert_eq!(res.needs_declared, 12, "每格声明 3 条 needs（带行锚 / 不带 / kind=api）× 4 格");
         assert!(res.cells.iter().all(|c| c.record.template_hash.as_deref() == Some(crate::prompt::scan_template_hash().as_str())));
         assert!(res.cells.iter().all(|c| c.record.attempts == 1 && c.record.iterations == 1));
         // 锚定：模型报第 9 行，quote 在第 2 行 → 行号改写
@@ -720,7 +742,7 @@ mod scan_tests {
         let w = rec.warn.as_deref().unwrap();
         assert!(w.contains("parse dropped: no_quote=1") && w.contains("1 suspicions dropped: quote not found") && w.contains("zero reasoning tokens (output 50 tokens)"), "{w}");
         assert_eq!(res.cells[0].output.as_ref().unwrap().suspicions.len(), 1);
-        assert_eq!(res.needs_declared, 2, "声明数按 scanner 报的算，与能否入队无关");
+        assert_eq!(res.needs_declared, 3, "声明数按 scanner 报的算，与能否入队无关（含不入队的 kind=api）");
         // 未钉档位 → 不报零推理；输出长 → 不报
         let unpinned = vec![entry("p/a", "alpha", false)];
         let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &unpinned, 1), None, None).await;
