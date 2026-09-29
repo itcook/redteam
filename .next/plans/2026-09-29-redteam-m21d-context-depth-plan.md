@@ -50,15 +50,23 @@ scanner 提出 `needs{kind:api}` 时，深挖 cell 带对应契约 **+ 函数体
 - 验收反过来抓到三处自身缺陷并已修：同名方法给错归属（`c997614`）、`use krate::Type;` 形态抽不出目标（`b588b0e`）、
   省略清单刷假 miss（`7bc0f0c`）——**都是单测照不到、只有真实仓库数据才暴露的**。
 
-## 批 B · 稳定前缀与确定性后滤（`feat/m21d-prefix-anchor`）
+## 批 B · 稳定前缀与确定性后滤（`feat/m21d-prefix-anchor`）✅ 2026-09-29
 
-### Task B-1 仓库简介入稳定前缀（交付项 4）
-`.redteam/brief.md`（约 2K token），段位在系统协议之后、spec 之前；缺失时行为与今日逐字节一致。
-验收：cache 命中率不降（本仓与 PR181 各一轮对照）。
+> 记录 `.next/private/m21d/2026-09-29-batchB-prefix-anchor-record.md`。开工调研改了两处范围理解：
+> B-1 的槽位 / 段序 / 中和表**本就在模板里**（只差读取与接线）；B-2 的 `anchorWindow` 键已被
+> 装包的禁真空窗半径占用 → 裁定新开 `findingWindow`、先只观测、降级默认关。
 
-### Task B-2 `anchor_window = ±N` 确定性后滤（交付项 6）
-落在改动行 ±N 外的疑点 / finding 降级或丢；**不误伤 carried 项**（跨轮沿用的 finding 锚点本就可能漂）。
-验收：PR181 改动行外 finding 数可观测。
+### Task B-1 仓库简介入稳定前缀（交付项 4）✅
+`.redteam/brief.md`（帽 8KB）进 `<repo_brief>` 槽，与 `--spec` 共用防线（非常规文件拒读、有界读、
+PEM 嗅探、**符号链接逃逸检查**）；缺失时与今日逐字节一致。
+中和**按三表并集**做（各角色表标签集不同，不统一会让稳定前缀分叉——dogfood 抓到，
+`--spec` 的同款问题随 code-review 一并修）。brief 字节从 pack 预算里扣、`.gitignore` 放行 brief.md。
+
+### Task B-2 `findingWindow = ±N` 确定性后滤（交付项 6）✅
+新键 `review.pack.findingWindow`（默认 30，0 = 关）。**默认只观测**：恒标记 `Finding.outside_window`
++ RunMeta 计数 + md 逐条披露；`findingWindowEnforce` 打开才「不计入 verdict 与计数、条目照留」。
+carried 项、变更集外文件、diff 重建不了三种情形都不判（各有理由，都有用例）。
+实测本仓一轮：窗外 2 / 41（4.9%），样本太小不足以支持开 enforce。
 
 ## 批 C · 按信号触发（`feat/m21d-tuning`）
 
