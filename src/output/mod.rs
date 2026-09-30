@@ -299,12 +299,12 @@ fn render_scan_md(r: &ReviewReport, s: &mut String) {
         ));
     }
     if !scan.groups.is_empty() {
-        s.push_str("\n  | Group | Files | Cells | Suspicions | Pack |\n  | --- | --- | --- | --- | --- |\n");
+        s.push_str("\n  | Group | Files | Diff bytes | Cells | Suspicions | Pack |\n  | --- | --- | --- | --- | --- | --- |\n");
         for (i, g) in scan.groups.iter().enumerate() {
             s.push_str(&format!(
-                "  | g{} `{}` | {} | {} | {} | {} · sliced {} · folded {} · outside {} · contracts {} |\n",
-                i + 1, g.label, g.files.len(), g.cells.len(), g.suspicions, g.pack.body, g.pack.sliced, g.pack.folded_lines,
-                g.pack.outside_sites, g.pack.contracts
+                "  | g{} `{}` | {} | {} | {} | {} | {} · sliced {} · folded {} · outside {} · contracts {} |\n",
+                i + 1, g.label, g.files.len(), g.pack.diff_bytes, g.cells.len(), g.suspicions, g.pack.body,
+                g.pack.sliced, g.pack.folded_lines, g.pack.outside_sites, g.pack.contracts
             ));
         }
     }
@@ -529,7 +529,7 @@ mod tests {
         run.cells.push(CellSummary { cell: "scan[g1]@p/a#1".into(), model: "p/a".into(), role: "scanner".into(), ok: true, iterations: 1, attempts: 1, duration_ms: 1200, queue_wait_ms: 0, input_tokens: 1000, output_tokens: 50, cached_input_tokens: 400 });
         let scan = ScanReport {
             groups: vec![
-                ScanGroup { label: "src/a.rs".into(), files: vec!["src/a.rs".into()], cells: vec!["scan[g1]@p/a#1".into(), "scan[g1]@q/b#1".into()], suspicions: 2, pack: crate::pack::PackStats { body: "slice".into(), sliced: 1, folded_lines: 30, ..Default::default() } },
+                ScanGroup { label: "src/a.rs".into(), files: vec!["src/a.rs".into()], cells: vec!["scan[g1]@p/a#1".into(), "scan[g1]@q/b#1".into()], suspicions: 2, pack: crate::pack::PackStats { body: "slice".into(), sliced: 1, folded_lines: 30, diff_bytes: 4096, ..Default::default() } },
                 ScanGroup { label: "src/b.rs".into(), files: vec!["src/b.rs".into()], cells: vec!["scan[g2]@p/a#1".into(), "scan[g2]@q/b#1".into()], suspicions: 1, pack: crate::pack::PackStats { body: "slice".into(), ..Default::default() } },
             ],
             suspicions: vec![
@@ -546,7 +546,8 @@ mod tests {
             "- Verdict: 🔎 scan-only",
             "## Scan",
             "- Groups: 2 · Cells: 3 ok / 1 failed · Suspicions: 3 (agreement ≥ 2: 1) · Changed-line coverage: 75% · Needs declared: 2",
-            "| g1 `src/a.rs` | 1 | 2 | 2 | slice · sliced 1 · folded 30 · outside 0 · contracts 0 |",
+            // 交付项 7 的切分键（每组 diff 字节）要在组表里读得到
+            "| g1 `src/a.rs` | 1 | 4096 | 2 | 2 | slice · sliced 1 · folded 30 · outside 0 · contracts 0 |",
             "- Failed cells: scan[g2]@q/b#1",
             "#### g1",
             "- `src/a.rs:3-3` [L1] conf 0.80 · agreement 2 (alpha, beta) — leak / secret logged",

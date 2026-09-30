@@ -87,6 +87,13 @@ pub struct PackStats {
     pub outside_sites: usize,
     pub outside_sigs: usize,
     pub outside_bytes: usize,
+    /// 本组自己的 diff 字节（M21d 批 C，交付项 7 的切分键）。
+    ///
+    /// 拆大组的验收**不挂墙钟**〔2026-09-23 实测推翻墙钟前提〕，改按「每格 diff 字节」判。
+    /// 这个数此前只有 `--pack-only` 的仪表报得出，真实评审的报告里读不到——
+    /// 于是「组是不是太大」永远只能靠跑一次仪表，日常 dogfood 攒不出分布。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub diff_bytes: usize,
     /// L4-B 三方契约（M21d 批 A）：注入的契约块数。
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub contracts: usize,
@@ -969,7 +976,7 @@ fn outside_render(
 /// `changeset`：全变更集文件路径（文件外搜索排除；调用方给全部 bundle 的文件）。
 pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: usize, opts: &PackOpts, changeset: &[String]) -> Packed {
     let remaining = budget.saturating_sub(own_diff_bytes);
-    let mut stats = PackStats::default();
+    let mut stats = PackStats { diff_bytes: own_diff_bytes, ..PackStats::default() };
     let mut omit: Vec<String> = Vec::new();
     let files = prepare_files(bundle, root);
 
@@ -1616,6 +1623,22 @@ mod tests {
         assert_eq!((p.stats.contracts, p.stats.contract_misses, p.stats.contract_spilled), (0, 0, 0));
         assert!(!p.text.contains("## 三方契约"), "{}", p.text);
         assert!(p.text.contains("pub fn decode"), "正文照旧: {}", p.text);
+    }
+
+    /// 交付项 7 的切分键要**在真实评审的报告里读得到**（批 C）：此前 `diff_bytes` 只有 `--pack-only`
+    /// 的仪表报得出，日常 dogfood 攒不出「组有多大」的分布，于是拆不拆大组永远得先跑一次仪表。
+    #[test]
+    fn pack_stats_carry_the_groups_own_diff_bytes() {
+        let (tmp, b, changeset) = outside_repo();
+        let own: usize = b.files.iter().map(|f| f.diff.len()).sum();
+        assert!(own > 0);
+
+        let p = pack_bundle(&b, tmp.path(), 1_000_000, own, &PackOpts::default(), &changeset);
+
+        assert_eq!(p.stats.diff_bytes, own, "组自己的 diff 字节要记进 PackStats");
+        // 传 0（`--pack-only` 之外的某些调用点按 0 记账）时不谎报
+        let p0 = pack_bundle(&b, tmp.path(), 1_000_000, 0, &PackOpts::default(), &changeset);
+        assert_eq!(p0.stats.diff_bytes, 0);
     }
 
     /// 批 C-1：折叠区间要被采出来，且**与渲染文本里的 `…（a-b 行折叠…）` 逐段一致**——
