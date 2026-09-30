@@ -111,6 +111,12 @@ fn is_zero_usize(v: &usize) -> bool {
 pub struct Packed {
     pub text: String,
     pub stats: PackStats,
+    /// 每个文件被折叠掉的行区间（1-based 含端点，M21d 批 C-1）。
+    ///
+    /// 只在运行时传递、**不进报告 JSON**（一组可能几百段，报告会被撑爆）。
+    /// 用途：判 design §10.2 的回退信号——scanner 的 `needs{kind:evidence}` 是不是在
+    /// **反复索要被折叠的函数体**。光看 needs 条数判不了这件事（三轮都稳定在三成）。
+    pub folded: std::collections::BTreeMap<String, Vec<(u32, u32)>>,
 }
 
 /// 切片块的形态（块头与统计用）。
@@ -118,6 +124,8 @@ struct SliceOut {
     text: String,
     one_hop: usize,
     folded_lines: usize,
+    /// 折叠掉的行区间（1-based 含端点）——与渲染出的 `…（a-b 行折叠…）` 同源，不另算一遍。
+    folded_ranges: Vec<(u32, u32)>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -330,17 +338,21 @@ fn slice_file(ctx: &FileCtx<'_>, opts: &PackOpts) -> Option<SliceOut> {
         }
     }
     let expand = merge_ranges(expand);
-    let (body, folds, folded_lines) = render_slice_body(ctx, &all, &expand);
+    let (body, folds, folded_lines, folded_ranges) = render_slice_body(ctx, &all, &expand);
     let one_hop = hop.callees.len() + hop.callers.len();
     let head = format!("{}:1-{n}（切片：核 {} · 一跳 {one_hop} · 折叠 {folds} 段）", ctx.fc.path, changed.len());
-    Some(SliceOut { text: format!("{head}\n{body}\n"), one_hop, folded_lines })
+    Some(SliceOut { text: format!("{head}\n{body}\n"), one_hop, folded_lines, folded_ranges })
 }
 
 /// 切片渲染机器（组切片 [`slice_file`] 与 reviewer 区域切片〔批 B `pack::region`〕共用，design §10.2 三层同批）：
 /// 保留行 = 文件头（≤ `HEADER_MAX_LINES`）+ 全部 def 签名；其余按外围 def 折叠，顶层胶水 ≤ `GLUE_MAX_LINES` 原样。
 /// 返回 (正文, 折叠段数, 折叠行数)。非支持语言无 def，「头」只看文件顶部 `HEADER_MAX_LINES` 行（评审修 7）；多行 import 组
 /// （Go `import (`、Rust `use x::{`、TS `import {`）按代码内括号配平整组保留（评审修 8；字符串 / 注释里的括号不计）。
-fn render_slice_body(ctx: &FileCtx<'_>, all: &[crate::diffsym::DefRange], expand: &[(usize, usize)]) -> (String, usize, usize) {
+fn render_slice_body(
+    ctx: &FileCtx<'_>,
+    all: &[crate::diffsym::DefRange],
+    expand: &[(usize, usize)],
+) -> (String, usize, usize, Vec<(u32, u32)>) {
     let lines: Vec<&str> = ctx.content.lines().collect();
     let n = lines.len();
     let mut keep: BTreeSet<usize> = BTreeSet::new();
@@ -382,6 +394,7 @@ fn render_slice_body(ctx: &FileCtx<'_>, all: &[crate::diffsym::DefRange], expand
     // 渲染
     let mut body = String::new();
     let (mut folds, mut folded_lines) = (0usize, 0usize);
+    let mut folded_ranges: Vec<(u32, u32)> = Vec::new();
     let mut ei = 0usize;
     let mut i = 0usize;
     while i < n {
@@ -416,6 +429,7 @@ fn render_slice_body(ctx: &FileCtx<'_>, all: &[crate::diffsym::DefRange], expand
                 body.push_str(&format!("…（{}-{} 行折叠：{}）\n", i + 1, j, all[idx].name));
                 folds += 1;
                 folded_lines += len;
+                folded_ranges.push((i as u32 + 1, j as u32));
             }
             None if len <= GLUE_MAX_LINES => {
                 for l in &lines[i..j] {
@@ -427,11 +441,12 @@ fn render_slice_body(ctx: &FileCtx<'_>, all: &[crate::diffsym::DefRange], expand
                 body.push_str(&format!("…（{}-{} 行折叠）\n", i + 1, j));
                 folds += 1;
                 folded_lines += len;
+                folded_ranges.push((i as u32 + 1, j as u32));
             }
         }
         i = j;
     }
-    (body, folds, folded_lines)
+    (body, folds, folded_lines, folded_ranges)
 }
 
 /// 0 壳段：每个改动文件一块，第一级 = 切片块（slice 档、大文件）或全文块（full 档 / 小文件 / 无可解析 hunk），
@@ -447,10 +462,18 @@ pub(crate) fn body_section(
     stats: &mut PackStats,
 ) -> String {
     let files = prepare_files(bundle, root);
-    body_section_ctx(&files, budget, omit, opts, stats)
+    body_section_ctx(&files, budget, omit, opts, stats, &mut Default::default())
 }
 
-fn body_section_ctx(files: &[FileCtx<'_>], budget: usize, omit: &mut Vec<String>, opts: &PackOpts, stats: &mut PackStats) -> String {
+#[allow(clippy::too_many_arguments)] // 文件 / 预算 / 省略清单 / 选项 / 统计 / 折叠区间各不同源
+fn body_section_ctx(
+    files: &[FileCtx<'_>],
+    budget: usize,
+    omit: &mut Vec<String>,
+    opts: &PackOpts,
+    stats: &mut PackStats,
+    folded: &mut std::collections::BTreeMap<String, Vec<(u32, u32)>>,
+) -> String {
     let mut out = String::new();
     stats.body = match opts.body {
         PackBody::Slice => "slice".to_string(),
@@ -481,6 +504,13 @@ fn body_section_ctx(files: &[FileCtx<'_>], budget: usize, omit: &mut Vec<String>
         };
         if out.len() + block.len() <= budget {
             out.push_str(&block);
+            // 折叠区间只在块**真的进了 pack** 时才记：没进去的块模型压根没看到，
+            // 那属于「预算截断」不是「被折叠」，混为一谈会把回退信号读虚。
+            if let Some(s) = &sliced {
+                if !s.folded_ranges.is_empty() {
+                    folded.entry(path.clone()).or_default().extend(s.folded_ranges.iter().copied());
+                }
+            }
             match kind {
                 "slice" => {
                     stats.sliced += 1;
@@ -944,7 +974,8 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
     let files = prepare_files(bundle, root);
 
     // 0 壳：改动源文（切片 / 全文 + 梯子；overflow → omit）
-    let bodies = body_section_ctx(&files, remaining, &mut omit, opts, &mut stats);
+    let mut folded: std::collections::BTreeMap<String, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
+    let bodies = body_section_ctx(&files, remaining, &mut omit, opts, &mut stats, &mut folded);
     // 文件外片段（仅 slice 档）：帽 = min(0 壳后剩余, 组预算 / 8)
     let outside_cap = remaining.saturating_sub(bodies.len()).min(budget / OUTSIDE_BUDGET_SHARE);
     let outside = if opts.body == PackBody::Slice {
@@ -1027,7 +1058,7 @@ pub fn pack_bundle(bundle: &Bundle, root: &Path, budget: usize, own_diff_bytes: 
         }
         sections.push(sec);
     }
-    Packed { text: sections.join("\n"), stats }
+    Packed { text: sections.join("\n"), stats, folded }
 }
 
 /// 只要正文的薄包装（二阶段补查与测试用）。
@@ -1585,6 +1616,41 @@ mod tests {
         assert_eq!((p.stats.contracts, p.stats.contract_misses, p.stats.contract_spilled), (0, 0, 0));
         assert!(!p.text.contains("## 三方契约"), "{}", p.text);
         assert!(p.text.contains("pub fn decode"), "正文照旧: {}", p.text);
+    }
+
+    /// 批 C-1：折叠区间要被采出来，且**与渲染文本里的 `…（a-b 行折叠…）` 逐段一致**——
+    /// 两处各算一遍必然漂，回退信号就废了。只有真的进了 pack 的块才算（没进去的是预算截断，不是折叠）。
+    #[test]
+    fn folded_ranges_match_the_rendered_fold_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // 造一个够大的文件：改动在 f0，其余 def 的体会被折叠
+        let mut body = String::from("// header\n");
+        // 要超过 slice_min_bytes（8KB）才会走切片，否则是小文件全文、不产生折叠
+        for i in 0..120 {
+            body.push_str(&format!(
+                "pub fn f{i}(x: u8) -> u8 {{\n    let a{i} = x; // padding padding padding padding\n    let b{i} = a{i} + 1;\n    b{i}\n}}\n\n"
+            ));
+        }
+        assert!(body.len() > 8192, "夹具要够大才会切片: {}", body.len());
+        std::fs::write(tmp.path().join("src/big.rs"), &body).unwrap();
+        let b = crate::bundle::Bundle::from_files(vec![crate::evidence::git::FileChange {
+            path: "src/big.rs".into(),
+            diff: "@@ -2,1 +2,1 @@\n+pub fn f0(x: u8) -> u8 {\n".into(),
+        }]);
+
+        let p = pack_bundle(&b, tmp.path(), 1_000_000, 0, &PackOpts::default(), &["src/big.rs".to_string()]);
+
+        let ranges = p.folded.get("src/big.rs").expect("该文件应有折叠区间");
+        assert!(!ranges.is_empty() && p.stats.folded_lines > 0, "{:?} / {:?}", ranges, p.stats);
+        // 渲染文本里的每一段折叠标记，都要能在区间表里找到同样的 (a,b)
+        let re = regex::Regex::new(r"…（(\d+)-(\d+) 行折叠").unwrap();
+        let rendered: Vec<(u32, u32)> = re
+            .captures_iter(&p.text)
+            .map(|c| (c[1].parse().unwrap(), c[2].parse().unwrap()))
+            .collect();
+        assert!(!rendered.is_empty(), "应有折叠标记: {}", &p.text[..p.text.len().min(400)]);
+        assert_eq!(rendered, *ranges, "渲染标记与采集的区间必须逐段一致");
     }
 
     /// 非 Cargo 工作区不该报「预算不足」：那类仓（PR181：15 `.ts` + 10 `.go`、零 Rust）本来就谈不上注入，

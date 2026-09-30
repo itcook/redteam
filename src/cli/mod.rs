@@ -176,25 +176,26 @@ pub(crate) fn build_packs(
     root: &std::path::Path,
     budget: usize,
     opts: &crate::pack::PackOpts,
-) -> (Vec<String>, DossierMeta, Vec<crate::pack::PackStats>) {
+) -> (Vec<String>, DossierMeta, Vec<crate::pack::PackStats>, Vec<FoldedRanges>) {
     // M21a 批 C：bundles 来自引用图分组（design §3.2，门未过时退化为单包），每格只装自家文件——
     // 视野外的改动文件由跨组索引（`{{OTHER_CHANGED_FILES}}`）而非兄弟注入提供。超预算由 build_pack
     // 自身的降级梯子（骨架/hunk 窗/省略清单）承接，分组「宁降不拆」不靠分格避让。
     // 全变更集路径：文件外片段搜索排除（它们已在各自的 cell 里，视野外的由跨组索引提供）。
     let changeset: Vec<String> = bundles.iter().flat_map(|b| &b.files).map(|f| f.path.clone()).collect();
-    let (entries, stats): (Vec<String>, Vec<crate::pack::PackStats>) = bundles
+    let (entries, stats): (Vec<String>, Vec<(crate::pack::PackStats, FoldedRanges)>) = bundles
         .iter()
         .map(|b| {
             // 预算记账扣本格自己的 diff 字节（单格默认下即全变更集真实 diff）。
             let own_diff_bytes: usize = b.files.iter().map(|fc| fc.diff.len()).sum();
             // 批 F-4：直接产裸 pack 正文（`build_scan_prompt` 自己包 <dossier> 与切片形态前言）。
             let packed = crate::pack::pack_bundle(b, root, budget, own_diff_bytes, opts, &changeset);
-            (packed.text, packed.stats)
+            (packed.text, (packed.stats, packed.folded))
         })
         .unzip();
+    let (stats, folded): (Vec<_>, Vec<_>) = stats.into_iter().unzip();
     let injected = entries.iter().filter(|s| !s.is_empty()).count();
     let meta = DossierMeta { bundles: bundles.len(), injected };
-    (entries, meta, stats)
+    (entries, meta, stats, folded)
 }
 
 /// 三条路径（全量 / 增量 / `--pack-only`）共用的「pack 预算 + spec 参照段」：spec 帽夹紧到 pack 预算一半
@@ -207,6 +208,9 @@ pub(crate) fn budget_and_spec(roles: &RoleSets, spec: &[String]) -> (usize, Stri
 }
 
 /// cell 规划产物：分组 + 每组裸 pack 正文（`dossiers`）+ 每组跨组索引 + 每组装包形态（四者等长等序）+ 观测。
+/// 每组「文件 → 被折叠的行区间」（M21d 批 C-1）：只在运行时传递，不进报告 JSON。
+pub(crate) type FoldedRanges = std::collections::BTreeMap<String, Vec<(u32, u32)>>;
+
 pub(crate) struct CellPlan {
     pub bundles: Vec<Bundle>,
     pub dossiers: Vec<String>,
@@ -215,6 +219,9 @@ pub(crate) struct CellPlan {
     pub stats: GroupingStats,
     /// 每组装包形态（批 E K13）：`--pack-only` 消费；RunMeta 接线 F-5。
     pub pack_stats: Vec<crate::pack::PackStats>,
+    /// 每组被折叠的行区间（批 C-1）：判 design §10.2 的回退信号——
+    /// scanner 的 `needs{kind:evidence}` 是不是在反复索要**被折叠的**函数体。
+    pub folded: Vec<FoldedRanges>,
 }
 
 /// 筛选后证据 → 引用图分组（design §3.2，预算门喂 pack 预算）→ 装包 → 跨组索引（design §10.6）。
@@ -231,10 +238,11 @@ pub(crate) fn plan_cells(
     let grouping = group(selected, Some(root), &grouping_opts(grouping_cfg, budget));
     let bundles = grouping.bundles;
     // `review.pack`（config.json，批 A-2 子表）→ 装包旋钮：缺省 slice〔D8〕、`full` 留旋钮（批 E K1）。
-    let (dossiers, dossier_meta, pack_stats) = build_packs(&bundles, root, budget, &crate::pack::PackOpts::from(pack_cfg));
+    let (dossiers, dossier_meta, pack_stats, folded) =
+        build_packs(&bundles, root, budget, &crate::pack::PackOpts::from(pack_cfg));
     let others =
         crate::bundle::render_cross_indices(&crate::bundle::cross_index(&bundles, extra_paths, delta), bundles.len());
-    CellPlan { bundles, dossiers, others, dossier_meta, stats: grouping.stats, pack_stats }
+    CellPlan { bundles, dossiers, others, dossier_meta, stats: grouping.stats, pack_stats, folded }
 }
 
 /// `review.grouping`（config.json，批 A-2 子表）→ 分组阈值；预算门由 pack 预算喂（批 C followup「后合者接一行」，2026-09-08 合入）。
@@ -339,11 +347,11 @@ pub async fn run_code_review(
     //（2026-09-29 `/code-review` 指出）。帽同时按 budget/4 夹紧，别让它一个人吃穿小模型的窗。
     let budget = budget.saturating_sub(repo_brief.len());
     // 分组 / 装包 / 跨组索引（plan_cells：与 --pack-only 同源）。门未过 → 单包。
-    let CellPlan { bundles, dossiers, others, dossier_meta, stats, pack_stats } =
+    let CellPlan { bundles, dossiers, others, dossier_meta, stats, pack_stats, folded } =
         plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
     let input = ScanFanoutInput {
         target_label: &target_label, bundles: &bundles, dossiers: &dossiers, others: &others,
-        user_focus: &focus, spec_docs: &spec_section, repo_brief: &repo_brief, root,
+        user_focus: &focus, spec_docs: &spec_section, repo_brief: &repo_brief, folded: &folded, root,
         entries: &entries, samples: cfg.review.scanners.samples,
     };
     let (results, mut deep) = if roles.reviewers.is_empty() {
@@ -760,6 +768,8 @@ pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
         agreement_ge2: merged.iter().filter(|m| m.agreement >= 2).count() as u32,
         by_category,
         needs_declared,
+        needs_evidence_anchored: f.results.needs_evidence_anchored,
+        needs_evidence_in_folded: f.results.needs_evidence_in_folded,
     };
     let scan = ScanReport { groups, suspicions: merged, scanned_coverage: f.scanned_coverage, stats };
 
@@ -4454,7 +4464,7 @@ mod tests {
             }]),
         ];
 
-        let (entries, meta, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES, &crate::pack::PackOpts::full());
+        let (entries, meta, _, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES, &crate::pack::PackOpts::full());
         assert!(entries[0].contains("target") && entries[0].contains("改动源文"), "bundle 1 自家内容非空含 0 壳: {entries:?}");
         assert!(entries[1].contains("other"), "bundle 2 自家内容非空: {entries:?}");
         assert_eq!(meta, DossierMeta { bundles: 2, injected: 2 });
@@ -4578,7 +4588,7 @@ mod tests {
             FileChange { path: "src/b.rs".into(), diff: "@@ -1,0 +2,1 @@\n+    let marker_body = 1;\n".into() },
         ])];
         // full 档：本测试锚的是回落梯子的真 diff 穿透（slice 档由 pack::tests 覆盖）
-        let (on, _, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES, &crate::pack::PackOpts::full());
+        let (on, _, _, _) = build_packs(&bundles, root, PACK_BUDGET_BYTES, &crate::pack::PackOpts::full());
         assert!(on[0].contains("alpha_marker"), "小文件全文在场");
         // 真 diff 穿透证明（集成级）：超预算文件迫入 def 锚回落分支（changed_def_ranges
         // 消费其真 diff）——空 diff 占位回归下无锚可寻，以下两条断言全灭。

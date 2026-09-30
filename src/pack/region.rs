@@ -222,7 +222,7 @@ fn slice_region(ctx: &FileCtx<'_>, ranges: &[(u32, u32)], opts: &PackOpts) -> Re
         }
     }
     let expand = merge_ranges(expand);
-    let (body, folds, folded_lines) = render_slice_body(ctx, &all, &expand);
+    let (body, folds, folded_lines, _folded_ranges) = render_slice_body(ctx, &all, &expand);
     let one_hop = hop.callees.len() + hop.callers.len();
     let head = format!("{}（区域切片：核 {} · 一跳 {one_hop} · 折叠 {folds} 段）", ctx.fc.path, core.len());
     RegionSlice { text: format!("{head}\n{body}\n"), sliced: true, core, one_hop, folded_lines }

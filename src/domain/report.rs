@@ -234,6 +234,15 @@ pub struct ScanStats {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_category: BTreeMap<String, u32>,
     pub needs_declared: u32,
+    /// 带行锚的 `needs{kind:evidence}` 条数，与其中**指向被折叠区间**的条数（M21d 批 C-1）。
+    ///
+    /// design §10.2 的切片回退信号是「scanner 反复索要**被折叠的**函数体」。
+    /// 光看 `needs_declared` 判不了它——本仓与 PR181 三轮都稳定在三成，那是常态不是信号。
+    /// 触发判据看比值：`in_folded / anchored` 高 = 切片把模型真正要看的东西折掉了。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub needs_evidence_anchored: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub needs_evidence_in_folded: u32,
 }
 
 /// scan-only 报告段（batch F-3，design §4 / §5）：按组的疑点索引 + 覆盖自报（`scanned_areas` ∪ ∩ 改动行 ÷ 改动行）。

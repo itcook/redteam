@@ -265,6 +265,15 @@ fn render_scan_md(r: &ReviewReport, s: &mut String) {
         "- Groups: {} · Cells: {} ok / {} failed · Suspicions: {} (agreement ≥ 2: {}) · Changed-line coverage: {cov} · Needs declared: {}\n",
         scan.groups.len(), scan.stats.cells_ok, scan.stats.cells_failed, scan.stats.total, scan.stats.agreement_ge2, scan.stats.needs_declared
     ));
+    // 切片回退信号（design §10.2，批 C-1）：scanner 索要的证据里有多少落在**被折叠的**区间。
+    // 只报条数判不了这件事——三轮都稳定在三成，那是常态。这一行报的是比值的两个分量。
+    if scan.stats.needs_evidence_anchored > 0 {
+        let (a, f) = (scan.stats.needs_evidence_anchored, scan.stats.needs_evidence_in_folded);
+        s.push_str(&format!(
+            "- Evidence needs pointing into folded regions: {f}/{a} ({:.0}%) — slice fallback signal (design §10.2)\n",
+            f as f32 / a as f32 * 100.0
+        ));
+    }
     // L4-B 三方契约（M21d 批 A）：注入量与**降级原因**都要走 md——ship 与裸终端读的是 md，
     // 只进 JSON 等于对主消费路径不存在（M21c 批 A 收口评审 #4 的同款教训）。全零则不占版面。
     let (inj, miss, spill, skipped) = scan.groups.iter().fold((0, 0, 0, 0), |(a, b, c, d), g| {
@@ -434,6 +443,34 @@ mod tests {
         let md = render_md(&r);
         assert!(md.contains("- Findings: 0 (+1 refuted by verifier"), "头条要说清: {}", &md[..md.len().min(400)]);
         assert!(md.contains("### F1: boom"), "详情照列——审计不断链");
+    }
+
+    /// 批 C-1：切片回退信号要走 md（design §10.2 的判据是比值，不是 needs 条数）。
+    #[test]
+    fn scan_md_reports_the_slice_fallback_signal() {
+        let mut r = report();
+        r.scan = Some(ScanReport {
+            groups: vec![],
+            suspicions: vec![],
+            stats: crate::domain::ScanStats {
+                needs_declared: 9,
+                needs_evidence_anchored: 8,
+                needs_evidence_in_folded: 6,
+                ..Default::default()
+            },
+            scanned_coverage: None,
+        });
+
+        let md = render_md(&r);
+
+        assert!(
+            md.contains("- Evidence needs pointing into folded regions: 6/8 (75%) — slice fallback signal"),
+            "要给比值的两个分量: {md}"
+        );
+
+        // 一条带锚的都没有 → 不占版面（分母为零时比值无意义）
+        r.scan.as_mut().unwrap().stats.needs_evidence_anchored = 0;
+        assert!(!render_md(&r).contains("folded regions"), "分母为零不报");
     }
 
     /// L4-B 三方契约（M21d 批 A）：注入量与降级原因必须走 **md**——ship 与裸终端读的是 md，
