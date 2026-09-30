@@ -803,3 +803,26 @@ B-1 仓库简介入稳定前缀：.redteam/brief.md 读进 <repo_brief> 槽，�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 27: M21d 批 C0：文档与代码分池（计划外，批 C 交付项 7 的前置）
+<!-- trellis-session: v=2 fp=710284ca74fdd4dd -->
+
+**Date**: 2026-09-30
+**Task**: M21d 批 C0：文档与代码分池（计划外，批 C 交付项 7 的前置）
+**Branch**: `feat/m21d-doc-lane`
+
+### Summary
+
+调研发现「代码优先」本就存在，但排在分层序第 5 层（种类 → 共识轴 → 风险档 → 烟量 → 代码优先），文档项只要疑点条数更多就在烟量层直接胜出。四项落地：代码优先提到烟量之前、is_doc_path 补 jsonl（\.json$ 匹配不到它）、Finding Details 按代码/文档分区、RunMeta 记 doc_findings/doc_dug_items。没做硬配额——给文档固定上限会让「改动几乎全是文档」的轮次预算空着，病在次序与呈现不在总量。端到端验证做了两轮对照（临时工作树 checkout 到批 A dogfood 当时的 HEAD、同一 diff、唯一变量是引擎），结果方向相反：本仓文档 finding 63%→12%、PR181 却 14%→25%。疑点池构成暴露真因——本仓代码疑点 15→50（+233%）、PR181 代码疑点 58→40（−31%），而 C0 不碰 scan 阶段，所以两轮的占比变化主因都是 scanner 轮次抖动。站得住的只有两条：排序本身由单测钉死（同等共识与风险档下代码恒先，变异能转红）、端到端不劣化（verdict 一致、代码 finding 在抖动带内）。「占比会真的降」不硬说，留观后续 dogfood。方法论账：这是 M21b「单轮墙钟不可信」在 finding 构成维度上的重演，第二次踩同一个坑；以后评估排序/预算类改动要么用 resume 回放固定疑点池、要么三轮取中位数。另记一处自查失误：第一轮对照按记忆假设 HEAD 是 7bc0f0c（实际 b22fab7），是「C0 不该影响 scan 却影响了」这个矛盾暴露的，不是先核对了 head_sha。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `809b7c9` | feat(queue,risk,output,cli): C0 文档与代码分池——代码优先提层 + 报告分区 |
+| `0766ec1` | docs(roadmap,private): C0 端到端对照的负面结果——两轮方向相反，效果被 scanner 抖动淹没 |
+
+### Status
+
+[OK] **Completed**
