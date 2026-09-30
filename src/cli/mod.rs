@@ -351,7 +351,7 @@ pub async fn run_code_review(
         plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
     let input = ScanFanoutInput {
         target_label: &target_label, bundles: &bundles, dossiers: &dossiers, others: &others,
-        user_focus: &focus, spec_docs: &spec_section, repo_brief: &repo_brief, folded: &folded, root,
+        user_focus: &focus, spec_docs: &spec_section, repo_brief: &repo_brief, root,
         entries: &entries, samples: cfg.review.scanners.samples,
     };
     let (results, mut deep) = if roles.reviewers.is_empty() {
@@ -459,6 +459,7 @@ pub async fn run_code_review(
     // 披露本轮变更文件上的休眠线索（A-2）：只读、不进 verdict。落账之后读，所以本轮刚截断的也会出现。
     let dormant_leads = read_dormant_leads(root, &changed_files);
     let (report, code) = finish_scan_report(ScanFinish {
+        folded: &folded,
         groups,
         scanned_coverage,
         grouping: Some(stats),
@@ -708,6 +709,9 @@ pub(crate) struct ScanFinish<'a> {
     pub risk: Option<RiskMeta>,
     pub dossier_meta: Option<DossierMeta>,
     pub results: ScanResults,
+    /// 每组「文件 → 被折叠的行区间」（批 C-1）：切片回退信号的判据之一。
+    /// partial 报告没有装包信息 → 传空，信号不出（`anchored = 0` 时 md 不渲染那一行）。
+    pub folded: &'a [FoldedRanges],
     pub model_names: Vec<String>,
     pub roles: Option<&'a RoleSets>,
     pub warnings: Vec<String>,
@@ -753,11 +757,37 @@ pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
     let cells_ok = f.results.cells.iter().filter(|c| c.record.ok).count() as u32;
     let failed: Vec<String> = f.results.cells.iter().filter(|c| !c.record.ok).map(|c| c.cell_id.clone()).collect();
     let (mut needs_declared, mut triggered) = (0u32, 0u32);
+    // 切片回退信号（design §10.2，批 C-1）：evidence needs 指向的行有多少落在**本组被折叠的**区间。
+    // 与 `needs_declared` 同在这个循环里算——它是全量 / resume / partial 三条入口的**共同**收口
+    // （函数头注释：「全部从 cell 记录重算」）。早先放在扇出侧，resume 与 partial 会静默读 0，
+    // 而 0 与「本轮没有带锚 evidence needs」不可区分（2026-09-30 `/code-review` 抓到）。
+    let (mut ev_anchored, mut ev_in_folded) = (0u32, 0u32);
     for c in &f.results.cells {
         if let Some(o) = &c.output {
             if !o.needs.is_empty() {
                 triggered += 1;
                 needs_declared += o.needs.len() as u32;
+            }
+            // 分母两道筛：带行锚，且**指向本组文件**——分子结构上只可能来自本组被切片的改动文件，
+            // 而 prompt 里有跨组索引与文件外片段，模型必然对组外路径提 needs；算进分母只会把比值
+            // 稀释成永远「不触发」的数（PR181 实测 14 条带锚里只有 2 条指向本组）。
+            let own: std::collections::BTreeSet<&str> =
+                groups.get(c.group).map(|g| g.files.iter().map(String::as_str).collect()).unwrap_or_default();
+            for n in o.needs.iter().filter(|n| n.kind == crate::domain::NeedKind::Evidence) {
+                let Some((a, b)) = second_pass::parse_need_lines(n.lines.as_deref()) else { continue };
+                let path = crate::orchestrate::queue::norm_path(&n.path);
+                if !own.contains(path.as_str()) {
+                    continue;
+                }
+                ev_anchored += 1;
+                let hit = f
+                    .folded
+                    .get(c.group)
+                    .and_then(|m| m.get(&path))
+                    .is_some_and(|rs| rs.iter().any(|&(x, y)| a <= y && b >= x));
+                if hit {
+                    ev_in_folded += 1;
+                }
             }
         }
     }
@@ -768,8 +798,8 @@ pub(crate) fn finish_scan_report(f: ScanFinish<'_>) -> (ReviewReport, i32) {
         agreement_ge2: merged.iter().filter(|m| m.agreement >= 2).count() as u32,
         by_category,
         needs_declared,
-        needs_evidence_anchored: f.results.needs_evidence_anchored,
-        needs_evidence_in_folded: f.results.needs_evidence_in_folded,
+        needs_evidence_anchored: ev_anchored,
+        needs_evidence_in_folded: ev_in_folded,
     };
     let scan = ScanReport { groups, suspicions: merged, scanned_coverage: f.scanned_coverage, stats };
 
@@ -952,7 +982,6 @@ pub struct PackCell {
     pub bytes: usize,
     pub est_tokens: u64,
     pub pack_bytes: usize,
-    pub diff_bytes: usize,
     pub over_budget: bool,
     /// 装包形态（批 E K13）：body / sliced / small_full / ladder / folded_lines / outside_*。
     pub pack: crate::pack::PackStats,
@@ -1030,7 +1059,9 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
             bytes: prompt.len(),
             est_tokens: (prompt.len() as f64 / PACK_BYTES_PER_TOKEN).round() as u64,
             pack_bytes: dossier.len(),
-            diff_bytes: b.files.iter().map(|f| f.diff.len()).sum(),
+            // 本组 diff 字节的**唯一来源**是 `pack.diff_bytes`（`PackStats`）。此前这里自己又 sum
+            // 一遍，两个表达式今天恰好相等、以后任一侧改口径就静默分叉，而且「相等」这件事
+            // 根本钉不住（变异换回去照绿）——所以删字段、不加断言（2026-09-30 `/code-review`）。
             over_budget: b.over_budget,
             pack: pack_stats.get(i).cloned().unwrap_or_default(),
         });
@@ -1061,7 +1092,7 @@ pub fn render_pack_only(r: &PackOnlyReport) -> String {
         let p = &c.pack;
         out.push_str(&format!(
             "cell-{} files={} bytes={} est_tokens={} pack_bytes={} diff_bytes={} over_budget={} body={} sliced={} small={} ladder={} folded_lines={} outside_sites={} outside_sigs={} contracts={} contract_misses={} contract_spilled={}\n",
-            c.cell, c.files, c.bytes, c.est_tokens, c.pack_bytes, c.diff_bytes, c.over_budget,
+            c.cell, c.files, c.bytes, c.est_tokens, c.pack_bytes, c.pack.diff_bytes, c.over_budget,
             p.body, p.sliced, p.small_full, p.ladder, p.folded_lines, p.outside_sites, p.outside_sigs,
             p.contracts, p.contract_misses, p.contract_spilled
         ));
@@ -1266,6 +1297,8 @@ fn partial_report(store: &crate::state::JobStore, job_id: &str, reason: String) 
     let total = manifest.len().max(records.len());
     let results = ScanResults { cells: scan_cells_from_records(records), ..Default::default() };
     let (mut report, _) = finish_scan_report(ScanFinish {
+        // partial 报告没有装包信息 → 切片回退信号不可得（`anchored = 0` 时 md 不渲染那一行）。
+        folded: &[],
         groups: vec![],
         scanned_coverage: None,
         grouping: None,
@@ -1432,6 +1465,9 @@ pub async fn run_resume(
     let scan_cells = scan_cells_from_records(scan_records);
     let results = ScanResults { cells: scan_cells.clone(), ..Default::default() };
     let (mut report, mut code) = finish_scan_report(ScanFinish {
+        // resume 的 scan 报告沿用 prior 那轮的结果，而折叠区间**刻意不落盘**（一组可能几百段）→
+        // 本轮重跑 plan_cells 在这之后，这里拿不到。回退信号只在全量评审时可得，是已知边界。
+        folded: &[],
         groups,
         scanned_coverage: prior.as_ref().and_then(|r| r.scan.as_ref()).and_then(|sc| sc.scanned_coverage),
         grouping: prior.as_ref().and_then(|r| r.run.grouping.clone()),
@@ -3907,6 +3943,63 @@ mod code_review_tests {
         }
     }
 
+    /// 批 C-1：切片回退信号在**共同收口**处算（全量 / resume / partial 同一口径，与 `needs_declared` 并排）。
+    ///
+    /// 分母两道筛：带行锚，且**指向本组文件**——分子结构上只可能来自本组被切片的改动文件，
+    /// 而 prompt 里有跨组索引与文件外片段，模型必然对组外路径提 needs；把它们算进分母，
+    /// 比值会被稀释成永远「不触发」的数（2026-09-30 `/code-review` 抓到：PR181 实测 14 条带锚里
+    /// 只有 2 条指向本组，7% 其实该读作 50%——**结论当场反转**）。
+    #[test]
+    fn slice_fallback_signal_counts_only_own_group_anchored_needs() {
+        use crate::domain::{NeedEntry, NeedKind, ScanOutput, Suspicion};
+        let need = |path: &str, lines: Option<&str>, kind| NeedEntry {
+            path: path.into(), lines: lines.map(str::to_string), reason: "r".into(), kind,
+        };
+        let out = ScanOutput {
+            suspicions: vec![Suspicion {
+                file: "a.rs".into(), line_start: 1, line_end: 1, hint: "h".into(), category: None,
+                confidence: 0.5, quote: "q".into(),
+            }],
+            needs: vec![
+                need("a.rs", Some("5-9"), NeedKind::Evidence),    // 本组 + 落在折叠区 → 分子
+                need("a.rs", Some("80-90"), NeedKind::Evidence),  // 本组 + 不在折叠区 → 只进分母
+                need("a.rs", None, NeedKind::Evidence),           // 无行锚 → 不计
+                need("zzz.rs", Some("5-9"), NeedKind::Evidence),  // **组外** → 不计（分子到不了那里）
+                need("a.rs", Some("5-9"), NeedKind::Api),         // api 不是 evidence → 不计
+            ],
+            ..Default::default()
+        };
+        let id = "scan[g1]@p/x#1";
+        let cells = vec![ScanCellResult {
+            cell_id: id.into(), group: 0, route_key: "p/x".into(), family: "alpha".into(), sample: 1,
+            record: crate::state::CellRecord::ok(id, "p/x", crate::domain::CellOutput::Scan(out.clone())),
+            output: Some(out),
+        }];
+        let folded: Vec<FoldedRanges> = vec![[("a.rs".to_string(), vec![(1u32, 20u32)])].into_iter().collect()];
+        let groups = vec![ScanGroup { label: "g1".into(), files: vec!["a.rs".into()], ..Default::default() }];
+
+        fn fin<'a>(groups: &[ScanGroup], cells: &[ScanCellResult], folded: &'a [FoldedRanges]) -> ScanFinish<'a> {
+            ScanFinish {
+            groups: groups.to_vec(), scanned_coverage: None, grouping: None, risk: None, dossier_meta: None,
+            results: ScanResults { cells: cells.to_vec(), ..Default::default() },
+            folded,
+            model_names: vec!["p/x".into()], roles: None, warnings: vec![],
+            inflight_peak: BTreeMap::new(), rate_limit: BTreeMap::new(), ledger_meta: None, head_sha: None,
+            duration_ms: 1, test_command: None, job_id: "j".into(), reused: vec![], dormant_leads: vec![],
+        }
+        }
+
+        let (r, _) = finish_scan_report(fin(&groups, &cells, &folded));
+        let st = &r.scan.as_ref().unwrap().stats;
+        assert_eq!((st.needs_evidence_anchored, st.needs_evidence_in_folded), (2, 1), "组外 / 无锚 / api 都不进分母");
+        assert_eq!(st.needs_declared, 5, "needs_declared 照旧数全部声明");
+
+        // 没有折叠表（resume / partial）→ 分母照算、分子为 0；这是已知边界，不是信号为零
+        let (r2, _) = finish_scan_report(fin(&groups, &cells, &[]));
+        let st2 = &r2.scan.as_ref().unwrap().stats;
+        assert_eq!((st2.needs_evidence_anchored, st2.needs_evidence_in_folded), (2, 0));
+    }
+
     /// 批 C0 观测：文档 / 代码的 finding 与已挖项分布要进 RunMeta——「代码优先」提层的效果就看这两个数。
     /// 口径复用 `risk::signals::is_doc_path`（全仓唯一一把尺）。
     #[test]
@@ -4501,6 +4594,7 @@ mod tests {
             risk: Some(crate::domain::RiskMeta { hotspots: 2, r: 1.25, tier: crate::risk::Tier::Mid, budget_cells: 12 }),
             dossier_meta: None,
             results: ScanResults { cells, ..Default::default() },
+            folded: &[],
             model_names: vec!["p/x".into(), "p/y".into()], roles: Some(&roles), warnings: vec![],
             inflight_peak: [("p".to_string(), 2u32)].into_iter().collect(), rate_limit: BTreeMap::new(), ledger_meta: None, head_sha: None,
             duration_ms: 7, test_command: None, job_id: "j".into(), reused,

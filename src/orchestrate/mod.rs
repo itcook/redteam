@@ -111,8 +111,6 @@ pub struct ScanFanoutInput<'a> {
     pub others: &'a [String],
     pub user_focus: &'a str,
     pub spec_docs: &'a str,
-    /// 每组「文件 → 被折叠的行区间」（批 C-1）：判回退信号用，空 = 不判。
-    pub folded: &'a [crate::cli::FoldedRanges],
     /// 仓库简介（M21d 批 B-1，design §10.5）：进**稳定前缀**，每格都带、按不可信证据注入。
     /// 空 = 没有 `.redteam/brief.md`，行为与今日逐字节一致。
     pub repo_brief: &'a str,
@@ -314,21 +312,6 @@ pub async fn run_scan_fanout(
         if c.record.ok {
             if let Some(o) = &c.output {
                 out.needs_declared += o.needs.len() as u32;
-                // 回退信号（design §10.2）：evidence 类 needs 指向的行是不是落在**本组被折叠的**区间里。
-                // 只数带行锚的——不带行锚的问的是「整个文件」，与「折叠了哪几段」无从比对。
-                for n in o.needs.iter().filter(|n| n.kind == crate::domain::NeedKind::Evidence) {
-                    let Some((a, b)) = crate::cli::second_pass::parse_need_lines(n.lines.as_deref()) else { continue };
-                    out.needs_evidence_anchored += 1;
-                    let path = crate::orchestrate::queue::norm_path(&n.path);
-                    let hit = input
-                        .folded
-                        .get(c.group)
-                        .and_then(|m| m.get(&path))
-                        .is_some_and(|rs| rs.iter().any(|&(x, y)| a <= y && b >= x));
-                    if hit {
-                        out.needs_evidence_in_folded += 1;
-                    }
-                }
             }
         } else {
             out.failed.push(c.cell_id.clone());
@@ -512,55 +495,7 @@ mod scan_tests {
         fn on_roles(&self, roles: &[Role]) { self.roles.lock().unwrap().extend_from_slice(roles); }
     }
     fn input<'a>(bundles: &'a [Bundle], dossiers: &'a [String], others: &'a [String], root: &'a std::path::Path, entries: &'a [ScanEntrySpec], samples: u32) -> ScanFanoutInput<'a> {
-        ScanFanoutInput { target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", repo_brief: "", folded: &[], root, entries, samples }
-    }
-
-    /// 批 C-1：切片回退信号——scanner 索要的证据里有多少落在**被折叠的**区间。
-    /// 只数带行锚的 evidence needs（不带行锚问的是整个文件，与「折叠了哪几段」无从比对），
-    /// 且要按**本组**的折叠表比（别组折了什么与这条 need 无关）。
-    #[tokio::test]
-    async fn evidence_needs_pointing_into_folded_regions_are_counted() {
-        let repo = repo();
-        let b = bundles(1);
-        let entries = vec![entry("p/a", "alpha", false)];
-        // 假输出里的 needs：`src/b.rs` 3-9（带锚）、`src/c.rs` 无锚、`src/a.rs` 1-2（带锚，kind=api 不计）
-        let mut reg = ProviderRegistry::new();
-        reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300))), Duration::from_secs(5), 0);
-
-        // 组 0 的折叠表：`src/b.rs` 折了 1-20 行 → 3-9 落在里面
-        let folded: Vec<crate::cli::FoldedRanges> =
-            vec![[("src/b.rs".to_string(), vec![(1u32, 20u32)])].into_iter().collect()];
-        let mut inp = input(&b, &[], &[], repo.path(), &entries, 1);
-        inp.folded = &folded;
-        let res = run_scan_fanout(&reg, &inp, None, None).await;
-
-        assert_eq!(res.needs_evidence_anchored, 1, "只数带行锚的 evidence needs");
-        assert_eq!(res.needs_evidence_in_folded, 1, "3-9 落在折叠的 1-20 里");
-
-        // 折叠表为空 → 分母照旧、分子归零（信号不成立，不是「没数据」）
-        let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
-        assert_eq!((res2.needs_evidence_anchored, res2.needs_evidence_in_folded), (1, 0));
-
-        // 折的是别的区间 → 不算命中
-        let other: Vec<crate::cli::FoldedRanges> =
-            vec![[("src/b.rs".to_string(), vec![(100u32, 200u32)])].into_iter().collect()];
-        let mut inp3 = input(&b, &[], &[], repo.path(), &entries, 1);
-        inp3.folded = &other;
-        let res3 = run_scan_fanout(&reg, &inp3, None, None).await;
-        assert_eq!((res3.needs_evidence_anchored, res3.needs_evidence_in_folded), (1, 0));
-
-        // **多组**：要按本组的折叠表比。组 0 没折、组 1 折了 → 两组各报一条 need，只有组 1 那条命中。
-        // 单组场景分不出「按本组比」与「恒查第 0 组」，这一段才钉得住。
-        let b2 = bundles(2);
-        let per_group: Vec<crate::cli::FoldedRanges> = vec![
-            crate::cli::FoldedRanges::new(),
-            [("src/b.rs".to_string(), vec![(1u32, 20u32)])].into_iter().collect(),
-        ];
-        let mut inp4 = input(&b2, &[], &[], repo.path(), &entries, 1);
-        inp4.folded = &per_group;
-        let res4 = run_scan_fanout(&reg, &inp4, None, None).await;
-        assert_eq!(res4.needs_evidence_anchored, 2, "两组各一条带锚 need");
-        assert_eq!(res4.needs_evidence_in_folded, 1, "只有组 1 折了那一段");
+        ScanFanoutInput { target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", repo_brief: "", root, entries, samples }
     }
 
     /// B-1 接线（M21d）：仓库简介要进**真实扇出**的 scanner 前缀。
