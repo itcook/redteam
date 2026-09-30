@@ -836,3 +836,17 @@ followup 里早有「任何按单轮墙钟做的比较都不可信，至少三�
 **随后续日常 dogfood 与 PR181 回归积累样本再判**——RunMeta 的 `doc_findings` / `doc_dug_items`
 已经在记，够攒数据。若多轮下来占比没降，再回头看是不是该动 scan 阶段（分组 / 选材），
 而不是继续调深挖排序。
+
+**`RunMeta.failed_models` 在产品路径上恒为空（2026-09-30 批 C-1 实测发现）**：
+`cli/mod.rs` 收口处硬编码 `failed_models: vec![]`，而它有两个消费者——md 的 Models 行靠它标
+`❗️fail`，`exit_code(verdict, failed_models_nonempty)` 的形参也叫这个名字。后果：
+**模型鉴权失败被移出池时，报告的 Models 行完全看不出来**（这轮 PR181 的 `agc/glm-5.3` 403 出局，
+只有 warnings 里一行）。另外那个形参的实参传的是 `debt`（`failed || skipped > 0`），名实不符，
+读代码会以为退出码看的是模型出局。修法要让 `DeepRun` 带出局成员名单（现在只有 `reviewer_failed: bool`），
+属中等改动，没在 C-1 里顺手做。
+
+**切片回退信号实测不成立，交付项 5 记账不改（2026-09-30）**：PR181 一轮
+`needs{evidence}` 指向折叠区 **1/14 = 7%**（折叠 4079 行、13 文件切片）。scanner 索要的证据
+绝大多数不是被折叠的函数体，而是变更集外 / 未进 pack 的文件。故不动 `slice_min_bytes`、不加二跳。
+**单轮在这里够用**：不作为的决定维持现状、风险低，7% 离阈值极远；若实测是 60% 才必须按
+「单轮不可信」多跑两轮再动手。后续日常 dogfood 会继续记这个比值，翻转了再说。
