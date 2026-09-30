@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 27
+- **Total Sessions**: 28
 - **Last Active**: 2026-09-30
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~828 | Active |
+| `journal-1.md` | ~855 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 28 | 2026-09-30 | M21d 批 C：按信号触发的调优（三项零行为改动 + 一次结论撤回） | `7c1ff93`, `a7467fd`, `40ddde6`, `070e55d`, `abdfc25`, `a5689ad` | `feat/m21d-tuning` |
 | 27 | 2026-09-30 | M21d 批 C0：文档与代码分池（计划外，批 C 交付项 7 的前置） | `809b7c9`, `0766ec1` | `feat/m21d-doc-lane` |
 | 26 | 2026-09-29 | M21d 批 B：稳定前缀与确定性后滤（B-1/B-2 + dogfood 3 条 + code-review 8 条） | `14c8f8f`, `a465b34`, `368a53e`, `355d05c`, `755b791`, `3fb3ddd`, `7b5107a`, `b4821c2` | `feat/m21d-prefix-anchor` |
 | 25 | 2026-09-29 | M21d 批 A：L4-B 三方契约注入（A-1..A-5 + dogfood + code-review 收口） | `02472c9`, `7ff4f99`, `abbd4cb`, `f634085`, `c997614`, `b588b0e`, `7bc0f0c`, `cdb996b`, `ac68be1` | `feat/m21d-contracts` |

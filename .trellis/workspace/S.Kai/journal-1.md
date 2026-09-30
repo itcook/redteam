@@ -826,3 +826,30 @@ B-1 仓库简介入稳定前缀：.redteam/brief.md 读进 <repo_brief> 槽，�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 28: M21d 批 C：按信号触发的调优（三项零行为改动 + 一次结论撤回）
+<!-- trellis-session: v=2 fp=ffdbd8d881cb3804 -->
+
+**Date**: 2026-09-30
+**Task**: M21d 批 C：按信号触发的调优（三项零行为改动 + 一次结论撤回）
+**Branch**: `feat/m21d-tuning`
+
+### Summary
+
+批 C 的三项都是「按信号触发，不触发就不做」，最终零行为改动、两处新观测。C-1 补上切片回退信号缺的那一半判据：折叠区间与渲染的「…（a-b 行折叠…）」同源采集、只记真的进了 pack 的块、运行时传递不进报告 JSON、按本组折叠表与带行锚 evidence needs 求交。交付项 7 把切分键「每组 diff 字节」补进 PackStats 与 md 组表（此前只有 --pack-only 报得出，日常 dogfood 攒不出分布）。交付项 3 记账不改：D11 已证伪「调数字换覆盖」（findings 55→65 但主题 6→5、墙钟 +53%），校准需要 oracle 而定义 oracle 是覆盖缺口那条 followup 的前置。本批最重要的事是一次结论撤回：C-1 首版实测 1/14=7% 判「信号不成立」，当日 /code-review 指出分母混入了结构上永远进不了分子的组外 needs——回查 PR181 的 cell 记录，14 条带锚里只有 2 条指向本组，其余全是跨组索引与文件外片段露出的路径。修正口径后是 1/2，方向相反，但分母只有 2、判不了。交付项 5 的动作不变（不动 slice_min_bytes），理由从「测过了不用改」改成「还没测出来」——这两句对下一步的指引相反。方法论账：首版我论证过「不作为的决定需要更少证据」，那句本身没错，错在建立于错误的分母；该先问的是「这个比值量的是不是我以为的那件事」，先验口径再谈样本量。评审另修两条（计数挂在扇出侧导致 resume/partial 静默归零 → 挪进共同收口；diff_bytes 两处独立计算且相等这件事钉不住 → 删字段消除重复而非加断言），另记两条未修（回退信号不覆盖预算截断，组越大读数越低、方向相反；宽锚必然命中折叠区，与不带锚不计的口径矛盾）。M21d 四批 A/B/C0/C 至此全部交付并合回 dev。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7c1ff93` | feat(pack,orchestrate,output): C-1 切片回退信号观测——needs 指向折叠区的比值 |
+| `a7467fd` | feat(pack,output): C 交付项 7 的观测——每组 diff 字节进报告与组表 |
+| `40ddde6` | fix(cli,orchestrate): code-review 三条——回退信号的分母口径错了，7% 其实该读 50% |
+| `070e55d` | docs(roadmap,plan,private): 撤回 C-1 的「7% 信号不成立」——分母口径错误 |
+| `abdfc25` | docs(roadmap,private): C-1 实测——回退信号 1/14=7% 不成立，交付项 5 记账不改 |
+| `a5689ad` | docs(plan,roadmap,private): 批 C 收口——三项零行为改动、两处新观测，M21d 全批交付 |
+
+### Status
+
+[OK] **Completed**
