@@ -148,6 +148,12 @@ fn render_md(r: &ReviewReport) -> String {
     }
     // 收敛三维（M21c 批 C，design §8.4）：ship 循环靠它判「还要不要再跑一轮」。与 dormant leads 同理，
     // **必须进 md**——那才是循环与裸终端读的那一份。不收敛时逐维说清差在哪，否则读者只看见一个 false。
+    // 算不出也要说一句（dogfood medium）：ship 循环读的是 md，什么都不写等于让它按
+    // 「缺失 = 收敛」默认收工，而我们其实是不知道。这个仓反复批判的正是这种静默。
+    // scan-only 轮不说——那条路本来就不产 finding、不谈收敛，提它只是噪音。
+    if r.run.convergence.is_none() && r.verdict != crate::domain::Verdict::ScanOnly && r.run.deep.is_some() {
+        s.push_str("\n- Convergence unavailable — 本轮算不出收敛（变更集重建不了，或台账读不出）；**不等于已收敛**\n");
+    }
     if let Some(c) = &r.run.convergence {
         if c.converged {
             s.push_str("\n- Converged — 无拦路问题、台账在本轮变更文件上没有未处理项、无激活超限；**可以收口**\n");
@@ -422,10 +428,17 @@ mod tests {
         });
         assert!(render_md(&r).contains("2 条疑点激活超限"), "{}", render_md(&r));
 
-        // 算不出（diff 重建不了）时一个字都不多写
+        // 算不出（diff 重建不了）时不给结论，但**要说一句信号不可用**（dogfood medium）：
+        // ship 读的是 md，什么都不写等于让它按「缺失 = 收敛」默认收工。
         r.run.convergence = None;
+        r.run.deep = Some(Default::default());
         let md = render_md(&r);
-        assert!(!md.contains("Converged") && !md.contains("Not converged"), "没有结论就不该渲染: {md}");
+        assert!(!md.contains("- Converged") && !md.contains("Not converged"), "没有结论就不该下结论: {md}");
+        assert!(md.contains("Convergence unavailable") && md.contains("不等于已收敛"), "但要说清信号不可用: {md}");
+
+        // scan-only 轮不提——那条路本来就不谈收敛，提它只是噪音
+        r.verdict = crate::domain::Verdict::ScanOnly;
+        assert!(!render_md(&r).contains("Convergence"), "scan-only 不该提收敛");
     }
 
     /// 批 C0：Finding Details 按**代码 / 文档**分区，摘要给一行「其中文档 N 条」。

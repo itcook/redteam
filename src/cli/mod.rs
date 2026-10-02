@@ -1296,7 +1296,10 @@ fn attach_convergence(report: &mut crate::domain::ReviewReport, cwd: &Path, chan
         Some((0, 0))
     };
     let Some((delta_adjacent, activation_overrun)) = counts else { return };
-    let verdict_clean = report.verdict == crate::domain::Verdict::Approve;
+    // 维度 1 也要排掉**带债的 approve**（dogfood medium）：退出码 2 的两种债里，预算截断那种
+    // 已经被维度 2 捕获（截断项落了账、就在变更文件上），但 **reviewer 格失败**那种不产生台账行——
+    // 没有这一条，一轮「有格没跑成但剩下的都干净」会被判收敛，ship 据此收工。
+    let verdict_clean = report.verdict == crate::domain::Verdict::Approve && report.run.coverage.failed.is_empty();
     let no_delta_adjacent = delta_adjacent == 0;
     let no_activation_overrun = activation_overrun == 0;
     report.run.convergence = Some(Convergence {
@@ -1344,7 +1347,7 @@ fn activate_dormant(
         }
     };
     match db.last_verdict() {
-        Ok(Some(v)) if v == "incomplete" => {
+        Ok(Some(v)) if v == crate::domain::Verdict::Incomplete.as_str() => {
             warnings.push("ledger: 上轮 verdict = incomplete（扫描不全、疑点集有选择偏差）→ 本轮不激活休眠疑点".into());
             return (ActivationOutcome::default(), warnings);
         }
@@ -5327,6 +5330,15 @@ mod tests {
             attach_convergence(&mut r, t.path(), &files);
             assert!(!r.run.convergence.as_ref().unwrap().verdict_clean, "{v:?} 不该算干净");
         }
+        // **带债的 approve 也不算干净**（dogfood medium）：退出码 2 的两种债里，预算截断那种被维度 2
+        // 捕获，而 reviewer 格失败那种不产生台账行——没有这一条，一轮「有格没跑成但剩下的都干净」
+        // 会被判收敛、ship 据此收工。
+        let mut debt = blank(Verdict::Approve);
+        debt.run.coverage.failed.insert(crate::domain::Role::Reviewer, vec!["review[x]@p/r".into()]);
+        attach_convergence(&mut debt, t.path(), &["other.rs".to_string()]);
+        let cd = debt.run.convergence.clone().unwrap();
+        assert!(!cd.verdict_clean && !cd.converged, "有失败格就不算裁决干净: {cd:?}");
+        assert!(cd.no_delta_adjacent, "夹具前提：这一维是真的，差的就是维度 1");
 
         // 三维都真 → 收敛：变更集换成台账里没有的文件
         let mut clean = blank(Verdict::Approve);
