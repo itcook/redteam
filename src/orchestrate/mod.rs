@@ -117,6 +117,12 @@ pub struct ScanFanoutInput<'a> {
     pub root: &'a std::path::Path,
     pub entries: &'a [ScanEntrySpec],
     pub samples: u32,
+    /// 活跃判例卡（M21c 批 B-1，design §4「判例前移」）：**逐组**按本组文件集筛后注入 scanner prompt。
+    ///
+    /// 来源必须是 `load_ledger` 产出的 `Ledger.cards`——它已经过 `--no-dismissed`（「本次评审完全
+    /// 关闭台账」）那道旗。**不在这一层自己开库**：批 C 刚因为五条台账路径各自解析库路径、集体绕过
+    /// 那面旗栽过第六次「同一件事不在两处各有一套」。空片 = 无判例，prompt 逐字节不变。
+    pub precedents: &'a [crate::db::DismissCard],
 }
 
 /// 一格结果：`record` 是落库形态（成功 / 失败一体，`ok` 区分）；`output` = 锚定后的疑点输出（失败 None）。
@@ -201,6 +207,16 @@ pub async fn run_scan_fanout(
     sink: Option<&dyn CellSink>,
     enqueue: Option<&tokio::sync::mpsc::Sender<queue::DeepMsg>>,
 ) -> ScanResults {
+    // 判例按组筛一次（design §4：同文件活跃判例摘要）。逐组算而不是整轮算一份：
+    // 别组文件上的判例对这一组没有参考价值，还会白占 prompt 预算。
+    let group_precedents: Vec<String> = input
+        .bundles
+        .iter()
+        .map(|b| {
+            let files: Vec<String> = b.files.iter().map(|f| f.path.clone()).collect();
+            crate::prompt::render_precedents_for_files(&files, input.precedents)
+        })
+        .collect();
     let prompts: Vec<ScanPrompt> = input
         .bundles
         .iter()
@@ -211,7 +227,7 @@ pub async fn run_scan_fanout(
                 bundle: b,
                 user_focus: input.user_focus,
                 cross_index: input.others.get(g).map(String::as_str).unwrap_or(""),
-                precedents: "",
+                precedents: &group_precedents[g],
                 dossier: input.dossiers.get(g).map(String::as_str).unwrap_or(""),
                 spec_docs: input.spec_docs,
                 repo_brief: input.repo_brief,
@@ -495,7 +511,7 @@ mod scan_tests {
         fn on_roles(&self, roles: &[Role]) { self.roles.lock().unwrap().extend_from_slice(roles); }
     }
     fn input<'a>(bundles: &'a [Bundle], dossiers: &'a [String], others: &'a [String], root: &'a std::path::Path, entries: &'a [ScanEntrySpec], samples: u32) -> ScanFanoutInput<'a> {
-        ScanFanoutInput { target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", repo_brief: "", root, entries, samples }
+        ScanFanoutInput { precedents: &[], target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", repo_brief: "", root, entries, samples }
     }
 
     /// B-1 接线（M21d）：仓库简介要进**真实扇出**的 scanner 前缀。
@@ -533,6 +549,59 @@ mod scan_tests {
         let _ = run_scan_fanout(&reg2, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
         let w2 = flat(&backend2);
         assert!(!w2.contains("BRIEF_MARKER_3A") && w2.contains("(none)"), "缺失时是空槽占位");
+    }
+
+    /// B-1 接线（M21c 批 B）：判例摘要要进**真实扇出**的 scanner prompt，而且**按组筛**。
+    ///
+    /// 照 `repo_brief_reaches_the_scanner_prompt_on_the_real_fanout` 的形状写——同一个理由：
+    /// `--pack-only` 是另一套 prompt 构造，只测它等于没测这条。这里连「按组筛」一起钉住：
+    /// 两组各自只该看到自己文件上的判例。
+    #[tokio::test]
+    async fn precedents_reach_the_scanner_prompt_per_group_on_the_real_fanout() {
+        let repo = repo();
+        let b = bundles(2); // src/f0.rs、src/f1.rs 各一组
+        let entries = vec![entry("p/a", "alpha", false)];
+        let card = |file: &str, reason: &str| crate::db::DismissCard {
+            id: "1111111111111111".into(), status: "dismissed".into(), title: "t".into(),
+            file: file.into(), quote: "qq".into(), severity: "high".into(),
+            reason: reason.into(), round: "r1".into(), updated_at: String::new(),
+        };
+        let cards = vec![card("src/f0.rs", "G0_PRECEDENT_MARK"), card("src/f1.rs", "G1_PRECEDENT_MARK")];
+
+        let backend = std::sync::Arc::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)));
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/a", "p", 8, Box::new(std::sync::Arc::clone(&backend)), Duration::from_secs(5), 0);
+        let flat = |b: &FakeChatBackend, idx: usize| -> String {
+            use crate::provider::tool_loop::ChatMessage as M;
+            b.messages_at(idx)
+                .iter()
+                .map(|m| match m {
+                    M::System(t) | M::User(t) => t.clone(),
+                    M::UserBlocks(bs) => bs.iter().map(|x| x.text.clone()).collect::<Vec<_>>().join("\n"),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut with = input(&b, &[], &[], repo.path(), &entries, 1);
+        with.precedents = &cards;
+        let _ = run_scan_fanout(&reg, &with, None, None).await;
+        assert_eq!(backend.turn_count(), 2, "两组各一格");
+        // 两格分别看到自己那条，且**看不到另一组的**
+        let seen: Vec<String> = (0..2).map(|i| flat(&backend, i)).collect();
+        let g0 = seen.iter().find(|t| t.contains("G0_PRECEDENT_MARK")).expect("G0 的判例没进 prompt");
+        let g1 = seen.iter().find(|t| t.contains("G1_PRECEDENT_MARK")).expect("G1 的判例没进 prompt");
+        assert!(!g0.contains("G1_PRECEDENT_MARK"), "别组判例串进来了: {g0}");
+        assert!(!g1.contains("G0_PRECEDENT_MARK"), "别组判例串进来了: {g1}");
+
+        // 反面：无判例时是空槽占位，prompt 不含任何判例痕迹
+        let backend2 = std::sync::Arc::new(FakeChatBackend::repeating(turn(&scan_json(""), None, 300)));
+        let mut reg2 = ProviderRegistry::new();
+        reg2.insert_scan("p/a", "p", 8, Box::new(std::sync::Arc::clone(&backend2)), Duration::from_secs(5), 0);
+        let _ = run_scan_fanout(&reg2, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
+        let w2 = flat(&backend2, 0);
+        assert!(!w2.contains("PRECEDENT_MARK") && w2.contains("(none)"), "无判例时空槽占位");
     }
 
     /// 格完成即入队（design C2 §2〔D15〕）：落盘之后逐条发**锚定后**的疑点——到达键 `{cell_id}#{i}`、家族 = 条目家族、行号取锚定值；

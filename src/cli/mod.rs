@@ -353,6 +353,9 @@ pub async fn run_code_review(
         target_label: &target_label, bundles: &bundles, dossiers: &dossiers, others: &others,
         user_focus: &focus, spec_docs: &spec_section, repo_brief: &repo_brief, root,
         entries: &entries, samples: cfg.review.scanners.samples,
+        // 判例前移（M21c 批 B-1）：`ledger` 来自 `load_ledger(args.dismissed, args.no_dismissed, root)`,
+        // 已过「完全关闭台账」那道旗——这一层不再自己开库。
+        precedents: &ledger.cards,
     };
     // 台账激活的 warning 要跨出下面这个 if/else（`warnings` 本体在深挖收场后才建）。
     let mut activation_warnings: Vec<String> = Vec::new();
@@ -1063,6 +1066,9 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     // 预算取自与真实评审同一角色集（`active_roles` → scanners 最小窗），量的才是真实会发出的 prompt；
     // 角色集为空（无配置）时按 128K 窗保守缺省，不报错——仪表无 provider 也能跑。
     let roles = cfg.active_roles();
+    // 判例前移（M21c 批 B-1）：`--pack-only` 与真实扇出**必须同口径**——「两处不一致」是本仓栽过的坑。
+    // 同一个 `load_ledger` 入口，同样认 `--no-dismissed`；加载失败不该让 pack-only 失败（它是诊断面）。
+    let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, cwd).unwrap_or_default();
     let (budget, spec_section, mut warnings) = budget_and_spec(&roles, &args.spec);
     // 老项目的 `.gitignore` 升级（已 init 过的仓不会专门再跑一次 init）；未 init 的下面那行补新 body。
     crate::project::upgrade_legacy_gitignore(cwd);
@@ -1091,8 +1097,10 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     for (i, b) in bundles.iter().enumerate() {
         let dossier = dossiers.get(i).map(String::as_str).unwrap_or("");
         let other = others.get(i).map(String::as_str).unwrap_or("");
+        let files: Vec<String> = b.files.iter().map(|f| f.path.clone()).collect();
+        let precedents = crate::prompt::render_precedents_for_files(&files, &ledger.cards);
         let sp = crate::prompt::build_scan_prompt(&crate::prompt::ScanPromptInput {
-            target_label: &target, bundle: b, user_focus: &focus, cross_index: other, precedents: "",
+            target_label: &target, bundle: b, user_focus: &focus, cross_index: other, precedents: &precedents,
             dossier, spec_docs: &spec_section, repo_brief: &repo_brief,
         });
         // 落盘形态 = system + 四块（openai kind 的 flatten 口径）；字节含 system 段（followup「--pack-only 口径切到 scan prompt」）。

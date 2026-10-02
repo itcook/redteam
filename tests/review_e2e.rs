@@ -858,3 +858,67 @@ fn pack_only_slices_large_file_and_reports_shape() {
     assert!(cell_full.contains("src/big.rs:1-610（全文，610 行）") && cell_full.contains("let u7 = 7;"), "{cell_full}");
     assert!(!cell_full.contains("## 文件外片段\n"), "full 档无文件外片段段（前言散文提到该段名不算）: {cell_full}");
 }
+
+/// B-1 两处同口径（M21c 批 B）：`--pack-only` 与真实扇出对同一输入必须产出同一判例段。
+///
+/// 这条测 pack-only 那一侧；真实扇出那一侧在 `orchestrate::scan_tests` 里（两套 prompt 构造，
+/// 只测一侧等于没测另一侧——本仓栽过这个坑）。这里另外钉住：判例来自 `.redteam/proj.db`，
+/// 而 `--no-dismissed` 必须把它整段关掉。
+#[test]
+fn pack_only_injects_precedents_and_honors_no_dismissed() {
+    use redteam::cli::{run_pack_only, ReviewArgs};
+    use redteam::config::Config;
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").current_dir(dir.path()).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "fn a() {\n    risky();\n}\n").unwrap();
+    git(&["add", "-A"]); // working-tree scope 要的是已入 index 的改动，untracked 不算
+
+    // 判例卡走 dismiss_upsert 写入（不手搓 DB 行——夹具要经真实写入口）
+    redteam::project::init_project(dir.path()).unwrap();
+    let mut db = redteam::db::ProjDb::open(dir.path()).unwrap();
+    db.dismiss_upsert(&redteam::db::DismissCard {
+        id: "abcdef0123456789".into(), status: "dismissed".into(),
+        title: "risky() 是本仓的测试桩".into(), file: "src/a.rs".into(),
+        quote: "risky();".into(), severity: "high".into(),
+        reason: "PACKONLY_PRECEDENT_MARK".into(), round: "r1".into(), updated_at: String::new(),
+    })
+    .unwrap();
+    drop(db);
+
+    let args = |no_dismissed: bool| ReviewArgs {
+        pack_only: true,
+        base: None, scope: "working-tree".into(), spec: vec![], focus: None,
+        block_threshold: None, conf_floor: None, background: false,
+        format: "json".into(), resume: None, dismissed: None, no_dismissed, incremental_from: None,
+        tools: None, test_command: None,
+    };
+    let read_packs = |root: &std::path::Path| -> String {
+        let packs = root.join(".redteam").join("packs");
+        let mut out = String::new();
+        for job in std::fs::read_dir(&packs).unwrap().filter_map(Result::ok) {
+            for cell in std::fs::read_dir(job.path()).unwrap().filter_map(Result::ok) {
+                out.push_str(&std::fs::read_to_string(cell.path()).unwrap());
+            }
+        }
+        out
+    };
+
+    let r = run_pack_only(&args(false), &Config::default(), dir.path()).unwrap();
+    assert_eq!(r.cells.len(), 1, "{:?}", r.warnings);
+    let with = read_packs(dir.path());
+    assert!(with.contains("PACKONLY_PRECEDENT_MARK"), "判例没进 pack-only 的 scanner prompt");
+    assert!(with.contains("<precedents>"), "{with}");
+
+    // `--no-dismissed` = 本次评审完全关闭台账 → 判例段必须是空槽占位
+    std::fs::remove_dir_all(dir.path().join(".redteam").join("packs")).unwrap();
+    let r2 = run_pack_only(&args(true), &Config::default(), dir.path()).unwrap();
+    assert_eq!(r2.cells.len(), 1);
+    let without = read_packs(dir.path());
+    assert!(!without.contains("PACKONLY_PRECEDENT_MARK"), "--no-dismissed 下不得注入判例: {without}");
+    assert!(without.contains("(none)\n</precedents>"), "要留空槽占位: {without}");
+}
