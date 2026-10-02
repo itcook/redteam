@@ -1264,15 +1264,10 @@ pub fn attach_cells(store: &crate::state::JobStore, job_id: &str, report: &mut R
     report.run.cells = records.iter().map(CellSummary::from_record).collect();
     report.cells = records;
 }
-/// R2.2：失败/超时时从 proj.db 的 cell checkpoint 组一份 `incomplete` 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。
-/// 疑点落账（M21c 批 A）：把本轮**没挖成**的疑点 upsert 进项目库的跨轮台账。
+/// 收敛三维装配（M21c 批 C，design §8.4）。
 ///
-/// 三条边界：
-/// - **不建库**：项目没 `init` 过就跳过（与 `load_ledger` 的 zero-config 同口径，评审不该有建库副作用）；
-/// - **不败评审**：写失败只记 warning（与队列快照同口径，design §7.1）——台账是增益，不该让一轮评审失败；
-/// - 轮次标识用 `head_sha`：前台裸跑没有 job_id，而台账要的本就是「第一次/最近一次见到它是哪个 HEAD」。
-/// 收敛三维装配（M21c 批 C，design §8.4）：在 `overlay_deep` **之后**调用——维度 1 读的是最终 verdict，
-/// 维度 2 读的是**落账之后**的台账（裁定 3 要求截断项计入）。两个前置顺序都不能提前。
+/// 在 `overlay_deep` **之后**调用——维度 1 读的是最终 verdict，维度 2 读的是**落账之后**的台账
+/// （裁定 3 要求截断项计入）。两个前置顺序都不能提前。
 ///
 /// `changed_files` 为空（diff 重建不了）→ 不设字段：没有变更集就没有「delta 邻接」可言，
 /// 装一个 `converged: false` 进去等于凭空断言，与窗口后滤「没有基准就不重算也不复位」同一处置。
@@ -1372,6 +1367,13 @@ fn activate_dormant(
     (out, warnings)
 }
 
+/// R2.2：失败/超时时从 proj.db 的 cell checkpoint 组一份 `incomplete` 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。
+/// 疑点落账（M21c 批 A）：把本轮**没挖成**的疑点 upsert 进项目库的跨轮台账。
+///
+/// 三条边界：
+/// - **不建库**：项目没 `init` 过就跳过（与 `load_ledger` 的 zero-config 同口径，评审不该有建库副作用）；
+/// - **不败评审**：写失败只记 warning（与队列快照同口径，design §7.1）——台账是增益，不该让一轮评审失败；
+/// - 轮次标识用 `head_sha`：前台裸跑没有 job_id，而台账要的本就是「第一次/最近一次见到它是哪个 HEAD」。
 fn persist_dormant_suspicions(cwd: &Path, items: &[crate::orchestrate::queue::QueueItem], round: &str, warnings: &mut Vec<String>) {
     // 没有轮次标识就别落账（收口评审 #7）：`first_job` 一旦以空串钉死就永远不再更新，
     // 批 C 按轮次判增量时会把这些行当成合法轮次参与比较。与「不建库」同一档边界。
@@ -5127,7 +5129,7 @@ mod tests {
         let (out, warns) = activate_dormant(t.path(), &["a.rs".to_string()], "sha2");
         assert_eq!(out.activated.len(), 1);
         assert!(out.activated[0].park && out.activated[0].force_dig, "{:?}", out.activated[0]);
-        let w = warns.iter().find(|w| w.contains("人工")).expect(&format!("要有停车提示: {warns:?}"));
+        let w = warns.iter().find(|w| w.contains("人工")).unwrap_or_else(|| panic!("要有停车提示: {warns:?}"));
         assert!(w.contains("边界没校验") && w.contains("a.rs"), "提示要带得上位置与线索: {w}");
     }
 

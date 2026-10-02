@@ -2339,7 +2339,7 @@ mod tests {
         let rows = [act(false)];
         let run = run_with(Run { first_run: true, activated: &rows, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
         assert_eq!(run.meta.ledger_activated, 1, "激活项要计数: {:?}", run.warnings);
-        let it = run.items.iter().find(|i| i.activated).expect(&format!("队列里要有激活项: {:?}", run.items));
+        let it = run.items.iter().find(|i| i.activated).unwrap_or_else(|| panic!("队列里要有激活项: {:?}", run.items));
         assert!(it.arrivals.iter().any(|a| a == "ledger:r1"), "到达键要能追回台账行: {:?}", it.arrivals);
         assert!(!it.force_dig, "没踩门的不强制必挖");
         assert_eq!(run.meta.ledger_force_dig, 0);
