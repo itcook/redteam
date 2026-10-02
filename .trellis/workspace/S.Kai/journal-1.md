@@ -853,3 +853,40 @@ B-1 仓库简介入稳定前缀：.redteam/brief.md 读进 <repo_brief> 槽，�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 29: M21c 批 C：增量激活与收敛三维
+<!-- trellis-session: v=2 fp=67e0eaad587a4256 -->
+
+**Date**: 2026-10-02
+**Task**: M21c 批 C：增量激活与收敛三维
+**Branch**: `feat/m21c-converge`
+
+### Summary
+
+休眠疑点按 delta 激活重入队 + 收敛三维（给 ship 循环的停止条件，不进 verdict）+ 活锁守卫两段门 + ship 协议消费。开工前摸台账发现批 B 的前提读错了机制——判例只由 ship 循环的人工裁定产生，M21 期间不跑 ship，等多少轮 dogfood 都攒不出来；dogfood 攒的是 suspicions，那是批 C 的料。故换序先 C 后 B，并补标了批 A 漏掉的交付。四条开工裁定：只做激活挂全量轮、排序新增独立层插在代码优先之后、收敛口径严格、活锁两段式 N=3/5。三轮真跑（本仓 r1/r2 + PR181）证明跨轮台账闭环跑通：r1 激活 2 条、r2 激活 16 条且两条计数累到 2、PR181 同 HEAD 零激活。最值钱的是 dogfood 抓到的 12 条（8 high + 4 多模型共识 medium），全部指向本批自己的代码：我设计的 dormant→activated→promoted 单向状态机没有回边，而「激活了但没挖成」恰恰最常见，于是 activations 饱和在 1、两段门成了不可达常量，活锁守卫整个是死代码——而它的单测是绿的。第二轮又浮出五条台账路径全都绕过 --no-dismissed，一轮「要求忽略台账」的评审反而被台账操纵，这是第六次栽在「同一件事不在两处各有一套」，这次按 followup 早记下的候选机制②做了遍历式不变式测试。新记一条方法论：夹具直接构造中间状态，等于把『怎么到达这个状态』排除在检查之外——变异检查只能验这行有没有用例盯着，验不了这条链在真实状态下能不能走通，两者是不同的问题。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e7b050f` | feat(db,orchestrate,cli,output): 台账激活与收敛三维——休眠疑点按 delta 捞回队列 |
+| `97836df` | docs(ship): 停机判定消费收敛三维——approve 不等于循环该停 |
+| `754816a` | build: 重建二进制 |
+| `bff0d22` | docs(roadmap,plan,followup): 批 C 收口 + 批 A 补标 ✅ + 批 B 换序的理由 |
+| `923652c` | fix(cli,output,orchestrate): clippy 清零 + 落账的 doc 归位 |
+| `0cc9ff8` | fix(db,orchestrate,cli): dogfood 八条 high 全修——状态机少了回边，活锁守卫整个是死代码 |
+| `231ebbf` | build: 重建二进制 |
+| `dbe0419` | docs(private,followup): 批 C 真跑记录 + 一条新的方法论教训 |
+| `d1e3fe0` | fix(cli,output,ship): dogfood medium 四条——都是「静默」类 |
+| `00901f3` | docs(followup): 批 C dogfood 的 medium 余项五条 |
+| `43e42c5` | docs(task): 批 C 验收逐条勾完 |
+| `ed87e6d` | fix(cli): r2 两条 high——五条台账路径全都绕过了 --no-dismissed |
+| `3c86d1c` | build: 重建二进制 |
+| `f1974e3` | fix(cli,db,orchestrate): r2 的四条多模型共识 medium——都让功能名不副实 |
+| `42b608f` | build: 重建二进制 |
+| `e2e6303` | docs(plan): 批 C 交付实况——三轮真跑 + dogfood 十二条全修 |
+
+### Status
+
+[OK] **Completed**
