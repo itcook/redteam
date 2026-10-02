@@ -125,32 +125,77 @@ pub struct AnchoredScan {
     pub output: ScanOutput,
     pub dropped: u32,
     pub dropped_unreadable: u32,
+    /// 跨文件重定位救回的条数（M21c 批 B-3）：quote 是真的、file 写错了。
+    /// 与 `dropped` 分开记——「救回来几条」和「丢了几条」是两件事，合并就看不出这一层有没有在起作用。
+    pub relocated: u32,
 }
 
 /// 疑点 quote 逐字硬约束（design §4〔D11〕：不在文件即丢弃）：定位成功改写 `line_start/line_end`，失败丢弃并计数；
 /// `needs` / `scanned_areas` 原样透传。与 `anchor` 同一 `safe_read` 防线；定位用 `locate_quote_near`（同匹配优先级，多命中时取最接近
 /// 模型自报行号者——scanner 的 quote 是短指针，`x.unwrap();` 类极易在同文件复现，首现会把疑点锚错地方，评审 #11）。
-pub fn anchor_suspicions(root: &Path, mut out: ScanOutput) -> AnchoredScan {
+pub fn anchor_suspicions(root: &Path, out: ScanOutput) -> AnchoredScan {
+    anchor_suspicions_within(root, out, &[])
+}
+
+/// 同上，外加**跨文件重定位**（M21c 批 B-3，design §9 L2）：quote 在它自称的文件里找不到时，
+/// 到 `changed` 里再找一遍——**恰好一个文件命中才接受**（改写 file 并计数），零或多个一律拒绝。
+///
+/// 救的是「quote 是真的、file 写错了」这一类：scanner 一次看一组多个文件，串文件名比 reviewer 常见得多。
+/// 现在这种疑点会被当幻觉整条丢掉，而它指向的问题是实的。
+///
+/// 「唯一命中才接受」是硬条件：两个文件都含同一段代码时无从判断是哪一处，猜一个等于把定位
+/// 变回概率性的——而这一层存在的全部理由就是确定性过滤。`changed` 为空 = 不做重定位，
+/// 行为与今日逐字节一致。
+pub fn anchor_suspicions_within(root: &Path, mut out: ScanOutput, changed: &[String]) -> AnchoredScan {
     let mut kept = Vec::with_capacity(out.suspicions.len());
     let (mut dropped, mut dropped_unreadable) = (0u32, 0u32);
+    let mut relocated = 0u32;
     for mut s in out.suspicions.drain(..) {
-        match safe_read(root, &s.file) {
+        let hit = safe_read(root, &s.file).and_then(|c| locate_quote_near(&c, &s.quote, s.line_start));
+        if let Some((ls, le)) = hit {
+            (s.line_start, s.line_end) = (ls, le);
+            kept.push(s);
+            continue;
+        }
+        // 自称的文件里没找到：可能是文件读不了，也可能是 quote 对不上——两种都试一次跨文件重定位
+        match relocate_across(root, &s.quote, changed) {
+            Some((file, ls, le)) => {
+                s.file = file;
+                (s.line_start, s.line_end) = (ls, le);
+                relocated += 1;
+                kept.push(s);
+            }
             None => {
                 dropped += 1;
-                dropped_unreadable += 1;
-            }
-            Some(content) => match locate_quote_near(&content, &s.quote, s.line_start) {
-                Some((ls, le)) => {
-                    s.line_start = ls;
-                    s.line_end = le;
-                    kept.push(s);
+                if safe_read(root, &s.file).is_none() {
+                    dropped_unreadable += 1;
                 }
-                None => dropped += 1,
-            },
+            }
         }
     }
     out.suspicions = kept;
-    AnchoredScan { output: out, dropped, dropped_unreadable }
+    AnchoredScan { output: out, dropped, dropped_unreadable, relocated }
+}
+
+/// 在 `changed` 里找 quote 的唯一归属（排除它自称的那个文件——那个已经试过了）。
+/// 多命中 / 零命中 → `None`。
+fn relocate_across(root: &Path, quote: &str, changed: &[String]) -> Option<(String, u32, u32)> {
+    if quote.trim().is_empty() {
+        return None;
+    }
+    // 不另判「跳过自称的那个文件」「变更集是否为空」：前者在上一步 `locate_quote_near` 已经试过且失败，
+    // 再命中一次也只是得到同一个答案；后者空集的 for 循环本就不执行。两个分支都没有可观测效果，
+    // 变异检查实测恒绿——加一个没人盯得住的分支不如不加。
+    let mut found: Option<(String, u32, u32)> = None;
+    for f in changed {
+        let Some(c) = safe_read(root, f) else { continue };
+        let Some((ls, le)) = locate_quote(&c, quote) else { continue };
+        if found.is_some() {
+            return None; // 多命中 → 无从判断是哪一处，拒绝
+        }
+        found = Some((f.clone(), ls, le));
+    }
+    found
 }
 
 /// 把 quote 确定性定位到真实行；定位失败即丢弃（确定性幻觉过滤，code 线每条 finding 须指向真实代码）。
@@ -233,6 +278,53 @@ mod tests {
         write(dir.path(), "src/b.rs", "a();\nx.unwrap();\nb();\nc();\nd();\nx.unwrap();\n");
         let near = anchor_suspicions(dir.path(), ScanOutput { suspicions: vec![sus("src/b.rs", "x.unwrap();")].into_iter().map(|mut s| { s.line_start = 6; s.line_end = 6; s }).collect(), ..Default::default() });
         assert_eq!(near.output.suspicions[0].line_start, 6);
+    }
+
+    /// 跨文件重定位（M21c 批 B-3，design §9 L2）：quote 是真的、file 写错了 → 在变更集里唯一命中就救回来。
+    ///
+    /// 「唯一命中才接受」是硬条件：两个文件都含同一段代码时无从判断是哪一处，猜一个等于把这一层
+    /// 从确定性过滤变回概率性的。
+    #[test]
+    fn relocates_a_misattributed_quote_only_when_exactly_one_file_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/real.rs", "fn real() {\n    let token = secret();\n}\n");
+        write(dir.path(), "src/claimed.rs", "fn other() {\n    nothing();\n}\n");
+        let changed = vec!["src/real.rs".to_string(), "src/claimed.rs".to_string()];
+        let one = |file: &str, quote: &str| ScanOutput {
+            suspicions: vec![crate::domain::Suspicion {
+                file: file.into(), line_start: 99, line_end: 99, hint: "h".into(),
+                category: None, confidence: 0.5, quote: quote.into(),
+            }],
+            ..Default::default()
+        };
+
+        // ① 自称 claimed.rs，quote 实际只在 real.rs → 改写 file、计入 relocated
+        let a = anchor_suspicions_within(dir.path(), one("src/claimed.rs", "let token = secret();"), &changed);
+        assert_eq!((a.relocated, a.dropped), (1, 0), "{a:?}");
+        assert_eq!(a.output.suspicions[0].file, "src/real.rs", "file 要被改写成真正的归属");
+        assert_eq!(a.output.suspicions[0].line_start, 2);
+
+        // ② 两个文件都含同一段 → 多命中，拒绝（照旧丢弃）
+        write(dir.path(), "src/twin.rs", "fn twin() {\n    let token = secret();\n}\n");
+        let twins = vec!["src/real.rs".to_string(), "src/twin.rs".to_string(), "src/claimed.rs".to_string()];
+        let b = anchor_suspicions_within(dir.path(), one("src/claimed.rs", "let token = secret();"), &twins);
+        assert_eq!((b.relocated, b.dropped), (0, 1), "多命中必须拒绝: {b:?}");
+        assert!(b.output.suspicions.is_empty());
+
+        // ③ 变更集里谁都没有 → 照旧丢弃（真幻觉）
+        let c = anchor_suspicions_within(dir.path(), one("src/claimed.rs", "这段代码根本不存在();"), &changed);
+        assert_eq!((c.relocated, c.dropped), (0, 1), "{c:?}");
+
+        // ④ 自称的文件里本来就找得到 → 不走重定位（优先信模型自报的归属）
+        let d = anchor_suspicions_within(dir.path(), one("src/real.rs", "let token = secret();"), &changed);
+        assert_eq!((d.relocated, d.dropped), (0, 0));
+        assert_eq!(d.output.suspicions[0].file, "src/real.rs");
+
+        // ⑤ 变更集为空 = 不做重定位，行为与今日逐字节一致
+        let e = anchor_suspicions_within(dir.path(), one("src/claimed.rs", "let token = secret();"), &[]);
+        assert_eq!((e.relocated, e.dropped), (0, 1), "空变更集不该救回任何东西: {e:?}");
+        assert_eq!(anchor_suspicions(dir.path(), one("src/claimed.rs", "let token = secret();")).dropped, 1,
+                   "老入口的行为不变");
     }
 
     #[test]

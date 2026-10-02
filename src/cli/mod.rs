@@ -1687,7 +1687,10 @@ pub async fn run_resume(
         };
         let pinned = entry_of(&cell.model).map(|e| e.thinking_pinned).unwrap_or(false);
         let (mut rec, _) = crate::orchestrate::scan_cell_record(
-            &cell.cell, &cell.model, &family_of(&cell.model), pinned, cwd, outcome, elapsed.as_millis() as u64, hash,
+            // resume 补跑**不做**跨文件重定位（B-3）：变更集要到后面才重建（`changed_now`），
+            // 这一步还拿不到。重定位是增益不是正确性——缺了只是少救回几条串了文件名的疑点。
+            // 要让它受益得把变更集重建提前，那是独立重构，已记 followup。
+            &cell.cell, &cell.model, &family_of(&cell.model), pinned, cwd, &[], outcome, elapsed.as_millis() as u64, hash,
         );
         rec.queue_wait_ms += queue_wait_ms;
         if let Err(e) = store.append_partial(job_id, &rec) {

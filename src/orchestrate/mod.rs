@@ -8,7 +8,7 @@ pub mod review_shot;
 use crate::bundle::Bundle;
 use crate::domain::{CellOutput, Finding, Origin, RawFinding, Role, ScanOutput};
 use crate::hash::fnv1a64_hex;
-use crate::positioning::anchor_suspicions;
+use crate::positioning::anchor_suspicions_within;
 use crate::prompt::{build_scan_prompt, ScanPrompt, ScanPromptInput};
 use crate::provider::registry::ProviderRegistry;
 use crate::state::{CellInput, CellRecord};
@@ -208,6 +208,12 @@ pub async fn run_scan_fanout(
     sink: Option<&dyn CellSink>,
     enqueue: Option<&tokio::sync::mpsc::Sender<queue::DeepMsg>>,
 ) -> ScanResults {
+    // 跨文件重定位的搜索范围（B-3）：整轮的变更文件集算一次。
+    let changed_files: Vec<String> = input
+        .bundles
+        .iter()
+        .flat_map(|b| b.files.iter().map(|f| f.path.clone()))
+        .collect();
     // 判例按组筛一次（design §4：同文件活跃判例摘要）。逐组算而不是整轮算一份：
     // 别组文件上的判例对这一组没有参考价值，还会白占 prompt 预算。
     let group_precedents: Vec<String> = input
@@ -271,6 +277,7 @@ pub async fn run_scan_fanout(
         let (g, e, k, id) = &plan[pi];
         let prompt = &prompts[*g];
         let template_hash = template_hash.clone();
+        let changed_files: &[String] = &changed_files;
         async move {
             let t0 = std::time::Instant::now();
             let mut queue_wait_ms = 0u64;
@@ -283,7 +290,7 @@ pub async fn run_scan_fanout(
                 Err(err) => Err(err),
             };
             let duration_ms = t0.elapsed().as_millis() as u64;
-            let (mut record, output) = scan_cell_record(id, &e.route_key, &e.family, e.thinking_pinned, input.root, res, duration_ms, template_hash);
+            let (mut record, output) = scan_cell_record(id, &e.route_key, &e.family, e.thinking_pinned, input.root, changed_files, res, duration_ms, template_hash);
             record.queue_wait_ms += queue_wait_ms; // 门等待 + 429 排队等待（scan_cell_record 已填后者）
             if let Some(s) = sink {
                 s.on_cell(record.clone());
@@ -349,13 +356,15 @@ pub fn scan_cell_record(
     family: &str,
     thinking_pinned: bool,
     root: &std::path::Path,
+    // `changed` = 本轮变更文件集：跨文件重定位的搜索范围（M21c 批 B-3）。空 = 不做重定位。
+    changed: &[String],
     res: Result<crate::provider::scan_shot::ScanCall, crate::provider::ProviderError>,
     duration_ms: u64,
     template_hash: String,
 ) -> (CellRecord, Option<ScanOutput>) {
     let (mut record, output) = match res {
         Ok(call) => {
-            let anchored = anchor_suspicions(root, call.output);
+            let anchored = anchor_suspicions_within(root, call.output, changed);
             let mut notes = scan_cell_notes(
                 &call.stats, anchored.dropped, anchored.dropped_unreadable, thinking_pinned, call.reasoning_tokens, call.output_tokens,
                 anchored.output.suspicions.len(),
@@ -550,6 +559,36 @@ mod scan_tests {
         let _ = run_scan_fanout(&reg2, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
         let w2 = flat(&backend2);
         assert!(!w2.contains("BRIEF_MARKER_3A") && w2.contains("(none)"), "缺失时是空槽占位");
+    }
+
+    /// B-3 接线（M21c 批 B）：跨文件重定位要在**真实扇出**里生效。
+    ///
+    /// `positioning` 那层有单测，但 `scan_cell_record` 的 `changed` 参数传成 `&[]` 它照绿——
+    /// 这是本批第三次撞上「某条接线没人盯」。搜索范围 = 本轮全部 bundle 的文件集。
+    #[tokio::test]
+    async fn cross_file_relocation_applies_on_the_real_fanout() {
+        let repo = repo();
+        // 两个文件各一组：疑点自称 f1.rs，而 quote 只在 f0.rs 里
+        let b = bundles(2);
+        std::fs::write(repo.path().join("src/f0.rs"), "fn zero() {\n    let token = secret();\n}\n").unwrap();
+        std::fs::write(repo.path().join("src/f1.rs"), "fn one() {\n    nothing();\n}\n").unwrap();
+        let entries = vec![entry("p/a", "alpha", false)];
+        let scan = r#"{"suspicions":[{"file":"src/f1.rs","line_start":2,"line_end":2,"hint":"串了文件名","confidence":0.8,"quote":"let token = secret();"}],"scanned_areas":[]}"#;
+        let backend = std::sync::Arc::new(FakeChatBackend::repeating(turn(scan, None, 300)));
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/a", "p", 8, Box::new(std::sync::Arc::clone(&backend)), Duration::from_secs(5), 0);
+
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
+        let anchored: Vec<_> = res
+            .cells
+            .iter()
+            .filter_map(|c| c.output.as_ref())
+            .flat_map(|o| o.suspicions.iter())
+            .collect();
+        assert!(
+            anchored.iter().any(|s| s.file == "src/f0.rs" && s.line_start == 2),
+            "quote 真实、file 写错 → 该被重定位救回并改写归属: {anchored:?}"
+        );
     }
 
     /// B-1 接线（M21c 批 B）：判例摘要要进**真实扇出**的 scanner prompt，而且**按组筛**。

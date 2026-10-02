@@ -416,7 +416,10 @@ mod tests {
         });
         let md = render_md(&r);
         assert!(md.contains("Not converged"), "{md}");
-        assert!(md.contains("reject"), "要说清裁决这一维怎么不干净: {md}");
+        // 断言**收敛行本身**带上裁决，不能只查 md 里有没有 "reject"——摘要头本来就有，
+        // 那样的断言恒真（dogfood 当场指出这条是 vacuous 的）。
+        let line = md.lines().find(|l| l.contains("Not converged")).unwrap();
+        assert!(line.contains("裁决非 approve（reject）"), "要在收敛行里说清这一维怎么不干净: {line}");
         assert!(md.contains("7 条"), "要带上台账那一维的实际条数: {md}");
         assert!(!md.contains("停车"), "没有超限项就别提停车: {md}");
         assert!(md.contains("不改本轮裁决"), "要挡住「收敛 = 裁决」的误读: {md}");
