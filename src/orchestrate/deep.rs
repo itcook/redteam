@@ -88,6 +88,9 @@ pub struct DeepInput<'a> {
     /// 在途入队通道（scanner 流式扇出，C2〔D15〕）：到达项走入口五态（到达键幂等）；通道关闭 = 关闭入口 → 收场 drain。`None` = 开跑即关闭。
     /// barrier 含「通道已关闭」：发送端未全部 drop 前，队列空也不收场。
     pub incoming: Option<mpsc::Receiver<crate::orchestrate::queue::DeepMsg>>,
+    /// 活跃判例卡（M21c 批 B-2）：入队前的判例门用。来源与 scanner 注入同一份
+    /// `Ledger.cards`（已过 `--no-dismissed`）。空片 = 不做判例判定，行为与今日逐字节一致。
+    pub precedents: &'a [crate::db::DismissCard],
     /// 台账激活项（M21c 批 C，design §8.3）：与 H0 同待遇——**开跑即在队列里**，不等 scanner。
     /// 它们本来就是上一轮扫出来的，没有理由再等本轮扫描一遍才排上队。
     /// resume 走快照恢复，激活标记随 `QueueItem` 序列化带回，所以 resume 侧传空片即可（重复激活会重复计数）。
@@ -163,13 +166,26 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             it.risk_band = blocks.band_for(&it.spec.file, range);
         }
     }
+    // 判例门要的「文件 → 本轮改动行范围」预算一次（B-2）：逐项解析 diff 会把同一份 diff 解析 N 遍。
+    let hunks_by_file: std::collections::BTreeMap<String, Vec<(usize, usize)>> = input
+        .bundles
+        .iter()
+        .flat_map(|b| b.files.iter())
+        .map(|f| (f.path.clone(), crate::pack::hunk_ranges(&f.diff)))
+        .collect();
+    let mut gate = PrecedentCtx {
+        cards: input.precedents,
+        hunks: &hunks_by_file,
+        root: input.root,
+        notes: Vec::new(),
+    };
     let t_enq = std::time::Instant::now();
     if let Some(route) = input.route {
         for h in &route.hotspots {
             enqueue_h0(&mut q, h, &mut meta, input.snapshot, &mut blocks);
         }
     }
-    enqueue_scan_cells(&mut q, input.scan_cells, &mut meta, input.snapshot, &mut blocks);
+    enqueue_scan_cells(&mut q, input.scan_cells, &mut meta, input.snapshot, &mut blocks, &mut gate);
     // 台账激活（M21c 批 C）：放在 H0 与 scan 格之后——撞到同一个块时由既有合并语义收口，
     // 顺序只决定谁先建项，合并结果与喂入顺序无关（到达键幂等）。
     for a in input.activated {
@@ -367,7 +383,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             msg = recv(&mut incoming), if !closed => {
                 let t0 = std::time::Instant::now();
                 if let Some(req) = absorb(msg, &mut streamed_api_needs) {
-                    on_arrival(req, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
+                    on_arrival(req, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks, &mut gate);
                 }
                 note_block(&mut meta, t0.elapsed());
             }
@@ -478,12 +494,12 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             match incoming.as_mut().map(mpsc::Receiver::try_recv) {
                 Some(Ok(msg)) => {
                     if let Some(req) = absorb(Some(msg), &mut streamed_api_needs) {
-                        on_arrival(req, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
+                        on_arrival(req, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks, &mut gate);
                     }
                     drained_arrival = true;
                 }
                 Some(Err(mpsc::error::TryRecvError::Disconnected)) => {
-                    on_arrival(None, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks);
+                    on_arrival(None, &mut q, &mut meta, &mut closed, input.snapshot, &mut blocks, &mut gate);
                     drained_arrival = true;
                 }
                 _ => break,
@@ -556,6 +572,8 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             verdicts.entry(id.clone()).or_insert_with(|| v.clone());
         }
     }
+    // 判例门攒下的话一次并进 warnings（B-2）：豁免与重挖都要在报告里说清，否则「少了一格」无从解释。
+    warnings.append(&mut gate.notes);
     // 复核尾部 = 队列排空（最后一格落地）→ 复核归零；复核全在排空前跑完则为 0。
     meta.verify_tail_ms = verify_zero_ms.saturating_sub(meta.drain_done_ms);
     let mut findings = Vec::new();
@@ -1298,6 +1316,56 @@ fn land(
 
 /// 经入队通道到达一项（scanner 流式扇出）：走入口五态（同一到达键再来记 `Duplicate`）+ 入队原因 + 队列深度峰值（运行中取最大）；只写受影响项的快照
 /// （新建项 / 并入目标；重复到达不写，C2 Q9〔D15〕）。可派与否由主循环的在线额度判定。`None` = 发送端全部 drop → 通道关闭。
+/// 判例门要的四样东西打成一包：`on_arrival` 的参数表已经够长，再加四个会压过可读性。
+struct PrecedentCtx<'a> {
+    cards: &'a [crate::db::DismissCard],
+    hunks: &'a std::collections::BTreeMap<String, Vec<(usize, usize)>>,
+    root: &'a Path,
+    /// 自己攒、收场一次并进 `warnings`——借 `&mut warnings` 会与主循环里别处的 push 打起来。
+    notes: Vec<String>,
+}
+
+/// 判例门（M21c 批 B-2，design §4 / §6 规则 2〔D13〕）：入队**之前**问一次「这处人判过没有」。
+///
+/// 返回 `None` = 豁免，调用方不入队；`Some(req)` = 照常入队（没命中判例，或命中但守卫没过）。
+/// 守卫不过时把理由记进 `warnings`——它是编排器的话、不是 scanner 的话，混进 hint 会让 reviewer
+/// 以为是扫描者说的。进 reviewer prompt 的判例笔记要改模板，留 followup。
+///
+/// **两条入队路径各调一次**（流式 `on_arrival` / resume 回放 `enqueue_scan_cells`），
+/// 两处都靠变异检查盯住；加第三条路径时记得也过这道门。
+fn precedent_gate(
+    req: EnqueueReq,
+    cards: &[crate::db::DismissCard],
+    hunks_by_file: &std::collections::BTreeMap<String, Vec<(usize, usize)>>,
+    root: &Path,
+    meta: &mut DeepMeta,
+    notes: &mut Vec<String>,
+) -> Option<EnqueueReq> {
+    if cards.is_empty() {
+        return Some(req);
+    }
+    // 只对**疑点项**判：H0 规则项每轮由规则重新产生、没有 quote 锚；needs 项的诉求不在任何 quote 上。
+    let Some(s) = req.spec.notes.first() else { return Some(req) };
+    let empty: Vec<(usize, usize)> = Vec::new();
+    let hunks = hunks_by_file.get(&s.file).unwrap_or(&empty);
+    match crate::orchestrate::precedent::judge(s, cards, hunks, root) {
+        Some(crate::orchestrate::precedent::Precedent::Exempt { card_id }) => {
+            meta.precedent_exempt += 1;
+            notes.push(format!(
+                "precedent {card_id}: {}:{} 沿用结案（引文仍锚得上、该区域本轮未改）——不入队、不重挖",
+                s.file, s.line_start
+            ));
+            None
+        }
+        Some(crate::orchestrate::precedent::Precedent::Note { note, .. }) => {
+            meta.precedent_redug += 1;
+            notes.push(format!("precedent: {note}"));
+            Some(req)
+        }
+        None => Some(req),
+    }
+}
+
 fn on_arrival(
     msg: Option<EnqueueReq>,
     q: &mut DeepQueue,
@@ -1305,9 +1373,13 @@ fn on_arrival(
     closed: &mut bool,
     snapshot: Option<&dyn Fn(&QueueItem)>,
     ctx: &mut BlockCtx,
+    gate: &mut PrecedentCtx<'_>,
 ) {
     let Some(req) = msg else {
         *closed = true;
+        return;
+    };
+    let Some(req) = precedent_gate(req, gate.cards, gate.hunks, gate.root, meta, &mut gate.notes) else {
         return;
     };
     let reason = match req.spec.origin {
@@ -1547,6 +1619,7 @@ fn enqueue_scan_cells(
     meta: &mut DeepMeta,
     snapshot: Option<&dyn Fn(&QueueItem)>,
     ctx: &mut BlockCtx,
+    gate: &mut PrecedentCtx<'_>,
 ) {
     let mut ordered: Vec<&ScanCellResult> = cells.iter().filter(|c| c.output.is_some()).collect();
     ordered.sort_by(|a, b| a.cell_id.cmp(&b.cell_id));
@@ -1554,6 +1627,11 @@ fn enqueue_scan_cells(
         let Some(out) = &c.output else { continue };
         for (i, s) in out.suspicions.iter().enumerate() {
             let Some(req) = EnqueueReq::scan(s, &c.family, crate::consolidate::scan::arrival_key(&c.cell_id, i, s)) else {
+                continue;
+            };
+            // 与流式路径同一道判例门（B-2）：resume 回放也要认判例，否则同一条疑点在首跑被豁免、
+            // 续跑又挖一遍。
+            let Some(req) = precedent_gate(req, gate.cards, gate.hunks, gate.root, meta, &mut gate.notes) else {
                 continue;
             };
             let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
@@ -1802,6 +1880,7 @@ mod tests {
                 prior_findings: vec![], tools,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                precedents: &[],
                 on_phase: None,
             },
             &(),
@@ -1859,6 +1938,7 @@ mod tests {
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                precedents: &[],
                 on_phase: None,
             },
             &events,
@@ -1929,6 +2009,7 @@ mod tests {
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                precedents: &[],
                 on_phase: None,
             },
             &(),
@@ -2020,6 +2101,7 @@ mod tests {
                 prior_findings: vec![prior_f], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                precedents: &[],
                 on_phase: None,
             },
             &(),
@@ -2047,6 +2129,7 @@ mod tests {
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                precedents: &[],
                 on_phase: None,
             },
             &(),
@@ -2086,6 +2169,7 @@ mod tests {
                 snapshot: None, restore: Some(&snap), prior_findings: vec![prior_f],
                 tools: ToolsMode::Off, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                precedents: &[],
                 on_phase: None,
             },
             &(),
@@ -2127,6 +2211,7 @@ mod tests {
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::InFlight)]), prior_findings: vec![],
                 tools: ToolsMode::TwoStage, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                precedents: &[],
                 on_phase: None,
             },
             &(),
@@ -2296,6 +2381,8 @@ mod tests {
         activated: &'a [crate::orchestrate::ledger::Activated],
         /// 阶段钩子：默认 `None`；复核尾段用例自带。
         on_phase: Option<&'a dyn Fn(crate::state::Phase, Option<String>)>,
+        /// 活跃判例卡（M21c 批 B-2）：默认空 = 不做判例判定。
+        precedents: &'a [crate::db::DismissCard],
         /// 往轮 finding（resume 形态）。
         prior: Vec<Finding>,
     }
@@ -2311,6 +2398,7 @@ mod tests {
                 snapshot: r.snapshot, restore: (!r.first_run).then_some(r.items), prior_findings: r.prior, tools: r.tools,
                 backend_factory: None, on_cell: r.on_cell, on_phase: r.on_phase, incoming: r.incoming, reopen_skipped: r.reopen_skipped, verify: r.verify,
                 activated: r.activated,
+                precedents: r.precedents,
             },
             r.sink,
         )
@@ -2322,6 +2410,7 @@ mod tests {
             reg, root, bundles, items, tools: ToolsMode::Off, incoming: None, on_cell: None, snapshot: None, sink: &(), reviewers: None,
             budget: 16, first_run: false, scan_cells: &[], repo_brief: "", reopen_skipped: false, route: None, verify: None, prior: vec![],
             activated: &[],
+            precedents: &[],
             on_phase: None,
         }
     }
@@ -2402,6 +2491,154 @@ mod tests {
         assert_eq!(run3.items.iter().filter(|i| i.activated).count(), 1, "夹具前提：两行并成一项");
         assert_eq!(run3.meta.ledger_activated, 1, "按项记，不是 2");
         assert_eq!(restored_meta(&run3.items).ledger_activated, 1, "与 resume 侧同口径");
+    }
+
+    /// B-2 验收①（M21c 批 B，〔D19-5〕）：已 dismissed 的变体在**入队侧被豁免**——不占 reviewer 格。
+    ///
+    /// 走真实入队链（`run_deep` + 流式通道），不是直接调判定函数：判定本身在
+    /// `orchestrate::precedent` 有单测，这里要的是「它真的接在入队之前」。
+    #[tokio::test]
+    async fn dismissed_variant_is_exempted_at_enqueue_time() {
+        let dir = tempfile::tempdir().unwrap();
+        // 借它把 a.rs 写到盘上（守卫 1 要重锚判例引文）；它的 bundle 不用——那份 diff 的 hunk 覆盖第 1 行，
+        // 正好会撞上守卫 2。下面自造一个改动落在第 9 行的 bundle。
+        let _ = routed_bundles(dir.path(), &["a"]);
+        let backend = Routed::new(vec![("a", 10, vec![found("a")])]);
+        let reg = routed_registry(&backend, 2);
+        let card = crate::db::DismissCard {
+            id: "1111111111111111".into(), status: "dismissed".into(), title: "t".into(),
+            file: "a.rs".into(), quote: "fn a() {".into(), severity: "high".into(),
+            reason: "人判过是误报".into(), round: "r1".into(), updated_at: String::new(),
+        };
+        let sus = crate::domain::Suspicion {
+            file: "a.rs".into(), line_start: 1, line_end: 1, hint: "可疑".into(),
+            category: None, confidence: 0.6, quote: "fn a() {".into(),
+        };
+
+        // 判例区域（第 1 行）本轮**没被改**：routed_bundles 的 diff hunk 覆盖 1-1，所以要先把它挪开。
+        // 用一个 hunk 落在别处的 bundle，确保守卫 2 能过。
+        let b = vec![Bundle::from_files(vec![FileChange {
+            path: "a.rs".into(),
+            // `Routed` 的判据是 `ROUTE_{name}\n`——标记后必须紧跟换行，跟空格匹配不上
+            diff: "@@ -9,1 +9,1 @@\n+// ROUTE_a\n".into(),
+        }])];
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(crate::orchestrate::queue::EnqueueReq::scan(&sus, "alpha", "cell#0".into()).unwrap().into())
+            .await
+            .unwrap();
+        drop(tx);
+        let cards = [card];
+        let run = run_with(Run {
+            first_run: true, incoming: Some(rx), precedents: &cards,
+            ..plain(&reg, dir.path(), &b, &[])
+        })
+        .await;
+
+        assert_eq!(run.meta.precedent_exempt, 1, "该被判例豁免: {:?}", run.warnings);
+        assert_eq!(run.meta.precedent_redug, 0);
+        assert!(run.items.is_empty(), "豁免 = 不入队: {:?}", run.items);
+        assert!(run.cells.is_empty(), "不占 reviewer 格");
+        assert!(run.warnings.iter().any(|w| w.contains("沿用结案")), "要说清为什么少了一格: {:?}", run.warnings);
+
+        // 反面：同样的输入、**没有判例** → 照常入队并挖
+        let (tx2, rx2) = tokio::sync::mpsc::channel(8);
+        tx2.send(crate::orchestrate::queue::EnqueueReq::scan(&sus, "alpha", "cell#0".into()).unwrap().into())
+            .await
+            .unwrap();
+        drop(tx2);
+        let bare = run_with(Run { first_run: true, incoming: Some(rx2), ..plain(&reg, dir.path(), &b, &[]) }).await;
+        assert_eq!(bare.meta.precedent_exempt, 0);
+        assert_eq!(bare.items.len(), 1, "无判例就该入队: {:?}", bare.items);
+    }
+
+    /// B-2 的判例门在 **resume 回放**那条路上也得生效（M21c 批 B）。
+    ///
+    /// 变异检查抓到的：两条验收用例都走流式通道，而 `enqueue_scan_cells`（resume 回放已完成的
+    /// scan 格）是另一条入队路径——删掉它那道门没有任何用例会红。这是 M21d 批 A 那个坑的镜像，
+    /// 那次是只构造了 resume 形态、首跑路径恒空；这次正好反过来。
+    #[tokio::test]
+    async fn precedent_gate_also_applies_on_resume_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = routed_bundles(dir.path(), &["a"]);
+        let b = vec![Bundle::from_files(vec![FileChange {
+            path: "a.rs".into(),
+            diff: "@@ -9,1 +9,1 @@\n+// ROUTE_a\n".into(), // 改动落在第 9 行，不碰判例区域
+        }])];
+        let backend = Routed::new(vec![("a", 10, vec![found("a")])]);
+        let reg = routed_registry(&backend, 2);
+        let cards = [crate::db::DismissCard {
+            id: "1111111111111111".into(), status: "dismissed".into(), title: "t".into(),
+            file: "a.rs".into(), quote: "fn a() {".into(), severity: "high".into(),
+            reason: "人判过是误报".into(), round: "r1".into(), updated_at: String::new(),
+        }];
+        let sus = crate::domain::Suspicion {
+            file: "a.rs".into(), line_start: 1, line_end: 1, hint: "可疑".into(),
+            category: None, confidence: 0.6, quote: "fn a() {".into(),
+        };
+        let out = crate::domain::ScanOutput { suspicions: vec![sus], ..Default::default() };
+        let id = "scan[g1]@p/alpha#1";
+        let cells = [ScanCellResult {
+            cell_id: id.into(), group: 0, route_key: "p/alpha".into(), family: "alpha".into(), sample: 1,
+            record: CellRecord::ok(id, "p/alpha", crate::domain::CellOutput::Scan(out.clone())),
+            output: Some(out),
+        }];
+
+        // 经 `scan_cells` 回放（不走流式通道）→ 判例门照样要拦下来
+        let run = run_with(Run {
+            first_run: true, scan_cells: &cells, precedents: &cards,
+            ..plain(&reg, dir.path(), &b, &[])
+        })
+        .await;
+        assert_eq!(run.meta.precedent_exempt, 1, "resume 回放也要认判例: {:?}", run.warnings);
+        assert!(run.items.is_empty(), "豁免 = 不入队: {:?}", run.items);
+
+        // 反面：同一条回放、无判例 → 照常入队
+        let bare = run_with(Run {
+            first_run: true, scan_cells: &cells,
+            ..plain(&reg, dir.path(), &b, &[])
+        })
+        .await;
+        assert_eq!(bare.meta.precedent_exempt, 0);
+        assert_eq!(bare.items.len(), 1, "{:?}", bare.items);
+    }
+
+    /// B-2 验收②（〔D19-5〕）：判例区域**本轮被改过** → 必须重挖，不得沿用旧结论。
+    /// design §4 点名这是无守卫时的漏报路径——fix 引入的新 bug 被旧判例盖住。
+    #[tokio::test]
+    async fn delta_in_the_precedent_region_forces_a_redig_through_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        // diff 的 hunk 覆盖第 1 行 —— 正是判例引文所在
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let backend = Routed::new(vec![("a", 10, vec![found("a")])]);
+        let reg = routed_registry(&backend, 2);
+        let cards = [crate::db::DismissCard {
+            id: "1111111111111111".into(), status: "dismissed".into(), title: "t".into(),
+            file: "a.rs".into(), quote: "fn a() {".into(), severity: "high".into(),
+            reason: "人判过是误报".into(), round: "r1".into(), updated_at: String::new(),
+        }];
+        let sus = crate::domain::Suspicion {
+            file: "a.rs".into(), line_start: 1, line_end: 1, hint: "可疑".into(),
+            category: None, confidence: 0.6, quote: "fn a() {".into(),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(crate::orchestrate::queue::EnqueueReq::scan(&sus, "alpha", "cell#0".into()).unwrap().into())
+            .await
+            .unwrap();
+        drop(tx);
+        let run = run_with(Run {
+            first_run: true, incoming: Some(rx), precedents: &cards,
+            ..plain(&reg, dir.path(), &bundles, &[])
+        })
+        .await;
+
+        assert_eq!(run.meta.precedent_exempt, 0, "区域有 delta 就不许豁免");
+        assert_eq!(run.meta.precedent_redug, 1, "要记成重挖: {:?}", run.warnings);
+        assert_eq!(run.items.len(), 1, "照常入队");
+        assert!(!run.cells.is_empty(), "照常挖");
+        assert!(
+            run.warnings.iter().any(|w| w.contains("这一轮被改过")),
+            "要说清为什么不沿用: {:?}", run.warnings
+        );
     }
 
     /// 乱序完成不错配、慢格不堵：完成序 b→c→a，每格 findings 仍对应自己的文件；报告里的 cells 按优先级序（a→b→c，C2 D2 起不看派发序）；
@@ -2918,6 +3155,7 @@ mod tests {
                 snapshot: Some(&snapshot), restore: Some(&items), prior_findings: vec![prior_same, prior_settled],
                 tools: ToolsMode::TwoStage, backend_factory: None, on_cell: Some(&on_cell), incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                precedents: &[],
                 on_phase: None,
             },
             &(),
@@ -3542,6 +3780,7 @@ mod tests {
             snapshot: None, restore: None, prior_findings: vec![], tools: ToolsMode::Off,
             backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
             activated: &[],
+            precedents: &[],
             on_phase: None,
         };
         let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 3)], QueueOrigin::Rule, vec![]).unwrap();

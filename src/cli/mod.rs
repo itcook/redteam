@@ -407,6 +407,8 @@ pub async fn run_code_review(
             registry,
             DeepInput {
                 activated: &activation.activated,
+                // 判例门（M21c 批 B-2）：与 scanner 注入同一份 cards，已过 `--no-dismissed`。
+                precedents: &ledger.cards,
                 route: deep_route.as_ref(),
                 scan_cells: &[],
                 bundles: &bundles,
@@ -1900,6 +1902,7 @@ pub async fn run_resume(
                     // 首跑已经激活过的项带着 `activated` / `force_dig` 标记从快照恢复。
                     // 这里重算会让同一轮的 `activations` 多加一次，把活锁守卫的门提前踩响。
                     activated: &[],
+                    precedents: &ledger.cards,
                     route: route_now.as_ref(),
                     // 全部成功 scanner 格按到达键幂等入队：首跑已到达的疑点跳过，补跑出的新疑点照常入队；旧快照（无到达键）走谓词合并兜底
                     scan_cells: &scan_cells,
@@ -4256,6 +4259,57 @@ mod code_review_tests {
         assert_eq!(row3.status, "promoted", "挖出 finding 的台账行要退出激活池");
     }
 
+    /// B-2 判例豁免走通**首跑整条链**（M21c 批 B）：从 CLI 入口跑，判例卡在库里 → 疑点被豁免、
+    /// 不占 reviewer 格。
+    ///
+    /// 为什么非要这一条：`deep.rs` 的单测直接构造 `DeepInput`，把 `cli` 里那个
+    /// `precedents: &ledger.cards` 换成 `&[]` 它们照绿——变异检查抓到的第三次同构
+    /// （M21d 批 A 的 `scan_cells`、批 C 的 `activated`，现在是 `precedents`）。
+    #[tokio::test]
+    async fn precedent_exemption_runs_end_to_end_from_the_cli_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        // 第 1 行是判例所指、第 2 行是本轮改动 —— 守卫 2 要能分清这两者
+        write(dir.path(), "src/a.rs", "fn a() {\n    db.write(token);\n}\n");
+        crate::project::init_project(dir.path()).unwrap();
+        let mut db = crate::db::ProjDb::open(dir.path()).unwrap();
+        db.dismiss_upsert(&crate::db::DismissCard {
+            id: "abcdef0123456789".into(), status: "dismissed".into(),
+            title: "fn a 的签名是故意这样的".into(), file: "src/a.rs".into(),
+            quote: "fn a() {".into(), severity: "high".into(),
+            reason: "人判过是误报".into(), round: "r1".into(), updated_at: String::new(),
+        })
+        .unwrap();
+        drop(db);
+
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let turn = |t: String| AssistantTurn { text: t, tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None };
+        // scanner 报的正是判例所指那一行（quote 逐字相同 → 机械匹配命中）
+        let scan = r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"签名可疑","confidence":0.8,"quote":"fn a() {"}],"scanned_areas":[]}"#;
+        let mk_reg = || {
+            let mut reg = ProviderRegistry::new();
+            reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(turn(scan.into()))), std::time::Duration::from_secs(5), 0);
+            reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(turn(r#"{"findings":[],"needs":[]}"#.into()))), std::time::Duration::from_secs(5), 0);
+            reg
+        };
+        // 本轮改的是第 2 行，判例区域（第 1 行）没动 → 两道守卫都过
+        let changes = || vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
+
+        let (report, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), dir.path(), Some("sha1".into()), None).await.unwrap();
+        let deep = report.run.deep.as_ref().expect("有 reviewer 就该有深挖段");
+        assert_eq!(deep.precedent_exempt, 1, "判例该在入队侧豁免掉它: {:?}", report.run.warnings);
+        assert_eq!(deep.precedent_redug, 0);
+        assert!(
+            report.run.warnings.iter().any(|w| w.contains("沿用结案")),
+            "要说清为什么少了一格: {:?}", report.run.warnings
+        );
+
+        // 反面：`--no-dismissed` 关掉台账 → 判例不生效，照常入队
+        let mut off = args();
+        off.no_dismissed = true;
+        let (rep2, _) = run_code_review(&off, &mk_reg(), &cfg, changes(), dir.path(), Some("sha1".into()), None).await.unwrap();
+        assert_eq!(rep2.run.deep.as_ref().unwrap().precedent_exempt, 0, "--no-dismissed 下不得豁免");
+    }
+
     /// 空变更集：0 cell、warning 可观测、scan-only / 0（不是假绿灯 approve）。
     #[tokio::test]
     async fn scan_review_empty_changes_is_scan_only_with_warning() {
@@ -5445,6 +5499,13 @@ mod tests {
             assert!(empty, "{name} 在 --no-dismissed 下该什么都不产出");
         }
         assert_eq!(names.len(), 5, "新加台账路径时这里也要加——漏了就等于漏了这道旗");
+        // **判例（dismissed）路径不在这个列表里，而且不该在**：这五条是 `suspicions` 台账的路径，
+        // 它们各自解析 `project_db_path`，所以每条都得自己带旗。判例走的是另一套——
+        // B-1 的 prompt 注入与 B-2 的入队豁免都从 `load_ledger` 的产物 `Ledger.cards` 取，
+        // 而那个入口第一行就是 `if no_dismissed { return Ok(Ledger::default()) }`
+        // （见 `load_ledger_no_dismissed_and_missing_db_are_empty_without_side_effects`）。
+        // 保护在入口、不在调用点，所以新加一条判例消费路径不需要在这里登记。
+        // 这正是两种机制的分野：没有唯一入口的，逐条带旗 + 遍历兜底；有唯一入口的，入口验一次就够。
         assert!(w.is_empty(), "关台账的路径连 warning 都不该有: {w:?}");
         assert_eq!(std::fs::read(&dbp).unwrap(), before, "库文件一个字节都不许动");
 

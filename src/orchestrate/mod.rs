@@ -1,6 +1,7 @@
 pub mod blocks;
 pub mod deep;
 pub mod ledger;
+pub mod precedent;
 pub mod queue;
 pub mod review_shot;
 

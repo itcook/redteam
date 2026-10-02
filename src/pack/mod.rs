@@ -256,7 +256,8 @@ fn synth_diff(hunks: &[Hunk]) -> String {
 }
 
 /// diff 各 hunk 的新文件起止 `(c, d)`（`@@ -a,b +c,d @@`；d 缺省 1）。
-fn hunk_ranges(diff: &str) -> Vec<(usize, usize)> {
+/// M21c 批 B-2 起也给判例守卫用（判「判例区域自那以来有没有 delta」），故提为 crate 可见。
+pub(crate) fn hunk_ranges(diff: &str) -> Vec<(usize, usize)> {
     diff.lines().filter(|l| l.starts_with("@@")).filter_map(parse_hunk_new_range).collect()
 }
 

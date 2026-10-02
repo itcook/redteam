@@ -429,6 +429,14 @@ pub struct DeepMeta {
     /// 活锁守卫：激活到强制必挖门的条数。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub ledger_force_dig: u32,
+    // ── M21c 批 B 判例前移观测（design §4）──
+    /// 命中判例且两道守卫全过 → 沿用结案、**没有入队**的条数（省下的 reviewer 格）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub precedent_exempt: u32,
+    /// 命中判例但守卫没过 → 照常入队重挖的条数。与上一项分开记：
+    /// 「判例帮上忙」和「判例在那儿但不敢用」是两件事，合成一个数就看不出守卫在拦多少。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub precedent_redug: u32,
     // ── C2 时间重叠观测（design v11 §6 / §12.3〔D15〕；为零不序列化，旧报告形状不变）──
     /// 收场（关闭入口）时刻，自深挖开跑起毫秒；与扫描同时开跑时即 scanner 段墙钟。resume 与开跑即关闭（无入队通道）时 0。
     #[serde(default, skip_serializing_if = "is_zero_u64")]
