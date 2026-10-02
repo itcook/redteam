@@ -124,7 +124,16 @@ compaction 后模型记忆不可靠，唯一可信源是磁盘文件与 db 台�
 
 ## 停机（每轮内循环完成后判定；即使 verdict=approve，待刹车 id 先走完刹车链)
 1. **verdict = approve**（合并集口径：携带 ∪ 本轮新发，redteam 已算好）：
-   - **`run.failed_models` 为空**（对照集完整）→ 收工。
+   - **`run.failed_models` 为空**（对照集完整）→ 看 `run.convergence`（M21c 批 C；旧报告无此键）：
+     - **`converged: true`**，或**该键缺失** → 收工。缺失 = 本轮算不出收敛（diff 重建不了），
+       按旧行为收口——不因为少一个新字段改变既有判定。
+     - **`converged: false` 且 `activation_overrun > 0`** → **停车交人**：有疑点被 delta 反复激活
+       却始终挖不出结果，机制已给过自愈机会。`AskUserQuestion` 交用户裁决（报告的
+       `Not converged` 行与 warning 里有具体是哪几条），按「停机（活锁）」记判定行，不算 approve。
+     - **`converged: false` 且只是 `delta_adjacent > 0`** → **不收工**，再跑一轮：
+       台账里还有疑点落在本轮改过的文件上没挖完（多半是上一轮被预算截断的），
+       下一轮预算重置、delta 多半已缩小，有机会消化。`--max-rounds` 护栏照常生效。
+       判定行仍按最终那一轮的结果记。
    - **`run.failed_models` 非空**（半失败：N 个模型未参战，对抗火力不全）→ **不收工**，
      `AskUserQuestion` 二选一交用户裁决：
      - 「接受降级 approve（N 模型未参战，对抗火力不全）」→ 用户接受后按 approve 收工，
