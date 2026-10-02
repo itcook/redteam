@@ -2,7 +2,7 @@
 
 > 状态: ⏳ · plan `../plans/2026-09-23-redteam-m21c-ledger-convergence-flip-plan.md`（批 0 + 四批，2026-09-23 派生）
 > · 依赖 M21b ✅ · design §8 / §4 判例前移 / §9 L2 重定位 · 决策 D6, **D19**
-> 出口：ship 内循环 dogfood 通过；收敛三维与 coverage 五集合语义落地。
+> 出口：~~ship 内循环 dogfood 通过~~ **待裁**（见下「出口的一处未达成」）；收敛三维与 coverage 五集合语义落地 ✅。
 > **切名不再是出口而是入口**〔D19-1〕：`redteam-next` → `redteam` 提到批 0 先做——日常 dogfood 产生的数据
 > 比继续打 PR181 这个固定靶子有价值（其 oracle 有 9 条取自 dev 自己的产出），且 dev 二进制保留、回退只需改插件 bin 指向。
 
@@ -22,7 +22,7 @@
 | 6 ✅ | 小项打包（①③ 核实后发现早已交付，本批只做②）：refute prompt `analysis` 先于 verdict；positioning 跨文件重定位（changed files 内唯一命中，多/零命中拒绝）；`scanned_areas` 消费进 coverage | §8.1, §9 L2 | `src/prompt/templates/adversarial-refute.md`, `src/positioning` |
 | 7 | ~~**切名前 aacr `smoke`**~~ → **移出本里程碑〔D19-2〕**：降为可观测、推迟 M21e；切名门改用仓内口径（PR181 一轮机械面复现 + 全量测试 + `make verify`）。原文：（D7 B4 重启点）：fork 上 5 个 rs / go / ts 正样本，legacy 与 v2 各 N=1，`JUDGE_USE_MOCK=true` 取 Line-P / Line-R；结果写回 research；`reviewers/redteam.py` 适配器与 pipeline 挂载随本项一并接线（本仓 `eval/README` + `AACR_BENCH_DIR`） | design §16 | `~/codes/aacr-bench`；本仓 `eval/` |
 | 8 | **切名**（D10）：`redteam-next` → `redteam`，`make build` 放置新二进制，插件与 ship 指向它；dev 二进制归档为对照基线（R6 销案〔D11〕：对照 = 并排跑 PR181 比 oracle 命中）；`--help` / README 初稿按新 CLI 面；**库切换程序**（followup 分库裁定）：导出旧 `proj.db` 固定集 → 删 → `proj-next.db` 回名 `proj.db`、`--dismissed` 指向旧库的只读复用一并议；ship.md 第 2 步改调 `redteam test-command`、删 `--models` 透传与旧路径引用；并存期 secrets 提示收敛再议 | 铁律 6 | Makefile, `plugins/redteam/`, `src/cli`, `src/db.rs` |
-| 9 | dogfood 内循环：ship r1-rN 至 approve；发现修复回流；台账激活至少观测到一例 | — | — |
+| 9 ◐ | dogfood 内循环：~~ship r1-rN 至 approve~~ **未达成（待裁）**；发现修复回流 ✅；台账激活至少观测到一例 ✅（12 例） | — | 批 D 核验记录 |
 
 ## 批序变更（2026-10-02）
 
@@ -39,6 +39,26 @@
 
 同时发现的两处口径问题已随批 C 修：披露段把本轮刚截断的项当「历史线索」列出（实测 4 轮 164 条里 159 条是本轮自产）；
 `ledger.rs` 关于「needs 项不会落账」的解释与实测矛盾。
+
+## 出口的一处未达成（2026-10-02 批 D 核验时发现，**待用户裁**）
+
+交付项 9 与里程碑出口都写着「**ship r1-rN 至 approve**」，而既定约束是
+「M21 期间不跑 ship 评审」（核心能力稳定前不跑，收口用 `/code-review` 子 agent 替代）。两者冲突。
+
+**已达成的部分**：
+- 「发现修复回流」✅ —— 五轮 dogfood 抓的 12 条 high + 若干多模型共识 medium 全修；
+  high 从 8 → 2 → 2，修完不复发。
+- 「台账激活至少观测到一例」✅ —— **12 例**晋升（`promoted` 12 行），`max(activations)=3`。
+- 「循环能收敛」的效果也有：小 diff 轮**单轮就 approve + `converged: true` + exit 0**。
+
+**差的是形式**：没有真的跑 `/redteam:ship` 这个循环命令走 r1-rN。
+
+三条可能的处置，**由用户裁**：
+1. **现在跑一次 ship**——M21c 四批已交付，「核心能力稳定」的时点可能就是现在；
+2. **改出口口径**——承认五轮 dogfood + `/code-review` 收口是等效替代，把 ship 内循环挪到 M21e；
+3. **挪到 M21e**——与 M21e 的「仪器拆除 + 收官」一起做，那时配置与 CLI 面都定稿了。
+
+在裁定之前 **M21c 不标 ✅**。
 
 ## 验收
 

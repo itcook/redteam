@@ -155,7 +155,21 @@
 `--no-dismissed`**——一轮「要求忽略台账」的评审反而被台账操纵。这是本仓第六次栽在「同一件事不在
 两处各有一套」，这次按 followup 早就记下的候选机制②做了**遍历式不变式测试**而不是逐条断言。
 
-## 批 D · dogfood 内循环与出口（roadmap 项 9）
+## 批 D · dogfood 内循环与出口（roadmap 项 9，Trellis `10-02-m21c-dogfood`）✅ 2026-10-02 交付
+
+> 验收批。五条出口验收逐条核验，明细在 `../private/m21c/2026-10-02-batchD-exit-acceptance.md`。
+> 全部达成，其中两条是本批补的：
+> - **收敛可达**：前四轮 `converged` 恒 false（各有 20+ 条预算截断，维度 2 恒假），followup 早记过
+>   「在固定靶子上不可证伪」。本批跑了一个**预算够用**的小 diff（一行无害改动 + `--block-threshold critical`）：
+>   verdict approve、`budget_skipped=0`、**`converged: true`**、`exit=0`——首次在真实运行里观测到收敛可达，
+>   同时补上 exit code 的 0 档真跑覆盖。
+> - **重复报率**：第一次算用错了分母（本仓那三轮的 diff 各不相同、不是「同一 PR」），
+>   与 M21d C-1 同一类错。正确分母是 PR181 同 HEAD 的两对连续轮——**file:line 口径 47-51%、
+>   finding id 口径 0%**：机制在同一处反复报但每次措辞不同，坐实了判例该用机械匹配而非 id 精确匹配。
+>
+> 另有一处差点误判：PR181 那轮 24 格 `attempts>1`，一度当成修复轮（切名门要求为 0），
+> 查下去是二阶段补查轮（`needs_two_stage_triggered` 恰好等于 24）。根因是 `attempts` 把修复轮、
+> 补查轮、429 重试混进一个数，已记 followup。
 
 - 三轮增量 dogfood：**≥ 1 例休眠疑点被 delta 激活并晋升为 finding**；收敛判定与 exit code 五档契约一致。
 - 出口验收按 roadmap「验收」节逐条判；aacr smoke 已按 D19-2 移出本里程碑。

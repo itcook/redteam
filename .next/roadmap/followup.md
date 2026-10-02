@@ -936,3 +936,12 @@ followup 里早有「任何按单轮墙钟做的比较都不可信，至少三�
 | **resume 补跑不做跨文件重定位** | `scan_cell_record` 在 resume 补跑处传空片——变更集要到 `changed_now`（约 1830 行）才重建，补跑在它之前（约 1691 行）拿不到。重定位是增益不是正确性。要让它受益得把变更集重建提前，那是独立重构 |
 | **reviewer finding 侧没有跨文件重定位** | 本批只给 scanner 侧（`anchor_suspicions_within`）。reviewer 聚焦单个队列项、串文件名的概率远低于 scanner（后者一次看一组多个文件）。`anchor_review_findings` 要不要也加，等真实样本里出现 reviewer 串文件名的案例再说 |
 | **一条误报的根因是切片折叠** | 批 B 建的第一张判例卡（`50ccdf31cbf0d84f`）就是这一类：reviewer 推断 `agreement_of([])` 返回 0（实际是 `.max(1)` 返回 1），而它**自己写明了不确定**——「the folded `QueueItem::new` could clamp it instead — hence the need」。它知道该声明 need，却选择了猜。这正是 M21d 批 C-1「切片回退信号」要量的那件事（`needs{evidence}` 指向折叠区），现在有了第一个实证案例：**折叠 + 不声明 need = 误报**。下次调切片参数时拿它当样本 |
+
+## M21c 批 D（出口核验）带出的账（2026-10-02）
+
+| 项 | 判断 |
+|---|---|
+| **`CellRecord.attempts` 把三件事混进一个数** | `rec.attempts = iterations + rate_limit_retries`，而 `iterations` 自己又含**修复轮**与**二阶段补查轮**。后果：切名门要求「修复轮 0」，而 PR181 那轮 24 格 `attempts>1` 全是二阶段补查——**我一度误判成修复轮**，靠 `needs_two_stage_triggered` 恰好等于 24 才辨清。要分开记（`repair_rounds` / `two_stage_rounds` / `rl_retries`），否则这个判据没法自动化 |
+| **前台跑不写 `results` 表** | 只有 `--background` 作业留记录。影响激活闸门：`last_verdict()` 读 `results` 最近一条，前台连跑多轮时它读到的「上一轮」可能是很久以前的后台作业。本仓实测——`results` 只有 09-29 那两轮，批 C r1/r2 与批 B r1 全不在内。要么前台也落一条，要么闸门改用别的轮次源 |
+| **重复报率的基线已测，判例前移后的效果未测** | PR181 同 HEAD 两对连续轮：**file:line 口径 47-51% 重复，finding id 口径 0%**。机制在同一处反复报、但每次措辞不同——这坐实了判例该用机械匹配而非 id 精确匹配。两对都在批 B 之前，所以是基线；判例前移后的效果要等下一轮 PR181 |
+| **判例命中在真实轮仍是 0** | 批 B 那轮零命中是正确行为（卡指向的 `queue.rs` 本轮未改，按组筛正确排除），但这意味着**豁免路径在真实场景一次都没走过**。要观测到需要：同一处代码被连续两轮都报，且第二轮那处没被改。47-51% 的 file:line 重复率说明这种情况常见，下一轮 PR181 有机会撞上 |
