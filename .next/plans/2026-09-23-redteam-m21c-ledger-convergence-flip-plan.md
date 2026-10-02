@@ -56,7 +56,7 @@
 - followup 里属于 provider 层的两条债一并处理或明确推后：5xx 拿不到 `Retry-After`（需改 `ProviderError` 形状）、
   `cfg!(test)` 缩退避只覆盖 lib 单测（换 `#[tokio::test(start_paused = true)]`）。
 
-## 批 A · 台账落账与 coverage 分级（`feat/m21c-ledger`，与 M21d L4-B 并行）
+## 批 A · 台账落账与 coverage 分级（`feat/m21c-ledger`，与 M21d L4-B 并行）✅ 2026-09-29 交付
 
 ### Task A-1 预算外疑点落账（roadmap 项 1）
 - `suspicions` 表写入：`quote_norm` 锚 + hint + confidence + origin（scan / rule / needs）+ **落入原因**（预算截断 / 规则豁免）+ 首末作业 + 激活次数。
@@ -79,7 +79,17 @@
 ### Task A-5 回归门
 - 跑 PR181 一轮，确认台账落账不改变 verdict 与 findings 集合（只增披露）；数字进私有记录。
 
-## 批 B · 判例前移与小项（`feat/m21c-precedent`，前提：批 0 + 若干轮日常 dogfood 攒出素材）
+## 批 B · 判例前移与小项（`feat/m21c-precedent`）⏸ **前提不成立，与批 C 换序**（2026-10-02）
+
+> 原前提「批 0 + 若干轮日常 dogfood 攒出素材」**读错了机制**：判例卡的唯一产出口是
+> `dismiss add` / `resolve add`，只由 ship 循环在人工裁定误报 / 已修时调用；M21 期间按既定约束不跑 ship，
+> 于是新库判例恒 0（本仓与 PR181 四轮报告的 `ledger.loaded` 全是 0）。dogfood 跑的是单轮 `review`，
+> 它攒的是 `suspicions`（批 C 的料），**不是判例**——等多少轮都攒不出来。
+>
+> 现成素材是 dev 时代留在主工作树 v0 库里的 63 条 dismissed + 3 条 resolved，且**只有 22/63 带 quote 锚**
+> （判例前移的机械匹配以「文件 + quote 归一」为身份，无锚的 41 条用不上）。
+> 批 B 开工前要先裁喂料方式：等到「可以跑 ship」那个时点，或者捡回批 0 搁置的 D19-4 议题
+> ——`--dismissed` 指向旧库的只读复用。
 
 ### Task B-1 判例摘要进快扫 prompt（roadmap 项 5）
 - 复用 `render_precedents`：同文件活跃判例摘要注入 scanner prompt；措辞照抄 claimed-resolved 卡。
@@ -97,7 +107,17 @@
 ### Task B-4 验收与观测
 - 同一 PR 连续两轮重复报同一 finding 的比例（人工判机制，按 `file:line` 对齐）——作观测量，不设门槛。
 
-## 批 C · 增量激活与收敛三维（`feat/m21c-converge`）
+## 批 C · 增量激活与收敛三维（`feat/m21c-converge`，Trellis `10-02-m21c-converge`）✅ 2026-10-02 交付
+
+> **提到批 B 之前做**（2026-10-02 用户裁）：批 B 的前提不成立而批 C 的素材已齐——
+> 本仓 27 条 + PR181 74 条休眠疑点，且本仓实测出现过跨轮项（第二轮 10 条披露里 5 条来自上一轮 HEAD）。
+>
+> 开工四条裁定：① **只做激活、挂全量轮**，`--incremental-from` 继续 bail（连带重建 M13 增量轮要先重裁
+> 「上轮 finding 要不要携带」，范围大几倍且牵出未裁的设计问题）；② 排序**新增独立层「激活」，插在「代码优先」
+> 之后**（放风险档之后会让被激活的文档疑点顶掉未激活的代码疑点，推翻批 C0 的分池序；写 `risk_band` 则污染
+> 区域级语义且下轮重算即丢）；③ 收敛口径**严格**（`file ∈ delta ∧ dormant` 即未处理，含本轮截断项——
+> 「有截断就不收敛」是特性，循环本就该再来一轮，死锁由活锁守卫兜底，故守卫是本口径的**配套而非可选项**）；
+> ④ 活锁守卫**两段式 N=3 强制必挖 / N=5 停车**。
 
 ### Task C-1 增量轮激活（roadmap 项 2）
 - `delta ∩ 锚定文件 ≠ ∅` → 休眠疑点重入队、优先级 +1 档；carry 机器（anchor_near / rename 迁移）复用。

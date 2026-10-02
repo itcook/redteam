@@ -124,8 +124,8 @@
 |---|---|---|
 | resume scan 重放无生产验证 | `run_resume` 用 manifest `scan` 请求重放差集 cell（旧格式作业记失败）；只有单测 / e2e 空 manifest 锚，无真 provider dogfood；角色集按当前配置重建 | M21b 队列快照 checkpoint 落地后重做（resume 读快照里的角色条目） |
 | thinking 映射未在真网关实测的家族 | 映射表按官方文档（2026-09-09）：GLM anthropic 形态文档无字段 → 无映射 + warning；Qwen `enable_thinking` / Gemini `reasoning_effort` 未实测；本仓 dogfood 只覆盖 DeepSeek（`thinking` + `reasoning_effort`）与 Qwen（openai 形态） | 出口 2 已跑（2026-09-09）：GLM 5.3 anthropic 形态无映射 → registry warning 1、未发思考参数，网关默认仍有推理输出，并集 / agreement 正常；映射待 Z.ai anthropic 文档给字段；其余按模型接入时实测 |
-| 增量轮显式报错 | `run_incremental_review` bail（M21c 恢复）；e2e `incremental_from_bails_until_m21c` 锚住报错；原 carry 端到端锚（携带 / dispute / re-raise）与 `render_incremental_section` / `two_layer_manifest` 随旧路径删 | M21c 疑点台账 + delta 激活时按 scan prompt 参考块加槽重建（批 C 延后项已记） |
-| dismissed 台账只披露不消费 | `load_ledger` 仍加载并进 `run.ledger`；`Ledger.ids / cards` 无消费者（`mark_dismissed` / 判例注入随旧尾段删）；e2e 改为披露断言 | M21c 判例前移进 scanner prompt（`<precedents>` 槽已在 D-2）+ 豁免裁决 |
+| 增量轮显式报错 | `run_incremental_review` bail；e2e `incremental_from_bails_until_m21c` 锚住报错；原 carry 端到端锚与 `render_incremental_section` / `two_layer_manifest` 随旧路径删 | **仍 bail**〔M21c 批 C 裁定 1，2026-10-02〕：delta 激活改**挂全量轮**落地（激活所需输入在全量轮上已全部具备，实测本仓两轮全量就产生过跨轮项），`--incremental-from` 不在批 C 范围。重建它要先重裁「上轮 finding 要不要携带」——`carry()` / `merge_carry()` 全是 `Finding` 形态，而新形态下 finding 只由深挖产出；`incremental_preflight` 四守卫仍 `#[allow(dead_code)]` 有测试无调用。连同那次设计重裁一起排期 |
+| dismissed 台账只披露不消费 | `load_ledger` 仍加载并进 `run.ledger`；`Ledger.ids / cards` 无消费者；e2e 改为披露断言 | M21c 批 B（判例前移）。**2026-10-02 摸台账发现前提不成立**：判例只由 ship 循环的人工裁定写入，M21 期间不跑 ship → 新库 `dismissed` / `resolved` 恒 0，本仓两轮与 PR181 四轮的 `ledger.loaded` 全是 0。旧库 63 + 3 条在主工作树 v0 库里且**仅 22 条带 quote 锚**。批 B 开工前先裁喂料方式（等可跑 ship，或捡回 D19-4 搁置的「`--dismissed` 指向旧库只读复用」） |
 | 无消费者的旗 | `--block-threshold` / `--conf-floor` / `--tools` / `--dismissed` / `--no-dismissed` 保留、`--help` 注明生效里程碑（prd K13） | M21b（前三）/ M21c（后二）接消费者；届时改回文案 |
 | 报告里的 finding 形态字段恒空 | `stats` 全零、`findings` / `clusters` 空数组仍序列化（schema 不翻号，followup :70）；插件 `result.md` / `review.md` 文案「呈现 findings」 | M21b 深挖产 finding 后自然填；插件文案 M21c 切名时改 |
 | `CellSummary.attempts` 口径 | 字段注释仍写「候补链尝试的 model 数」，scan 路径恒 1（无候补，D7 A3） | M21e 清扫改注释或删字段 |
@@ -865,3 +865,14 @@ followup 里早有「任何按单轮墙钟做的比较都不可信，至少三�
 语义上就是「整个文件给我」，而 `a <= y && b >= x` 沾边即算命中，必然抬高分子——与
 「不带行锚的不计入分母」的口径自相矛盾。等价的宽锚该同档处理。加阈值需要数据支撑
 （跨度多大算「整文件」），先记着。
+
+## M21c 批 C 带出的账（2026-10-02，台账摸底 + 激活落地）
+
+| 项 | 现状 | 去处 |
+|---|---|---|
+| **纯 needs 项落不了账** | 落账身份是「文件 + quote 归一」，而 needs 补查项的诉求不在任何 quote 上。注意形状：与 scan 疑点合并进同一队列项的 needs 项**会**落账（落的是那条 scan 疑点的身份，PR181 库里实有一条 `origin='Needs'` 的行），落不了的是**纯** needs 项。批 C 已订正 `ledger.rs` 里「needs 项 members 恒空」的错误解释 | 要捞得先给补查项一条独立于 quote 的身份（如 `path:lines:理由指纹`，入队侧的到达键已是这个形状）。随「二阶段补查的跨轮记忆」一起做 |
+| **`first_job` / `last_job` 字段名与语义漂移** | 名字是 job，存的是 **HEAD sha**（对外经 `DormantLead.first_round` 转成 round，那个名字反而准）。语义本身是对的——批 C 的激活判据要算的正是「自上次见到以来有没有 delta」，HEAD 才是基准；但同一 HEAD 跑 N 轮在台账上不可区分（PR181 四轮同 HEAD，74 条全是 `first=last`，「跨轮复现」在固定靶子上恒不可观测） | 改名为 `first_round` / `last_round` 与对外一致（schema 迁移，攒够别的 schema 改动一起做）。若将来要数「被看见几次」，那是另一个字段，别复用这两个 |
+| **落入原因只有 `budget` 一种** | `REASON_BUDGET` 是 `ledger.rs` 里唯一取值；design 原文的「规则豁免」那一类要等批 B 的判例豁免落地才产生 | 随批 B |
+| **resume 不重算激活** | 同一个 job 续跑、HEAD 与 delta 都没变，激活标记随 `QueueItem` 快照恢复，所以 resume 侧传空片（重算会让 `activations` 多加一轮、提前踩响活锁门）。代价：**首跑若崩在激活之前**，那批疑点这一轮就错过了（下一轮会再来） | 可接受。若要修，得在 job 状态里记「本轮激活是否已执行」，成本高于收益 |
+| **活锁守卫的 N 取值无数据支撑** | N=3 / N=5 是开工时按「给机制两次自愈机会」裁的，不是实测出来的——台账里目前一条 `activations > 0` 的行都没有（批 C 之前激活不存在） | 等批 D dogfood 攒出激活样本后回校；R12「台账激活上限 N 与停车通道形态」本就挂着 M21e 收口 |
+| **收敛三维在固定靶子上不可证伪** | 维度 2 严格口径下「有预算截断就不收敛」，而 PR181 每轮都有截断 → 它在那个靶子上恒为假。要验「收敛真能达成」需要一个**预算够用**的小 diff | 批 D dogfood 里专门跑一个小改动验收敛可达 |
