@@ -927,3 +927,12 @@ followup 里早有「任何按单轮墙钟做的比较都不可信，至少三�
 
 **还没做的第 2 步**：把「带状态机的模块至少一条用例走完整往返」写进 `.trellis/spec/`，
 让它在下次开发时自动注入，而不是靠记得。
+
+## M21c 批 B 带出的账（2026-10-02）
+
+| 项 | 判断 |
+|---|---|
+| **判例笔记没进 reviewer prompt** | B-2 守卫不过时把理由记进 `warnings`，没进 prompt。笔记的用途是让 reviewer 知道「这处人判过误报，但区域变了」，要进 prompt 得改 reviewer tail 模板。本批不做的理由：验收②只要求「必须重挖」，笔记在 plan 描述里但不在验收里；而改模板会动稳定前缀以外的渲染面，值得单独一批 |
+| **resume 补跑不做跨文件重定位** | `scan_cell_record` 在 resume 补跑处传空片——变更集要到 `changed_now`（约 1830 行）才重建，补跑在它之前（约 1691 行）拿不到。重定位是增益不是正确性。要让它受益得把变更集重建提前，那是独立重构 |
+| **reviewer finding 侧没有跨文件重定位** | 本批只给 scanner 侧（`anchor_suspicions_within`）。reviewer 聚焦单个队列项、串文件名的概率远低于 scanner（后者一次看一组多个文件）。`anchor_review_findings` 要不要也加，等真实样本里出现 reviewer 串文件名的案例再说 |
+| **一条误报的根因是切片折叠** | 批 B 建的第一张判例卡（`50ccdf31cbf0d84f`）就是这一类：reviewer 推断 `agreement_of([])` 返回 0（实际是 `.max(1)` 返回 1），而它**自己写明了不确定**——「the folded `QueueItem::new` could clamp it instead — hence the need」。它知道该声明 need，却选择了猜。这正是 M21d 批 C-1「切片回退信号」要量的那件事（`needs{evidence}` 指向折叠区），现在有了第一个实证案例：**折叠 + 不声明 need = 误报**。下次调切片参数时拿它当样本 |
