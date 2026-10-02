@@ -137,10 +137,20 @@ pub fn activations_for(rows: &[crate::db::SuspicionRow], head: &str, root: &std:
     out
 }
 
-/// 台账状态机（design §8.3）：`dormant` → `activated`（被 delta 碰到、重新入队）→ `promoted`（深挖晋升为 finding）。
-/// 单向：已 activated 的行不再被激活判据选中，所以同一轮里一条疑点只会被激活一次。
+/// 台账状态机（design §8.3）：**两态**——`dormant`（休眠，可被激活）与 `promoted`（已晋升为 finding，不再激活）。
+///
+/// 这里原本有第三个中间态 `activated`，批 C 的 dogfood 当场证明它是错的：激活把行改成 `activated`，
+/// 而激活判据与回写都只认 `dormant`，于是 `activations` 永远饱和在 1、两段门（3 / 5）**是不可达常量**，
+/// 活锁守卫整个是死代码；更糟的是「激活了但没挖成」的行从此既不被激活也不被披露，**彻底消失**。
+/// 根因是那个状态机没有回边，而「激活了没挖成」恰恰是最常见的情形（本轮预算同样会截断它）。
+///
+/// 两态下：激活**不动 status**，只 `activations += 1` 并把 `last_job` 记成本轮；
+/// 同轮幂等由 `last_job <> 本轮` 保证（见 `ProjDb::suspicion_activate`），
+/// 跨轮则每轮各加一次，门才可达。挖出 finding 时才写 `promoted`（见 `promote_rows`）。
+///
+/// 「当前在队列里挖着」是**轮内**状态，不该写进跨轮台账——这是上面那个设计错误的教训。
 pub const STATUS_DORMANT: &str = "dormant";
-pub const STATUS_ACTIVATED: &str = "activated";
+pub const STATUS_PROMOTED: &str = "promoted";
 
 #[cfg(test)]
 mod tests {
@@ -262,11 +272,9 @@ mod tests {
         // ② 同 HEAD 重跑：同一个 head 第二次跑，台账里 last_job 已是它——没有新 delta，激活无依据
         let rerun = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha1", 0, q)], "sha1", t.path());
         assert!(rerun.activated.is_empty(), "同 HEAD 重跑不激活: {rerun:?}");
-        // ③ 状态机单向：已激活 / 已晋升的不再激活
-        for st in [STATUS_ACTIVATED, "promoted"] {
-            let done = activations_for(&[row("r1", "a.rs", st, "sha1", 2, q)], "sha2", t.path());
-            assert!(done.activated.is_empty(), "{st} 不该再被激活: {done:?}");
-        }
+        // ③ 已晋升的退出激活池（挖出过 finding，不该再反复重挖）
+        let done = activations_for(&[row("r1", "a.rs", STATUS_PROMOTED, "sha1", 2, q)], "sha2", t.path());
+        assert!(done.activated.is_empty(), "promoted 不该再被激活: {done:?}");
         // 无轮次标识（非 git / 无 commit）：与落账同一道门
         let noround = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha1", 0, q)], "", t.path());
         assert!(noround.activated.is_empty(), "无轮次标识不激活");

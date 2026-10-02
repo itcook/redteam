@@ -658,29 +658,55 @@ impl ProjDb {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// 激活回写（M21c 批 C）：`dormant` → `activated`、计数 +1、`last_job` 记本轮。
-    /// **条件带 `status = 'dormant'`**：并发或重复调用时第二次写不进去，激活次数不会被同一轮多加一次。
+    /// 激活回写（M21c 批 C）：计数 +1、`last_job` 记本轮，**不动 status**。
+    ///
+    /// 幂等靠 `last_job <> ?2`：同一轮里重复调用（或与别的写者撞上）第二次写不进去，计数不会多加；
+    /// 而**换一轮**就能再加一次——两段活锁门（3 / 5）正是靠这个才可达。
+    ///
+    /// 这里原先写 `status='activated'` 且条件为 `status='dormant'`，于是一行一生只能加一次、
+    /// 门成了不可达常量，守卫整个是死代码（批 C dogfood 抓到）。状态机为什么收成两态见
+    /// `ledger::STATUS_DORMANT` 的注释。
     pub fn suspicion_activate(&self, id: &str, job: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE suspicions SET status='activated', activations=activations+1, last_job=?2
-             WHERE id=?1 AND status='dormant'",
+            "UPDATE suspicions SET activations=activations+1, last_job=?2
+             WHERE id=?1 AND status='dormant' AND last_job<>?2",
             rusqlite::params![id, job],
         )?;
+        Ok(())
+    }
+
+    /// 晋升（M21c 批 C）：这条台账疑点在本轮被挖出了 finding → 退出激活池。
+    ///
+    /// 没有它，一条已经产出 finding 的疑点会在后续每一轮被反复激活重挖，`activations` 一路涨到停车门，
+    /// 然后报告对人说「机制挖不动它」——而它明明挖出来了。语义正好反了。
+    ///
+    /// 无状态前提（不写 `WHERE status='dormant'`）：两态下 `promoted` 行根本进不了激活池、也就进不了
+    /// 晋升的候选，那个条件没有任何可观测效果——加一个没人盯得住的分支不如不加。
+    /// 将来真有第三个状态（如 `parked`）时再按那时的语义补。
+    pub fn suspicion_promote(&self, id: &str) -> Result<()> {
+        self.conn.execute("UPDATE suspicions SET status='promoted' WHERE id=?1", rusqlite::params![id])?;
         Ok(())
     }
 
     /// 上一轮的裁决（M21c 批 C 的激活闸门，design §8.3「上轮 verdict = Incomplete 时台账疑点不可信」）。
     ///
     /// 取 `results` 里最近一条——激活发生在本轮写结果**之前**，所以最近一条必定是上一轮。
-    /// 没有历史轮次（首次在本仓跑）→ `None`，调用方按「无闸门」处理：台账本来也是空的。
+    ///
+    /// 三种结果**必须分开**（dogfood 抓到原先把后两种都塞进 `None`）：
+    /// - `Ok(None)` = 确实没有往轮（首次在本仓跑）→ 无闸门，台账本来也是空的；
+    /// - `Ok(Some(v))` = 读到了裁决；
+    /// - `Err(_)` = 有往轮但读不出（JSON 坏了 / 没有 `verdict` 键 / 查询失败）→ 调用方按**保守**处理不激活。
+    ///   混成 `None` 的后果是闸门静默失效：恰恰在往轮记录可疑的时候，我们照着它的台账去激活。
     pub fn last_verdict(&self) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare("SELECT json FROM results ORDER BY created_at DESC LIMIT 1")?;
         let mut rows = stmt.query([])?;
         let Some(r) = rows.next()? else { return Ok(None) };
         let js: String = r.get(0)?;
-        Ok(serde_json::from_str::<serde_json::Value>(&js)
-            .ok()
-            .and_then(|v| v.get("verdict").and_then(|x| x.as_str().map(str::to_string))))
+        let v: serde_json::Value = serde_json::from_str(&js).context("上一轮结果 JSON 解析失败")?;
+        v.get("verdict")
+            .and_then(|x| x.as_str())
+            .map(|x| Some(x.to_string()))
+            .context("上一轮结果里没有 verdict 键")
     }
 
     pub fn active_ids(&self) -> Result<HashSet<String>> {
@@ -1549,11 +1575,14 @@ mod guard_tests {
         assert!(db.suspicions_for_files(&[]).unwrap().is_empty());
     }
 
-    /// 激活回写只认 `dormant`（M21c 批 C）：`WHERE status='dormant'` 这个条件是幂等护栏——
-    /// 同一轮里重复调用（或与别的写者撞上）时第二次写不进去，激活次数不会被同一轮多加一次。
-    /// 没有它，活锁守卫的门会被重复调用提前踩响，把一条正常的疑点误判成「机制挖不动」。
+    /// 激活回写：**同轮幂等、跨轮累加**（M21c 批 C；原版在 dogfood 里被判为死代码，见下）。
+    ///
+    /// 幂等靠 `last_job <> ?`，不是靠改 status。原先这条 UPDATE 写 `status='activated'` 而条件是
+    /// `status='dormant'`，于是一行一生只能加一次，`activations` 饱和在 1，而两段门在 3 / 5——
+    /// 整个活锁守卫是不可达的死代码。这条用例因此**走真实 DB 往返**而不是手搓中间状态：
+    /// 原来的单测直接构造 `activations: 2..4` 的行，那是生产路径产生不出来的，所以测不出门不可达。
     #[test]
-    fn activation_writeback_only_advances_a_dormant_row_once() {
+    fn activation_writeback_is_idempotent_per_round_but_accumulates_across_rounds() {
         let dir = tempfile::tempdir().unwrap();
         let db = ProjDb::open(dir.path()).unwrap();
         let row = |id: &str, status: &str| SuspicionRow {
@@ -1564,17 +1593,31 @@ mod guard_tests {
         db.suspicion_upsert(&row("d1", "dormant")).unwrap();
         db.suspicion_upsert(&row("p1", "promoted")).unwrap();
 
-        db.suspicion_activate("d1", "sha2").unwrap();
-        db.suspicion_activate("d1", "sha3").unwrap(); // 第二次：状态已非 dormant，写不进去
-        db.suspicion_activate("p1", "sha2").unwrap(); // 已晋升的行不该被拉回 activated
+        let count = |id: &str| {
+            let got = db.suspicions_for_files(&["a.rs".into()]).unwrap();
+            let r = got.into_iter().find(|r| r.id == id).unwrap();
+            (r.status, r.activations, r.last_job)
+        };
 
-        let got = db.suspicions_for_files(&["a.rs".into()]).unwrap();
-        let d1 = got.iter().find(|r| r.id == "d1").unwrap();
-        assert_eq!((d1.status.as_str(), d1.activations, d1.last_job.as_str()), ("activated", 1, "sha2"),
-                   "只认第一次：计数 1、last_job 停在 sha2");
-        let p1 = got.iter().find(|r| r.id == "p1").unwrap();
-        assert_eq!((p1.status.as_str(), p1.activations, p1.last_job.as_str()), ("promoted", 0, "sha1"),
-                   "非 dormant 的行一个字段都不该动");
+        // 同一轮重复调用只加一次
+        db.suspicion_activate("d1", "sha2").unwrap();
+        db.suspicion_activate("d1", "sha2").unwrap();
+        assert_eq!(count("d1"), ("dormant".into(), 1, "sha2".into()), "同轮幂等，且 status 不动");
+
+        // 换一轮再加一次——门（3 / 5）正是靠这个才可达
+        db.suspicion_activate("d1", "sha3").unwrap();
+        db.suspicion_activate("d1", "sha4").unwrap();
+        assert_eq!(count("d1"), ("dormant".into(), 3, "sha4".into()), "跨轮累加，三轮后踩到强制必挖门");
+
+        // 已晋升的行一个字段都不动
+        db.suspicion_activate("p1", "sha2").unwrap();
+        assert_eq!(count("p1"), ("promoted".into(), 0, "sha1".into()));
+
+        // 晋升：挖出 finding 的退出激活池，且只对 dormant 生效（不把别的状态拉回来）
+        db.suspicion_promote("d1").unwrap();
+        assert_eq!(count("d1"), ("promoted".into(), 3, "sha4".into()), "晋升只改 status、不动计数");
+        db.suspicion_activate("d1", "sha5").unwrap();
+        assert_eq!(count("d1"), ("promoted".into(), 3, "sha4".into()), "晋升后不再被激活");
     }
 
     /// 旧库有数据、**且台账表与 v4 不同构**（这里 dismissed 只有 3 列）→ 拒开：文案指向导出脚本与库路径、

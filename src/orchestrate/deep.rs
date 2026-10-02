@@ -1357,6 +1357,11 @@ pub fn restored_meta(items: &[QueueItem]) -> DeepMeta {
         .flat_map(|it| it.arrivals.iter())
         .filter(|k| !k.starts_with("rule:") && !k.starts_with("needs:"))
         .count() as u32;
+    // 激活观测同理从快照重建（M21c 批 C，dogfood 抓到）：resume 不重算激活（HEAD 与 delta 都没变），
+    // 若从 0 起算，首跑激活过的那几项在续跑的报告里就凭空消失，看起来像「这一轮台账什么都没做」。
+    // 标记随 `QueueItem` 序列化带回，逐项数即可。
+    meta.ledger_activated = items.iter().filter(|it| it.activated).count() as u32;
+    meta.ledger_force_dig = items.iter().filter(|it| it.force_dig).count() as u32;
     observe_selection_items(items, &mut meta);
     meta
 }
@@ -3693,6 +3698,23 @@ mod tests {
 
     /// resume 轮的观测从快照重建（评审）：回放的疑点走到达键幂等、按 `Duplicate` 不计，
     /// 从 0 起算会让压缩比在 resume 轮变成 0÷n；项上记着的到达键就是往轮收过的疑点。
+    /// resume 从快照重建激活观测（M21c 批 C 的 dogfood 修）：续跑不重算激活（HEAD 与 delta 都没变），
+    /// 若观测从 0 起算，首跑激活过的那几项在续跑报告里凭空消失，看起来像「这一轮台账什么都没做」。
+    #[test]
+    fn restored_meta_rebuilds_the_ledger_activation_observables() {
+        let mut hot = item_of("a", ItemKind::Suspicion, ItemState::Settled, 1);
+        hot.activated = true;
+        hot.force_dig = true;
+        let mut warm = item_of("b", ItemKind::Suspicion, ItemState::Skipped, 1);
+        warm.activated = true;
+        let cold = item_of("c", ItemKind::Suspicion, ItemState::Settled, 1);
+
+        let m = restored_meta(&[hot, warm, cold]);
+        assert_eq!(m.ledger_activated, 2, "两项带激活标记");
+        assert_eq!(m.ledger_force_dig, 1, "其中一项踩过强制必挖门");
+        assert_eq!(restored_meta(&[]).ledger_activated, 0);
+    }
+
     #[test]
     fn restored_meta_rebuilds_the_selection_observables() {
         let mut settled = item_of("a", ItemKind::Suspicion, ItemState::Settled, 1);

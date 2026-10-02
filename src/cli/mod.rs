@@ -466,6 +466,9 @@ pub async fn run_code_review(
         d.meta.queue_split_clusters = crate::consolidate::scan::split_clusters(&results.cells, &d.items);
         // 重锚失败数记进观测（M21c 批 C）：激活算在深挖之前，而 meta 要等深挖跑完才在手上。
         d.meta.ledger_anchor_lost = anchor_lost;
+        // 晋升在落账之前（M21c 批 C）：两者对象不相交（Settled 有 finding / Skipped），顺序本不冲突，
+        // 但晋升写的是 status、落账的 upsert 明确不动 status，先晋升读起来更顺（账先结清再记新的）。
+        promote_dug_suspicions(root, &d.items, &d.findings, head_sha.as_deref().unwrap_or(""), &mut warnings);
         // 疑点落账（M21c 批 A，design §8.2）：本轮被预算截断的疑点进跨轮台账，供下轮 delta 激活（批 C）。
         persist_dormant_suspicions(root, &d.items, head_sha.as_deref().unwrap_or(""), &mut warnings);
     }
@@ -1277,22 +1280,22 @@ fn attach_convergence(report: &mut crate::domain::ReviewReport, cwd: &Path, chan
         return;
     }
     let p = crate::db::project_db_path(cwd);
-    let (delta_adjacent, activation_overrun) = if p.exists() {
-        crate::db::ProjDb::open_read_only(&p)
-            .ok()
-            .and_then(|db| db.suspicions_for_files(changed_files).ok())
-            .map(|rows| {
-                let dormant = rows.iter().filter(|r| r.status == crate::orchestrate::ledger::STATUS_DORMANT).count() as u32;
-                let over = rows
-                    .iter()
-                    .filter(|r| r.activations >= crate::orchestrate::ledger::ACTIVATION_PARK)
-                    .count() as u32;
-                (dormant, over)
-            })
-            .unwrap_or((0, 0))
+    // 库在但读不出来 → **不设字段**（fail-closed，dogfood 抓到）。原先这里 `unwrap_or((0, 0))`，
+    // 于是一个读不开的台账会被报成「没有未处理项」，三维凑齐就输出 `converged: true`——
+    // ship 循环据此收工，而我们其实不知道台账里有什么。没有基准就别给结论，与下面空变更集同一处置。
+    let counts = if p.exists() {
+        match crate::db::ProjDb::open_read_only(&p).and_then(|db| db.suspicions_for_files(changed_files)) {
+            Ok(rows) => Some((
+                rows.iter().filter(|r| r.status == crate::orchestrate::ledger::STATUS_DORMANT).count() as u32,
+                rows.iter().filter(|r| r.activations >= crate::orchestrate::ledger::ACTIVATION_PARK).count() as u32,
+            )),
+            Err(_) => None,
+        }
     } else {
-        (0, 0)
+        // 没有项目库 = 没有台账 = 没有未处理项。这是「确知为空」，与「读不出」不同。
+        Some((0, 0))
     };
+    let Some((delta_adjacent, activation_overrun)) = counts else { return };
     let verdict_clean = report.verdict == crate::domain::Verdict::Approve;
     let no_delta_adjacent = delta_adjacent == 0;
     let no_activation_overrun = activation_overrun == 0;
@@ -1340,9 +1343,19 @@ fn activate_dormant(
             return (ActivationOutcome::default(), warnings);
         }
     };
-    if db.last_verdict().ok().flatten().as_deref() == Some("incomplete") {
-        warnings.push("ledger: 上轮 verdict = incomplete（扫描不全、疑点集有选择偏差）→ 本轮不激活休眠疑点".into());
-        return (ActivationOutcome::default(), warnings);
+    match db.last_verdict() {
+        Ok(Some(v)) if v == "incomplete" => {
+            warnings.push("ledger: 上轮 verdict = incomplete（扫描不全、疑点集有选择偏差）→ 本轮不激活休眠疑点".into());
+            return (ActivationOutcome::default(), warnings);
+        }
+        // 有往轮但读不出 → 保守不激活：闸门的前提就是「知道上轮跑成什么样」，不知道时照着它的台账
+        // 去激活，恰恰是在往轮记录可疑的时候最不该做的事。
+        Err(e) => {
+            warnings.push(format!("ledger: 上轮裁决读不出（{e}）→ 保守起见本轮不激活休眠疑点"));
+            return (ActivationOutcome::default(), warnings);
+        }
+        // `Ok(None)` = 确实没有往轮（首次在本仓跑），台账本来也是空的 → 无闸门。
+        Ok(_) => {}
     }
     let rows = match db.suspicions_for_files(changed_files) {
         Ok(r) => r,
@@ -1365,6 +1378,51 @@ fn activate_dormant(
         }
     }
     (out, warnings)
+}
+
+/// 晋升（M21c 批 C）：本轮**挖出了 finding** 的激活项 → 对应台账行退出激活池。
+///
+/// 与落账（下面那个函数）对称：落账管「没挖成的」，晋升管「挖成了的」。少了它，一条已经产出 finding
+/// 的疑点会在后续每一轮被反复激活重挖，`activations` 一路涨到停车门，然后报告对人说
+/// 「机制挖不动它」——而它明明挖出来了，语义正好反了。
+///
+/// 关联靠队列项而不是 finding 的 quote：reviewer 写 finding 时引的未必是疑点那一行，
+/// 按 quote 对身份会大面积漏配。项带着 `ledger:{row_id}` 到达键，是可靠的回指。
+fn promote_dug_suspicions(
+    cwd: &Path,
+    items: &[crate::orchestrate::queue::QueueItem],
+    findings: &[crate::domain::Finding],
+    round: &str,
+    warnings: &mut Vec<String>,
+) {
+    use crate::orchestrate::queue::ItemState;
+    if round.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = items
+        .iter()
+        .filter(|it| it.activated && it.state == ItemState::Settled)
+        .filter(|it| {
+            findings.iter().any(|f| {
+                crate::orchestrate::queue::norm_path(&f.file) == it.spec.file
+                    && it.spec.ranges.iter().any(|&(a, b)| f.line_start >= a && f.line_start <= b)
+            })
+        })
+        .flat_map(|it| it.arrivals.iter().filter_map(|a| a.strip_prefix("ledger:").map(str::to_string)))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let p = crate::db::project_db_path(cwd);
+    if !p.exists() || !crate::db::ProjDb::is_current_version(&p) {
+        return;
+    }
+    let Ok(db) = crate::db::ProjDb::open_at(&p) else { return };
+    for id in ids {
+        if let Err(e) = db.suspicion_promote(&id) {
+            warnings.push(format!("ledger: 晋升回写失败 {id}（{e}）"));
+        }
+    }
 }
 
 /// R2.2：失败/超时时从 proj.db 的 cell checkpoint 组一份 `incomplete` 报告——绝不因为 dispatch 出错/超时就静默丢掉已经跑完的 cell。
@@ -1685,6 +1743,7 @@ pub async fn run_resume(
                     // 「某 finding verdict=Refuted」而 `verify_triggered == 0`，正是出口验收第 6 项要杜绝的那种误判。
                     crate::orchestrate::deep::fold_reused_verify(&mut deep.meta, &deep.reused_cells);
                     // 落账同理（收口评审 #9）：首跑崩在深挖收场之后、进程退出之前时，那批截断疑点从没被落过账。
+                    promote_dug_suspicions(cwd, &deep.items, &deep.findings, &round_id, &mut report.run.warnings);
                     persist_dormant_suspicions(cwd, &deep.items, &round_id, &mut report.run.warnings);
                     // 这条是**「diff 重建不了」**（`changed_files` 报错）那条路：没有变更集可比，
                     // 窗口后滤不重算也不复位，往轮的标记与披露原样留住。
@@ -1810,6 +1869,7 @@ pub async fn run_resume(
             crate::orchestrate::deep::fold_reused_verify(&mut deep.meta, &deep.reused_cells);
             // resume 也要落账（收口评审 #9）：`persist_dormant_suspicions` 原先只挂在 `run_code_review` 上，
             // 崩在深挖中途的作业续跑后再次产出的 Skipped 项就永远进不了跨轮台账。
+            promote_dug_suspicions(cwd, &deep.items, &deep.findings, &round_id, &mut report.run.warnings);
             persist_dormant_suspicions(cwd, &deep.items, &round_id, &mut report.run.warnings);
             // 不可重建的照实说，别静默留 null：`close_ms` 是首跑扇出关闭的时刻、`budget_cells` 是首跑的预算档，
             // 两者都不在 cell 记录里，续跑重算只会得到本轮的数、与首跑语义不同。
@@ -3029,6 +3089,13 @@ mod resume_tests {
         let rows = db.suspicions_for_files(&["z.rs".into()]).unwrap();
         assert_eq!(rows.len(), 1, "主路径也要落账: {:?}", report.run.warnings);
         assert_eq!((rows[0].hint.as_str(), rows[0].last_job.as_str()), ("首跑就被截掉的", head.as_str()));
+        // 收敛三维也要在 resume 主路径装配（M21c 批 C；这一条曾是假绿：装配点删掉也没人发现）。
+        // 「diff 重建不了」那条路不装——没有变更集就没有基准，见那条用例。
+        let c = report.run.convergence.as_ref().expect("resume 主路径该带上收敛三维");
+        // 刚落的账在 z.rs，而本轮变更集是 x.rs —— 维度 2 只数**落在变更集内**的 dormant 行，
+        // 所以这里恰好为 0。顺带钉住这个区分：台账里有未处理项 ≠ 不收敛，它得就在你改的文件上。
+        assert_eq!(c.delta_adjacent, 0, "z.rs 不在本轮变更集里: {c:?}");
+        assert!(c.converged, "{c:?}");
     }
 
     /// resume 的**第二条**收口路径（diff 重建不了）同样要并复用复核账、同样要落账（收口评审 #1 / #9）。
@@ -4061,11 +4128,15 @@ mod code_review_tests {
         let deep = report.run.deep.as_ref().expect("有 reviewer 就该有深挖段");
         assert_eq!(deep.ledger_activated, 1, "首跑整条链要把台账项激活进队列: {:?}", report.run.warnings);
         assert_eq!(deep.ledger_anchor_lost, 0);
+        // 收敛三维也要在首跑路径上装配（这一条曾是假绿：装配点删掉也没人发现）
+        let c = report.run.convergence.as_ref().expect("首跑该带上收敛三维");
+        assert!(!c.converged && !c.no_delta_adjacent, "台账里还有落在变更文件上的 dormant 行: {c:?}");
 
         // 台账已回写：状态单向推进、计数 +1
         let db = crate::db::ProjDb::open(dir.path()).unwrap();
         let row = db.suspicions_for_files(&["src/a.rs".into()]).unwrap().into_iter().next().unwrap();
-        assert_eq!((row.status.as_str(), row.activations, row.last_job.as_str()), ("activated", 1, "sha2"));
+        assert_eq!((row.status.as_str(), row.activations, row.last_job.as_str()), ("dormant", 1, "sha2"),
+                   "激活只加计数、记轮次，**不动 status**——状态机收成两态的理由见 ledger::STATUS_DORMANT");
         drop(db);
 
         // 反面：同 HEAD 重跑不激活（没有新 delta）。另起一个项目，台账的 last_job 就是本轮 head。
@@ -4082,6 +4153,31 @@ mod code_review_tests {
         drop(db2);
         let (rep2, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), d2.path(), Some("sha9".into()), None).await.unwrap();
         assert_eq!(rep2.run.deep.as_ref().unwrap().ledger_activated, 0, "同 HEAD 重跑不该激活");
+
+        // 激活项真挖出 finding → 台账行晋升，此后不再被激活。少了这一步，一条已经报出来的疑点
+        // 会被后续每轮反复重挖、计数涨到停车门，然后报告说「机制挖不动它」——而它明明挖出来了。
+        let d3 = tempfile::tempdir().unwrap();
+        write(d3.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        crate::project::init_project(d3.path()).unwrap();
+        let db3 = crate::db::ProjDb::open(d3.path()).unwrap();
+        db3.suspicion_upsert(&crate::db::SuspicionRow {
+            id: "r1".into(), file: "src/a.rs".into(), quote_norm: "db.write(token);".into(),
+            hint: "往轮被截断的".into(), status: "dormant".into(),
+            first_job: "sha0".into(), last_job: "sha1".into(), activations: 0,
+            json: serde_json::json!({"line_start": 2, "quote": "db.write(token);", "confidence": 0.6}).to_string(),
+        }).unwrap();
+        drop(db3);
+        let mut reg3 = ProviderRegistry::new();
+        reg3.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(turn(r#"{"suspicions":[],"scanned_areas":[]}"#.into()))), std::time::Duration::from_secs(5), 0);
+        reg3.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(turn(
+            r#"{"findings":[{"severity":"low","title":"t","body":"b","file":"src/a.rs","line_start":2,"line_end":2,"confidence":0.5,"recommendation":"r","quote":"db.write(token);"}],"needs":[]}"#.into()))),
+            std::time::Duration::from_secs(5), 0);
+        let (rep3, _) = run_code_review(&args(), &reg3, &cfg, changes(), d3.path(), Some("sha2".into()), None).await.unwrap();
+        assert_eq!(rep3.run.deep.as_ref().unwrap().ledger_activated, 1, "{:?}", rep3.run.warnings);
+        assert!(!rep3.findings.is_empty(), "夹具前提：这一轮要真挖出 finding");
+        let db3 = crate::db::ProjDb::open(d3.path()).unwrap();
+        let row3 = db3.suspicions_for_files(&["src/a.rs".into()]).unwrap().into_iter().next().unwrap();
+        assert_eq!(row3.status, "promoted", "挖出 finding 的台账行要退出激活池");
     }
 
     /// 空变更集：0 cell、warning 可观测、scan-only / 0（不是假绿灯 approve）。
@@ -5100,9 +5196,13 @@ mod tests {
         assert_eq!(out.activated.len(), 1, "{out:?} {warns:?}");
         assert!(warns.is_empty(), "{warns:?}");
 
-        // 回写已生效：状态机单向，同一行不会被激活第二次
+        // 同一轮再调用不重复计数（幂等靠 last_job，不靠改 status）
+        let (same, _) = activate_dormant(t.path(), &files, "sha2");
+        assert!(same.activated.is_empty(), "同轮重复调用不该再激活一次: {same:?}");
+        // 换一轮能再加——两段活锁门（3 / 5）正是靠这个才可达
         let (again, _) = activate_dormant(t.path(), &files, "sha3");
-        assert!(again.activated.is_empty(), "已 activated 的行不再激活: {again:?}");
+        assert_eq!(again.activated.len(), 1, "新一轮该再激活: {again:?}");
+        assert_eq!(again.activated[0].activations, 2, "跨轮累加");
 
         // 上轮 incomplete → 闸门落下
         let t2 = ledger_fixture("sha1", 0);
@@ -5131,6 +5231,75 @@ mod tests {
         assert!(out.activated[0].park && out.activated[0].force_dig, "{:?}", out.activated[0]);
         let w = warns.iter().find(|w| w.contains("人工")).unwrap_or_else(|| panic!("要有停车提示: {warns:?}"));
         assert!(w.contains("边界没校验") && w.contains("a.rs"), "提示要带得上位置与线索: {w}");
+    }
+
+    /// 活锁守卫**在真实路径上可达**（M21c 批 C 的 dogfood 修）：连跑三轮 → 强制必挖；到第五轮 → 停车。
+    ///
+    /// 原实现把激活写成 `dormant → activated` 单向，而判据与回写都只认 `dormant`，于是计数饱和在 1、
+    /// 门（3 / 5）成了不可达常量，整个守卫是死代码。当时的单测手搓 `activations: 2..4` 的行去测门，
+    /// 那是生产路径产生不出来的状态——**所以它绿着，而功能是死的**。这条用例因此逐轮走
+    /// `activate_dormant` 真实往返，一次都不碰夹具里的中间状态。
+    #[test]
+    fn livelock_guard_is_reachable_through_real_round_trips() {
+        use crate::orchestrate::ledger::{ACTIVATION_FORCE_DIG, ACTIVATION_PARK};
+        let t = ledger_fixture("sha0", 0);
+        let files = vec!["a.rs".to_string()];
+        let mut seen = Vec::new();
+        for r in 1..=ACTIVATION_PARK {
+            let (out, warns) = activate_dormant(t.path(), &files, &format!("sha{r}"));
+            let a = out.activated.into_iter().next().unwrap_or_else(|| panic!("第 {r} 轮该激活: {warns:?}"));
+            seen.push((a.activations, a.force_dig, a.park, warns.iter().any(|w| w.contains("人工"))));
+        }
+        // 计数逐轮累加，不是卡在 1
+        assert_eq!(seen.iter().map(|x| x.0).collect::<Vec<_>>(), (1..=ACTIVATION_PARK).collect::<Vec<_>>(), "{seen:?}");
+        // 第一段门：到 FORCE_DIG 那轮起恒为真
+        for (i, s) in seen.iter().enumerate() {
+            let n = i as i64 + 1;
+            assert_eq!(s.1, n >= ACTIVATION_FORCE_DIG, "第 {n} 轮 force_dig 应为 {}: {seen:?}", n >= ACTIVATION_FORCE_DIG);
+            assert_eq!(s.2, n >= ACTIVATION_PARK, "第 {n} 轮 park 应为 {}: {seen:?}", n >= ACTIVATION_PARK);
+            assert_eq!(s.3, s.2, "停车那轮才给人工提示");
+        }
+    }
+
+    /// 晋升：挖出 finding 的激活项退出激活池（M21c 批 C 的 dogfood 修）。
+    /// 少了它，已经产出 finding 的疑点会被后续每一轮反复激活重挖，计数一路涨到停车门，
+    /// 然后报告对人说「机制挖不动它」——而它明明挖出来了。
+    #[test]
+    fn digging_out_a_finding_promotes_the_ledger_row_out_of_the_pool() {
+        let t = ledger_fixture("sha0", 0);
+        let files = vec!["a.rs".to_string()];
+        let (out, _) = activate_dormant(t.path(), &files, "sha1");
+        assert_eq!(out.activated.len(), 1);
+
+        // 造一个「已结案的激活项」，带着回指台账的到达键
+        let item: crate::orchestrate::queue::QueueItem = serde_json::from_value(serde_json::json!({
+            "id": "a.rs:scan:1-9", "score": 1.0, "agreement": 1, "state": "settled", "kind": "suspicion",
+            "dispatch_agreement": 1, "landed_agreement": null, "families": ["alpha"],
+            "spec": { "file": "a.rs", "ranges": [[1, 9]], "origin": "scan", "notes": [] },
+            "arrivals": ["ledger:r1"], "activated": true,
+        })).unwrap();
+        let finding = |line: u32| -> crate::domain::Finding {
+            serde_json::from_value(serde_json::json!({
+                "id": "f1", "severity": "low", "title": "t", "body": "b", "file": "a.rs",
+                "line_start": line, "line_end": line, "confidence": 0.5, "recommendation": "r",
+                "models": ["m"], "agreement": 1, "hard_constraint": false, "quote": "q",
+            })).unwrap()
+        };
+
+        // finding 落在项的区间外 → 不算这一项挖出来的，不晋升
+        let mut w = vec![];
+        promote_dug_suspicions(t.path(), std::slice::from_ref(&item), &[finding(99)], "sha1", &mut w);
+        let st = |t: &tempfile::TempDir| {
+            let db = crate::db::ProjDb::open(t.path()).unwrap();
+            db.suspicions_for_files(&["a.rs".into()]).unwrap().into_iter().next().unwrap().status
+        };
+        assert_eq!(st(&t), "dormant", "区间外的 finding 不该让它晋升");
+
+        // 落在区间内 → 晋升，此后不再被激活
+        promote_dug_suspicions(t.path(), std::slice::from_ref(&item), &[finding(3)], "sha1", &mut w);
+        assert_eq!(st(&t), "promoted", "{w:?}");
+        let (after, _) = activate_dormant(t.path(), &files, "sha2");
+        assert!(after.activated.is_empty(), "已晋升的不再激活: {after:?}");
     }
 
     /// 收敛三维（design §8.4）：三维取与，**任一维为假都不收敛**，且 verdict / exit code 不受影响。
@@ -5185,6 +5354,46 @@ mod tests {
         let mut none = blank(Verdict::Approve);
         attach_convergence(&mut none, t.path(), &[]);
         assert!(none.run.convergence.is_none(), "没有基准就不该断言收敛与否");
+
+        // 没有项目库 = 确知台账为空，与「读不出」不同：三维都真 → 收敛
+        let bare = tempfile::tempdir().unwrap();
+        let mut b = blank(Verdict::Approve);
+        attach_convergence(&mut b, bare.path(), &files);
+        assert!(b.run.convergence.as_ref().unwrap().converged, "无库 = 无台账 = 没有未处理项");
+        assert!(!bare.path().join(".redteam").exists(), "收敛装配不得建库");
+
+        // **库在但读不出 → 不设字段**（fail-closed，dogfood 抓到）：原先 `unwrap_or((0,0))`
+        // 会把读不开的台账报成「没有未处理项」，三维凑齐就输出 converged: true，
+        // ship 循环据此收工——而我们其实不知道台账里有什么。
+        let broken = tempfile::tempdir().unwrap();
+        crate::project::init_project(broken.path()).unwrap();
+        std::fs::write(crate::db::project_db_path(broken.path()), b"not a sqlite file at all").unwrap();
+        let mut bad = blank(Verdict::Approve);
+        attach_convergence(&mut bad, broken.path(), &files);
+        assert!(bad.run.convergence.is_none(), "台账读不出时不得给出收敛结论");
+    }
+
+    /// 激活闸门对「上轮裁决读不出」要保守（M21c 批 C 的 dogfood 修）：原先 `last_verdict()` 把
+    /// 「没有往轮」和「往轮记录读不出」都压成 `None`，于是闸门静默失效——**恰恰在往轮记录可疑的时候**，
+    /// 我们照着它的台账去激活。
+    #[test]
+    fn activation_is_conservative_when_the_prior_verdict_cannot_be_read() {
+        let t = ledger_fixture("sha1", 0);
+        let files = vec!["a.rs".to_string()];
+        let db = crate::db::ProjDb::open(t.path()).unwrap();
+        db.result_put_json("j1", "{ this is not json").unwrap();
+        drop(db);
+
+        let (out, warns) = activate_dormant(t.path(), &files, "sha2");
+        assert!(out.activated.is_empty(), "读不出上轮裁决时不激活: {out:?}");
+        assert!(warns.iter().any(|w| w.contains("读不出")), "要说清为什么没激活: {warns:?}");
+
+        // 对照：往轮记录完好且是 approve 时照常激活（证明上面挡住的是「读不出」而不是别的）
+        let t2 = ledger_fixture("sha1", 0);
+        let db2 = crate::db::ProjDb::open(t2.path()).unwrap();
+        db2.result_put_json("j1", r#"{"verdict":"approve"}"#).unwrap();
+        drop(db2);
+        assert_eq!(activate_dormant(t2.path(), &files, "sha2").0.activated.len(), 1);
     }
 
     /// 落账的两条边界（M21c 批 A）：**不建库**（项目没 init 过就跳过，评审不该有建库副作用，

@@ -525,6 +525,12 @@ impl DeepQueue {
         }
         // scan 与 needs 同一身份空间：层级取高的那个（`Needs` 并进疑点项后按疑点派，反之亦然）。
         it.kind = it.kind.min(req.kind);
+        // 激活标记取并（M21c 批 C，dogfood 抓到）：两者都是「这一项该受什么待遇」而非「谁提出的」，
+        // 并进来就该生效。原先这里不读这两个字段，而入队序是 H0 → scan 格 → 激活项——激活项**通常是后到的那个**，
+        // 于是标记被静默丢弃成了常态：排序提档失效、`force_dig` 失效（活锁守卫形同虚设），
+        // 且合并后到达键已记在项上，同一行再到达只会得到 `Duplicate`、零变更——丢了就永远补不回来。
+        it.activated |= req.activated;
+        it.force_dig |= req.force_dig;
         // 旧快照没有 `member_families`（serde default 空）：先补齐到与 `members` 等长，
         // 否则下面的 `get_mut` 拿不到槽位、家族被静默丢掉，两列长度永久错开（评审 #14）。
         if it.member_families.len() < it.members.len() {
@@ -935,6 +941,35 @@ mod tests {
         assert!(doc_hot.id < code_cold.id, "夹具前提：文档项的 id 字典序在前");
         assert_eq!(cmp_priority(&code_cold, &doc_hot), std::cmp::Ordering::Less,
                    "未激活的代码项仍要排在已激活的文档项前面——激活层不得越过代码优先");
+    }
+
+    /// 合并时激活标记取并（M21c 批 C 的 dogfood 修）：标记是「这一项该受什么待遇」而非「谁提出的」。
+    ///
+    /// 这不是边缘情形——`run_deep` 的入队序是 H0 → scan 格 → 激活项，**激活项通常是后到的那个**，
+    /// 所以「并进已有项」才是常态。原实现不读这两个字段，于是提档与强制必挖被静默丢弃；
+    /// 更糟的是合并会把到达键记在目标项上，同一台账行再到达只得到 `Duplicate`、零变更——丢了补不回来。
+    #[test]
+    fn merging_a_ledger_activation_into_an_existing_item_keeps_its_flags() {
+        let sus = sus("src/a.rs", 1, 3, "let x = 1;", "h");
+        let mut q = DeepQueue::new();
+        // 先到：普通 scanner 疑点，无标记
+        q.enqueue(EnqueueReq::scan(&sus, "alpha", "cell#0".into()).unwrap());
+        assert!(!q.items()[0].activated && !q.items()[0].force_dig, "前提：目标项本来没有标记");
+
+        // 后到：同一处的台账激活项，带强制必挖
+        let out = q.enqueue(EnqueueReq::from_ledger(&sus, "r1", true).unwrap());
+        assert_ne!(out, EnqueueOutcome::New, "夹具前提：该走合并而不是新建项");
+        assert_eq!(q.items().len(), 1);
+        let it = &q.items()[0];
+        assert!(it.activated, "激活标记要并上来，否则排序提档失效");
+        assert!(it.force_dig && must_dig(it), "强制必挖要并上来，否则活锁守卫形同虚设");
+        assert!(it.arrivals.iter().any(|a| a == "ledger:r1"), "到达键照记: {:?}", it.arrivals);
+
+        // 反向：已带标记的项被无标记的疑点并入时，标记不得被抹掉
+        let mut q2 = DeepQueue::new();
+        q2.enqueue(EnqueueReq::from_ledger(&sus, "r2", true).unwrap());
+        q2.enqueue(EnqueueReq::scan(&sus, "beta", "cell#1".into()).unwrap());
+        assert!(q2.items()[0].activated && q2.items()[0].force_dig, "取并不是取后者");
     }
 
     /// 活锁守卫的强制必挖走 `must_dig` 同一个口子（M21c 批 C）：共识只有 1、也不是主区，
