@@ -905,3 +905,25 @@ followup 里早有「任何按单轮墙钟做的比较都不可信，至少三�
 | md 的收敛标题信任 `converged` 而理由来自三个分量 | 两者不一致时会出现「Not converged」却列不出理由。目前 `converged` 就是三者之与、不可能不一致，但那是**调用方**保证的，渲染侧没有断言 |
 | 两态落地没有规范化旧库里 `status='activated'` 的行（r2 medium，agreement 2） | 那是批 C 修复前的二进制写的，新语义下它们既不被激活也不被披露，**永久卡住**。本仓那 2 条已手工复位，PR181 库里没有。工具未发布、库只在这两处，所以不加迁移；**发布前**要么加一次性规范化（`UPDATE … SET status='dormant' WHERE status='activated'`），要么确认没有外部库 |
 | `promote_dug_suspicions` 的归因偏宽（r2 medium，agreement 2） | 判据是「finding 落在该项区间内」，而同一区间里的 finding 可能来自兄弟疑点、往轮携带、或已被 verifier 驳回的那条。后果是**提前**把一条还没真挖出结果的台账行请出激活池（偏向少挖而不是多挖，方向安全）。要收紧得让 finding 带上产出它的队列项 id——那是 `Finding` 的 schema 改动，攒够一起做 |
+
+## 状态机盘点（2026-10-02，批 C 收口后针对「夹具绕过真实路径」这个盲区做的穷举）
+
+起因：批 C 的活锁守卫在真实路径上是死代码而单测绿着。得出的教训是「我对状态机的自检有系统性盲区」，
+于是把全仓状态机逐个列出「状态 × 谁写它」。**半小时读代码，照出一个同构缺陷**——这类问题可穷举，
+不该交给 dogfood 抽签（dogfood 抓到什么取决于那一轮模型碰巧注意到什么）。
+
+| 状态机 | 状态数 | 结论 |
+|---|---|---|
+| `JobStatus` | 6 | ✓ **正面样板**，见下 |
+| `Phase` | 7 | **`Verify` 零产品写入**——已修（`ac936f3`） |
+| `ItemState` | 4 | ✓ 失败 cell 也无条件 `mark_settled`，InFlight 无悬挂出口；Skipped 有两条回边（`reopen_skipped` / `merge_into`） |
+| `suspicions.status` | 2 | ✓ 批 C 刚从三态改两态 |
+| `dismissed.status` | 5 | ✓ 五个状态都有来路（`dismiss add` / `set-status` / `gc`），`--help` 说明完整 |
+
+**`JobStatus` 值得作为参照**：所有写入过 `JobStore::update_if_active` 这一个口，终态封盘
+（`if st.status.is_terminal() { return None }`）就写在那个口里——保护是**结构性**的，不靠每个
+调用点自觉。这正是「同一件事不在两处各有一套」那条 followup 里「候选机制①：收成唯一入口」的实例。
+下次重构读写入口时照它改。
+
+**还没做的第 2 步**：把「带状态机的模块至少一条用例走完整往返」写进 `.trellis/spec/`，
+让它在下次开发时自动注入，而不是靠记得。
