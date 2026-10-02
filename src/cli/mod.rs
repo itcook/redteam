@@ -1305,7 +1305,12 @@ fn attach_convergence(report: &mut crate::domain::ReviewReport, cwd: &Path, chan
         match crate::db::ProjDb::open_read_only(&p).and_then(|db| db.suspicions_for_files(changed_files)) {
             Ok(rows) => Some((
                 rows.iter().filter(|r| r.status == crate::orchestrate::ledger::STATUS_DORMANT).count() as u32,
-                rows.iter().filter(|r| r.activations >= crate::orchestrate::ledger::ACTIVATION_PARK).count() as u32,
+                // 只数**仍在池里**的（dogfood medium，agreement 2）：已晋升的行挖出来过、不该再钉住收敛，
+                // 否则一条挖完的疑点只要文件还在变更集里，就能让这个 PR 永远不收敛。
+                rows.iter()
+                    .filter(|r| r.status == crate::orchestrate::ledger::STATUS_DORMANT
+                        && r.activations >= crate::orchestrate::ledger::ACTIVATION_PARK)
+                    .count() as u32,
             )),
             Err(_) => None,
         }
@@ -5471,17 +5476,30 @@ mod tests {
         let t3 = tempfile::tempdir().unwrap();
         crate::project::init_project(t3.path()).unwrap();
         let db = crate::db::ProjDb::open(t3.path()).unwrap();
+        // 仍在池里（dormant）但激活次数已到停车门——这才是维度 3 要表达的那一类
         db.suspicion_upsert(&crate::db::SuspicionRow {
             id: "r9".into(), file: "a.rs".into(), quote_norm: "q".into(), hint: "h".into(),
-            status: "activated".into(), first_job: "sha0".into(), last_job: "sha1".into(),
+            status: crate::orchestrate::ledger::STATUS_DORMANT.into(),
+            first_job: "sha0".into(), last_job: "sha1".into(),
             activations: crate::orchestrate::ledger::ACTIVATION_PARK, json: "{}".into(),
         }).unwrap();
         drop(db);
         let mut over = blank(Verdict::Approve);
         attach_convergence(&mut over, t3.path(), &files, false);
         let c3 = over.run.convergence.clone().unwrap();
-        assert_eq!((c3.converged, c3.no_delta_adjacent, c3.no_activation_overrun), (false, true, false), "{c3:?}");
+        assert_eq!((c3.converged, c3.no_activation_overrun), (false, false), "{c3:?}");
         assert_eq!(c3.activation_overrun, 1);
+
+        // **已晋升的不算超限**（dogfood medium）：它挖出来过，不该再钉住收敛——
+        // 否则一条挖完的疑点只要文件还在变更集里，就能让这个 PR 永远不收敛。
+        let db = crate::db::ProjDb::open(t3.path()).unwrap();
+        db.suspicion_promote("r9").unwrap();
+        drop(db);
+        let mut done = blank(Verdict::Approve);
+        attach_convergence(&mut done, t3.path(), &files, false);
+        let c4 = done.run.convergence.clone().unwrap();
+        assert_eq!((c4.activation_overrun, c4.delta_adjacent), (0, 0), "晋升后两维都该放手: {c4:?}");
+        assert!(c4.converged);
 
         // diff 重建不了（空变更集）→ 不设字段，而不是装一个 false
         let mut none = blank(Verdict::Approve);

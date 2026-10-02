@@ -172,6 +172,10 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     for a in input.activated {
         enqueue_activated(&mut q, a, &mut meta, input.snapshot, &mut blocks);
     }
+    // 激活观测按**项**数，与 resume 侧的 `restored_meta` 同一口径（dogfood medium，agreement 2）：
+    // 原先首跑按「台账行」逐条累加，而 resume 数的是带标记的项——两条台账行并进同一项时，
+    // 同一轮的数在首跑是 2、续跑后变成 1，一个口径不一致的观测比没有观测更坏。
+    count_activated(&q, &mut meta);
     note_block(&mut meta, t_enq.elapsed());
     meta.queue_depth_peak = meta.queue_depth_peak.max(q.items().len() as u32);
 
@@ -1489,6 +1493,12 @@ fn enqueue_h0(q: &mut DeepQueue, h: &Hotspot, meta: &mut DeepMeta, snapshot: Opt
     }
 }
 
+/// 激活观测按项计（与 `restored_meta` 同源）：两条台账行并进同一项时只算一项。
+fn count_activated(q: &DeepQueue, meta: &mut DeepMeta) {
+    meta.ledger_activated = q.items().iter().filter(|it| it.activated).count() as u32;
+    meta.ledger_force_dig = q.items().iter().filter(|it| it.force_dig).count() as u32;
+}
+
 /// 台账激活项入队（M21c 批 C）：一条台账行 = 一条疑点，走与 scanner 疑点同一条入队流程。
 /// 入不进去（区间形状非法）就算了——它只是个跨轮线索，不值得为它失败整轮。
 fn enqueue_activated(
@@ -1503,12 +1513,6 @@ fn enqueue_activated(
     };
     let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
     note_enq(outcome, "ledger", meta);
-    if outcome != EnqueueOutcome::Duplicate {
-        meta.ledger_activated += 1;
-        if a.force_dig {
-            meta.ledger_force_dig += 1;
-        }
-    }
     if let Some(i) = affected {
         snap_one(&q.items()[i], snapshot);
     }
@@ -2359,6 +2363,15 @@ mod tests {
         let run2 = run_with(Run { first_run: true, activated: &hot, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
         assert_eq!(run2.meta.ledger_force_dig, 1);
         assert!(run2.items.iter().any(|i| i.activated && i.force_dig), "{:?}", run2.items);
+
+        // 观测按**项**数而不是按台账行数（dogfood medium，agreement 2）：两条台账行落在同一处时
+        // 并成一项，首跑该记 1。原先首跑逐行累加、resume 数项，同一轮的数会在续跑后从 2 变 1——
+        // 一个口径不一致的观测比没有观测更坏。两边现在同源（`count_activated` / `restored_meta`）。
+        let same_spot = [act(false), crate::orchestrate::ledger::Activated { row_id: "r2".into(), ..act(false) }];
+        let run3 = run_with(Run { first_run: true, activated: &same_spot, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+        assert_eq!(run3.items.iter().filter(|i| i.activated).count(), 1, "夹具前提：两行并成一项");
+        assert_eq!(run3.meta.ledger_activated, 1, "按项记，不是 2");
+        assert_eq!(restored_meta(&run3.items).ledger_activated, 1, "与 resume 侧同口径");
     }
 
     /// 乱序完成不错配、慢格不堵：完成序 b→c→a，每格 findings 仍对应自己的文件；报告里的 cells 按优先级序（a→b→c，C2 D2 起不看派发序）；

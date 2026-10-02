@@ -107,6 +107,13 @@ pub fn activations_for(rows: &[crate::db::SuspicionRow], head: &str, root: &std:
         if r.status != STATUS_DORMANT || r.last_job == head || head.is_empty() {
             continue;
         }
+        // 已停车的不再自动激活（dogfood medium，agreement 2）：停车的含义是「机制挖不动它、交人」，
+        // 而原先 `park` 只产生一条 warning，下一轮它照样被激活、照样强制必挖、计数继续涨——
+        // 「交人」从未真正发生。它仍然留在台账里让维度 3 为假（见 `attach_convergence`），
+        // 收敛因此不成立、ship 会停下来问人，这才是设计里那条通道。
+        if r.activations >= ACTIVATION_PARK {
+            continue;
+        }
         let d: serde_json::Value = serde_json::from_str(&r.json).unwrap_or(serde_json::Value::Null);
         let quote = d.get("quote").and_then(|v| v.as_str()).unwrap_or_default();
         if quote.is_empty() {
@@ -304,5 +311,12 @@ mod tests {
         assert_eq!(at(ACTIVATION_FORCE_DIG - 2), (ACTIVATION_FORCE_DIG - 1, false, false), "门前一步还没响");
         assert_eq!(at(ACTIVATION_FORCE_DIG - 1), (ACTIVATION_FORCE_DIG, true, false), "踩到强制必挖门");
         assert_eq!(at(ACTIVATION_PARK - 1), (ACTIVATION_PARK, true, true), "踩到停车门时仍然必挖");
+
+        // **停车之后不再自动激活**（dogfood medium，agreement 2）：停车的含义是「机制挖不动它、交人」。
+        // 原先 `park` 只产生一条 warning，下一轮它照样被激活、照样强制必挖、计数继续涨——「交人」从未发生。
+        let parked = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha1", ACTIVATION_PARK, q)], "sha2", t.path());
+        assert!(parked.activated.is_empty(), "已停车的不该被机器再捞一次: {parked:?}");
+        // 它仍留在台账里（status 还是 dormant），维度 3 据此为假、收敛不成立，ship 会停下来问人——
+        // 那才是设计里的「停车通道」。
     }
 }

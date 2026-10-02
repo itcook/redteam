@@ -698,7 +698,12 @@ impl ProjDb {
     /// - `Err(_)` = 有往轮但读不出（JSON 坏了 / 没有 `verdict` 键 / 查询失败）→ 调用方按**保守**处理不激活。
     ///   混成 `None` 的后果是闸门静默失效：恰恰在往轮记录可疑的时候，我们照着它的台账去激活。
     pub fn last_verdict(&self) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT json FROM results ORDER BY created_at DESC LIMIT 1")?;
+        // `json <> ''` 跳过 md-first 写入留下的半行（dogfood medium，agreement 2）：
+        // `result_put_md` 先建行时 json 列是空串，被它选中会解析失败 → `Err` → 闸门保守关闭，
+        // 于是一次正常的 md 落盘就能把下一轮的激活整个掐掉。
+        let mut stmt = self
+            .conn
+            .prepare("SELECT json FROM results WHERE json <> '' ORDER BY created_at DESC LIMIT 1")?;
         let mut rows = stmt.query([])?;
         let Some(r) = rows.next()? else { return Ok(None) };
         let js: String = r.get(0)?;
@@ -1618,6 +1623,24 @@ mod guard_tests {
         assert_eq!(count("d1"), ("promoted".into(), 3, "sha4".into()), "晋升只改 status、不动计数");
         db.suspicion_activate("d1", "sha5").unwrap();
         assert_eq!(count("d1"), ("promoted".into(), 3, "sha4".into()), "晋升后不再被激活");
+    }
+
+    /// md-first 写入留下的半行（`json=''`）不得被当成「上一轮的裁决」（dogfood medium，agreement 2）：
+    /// 选中它会解析失败 → `Err` → 激活闸门保守关闭，**一次正常的 md 落盘就把下一轮的激活整个掐掉**。
+    ///
+    /// 用例刻意只放那一行：如果再放一行正常的 json，两行的 `created_at` 在同一秒内写入、
+    /// 排序没有 tie-breaker（这本身是另一条已记账的债），断言会变成掷硬币——变异检查当场抓到过。
+    #[test]
+    fn last_verdict_skips_md_first_stub_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ProjDb::open(dir.path()).unwrap();
+        assert_eq!(db.last_verdict().unwrap(), None, "没有任何轮次");
+
+        db.result_put_md("j1", "# 只有 md 的那一行").unwrap();
+        assert_eq!(db.last_verdict().unwrap(), None, "半行 = 没有可读的往轮裁决，不是读失败");
+
+        db.result_put_json("j1", r#"{"verdict":"approve"}"#).unwrap();
+        assert_eq!(db.last_verdict().unwrap().as_deref(), Some("approve"), "补上 json 后读得到");
     }
 
     /// 旧库有数据、**且台账表与 v4 不同构**（这里 dismissed 只有 3 列）→ 拒开：文案指向导出脚本与库路径、

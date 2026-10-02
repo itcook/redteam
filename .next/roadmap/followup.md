@@ -903,3 +903,5 @@ followup 里早有「任何按单轮墙钟做的比较都不可信，至少三�
 | 收敛只在深挖路径装配，scan-only 轮没有 | ship 的第 1 条分支判的是 `verdict = approve`，scan-only 不命中，所以当前安全。但「没有 reviewer 配置」时的循环语义本就没定过，和那件事一起想 |
 | 维度 2 对「永远重锚不上」的台账行没有出口 | 这类行会一直计入 `delta_adjacent` 让收敛不可达，而活锁守卫只数**激活**次数、够不着它们（它们根本激活不了）。需要一个「连续 N 轮重锚失败 → 标记退役」的通道。等批 D 看真实比例再定 |
 | md 的收敛标题信任 `converged` 而理由来自三个分量 | 两者不一致时会出现「Not converged」却列不出理由。目前 `converged` 就是三者之与、不可能不一致，但那是**调用方**保证的，渲染侧没有断言 |
+| 两态落地没有规范化旧库里 `status='activated'` 的行（r2 medium，agreement 2） | 那是批 C 修复前的二进制写的，新语义下它们既不被激活也不被披露，**永久卡住**。本仓那 2 条已手工复位，PR181 库里没有。工具未发布、库只在这两处，所以不加迁移；**发布前**要么加一次性规范化（`UPDATE … SET status='dormant' WHERE status='activated'`），要么确认没有外部库 |
+| `promote_dug_suspicions` 的归因偏宽（r2 medium，agreement 2） | 判据是「finding 落在该项区间内」，而同一区间里的 finding 可能来自兄弟疑点、往轮携带、或已被 verifier 驳回的那条。后果是**提前**把一条还没真挖出结果的台账行请出激活池（偏向少挖而不是多挖，方向安全）。要收紧得让 finding 带上产出它的队列项 id——那是 `Finding` 的 schema 改动，攒够一起做 |
