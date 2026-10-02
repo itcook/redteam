@@ -890,3 +890,31 @@ B-1 仓库简介入稳定前缀：.redteam/brief.md 读进 <repo_brief> 槽，�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 30: M21c 批 B：判例前移与小项
+<!-- trellis-session: v=2 fp=bcd1faaf7d94a26f -->
+
+**Date**: 2026-10-02
+**Task**: M21c 批 B：判例前移与小项
+**Branch**: `feat/m21c-precedent`
+
+### Summary
+
+B-1 判例摘要进快扫 prompt（那个槽从来是空的，两个构造点都传空串）+ B-2 matches_precedent 前移到入队侧带两道守卫 + B-3 跨文件重定位。开工时纠正了自己十天前的误判：早先说批 B「前提不成立、卡着不能动」，而 B-1/B-2/B-3 的验收全是构造用例、B-4 不设门槛，没有一条需要真实判例；D19-5 在 2026-09-23 就为「真实判例太少」改过口径，那个问题当时已处理，我十天后又当成未解决的阻塞，白搁了一批。喂料实测后定案从新鲜 finding 的误报建卡：旧库 22 条带锚判例里只有 9 条还能命中当前代码（锚失效 10、文件已删 7）。同时纠正了给用户的建议里一处不准确：「记账不修」不等于误报，拿优先级低的真问题建判例卡会教坏评审器。建的第一张卡本身有价值——它是一条因切片折叠导致的误报（reviewer 推断 agreement_of([]) 返回 0，实际 .max(1) 返回 1，而它自己写明了不确定却选择猜而不是声明 need），这正是 M21d 批 C-1「切片回退信号」要量的那件事的第一个实证样本。dismiss add --from 这条 M21 期间从没跑过的路径实跑通。守卫 2 的口径自定为「判例 quote 的当前行范围与本轮 hunk 相交」——判例卡只有 round 字符串和天粒度 updated_at 推不出 commit，而粗做法「file ∈ 变更集」会让豁免永不触发。本批变异检查抓了八次假绿，形态高度集中：三次「某条接线没人盯」（CLI 入口的 precedents 是同一位置第三次，前两次是 scan_cells 和 activated）、三次冗余分支、两次夹具不符合真实形状。真实验证轮又暴露一条我自己刚犯的错：relocated 字段加了却没有任何消费面，这一层在真实运行里不可见——与刚修过的 Phase::Verify 同构，于是把状态机指南里「某状态没有产品 writer」推广成「任何定义了却没人用的东西」通则。判例在那一轮零命中是正确行为（那张卡指向的 queue.rs 本轮没改，按组筛正确排除），我一度误判成注入失效。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5064841` | feat(prompt,orchestrate,cli): B-1 判例摘要进快扫 prompt——那个槽一直是空的 |
+| `2ff556c` | feat(orchestrate,cli,domain): B-2 判例前移到入队侧——带两道守卫 |
+| `5f79e27` | feat(positioning,orchestrate): B-3 跨文件重定位 + 修一条自己写的 vacuous 断言 |
+| `1400a21` | build: 重建二进制 |
+| `2d6adec` | docs(roadmap,plan,followup): 批 B 交付 + 纠正「前提不成立」那个误判 |
+| `75e3633` | fix(orchestrate,spec): relocated 加了却没出口——这一层在真实运行里不可见 |
+| `0ecb85d` | build: 重建二进制 |
+
+### Status
+
+[OK] **Completed**

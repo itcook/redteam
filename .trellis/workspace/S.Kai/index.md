@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 29
+- **Total Sessions**: 30
 - **Last Active**: 2026-10-02
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~892 | Active |
+| `journal-1.md` | ~920 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 30 | 2026-10-02 | M21c 批 B：判例前移与小项 | `5064841`, `2ff556c`, `5f79e27`, `1400a21`, `2d6adec`, `75e3633`, `0ecb85d` | `feat/m21c-precedent` |
 | 29 | 2026-10-02 | M21c 批 C：增量激活与收敛三维 | `e7b050f`, `97836df`, `754816a`, `bff0d22`, `923652c`, `0cc9ff8`, `231ebbf`, `dbe0419`, `d1e3fe0`, `00901f3`, `43e42c5`, `ed87e6d`, `3c86d1c`, `f1974e3`, `42b608f`, `e2e6303` | `feat/m21c-converge` |
 | 28 | 2026-09-30 | M21d 批 C：按信号触发的调优（三项零行为改动 + 一次结论撤回） | `7c1ff93`, `a7467fd`, `40ddde6`, `070e55d`, `abdfc25`, `a5689ad` | `feat/m21d-tuning` |
 | 27 | 2026-09-30 | M21d 批 C0：文档与代码分池（计划外，批 C 交付项 7 的前置） | `809b7c9`, `0766ec1` | `feat/m21d-doc-lane` |
