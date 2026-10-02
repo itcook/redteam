@@ -23,6 +23,7 @@ These guides help you **ask the right questions before coding**.
 |-------|---------|-------------|
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
+| [状态机思考指南](./state-machine-thinking-guide.md) | 每个状态谁写、从每个状态出得去吗；夹具别绕开被测路径 | 动到有状态的东西（enum 状态、DB 状态列、队列项状态）时 |
 
 ---
 
@@ -50,6 +51,20 @@ These guides help you **ask the right questions before coding**.
 - [ ] Multiple branches update the same derived state from `kind` / `action`
 
 → Read [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md)
+
+### 什么时候该想状态机的事
+
+- [ ] 你在加一个**状态值**（enum variant、DB 的 status 列取值、常量字符串）
+- [ ] 你在改**状态之间的转换规则**，或加一条新的转换路径
+- [ ] 你在加第 N 条**读写同一份状态**的代码路径（第 N+1 条加进来时谁提醒他过那道门？）
+- [ ] 你的测试夹具里出现**直接把对象摆成某个中间态**（`status: "xxx"` / `count: 4` / `state: Settled`）
+- [ ] 你在写「只做一次」「超过 N 次就…」这类**依赖累计量**的逻辑
+
+→ 读 [状态机思考指南](./state-machine-thinking-guide.md)
+
+**本仓已栽两次，两次都是单测绿着而功能是死的**：台账的激活状态机缺回边，两段活锁守卫成了
+不可达的死代码；`Phase::Verify` 定义了却零产品写入，复核阶段在作业状态里不可见。
+两次都不是变异检查能发现的——变异只验「这行有没有用例盯着」，验不了「这条链在真实状态下走不走得通」。
 
 ### When Verifying AI Cross-Review Results
 
