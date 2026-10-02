@@ -43,7 +43,10 @@ pub enum Phase {
     Fanout,     // 旧 finding 扇出（F-4 后不再打；旧作业 state 可读）
     Scan,       // 批 F-5：scanner 静态扇出（cell 并发执行中，progress.done 推进）
     Deep,       // M21b 批 C：深挖队列消费中
-    Verify,     // M21b 批 D：verifier 流式复核（C 先占位，新作业不打 Refute）
+    // M21b 批 C 占位、批 D 做了流式复核却没接上打点（全仓零产品写入，M21c 批 C 的状态机盘点查出来）。
+    // 现在打在**复核尾段**：深挖队列排空、就剩复核还在跑的那一段——`verify_tail_ms` 量的正是它。
+    // 复核与深挖重叠的部分仍算 Deep，这里标的是「深挖该收了，在等复核」。
+    Verify,
     Finalizing, // 尾段：合并 / 报告（progress/last_active 静止）
     Refute,     // 旧 verifier 子阶段（serde 仍可读；新作业打 Verify）
 }

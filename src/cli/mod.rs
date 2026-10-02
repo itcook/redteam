@@ -379,6 +379,12 @@ pub async fn run_code_review(
         if let Some(s) = sink {
             s.on_deep_start(crate::state::DeepHeader { budget_cells });
         }
+        // 深挖内部的阶段钩子（M21c 批 C 的状态机盘点补）：复核尾段打 `Phase::Verify`。
+        let on_phase = |ph: crate::state::Phase, note: Option<String>| {
+            if let Some(s) = sink {
+                s.on_phase(ph, note);
+            }
+        };
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let scan = async move {
             let r = run_scan_fanout(registry, &input, sink, Some(&tx)).await;
@@ -423,6 +429,7 @@ pub async fn run_code_review(
                     known: &no_known,
                 }),
                 on_cell: Some(&on_cell),
+                on_phase: Some(&on_phase),
                 incoming: Some(rx),
                 reopen_skipped: false,
             },
@@ -1854,6 +1861,11 @@ pub async fn run_resume(
                 .filter(|r| !r.output.findings().is_empty())
                 .map(|r| (r.cell.as_str(), r.output.findings()))
                 .collect();
+            let on_phase2 = |ph: crate::state::Phase, note: Option<String>| {
+                if let Err(e) = store.update_if_active(job_id, |st| st.set_phase(ph, note.clone())) {
+                    eprintln!("warn: job {job_id} resume phase 写失败: {e}");
+                }
+            };
             let on_cell2 = |rec: &crate::state::CellRecord| {
                 // 重挖失败不抹掉往轮载体（评审修 #2 连带）：本轮报告靠事先读出的 prior findings 侥幸完整，
                 // 下一次 resume 就永久丢失——失败格照写（债与重挖资格不变），但带上往轮 finding。
@@ -1905,6 +1917,7 @@ pub async fn run_resume(
                         known: &known,
                     }),
                     on_cell: Some(&on_cell2),
+                    on_phase: Some(&on_phase2),
                     incoming: None,
                     reopen_skipped: replayed,
                 },

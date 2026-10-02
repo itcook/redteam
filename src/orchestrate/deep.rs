@@ -80,6 +80,9 @@ pub struct DeepInput<'a> {
     /// reviewer cell 落盘（后台 job checkpoint —— resume 靠它认已挖过的格与其 findings）。
     /// `None` → 不落盘（前台一次性跑）。
     pub on_cell: Option<&'a dyn Fn(&CellRecord)>,
+    /// 阶段转换钩子（与 `on_cell` 同形）：深挖内部唯一要打的是复核尾段的 `Phase::Verify`。
+    /// `None` → 不打（前台一次性跑没有 job 状态可写）。
+    pub on_phase: Option<&'a dyn Fn(crate::state::Phase, Option<String>)>,
     /// 复核输入（批 D〔D17〕）：`None` = 本轮不复核，整段行为等价于批 C3 收口态。
     pub verify: Option<VerifyInput<'a>>,
     /// 在途入队通道（scanner 流式扇出，C2〔D15〕）：到达项走入口五态（到达键幂等）；通道关闭 = 关闭入口 → 收场 drain。`None` = 开跑即关闭。
@@ -224,6 +227,8 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut verify_warnings: Vec<String> = Vec::new();
     // 复核归零时刻（`verify_tail_ms` 的右端）；无复核则恒 0。
     let mut verify_zero_ms = 0u64;
+    // 复核尾段的 `Phase::Verify` 只打一次（phase 是时间线上的一格，不是心跳）。
+    let mut verify_phase_marked = false;
     let mut landed: Vec<Landed> = Vec::new();
     // 分派池空（成员全部出局）= 停派：通道未关照收、在途照等，剩余项保持 Pending（resume 可续）。
     let mut pool = Pool::new(members.len());
@@ -318,6 +323,21 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         if !any_eligible {
             parked = None;
             waits = None;
+        }
+        // 复核尾段开始：barrier 的条件**只差复核归零**这一项——深挖该收了，就剩复核还在跑。
+        // `Phase::Verify` 在 M21b 批 C 占位、批 D 做了流式复核却没接上，于是后台作业跑在这一段时
+        // `redteam status` 显示的还是 `deep`（M21c 批 C 的状态机盘点查出来的：全仓零产品写入）。
+        // 这一段是真实存在的——`verify_tail_ms = verify_zero_ms − drain_done_ms` 量的就是它。
+        if !verify_phase_marked
+            && running.is_empty()
+            && !verifying.is_empty()
+            && closed
+            && (pool.is_empty() || !any_eligible)
+        {
+            if let Some(cb) = input.on_phase {
+                cb(crate::state::Phase::Verify, Some(format!("{} in flight", verifying.len())));
+            }
+            verify_phase_marked = true;
         }
         // 在途 0 ∧ **复核在途 0** ∧（可派 0 ∨ 池空）∧ 入口已关（design §2：barrier 等复核归零，批 D-3 接上）
         if running.is_empty() && verifying.is_empty() && closed && (pool.is_empty() || !any_eligible) {
@@ -1782,6 +1802,7 @@ mod tests {
                 prior_findings: vec![], tools,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                on_phase: None,
             },
             &(),
         )
@@ -1838,6 +1859,7 @@ mod tests {
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                on_phase: None,
             },
             &events,
         )
@@ -1907,6 +1929,7 @@ mod tests {
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                on_phase: None,
             },
             &(),
         )
@@ -1997,6 +2020,7 @@ mod tests {
                 prior_findings: vec![prior_f], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                on_phase: None,
             },
             &(),
         )
@@ -2023,6 +2047,7 @@ mod tests {
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                on_phase: None,
             },
             &(),
         )
@@ -2061,6 +2086,7 @@ mod tests {
                 snapshot: None, restore: Some(&snap), prior_findings: vec![prior_f],
                 tools: ToolsMode::Off, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                on_phase: None,
             },
             &(),
         )
@@ -2101,6 +2127,7 @@ mod tests {
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::InFlight)]), prior_findings: vec![],
                 tools: ToolsMode::TwoStage, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                on_phase: None,
             },
             &(),
         )
@@ -2267,6 +2294,8 @@ mod tests {
         verify: Option<VerifyInput<'a>>,
         /// 台账激活项（M21c 批 C）：默认空。
         activated: &'a [crate::orchestrate::ledger::Activated],
+        /// 阶段钩子：默认 `None`；复核尾段用例自带。
+        on_phase: Option<&'a dyn Fn(crate::state::Phase, Option<String>)>,
         /// 往轮 finding（resume 形态）。
         prior: Vec<Finding>,
     }
@@ -2280,7 +2309,7 @@ mod tests {
                 reviewers: r.reviewers.unwrap_or(&single), budget_cells: r.budget,
                 pack: &Default::default(), spec_docs: "", repo_brief: r.repo_brief, target_label: "t",
                 snapshot: r.snapshot, restore: (!r.first_run).then_some(r.items), prior_findings: r.prior, tools: r.tools,
-                backend_factory: None, on_cell: r.on_cell, incoming: r.incoming, reopen_skipped: r.reopen_skipped, verify: r.verify,
+                backend_factory: None, on_cell: r.on_cell, on_phase: r.on_phase, incoming: r.incoming, reopen_skipped: r.reopen_skipped, verify: r.verify,
                 activated: r.activated,
             },
             r.sink,
@@ -2293,6 +2322,7 @@ mod tests {
             reg, root, bundles, items, tools: ToolsMode::Off, incoming: None, on_cell: None, snapshot: None, sink: &(), reviewers: None,
             budget: 16, first_run: false, scan_cells: &[], repo_brief: "", reopen_skipped: false, route: None, verify: None, prior: vec![],
             activated: &[],
+            on_phase: None,
         }
     }
 
@@ -2888,6 +2918,7 @@ mod tests {
                 snapshot: Some(&snapshot), restore: Some(&items), prior_findings: vec![prior_same, prior_settled],
                 tools: ToolsMode::TwoStage, backend_factory: None, on_cell: Some(&on_cell), incoming: None, reopen_skipped: false, verify: None,
                 activated: &[],
+                on_phase: None,
             },
             &(),
         )
@@ -3511,6 +3542,7 @@ mod tests {
             snapshot: None, restore: None, prior_findings: vec![], tools: ToolsMode::Off,
             backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
             activated: &[],
+            on_phase: None,
         };
         let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 3)], QueueOrigin::Rule, vec![]).unwrap();
 
@@ -4289,7 +4321,17 @@ mod tests {
         let known = Default::default();
         let items = pending_items(&["a"]);
         let t0 = tokio::time::Instant::now();
-        let run = run_with(Run { verify: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        // 这一段也要在作业状态里看得见（M21c 批 C 的状态机盘点补）：`Phase::Verify` 在 M21b 批 C
+        // 占位、批 D 做了流式复核却没接上，于是全仓零产品写入——后台作业跑在这 30 秒里，
+        // `redteam status` 显示的还是 `deep`。被盘点的「状态 × 谁写它」表照出来。
+        let seen: std::sync::Mutex<Vec<(crate::state::Phase, Option<String>)>> = Default::default();
+        let rec_phase = |ph: crate::state::Phase, note: Option<String>| seen.lock().unwrap().push((ph, note));
+        let run = run_with(Run {
+            verify: Some(vin(&roles, &known)),
+            on_phase: Some(&rec_phase),
+            ..plain(&reg, dir.path(), &bundles, &items)
+        })
+        .await;
 
         assert!(run.findings[0].verify.is_some(), "没等复核回来就收场了");
         assert!(t0.elapsed() >= Duration::from_secs(40), "墙钟得含复核尾部");
@@ -4298,6 +4340,72 @@ mod tests {
             "尾部 = 排空 → 归零（≈30s），不是整轮墙钟：tail={} drain={}",
             run.meta.verify_tail_ms, run.meta.drain_done_ms
         );
+        let phases = seen.lock().unwrap().clone();
+        assert_eq!(phases.len(), 1, "phase 是时间线上的一格，不是心跳: {phases:?}");
+        assert_eq!(phases[0].0, crate::state::Phase::Verify);
+        assert_eq!(phases[0].1.as_deref(), Some("1 in flight"), "注记带上还在跑的复核数");
+    }
+
+    /// `Phase::Verify` 在尾段里**只打一次**（M21c 批 C）：尾段每回来一批复核，主循环就迭代一次，
+    /// 没有那个标记就会每轮都打，而 `set_phase` 无条件 push——`phase_history` 里会出现一串 verify 格。
+    ///
+    /// 要让两条复核**错开**回来才测得出：同一批同时回来会被 `while let … now_or_never()` 一次取光，
+    /// 尾段只迭代一次，标记就没有可观测效果（变异检查连抓两次）。这里用 `Routed` 给两个 reviewer 格
+    /// 设不同延迟，finding 错开落地 → 复核错开派出 → 统一延迟下也错开回来。
+    #[tokio::test(start_paused = true)]
+    async fn verify_phase_is_marked_once_not_per_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a", "b"]);
+        let high = |n: &str| {
+            Ok(turn(&format!(
+                r#"{{"findings":[{{"severity":"high","title":"t","body":"b","file":"{n}.rs","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r","quote":"fn {n}() {{"}}],"needs":[]}}"#
+            )))
+        };
+        let reviewer = Routed::new(vec![("a", 10_000, vec![high("a")]), ("b", 20_000, vec![high("b")])]);
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8, Box::new(Arc::clone(&reviewer)), Duration::from_secs(120), 0);
+        reg.insert_scan("p/v", "p", 8,
+            Box::new(FakeChatBackend::new(vec![turn(&verdict_json("UPHELD")), turn(&verdict_json("UPHELD"))])
+                .with_delay(Duration::from_secs(30))),
+            Duration::from_secs(120), 0);
+        let roles = verify_roles();
+        let known = Default::default();
+        let items = pending_items(&["a", "b"]);
+        let seen: std::sync::Mutex<Vec<(crate::state::Phase, Option<String>)>> = Default::default();
+        let rec_phase = |ph: crate::state::Phase, note: Option<String>| seen.lock().unwrap().push((ph, note));
+        let run = run_with(Run {
+            verify: Some(vin(&roles, &known)),
+            on_phase: Some(&rec_phase),
+            ..plain(&reg, dir.path(), &bundles, &items)
+        })
+        .await;
+
+        assert_eq!(run.meta.verify_triggered, 2, "夹具前提：两条复核");
+        assert!(run.meta.verify_tail_ms > 0, "夹具前提：有尾段");
+        let phases = seen.lock().unwrap().clone();
+        assert_eq!(phases.len(), 1, "两条判决错开回来各唤醒一次主循环，阶段仍只打一次: {phases:?}");
+        assert_eq!(phases[0].0, crate::state::Phase::Verify);
+    }
+
+    /// 没有复核尾段就不打 `Phase::Verify`（M21c 批 C）：复核与深挖同时结束、或整轮不复核时，
+    /// 打一个零长度的阶段只会让 `phase_history` 多一格噪音。
+    #[tokio::test(start_paused = true)]
+    async fn no_verify_phase_when_there_is_no_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = one_bundle(dir.path());
+        let mut reg = crate::provider::registry::ProviderRegistry::new();
+        reg.insert_scan("p/r", "p", 8,
+            Box::new(FakeChatBackend::new(vec![turn(&blocking_cell("fn a() {"))]).with_delay(Duration::from_secs(10))),
+            Duration::from_secs(60), 0);
+        let items = pending_items(&["a"]);
+        let seen: std::sync::Mutex<Vec<(crate::state::Phase, Option<String>)>> = Default::default();
+        let rec_phase = |ph: crate::state::Phase, note: Option<String>| seen.lock().unwrap().push((ph, note));
+        // `verify: None` = 整轮不复核
+        let run = run_with(Run { on_phase: Some(&rec_phase), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+
+        assert!(!run.findings.is_empty(), "夹具前提：这一轮是挖出东西的");
+        assert_eq!(run.meta.verify_tail_ms, 0, "没有尾段");
+        assert!(seen.lock().unwrap().is_empty(), "没尾段就不该打阶段: {:?}", seen.lock().unwrap());
     }
 
     /// 复核失败 / 读不懂判决 → 保守 upheld + warning（§8.1）：误驳会静默删掉一条真缺陷，
