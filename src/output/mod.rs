@@ -138,12 +138,31 @@ fn render_md(r: &ReviewReport) -> String {
     // 休眠疑点线索（M21c 批 A，A-2）：只披露、不进 verdict。**必须进 md**——ship 循环与裸终端读的都是 md
     // （`redteam result <job> --format md`），只落 JSON 等于这个功能对主消费路径不存在（收口评审 #4）。
     if !r.run.dormant_leads.is_empty() {
-        s.push_str(&format!("\n- Dormant leads ({}) — 台账里落在本轮变更文件上的历史截断项；**未经深挖、不进裁决**\n\n", r.run.dormant_leads.len()));
+        s.push_str(&format!("\n- Dormant leads ({}) — 台账里挂着、本轮文件也改了、却没能激活回来的往轮截断项；**未经深挖、不进裁决**\n\n", r.run.dormant_leads.len()));
         s.push_str("  | File:Line | Hint | First seen | Activations |\n");
         s.push_str("  | --- | --- | --- | --- |\n");
         for l in &r.run.dormant_leads {
             let short = l.first_round.chars().take(9).collect::<String>();
             s.push_str(&format!("  | {}:{} | {} | {} | {} |\n", l.file, l.line, l.hint, short, l.activations));
+        }
+    }
+    // 收敛三维（M21c 批 C，design §8.4）：ship 循环靠它判「还要不要再跑一轮」。与 dormant leads 同理，
+    // **必须进 md**——那才是循环与裸终端读的那一份。不收敛时逐维说清差在哪，否则读者只看见一个 false。
+    if let Some(c) = &r.run.convergence {
+        if c.converged {
+            s.push_str("\n- Converged — 无拦路问题、台账在本轮变更文件上没有未处理项、无激活超限；**可以收口**\n");
+        } else {
+            let mut why: Vec<String> = Vec::new();
+            if !c.verdict_clean {
+                why.push(format!("裁决非 approve（{}）", r.verdict.as_str()));
+            }
+            if !c.no_delta_adjacent {
+                why.push(format!("台账里有 {} 条疑点落在本轮变更文件上且仍未挖", c.delta_adjacent));
+            }
+            if !c.no_activation_overrun {
+                why.push(format!("{} 条疑点激活超限、已停车待人工裁定", c.activation_overrun));
+            }
+            s.push_str(&format!("\n- Not converged — {}；**建议再跑一轮**（收敛是循环的停止条件，不改本轮裁决与退出码）\n", why.join("；")));
         }
     }
     // T55（cell 级可观测）：per-model 运行摘要——耗时/轮次（>1=有 repair/多轮）/用量一眼可见，
@@ -367,6 +386,46 @@ mod tests {
         // 没有线索时一个字都不多写
         r.run.dormant_leads.clear();
         assert!(!render_md(&r).contains("Dormant"), "空则不渲染");
+    }
+
+    /// 收敛三维进 md（M21c 批 C）：ship 循环与裸终端读的都是 md，只落 JSON 等于这个字段
+    /// 对主消费路径不存在。不收敛时要逐维说清差在哪——只给一个 false 等于没说。
+    #[test]
+    fn md_renders_convergence_with_a_reason_per_failing_dimension() {
+        use crate::domain::report::Convergence;
+        let mut r = report();
+
+        r.run.convergence = Some(Convergence {
+            converged: true, verdict_clean: true, no_delta_adjacent: true, no_activation_overrun: true,
+            delta_adjacent: 0, activation_overrun: 0,
+        });
+        let md = render_md(&r);
+        assert!(md.contains("Converged") && md.contains("可以收口"), "{md}");
+
+        // 两维同时为假 → 两条理由都要出现，且带得上实际条数
+        r.verdict = crate::domain::Verdict::Reject;
+        r.run.convergence = Some(Convergence {
+            converged: false, verdict_clean: false, no_delta_adjacent: false, no_activation_overrun: true,
+            delta_adjacent: 7, activation_overrun: 0,
+        });
+        let md = render_md(&r);
+        assert!(md.contains("Not converged"), "{md}");
+        assert!(md.contains("reject"), "要说清裁决这一维怎么不干净: {md}");
+        assert!(md.contains("7 条"), "要带上台账那一维的实际条数: {md}");
+        assert!(!md.contains("停车"), "没有超限项就别提停车: {md}");
+        assert!(md.contains("不改本轮裁决"), "要挡住「收敛 = 裁决」的误读: {md}");
+
+        // 停车维单独成立
+        r.run.convergence = Some(Convergence {
+            converged: false, verdict_clean: true, no_delta_adjacent: true, no_activation_overrun: false,
+            delta_adjacent: 0, activation_overrun: 2,
+        });
+        assert!(render_md(&r).contains("2 条疑点激活超限"), "{}", render_md(&r));
+
+        // 算不出（diff 重建不了）时一个字都不多写
+        r.run.convergence = None;
+        let md = render_md(&r);
+        assert!(!md.contains("Converged") && !md.contains("Not converged"), "没有结论就不该渲染: {md}");
     }
 
     /// 批 C0：Finding Details 按**代码 / 文档**分区，摘要给一行「其中文档 N 条」。

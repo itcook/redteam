@@ -85,6 +85,10 @@ pub struct DeepInput<'a> {
     /// 在途入队通道（scanner 流式扇出，C2〔D15〕）：到达项走入口五态（到达键幂等）；通道关闭 = 关闭入口 → 收场 drain。`None` = 开跑即关闭。
     /// barrier 含「通道已关闭」：发送端未全部 drop 前，队列空也不收场。
     pub incoming: Option<mpsc::Receiver<crate::orchestrate::queue::DeepMsg>>,
+    /// 台账激活项（M21c 批 C，design §8.3）：与 H0 同待遇——**开跑即在队列里**，不等 scanner。
+    /// 它们本来就是上一轮扫出来的，没有理由再等本轮扫描一遍才排上队。
+    /// resume 走快照恢复，激活标记随 `QueueItem` 序列化带回，所以 resume 侧传空片即可（重复激活会重复计数）。
+    pub activated: &'a [crate::orchestrate::ledger::Activated],
 }
 
 pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sink: &dyn FindingSink) -> DeepRun {
@@ -163,6 +167,11 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         }
     }
     enqueue_scan_cells(&mut q, input.scan_cells, &mut meta, input.snapshot, &mut blocks);
+    // 台账激活（M21c 批 C）：放在 H0 与 scan 格之后——撞到同一个块时由既有合并语义收口，
+    // 顺序只决定谁先建项，合并结果与喂入顺序无关（到达键幂等）。
+    for a in input.activated {
+        enqueue_activated(&mut q, a, &mut meta, input.snapshot, &mut blocks);
+    }
     note_block(&mut meta, t_enq.elapsed());
     meta.queue_depth_peak = meta.queue_depth_peak.max(q.items().len() as u32);
 
@@ -1467,9 +1476,34 @@ fn enqueue_h0(q: &mut DeepQueue, h: &Hotspot, meta: &mut DeepMeta, snapshot: Opt
     // H0 也记到达键（评审 #8）：resume 每轮按当前 diff 幂等重建 H0——首跑那次入队快照写失败时它才补得回来，
     // 已在队列里的则走到达键幂等、不改项也不计去重命中。
     let arrival = Some(format!("rule:{}:{start}-{end}", h.file));
-    let req = EnqueueReq { spec, score: h.score, kind, families: vec![], arrival };
+    let req = EnqueueReq { spec, score: h.score, kind, families: vec![], arrival, activated: false, force_dig: false };
     let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
     note_enq(outcome, "rule", meta);
+    if let Some(i) = affected {
+        snap_one(&q.items()[i], snapshot);
+    }
+}
+
+/// 台账激活项入队（M21c 批 C）：一条台账行 = 一条疑点，走与 scanner 疑点同一条入队流程。
+/// 入不进去（区间形状非法）就算了——它只是个跨轮线索，不值得为它失败整轮。
+fn enqueue_activated(
+    q: &mut DeepQueue,
+    a: &crate::orchestrate::ledger::Activated,
+    meta: &mut DeepMeta,
+    snapshot: Option<&dyn Fn(&QueueItem)>,
+    ctx: &mut BlockCtx,
+) {
+    let Some(req) = EnqueueReq::from_ledger(&a.suspicion, &a.row_id, a.force_dig) else {
+        return;
+    };
+    let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));
+    note_enq(outcome, "ledger", meta);
+    if outcome != EnqueueOutcome::Duplicate {
+        meta.ledger_activated += 1;
+        if a.force_dig {
+            meta.ledger_force_dig += 1;
+        }
+    }
     if let Some(i) = affected {
         snap_one(&q.items()[i], snapshot);
     }
@@ -1699,7 +1733,7 @@ mod tests {
             id: format!("{file}:rule:1-2"),
             spec, score: 1.0, agreement: 1, state, kind: ItemKind::Primary,
             dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
-            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
+            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0, activated: false, force_dig: false,
         }
     }
 
@@ -1738,6 +1772,7 @@ mod tests {
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Pending)]),
                 prior_findings: vec![], tools,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                activated: &[],
             },
             &(),
         )
@@ -1771,6 +1806,8 @@ mod tests {
             members: vec![sus(2, "    hot();"), sus(9, "    cold();")],
             member_families: vec![vec!["alpha".into(), "beta".into()], vec!["gamma".into()]],
             block: Default::default(), peak_agreement: 2, risk_band: 0,
+            activated: false,
+            force_dig: false,
         };
         let two = r#"{"findings":[
             {"severity":"low","title":"on","body":"b","file":"a.rs","line_start":2,"line_end":2,"confidence":0.5,"recommendation":"r","quote":"    hot();"},
@@ -1791,6 +1828,7 @@ mod tests {
                 snapshot: None, restore: Some(std::slice::from_ref(&item)),
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                activated: &[],
             },
             &events,
         )
@@ -1859,6 +1897,7 @@ mod tests {
                 snapshot: None, restore: Some(std::slice::from_ref(&item)),
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                activated: &[],
             },
             &(),
         )
@@ -1948,6 +1987,7 @@ mod tests {
                 snapshot: None, restore: Some(&[snap_item("c.rs", ItemState::Pending)]),
                 prior_findings: vec![prior_f], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                activated: &[],
             },
             &(),
         )
@@ -1973,6 +2013,7 @@ mod tests {
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Settled)]),
                 prior_findings: vec![], tools: ToolsMode::Off,
                 backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                activated: &[],
             },
             &(),
         )
@@ -2010,6 +2051,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&snap), prior_findings: vec![prior_f],
                 tools: ToolsMode::Off, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                activated: &[],
             },
             &(),
         )
@@ -2049,6 +2091,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::InFlight)]), prior_findings: vec![],
                 tools: ToolsMode::TwoStage, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                activated: &[],
             },
             &(),
         )
@@ -2213,6 +2256,8 @@ mod tests {
         route: Option<&'a RiskRoute>,
         /// `None` = 不复核（多数用例）；复核段用例自带 `VerifyInput`。
         verify: Option<VerifyInput<'a>>,
+        /// 台账激活项（M21c 批 C）：默认空。
+        activated: &'a [crate::orchestrate::ledger::Activated],
         /// 往轮 finding（resume 形态）。
         prior: Vec<Finding>,
     }
@@ -2227,6 +2272,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", repo_brief: r.repo_brief, target_label: "t",
                 snapshot: r.snapshot, restore: (!r.first_run).then_some(r.items), prior_findings: r.prior, tools: r.tools,
                 backend_factory: None, on_cell: r.on_cell, incoming: r.incoming, reopen_skipped: r.reopen_skipped, verify: r.verify,
+                activated: r.activated,
             },
             r.sink,
         )
@@ -2237,6 +2283,7 @@ mod tests {
         Run {
             reg, root, bundles, items, tools: ToolsMode::Off, incoming: None, on_cell: None, snapshot: None, sink: &(), reviewers: None,
             budget: 16, first_run: false, scan_cells: &[], repo_brief: "", reopen_skipped: false, route: None, verify: None, prior: vec![],
+            activated: &[],
         }
     }
 
@@ -2265,6 +2312,48 @@ mod tests {
         assert_eq!(reg.gate_stats()["p"].peak, 2, "在途峰值 = 门宽");
         assert_eq!(run.cells.iter().filter(|c| c.ok).count(), 5, "{:?}", run.warnings);
         assert!(elapsed >= Duration::from_millis(150) && elapsed < Duration::from_millis(200), "ceil(5/2)×50 ms，实测 {elapsed:?}");
+    }
+
+    /// 台账激活项真的进了**首跑**的队列（M21c 批 C）。
+    ///
+    /// 这条盯的是接线，不是判据：判据在 `ledger::activations_for` 已经钉死，但判出来的项要有人
+    /// 真的喂给 `run_deep` 才算数。M21d 批 A 的 `needs{api}` 就是在这一步断的——两条用例都只构造
+    /// resume 形态，首跑路径上那个参数恒空，整条链一轮都没生效过。所以这里**只跑首跑形态**。
+    #[tokio::test(start_paused = true)]
+    async fn activated_ledger_rows_reach_the_first_run_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let backend = Routed::new(vec![("a", 10, vec![found("a")])]);
+        let reg = routed_registry(&backend, 2);
+        let act = |force_dig: bool| crate::orchestrate::ledger::Activated {
+            row_id: "r1".into(),
+            suspicion: crate::domain::Suspicion {
+                file: "a.rs".into(), line_start: 1, line_end: 1, hint: "往轮挂着的".into(),
+                category: None, confidence: 0.6, quote: "fn a() {".into(),
+            },
+            activations: 1,
+            force_dig,
+            park: false,
+        };
+
+        let rows = [act(false)];
+        let run = run_with(Run { first_run: true, activated: &rows, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+        assert_eq!(run.meta.ledger_activated, 1, "激活项要计数: {:?}", run.warnings);
+        let it = run.items.iter().find(|i| i.activated).expect(&format!("队列里要有激活项: {:?}", run.items));
+        assert!(it.arrivals.iter().any(|a| a == "ledger:r1"), "到达键要能追回台账行: {:?}", it.arrivals);
+        assert!(!it.force_dig, "没踩门的不强制必挖");
+        assert_eq!(run.meta.ledger_force_dig, 0);
+
+        // 没有激活项时一个数都不涨（否则上面的 1 可能来自别处）
+        let bare = run_with(Run { first_run: true, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+        assert_eq!((bare.meta.ledger_activated, bare.meta.ledger_force_dig), (0, 0));
+        assert!(!bare.items.iter().any(|i| i.activated), "没喂激活项就不该有");
+
+        // 踩门的项带着 force_dig 进队列，并计进活锁观测
+        let hot = [act(true)];
+        let run2 = run_with(Run { first_run: true, activated: &hot, ..plain(&reg, dir.path(), &bundles, &[]) }).await;
+        assert_eq!(run2.meta.ledger_force_dig, 1);
+        assert!(run2.items.iter().any(|i| i.activated && i.force_dig), "{:?}", run2.items);
     }
 
     /// 乱序完成不错配、慢格不堵：完成序 b→c→a，每格 findings 仍对应自己的文件；报告里的 cells 按优先级序（a→b→c，C2 D2 起不看派发序）；
@@ -2329,6 +2418,8 @@ mod tests {
             families: vec![family.into()], enqueued_ms: None,
             arrivals: vec![], members: vec![note], member_families: vec![vec![family.into()]],
             block: Default::default(), peak_agreement: 1, risk_band: 0,
+            activated: false,
+            force_dig: false,
         };
         (item, spec)
     }
@@ -2347,7 +2438,7 @@ mod tests {
         let events = Events(Mutex::new(Vec::new()));
         let feed = async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            tx.send(EnqueueReq { spec, score: 0.5, kind: ItemKind::Suspicion, families: vec!["beta".into()], arrival: None }.into()).await.unwrap();
+            tx.send(EnqueueReq { spec, score: 0.5, kind: ItemKind::Suspicion, families: vec!["beta".into()], arrival: None, activated: false, force_dig: false }.into()).await.unwrap();
         };
         let (run, ()) = tokio::join!(
             run_with(Run { incoming: Some(rx), sink: &events, ..plain(&reg, dir.path(), &bundles, &items) }),
@@ -2376,7 +2467,7 @@ mod tests {
         let feed = async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap();
-            tx.send(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, families: vec![], arrival: None }.into()).await.unwrap();
+            tx.send(EnqueueReq { spec, score: 1.0, kind: ItemKind::Primary, families: vec![], arrival: None, activated: false, force_dig: false }.into()).await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         let t0 = tokio::time::Instant::now();
@@ -2728,6 +2819,8 @@ mod tests {
             spec: QueueItemSpec::new(file.into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap(),
             score: 1.0, agreement: 1, state, kind, dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
             arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
+            activated: false,
+            force_dig: false,
         };
         let note = crate::domain::Suspicion {
             file: "s.rs".into(), line_start: 1, line_end: 1, hint: "h".into(), category: None, confidence: 0.5, quote: "fn s() {".into(),
@@ -2738,6 +2831,8 @@ mod tests {
             score: 0.5, agreement: 2, state: ItemState::Pending, kind: ItemKind::Suspicion,
             dispatch_agreement: 0, landed_agreement: None, families: vec!["alpha".into(), "beta".into()], enqueued_ms: None,
             arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
+            activated: false,
+            force_dig: false,
         };
         let items = vec![
             rule("r.rs", ItemKind::Ripple, ItemState::Pending),
@@ -2774,6 +2869,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: Some(&snapshot), restore: Some(&items), prior_findings: vec![prior_same, prior_settled],
                 tools: ToolsMode::TwoStage, backend_factory: None, on_cell: Some(&on_cell), incoming: None, reopen_skipped: false, verify: None,
+                activated: &[],
             },
             &(),
         )
@@ -2941,6 +3037,8 @@ mod tests {
             id, spec, score: 1.0, agreement: 1, state, kind, dispatch_agreement, landed_agreement: None,
             families: vec![], enqueued_ms: None, arrivals: vec![], members, member_families,
             block: Default::default(), peak_agreement: 0, risk_band: 0,
+            activated: false,
+            force_dig: false,
         }
     }
 
@@ -2984,7 +3082,7 @@ mod tests {
     /// 经通道到达的 H0 形态项（主区 / 涟漪）。
     fn rule_req(name: &str, kind: ItemKind, score: f32) -> EnqueueReq {
         let spec = QueueItemSpec::new(format!("{name}.rs"), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap();
-        EnqueueReq { spec, score, kind, families: vec![], arrival: None }
+        EnqueueReq { spec, score, kind, families: vec![], arrival: None, activated: false, force_dig: false }
     }
 
     /// 虚拟时钟下「自测试开始起第 `ms` 毫秒」（各用例开头即调用，t0 = 当前）。
@@ -3394,6 +3492,7 @@ mod tests {
             reviewers: &[], budget_cells: 0, pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
             snapshot: None, restore: None, prior_findings: vec![], tools: ToolsMode::Off,
             backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+            activated: &[],
         };
         let spec = QueueItemSpec::new("a.rs".into(), vec![(1, 3)], QueueOrigin::Rule, vec![]).unwrap();
 
@@ -4122,6 +4221,8 @@ mod tests {
             families: vec!["alpha".into(), "beta".into()], enqueued_ms: None, arrivals: vec![],
             members: vec![sus], member_families: vec![vec!["alpha".into(), "beta".into()]],
             block: Default::default(), peak_agreement: 2, risk_band: 0,
+            activated: false,
+            force_dig: false,
         };
         let roles = verify_roles();
         let known = Default::default();

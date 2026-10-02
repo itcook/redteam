@@ -12,11 +12,15 @@ pub const REASON_BUDGET: &str = "budget";
 
 /// 把队列项里**没挖成**的那些提炼成台账行（每条疑点一行）。
 ///
-/// 只落**带疑点的项**——实际就是 scanner 疑点来源的项（收口评审 #6 订正）：
-/// `QueueItem.members` 只有 scan 项非空，H0 规则项与 needs 补查项都是空的（见 `queue.rs` 的字段注释），
-/// 所以后两类不会落账。H0 每轮由规则重新产生、不需要跨轮记忆，这是设计意图；
-/// **needs 项落不了账是已知缺口**——被截断的二阶段补查项进不了台账，批 C 的 delta 激活也就捞不回它们，
-/// 要捞得给它一条独立于 quote 的身份（记 followup，别让批 C 按错误前提实现）。
+/// 只落**带疑点的项**：`members` 为空的项没有 quote 锚、也就没有跨轮身份。
+/// H0 规则项的 `members` 恒空（规则不产疑点），每轮由规则重新产生、不需要跨轮记忆——这是设计意图。
+///
+/// needs 项**不一定**空（批 C 订正：原注释称「needs 补查项 members 恒空、故不会落账」，与实测不符）：
+/// `members = spec.notes.clone()`，而 needs 项在合并时会吸收到达请求的 notes（`queue.rs` 的 merge 分支），
+/// 于是「与 needs 项落在同一块的 scan 疑点」会跟着 needs 项的身份落账——PR181 库里实有一条 `origin='Needs'` 的行。
+/// 缺口本身仍然成立，但要按它的真实形状理解：**纯 needs 项**（没有 scan 疑点并进来的）落不了账，
+/// 因为落账身份是「文件 + quote 归一」而补查项的诉求不在任何 quote 上；批 C 的 delta 激活也就捞不回它们。
+/// 要捞得先给它一条独立于 quote 的身份（已记 followup）。
 /// 同一处疑点在一轮里可能由多个家族重复提出 → 按 id 去重，保留第一条（`members` 是到达序）。
 pub fn rows_from_skipped(items: &[QueueItem], job_id: &str) -> Vec<SuspicionRow> {
     let mut out: Vec<SuspicionRow> = Vec::new();
@@ -46,7 +50,7 @@ pub fn rows_from_skipped(items: &[QueueItem], job_id: &str) -> Vec<SuspicionRow>
                 file: s.file.clone(),
                 quote_norm,
                 hint: s.hint.clone(),
-                status: "dormant".into(),
+                status: STATUS_DORMANT.into(),
                 first_job: job_id.to_string(),
                 last_job: job_id.to_string(),
                 activations: 0,
@@ -56,6 +60,87 @@ pub fn rows_from_skipped(items: &[QueueItem], job_id: &str) -> Vec<SuspicionRow>
     }
     out
 }
+
+/// 活锁守卫两段门（M21c 批 C〔用户裁 2026-10-02〕，design §8.4）：激活到 `FORCE_DIG` 次仍未晋升 →
+/// 本轮强制入必挖集（不受预算截断）；到 `PARK` 次仍未晋升 → 停车交人。
+/// 两段式的理由：直接停车放弃了「强制必挖可能一次就挖出来」的自愈机会，只必挖不停车则真挖不动的
+/// 疑点每轮占一个必挖位、成为长期税。计数是**激活次数**，不是「被看见次数」。
+pub const ACTIVATION_FORCE_DIG: i64 = 3;
+pub const ACTIVATION_PARK: i64 = 5;
+
+/// 一条被激活的台账疑点：待入队的疑点本体 + 待回写的台账身份。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Activated {
+    /// 台账行 id（回写 `status` / `activations` 用）。
+    pub row_id: String,
+    /// 重锚到**当前**文件内容后的疑点（行号已更新，quote / hint / 置信沿用台账）。
+    pub suspicion: crate::domain::Suspicion,
+    /// 回写后的激活次数（= 原值 + 1）。
+    pub activations: i64,
+    /// 本轮是否踩到强制必挖门（`activations >= ACTIVATION_FORCE_DIG`）。
+    pub force_dig: bool,
+    /// 本轮是否踩到停车门（`activations >= ACTIVATION_PARK`）。
+    pub park: bool,
+}
+
+/// 激活的产物：待入队项 + 两类不激活的计数（都要能在报告里说清楚，别静默吞掉）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ActivationOutcome {
+    pub activated: Vec<Activated>,
+    /// 判据过了但 quote 重锚不上（代码改到锚失效）→ 不入队。锚丢了就没有可靠位置，宁可不挖。
+    pub anchor_lost: Vec<String>,
+}
+
+/// 台账行 → 本轮该重新入队的疑点（M21c 批 C，design §8.3）。纯粹按判据挑 + 重锚，不写库、不入队。
+///
+/// 三条判据缺一不可：
+/// - `status == "dormant"`：已激活 / 已晋升的不重复激活（状态机单向推进）。
+/// - **文件 ∈ 本轮变更集**：由调用方的 `suspicions_for_files(changed_files)` 查询保证，本函数不再判。
+/// - `last_job != 本轮 head`：一条判据挡掉两种假激活——① 本轮自产（本轮刚被截断，激活了也没有预算再挖它）
+///   ② 同 HEAD 重跑（没有新 delta，激活无依据；PR181 那种固定靶子四轮同 HEAD，正是这一类）。
+///
+/// **落账在深挖之后、激活在深挖之前**，所以这里读到的 `last_job` 必定是上一轮写的——判据③ 靠这个先后成立，
+/// 两者的顺序不能调换。调换了本轮自产的疑点会在同一轮里被自己激活一次。
+pub fn activations_for(rows: &[crate::db::SuspicionRow], head: &str, root: &std::path::Path) -> ActivationOutcome {
+    let mut out = ActivationOutcome::default();
+    for r in rows {
+        if r.status != STATUS_DORMANT || r.last_job == head || head.is_empty() {
+            continue;
+        }
+        let d: serde_json::Value = serde_json::from_str(&r.json).unwrap_or(serde_json::Value::Null);
+        let quote = d.get("quote").and_then(|v| v.as_str()).unwrap_or_default();
+        if quote.is_empty() {
+            continue; // 无 quote = 无锚，落账时本就不该有这种行
+        }
+        let old_line = d.get("line_start").and_then(serde_json::Value::as_u64).unwrap_or(1) as u32;
+        let Some((ls, le)) = crate::positioning::anchor_near(root, &r.file, quote, old_line) else {
+            out.anchor_lost.push(r.id.clone());
+            continue;
+        };
+        let activations = r.activations + 1;
+        out.activated.push(Activated {
+            row_id: r.id.clone(),
+            suspicion: crate::domain::Suspicion {
+                file: r.file.clone(),
+                line_start: ls,
+                line_end: le,
+                hint: r.hint.clone(),
+                category: d.get("category").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or(None),
+                confidence: d.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32,
+                quote: quote.to_string(),
+            },
+            activations,
+            force_dig: activations >= ACTIVATION_FORCE_DIG,
+            park: activations >= ACTIVATION_PARK,
+        });
+    }
+    out
+}
+
+/// 台账状态机（design §8.3）：`dormant` → `activated`（被 delta 碰到、重新入队）→ `promoted`（深挖晋升为 finding）。
+/// 单向：已 activated 的行不再被激活判据选中，所以同一轮里一条疑点只会被激活一次。
+pub const STATUS_DORMANT: &str = "dormant";
+pub const STATUS_ACTIVATED: &str = "activated";
 
 #[cfg(test)]
 mod tests {
@@ -127,5 +212,89 @@ mod tests {
         ])], "sha1");
         assert_eq!(dup.len(), 1);
         assert_eq!(dup[0].hint, "甲说", "保留到达序里的第一条");
+    }
+
+    // ───────────────────────── 批 C：激活判据 ─────────────────────────
+
+    fn row(id: &str, file: &str, status: &str, last_job: &str, activations: i64, quote: &str) -> crate::db::SuspicionRow {
+        crate::db::SuspicionRow {
+            id: id.into(),
+            file: file.into(),
+            quote_norm: crate::orchestrate::normalize_quote(quote),
+            hint: "边界没校验".into(),
+            status: status.into(),
+            first_job: "sha0".into(),
+            last_job: last_job.into(),
+            activations,
+            json: serde_json::json!({ "line_start": 1, "quote": quote, "confidence": 0.62, "category": "L2" }).to_string(),
+        }
+    }
+
+    /// 写一个两行文件，第 2 行是 quote 的落点（重锚要能找到它）。
+    fn repo(body: &str) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("a.rs"), body).unwrap();
+        t
+    }
+
+    /// 激活正路：往轮落的账 + 本轮 head 不同 → 激活，行号重锚到当前内容，计数 +1。
+    #[test]
+    fn activates_a_dormant_row_from_a_previous_round() {
+        let t = repo("fn f() {\n    let x = take(v);\n}\n");
+        let out = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha1", 0, "let x = take(v);")], "sha2", t.path());
+        assert_eq!(out.activated.len(), 1, "{out:?}");
+        let a = &out.activated[0];
+        assert_eq!((a.row_id.as_str(), a.activations, a.force_dig, a.park), ("r1", 1, false, false));
+        assert_eq!(a.suspicion.line_start, 2, "重锚到当前内容里 quote 实际所在的行");
+        assert_eq!(a.suspicion.hint, "边界没校验", "hint 沿用台账");
+        assert!((a.suspicion.confidence - 0.62).abs() < 1e-6);
+        assert!(out.anchor_lost.is_empty());
+    }
+
+    /// 三类不激活，各自单独成立（判据 ① 与 ③；判据 ② 由调用方的 SQL 保证，不在本函数）。
+    #[test]
+    fn three_kinds_of_rows_are_not_activated() {
+        let t = repo("fn f() {\n    let x = take(v);\n}\n");
+        let q = "let x = take(v);";
+        // ① 本轮自产：落账在深挖之后、激活在深挖之前，所以 last_job == 本轮 head 只可能是本轮刚写的
+        let own = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha2", 0, q)], "sha2", t.path());
+        assert!(own.activated.is_empty(), "本轮刚截断的不在本轮激活（没预算再挖它）: {own:?}");
+        // ② 同 HEAD 重跑：同一个 head 第二次跑，台账里 last_job 已是它——没有新 delta，激活无依据
+        let rerun = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha1", 0, q)], "sha1", t.path());
+        assert!(rerun.activated.is_empty(), "同 HEAD 重跑不激活: {rerun:?}");
+        // ③ 状态机单向：已激活 / 已晋升的不再激活
+        for st in [STATUS_ACTIVATED, "promoted"] {
+            let done = activations_for(&[row("r1", "a.rs", st, "sha1", 2, q)], "sha2", t.path());
+            assert!(done.activated.is_empty(), "{st} 不该再被激活: {done:?}");
+        }
+        // 无轮次标识（非 git / 无 commit）：与落账同一道门
+        let noround = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha1", 0, q)], "", t.path());
+        assert!(noround.activated.is_empty(), "无轮次标识不激活");
+    }
+
+    /// 重锚不上就不入队，但要记下来——「没激活」有两种原因，合成一个数就查不出是哪种。
+    #[test]
+    fn rows_whose_quote_no_longer_anchors_are_counted_not_enqueued() {
+        let t = repo("fn f() {\n    let y = other();\n}\n"); // quote 已经不在文件里了
+        let out = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha1", 0, "let x = take(v);")], "sha2", t.path());
+        assert!(out.activated.is_empty());
+        assert_eq!(out.anchor_lost, vec!["r1".to_string()], "锚丢了要能看见");
+    }
+
+    /// 活锁守卫两段门：到 `ACTIVATION_FORCE_DIG` 置 `force_dig`、到 `ACTIVATION_PARK` 再置 `park`。
+    /// 门按**回写后**的次数判（本次激活算数），否则第 N 次激活时门还没响、要等到第 N+1 次。
+    #[test]
+    fn livelock_guard_has_two_stages() {
+        let t = repo("fn f() {\n    let x = take(v);\n}\n");
+        let q = "let x = take(v);";
+        let at = |prior: i64| {
+            let o = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha1", prior, q)], "sha2", t.path());
+            let a = o.activated.into_iter().next().unwrap();
+            (a.activations, a.force_dig, a.park)
+        };
+        assert_eq!(at(0), (1, false, false));
+        assert_eq!(at(ACTIVATION_FORCE_DIG - 2), (ACTIVATION_FORCE_DIG - 1, false, false), "门前一步还没响");
+        assert_eq!(at(ACTIVATION_FORCE_DIG - 1), (ACTIVATION_FORCE_DIG, true, false), "踩到强制必挖门");
+        assert_eq!(at(ACTIVATION_PARK - 1), (ACTIVATION_PARK, true, true), "踩到停车门时仍然必挖");
     }
 }

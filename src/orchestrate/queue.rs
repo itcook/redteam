@@ -91,6 +91,19 @@ pub struct QueueItem {
     /// 所在风险区档（C3-2 排序用，入队时由 `RiskRoute.zones` 算）：3 = 分 ≥ θ · 2 = ≥ θ/2 · 1 = > 0 · 0 = 无区。
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub risk_band: u8,
+    /// 由台账激活而来（M21c 批 C）：上一轮被预算截断、本轮 delta 又碰到了它所在的文件。
+    /// 排序上提一档（`cmp_priority` 第 5 层），但**不**越过「代码优先」——裁定 2〔2026-10-02〕：
+    /// 被激活的文档疑点不该排到未激活的代码疑点前面，那会推翻 C0 刚钉死的分池序。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub activated: bool,
+    /// 活锁守卫的强制必挖（M21c 批 C）：同一疑点激活到 `ACTIVATION_FORCE_DIG` 次仍未晋升 →
+    /// 本轮不受预算截断。走 `must_dig` 同一个口子，这样「不截断」这件事只有一处实现。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub force_dig: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -103,7 +116,7 @@ fn is_zero_u8(v: &u8) -> bool {
 
 impl QueueItem {
     fn new(req: EnqueueReq, block: Block, risk_band: u8) -> Self {
-        let EnqueueReq { mut spec, score, kind, families, arrival } = req;
+        let EnqueueReq { mut spec, score, kind, families, arrival, activated, force_dig } = req;
         // 区间 = 块的行范围（design C3 §2）：项覆盖整个 def / 标题节，id 也随之锚在结构上
         // （同块的两条疑点算出同一 id——取消 id 捷径后 id 唯一仍成立）。
         if !block.is_empty() {
@@ -130,6 +143,8 @@ impl QueueItem {
             block,
             peak_agreement: 0,
             risk_band,
+            activated,
+            force_dig,
         };
         it.recompute_peak();
         it
@@ -277,6 +292,10 @@ pub struct EnqueueReq {
     pub families: Vec<String>,
     /// 疑点到达键 `{scan cell_id}#{i}`（i = 该格锚定后疑点下标；落盘输出同序，resume 可复算）。H0 / 测试构造为 `None`。
     pub arrival: Option<String>,
+    /// 来自台账激活（M21c 批 C）：传到 `QueueItem.activated`。scanner / H0 路径恒 false。
+    pub activated: bool,
+    /// 活锁守卫强制必挖（M21c 批 C）：传到 `QueueItem.force_dig`。
+    pub force_dig: bool,
 }
 
 impl EnqueueReq {
@@ -285,7 +304,7 @@ impl EnqueueReq {
     pub fn scan(s: &Suspicion, family: &str, arrival: String) -> Option<EnqueueReq> {
         let start = s.line_start.max(1);
         let spec = QueueItemSpec::new(s.file.clone(), vec![(start, s.line_end.max(start))], QueueOrigin::Scan, vec![s.clone()]).ok()?;
-        Some(EnqueueReq { spec, score: s.confidence, kind: ItemKind::Suspicion, families: vec![family.to_string()], arrival: Some(arrival) })
+        Some(EnqueueReq { spec, score: s.confidence, kind: ItemKind::Suspicion, families: vec![family.to_string()], arrival: Some(arrival), activated: false, force_dig: false })
     }
 
     /// scanner needs 入队请求（C3〔D16〕Q8，design §6 的第三种生产者）：`kind = evidence` 的一条声明成一项——
@@ -304,7 +323,29 @@ impl EnqueueReq {
         let path = norm_path(&n.path);
         let spec = QueueItemSpec::new(path.clone(), vec![(a, b)], QueueOrigin::Needs, vec![]).ok()?;
         let arrival = format!("needs:{path}:{a}-{b}:{}", crate::hash::fnv1a64_hex(&[n.reason.as_str()]));
-        Some(EnqueueReq { spec, score: NEEDS_MID_SCORE, kind: ItemKind::Needs, families: vec![], arrival: Some(arrival) })
+        Some(EnqueueReq { spec, score: NEEDS_MID_SCORE, kind: ItemKind::Needs, families: vec![], arrival: Some(arrival), activated: false, force_dig: false })
+    }
+
+    /// 台账激活入队请求（M21c 批 C，design §8.3）：上一轮被截断的疑点，本轮 delta 碰到了它的文件。
+    ///
+    /// 形态与 `scan` 几乎一样（它本来就是一条 scanner 疑点），三处刻意不同：
+    /// - **家族留空**：共识是「本轮有几个家族独立看见它」，跨轮重看不是独立证据（与 `merge_carry`
+    ///   的「agreement 不变」同一条道理）。给它补一个假家族会让它凭空挤进必挖集。
+    /// - **到达键 `ledger:{row_id}`**：同一台账行一轮只入一次；与本轮 scanner 重新扫出的同一处疑点
+    ///   撞到同一个块 id 时走既有合并语义——那是对的，本轮确实又看见它了，该并。
+    /// - `activated` / `force_dig` 置位：前者进排序第 5 层，后者是活锁守卫的强制必挖。
+    pub fn from_ledger(s: &Suspicion, row_id: &str, force_dig: bool) -> Option<EnqueueReq> {
+        let start = s.line_start.max(1);
+        let spec = QueueItemSpec::new(s.file.clone(), vec![(start, s.line_end.max(start))], QueueOrigin::Scan, vec![s.clone()]).ok()?;
+        Some(EnqueueReq {
+            spec,
+            score: s.confidence,
+            kind: ItemKind::Suspicion,
+            families: vec![],
+            arrival: Some(format!("ledger:{row_id}")),
+            activated: true,
+            force_dig,
+        })
     }
 }
 
@@ -682,8 +723,11 @@ impl DeepQueue {
 ///
 /// C3〔D16〕起共识分两轴，必挖只认**项内**最大簇的家族数：结构定项后一块里可能落着好几条互不相关的疑点，
 /// 按区域级家族并集判定会让必挖集从每轮 4 条涨到 7–9 个块（PR181 规模 18/23）——必挖不受预算截断，`maxCells` 就形同虚设。
+///
+/// `force_dig`（M21c 批 C 活锁守卫）走同一个口子：被反复激活却总挖不出结果的疑点，到门槛后不再受预算截断。
+/// 并进 `must_dig` 而不是另立一条「也不许截断」的路径——「不受预算截断」这件事只该有一处实现。
 pub(crate) fn must_dig(it: &QueueItem) -> bool {
-    it.kind == ItemKind::Primary || consensus_axis(it) >= 2
+    it.kind == ItemKind::Primary || it.force_dig || consensus_axis(it) >= 2
 }
 
 /// 必挖轴取值：有 `peak_agreement` 用它；0 = 未算（旧快照 / H0 无疑点）→ 退回区域级 `agreement`（C1/C2 行为）。
@@ -732,6 +776,7 @@ pub(crate) fn cmp_priority(a: &QueueItem, b: &QueueItem) -> std::cmp::Ordering {
         .then_with(|| consensus_axis(b).cmp(&consensus_axis(a)))
         .then_with(|| b.risk_band.cmp(&a.risk_band))
         .then_with(|| ord(!is_doc(&a.spec.file)).cmp(&ord(!is_doc(&b.spec.file))))
+        .then_with(|| ord(a.activated).cmp(&ord(b.activated)))
         .then_with(|| b.suspicions().len().cmp(&a.suspicions().len()))
         .then_with(|| confidence_of(b).partial_cmp(&confidence_of(a)).unwrap_or(std::cmp::Ordering::Equal))
         .then_with(|| a.id.cmp(&b.id))
@@ -861,6 +906,56 @@ mod tests {
         QueueItemSpec::new(file.into(), vec![(start, end)], QueueOrigin::Rule, vec![]).unwrap()
     }
 
+    /// 激活层（M21c 批 C，裁定 2〔2026-10-02〕）：**插在「代码优先」之后、「烟量」之前**。
+    ///
+    /// 两条断言各钉一半，缺一条就测不出层序：
+    /// - 同为代码文件时，激活项先于未激活项（这一层真的在起作用）；
+    /// - **未激活的代码项仍先于已激活的文档项**（这一层没有越过代码优先）。
+    ///   第二条是裁定 2 的本体：把激活放到风险档之后会让被激活的文档疑点顶掉代码疑点，
+    ///   推翻批 C0 刚钉死的分池序。
+    #[test]
+    fn activation_outranks_within_a_lane_but_never_crosses_the_code_doc_lane() {
+        let mk = |file: &str, activated: bool| {
+            let spec = spec_scan(file, 1, 3, "let x = 1;", "h");
+            let r = EnqueueReq {
+                spec, score: 0.5, kind: ItemKind::Suspicion, families: vec!["alpha".into()],
+                arrival: None, activated, force_dig: false,
+            };
+            QueueItem::new(r, Block::default(), 0)
+        };
+        // 文件名刻意让**未激活**的那个 id 在前：否则删掉激活层后，比较会一路落到末层 id，
+        // 恰好也给出同样的顺序，这条用例就盯不住任何东西（变异检查实测过的假绿）。
+        let (code_hot, code_cold) = (mk("src/z.rs", true), mk("src/a.rs", false));
+        assert!(code_hot.id > code_cold.id, "夹具前提：激活项的 id 字典序在后");
+        assert_eq!(cmp_priority(&code_hot, &code_cold), std::cmp::Ordering::Less, "同为代码：激活的先挖");
+        assert_eq!(cmp_priority(&code_cold, &code_hot), std::cmp::Ordering::Greater);
+
+        // 同理：文档项的 id 要排在代码项之前，这样「代码仍然优先」才是代码优先层给的结论。
+        let doc_hot = mk("AAA.md", true);
+        assert!(doc_hot.id < code_cold.id, "夹具前提：文档项的 id 字典序在前");
+        assert_eq!(cmp_priority(&code_cold, &doc_hot), std::cmp::Ordering::Less,
+                   "未激活的代码项仍要排在已激活的文档项前面——激活层不得越过代码优先");
+    }
+
+    /// 活锁守卫的强制必挖走 `must_dig` 同一个口子（M21c 批 C）：共识只有 1、也不是主区，
+    /// 单凭 `force_dig` 就该进必挖集（= 不受预算截断）。
+    #[test]
+    fn force_dig_alone_puts_an_item_in_the_must_dig_set() {
+        let mk = |force_dig: bool| {
+            let spec = spec_scan("src/a.rs", 1, 3, "let x = 1;", "h");
+            let r = EnqueueReq {
+                spec, score: 0.5, kind: ItemKind::Suspicion, families: vec!["alpha".into()],
+                arrival: None, activated: true, force_dig,
+            };
+            QueueItem::new(r, Block::default(), 0)
+        };
+        let plain = mk(false);
+        assert_eq!(plain.kind, ItemKind::Suspicion);
+        assert!(consensus_axis(&plain) < 2, "夹具前提：共识轴不足以自己进必挖集");
+        assert!(!must_dig(&plain), "没踩门的激活项不是必挖");
+        assert!(must_dig(&mk(true)), "踩到强制必挖门的要进必挖集");
+    }
+
     /// **代码优先排在烟量之前**（批 C0，2026-09-29）：同等共识轴与风险档下，代码项恒先于文档项，
     /// **不论文档项的疑点条数多出多少**。原先代码优先在烟量之后，于是文档项靠「疑点多」直接胜出——
     /// 批 A dogfood 实测 16 个 reviewer 格里 10 个花在文档上。
@@ -907,6 +1002,8 @@ mod tests {
             kind: ItemKind::Suspicion,
             families: family.map(|f| vec![f.to_string()]).unwrap_or_default(),
             arrival: None,
+            activated: false,
+            force_dig: false,
         }
     }
 
@@ -1005,6 +1102,8 @@ mod tests {
             kind: ItemKind::Suspicion,
             families: vec!["alpha".into()],
             arrival: None,
+            activated: false,
+            force_dig: false,
         });
         q.enqueue(EnqueueReq {
             spec: spec_scan("a.rs", 80, 80, "db.write(t);", "h2"),
@@ -1012,6 +1111,8 @@ mod tests {
             kind: ItemKind::Suspicion,
             families: vec!["alpha".into(), "beta".into(), "gamma".into()],
             arrival: None,
+            activated: false,
+            force_dig: false,
         });
         assert_eq!(q.items().len(), 2, "行不重叠不合并");
         let first = q.items().iter().find(|i| i.spec.ranges == vec![(10, 10)]).unwrap();
@@ -1032,6 +1133,8 @@ mod tests {
             kind: ItemKind::Suspicion,
             families: vec!["alpha".into(), "alpha".into(), "".into(), "beta".into()],
             arrival: None,
+            activated: false,
+            force_dig: false,
         });
         assert_eq!(q.items()[0].agreement, 2);
         assert_eq!(q.items()[0].families, vec!["alpha".to_string(), "beta".to_string()]);
@@ -1047,7 +1150,7 @@ mod tests {
     }
 
     fn req_kind(spec: QueueItemSpec, kind: ItemKind, score: f32, family: Option<&str>) -> EnqueueReq {
-        EnqueueReq { spec, score, kind, families: family.map(|f| vec![f.to_string()]).unwrap_or_default(), arrival: None }
+        EnqueueReq { spec, score, kind, families: family.map(|f| vec![f.to_string()]).unwrap_or_default(), arrival: None, activated: false, force_dig: false }
     }
 
     fn spec_needs(file: &str, start: u32, end: u32) -> QueueItemSpec {
@@ -1158,6 +1261,8 @@ mod tests {
             kind: ItemKind::Suspicion,
             families: vec!["beta".into(), "gamma".into()],
             arrival: None,
+            activated: false,
+            force_dig: false,
         });
         assert_eq!(o, EnqueueOutcome::MergedPending);
         assert_eq!(q.items().len(), 1);
@@ -1494,7 +1599,7 @@ mod tests {
         let ripple_spec = spec_rule("b.rs", 1, 9);
         q.enqueue(req_kind(ripple_spec, ItemKind::Ripple, 0.1, None));
         let needs_spec = QueueItemSpec::new("c.rs".into(), vec![(1, 9)], QueueOrigin::Needs, vec![]).unwrap();
-        q.enqueue(EnqueueReq { spec: needs_spec, score: 0.5, kind: ItemKind::Needs, families: vec![], arrival: None });
+        q.enqueue(EnqueueReq { spec: needs_spec, score: 0.5, kind: ItemKind::Needs, families: vec![], arrival: None, activated: false, force_dig: false });
 
         let order: Vec<&str> = q.pending_order().into_iter().map(|i| q.items()[i].spec.file.as_str()).collect();
 
@@ -1597,7 +1702,7 @@ mod tests {
     fn needs_and_scan_in_the_same_block_are_one_item() {
         let b = blk("def:f1", 10, 40);
         let needs_spec = QueueItemSpec::new("a.rs".into(), vec![(10, 40)], QueueOrigin::Needs, vec![]).unwrap();
-        let needs = EnqueueReq { spec: needs_spec, score: 0.5, kind: ItemKind::Needs, families: vec![], arrival: Some("needs:a.rs:10-40:f".into()) };
+        let needs = EnqueueReq { spec: needs_spec, score: 0.5, kind: ItemKind::Needs, families: vec![], arrival: Some("needs:a.rs:10-40:f".into()), activated: false, force_dig: false };
         let mut q = DeepQueue::new();
         q.enqueue(Arrival { req: needs, block: b.clone(), risk_band: 0 });
         let o = q.enqueue(arr(spec_scan("a.rs", 12, 12, "q", "h"), Some("alpha"), b));
@@ -1674,7 +1779,7 @@ mod tests {
             .map(|k| Suspicion { confidence: conf, ..sus(file, line + k as u32, line + k as u32, "q", "h") })
             .collect();
         let spec = QueueItemSpec::new(file.into(), vec![(line, line)], QueueOrigin::Scan, notes).unwrap();
-        let req = EnqueueReq { spec, score: conf, kind: ItemKind::Suspicion, families: vec!["alpha".into()], arrival: None };
+        let req = EnqueueReq { spec, score: conf, kind: ItemKind::Suspicion, families: vec!["alpha".into()], arrival: None, activated: false, force_dig: false };
         let mut it = QueueItem::new(req, blk(&format!("def:{file}:{line}"), line, line), band);
         it.peak_agreement = peak;
         it

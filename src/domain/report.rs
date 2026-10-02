@@ -147,6 +147,32 @@ impl Coverage {
     }
 }
 
+/// 收敛三维（M21c 批 C，design §8.4）：**给 ship 循环的停止条件**——判「这个 PR 还要不要再跑一轮」，
+/// 与 `verdict` 正交。**不进 verdict、不改 exit code 五档**：一轮可以 approve（这轮没发现拦路问题）
+/// 却不收敛（台账里还挂着没挖的），那正是该再跑一轮的情形。
+///
+/// 三维取「与」。缺任一维都不收敛，各维的实际数一并留下，便于读报告的人知道差在哪。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Convergence {
+    /// 三维之与。
+    pub converged: bool,
+    /// 维度 1「无 blocking findings」。实现取 `verdict == approve`：reject 显然不收敛；
+    /// **incomplete 也判不收敛**——scanner 有格没跑成，疑点集有结构性缺口，这时候说「问题都找完了」没有依据。
+    /// 这比字面的「blocking 条数为 0」保守，保守的方向是对的（宁可多跑一轮）。
+    pub verdict_clean: bool,
+    /// 维度 2「台账无 delta 邻接未处理项」。口径为严格〔裁定 3，2026-10-02〕：
+    /// 台账里 `file ∈ 本轮变更集 ∧ status == dormant` 即算未处理，**含本轮刚被预算截断的**。
+    /// 于是「本轮有截断 → 不收敛」恒成立——这是特性不是缺陷：债就在你改的文件上，循环本就该再来一轮
+    /// （下轮预算重置、delta 多半已缩小）。死锁风险由活锁守卫兜底，所以守卫是本口径的配套而非可选项。
+    pub no_delta_adjacent: bool,
+    /// 维度 3「无激活超限项」：没有疑点的激活次数踩到停车门。
+    pub no_activation_overrun: bool,
+    /// 维度 2 的实际条数。
+    pub delta_adjacent: u32,
+    /// 维度 3 的实际条数（已停车、等人裁的疑点数）。
+    pub activation_overrun: u32,
+}
+
 /// 一条休眠疑点线索（`RunMeta::dormant_leads`）：台账里的历史截断项，落在本轮变更文件上。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct DormantLead {
@@ -293,6 +319,10 @@ pub struct RunMeta {
     /// 批 C 的增量激活会让其中被 delta 碰到的那些重新入队，那时它们才有机会成为 finding。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub dormant_leads: Vec<DormantLead>,
+    /// 收敛三维（M21c 批 C）。`None` = 本轮算不出（diff 重建不了，没有变更集做基准）——
+    /// 与窗口后滤同一处置：没有基准就不装作有一个结论。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence: Option<Convergence>,
     /// R3 stamp：证据收集实跑刻的 rev-parse HEAD（code 模式全路径回填；doc 为 None）。
     /// 增量轮以上轮此值为 delta base。serde default 兼容 v2。
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -388,6 +418,17 @@ pub struct DeepMeta {
     pub api_contract_spilled: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub api_contract_budget_skipped: u32,
+    // ── M21c 批 C 台账激活观测 ──
+    /// 由台账激活而重新入队的疑点数（上轮被截断、本轮 delta 碰到了它的文件）。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub ledger_activated: u32,
+    /// 判据过了但 quote 重锚不上、因而没入队的条数（代码改到锚失效）。与上一项分开记：
+    /// 「没激活」有两种完全不同的原因，合并成一个数就查不出是 delta 没碰到还是锚丢了。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub ledger_anchor_lost: u32,
+    /// 活锁守卫：激活到强制必挖门的条数。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub ledger_force_dig: u32,
     // ── C2 时间重叠观测（design v11 §6 / §12.3〔D15〕；为零不序列化，旧报告形状不变）──
     /// 收场（关闭入口）时刻，自深挖开跑起毫秒；与扫描同时开跑时即 scanner 段墙钟。resume 与开跑即关闭（无入队通道）时 0。
     #[serde(default, skip_serializing_if = "is_zero_u64")]

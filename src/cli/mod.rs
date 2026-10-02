@@ -354,6 +354,10 @@ pub async fn run_code_review(
         user_focus: &focus, spec_docs: &spec_section, repo_brief: &repo_brief, root,
         entries: &entries, samples: cfg.review.scanners.samples,
     };
+    // 台账激活的 warning 要跨出下面这个 if/else（`warnings` 本体在深挖收场后才建）。
+    let mut activation_warnings: Vec<String> = Vec::new();
+    // 重锚不上的条数单独记：与「delta 没碰到」是两种原因，合成一个数就查不出哪种。
+    let mut anchor_lost: u32 = 0;
     let (results, mut deep) = if roles.reviewers.is_empty() {
         (run_scan_fanout(registry, &input, sink, None).await, None)
     } else {
@@ -385,9 +389,15 @@ pub async fn run_code_review(
         // 首跑无往轮判决（resume 才有）。
         let no_known = BTreeMap::new();
         let thresholds = verdict_thresholds(args, cfg);
+        // 台账激活（M21c 批 C）：在深挖**开跑之前**算完并回写，激活项与 H0 同待遇即刻在队列里。
+        // resume 侧不重算（见那一处的注释）——激活标记随快照恢复，重算会把 activations 多加一轮。
+        let (activation, aw) = activate_dormant(root, &changed_files, head_sha.as_deref().unwrap_or(""));
+        activation_warnings = aw;
+        anchor_lost = activation.anchor_lost.len() as u32;
         let deep = run_deep(
             registry,
             DeepInput {
+                activated: &activation.activated,
                 route: deep_route.as_ref(),
                 scan_cells: &[],
                 bundles: &bundles,
@@ -432,6 +442,7 @@ pub async fn run_code_review(
     if let Some(s) = sink { s.on_phase(crate::state::Phase::Finalizing, None); }
     let mut warnings: Vec<String> = registry.warnings().to_vec();
     warnings.extend(spec_warnings);
+    warnings.append(&mut activation_warnings);
     // 空证据必须可观测（r1 20260703 事故：干净树 0 cell 秒出无警 approve 假绿灯）。
     if bundles.is_empty() {
         warnings.push(format!(
@@ -453,11 +464,13 @@ pub async fn run_code_review(
     if let Some(d) = deep.as_mut() {
         // 合并残差对账（design C2 §4〔D15〕）：scan 报告的组内闭包簇被队列逐条合并拆进多项的簇数。
         d.meta.queue_split_clusters = crate::consolidate::scan::split_clusters(&results.cells, &d.items);
+        // 重锚失败数记进观测（M21c 批 C）：激活算在深挖之前，而 meta 要等深挖跑完才在手上。
+        d.meta.ledger_anchor_lost = anchor_lost;
         // 疑点落账（M21c 批 A，design §8.2）：本轮被预算截断的疑点进跨轮台账，供下轮 delta 激活（批 C）。
         persist_dormant_suspicions(root, &d.items, head_sha.as_deref().unwrap_or(""), &mut warnings);
     }
-    // 披露本轮变更文件上的休眠线索（A-2）：只读、不进 verdict。落账之后读，所以本轮刚截断的也会出现。
-    let dormant_leads = read_dormant_leads(root, &changed_files);
+    // 披露本轮变更文件上的历史休眠线索（A-2，口径见 `read_dormant_leads`）：只读、不进 verdict。
+    let dormant_leads = read_dormant_leads(root, &changed_files, head_sha.as_deref().unwrap_or(""));
     let (report, code) = finish_scan_report(ScanFinish {
         folded: &folded,
         groups,
@@ -480,14 +493,28 @@ pub async fn run_code_review(
         reused: vec![],
     });
     match deep {
-        Some(deep) => Ok(overlay_deep(report, code, deep, args, cfg, registry, Some(&bundles), t0)),
+        Some(deep) => {
+            let (mut rep, code) = overlay_deep(report, code, deep, args, cfg, registry, Some(&bundles), t0);
+            attach_convergence(&mut rep, root, &changed_files);
+            Ok((rep, code))
+        }
         None => Ok((report, code)),
     }
 }
 
-/// 读本轮变更文件上的休眠疑点（M21c 批 A，A-2）：**只读、零副作用**——库不在就空，读失败也空（不打扰评审）。
+/// 读本轮变更文件上的**历史**休眠疑点（M21c 批 A A-2，口径在批 C 收紧）：**只读、零副作用**——
+/// 库不在就空，读失败也空（不打扰评审）。
 /// 这是披露面，不是判定面：它们没被深挖过、没有危害链论证，当 finding 用会把「没挖」误读成「有问题」。
-fn read_dormant_leads(cwd: &Path, changed_files: &[String]) -> Vec<crate::domain::DormantLead> {
+///
+/// **`last_job == 本轮 round` 的不列**（批 C 订正）：落账在深挖之后、披露在落账之后，所以本轮刚被截断的
+/// 疑点也躺在表里。批 A 原样列了它们，于是真实数据里 4 轮共 164 条披露中有 159 条是本轮自产——
+/// 一批「本轮没挖完」被同一份报告以「历史线索」的身份又说了一遍，读者会当成挂了好几轮没人管。
+/// 本轮截断量由 `deep.budget_skipped` 表达，同一事实不在两处各记一套。
+///
+/// 剩下的就是真正有话要说的那一类：**台账里挂着、文件这轮也改了、却没能激活回来**的项
+/// （重锚失败，或被「上轮 incomplete」闸门挡住）——正是需要人看一眼的集合。
+/// 已激活的不在此列：它们 `status` 已是 `activated`、进了队列，由 finding 或截断记账接手。
+fn read_dormant_leads(cwd: &Path, changed_files: &[String], round: &str) -> Vec<crate::domain::DormantLead> {
     if changed_files.is_empty() {
         return vec![];
     }
@@ -498,7 +525,7 @@ fn read_dormant_leads(cwd: &Path, changed_files: &[String]) -> Vec<crate::domain
     let Ok(db) = crate::db::ProjDb::open_read_only(&p) else { return vec![] };
     let Ok(rows) = db.suspicions_for_files(changed_files) else { return vec![] };
     rows.into_iter()
-        .filter(|r| r.status == "dormant")
+        .filter(|r| r.status == crate::orchestrate::ledger::STATUS_DORMANT && r.last_job != round)
         .map(|r| {
             let line = serde_json::from_str::<serde_json::Value>(&r.json)
                 .ok()
@@ -1244,6 +1271,107 @@ pub fn attach_cells(store: &crate::state::JobStore, job_id: &str, report: &mut R
 /// - **不建库**：项目没 `init` 过就跳过（与 `load_ledger` 的 zero-config 同口径，评审不该有建库副作用）；
 /// - **不败评审**：写失败只记 warning（与队列快照同口径，design §7.1）——台账是增益，不该让一轮评审失败；
 /// - 轮次标识用 `head_sha`：前台裸跑没有 job_id，而台账要的本就是「第一次/最近一次见到它是哪个 HEAD」。
+/// 收敛三维装配（M21c 批 C，design §8.4）：在 `overlay_deep` **之后**调用——维度 1 读的是最终 verdict，
+/// 维度 2 读的是**落账之后**的台账（裁定 3 要求截断项计入）。两个前置顺序都不能提前。
+///
+/// `changed_files` 为空（diff 重建不了）→ 不设字段：没有变更集就没有「delta 邻接」可言，
+/// 装一个 `converged: false` 进去等于凭空断言，与窗口后滤「没有基准就不重算也不复位」同一处置。
+fn attach_convergence(report: &mut crate::domain::ReviewReport, cwd: &Path, changed_files: &[String]) {
+    use crate::domain::report::Convergence;
+    if changed_files.is_empty() {
+        return;
+    }
+    let p = crate::db::project_db_path(cwd);
+    let (delta_adjacent, activation_overrun) = if p.exists() {
+        crate::db::ProjDb::open_read_only(&p)
+            .ok()
+            .and_then(|db| db.suspicions_for_files(changed_files).ok())
+            .map(|rows| {
+                let dormant = rows.iter().filter(|r| r.status == crate::orchestrate::ledger::STATUS_DORMANT).count() as u32;
+                let over = rows
+                    .iter()
+                    .filter(|r| r.activations >= crate::orchestrate::ledger::ACTIVATION_PARK)
+                    .count() as u32;
+                (dormant, over)
+            })
+            .unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    let verdict_clean = report.verdict == crate::domain::Verdict::Approve;
+    let no_delta_adjacent = delta_adjacent == 0;
+    let no_activation_overrun = activation_overrun == 0;
+    report.run.convergence = Some(Convergence {
+        converged: verdict_clean && no_delta_adjacent && no_activation_overrun,
+        verdict_clean,
+        no_delta_adjacent,
+        no_activation_overrun,
+        delta_adjacent,
+        activation_overrun,
+    });
+}
+
+/// 台账激活（M21c 批 C，design §8.3）：读本轮变更文件上的休眠疑点，按判据挑出该重新入队的，
+/// 回写台账后交给深挖。返回 (待入队项, warning)。
+///
+/// 边界与落账同档：不建库、不败评审（读写失败只记 warning）、无轮次标识（非 git / 无 commit）直接跳过。
+///
+/// **闸门**：上一轮 verdict = Incomplete 时整轮不激活。Incomplete 意味着 scanner 有格没跑成，
+/// 那一轮的疑点集有结构性选择偏差——基于它落的账说不清「这个区域真的只有这些问题」，
+/// 据此激活等于把一次残缺扫描的结论当跨轮证据用。
+fn activate_dormant(
+    cwd: &Path,
+    changed_files: &[String],
+    round: &str,
+) -> (crate::orchestrate::ledger::ActivationOutcome, Vec<String>) {
+    use crate::orchestrate::ledger::ActivationOutcome;
+    let mut warnings = Vec::new();
+    if round.is_empty() || changed_files.is_empty() {
+        return (ActivationOutcome::default(), warnings);
+    }
+    let p = crate::db::project_db_path(cwd);
+    if !p.exists() {
+        return (ActivationOutcome::default(), warnings);
+    }
+    // 旧 schema 库不在这里迁移（与落账同口径）：`open_at` 会触发整库快照 + 丢弃评审史，
+    // 而激活只是「顺手把往轮的线索捞回来」，不该带这种副作用。迁移交给显式写入口。
+    if !crate::db::ProjDb::is_current_version(&p) {
+        return (ActivationOutcome::default(), warnings);
+    }
+    let db = match crate::db::ProjDb::open_at(&p) {
+        Ok(db) => db,
+        Err(e) => {
+            warnings.push(format!("ledger: 台账打不开，本轮不激活休眠疑点（{e}）"));
+            return (ActivationOutcome::default(), warnings);
+        }
+    };
+    if db.last_verdict().ok().flatten().as_deref() == Some("incomplete") {
+        warnings.push("ledger: 上轮 verdict = incomplete（扫描不全、疑点集有选择偏差）→ 本轮不激活休眠疑点".into());
+        return (ActivationOutcome::default(), warnings);
+    }
+    let rows = match db.suspicions_for_files(changed_files) {
+        Ok(r) => r,
+        Err(e) => {
+            warnings.push(format!("ledger: 台账读失败，本轮不激活休眠疑点（{e}）"));
+            return (ActivationOutcome::default(), warnings);
+        }
+    };
+    let out = crate::orchestrate::ledger::activations_for(&rows, round, cwd);
+    for a in &out.activated {
+        if let Err(e) = db.suspicion_activate(&a.row_id, round) {
+            warnings.push(format!("ledger: 激活回写失败 {}（{e}）", a.row_id));
+        }
+        // 停车（活锁守卫第二段）：激活到门槛仍没晋升过，机制已经给过两次自愈机会，交人。
+        if a.park {
+            warnings.push(format!(
+                "ledger: 疑点 {}（{}:{}）已被 delta 激活 {} 次仍未晋升为 finding——机制挖不动它，请人工判一次：{}",
+                a.row_id, a.suspicion.file, a.suspicion.line_start, a.activations, a.suspicion.hint
+            ));
+        }
+    }
+    (out, warnings)
+}
+
 fn persist_dormant_suspicions(cwd: &Path, items: &[crate::orchestrate::queue::QueueItem], round: &str, warnings: &mut Vec<String>) {
     // 没有轮次标识就别落账（收口评审 #7）：`first_job` 一旦以空串钉死就永远不再更新，
     // 批 C 按轮次判增量时会把这些行当成合法轮次参与比较。与「不建库」同一档边界。
@@ -1564,6 +1692,8 @@ pub async fn run_resume(
                 }
             };
             let selected = select_files(changes);
+            // 收敛维度 2 要的变更集（`selected` 下面会被 `plan_cells` 吃掉，先抄路径）。
+            let changed_now: Vec<String> = selected.iter().map(|c| c.path.clone()).collect();
             // 阶段 0 路由按当前 diff 重算（design C2 §6〔D15〕）：H0 每轮幂等重入队（快照为空时等于重建）；连队列头与原报告 risk 段
             // 都没有时，预算也退到重算值（缺省 4 会把首跑留下的项截掉）。
             let prior_risk = prior.as_ref().and_then(|r| r.run.risk.clone());
@@ -1630,6 +1760,10 @@ pub async fn run_resume(
             let deep = run_deep(
                 registry,
                 DeepInput {
+                    // resume 不重算激活（M21c 批 C）：同一个 job 续跑，HEAD 没变、delta 没变，
+                    // 首跑已经激活过的项带着 `activated` / `force_dig` 标记从快照恢复。
+                    // 这里重算会让同一轮的 `activations` 多加一次，把活锁守卫的门提前踩响。
+                    activated: &[],
                     route: route_now.as_ref(),
                     // 全部成功 scanner 格按到达键幂等入队：首跑已到达的疑点跳过，补跑出的新疑点照常入队；旧快照（无到达键）走谓词合并兜底
                     scan_cells: &scan_cells,
@@ -1685,6 +1819,7 @@ pub async fn run_resume(
             let over = overlay_deep(report, code, deep, &args, cfg, registry, Some(&bundles), t0);
             report = over.0;
             code = over.1;
+            attach_convergence(&mut report, cwd, &changed_now);
         }
     }
     // 回写 proj.db：resume 产出的合并报告覆盖扇出原始落盘（否则 result 命令永远返回旧报告）。终态字段不动。
@@ -2621,6 +2756,8 @@ mod resume_tests {
             kind: crate::orchestrate::queue::ItemKind::Primary,
             dispatch_agreement: 1, landed_agreement: Some(1), families: vec![], enqueued_ms: None,
             arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
+            activated: false,
+            force_dig: false,
         };
         store.put_queue_item("j", &item).unwrap();
         store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
@@ -2664,7 +2801,7 @@ mod resume_tests {
             id: format!("{file}:rule:1-2"), spec, score: 1.0, agreement: 1, state,
             kind: crate::orchestrate::queue::ItemKind::Primary,
             dispatch_agreement: 1, landed_agreement: None, families: vec![], enqueued_ms: None,
-            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
+            arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0, activated: false, force_dig: false,
         }
     }
 
@@ -2877,6 +3014,8 @@ mod resume_tests {
             dispatch_agreement: 1, landed_agreement: None, families: vec!["alpha".into()], enqueued_ms: None,
             arrivals: vec![], members: vec![sus], member_families: vec![vec!["alpha".into()]],
             block: Default::default(), peak_agreement: 0, risk_band: 0,
+            activated: false,
+            force_dig: false,
         }).unwrap();
         let (reg, _rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
 
@@ -2947,6 +3086,8 @@ mod resume_tests {
             dispatch_agreement: 1, landed_agreement: None, families: vec!["alpha".into()], enqueued_ms: None,
             arrivals: vec![], members: vec![sus], member_families: vec![vec!["alpha".into()]],
             block: Default::default(), peak_agreement: 0, risk_band: 0,
+            activated: false,
+            force_dig: false,
         }).unwrap();
         let (reg, _rev) = deep_registry(r#"{"findings":[],"needs":[]}"#);
 
@@ -3883,6 +4024,64 @@ mod code_review_tests {
         assert!(report.run.coverage.failed.contains_key(&Role::Reviewer));
     }
 
+    /// 台账激活走通**首跑整条链**（M21c 批 C）：台账里有往轮挂着的疑点、本轮 delta 碰到它的文件
+    /// → 激活 → 入队 → 观测可见 → 台账状态回写。
+    ///
+    /// 为什么要有这条而不是只测各段：M21d 批 A 的 `needs{api}` 各段都绿、接起来不通——
+    /// `run_code_review` 里那个参数恒空，整条链一轮都没真正跑过。所以这条**从 CLI 入口跑**，
+    /// 并且反面也钉住：换成同一个 head（同 HEAD 重跑）时激活数必须是 0。
+    #[tokio::test]
+    async fn ledger_activation_runs_end_to_end_from_the_cli_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        crate::project::init_project(dir.path()).unwrap();
+        let db = crate::db::ProjDb::open(dir.path()).unwrap();
+        db.suspicion_upsert(&crate::db::SuspicionRow {
+            id: "r1".into(), file: "src/a.rs".into(), quote_norm: "db.write(token);".into(),
+            hint: "往轮被截断的".into(), status: "dormant".into(),
+            first_job: "sha0".into(), last_job: "sha1".into(), activations: 0,
+            json: serde_json::json!({"line_start": 2, "quote": "db.write(token);", "confidence": 0.6}).to_string(),
+        }).unwrap();
+        drop(db);
+
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let turn = |t: String| AssistantTurn { text: t, tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None };
+        let mk_reg = || {
+            let mut reg = ProviderRegistry::new();
+            reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(turn(r#"{"suspicions":[],"scanned_areas":[]}"#.into()))), std::time::Duration::from_secs(5), 0);
+            reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(turn(r#"{"findings":[],"needs":[]}"#.into()))), std::time::Duration::from_secs(5), 0);
+            reg
+        };
+        let changes = || vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
+
+        // 新 head → 激活
+        let (report, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), dir.path(), Some("sha2".into()), None).await.unwrap();
+        let deep = report.run.deep.as_ref().expect("有 reviewer 就该有深挖段");
+        assert_eq!(deep.ledger_activated, 1, "首跑整条链要把台账项激活进队列: {:?}", report.run.warnings);
+        assert_eq!(deep.ledger_anchor_lost, 0);
+
+        // 台账已回写：状态单向推进、计数 +1
+        let db = crate::db::ProjDb::open(dir.path()).unwrap();
+        let row = db.suspicions_for_files(&["src/a.rs".into()]).unwrap().into_iter().next().unwrap();
+        assert_eq!((row.status.as_str(), row.activations, row.last_job.as_str()), ("activated", 1, "sha2"));
+        drop(db);
+
+        // 反面：同 HEAD 重跑不激活（没有新 delta）。另起一个项目，台账的 last_job 就是本轮 head。
+        let d2 = tempfile::tempdir().unwrap();
+        write(d2.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
+        crate::project::init_project(d2.path()).unwrap();
+        let db2 = crate::db::ProjDb::open(d2.path()).unwrap();
+        db2.suspicion_upsert(&crate::db::SuspicionRow {
+            id: "r1".into(), file: "src/a.rs".into(), quote_norm: "db.write(token);".into(),
+            hint: "本轮刚截断的".into(), status: "dormant".into(),
+            first_job: "sha9".into(), last_job: "sha9".into(), activations: 0,
+            json: serde_json::json!({"line_start": 2, "quote": "db.write(token);", "confidence": 0.6}).to_string(),
+        }).unwrap();
+        drop(db2);
+        let (rep2, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), d2.path(), Some("sha9".into()), None).await.unwrap();
+        assert_eq!(rep2.run.deep.as_ref().unwrap().ledger_activated, 0, "同 HEAD 重跑不该激活");
+    }
+
     /// 空变更集：0 cell、warning 可观测、scan-only / 0（不是假绿灯 approve）。
     #[tokio::test]
     async fn scan_review_empty_changes_is_scan_only_with_warning() {
@@ -4021,6 +4220,8 @@ mod code_review_tests {
                 dispatch_agreement: 1, landed_agreement: None, families: vec![], enqueued_ms: None,
                 arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(),
                 peak_agreement: 0, risk_band: 0,
+                activated: false,
+                force_dig: false,
             }
         };
         let deep = crate::orchestrate::deep::DeepRun {
@@ -4828,8 +5029,11 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(rt.join("proj.db").is_file() && !rt.join("proj-next.db").exists(), "落账路径要接管分支期库");
 
-        let leads = read_dormant_leads(tmp.path(), &["a.rs".into()]);
-        assert_eq!(leads.len(), 1, "披露路径读得到刚落的账: {leads:?}");
+        // 口径（批 C 收紧）：本轮刚落的账**不**在本轮披露——那是「本轮没挖完」，由 `budget_skipped` 记。
+        assert!(read_dormant_leads(tmp.path(), &["a.rs".into()], "sha1").is_empty(), "本轮自产不进披露段");
+        // 换一轮再读，它才是「往轮挂着的历史项」。
+        let leads = read_dormant_leads(tmp.path(), &["a.rs".into()], "sha2");
+        assert_eq!(leads.len(), 1, "下一轮读得到上一轮落的账: {leads:?}");
         assert_eq!(leads[0].hint, "可疑");
     }
 
@@ -4850,16 +5054,135 @@ mod tests {
         db.suspicion_upsert(&row("s3", "a.rs", "promoted")).unwrap();      // 已晋升，不再是线索
         drop(db);
 
-        let leads = read_dormant_leads(tmp.path(), &["a.rs".into()]);
+        let leads = read_dormant_leads(tmp.path(), &["a.rs".into()], "sha2");
         assert_eq!(leads.len(), 1, "只披露本轮变更文件上、仍处 dormant 的那条: {leads:?}");
         assert_eq!((leads[0].file.as_str(), leads[0].line, leads[0].activations), ("a.rs", 42, 1));
         assert_eq!(leads[0].first_round, "sha0", "首次见到它的那轮");
 
         // 零副作用：没 init 过的目录、空变更集都返回空且不建库
         let bare = tempfile::tempdir().unwrap();
-        assert!(read_dormant_leads(bare.path(), &["a.rs".into()]).is_empty());
+        assert!(read_dormant_leads(bare.path(), &["a.rs".into()], "sha2").is_empty());
         assert!(!bare.path().join(".redteam").exists(), "披露不得建库");
-        assert!(read_dormant_leads(tmp.path(), &[]).is_empty(), "空变更集不该退化成全表");
+        assert!(read_dormant_leads(tmp.path(), &[], "sha2").is_empty(), "空变更集不该退化成全表");
+        // 本轮自产（`last_job == round`）不列：s1 的 last_job 是 sha1。
+        assert!(read_dormant_leads(tmp.path(), &["a.rs".into()], "sha1").is_empty(), "本轮刚截断的不算历史线索");
+    }
+
+    // ───────────────────────── 批 C：激活闸门与收敛三维 ─────────────────────────
+
+    /// 造一个带 `a.rs` 与一条休眠台账行的项目；`last_job` 由调用方给。
+    fn ledger_fixture(last_job: &str, activations: i64) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        crate::project::init_project(t.path()).unwrap();
+        std::fs::write(t.path().join("a.rs"), "fn f() {\n    let x = take(v);\n}\n").unwrap();
+        let db = crate::db::ProjDb::open(t.path()).unwrap();
+        db.suspicion_upsert(&crate::db::SuspicionRow {
+            id: "r1".into(), file: "a.rs".into(), quote_norm: "letx=take(v);".into(),
+            hint: "边界没校验".into(), status: "dormant".into(),
+            first_job: "sha0".into(), last_job: last_job.into(), activations,
+            json: serde_json::json!({"line_start": 2, "quote": "let x = take(v);", "confidence": 0.6}).to_string(),
+        }).unwrap();
+        t
+    }
+
+    /// 激活闸门（design §8.3）：上一轮 verdict = incomplete → 整轮不激活，并说清为什么。
+    /// incomplete 意味着 scanner 有格没跑成，那一轮的疑点集有结构性缺口——据此激活
+    /// 等于把一次残缺扫描的结论当跨轮证据用。
+    #[test]
+    fn activation_is_gated_by_the_previous_rounds_verdict() {
+        let t = ledger_fixture("sha1", 0);
+        let files = vec!["a.rs".to_string()];
+
+        // 没有历史轮次 → 无闸门，正常激活
+        let (out, warns) = activate_dormant(t.path(), &files, "sha2");
+        assert_eq!(out.activated.len(), 1, "{out:?} {warns:?}");
+        assert!(warns.is_empty(), "{warns:?}");
+
+        // 回写已生效：状态机单向，同一行不会被激活第二次
+        let (again, _) = activate_dormant(t.path(), &files, "sha3");
+        assert!(again.activated.is_empty(), "已 activated 的行不再激活: {again:?}");
+
+        // 上轮 incomplete → 闸门落下
+        let t2 = ledger_fixture("sha1", 0);
+        let db = crate::db::ProjDb::open(t2.path()).unwrap();
+        db.result_put_json("j1", r#"{"verdict":"incomplete"}"#).unwrap();
+        drop(db);
+        let (gated, warns) = activate_dormant(t2.path(), &files, "sha2");
+        assert!(gated.activated.is_empty(), "上轮 incomplete 时不激活: {gated:?}");
+        assert!(warns.iter().any(|w| w.contains("incomplete")), "要说清为什么没激活: {warns:?}");
+
+        // 上轮 approve → 不挡
+        let t3 = ledger_fixture("sha1", 0);
+        let db = crate::db::ProjDb::open(t3.path()).unwrap();
+        db.result_put_json("j1", r#"{"verdict":"approve"}"#).unwrap();
+        drop(db);
+        assert_eq!(activate_dormant(t3.path(), &files, "sha2").0.activated.len(), 1, "approve 不该挡");
+    }
+
+    /// 停车（活锁守卫第二段）：激活次数踩到门 → 报告里给人一句能看懂的话。
+    #[test]
+    fn parking_a_livelocked_suspicion_produces_a_readable_warning() {
+        use crate::orchestrate::ledger::ACTIVATION_PARK;
+        let t = ledger_fixture("sha1", ACTIVATION_PARK - 1);
+        let (out, warns) = activate_dormant(t.path(), &["a.rs".to_string()], "sha2");
+        assert_eq!(out.activated.len(), 1);
+        assert!(out.activated[0].park && out.activated[0].force_dig, "{:?}", out.activated[0]);
+        let w = warns.iter().find(|w| w.contains("人工")).expect(&format!("要有停车提示: {warns:?}"));
+        assert!(w.contains("边界没校验") && w.contains("a.rs"), "提示要带得上位置与线索: {w}");
+    }
+
+    /// 收敛三维（design §8.4）：三维取与，**任一维为假都不收敛**，且 verdict / exit code 不受影响。
+    #[test]
+    fn convergence_is_the_conjunction_of_three_dimensions() {
+        use crate::domain::report::Convergence;
+        let blank = |v: Verdict| ReviewReport {
+            run: Default::default(), verdict: v, stats: Default::default(), findings: vec![],
+            scan: None, cells: vec![], clusters: Default::default(), schema_version: Default::default(),
+        };
+        let files = vec!["a.rs".to_string()];
+
+        // 维度 2 为假：台账里有落在变更文件上的 dormant 行
+        let t = ledger_fixture("sha1", 0);
+        let mut rep = blank(Verdict::Approve);
+        attach_convergence(&mut rep, t.path(), &files);
+        let c: Convergence = rep.run.convergence.clone().unwrap();
+        assert_eq!((c.converged, c.verdict_clean, c.no_delta_adjacent), (false, true, false), "{c:?}");
+        assert_eq!(c.delta_adjacent, 1);
+        assert_eq!(rep.verdict, Verdict::Approve, "收敛不进 verdict");
+
+        // 维度 1 为假：reject / incomplete 都不算干净
+        for v in [Verdict::Reject, Verdict::Incomplete] {
+            let mut r = blank(v);
+            attach_convergence(&mut r, t.path(), &files);
+            assert!(!r.run.convergence.as_ref().unwrap().verdict_clean, "{v:?} 不该算干净");
+        }
+
+        // 三维都真 → 收敛：变更集换成台账里没有的文件
+        let mut clean = blank(Verdict::Approve);
+        attach_convergence(&mut clean, t.path(), &["other.rs".to_string()]);
+        let c2 = clean.run.convergence.clone().unwrap();
+        assert!(c2.converged && c2.no_delta_adjacent && c2.no_activation_overrun, "{c2:?}");
+
+        // 维度 3 为假：有激活超限项（verdict 干净、文件也没有别的 dormant 行）
+        let t3 = tempfile::tempdir().unwrap();
+        crate::project::init_project(t3.path()).unwrap();
+        let db = crate::db::ProjDb::open(t3.path()).unwrap();
+        db.suspicion_upsert(&crate::db::SuspicionRow {
+            id: "r9".into(), file: "a.rs".into(), quote_norm: "q".into(), hint: "h".into(),
+            status: "activated".into(), first_job: "sha0".into(), last_job: "sha1".into(),
+            activations: crate::orchestrate::ledger::ACTIVATION_PARK, json: "{}".into(),
+        }).unwrap();
+        drop(db);
+        let mut over = blank(Verdict::Approve);
+        attach_convergence(&mut over, t3.path(), &files);
+        let c3 = over.run.convergence.clone().unwrap();
+        assert_eq!((c3.converged, c3.no_delta_adjacent, c3.no_activation_overrun), (false, true, false), "{c3:?}");
+        assert_eq!(c3.activation_overrun, 1);
+
+        // diff 重建不了（空变更集）→ 不设字段，而不是装一个 false
+        let mut none = blank(Verdict::Approve);
+        attach_convergence(&mut none, t.path(), &[]);
+        assert!(none.run.convergence.is_none(), "没有基准就不该断言收敛与否");
     }
 
     /// 落账的两条边界（M21c 批 A）：**不建库**（项目没 init 过就跳过，评审不该有建库副作用，

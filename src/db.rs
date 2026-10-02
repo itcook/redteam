@@ -658,6 +658,31 @@ impl ProjDb {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// 激活回写（M21c 批 C）：`dormant` → `activated`、计数 +1、`last_job` 记本轮。
+    /// **条件带 `status = 'dormant'`**：并发或重复调用时第二次写不进去，激活次数不会被同一轮多加一次。
+    pub fn suspicion_activate(&self, id: &str, job: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE suspicions SET status='activated', activations=activations+1, last_job=?2
+             WHERE id=?1 AND status='dormant'",
+            rusqlite::params![id, job],
+        )?;
+        Ok(())
+    }
+
+    /// 上一轮的裁决（M21c 批 C 的激活闸门，design §8.3「上轮 verdict = Incomplete 时台账疑点不可信」）。
+    ///
+    /// 取 `results` 里最近一条——激活发生在本轮写结果**之前**，所以最近一条必定是上一轮。
+    /// 没有历史轮次（首次在本仓跑）→ `None`，调用方按「无闸门」处理：台账本来也是空的。
+    pub fn last_verdict(&self) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT json FROM results ORDER BY created_at DESC LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        let Some(r) = rows.next()? else { return Ok(None) };
+        let js: String = r.get(0)?;
+        Ok(serde_json::from_str::<serde_json::Value>(&js)
+            .ok()
+            .and_then(|v| v.get("verdict").and_then(|x| x.as_str().map(str::to_string))))
+    }
+
     pub fn active_ids(&self) -> Result<HashSet<String>> {
         let mut stmt = self
             .conn
@@ -1522,6 +1547,34 @@ mod guard_tests {
         // 按文件查：不匹配的文件与空入参都不返回（空入参不得退化成全表）
         assert!(db.suspicions_for_files(&["b.rs".into()]).unwrap().is_empty());
         assert!(db.suspicions_for_files(&[]).unwrap().is_empty());
+    }
+
+    /// 激活回写只认 `dormant`（M21c 批 C）：`WHERE status='dormant'` 这个条件是幂等护栏——
+    /// 同一轮里重复调用（或与别的写者撞上）时第二次写不进去，激活次数不会被同一轮多加一次。
+    /// 没有它，活锁守卫的门会被重复调用提前踩响，把一条正常的疑点误判成「机制挖不动」。
+    #[test]
+    fn activation_writeback_only_advances_a_dormant_row_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ProjDb::open(dir.path()).unwrap();
+        let row = |id: &str, status: &str| SuspicionRow {
+            id: id.into(), file: "a.rs".into(), quote_norm: "q".into(), hint: "h".into(),
+            status: status.into(), first_job: "sha0".into(), last_job: "sha1".into(),
+            activations: 0, json: "{}".into(),
+        };
+        db.suspicion_upsert(&row("d1", "dormant")).unwrap();
+        db.suspicion_upsert(&row("p1", "promoted")).unwrap();
+
+        db.suspicion_activate("d1", "sha2").unwrap();
+        db.suspicion_activate("d1", "sha3").unwrap(); // 第二次：状态已非 dormant，写不进去
+        db.suspicion_activate("p1", "sha2").unwrap(); // 已晋升的行不该被拉回 activated
+
+        let got = db.suspicions_for_files(&["a.rs".into()]).unwrap();
+        let d1 = got.iter().find(|r| r.id == "d1").unwrap();
+        assert_eq!((d1.status.as_str(), d1.activations, d1.last_job.as_str()), ("activated", 1, "sha2"),
+                   "只认第一次：计数 1、last_job 停在 sha2");
+        let p1 = got.iter().find(|r| r.id == "p1").unwrap();
+        assert_eq!((p1.status.as_str(), p1.activations, p1.last_job.as_str()), ("promoted", 0, "sha1"),
+                   "非 dormant 的行一个字段都不该动");
     }
 
     /// 旧库有数据、**且台账表与 v4 不同构**（这里 dismissed 只有 3 列）→ 拒开：文案指向导出脚本与库路径、
