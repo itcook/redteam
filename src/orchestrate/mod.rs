@@ -366,7 +366,7 @@ pub fn scan_cell_record(
         Ok(call) => {
             let anchored = anchor_suspicions_within(root, call.output, changed);
             let mut notes = scan_cell_notes(
-                &call.stats, anchored.dropped, anchored.dropped_unreadable, thinking_pinned, call.reasoning_tokens, call.output_tokens,
+                &call.stats, anchored.dropped, anchored.dropped_unreadable, anchored.relocated, thinking_pinned, call.reasoning_tokens, call.output_tokens,
                 anchored.output.suspicions.len(),
             );
             if let Some(n) = call.repair_note {
@@ -397,10 +397,12 @@ pub fn scan_cell_record(
     (record, output)
 }
 /// cell warn 片段：parse 丢弃 / 截断计数、锚定丢弃、零推理观测——不静默（批 D-1 注释「丢弃 / 截断计数由调用方写进 cell warn」）。
+#[allow(clippy::too_many_arguments)] // 纯展平的观测入参：打包成结构体只会多一层间接、不增可读性
 fn scan_cell_notes(
     st: &crate::provider::parse::ScanParseStats,
     dropped: u32,
     unreadable: u32,
+    relocated: u32,
     pinned: bool,
     reasoning: Option<u64>,
     output_tokens: u64,
@@ -424,6 +426,11 @@ fn scan_cell_notes(
     }
     if unreadable > 0 {
         notes.push(format!("{unreadable} suspicions dropped: file unreadable"));
+    }
+    // 跨文件重定位救回的（B-3）：加了观测就得有出口，否则这一层在真实运行里不可见——
+    // 本批自己踩过（字段加完没人消费，和 `Phase::Verify` 同一类形状）。
+    if relocated > 0 {
+        notes.push(format!("{relocated} suspicions relocated: quote found in another changed file"));
     }
     if pinned && reasoning == Some(0) && output_tokens < ZERO_REASONING_SHORT_OUTPUT_TOKENS {
         notes.push(format!("pinned thinking but zero reasoning tokens (output {output_tokens} tokens)"));
@@ -588,6 +595,13 @@ mod scan_tests {
         assert!(
             anchored.iter().any(|s| s.file == "src/f0.rs" && s.line_start == 2),
             "quote 真实、file 写错 → 该被重定位救回并改写归属: {anchored:?}"
+        );
+        // 救回来这件事要在 cell 记录里看得见——加了观测没出口等于这一层在真实运行里不可见
+        // （本批自己踩过：`relocated` 字段加完没人消费，和 `Phase::Verify` 同一类形状）。
+        assert!(
+            res.cells.iter().any(|c| c.record.warn.as_deref().unwrap_or("").contains("relocated")),
+            "重定位要进 cell notes: {:?}",
+            res.cells.iter().map(|c| &c.record.warn).collect::<Vec<_>>()
         );
     }
 
@@ -903,12 +917,12 @@ mod scan_tests {
         let unpinned = vec![entry("p/a", "alpha", false)];
         let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &unpinned, 1), None, None).await;
         assert!(!res2.cells[0].record.warn.as_deref().unwrap().contains("zero reasoning"));
-        assert!(!scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 300, 1).iter().any(|n| n.contains("zero reasoning")));
-        assert!(scan_cell_notes(&Default::default(), 0, 0, true, Some(0), 10, 1).len() == 1);
+        assert!(!scan_cell_notes(&Default::default(), 0, 0, 0, true, Some(0), 300, 1).iter().any(|n| n.contains("zero reasoning")));
+        assert!(scan_cell_notes(&Default::default(), 0, 0, 0, true, Some(0), 10, 1).len() == 1);
         // 零疑点短输出（出口验收）：0 疑点 + 883 token → warn；0 疑点但输出正常体量不 warn；有疑点不 warn。
-        assert!(scan_cell_notes(&Default::default(), 0, 0, false, None, 883, 0).iter().any(|n| n.contains("0 suspicions with short output")));
-        assert!(scan_cell_notes(&Default::default(), 0, 0, false, None, 9_000, 0).is_empty());
-        assert!(scan_cell_notes(&Default::default(), 0, 0, false, None, 883, 1).is_empty());
-        assert!(scan_cell_notes(&Default::default(), 0, 0, true, None, 10, 1).is_empty(), "provider 不分列 → 不报");
+        assert!(scan_cell_notes(&Default::default(), 0, 0, 0, false, None, 883, 0).iter().any(|n| n.contains("0 suspicions with short output")));
+        assert!(scan_cell_notes(&Default::default(), 0, 0, 0, false, None, 9_000, 0).is_empty());
+        assert!(scan_cell_notes(&Default::default(), 0, 0, 0, false, None, 883, 1).is_empty());
+        assert!(scan_cell_notes(&Default::default(), 0, 0, 0, true, None, 10, 1).is_empty(), "provider 不分列 → 不报");
     }
 }
