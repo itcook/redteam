@@ -918,3 +918,27 @@ B-1 判例摘要进快扫 prompt（那个槽从来是空的，两个构造点都
 ### Status
 
 [OK] **Completed**
+
+
+## Session 31: M21c 批 D：出口核验与里程碑收口
+<!-- trellis-session: v=2 fp=998ed182a59d0c71 -->
+
+**Date**: 2026-10-03
+**Task**: M21c 批 D：出口核验与里程碑收口
+**Branch**: `feat/m21c-dogfood`
+
+### Summary
+
+验收批。五条出口验收逐条核验、每条附可追证据，明细在私有记录。补了两项缺的：① 收敛可达——前四轮 converged 恒 false（各有 20+ 条预算截断，维度 2 恒假），followup 早记过「在固定靶子上不可证伪」；本批跑了个预算够用的小 diff（一行无害改动 + --block-threshold critical），得到 approve、budget_skipped=0、converged:true、exit=0，首次在真实运行里观测到收敛可达，同时补上 exit code 0 档的真跑覆盖，也反过来印证前四轮的 false 是对的。② 重复报率——第一次算用错了分母（本仓那三轮的 diff 各不相同、不是「同一 PR」），与 M21d C-1 同一类错；正确分母是 PR181 同 HEAD 的两对连续轮，file:line 口径 47-51%、finding id 口径 0%，说明机制在同一处反复报但每次措辞不同，坐实了判例该用机械匹配而非 id 精确匹配，且这是判例前移落地前的基线。一处差点误判：PR181 那轮 24 格 attempts>1 一度当成修复轮（切名门要求为 0），查下去 queue_wait_ms 全 0、provider_rate_limit 空、needs_two_stage_triggered 恰好等于 24，是二阶段补查轮；根因是 attempts 把修复轮、补查轮、429 重试混进一个数。准备跑 ship 时又查出一个会卡住 r2 的协议缺口：ship 从 r2 起加 --incremental-from 而那条路径按批 C 裁定仍 bail，而 ship.md 的守卫报错清单是穷举式的、这条不在列，已补降级条目。最后用户裁定 ship 不在 M21c 范围内、单独成一个调整/优化/重构单元，于是交付项 9 的另两句（修复回流、台账激活观测到一例 12 例）标 ✅，M21c 五批全部交付、里程碑标 ✅。新记五笔账，其中「ship 作为独立单元」一节列了六条已攒齐的输入条件。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8e020cf` | docs(roadmap,plan,followup,private): 批 D 出口核验——五条逐条过，但出口有一处未达成 |
+| `0d0a21f` | docs(ship): 守卫清单补「增量轮尚未恢复」——否则 r2 大概率卡住 |
+| `8fe9ff2` | docs(roadmap,plan,followup): M21c ✅ 收口——ship 内循环挪出、单独成单元 |
+
+### Status
+
+[OK] **Completed**
