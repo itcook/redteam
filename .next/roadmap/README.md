@@ -36,7 +36,7 @@
 | **P0** | 验证门 | E1 PR181 回放定风险规则与预算形状；E3 疑点契约召回；grill → design 锁定、M21 登记 | — | ✅ | `P0-validation-gate.md` |
 | **M21a** | 疑点扫描地基 | 配置节（用户级唯一 `~/.redteam/`、角色列表、provider 在途上限）+ 引用图分组 + 正反向跨组索引 + **切片装包（scanner 默认 slice）** + 疑点契约 + 提示词共享头 / scanner 尾 + `--pack-only`；proj.db v4 一次重置 + cache 断点；出口 slice vs full A/B；分支硬切删除旧编排，`redteam-next` 仅 scanner 段 | P0 | ✅（2026-09-09 出口验收交付；两门槛改口径见 M21a 状态行） | `M21a-scan-foundation.md` |
 | **M21b** | 风险路由与深挖队列 | 风险评分器 + 优先级队列（分派池、无候补）+ reviewer cell + 预算 / 必挖集 + verifier 流式段；finding 只由深挖产出 | M21a | ✅ 2026-09-23〔D18〕机械面全过·覆盖面记账 | `M21b-risk-deep-queue.md` |
-| **M21c** | 台账·收敛·切名 | 疑点台账 + delta 激活 + 收敛三维 + coverage 分级 + 判例前移等小项；**切名前 aacr smoke**；`redteam-next` → `redteam` + dogfood | M21b | ⏳ | `M21c-ledger-convergence-flip.md` |
+| **M21c** | 台账·收敛·切名 | 疑点台账 + delta 激活 + 收敛三维 + coverage 分级 + 判例前移等小项；`redteam-next` → `redteam` + dogfood（aacr smoke 随 D19-2 移 M21e；**ship 内循环 2026-10-03 挪出、单独成单元**） | M21b | ✅ 2026-10-03（批 0/A/B/C/D 五批） | `M21c-ledger-convergence-flip.md` |
 | **M21d** | 上下文深化 | L4-B 三方契约 + 仓库简介前缀 + `findingWindow` 后滤 + 文档/代码分池；切片调优按信号判**未触发** | M21b（与 c 并行） | ✅ | `M21d-context-depth.md` |
 | **M21e** | 多样性与收官 | 第二家族 scanner + **aacr gate 三方对照（legacy / v2 / ocr）** + 校准收口 + 仪器拆除 + `--help`/文档 | M21c, M21d | ⏳ | `M21e-diversity-closeout.md` |
 
