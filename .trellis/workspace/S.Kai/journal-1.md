@@ -965,3 +965,26 @@ B-1 判例摘要进快扫 prompt（那个槽从来是空的，两个构造点都
 ### Status
 
 [OK] **Completed**
+
+
+## Session 33: followup 对账 + A 类四条小修
+<!-- trellis-session: v=2 fp=23a6e134e8bd5a0b -->
+
+**Date**: 2026-10-04
+**Task**: followup 对账 + A 类四条小修
+**Branch**: `chore/followup-reconcile`
+
+### Summary
+
+抽查 9 条旧债 7 条早已解决无人回标，扩到 12 条全部回标（账面 226/29 → 223/45）。根因是条件触发式的债没有触发机制——一批挂着「M21c 切名后做」，而切名 2026-09-28 就完成、没人在那天提醒；followup 顶部立「到期看板」。A 类四条：secrets 并存提示从每次加载收窄到 model list/check（端到端验过两侧）、md 收敛渲染矛盾兜底、三态遗留行规范化（发布门，挂 open_at、只复位 activated）、enqueue_activated 核下来不是静默债而是第四种病（分支不可达，改 debug_assert 钉不变量 + 立不变量用例）。变异检查 M4 首跑假绿——perl 无 /g 只改第一处而被测函数在第二处，按行号重做后转红，教训已写进状态机指南。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `25f3df2` | chore(followup,config,db): followup 对账 + A 类四条小修 |
+| `da2e519` | build: 重建二进制 |
+
+### Status
+
+[OK] **Completed**
