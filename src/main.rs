@@ -983,6 +983,11 @@ async fn main() {
         }
         Cmd::Model { action } => match action {
             ModelCmd::Check => {
+                // 旧路径迁移 notice 只在这两条「查配置」命令打
+                // （2026-10-04 对账：原来挂在 Config::load 上，每条命令都刷）。
+                for m in redteam::config::legacy_migration_notices() {
+                    eprintln!("{m}");
+                }
                 let cfg = load_config_warned();
                 let prober = redteam::model::probe::HttpProber::new();
                 let avs = redteam::model::check_all(&cfg, &prober).await;
@@ -1122,6 +1127,11 @@ async fn main() {
                 0
             }
             ModelCmd::List { remote } => {
+                // 旧路径迁移 notice 只在这两条「查配置」命令打
+                // （2026-10-04 对账：原来挂在 Config::load 上，每条命令都刷）。
+                for m in redteam::config::legacy_migration_notices() {
+                    eprintln!("{m}");
+                }
                 let cfg = load_config_warned();
                 let prober = redteam::model::probe::HttpProber::new();
                 match remote {

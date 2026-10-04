@@ -304,7 +304,35 @@ impl ProjDb {
             }
             eprintln!("warning: {} 只读打开，无法切换 journal_mode=WAL（{e}），继续以只读方式使用", path.display());
         }
+        Self::normalize_legacy_activated(&conn, path);
         Ok(Self { conn, legacy_migration })
+    }
+
+    /// 三态遗留行的一次性规范化（发布门，2026-10-04 对账落地）。
+    ///
+    /// 批 C 把台账从 `dormant → activated → promoted` 收成两态时**没有规范化已有数据**。
+    /// 旧二进制写下的 `status='activated'` 行在新语义下谁也不认：激活判据只看 `dormant`、
+    /// 披露只看 `dormant`，于是它们**永久卡住**——既不会被重新挖，也不会出现在报告里。
+    ///
+    /// 为什么不能放进 `setup_schema`：那些库**已经是 v4 且表齐全**，`needs_setup` 为假，
+    /// 整条迁移路径根本不跑。所以挂在 open 上，幂等、无匹配行时近乎零成本。
+    ///
+    /// 失败只告警不拒开：这是数据修复，不是打开库的前提条件。
+    fn normalize_legacy_activated(conn: &Connection, path: &Path) {
+        match conn.execute("UPDATE suspicions SET status='dormant' WHERE status='activated'", []) {
+            Ok(0) => {}
+            Ok(n) => eprintln!(
+                "notice: {} 里有 {n} 条 `status='activated'` 的三态遗留行（批 C 两态化之前的二进制写的），\
+                 已复位为 dormant——否则它们既不被激活也不被披露，永久卡住",
+                path.display()
+            ),
+            // 表不在（旧 schema 库走 open_read_only 这类路径）不是错
+            Err(e) => {
+                if !matches!(&e, rusqlite::Error::SqliteFailure(_, Some(m)) if m.contains("no such table")) {
+                    eprintln!("warning: {} 三态遗留行规范化失败（{e}）——不影响本次使用", path.display());
+                }
+            }
+        }
     }
 
     /// **只读**打开（`--dismissed <db路径>` 这类「只想读一份台账」的入口，收口评审 #2）：
@@ -997,6 +1025,41 @@ mod tests {
         let db = ProjDb::open_at(&dir.path().join("t.db")).unwrap();
         std::mem::forget(dir); // 保持文件到进程尾（测试级泄漏可接受）
         db
+    }
+
+    /// 三态遗留行在 open 时被复位（2026-10-04 对账落地的发布门）。
+    ///
+    /// 批 C 把台账从三态收成两态时没规范化已有数据：旧二进制写下的 `status='activated'`
+    /// 行在新语义下谁也不认（激活判据只看 `dormant`、披露也只看 `dormant`），**永久卡住**。
+    ///
+    /// 关键在于这类库**已经是 v4 且表齐全**——`needs_setup` 为假，`setup_schema` 整条
+    /// 迁移路径根本不跑。所以规范化挂在 open 上，这条用例也必须走「关掉再打开」而不是
+    /// 建库那一次。
+    #[test]
+    fn reopening_normalizes_three_state_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.db");
+        let row = |id: &str, status: &str| SuspicionRow {
+            id: id.into(), file: "a.rs".into(), quote_norm: format!("q{id}"), hint: "h".into(),
+            status: status.into(), first_job: "j1".into(), last_job: "j1".into(),
+            activations: 0, json: "{}".into(),
+        };
+        {
+            let db = ProjDb::open_at(&path).unwrap();
+            // `suspicion_upsert` 不动 status，正好用来摆出旧二进制留下的那种行
+            db.suspicion_upsert(&row("aaaaaaaaaaaaaaaa", "activated")).unwrap();
+            db.suspicion_upsert(&row("bbbbbbbbbbbbbbbb", "dormant")).unwrap();
+            db.suspicion_upsert(&row("cccccccccccccccc", "promoted")).unwrap();
+        }
+        let db = ProjDb::open_at(&path).unwrap();
+        let status_of = |id: &str| -> String {
+            db.conn
+                .query_row("SELECT status FROM suspicions WHERE id=?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(status_of("aaaaaaaaaaaaaaaa"), "dormant", "三态遗留行要复位，否则永久卡住");
+        assert_eq!(status_of("bbbbbbbbbbbbbbbb"), "dormant", "本来就 dormant 的不动");
+        assert_eq!(status_of("cccccccccccccccc"), "promoted", "已晋升的**不能**被复位——那会让它被反复重挖");
     }
 
     #[test]

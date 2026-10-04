@@ -886,6 +886,29 @@ mod tests {
     use super::*;
     use crate::domain::Category;
 
+    /// `from_ledger` 对**任何**台账行都必须成功（2026-10-04 对账立）。
+    ///
+    /// `deep.rs::enqueue_activated` 的 `else` 分支靠这条不变量才敢说「不可达」——它在
+    /// debug 下 `debug_assert!(false)`。那条分支本身测不了（喂它的输入到不了），
+    /// 能守住它的只有这里：`line_start.max(1)` + `line_end.max(start)` 恒满足
+    /// `QueueItemSpec::new` 的「`a != 0 && b >= a`」。拿边界值逐个压。
+    ///
+    /// 谁要是把那两个 `max` 去掉，这条就该红。
+    #[test]
+    fn from_ledger_never_fails_on_any_ledger_row() {
+        // (line_start, line_end)：0 行、倒挂、极值——台账行的 line_* 来自 anchor_near，
+        // 但这条不变量不该依赖上游的善意。
+        let cases = [(0, 0), (0, 5), (5, 0), (1, 1), (7, 3), (u32::MAX, 0), (0, u32::MAX), (u32::MAX, u32::MAX)];
+        for (a, b) in cases {
+            let s = sus("a.rs", a, b, "q", "h");
+            let req = EnqueueReq::from_ledger(&s, "r1", false)
+                .unwrap_or_else(|| panic!("from_ledger 对 ({a}, {b}) 返回了 None——\
+                     enqueue_activated 的 debug_assert 会炸"));
+            let (lo, hi) = req.spec.ranges[0];
+            assert!(lo >= 1 && hi >= lo, "({a},{b}) 归一出非法区间 ({lo},{hi})");
+        }
+    }
+
     fn sus(file: &str, start: u32, end: u32, quote: &str, hint: &str) -> Suspicion {
         Suspicion {
             file: file.into(),

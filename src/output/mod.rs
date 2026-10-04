@@ -180,6 +180,18 @@ fn render_md(r: &ReviewReport) -> String {
             if !c.no_activation_overrun {
                 why.push(format!("{} 条疑点激活超限、已停车待人工裁定", c.activation_overrun));
             }
+            // 渲染侧兜底（2026-10-04 对账）：标题信任 `converged`，理由却来自三个分量——
+            // 调用方保证两者一致（`converged` = 三者之与），但那是**调用方**的保证，这里没有。
+            // 真不一致时原来会输出「Not converged — ；建议再跑一轮」，一个理由都列不出，
+            // 而 ship 循环读的正是这一行：它会按「不收敛」再跑一轮却不知道为什么。
+            // 与其静默，不如把矛盾本身说出来——这个仓反复批判的就是「缺失当正常」。
+            if why.is_empty() {
+                why.push(
+                    "三个分量都为真却标成不收敛——`converged` 与分量不一致（装配侧 bug），\
+                     本行不可据以判停"
+                        .into(),
+                );
+            }
             s.push_str(&format!("\n- Not converged — {}；**建议再跑一轮**（收敛是循环的停止条件，不改本轮裁决与退出码）\n", why.join("；")));
         }
     }
@@ -404,6 +416,32 @@ mod tests {
         // 没有线索时一个字都不多写
         r.run.dormant_leads.clear();
         assert!(!render_md(&r).contains("Dormant"), "空则不渲染");
+    }
+
+    /// `converged` 与三个分量矛盾时，渲染侧要把矛盾本身说出来（2026-10-04 对账立）。
+    ///
+    /// 标题信任 `converged`，理由却来自三个分量——两者一致是**调用方**的保证，渲染侧没有。
+    /// 真不一致时原来输出「Not converged — ；建议再跑一轮」，一个理由都列不出，
+    /// 而 ship 循环读的正是这一行：它会按「不收敛」再跑一轮却不知道为什么。
+    #[test]
+    fn md_says_so_when_converged_contradicts_its_components() {
+        use crate::domain::report::Convergence;
+        let mut r = report();
+        // 装配侧 bug 的形状：三个分量全真，`converged` 却是 false
+        r.run.convergence = Some(Convergence {
+            converged: false, verdict_clean: true, no_delta_adjacent: true, no_activation_overrun: true,
+            delta_adjacent: 0, activation_overrun: 0,
+        });
+        let md = render_md(&r);
+        let line = md.lines().find(|l| l.contains("Not converged")).expect("{md}");
+        assert!(
+            line.contains("不一致"),
+            "矛盾要写进收敛行，而不是留一个列不出理由的空句: {line}"
+        );
+        assert!(
+            !line.contains("— ；"),
+            "原来的失败形态：理由为空、破折号后直接分号: {line}"
+        );
     }
 
     /// 收敛三维进 md（M21c 批 C）：ship 循环与裸终端读的都是 md，只落 JSON 等于这个字段

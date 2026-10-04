@@ -189,7 +189,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     // 台账激活（M21c 批 C）：放在 H0 与 scan 格之后——撞到同一个块时由既有合并语义收口，
     // 顺序只决定谁先建项，合并结果与喂入顺序无关（到达键幂等）。
     for a in input.activated {
-        enqueue_activated(&mut q, a, &mut meta, input.snapshot, &mut blocks);
+        enqueue_activated(&mut q, a, &mut meta, input.snapshot, &mut blocks, &mut warnings);
     }
     // 激活观测按**项**数，与 resume 侧的 `restored_meta` 同一口径（dogfood medium，agreement 2）：
     // 原先首跑按「台账行」逐条累加，而 resume 数的是带标记的项——两条台账行并进同一项时，
@@ -1685,15 +1685,38 @@ fn count_activated(q: &DeepQueue, meta: &mut DeepMeta) {
 }
 
 /// 台账激活项入队（M21c 批 C）：一条台账行 = 一条疑点，走与 scanner 疑点同一条入队流程。
-/// 入不进去（区间形状非法）就算了——它只是个跨轮线索，不值得为它失败整轮。
+/// 入不进去（区间形状非法）不为它失败整轮——它只是个跨轮线索——**但要说出来**。
 fn enqueue_activated(
     q: &mut DeepQueue,
     a: &crate::orchestrate::ledger::Activated,
     meta: &mut DeepMeta,
     snapshot: Option<&dyn Fn(&QueueItem)>,
     ctx: &mut BlockCtx,
+    warnings: &mut Vec<String>,
 ) {
     let Some(req) = EnqueueReq::from_ledger(&a.suspicion, &a.row_id, a.force_dig) else {
+        // **这条分支不可达，且是有意保留的**（2026-10-04 对账查清）。
+        //
+        // `from_ledger` 先做 `line_start.max(1)` 与 `line_end.max(start)`，而 `QueueItemSpec::new`
+        // 只拒 `a == 0 || b < a`——两边一对，区间恒合法。原来这里是默默 `return`，账上记作
+        // 「静默丢弃」债；核下来它不是静默问题，是**第四种病**（分支可达、喂它的那类输入到不了）。
+        //
+        // 为什么不删：静默丢弃的**后果**很重，值得把不变量钉在这儿。台账回写
+        // （`suspicion_activate`：`activations` +1、`last_job` 更新）**已经在 CLI 层发生过**，
+        // 早于本函数。真丢掉的话，台账以为这条疑点被激活过、逐步逼近活锁门（N=3 必挖 / N=5 停车），
+        // 而它一次都没被挖过——最后报告对人说「机制挖不动它」，语义正好反了。
+        //
+        // 所以：debug 下直接炸（谁改坏了 `from_ledger` 的保证，测试当场红），release 下披露而非静默。
+        // 真正守住这条不变量的是 `from_ledger_never_fails_on_any_ledger_row`，不是这段代码。
+        debug_assert!(
+            false,
+            "from_ledger 对台账行恒成功（line_start.max(1) / line_end.max(start) 保证区间合法）；\
+             返回 None 说明那个保证被改坏了"
+        );
+        warnings.push(format!(
+            "ledger: 疑点 {}（{}:{}）已回写激活但入队失败（区间形状非法）——             本轮不会挖它，而台账的 activations 已计数；连续发生会假性逼近活锁门",
+            a.row_id, a.suspicion.file, a.suspicion.line_start
+        ));
         return;
     };
     let (outcome, affected) = q.enqueue_affected(ctx.arrival(req));

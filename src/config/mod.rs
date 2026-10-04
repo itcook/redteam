@@ -474,25 +474,10 @@ impl Config {
     fn load_with_messages_opts(read_secrets: bool) -> anyhow::Result<(Config, Vec<String>)> {
         let mut messages = Vec::new();
         let path = config_path()?;
-        if !path.is_file() {
-            for p in legacy_config_paths_present() {
-                messages.push(format!(
-                    "notice: 配置已改读 {}（REDTEAM_HOME 可覆盖，严格 JSON）；旧文件 {} 未读，请手动迁移（redteam model setup --help）",
-                    path.display(),
-                    p.display()
-                ));
-            }
-        }
-        let spath = secrets::secrets_path()?;
-        if !spath.is_file() {
-            for p in legacy_secrets_paths_present() {
-                messages.push(format!(
-                    "notice: 密钥已改读 {}（严格 JSON）；旧文件 {} 未读——用 `redteam model setup … --key-store secrets [--model-key]` 重写或手动迁移",
-                    spath.display(),
-                    p.display()
-                ));
-            }
-        }
+        // 旧路径迁移 notice **不在这里打**（2026-10-04 对账收窄）：配置每条命令都要加载，而
+        // dev 二进制的 `~/.config/redteam/*.toml` 与首版 TOML 在并存期长期存在——只用 env 存 key
+        // 的用户于是每次调用都看见同样两行。迁移是一次性动作，提示属于「查配置」那两条命令：
+        // `model list` / `model check` 调 `legacy_migration_notices()` 打。
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -888,6 +873,37 @@ fn comment_only(p: &Path) -> bool {
         }),
         Err(_) => false,
     }
+}
+
+/// 旧路径迁移 notice（`model list` / `model check` 专用，2026-10-04 对账从 `Config::load` 收窄而来）。
+///
+/// 新文件已在场即视为已迁移、不提示。放在这两条命令而不是每次加载：迁移是一次性动作，
+/// 而 dev 二进制的旧文件在并存期长期存在——挂在加载链上等于对只用 env 存 key 的用户永久刷屏。
+pub fn legacy_migration_notices() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(path) = config_path() {
+        if !path.is_file() {
+            for p in legacy_config_paths_present() {
+                out.push(format!(
+                    "notice: 配置已改读 {}（REDTEAM_HOME 可覆盖，严格 JSON）；旧文件 {} 未读，请手动迁移（redteam model setup --help）",
+                    path.display(),
+                    p.display()
+                ));
+            }
+        }
+    }
+    if let Ok(spath) = secrets::secrets_path() {
+        if !spath.is_file() {
+            for p in legacy_secrets_paths_present() {
+                out.push(format!(
+                    "notice: 密钥已改读 {}（严格 JSON）；旧文件 {} 未读——用 `redteam model setup … --key-store secrets [--model-key]` 重写或手动迁移",
+                    spath.display(),
+                    p.display()
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// 旧路径探测（只提示不读）：`$XDG_CONFIG_HOME/redteam/config.toml`、`~/.config/redteam/config.toml`（09-04 前用户层）、
@@ -1377,6 +1393,47 @@ mod tests {
         let err = Config::load().unwrap_err().to_string();
         assert!(err.contains("读取"), "io 错误不得吞成空配置（#13）: {err}");
         unsafe { std::env::remove_var("REDTEAM_HOME"); }
+    }
+
+    /// 旧路径迁移 notice **不再挂在每次配置加载上**（2026-10-04 对账收窄）。
+    ///
+    /// 债的原话：「只用 env 存 key 的用户永远看到」——dev 二进制的旧文件在并存期长期存在，
+    /// 而配置每条命令都加载，于是每次调用都刷同样两行。迁移是一次性动作，
+    /// 提示该属于「查配置」的那两条命令（`model list` / `model check` 调
+    /// `legacy_migration_notices()`）。
+    ///
+    /// 摘掉那两条时全量测试**照绿**——原行为没有任何用例盯着，这条补上。
+    #[test]
+    fn legacy_notices_moved_off_the_load_path() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // 新配置不在场 + 旧 TOML 在场 = 该提示的那种局面
+        std::fs::write(home.join("config.toml"), "[review]\n").unwrap();
+        std::fs::write(home.join("secrets.toml"), "[providers.p]\nx=\"y\"\n").unwrap();
+        // SAFETY: ENV_LOCK 串行化
+        unsafe {
+            std::env::set_var("REDTEAM_HOME", &home);
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        // 只断言本用例造的那两个文件：真机上 `~/.config/redteam/` 往往也在（dev 二进制的旧配置），
+        // 那正是这条债描述的现实局面——数总数会把用例绑在开发机环境上。
+        let notices = legacy_migration_notices();
+        let mine = |suffix: &str| {
+            notices.iter().any(|m| m.contains(&home.join(suffix).display().to_string()))
+        };
+        assert!(mine("config.toml"), "旧 config.toml 该进 notice: {notices:?}");
+        assert!(mine("secrets.toml"), "旧 secrets.toml 该进 notice: {notices:?}");
+        assert!(notices.iter().any(|m| m.contains("配置已改读")), "{notices:?}");
+        assert!(notices.iter().any(|m| m.contains("密钥已改读")), "{notices:?}");
+
+        let (_, messages) = Config::load_with_messages().unwrap();
+        assert!(
+            !messages.iter().any(|m| m.contains("已改读")),
+            "加载路径不该再带迁移 notice（每条命令都会刷）: {messages:?}"
+        );
     }
 
     #[test]

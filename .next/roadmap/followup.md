@@ -3,6 +3,22 @@
 > 只记 M21 内跨里程碑事项；零散 polish 走 `.doc/TODO/`；M21 外的 backlog 走 `.doc/roadmap/followup.md` M20 段。
 > v2（2026-09-05，D7 后）：R1 撤销、R16-R20 新增、实现债更新。
 
+## ▲ 到期看板（挑活先扫这一节）2026-10-04 立
+
+起因：一批债挂的触发条件是「**M21c 切名后**做」，而切名 2026-09-28 就完成了——它们集体到期却无人认领，
+因为**没有任何机制在切名那天提醒**。2026-10-04 对账抽查 9 条，**7 条早已解决、无人回标**。
+写条件触发式的债时，把条件登进本表；条件满足当天回来扫一遍。
+
+| 触发条件 | 状态 | 挂着的债 |
+|---|---|---|
+| M21c 切名完成 | ✅ 2026-09-28 已满足 | ✅ 全清：`DB_FILE` 定回、ship.md 改调内置 `test-command`、并存期 secrets 提示已收窄到 `model list` / `model check`（2026-10-04） |
+| 增量轮恢复 | ✅ 2026-10-04 已满足 | 已清：followup:80/95/127/136/214/959 六条（见「增量轮重建带出的账」） |
+| 攒够一批 schema 改动 | ⚠️ **已攒够 4 条，可开批** | `first_job`/`last_job` 改名、`last_verdict()` tie-breaker、`Finding` 带队列项 id、`CellRecord.attempts` 拆三个字段 |
+| 发布前 | ⏳ 未到 | ✅ 旧库 `status='activated'` 规范化已提前做掉（2026-10-04，挂在 `ProjDb::open_at`）。待办：台账固定集导出是否内置 |
+| ship 单元开工 | ⏳ 未到 | ship 协议整体内置时评估拆卸 `test-command`；见「ship 作为独立单元」节 |
+| 下一轮 PR181 dogfood | ⏳ 未到 | 判例命中仍为 0、判例前移后的重复报率、活锁守卫 N 回校 |
+| M21e 收口 | ⏳ 未到 | R3 / R7 / R8 / R9 / R12 / R20；「清扫」类条目 |
+
 ## design §17 残留 → 归属
 
 | R | 未决 | 归属 | 裁决方式 |
@@ -34,14 +50,14 @@
 
 | 债 | 现状 | 偿还 |
 |---|---|---|
-| ThinkingLevel schema 零消费 | `src/config/mod.rs` 先行入 schema、无消费点 | M21a 角色条目 `thinking_level` 首个消费者 |
+| ThinkingLevel schema 零消费 | `src/config/mod.rs` 先行入 schema、无消费点 | ✅ 已偿（2026-10-04 对账核实）：`main.rs:529/555` 按模型名登记并校同名模型的 `thinking_level` 冲突 |
 | `extract_imports` 只认相对 import | TS 裸模块 / Rust `use crate` / Go 包路径不解析 | ✅ M21a 批 C C-1（2026-09-08）：`bundle::import_edges` + `ImportResolver`（tsconfig baseUrl/paths/extends、go.mod module、crate 根） |
 | `CellRecord.findings: Vec<Finding>` 是 proj.db 契约 | 疑点放不进 | M21a schema v4 一次重置（cell 带角色、suspicions、queue_snapshot、coverage、runs meta），旧库先导出 dismissed / upheld 固定集（D10） |
 | resume = manifest 差集 + 存档 prompt 重放 | 不理解阶段转移与队列 | M21b 队列快照 checkpoint |
-| per-fanout 单一模型计划 | `OrchestrateOpts` 单模型 + replicate | M21a 角色化（cell 类型 → 角色列表 → route_key） |
-| `priority` 候补链 / `resolve_models` 四分支 / `--models` `--models-all` | 全链复跑与候补语义 | M21a 退场（D7 A3 / A9） |
-| 项目层配置与剥离清单 `from_layers_tagged` | 威胁模型 B 的剥离逻辑 | M21a 整段删除（D7 A8） |
-| `XDG_CONFIG_HOME` 测试串行化 hack | `dirs_config()` 路径 | M21a 换 `REDTEAM_HOME` |
+| per-fanout 单一模型计划 | `OrchestrateOpts` 单模型 + replicate | ✅ 已偿（2026-10-04 对账核实）：深挖走 `input.reviewers: &[EffectiveModel]`，分派池按角色成员轮转 |
+| `priority` 候补链 / `resolve_models` 四分支 / `--models` `--models-all` | 全链复跑与候补语义 | ✅ 已偿（2026-10-04 对账核实）：`resolve_models` / `run_code_fanout` / `legacy_opts_from_roles` 全零引用，`--models` 已被 clap 拒收、ship.md 的透传也删了 |
+| 项目层配置与剥离清单 `from_layers_tagged` | 威胁模型 B 的剥离逻辑 | ✅ 已偿（2026-10-04 对账核实）：`from_layers_tagged` 零引用 |
+| `XDG_CONFIG_HOME` 测试串行化 hack | `dirs_config()` 路径 | ✅ 已偿（2026-10-04 对账核实）：已换 `REDTEAM_HOME`；`XDG_CONFIG_HOME` 只剩旧路径探测（`legacy_paths_present`，只提示不读） |
 | `model setup` / `write_secret` 写旧形状 | `[provider."model"] api_key` | 已偿（批 A 重做 9b817da〔D12〕）：`secrets.json` `providers.X.{apiKey, models.<id>}`；`model setup` 走 `SetupPatch` 三层显式合并 + 写前校验 |
 | `config.json` 未知字段 | `shape_guard` 按已知层级预扫：snake_case / 旧键名（`name`）/ 非法角色 → 错误；其余未知键 → warning（评审 #4）；不开 `deny_unknown_fields`（保向前兼容） | 新增配置字段时同步 `shape_guard` 已知键表（单测兜底）；`serde_json` 键序为字典序（`preserve_order` 未开，手写顺序落盘后丢失，纯观感） |
 | 批 A 首版 TOML → JSON 迁移脚本 | 只在维护者本机跑过一次（`/tmp/rt-migrate-config-json.py`，2026-09-08），不入库 | 无外部用户持有首版 TOML（分支未发布）；`legacy_config_paths_present` 对 `$REDTEAM_HOME/config.toml` 只提示不读即够，不做内置迁移 |
@@ -58,19 +74,19 @@
 | 并存期 secrets 提示 | dev 二进制的 `~/.config/redteam/secrets.toml` 长期存在，`secrets.json` 未创建前每次调用都打「密钥已改读」notice；只用 env 存 key 的用户永远看到 | M21c 切名再议（如只在 `model list / check` 打） |
 | 批 A 重做评审子 agent 提出、未核实项（2026-09-08） | `eval/e3_contract_ab.py:315` `anchored` 疑似恒真式；`eval/risk_replay.py` parse_diff 疑似把列首 `--` / `++` 内容行当文件头；`provider_probe_kind` 对混协议网关取字典序首个模型的 kind（只影响 `model list --remote`）；`check_all` 串行探测、每次 `resolve_key` 重读 secrets（性能观感） | M21b 起用 `risk_replay.py` 作回归门前先核实前两条；其余 M21e 清扫 |
 | FINALIZE / REPAIR 三层兜底 | 为一次性大 JSON 服务 | reviewer cell 输出有界后 M21e 评估简化；`finish_reason` 降为观测信号 |
-| `consolidate/verify.rs` 后置 barrier 形态 | refute_targets 需全集 | M21b 改为流消费者，agreement 从队列项取 |
+| `consolidate/verify.rs` 后置 barrier 形态 | refute_targets 需全集 | ✅ 已偿（2026-10-04 对账核实）：`refute_targets` 零引用；复核已是 landed 循环里逐格流式派发 |
 | `eval/harness.py` 只测 dossier 召回 | findings 层无 oracle | aacr 重启后由 fork 评估器接管；本仓不再自建 |
-| `adversarial-code-bundle.md` / `adversarial-refute.md` 单模板 | 角色协议段在头部、三立场混一 | M21a 拆 `shared-head.md` + `scanner.md`；M21b 加 `reviewer.md` / `verifier.md`（D9） |
+| `adversarial-code-bundle.md` / `adversarial-refute.md` 单模板 | 角色协议段在头部、三立场混一 | ✅ 已偿（2026-10-04 对账核实）：`src/prompt/templates/` 下 shared-head / scanner / reviewer / verifier 四份都在；`adversarial-code-bundle.md` 零引用，`adversarial-refute.md` 留作 REFUTE_TPL（任务模板，与角色协议段分层，不再是「三立场混一」） |
 | M6-b 提示词 harness（M20 backlog） | 无角色级回归集 | 三角色离线回归集随 M21a / M21b 落地（verifier 用 proj.db dismissed vs upheld，零新数据）；M20 只剩通用 harness |
 | `examples/dump_pack.rs`（P0 E3 dev-time 组包仪器） | 用 lib pub API 照抄三处 `pub(crate)` 辅助与 `NO_TOOLS_SYSTEM` 落盘单发 prompt；随 `cargo test` 编译 | ✅ M21a 批 C C-2 已删（2026-09-08，`Bundle` 形状变更后亦无法编译）；产品等价物 `redteam review --pack-only`（C-4）；`eval/risk_replay.py` 保留为 M21b 风险规则的离线回归器 |
-| `redteam test-command` 子命令（M21a 批 A K1，过渡形态） | 项目层 `test_command` 随项目 config 退场后，推断链进二进制（Cargo / package.json / Makefile / go.mod）；`review --test-command` 记 RunMeta | ship 协议进二进制（M21c 切名后 ship.md 第 2 步改调本子命令；协议整体内置时评估把它拆卸 / 并入）——用户 2026-09-08 要求记下拆卸 |
-| ship.md 第 2 步「测试命令探测」仍在 prompt 侧（且第 28 行仍引用已退场的项目层 `.redteam/config.toml` `test_command`）；第 13 行仍透传 `--models`（code-review #12） | 插件在 M21a-b 跑 dev 二进制，无 `test-command`；`--models` 已被 clap 拒收 | M21c 切名后改为调用 `${CLAUDE_PLUGIN_ROOT}/bin/redteam test-command`（退出码 2 → AskUser）并删 `--models` 透传，删 prompt 侧启发式与旧路径引用 |
+| `redteam test-command` 子命令（M21a 批 A K1，过渡形态） | 项目层 `test_command` 随项目 config 退场后，推断链进二进制（Cargo / package.json / Makefile / go.mod）；`review --test-command` 记 RunMeta | 前半 ✅ 已偿（2026-10-04 对账核实）：ship.md 第 2 步已改调本子命令。**待办仍在**：协议整体内置时评估把它拆卸 / 并入（用户 2026-09-08 要求记下）——归 ship 单元 |
+| ship.md 第 2 步「测试命令探测」仍在 prompt 侧（且第 28 行仍引用已退场的项目层 `.redteam/config.toml` `test_command`）；第 13 行仍透传 `--models`（code-review #12） | 插件在 M21a-b 跑 dev 二进制，无 `test-command`；`--models` 已被 clap 拒收 | ✅ 已偿（2026-10-04 对账核实）：`ship.md:28` 已调 `${CLAUDE_PLUGIN_ROOT}/bin/redteam test-command`；`--models` 透传已删；prompt 侧启发式与 `.redteam/config.toml` 旧路径引用已清 |
 | `--resume` 老作业按当前 `[[scanners]]` 重建 registry 与 RunMeta.models | 批 A 删 `--models` 后 args.json 里的模型集不再是权威源（批 A ship 评审 8fc07250 亦指出） | M21b 队列快照落地后 resume 读快照里的角色条目；此前只在 dogfood 观察，不修 |
 | `legacy_opts_from_roles` 适配器（cli）+ `PlannedModel.priority` 恒 0 | 旧 fan-out 靠它跑到批 F | ✅ 批 F-4（2026-09-09）已删，连同 `run_code_fanout` / 候补链 / `TailCtx` / 旧模板 |
-| `redteam-next` 独立库文件 `.redteam/proj-next.db`（批 B 评审裁定 2026-09-08：与 dev `proj.db` 分库，避免 v4 `cells.role NOT NULL` 让 dev checkpoint 写失败、旧库被 v4 守卫拒开） | `db::DB_FILE = "proj-next.db"`；`--help` / `load_ledger` / `init` 文案随之；dev 的 63 张判例卡对 next 不可见（M21a-b 不产 finding，无需） | M21c 切名时定切换程序：导出旧 `proj.db` 固定集 → 删 → `proj-next.db` 改名回 `proj.db`（或 `DB_FILE` 定回），`--help` 文案回改；`--dismissed` 指向 v0 `proj.db` 的只读复用届时一并议 |
+| `redteam-next` 独立库文件 `.redteam/proj-next.db`（批 B 评审裁定 2026-09-08：与 dev `proj.db` 分库，避免 v4 `cells.role NOT NULL` 让 dev checkpoint 写失败、旧库被 v4 守卫拒开） | `db::DB_FILE = "proj-next.db"`；`--help` / `load_ledger` / `init` 文案随之；dev 的 63 张判例卡对 next 不可见（M21a-b 不产 finding，无需） | ✅ 已偿（2026-10-04 对账核实）：`db.rs:13` `DB_FILE = "proj.db"` 已定回，`proj-next.db` 降为 `BRANCH_ERA_DB_FILE` 历史常量 |
 | `SCHEMA_VERSION = "4"` 先于形状变化翻号 | 批 B 报告 JSON 与 v3 逐字节相同（五个 v4 字段全 default 不序列化），版本号已是 4（plan B-4 明文） | F-5 落 coverage / cache / 模板哈希值时不再翻号；若届时需区分「v4 未填」与「v4 无 coverage」再议 `4.1` |
 | 台账固定集导出在仓内 python 脚本（`eval/export_ledger.py`） | 拒开文案指向它，插件分发不含 `eval/`；评审建议内置 `redteam ledger export`（CLAUDE.md 内置命令优先） | 用户 2026-09-08 裁定搁置（M21a-b 未发布、暂无导出需求）；发布前若保留拒开路径再评估内置 |
-| 测试助手 `finding(..)` 三份（`consolidate/verify.rs` / `prompt/mod.rs` / `domain/suspicion.rs`）、`NeedEntry` 字面量十余处 | M21b 给 `Finding` / `NeedEntry` 加字段时要逐处补 | 抽 `#[cfg(test)] pub(crate) mod fixtures` 于 `domain/finding.rs`；`NeedEntry::evidence(..)` 构造器——M21b 加字段时顺手做 |
+| 测试助手 `finding(..)` 三份（`consolidate/verify.rs` / `prompt/mod.rs` / `domain/suspicion.rs`）、`NeedEntry` 字面量十余处 | M21b 给 `Finding` / `NeedEntry` 加字段时要逐处补 | ✅ 已偿（2026-10-04 对账核实）：`domain/finding.rs:268` 已有 `pub(crate) mod fixtures` |
 | 固定集 `ledger-upheld.jsonl` 3 行指向 gitignored `.doc/` 设计稿、数十行指向已改名历史路径 | quote 在现树锚不到；行已带 `head_sha`（部分作业无 stamp 为空） | D-5 / M21b 回归评分器按 `head_sha` 树锚定，空 `head_sha` 行按 `p0_oracle.py` 的 created_at 推断 |
 
 ## M21a 批 C 延后项（2026-09-08，Trellis `09-08-m21a-grouping`，prd K9 / K15 / R-C5.1）
@@ -892,7 +908,7 @@ followup 里早有「任何按单轮墙钟做的比较都不可信，至少三�
 | **落入原因只有 `budget` 一种** | `REASON_BUDGET` 是 `ledger.rs` 里唯一取值；design 原文的「规则豁免」那一类要等批 B 的判例豁免落地才产生 | 随批 B |
 | **resume 不重算激活** | 同一个 job 续跑、HEAD 与 delta 都没变，激活标记随 `QueueItem` 快照恢复，所以 resume 侧传空片（重算会让 `activations` 多加一轮、提前踩响活锁门）。代价：**首跑若崩在激活之前**，那批疑点这一轮就错过了（下一轮会再来） | 可接受。若要修，得在 job 状态里记「本轮激活是否已执行」，成本高于收益 |
 | **活锁守卫的 N 取值无数据支撑** | N=3 / N=5 是开工时按「给机制两次自愈机会」裁的，不是实测出来的。批 C 首轮 dogfood 后台账里最大 `activations` 仍是 1——门**现在可达了**（原实现是死代码，见记录），但还没有真实样本走到过 3 | 等批 D 连续多轮 dogfood 攒出激活样本后回校；R12「台账激活上限 N 与停车通道形态」本就挂着 M21e 收口 |
-| **收敛三维在固定靶子上不可证伪** | 维度 2 严格口径下「有预算截断就不收敛」，而 PR181 每轮都有截断 → 它在那个靶子上恒为假。要验「收敛真能达成」需要一个**预算够用**的小 diff | 批 D dogfood 里专门跑一个小改动验收敛可达 |
+| **收敛三维在固定靶子上不可证伪** | 维度 2 严格口径下「有预算截断就不收敛」，而 PR181 每轮都有截断 → 它在那个靶子上恒为假。要验「收敛真能达成」需要一个**预算够用**的小 diff | ✅ 已观测到（2026-10-04）：小 diff 轮（一行无害改动 + `--block-threshold critical`）得 approve / `budget_skipped=0` / `converged: true` / exit=0——**收敛真能达成**。PR181 那个靶子上恒为假的结论不变（每轮都有截断），那是靶子特性不是机制缺陷 |
 
 ### 批 C dogfood 的 medium 余项（2026-10-02，19 条相关里修了 4 条，其余在此）
 
@@ -925,8 +941,8 @@ followup 里早有「任何按单轮墙钟做的比较都不可信，至少三�
 调用点自觉。这正是「同一件事不在两处各有一套」那条 followup 里「候选机制①：收成唯一入口」的实例。
 下次重构读写入口时照它改。
 
-**还没做的第 2 步**：把「带状态机的模块至少一条用例走完整往返」写进 `.trellis/spec/`，
-让它在下次开发时自动注入，而不是靠记得。
+**第 2 步 ✅ 已做**（2026-10-04 对账核实）：`.trellis/spec/guides/state-machine-thinking-guide.md` 已写（含「夹具不能绕开被测路径」与往返用例要求），`CLAUDE.md` 加了指针节「状态机：先问『谁写它』」。
+2026-10-04 增量轮重建又给它补了**第四种病**：分支可达、消费方齐全、单测直接构造输入测它——而喂它的那类输入根本到不了这个函数（`SkipCarried` 实例）。**第① 条的 grep 判据对这种病完全无效。**
 
 ## M21c 批 B 带出的账（2026-10-02）
 
@@ -996,3 +1012,20 @@ PR181 是现成的（公司仓，一轮 40-60 分钟），或者等下一批真�
 | **resume 轮的复核量会变** | 主循环前的派发段对 `prior_findings` 一视同仁：往轮已判的被 `known` 拦下记 `resumed`（不发请求），往轮**没验完**的（格成功、复核被 kill）这轮补验。方向是更准，但 `verify_triggered` 在 resume 轮会比以前高——第一次真实 resume 要看一眼这个数，别误读成回归 |
 | **`verify_rotation` 的起点被 carried 占用** | 派发段在主循环前跑，轮转游标从 0 开始先被 carried 用掉若干。只影响多 verifier 时的摊派顺序，不影响正确性；但读「哪个 verifier 验了几条」时要知道有这一段 |
 | **landed 循环的 `decide` 不再管 carried** | 那条路上的 `f` 恒 `Origin::New`，`delta_hunks` 传空片并已注明。将来若有人想在那里加 carried 相关判据，先看主循环前的派发段——carried 的挂点在那儿 |
+
+## followup 对账（2026-10-04，Trellis `10-04-followup-reconcile`）
+
+抽查 9 条，**7 条早已解决、无人回标**；扩到 12 条全部回标（见各条目的「✅ 已偿（2026-10-04 对账核实）」）。
+脚本数出的 226 条「未解」严重虚高。
+
+**根因不是懒得回标，是条件触发式的债没有触发机制。** 一批债挂的是「M21c 切名后做」，
+而切名 2026-09-28 就完成了——没有任何东西在那天提醒，于是集体到期却无人认领。
+同形的还有「攒够一批 schema 改动」「发布前」「下一轮 PR181 dogfood」。
+处置：顶部立「▲ 到期看板」，写条件触发式的债时登进去；条件满足当天回来扫一遍。
+
+| 项 | 判断 |
+|---|---|
+| **B 类 schema 包已攒够，可开批** | `first_job`/`last_job` 改名、`last_verdict()` tie-breaker、`Finding` 带队列项 id、`CellRecord.attempts` 拆三个字段。最后一条影响切名门自动化——PR181 那轮 24 格 `attempts>1` 全是二阶段补查，一度被误判成修复轮，靠 `needs_two_stage_triggered` 恰好等于 24 才辨清 |
+| **A3 核下来不是「静默丢弃」债，是第四种病** | `enqueue_activated` 里 `from_ledger` 返回 `None` 的分支**不可达**（`line_start.max(1)` + `line_end.max(start)` 对上 `QueueItemSpec::new` 只拒 `a==0 \|\| b<a`）。没删：静默的**后果**重（台账回写早于入队，真丢会假性逼近活锁门、报告说「机制挖不动它」而它一次没被挖过）。改为 debug 下 `debug_assert!(false)` + release 披露，并立不变量用例 `from_ledger_never_fails_on_any_ledger_row` 真正守住它 |
+| **A1 的旧行为无人盯** | 把两条迁移 notice 从 `Config::load` 摘掉时全量测试**照绿**。又一处假绿，已补用例 |
+| **用例不该数「总数」** | A1 用例一度红在真机环境：`~/.config/redteam/` 确实存在（dev 二进制的旧配置），探测到 4 条而非 2 条。断言收紧到用例自己造的文件——**数总数会把用例绑在开发机环境上** |
