@@ -7,23 +7,72 @@ use std::path::Path;
 
 use super::ReviewArgs;
 
-/// M13 增量轮入口（只由 run_review_dispatch 路由进入）。M21a 批 F-4：旧 finding 路径已删，增量轮在 M21c 疑点台账 + delta 激活
-/// 落地后恢复；本版本显式报错（不静默降级为全量——守卫语义与 preflight 保持一致）。
+/// 增量轮入口（只由 `run_review_dispatch` 路由进入）。
+///
+/// 流程：四守卫 preflight → rename 迁移 → carry（重锚 + 排除已销案）→ 跑一轮**只含 delta** 的
+/// 评审并把携带项交给深挖 → 合并集收口。
+///
+/// 与全量轮的三处不同：
+/// - **证据范围是 delta**（上轮 stamped HEAD 以来的已提交改动），不是整个 changeset；
+/// - **携带项不入队、不占 cell**，只在收场并进 findings 集 → verdict 自动是合并集口径
+///   （携带 ∪ 新发），这正是 ship 协议要的；
+/// - 携带账进 `RunMeta.carry`，**不进 coverage 五集合**〔裁定 2〕——那五集合是 per cell 的，
+///   而携带项属于上一个 job 的格。
 pub async fn run_incremental_review(
     args: &ReviewArgs,
     prior_job: &str,
-    _cfg: &Config,
-    _root: &Path,
+    cfg: &Config,
+    root: &Path,
+    registry: &crate::provider::registry::ProviderRegistry,
+    sink: Option<&dyn crate::orchestrate::CellSink>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
-    anyhow::bail!(
-        "--incremental-from {prior_job}: 增量轮在 M21c 疑点台账回流后恢复（M21a scan-only 无 finding 可携带）；本版本请跑全量 `review --base {}`",
-        args.base.as_deref().unwrap_or("<base>")
+    // 先判库在不在再开（零副作用）：`JobStore::open` 会 `create_dir_all` 并建库，而**拒跑不该建库**
+    // 是本仓一贯的门（与 `load_ledger` / 落账 / 激活同口径）。库都没有就没有上轮 job 可言，直接报错。
+    let db_path = crate::db::project_db_path(root);
+    anyhow::ensure!(
+        db_path.exists(),
+        "--incremental-from {prior_job}: 项目库不存在（{}），没有上轮作业可承接；先跑一次全量 `redteam review`",
+        db_path.display()
+    );
+    let store = crate::state::JobStore::open(root)?;
+    let base = incremental_preflight(&store, args, prior_job, root)?;
+
+    // rename 迁移在 carry 之前：旧路径上的 finding 先改到新路径，否则重锚一定落空。
+    let mut prior = base.prior_findings;
+    crate::consolidate::carry::migrate_renames(&mut prior, &base.renames);
+
+    // 已销案的不再携带（`resolve add` 的语义：下一轮增量据此不再携带该 finding）。
+    let resolved_ids: std::collections::HashSet<String> = crate::db::ProjDb::open_read_only(
+        &crate::db::project_db_path(root),
     )
+    .ok()
+    .and_then(|db| db.resolved_cards().ok())
+    .map(|cards| cards.into_iter().map(|c| c.id).collect())
+    .unwrap_or_default();
+
+    let outcome = crate::consolidate::carry::carry(prior, &resolved_ids, root);
+    let carry_meta = crate::domain::report::CarryMeta {
+        base_sha: base.base_sha.clone(),
+        carried: outcome.carried.len() as u32,
+        dropped: outcome.carried_dropped.len() as u32,
+        resolved_applied: outcome.resolved_applied.len() as u32,
+    };
+    let disputed = outcome.resolution_disputed.clone();
+
+    // 证据范围 = delta。head_sha 与全量轮同一单点（证据收集实跑刻）。
+    let head_sha = crate::evidence::git::head_sha_at(root).ok();
+    let (mut report, code) = super::run_code_review(
+        args, registry, cfg, base.delta, root, head_sha, sink, outcome.carried,
+    )
+    .await?;
+    report.run.carry = Some(carry_meta);
+    // 假修复争议进报告（md 的「⚠️ Disputed」行一直在等这个 writer）。
+    report.run.resolution_disputed = disputed;
+    Ok((report, code))
 }
 
-/// M13 增量基线（incremental_preflight 产物）。M21c 增量轮恢复前无生产调用（守卫语义与测试保留）。
+/// M13 增量基线（`incremental_preflight` 产物），由 `run_incremental_review` 主流水线消费。
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct IncrementalBaseline {
     /// 上轮 stamped HEAD（delta base）。
     pub base_sha: String,
@@ -35,7 +84,6 @@ pub(crate) struct IncrementalBaseline {
     pub delta: Vec<crate::evidence::git::FileChange>,
 }
 
-#[allow(dead_code)] // M21c 增量轮恢复前无生产调用；四守卫测试保留
 /// 决议 7 前置守卫：违反**显式报错拒跑**（不静默降级全量——成本意外）。
 /// ①谱系 ②同族（scope，含 v1 范围收窄 branch）③健康基线（R2 三查）④空 delta。
 pub(crate) fn incremental_preflight(

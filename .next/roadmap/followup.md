@@ -77,7 +77,7 @@
 
 | 项 | 现状 | 归属 |
 |---|---|---|
-| 增量轮两份清单 | 旧 prompt：`{{OTHER_CHANGED_FILES}}` 跨组索引已含全分支非 delta 文件 + `[delta]`，`<incremental_round>` 仍渲染 `two_layer_manifest` 双层清单（同信息两处，≤ 8K 字符）。新 `build_scan_prompt`（批 D-3，2026-09-08）只保住 `[delta]`（跨组索引槽），增量轮框架语（delta base 一句 + 上轮 claimed/resolved 顺带验证清单）**无槽** | 旧 prompt 与 `two_layer_manifest`、E11-Q5 红测群随 F-4 整体删；增量轮框架语 + 顺带验证清单在 M21c 台账回流时给 scan prompt 加槽（参考块内，需中和） |
+| 增量轮两份清单 | 旧 prompt：`{{OTHER_CHANGED_FILES}}` 跨组索引已含全分支非 delta 文件 + `[delta]`，`<incremental_round>` 仍渲染 `two_layer_manifest` 双层清单（同信息两处，≤ 8K 字符）。新 `build_scan_prompt`（批 D-3，2026-09-08）只保住 `[delta]`（跨组索引槽），增量轮框架语（delta base 一句 + 上轮 claimed/resolved 顺带验证清单）**无槽** | 旧 prompt 与 `two_layer_manifest`、E11-Q5 红测群随 F-4 整体删。✅ **实质已解（2026-10-04 增量轮重建单元）**：核实下来这条的内核不是 prompt 槽，而是**假修复检测**这个功能缺口（与 followup:136 第②句同根），而它落进了**二进制**而非 prompt——`carry()` 直接用 `anchor_near` 判 quote 还在不在，比让模型在 prompt 里「顺带验证」确定得多（符合「内置命令优先」）。剩下的「delta base 一句」纯属信息性框架语，`[delta]` 槽已带这层语义，不再单独加槽 |
 | `review --format json` 无 scanner 输出面 | `run.cells` 是 CellSummary（无 output）；`eval/scan_score.py` 的 `cells[].output.suspicions` 输入形态今天没有产品面产出 | ✅ 批 F-3 / F-4（2026-09-09）：报告顶层 `cells: Vec<CellRecord>`（含 `output`，tag `role`），前台 / job / resume 三路都填；评分器零改 |
 | `--pack-only` 预算的模型窗来源 | ✅ 合入批 A 时已改读 `cfg.active_roles()`（与真实评审同一 `budget_and_spec`） | — |
 | `GroupingStats` 只在 `--pack-only` 可见 | stdout + `summary.json`；真实评审的 RunMeta 未接线（避免撞批 B 的 `report.rs`） | ✅ 批 F-5（2026-09-09）`RunMeta.grouping`；分种计数（:49）仍待 |
@@ -92,7 +92,7 @@
 | 切片常数：一跳 K=3 调用点 / 名、`anchorWindow` 30、文件外段帽 = 组预算 / 8、名字上限 40、走仓上限 20000 文件、文件头 ≤ 80 行、多行签名 ≤ 6、胶水 ≤ 3 | 常量在 `src/pack/mod.rs`；`anchorWindow` / `sliceMinBytes` 已是配置键 | R7（出口 3 A/B 回退信号后调优 / M21d） |
 | 文件外搜索的读守卫口径 = `search_repo` 工具（ignore 走仓 + denylist，不逐文件 `git ls-files`）；路径非模型可控 | 未跟踪但未被 gitignore 的支持语言文件会被搜到调用点 | 威胁模型 B 若要求「只读 git-tracked」，一次 `git ls-files -z` 取集合再过滤（F-2 scanner 路径评估） |
 | 文件外走仓每组一次（N 组 = N 次串行全仓扫描，每文件新建 Searcher）；`> 20000` 文件截断处非确定（walker 序） | 本仓 2 组 2.0 s；PR181 规模 ≤ 5 组可接受 | 大仓变慢再做「一次走仓、按组分发」（build_packs 层合并名集）；截断时改按路径排序后截 |
-| 评审 PLAUSIBLE 未核实：增量路径 `extra_paths`（全分支非 delta 文件）是否会经文件外片段泄漏进 pack | 文件外搜索只排除 `changeset`（当轮 bundles 的文件），增量轮的非 delta 分支文件不在其中——会被当普通仓文件搜调用点（内容非密，但与跨组索引「只带路径」的口径不一致） | F-2 / 增量轮清单合并（D-3）时定口径：`changeset ∪ extra_paths` 或维持 |
+| 评审 PLAUSIBLE 未核实：增量路径 `extra_paths`（全分支非 delta 文件）是否会经文件外片段泄漏进 pack | 文件外搜索只排除 `changeset`（当轮 bundles 的文件），增量轮的非 delta 分支文件不在其中——会被当普通仓文件搜调用点（内容非密，但与跨组索引「只带路径」的口径不一致） | **仍开放，但当前不触发**（2026-10-04 增量轮重建时核实）：重建后的增量轮只把 **delta** 当证据范围喂 `run_code_review`，根本没有 `extra_paths`（全分支非 delta 文件）那一层，所以这条泄漏路径现在不存在。将来若补「全分支索引」要连这个口径一起定：`changeset ∪ extra_paths` 或维持 |
 | 切片默认后 `Bundle.over_budget` 组的 pack 仍可能很大（本仓 cell-2：6 文件切片 + 1 梯子 = 220 KB） | 切片只降无关体，改动密集文件（本批 pack/mod.rs 核 57）切片 ≈ 全文 | R7 / lib.rs 超级枢纽议题一并看：分组预算门用估算字节、装包用切片字节，两者口径待对齐（M21b 前用 PR181 回放） |
 | 「改动 def 名」两套口径：分组引用边 `bundle::changed_def_names`（hunk 首行锚定 + `block_end`、含测试 def）vs 文件外搜索键 `pack::outside_names`（全改动行 + `value_end` + 容器 / 测试排除 + 重锚定坐标） | 边与搜索键落在不同符号集上；分组侧改口径会扰动 C 的确定性测试与 stats | M21b 风险规则复用 `changed_defs` 时一并统一（分组侧改为吃 `all_defs` / `changed_defs`），届时重跑分组回归 |
 
@@ -124,7 +124,7 @@
 |---|---|---|
 | resume scan 重放无生产验证 | `run_resume` 用 manifest `scan` 请求重放差集 cell（旧格式作业记失败）；只有单测 / e2e 空 manifest 锚，无真 provider dogfood；角色集按当前配置重建 | M21b 队列快照 checkpoint 落地后重做（resume 读快照里的角色条目） |
 | thinking 映射未在真网关实测的家族 | 映射表按官方文档（2026-09-09）：GLM anthropic 形态文档无字段 → 无映射 + warning；Qwen `enable_thinking` / Gemini `reasoning_effort` 未实测；本仓 dogfood 只覆盖 DeepSeek（`thinking` + `reasoning_effort`）与 Qwen（openai 形态） | 出口 2 已跑（2026-09-09）：GLM 5.3 anthropic 形态无映射 → registry warning 1、未发思考参数，网关默认仍有推理输出，并集 / agreement 正常；映射待 Z.ai anthropic 文档给字段；其余按模型接入时实测 |
-| 增量轮显式报错 | `run_incremental_review` bail；e2e `incremental_from_bails_until_m21c` 锚住报错；原 carry 端到端锚与 `render_incremental_section` / `two_layer_manifest` 随旧路径删 | **仍 bail**〔M21c 批 C 裁定 1，2026-10-02〕：delta 激活改**挂全量轮**落地（激活所需输入在全量轮上已全部具备，实测本仓两轮全量就产生过跨轮项），`--incremental-from` 不在批 C 范围。重建它要先重裁「上轮 finding 要不要携带」——`carry()` / `merge_carry()` 全是 `Finding` 形态，而新形态下 finding 只由深挖产出；`incremental_preflight` 四守卫仍 `#[allow(dead_code)]` 有测试无调用。连同那次设计重裁一起排期 |
+| 增量轮显式报错 | `run_incremental_review` bail；e2e `incremental_from_bails_until_m21c` 锚住报错；原 carry 端到端锚与 `render_incremental_section` / `two_layer_manifest` 随旧路径删 | ✅ **已解除（2026-10-04 增量轮重建单元）**：主流水线接通，bail 锚换成 `incremental_from_is_refused_by_preflight_guards` + 真实增量轮 e2e；`incremental_preflight` 与 `IncrementalBaseline` 的 `#[allow(dead_code)]` 已摘（有生产调用）。**开工前核实推翻了「要先重裁上轮 finding 要不要携带」**：那不是开放问题（design §8.2 / ship 协议 / `resolve` 语义三处已锁），携带机制也一直在跑（为 resume 建的），缺的只有 preflight 之后的接线。真正没定过的是批 B/C 引入的新交叉，四个交叉点已查清（见 Trellis 任务 `10-04-incremental-rebuild/prd.md`）。〔历史〕**曾 bail**〔M21c 批 C 裁定 1，2026-10-02〕：delta 激活改挂全量轮落地，`--incremental-from` 不在批 C 范围 |
 | ~~dismissed 台账只披露不消费~~ **已消费**（批 B 接 `cards`，2026-10-04 接回 `previously_dismissed`） | `cards` 现供三处：scanner prompt 注入、入队侧判例豁免、精确 id 命中标 `previously_dismissed`。**`Ledger.ids` 仍无消费者**——精确 id 匹配直接用 `cards` 的 id 做，`ids` 可删或留作 csv 形态（`--dismissed <csv>` 只产 ids 不产 cards，那条路现在拿不到豁免，要么补要么在 `--help` 里说清） | M21c 批 B（判例前移）。**2026-10-02 摸台账发现前提不成立**：判例只由 ship 循环的人工裁定写入，M21 期间不跑 ship → 新库 `dismissed` / `resolved` 恒 0，本仓两轮与 PR181 四轮的 `ledger.loaded` 全是 0。旧库 63 + 3 条在主工作树 v0 库里且**仅 22 条带 quote 锚**。批 B 开工前先裁喂料方式（等可跑 ship，或捡回 D19-4 搁置的「`--dismissed` 指向旧库只读复用」） |
 | 无消费者的旗 | `--block-threshold` / `--conf-floor` / `--tools` / `--dismissed` / `--no-dismissed` 保留、`--help` 注明生效里程碑（prd K13） | M21b（前三）/ M21c（后二）接消费者；届时改回文案 |
 | 报告里的 finding 形态字段恒空 | `stats` 全零、`findings` / `clusters` 空数组仍序列化（schema 不翻号，followup :70）；插件 `result.md` / `review.md` 文案「呈现 findings」 | M21b 深挖产 finding 后自然填；插件文案 M21c 切名时改 |
@@ -133,7 +133,7 @@
 | 大 diff 组的单 cell 体量 | 本分支 dogfood diff：cell-3 26 文件 / 466 KB diff / 782 KB prompt（≈ 224K token，16 文件走梯子）——分组预算门按估算字节、装包按切片字节（批 E 延后项已记） | R7 / lib.rs 超级枢纽议题一并看；M21b 前用 PR181 回放 |
 | `GroupingStats` 分种计数 | `RunMeta.grouping` 已接（F-5），`cross_edges` / `weak_cut` 仍按全部边种计（:49） | ✅ 2026-09-10 已偿（`09-10-grouping-stats-kinds`，见上表同行） |
 | Anthropic thinking 注入未按 tools 守卫 | `thinking{enabled}` 与工具往返同发时 Anthropic 要求 `tool_choice` / 交替约束，M21b reviewer 工具循环走 anthropic kind 会 400（评审帽外项，当前 scanner 无工具不可达） | M21b reviewer 接线时在 `build_anthropic_tools_body_ext` 按 tools 非空守卫 |
-| `resolve --help` 文案仍承诺增量轮消费 | `resolve` 子命令 doc「增量轮据此不再携带该 finding」——增量轮 M21c 恢复前无消费者 | M21c 恢复增量轮时一并核文案 |
+| ~~`resolve --help` 文案仍承诺增量轮消费~~ | `resolve` 子命令 doc 两句承诺：①「增量轮据此不再携带该 finding」②「quote 未随修复消失的会注入下轮顺带验证防假修复」 | ✅ **两句都兑现了（2026-10-04 增量轮重建单元）**：① 主流水线读 `resolved_cards()` 喂 `carry()`；② `carry()` 在排除 resolved 那支顺手查一次 `anchor_near`——锚得上 = 没真修 = 争议，经 `CarryOutcome.resolution_disputed` → `RunMeta` → md「⚠️ Disputed」。②**此前是「有读无写」**：渲染和测试都在，产品路径零 writer，接通增量轮才让这条风险真实暴露（人 resolve 说已修、quote 还在、这轮不携带、报告也不提 = 假修复被静默放过） |
 | `exit_code(verdict, failed_models_nonempty)` 第二参在 scan 路径恒 false | 五档契约保留 2 档给 M21b（reviewer 失败带债 approve） | M21b 定 failed_models 语义后再定是否收敛签名 |
 | `ScanResults.usage / failed / needs_declared` 生产无消费者 | `finish_scan_report` 从记录重算；三字段只有测试读 | M21e 清扫时删或改成 `#[cfg(test)]` 访问器 |
 | `anchor_suspicions` 每疑点重读同文件 | 一 cell 几十条疑点 × `safe_read` | 语料大时按文件缓存一次读（M21c 跨文件重定位落地时顺手） |
@@ -209,9 +209,9 @@ coverage `failed` 数。
   批 C1 的并发派发一开即触发（多格同时在途时入队），Task C1-1 先把队列项身份与 spec 解耦（id 固定，ranges 可变）；批 D 的复核回灌同理。
 - **`merge_into` 命中 Skipped 项返回 `MergedPending` 但不改回 Pending**：并入后 agreement 升到 ≥2（进必挖集）也不会被
   重挖。同样因 drain 在消费循环前、其后无入队而不可触发；解法与上条同源。
-- **`ItemKind::Needs` / `QueueOrigin::Needs` 无生产路径**：needs 改走 cell 内二阶段补查轮（design §11 R2），
-  队列 Needs 层与 `DeepMeta.enqueue_reasons["needs"]` 恒空。prd 的四层优先级实际只有三层活——保留枚举作 M21c
-  增量轮的入队口，或届时删。
+- ~~**`ItemKind::Needs` / `QueueOrigin::Needs` 无生产路径**~~ → ✅ **已过期，不用删**（2026-10-04 增量轮重建时核实）：
+  批 C3〔D16〕Q8 已给它生产路径（`orchestrate/mod.rs:306` 的 needs 入队），四层优先级现在四层都活。
+  原文：needs 改走 cell 内二阶段补查轮（design §11 R2），队列 Needs 层与 `DeepMeta.enqueue_reasons["needs"]` 恒空。
 
 ## Anthropic thinking 两处真债（2026-09-12 查证官方文档立项；批 C 守卫已按此更正）
 
@@ -956,7 +956,7 @@ M21c 批 D 核验时，交付项 9 的「ship r1-rN 至 approve」与「M21 期�
 | 待处置 | 来由 |
 |---|---|
 | **收敛三维的消费从未在真实循环里跑过** | 批 B 给 `ship.md` 接了停机判定（活锁优先、converged 分支、缺键按旧行为），全靠读协议文本推演，一轮都没真跑验证过 |
-| **增量轮未恢复 → ship 的 r2 要降级** | ship 从 r2 起加 `--incremental-from`，而那条路径按批 C 裁定 1 仍 bail。批 D 已往守卫清单补了降级条目，但**那条降级路径同样没真跑过**。要么验它，要么顺带把增量轮重建（它要先重裁「上轮 finding 要不要携带」） |
+| ~~**增量轮未恢复 → ship 的 r2 要降级**~~ → **前提已消失（2026-10-04 增量轮重建单元）** | 原文：ship 从 r2 起加 `--incremental-from`，而那条路径按批 C 裁定 1 仍 bail；批 D 补的降级条目同样没真跑过。**现在 `--incremental-from` 可跑了**，ship 的 r2 走设计时的主路径，不必降级。**但三件事要在 ship 单元里确认**：① 守卫清单里的降级条目与「增量轮尚未恢复」提示该拆掉（`0d0a21f` 加的）；② preflight 四守卫会**显式拒跑**（脏工作树 / 谱系 / 同族 / 空 delta），ship 得会读这个错并决定是停还是退全量——拒跑不是降级信号，是让人去提交；③ r2 起 carried finding 会进合并集，ship 判「还有没有新问题」时要分清携带与新发（`run.carry` 三量 + `Origin::Carried`） |
 | **判例建卡在循环里是核心动作** | 批 B 只验了单条 `dismiss add --from`。ship 的内循环每轮要对误报批量建卡、对已修项 `resolve add`，还有 `dismiss set-status` 的复裁链（re-upheld / withdrawn / human-confirmed）——这些状态在批 D 的状态机盘点里确认有来路，但**全是 CLI 手工路径，没有循环中的实测** |
 | **`disable-model-invocation: true`** | ship 禁止模型自调，只能人触发。这对「循环」是个结构性限制：每一轮都要人起一次。要不要改、怎么改（比如只在首轮要人、后续轮自动续），是这个单元该裁的 |
 | **停滞 / 活锁守卫在 ship 侧的形态** | R12 一直挂着「台账激活上限 N 与停车通道形态」。批 C 做了引擎侧的两段门（3 强制必挖 / 5 停车），ship 侧的「停车 → AskUserQuestion 交人」只有协议文本 |
@@ -983,3 +983,16 @@ PR181 是现成的（公司仓，一轮 40-60 分钟），或者等下一批真�
 **这是第三次撞上「定义了却没人用」的同形**（`Phase::Verify` 没人写、`relocated` 没人读、
 这次是有人读没人写）。前两次的判据「grep 消费方、排除测试、看还剩几个」只覆盖了一半——
 **反向也要查：有消费者的字段，谁在写它？** 已把这一句补进状态机指南。
+
+## 增量轮重建带出的账（2026-10-04，Trellis `10-04-incremental-rebuild`）
+
+> 本单元解掉的旧账见各自条目：followup:80（假修复检测，实质已解）、:95（`extra_paths` 口径，
+> 当前不触发）、:127（增量轮 bail，已解除）、:136（`resolve --help` 两句承诺都兑现）、
+> :214（`ItemKind::Needs` 已过期不用删）、:959（ship r2 降级的前提消失）。
+
+| 项 | 说明 |
+|---|---|
+| **后台增量轮仍不支持** | `--background --incremental-from` 在命令层拒（`main.rs`）。拒的理由**变了**：不再是「worker 里一定 bail」，而是 preflight 四守卫在 worker 内拒跑会落成 Failed 作业——参数与环境问题不该让用户去 `status <id>` 才看见。要支持得把 preflight 提到建 job 之前。`run_review_dispatch` 的增量分流本身前后台共用，不构成障碍 |
+| **resume 轮的复核量会变** | 主循环前的派发段对 `prior_findings` 一视同仁：往轮已判的被 `known` 拦下记 `resumed`（不发请求），往轮**没验完**的（格成功、复核被 kill）这轮补验。方向是更准，但 `verify_triggered` 在 resume 轮会比以前高——第一次真实 resume 要看一眼这个数，别误读成回归 |
+| **`verify_rotation` 的起点被 carried 占用** | 派发段在主循环前跑，轮转游标从 0 开始先被 carried 用掉若干。只影响多 verifier 时的摊派顺序，不影响正确性；但读「哪个 verifier 验了几条」时要知道有这一段 |
+| **landed 循环的 `decide` 不再管 carried** | 那条路上的 `f` 恒 `Origin::New`，`delta_hunks` 传空片并已注明。将来若有人想在那里加 carried 相关判据，先看主循环前的派发段——carried 的挂点在那儿 |

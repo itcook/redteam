@@ -17,6 +17,13 @@ fn scan_registry(entries: &[(&str, &str)]) -> ProviderRegistry {
     }
     reg
 }
+/// scanner + reviewer 各一个条目的 registry（增量轮 e2e 用：要真挖出 finding 才有东西可携带）。
+fn scan_and_review_registry(scan: &str, review: &str) -> ProviderRegistry {
+    let mut reg = ProviderRegistry::new();
+    reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(scan_turn(scan))), Duration::from_secs(5), 0);
+    reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(scan_turn(review))), Duration::from_secs(5), 0);
+    reg
+}
 fn args_wt() -> ReviewArgs {
     ReviewArgs { pack_only: false,
         base: None, scope: "working-tree".into(),
@@ -46,7 +53,7 @@ async fn scan_anchors_real_suspicion_and_drops_fabricated() {
     let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let changes = vec![FileChange { path: "src/auth.rs".into(), diff: "@@ -3,1 +3,1 @@\n+    db.write(token);".into() }];
 
-    let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, root.path(), None, None).await.unwrap();
+    let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, root.path(), None, None, vec![]).await.unwrap();
 
     assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0));
     let scan = report.scan.as_ref().expect("scan 段");
@@ -78,7 +85,7 @@ async fn two_scanner_families_same_quote_yield_agreement_two() {
         ("p/beta", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"write without validation","confidence":0.7,"quote":"db.write(token);"}],"scanned_areas":[]}"#),
     ]);
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    db.write(token);".into() }];
-    let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+    let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
 
     assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0));
     let scan = report.scan.as_ref().unwrap();
@@ -102,7 +109,7 @@ async fn unreachable_scanner_cell_makes_scan_incomplete_exit_three() {
     let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"ghost":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let reg = scan_registry(&[("p/alpha", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"minor","confidence":0.3,"quote":"let x = 1;"}],"scanned_areas":[]}"#)]);
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
-    let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+    let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
 
     assert_eq!((report.verdict, code), (Verdict::Incomplete, 3));
     assert_eq!(report.run.coverage.failed.get(&Role::Scanner), Some(&vec!["scan[g1]@p/ghost#1".to_string()]));
@@ -133,19 +140,64 @@ fn incremental_from_background_is_rejected_before_spawning_job() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("M21c"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--incremental-from"),
+        "{}", String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!dir.path().join(".redteam").join(redteam::db::DB_FILE).exists(), "不建 job / 不落库");
 }
 
-/// M21a 批 F-4：增量轮在 M21c 台账回流前显式报错（不静默降级全量），走 `run_review_dispatch` 真路由。
+/// **CLI 入口真的放行增量轮**（增量轮重建，2026-10-04）。
+///
+/// 重建时差点漏掉的一层：`main.rs` 有过一个**无条件**拒收
+/// （`if args.incremental_from.is_some() { exit(1) }`，文案「在 M21c 疑点台账回流后恢复」），
+/// 而本单元其余 e2e 全走库函数 `run_review_dispatch`，**绕过了命令层**——
+/// 于是主流水线接通了、测试全绿，裸终端用户照样用不了。这条拿真二进制堵住那个缺口。
+///
+/// 判据选「错误不再是那句过期文案」而不是「跑通」：跑通要配 provider、要有上一轮 job，
+/// 成本远超这条要守的东西。到得了 preflight / 项目库检查，就说明命令层放行了。
+#[test]
+fn cli_entry_lets_incremental_through_to_the_pipeline() {
+    let bin = env!("CARGO_BIN_EXE_redteam");
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new("git")
+        .current_dir(dir.path()).args(["init", "-q", "-b", "main"]).output().unwrap();
+    assert!(out.status.success());
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.json"), r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+
+    let out = std::process::Command::new(bin)
+        .current_dir(dir.path())
+        .env("REDTEAM_HOME", home.path())
+        .args(["review", "--base", "main", "--incremental-from", "prior1"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !err.contains("M21c"),
+        "命令层不该再无条件拒收增量轮（那句过期文案还在 = 主流水线根本进不去）: {err}"
+    );
+    assert!(
+        err.contains("项目库不存在") || err.contains("--incremental-from prior1"),
+        "该走到增量流水线自己的检查（项目库 / preflight 守卫）: {err}"
+    );
+}
+
+/// 增量轮的 preflight 守卫**显式拒跑、不静默降级全量**，走 `run_review_dispatch` 真路由。
+///
+/// 原来这条锚的是「增量轮整个 bail」那段过渡文案（含 "M21c"）；增量轮重建后主流水线接通了，
+/// 拒跑改由四守卫负责——这里的空目录会撞上脏树/基线守卫。锚 `--incremental-from` 前缀而不是
+/// 某一条具体文案：守卫顺序将来可能变，而「报错里要指出是哪个 flag 的问题」是稳定契约。
 #[tokio::test]
-async fn incremental_from_bails_until_m21c() {
+async fn incremental_from_is_refused_by_preflight_guards() {
     use redteam::cli::run_review_dispatch;
     let dir = tempfile::tempdir().unwrap();
     let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let args = ReviewArgs { base: Some("main".into()), scope: "branch".into(), incremental_from: Some("prior1".into()), ..args_wt() };
     let err = run_review_dispatch(&args, &ProviderRegistry::new(), &cfg, dir.path(), None).await.unwrap_err();
-    assert!(err.to_string().contains("M21c") && err.to_string().contains("prior1"), "{err}");
+    assert!(err.to_string().contains("--incremental-from"), "报错要指出是哪个 flag: {err}");
+    assert!(!dir.path().join(".redteam").join(redteam::db::DB_FILE).exists(), "拒跑不该建库");
 }
 
 /// M17-c Task 6（批 F-4 scan 版）：背景 job 冒烟 e2e——真 worker 落盘链路首条端到端锚（C-Q5）：进程内驱动 `run_job`（pub API，
@@ -462,7 +514,7 @@ async fn dismissed_ledger_is_loaded_and_disclosed_in_scan_only() {
     let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let reg = scan_registry(&[("p/m", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"unvalidated write","confidence":0.9,"quote":"db.write(token);"}],"scanned_areas":[]}"#)]);
     let changes = vec![FileChange { path: file.into(), diff: "+    db.write(token);".into() }];
-    let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+    let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
 
     let ledger = report.run.ledger.as_ref().expect("台账应自动加载，run.ledger 应披露");
     assert_eq!(ledger.loaded, 1, "应加载到刚写入的这 1 条判例");
@@ -921,4 +973,194 @@ fn pack_only_injects_precedents_and_honors_no_dismissed() {
     let without = read_packs(dir.path());
     assert!(!without.contains("PACKONLY_PRECEDENT_MARK"), "--no-dismissed 下不得注入判例: {without}");
     assert!(without.contains("(none)\n</precedents>"), "要留空槽占位: {without}");
+}
+
+/// 增量轮端到端（增量轮重建，2026-10-04）：r1 全量留下 finding → 改一处 → r2 增量携带它。
+///
+/// 这是整个单元的主验收。钉四件事：
+/// ① carried finding 进了本轮合并集（verdict 是「携带 ∪ 新发」口径，ship 协议要的）；
+/// ② 携带账进 `RunMeta.carry`，而**不进 coverage 五集合**〔裁定 2〕；
+/// ③ 证据范围是 delta 而非整个 changeset；
+/// ④ 划分不变式 `selected = completed ⊎ reused ⊎ failed ⊎ waived` 仍成立。
+#[tokio::test]
+async fn incremental_round_carries_prior_findings_into_the_merged_set() {
+    use redteam::cli::{run_review_dispatch, ReviewArgs};
+    use redteam::config::Config;
+    use redteam::state::JobStore;
+    use std::sync::Arc;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    // `.redteam/` 不入版本控制——真实项目都这么配。不 ignore 的话 `git add -A` 会把 r1 建的
+    // 作业库提交进去，之后任何写库（下销案卡、r2 自己跑）都让工作树变脏，
+    // 直接撞上 preflight 的「干净工作树」守卫。
+    std::fs::write(dir.path().join(".gitignore"), ".redteam/\n").unwrap();
+    // 两个文件：old.rs 的问题在 r2 不会被重扫（它不在 delta 里）→ 只能靠携带活下来
+    std::fs::write(dir.path().join("src/old.rs"), "fn old() {\n    db.write(token);\n}\n").unwrap();
+    std::fs::write(dir.path().join("src/new.rs"), "fn new_one() {\n    ok();\n}\n").unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "base"]);
+    git(dir.path(), &["checkout", "-qb", "work"]);
+    std::fs::write(dir.path().join("src/old.rs"), "fn old() {\n    db.write(token);\n    more();\n}\n").unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "r1 target"]);
+
+    let cfg = Config::from_json(
+        r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#,
+    )
+    .unwrap();
+    // r1：在 old.rs 上挖出**两条** finding——一条留着走携带，一条用来验假修复检测。
+    let scan1 = r#"{"suspicions":[{"file":"src/old.rs","line_start":2,"line_end":2,"hint":"未校验写入","confidence":0.9,"quote":"db.write(token);"},{"file":"src/old.rs","line_start":3,"line_end":3,"hint":"多余调用","confidence":0.9,"quote":"more();"}],"scanned_areas":[]}"#;
+    let rev1 = r#"{"findings":[{"severity":"high","title":"unvalidated write","body":"b","file":"src/old.rs","line_start":2,"line_end":2,"confidence":0.9,"recommendation":"r","quote":"db.write(token);"},{"severity":"high","title":"stray call","body":"b","file":"src/old.rs","line_start":3,"line_end":3,"confidence":0.9,"recommendation":"r","quote":"more();"}],"needs":[]}"#;
+    let reg1 = scan_and_review_registry(scan1, rev1);
+
+    let args1 = ReviewArgs {
+        base: Some("main".into()), scope: "branch".into(), background: true,
+        ..args_wt()
+    };
+    let job1 = "r1job";
+    let store = Arc::new(JobStore::open(dir.path()).unwrap());
+    store.write_args_raw(job1, &serde_json::to_string(&args1).unwrap()).unwrap();
+    store.create_job(job1, 1_000).unwrap();
+    let _ = redteam::cli::run_job(job1, &args1, &reg1, &cfg, dir.path(), 1_000, Arc::clone(&store)).await;
+    let r1: redteam::domain::ReviewReport =
+        serde_json::from_str(&store.read_result(job1).expect("r1 result")).unwrap();
+    assert_eq!(r1.findings.len(), 2, "r1 该挖出两条: {:?}", r1.run.warnings);
+    let carried_id = r1.findings.iter().find(|f| f.title == "unvalidated write").unwrap().id.clone();
+    let resolved_f = r1.findings.iter().find(|f| f.title == "stray call").unwrap().clone();
+
+    // r2 的 delta 只碰 new.rs —— old.rs 不在 delta 里，那条 finding 只能靠携带活下来
+    std::fs::write(dir.path().join("src/new.rs"), "fn new_one() {\n    ok();\n    extra();\n}\n").unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "r2 fix"]);
+
+    // 人对第二条下销案卡说「已修」——但 old.rs 原样没动，`more();` 还在那儿。
+    // 这是 `resolve --help` 承诺要防的**假修复**：不携带 + 报告里出「⚠️ Disputed」。
+    // 写在最后一次 commit **之后**：既贴合真实用法（人在两轮之间 resolve），
+    // 也避开 `git add -A` 把 `.redteam/` 库文件收进版本控制——那样 r2 写库就会让工作树变脏，
+    // 撞上 preflight 的「干净工作树」守卫。
+    {
+        let mut pdb = redteam::db::ProjDb::open(dir.path()).unwrap();
+        pdb.resolve_upsert(&redteam::db::ResolveCard {
+            id: resolved_f.id.clone(), title: resolved_f.title.clone(), file: resolved_f.file.clone(),
+            quote: resolved_f.quote.clone(), severity: "high".into(), reason: "已修".into(),
+            round: "r1".into(), updated_at: String::new(),
+        })
+        .unwrap();
+    }
+
+    // r2 的 scanner 在 new.rs 上什么都不报 → 新发为 0，合并集里只剩携带项
+    let reg2 = scan_and_review_registry(r#"{"suspicions":[],"scanned_areas":[]}"#, r#"{"findings":[],"needs":[]}"#);
+    let args2 = ReviewArgs {
+        base: Some("main".into()), scope: "branch".into(),
+        incremental_from: Some(job1.into()), ..args_wt()
+    };
+    let (r2, _code) = run_review_dispatch(&args2, &reg2, &cfg, dir.path(), None).await.expect("r2 该跑通");
+
+    // ① 携带进了合并集
+    assert!(
+        r2.findings.iter().any(|f| f.id == carried_id),
+        "上轮的 finding 该被携带进来: {:?}", r2.findings.iter().map(|f| &f.id).collect::<Vec<_>>()
+    );
+    let c = r2.findings.iter().find(|f| f.id == carried_id).unwrap();
+    assert_eq!(c.origin, redteam::domain::Origin::Carried, "携带项要标 Carried");
+
+    // ② 携带账在 RunMeta，不在 coverage
+    let carry = r2.run.carry.as_ref().expect("增量轮该有携带账");
+    assert_eq!((carry.carried, carry.resolved_applied), (1, 1), "{carry:?}");
+
+    // ②′ 假修复检测的**出口**：人说修了、quote 还锚得上 → 不携带，但报告要点名。
+    //     只测 `carry()` 的产出不够——主流水线那行 `report.run.resolution_disputed = disputed`
+    //     是条独立接线，没有这条断言把它删掉全量测试照绿（本单元第四次同形）。
+    assert!(
+        !r2.findings.iter().any(|f| f.id == resolved_f.id),
+        "销案的不该再携带"
+    );
+    assert_eq!(
+        r2.run.resolution_disputed, vec![resolved_f.id.clone()],
+        "quote 未随修复消失 → 该进 resolution_disputed（`resolve --help` 承诺的那半句）"
+    );
+    let cov = &r2.run.coverage;
+    let all_cells: Vec<&String> = cov.selected.values().flatten().collect();
+    assert!(
+        !all_cells.iter().any(|c| c.contains(&carried_id)),
+        "携带项没有本轮 cell，不该出现在 coverage 里: {all_cells:?}"
+    );
+
+    // ③ 证据范围是 **delta 而非整个 changeset**：r2 只该审 new.rs。
+    //    old.rs 从 main 看也是改过的（r1 那个提交），所以「只跑了格」证明不了什么——
+    //    必须断言它**没出现在本轮的格里**（变异检查实测：弱断言下把 delta 换成全量照绿）。
+    let scanned: Vec<String> = r2.run.cells.iter().map(|c| c.cell.clone()).collect();
+    assert!(!scanned.is_empty(), "r2 该真跑了格");
+    assert!(
+        scanned.iter().any(|c| c.contains("new.rs")) || !scanned.iter().any(|c| c.contains("old.rs")),
+        "证据范围该是 delta（只有 new.rs），old.rs 不该再被扫: {scanned:?}"
+    );
+    let r2_files: Vec<&str> = r2.scan.as_ref().map(|s| s.groups.iter().flat_map(|g| g.files.iter().map(String::as_str)).collect()).unwrap_or_default();
+    assert!(!r2_files.contains(&"src/old.rs"), "old.rs 不在 delta 里，不该进本轮装包: {r2_files:?}");
+
+    // ④ 划分不变式仍成立
+    cov.check_partition().expect("五集合划分不该被携带项破坏");
+}
+
+/// 增量轮的三条携带分支：rename 迁移 / 销案排除 / **假修复争议**（增量轮重建，2026-10-04）。
+///
+/// 前两条变异检查实测在主 e2e 里是假绿的——那条用例没有改名场景、也没有 resolve 卡。
+/// 第三条是本单元新补的 writer：`resolution_disputed` 此前有渲染、有测试、没人写。
+#[test]
+fn carry_migrates_renames_drops_resolved_and_flags_fake_fixes() {
+    use redteam::consolidate::carry::{carry, migrate_renames};
+    use std::collections::HashSet;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    // moved.rs 是 old.rs 改名来的；fake.rs 里那行「说修了其实没修」
+    std::fs::write(dir.path().join("src/moved.rs"), "fn m() {\n    db.write(token);\n}\n").unwrap();
+    std::fs::write(dir.path().join("src/fake.rs"), "fn k() {\n    still_broken();\n}\n").unwrap();
+    std::fs::write(dir.path().join("src/real.rs"), "fn r() {\n    fixed_now();\n}\n").unwrap();
+
+    let mk = |id: &str, file: &str, quote: &str| -> redteam::domain::Finding {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "severity": "high", "title": "t", "body": "b", "file": file,
+            "line_start": 2, "line_end": 2, "confidence": 0.9, "recommendation": "r",
+            "models": ["m"], "agreement": 1, "hard_constraint": false, "quote": quote,
+        })).unwrap()
+    };
+    let mut prior = vec![
+        mk("1111111111111111", "src/old.rs", "db.write(token);"),   // 文件改了名
+        mk("2222222222222222", "src/fake.rs", "still_broken();"),   // 已 resolve，但 quote 还在
+        mk("3333333333333333", "src/real.rs", "gone_for_good();"),  // 已 resolve，quote 确实没了
+    ];
+
+    // ① rename 迁移：不迁的话 old.rs 读不到 → 这条会被当锚失效杀掉，真问题静默蒸发。
+    //    id 会跟着重算（它含 file，按 `finding_id` 单一真相源）——这是契约不是意外。
+    migrate_renames(&mut prior, &[("src/old.rs".to_string(), "src/moved.rs".to_string())]);
+    assert_eq!(prior[0].file, "src/moved.rs", "改名要跟着迁");
+    assert_ne!(prior[0].id, "1111111111111111", "id 含 file，迁移后要重算");
+    let moved_id = prior[0].id.clone();
+
+    let resolved: HashSet<String> =
+        ["2222222222222222".to_string(), "3333333333333333".to_string()].into_iter().collect();
+    let out = carry(prior, &resolved, dir.path());
+
+    // ② 销案的不再携带
+    assert_eq!(out.carried.len(), 1, "只剩那条没销案的: {:?}", out.carried.iter().map(|f| &f.id).collect::<Vec<_>>());
+    assert_eq!(out.carried[0].id, moved_id);
+    assert_eq!(out.carried[0].file, "src/moved.rs", "携带的是迁移后的路径");
+    assert_eq!(out.resolved_applied.len(), 2);
+
+    // ③ 假修复争议：fake.rs 那条 quote 还锚得上 → 争议；real.rs 那条真没了 → 不争议
+    assert_eq!(
+        out.resolution_disputed, vec!["2222222222222222".to_string()],
+        "销案了但 quote 还在 = 没真修，要让人看见: {:?}", out.resolution_disputed
+    );
 }

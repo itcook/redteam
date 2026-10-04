@@ -147,6 +147,22 @@ impl Coverage {
     }
 }
 
+/// 增量轮的携带账（增量轮重建，2026-10-04）：三个量来自 `consolidate::carry::CarryOutcome`。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CarryMeta {
+    /// 本轮 delta 的基线 commit（上轮 stamped HEAD）。读报告的人靠它知道「这轮增量是从哪儿算起的」——
+    /// 没有它，下面三个数悬空：说携带了 N 条，却看不出相对哪一轮。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_sha: String,
+    /// 重锚成活、携带进本轮合并集的条数。
+    pub carried: u32,
+    /// 重锚失败被消灭的条数。使锚失效的改动必在本轮 delta 内、正被审，所以丢掉是安全的——
+    /// 但要记下来：它与「这轮真的没问题了」是两回事。
+    pub dropped: u32,
+    /// 命中 resolve 台账、因已销案而不再携带的条数。
+    pub resolved_applied: u32,
+}
+
 /// 收敛三维（M21c 批 C，design §8.4）：**给 ship 循环的停止条件**——判「这个 PR 还要不要再跑一轮」，
 /// 与 `verdict` 正交。**不进 verdict、不改 exit code 五档**：一轮可以 approve（这轮没发现拦路问题）
 /// 却不收敛（台账里还挂着没挖的），那正是该再跑一轮的情形。
@@ -319,6 +335,14 @@ pub struct RunMeta {
     /// 批 C 的增量激活会让其中被 delta 碰到的那些重新入队，那时它们才有机会成为 finding。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub dormant_leads: Vec<DormantLead>,
+    /// 增量轮的携带账（增量轮重建，2026-10-04）：`None` = 本轮不是增量轮。
+    ///
+    /// **不进 coverage 五集合**〔裁定 2〕：那五集合是 **per cell** 的（design §8.4），
+    /// 而 carried finding 没有本轮 cell——它属于上一个 job 的格、在那份报告的 coverage 里。
+    /// 不记就不会破坏 `selected = completed ⊎ reused ⊎ failed ⊎ waived` 的划分不变式。
+    /// 但三个量必须在这里露出来，否则读报告的人不知道这轮有几条是携带来的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry: Option<CarryMeta>,
     /// 收敛三维（M21c 批 C）。`None` = 本轮算不出（diff 重建不了，没有变更集做基准）——
     /// 与窗口后滤同一处置：没有基准就不装作有一个结论。
     #[serde(default, skip_serializing_if = "Option::is_none")]

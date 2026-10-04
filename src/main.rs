@@ -106,8 +106,11 @@ enum Cmd {
         /// 本次评审完全关闭台账（豁免/预筛/判例注入全停）。
         #[arg(long)]
         no_dismissed: bool,
-        /// 增量轮（M13）：以指定作业的评审为基线只审 fix delta。M21a 硬切后**暂不可用**（显式报错，不静默降级全量）——
-        /// M21c 疑点台账 + delta 激活落地后恢复；仅 branch scope（须 --base）。
+        /// 增量轮（M13）：以指定作业的评审为基线只审 fix delta。仅 branch scope（须 --base），且**工作树须干净**
+        /// （未提交改动会让携带项的锚点失效却不在被审 delta 里）。上轮未被 delta 覆盖的 finding 由 redteam 重锚定
+        /// 携带进本轮，verdict 是合并集口径（携带 ∪ 新发）；`resolve` 过的不再携带，但 quote 仍锚得上的会报
+        /// 「⚠️ Disputed」（假修复）。四道守卫（谱系 / 同族 / 健康基线 / 空 delta）**显式报错拒跑、不静默降级全量**。
+        /// 不支持与 --background 同用（前台跑）。
         #[arg(long)]
         incremental_from: Option<String>,
         /// 预算仪表（M21a）：只收集证据 → 分组 → 装包 → 落盘 .redteam/packs/<job>/cell-<n>.md（= 真实发出的 scanner prompt：
@@ -674,9 +677,14 @@ async fn main() {
                 resume: None, dismissed, no_dismissed, incremental_from, test_command, pack_only,
             };
 
-            // 批 F-4（评审帽外项）：增量轮在 M21c 恢复前对前台 / 后台都在这里拒收——不能先建 job 再在 worker 里 bail 落成 Failed 作业。
-            if args.incremental_from.is_some() {
-                eprintln!("error: --incremental-from（增量轮）在 M21c 疑点台账回流后恢复；先跑全量 `review --base <base>`");
+            // 增量轮 × 后台：在命令层就拒，不先建 job（批 F-4 评审帽外项）。
+            // 前台增量轮已接通〔增量轮重建，2026-10-04〕，走 `run_review_dispatch` 的增量分流；
+            // 后台还拒着的理由变了——不再是「worker 里一定 bail」，而是 **preflight 四守卫
+            // （脏工作树 / 谱系 / 同族 / 空 delta）在 worker 内拒跑会落成 Failed 作业**：
+            // 那是参数与环境问题，不该让用户再去 `status <id>` 才看见。
+            // 要支持后台增量轮，得把 preflight 提到建 job 之前——见 followup。
+            if background && args.incremental_from.is_some() {
+                eprintln!("error: --incremental-from 不支持 --background；去掉 --background 前台跑增量轮");
                 std::process::exit(1);
             }
 

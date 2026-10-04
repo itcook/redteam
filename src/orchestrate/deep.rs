@@ -255,6 +255,67 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut waits = None;
     let mut reviewer_failed = false;
 
+    // 往轮 finding 的复核派发（增量轮重建〔裁定 1′，2026-10-04〕）。
+    //
+    // **此前这条链是断的**：`decide` 只在下面的 landed 循环里对**本轮格的输出**调用，而往轮
+    // finding 走的是收场的 `findings.extend(prior_findings)`——两条路从不相交。后果是
+    // `VerifyDecision::SkipCarried`（design §8.1 定义、`8517784` 随 M21 复核设计一起引入）
+    // **自引入起就不可达**，`--help` 承诺的 `carried` 跳过分类也从没出现过；carried 一律沿用
+    // 往轮判决、从不重验，连「往轮根本没判过」的也照沿用。
+    //
+    // 派发放在主循环**之前**而不是收场：往轮 finding 在 `run_deep` 入口就全在手里
+    // （`input.prior_findings`），塞进同一个 `verifying` 池即可，不必另起一套收场批次——
+    // 收端 `apply_known(&mut prior_findings, &verdicts)` 早已接通，缺的只有派发。
+    //
+    // 覆盖面不止 carried：resume 的 `prior_findings` 同样过这道门。往轮已判的被 `known` 拦下
+    // 记 `resumed`（不发请求），往轮**没验完**的（格成功、复核被 kill）这轮补验——那正是收场处
+    // 注释自承、原本「留待 M21c 一并处理」的缺口。首跑 `prior_findings` 为空，整段不执行。
+    if let Some(vin) = input.verify.as_ref() {
+        for f in &prior_findings {
+            let f_hunks: &[(usize, usize)] =
+                hunks_by_file.get(&f.file).map(Vec::as_slice).unwrap_or(&[]);
+            let d = crate::consolidate::verify::decide(
+                f, vin.precedents, vin.block_threshold, vin.conf_floor, vin.enabled, f_hunks,
+            );
+            if !d.is_verify() {
+                *meta.verify_skipped.entry(d.reason().to_string()).or_default() += 1;
+                continue;
+            }
+            // 往轮判过的直接用、不重验（与格侧同一条规矩：同一条两次复核可能给出不同结论）。
+            if let Some(v) = vin.known.get(&f.id) {
+                verdicts.insert(f.id.clone(), v.clone());
+                *meta.verify_skipped.entry("resumed".into()).or_default() += 1;
+                continue;
+            }
+            // 先占 `verify_seen`：本轮某个格若又报出同一条，记 `cached` 不重复派（格侧同款）。
+            if !verify_seen.insert(f.id.clone()) {
+                *meta.verify_skipped.entry("cached".into()).or_default() += 1;
+                continue;
+            }
+            // 异族选择要一个「作者」。往轮 finding 的作者只剩模型**名字**（`models`），按名查本轮
+            // 在编成员；查不到 = 那个模型本轮不在编、同族自验的风险本就不存在，取谁都行
+            // （`members[0]` 只是喂签名要个具体值；`members` 非空由上面 `reviewers.is_empty()` 早退保证）。
+            let author = f
+                .models
+                .iter()
+                .find_map(|n| members.iter().find(|m| &m.name == n))
+                .unwrap_or(&members[0]);
+            match crate::consolidate::verify::pick_verifier(vin.roles, author, verify_rotation) {
+                Some((m, warn)) => {
+                    verify_rotation += 1;
+                    meta.verify_triggered += 1;
+                    verifying.push(run_verify(&env, VerifyJob {
+                        finding: f.clone(),
+                        verifier: m,
+                        from_cell: format!("carried:{}", f.id),
+                        warn,
+                    }));
+                }
+                None => *meta.verify_skipped.entry("no_verifier".into()).or_default() += 1,
+            }
+        }
+    }
+
     loop {
         // ① 收场：关闭入口后剩余预算 drain 一次；Skipped 只在此刻产生（design v11 §6 规则 3）
         if closed && !drained {
@@ -410,7 +471,13 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             }
             if let Some(vin) = input.verify.as_ref() {
                 for f in l.rec.output.findings() {
-                    let d = crate::consolidate::verify::decide(f, vin.precedents, vin.block_threshold, vin.conf_floor, vin.enabled);
+                    // `delta_hunks` 恒空片：它只喂 `decide` 的 carried 判据，而这条路上的 `f` 来自
+                    // 本轮格的输出、`origin` 恒 `New`（`Origin::Carried` 的唯一产品写入点是
+                    // `carry::carry`），那个分支进不来。carried 的复核在主循环前单独派发——
+                    // 传真 hunks 只会让人以为这里管着 carried。
+                    let d = crate::consolidate::verify::decide(
+                        f, vin.precedents, vin.block_threshold, vin.conf_floor, vin.enabled, &[],
+                    );
                     if !d.is_verify() {
                         *meta.verify_skipped.entry(d.reason().to_string()).or_default() += 1;
                         continue;
@@ -625,8 +692,9 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     }
 
     // 往轮 finding 同样回填判决：它们不经本轮的格，漏了就会在 resume 报告里复活成未判决。
-    // 已知缺口：往轮**没验完**的（格成功、复核被 kill）本轮不补验——它所在的项已 Settled、不重挖，
-    // 没有格就没有派发点。方向保守（没判决 = 照拦），留待 M21c 判例台账一并处理。
+    // 这里也是**主循环前那批复核的收端**——往轮没验完的（格成功、复核被 kill）在那里补派，
+    // 判决经 `verdicts` 回到这儿贴上（`set_verdict` 无条件覆盖，新判决胜过旧判决）。
+    // 原「没有格就没有派发点」的缺口已由〔裁定 1′，2026-10-04〕的派发段补上。
     apply_known(&mut prior_findings, &verdicts);
     findings.extend(prior_findings);
     mark_previously_dismissed(&mut findings, input.precedents);
@@ -2516,6 +2584,113 @@ mod tests {
         assert_eq!(run3.items.iter().filter(|i| i.activated).count(), 1, "夹具前提：两行并成一项");
         assert_eq!(run3.meta.ledger_activated, 1, "按项记，不是 2");
         assert_eq!(restored_meta(&run3.items).ledger_activated, 1, "与 resume 侧同口径");
+    }
+
+    /// 一条往轮带过来的 finding。`line`/`quote` 要避开本轮格产出的那条（a.rs 第 1 行、
+    /// quote `fn a() {`）——同 file + 行重叠 + quote 重叠会被 `dedup` 合并掉，
+    /// 合并保留先到者（本轮产出）的 id，断言就找不着它了。
+    ///
+    /// `judged` = 出生轮是否给出过判决（判据 ① 的输入）。往轮判决用 UPHELD，
+    /// 与本轮 verifier 脚本的 REFUTED 分得开——据此可判「这条到底有没有重验过」。
+    fn carried_at(line: u32, quote: &str, judged: bool) -> crate::domain::Finding {
+        let mut f: crate::domain::Finding = serde_json::from_value(serde_json::json!({
+            "id": "aaaaaaaaaaaaaaaa", "severity": "high", "title": "carried one", "body": "b",
+            "file": "a.rs", "line_start": line, "line_end": line, "confidence": 0.9,
+            "recommendation": "r", "models": ["m"], "agreement": 1,
+            "hard_constraint": false, "quote": quote,
+        }))
+        .unwrap();
+        f.origin = crate::domain::Origin::Carried;
+        if judged {
+            f.verify = Some(crate::domain::Verify {
+                verdict: crate::domain::VerifyVerdict::Upheld,
+                model: "p/r".into(),
+                note: "往轮判过".into(),
+            });
+        }
+        f
+    }
+
+    /// 跑一轮带 carried 的深挖，取回那条 carried。`routed_bundles` 的 diff 是
+    /// `@@ -1,1 +1,2 @@` → 本轮 hunk = 第 1-2 行；文件三行 `fn a() {` / `    body();` / `}`。
+    async fn run_carried(dir: &Path, carried: crate::domain::Finding) -> (DeepRun, crate::domain::Finding) {
+        let bundles = routed_bundles(dir, &["a"]);
+        let reg = verify_reg(
+            vec![turn(&blocking_cell("fn a() {"))],
+            FakeChatBackend::repeating(turn(&verdict_json("REFUTED"))),
+        );
+        let roles = verify_roles();
+        let known = Default::default();
+        let run = run_with(Run {
+            verify: Some(vin(&roles, &known)),
+            prior: vec![carried],
+            ..plain(&reg, dir, &bundles, &pending_items(&["a"]))
+        })
+        .await;
+        let got = run
+            .findings
+            .iter()
+            .find(|f| f.id == "aaaaaaaaaaaaaaaa")
+            .expect("携带项该在（没被 dedup 合并掉）")
+            .clone();
+        (run, got)
+    }
+
+    /// 判据 ②（区域动过就重验）**的接线**：`decide` 拿到的 hunks 必须是该 finding 所在文件
+    /// 本轮的改动范围，而不是空片。
+    ///
+    /// 两层都要真才绿：① `run_deep` 得真把往轮 finding 派去复核——这条链在
+    /// 〔裁定 1′〕之前整个是断的（`decide` 只在 landed 循环里对本轮格的输出调用，
+    /// 往轮 finding 走收场的 `extend`，于是 `SkipCarried` 自引入起不可达）；
+    /// ② 派发时得把该文件的 hunks 接进去——换成 `&[]` 它就该红。
+    #[tokio::test]
+    async fn carried_in_a_touched_region_is_reverified() {
+        let dir = tempfile::tempdir().unwrap();
+        // 第 2 行 `    body();` 落在 hunk (1,2) 内 → 相交 → 旧判决不再可信
+        let (run, got) = run_carried(dir.path(), carried_at(2, "    body();", true)).await;
+
+        assert_eq!(
+            got.verify.as_ref().map(|v| &v.verdict),
+            Some(&crate::domain::VerifyVerdict::Refuted),
+            "区域有 delta 的 carried 要重验、拿本轮的新判决（UPHELD = 还是往轮那个旧判决）"
+        );
+        assert_eq!(run.meta.verify_skipped.get("carried"), None, "不该再记成 carried 免验");
+    }
+
+    /// 判据 ② 的反向：区域没被本轮 delta 碰到 → 维持免验，沿用往轮判决。
+    /// 没有这条，把判据 ② 改成恒真（「carried 一律重验」）也照绿——那会每轮白烧一次复核。
+    #[tokio::test]
+    async fn carried_outside_the_delta_keeps_its_prior_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        // 第 3 行 `}` 在 hunk (1,2) 之外 → 不相交；且往轮判过 → 两条判据都成立 → 免验
+        let (run, got) = run_carried(dir.path(), carried_at(3, "}", true)).await;
+
+        assert_eq!(
+            got.verify.as_ref().map(|v| v.note.as_str()),
+            Some("往轮判过"),
+            "区域没动过的 carried 不该重验——拿到 REFUTED 说明它白跑了一次 verifier"
+        );
+        assert_eq!(
+            run.meta.verify_skipped.get("carried"),
+            Some(&1),
+            "免验要记进 `carried` 分类（--help 列着它，此前从不可达）"
+        );
+    }
+
+    /// 判据 ①（往轮压根没判过 → 无条件重验）：区域在 delta 之外，单看判据 ② 该免验，
+    /// 但出生轮没留下判决——沿用一个不存在的判决等于把「未复核」当「已复核」收。
+    /// 这正是收场处注释自承、原本「留待 M21c 一并处理」的那个缺口（复核被 kill 的往轮项）。
+    #[tokio::test]
+    async fn carried_never_judged_is_verified_even_outside_the_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, got) = run_carried(dir.path(), carried_at(3, "}", false)).await;
+
+        assert_eq!(
+            got.verify.as_ref().map(|v| &v.verdict),
+            Some(&crate::domain::VerifyVerdict::Refuted),
+            "往轮没判过的 carried 要补验——None 说明判据 ① 没生效"
+        );
+        assert_eq!(run.meta.verify_skipped.get("carried"), None, "没判过就不是「出生轮已复核」");
     }
 
     /// 精确 id 命中判例 → `previously_dismissed` → **不再拦路**（断了很久的一条链）。

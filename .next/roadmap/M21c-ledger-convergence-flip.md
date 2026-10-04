@@ -16,7 +16,7 @@
 | # | 项 | design | 落点 |
 |---|---|---|---|
 | 1 ✅ | 疑点台账表（proj.db，镜像 DismissCard / ResolveCard）：预算外疑点落账（quote 锚 + hint + confidence + origin + 落入原因）；报告披露为低置信线索；**不进 verdict** | §8.2 | `src/db.rs`, `src/output` |
-| 2 ✅ | 增量轮激活（**挂全量轮**，`--incremental-from` 仍 bail〔裁定 1，2026-10-02〕）：`delta ∩ 锚定文件 ≠ ∅` → 重入队优先级 +1 档；carry 机器（anchor_near / rename 迁移）复用；注入措辞照抄 claimed-resolved 卡；preflight 守卫扩展（上轮 Incomplete → 台账疑点不可信） | §8.2 | `src/cli/incremental.rs`, `src/consolidate/carry.rs` |
+| 2 ✅ | 增量轮激活（**挂全量轮**，`--incremental-from` 当时仍 bail〔裁定 1，2026-10-02〕；**该 flag 已于 2026-10-04 由「增量轮重建」独立单元接通**）：`delta ∩ 锚定文件 ≠ ∅` → 重入队优先级 +1 档；carry 机器（anchor_near / rename 迁移）复用；注入措辞照抄 claimed-resolved 卡；preflight 守卫扩展（上轮 Incomplete → 台账疑点不可信） | §8.2 | `src/cli/incremental.rs`, `src/consolidate/carry.rs` |
 | 3 ✅ | 收敛三维（无 blocking ∧ 台账无 delta 邻接未处理项 ∧ 无激活超限）+ 活锁守卫（**两段式 N=3 强制必挖 / N=5 停车**〔裁定 4〕）；ship 协议消费新 RunMeta 字段 | §8.3 | `src/verdict.rs` 不动；RunMeta；`plugins/redteam/commands/ship.md` + `make gen` |
 | 4 ✅ | coverage 五集合（selected / completed / reused / failed / waived，per cell 类型）+ 角色分级：快扫失败 → 硬 Incomplete；深挖截断/失败 → 带债 approve | §8.4 | `src/orchestrate` CellSink.manifest, `src/cli/incremental.rs` preflight |
 | 5 ✅ | 判例前移进快扫 prompt：同文件活跃判例摘要；机械匹配命中 → **跨轮沿用结案带守卫**（锚定可重定位 ∧ 区域自判例以来无 delta → dismissed 豁免不入队 / upheld carry 不重挖；守卫不过 → 入队带判例笔记）〔D13，替代「降级候选」〕 | §4, §6 规则 2 | `src/prompt/mod.rs` render_precedents 复用；`src/consolidate/verify.rs` matches_precedent 前移调用点 |

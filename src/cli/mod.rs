@@ -297,6 +297,7 @@ fn stage0_risk(
 /// 扫描全部返回即收场），收口后叠加 finding 与 verdict；scanner 有格失败时深挖照跑、判定仍 Incomplete / 3。
 /// 未配 reviewer = scan-only：不产 finding，退出码 0 = scan 完成、3 = 任一 scanner cell 失败（design §8.4）。
 /// `--background` 由 main.rs 在 dispatch 之前分叉（spawn worker）；到达这里即路由 bug。
+#[allow(clippy::too_many_arguments)] // 参数 / registry / 配置 / 变更集 / 仓根 / HEAD / sink / 携带项各不同源
 pub async fn run_code_review(
     args: &ReviewArgs,
     registry: &ProviderRegistry,
@@ -305,6 +306,10 @@ pub async fn run_code_review(
     root: &Path,
     head_sha: Option<String>,
     sink: Option<&dyn CellSink>,
+    // 增量轮携带来的上轮 finding（已 `carry` 重锚、已排除 resolved、已过 rename 迁移）。
+    // 全量轮传空片 → 行为与今日逐字节一致。它们**不入队也不占 cell**，只在收场并进 findings 集，
+    // 所以 verdict 自动是合并集口径（携带 ∪ 新发）——ship 协议要的正是这个。
+    carried: Vec<crate::domain::Finding>,
 ) -> anyhow::Result<(ReviewReport, i32)> {
     if args.background {
         anyhow::bail!("--background forks in main.rs before dispatch; reaching here is a routing bug");
@@ -421,7 +426,7 @@ pub async fn run_code_review(
                 target_label: &target_label,
                 snapshot: Some(&snap),
                 restore: None,
-                prior_findings: vec![],
+                prior_findings: carried,
                 tools: resolve_tools(args, cfg),
                 backend_factory: Some(factory.as_ref()),
                 verify: Some(crate::orchestrate::deep::VerifyInput {
@@ -995,14 +1000,14 @@ pub async fn run_review_dispatch(
     let branch_scope = sync_args.scope == "branch";
     // M13：增量轮路由（前台与后台 worker 共用本单点；scope 守卫在 preflight 内）。
     if let Some(prior) = sync_args.incremental_from.clone() {
-        return run_incremental_review(&sync_args, &prior, cfg, cwd).await;
+        return run_incremental_review(&sync_args, &prior, cfg, cwd, registry, sink).await;
     }
 
     let changes = crate::evidence::git::changed_files(cwd, sync_args.base.as_deref(), branch_scope)?;
     // R3：stamp 权威时刻 = 证据收集实跑刻（与 changed_files 同刻同 cwd）；
     // 非 git 目录折 None——前台裸 review 与后台 job 共用本单点，前后台天然同 sha。
     let head_sha = crate::evidence::git::head_sha_at(cwd).ok();
-    run_code_review(&sync_args, registry, cfg, changes, cwd, head_sha, sink).await
+    run_code_review(&sync_args, registry, cfg, changes, cwd, head_sha, sink, vec![]).await
 }
 
 fn now_unix() -> u64 {
@@ -4079,7 +4084,7 @@ mod code_review_tests {
             ("p/m2", &format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("unvalidated", "db.write(token);", 0.6))),
         ]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
         assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0));
         let scan = report.scan.as_ref().unwrap();
         assert_eq!(scan.suspicions.len(), 1, "编造丢弃、真疑点跨家族合并: {:?}", scan.suspicions);
@@ -4123,7 +4128,7 @@ mod code_review_tests {
 
         let mut a = args();
         a.conf_floor = Some(0.3);
-        let (report, code) = run_code_review(&a, &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+        let (report, code) = run_code_review(&a, &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
 
         let deep = report.run.deep.as_ref().expect("有 reviewer → 有 deep 段");
         assert_eq!(
@@ -4148,7 +4153,7 @@ mod code_review_tests {
         reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(scan_turn)), std::time::Duration::from_secs(5), 0);
         reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(rev_turn)), std::time::Duration::from_secs(5), 0);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
         assert_eq!(code, 0, "warnings={:?} verdict={:?}", report.run.warnings, report.verdict);
         assert_eq!(report.verdict, Verdict::Approve);
         assert!(!report.findings.is_empty(), "findings={:?}", report.findings);
@@ -4169,7 +4174,7 @@ mod code_review_tests {
         reg.insert_scan("p/s", "p", 8, Box::new(FakeChatBackend::repeating(scan_turn)), std::time::Duration::from_secs(5), 0);
         reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::new(vec![bad.clone(), bad])), std::time::Duration::from_secs(5), 0);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
-        let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
         assert_eq!(report.verdict, Verdict::Approve);
         assert_eq!(code, 2);
         assert!(report.run.coverage.failed.contains_key(&Role::Reviewer));
@@ -4206,7 +4211,7 @@ mod code_review_tests {
         let changes = || vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
 
         // 新 head → 激活
-        let (report, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), dir.path(), Some("sha2".into()), None).await.unwrap();
+        let (report, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), dir.path(), Some("sha2".into()), None, vec![]).await.unwrap();
         let deep = report.run.deep.as_ref().expect("有 reviewer 就该有深挖段");
         assert_eq!(deep.ledger_activated, 1, "首跑整条链要把台账项激活进队列: {:?}", report.run.warnings);
         assert_eq!(deep.ledger_anchor_lost, 0);
@@ -4233,7 +4238,7 @@ mod code_review_tests {
             json: serde_json::json!({"line_start": 2, "quote": "db.write(token);", "confidence": 0.6}).to_string(),
         }).unwrap();
         drop(db2);
-        let (rep2, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), d2.path(), Some("sha9".into()), None).await.unwrap();
+        let (rep2, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), d2.path(), Some("sha9".into()), None, vec![]).await.unwrap();
         assert_eq!(rep2.run.deep.as_ref().unwrap().ledger_activated, 0, "同 HEAD 重跑不该激活");
 
         // 激活项真挖出 finding → 台账行晋升，此后不再被激活。少了这一步，一条已经报出来的疑点
@@ -4254,7 +4259,7 @@ mod code_review_tests {
         reg3.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(turn(
             r#"{"findings":[{"severity":"low","title":"t","body":"b","file":"src/a.rs","line_start":2,"line_end":2,"confidence":0.5,"recommendation":"r","quote":"db.write(token);"}],"needs":[]}"#.into()))),
             std::time::Duration::from_secs(5), 0);
-        let (rep3, _) = run_code_review(&args(), &reg3, &cfg, changes(), d3.path(), Some("sha2".into()), None).await.unwrap();
+        let (rep3, _) = run_code_review(&args(), &reg3, &cfg, changes(), d3.path(), Some("sha2".into()), None, vec![]).await.unwrap();
         assert_eq!(rep3.run.deep.as_ref().unwrap().ledger_activated, 1, "{:?}", rep3.run.warnings);
         assert!(!rep3.findings.is_empty(), "夹具前提：这一轮要真挖出 finding");
         let db3 = crate::db::ProjDb::open(d3.path()).unwrap();
@@ -4297,7 +4302,7 @@ mod code_review_tests {
         // 本轮改的是第 2 行，判例区域（第 1 行）没动 → 两道守卫都过
         let changes = || vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
 
-        let (report, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), dir.path(), Some("sha1".into()), None).await.unwrap();
+        let (report, _) = run_code_review(&args(), &mk_reg(), &cfg, changes(), dir.path(), Some("sha1".into()), None, vec![]).await.unwrap();
         let deep = report.run.deep.as_ref().expect("有 reviewer 就该有深挖段");
         assert_eq!(deep.precedent_exempt, 1, "判例该在入队侧豁免掉它: {:?}", report.run.warnings);
         assert_eq!(deep.precedent_redug, 0);
@@ -4309,7 +4314,7 @@ mod code_review_tests {
         // 反面：`--no-dismissed` 关掉台账 → 判例不生效，照常入队
         let mut off = args();
         off.no_dismissed = true;
-        let (rep2, _) = run_code_review(&off, &mk_reg(), &cfg, changes(), dir.path(), Some("sha1".into()), None).await.unwrap();
+        let (rep2, _) = run_code_review(&off, &mk_reg(), &cfg, changes(), dir.path(), Some("sha1".into()), None, vec![]).await.unwrap();
         assert_eq!(rep2.run.deep.as_ref().unwrap().precedent_exempt, 0, "--no-dismissed 下不得豁免");
     }
 
@@ -4319,7 +4324,7 @@ mod code_review_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let reg = registry(&[("p/m", r#"{"suspicions":[],"scanned_areas":[]}"#)]);
-        let (report, code) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), None, None).await.unwrap();
+        let (report, code) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), None, None, vec![]).await.unwrap();
         assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0));
         assert!(report.cells.is_empty() && report.scan.as_ref().unwrap().suspicions.is_empty());
         assert!(report.run.warnings.iter().any(|w| w.contains("no reviewable evidence")), "{:?}", report.run.warnings);
@@ -4333,7 +4338,7 @@ mod code_review_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
         let reg = registry(&[("p/s", r#"{"suspicions":[],"scanned_areas":[]}"#), ("p/r", r#"{"findings":[],"needs":[]}"#)]);
-        let (report, code) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), None, None).await.unwrap();
+        let (report, code) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), None, None, vec![]).await.unwrap();
         assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0), "warnings={:?}", report.run.warnings);
         assert!(report.findings.is_empty());
         assert!(report.run.warnings.iter().any(|w| w.contains("no reviewable evidence")), "{:?}", report.run.warnings);
@@ -4364,7 +4369,7 @@ mod code_review_tests {
         reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(rev_turn)), std::time::Duration::from_secs(5), 0);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -2,1 +2,1 @@\n+    db.write(token);".into() }];
         let sink = Rec(StdMutex::new(Vec::new()));
-        let (report, _) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, Some(&sink)).await.unwrap();
+        let (report, _) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, Some(&sink), vec![]).await.unwrap();
         let seen = sink.0.lock().unwrap();
         assert!(seen.iter().any(|c| c.starts_with("review[")), "reviewer cell 未落盘: {seen:?}");
         // 落盘的格与报告里的格同名——attach_cells 覆盖后 coverage 才不会指空。
@@ -4574,7 +4579,7 @@ mod code_review_tests {
     async fn scan_review_errors_without_scanner_role() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
-        let err = run_code_review(&args(), &ProviderRegistry::new(), &cfg, vec![], dir.path(), None, None).await.unwrap_err();
+        let err = run_code_review(&args(), &ProviderRegistry::new(), &cfg, vec![], dir.path(), None, None, vec![]).await.unwrap_err();
         assert!(err.to_string().contains("scanner"), "{err}");
     }
 
@@ -4585,11 +4590,11 @@ mod code_review_tests {
         let reg = registry(&[("p/m", r#"{"suspicions":[],"scanned_areas":[]}"#)]);
         // K1：无 --test-command 时按项目推断（Cargo.toml → cargo test）进 RunMeta。
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"\n").unwrap();
-        let (report, _) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), Some("abc123".into()), None).await.unwrap();
+        let (report, _) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), Some("abc123".into()), None, vec![]).await.unwrap();
         assert_eq!(report.run.head_sha.as_deref(), Some("abc123"));
         assert_eq!(report.run.test_command.as_deref(), Some("cargo test"));
         let over = ReviewArgs { test_command: Some("make check".into()), ..args() };
-        let (report2, _) = run_code_review(&over, &reg, &cfg, vec![], dir.path(), None, None).await.unwrap();
+        let (report2, _) = run_code_review(&over, &reg, &cfg, vec![], dir.path(), None, None, vec![]).await.unwrap();
         assert_eq!(report2.run.test_command.as_deref(), Some("make check"));
         assert_eq!(report2.run.head_sha, None, "非 git 环境如实 None，不编造");
     }
@@ -4766,7 +4771,7 @@ mod code_review_tests {
         reg.insert_scan("p/r", "p", 8, Box::new(fast_review), Duration::from_secs(5), 0);
         let sink = Timeline::new();
 
-        let (report, code) = run_code_review(&args(), &reg, &scanner_and_reviewer_cfg(), changes, dir.path(), None, Some(&sink)).await.unwrap();
+        let (report, code) = run_code_review(&args(), &reg, &scanner_and_reviewer_cfg(), changes, dir.path(), None, Some(&sink), vec![]).await.unwrap();
 
         assert_eq!((report.verdict, code), (Verdict::Approve, 0), "{:?}", report.run.warnings);
         let deep = report.run.deep.as_ref().unwrap();
@@ -4796,7 +4801,7 @@ mod code_review_tests {
         reg.insert_scan("p/r", "p", 1, Box::new(review), Duration::from_secs(5), 0);
         let sink = Timeline::new();
 
-        let (report, _) = run_code_review(&args(), &reg, &scanner_and_reviewer_cfg(), changes, dir.path(), None, Some(&sink)).await.unwrap();
+        let (report, _) = run_code_review(&args(), &reg, &scanner_and_reviewer_cfg(), changes, dir.path(), None, Some(&sink), vec![]).await.unwrap();
 
         assert_eq!(sink.landed("scan["), [100], "{:?}", report.run.warnings);
         let h0 = sink.landed("review[src/auth.rs:rule:");
@@ -4824,7 +4829,7 @@ mod code_review_tests {
         };
 
         let reg = reg_with(FakeChatBackend::repeating(turn_of(blocking)));
-        let (report, code) = run_code_review(&args(), &reg, &cfg, changes(), dir.path(), None, None).await.unwrap();
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes(), dir.path(), None, None, vec![]).await.unwrap();
         let w = &report.run.warnings;
         assert_eq!((report.verdict, code), (Verdict::Incomplete, 3), "{w:?}");
         assert_eq!(report.findings.len(), 1, "深挖照跑、findings 进报告: {w:?}");
@@ -4835,7 +4840,7 @@ mod code_review_tests {
 
         let bad = turn_of("not-json");
         let reg = reg_with(FakeChatBackend::new(vec![bad.clone(), bad]));
-        let (report, code) = run_code_review(&args(), &reg, &cfg, changes(), dir.path(), None, None).await.unwrap();
+        let (report, code) = run_code_review(&args(), &reg, &cfg, changes(), dir.path(), None, None, vec![]).await.unwrap();
         let w = &report.run.warnings;
         assert_eq!((report.verdict, code), (Verdict::Incomplete, 3), "带债也不降成 exit 2: {w:?}");
         assert!(w.iter().any(|x| x == "reviewer debt: failed reviewer cell, undispatched queue items, or budget skip"), "{w:?}");
@@ -4867,7 +4872,7 @@ mod code_review_tests {
         reg.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(turn_of(r#"{"findings":[],"needs":[]}"#))), Duration::from_secs(5), 0);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "@@ -1,8 +1,8 @@\n+    tick();\n+    tick();\n+    tick();".into() }];
 
-        let (report, _) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None).await.unwrap();
+        let (report, _) = run_code_review(&args(), &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
 
         let scan = report.scan.as_ref().unwrap();
         assert_eq!(scan.suspicions.len(), 1, "scan 报告疑点并集不变: {:?}", scan.suspicions);
@@ -4919,7 +4924,7 @@ mod spec_tests {
         let args = spec_test_args(vec![spec_path.to_string_lossy().to_string()]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
 
-        run_code_review(&args, &reg, &cfg, changes, root, None, None).await.unwrap();
+        run_code_review(&args, &reg, &cfg, changes, root, None, None, vec![]).await.unwrap();
 
         assert_eq!(backend.turn_count(), 1, "单格全审默认下第一趟只应有一次调用");
         let sys = system_of(&backend);
@@ -4939,7 +4944,7 @@ mod spec_tests {
         let args = spec_test_args(vec![]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
 
-        run_code_review(&args, &reg, &cfg, changes, root, None, None).await.unwrap();
+        run_code_review(&args, &reg, &cfg, changes, root, None, None, vec![]).await.unwrap();
 
         let sys = system_of(&backend);
         assert!(sys.contains("(none — no spec docs provided)"), "空 spec 渲染占位: {sys}");

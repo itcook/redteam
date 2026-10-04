@@ -146,6 +146,18 @@ fn render_md(r: &ReviewReport) -> String {
             s.push_str(&format!("  | {}:{} | {} | {} | {} |\n", l.file, l.line, l.hint, short, l.activations));
         }
     }
+    // 增量轮的携带账：这轮报告里有几条不是本轮挖的，要说清楚——否则读者会把携带项当成新发现。
+    if let Some(c) = &r.run.carry {
+        let base = if c.base_sha.is_empty() {
+            String::new()
+        } else {
+            format!("（base {}）", &c.base_sha[..c.base_sha.len().min(8)])
+        };
+        s.push_str(&format!(
+            "\n- Carried from the previous round{base} — 携带 {} 条（重锚失败丢弃 {} · 已销案不再携带 {}）；verdict 是合并集口径（携带 ∪ 新发）\n",
+            c.carried, c.dropped, c.resolved_applied
+        ));
+    }
     // 收敛三维（M21c 批 C，design §8.4）：ship 循环靠它判「还要不要再跑一轮」。与 dormant leads 同理，
     // **必须进 md**——那才是循环与裸终端读的那一份。不收敛时逐维说清差在哪，否则读者只看见一个 false。
     // 算不出也要说一句（dogfood medium）：ship 循环读的是 md，什么都不写等于让它按

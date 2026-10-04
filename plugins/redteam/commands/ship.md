@@ -52,10 +52,6 @@ compaction 后模型记忆不可靠，唯一可信源是磁盘文件与 db 台�
      working-tree scope：不加该 flag，照旧全量循环。
    - **守卫报错处置**（redteam 显式拒跑，不静默降级）：谱系（rebase/reset）/同族/健康基线/无 stamp/
      无持久化 result 报错 → 本轮**去掉 `--incremental-from` 改跑全量**，简报注记原因与守卫名；
-     **增量轮尚未恢复**（报错含「增量轮在 M21c 疑点台账回流后恢复」）→ 同样去掉 flag 跑全量。
-     这不是故障：M21c 批 C 裁定〔2026-10-02〕只做「台账激活挂全量轮」，`--incremental-from`
-     的主流水线留待重建（它要先重裁「上轮 finding 要不要携带」）。全量轮本身已带跨轮能力——
-     休眠疑点按 delta 激活重入队，所以循环的收敛性不受影响，只是每轮成本是全量的；
      **空 delta 或 delta 全被噪声过滤报错**（"empty delta" / "all noise-filtered"）→ 按 §停机
      停滞守卫处理（空转，停，交用户）；**脏工作树报错**（"clean working tree"）→ 停，先处置未
      提交改动（评审前的修复必须已 commit；改全量并不消除问题）。

@@ -15,6 +15,13 @@ pub struct CarryOutcome {
     pub carried_dropped: Vec<String>,
     /// 命中 resolve 台账被排除携带的 id（销案生效审计）。
     pub resolved_applied: Vec<String>,
+    /// **假修复争议**：人已 `resolve`（说已修），而它的 quote 仍锚得上——代码没真改。
+    ///
+    /// `resolve --help` 承诺过这件事（「quote 未随修复消失的会注入下轮顺带验证防假修复」），
+    /// 而 `RunMeta.resolution_disputed` 一直有渲染（md 的「⚠️ Disputed」）、有测试、**没有 writer**。
+    /// 增量轮接通之前这条路径不存在，接通之后「销案了就不携带」会把假修复**静默放过**
+    /// ——人说修了、其实没修、这轮不携带、报告也不提。所以 writer 必须和携带一起落。
+    pub resolution_disputed: Vec<String>,
 }
 
 /// R1 rename 迁移：finding.file 命中旧路径 → 改新路径并按 finding_id 单一真相源重算 id。
@@ -51,9 +58,19 @@ pub fn migrate_resolve_cards(cards: &mut [ResolveCard], renames: &[(String, Stri
 /// 决议 3 携带主流程（调用方须先做 rename 迁移）：resolved 排除 → anchor_near 重锚
 /// （成活更新行号 + origin=Carried；失败进 carried_dropped）。输出 id 列表排序去重（确定性）。
 pub fn carry(prior: Vec<Finding>, resolved_ids: &HashSet<String>, root: &Path) -> CarryOutcome {
-    let mut out = CarryOutcome { carried: vec![], carried_dropped: vec![], resolved_applied: vec![] };
+    let mut out = CarryOutcome {
+        carried: vec![],
+        carried_dropped: vec![],
+        resolved_applied: vec![],
+        resolution_disputed: vec![],
+    };
     for mut f in prior {
         if resolved_ids.contains(&f.id) {
+            // 销案了就不携带——但先问一句「真修了吗」：quote 还锚得上 = 那几行没动 = 假修复。
+            // 只记争议、不改携带决定（销案是人的判断，机制不替他翻案；报告里让他看见即可）。
+            if crate::positioning::anchor_near(root, &f.file, &f.quote, f.line_start).is_some() {
+                out.resolution_disputed.push(f.id.clone());
+            }
             out.resolved_applied.push(f.id);
             continue;
         }

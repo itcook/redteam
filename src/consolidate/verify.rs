@@ -196,6 +196,8 @@ pub fn decide(
     block_threshold: Severity,
     floor: f32,
     enabled: bool,
+    // `delta_hunks` = 本轮 delta 在该 finding 所在文件上的改动行范围（增量轮才非空）。
+    delta_hunks: &[(usize, usize)],
 ) -> VerifyDecision {
     if f.severity < block_threshold || f.confidence < floor {
         return VerifyDecision::SkipNotTriggered;
@@ -203,8 +205,25 @@ pub fn decide(
     if !enabled {
         return VerifyDecision::SkipDisabled;
     }
+    // carried 免验的两条判据（增量轮重建〔裁定 1′，2026-10-04〕）。免验的理由是
+    // 「出生轮已复核过」，它要同时成立两件事——**确实判过** ∧ **那片代码没再动过**：
+    //
+    // 判据 ①（往轮判过）：`verify` 为空 = 出生轮压根没给出判决（复核被 kill、或那轮没开
+    //   verifier）。沿用一个不存在的判决就是把「未复核」当「已复核」收，`deep.rs` 收场处
+    //   自承的那个缺口（「没有格就没有派发点」）正是这一种。
+    // 判据 ②（区域没动过）：本轮 delta 碰到它所在的区域 → 旧判决可能已不适用。与批 B 给
+    //   判例豁免加的守卫同构——design §4 点名要防的是同一条漏报路径：fix 引入的新问题被
+    //   旧结论盖住。`delta_hunks` 为空（全量轮、或该文件本轮没改）→ 该判据自然成立。
+    //
+    // 两条都成立才免验；任一不成立就落到后续判定（该验就验）。
     if f.origin == crate::domain::Origin::Carried {
-        return VerifyDecision::SkipCarried;
+        let judged = f.verify.is_some();
+        let touched = delta_hunks
+            .iter()
+            .any(|&(a, b)| f.line_start as usize <= b && a <= f.line_end as usize);
+        if judged && !touched {
+            return VerifyDecision::SkipCarried;
+        }
     }
     if precedents.iter().any(|c| c.id == f.id) {
         return VerifyDecision::SkipPrecedent;
@@ -405,6 +424,22 @@ mod tests {
         f
     }
 
+    /// 一条**出生轮已判过**的 carried（判据 ① 成立）。`decide` 的 carried 分支要两条判据
+    /// 同时成立才免验，所以测判据 ②（delta 相交）的夹具必须先把 ① 喂满——
+    /// 否则 ① 先把它放去重验，②（相交与否）测不出任何差别。
+    fn carried_judged(line_start: u32, line_end: u32) -> Finding {
+        let mut f = blocking(0.9);
+        f.origin = crate::domain::Origin::Carried;
+        f.line_start = line_start;
+        f.line_end = line_end;
+        f.verify = Some(crate::domain::Verify {
+            verdict: crate::domain::VerifyVerdict::Upheld,
+            model: "p/v".into(),
+            note: String::new(),
+        });
+        f
+    }
+
     fn model(name: &str, family: &str) -> EffectiveModel {
         EffectiveModel {
             name: name.into(), display_name: None, id: name.rsplit('/').next().unwrap().into(),
@@ -421,33 +456,77 @@ mod tests {
     #[test]
     fn trigger_set_matches_the_verdict_blocking_predicate() {
         let low_sev = finding("t", Severity::Low, 1, "alpha");
-        assert_eq!(decide(&low_sev, &[], Severity::Medium, 0.5, true), VerifyDecision::SkipNotTriggered);
-        assert_eq!(decide(&blocking(0.4), &[], Severity::Medium, 0.5, true), VerifyDecision::SkipNotTriggered, "低于 floor 不触发");
-        assert_eq!(decide(&blocking(0.5), &[], Severity::Medium, 0.5, true), VerifyDecision::Verify, "正好到 floor 就触发");
-        assert_eq!(decide(&blocking(0.9), &[], Severity::Medium, 0.5, true), VerifyDecision::Verify);
+        assert_eq!(decide(&low_sev, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipNotTriggered);
+        assert_eq!(decide(&blocking(0.4), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipNotTriggered, "低于 floor 不触发");
+        assert_eq!(decide(&blocking(0.5), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Verify, "正好到 floor 就触发");
+        assert_eq!(decide(&blocking(0.9), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Verify);
     }
 
     /// 跳过四类各自命中，且分类可读（「没触发」与「触发了被免验」在 RunMeta 里必须分得开）。
     #[test]
     fn skip_reasons_are_classified() {
         let f = blocking(0.9);
-        assert_eq!(decide(&f, &[], Severity::Medium, 0.5, false).reason(), "disabled");
+        assert_eq!(decide(&f, &[], Severity::Medium, 0.5, false, &[]).reason(), "disabled");
 
-        let mut carried = blocking(0.9);
-        carried.origin = crate::domain::Origin::Carried;
-        assert_eq!(decide(&carried, &[], Severity::Medium, 0.5, true).reason(), "carried");
+        let carried = carried_judged(1, 1);
+        assert_eq!(decide(&carried, &[], Severity::Medium, 0.5, true, &[]).reason(), "carried");
 
         let card = DismissCard {
             id: f.id.clone(), status: "dismissed".into(), title: f.title.clone(), file: f.file.clone(),
             quote: f.quote.clone(), severity: "high".into(), reason: "人裁".into(),
             round: String::new(), updated_at: String::new(),
         };
-        assert_eq!(decide(&f, std::slice::from_ref(&card), Severity::Medium, 0.5, true).reason(), "precedent");
+        assert_eq!(decide(&f, std::slice::from_ref(&card), Severity::Medium, 0.5, true, &[]).reason(), "precedent");
+
+        // ── carried 免验的两条判据（增量轮重建〔裁定 1′，2026-10-04〕）──
+        // 免验的理由是「出生轮已复核过」，它要同时成立：①确实判过 ∧ ②那片代码没再动过。
+        let carried = carried_judged(10, 12);
+
+        // 判据 ①：出生轮压根没判过（复核被 kill / 那轮没开 verifier）→ 无条件重验，
+        // 哪怕区域在 delta 之外。沿用一个不存在的判决 = 把「未复核」当「已复核」收。
+        let mut never_judged = carried_judged(10, 12);
+        never_judged.verify = None;
+        assert_eq!(
+            decide(&never_judged, &[], Severity::Medium, 0.5, true, &[]),
+            VerifyDecision::Verify,
+            "往轮没判过就不是「出生轮已复核」——这是 deep 收场处自承的那个缺口"
+        );
+        assert_eq!(
+            decide(&never_judged, &[], Severity::Medium, 0.5, true, &[(50, 52)]),
+            VerifyDecision::Verify,
+            "判据 ① 不受区域影响：没判过，改没改过都得验"
+        );
+
+        // 判据 ②：全量轮 / 该文件本轮没改 → 空片 → 维持无条件免验（与今日逐字节一致）
+        assert_eq!(decide(&carried, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipCarried);
+        // 本轮改的是别处（第 50 行）→ 区域没被碰 → 仍免验
+        assert_eq!(
+            decide(&carried, &[], Severity::Medium, 0.5, true, &[(50, 52)]),
+            VerifyDecision::SkipCarried,
+            "不相交就不该多验一次"
+        );
+        // 本轮 hunk 盖住它所在的 10-12 行 → **不再免验**，落到后续判定（该验就验）
+        assert_eq!(
+            decide(&carried, &[], Severity::Medium, 0.5, true, &[(8, 14)]),
+            VerifyDecision::Verify,
+            "区域被改过，上轮判决可能已不适用——design §4 点名要防的那条漏报路径"
+        );
+        // 边界：hunk 紧贴但不相交（13-20 vs finding 10-12）→ 仍免验
+        assert_eq!(
+            decide(&carried, &[], Severity::Medium, 0.5, true, &[(13, 20)]),
+            VerifyDecision::SkipCarried
+        );
+        // 守卫不越过更前面的判定：verifier 全局关时照旧 SkipDisabled，不因有 delta 就去验
+        assert_eq!(
+            decide(&carried, &[], Severity::Medium, 0.5, false, &[(8, 14)]),
+            VerifyDecision::SkipDisabled,
+            "verifier 关着时行为与今日完全一致——这是裁定 1「纯增益、无回退风险」的那一半"
+        );
 
         let mut consensus = blocking(0.9);
         consensus.suspicion_agreement = 2;
-        assert_eq!(decide(&consensus, &[], Severity::Medium, 0.5, true).reason(), "consensus");
-        assert!(!decide(&consensus, &[], Severity::Medium, 0.5, true).is_verify());
+        assert_eq!(decide(&consensus, &[], Severity::Medium, 0.5, true, &[]).reason(), "consensus");
+        assert!(!decide(&consensus, &[], Severity::Medium, 0.5, true, &[]).is_verify());
     }
 
     /// 免验读的是**区域**轴，不是模型轴：单 reviewer 配置下 `agreement` 恒为 1，
@@ -457,12 +536,12 @@ mod tests {
         let mut model_axis = blocking(0.9);
         model_axis.agreement = 3;
         model_axis.suspicion_agreement = 1;
-        assert_eq!(decide(&model_axis, &[], Severity::Medium, 0.5, true), VerifyDecision::Verify, "模型轴高也照验");
+        assert_eq!(decide(&model_axis, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Verify, "模型轴高也照验");
 
         let mut region_axis = blocking(0.9);
         region_axis.agreement = 1;
         region_axis.suspicion_agreement = 2;
-        assert_eq!(decide(&region_axis, &[], Severity::Medium, 0.5, true), VerifyDecision::SkipConsensus);
+        assert_eq!(decide(&region_axis, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipConsensus);
     }
 
     /// verifiers 活跃集非空 → 从中轮转（多个 verifier 摊开，不全压一个）。
