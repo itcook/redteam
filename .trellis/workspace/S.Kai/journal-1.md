@@ -942,3 +942,26 @@ B-1 判例摘要进快扫 prompt（那个槽从来是空的，两个构造点都
 ### Status
 
 [OK] **Completed**
+
+
+## Session 32: 增量轮重建：carried 的复核挂点自 M21 起就不存在
+<!-- trellis-session: v=2 fp=ad7697cbcaf62a51 -->
+
+**Date**: 2026-10-04
+**Task**: 增量轮重建：carried 的复核挂点自 M21 起就不存在
+**Branch**: `feat/incremental-rebuild`
+
+### Summary
+
+重建 --incremental-from 主流水线。实施中推翻了开工裁定 1 的前提：decide 只对本轮格的输出调用，carried 走收场的 extend，两条路从不相交——SkipCarried 自 8517784（M21 复核设计）引入起就不可达，--help 列着的 carried 跳过分类从没出现过。改为裁定 1′：派发挂点补在主循环之前（收端 apply_known 早已接通，缺的只有派发），免验收紧成两条判据（①出生轮确实判过 ②区域没再动过）。随后又发现 main.rs 有一道无条件拒收，而本单元其余 e2e 全走库函数绕过了命令层——整条功能的总开关无人覆盖，补真二进制 e2e 堵住。连带：假修复检测补 writer、CarryMeta 加 base_sha、followup 六条旧账收口、状态机指南补第四种病（分支可达但喂它的输入到不了这个函数，grep 判据对它无效）。变异检查五个全部精确命中；全量测试 1008 项绿、make verify 绿、clippy 本批零新增。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `989a818` | feat(incremental,verify): 增量轮重建——carried 的复核挂点自 M21 起就不存在 |
+| `074ec19` | build: 重建二进制 |
+
+### Status
+
+[OK] **Completed**

@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 31
-- **Last Active**: 2026-10-03
+- **Total Sessions**: 32
+- **Last Active**: 2026-10-04
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~944 | Active |
+| `journal-1.md` | ~967 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 32 | 2026-10-04 | 增量轮重建：carried 的复核挂点自 M21 起就不存在 | `989a818`, `074ec19` | `feat/incremental-rebuild` |
 | 31 | 2026-10-03 | M21c 批 D：出口核验与里程碑收口 | `8e020cf`, `0d0a21f`, `8fe9ff2` | `feat/m21c-dogfood` |
 | 30 | 2026-10-02 | M21c 批 B：判例前移与小项 | `5064841`, `2ff556c`, `5f79e27`, `1400a21`, `2d6adec`, `75e3633`, `0ecb85d` | `feat/m21c-precedent` |
 | 29 | 2026-10-02 | M21c 批 C：增量激活与收敛三维 | `e7b050f`, `97836df`, `754816a`, `bff0d22`, `923652c`, `0cc9ff8`, `231ebbf`, `dbe0419`, `d1e3fe0`, `00901f3`, `43e42c5`, `ed87e6d`, `3c86d1c`, `f1974e3`, `42b608f`, `e2e6303` | `feat/m21c-converge` |
