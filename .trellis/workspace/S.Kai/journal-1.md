@@ -988,3 +988,26 @@ B-1 判例摘要进快扫 prompt（那个槽从来是空的，两个构造点都
 ### Status
 
 [OK] **Completed**
+
+
+## Session 34: B 类 schema 改动包（四条）
+<!-- trellis-session: v=2 fp=e21529e21d7a46dd -->
+
+**Date**: 2026-10-04
+**Task**: B 类 schema 改动包（四条）
+**Branch**: `feat/schema-batch`
+
+### Summary
+
+「到期看板」标 ⚠️ 的四条一起做。核下来只有 B-1 真动 sqlite schema，不翻 USER_VERSION。四条里三条账上写的实现方式都不是最优：B-1 的改名方向是错的（对外 first_round 也存 sha、doc 自承，裁定一次改到准 first_seen_sha）；B-2 根本不用动 schema（隐式 rowid 就够）；B-3 记在 QueueItem.produced 比给 Finding 加字段省 31 处构造点且不污染对外 JSON；B-4 账上说混三件事实际五件（deep.rs:1208 把二阶段累加进首轮 iterations）。切名门「修复轮为 0」从此可自动化。全量 1016 项绿、verify 绿、clippy 零新增、五个变异精确命中。过程中自己踩中 basename 备份冲突（两个 mod.rs 压成同名、后者覆盖前者），在还原前停住并手动精确还原，教训已写进状态机指南。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f447f93` | refactor(db,orchestrate,report): B 类 schema 改动包——四条一起做 |
+| `90169f6` | build: 重建二进制 |
+
+### Status
+
+[OK] **Completed**

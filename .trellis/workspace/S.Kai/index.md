@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 33
+- **Total Sessions**: 34
 - **Last Active**: 2026-10-04
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~990 | Active |
+| `journal-1.md` | ~1013 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 34 | 2026-10-04 | B 类 schema 改动包（四条） | `f447f93`, `90169f6` | `feat/schema-batch` |
 | 33 | 2026-10-04 | followup 对账 + A 类四条小修 | `25f3df2`, `da2e519` | `chore/followup-reconcile` |
 | 32 | 2026-10-04 | 增量轮重建：carried 的复核挂点自 M21 起就不存在 | `989a818`, `074ec19` | `feat/incremental-rebuild` |
 | 31 | 2026-10-03 | M21c 批 D：出口核验与里程碑收口 | `8e020cf`, `0d0a21f`, `8fe9ff2` | `feat/m21c-dogfood` |
