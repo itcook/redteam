@@ -629,6 +629,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     // 没有格就没有派发点。方向保守（没判决 = 照拦），留待 M21c 判例台账一并处理。
     apply_known(&mut prior_findings, &verdicts);
     findings.extend(prior_findings);
+    mark_previously_dismissed(&mut findings, input.precedents);
     DeepRun {
         findings: crate::consolidate::dedup(findings),
         cells,
@@ -637,6 +638,30 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         reviewer_failed,
         reused_cells: vec![],
         items: q.items().to_vec(),
+    }
+}
+
+/// 精确 id 命中活跃判例 → 标 `previously_dismissed`（人已驳回，`blocking_count` 据此不让它拦路）。
+///
+/// **这条链此前是断的**：`blocking_count` 一直消费这个字段（R8.2「人已驳回 → 不 blocking」）、
+/// 还有测试盯着，但原来的 writer `mark_dismissed` 随 M21a 批 F-4 的旧尾段删了，之后没人补。
+/// 后果不是少一个优化，而是 `decide` 的判定链建立在一个不成立的假设上——它第 4 条
+/// 「精确 id 在判例里 → `SkipPrecedent`」的注释写着「**那是豁免的职责**，再验纯浪费」，
+/// 于是这类 finding **既不复核、也不豁免**，以未复核状态直接拦路。
+/// 人已经判过是误报而机制还在拦，比漏报更糟。
+///
+/// 标在**本轮产出与 `prior_findings` 合流之后、dedup 之前**：两条来源一次覆盖，
+/// 新加第三条来源时也自动受保护（不必记得在各自的产出点各标一遍）。
+/// 只标不删：证据保留在报告里，只是不参与 blocking 判定（R8.2 的原话是「证据保留」）。
+fn mark_previously_dismissed(findings: &mut [Finding], precedents: &[crate::db::DismissCard]) {
+    if precedents.is_empty() {
+        return;
+    }
+    let ids: std::collections::HashSet<&str> = precedents.iter().map(|c| c.id.as_str()).collect();
+    for f in findings.iter_mut() {
+        if ids.contains(f.id.as_str()) {
+            f.previously_dismissed = true;
+        }
     }
 }
 
@@ -2491,6 +2516,54 @@ mod tests {
         assert_eq!(run3.items.iter().filter(|i| i.activated).count(), 1, "夹具前提：两行并成一项");
         assert_eq!(run3.meta.ledger_activated, 1, "按项记，不是 2");
         assert_eq!(restored_meta(&run3.items).ledger_activated, 1, "与 resume 侧同口径");
+    }
+
+    /// 精确 id 命中判例 → `previously_dismissed` → **不再拦路**（断了很久的一条链）。
+    ///
+    /// `blocking_count` 一直消费这个字段、还有测试盯着，但 writer 随 M21a 批 F-4 删了之后没人补。
+    /// 后果是 `decide` 第 4 条 `SkipPrecedent` 的假设落空——它注释写「那是豁免的职责」，
+    /// 于是这类 finding 既不复核、也不豁免，以未复核状态直接 reject。
+    #[tokio::test]
+    async fn exact_id_precedent_marks_finding_as_previously_dismissed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = routed_bundles(dir.path(), &["a"]);
+        let backend = Routed::new(vec![("a", 10, vec![Ok(turn(&blocking_cell("fn a() {")))])]);
+        let reg = routed_registry(&backend, 2);
+        let items = pending_items(&["a"]);
+
+        // 先跑一轮拿到 finding 的真实 id（它是 title + quote 的内容指纹，手写不出来）
+        let first = run_with(Run { ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        let fid = first.findings[0].id.clone();
+        assert!(!first.findings[0].previously_dismissed, "没有判例时不该标");
+        assert_eq!(
+            crate::verdict::blocking_count(&first.findings, crate::domain::Severity::Medium, 0.5),
+            1,
+            "夹具前提：这条本来是拦路的"
+        );
+
+        // 把它写成判例卡，再跑一轮——同 id 命中 → 标上、不再拦路
+        let cards = [crate::db::DismissCard {
+            id: fid.clone(), status: "dismissed".into(), title: "t".into(), file: "a.rs".into(),
+            quote: "fn a() {".into(), severity: "high".into(), reason: "人判过是误报".into(),
+            round: "r1".into(), updated_at: String::new(),
+        }];
+        let backend2 = Routed::new(vec![("a", 10, vec![Ok(turn(&blocking_cell("fn a() {")))])]);
+        let reg2 = routed_registry(&backend2, 2);
+        // 判例区域有 delta（routed_bundles 的 hunk 覆盖第 1 行）→ 入队豁免不生效，
+        // 这条会被真的挖出来——正是要测的那条路径。
+        let second = run_with(Run {
+            precedents: &cards,
+            ..plain(&reg2, dir.path(), &bundles, &pending_items(&["a"]))
+        })
+        .await;
+        let got = second.findings.iter().find(|f| f.id == fid).expect("该挖出来: {second:?}");
+        assert!(got.previously_dismissed, "精确 id 命中判例要标上");
+        assert_eq!(
+            crate::verdict::blocking_count(&second.findings, crate::domain::Severity::Medium, 0.5),
+            0,
+            "人已驳回 → 不再拦路（证据仍在 findings 里）"
+        );
+        assert!(second.findings.iter().any(|f| f.id == fid), "只标不删，证据保留");
     }
 
     /// B-2 验收①（M21c 批 B，〔D19-5〕）：已 dismissed 的变体在**入队侧被豁免**——不占 reviewer 格。

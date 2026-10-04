@@ -125,7 +125,7 @@
 | resume scan 重放无生产验证 | `run_resume` 用 manifest `scan` 请求重放差集 cell（旧格式作业记失败）；只有单测 / e2e 空 manifest 锚，无真 provider dogfood；角色集按当前配置重建 | M21b 队列快照 checkpoint 落地后重做（resume 读快照里的角色条目） |
 | thinking 映射未在真网关实测的家族 | 映射表按官方文档（2026-09-09）：GLM anthropic 形态文档无字段 → 无映射 + warning；Qwen `enable_thinking` / Gemini `reasoning_effort` 未实测；本仓 dogfood 只覆盖 DeepSeek（`thinking` + `reasoning_effort`）与 Qwen（openai 形态） | 出口 2 已跑（2026-09-09）：GLM 5.3 anthropic 形态无映射 → registry warning 1、未发思考参数，网关默认仍有推理输出，并集 / agreement 正常；映射待 Z.ai anthropic 文档给字段；其余按模型接入时实测 |
 | 增量轮显式报错 | `run_incremental_review` bail；e2e `incremental_from_bails_until_m21c` 锚住报错；原 carry 端到端锚与 `render_incremental_section` / `two_layer_manifest` 随旧路径删 | **仍 bail**〔M21c 批 C 裁定 1，2026-10-02〕：delta 激活改**挂全量轮**落地（激活所需输入在全量轮上已全部具备，实测本仓两轮全量就产生过跨轮项），`--incremental-from` 不在批 C 范围。重建它要先重裁「上轮 finding 要不要携带」——`carry()` / `merge_carry()` 全是 `Finding` 形态，而新形态下 finding 只由深挖产出；`incremental_preflight` 四守卫仍 `#[allow(dead_code)]` 有测试无调用。连同那次设计重裁一起排期 |
-| dismissed 台账只披露不消费 | `load_ledger` 仍加载并进 `run.ledger`；`Ledger.ids / cards` 无消费者；e2e 改为披露断言 | M21c 批 B（判例前移）。**2026-10-02 摸台账发现前提不成立**：判例只由 ship 循环的人工裁定写入，M21 期间不跑 ship → 新库 `dismissed` / `resolved` 恒 0，本仓两轮与 PR181 四轮的 `ledger.loaded` 全是 0。旧库 63 + 3 条在主工作树 v0 库里且**仅 22 条带 quote 锚**。批 B 开工前先裁喂料方式（等可跑 ship，或捡回 D19-4 搁置的「`--dismissed` 指向旧库只读复用」） |
+| ~~dismissed 台账只披露不消费~~ **已消费**（批 B 接 `cards`，2026-10-04 接回 `previously_dismissed`） | `cards` 现供三处：scanner prompt 注入、入队侧判例豁免、精确 id 命中标 `previously_dismissed`。**`Ledger.ids` 仍无消费者**——精确 id 匹配直接用 `cards` 的 id 做，`ids` 可删或留作 csv 形态（`--dismissed <csv>` 只产 ids 不产 cards，那条路现在拿不到豁免，要么补要么在 `--help` 里说清） | M21c 批 B（判例前移）。**2026-10-02 摸台账发现前提不成立**：判例只由 ship 循环的人工裁定写入，M21 期间不跑 ship → 新库 `dismissed` / `resolved` 恒 0，本仓两轮与 PR181 四轮的 `ledger.loaded` 全是 0。旧库 63 + 3 条在主工作树 v0 库里且**仅 22 条带 quote 锚**。批 B 开工前先裁喂料方式（等可跑 ship，或捡回 D19-4 搁置的「`--dismissed` 指向旧库只读复用」） |
 | 无消费者的旗 | `--block-threshold` / `--conf-floor` / `--tools` / `--dismissed` / `--no-dismissed` 保留、`--help` 注明生效里程碑（prd K13） | M21b（前三）/ M21c（后二）接消费者；届时改回文案 |
 | 报告里的 finding 形态字段恒空 | `stats` 全零、`findings` / `clusters` 空数组仍序列化（schema 不翻号，followup :70）；插件 `result.md` / `review.md` 文案「呈现 findings」 | M21b 深挖产 finding 后自然填；插件文案 M21c 切名时改 |
 | `CellSummary.attempts` 口径 | 字段注释仍写「候补链尝试的 model 数」，scan 路径恒 1（无候补，D7 A3） | M21e 清扫改注释或删字段 |
@@ -965,3 +965,21 @@ M21c 批 D 核验时，交付项 9 的「ship r1-rN 至 approve」与「M21 期�
 **第一次跑的目标选择**：当前分支的 diff 几乎全是文档，喂不出多轮循环。要看循环真的转起来
 （r1 发现问题 → 修 → r2 → approve），得找一个有实质代码改动、且已知有问题的目标。
 PR181 是现成的（公司仓，一轮 40-60 分钟），或者等下一批真实开发时顺带。
+
+## `previously_dismissed` 的 writer 断了很久（2026-10-04 修）
+
+`blocking_count` 一直消费 `f.previously_dismissed`（R8.2「人已驳回 → 不 blocking，证据保留」）、
+还有测试 `dismissed_blocking_finding_is_exempt` 盯着，**但产品路径里没有任何地方把它置 true**——
+原 writer `mark_dismissed` 随 M21a 批 F-4 的旧尾段删掉后没人补。
+
+后果不是「少一个优化」，而是 `consolidate::verify::decide` 的判定链建立在一个不成立的假设上：
+它第 4 条「精确 id 在判例里 → `SkipPrecedent`」的注释写着「**那是豁免的职责**，再验纯浪费」，
+于是这类 finding **既不复核、也不豁免**，以未复核状态直接拦路。
+**人已经判过是误报而机制还在拦，比漏报更糟。**
+
+修法：在 `run_deep` 收场、本轮产出与 `prior_findings` 合流之后、`dedup` 之前统一标一次
+（两条来源一次覆盖，新加第三条来源也自动受保护）。只标不删——证据留在报告里，只是不参与 blocking。
+
+**这是第三次撞上「定义了却没人用」的同形**（`Phase::Verify` 没人写、`relocated` 没人读、
+这次是有人读没人写）。前两次的判据「grep 消费方、排除测试、看还剩几个」只覆盖了一半——
+**反向也要查：有消费者的字段，谁在写它？** 已把这一句补进状态机指南。
