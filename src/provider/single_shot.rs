@@ -49,6 +49,7 @@ pub async fn run_single_shot(
             output_tokens: out_tok,
             cached_input_tokens: cached_tok,
             iterations: 1,
+            repair_rounds: 0, // 单发单收，一次过
             tool_use: crate::tools::ToolUse::default(),
         });
     }
@@ -71,6 +72,7 @@ pub async fn run_single_shot(
             output_tokens: out_tok,
             cached_input_tokens: cached_tok,
             iterations: 2,
+            repair_rounds: 1, // 2 = 首轮 + 修复轮
             tool_use: crate::tools::ToolUse::default(),
         }),
         Err(_) => Err(diagnostic_parse_error(&repair_turn).attach_usage((in_tok, out_tok, cached_tok))),

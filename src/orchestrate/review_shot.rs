@@ -128,6 +128,12 @@ pub struct ReviewCall {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub iterations: u32,
+    /// 其中**修复轮**（schema 批 B-4）。二阶段合并时两轮的修复轮都累加进来。
+    pub repair_rounds: u32,
+    /// 二阶段补查的轮次（schema 批 B-4）。**不再混进 `iterations`**——原来
+    /// `c.iterations += c2.iterations` 把两件事揉成一个数，于是「这格跑了多轮」
+    /// 分不出是探索深、修过错、还是声明了 needs。
+    pub two_stage_rounds: u32,
     /// 单轮最大输出 token（首轮 / repair 轮 / 二阶段轮取 max；见 `TurnUsage::max_turn`）。
     pub max_turn_output_tokens: u64,
     pub finish_reason: Option<String>,
@@ -298,6 +304,11 @@ fn finish_parse(
         output_tokens: usage.output,
         cached_input_tokens: usage.cached,
         iterations,
+        // review 路径的 `iterations` 恒为 1（首轮即成）或 2（修复后成）——两个调用点就这两种，
+        // 所以减 1 就是修复轮数，不是估算。
+        repair_rounds: iterations.saturating_sub(1),
+        // 二阶段在 `deep.rs` 合并两次调用时才产生，单次 shot 恒 0。
+        two_stage_rounds: 0,
         max_turn_output_tokens: usage.max_turn,
         finish_reason,
         reasoning_tokens: usage.reasoning,

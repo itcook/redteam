@@ -91,8 +91,8 @@ const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS dismissed (
                quote_norm TEXT NOT NULL,
                hint TEXT NOT NULL DEFAULT '',
                status TEXT NOT NULL,
-               first_job TEXT NOT NULL DEFAULT '',
-               last_job TEXT NOT NULL DEFAULT '',
+               first_seen_sha TEXT NOT NULL DEFAULT '',
+               last_seen_sha TEXT NOT NULL DEFAULT '',
                activations INTEGER NOT NULL DEFAULT 0,
                json TEXT NOT NULL
              );";
@@ -178,8 +178,8 @@ pub struct SuspicionRow {
     pub hint: String,
     /// `dormant` = 休眠（本批只产这一种）；`activated` / `promoted` 留给批 C 的增量激活。
     pub status: String,
-    pub first_job: String,
-    pub last_job: String,
+    pub first_seen_sha: String,
+    pub last_seen_sha: String,
     /// 被 delta 激活过几次（批 C 的活锁守卫据此封顶）。本批恒 0。
     pub activations: i64,
     /// 明细 JSON：行区间、confidence、category、来源、落账原因、所属队列项。
@@ -304,6 +304,7 @@ impl ProjDb {
             }
             eprintln!("warning: {} 只读打开，无法切换 journal_mode=WAL（{e}），继续以只读方式使用", path.display());
         }
+        Self::rename_legacy_suspicion_columns(&conn, path);
         Self::normalize_legacy_activated(&conn, path);
         Ok(Self { conn, legacy_migration })
     }
@@ -317,6 +318,39 @@ impl ProjDb {
     /// 为什么不能放进 `setup_schema`：那些库**已经是 v4 且表齐全**，`needs_setup` 为假，
     /// 整条迁移路径根本不跑。所以挂在 open 上，幂等、无匹配行时近乎零成本。
     ///
+    /// `first_job`/`last_job` → `first_seen_sha`/`last_seen_sha`（schema 批 B-1，2026-10-04）。
+    ///
+    /// 旧名字说的是 job，存的却是 **HEAD sha**。账上原本写「改成 `first_round` 与对外一致」，
+    /// 核实下来那个理由不成立：对外的 `DormantLead.first_round` 是**直接赋值**、没有「转成 round」
+    /// 这回事，而它自己的 doc 写着「那轮 head_sha」——名字和注释打架。一次改到准。
+    ///
+    /// 与 `normalize_legacy_activated` 同理，这类库**已经是 v4 且表齐全**，`needs_setup` 为假、
+    /// `setup_schema` 整条迁移路径不跑，所以挂在 open 上。幂等：先查列在不在，在才改。
+    /// **必须早于任何按新列名发的 SQL**（包括 `normalize_legacy_activated`）。
+    fn rename_legacy_suspicion_columns(conn: &Connection, path: &Path) {
+        let has = |col: &str| -> bool {
+            conn.prepare("SELECT 1 FROM pragma_table_info('suspicions') WHERE name = ?1")
+                .and_then(|mut st| st.exists([col]))
+                .unwrap_or(false)
+        };
+        for (old, new) in [("first_job", "first_seen_sha"), ("last_job", "last_seen_sha")] {
+            // 新列已在 = 这库改过了；旧列不在 = 新建的库。两种都跳过。
+            if !has(old) || has(new) {
+                continue;
+            }
+            match conn.execute_batch(&format!("ALTER TABLE suspicions RENAME COLUMN {old} TO {new}")) {
+                Ok(()) => eprintln!(
+                    "notice: {} 的台账列 {old} 已改名为 {new}（存的一直是 HEAD sha，旧名字误导）",
+                    path.display()
+                ),
+                Err(e) => eprintln!(
+                    "warning: {} 的台账列 {old} 改名失败（{e}）——本次运行读写台账会失败，请人工处置",
+                    path.display()
+                ),
+            }
+        }
+    }
+
     /// 失败只告警不拒开：这是数据修复，不是打开库的前提条件。
     fn normalize_legacy_activated(conn: &Connection, path: &Path) {
         match conn.execute("UPDATE suspicions SET status='dormant' WHERE status='activated'", []) {
@@ -654,15 +688,15 @@ impl ProjDb {
     }
 
     /// 疑点落账（M21c 批 A，design §8.2）：**幂等 upsert**——同一处疑点跨轮只有一行。
-    /// 新行写全量、`activations = 0`；已有行只更新 `last_job` / `hint` / `json`，
-    /// **不动** `first_job`（第一次见到它的那轮）、`activations` 与 `status`（激活与晋升是批 C 的事，不能被落账覆盖回 dormant）。
+    /// 新行写全量、`activations = 0`；已有行只更新 `last_seen_sha` / `hint` / `json`，
+    /// **不动** `first_seen_sha`（第一次见到它的那轮）、`activations` 与 `status`（激活与晋升是批 C 的事，不能被落账覆盖回 dormant）。
     pub fn suspicion_upsert(&self, row: &SuspicionRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO suspicions (id,file,quote_norm,hint,status,first_job,last_job,activations,json)
+            "INSERT INTO suspicions (id,file,quote_norm,hint,status,first_seen_sha,last_seen_sha,activations,json)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-             ON CONFLICT(id) DO UPDATE SET last_job=excluded.last_job, hint=excluded.hint, json=excluded.json",
+             ON CONFLICT(id) DO UPDATE SET last_seen_sha=excluded.last_seen_sha, hint=excluded.hint, json=excluded.json",
             rusqlite::params![row.id, row.file, row.quote_norm, row.hint, row.status,
-                              row.first_job, row.last_job, row.activations, row.json],
+                              row.first_seen_sha, row.last_seen_sha, row.activations, row.json],
         )?;
         Ok(())
     }
@@ -674,21 +708,21 @@ impl ProjDb {
         }
         let ph = (1..=files.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT id,file,quote_norm,hint,status,first_job,last_job,activations,json
+            "SELECT id,file,quote_norm,hint,status,first_seen_sha,last_seen_sha,activations,json
              FROM suspicions WHERE file IN ({ph}) ORDER BY file, id"
         ))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(files.iter()), |r| {
             Ok(SuspicionRow {
                 id: r.get(0)?, file: r.get(1)?, quote_norm: r.get(2)?, hint: r.get(3)?, status: r.get(4)?,
-                first_job: r.get(5)?, last_job: r.get(6)?, activations: r.get(7)?, json: r.get(8)?,
+                first_seen_sha: r.get(5)?, last_seen_sha: r.get(6)?, activations: r.get(7)?, json: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// 激活回写（M21c 批 C）：计数 +1、`last_job` 记本轮，**不动 status**。
+    /// 激活回写（M21c 批 C）：计数 +1、`last_seen_sha` 记本轮，**不动 status**。
     ///
-    /// 幂等靠 `last_job <> ?2`：同一轮里重复调用（或与别的写者撞上）第二次写不进去，计数不会多加；
+    /// 幂等靠 `last_seen_sha <> ?2`：同一轮里重复调用（或与别的写者撞上）第二次写不进去，计数不会多加；
     /// 而**换一轮**就能再加一次——两段活锁门（3 / 5）正是靠这个才可达。
     ///
     /// 这里原先写 `status='activated'` 且条件为 `status='dormant'`，于是一行一生只能加一次、
@@ -696,8 +730,8 @@ impl ProjDb {
     /// `ledger::STATUS_DORMANT` 的注释。
     pub fn suspicion_activate(&self, id: &str, job: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE suspicions SET activations=activations+1, last_job=?2
-             WHERE id=?1 AND status='dormant' AND last_job<>?2",
+            "UPDATE suspicions SET activations=activations+1, last_seen_sha=?2
+             WHERE id=?1 AND status='dormant' AND last_seen_sha<>?2",
             rusqlite::params![id, job],
         )?;
         Ok(())
@@ -729,9 +763,15 @@ impl ProjDb {
         // `json <> ''` 跳过 md-first 写入留下的半行（dogfood medium，agreement 2）：
         // `result_put_md` 先建行时 json 列是空串，被它选中会解析失败 → `Err` → 闸门保守关闭，
         // 于是一次正常的 md 落盘就能把下一轮的激活整个掐掉。
-        let mut stmt = self
-            .conn
-            .prepare("SELECT json FROM results WHERE json <> '' ORDER BY created_at DESC LIMIT 1")?;
+        // `rowid` 兜底（2026-10-04 schema 批 B-2）：`created_at` 是
+        // `strftime('%Y-%m-%dT%H:%M:%SZ')`，**只到秒**。同秒落盘的两轮在 `created_at` 上并列，
+        // 谁被选成「上一轮」由 sqlite 的扫描顺序决定——而激活闸门正是按这条的 verdict 开关的，
+        // 取错一轮等于拿着别人的裁决去决定本轮激不激活。
+        // `results` 不是 WITHOUT ROWID 表，隐式 `rowid` 单调递增 = 插入序，拿它当次序主键最准，
+        // 且**不用动 schema**（加显式自增列要改 DDL 并迁移两个现存库）。
+        let mut stmt = self.conn.prepare(
+            "SELECT json FROM results WHERE json <> '' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )?;
         let mut rows = stmt.query([])?;
         let Some(r) = rows.next()? else { return Ok(None) };
         let js: String = r.get(0)?;
@@ -1027,6 +1067,85 @@ mod tests {
         db
     }
 
+    /// 同秒落盘的两轮，`last_verdict()` 要取**后插入**的那条（schema 批 B-2，2026-10-04）。
+    ///
+    /// `created_at` 是 `strftime('%Y-%m-%dT%H:%M:%SZ')`——只到秒。同秒的两行在它上面并列，
+    /// 原来 `ORDER BY created_at DESC LIMIT 1` 取谁由扫描顺序决定，而激活闸门正是按这条的
+    /// verdict 开关：取错一轮等于拿着别人的裁决去决定本轮激不激活。
+    /// 加 `rowid DESC` 兜底（`results` 不是 WITHOUT ROWID 表，隐式 rowid 就是插入序）。
+    #[test]
+    fn last_verdict_breaks_same_second_ties_by_insertion_order() {
+        let db = mem_db();
+        // 两行同一个 created_at，故意让 job_id 的字典序与插入序**相反**——
+        // 这样「按 job_id 排」「按扫描顺序排」都会取错，只有 rowid 是对的。
+        for (job, verdict) in [("zz-older", "approve"), ("aa-newer", "reject")] {
+            db.conn
+                .execute(
+                    "INSERT INTO results (job_id, json, created_at) VALUES (?1, ?2, '2026-10-04T12:00:00Z')",
+                    rusqlite::params![job, format!(r#"{{"verdict":"{verdict}"}}"#)],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            db.last_verdict().unwrap().as_deref(),
+            Some("reject"),
+            "同秒并列时要取后插入的那条——取错一轮，激活闸门就按别人的裁决开关"
+        );
+    }
+
+    /// 旧库的 `first_job`/`last_job` 列在 open 时被改名（schema 批 B-1，2026-10-04）。
+    ///
+    /// 这类库**已经是 v4 且表齐全**，`needs_setup` 为假、`setup_schema` 不跑——
+    /// 和三态遗留行同一个处境，所以同样挂在 open 上。
+    ///
+    /// 顺带钉住一条**次序**不变量：改名必须早于任何按新列名发的 SQL。
+    /// 本测试里 `suspicion_upsert` 用的就是新列名——它能跑通，就说明改名跑在了前面。
+    #[test]
+    fn reopening_renames_legacy_job_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.db");
+        // 先建一个 v4 库，再把两列改回旧名，模拟 M21c 批 A 那版二进制留下的库
+        {
+            let db = ProjDb::open_at(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "ALTER TABLE suspicions RENAME COLUMN first_seen_sha TO first_job;\
+                     ALTER TABLE suspicions RENAME COLUMN last_seen_sha TO last_job;",
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO suspicions (id,file,quote_norm,hint,status,first_job,last_job,activations,json)
+                     VALUES ('aaaaaaaaaaaaaaaa','a.rs','q','h','dormant','sha1','sha2',0,'{}')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let db = ProjDb::open_at(&path).unwrap();
+        let cols: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('suspicions')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(cols.contains(&"first_seen_sha".to_string()), "该改名了: {cols:?}");
+        assert!(cols.contains(&"last_seen_sha".to_string()), "该改名了: {cols:?}");
+        assert!(!cols.iter().any(|c| c == "first_job" || c == "last_job"), "旧列不该还在: {cols:?}");
+
+        // 数据跟着列走，没丢
+        let rows = db.suspicions_for_files(&["a.rs".to_string()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].first_seen_sha.as_str(), rows[0].last_seen_sha.as_str()), ("sha1", "sha2"));
+
+        // 幂等：再开一次不报错、列名不变
+        drop(db);
+        let db2 = ProjDb::open_at(&path).unwrap();
+        assert_eq!(db2.suspicions_for_files(&["a.rs".to_string()]).unwrap().len(), 1);
+    }
+
     /// 三态遗留行在 open 时被复位（2026-10-04 对账落地的发布门）。
     ///
     /// 批 C 把台账从三态收成两态时没规范化已有数据：旧二进制写下的 `status='activated'`
@@ -1041,7 +1160,7 @@ mod tests {
         let path = dir.path().join("proj.db");
         let row = |id: &str, status: &str| SuspicionRow {
             id: id.into(), file: "a.rs".into(), quote_norm: format!("q{id}"), hint: "h".into(),
-            status: status.into(), first_job: "j1".into(), last_job: "j1".into(),
+            status: status.into(), first_seen_sha: "j1".into(), last_seen_sha: "j1".into(),
             activations: 0, json: "{}".into(),
         };
         {
@@ -1614,7 +1733,7 @@ mod guard_tests {
     }
 
     /// 疑点台账 upsert 幂等（M21c 批 A）：同一处疑点跨轮只有一行，
-    /// 第二轮只更新 `last_job` / `hint` / `json`，**不动** `first_job` / `activations` / `status`
+    /// 第二轮只更新 `last_seen_sha` / `hint` / `json`，**不动** `first_seen_sha` / `activations` / `status`
     /// ——否则批 C 的激活计数与晋升状态会被下一轮落账悄悄抹回 dormant。
     #[test]
     fn suspicion_upsert_is_idempotent_and_keeps_activation_state() {
@@ -1622,7 +1741,7 @@ mod guard_tests {
         let db = ProjDb::open(dir.path()).unwrap();
         let row = |job: &str, hint: &str| SuspicionRow {
             id: "abc123".into(), file: "a.rs".into(), quote_norm: "letx=1;".into(), hint: hint.into(),
-            status: "dormant".into(), first_job: job.into(), last_job: job.into(), activations: 0,
+            status: "dormant".into(), first_seen_sha: job.into(), last_seen_sha: job.into(), activations: 0,
             json: format!("{{\"round\":\"{job}\"}}"),
         };
         db.suspicion_upsert(&row("sha1", "第一轮说法")).unwrap();
@@ -1633,7 +1752,7 @@ mod guard_tests {
         let got = db.suspicions_for_files(&["a.rs".into()]).unwrap();
         assert_eq!(got.len(), 1, "跨轮只有一行");
         let r = &got[0];
-        assert_eq!((r.first_job.as_str(), r.last_job.as_str()), ("sha1", "sha2"), "first 不动、last 更新");
+        assert_eq!((r.first_seen_sha.as_str(), r.last_seen_sha.as_str()), ("sha1", "sha2"), "first 不动、last 更新");
         assert_eq!((r.activations, r.status.as_str()), (2, "activated"), "激活状态不被落账覆盖");
         assert_eq!(r.hint, "第二轮说法", "hint / json 取最新");
         assert!(r.json.contains("sha2"));
@@ -1645,7 +1764,7 @@ mod guard_tests {
 
     /// 激活回写：**同轮幂等、跨轮累加**（M21c 批 C；原版在 dogfood 里被判为死代码，见下）。
     ///
-    /// 幂等靠 `last_job <> ?`，不是靠改 status。原先这条 UPDATE 写 `status='activated'` 而条件是
+    /// 幂等靠 `last_seen_sha <> ?`，不是靠改 status。原先这条 UPDATE 写 `status='activated'` 而条件是
     /// `status='dormant'`，于是一行一生只能加一次，`activations` 饱和在 1，而两段门在 3 / 5——
     /// 整个活锁守卫是不可达的死代码。这条用例因此**走真实 DB 往返**而不是手搓中间状态：
     /// 原来的单测直接构造 `activations: 2..4` 的行，那是生产路径产生不出来的，所以测不出门不可达。
@@ -1655,7 +1774,7 @@ mod guard_tests {
         let db = ProjDb::open(dir.path()).unwrap();
         let row = |id: &str, status: &str| SuspicionRow {
             id: id.into(), file: "a.rs".into(), quote_norm: "q".into(), hint: "h".into(),
-            status: status.into(), first_job: "sha0".into(), last_job: "sha1".into(),
+            status: status.into(), first_seen_sha: "sha0".into(), last_seen_sha: "sha1".into(),
             activations: 0, json: "{}".into(),
         };
         db.suspicion_upsert(&row("d1", "dormant")).unwrap();
@@ -1664,7 +1783,7 @@ mod guard_tests {
         let count = |id: &str| {
             let got = db.suspicions_for_files(&["a.rs".into()]).unwrap();
             let r = got.into_iter().find(|r| r.id == id).unwrap();
-            (r.status, r.activations, r.last_job)
+            (r.status, r.activations, r.last_seen_sha)
         };
 
         // 同一轮重复调用只加一次

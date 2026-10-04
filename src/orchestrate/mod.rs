@@ -377,7 +377,12 @@ pub fn scan_cell_record(
             rec.output_tokens = call.output_tokens;
             rec.cached_input_tokens = call.cached_input_tokens;
             rec.iterations = call.iterations;
+            // `attempts` 是总数；分量单记（schema 批 B-4）。
+            // scanner 的 `iterations` 恒为 1（首发即成）或 2（修复后成）——`scan_shot` 就这两个
+            // 构造点，所以减 1 就是修复轮数；scanner 没有二阶段补查（那是 reviewer 的）。
             rec.attempts = call.iterations + call.rate_limit_retries;
+            rec.repair_rounds = call.iterations.saturating_sub(1);
+            rec.rl_retries = call.rate_limit_retries;
             rec.queue_wait_ms = call.rate_limit_wait_ms;
             rec.warn = if notes.is_empty() { None } else { Some(notes.join("; ")) };
             (rec, Some(anchored.output))

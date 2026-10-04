@@ -67,6 +67,15 @@ pub struct QueueItem {
     /// 入队时刻（epoch ms，观测：item_wait_ms = 派发时刻 − 此值）。None = 旧快照。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enqueued_ms: Option<u64>,
+    /// **本项落地时产出的 finding id**（schema 批 B-3，2026-10-04）。
+    ///
+    /// 给晰晋判据用。原来 `promote_dug_suspicions` 问的是「**有任何** finding 落在该项区间内」——
+    /// 同一区间里的 finding 可能来自兄弟疑点、往轮携带（`Origin::Carried`）、
+    /// 或已被 verifier 驳回的那条，于是把一条还没真挖出结果的台账行提前请出激活池。
+    /// 记在项上而不是给 `Finding` 加字段：后者要改 43 处构造点、还把归因细节泄进对外报告 JSON。
+    /// 旧快照空 → `promote` 自动回落旧的区间判据（较宽，方向安全）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produced: Vec<String>,
     /// 并入本项的到达键（疑点 `{scan cell_id}#{i}:{内容指纹}`、H0 `rule:{file}:{start}-{end}`，C2〔D15〕）：再到达即幂等（`EnqueueOutcome::Duplicate`），
     /// 收场据此把组内闭包簇映射回队列项做拆簇对账。H0 无到达键；旧快照空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -137,6 +146,7 @@ impl QueueItem {
             landed_agreement: None,
             families,
             enqueued_ms: Some(now_ms()),
+            produced: Vec::new(), // 落地时由 `land` 回填
             arrivals: arrival.into_iter().collect(),
             members,
             member_families,
@@ -702,6 +712,14 @@ impl DeepQueue {
         if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
             it.state = ItemState::Settled;
             it.landed_agreement = Some(landed_agreement);
+        }
+    }
+
+    /// 结案时记下本项产出的 finding id（schema 批 B-3）。与 `mark_settled` 分开：
+    /// 那条路有很多调用方（含失败格、resume 回放），而这里只有真拿到输出的那一处该调。
+    pub fn mark_produced(&mut self, id: &str, finding_ids: Vec<String>) {
+        if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
+            it.produced = finding_ids;
         }
     }
 

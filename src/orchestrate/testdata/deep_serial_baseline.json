@@ -51,7 +51,7 @@
       "duration_ms": 0,
       "family": "r",
       "input_tokens": 2,
-      "iterations": 2,
+      "iterations": 1,
       "model": "p/r",
       "ok": true,
       "output": {

@@ -142,7 +142,7 @@ fn render_md(r: &ReviewReport) -> String {
         s.push_str("  | File:Line | Hint | First seen | Activations |\n");
         s.push_str("  | --- | --- | --- | --- |\n");
         for l in &r.run.dormant_leads {
-            let short = l.first_round.chars().take(9).collect::<String>();
+            let short = l.first_seen_sha.chars().take(9).collect::<String>();
             s.push_str(&format!("  | {}:{} | {} | {} | {} |\n", l.file, l.line, l.hint, short, l.activations));
         }
     }
@@ -203,7 +203,28 @@ fn render_md(r: &ReviewReport) -> String {
         s.push_str("  | --- | --- | --- | --- | --- | --- | --- | --- |\n");
         for c in &r.run.cells {
             let st = if c.ok { "✓" } else { "✗" };
-            let att = if c.attempts > 1 { format!(" ({} att)", c.attempts) } else { String::new() };
+            // `attempts` 是总数，单看它分不出「探索深」「修过错」「声明了 needs」（schema 批 B-4）。
+            // 非 0 的分量跟在后面标出来——尤其 `repair`：切名门的判据是「修复轮为 0」，
+            // 而 PR181 那轮 24 格 `attempts > 1` 曾被误判成修复轮、实际全是二阶段补查。
+            let att = if c.attempts > 1 {
+                let mut parts: Vec<String> = Vec::new();
+                if c.repair_rounds > 0 {
+                    parts.push(format!("{} repair", c.repair_rounds));
+                }
+                if c.two_stage_rounds > 0 {
+                    parts.push(format!("{} 2nd-stage", c.two_stage_rounds));
+                }
+                if c.rl_retries > 0 {
+                    parts.push(format!("{} rl-retry", c.rl_retries));
+                }
+                if parts.is_empty() {
+                    format!(" ({} att)", c.attempts)
+                } else {
+                    format!(" ({} att: {})", c.attempts, parts.join(", "))
+                }
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
                 "  | {} | {} | {st} | {}{} | {} | {} | {} | {} |\n",
                 if c.cell.is_empty() { "-" } else { c.cell.as_str() },
@@ -405,8 +426,8 @@ mod tests {
     fn md_renders_dormant_leads_as_disclosure() {
         let mut r = report();
         r.run.dormant_leads = vec![
-            DormantLead { file: "a.rs".into(), line: 42, hint: "边界没校验".into(), first_round: "4317c8afce0".into(), activations: 2 },
-            DormantLead { file: "b.ts".into(), line: 7, hint: "超时不可调".into(), first_round: "4317c8afce0".into(), activations: 0 },
+            DormantLead { file: "a.rs".into(), line: 42, hint: "边界没校验".into(), first_seen_sha: "4317c8afce0".into(), activations: 2 },
+            DormantLead { file: "b.ts".into(), line: 7, hint: "超时不可调".into(), first_seen_sha: "4317c8afce0".into(), activations: 0 },
         ];
         let md = render_md(&r);
         assert!(md.contains("Dormant leads (2)"), "要有披露段: {md}");
@@ -416,6 +437,51 @@ mod tests {
         // 没有线索时一个字都不多写
         r.run.dormant_leads.clear();
         assert!(!render_md(&r).contains("Dormant"), "空则不渲染");
+    }
+
+    /// cell 行要把轮次的**分量**标出来，不只给一个总数（schema 批 B-4，2026-10-04）。
+    ///
+    /// `attempts` 把五件事揉在一起（探索轮/收尾轮/修复轮/二阶段/429 重试），
+    /// 只渲染 `(3 att)` 的话，读报告的人分不出这格是「探索深」还是「修过错」。
+    /// 切名门要的恰恰是「修复轮为 0」——PR181 那轮 24 格 `attempts > 1` 就是这么被误判的。
+    ///
+    /// 这条渲染此前**没有任何用例盯着**（改它全量测试照绿）。
+    #[test]
+    fn md_cell_row_breaks_attempts_into_components() {
+        let mut r = report();
+        let cell = |attempts: u32, repair: u32, two_stage: u32, rl: u32| CellSummary {
+            cell: "rev[a.rs]@p/r".into(), model: "p/r".into(), role: "reviewer".into(), ok: true,
+            iterations: 1, attempts, repair_rounds: repair, two_stage_rounds: two_stage, rl_retries: rl,
+            duration_ms: 1000, queue_wait_ms: 0, input_tokens: 100, output_tokens: 10, cached_input_tokens: 0,
+        };
+
+        // 二阶段 1 轮：不该让人以为走了修复
+        r.run.cells = vec![cell(2, 0, 1, 0)];
+        let md = render_md(&r);
+        let line = md.lines().find(|l| l.contains("rev[a.rs]")).expect("{md}");
+        assert!(line.contains("2 att: 1 2nd-stage"), "二阶段要标出来: {line}");
+        assert!(!line.contains("repair"), "没走修复轮就不该出现 repair 字样: {line}");
+
+        // 修复轮：切名门判据，必须可见
+        r.run.cells = vec![cell(2, 1, 0, 0)];
+        let md = render_md(&r);
+        let line = md.lines().find(|l| l.contains("rev[a.rs]")).expect("{md}");
+        assert!(line.contains("1 repair"), "修复轮要标出来——切名门就看它: {line}");
+
+        // 分量齐全时都列
+        r.run.cells = vec![cell(4, 1, 1, 1)];
+        let md = render_md(&r);
+        let line = md.lines().find(|l| l.contains("rev[a.rs]")).expect("{md}");
+        for want in ["1 repair", "1 2nd-stage", "1 rl-retry"] {
+            assert!(line.contains(want), "缺 {want}: {line}");
+        }
+
+        // 旧报告（三分量全 0 而 attempts > 1）：退回只给总数，不编造分解
+        r.run.cells = vec![cell(3, 0, 0, 0)];
+        let md = render_md(&r);
+        let line = md.lines().find(|l| l.contains("rev[a.rs]")).expect("{md}");
+        assert!(line.contains("(3 att)"), "旧报告无分量，照旧只给总数: {line}");
+        assert!(!line.contains("att:"), "不该凭空分解: {line}");
     }
 
     /// `converged` 与三个分量矛盾时，渲染侧要把矛盾本身说出来（2026-10-04 对账立）。
@@ -651,7 +717,7 @@ mod tests {
         let susp = |file: &str, ls: u32, hint: &str, conf: f32, quote: &str| Suspicion { file: file.into(), line_start: ls, line_end: ls, hint: hint.into(), category: Some(Category::L1), confidence: conf, quote: quote.into() };
         let mut run = RunMeta { job_id: "j9".into(), models: vec!["p/a".into(), "q/b".into()], ..Default::default() };
         run.coverage.failed.insert(Role::Scanner, vec!["scan[g2]@q/b#1".into()]);
-        run.cells.push(CellSummary { cell: "scan[g1]@p/a#1".into(), model: "p/a".into(), role: "scanner".into(), ok: true, iterations: 1, attempts: 1, duration_ms: 1200, queue_wait_ms: 0, input_tokens: 1000, output_tokens: 50, cached_input_tokens: 400 });
+        run.cells.push(CellSummary { cell: "scan[g1]@p/a#1".into(), model: "p/a".into(), role: "scanner".into(), ok: true, iterations: 1, attempts: 1, repair_rounds: 0, two_stage_rounds: 0, rl_retries: 0, duration_ms: 1200, queue_wait_ms: 0, input_tokens: 1000, output_tokens: 50, cached_input_tokens: 400 });
         let scan = ScanReport {
             groups: vec![
                 ScanGroup { label: "src/a.rs".into(), files: vec!["src/a.rs".into()], cells: vec!["scan[g1]@p/a#1".into(), "scan[g1]@q/b#1".into()], suspicions: 2, pack: crate::pack::PackStats { body: "slice".into(), sliced: 1, folded_lines: 30, diff_bytes: 4096, ..Default::default() } },

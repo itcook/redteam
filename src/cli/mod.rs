@@ -526,7 +526,7 @@ pub async fn run_code_review(
 /// 库不在就空，读失败也空（不打扰评审）。
 /// 这是披露面，不是判定面：它们没被深挖过、没有危害链论证，当 finding 用会把「没挖」误读成「有问题」。
 ///
-/// **`last_job == 本轮 round` 的不列**（批 C 订正）：落账在深挖之后、披露在落账之后，所以本轮刚被截断的
+/// **`last_seen_sha == 本轮 round` 的不列**（批 C 订正）：落账在深挖之后、披露在落账之后，所以本轮刚被截断的
 /// 疑点也躺在表里。批 A 原样列了它们，于是真实数据里 4 轮共 164 条披露中有 159 条是本轮自产——
 /// 一批「本轮没挖完」被同一份报告以「历史线索」的身份又说了一遍，读者会当成挂了好几轮没人管。
 /// 本轮截断量由 `deep.budget_skipped` 表达，同一事实不在两处各记一套。
@@ -554,14 +554,14 @@ fn read_dormant_leads(cwd: &Path, changed_files: &[String], round: &str, ledger_
     let Ok(db) = crate::db::ProjDb::open_read_only(&p) else { return vec![] };
     let Ok(rows) = db.suspicions_for_files(changed_files) else { return vec![] };
     rows.into_iter()
-        .filter(|r| r.status == crate::orchestrate::ledger::STATUS_DORMANT && r.last_job != round)
+        .filter(|r| r.status == crate::orchestrate::ledger::STATUS_DORMANT && r.last_seen_sha != round)
         .map(|r| {
             let line = serde_json::from_str::<serde_json::Value>(&r.json)
                 .ok()
                 .and_then(|j| j.get("line_start").and_then(|v| v.as_u64()))
                 .unwrap_or(0) as u32;
             crate::domain::DormantLead {
-                file: r.file, line, hint: r.hint, first_round: r.first_job, activations: r.activations,
+                file: r.file, line, hint: r.hint, first_seen_sha: r.first_seen_sha, activations: r.activations,
             }
         })
         .collect()
@@ -1471,9 +1471,25 @@ fn promote_dug_suspicions(
         .iter()
         .filter(|it| it.activated && it.state == ItemState::Settled)
         .filter(|it| {
+            // 晋升判据（schema 批 B-3 收紧，2026-10-04）：要的是「**这个项**挖出了站得住的 finding」。
+            //
+            // 原来问的是「有任何 finding 落在该项区间内」，那会把三类不属于它的算进来：
+            // 兄弟疑点的产出、往轮携带（`Origin::Carried`，根本不是本轮挖的）、
+            // 以及已被 verifier 驳回的那条。后果是把一条还没真挖出结果的台账行**提前**请出
+            // 激活池（方向偏安全，但语义是错的）。
+            //
+            // `produced` 是落地时记的「本项自己的输出」，前两类自然排除；第三类靠最终判决过滤
+            // （复核是异步的，落地那刻还不知道结论）。
+            // 旧快照（resume）的 `produced` 为空 → 回落旧的区间判据，不因为换了口径就漏晋升。
+            if it.produced.is_empty() {
+                return findings.iter().any(|f| {
+                    crate::orchestrate::queue::norm_path(&f.file) == it.spec.file
+                        && it.spec.ranges.iter().any(|&(a, b)| f.line_start >= a && f.line_start <= b)
+                });
+            }
             findings.iter().any(|f| {
-                crate::orchestrate::queue::norm_path(&f.file) == it.spec.file
-                    && it.spec.ranges.iter().any(|&(a, b)| f.line_start >= a && f.line_start <= b)
+                it.produced.contains(&f.id)
+                    && f.verify.as_ref().is_none_or(|v| v.verdict != crate::domain::VerifyVerdict::Refuted)
             })
         })
         .flat_map(|it| it.arrivals.iter().filter_map(|a| a.strip_prefix("ledger:").map(str::to_string)))
@@ -1510,7 +1526,7 @@ fn persist_dormant_suspicions(cwd: &Path, items: &[crate::orchestrate::queue::Qu
     if ledger_off { // GUARD:persist_dormant_suspicions
         return;
     }
-    // 没有轮次标识就别落账（收口评审 #7）：`first_job` 一旦以空串钉死就永远不再更新，
+    // 没有轮次标识就别落账（收口评审 #7）：`first_seen_sha` 一旦以空串钉死就永远不再更新，
     // 批 C 按轮次判增量时会把这些行当成合法轮次参与比较。与「不建库」同一档边界。
     if round.is_empty() {
         return;
@@ -2903,7 +2919,7 @@ mod resume_tests {
             id: "c.rs:rule:1-2".into(), spec, score: 1.0, agreement: 1,
             state: crate::orchestrate::queue::ItemState::Settled,
             kind: crate::orchestrate::queue::ItemKind::Primary,
-            dispatch_agreement: 1, landed_agreement: Some(1), families: vec![], enqueued_ms: None,
+            dispatch_agreement: 1, landed_agreement: Some(1), families: vec![], enqueued_ms: None, produced: Vec::new(),
             arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
             activated: false,
             force_dig: false,
@@ -2949,7 +2965,7 @@ mod resume_tests {
         crate::orchestrate::queue::QueueItem {
             id: format!("{file}:rule:1-2"), spec, score: 1.0, agreement: 1, state,
             kind: crate::orchestrate::queue::ItemKind::Primary,
-            dispatch_agreement: 1, landed_agreement: None, families: vec![], enqueued_ms: None,
+            dispatch_agreement: 1, landed_agreement: None, families: vec![], enqueued_ms: None, produced: Vec::new(),
             arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0, activated: false, force_dig: false,
         }
     }
@@ -3160,7 +3176,7 @@ mod resume_tests {
             spec: crate::pack::region::QueueItemSpec::new("z.rs".into(), vec![(1, 9)],
                 crate::pack::region::Origin::Scan, vec![sus.clone()]).unwrap(),
             score: 1.0, agreement: 1, state: ItemState::Skipped, kind: ItemKind::Suspicion,
-            dispatch_agreement: 1, landed_agreement: None, families: vec!["alpha".into()], enqueued_ms: None,
+            dispatch_agreement: 1, landed_agreement: None, families: vec!["alpha".into()], enqueued_ms: None, produced: Vec::new(),
             arrivals: vec![], members: vec![sus], member_families: vec![vec!["alpha".into()]],
             block: Default::default(), peak_agreement: 0, risk_band: 0,
             activated: false,
@@ -3175,7 +3191,7 @@ mod resume_tests {
         let db = crate::db::ProjDb::open(ws).unwrap();
         let rows = db.suspicions_for_files(&["z.rs".into()]).unwrap();
         assert_eq!(rows.len(), 1, "主路径也要落账: {:?}", report.run.warnings);
-        assert_eq!((rows[0].hint.as_str(), rows[0].last_job.as_str()), ("首跑就被截掉的", head.as_str()));
+        assert_eq!((rows[0].hint.as_str(), rows[0].last_seen_sha.as_str()), ("首跑就被截掉的", head.as_str()));
         // 收敛三维也要在 resume 主路径装配（M21c 批 C；这一条曾是假绿：装配点删掉也没人发现）。
         // 「diff 重建不了」那条路不装——没有变更集就没有基准，见那条用例。
         let c = report.run.convergence.as_ref().expect("resume 主路径该带上收敛三维");
@@ -3239,7 +3255,7 @@ mod resume_tests {
             spec: crate::pack::region::QueueItemSpec::new("y.rs".into(), vec![(1, 9)],
                 crate::pack::region::Origin::Scan, vec![sus.clone()]).unwrap(),
             score: 1.0, agreement: 1, state: ItemState::Skipped, kind: ItemKind::Suspicion,
-            dispatch_agreement: 1, landed_agreement: None, families: vec!["alpha".into()], enqueued_ms: None,
+            dispatch_agreement: 1, landed_agreement: None, families: vec!["alpha".into()], enqueued_ms: None, produced: Vec::new(),
             arrivals: vec![], members: vec![sus], member_families: vec![vec!["alpha".into()]],
             block: Default::default(), peak_agreement: 0, risk_band: 0,
             activated: false,
@@ -3256,7 +3272,7 @@ mod resume_tests {
         let db = crate::db::ProjDb::open(ws).unwrap();
         let rows = db.suspicions_for_files(&["y.rs".into()]).unwrap();
         assert_eq!(rows.len(), 1, "被截断的疑点要进跨轮台账");
-        assert_eq!((rows[0].hint.as_str(), rows[0].first_job.as_str()), ("被截断的疑点", head.as_str()));
+        assert_eq!((rows[0].hint.as_str(), rows[0].first_seen_sha.as_str()), ("被截断的疑点", head.as_str()));
     }
 
     /// 「re-digging」只在真会重挖时披露（评审第 2 档 #7）：diff 重建不了（变更集为空 / 不在 git 仓）时重开的项跑不了，
@@ -4195,7 +4211,7 @@ mod code_review_tests {
         db.suspicion_upsert(&crate::db::SuspicionRow {
             id: "r1".into(), file: "src/a.rs".into(), quote_norm: "db.write(token);".into(),
             hint: "往轮被截断的".into(), status: "dormant".into(),
-            first_job: "sha0".into(), last_job: "sha1".into(), activations: 0,
+            first_seen_sha: "sha0".into(), last_seen_sha: "sha1".into(), activations: 0,
             json: serde_json::json!({"line_start": 2, "quote": "db.write(token);", "confidence": 0.6}).to_string(),
         }).unwrap();
         drop(db);
@@ -4222,11 +4238,11 @@ mod code_review_tests {
         // 台账已回写：状态单向推进、计数 +1
         let db = crate::db::ProjDb::open(dir.path()).unwrap();
         let row = db.suspicions_for_files(&["src/a.rs".into()]).unwrap().into_iter().next().unwrap();
-        assert_eq!((row.status.as_str(), row.activations, row.last_job.as_str()), ("dormant", 1, "sha2"),
+        assert_eq!((row.status.as_str(), row.activations, row.last_seen_sha.as_str()), ("dormant", 1, "sha2"),
                    "激活只加计数、记轮次，**不动 status**——状态机收成两态的理由见 ledger::STATUS_DORMANT");
         drop(db);
 
-        // 反面：同 HEAD 重跑不激活（没有新 delta）。另起一个项目，台账的 last_job 就是本轮 head。
+        // 反面：同 HEAD 重跑不激活（没有新 delta）。另起一个项目，台账的 last_seen_sha 就是本轮 head。
         let d2 = tempfile::tempdir().unwrap();
         write(d2.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
         crate::project::init_project(d2.path()).unwrap();
@@ -4234,7 +4250,7 @@ mod code_review_tests {
         db2.suspicion_upsert(&crate::db::SuspicionRow {
             id: "r1".into(), file: "src/a.rs".into(), quote_norm: "db.write(token);".into(),
             hint: "本轮刚截断的".into(), status: "dormant".into(),
-            first_job: "sha9".into(), last_job: "sha9".into(), activations: 0,
+            first_seen_sha: "sha9".into(), last_seen_sha: "sha9".into(), activations: 0,
             json: serde_json::json!({"line_start": 2, "quote": "db.write(token);", "confidence": 0.6}).to_string(),
         }).unwrap();
         drop(db2);
@@ -4250,7 +4266,7 @@ mod code_review_tests {
         db3.suspicion_upsert(&crate::db::SuspicionRow {
             id: "r1".into(), file: "src/a.rs".into(), quote_norm: "db.write(token);".into(),
             hint: "往轮被截断的".into(), status: "dormant".into(),
-            first_job: "sha0".into(), last_job: "sha1".into(), activations: 0,
+            first_seen_sha: "sha0".into(), last_seen_sha: "sha1".into(), activations: 0,
             json: serde_json::json!({"line_start": 2, "quote": "db.write(token);", "confidence": 0.6}).to_string(),
         }).unwrap();
         drop(db3);
@@ -4453,7 +4469,7 @@ mod code_review_tests {
             crate::orchestrate::queue::QueueItem {
                 id: format!("{file}:rule:1-2"), spec, score: 1.0, agreement: 1, state,
                 kind: crate::orchestrate::queue::ItemKind::Primary,
-                dispatch_agreement: 1, landed_agreement: None, families: vec![], enqueued_ms: None,
+                dispatch_agreement: 1, landed_agreement: None, families: vec![], enqueued_ms: None, produced: Vec::new(),
                 arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(),
                 peak_agreement: 0, risk_band: 0,
                 activated: false,
@@ -5036,7 +5052,7 @@ mod tests {
             inflight_peak: [("p".to_string(), 2u32)].into_iter().collect(), rate_limit: BTreeMap::new(), ledger_meta: None, head_sha: None,
             duration_ms: 7, test_command: None, job_id: "j".into(), reused,
             dormant_leads: vec![crate::domain::DormantLead {
-                file: "a.rs".into(), line: 42, hint: "历史截断项".into(), first_round: "sha0".into(), activations: 1,
+                file: "a.rs".into(), line: 42, hint: "历史截断项".into(), first_seen_sha: "sha0".into(), activations: 1,
             }],
         };
         let (r, code) = finish_scan_report(base(cells.clone(), vec!["scan[g1]@p/y#1".into()]));
@@ -5193,7 +5209,7 @@ mod tests {
     /// 落账不得把破坏性迁移拉进前台评审（收口评审 #3）：旧 schema 库上只记 warning、跳过落账，
     /// 库一个字节不动——否则「跑一次自认为只读的 review」会触发整库快照 + 丢弃评审史，
     /// 而它是否触发还取决于「本轮恰好有没有截断项」这种与库无关的偶然条件。
-    /// 同时：没有轮次标识（非 git / 无 commit）也跳过（#7）——`first_job` 一旦以空串钉死就永不更新。
+    /// 同时：没有轮次标识（非 git / 无 commit）也跳过（#7）——`first_seen_sha` 一旦以空串钉死就永不更新。
     #[test]
     fn persist_skips_legacy_db_and_empty_round() {
         use crate::orchestrate::queue::QueueItem;
@@ -5282,7 +5298,7 @@ mod tests {
         let db = crate::db::ProjDb::open(tmp.path()).unwrap();
         let row = |id: &str, file: &str, status: &str| crate::db::SuspicionRow {
             id: id.into(), file: file.into(), quote_norm: "letx=1;".into(), hint: "可疑的边界".into(),
-            status: status.into(), first_job: "sha0".into(), last_job: "sha1".into(), activations: 1,
+            status: status.into(), first_seen_sha: "sha0".into(), last_seen_sha: "sha1".into(), activations: 1,
             json: r#"{"line_start":42}"#.into(),
         };
         db.suspicion_upsert(&row("s1", "a.rs", "dormant")).unwrap();
@@ -5293,21 +5309,21 @@ mod tests {
         let leads = read_dormant_leads(tmp.path(), &["a.rs".into()], "sha2", false);
         assert_eq!(leads.len(), 1, "只披露本轮变更文件上、仍处 dormant 的那条: {leads:?}");
         assert_eq!((leads[0].file.as_str(), leads[0].line, leads[0].activations), ("a.rs", 42, 1));
-        assert_eq!(leads[0].first_round, "sha0", "首次见到它的那轮");
+        assert_eq!(leads[0].first_seen_sha, "sha0", "首次见到它的那轮");
 
         // 零副作用：没 init 过的目录、空变更集都返回空且不建库
         let bare = tempfile::tempdir().unwrap();
         assert!(read_dormant_leads(bare.path(), &["a.rs".into()], "sha2", false).is_empty());
         assert!(!bare.path().join(".redteam").exists(), "披露不得建库");
         assert!(read_dormant_leads(tmp.path(), &[], "sha2", false).is_empty(), "空变更集不该退化成全表");
-        // 本轮自产（`last_job == round`）不列：s1 的 last_job 是 sha1。
+        // 本轮自产（`last_seen_sha == round`）不列：s1 的 last_seen_sha 是 sha1。
         assert!(read_dormant_leads(tmp.path(), &["a.rs".into()], "sha1", false).is_empty(), "本轮刚截断的不算历史线索");
     }
 
     // ───────────────────────── 批 C：激活闸门与收敛三维 ─────────────────────────
 
-    /// 造一个带 `a.rs` 与一条休眠台账行的项目；`last_job` 由调用方给。
-    fn ledger_fixture(last_job: &str, activations: i64) -> tempfile::TempDir {
+    /// 造一个带 `a.rs` 与一条休眠台账行的项目；`last_seen_sha` 由调用方给。
+    fn ledger_fixture(last_seen_sha: &str, activations: i64) -> tempfile::TempDir {
         let t = tempfile::tempdir().unwrap();
         crate::project::init_project(t.path()).unwrap();
         std::fs::write(t.path().join("a.rs"), "fn f() {\n    let x = take(v);\n}\n").unwrap();
@@ -5315,7 +5331,7 @@ mod tests {
         db.suspicion_upsert(&crate::db::SuspicionRow {
             id: "r1".into(), file: "a.rs".into(), quote_norm: "letx=take(v);".into(),
             hint: "边界没校验".into(), status: "dormant".into(),
-            first_job: "sha0".into(), last_job: last_job.into(), activations,
+            first_seen_sha: "sha0".into(), last_seen_sha: last_seen_sha.into(), activations,
             json: serde_json::json!({"line_start": 2, "quote": "let x = take(v);", "confidence": 0.6}).to_string(),
         }).unwrap();
         t
@@ -5334,7 +5350,7 @@ mod tests {
         assert_eq!(out.activated.len(), 1, "{out:?} {warns:?}");
         assert!(warns.is_empty(), "{warns:?}");
 
-        // 同一轮再调用不重复计数（幂等靠 last_job，不靠改 status）
+        // 同一轮再调用不重复计数（幂等靠 last_seen_sha，不靠改 status）
         let (same, _) = activate_dormant(t.path(), &files, "sha2", false);
         assert!(same.activated.is_empty(), "同轮重复调用不该再激活一次: {same:?}");
         // 换一轮能再加——两段活锁门（3 / 5）正是靠这个才可达
@@ -5438,6 +5454,75 @@ mod tests {
         assert_eq!(st(&t), "promoted", "{w:?}");
         let (after, _) = activate_dormant(t.path(), &files, "sha2", false);
         assert!(after.activated.is_empty(), "已晋升的不再激活: {after:?}");
+    }
+
+    /// 晋升判据按「**这个项**挖出来的」算，不是「这个区间里有」（schema 批 B-3，2026-10-04）。
+    ///
+    /// 旧判据是 `findings.iter().any(落在 it.spec.ranges 内)`，把三类不属于本项的也算进来：
+    /// 兄弟疑点的产出、往轮携带（`Origin::Carried`，根本不是本轮挖的）、已被 verifier 驳回的。
+    /// 后果是把一条还没真挖出结果的台账行**提前**请出激活池——它再也不会被重挖，
+    /// 而报告里也没有对应的 finding，这条线索就此消失。
+    #[test]
+    fn promotion_counts_only_findings_this_item_produced() {
+        let st = |t: &tempfile::TempDir| {
+            let db = crate::db::ProjDb::open(t.path()).unwrap();
+            db.suspicions_for_files(&["a.rs".into()]).unwrap().into_iter().next().unwrap().status
+        };
+        // 项占 1-9 行、回指台账 r1；`produced` 说明它自己只产出了 f_mine
+        let item = |produced: &[&str]| -> crate::orchestrate::queue::QueueItem {
+            serde_json::from_value(serde_json::json!({
+                "id": "a.rs:scan:1-9", "score": 1.0, "agreement": 1, "state": "settled", "kind": "suspicion",
+                "dispatch_agreement": 1, "landed_agreement": null, "families": ["alpha"],
+                "spec": { "file": "a.rs", "ranges": [[1, 9]], "origin": "scan", "notes": [] },
+                "arrivals": ["ledger:r1"], "activated": true,
+                "produced": produced,
+            })).unwrap()
+        };
+        let finding = |id: &str, verdict: Option<&str>| -> crate::domain::Finding {
+            let mut f: crate::domain::Finding = serde_json::from_value(serde_json::json!({
+                "id": id, "severity": "low", "title": "t", "body": "b", "file": "a.rs",
+                "line_start": 3, "line_end": 3, "confidence": 0.5, "recommendation": "r",
+                "models": ["m"], "agreement": 1, "hard_constraint": false, "quote": "q",
+            })).unwrap();
+            if let Some(v) = verdict {
+                f.verify = Some(crate::domain::Verify {
+                    verdict: if v == "refuted" {
+                        crate::domain::VerifyVerdict::Refuted
+                    } else {
+                        crate::domain::VerifyVerdict::Upheld
+                    },
+                    model: "p/v".into(),
+                    note: String::new(),
+                });
+            }
+            f
+        };
+        let mut w = vec![];
+
+        // ① 兄弟疑点：区间内有 finding，但不是本项产出的 → 不晋升
+        let t = ledger_fixture("sha0", 0);
+        let (out, _) = activate_dormant(t.path(), &["a.rs".to_string()], "sha1", false);
+        assert_eq!(out.activated.len(), 1, "夹具前提");
+        promote_dug_suspicions(t.path(), &[item(&["f_mine"])], &[finding("f_sibling", None)], "sha1", false, &mut w);
+        assert_eq!(st(&t), "dormant", "别的项挖出来的不算它的");
+
+        // ② 已被 verifier 驳回：是本项产出的，但判决不成立 → 不晋升
+        let t2 = ledger_fixture("sha0", 0);
+        activate_dormant(t2.path(), &["a.rs".to_string()], "sha1", false);
+        promote_dug_suspicions(t2.path(), &[item(&["f_mine"])], &[finding("f_mine", Some("refuted"))], "sha1", false, &mut w);
+        assert_eq!(st(&t2), "dormant", "被驳回的不算挖出了东西");
+
+        // ③ 本项产出且站得住 → 晋升
+        let t3 = ledger_fixture("sha0", 0);
+        activate_dormant(t3.path(), &["a.rs".to_string()], "sha1", false);
+        promote_dug_suspicions(t3.path(), &[item(&["f_mine"])], &[finding("f_mine", Some("upheld"))], "sha1", false, &mut w);
+        assert_eq!(st(&t3), "promoted", "{w:?}");
+
+        // ④ 旧快照（resume）`produced` 为空 → 回落旧的区间判据，不因换口径而漏晋升
+        let t4 = ledger_fixture("sha0", 0);
+        activate_dormant(t4.path(), &["a.rs".to_string()], "sha1", false);
+        promote_dug_suspicions(t4.path(), &[item(&[])], &[finding("f_whatever", None)], "sha1", false, &mut w);
+        assert_eq!(st(&t4), "promoted", "旧快照没有 produced，按区间判——否则 resume 轮会集体漏晋升");
     }
 
     /// `--no-dismissed` 必须关掉**每一条**台账路径（M21c 批 C 的 dogfood 修）。
@@ -5570,7 +5655,7 @@ mod tests {
         db.suspicion_upsert(&crate::db::SuspicionRow {
             id: "r9".into(), file: "a.rs".into(), quote_norm: "q".into(), hint: "h".into(),
             status: crate::orchestrate::ledger::STATUS_DORMANT.into(),
-            first_job: "sha0".into(), last_job: "sha1".into(),
+            first_seen_sha: "sha0".into(), last_seen_sha: "sha1".into(),
             activations: crate::orchestrate::ledger::ACTIVATION_PARK, json: "{}".into(),
         }).unwrap();
         drop(db);
@@ -5665,7 +5750,7 @@ mod tests {
         let db = crate::db::ProjDb::open(tmp2.path()).unwrap();
         let rows = db.suspicions_for_files(&["a.rs".into()]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].status.as_str(), rows[0].last_job.as_str()), ("dormant", "sha1"));
+        assert_eq!((rows[0].status.as_str(), rows[0].last_seen_sha.as_str()), ("dormant", "sha1"));
     }
 
     #[test]

@@ -34,6 +34,7 @@ impl ReviewProvider for FakeProvider {
                 output_tokens: self.tokens.1,
                 cached_input_tokens: self.tokens.2,
                 iterations: 1,
+                repair_rounds: 0,
                 tool_use: Default::default(),
                 needs: vec![],
             }),

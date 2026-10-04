@@ -1029,3 +1029,27 @@ PR181 是现成的（公司仓，一轮 40-60 分钟），或者等下一批真�
 | **A3 核下来不是「静默丢弃」债，是第四种病** | `enqueue_activated` 里 `from_ledger` 返回 `None` 的分支**不可达**（`line_start.max(1)` + `line_end.max(start)` 对上 `QueueItemSpec::new` 只拒 `a==0 \|\| b<a`）。没删：静默的**后果**重（台账回写早于入队，真丢会假性逼近活锁门、报告说「机制挖不动它」而它一次没被挖过）。改为 debug 下 `debug_assert!(false)` + release 披露，并立不变量用例 `from_ledger_never_fails_on_any_ledger_row` 真正守住它 |
 | **A1 的旧行为无人盯** | 把两条迁移 notice 从 `Config::load` 摘掉时全量测试**照绿**。又一处假绿，已补用例 |
 | **用例不该数「总数」** | A1 用例一度红在真机环境：`~/.config/redteam/` 确实存在（dev 二进制的旧配置），探测到 4 条而非 2 条。断言收紧到用例自己造的文件——**数总数会把用例绑在开发机环境上** |
+
+## B 类 schema 改动包（2026-10-04，Trellis `10-04-schema-batch`）
+
+「到期看板」里标 ⚠️ 的那批，四条一起做掉。**开工时的分野与账上假设不同**：只有 B-1 真动 sqlite
+schema，B-2 只改一行 SQL，B-3/B-4 是报告 JSON 的 serde 字段——所以 `USER_VERSION` 不翻。
+
+| 条目 | 落地 | 与账上的差异 |
+|---|---|---|
+| **B-1** `first_job`/`last_job` 改名 | → `first_seen_sha` / `last_seen_sha`（62 行 + 幂等 `ALTER TABLE RENAME COLUMN`，挂 `open_at`） | **账上的改名方向是错的**：它说「改成 `first_round` 与对外一致，那个名字反而准」，而 `cli/mod.rs:564` 是 `first_round: r.first_job` **直接赋值、没有任何转换**，存的是 HEAD sha；`DormantLead.first_round` 的 doc 自己写着「那轮 head_sha」——名字和注释打架。照债改等于把一个错名换成另一个错名还要付迁移代价。用户裁「一次改到准」 |
+| **B-2** `last_verdict()` tie-breaker | `ORDER BY created_at DESC, rowid DESC` | **不用动 schema**：`results` 不是 WITHOUT ROWID 表，隐式 `rowid` 就是插入序。加显式自增列反而要改 DDL + 迁移两个现存库 |
+| **B-3** finding 带队列项 id | 改为 **`QueueItem.produced: Vec<String>`**，`land` 回填，`promote` 用它 + 按最终判决过滤 | 账上说给 `Finding` 加字段：那要改 **43 处**构造点（vs 项侧 12 处），还把归因细节泄进**对外报告 JSON**。而 `promote_dug_suspicions` 的入参本来就是 `items`，信息量一样 |
+| **B-4** `attempts` 拆分 | `repair_rounds` / `two_stage_rounds` / `rl_retries` 三分量；`attempts` 保留为总数并订正 doc；md 标出非 0 分量 | 账上说混**三**件事，实际**五**件——`deep.rs:1208` 的 `c.iterations += c2.iterations` 把二阶段整个累加进了首轮 `iterations`，再进 `attempts` |
+
+**切名门「修复轮为 0」从此可自动化**。此前 PR181 那轮 24 格 `attempts > 1` 被误判成修复轮，
+实际全是二阶段补查，靠 `needs_two_stage_triggered` 恰好等于 24 才辨清。
+
+| 项 | 判断 |
+|---|---|
+| **`attempts` 的 doc 早和实现脱节** | 写的是「候补链实际尝试的 model 数」，而候补链 M21a 就退场了，实现一直在写轮次和。**doc 与实现脱节比没有 doc 更坏**——它让人以为自己读懂了。已订正为「总数 = 三分量之和，别拿它判任何单一轮次」 |
+| **md 的 `(N att)` 渲染此前无人盯** | 改它全量测试照绿。本会话第 N 次同形，已补 `md_cell_row_breaks_attempts_into_components`（含「旧报告三分量全 0 → 退回只给总数，不编造分解」一支） |
+| **B-3 的旧快照回落** | resume 的 `produced` 为空 → 回落旧的区间判据。不这么做的话，换口径当轮所有 resume 项会集体漏晋升——那比归因偏宽更糟 |
+| **收窄 `iterations` 语义的影响面已核** | 它的消费者只有 md 的 Iter 列（纯显示）与 `CellSummary::from_record`（纯传递）——**没有任何判据依赖它**，所以把二阶段摘出去是安全的。`attempts`（总数）口径不变，下游兼容；两条既有用例因此只改到 `iterations` 这一项上 |
+| **历史文档里的旧字段名不改** | `.next/plans/`（M21a / M21c 当时的计划）与 `.next/private/` 的记录里仍写 `first_job` / `last_job`。按仓内规范历史制品保留原样——**读到时按此对照**：`first_job` → `first_seen_sha`、`last_job` → `last_seen_sha`、对外的 `DormantLead.first_round` → `first_seen_sha` |
+| **B-1 的次序约束** | 列改名必须早于任何按新列名发的 SQL（含 `normalize_legacy_activated`）。用例里 `suspicion_upsert` 用的就是新列名，它能跑通就是这条次序的哨兵 |

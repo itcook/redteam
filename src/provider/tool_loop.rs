@@ -128,6 +128,7 @@ pub async fn run_tool_loop(
                         output_tokens: out_tok,
                         cached_input_tokens: cached_tok,
                         iterations: i + 1,
+                        repair_rounds: 0, // 自收敛，没走修复
                         tool_use: tool_use.clone(),
                     });
                 }
@@ -156,6 +157,7 @@ pub async fn run_tool_loop(
                             // 未修复分支为 i+1；此处多付出 1 次真实往返，记 i+2（同下方
                             // FINALIZE repaired=max_iters+2 的记账惯例，"多一轮就多计一"）。
                             iterations: i + 2,
+                            repair_rounds: 1, // 就是 i+2 里多出来的那一轮
                             tool_use: tool_use.clone(),
                         }),
                         Err(_) => Err(diagnostic_parse_error(&repair_turn).attach_usage((in_tok, out_tok, cached_tok))),
@@ -209,6 +211,7 @@ pub async fn run_tool_loop(
         cached_input_tokens: cached_tok,
         // 未修复=正常收尾轮 max_iters+1；修复成功=多付出一轮真实往返，计 max_iters+2。
         iterations: if repaired { max_iters + 2 } else { max_iters + 1 },
+        repair_rounds: u32::from(repaired),
         tool_use,
     })
 }

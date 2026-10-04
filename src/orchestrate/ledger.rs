@@ -51,8 +51,8 @@ pub fn rows_from_skipped(items: &[QueueItem], job_id: &str) -> Vec<SuspicionRow>
                 quote_norm,
                 hint: s.hint.clone(),
                 status: STATUS_DORMANT.into(),
-                first_job: job_id.to_string(),
-                last_job: job_id.to_string(),
+                first_seen_sha: job_id.to_string(),
+                last_seen_sha: job_id.to_string(),
                 activations: 0,
                 json: json.to_string(),
             });
@@ -96,15 +96,15 @@ pub struct ActivationOutcome {
 /// 三条判据缺一不可：
 /// - `status == "dormant"`：已激活 / 已晋升的不重复激活（状态机单向推进）。
 /// - **文件 ∈ 本轮变更集**：由调用方的 `suspicions_for_files(changed_files)` 查询保证，本函数不再判。
-/// - `last_job != 本轮 head`：一条判据挡掉两种假激活——① 本轮自产（本轮刚被截断，激活了也没有预算再挖它）
+/// - `last_seen_sha != 本轮 head`：一条判据挡掉两种假激活——① 本轮自产（本轮刚被截断，激活了也没有预算再挖它）
 ///   ② 同 HEAD 重跑（没有新 delta，激活无依据；PR181 那种固定靶子四轮同 HEAD，正是这一类）。
 ///
-/// **落账在深挖之后、激活在深挖之前**，所以这里读到的 `last_job` 必定是上一轮写的——判据③ 靠这个先后成立，
+/// **落账在深挖之后、激活在深挖之前**，所以这里读到的 `last_seen_sha` 必定是上一轮写的——判据③ 靠这个先后成立，
 /// 两者的顺序不能调换。调换了本轮自产的疑点会在同一轮里被自己激活一次。
 pub fn activations_for(rows: &[crate::db::SuspicionRow], head: &str, root: &std::path::Path) -> ActivationOutcome {
     let mut out = ActivationOutcome::default();
     for r in rows {
-        if r.status != STATUS_DORMANT || r.last_job == head || head.is_empty() {
+        if r.status != STATUS_DORMANT || r.last_seen_sha == head || head.is_empty() {
             continue;
         }
         // 已停车的不再自动激活（dogfood medium，agreement 2）：停车的含义是「机制挖不动它、交人」，
@@ -151,8 +151,8 @@ pub fn activations_for(rows: &[crate::db::SuspicionRow], head: &str, root: &std:
 /// 活锁守卫整个是死代码；更糟的是「激活了但没挖成」的行从此既不被激活也不被披露，**彻底消失**。
 /// 根因是那个状态机没有回边，而「激活了没挖成」恰恰是最常见的情形（本轮预算同样会截断它）。
 ///
-/// 两态下：激活**不动 status**，只 `activations += 1` 并把 `last_job` 记成本轮；
-/// 同轮幂等由 `last_job <> 本轮` 保证（见 `ProjDb::suspicion_activate`），
+/// 两态下：激活**不动 status**，只 `activations += 1` 并把 `last_seen_sha` 记成本轮；
+/// 同轮幂等由 `last_seen_sha <> 本轮` 保证（见 `ProjDb::suspicion_activate`），
 /// 跨轮则每轮各加一次，门才可达。挖出 finding 时才写 `promoted`（见 `promote_rows`）。
 ///
 /// 「当前在队列里挖着」是**轮内**状态，不该写进跨轮台账——这是上面那个设计错误的教训。
@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "只有 i1 该落账：{:?}", rows.iter().map(|r| &r.file).collect::<Vec<_>>());
         let r = &rows[0];
         assert_eq!((r.file.as_str(), r.hint.as_str(), r.status.as_str()), ("a.rs", "空指针", "dormant"));
-        assert_eq!((r.first_job.as_str(), r.last_job.as_str(), r.activations), ("sha1", "sha1", 0));
+        assert_eq!((r.first_seen_sha.as_str(), r.last_seen_sha.as_str(), r.activations), ("sha1", "sha1", 0));
         assert_eq!(r.quote_norm, "letx=take(v);", "quote 去空白即身份");
         let j: serde_json::Value = serde_json::from_str(&r.json).unwrap();
         assert_eq!(j["reason"], REASON_BUDGET);
@@ -233,15 +233,15 @@ mod tests {
 
     // ───────────────────────── 批 C：激活判据 ─────────────────────────
 
-    fn row(id: &str, file: &str, status: &str, last_job: &str, activations: i64, quote: &str) -> crate::db::SuspicionRow {
+    fn row(id: &str, file: &str, status: &str, last_seen_sha: &str, activations: i64, quote: &str) -> crate::db::SuspicionRow {
         crate::db::SuspicionRow {
             id: id.into(),
             file: file.into(),
             quote_norm: crate::orchestrate::normalize_quote(quote),
             hint: "边界没校验".into(),
             status: status.into(),
-            first_job: "sha0".into(),
-            last_job: last_job.into(),
+            first_seen_sha: "sha0".into(),
+            last_seen_sha: last_seen_sha.into(),
             activations,
             json: serde_json::json!({ "line_start": 1, "quote": quote, "confidence": 0.62, "category": "L2" }).to_string(),
         }
@@ -273,10 +273,10 @@ mod tests {
     fn three_kinds_of_rows_are_not_activated() {
         let t = repo("fn f() {\n    let x = take(v);\n}\n");
         let q = "let x = take(v);";
-        // ① 本轮自产：落账在深挖之后、激活在深挖之前，所以 last_job == 本轮 head 只可能是本轮刚写的
+        // ① 本轮自产：落账在深挖之后、激活在深挖之前，所以 last_seen_sha == 本轮 head 只可能是本轮刚写的
         let own = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha2", 0, q)], "sha2", t.path());
         assert!(own.activated.is_empty(), "本轮刚截断的不在本轮激活（没预算再挖它）: {own:?}");
-        // ② 同 HEAD 重跑：同一个 head 第二次跑，台账里 last_job 已是它——没有新 delta，激活无依据
+        // ② 同 HEAD 重跑：同一个 head 第二次跑，台账里 last_seen_sha 已是它——没有新 delta，激活无依据
         let rerun = activations_for(&[row("r1", "a.rs", STATUS_DORMANT, "sha1", 0, q)], "sha1", t.path());
         assert!(rerun.activated.is_empty(), "同 HEAD 重跑不激活: {rerun:?}");
         // ③ 已晋升的退出激活池（挖出过 finding，不该再反复重挖）

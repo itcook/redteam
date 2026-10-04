@@ -197,9 +197,26 @@ pub struct CellRecord {
     /// 命中缓存读的输入量（input_tokens 子集，L1 缓存观测）；缺失/未知记 0。
     #[serde(default)]
     pub cached_input_tokens: u64,
-    /// 候补链实际尝试的 model 数（成功=第几家成功；整链失败=链长）。
+    /// **总轮次** = `iterations` + `two_stage_rounds` + `rl_retries`。
+    ///
+    /// 原 doc 写的是「候补链实际尝试的 model 数」——那是 M21a 退场的候补链留下的，
+    /// 实现早就在写轮次和。**别拿它判任何单一轮次**：它把探索轮 / 收尾轮 /
+    /// 修复轮 / 二阶段补查 / 429 重试揉在一起，下面三个分量才是可判据的。
     #[serde(default)]
     pub attempts: u32,
+    /// 其中**修复轮**（解析失败后补发 `REPAIR_PROMPT`）。切名门「修复轮为 0」就看它。
+    ///
+    /// 单独记的由来（2026-10-04 schema 批 B-4）：PR181 那轮 24 格 `attempts > 1`，
+    /// 一度被误判成修复轮，实际全是二阶段补查——靠 `needs_two_stage_triggered`
+    /// 恰好等于 24 才辨清。混在一个数里的观测量没法当判据用。旧记录 0。
+    #[serde(default)]
+    pub repair_rounds: u32,
+    /// 其中**二阶段补查轮**（`needs` 非空触发的第二次调用）。旧记录 0。
+    #[serde(default)]
+    pub two_stage_rounds: u32,
+    /// 其中 **429 重试**（限流退避，不是探索深度）。旧记录 0。
+    #[serde(default)]
+    pub rl_retries: u32,
     /// 胜出 call 的 tool-loop 迭代数（计 FINALIZE、不计 turn 级重试；单发单收=1）。
     /// 0＝失败/未观测（旧记录、整链失败、resume 格）。
     #[serde(default)]
@@ -227,7 +244,7 @@ impl CellRecord {
     pub fn ok(cell: impl Into<String>, model: impl Into<String>, output: crate::domain::CellOutput) -> Self {
         Self {
             cell: cell.into(), model: model.into(), family: String::new(), ok: true, output, warn: None,
-            duration_ms: 0, queue_wait_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0,
+            duration_ms: 0, queue_wait_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0, repair_rounds: 0, two_stage_rounds: 0, rl_retries: 0,
             max_turn_output_tokens: 0, tool_use: Default::default(), template_hash: None,
         }
     }

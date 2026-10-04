@@ -16,7 +16,23 @@ pub struct LensRequest { pub route_key: String, pub prompt: String }
 /// iterations：本次调用实际消耗的 tool-loop 逻辑迭代数（计 FINALIZE 强制收尾轮、
 /// 不计 turn 级 retry 重试）。成功恒 >=1（单发单收即 1）；0 保留给「失败/未观测」。
 #[derive(Clone, Debug)]
-pub struct LensCall { pub findings: Vec<RawFinding>, pub input_tokens: u64, pub output_tokens: u64, pub cached_input_tokens: u64, pub iterations: u32, pub tool_use: crate::tools::ToolUse, pub needs: Vec<crate::domain::NeedEntry> }
+pub struct LensCall {
+    pub findings: Vec<RawFinding>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    /// 逻辑迭代数：探索轮 + 收尾轮 + 修复轮（**不含**二阶段补查，那条单独记）。
+    pub iterations: u32,
+    /// 其中**修复轮**的数量（0 或 1：解析失败后至多补发一次 `REPAIR_PROMPT`）。
+    ///
+    /// 从 `iterations` 里单独标出来（schema 批 B-4，2026-10-04）：切名门的判据是「修复轮为 0」，
+    /// 而 `iterations` 把探索轮、收尾轮、修复轮揉在一个数里，判据没法自动化。
+    /// PR181 那轮 24 格 `attempts>1` 一度被误判成修复轮，实际全是二阶段补查——
+    /// 靠 `needs_two_stage_triggered` 恰好等于 24 才辨清。
+    pub repair_rounds: u32,
+    pub tool_use: crate::tools::ToolUse,
+    pub needs: Vec<crate::domain::NeedEntry>,
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProviderError {

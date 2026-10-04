@@ -1205,7 +1205,10 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                                     c.input_tokens += c2.input_tokens;
                                     c.output_tokens += c2.output_tokens;
                                     c.cached_input_tokens += c2.cached_input_tokens;
-                                    c.iterations += c2.iterations;
+                                    // 二阶段的轮次单记（schema 批 B-4）：原来 `c.iterations += c2.iterations`
+                                    // 把「探索深」和「声明了 needs」揉成一个数，读报告的人分不出是哪种。
+                                    c.two_stage_rounds += c2.iterations;
+                                    c.repair_rounds += c2.repair_rounds;
                                     c.max_turn_output_tokens = c.max_turn_output_tokens.max(c2.max_turn_output_tokens);
                                     // 解析 / 锚定丢弃计数取终判那一轮（首轮草稿被丢的不算这一格的产出丢失）；旁路丢弃两轮都真实发生，累加。
                                     c.stats = ReviewParseStats { stream_discarded: c.stats.stream_discarded + c2.stats.stream_discarded, ..c2.stats };
@@ -1225,7 +1228,7 @@ async fn run_cell<'b>(env: &CellEnv<'b>, d: Dispatched<'b>) -> CellDone<'b> {
                                     // 那正是 D3 要消除的误判（出口验收评审 #1）。失败轮内的逐轮大小不可观测，
                                     // 与上面「是否走过 REPAIR 不可观测」同理；失败本身已经作为债与 warning 露出来了。
                                     // 第二轮确实发出过：轮次记下限 1（失败轮内是否走过 REPAIR 不可观测），attempts 随之计入。
-                                    c.iterations += 1;
+                                    c.two_stage_rounds += 1;
                                     warnings.push(format!("{cell_id}: second-stage round failed: {e} — keeping first-round findings (debt)"));
                                     stage2_error = Some(format!("second-stage round failed: {e}"));
                                     Stage2::Failed
@@ -1358,8 +1361,11 @@ fn land(
             rec.cached_input_tokens = c.cached_input_tokens;
             rec.iterations = c.iterations;
             rec.max_turn_output_tokens = c.max_turn_output_tokens;
-            // 与 scanner 同口径（orchestrate/mod.rs）：attempts = 轮次 + 429 重试。
-            rec.attempts = c.iterations + rl_retries;
+            // `attempts` 是**总数**（与 scanner 同口径）；三个分量单记，才能当判据用。
+            rec.attempts = c.iterations + c.two_stage_rounds + rl_retries;
+            rec.repair_rounds = c.repair_rounds;
+            rec.two_stage_rounds = c.two_stage_rounds;
+            rec.rl_retries = rl_retries;
             rec.queue_wait_ms = rl_wait_ms;
             rec.template_hash = Some(review_template_hash());
             // 二阶段失败（评审修 #2）：首轮 finding 留在格里（报告与 resume 的 prior findings 都从这里取），但格按失败落盘——
@@ -1379,6 +1385,7 @@ fn land(
             rec.output_tokens = bo;
             rec.cached_input_tokens = bc;
             rec.attempts = 1 + rl_retries;
+            rec.rl_retries = rl_retries; // 失败格内的轮次构成不可观测，只有 429 计数是确定的
             rec.queue_wait_ms = rl_wait_ms;
             warnings.push(format!("{cell_id} failed: {e}"));
             (rec, 0)
@@ -1387,6 +1394,10 @@ fn land(
     // 先落盘 cell（finding 的权威载体）再写队列快照：kill 落在两者之间时，快照仍是 InFlight → resume 重跑，
     // 宁可重挖一格也不丢 finding（design §7.1）。
     snap_cell(&rec, on_cell);
+    // 本项产出的 finding id（schema 批 B-3）：晋升判据要的是「这个项挖出了东西」，
+    // 不是「这个区间里有东西」——后者会把兄弟疑点 / 往轮携带 / 已驳回的都算进来。
+    // 这里是唯一同时拿得到「项」与「它自己的输出」的地方。
+    q.mark_produced(&item.id, rec.output.findings().iter().map(|f| f.id.clone()).collect());
     q.mark_settled(&item.id, landed);
     if let Some(it) = q.get(&item.id) {
         snap_one(it, snapshot);
@@ -1702,7 +1713,7 @@ fn enqueue_activated(
         // 「静默丢弃」债；核下来它不是静默问题，是**第四种病**（分支可达、喂它的那类输入到不了）。
         //
         // 为什么不删：静默丢弃的**后果**很重，值得把不变量钉在这儿。台账回写
-        // （`suspicion_activate`：`activations` +1、`last_job` 更新）**已经在 CLI 层发生过**，
+        // （`suspicion_activate`：`activations` +1、`last_seen_sha` 更新）**已经在 CLI 层发生过**，
         // 早于本函数。真丢掉的话，台账以为这条疑点被激活过、逐步逼近活锁门（N=3 必挖 / N=5 停车），
         // 而它一次都没被挖过——最后报告对人说「机制挖不动它」，语义正好反了。
         //
@@ -1955,7 +1966,7 @@ mod tests {
         crate::orchestrate::queue::QueueItem {
             id: format!("{file}:rule:1-2"),
             spec, score: 1.0, agreement: 1, state, kind: ItemKind::Primary,
-            dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
+            dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None, produced: Vec::new(),
             arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0, activated: false, force_dig: false,
         }
     }
@@ -2027,7 +2038,7 @@ mod tests {
         let item = QueueItem {
             id: "a.rs:scan:1-10".into(), spec, score: 0.5, agreement: 3, state: ItemState::Pending,
             kind: ItemKind::Suspicion, dispatch_agreement: 0, landed_agreement: None,
-            families: vec!["alpha".into(), "beta".into(), "gamma".into()], enqueued_ms: None, arrivals: vec![],
+            families: vec!["alpha".into(), "beta".into(), "gamma".into()], enqueued_ms: None, produced: Vec::new(), arrivals: vec![],
             members: vec![sus(2, "    hot();"), sus(9, "    cold();")],
             member_families: vec![vec!["alpha".into(), "beta".into()], vec!["gamma".into()]],
             block: Default::default(), peak_agreement: 2, risk_band: 0,
@@ -2337,6 +2348,19 @@ mod tests {
         assert_eq!(run.cells.len(), 1);
         assert!(run.cells[0].ok);
         assert_eq!(run.findings.len(), 1, "终判取第二轮 CONFIRM 后同一条");
+
+        // 轮次分量（schema 批 B-4，2026-10-04）：二阶段不再混进 `iterations`。
+        // 这正是 PR181 那 24 格被误判成「修复轮」的形态：两轮都首发即成、
+        // 一个修复轮都没走，而旧口径下 `attempts` 是 2。切名门要的是 `repair_rounds == 0`。
+        let c = &run.cells[0];
+        assert_eq!(c.two_stage_rounds, 1, "二阶段跑了一轮，要记在自己的字段上: {c:?}");
+        assert_eq!(c.repair_rounds, 0, "两轮都首发即成，一个修复轮都没走");
+        assert_eq!(c.iterations, 1, "`iterations` 只算首轮——混进二阶段就是 2，那是旧口径");
+        assert_eq!(
+            c.attempts,
+            c.iterations + c.two_stage_rounds + c.rl_retries,
+            "`attempts` 是三个分量的和，不是别的东西: {c:?}"
+        );
     }
 
     /// `--tools on`：M21b 还没有工具循环，`on` 至少不能比 `two-stage` 弱——
@@ -2971,7 +2995,7 @@ mod tests {
         let item = QueueItem {
             id: format!("{file}:scan:1-1"), spec: spec.clone(), score: 0.5, agreement: 1, state: ItemState::Pending,
             kind: ItemKind::Suspicion, dispatch_agreement: 0, landed_agreement: None,
-            families: vec![family.into()], enqueued_ms: None,
+            families: vec![family.into()], enqueued_ms: None, produced: Vec::new(),
             arrivals: vec![], members: vec![note], member_families: vec![vec![family.into()]],
             block: Default::default(), peak_agreement: 1, risk_band: 0,
             activated: false,
@@ -3096,8 +3120,16 @@ mod tests {
         assert!(!run.cells[0].ok, "二阶段失败的格不能以 ok 形态落盘");
         assert_eq!(run.cells[0].output.findings().len(), 1, "失败格仍携带首轮 finding（resume 的 prior findings 载体）");
         assert!(run.cells[0].warn.as_deref().unwrap_or("").contains("second-stage round failed"), "{:?}", run.cells[0].warn);
-        // 第二轮确实发出过（token 已入账）→ 轮次与尝试数也要算上它（评审修 #8）
-        assert_eq!((run.cells[0].iterations, run.cells[0].attempts), (2, 2), "首轮 1 + 第二轮 1");
+        // 第二轮确实发出过（token 已入账）→ 要算进总数（评审修 #8）。
+        // schema 批 B-4（2026-10-04）拆分后口径变了：`iterations` 只算首轮，
+        // 二阶段走 `two_stage_rounds`，`attempts` 仍是两者之和。这正是拆分要的区分度：
+        // 旧口径下「2」分不出是探索深还是声明了 needs。
+        let c = &run.cells[0];
+        assert_eq!(
+            (c.iterations, c.two_stage_rounds, c.repair_rounds, c.attempts),
+            (1, 1, 0, 2),
+            "首轮 1 + 二阶段 1 = 总数 2，且没走修复轮: {c:?}"
+        );
     }
 
     /// 429 注入：门收窄后照样全部完成、无死锁（虚拟时间下死锁会撞 timeout 而不是挂住）。
@@ -3373,7 +3405,7 @@ mod tests {
         let rule = |file: &str, kind: ItemKind, state: ItemState| QueueItem {
             id: format!("{file}:rule:1-2"),
             spec: QueueItemSpec::new(file.into(), vec![(1, 2)], QueueOrigin::Rule, vec![]).unwrap(),
-            score: 1.0, agreement: 1, state, kind, dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None,
+            score: 1.0, agreement: 1, state, kind, dispatch_agreement: 0, landed_agreement: None, families: vec![], enqueued_ms: None, produced: Vec::new(),
             arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
             activated: false,
             force_dig: false,
@@ -3385,7 +3417,7 @@ mod tests {
             id: "s.rs:scan:1-1".into(),
             spec: QueueItemSpec::new("s.rs".into(), vec![(1, 1)], QueueOrigin::Scan, vec![note]).unwrap(),
             score: 0.5, agreement: 2, state: ItemState::Pending, kind: ItemKind::Suspicion,
-            dispatch_agreement: 0, landed_agreement: None, families: vec!["alpha".into(), "beta".into()], enqueued_ms: None,
+            dispatch_agreement: 0, landed_agreement: None, families: vec!["alpha".into(), "beta".into()], enqueued_ms: None, produced: Vec::new(),
             arrivals: vec![], members: vec![], member_families: vec![], block: Default::default(), peak_agreement: 0, risk_band: 0,
             activated: false,
             force_dig: false,
@@ -3507,6 +3539,17 @@ mod tests {
         // M21b 出口验收 D3 的「单轮最大输出」。
         strip_key(&mut got, "max_turn_output_tokens");
         strip_key(&mut want, "max_turn_output_tokens");
+        // schema 批 B-4 新增的三个分量：golden 没有这些键，剔掉。
+        //
+        // 注意这条测试保的是「门=1 的**并发路径**与串行基线同构」，不是「口径永不变」。
+        // B-4 把二阶段从 `iterations` 里摘出去，是**所有路径一致地**改口径，不破坏该不变量，
+        // 所以 golden 里 `review[2]@p/r` 那格的 `iterations` 随之 2 → 1（它走过二阶段）。
+        // **没有把 `iterations` 一并 strip 掉**：那会削弱这条测试——它本来能抓「并发路径下轮次算错」。
+        // 同格的 `attempts` 仍是 2（总数口径未变），这正是拆分向下兼容的证据。
+        for k in ["repair_rounds", "two_stage_rounds", "rl_retries"] {
+            strip_key(&mut got, k);
+            strip_key(&mut want, k);
+        }
         assert!(
             got == want,
             "与批 C 串行基线不同构\n--- got ---\n{}\n--- want ---\n{}",
@@ -3593,7 +3636,7 @@ mod tests {
         let member_families = vec![Vec::new(); members.len()];
         QueueItem {
             id, spec, score: 1.0, agreement: 1, state, kind, dispatch_agreement, landed_agreement: None,
-            families: vec![], enqueued_ms: None, arrivals: vec![], members, member_families,
+            families: vec![], enqueued_ms: None, produced: Vec::new(), arrivals: vec![], members, member_families,
             block: Default::default(), peak_agreement: 0, risk_band: 0,
             activated: false,
             force_dig: false,
@@ -4795,7 +4838,7 @@ mod tests {
         let item = QueueItem {
             id: "a.rs:scan:1-2".into(), spec, score: 1.0, agreement: 2, state: ItemState::Pending,
             kind: ItemKind::Suspicion, dispatch_agreement: 0, landed_agreement: None,
-            families: vec!["alpha".into(), "beta".into()], enqueued_ms: None, arrivals: vec![],
+            families: vec!["alpha".into(), "beta".into()], enqueued_ms: None, produced: Vec::new(), arrivals: vec![],
             members: vec![sus], member_families: vec![vec!["alpha".into(), "beta".into()]],
             block: Default::default(), peak_agreement: 2, risk_band: 0,
             activated: false,
