@@ -13,7 +13,8 @@
 |---|---|---|
 | M21c 切名完成 | ✅ 2026-09-28 已满足 | ✅ 全清：`DB_FILE` 定回、ship.md 改调内置 `test-command`、并存期 secrets 提示已收窄到 `model list` / `model check`（2026-10-04） |
 | 增量轮恢复 | ✅ 2026-10-04 已满足 | 已清：followup:80/95/127/136/214/959 六条（见「增量轮重建带出的账」） |
-| 攒够一批 schema 改动 | ⚠️ **已攒够 4 条，可开批** | `first_job`/`last_job` 改名、`last_verdict()` tie-breaker、`Finding` 带队列项 id、`CellRecord.attempts` 拆三个字段 |
+| 攒够一批 schema 改动 | ✅ 2026-10-04 已清（B 类四条）；计数归零 | 已做：`first_seen_sha`/`last_seen_sha` 改名、`last_verdict()` rowid tie-breaker、`QueueItem.produced` 收紧晋升归因、`attempts` 拆三分量。详见「B 类 schema 改动包」节。**下一批：再攒够 3-4 条再开**（当前已知 0 条） |
+| 看板自身要记得更新 | ⚠️ **2026-11-17 发现漏更** | B 类 2026-10-04 做完，而本表直到 11-17 还挂着 ⚠️——**看板治的那个病，看板自己又犯了一次**。收口时把本表一并更新，当成 checklist 的一项 |
 | 发布前 | ⏳ 未到 | ✅ 旧库 `status='activated'` 规范化已提前做掉（2026-10-04，挂在 `ProjDb::open_at`）。待办：台账固定集导出是否内置 |
 | ship 单元开工 | ⏳ 未到 | ship 协议整体内置时评估拆卸 `test-command`；见「ship 作为独立单元」节 |
 | 下一轮 PR181 dogfood | ⏳ 未到 | 判例命中仍为 0、判例前移后的重复报率、活锁守卫 N 回校 |

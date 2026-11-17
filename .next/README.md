@@ -5,6 +5,7 @@
 
 | 目录 | 内容 | 入库 |
 |---|---|---|
+| **`HANDOFF.md`** | **重开 session 先读这个**：三十秒状态 + 三个候选活的起手式与已知坑。临时文档，起手后就该更新或删掉 | ✅ |
 | `roadmap/` | M21 路线图（原 `.roadmap/`）：README · P0 · M21a-e · followup | ✅ |
 | `design/` | `2026-09-04-redteam-review-engine-architecture-design.md`（**v13** 锁定；v7 为 P0 出口版） | ✅ |
 | `decisions/` | 同名 decisions（**D1-D17**） | ✅ |
