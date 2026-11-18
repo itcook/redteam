@@ -3,7 +3,7 @@ use redteam::config::Config;
 use redteam::model::Prober as _;
 use redteam::output::render;
 use redteam::provider::backends::backend_from_config;
-use redteam::provider::registry::ProviderRegistry;
+use redteam::provider::registry::{role_key, ProviderRegistry};
 use clap::{Parser, Subcommand};
 use std::path::Path;
 
@@ -373,9 +373,9 @@ enum ModelCmd {
         /// 思考型模型（thinking 计入 output 额度）：`--reasoning` 即 true，`--reasoning false` 显式关；不给不写。
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         reasoning: Option<bool>,
-        /// 本次 --role 各角色的思考档位（角色属性）：off | low | medium | high。
-        #[arg(long, value_parser = ["off", "low", "medium", "high"])]
-        thinking_level: Option<String>,
+        /// 本次 --role 各角色的推理强度（角色属性）：minimal | low | medium | high | xhigh | max | ultra。
+        #[arg(long, value_parser = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"])]
+        reasoning_effort: Option<String>,
     },
     /// 列已配置 provider + 可用性 + 配置位置。
     List {
@@ -509,24 +509,21 @@ fn resolve_result(
     }
 }
 
-/// 构造 ProviderRegistry（前台与 worker 共用）：只装 scanner 条目（route_key = `provider/id`，批 F-2 prd K1）——scanner 一律
+/// 构造 ProviderRegistry（前台与 worker 共用）：scanner / reviewer / verifier 各按 **角色键**
+/// `role:provider/id` 注册一份 backend（`reasoningEffort` 是角色属性，同一模型跨角色不能共用一份档位）——scanner 一律
 /// scan 单发（`--tools` 对 scanner 无效，K3）；provider 在途门 = `maxConcurrency` 缺省继承 `review.max_concurrency`（D7 A5；唯一闸，无角色级 workers，D13）；
-/// thinkingLevel 无映射的告警进 registry.warnings → RunMeta.warnings。reviewers / verifiers 在 M21b 接线（同一模型跨角色同名时键会
-/// 冲突，届时 route_key 带角色前缀）。scanners 为空 → 配置错误；返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
+/// reasoningEffort 无映射的告警进 registry.warnings → RunMeta.warnings。scanners 为空 → 配置错误；返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
 fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<ProviderRegistry, String> {
     let roles = cfg.active_roles();
     if roles.scanners.is_empty() {
         return Err(redteam::cli::NO_SCANNER_MSG.to_string());
     }
     let mut registry = ProviderRegistry::new();
-    // thinkingLevel 无映射 warnings 按角色条目统一给——兼任 scanner 的 reviewer 下面会被跳过注册，它的档位不能跟着漏报。
-    for w in redteam::provider::backends::role_thinking_warnings(&roles) {
+    // reasoningEffort 无映射 warnings 按角色条目统一给——同一模型跨角色各有各的档位，不能只报先注册的那条。
+    for w in redteam::provider::backends::role_reasoning_effort_warnings(&roles) {
         registry.push_warning(w);
     }
-    // 已注册的 route_key → 其 backend 的 thinkingLevel（跨角色同名冲突的告警依据）。
-    let mut registered: std::collections::BTreeMap<String, Option<redteam::config::ThinkingLevel>> = Default::default();
     for em in &roles.scanners {
-        registered.insert(em.name.clone(), em.thinking_level);
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
         let backend = match backend_from_config(em, key) {
             Ok(b) => b,
@@ -538,29 +535,17 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
         // usize → u32 饱和而非截断（评审修：误填 2^32 以上的值不会被截成 0 / 小数）。
         let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
-        registry.insert_scan(em.name.clone(), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
+        registry.insert_scan(role_key(redteam::config::Role::Scanner, &em.name), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
     }
-    // reviewer 与 verifier 同一套注册逻辑：按 `em.name`（= `provider/id`）去重——同一模型兼任多角色时
-    // 只装一份 backend。批 D〔D17〕：verifier 必须在这里注册，否则 `pick_verifier` 选中一个纯 verifier
-    // 模型时 `registry.lease()` 直接 Unavailable，每条复核都静默落成「保守 upheld」——看起来跑了、其实一次没验。
+    // reviewer 与 verifier 各按角色键注册（同模型不同档位各占一份 backend，不互相覆盖）。批 D〔D17〕：
+    // verifier 必须在这里注册，否则 `pick_verifier` 选中一个纯 verifier 模型时 `registry.lease()` 直接
+    // Unavailable，每条复核都静默落成「保守 upheld」——看起来跑了、其实一次没验。
     for (em, role) in roles
         .reviewers
         .iter()
         .map(|m| (m, redteam::config::Role::Reviewer))
         .chain(roles.verifiers.iter().map(|m| (m, redteam::config::Role::Verifier)))
     {
-        if registry.has_scan(&em.name) {
-            // 同名不同档（scanner high / verifier medium 之类）：先到的 backend 生效，档位差异必须可见——
-            // 静默用错档会让离线基线与线上行为对不上。route_key 带角色前缀是 M21c 的活（D13 已记）。
-            if registered.get(&em.name).is_some_and(|prev| *prev != em.thinking_level) {
-                registry.push_warning(format!(
-                    "{} 兼任多角色且 thinkingLevel 不一致（已注册 {:?}、本角色 {:?}）——本轮按已注册档位跑",
-                    em.name, registered[&em.name], em.thinking_level
-                ));
-            }
-            continue;
-        }
-        registered.insert(em.name.clone(), em.thinking_level);
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
         let backend = match backend_from_config(em, key) {
             Ok(b) => b,
@@ -575,7 +560,7 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
         };
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
         let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
-        registry.insert_scan(em.name.clone(), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
+        registry.insert_scan(role_key(role, &em.name), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
     }
     Ok(registry)
 }
@@ -996,7 +981,7 @@ async fn main() {
                 }
                 redteam::model::check_exit_code(&avs)
             }
-            ModelCmd::Setup { provider, model, role, display_name, kind, base_url, api_key_env, max_concurrency, key, key_store, model_key, context_window, max_output_tokens, per_turn_timeout_secs, reasoning, thinking_level } => {
+            ModelCmd::Setup { provider, model, role, display_name, kind, base_url, api_key_env, max_concurrency, key, key_store, model_key, context_window, max_output_tokens, per_turn_timeout_secs, reasoning, reasoning_effort } => {
                 let mut roles: Vec<redteam::config::Role> = Vec::new();
                 for r in role.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     match redteam::config::Role::parse(r) {
@@ -1012,10 +997,10 @@ async fn main() {
                     eprintln!("error: --role 至少给一个角色：scanner | reviewer | verifier");
                     std::process::exit(1);
                 }
-                let thinking_level = match thinking_level.as_deref() {
-                    Some(s) => match redteam::config::ThinkingLevel::parse(s) {
+                let reasoning_effort = match reasoning_effort.as_deref() {
+                    Some(s) => match redteam::config::ReasoningEffort::parse(s) {
                         Some(t) => Some(t),
-                        None => { eprintln!("error: --thinking-level 取 off | low | medium | high"); std::process::exit(1); }
+                        None => { eprintln!("error: --reasoning-effort 取 minimal | low | medium | high | xhigh | max | ultra"); std::process::exit(1); }
                     },
                     None => None,
                 };
@@ -1065,7 +1050,7 @@ async fn main() {
                     max_output_tokens,
                     per_turn_timeout_secs,
                     reasoning,
-                    thinking_level,
+                    reasoning_effort,
                     kind_if_new,
                     api_key_env_if_new: Some(redteam::model::derive_api_key_env(&provider)),
                 };
@@ -1702,8 +1687,15 @@ mod tests {
         )
         .unwrap();
         let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new(".")).unwrap();
-        assert!(reg.has_scan("p/s") && reg.has_scan("p/r"), "scanner / reviewer 照旧");
-        assert!(reg.has_scan("p/v"), "纯 verifier 模型必须能 lease，否则复核全程静默保守 upheld");
+        assert!(
+            reg.has_for(redteam::config::Role::Scanner, "p/s")
+                && reg.has_for(redteam::config::Role::Reviewer, "p/r"),
+            "scanner / reviewer 按角色键注册"
+        );
+        assert!(
+            reg.has_for(redteam::config::Role::Verifier, "p/v"),
+            "纯 verifier 模型必须能 lease，否则复核全程静默保守 upheld"
+        );
     }
 
     /// 批 D-5（收口评审 #8）：verifier 模型造不出 backend **不该拒跑整条命令**——复核缺省还关着，
@@ -1720,7 +1712,10 @@ mod tests {
         .unwrap();
         let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new("."))
             .expect("verifier 造不出 backend 不该让整条 review 拒跑");
-        assert!(reg.has_scan("p/s") && !reg.has_scan("g/v"));
+        assert!(
+            reg.has_for(redteam::config::Role::Scanner, "p/s")
+                && !reg.has_for(redteam::config::Role::Verifier, "g/v")
+        );
         assert!(
             reg.warnings().iter().any(|w| w.contains("verifier g/v 不可用")),
             "跳过要可观测: {:?}",
@@ -1728,21 +1723,24 @@ mod tests {
         );
     }
 
-    /// 同一模型兼任多角色且 thinkingLevel 不一致：先到的 backend 生效，差异必须留下 warning——
-    /// 静默用错档会让离线基线与线上行为对不上。
+    /// 同一模型兼任多角色：按角色键各注册一份 backend，档位互不覆盖。
+    /// dogfood 暴露的真问题：旧实现只留先注册的 scanner 档，reviewer / verifier 配 high 照样跑 medium。
     #[test]
-    fn build_registry_warns_on_cross_role_thinking_level_mismatch() {
+    fn build_registry_keeps_role_scoped_reasoning_efforts() {
         let cfg: redteam::config::Config = serde_json::from_str(
             r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
-                "m":{"roles":{"scanner":{"thinkingLevel":"high"},"verifier":{"thinkingLevel":"low"}}}
+                "m":{"roles":{"scanner":{"reasoningEffort":"medium"},"reviewer":{"reasoningEffort":"high"},"verifier":{"reasoningEffort":"high"}}}
             }}}}"#,
         )
         .unwrap();
         let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new(".")).unwrap();
-        assert!(reg.has_scan("p/m"));
+        use redteam::config::Role;
+        assert!(reg.has_for(Role::Scanner, "p/m"), "scanner 一份");
+        assert!(reg.has_for(Role::Reviewer, "p/m"), "reviewer 自己一份（档位 high）");
+        assert!(reg.has_for(Role::Verifier, "p/m"), "verifier 自己一份（档位 high）");
         assert!(
-            reg.warnings().iter().any(|w| w.contains("thinkingLevel 不一致")),
-            "档位冲突必须可观测: {:?}",
+            !reg.warnings().iter().any(|w| w.contains("reasoningEffort 不一致")),
+            "角色键隔离后不该再有档位冲突告警: {:?}",
             reg.warnings()
         );
     }

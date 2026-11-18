@@ -38,21 +38,25 @@ impl ProviderKind {
     }
 }
 
-/// 思考档位（角色属性：同一模型可在 scanner 位 low、reviewer 位 high）。backend 消费在批 F。
+/// 推理强度（角色属性：同一模型可在 scanner 位 low、reviewer 位 high）。backend 消费在批 F。
+/// 值原样透传给上游；`off` / `none` 不再建模——只有极少数模型支持关推理，需要时由模型默认行为决定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum ThinkingLevel { Off, Low, Medium, High }
+pub enum ReasoningEffort { Minimal, Low, Medium, High, Xhigh, Max, Ultra }
 
-impl ThinkingLevel {
-    pub fn parse(s: &str) -> Option<ThinkingLevel> {
+impl ReasoningEffort {
+    pub fn parse(s: &str) -> Option<ReasoningEffort> {
         serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
     }
     pub fn as_str(&self) -> &'static str {
         match self {
-            ThinkingLevel::Off => "off",
-            ThinkingLevel::Low => "low",
-            ThinkingLevel::Medium => "medium",
-            ThinkingLevel::High => "high",
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+            ReasoningEffort::Max => "max",
+            ReasoningEffort::Ultra => "ultra",
         }
     }
 }
@@ -86,7 +90,7 @@ impl Role {
 #[serde(rename_all = "camelCase")]
 pub struct RoleAttrs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_level: Option<ThinkingLevel>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// 模型（`providers.<name>.models.<id>`）：固有属性只写一次；`roles` 键即该模型参与的角色。
@@ -157,7 +161,7 @@ pub struct EffectiveModel {
     pub max_output_tokens: Option<u64>,
     pub per_turn_timeout_secs: Option<u64>,
     pub reasoning: bool,
-    pub thinking_level: Option<ThinkingLevel>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub family: String,
     pub max_concurrency: Option<u32>,
 }
@@ -561,7 +565,7 @@ impl Config {
             max_output_tokens: m.max_output_tokens,
             per_turn_timeout_secs: m.per_turn_timeout_secs,
             reasoning: m.reasoning,
-            thinking_level: m.roles.get(&role).and_then(|r| r.thinking_level),
+            reasoning_effort: m.roles.get(&role).and_then(|r| r.reasoning_effort),
             family: m.family.clone().unwrap_or_else(|| {
                 id.split(['-', '_', '.']).next().unwrap_or(id).to_lowercase()
             }),
@@ -708,7 +712,7 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     const ROOT: &[&str] = &["providers", "review"];
     const PROVIDER: &[&str] = &["kind", "baseUrl", "apiKeyEnv", "maxConcurrency", "models"];
     const MODEL: &[&str] = &["displayName", "kind", "apiKeyEnv", "family", "contextWindow", "maxOutputTokens", "perTurnTimeoutSecs", "reasoning", "roles"];
-    const ROLE_ATTRS: &[&str] = &["thinkingLevel"];
+    const ROLE_ATTRS: &[&str] = &["reasoningEffort"];
     const REVIEW: &[&str] = &["blockThreshold", "confFloor", "maxConcurrency", "tools", "scanners", "reviewers", "verifiers", "grouping", "pack"];
     /// review 已删键：`risk`（D11 无模式旋钮）。
     const REVIEW_REMOVED: &[(&str, &str)] = &[("risk", "D11：无模式旋钮")];
@@ -783,7 +787,7 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
                                     continue;
                                 }
                                 if let Some(ra) = rv.as_object() {
-                                    check(&mut errors, &mut warnings, &format!("{mpath}.roles.{role}"), ra, ROLE_ATTRS, "thinkingLevel");
+                                    check(&mut errors, &mut warnings, &format!("{mpath}.roles.{role}"), ra, ROLE_ATTRS, "reasoningEffort");
                                 }
                             }
                         }
@@ -960,7 +964,7 @@ pub struct SetupPatch {
     pub max_output_tokens: Option<u64>,
     pub per_turn_timeout_secs: Option<u64>,
     pub reasoning: Option<bool>,
-    pub thinking_level: Option<ThinkingLevel>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// 新建 provider 且未显式 `--kind` 时的推断值（已存在的 provider 不动）。
     pub kind_if_new: ProviderKind,
     /// 新建 provider 且未显式 `--api-key-env` 时的推断值。
@@ -972,7 +976,7 @@ impl Default for SetupPatch {
         SetupPatch {
             provider: String::new(), model_id: String::new(), roles: Vec::new(), display_name: None, kind: None, base_url: None,
             api_key_env: None, max_concurrency: None, context_window: None, max_output_tokens: None, per_turn_timeout_secs: None,
-            reasoning: None, thinking_level: None, kind_if_new: ProviderKind::OpenaiCompatible, api_key_env_if_new: None,
+            reasoning: None, reasoning_effort: None, kind_if_new: ProviderKind::OpenaiCompatible, api_key_env_if_new: None,
         }
     }
 }
@@ -1040,14 +1044,14 @@ pub fn write_setup(patch: &SetupPatch) -> anyhow::Result<PathBuf> {
     if let Some(r) = patch.reasoning {
         mo.insert("reasoning".into(), serde_json::json!(r));
     }
-    // 角色层：不存在建 {}；thinkingLevel 显式才写
+    // 角色层：不存在建 {}；reasoningEffort 显式才写
     let roles = mo.entry("roles").or_insert_with(|| serde_json::json!({}));
     let roles_o = roles.as_object_mut().ok_or_else(|| anyhow::anyhow!("models.{}.roles 不是对象", patch.model_id))?;
     for role in &patch.roles {
         let rv = roles_o.entry(role.as_str().to_string()).or_insert_with(|| serde_json::json!({}));
-        if let Some(tl) = patch.thinking_level {
+        if let Some(effort) = patch.reasoning_effort {
             if let Some(ro) = rv.as_object_mut() {
-                ro.insert("thinkingLevel".into(), serde_json::json!(tl.as_str()));
+                ro.insert("reasoningEffort".into(), serde_json::json!(effort.as_str()));
             }
         }
     }
@@ -1108,9 +1112,9 @@ mod tests {
       "kind": "openai", "baseUrl": "https://api.deepseek.com", "apiKeyEnv": "DEEPSEEK_API_KEY", "maxConcurrency": 20,
       "models": {
         "deepseek-v4-flash": { "displayName": "DeepSeek V4 Flash", "contextWindow": 1000000, "maxOutputTokens": 384000, "reasoning": true,
-                               "roles": { "scanner": { "thinkingLevel": "low" } } },
+                               "roles": { "scanner": { "reasoningEffort": "low" } } },
         "deepseek-v4-pro":   { "contextWindow": 1000000, "maxOutputTokens": 384000, "reasoning": true, "perTurnTimeoutSecs": 1200,
-                               "roles": { "reviewer": { "thinkingLevel": "high" } } }
+                               "roles": { "reviewer": { "reasoningEffort": "high" } } }
       }
     },
     "agct": {
@@ -1118,7 +1122,7 @@ mod tests {
       "models": {
         "gemini-3.8-flash": { "kind": "openai", "apiKeyEnv": "AGCT_GEMINI_API_KEY", "family": "gemini",
                               "contextWindow": 1048576, "maxOutputTokens": 65536, "reasoning": true,
-                              "roles": { "scanner": { "thinkingLevel": "low" }, "verifier": { "thinkingLevel": "high" } } }
+                              "roles": { "scanner": { "reasoningEffort": "low" }, "verifier": { "reasoningEffort": "high" } } }
       }
     }
   },
@@ -1155,8 +1159,8 @@ mod tests {
         let gem = &roles.scanners[0];
         assert_eq!(gem.kind, ProviderKind::Openai, "模型层 kind 覆盖 provider 层缺失");
         assert_eq!(gem.family, "gemini");
-        assert_eq!(gem.thinking_level, Some(ThinkingLevel::Low));
-        assert_eq!(roles.verifiers[0].thinking_level, Some(ThinkingLevel::High), "同一模型不同角色不同档");
+        assert_eq!(gem.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(roles.verifiers[0].reasoning_effort, Some(ReasoningEffort::High), "同一模型不同角色不同档");
         let pro = &roles.reviewers[0];
         assert_eq!(pro.per_turn_timeout_secs, Some(1200));
         assert_eq!(pro.role, Role::Reviewer);
@@ -1176,7 +1180,7 @@ mod tests {
         assert_eq!(em.name, "p/glm-5.3");
         assert_eq!(em.family, "glm");
         assert_eq!(em.context_window, 128_000);
-        assert_eq!(em.thinking_level, None);
+        assert_eq!(em.reasoning_effort, None);
         assert_eq!(cfg.review.pack.body, PackBody::Slice, "D8：slice 默认");
         assert_eq!(cfg.review.max_concurrency, 10, "D13：缺省 10，provider 门是唯一闸");
         assert!(Config::from_json("  \n").unwrap().providers.is_empty(), "空白 = 空配置");
@@ -1242,8 +1246,8 @@ mod tests {
         assert!(e3.contains("camelCase") && e3.contains("base_url"), "{e3}");
         let e4 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"context_window":1}}}}}"#).unwrap_err().to_string();
         assert!(e4.contains("context_window"), "{e4}");
-        let e5 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{"thinking_level":"high"}}}}}},"review":{"reviewers":{"max_cells":4}}}"#).unwrap_err().to_string();
-        assert!(e5.contains("roles.scanner.thinking_level") && e5.contains("review.reviewers.max_cells"), "嵌套段 snake_case 也拦（评审 #4）: {e5}");
+        let e5 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{"reasoning_effort":"high"}}}}}},"review":{"reviewers":{"max_cells":4}}}"#).unwrap_err().to_string();
+        assert!(e5.contains("roles.scanner.reasoning_effort") && e5.contains("review.reviewers.max_cells"), "嵌套段 snake_case 也拦（评审 #4）: {e5}");
         let e6 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"name":"M","roles":{"scanner":{}}}}}}}"#).unwrap_err().to_string();
         assert!(e6.contains("name 已改名 displayName"), "{e6}");
         let e7 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"judge":{}}}}}}}"#).unwrap_err().to_string();
@@ -1479,13 +1483,13 @@ mod tests {
         unsafe { std::env::set_var("REDTEAM_HOME", dir.path()); }
         // 手写：provider anthropic + 模型级字段
         std::fs::write(dir.path().join("config.json"), r#"{"providers":{"agc":{"kind":"anthropic","apiKeyEnv":"MY_KEY","models":{
-            "glm-5.3":{"displayName":"GLM","family":"fam","perTurnTimeoutSecs":999,"apiKeyEnv":"GLM_KEY","roles":{"scanner":{"thinkingLevel":"low"}}}}}},
+            "glm-5.3":{"displayName":"GLM","family":"fam","perTurnTimeoutSecs":999,"apiKeyEnv":"GLM_KEY","roles":{"scanner":{"reasoningEffort":"low"}}}}}},
             "review":{"blockThreshold":"high"}}"#).unwrap();
         // 已存在 provider：不带 --kind 且带 base_url 的 setup 不得改 kind / apiKeyEnv（#3）；模型层只加 contextWindow；追加 reviewer 角色
         let mut p = patch("agc", "glm-5.3", &[Role::Reviewer]);
         p.base_url = Some("https://gw/v1".into());
         p.context_window = Some(200_000);
-        p.thinking_level = Some(ThinkingLevel::High);
+        p.reasoning_effort = Some(ReasoningEffort::High);
         write_setup(&p).unwrap();
         let cfg = Config::load().unwrap();
         let prov = &cfg.providers["agc"];
@@ -1498,8 +1502,8 @@ mod tests {
         assert_eq!(m.per_turn_timeout_secs, Some(999));
         assert_eq!(m.api_key_env.as_deref(), Some("GLM_KEY"));
         assert_eq!(m.context_window, Some(200_000));
-        assert_eq!(m.roles[&Role::Scanner].thinking_level, Some(ThinkingLevel::Low), "原角色属性不动");
-        assert_eq!(m.roles[&Role::Reviewer].thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(m.roles[&Role::Scanner].reasoning_effort, Some(ReasoningEffort::Low), "原角色属性不动");
+        assert_eq!(m.roles[&Role::Reviewer].reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(cfg.review.block_threshold, Severity::High, "review 段保留");
         // 新 provider：推断 kind / apiKeyEnv 补齐
         write_setup(&patch("newp", "m1", &[Role::Scanner])).unwrap();

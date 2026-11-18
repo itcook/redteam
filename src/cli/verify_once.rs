@@ -59,7 +59,7 @@ fn claim_to_finding(c: Claim) -> Finding {
 }
 
 /// 选复核模型：显式 `--verifier` 优先按 `provider/id` 取；缺省取 verifier 角色首个。
-/// **优先 verifier 角色条目**（thinkingLevel 等档位按角色配）；该模型没配 verifier 角色时
+/// **优先 verifier 角色条目**（reasoningEffort 等档位按角色配）；该模型没配 verifier 角色时
 /// 回落它的其他角色条目，并在输出里标出用的是哪个角色的档位——离线基线与线上不同档必须看得见。
 fn pick_model(cfg: &Config, want: Option<&str>) -> Result<(EffectiveModel, &'static str), String> {
     // `active_roles()` 返回的是自有集合——取一份克隆，调用方不必跟着它的生命周期。

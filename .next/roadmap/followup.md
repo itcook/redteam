@@ -685,12 +685,12 @@ deepseek 的输出则随规模走（5k / 32–39k）。推论：拆大组对 qwe
 **单轮之间的抖动就有这个量级**，此前所有「单轮 vs 单轮」的档位比较（deepseek medium vs high 等）只能当弱信号，
 要下结论至少三轮同配置。
 
-**角色级 thinkingLevel 半生效（2026-09-23 查证）**：design decisions §4「thinking_level 是角色属性（同模型两档消费）」
-在 **reviewer 上已生效**——深挖每格走 `per_cell_backend_factory`（`src/cli/mod.rs`），按 reviewer 自己的 `EffectiveModel`
-另造 backend，registry 的共享实例只是造不出来时的兜底；**verifier 上未生效**——`run_verify` 用 `lease.backend()`，
-档位跟着先注册的角色（scanner）走。附带缺陷：`build_registry` 那条 warning 写「本轮按已注册档位跑」，对 reviewer 是**错的**
-（reviewer 按自己的档跑）。修法：warning 限定到真正共享 backend 的角色；verifier 也走 per-cell backend，
-或 route_key 带角色前缀（M21c 已记的活）。
+**✅ 角色级 reasoningEffort 已生效（2026-11-18 修复；2026-09-23 查证时半生效）**：design decisions §4「reasoningEffort 是角色属性（同模型两档消费）」
+原先 reviewer 已生效（深挖每格走 `per_cell_backend_factory`，按 reviewer 自己的 `EffectiveModel` 另造 backend），
+**verifier 未生效**（`run_verify` 用共享 lease，档位跟着先注册的 scanner 走），且 registry 那条「本轮按已注册档位跑」的 warning 对 reviewer 是错的。
+现 `build_registry` 按角色键 `role:provider/id` 各注册一份 backend，`lease_for(role, name)` 让扫描 / 深挖 / 复核 / resume 各取各的档位，该 warning 一并删除。
+同批把配置键从 `thinkingLevel` 改名 `reasoningEffort`，枚举改为 `minimal|low|medium|high|xhigh|max|ultra`（去掉 `off`/`none`），
+值原样透传；Anthropic 走 `thinking{type:"adaptive"}` + `output_config.effort`（不再按 budget_tokens 换算）。
 
 **resume 报告的深挖账目只算本轮、复用格不入账（2026-09-23 出口验收第 6 项实测，两次续跑对照）**：
 后台 job 深挖中途 SIGKILL → `--resume` 续跑，报告里的深挖计数**只统计续跑自己做的工作**，复用的 cell 不进计数。

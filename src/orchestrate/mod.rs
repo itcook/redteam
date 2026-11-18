@@ -82,24 +82,23 @@ pub fn enrich(raw: &RawFinding, model: &str) -> Finding {
 
 // ── scanner 扇出（M21a 批 F-2，design §5 / §12.3；prd K1 / K5 / K6 / K7）──────────────────────────────────────────────
 
-/// scanner 条目（由 cli 从 `EffectiveModel` 转出）：route_key = `provider/id`（K1）；`thinking_pinned` = 配置了非 Off 档位
-/// （零推理观测门，K5）。
+/// scanner 条目（由 cli 从 `EffectiveModel` 转出）：route_key = `provider/id`（K1）；`reasoning_pinned` = 配置了
+/// `reasoningEffort` 且该 (kind, family) 真有参数映射（零推理观测门，K5）。
 #[derive(Clone, Debug)]
 pub struct ScanEntrySpec {
     pub route_key: String,
     pub family: String,
-    pub thinking_pinned: bool,
+    pub reasoning_pinned: bool,
 }
 
 impl From<&crate::config::EffectiveModel> for ScanEntrySpec {
     fn from(em: &crate::config::EffectiveModel) -> Self {
-        // pinned = 配置了非 Off 档位 **且** 该 (kind, family, id) 真有参数映射并会发出（评审修 9：无映射家族不该触发零推理告警）。
-        let pinned = em.thinking_level.is_some_and(|l| {
-            l != crate::config::ThinkingLevel::Off
-                && crate::provider::backends::thinking_params(em.kind, &em.family, &em.id, l, em.max_tokens_effective())
-                    .is_some_and(|v| !v.is_empty())
+        // pinned = 配置了 reasoningEffort **且** 该 (kind, family, id) 真有参数映射并会发出（评审修 9：无映射家族不该触发零推理告警）。
+        let pinned = em.reasoning_effort.is_some_and(|e| {
+            crate::provider::backends::reasoning_effort_params(em.kind, &em.family, &em.id, e)
+                .is_some_and(|v| !v.is_empty())
         });
-        ScanEntrySpec { route_key: em.name.clone(), family: em.family.clone(), thinking_pinned: pinned }
+        ScanEntrySpec { route_key: em.name.clone(), family: em.family.clone(), reasoning_pinned: pinned }
     }
 }
 
@@ -282,7 +281,7 @@ pub async fn run_scan_fanout(
             let t0 = std::time::Instant::now();
             let mut queue_wait_ms = 0u64;
             // 过 provider 在途门即发出（唯一闸，D13）；未注册条目在此即失败。
-            let res = match registry.lease(&e.route_key).await {
+            let res = match registry.lease_for(Role::Scanner, &e.route_key).await {
                 Ok(lease) => {
                     queue_wait_ms = t0.elapsed().as_millis() as u64; // 门等待 = 排队
                     lease.run(prompt).await
@@ -290,7 +289,7 @@ pub async fn run_scan_fanout(
                 Err(err) => Err(err),
             };
             let duration_ms = t0.elapsed().as_millis() as u64;
-            let (mut record, output) = scan_cell_record(id, &e.route_key, &e.family, e.thinking_pinned, input.root, changed_files, res, duration_ms, template_hash);
+            let (mut record, output) = scan_cell_record(id, &e.route_key, &e.family, e.reasoning_pinned, input.root, changed_files, res, duration_ms, template_hash);
             record.queue_wait_ms += queue_wait_ms; // 门等待 + 429 排队等待（scan_cell_record 已填后者）
             if let Some(s) = sink {
                 s.on_cell(record.clone());
@@ -354,7 +353,7 @@ pub fn scan_cell_record(
     cell_id: &str,
     route_key: &str,
     family: &str,
-    thinking_pinned: bool,
+    reasoning_pinned: bool,
     root: &std::path::Path,
     // `changed` = 本轮变更文件集：跨文件重定位的搜索范围（M21c 批 B-3）。空 = 不做重定位。
     changed: &[String],
@@ -366,7 +365,7 @@ pub fn scan_cell_record(
         Ok(call) => {
             let anchored = anchor_suspicions_within(root, call.output, changed);
             let mut notes = scan_cell_notes(
-                &call.stats, anchored.dropped, anchored.dropped_unreadable, anchored.relocated, thinking_pinned, call.reasoning_tokens, call.output_tokens,
+                &call.stats, anchored.dropped, anchored.dropped_unreadable, anchored.relocated, reasoning_pinned, call.reasoning_tokens, call.output_tokens,
                 anchored.output.suspicions.len(),
             );
             if let Some(n) = call.repair_note {
@@ -523,7 +522,7 @@ mod scan_tests {
         (0..n).map(|i| Bundle::from_files(vec![FileChange { path: format!("src/f{i}.rs"), diff: format!("+line {i}") }])).collect()
     }
     fn entry(key: &str, fam: &str, pinned: bool) -> ScanEntrySpec {
-        ScanEntrySpec { route_key: key.into(), family: fam.into(), thinking_pinned: pinned }
+        ScanEntrySpec { route_key: key.into(), family: fam.into(), reasoning_pinned: pinned }
     }
     struct RecSink { manifest: Mutex<Vec<CellInput>>, cells: Mutex<Vec<CellRecord>>, roles: Mutex<Vec<Role>> }
     impl RecSink { fn new() -> Self { RecSink { manifest: Mutex::new(vec![]), cells: Mutex::new(vec![]), roles: Mutex::new(vec![]) } } }

@@ -446,7 +446,7 @@ mod tests {
             provider: name.split('/').next().unwrap().into(),
             role: crate::config::Role::Verifier, kind: crate::config::ProviderKind::Openai,
             base_url: None, context_window: 100_000, max_output_tokens: None,
-            per_turn_timeout_secs: None, reasoning: false, thinking_level: None,
+            per_turn_timeout_secs: None, reasoning: false, reasoning_effort: None,
             family: family.into(), max_concurrency: None,
         }
     }

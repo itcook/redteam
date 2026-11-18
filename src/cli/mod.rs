@@ -1674,7 +1674,7 @@ pub async fn run_resume(
         let t0 = std::time::Instant::now();
         let mut queue_wait_ms = 0u64;
         let res = match &cell.scan {
-            Some(p) => match registry.lease(&cell.model).await {
+            Some(p) => match registry.lease_for(Role::Scanner, &cell.model).await {
                 Ok(lease) => {
                     queue_wait_ms = t0.elapsed().as_millis() as u64;
                     lease.run(p).await
@@ -1706,7 +1706,7 @@ pub async fn run_resume(
             }
             None => current_hash.clone(),
         };
-        let pinned = entry_of(&cell.model).map(|e| e.thinking_pinned).unwrap_or(false);
+        let pinned = entry_of(&cell.model).map(|e| e.reasoning_pinned).unwrap_or(false);
         let (mut rec, _) = crate::orchestrate::scan_cell_record(
             // resume 补跑**不做**跨文件重定位（B-3）：变更集要到后面才重建（`changed_now`），
             // 这一步还拿不到。重定位是增益不是正确性——缺了只是少救回几条串了文件名的疑点。
@@ -4686,20 +4686,20 @@ mod code_review_tests {
         assert_eq!(r.cells.len(), 3);
     }
 
-    /// 评审修 9：`thinking_pinned` 只在 (kind, family, id) 真有映射且会发出时为 true。
+    /// 评审修 9：`reasoning_pinned` 只在 (kind, family, id) 真有映射且会发出时为 true。
     #[test]
-    fn scan_entry_spec_pinned_requires_a_thinking_mapping() {
+    fn scan_entry_spec_pinned_requires_a_reasoning_effort_mapping() {
         use crate::orchestrate::ScanEntrySpec;
         let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{
-            "deepseek-v4-flash":{"roles":{"scanner":{"thinkingLevel":"low"}}},
-            "grok-4":{"roles":{"scanner":{"thinkingLevel":"high"}}},
-            "gpt-5":{"roles":{"scanner":{"thinkingLevel":"off"}}},
+            "deepseek-v4-flash":{"roles":{"scanner":{"reasoningEffort":"low"}}},
+            "grok-4":{"roles":{"scanner":{"reasoningEffort":"high"}}},
+            "gpt-5":{"roles":{"scanner":{"reasoningEffort":"minimal"}}},
             "qwen3":{"roles":{"scanner":{}}}}}}}"#).unwrap();
         let roles = cfg.active_roles();
-        let pinned: std::collections::BTreeMap<String, bool> = roles.scanners.iter().map(|em| (em.id.clone(), ScanEntrySpec::from(em).thinking_pinned)).collect();
+        let pinned: std::collections::BTreeMap<String, bool> = roles.scanners.iter().map(|em| (em.id.clone(), ScanEntrySpec::from(em).reasoning_pinned)).collect();
         assert!(pinned["deepseek-v4-flash"]);
         assert!(!pinned["grok-4"], "无映射家族不算 pinned");
-        assert!(!pinned["gpt-5"], "Off 不算 pinned");
+        assert!(pinned["gpt-5"], "有映射就算 pinned（off 档已移除）");
         assert!(!pinned["qwen3"], "未配档位不算 pinned");
     }
 

@@ -1,3 +1,4 @@
+use crate::config::Role;
 use crate::domain::report::RateLimitMeta;
 use crate::prompt::ScanPrompt;
 use crate::provider::scan_shot::{run_scan_shot_with, ScanCall};
@@ -9,6 +10,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+
+/// 角色限定的注册键：`reasoningEffort` 是角色属性，同一模型在不同角色下必须是不同 backend，
+/// 否则 scanner 的档位会被 reviewer / verifier 静默复用。
+pub fn role_key(role: Role, name: &str) -> String {
+    format!("{}:{}", role.as_str(), name)
+}
 
 /// provider 级在途门（design §12.3〔D13〕）：**唯一一道闸**。名额 = 门宽（provider `maxConcurrency`，缺省继承 `review.max_concurrency`），
 /// 同一 provider 下全部角色条目共享一把（scanner 与 M21b 的 reviewer / verifier 同门）。自管计数 + `Notify` 而非 tokio `Semaphore`：
@@ -402,7 +409,14 @@ impl ProviderRegistry {
     }
     /// route_key → 所属 provider。
     pub fn provider_of(&self, route_key: &str) -> Option<&str> {
-        self.scan.get(route_key).map(|e| e.provider.as_str())
+        if let Some(e) = self.scan.get(route_key) {
+            return Some(e.provider.as_str());
+        }
+        // 角色限定键（`role:provider/id`）→ 裸身份串的查询（queue_warnings 等调用方只带身份）。
+        self.scan
+            .iter()
+            .find(|(k, _)| k.split_once(':').is_some_and(|(_, name)| name == route_key))
+            .map(|(_, e)| e.provider.as_str())
     }
     /// provider 配置门宽（`maxConcurrency` 或继承的缺省）；未建门 → None。
     pub fn cap_of(&self, provider: &str) -> Option<u32> {
@@ -486,6 +500,30 @@ impl ProviderRegistry {
     pub fn try_lease(&self, route_key: &str) -> Result<Option<ScanLease<'_>>, ProviderError> {
         let (entry, gate) = self.entry_and_gate(route_key)?;
         Ok(gate.try_enter().map(|permit| ScanLease { entry, gate, _permit: permit }))
+    }
+
+    /// 角色感知的租约键：优先取 `role:provider/id` 条目，未按角色注册时回退裸身份串
+    /// （测试与旧手工注册仍按原键工作）。
+    fn resolved_key(&self, role: Role, name: &str) -> String {
+        let key = role_key(role, name);
+        if self.scan.contains_key(&key) { key } else { name.to_string() }
+    }
+
+    /// [`Self::lease`] 的角色感知版：同一模型在不同角色下各取各的 backend（档位不再串味）。
+    pub async fn lease_for(&self, role: Role, name: &str) -> Result<ScanLease<'_>, ProviderError> {
+        let key = self.resolved_key(role, name);
+        self.lease(&key).await
+    }
+
+    /// [`Self::try_lease`] 的角色感知版（回退规则同 [`Self::lease_for`]）。
+    pub fn try_lease_for(&self, role: Role, name: &str) -> Result<Option<ScanLease<'_>>, ProviderError> {
+        let key = self.resolved_key(role, name);
+        self.try_lease(&key)
+    }
+
+    /// 该角色是否已按角色键注册此模型（诊断与测试用）。
+    pub fn has_for(&self, role: Role, name: &str) -> bool {
+        self.scan.contains_key(&role_key(role, name))
     }
 
     /// scanner 调用：过 provider 在途门 → 两轮单发（`lease` + `run`）。

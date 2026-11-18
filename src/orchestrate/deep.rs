@@ -425,7 +425,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         } else if any_eligible && no_slot && waits.is_none() {
             waits = Some(
                 pool.alive_rotated()
-                    .map(|i| async move { (i, registry.lease(&members[i].name).await) })
+                    .map(|i| async move { (i, registry.lease_for(Role::Reviewer, &members[i].name).await) })
                     .collect::<FuturesUnordered<_>>(),
             );
         }
@@ -879,7 +879,7 @@ impl Pool {
             if self.removed[i].is_some() {
                 continue;
             }
-            match registry.try_lease(&members[i].name) {
+            match registry.try_lease_for(Role::Reviewer, &members[i].name) {
                 Ok(Some(lease)) => return Some((lease, i)),
                 Ok(None) => {}
                 Err(e) => self.remove(i, format!("deep: reviewer {} lease failed: {e} — removed from pool", members[i].name)),
@@ -1047,7 +1047,7 @@ async fn run_verify<'b>(env: &CellEnv<'b>, job: VerifyJob<'b>) -> VerifyDone {
         note: note.to_string(),
     };
 
-    let lease = match env.registry.lease(&verifier.name).await {
+    let lease = match env.registry.lease_for(verifier.role, &verifier.name).await {
         Ok(l) => l,
         Err(e) => {
             warnings.push(format!("verify {cell_id}: lease failed ({e}); conservatively upheld"));
@@ -1976,7 +1976,7 @@ mod tests {
             name: "p/r".into(), display_name: None, id: "r".into(), provider: "p".into(),
             role: crate::config::Role::Reviewer, kind: crate::config::ProviderKind::Openai,
             base_url: None, context_window: 100_000, max_output_tokens: None,
-            per_turn_timeout_secs: None, reasoning: false, thinking_level: None,
+            per_turn_timeout_secs: None, reasoning: false, reasoning_effort: None,
             family: "r".into(), max_concurrency: None,
         }
     }

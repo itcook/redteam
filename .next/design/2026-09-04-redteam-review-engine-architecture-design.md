@@ -166,7 +166,7 @@ scanned_areas: [{ file, ranges }]                                               
 - 可选：同模型多 lens 采样并集 `review.scanners.samples = 1`（换召回，不换墙钟）。
 - `quote` 是跨模型疑点合并与判例预筛的锚（`quote_overlap` 口径复用）；**quote 逐字硬约束，不在文件即丢弃**（E3：疑点模式守约弱于 finding 模式）；
   `category` 取 L0-L5；`hint` 归一化后置 M21c（R4，〔D11〕）。
-- scanner 请求显式钉推理档（角色属性 `thinkingLevel` 首个消费者）；零推理 + 短输出记 RunMeta 观测，不重跑（E3：疑点模式 2/3 跑几乎零推理）。
+- scanner 请求显式钉推理档（角色属性 `reasoningEffort` 首个消费者）；零推理 + 短输出记 RunMeta 观测，不重跑（E3：疑点模式 2/3 跑几乎零推理）。
 - 提示词 = 共享头 + scanner 角色尾（§10.7）。
 
 ---
@@ -222,7 +222,7 @@ cell 的记录形状与 resume 语义见 §17 R14〔D11〕。
   `kind = api` 时含函数体）+ spec 段（`--spec` 已有）。确定性代码预装配，**不拿工具自主探查**。
   区域 pack **由构造即切片**，不受 `review.pack.body` 控制（该轴只管 scanner 的组 pack）。
 - **输出**：完整 finding（危害链、修复建议）。**finding 只由此产出**（C7）。每 cell 输出天然有界。思考档由角色属性
-  `thinkingLevel` 给（典型 high）。
+  `reasoningEffort` 给（典型 high）。
 - **流式持久化**〔D10〕：响应 SSE 流上对 `findings` 数组做增量 JSON 解析，每个对象闭合即落盘，cell 中途死亡时已产出项不丢。
   不改模型契约、不引入工具循环、无 `submit` 旋钮；FINALIZE / REPAIR 仍管最终整体解析，流式持久化只是旁路。**定性为持久化旁路**〔D13〕：
   思考模型的可见 JSON 在尾部数秒内闭合，逐 finding 与逐 cell 在墙钟上等价；价值在格中途死亡时已闭合对象不丢。模型在一次请求内不能边调工具边交付，
@@ -378,7 +378,7 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
 - **共享头内容**：系统协议、评审规则、对抗立场、CI 已覆盖类别跳过清单（L1）、不可信输入免疫段（威胁模型 B）、仓库简介、spec。
   角色尾不重复共享头。
 - **注入段全部过 `neutralize_structure`**：笔记、判例摘要、跨组索引、brief、三方契约。
-- **思考档位由角色属性 `thinkingLevel` 给**，prompt 不写「仔细思考」类散文。
+- **思考档位由角色属性 `reasoningEffort` 给**，prompt 不写「仔细思考」类散文。
 - **模板哈希入 RunMeta**：共享头与每个角色尾各一 hash，A/B 归因用。
 - **离线回归集**（M6-b 提示词 harness 的复活形态，零新数据；改模板必跑对应集）：
   - verifier：proj.db 已 dismissed findings = 已知假阳、upheld = 已知真 → 二分类准确率；
@@ -420,14 +420,14 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
           "contextWindow": 1000000,
           "maxOutputTokens": 384000,
           "reasoning": true,
-          "roles": { "scanner": { "thinkingLevel": "low" } }
+          "roles": { "scanner": { "reasoningEffort": "low" } }
         },
         "deepseek-v4-pro": {
           "contextWindow": 1000000,
           "maxOutputTokens": 384000,
           "reasoning": true,
           "perTurnTimeoutSecs": 1200,
-          "roles": { "reviewer": { "thinkingLevel": "high" } }
+          "roles": { "reviewer": { "reasoningEffort": "high" } }
         }
       }
     },
@@ -442,7 +442,7 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
           "contextWindow": 1048576,
           "maxOutputTokens": 65536,
           "reasoning": true,
-          "roles": { "scanner": { "thinkingLevel": "low" }, "verifier": { "thinkingLevel": "high" } }
+          "roles": { "scanner": { "reasoningEffort": "low" }, "verifier": { "reasoningEffort": "high" } }
         }
       }
     }
@@ -462,7 +462,7 @@ B 层 Rust 定位链：`use` → crate → Cargo.lock 版本 → registry 路径
 
 字段：provider 层 `kind`（模型层可覆盖，两层都缺 → 校验报错）/ `baseUrl` / `apiKeyEnv` / `maxConcurrency`（该 provider 在途上限，缺省继承
 `review.maxConcurrency` = 10；> 128 校验 warning「像是填错字段」〔D13〕）；模型层 `name`（人读显示，缺省 `provider/id`）/ `kind` / `apiKeyEnv` / `family`（缺省 id 首段）/ `contextWindow`
-（缺省保守 128K，有下限）/ `maxOutputTokens` / `perTurnTimeoutSecs` / `reasoning`（思考 token 计入输出额度）；角色层 `thinkingLevel`
+（缺省保守 128K，有下限）/ `maxOutputTokens` / `perTurnTimeoutSecs` / `reasoning`（思考 token 计入输出额度）；角色层 `reasoningEffort`
 （`off | low | medium | high`，角色属性：同一模型可 scanner 位 low、reviewer 位 high）。route_key / 报告名 = `provider/id`；活跃集顺序按
 provider 名、model id 字典序（无语义）。`verifiers` 无任何模型声明 → 自动异族（§8.1）。无 `priority`、无 `--models`（多模型即多条目）。无角色级 `workers`、无 `--workers`〔D13〕。
 
