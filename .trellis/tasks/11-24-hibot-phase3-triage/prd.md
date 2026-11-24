@@ -33,7 +33,7 @@ hibot audit 执行单元接入的 U4 单元（协调者 session `01a20ba0` 派�
 6. **分片 / 并发 / 预算**：安全轴按 changed-file 分组建片 `N = min(4, ceil(files/6))`；
    漂移轴按模块（目录）分片 `N = min(4, modules)`；意图轴单 cell（全局声明，分片无意义）。
    三轴并行，并发**只受 provider 子闸**约束（D72），不设 job 总闸；单轴失败 → `partial` +
-   `triage_axis_failed:<axis>`。不加新配置块（复用 `roles.scanner`，上限取代码内默认）。
+   `triage_axis_failed:<axis>`。不加新配置块（**2026-11-24 用户调整：复用 `roles.reviewer`**，用 reviewer 的思考档位；`config check --kind triage` 也改为要求 reviewer）。
    `wall_clock_s` 三档：high=100%（=manifest 上限）、medium=75%、low=50%，下限 300s，恒 ≤ manifest。
    `focus` ≤5 条：structural→`file`、security→`<surface>@file`、intent→`intent:<短句>`。
 7. **3.6 `blockers` 落点**：`extensions.redteam.blockers[]` 是**给 hibot 的披露面**；
@@ -56,6 +56,19 @@ hibot audit 执行单元接入的 U4 单元（协调者 session `01a20ba0` 派�
   仍报行、mitigation 只进 `note`，不参与 conf 打分。模板哈希 `c567e0d51fe82c91` → `2c750615f126b5f3`。
 - `axes[].dropped` 增加 `dropped_total` 与 `dropped_rows[]`（每轴 ≤20；`{file,line,surface,conf,reason}`），
   只作诊断披露，不进契约必需字段。
+### 2026-11-24 A 两阶段 intent（定案）
+
+- **map 键 = diff 切片，claim 是 reduce 键**：不按 claim 拆（那会把完整 diff 复制进每组）；每个切片带
+  「完整 claims 列表 + 自己的 diff」，输出 `delivered[]` + `scope_creep[]`。
+- **I0 串行**：PR body + linked issues + 非 bot/非作者 comments → `claims[]`（id 由执行单元规范化为 c1..cn）
+  + `maintainer_overlap`；预算 `min(150s, remaining/4)`。I0 失败 → intent 快速失败，不占波次门位。
+- **I1..In**：N 与 security 同源（`min(4, ceil(files/6))`）；缺证据的 claim 不在该切片判未兑现
+  （absence 不是证据），由 reduce 并集判定。
+- **partial 语义**：slice 未全成 → `verification_complete=false`；未验证 claim 只披露，
+  **不计入 `intent_undelivered`/blockers**（协调者 2026-11-24 裁）。
+- 模板：`triage-intent.md` 退役，新增 `triage-intent-claims.md` / `triage-intent-slice.md`；
+  模板哈希 `2c750615f126b5f3` → `ad41f9d1df42eb13`。
+
 ### tier2 白名单对照表（可复核）
 
 | 面 | 名称 | 判据（摘要） | 可升 tier2 |
@@ -75,8 +88,9 @@ job.json ──manifest/artifact 校验──► pr_context / diff_patch / merge
     │
     ├─ standards::build ──► StandardsMap（逐 changed file：doc|linter|peer）
     ├─ lenses::security × N ─┐
-    ├─ lenses::drift    × N ─┼─► 各轴 rows（带 file/line/quote/hint/conf）
-    └─ lenses::intent   × 1 ─┘
+    ├─ lenses::drift    × N ─┤
+    ├─ intent claims     × 1 ─┤（串行 I0：body/issues/comments，无 diff）
+    └─ intent slices     × N ─┘（I0 之后：每片 = claims + 自己的 diff）
               │
               ├─ 逐字重锚（quote 必须是 repo 原文；失败 → 丢弃 + 计数）
               ├─ 按轴去重（安全/漂移 file+归一 quote+hint；意图按声明身份）

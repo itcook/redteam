@@ -111,6 +111,9 @@ pub struct Evidence {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Claim {
+    /// I0 由执行单元规范化（c1..cn）；slice 只引用这个 id。
+    #[serde(default)]
+    pub id: String,
     #[serde(default)]
     pub claim: String,
     /// 只接受 `body` / `issue`（含 `issue#N`）；其它来源丢弃。
@@ -154,6 +157,41 @@ pub struct IntentOutput {
     pub maintainer_overlap: MaintainerOverlap,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// 执行单元设置：所有 I1..In slice 都完成才为 true；false 时未验证 claim 不计入 undelivered/blockers。
+    #[serde(skip)]
+    pub verification_complete: bool,
+}
+
+/// I0：从 PR body + linked issues 抽 claims；同时判维护者重复（只看 comments）。
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct IntentClaimsOutput {
+    #[serde(default)]
+    pub claims: Vec<Claim>,
+    #[serde(default)]
+    pub maintainer_overlap: MaintainerOverlap,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+/// I1..In：单个 diff 切片对 claims 的兑现证据 + 该切片内的 scope creep。
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeliveredClaim {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct IntentSliceOutput {
+    #[serde(default)]
+    pub delivered: Vec<DeliveredClaim>,
+    #[serde(default)]
+    pub scope_creep: Vec<ScopeCreep>,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// 一轴的执行结果（成功格的行 + 失败信息；失败轴的行仍保留，整体标 partial）。
@@ -186,7 +224,7 @@ async fn lease_with_budget<'a>(
     route_key: &str,
     deadline: tokio::time::Instant,
 ) -> Result<crate::provider::registry::ScanLease<'a>, String> {
-    match tokio::time::timeout_at(deadline, registry.lease_for(crate::domain::Role::Scanner, route_key)).await {
+    match tokio::time::timeout_at(deadline, registry.lease_for(crate::domain::Role::Reviewer, route_key)).await {
         Ok(Ok(l)) => Ok(l),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("provider gate wait exceeded the cell budget".into()),
@@ -197,7 +235,8 @@ async fn lease_with_budget<'a>(
 pub const SYSTEM_TPL: &str = include_str!("../prompt/templates/triage-system.md");
 pub const SECURITY_TPL: &str = include_str!("../prompt/templates/triage-security.md");
 pub const DRIFT_TPL: &str = include_str!("../prompt/templates/triage-drift.md");
-pub const INTENT_TPL: &str = include_str!("../prompt/templates/triage-intent.md");
+pub const INTENT_CLAIMS_TPL: &str = include_str!("../prompt/templates/triage-intent-claims.md");
+pub const INTENT_SLICE_TPL: &str = include_str!("../prompt/templates/triage-intent-slice.md");
 
 pub fn shared_system(lang: &OutputLang) -> String {
     SYSTEM_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name)
@@ -415,26 +454,26 @@ pub async fn run_drift(
     out
 }
 
-pub async fn run_intent(
+/// I0：声明抽取 + 维护者重复信号。**不喂 diff**（只在 slice 阶段读代码）。
+pub async fn run_intent_claims(
     registry: &ProviderRegistry,
     route_key: &str,
     lang: &OutputLang,
     pr: &PrContext,
-    files: &[(String, String)],
     cell_timeout: std::time::Duration,
-) -> AxisRun<IntentOutput> {
+) -> AxisRun<IntentClaimsOutput> {
     let system = shared_system(lang);
-    let tail = INTENT_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
+    let tail = INTENT_CLAIMS_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
     let cell_deadline = tokio::time::Instant::now() + cell_timeout;
     let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
         Ok(l) => l,
         Err(e) => return AxisRun::failed(e),
     };
     let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
-    let mut claims = String::from("# Stated intent sources (author assertions only)\n");
-    claims.push_str(&format!("## PR body\n{}\n", if pr.body.trim().is_empty() { "(empty)" } else { pr.body.as_str() }));
+    let mut text = String::from("# Stated intent sources (author assertions only)\n");
+    text.push_str(&format!("## PR body\n{}\n", if pr.body.trim().is_empty() { "(empty)" } else { pr.body.as_str() }));
     for issue in &pr.linked_issues {
-        claims.push_str(&format!(
+        text.push_str(&format!(
             "## linked issue #{} ({})\n{}\n{}\n",
             issue.number,
             issue.state,
@@ -442,23 +481,115 @@ pub async fn run_intent(
             issue.body.as_deref().unwrap_or("")
         ));
     }
+    text.push_str("\n## Reviewer comments (non-bot, non-author; use ONLY for maintainer_overlap)\n");
+    let mut used = 0usize;
+    for c in pr.comments.iter().filter(|c| !c.is_bot && c.author != pr.author) {
+        let chunk = format!("### @{} ({})\n{}\n", c.author, c.created_at, c.body);
+        if used + chunk.len() > 20 * 1024 {
+            break;
+        }
+        used += chunk.len();
+        text.push_str(&chunk);
+    }
     let blocks = vec![
-        block(format!("# Axis: intent vs diff\n{}", pr_header(pr)), false),
-        block(claims, false),
-        block(patch_block(files), true),
+        block(format!("# Axis: intent claims\n{}", pr_header(pr)), false),
+        block(text, false),
         block(tail, false),
     ];
-    match shot::run::<IntentOutput>(&lease, system, blocks, "triage-intent", budget).await {
-        Ok(call) => AxisRun {
-            cells: 1,
-            rows: vec![call.output],
-            ok: true,
-            error: None,
-            usage: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
-            repair_notes: call.repair_note.into_iter().collect(),
-        },
+    match shot::run::<IntentClaimsOutput>(&lease, system, blocks, "triage-intent-claims", budget).await {
+        Ok(mut call) => {
+            // id 由执行单元规范化（不信任模型自报 id）；slice 引用同一套 id。
+            for (i, c) in call.output.claims.iter_mut().enumerate() {
+                c.id = format!("c{}", i + 1);
+            }
+            AxisRun {
+                cells: 1,
+                rows: vec![call.output],
+                ok: true,
+                error: None,
+                usage: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
+                repair_notes: call.repair_note.into_iter().collect(),
+            }
+        }
         Err(e) => AxisRun::failed(e.to_string()),
     }
+}
+
+/// I1..In：按 diff 切片做 map——每个 cell 只带 claims 列表 + 自己的 diff；
+/// 输出「本切片兑现了哪些 claim」+「本切片内的无声明改动」。absence 不代表未兑现（其他切片覆盖其他文件）。
+pub async fn run_intent_slices(
+    registry: &ProviderRegistry,
+    route_key: &str,
+    lang: &OutputLang,
+    pr: &PrContext,
+    claims: &[Claim],
+    files: &[(String, String)],
+    cell_timeout: std::time::Duration,
+) -> AxisRun<IntentSliceOutput> {
+    if files.is_empty() {
+        // 空 diff：没有可验证的交付面；claims 由上层按“未兑现”处理。
+        return AxisRun { ok: true, ..Default::default() };
+    }
+    let shards = balanced_chunks(files, security_shard_count(files.len()));
+    let system = shared_system(lang);
+    let tail = INTENT_SLICE_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
+    let mut claims_text = String::from("# Claims (canonical ids; refer to them by id only)\n");
+    for c in claims {
+        claims_text.push_str(&format!("{} [{}] {}\n", c.id, c.source, c.claim));
+    }
+    let header = format!("# Axis: intent slice\n{}", pr_header(pr));
+    let futs = shards.iter().map(|shard| {
+        let system = system.clone();
+        let tail = tail.clone();
+        let claims_text = claims_text.clone();
+        let header = header.clone();
+        let patch = patch_block(shard);
+        async move {
+            let cell_deadline = tokio::time::Instant::now() + cell_timeout;
+            let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
+                Ok(l) => l,
+                Err(e) => return Err((e, (0, 0, 0))),
+            };
+            let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let blocks = vec![
+                block(header, false),
+                block(claims_text, false),
+                block(patch, true),
+                block(tail, false),
+            ];
+            match shot::run::<IntentSliceOutput>(&lease, system, blocks, "triage-intent-slice", budget).await {
+                Ok(call) => Ok(call),
+                Err(e) => Err((e.to_string(), e.burned_usage())),
+            }
+        }
+    });
+    let results = futures::future::join_all(futs).await;
+    let mut out = AxisRun { ok: true, ..Default::default() };
+    for r in results {
+        match r {
+            Ok(call) => {
+                out.cells += 1;
+                out.usage.0 += call.input_tokens;
+                out.usage.1 += call.output_tokens;
+                out.usage.2 += call.cached_input_tokens;
+                if let Some(n) = call.repair_note {
+                    out.repair_notes.push(n);
+                }
+                out.rows.push(call.output);
+            }
+            Err((msg, usage)) => {
+                out.ok = false;
+                out.usage.0 += usage.0;
+                out.usage.1 += usage.1;
+                out.usage.2 += usage.2;
+                out.error.get_or_insert(msg);
+            }
+        }
+    }
+    if out.cells == 0 && out.error.is_none() {
+        out = AxisRun::failed("intent slices produced no cells".into());
+    }
+    out
 }
 
 fn de_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {

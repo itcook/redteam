@@ -430,12 +430,12 @@ async fn run_triage(
         Ok(h) => h,
         Err(e) => return report::error_report(manifest, lang, &e),
     };
-    let route_key = match crate::triage::scanner_route(cfg) {
+    let route_key = match crate::triage::triage_route(cfg) {
         Some(m) => m.name,
-        None => return report::error_report(manifest, lang, &JobFailure::new("missing_role", Some("scanner".into()))),
+        None => return report::error_report(manifest, lang, &JobFailure::new("missing_role", Some("reviewer".into()))),
     };
     // backend 构造失败 = 配置问题（与 review 同一口径）。
-    let registry = match crate::cli::build_registry_with(&triage_args(&base), cfg, over) {
+    let registry = match crate::cli::build_registry_for_triage(&triage_args(&base), cfg, over) {
         Ok(r) => r,
         Err(e) => return report::error_report(manifest, lang, &JobFailure::with_reason("config_invalid", None, e)),
     };
@@ -445,29 +445,14 @@ async fn run_triage(
         Ok(d) => d,
         Err(e) => return report::error_report(manifest, lang, &e),
     };
-    // 墙钟优化：按"剩余预算 / 预计波次"给每格封顶，单格不能吃掉整个 job 预算。
-    // 预计波次 = ceil(cells / provider 门宽)；cells 与 `triage::run` 的分片公式同源。
-    let files: Vec<&crate::evidence::git::FileChange> = changes.iter().filter(|c| !c.diff.trim().is_empty()).collect();
-    let modules: std::collections::BTreeSet<String> = files
-        .iter()
-        .map(|c| crate::triage::standards::module_of(&c.path))
-        .collect();
-    let cells = crate::triage::lenses::security_shard_count(files.len())
-        + crate::triage::lenses::drift_shard_count(modules.len())
-        + 1;
-    let provider_cap = registry
-        .provider_of(&route_key)
-        .and_then(|p| registry.cap_of(p))
-        .unwrap_or(4) as usize;
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let cell_timeout = crate::triage::cell_budget(remaining, cells, provider_cap);
+    // 墙钟优化在 `triage::run` 内做：I0 串行预算 + 波次预算（含等门）。
     let req = crate::triage::TriageRequest {
         repo: &repo,
         pr: &pr,
         changes: &changes,
         lang,
         manifest_cap_s: manifest.limits.wall_clock_s,
-        cell_timeout,
+        deadline,
         route_key,
     };
     let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::triage::Progress::default()));

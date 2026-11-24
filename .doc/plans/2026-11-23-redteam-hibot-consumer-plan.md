@@ -260,7 +260,7 @@ paths.repo ──► root（只读检出，HEAD 必须等于 pr.head_sha）
 |---|---|---|---|
 | 3.1 | **输入**：`pr_context`+`diff_patch`+`merge_base`（必需）；repo 检出按 Q4 冻结结果 | `src/triage/mod.rs` | 输入缺失 → `error` |
 | 3.2 | **`StandardsMap`**：逐模块 doc→linter→peer；`no-standard` 仅三者皆无 | `src/triage/standards.rs` | 三种 source 各命中 |
-| 3.3 | **三轴 lens + 扇出**：安全轴读 patch（7 类 sink 面，行内置信度 **0–10**，<8 丢弃；给不出 source→sink 路径的封顶 7）；漂移轴；意图轴。分片：安全 `min(4, ceil(files/6))`、漂移 `min(4, modules)`、意图单 cell；三轴并行，走 provider 子闸（**无 job 总闸**，见 Q15/D72）。三轴的行文本与 blockers 说明随 P15 语言 | `src/triage/lenses.rs`、`src/prompt/templates/triage-*.md` | 三轴各 1 fake backend → 行数正确；某轴失败 → `partial` 点名；`en_US` 下无中文残留（除引用原文） |
+| 3.3 | **三轴 lens + 扇出**：安全轴读 patch（7 类 sink 面，行内置信度 **0–10**，<8 丢弃；给不出 source→sink 路径的封顶 7）；漂移轴；**意图轴两阶段**（I0 串行抽 claims/overlap，I1..In 按 diff 切片验证 + scope creep，N 同安全）。分片：安全 `min(4, ceil(files/6))`、漂移 `min(4, modules)`；三轴模型取 **`roles.reviewer`**（2026-11-24 用户调整）；I0 之后三轴并行，走 provider 子闸（**无 job 总闸**，见 Q15/D72）。三轴的行文本与 blockers 说明随 P15 语言 | `src/triage/lenses.rs`、`src/prompt/templates/triage-*.md` | 四类 fake（security/drift/claims/slice）→ 行数正确；某轴失败 → `partial` 点名；slice 未全成 → 未验证 claim 不计 blockers；`en_US` 下无中文残留（除引用原文） |
 | 3.4 | **去重按轴分开**：安全/漂移按 `file+quote 归一+hint`；**意图未兑现项可能无代码锚 → 按声明身份去重**，不硬推 file+quote | `src/triage/tally.rs` | 无锚意图项不被误并；跨分片只计一次 |
 | 3.5 | **确定性 tally 与字段生成**（单点实现 + 表驱动单测）：<br>· `blockers = structural + intent_undelivered`（local 不计）<br>· `security_tier`：**2 仅限 supply-chain/CI 投毒/代码执行且 confidence≥8**；其它安全问题 1；无 0<br>· `convention_drift`：structural>0→structural；仅 local→local；否则 none<br>· `risk`：tier≥1 ∨ blockers≥3 → high；blockers≥1 ∨ scope_creep>0 → medium；否则 low<br>· `fit`（**2026-11-24 grill 定案，替代原 `[拟议]`**）：结构性漂移含 placement/naming/ownership/versioning 破坏 **或** 有声明未兑现 → needs-scope-decision；维护者（非作者、非 bot）评论指出重复且无未兑现 → possibly-redundant；否则 in-scope<br>· **`summary.routing`**：`focus`=top blockers 类别/文件（≤5）、`specs`=StandardsMap 的 **doc 来源**相对路径（去重、≤8）、`wall_clock_s`=risk 三档 high 100%/medium 75%/low 50%（下限 300s，≤ manifest）<br>· report `confidence` 0..1：**8/10→0.8**，单点函数 | `src/triage/tally.rs` | 覆盖需求 §4.1 每条口径；`blockers != structural+intent` 断言失败；tier2 白名单有反例（SQL 注入不升 2） |
 | 3.6 | **blockers 仅披露**：`extensions.redteam.blockers[]` 给 hibot 一个可定位列表（structural + intent 未兑现，可无锚）；**禁止把全部 findings 当阻塞项**；review 侧唯一输入仍是 `summary.routing`，**不读 blockers 数组**（blockers 只经 `routing.focus` 影响 review） | `src/job/report.rs` | findings 5 条 / blockers 2 条 → 两个数组不同；review 不读 blockers（断言） |
@@ -276,7 +276,7 @@ paths.repo ──► root（只读检出，HEAD 必须等于 pr.head_sha）
 3. `risk` 照本节公式；`fit` 用混合口径（见 3.5）。
 4. 意图声明只取 PR body + linked issues；title 仅摘要；comments 不作声明；`is_bot` 不作作者意图；维护者评论只用于 fit/重复；linked issue > body。
 5. `StandardsMap` 见 3.2；`routing.specs` 只放 doc 来源相对路径（≤8），linter/peer 只进 `extensions.axes`。
-6. 分片/预算见 3.3/3.5；不加 triage 配置块（复用 `roles.scanner`）。
+6. 分片/预算见 3.3/3.5；不加 triage 配置块（复用 `roles.reviewer`；2026-11-24 用户调整，triage 用 reviewer 的思考档位）。
 7. 3.6 为披露面：review 不读 blockers，阻断阈值仍由配置决定。
 8. 3.8 清单与上限见 3.8。
 

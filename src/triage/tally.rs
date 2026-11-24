@@ -111,6 +111,8 @@ pub struct ClaimRow {
     pub source: String,
     pub delivered: bool,
     pub note: String,
+    /// slice 全成（或该 claim 已有交付证据）才为 true；false 时不计入 undelivered/blockers。
+    pub verified: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -245,6 +247,8 @@ pub fn prepare(
     // ── 意图：声明只认 body / issue；按 (声明文本归一, 来源) 去重；scope creep 按标题归一 ──
     if let Some(intent) = intent {
         let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        // 未验证 claim 只披露、不计入 undelivered/blockers（协调者 2026-11-24 裁）。
+        let verification_complete = intent.verification_complete;
         for c in &intent.claims {
             let Some(source) = normalize_claim_source(&c.source) else {
                 out.drops.intent.note("invalid_claim_source", DroppedRow { file: None, line: None, surface: None, conf: None, reason: "invalid_claim_source".into() });
@@ -265,6 +269,7 @@ pub fn prepare(
                 source,
                 delivered: c.delivered,
                 note: c.note.trim().to_string(),
+                verified: c.delivered || verification_complete,
             });
         }
         let mut seen_creep: BTreeSet<String> = BTreeSet::new();
@@ -344,7 +349,7 @@ pub struct Tallied {
 pub fn tally(prepared: &Prepared, map: &StandardsMap, manifest_cap_s: u64, zh: bool) -> Tallied {
     let structural_count = prepared.drift.iter().filter(|d| d.drift == DriftKind::Structural).count() as u32;
     let local_count = prepared.drift.iter().filter(|d| d.drift == DriftKind::Local).count() as u32;
-    let intent_undelivered = prepared.claims.iter().filter(|c| !c.delivered).count() as u32;
+    let intent_undelivered = prepared.claims.iter().filter(|c| c.verified && !c.delivered).count() as u32;
     let scope_creep_count = prepared.scope_creep.len() as u32;
     let blockers_count = structural_count + intent_undelivered;
     let security_tier = security_tier(&prepared.security);
@@ -379,7 +384,7 @@ pub fn tally(prepared: &Prepared, map: &StandardsMap, manifest_cap_s: u64, zh: b
             "category": d.category,
         }));
     }
-    for c in prepared.claims.iter().filter(|c| !c.delivered) {
+    for c in prepared.claims.iter().filter(|c| c.verified && !c.delivered) {
         blockers.push(json!({
             "kind": "intent",
             "claim": c.claim,
@@ -442,7 +447,7 @@ pub fn fit_of(prepared: &Prepared) -> &'static str {
         d.drift == DriftKind::Structural
             && matches!(d.category.as_str(), "placement" | "naming" | "ownership" | "versioning")
     });
-    let undelivered = prepared.claims.iter().any(|c| !c.delivered);
+    let undelivered = prepared.claims.iter().any(|c| c.verified && !c.delivered);
     if placement_break || undelivered {
         "needs-scope-decision"
     } else if prepared.overlap.flagged {
@@ -487,7 +492,7 @@ pub fn focus_of(prepared: &Prepared, cap: usize) -> Vec<String> {
     for f in drift_files {
         push_unique(&mut out, f.to_string(), cap);
     }
-    for c in prepared.claims.iter().filter(|c| !c.delivered) {
+    for c in prepared.claims.iter().filter(|c| c.verified && !c.delivered) {
         let short: String = c.claim.chars().take(60).collect();
         push_unique(&mut out, format!("intent:{short}"), cap);
     }
@@ -656,7 +661,7 @@ mod tests {
         }];
         assert_eq!(fit_of(&p), "needs-scope-decision", "placement 破坏 → needs-scope-decision");
         p.drift.clear();
-        p.claims = vec![ClaimRow { claim: "x".into(), source: "body".into(), delivered: false, note: String::new() }];
+        p.claims = vec![ClaimRow { claim: "x".into(), source: "body".into(), delivered: false, note: String::new(), verified: true }];
         assert_eq!(fit_of(&p), "needs-scope-decision", "声明未兑现 → needs-scope-decision");
         p.claims.clear();
         p.overlap = MaintainerOverlap { flagged: true, author: "m".into(), quote: "dup".into() };
@@ -698,11 +703,12 @@ mod tests {
         let (_d, root) = repo_with(&[("src/a.rs", "let a = 1;\nlet b = 2;\n")]);
         let sec = vec![sec(5, 9, "r", "src/a.rs", "let a = 1;"), sec(5, 9, "r2", "src/a.rs", "let a = 1;")];
         let intent = IntentOutput {
+            verification_complete: true,
             claims: vec![
-                Claim { claim: "add X".into(), source: "body".into(), delivered: false, evidence: vec![], note: String::new() },
-                Claim { claim: "add X".into(), source: "body".into(), delivered: true, evidence: vec![], note: String::new() },
-                Claim { claim: "remove Y".into(), source: "issue#3".into(), delivered: false, evidence: vec![], note: String::new() },
-                Claim { claim: "from comment".into(), source: "comment".into(), delivered: false, evidence: vec![], note: String::new() },
+                Claim { id: String::new(), claim: "add X".into(), source: "body".into(), delivered: false, evidence: vec![], note: String::new() },
+                Claim { id: String::new(), claim: "add X".into(), source: "body".into(), delivered: true, evidence: vec![], note: String::new() },
+                Claim { id: String::new(), claim: "remove Y".into(), source: "issue#3".into(), delivered: false, evidence: vec![], note: String::new() },
+                Claim { id: String::new(), claim: "from comment".into(), source: "comment".into(), delivered: false, evidence: vec![], note: String::new() },
             ],
             scope_creep: vec![
                 ScopeCreep { title: "extra".into(), files: vec!["src/a.rs".into()], note: String::new() },
@@ -727,6 +733,27 @@ mod tests {
     }
 
     #[test]
+    fn unverified_claims_are_disclosed_but_never_blockers() {
+        let (_d, root) = repo_with(&[("src/a.rs", "let a = 1;\n")]);
+        let intent = IntentOutput {
+            claims: vec![Claim {
+                id: "c1".into(), claim: "x".into(), source: "body".into(), delivered: false,
+                evidence: vec![], note: String::new(),
+            }],
+            verification_complete: false,
+            ..Default::default()
+        };
+        let p = prepare(&root, &pr(), &changed(), &[], &[], Some(&intent));
+        assert_eq!(p.claims.len(), 1, "未验证 claim 仍披露");
+        assert!(!p.claims[0].verified);
+        let t = tally(&p, &StandardsMap::default(), 3600, false);
+        let s = t.summary.unwrap();
+        assert_eq!(s["intent_undelivered"], 0, "未验证不计 undelivered");
+        assert_eq!(s["blockers_count"], 0);
+        assert!(!t.focus.iter().any(|f| f.starts_with("intent:")));
+    }
+
+    #[test]
     fn overlap_requires_a_real_non_bot_non_author_comment_quote() {
         let (_d, root) = repo_with(&[("src/a.rs", "let a = 1;\n")]);
         let mut pr = pr();
@@ -735,6 +762,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(), is_bot: false,
         }];
         let intent = IntentOutput {
+            verification_complete: true,
             claims: vec![],
             scope_creep: vec![],
             maintainer_overlap: MaintainerOverlap {
@@ -758,8 +786,9 @@ mod tests {
         let (_d, root) = repo_with(&[("src/a.rs", "let a = 1;\n")]);
         let sec = vec![sec(4, 9, "r", "src/a.rs", "let a = 1;")];
         let intent = IntentOutput {
+            verification_complete: true,
             claims: (0..8)
-                .map(|i| Claim { claim: format!("claim {i}"), source: "body".into(), delivered: false, evidence: vec![], note: String::new() })
+                .map(|i| Claim { id: String::new(), claim: format!("claim {i}"), source: "body".into(), delivered: false, evidence: vec![], note: String::new() })
                 .collect(),
             ..Default::default()
         };
@@ -815,9 +844,10 @@ mod tests {
             })
             .collect();
         let intent = IntentOutput {
+            verification_complete: true,
             claims: vec![
-                Claim { claim: "claim one".into(), source: "body".into(), delivered: false, evidence: vec![], note: String::new() },
-                Claim { claim: "claim two".into(), source: "issue#1".into(), delivered: false, evidence: vec![], note: String::new() },
+                Claim { id: String::new(), claim: "claim one".into(), source: "body".into(), delivered: false, evidence: vec![], note: String::new() },
+                Claim { id: String::new(), claim: "claim two".into(), source: "issue#1".into(), delivered: false, evidence: vec![], note: String::new() },
             ],
             ..Default::default()
         };

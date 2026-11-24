@@ -10,7 +10,7 @@ pub mod standards;
 pub mod tally;
 
 use crate::config::OutputLang;
-use crate::domain::{Finding, Role};
+use crate::domain::Finding;
 use crate::evidence::git::FileChange;
 use crate::job::status::JobFailure;
 use crate::provider::registry::ProviderRegistry;
@@ -30,8 +30,8 @@ pub struct TriageRequest<'a> {
     pub lang: &'a OutputLang,
     /// manifest 的墙钟硬上限（秒）；`routing.wall_clock_s` 由它派生。
     pub manifest_cap_s: u64,
-    /// 单格预算（墙钟优化）：shot 取 `min(lease.per_turn(), cell_timeout)`。
-    pub cell_timeout: std::time::Duration,
+    /// 绝对截止时刻（manifest 墙钟）：I0 与波次预算都从这里扣除已用时间。
+    pub deadline: std::time::Instant,
     /// 三轴使用的模型（`roles.scanner` 的第一条；grill：不新增配置块）。
     pub route_key: String,
 }
@@ -81,6 +81,8 @@ fn patch_pairs(changes: &[FileChange]) -> Vec<(String, String)> {
 }
 
 /// 跑三轴（并发，只受 provider 门约束）。`progress` 在每轴完成时更新，取消后仍可取快照。
+/// 两阶段 intent：先串行 I0（claims + overlap），再按 diff 切片 map（兑现 + scope creep）。
+/// I0 失败 → intent 快速失败，不占波次门位；slice 未全成 → verification_complete=false。
 pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress: Arc<Mutex<Progress>>) -> TriageOutcome {
     let changed = changed_files(req.changes);
     let files = patch_pairs(req.changes);
@@ -94,36 +96,157 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
     }
 
     if files.is_empty() {
-        // 空 patch：没有可审计的注入/漂移面；意图轴仍判"声明是否兑现"。
+        // 空 patch：没有可审计的注入/漂移面；intent 仍判"声明是否兑现"（没有 diff = 无交付证据）。
         let mut p = progress.lock().unwrap();
         p.security = Some(lenses::AxisRun { ok: true, ..Default::default() });
         p.drift = Some(lenses::AxisRun { ok: true, ..Default::default() });
     }
 
-    // 先 poll intent（单 cell）：它不会因为分片把 provider 门占满而排在最后一波。
-    let (intent, sec, drift) = tokio::join!(
-        async {
-            let r = lenses::run_intent(registry, &req.route_key, req.lang, req.pr, &files, req.cell_timeout).await;
-            progress.lock().unwrap().intent = Some(r);
-        },
-        async {
-            if files.is_empty() {
-                return;
+    // ── I0：串行、小输入（不喂 diff）；预算封顶 25% 且 ≤150s，避免它吃掉整轮 ──
+    let remaining = req.deadline.saturating_duration_since(std::time::Instant::now());
+    let i0_budget = (remaining / 4).min(std::time::Duration::from_secs(150));
+    let claims_run = lenses::run_intent_claims(registry, &req.route_key, req.lang, req.pr, i0_budget).await;
+
+    // I0 之后重算波次预算：cells = security + drift + intent slices（I0 已在波次之外）。
+    let provider_cap = registry
+        .provider_of(&req.route_key)
+        .and_then(|p| registry.cap_of(p))
+        .unwrap_or(4) as usize;
+    let sec_cells = if files.is_empty() { 0 } else { lenses::security_shard_count(files.len()) };
+    let modules: std::collections::BTreeSet<String> =
+        files.iter().map(|(p, _)| standards::module_of(p)).collect();
+    let drift_cells = if files.is_empty() { 0 } else { lenses::drift_shard_count(modules.len()) };
+    let intent_slices = if claims_run.ok && !files.is_empty() {
+        lenses::security_shard_count(files.len())
+    } else {
+        0
+    };
+    let cells = (sec_cells + drift_cells + intent_slices).max(1);
+    let remaining = req.deadline.saturating_duration_since(std::time::Instant::now());
+    let wave_budget = cell_budget(remaining, cells, provider_cap);
+
+    let claims = claims_run.rows.first().cloned().unwrap_or_default();
+    if claims_run.ok {
+        let (intent, sec, drift) = tokio::join!(
+            // 先 poll intent slices：它们只有少量 cell，先拿门位；不再被分片挤到最后一波。
+            async {
+                let r = lenses::run_intent_slices(
+                    registry,
+                    &req.route_key,
+                    req.lang,
+                    req.pr,
+                    &claims.claims,
+                    &files,
+                    wave_budget,
+                )
+                .await;
+                let assembled = assemble_intent(&claims, &r);
+                let mut out = lenses::AxisRun {
+                    ok: r.ok,
+                    error: r.error,
+                    usage: (claims_run.usage.0 + r.usage.0, claims_run.usage.1 + r.usage.1, claims_run.usage.2 + r.usage.2),
+                    cells: claims_run.cells + r.cells,
+                    ..Default::default()
+                };
+                out.repair_notes.extend(claims_run.repair_notes.iter().cloned());
+                out.repair_notes.extend(r.repair_notes.iter().cloned());
+                // 即使 slice 未全成，也保留已抽出的 claims/overlap 与已交付证据（partial 可披露）。
+                out.rows.push(assembled);
+                progress.lock().unwrap().intent = Some(out);
+            },
+            async {
+                if files.is_empty() {
+                    return;
+                }
+                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, wave_budget).await;
+                progress.lock().unwrap().security = Some(r);
+            },
+            async {
+                if files.is_empty() {
+                    return;
+                }
+                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, wave_budget).await;
+                progress.lock().unwrap().drift = Some(r);
             }
-            let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, req.cell_timeout).await;
-            progress.lock().unwrap().security = Some(r);
-        },
-        async {
-            if files.is_empty() {
-                return;
-            }
-            let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, req.cell_timeout).await;
-            progress.lock().unwrap().drift = Some(r);
+        );
+        let _ = (intent, sec, drift);
+    } else {
+        // I0 失败：intent 轴直接失败（不占波次门位），security/drift 照常跑。
+        {
+            let mut p = progress.lock().unwrap();
+            p.intent = Some(lenses::AxisRun {
+                ok: false,
+                error: claims_run.error.clone().or_else(|| Some("intent claims extraction failed".into())),
+                usage: claims_run.usage,
+                cells: claims_run.cells,
+                ..Default::default()
+            });
         }
-    );
-    let _ = (sec, drift, intent);
+        let (sec, drift) = tokio::join!(
+            async {
+                if files.is_empty() {
+                    return;
+                }
+                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, wave_budget).await;
+                progress.lock().unwrap().security = Some(r);
+            },
+            async {
+                if files.is_empty() {
+                    return;
+                }
+                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, wave_budget).await;
+                progress.lock().unwrap().drift = Some(r);
+            }
+        );
+        let _ = (sec, drift);
+    }
+
     let snapshot = progress.lock().unwrap().clone();
     finalize(req, &snapshot, true)
+}
+
+/// 把 I0 的 claims/overlap + 各 slice 的 delivered/scope creep 合成一个 IntentOutput。
+fn assemble_intent(claims_output: &lenses::IntentClaimsOutput, slices: &lenses::AxisRun<lenses::IntentSliceOutput>) -> lenses::IntentOutput {
+    let mut claims = claims_output.claims.clone();
+    let idx: std::collections::BTreeMap<String, usize> = claims
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.clone(), i))
+        .collect();
+    let mut scope: Vec<lenses::ScopeCreep> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    let mut notes = claims_output.notes.clone();
+    for slice in &slices.rows {
+        for d in &slice.delivered {
+            if let Some(&i) = idx.get(&d.id) {
+                claims[i].delivered = true;
+                claims[i].evidence.extend(d.evidence.clone());
+                if !d.note.trim().is_empty() {
+                    if claims[i].note.is_empty() {
+                        claims[i].note = d.note.trim().to_string();
+                    } else {
+                        claims[i].note.push_str("; ");
+                        claims[i].note.push_str(d.note.trim());
+                    }
+                }
+            }
+            // 未知 id 忽略（模型幻觉；不猜）。
+        }
+        for s in &slice.scope_creep {
+            let key = s.title.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+            if seen.insert(key) {
+                scope.push(s.clone());
+            }
+        }
+        notes.extend(slice.notes.clone());
+    }
+    lenses::IntentOutput {
+        claims,
+        scope_creep: scope,
+        maintainer_overlap: claims_output.maintainer_overlap.clone(),
+        notes,
+        verification_complete: slices.ok,
+    }
 }
 
 /// 把（可能不完整的）三轴结果收敛成报告素材。`completed=false` → 永不生成 `summary`。
@@ -188,7 +311,13 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
         usage.1 += a.usage.1;
         usage.2 += a.usage.2;
         let notes = a.rows.iter().flat_map(|r| r.notes.clone()).collect::<Vec<_>>();
-        axes.push(axis_json("intent", a.ok, a.rows.len(), a.cells, a.error.as_deref(), a.usage, &a.repair_notes, Value::Null, Some(notes)));
+        let disclosure = a.rows.first().map(|r| json!({
+            "claims": r.claims.len(),
+            "delivered": r.claims.iter().filter(|c| c.delivered).count(),
+            "scope_creep": r.scope_creep.len(),
+            "verification_complete": r.verification_complete,
+        })).unwrap_or(Value::Null);
+        axes.push(axis_json("intent", a.ok, a.rows.len(), a.cells, a.error.as_deref(), a.usage, &a.repair_notes, disclosure, Some(notes)));
         if !a.ok {
             reasons.push(JobFailure::new("triage_axis_failed", Some("intent".into())));
         }
@@ -287,21 +416,15 @@ pub fn template_hash() -> String {
         lenses::SYSTEM_TPL,
         lenses::SECURITY_TPL,
         lenses::DRIFT_TPL,
-        lenses::INTENT_TPL,
+        lenses::INTENT_CLAIMS_TPL,
+        lenses::INTENT_SLICE_TPL,
     ])
 }
 
-/// 三轴使用的模型：`roles.scanner` 的第一条（确定性顺序 = 配置的 BTreeMap 顺序）。
-pub fn scanner_route(cfg: &crate::config::Config) -> Option<crate::config::EffectiveModel> {
-    cfg.active_roles().scanners.into_iter().next()
-}
-
-/// 轻量校验：三轴都要 scanner 角色（P2）；缺 → `missing_role`。
-pub fn ensure_roles(cfg: &crate::config::Config) -> Result<(), JobFailure> {
-    if cfg.active_roles().scanners.is_empty() {
-        return Err(JobFailure::new("missing_role", Some(Role::Scanner.as_str().to_string())));
-    }
-    Ok(())
+/// 三轴使用的模型：`roles.reviewer` 的第一条（2026-11-24 用户调整：triage 用 reviewer 的思考档位，
+/// 不再用 scanner；确定性顺序 = 配置的 BTreeMap 顺序）。
+pub fn triage_route(cfg: &crate::config::Config) -> Option<crate::config::EffectiveModel> {
+    cfg.active_roles().reviewers.into_iter().next()
 }
 
 #[cfg(test)]

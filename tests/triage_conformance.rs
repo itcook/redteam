@@ -116,7 +116,7 @@ fn read_report(job: &Path) -> serde_json::Value {
 fn config() -> String {
     serde_json::json!({
         "providers": {"p1": {"kind": "openai", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
-            "models": {"s": {"roles": {"scanner": {}}}}}},
+            "models": {"s": {"roles": {"scanner": {}}}, "r": {"roles": {"reviewer": {}}}}}},
         "language": "en_US"
     })
     .to_string()
@@ -139,7 +139,8 @@ fn turn(text: &str) -> AssistantTurn {
 struct TriageFake {
     security: String,
     drift: String,
-    intent: String,
+    claims: String,
+    slice: String,
 }
 
 fn flatten(messages: &[ChatMessage]) -> String {
@@ -164,8 +165,10 @@ impl ChatBackend for TriageFake {
             Ok(turn(&self.security))
         } else if text.contains("# Axis: convention drift") {
             Ok(turn(&self.drift))
-        } else if text.contains("# Axis: intent vs diff") {
-            Ok(turn(&self.intent))
+        } else if text.contains("# Axis: intent claims") {
+            Ok(turn(&self.claims))
+        } else if text.contains("# Axis: intent slice") {
+            Ok(turn(&self.slice))
         } else {
             Err(ProviderError::Unavailable("unknown triage axis".into()))
         }
@@ -190,10 +193,15 @@ fn good_fake() -> Arc<TriageFake> {
             "standard": "src/AGENTS.md#layout", "note": "entrypoint helper added to app.js"
         }]})
         .to_string(),
-        intent: serde_json::json!({
-            "claims": [{"claim": "add input validation", "source": "body", "delivered": false, "evidence": [], "note": "no validation added"}],
-            "scope_creep": [{"title": "adds eval helper", "files": ["src/app.js"], "note": "not stated"}],
+        claims: serde_json::json!({
+            "claims": [{"claim": "add input validation", "source": "body", "note": ""}],
             "maintainer_overlap": {"flagged": false, "author": "", "quote": ""},
+            "notes": []
+        })
+        .to_string(),
+        slice: serde_json::json!({
+            "delivered": [],
+            "scope_creep": [{"title": "adds eval helper", "files": ["src/app.js"], "note": "not stated"}],
             "notes": []
         })
         .to_string(),
@@ -325,6 +333,57 @@ async fn en_us_output_has_no_chinese_residue() {
     // 被引用的源码与路径可含任意字符；本夹具里没有中文源码。
     text.retain(|c| c != ' ');
     assert!(!text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "en_US 报告不得有中文残留: {r}");
+}
+
+#[tokio::test]
+async fn intent_slice_delivers_claims_and_discloses_counts() {
+    let fx = make_job(&config(), "body", true);
+    let mut fake = (*good_fake()).clone();
+    fake.claims = serde_json::json!({
+        "claims": [
+            {"claim": "add input validation", "source": "body", "note": ""},
+            {"claim": "remove legacy path", "source": "issue#1", "note": ""}
+        ],
+        "maintainer_overlap": {"flagged": false, "author": "", "quote": ""},
+        "notes": []
+    })
+    .to_string();
+    fake.slice = serde_json::json!({
+        "delivered": [{"id": "c1", "evidence": [{"file": "src/app.js", "line_start": 5, "line_end": 6}], "note": ""}],
+        "scope_creep": [],
+        "notes": []
+    })
+    .to_string();
+    let over = fake_override(Arc::new(fake));
+    let code = redteam::job::run::run_with(JobKind::Triage, &fx.job, Some(over.as_ref())).await;
+    assert_eq!(code, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok", "{r}");
+    assert_eq!(r["summary"]["intent_undelivered"], 1, "c1 已交付，c2 未兑现");
+    let intent = r["extensions"]["redteam"]["axes"].as_array().unwrap().iter().find(|a| a["axis"] == "intent").unwrap();
+    assert_eq!(intent["claims"], 2);
+    assert_eq!(intent["delivered"], 1);
+    assert_eq!(intent["verification_complete"], true);
+}
+
+#[tokio::test]
+async fn unfinished_intent_slices_do_not_create_intent_blockers() {
+    let fx = make_job(&config(), "body", true);
+    let mut fake = (*good_fake()).clone();
+    fake.slice = "not json".into();
+    let over = fake_override(Arc::new(fake));
+    let code = redteam::job::run::run_with(JobKind::Triage, &fx.job, Some(over.as_ref())).await;
+    assert_eq!(code, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "partial", "{r}");
+    assert!(r.get("summary").is_none());
+    let blockers = r["extensions"]["redteam"]["blockers"].as_array().unwrap();
+    assert!(!blockers.iter().any(|b| b["kind"] == "intent"), "未验证 claim 不得成 blocker: {r}");
+    assert!(blockers.iter().any(|b| b["kind"] == "structural"));
+    let intent = r["extensions"]["redteam"]["axes"].as_array().unwrap().iter().find(|a| a["axis"] == "intent").unwrap();
+    assert_eq!(intent["ok"], false);
+    assert_eq!(intent["verification_complete"], false);
+    assert_eq!(intent["claims"], 1, "I0 的 claims 仍披露");
 }
 
 /// 3.6 + 3.9 的接缝：review 消费 triage 报告时只读 `summary.routing`（blockers 数组不进投影）。
