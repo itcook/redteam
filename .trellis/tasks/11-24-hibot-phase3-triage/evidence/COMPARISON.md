@@ -152,3 +152,16 @@
 - per-cell 预算：security 44KB ≈ 373s，实测 3 cells 共 272s；drift 44KB+pack，实际可用 <373s（排队后只剩 49.9s）。
 - **剩余问题**：join 顺序是 intent → security → drift，drift 永远最后拿门；cap=4 时 security(3)+intent(2) 已占满，drift 只能等。需要 per-axis 最小配额或 round-robin 调度。
 - 原始报告：`report.hiapi-backend-pr-333-glm54budget.json`（I0 73.6s）、`...-glm54budget2.json`（I0 120s）、`...-deepseekbudget.json`。
+
+### 预算 v1 后续三次 5.4 验证（门公平性 / 字节均衡）
+
+| 轮次 | 改动 | 墙钟 | status | security | drift | intent |
+|---|---|---|---|---|---|---|
+| `-glm54budget2` | I0 基线 120s | 840.5s | partial | ok，272s | 1/3（等门后只剩 49.9s） | **ok：20/20 delivered，839s** |
+| `-glm54budget3` | 等门不再吃 cell 预算 | 675.2s | partial | 2/3（64KB shard 538s 在飞） | **ok，3/3** | I0 网络超时（attempts=2，last_error=network timeout） |
+| `-glm54budget4` | 分片按字节均衡 | 496.1s | partial | ok | 2/3（169.8s 在飞） | I0 ok + 1 slice 391s 在飞 |
+
+- 字节均衡后 security 稳定完成；drift 从“0/3 饿死”提升到 2/3；intent 的 slice 仍会因 5.4 单次 >390s 而超时。
+- 诊断为 **5.4 high 的单次调用方差大**（有时 300s 内完成 3 slice，有时 391s 不返回），不是预算公式或网关重试； 
+  网络超时只在 `-glm54budget3` 的 I0 出现一次（`last_error=network timeout`，attempts=2）。
+- DeepSeek high 在同预算下 251.8s / ok / tier1 / blockers0，intent 4 cells 全成——**快模型下 scale 预算不增加墙钟**。

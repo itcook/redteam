@@ -283,6 +283,28 @@ fn patch_block(files: &[(String, String)]) -> String {
     out
 }
 
+/// 按权重（字节）均衡分片：每次把下一个 item 放进当前最轻的 bin。
+/// 与按文件数均分不同，避免出现 24/64/44KB 这种“文件数均衡、字节失衡”的 shard。
+pub fn balanced_chunks_weighted<T: Clone>(
+    items: &[T],
+    n: usize,
+    weight: impl Fn(&T) -> usize,
+) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return vec![Vec::new()];
+    }
+    let n = n.clamp(1, items.len());
+    let mut bins: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
+    let mut sums = vec![0usize; n];
+    for item in items {
+        let i = (0..n).min_by_key(|&i| sums[i]).unwrap_or(0);
+        sums[i] += weight(item);
+        bins[i].push(item.clone());
+    }
+    bins.retain(|b| !b.is_empty());
+    bins
+}
+
 /// 把 `items` 顺序均分成 `n` 段（保持相对顺序；空段不产生）。
 pub fn balanced_chunks<T: Clone>(items: &[T], n: usize) -> Vec<Vec<T>> {
     if items.is_empty() {
@@ -311,7 +333,7 @@ pub async fn run_security(
     hard_deadline: std::time::Instant,
 ) -> AxisRun<SecurityRow> {
     let t0 = std::time::Instant::now();
-    let shards = balanced_chunks(files, shard_count.max(1));
+    let shards = balanced_chunks_weighted(files, shard_count.max(1), |(_, d)| d.len());
     let system = shared_system(lang);
     let tail = SECURITY_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
     let futs = shards.iter().enumerate().map(|(i, shard)| {
@@ -322,17 +344,15 @@ pub async fn run_security(
         let cell_budget = budget::cell_timeout(budget::slice_kb(shard), 0.0);
         async move {
             let hard = tokio::time::Instant::from_std(hard_deadline);
-            let now = tokio::time::Instant::now();
-            let budget = cell_budget.min(hard.saturating_duration_since(now));
-            if budget.is_zero() {
-                return Err((i, "no budget left".to_string(), (0, 0, 0), 0));
-            }
-            let cell_deadline = now + budget;
-            let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
+            // 等门由全局 deadline 兜底；cell 预算只算模型工作时间（否则排队的轴会被饿死）。
+            let lease = match lease_with_budget(registry, route_key, hard).await {
                 Ok(l) => l,
                 Err(e) => return Err((i, e, (0, 0, 0), 0)),
             };
-            let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let budget = cell_budget.min(hard.saturating_duration_since(tokio::time::Instant::now()));
+            if budget.is_zero() {
+                return Err((i, "no budget left".to_string(), (0, 0, 0), 0));
+            }
             let blocks = vec![
                 block(format!("# Axis: security\n{header}"), false),
                 block(patch, true),
@@ -395,7 +415,8 @@ pub async fn run_drift(
         }
         by_module.entry(m).or_default().push((path.clone(), diff.clone()));
     }
-    let shards = balanced_chunks(&modules, shard_count.max(1));
+    let module_weight = |m: &String| by_module.get(m).map(|fs| fs.iter().map(|(_, d)| d.len()).sum()).unwrap_or(0);
+    let shards = balanced_chunks_weighted(&modules, shard_count.max(1), module_weight);
     let lang_zh = lang.value.starts_with("zh");
     let system = shared_system(lang);
     // 每个 shard 只带自己模块的标准包（否则全量 pack 会重复进每个 cell，白白放大输入与延迟）。
@@ -420,17 +441,14 @@ pub async fn run_drift(
         let module_list = shard.join(", ");
         async move {
             let hard = tokio::time::Instant::from_std(hard_deadline);
-            let now = tokio::time::Instant::now();
-            let budget = cell_budget.min(hard.saturating_duration_since(now));
-            if budget.is_zero() {
-                return Err(("no budget left".to_string(), (0, 0, 0)));
-            }
-            let cell_deadline = now + budget;
-            let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
+            let lease = match lease_with_budget(registry, route_key, hard).await {
                 Ok(l) => l,
                 Err(e) => return Err((e, (0, 0, 0))),
             };
-            let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let budget = cell_budget.min(hard.saturating_duration_since(tokio::time::Instant::now()));
+            if budget.is_zero() {
+                return Err(("no budget left".to_string(), (0, 0, 0)));
+            }
             let blocks = vec![
                 block(format!("# Axis: convention drift\nmodules in this shard: {module_list}\n"), false),
                 block(pack, false),
@@ -560,7 +578,7 @@ pub async fn run_intent_slices(
         out.elapsed_ms = t0.elapsed().as_millis() as u64;
         return out;
     }
-    let shards = balanced_chunks(files, shard_count.max(1));
+    let shards = balanced_chunks_weighted(files, shard_count.max(1), |(_, d)| d.len());
     let system = shared_system(lang);
     let tail = INTENT_SLICE_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
     let mut claims_text = String::from("# Claims (canonical ids; refer to them by id only)\n");
@@ -598,17 +616,14 @@ pub async fn run_intent_slices(
             let cell_budget = budgets[i];
             async move {
                 let hard = tokio::time::Instant::from_std(hard_deadline);
-                let now = tokio::time::Instant::now();
-                let budget = cell_budget.min(hard.saturating_duration_since(now));
-                if budget.is_zero() {
-                    return Err(("no budget left".to_string(), (0, 0, 0)));
-                }
-                let cell_deadline = now + budget;
-                let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
+                let lease = match lease_with_budget(registry, route_key, hard).await {
                     Ok(l) => l,
                     Err(e) => return Err((e, (0, 0, 0))),
                 };
-                let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let budget = cell_budget.min(hard.saturating_duration_since(tokio::time::Instant::now()));
+                if budget.is_zero() {
+                    return Err(("no budget left".to_string(), (0, 0, 0)));
+                }
                 let blocks = vec![
                     block(header, false),
                     block(claims_text, false),
@@ -695,6 +710,19 @@ mod tests {
         assert_eq!(chunks, vec![vec![0, 1, 2], vec![3, 4], vec![5, 6]]);
         assert_eq!(balanced_chunks(&items, 9).len(), 7, "n 不超过项数");
         assert_eq!(balanced_chunks::<u32>(&[], 3), vec![Vec::<u32>::new()]);
+    }
+
+    #[test]
+    fn weighted_chunks_balance_bytes_not_file_count() {
+        let files: Vec<(String, String)> = [64_000usize, 24_000, 20_000, 15_000, 5_000]
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| (format!("f{i}.rs"), "x".repeat(n)))
+            .collect();
+        let chunks = balanced_chunks_weighted(&files, 2, |(_, d)| d.len());
+        let sums: Vec<usize> = chunks.iter().map(|c| c.iter().map(|(_, d)| d.len()).sum()).collect();
+        assert_eq!(sums.len(), 2);
+        assert!(sums.iter().max().unwrap() - sums.iter().min().unwrap() <= 20_000, "{sums:?}");
     }
 
     #[test]
