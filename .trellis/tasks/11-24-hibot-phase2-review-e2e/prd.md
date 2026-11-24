@@ -89,7 +89,10 @@ paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
 | `be4c7f9` | 附录 D/E 补 Phase 2 新键/新码；无 prior 时不写 `prior_routing` |
 | `e9cb9cd` | 收口评审修正（dismissed 计数/判定、中断报告事实、绝对 deadline、quote 子串、完整性、patch 边界、2.3/2.7 证据） |
 | `3e6e4c0` | dismissed+REFUTED 判例 + 证据日志 |
-| 本轮 | 二轮收口：refuted 在共同映射点收口、verdict 重算保留 ScanOnly/窗口口径、deadline 溢出错误路径、diff 读 blob、2.3 走生产投影入口、2.7 refuter 判决正文 |
+| `cb0ab1f` | 二轮收口：refuted 共同映射点、verdict 语义、deadline 溢出、diff 读 blob、生产投影阈值证据、refuter 判决正文 |
+| `f29dadf` | 三轮收口：quote 字节安全/CRLF、counted 口径、prior 复用 renderer、超时/缺 blob 集成反例、git 读取约束 |
+| `b3b03a6` | 2.6 报告级反例（浅克隆 / 无共同祖先） |
+| `c92e048` | 四轮收口：spec 共享预算与真实接纳、quote 反例精准化、无共同祖先真反例、准备阶段超时、job git 读取约束 |
 
 ### 关键实现
 
@@ -101,11 +104,11 @@ paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
 
 ### 验证
 
-- `cargo test`：1072 lib + 21 bin + 4 capabilities + 22 job_conformance + 7 packaging + 24 e2e，全绿（exit 0）。
+- `cargo test`（受测提交 `c92e048`，工作树 clean）：1073 lib + 21 bin + 4 capabilities + 23 job_conformance + 7 packaging + 24 e2e，全绿（exit 0）。
 - `make verify`：exit 0（codex-skills 与 `dist/config.schema.json` 零 diff，packaging 7/7）。
 - capabilities 用 hibot `audit-capabilities.schema.json` 原位只读校验：PASS。
-- 原文日志：`evidence/cargo-test.log`、`evidence/make-verify.log`；命令、退出码与提交 SHA 记在 `evidence/SUMMARY.md`
-  （日志本身不含退出码）。
+- 原文日志与元信息：`evidence/cargo-test.log`、`evidence/make-verify.log`、`evidence/SUMMARY.md`
+  （记录受测提交 SHA、运行前工作树状态与两个退出码；日志本身不含退出码）。
 - 收口评审修正后补的判例：浅克隆 / base commit 对象被删 / 非 SHA revision / 带引号 patch 路径 /
   行尾空格属于内容 / 行内子串 quote / 中断报告共享运行事实 / dismissed+REFUTED 仍 `refuted=false` /
   非默认阈值下 prior 前后生效阈值相同 / 三类模型 prompt 语言槽。
