@@ -37,6 +37,10 @@ libc = "0.2"
 # 台账/评审史持久层（.redteam/proj.db）。bundled：sqlite 编译进二进制,零系统依赖。
 # turso embedded 对比后因 beta 定案不用、不留期权(见 .doc/design/2026-07-03 台账机器化)。
 rusqlite = { version = "0.32", features = ["bundled"] }
+# 自更新（计划 §10 / 7.4）：解 tar.gz + 版本比较。均为纯 Rust，无 OpenSSL。
+flate2 = "1"
+tar = "0.4"
+semver = "1"
 
 [dev-dependencies]
 # 测试 fixture 用临时目录/文件（e2e + 单元测试大量消费）。SCIP 语义引擎曾在运行期用它建

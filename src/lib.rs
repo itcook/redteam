@@ -20,4 +20,5 @@ pub mod provider;
 pub mod risk;
 pub mod state;
 pub mod tools;
+pub mod update;
 pub mod verdict;
