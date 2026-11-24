@@ -1,7 +1,7 @@
 BIN := plugins/redteam/bin/darwin/aarch64/redteam
 TARGET := aarch64-apple-darwin
 
-.PHONY: all gen build verify
+.PHONY: all gen build verify schema
 
 all: build gen
 
@@ -25,7 +25,12 @@ build:
 # （最后重建于 feebc92，2026-09-04）并入库；它是 M21 对照基线（design 铁律 6），本分支不重建、不覆盖。需要重建时
 # 切到 dev 检出用其 Makefile 的 build 目标。
 
-# 本地等价 CI 防漂移：重生成后无 git 改动
-verify: gen
+# 本地等价 CI 防漂移：重生成后无 git 改动（codex-skills 镜像 + 配置 schema 生成物）
+verify: gen schema
 	git diff --exit-code plugins/redteam/codex-skills/
+	git diff --exit-code dist/config.schema.json
 	cargo test --test packaging
+
+# 配置契约生成物（P17 / 1.9）：schema 从类型 derive，入库防漂移。
+schema:
+	cargo run --quiet -- config schema --out dist/config.schema.json
