@@ -379,6 +379,18 @@ mod tests {
         hb.shutdown();
     }
 
+    /// `Drop`（job future 被取消/提前释放）也停写：join 后文件字节不变。
+    #[tokio::test]
+    async fn drop_stops_writes() {
+        let d = tempfile::tempdir().unwrap();
+        let hb = Heartbeat::start(d.path(), "J-drop");
+        let path = d.path().join("state.json");
+        let before = std::fs::read(&path).unwrap();
+        drop(hb);
+        tokio::time::sleep(TICK + Duration::from_millis(300)).await;
+        assert_eq!(std::fs::read(&path).unwrap(), before, "Drop 后不再写 state.json");
+    }
+
     /// `set_phase(Finishing)` 从 preparing 直接调用也要补一帧 running（不跳段）。
     #[tokio::test]
     async fn set_phase_finishing_does_not_skip_running() {
