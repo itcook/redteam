@@ -1,0 +1,191 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:aee7fdcd531c1bead8154b6184c30dc3634381d67df8c0b123d263f6e81f65eb",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_client.go",
+      "line_start": 286,
+      "line_end": 286,
+      "quote": "{\"role\": \"user\", \"content\": text},",
+      "title": "Security (surface 5): injection",
+      "body": "Reachability: Feishu event field event.message.content is decoded at service/feishu_finance_agent.go:319 into `text`, persisted as RawText at service/feishu_finance_agent.go:334, passed to parseFeishuFinanceAgentCommand at service/feishu_finance_agent.go:359, embedded verbatim as the LLM user message at service/feishu_finance_agent_client.go:286, and POSTed to the configured LLM endpoint at service/feishu_finance_agent_client.go:349; the model's structured output becomes the plan that, after card confirmation, is executed by executeFeishuFinanceAgentPlan via model.AddAffPromotionUsers and model.GrantAdminCredits.\nNote: Prompt injection into the instruction-parsing LLM: chat text (group messages or third-party content pasted by the operator, both explicitly treated as untrusted in the file's own threat-model comment) reaches the model unescaped, and the model output is converted into privileged writes (promotion enrollment, per-user commission rate, withdrawal switch, credit grants up to 1,000,000 per action). Mitigations present but not breaking the path: sender must be whitelisted and still Root at both message and confirm time (authorizeFeishuFinanceAgentOperator), target account must appear verbatim in the raw text (feishuFinanceAgentTargetMentioned), numeric bounds are clamped server-side (buildFeishuFinanceAgentPlan), and the confirm card shows the raw text plus injection warnings (feishuFinanceAgentInjectionWarningText).",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:7ca6f9432daae2bf0ad0489da3f9fdc9e8f163910b7231192ee0e049fc4f6284",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_ws.go",
+      "line_start": 101,
+      "line_end": 106,
+      "quote": "if domain := feishuFinanceAgentWSDomain(cfg.OpenAPIBase); domain != \"\" {\n\t\topts = append(opts, larkws.WithDomain(domain))\n\t}\n\n\tclient := larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...)\n\treturn client.Start(context.Background())",
+      "title": "Security (surface 7): SSRF",
+      "body": "Reachability: env var FEISHU_FINANCE_AGENT_OPENAPI_BASE read at setting/feishu_finance_agent_setting.go:32 (os.Getenv -> FeishuFinanceAgentSetting.OpenAPIBase) -> setting.GetFeishuFinanceAgentSetting() at service/feishu_finance_agent_ws.go:35 -> cfg passed to runFeishuFinanceAgentWS -> runFeishuFinanceAgentWSSession -> feishuFinanceAgentWSDomain(cfg.OpenAPIBase) at line 101 (service/feishu_finance_agent_ws.go:111-119 only trims whitespace/\"/open-apis\", no host allowlist or scheme validation) -> larkws.WithDomain(domain) at line 102 -> larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...) at line 105 -> client.Start at line 106 dials an outbound WebSocket to the env-chosen host\nNote: The long-connection endpoint is taken verbatim from an environment variable with no allowlist or scheme/host validation. A malicious or misconfigured FEISHU_FINANCE_AGENT_OPENAPI_BASE makes the process open an outbound WebSocket to an arbitrary host, and the SDK hands the Feishu AppID/AppSecret to that host during connection setup (credential exfiltration), after which all IM/card events that drive credit grants and commission changes are supplied by the attacker-chosen endpoint. The source is deployment environment configuration rather than remote user input, which bounds real-world likelihood; the comment '本地冒烟可指向假服务' shows this is an intentional but unvalidated override knob.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 118540,
+    "output_tokens": 70654,
+    "cached_input_tokens": 54912,
+    "wall_clock_ms": 467036
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 393214,
+          "ok": true,
+          "repair_notes": [
+            "triage-security: first turn parse failed (finish=max_tokens, text_len=1591, head=\"{\\\"rows\\\": [{\\\"file\\\": \\\"service/feishu_finance_agent_client.go\\\", \\\"line_start\\\": 286, \"); repaired"
+          ],
+          "rows": 2,
+          "usage": {
+            "cached_input_tokens": 54912,
+            "input_tokens": 66627,
+            "output_tokens": 58435
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 94647,
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 51913,
+            "output_tokens": 12219
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 73654,
+          "error": "timeout: triage cell `triage-intent-claims` exceeded its 73.652328375s budget (attempts=1 last_call_ms=None in_flight_ms=Some(73654) last_finish=None last_text_len=None last_error=None)",
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:intent",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

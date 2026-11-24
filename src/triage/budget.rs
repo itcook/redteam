@@ -12,9 +12,9 @@ pub const SAFETY: f64 = 1.15;
 pub const MIN_CELL_S: f64 = 120.0;
 pub const MAX_CELL_S: f64 = 600.0;
 
-pub const I0_BASE_S: f64 = 60.0;
+pub const I0_BASE_S: f64 = 120.0;
+pub const I0_MAX_S: f64 = 240.0;
 pub const I0_PER_KB_S: f64 = 2.0;
-pub const I0_MAX_S: f64 = 180.0;
 
 /// 目标单切片大小；分片数 = min(4, ceil(total_kb/45), ceil(files/6))。
 pub const TARGET_SLICE_KB: f64 = 45.0;
@@ -77,9 +77,11 @@ mod tests {
 
     #[test]
     fn i0_timeout_scales_with_text() {
-        assert_eq!(i0_timeout(0.0).as_secs(), 60);
-        assert_eq!(i0_timeout(5.0).as_secs(), 70);
-        assert_eq!(i0_timeout(1_000.0).as_secs(), 180, "上限");
+        // v1.1 校准：GLM-5.4 在 73.6s 内未返回 claims（in-flight），5.3 在 150s 内也未完成；
+        // 基线抬到 120s、上限 240s。
+        assert_eq!(i0_timeout(0.0).as_secs(), 120);
+        assert_eq!(i0_timeout(5.0).as_secs(), 130);
+        assert_eq!(i0_timeout(1_000.0).as_secs(), 240, "上限");
     }
 
     #[test]

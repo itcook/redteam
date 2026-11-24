@@ -135,3 +135,20 @@
   不是我们的重试链或输出上限。
 - 结论：要拿完整 intent，需要给 slice 更大的单格预算（把 intent 的预算份额提高/减少波次），
   或换更快的模型/更低 reasoning；单纯“用剩余预算重试”只在单次调用能在重试预算内返回时才有意义。
+
+## 预算 v1（scale-based）验证（2026-11-24）
+
+常量：`BASE=60s / PER_KB=6s / SAFETY=1.15 / MIN=120 / MAX=600`；I0 初版 60–180s，实测后调到 **120–240s**。
+
+### backend #333
+
+| 模型 | 墙钟 | status | security | drift | intent | 备注 |
+|---|---|---|---|---|---|---|
+| GLM-5.4 high（I0 60s 基线） | 467.9s | partial | ok，393s | ok，94.6s | **I0 73.6s 超时** | I0 文本预算太低；据此把 I0 基线抬到 120s |
+| **GLM-5.4 high（I0 120s 基线）** | **840.5s** | partial | ok，272s，4 行（2 行 <8 丢） | **1/3 cells**；等门后只剩 49.9s 超时 | **ok：20 claims / 20 delivered / 3 creep，839s，complete** | intent 首次完整；drift 被 security+intent 占满门饿死 |
+| **DeepSeek high（同预算）** | **251.8s** | **ok** | ok，3 cells | ok，3 cells | ok，4 cells | tier1 / blockers0 / local2 / creep4 |
+
+- 规模分片：backend #333 = 3 片（130KB / 13 文件），与旧公式一致；sites #328 按新公式应为 3 片（旧公式 4 片，本轮未跑）。
+- per-cell 预算：security 44KB ≈ 373s，实测 3 cells 共 272s；drift 44KB+pack，实际可用 <373s（排队后只剩 49.9s）。
+- **剩余问题**：join 顺序是 intent → security → drift，drift 永远最后拿门；cap=4 时 security(3)+intent(2) 已占满，drift 只能等。需要 per-axis 最小配额或 round-robin 调度。
+- 原始报告：`report.hiapi-backend-pr-333-glm54budget.json`（I0 73.6s）、`...-glm54budget2.json`（I0 120s）、`...-deepseekbudget.json`。

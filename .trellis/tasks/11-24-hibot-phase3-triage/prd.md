@@ -75,7 +75,7 @@ hibot audit 执行单元接入的 U4 单元（协调者 session `01a20ba0` 派�
 
 - `cell_timeout = clamp((60 + 6*diff_kb + extra_s) * 1.15, 120, 600)` 秒
   - security：`extra=0`；drift：`extra=pack_kb*1`；intent slice：`extra=20 + claims*0.5`
-- `i0_timeout = clamp(60 + 2*text_kb, 60, 180)` 秒；另与 `remaining*0.8` 取 min
+- `i0_timeout = clamp(120 + 2*text_kb, 120, 240)` 秒（v1.1：GLM-5.4 实测 73.6s 内未返回）；另与 `remaining*0.8` 取 min
 - 分片：`n = min(4, ceil(total_diff_kb/45), ceil(files/6))`；drift 再 `min(modules)`
 - 每个 cell 的预算独立按自己的 diff 规模算；`axes[].elapsed_ms` 落盘用于后续校准
 - 原 grill 的 `min(4, ceil(files/6))` / `min(4, modules)` 由本节替代。

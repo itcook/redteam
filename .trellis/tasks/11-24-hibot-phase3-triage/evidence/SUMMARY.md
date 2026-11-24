@@ -16,7 +16,7 @@
 
 | 目标 | 结果 |
 |---|---|
-| lib | 1132 passed |
+| lib | 1134 passed |
 | bin | 21 passed |
 | `capabilities` | 4 passed |
 | `job_conformance` | 23 passed |
@@ -70,9 +70,9 @@ intent 轴 `{ok:false, rows:0, error:"structured-output parse failed: finish_rea
 ## 已知限制
 
 - `risk` 的 `blockers≥3 → high` 是 grill 定案的 `[拟议]` 规则，与人工的 medium/high 判断有系统性差异（已记入 COMPARISON）。
-- 真实对拍主模型为 DeepSeek Flash；GLM-5.3 在 A 流程下仍无法在 1200s 内完成（I0/slice 超时）；
-  GLM-5.4 已可调用，但 slice 验证仍超时。诊断为**单次调用在 320s 内未返回**（`attempts=1`、无 error/finish），
-  不是网关超时/重试/截断；需要更大单格预算或更快的模型。
+- 预算 v1（scale-based）已验证：DeepSeek high backend #333 251.8s/ok；GLM-5.4 high 840.5s，intent 完整
+  （20/20 claims，4 cells），security 完整；但 drift 因 join 顺序最后拿门被饿死（1/3 cells）。
+  剩余问题是 per-axis 门配额，不是预算公式。
 - `triage` 现在取 `roles.reviewer`（2026-11-24 用户调整）；`config check --kind triage` 也要求 reviewer。
 - 3.8 的报告是单次运行；人工基线中 sites #328 本身有 3 次不同结论（blk1/1/4），差异表按全部列出。
 - `dropped_rows` 是诊断披露，不是契约必需字段；每轴最多 20 条样本。
