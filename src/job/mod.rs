@@ -29,4 +29,6 @@ pub mod quote;
 pub mod report;
 pub mod repo;
 pub mod run;
+/// Phase 5：`out/state.json` 运行态心跳（契约 §3.6）。
+pub mod state;
 pub mod status;

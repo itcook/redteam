@@ -133,6 +133,27 @@ enum Cmd {
         #[command(subcommand)]
         action: ConfigCmd,
     },
+    /// 自更新（standalone 安装）：默认检查并升级到最新正式版。
+    ///
+    /// 插件目录（`plugins/redteam/bin/`）下的二进制默认拒写——插件版随插件更新；
+    /// `--check` 只读（不取锁、不下载归档）；失败不覆盖旧件。
+    Update {
+        /// 只检查，不写任何文件。
+        #[arg(long)]
+        check: bool,
+        /// 指定版本（`vX.Y.Z` 或 `X.Y.Z`）。
+        #[arg(long)]
+        version: Option<String>,
+        /// 即使已是最新也重装。
+        #[arg(long)]
+        force: bool,
+        /// 下载源：github | r2（默认 github）。
+        #[arg(long, value_parser = ["github", "r2"])]
+        from: Option<String>,
+        /// 下载基址（覆盖默认；本地测试用）。
+        #[arg(long)]
+        base_url: Option<String>,
+    },
     /// triage（外派）：读 job 目录，写 hibot `report.triage/1`（Phase 1 仅命令面）。
     Triage {
         /// job 目录（必需）：manifest `hibot.audit.job.triage/1`。
@@ -1186,6 +1207,21 @@ async fn main() {
             ConfigCmd::Schema { out } => redteam::cli::config_cmd::run_schema(out.as_deref()),
             ConfigCmd::Check { input, kind } => redteam::cli::config_cmd::run_check(&input, kind.as_deref()),
         },
+        Cmd::Update { check, version, force, from, base_url } => {
+            let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("redteam"));
+            let options = redteam::update::UpdateOptions {
+                check,
+                version,
+                force,
+                from: from.unwrap_or_else(|| redteam::update::DEFAULT_FROM.to_string()),
+                base_url,
+            };
+            // 自更新错误必须保留 `{e:#}` 上下文链（下载/校验/自检哪一步失败要能一眼看出）。
+            match redteam::update::run(&options, &exe).await {
+                Ok(outcome) => { println!("{}", outcome.render()); 0 }
+                Err(error) => { eprintln!("error: {error:#}"); 1 }
+            }
+        }
         Cmd::Triage { job_dir } => {
             redteam::job::run::run(redteam::job::manifest::JobKind::Triage, std::path::Path::new(&job_dir)).await
         }

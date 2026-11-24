@@ -27,6 +27,7 @@ use crate::config::{Config, OutputLang};
 use crate::job::lifecycle::{self, JobDirCellSink};
 use crate::job::manifest::{JobKind, JobManifest};
 use crate::job::report;
+use crate::job::state;
 use crate::job::status::{JobFailure, JobStatus};
 use crate::job::{artifact, executor_config, io};
 use std::path::Path;
@@ -78,11 +79,13 @@ pub async fn run_with(
     };
     // 从这里起 manifest 可解析：任何失败都要写出合法 error 报告。
     let fallback_lang = OutputLang::default();
-
+    // Phase 5：心跳从“manifest 可解析”起手（首帧 preparing，覆盖 config/artifact 准备期）。
+    // out_dir 已定；此后所有失败路径都走 finish → shutdown（补 running → finishing，不跳段）。
+    let heartbeat = state::Heartbeat::start(&out_dir, &manifest.job_id);
     // 先加载 executor config：后续 error 报告的 status_reason 才能跟随配置的语言（1.4）。
     let cfg = match executor_config::load(&manifest, &job_dir) {
         Ok(c) => c,
-        Err(e) => return finish(&out_dir, report::error_report(&manifest, &fallback_lang, &e)),
+        Err(e) => return finish(&out_dir, report::error_report(&manifest, &fallback_lang, &e), &heartbeat),
     };
     // 1.4：job 模式语言 = 配置 > 缺省 en_US；**不读 env**。
     let lang = OutputLang::resolve_job(&cfg);
@@ -90,29 +93,37 @@ pub async fn run_with(
     install_panic_report_hook(manifest.clone(), out_dir.clone(), lang.clone());
 
     if let Err(e) = manifest.validate() {
-        return finish(&out_dir, report::error_report(&manifest, &lang, &e));
+        return finish(&out_dir, report::error_report(&manifest, &lang, &e), &heartbeat);
     }
     if let Err(e) = manifest.check_cli_kind(cli_kind) {
-        return finish(&out_dir, report::error_report(&manifest, &lang, &e));
+        return finish(&out_dir, report::error_report(&manifest, &lang, &e), &heartbeat);
     }
     let artifacts = match artifact::load(&manifest, &job_dir) {
         Ok(a) => a,
-        Err(e) => return finish(&out_dir, report::error_report(&manifest, &lang, &e)),
+        Err(e) => return finish(&out_dir, report::error_report(&manifest, &lang, &e), &heartbeat),
     };
 
     // Phase 3：triage 有分析实现；verify 仍是 Phase 1 的 stub（协调者 2026-11-24 裁 A：
     // 必须逐条覆盖输入指纹，故对每条输出 `inconclusive`，整体仍 error——不伪造 resolved/unresolved）。
     match manifest.kind {
         JobKind::Triage => {
-            let r = run_triage(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, started, &mut sigterm, over).await;
-            return finish(&out_dir, r);
+            let r = run_triage(
+                &manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, started, &mut sigterm, &heartbeat, over,
+            )
+            .await;
+            return finish(&out_dir, r, &heartbeat);
         }
         JobKind::Verify => {
             let r = match verify_fingerprints(&artifacts) {
-                Ok(fps) => report::kind_not_implemented_verify(&manifest, &lang, &fps),
+                Ok(fps) => {
+                    // Phase 5：分析未实现，但输入项数可知；progress.unit 固定 items。
+                    heartbeat.set_progress_total("items", fps.len() as u64);
+                    report::kind_not_implemented_verify(&manifest, &lang, &fps)
+                }
                 Err(e) => report::error_report(&manifest, &lang, &e),
             };
-            return finish(&out_dir, r);
+            heartbeat.set_phase(state::Phase::Running);
+            return finish(&out_dir, r, &heartbeat);
         }
         JobKind::Review => {}
     }
@@ -121,33 +132,37 @@ pub async fn run_with(
     let dismissed = match artifacts.get("dismissed") {
         Some(a) => match crate::job::dismissed::parse(&a.bytes) {
             Ok(d) => d,
-            Err(e) => return finish(&out_dir, report::error_report(&manifest, &lang, &e)),
+            Err(e) => return finish(&out_dir, report::error_report(&manifest, &lang, &e), &heartbeat),
         },
         None => {
             let e = JobFailure::new("input_missing", Some("dismissed".into()));
-            return finish(&out_dir, report::error_report(&manifest, &lang, &e));
+            return finish(&out_dir, report::error_report(&manifest, &lang, &e), &heartbeat);
         }
     };
     // 准备阶段已收到 SIGTERM 或预算已耗尽：直接写 partial（成果为空）。
     let deadline = match effective_deadline(started, manifest.limits.wall_clock_s, None) {
         Ok(d) => d,
-        Err(e) => return finish(&out_dir, report::error_report(&manifest, &lang, &e)),
+        Err(e) => return finish(&out_dir, report::error_report(&manifest, &lang, &e), &heartbeat),
     };
     let early_signal = match sigterm.as_mut() {
         Some(s) => tokio::time::timeout(Duration::from_millis(0), s.recv()).await.is_ok(),
         None => false,
     };
     if deadline.saturating_duration_since(std::time::Instant::now()).is_zero() || early_signal {
-        let sink = JobDirCellSink::new(out_dir.clone());
+        let sink = JobDirCellSink::with_heartbeat(out_dir.clone(), Arc::clone(&heartbeat));
         let refute_skipped = (cfg.review.refuters.enabled && cfg.active_roles().refuters.is_empty())
             .then_some("no_refuter");
         let base_extras = report::ReviewExtras { refute_skipped, ..Default::default() };
         let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink, None, &dismissed, &base_extras);
-        return finish(&out_dir, r);
+        return finish(&out_dir, r, &heartbeat);
     }
-    match run_review(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, &dismissed, started, &mut sigterm, over).await {
-        Ok(r) => finish(&out_dir, r),
-        Err(e) => finish(&out_dir, report::error_report(&manifest, &lang, &e)),
+    match run_review(
+        &manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, &dismissed, started, &mut sigterm, &heartbeat, over,
+    )
+    .await
+    {
+        Ok(r) => finish(&out_dir, r, &heartbeat),
+        Err(e) => finish(&out_dir, report::error_report(&manifest, &lang, &e), &heartbeat),
     }
 }
 
@@ -215,6 +230,7 @@ async fn run_review(
     dismissed: &crate::job::dismissed::Dismissed,
     started: std::time::Instant,
     sigterm: &mut Option<tokio::signal::unix::Signal>,
+    heartbeat: &Arc<state::Heartbeat>,
     over: Option<&crate::cli::BackendOverride<'_>>,
 ) -> Result<report::HibotReport, JobFailure> {
     let repo = io::resolve_repo(job_dir, &manifest.paths.repo)?;
@@ -276,6 +292,8 @@ async fn run_review(
     // 机器码用 config_invalid（无 pointer 时只给基础码），原始报错进 status_reason。
     let registry = crate::cli::build_registry_with(&args, cfg, over)
         .map_err(|e| JobFailure::with_reason("config_invalid", None, e))?;
+    // Phase 5：registry 建好即绑定心跳（preparing 阶段也如实披露 provider 帽）。
+    heartbeat.attach_llm(registry.gate_handles());
     // 预算已耗尽（含 registry 构造耗时）→ 不进模型派发，直接落 partial。
     if deadline.saturating_duration_since(std::time::Instant::now()).is_zero() {
         let text = JobFailure::new("wall_clock_exhausted", None).status_text(lang);
@@ -287,7 +305,9 @@ async fn run_review(
         };
         return Ok(report::partial_report(manifest, lang, &text, vec![], usage, cfg, 0, &base_extras));
     }
-    let sink = Arc::new(JobDirCellSink::new(out_dir.to_path_buf()));
+    // 进入模型派发：job 视角从 preparing 推进到 running（此后不再回退）。
+    heartbeat.set_phase(state::Phase::Running);
+    let sink = Arc::new(JobDirCellSink::with_heartbeat(out_dir.to_path_buf(), Arc::clone(heartbeat)));
     // 2.1 / 2.2：变更集来自已校验的 `inputs.diff_patch`，**不**再走 `run_review_dispatch`（它会重新 `git diff`）。
     // `head` 是完整性检查解析出的完整 commit（逐字透传给风险路由的 stamp）。
     let run = Box::pin(crate::cli::run_code_review(
@@ -308,6 +328,8 @@ async fn run_review(
     };
     match outcome {
         Ok(Ok((mut internal, _code))) => {
+            // 分析结束、进入收尾（重锚/去重/报告投影）：finishing 覆盖这段，报告写入期间心跳继续。
+            heartbeat.set_phase(state::Phase::Finishing);
             // 2.5：重锚 → 用检出原文修正 quote/行号；失败即丢弃并计数（不静默）。
             // 指纹在 `map_finding` 里按修正后的 quote 生成；dismissed 匹配接在指纹之后（2.4）。
             let verified = crate::job::quote::verify(std::mem::take(&mut internal.findings), &repo);
@@ -350,10 +372,14 @@ async fn run_review(
                 },
             ))
         }
-        Ok(Err(e)) => Err(JobFailure::new("internal_panic", Some(e.to_string()))),
+        Ok(Err(e)) => {
+            heartbeat.set_phase(state::Phase::Finishing);
+            Err(JobFailure::new("internal_panic", Some(e.to_string())))
+        }
         Err(()) => {
             // 停止派发：drop 掉运行 future（tokio 取消），再用已落地 cell 组 partial。
             drop(run);
+            heartbeat.set_phase(state::Phase::Finishing);
             Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink, Some(&repo), dismissed, &base_extras))
         }
     }
@@ -371,6 +397,7 @@ async fn run_triage(
     artifacts: &artifact::Artifacts,
     started: std::time::Instant,
     sigterm: &mut Option<tokio::signal::unix::Signal>,
+    heartbeat: &state::Heartbeat,
     over: Option<&crate::cli::BackendOverride<'_>>,
 ) -> report::HibotReport {
     let repo = match io::resolve_repo(job_dir, &manifest.paths.repo) {
@@ -412,6 +439,8 @@ async fn run_triage(
         Ok(r) => r,
         Err(e) => return report::error_report(manifest, lang, &JobFailure::with_reason("config_invalid", None, e)),
     };
+    // Phase 5：triage 与 review 同用一张 provider 门表（`llm` 段）；阶段 preparing → running → finishing。
+    heartbeat.attach_llm(registry.gate_handles());
     let req = crate::triage::TriageRequest {
         repo: &repo,
         pr: &pr,
@@ -425,6 +454,8 @@ async fn run_triage(
         Ok(d) => d,
         Err(e) => return report::error_report(manifest, lang, &e),
     };
+    // Phase 5：三 kind 都走心跳；进入模型派发即 running（triage 的 manifest 没有 item 清单，不伪造 progress）。
+    heartbeat.set_phase(state::Phase::Running);
     let mut fut = Box::pin(crate::triage::run(&registry, &req, progress.clone()));
     let outcome: Result<_, ()> = tokio::select! {
         out = &mut fut => Ok(out),
@@ -511,9 +542,13 @@ fn seal_job_env() {
 }
 
 /// 原子写报告并返回退出码（partial 也算已写出 → 0；error → 1）。
-fn finish(out_dir: &Path, report: report::HibotReport) -> i32 {
+/// 报告写入期间心跳继续（`finishing` 覆盖整个收尾段）；报告落盘（或写失败）后再停写。
+fn finish(out_dir: &Path, report: report::HibotReport, heartbeat: &state::Heartbeat) -> i32 {
+    // 所有出口（含配置/输入错误、triage/verify、准备期超时）都在写报告前进入 finishing；
+    // 正常 review 已在收尾链起点提前进入（幂等）。
+    heartbeat.set_phase(state::Phase::Finishing);
     let path = out_dir.join("report.json");
-    match io::atomic_write_json(&path, &report) {
+    let code = match io::atomic_write_json(&path, &report) {
         Ok(()) => {
             if report.status == JobStatus::Error { 1 } else { 0 }
         }
@@ -521,7 +556,10 @@ fn finish(out_dir: &Path, report: report::HibotReport) -> i32 {
             eprintln!("error: {e}");
             1
         }
-    }
+    };
+    // 报告已写（或写失败）：停写并留下最后一帧 finishing。
+    heartbeat.shutdown();
+    code
 }
 
 fn install_sigterm() -> Option<tokio::signal::unix::Signal> {

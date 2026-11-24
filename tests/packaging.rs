@@ -36,7 +36,8 @@ fn manifests_valid_and_named() {
     // plugin.json
     let p = json("plugins/redteam/.claude-plugin/plugin.json");
     assert_eq!(p["name"], "redteam", "plugin name → namespace");
-    assert_eq!(p["version"], "1.0.0", "plugin version is authoritative");
+    // 单一真相是 Cargo.toml（计划 §10 / 7.1）：plugin.json 由 `make gen` 写入，禁止手改。
+    assert_eq!(p["version"], env!("CARGO_PKG_VERSION"), "plugin version follows Cargo.toml");
     assert_eq!(p["author"]["email"], "laiwei@me.com");
 
     // .codex-plugin/plugin.json

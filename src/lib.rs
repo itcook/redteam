@@ -21,4 +21,5 @@ pub mod risk;
 pub mod state;
 pub mod tools;
 pub mod triage;
+pub mod update;
 pub mod verdict;

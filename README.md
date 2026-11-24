@@ -46,6 +46,19 @@ redteam review --base main                                     # 评审当前分
 `commands/` 是命令壳层（真相源），`codex-skills/` 是它的镜像，由 `make gen` 生成。
 `make verify` 会重新生成并要求零 diff，防两边漂移。
 
+## 安装（standalone CLI）
+
+首期仅 **macOS arm64**：
+
+```sh
+curl -fsSL https://github.com/itcook/redteam/releases/latest/download/install.sh | sh
+redteam update --check     # 只检查；redteam update 升级到最新正式版
+```
+
+安装脚本会校验 `SHA256SUMS`、原子替换旧版本，并拒绝非 macOS arm64 平台。
+插件渠道（下面的 `plugins/redteam/`）走 marketplace / `git pull`，不用 `install.sh`；
+`redteam update` 在插件目录下默认拒写（`--force` 才覆盖）。
+
 ## 从源码构建
 
 ```sh

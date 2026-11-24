@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""sync-version — 把 `Cargo.toml` 的 version 写入所有派生产物（单一真相：Cargo.toml）。
+
+写入对象（计划 §10 Phase 7 / 7.1）：
+  plugins/redteam/.claude-plugin/plugin.json   插件市场用（version 是权威源之一）
+  plugins/redteam/.codex-plugin/plugin.json    Codex 插件用
+  capabilities/redteam.json                    hibot 契约（tests/capabilities.rs 另有断言）
+
+行为约束：
+  - 只改 `"version": "..."` 这一个 token，不重排 JSON、不改其它字段——避免 `make gen` 产生
+    无意义的格式 diff（serde_json 往返会丢键序/缩进）。
+  - 幂等：已一致的文件不写（mtime 都不动）。
+  - `--check` 只校验，不写；不一致打印「文件: 现值 → 期望值」并以 1 退出（`make verify` 用）。
+
+用法：
+  scripts/sync-version            # 写入
+  scripts/sync-version --check    # 校验（CI / make verify）
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CARGO_TOML = ROOT / "Cargo.toml"
+TARGETS = (
+    "plugins/redteam/.claude-plugin/plugin.json",
+    "plugins/redteam/.codex-plugin/plugin.json",
+    "capabilities/redteam.json",
+)
+
+CARGO_VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
+JSON_VERSION_RE = re.compile(r'"version"\s*:\s*"([^"]*)"')
+
+
+def fail(message: str) -> None:
+    print(f"sync-version: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def cargo_version() -> str:
+    match = CARGO_VERSION_RE.search(CARGO_TOML.read_text(encoding="utf-8"))
+    if not match:
+        fail("Cargo.toml 里找不到 `version = \"...\"`")
+    return match.group(1)
+
+
+def current_version(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    match = JSON_VERSION_RE.search(text)
+    if not match:
+        fail(f"{path.relative_to(ROOT)} 里找不到 \"version\" 字段")
+    return match.group(1)
+
+
+def rewrite(path: Path, version: str) -> bool:
+    """把首个 `"version": "..."` 替换为 version；返回是否有改动。"""
+    text = path.read_text(encoding="utf-8")
+    new_text, count = JSON_VERSION_RE.subn(f'"version": "{version}"', text, count=1)
+    if count != 1:
+        fail(f"{path.relative_to(ROOT)} 里找不到 \"version\" 字段")
+    try:
+        parsed = json.loads(new_text)
+    except json.JSONDecodeError as error:
+        fail(f"{path.relative_to(ROOT)} 替换后不是合法 JSON: {error}")
+    if parsed.get("version") != version:
+        fail(f"{path.relative_to(ROOT)} 替换未生效（仍是 {parsed.get('version')!r}）")
+    if new_text == text:
+        return False
+    path.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def main(argv: list[str]) -> int:
+    check = False
+    for arg in argv:
+        if arg == "--check":
+            check = True
+        elif arg in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        else:
+            fail(f"未知参数: {arg}（支持 --check）")
+
+    version = cargo_version()
+    drift: list[str] = []
+    for relative in TARGETS:
+        path = ROOT / relative
+        if not path.is_file():
+            fail(f"缺少文件: {relative}")
+        if check:
+            found = current_version(path)
+            if found != version:
+                drift.append(f"  {relative}: {found} → {version}")
+            continue
+        if rewrite(path, version):
+            print(f"sync-version: {relative} → {version}")
+
+    if check:
+        if drift:
+            print("sync-version: 版本不同源（Cargo.toml 是唯一真相，跑 `make gen`）：", file=sys.stderr)
+            print("\n".join(drift), file=sys.stderr)
+            return 1
+        print(f"sync-version: ok（{version}，{len(TARGETS)} 处一致）")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
