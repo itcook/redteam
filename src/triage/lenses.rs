@@ -331,6 +331,7 @@ pub async fn run_security(
     files: &[(String, String)],
     shard_count: usize,
     hard_deadline: std::time::Instant,
+    budget_factor: f64,
 ) -> AxisRun<SecurityRow> {
     let t0 = std::time::Instant::now();
     let shards = balanced_chunks_weighted(files, shard_count.max(1), |(_, d)| d.len());
@@ -341,7 +342,7 @@ pub async fn run_security(
         let tail = tail.clone();
         let header = pr_header(pr);
         let patch = patch_block(shard);
-        let cell_budget = budget::cell_timeout(budget::slice_kb(shard), 0.0);
+        let cell_budget = budget::scaled_cell_timeout(budget::slice_kb(shard), 0.0, budget_factor);
         async move {
             let hard = tokio::time::Instant::from_std(hard_deadline);
             // 等门由全局 deadline 兜底；cell 预算只算模型工作时间（否则排队的轴会被饿死）。
@@ -403,6 +404,7 @@ pub async fn run_drift(
     files: &[(String, String)],
     shard_count: usize,
     hard_deadline: std::time::Instant,
+    budget_factor: f64,
 ) -> AxisRun<DriftRow> {
     let t0 = std::time::Instant::now();
     // 按模块分组（顺序 = changed 文件顺序的首次出现）。
@@ -434,9 +436,10 @@ pub async fn run_drift(
             .flat_map(|m| by_module.get(m).cloned().unwrap_or_default())
             .collect();
         let patch = patch_block(&shard_files);
-        let cell_budget = budget::cell_timeout(
+        let cell_budget = budget::scaled_cell_timeout(
             budget::slice_kb(&shard_files),
             budget::kb(pack.len()) * budget::DRIFT_PER_PACK_KB_S,
+            budget_factor,
         );
         let module_list = shard.join(", ");
         async move {
@@ -570,6 +573,7 @@ pub async fn run_intent_slices(
     shard_count: usize,
     concurrency: usize,
     hard_deadline: std::time::Instant,
+    budget_factor: f64,
 ) -> AxisRun<IntentSliceOutput> {
     let t0 = std::time::Instant::now();
     if files.is_empty() {
@@ -598,9 +602,10 @@ pub async fn run_intent_slices(
     let budgets: Vec<std::time::Duration> = shards
         .iter()
         .map(|shard| {
-            budget::cell_timeout(
+            budget::scaled_cell_timeout(
                 budget::slice_kb(shard),
                 budget::INTENT_EXTRA_S + claims.len() as f64 * budget::INTENT_PER_CLAIM_S,
+                budget_factor,
             )
         })
         .collect();

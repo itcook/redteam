@@ -1,0 +1,181 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `drift` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "usage": {
+    "input_tokens": 90276,
+    "output_tokens": 51541,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 461079
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 4,
+            "dropped_rows": [
+              {
+                "conf": 6,
+                "file": "service/feishu_finance_agent.go",
+                "line": 359,
+                "reason": "below_threshold",
+                "surface": 5
+              },
+              {
+                "conf": 4,
+                "file": "service/feishu_finance_agent_client.go",
+                "line": 349,
+                "reason": "below_threshold",
+                "surface": 7
+              },
+              {
+                "conf": 4,
+                "file": "service/feishu_finance_agent_ws.go",
+                "line": 105,
+                "reason": "below_threshold",
+                "surface": 7
+              },
+              {
+                "conf": 5,
+                "file": "service/feishu_finance_agent_client.go",
+                "line": 286,
+                "reason": "below_threshold",
+                "surface": 5
+              }
+            ],
+            "dropped_total": 4,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 327289,
+          "ok": true,
+          "rows": 4,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 45074,
+            "output_tokens": 41794
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 2,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 286679,
+          "error": "timeout: triage cell `triage-drift` exceeded its 254.666601562s budget (attempts=1 last_call_ms=None in_flight_ms=Some(254668) last_finish=None last_text_len=None last_error=None)",
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 45202,
+            "output_tokens": 9747
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 133656,
+          "error": "timeout: triage cell `triage-intent-claims` exceeded its 133.652339333s budget (attempts=1 last_call_ms=None in_flight_ms=Some(133656) last_finish=None last_text_len=None last_error=None)",
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1800
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:drift",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

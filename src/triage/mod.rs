@@ -96,12 +96,13 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
 
     // ── I0：串行、小输入（不喂 diff）；预算按文本规模（60–180s），并留 20% 全局余量 ──
     let remaining = req.deadline.saturating_duration_since(std::time::Instant::now());
+    let budget_factor = budget::time_factor(req.manifest_cap_s);
     let i0_text_kb = budget::kb(
         req.pr.body.len()
             + req.pr.linked_issues.iter().map(|i| i.body.as_deref().unwrap_or("").len()).sum::<usize>()
             + req.pr.comments.iter().filter(|c| !c.is_bot && c.author != req.pr.author).map(|c| c.body.len()).sum::<usize>(),
     );
-    let i0_budget = budget::i0_timeout(i0_text_kb).min(remaining.mul_f64(0.8));
+    let i0_budget = budget::scaled_i0_timeout(i0_text_kb, budget_factor).min(remaining.mul_f64(0.8));
     let i0_start = std::time::Instant::now();
     let claims_run = lenses::run_intent_claims(registry, &req.route_key, req.lang, req.pr, i0_budget).await;
     let i0_elapsed = i0_start.elapsed().as_millis() as u64;
@@ -132,6 +133,7 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                     n_sec,
                     (provider_cap / 2).max(1),
                     req.deadline,
+                    budget_factor,
                 )
                 .await;
                 let assembled = assemble_intent(&claims, &r);
@@ -153,14 +155,14 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline).await;
+                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
                 progress.lock().unwrap().security = Some(r);
             },
             async {
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline).await;
+                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
                 progress.lock().unwrap().drift = Some(r);
             }
         );
@@ -183,14 +185,14 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline).await;
+                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
                 progress.lock().unwrap().security = Some(r);
             },
             async {
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline).await;
+                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
                 progress.lock().unwrap().drift = Some(r);
             }
         );

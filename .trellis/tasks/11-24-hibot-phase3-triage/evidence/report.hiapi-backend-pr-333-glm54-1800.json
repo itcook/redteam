@@ -1,0 +1,168 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `security` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "usage": {
+    "input_tokens": 86479,
+    "output_tokens": 42288,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 613037
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 2,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 356439,
+          "error": "timeout: triage cell `triage-security` exceeded its 356.434863281s budget (attempts=1 last_call_ms=None in_flight_ms=Some(356436) last_finish=None last_text_len=None last_error=None)",
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 31641,
+            "output_tokens": 6257
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 497065,
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 3,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 51913,
+            "output_tokens": 28048
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 1,
+          "claims": 20,
+          "delivered": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 561182,
+          "error": "timeout: triage cell `triage-intent-slice` exceeded its 390.934863281s budget (attempts=1 last_call_ms=None in_flight_ms=Some(390936) last_finish=None last_text_len=None last_error=None)",
+          "notes": [
+            "Verification statements (not counted as claims): the author reports 20 new/updated tests covering plan building, full confirm flow, double-click, non-initiator/demoted Root, cancel/expiry, stranger handling, SDK event and card-callback conversion, re-click while executing, crash recovery, no racing of fresh records, json_schema→json_object degrade, command JSON field validation, injection warnings, replay re-auth, fencing version, parsing recovery, and withdrawal current value; `go build ./...` and `go test ./service ./model ./router ./controller` reportedly pass.",
+            "The author reports re-testing with a real DeepSeek model (`deepseek-v4.1-flash`) for three command classes (execute, all fields, follow-up question) and a local end-to-end smoke test with a real Feishu app and real model (message → confirmation card → confirm → database verified).",
+            "The PR body explicitly states the threat model (LLM-parsed commands gated by human confirmation of a current→new-value card) requires Root-side acceptance before rollout; this is an open approval item rather than a delivered behavior.",
+            "Deployment configuration is via environment variables: `FEISHU_FINANCE_AGENT_APP_ID`, `FEISHU_FINANCE_AGENT_APP_SECRET`, `FEISHU_FINANCE_AGENT_LLM_BASE_URL`, `FEISHU_FINANCE_AGENT_LLM_API_KEY`, `FEISHU_FINANCE_AGENT_LLM_MODEL`, and optional `FEISHU_FINANCE_AGENT_OPENAPI_BASE`; the Feishu app must subscribe to `im.message.receive_v1` and `card.action.trigger` with permissions `im:message:send_as_bot`, `im:message.p2p_msg:readonly`, `im:message.group_at_msg:readonly`.",
+            "Operational note from the author: multiple backend instances may share one Feishu app; events are randomly distributed and single execution relies on database dedup and state claiming.",
+            "The author flags a local SQLite development issue with glebarez v1.10 restart DDL as unrelated to this PR; production uses PostgreSQL.",
+            "The body documents dispositions for two prior review rounds (items 1–6 and F1–F6/S5/Q7/Q13/Q30); the corresponding behavior changes are reflected in the claims above.",
+            "No linked issues were provided; all claims are sourced from the PR body.",
+            "No non-bot, non-author reviewer comments were supplied, so maintainer overlap cannot be assessed beyond the default.",
+            "The PR body ends with \"Generated with Claude Code\", indicating AI-assisted authorship."
+          ],
+          "ok": false,
+          "rows": 1,
+          "scope_creep": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 2925,
+            "output_tokens": 7983
+          },
+          "verification_complete": false
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1800
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:security",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

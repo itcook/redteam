@@ -165,3 +165,19 @@
 - 诊断为 **5.4 high 的单次调用方差大**（有时 300s 内完成 3 slice，有时 391s 不返回），不是预算公式或网关重试； 
   网络超时只在 `-glm54budget3` 的 I0 出现一次（`last_error=network timeout`，attempts=2）。
 - DeepSeek high 在同预算下 251.8s / ok / tier1 / blockers0，intent 4 cells 全成——**快模型下 scale 预算不增加墙钟**。
+
+## 总预算 1800s（2026-11-24 用户决定）
+
+为让总预算真正生效，cell 预算乘以 `time_factor = clamp(manifest/1200, 1.0, 1.5)`（1800→1.5×，上限 900s），
+I0 同系数放大（上限 360s）。
+
+| 轮次 | 改动 | 墙钟 | status | security | drift | intent |
+|---|---|---|---|---|---|---|
+| `-glm54-1800` | 仅 manifest 1800（cell 仍 1200 规模） | 613.1s | partial | 2/3（356s 在飞） | ok 3/3 | I0 133s 超时 |
+| `-glm54-1800b` | cell ×1.5，I0 未放大 | 462.3s | partial | ok 3/3（2 行 conf7 丢） | 2/3（254s 在飞） | I0 133s 超时 |
+| **`-glm54-1800c`** | **cell ×1.5 + I0 ×1.5** | **1051.4s** | **ok** | **ok 3/3**（2 行 conf7 丢，tier0） | **ok 3/3** | **ok：20/20 delivered，1 creep，complete** |
+
+- 1800s 下三轴全部完成，`summary` 合法；`risk=medium`、`local=3`、`blockers=0`。
+- 仍是 **tier0 vs 人工 tier2**：两行安全候选都是 conf7（模型这次没给到 8–9），不是预算问题。
+- 结论：**1800s 总预算 + 1.5× 单格/I0 放大可以让 GLM-5.4 稳定完成 triage**；tier2 召回仍取决于模型评分。
+- 原始报告：`report.hiapi-backend-pr-333-glm54-1800{,b,c}.json`。

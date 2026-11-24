@@ -16,7 +16,7 @@
 
 | 目标 | 结果 |
 |---|---|
-| lib | 1135 passed |
+| lib | 1136 passed |
 | bin | 21 passed |
 | `capabilities` | 4 passed |
 | `job_conformance` | 23 passed |
@@ -71,8 +71,8 @@ intent 轴 `{ok:false, rows:0, error:"structured-output parse failed: finish_rea
 
 - `risk` 的 `blockers≥3 → high` 是 grill 定案的 `[拟议]` 规则，与人工的 medium/high 判断有系统性差异（已记入 COMPARISON）。
 - 预算 v1（scale-based + 字节均衡 + 等门不计入 cell 预算）已验证：
-  DeepSeek high backend #333 251.8s/ok；GLM-5.4 high 最好一轮 840.5s 拿到完整 intent（20/20），
-  但单次调用方差大（后续轮次 slice 391s 仍在飞），稳定产出仍不如 DeepSeek。
+  DeepSeek high backend #333 251.8s/ok；GLM-5.4 high 在 **1800s 总预算 + 1.5× 单格/I0** 下
+  1051.4s/ok，intent 20/20、drift 3/3、security 3/3（但安全候选 conf7 → 仍 tier0）。
 - `triage` 现在取 `roles.reviewer`（2026-11-24 用户调整）；`config check --kind triage` 也要求 reviewer。
 - 3.8 的报告是单次运行；人工基线中 sites #328 本身有 3 次不同结论（blk1/1/4），差异表按全部列出。
 - `dropped_rows` 是诊断披露，不是契约必需字段；每轴最多 20 条样本。
