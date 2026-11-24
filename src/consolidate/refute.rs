@@ -1,4 +1,4 @@
-//! verifier 判定层（M21b 批 D-2，design §8.1〔D17〕）：**零 provider 调用**——
+//! refuter 判定层（M21b 批 D-2，design §8.1〔D17〕）：**零 provider 调用**——
 //! 谁该被复核（触发集）、谁可以免验（跳过四类）、交给谁复核（异族选择）。
 //! 真正的调用与流式消费在批 D-3 接进深挖主循环。
 //!
@@ -145,12 +145,12 @@ fn matches_precedent(f: &Finding, c: &DismissCard) -> bool {
 
 /// 一条 finding 的复核决定（进 RunMeta 的跳过分布——「没触发」与「触发了被免验」必须分得开）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VerifyDecision {
+pub enum RefuteDecision {
     /// 该验。
-    Verify,
+    Refute,
     /// 低危 / 低置信：`verdict` 层本就不认它，复核它纯烧 token 无裁决增益。
     SkipNotTriggered,
-    /// `review.verifiers.enabled = false`（全局关）。
+    /// `review.refuters.enabled = false`（全局关）。
     SkipDisabled,
     /// carried：出生轮已复核过。
     SkipCarried,
@@ -160,20 +160,20 @@ pub enum VerifyDecision {
     SkipConsensus,
 }
 
-impl VerifyDecision {
+impl RefuteDecision {
     /// RunMeta 里的分类键（跳过原因分布）。
     pub fn reason(self) -> &'static str {
         match self {
-            VerifyDecision::Verify => "verify",
-            VerifyDecision::SkipNotTriggered => "not_triggered",
-            VerifyDecision::SkipDisabled => "disabled",
-            VerifyDecision::SkipCarried => "carried",
-            VerifyDecision::SkipPrecedent => "precedent",
-            VerifyDecision::SkipConsensus => "consensus",
+            RefuteDecision::Refute => "refute",
+            RefuteDecision::SkipNotTriggered => "not_triggered",
+            RefuteDecision::SkipDisabled => "disabled",
+            RefuteDecision::SkipCarried => "carried",
+            RefuteDecision::SkipPrecedent => "precedent",
+            RefuteDecision::SkipConsensus => "consensus",
         }
     }
-    pub fn is_verify(self) -> bool {
-        self == VerifyDecision::Verify
+    pub fn is_refute(self) -> bool {
+        self == RefuteDecision::Refute
     }
 }
 
@@ -198,18 +198,18 @@ pub fn decide(
     enabled: bool,
     // `delta_hunks` = 本轮 delta 在该 finding 所在文件上的改动行范围（增量轮才非空）。
     delta_hunks: &[(usize, usize)],
-) -> VerifyDecision {
+) -> RefuteDecision {
     if f.severity < block_threshold || f.confidence < floor {
-        return VerifyDecision::SkipNotTriggered;
+        return RefuteDecision::SkipNotTriggered;
     }
     if !enabled {
-        return VerifyDecision::SkipDisabled;
+        return RefuteDecision::SkipDisabled;
     }
     // carried 免验的两条判据（增量轮重建〔裁定 1′，2026-10-04〕）。免验的理由是
     // 「出生轮已复核过」，它要同时成立两件事——**确实判过** ∧ **那片代码没再动过**：
     //
-    // 判据 ①（往轮判过）：`verify` 为空 = 出生轮压根没给出判决（复核被 kill、或那轮没开
-    //   verifier）。沿用一个不存在的判决就是把「未复核」当「已复核」收，`deep.rs` 收场处
+    // 判据 ①（往轮判过）：`refute` 为空 = 出生轮压根没给出判决（复核被 kill、或那轮没开
+    //   refuter）。沿用一个不存在的判决就是把「未复核」当「已复核」收，`deep.rs` 收场处
     //   自承的那个缺口（「没有格就没有派发点」）正是这一种。
     // 判据 ②（区域没动过）：本轮 delta 碰到它所在的区域 → 旧判决可能已不适用。与批 B 给
     //   判例豁免加的守卫同构——design §4 点名要防的是同一条漏报路径：fix 引入的新问题被
@@ -217,46 +217,46 @@ pub fn decide(
     //
     // 两条都成立才免验；任一不成立就落到后续判定（该验就验）。
     if f.origin == crate::domain::Origin::Carried {
-        let judged = f.verify.is_some();
+        let judged = f.refute.is_some();
         let touched = delta_hunks
             .iter()
             .any(|&(a, b)| f.line_start as usize <= b && a <= f.line_end as usize);
         if judged && !touched {
-            return VerifyDecision::SkipCarried;
+            return RefuteDecision::SkipCarried;
         }
     }
     if precedents.iter().any(|c| c.id == f.id) {
-        return VerifyDecision::SkipPrecedent;
+        return RefuteDecision::SkipPrecedent;
     }
     if f.suspicion_agreement >= 2 {
-        return VerifyDecision::SkipConsensus;
+        return RefuteDecision::SkipConsensus;
     }
-    VerifyDecision::Verify
+    RefuteDecision::Refute
 }
 
-/// 选 verifier（design §8.1）：verifiers 活跃集非空 → 从中轮转；否则自动异族
+/// 选 refuter（design §8.1）：refuters 活跃集非空 → 从中轮转；否则自动异族
 /// （family ≠ 该 finding 的 reviewer 家族，优先 reviewers 档 → scanners 档）；
 /// 一个异族都没有 → 同族复核 + warning。
 ///
-/// `rotation` = 轮转游标（调用方按已派复核数递增），与 reviewer 分派池同款——多个 verifier 时摊开，不全压一个。
-/// 返回 `None` = 一个可用模型都没有（调用方按「无 verifier」跳过并 warning）。
-pub fn pick_verifier<'a>(
+/// `rotation` = 轮转游标（调用方按已派复核数递增），与 reviewer 分派池同款——多个 refuter 时摊开，不全压一个。
+/// 返回 `None` = 一个可用模型都没有（调用方按「无 refuter」跳过并 warning）。
+pub fn pick_refuter<'a>(
     roles: &'a RoleSets,
     reviewer: &EffectiveModel,
     rotation: usize,
 ) -> Option<(&'a EffectiveModel, Option<String>)> {
     let reviewer_family = reviewer.family.as_str();
-    if !roles.verifiers.is_empty() {
-        let n = roles.verifiers.len();
-        let picked = &roles.verifiers[rotation % n];
+    if !roles.refuters.is_empty() {
+        let n = roles.refuters.len();
+        let picked = &roles.refuters[rotation % n];
         // 显式声明也要如实告知（收口评审 #11）：轮到的这个若与产出该 finding 的 reviewer 同模型
         // （自己验自己）或同家族，判决的独立性就打了折。只 warning 不改选：用户显式配的，他有权这么配。
         // 注：离线基线只支持「异族驳回更多」（31% vs 19%），误驳两臂分不出高下——
         // 独立性这条依据是先验，不是本仓数据。
         let warn = if picked.name == reviewer.name {
-            Some(format!("verifier {} 与产出该 finding 的 reviewer 是同一个模型——自己验自己，判决不独立", picked.name))
+            Some(format!("refuter {} 与产出该 finding 的 reviewer 是同一个模型——自己验自己，判决不独立", picked.name))
         } else if picked.family == reviewer.family {
-            Some(format!("verifier {} 与 reviewer 同家族（{}）——同家族的判决独立性打折", picked.name, picked.family))
+            Some(format!("refuter {} 与 reviewer 同家族（{}）——同家族的判决独立性打折", picked.name, picked.family))
         } else {
             None
         };
@@ -273,7 +273,7 @@ pub fn pick_verifier<'a>(
     // 无异族：同族复核，但必须可观测——§8.1 明写「一个异族都没有 → 同族 + warning」。
     let same = roles.reviewers.iter().chain(roles.scanners.iter()).next()?;
     let warn = format!(
-        "no cross-family verifier available (all models are family {reviewer_family}); verified by same family {}",
+        "no cross-family refuter available (all models are family {reviewer_family}); verified by same family {}",
         same.name
     );
     Some((same, Some(warn)))
@@ -432,8 +432,8 @@ mod tests {
         f.origin = crate::domain::Origin::Carried;
         f.line_start = line_start;
         f.line_end = line_end;
-        f.verify = Some(crate::domain::Verify {
-            verdict: crate::domain::VerifyVerdict::Upheld,
+        f.refute = Some(crate::domain::Refute {
+            verdict: crate::domain::RefuteVerdict::Upheld,
             model: "p/v".into(),
             note: String::new(),
         });
@@ -444,7 +444,7 @@ mod tests {
         EffectiveModel {
             name: name.into(), display_name: None, id: name.rsplit('/').next().unwrap().into(),
             provider: name.split('/').next().unwrap().into(),
-            role: crate::config::Role::Verifier, kind: crate::config::ProviderKind::Openai,
+            role: crate::config::Role::Refuter, kind: crate::config::ProviderKind::Openai,
             base_url: None, context_window: 100_000, max_output_tokens: None,
             per_turn_timeout_secs: None, reasoning: false, reasoning_effort: None,
             family: family.into(), max_concurrency: None,
@@ -456,10 +456,10 @@ mod tests {
     #[test]
     fn trigger_set_matches_the_verdict_blocking_predicate() {
         let low_sev = finding("t", Severity::Low, 1, "alpha");
-        assert_eq!(decide(&low_sev, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipNotTriggered);
-        assert_eq!(decide(&blocking(0.4), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipNotTriggered, "低于 floor 不触发");
-        assert_eq!(decide(&blocking(0.5), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Verify, "正好到 floor 就触发");
-        assert_eq!(decide(&blocking(0.9), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Verify);
+        assert_eq!(decide(&low_sev, &[], Severity::Medium, 0.5, true, &[]), RefuteDecision::SkipNotTriggered);
+        assert_eq!(decide(&blocking(0.4), &[], Severity::Medium, 0.5, true, &[]), RefuteDecision::SkipNotTriggered, "低于 floor 不触发");
+        assert_eq!(decide(&blocking(0.5), &[], Severity::Medium, 0.5, true, &[]), RefuteDecision::Refute, "正好到 floor 就触发");
+        assert_eq!(decide(&blocking(0.9), &[], Severity::Medium, 0.5, true, &[]), RefuteDecision::Refute);
     }
 
     /// 跳过四类各自命中，且分类可读（「没触发」与「触发了被免验」在 RunMeta 里必须分得开）。
@@ -482,51 +482,51 @@ mod tests {
         // 免验的理由是「出生轮已复核过」，它要同时成立：①确实判过 ∧ ②那片代码没再动过。
         let carried = carried_judged(10, 12);
 
-        // 判据 ①：出生轮压根没判过（复核被 kill / 那轮没开 verifier）→ 无条件重验，
+        // 判据 ①：出生轮压根没判过（复核被 kill / 那轮没开 refuter）→ 无条件重验，
         // 哪怕区域在 delta 之外。沿用一个不存在的判决 = 把「未复核」当「已复核」收。
         let mut never_judged = carried_judged(10, 12);
-        never_judged.verify = None;
+        never_judged.refute = None;
         assert_eq!(
             decide(&never_judged, &[], Severity::Medium, 0.5, true, &[]),
-            VerifyDecision::Verify,
+            RefuteDecision::Refute,
             "往轮没判过就不是「出生轮已复核」——这是 deep 收场处自承的那个缺口"
         );
         assert_eq!(
             decide(&never_judged, &[], Severity::Medium, 0.5, true, &[(50, 52)]),
-            VerifyDecision::Verify,
+            RefuteDecision::Refute,
             "判据 ① 不受区域影响：没判过，改没改过都得验"
         );
 
         // 判据 ②：全量轮 / 该文件本轮没改 → 空片 → 维持无条件免验（与今日逐字节一致）
-        assert_eq!(decide(&carried, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipCarried);
+        assert_eq!(decide(&carried, &[], Severity::Medium, 0.5, true, &[]), RefuteDecision::SkipCarried);
         // 本轮改的是别处（第 50 行）→ 区域没被碰 → 仍免验
         assert_eq!(
             decide(&carried, &[], Severity::Medium, 0.5, true, &[(50, 52)]),
-            VerifyDecision::SkipCarried,
+            RefuteDecision::SkipCarried,
             "不相交就不该多验一次"
         );
         // 本轮 hunk 盖住它所在的 10-12 行 → **不再免验**，落到后续判定（该验就验）
         assert_eq!(
             decide(&carried, &[], Severity::Medium, 0.5, true, &[(8, 14)]),
-            VerifyDecision::Verify,
+            RefuteDecision::Refute,
             "区域被改过，上轮判决可能已不适用——design §4 点名要防的那条漏报路径"
         );
         // 边界：hunk 紧贴但不相交（13-20 vs finding 10-12）→ 仍免验
         assert_eq!(
             decide(&carried, &[], Severity::Medium, 0.5, true, &[(13, 20)]),
-            VerifyDecision::SkipCarried
+            RefuteDecision::SkipCarried
         );
-        // 守卫不越过更前面的判定：verifier 全局关时照旧 SkipDisabled，不因有 delta 就去验
+        // 守卫不越过更前面的判定：refuter 全局关时照旧 SkipDisabled，不因有 delta 就去验
         assert_eq!(
             decide(&carried, &[], Severity::Medium, 0.5, false, &[(8, 14)]),
-            VerifyDecision::SkipDisabled,
-            "verifier 关着时行为与今日完全一致——这是裁定 1「纯增益、无回退风险」的那一半"
+            RefuteDecision::SkipDisabled,
+            "refuter 关着时行为与今日完全一致——这是裁定 1「纯增益、无回退风险」的那一半"
         );
 
         let mut consensus = blocking(0.9);
         consensus.suspicion_agreement = 2;
         assert_eq!(decide(&consensus, &[], Severity::Medium, 0.5, true, &[]).reason(), "consensus");
-        assert!(!decide(&consensus, &[], Severity::Medium, 0.5, true, &[]).is_verify());
+        assert!(!decide(&consensus, &[], Severity::Medium, 0.5, true, &[]).is_refute());
     }
 
     /// 免验读的是**区域**轴，不是模型轴：单 reviewer 配置下 `agreement` 恒为 1，
@@ -536,80 +536,86 @@ mod tests {
         let mut model_axis = blocking(0.9);
         model_axis.agreement = 3;
         model_axis.suspicion_agreement = 1;
-        assert_eq!(decide(&model_axis, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Verify, "模型轴高也照验");
+        assert_eq!(decide(&model_axis, &[], Severity::Medium, 0.5, true, &[]), RefuteDecision::Refute, "模型轴高也照验");
 
         let mut region_axis = blocking(0.9);
         region_axis.agreement = 1;
         region_axis.suspicion_agreement = 2;
-        assert_eq!(decide(&region_axis, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipConsensus);
+        assert_eq!(decide(&region_axis, &[], Severity::Medium, 0.5, true, &[]), RefuteDecision::SkipConsensus);
     }
 
-    /// verifiers 活跃集非空 → 从中轮转（多个 verifier 摊开，不全压一个）。
+    /// refuters 活跃集非空 → 从中轮转（多个 refuter 摊开，不全压一个）。
     #[test]
-    fn declared_verifiers_win_and_rotate() {
+    fn declared_refuters_win_and_rotate() {
         let roles = RoleSets {
             scanners: vec![model("p/s", "deepseek")],
             reviewers: vec![model("p/r", "glm")],
-            verifiers: vec![model("p/v1", "kimi"), model("p/v2", "qwen")],
+            refuters: vec![model("p/v1", "kimi"), model("p/v2", "qwen")],
+            verifiers: vec![],
         };
         let rev = model("p/r", "glm");
-        let names: Vec<&str> = (0..4).map(|i| pick_verifier(&roles, &rev, i).unwrap().0.name.as_str()).collect();
+        let names: Vec<&str> = (0..4).map(|i| pick_refuter(&roles, &rev, i).unwrap().0.name.as_str()).collect();
         assert_eq!(names, ["p/v1", "p/v2", "p/v1", "p/v2"]);
-        assert!(pick_verifier(&roles, &rev, 0).unwrap().1.is_none(), "显式声明的异族 verifier 不报 warning");
+        assert!(pick_refuter(&roles, &rev, 0).unwrap().1.is_none(), "显式声明的异族 refuter 不报 warning");
     }
 
-    /// 显式声明的 verifier 也要查独立性（收口评审 #11）：轮到的那个与产出该 finding 的 reviewer
+    /// 显式声明的 refuter 也要查独立性（收口评审 #11）：轮到的那个与产出该 finding 的 reviewer
     /// 同模型（自己验自己）或同家族时，照用但留 warning——离线基线里同族那臂误驳 20% vs 异族 12%，
     /// 用户有权这么配，但不能不知道自己配了什么。
     #[test]
-    fn declared_verifier_that_is_the_reviewer_itself_warns() {
+    fn declared_refuter_that_is_the_reviewer_itself_warns() {
         let same = RoleSets {
             scanners: vec![],
             reviewers: vec![model("p/r", "glm")],
-            verifiers: vec![model("p/r", "glm")], // 现配置就是这个形状：一个模型兼两角色
+            refuters: vec![model("p/r", "glm")], // 现配置就是这个形状：一个模型兼两角色
+            verifiers: vec![],
         };
-        let (m, warn) = pick_verifier(&same, &model("p/r", "glm"), 0).unwrap();
+        let (m, warn) = pick_refuter(&same, &model("p/r", "glm"), 0).unwrap();
         assert_eq!(m.name, "p/r");
         assert!(warn.as_deref().is_some_and(|w| w.contains("同一个模型")), "自己验自己必须可观测: {warn:?}");
 
         let kin = RoleSets {
             scanners: vec![],
             reviewers: vec![model("p/r", "glm")],
-            verifiers: vec![model("p/r2", "glm")], // 不同模型、同家族
+            refuters: vec![model("p/r2", "glm")], // 不同模型、同家族
+            verifiers: vec![],
         };
-        let (_, warn) = pick_verifier(&kin, &model("p/r", "glm"), 0).unwrap();
+        let (_, warn) = pick_refuter(&kin, &model("p/r", "glm"), 0).unwrap();
         assert!(warn.as_deref().is_some_and(|w| w.contains("同家族")), "同族也要说一声: {warn:?}");
     }
 
-    /// 未声明 verifiers → 自动异族，优先 reviewers 档再 scanners 档。
+    /// 未声明 refuters → 自动异族，优先 reviewers 档再 scanners 档。
     #[test]
     fn auto_pick_prefers_a_cross_family_reviewer_then_scanner() {
         let roles = RoleSets {
             scanners: vec![model("p/s", "deepseek")],
             reviewers: vec![model("p/r", "glm"), model("p/r2", "kimi")],
+            refuters: vec![],
             verifiers: vec![],
         };
-        assert_eq!(pick_verifier(&roles, &model("p/r", "glm"), 0).unwrap().0.name, "p/r2", "异族 reviewer 优先");
+        assert_eq!(pick_refuter(&roles, &model("p/r", "glm"), 0).unwrap().0.name, "p/r2", "异族 reviewer 优先");
 
         let only_scanner_cross = RoleSets {
             scanners: vec![model("p/s", "deepseek")],
             reviewers: vec![model("p/r", "glm")],
+            refuters: vec![],
             verifiers: vec![],
         };
-        assert_eq!(pick_verifier(&only_scanner_cross, &model("p/r", "glm"), 0).unwrap().0.name, "p/s", "没有异族 reviewer 就取 scanner 档");
+        assert_eq!(pick_refuter(&only_scanner_cross, &model("p/r", "glm"), 0).unwrap().0.name, "p/s", "没有异族 reviewer 就取 scanner 档");
     }
 
-    /// 一个异族都没有 → 同族复核 + warning（§8.1 明写；现配置 glm 既是 reviewer 又是 verifier，正是这条路）。
+    /// 一个异族都没有 → 同族复核 + warning（§8.1 明写；现配置 glm 既是 reviewer 又是 refuter，正是这条路）。
     #[test]
     fn all_same_family_falls_back_with_a_warning() {
         let roles = RoleSets {
             scanners: vec![model("p/s", "glm")],
             reviewers: vec![model("p/r", "glm")],
+            refuters: vec![],
             verifiers: vec![],
         };
-        let (m, warn) = pick_verifier(&roles, &model("p/r", "glm"), 0).unwrap();
+        let (m, warn) = pick_refuter(&roles, &model("p/r", "glm"), 0).unwrap();
         assert_eq!(m.name, "p/r");
-        assert!(warn.unwrap().contains("no cross-family verifier"), "同族复核必须可观测");
-        assert!(pick_verifier(&RoleSets::default(), &model("p/r", "glm"), 0).is_none(), "一个模型都没有 → None");
+        assert!(warn.unwrap().contains("no cross-family refuter"), "同族复核必须可观测");
+        assert!(pick_refuter(&RoleSets::default(), &model("p/r", "glm"), 0).is_none(), "一个模型都没有 → None");
     }
 }

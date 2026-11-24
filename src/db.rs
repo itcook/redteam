@@ -1854,8 +1854,8 @@ mod guard_tests {
         let db = ProjDb::open_at(&path).unwrap();
         assert_eq!(user_version(&db.conn), USER_VERSION);
         assert_eq!(table_names(&db.conn).len(), 9);
-        db.cell_put("j", "c", "verifier", "{}").unwrap();
-        assert_eq!(db.cell_role("j", "c").unwrap().as_deref(), Some("verifier"));
+        db.cell_put("j", "c", "refuter", "{}").unwrap();
+        assert_eq!(db.cell_role("j", "c").unwrap().as_deref(), Some("refuter"));
     }
 
     /// 版本高于本二进制 → 拒开且不降级（旧二进制不能把新库盖章成 v4）。

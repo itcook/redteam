@@ -1,19 +1,19 @@
-//! `verify-once` 离线单发（M21b 批 D-4，design §8.1「去留由数据决定」〔D17〕）。
+//! `refute-once` 离线单发（M21b 批 D-4，design §8.1「去留由数据决定」〔D17〕）。
 //!
-//! 只读仓、零写库：读一条 finding 声明 → 建**产品同一份**复核 prompt → 按 `--verifier` 发一轮 →
-//! 按产品同一份解析吐判决 JSON。`eval/verify_score.py` 靠它打离线基线——固定集与评分留在 Python，
+//! 只读仓、零写库：读一条 finding 声明 → 建**产品同一份**复核 prompt → 按 `--refuter` 发一轮 →
+//! 按产品同一份解析吐判决 JSON。`eval/refute_score.py` 靠它打离线基线——固定集与评分留在 Python，
 //! prompt / provider / 解析一律不在 Python 复刻：复刻一份，测的就不是产品了。
 
 use crate::config::{Config, EffectiveModel};
 use crate::domain::{Finding, Origin, Severity};
 
-pub struct VerifyOnceArgs<'a> {
+pub struct RefuteOnceArgs<'a> {
     /// finding JSON 路径（`-` = stdin）。
     pub finding: &'a str,
     /// 证据树根（缺省当前目录）；固定集按 `git show <sha>:<path>` 物化到临时树后指过来。
     pub root: Option<&'a str>,
-    /// 复核模型 `provider/id`（缺省取配置里 verifier 角色的第一个）。
-    pub verifier: Option<&'a str>,
+    /// 复核模型 `provider/id`（缺省取配置里 refuter 角色的第一个）。
+    pub refuter: Option<&'a str>,
     /// 只打印 prompt，不发请求（零网络）。
     pub dump_prompt: bool,
 }
@@ -54,12 +54,12 @@ fn claim_to_finding(c: Claim) -> Finding {
         origin: Origin::New,
         outside_window: false,
         cluster_id: None,
-        verify: None,
+        refute: None,
     }
 }
 
-/// 选复核模型：显式 `--verifier` 优先按 `provider/id` 取；缺省取 verifier 角色首个。
-/// **优先 verifier 角色条目**（reasoningEffort 等档位按角色配）；该模型没配 verifier 角色时
+/// 选复核模型：显式 `--refuter` 优先按 `provider/id` 取；缺省取 `refuter` 角色首个。
+/// **优先 refuter 角色条目**（reasoningEffort 等档位按角色配）；该模型没配 refuter 角色时
 /// 回落它的其他角色条目，并在输出里标出用的是哪个角色的档位——离线基线与线上不同档必须看得见。
 fn pick_model(cfg: &Config, want: Option<&str>) -> Result<(EffectiveModel, &'static str), String> {
     // `active_roles()` 返回的是自有集合——取一份克隆，调用方不必跟着它的生命周期。
@@ -67,13 +67,13 @@ fn pick_model(cfg: &Config, want: Option<&str>) -> Result<(EffectiveModel, &'sta
     let find = |set: &[EffectiveModel], name: &str| set.iter().find(|m| m.name == name).cloned();
     match want {
         None => roles
-            .verifiers
+            .refuters
             .first()
-            .map(|m| (m.clone(), "verifier"))
-            .ok_or_else(|| "配置里没有 verifier 角色的模型；用 --verifier provider/id 指定".to_string()),
+            .map(|m| (m.clone(), "refuter"))
+            .ok_or_else(|| "配置里没有 refuter 角色的模型；用 --refuter provider/id 指定".to_string()),
         Some(name) => {
-            if let Some(m) = find(&roles.verifiers, name) {
-                return Ok((m, "verifier"));
+            if let Some(m) = find(&roles.refuters, name) {
+                return Ok((m, "refuter"));
             }
             if let Some(m) = find(&roles.reviewers, name) {
                 return Ok((m, "reviewer"));
@@ -97,7 +97,7 @@ fn read_claim(path: &str) -> Result<Claim, String> {
     serde_json::from_str(&raw).map_err(|e| format!("finding JSON 解析失败: {e}"))
 }
 
-pub async fn run_verify_once(a: VerifyOnceArgs<'_>, cfg: &Config) -> i32 {
+pub async fn run_refute_once(a: RefuteOnceArgs<'_>, cfg: &Config) -> i32 {
     let claim = match read_claim(a.finding) {
         Ok(c) => c,
         Err(e) => {
@@ -111,8 +111,8 @@ pub async fn run_verify_once(a: VerifyOnceArgs<'_>, cfg: &Config) -> i32 {
     // ① 这里不过 `need_read_allowed_in` 读守卫——`--root` 是评测脚本按 git 对象现物化的单文件树，
     //    路径由维护者的固定集给定、不是模型在线输出，而那棵树根本不是 git 仓（守卫会一律拒）；
     // ② `spec_docs` 恒空：离线基线不注入 spec，两臂同条件可比优先。
-    let source_context = crate::consolidate::verify::source_snippet(root, &f);
-    let prompt = crate::prompt::build_verify_prompt(&crate::prompt::VerifyPromptInput {
+    let source_context = crate::consolidate::refute::source_snippet(root, &f);
+    let prompt = crate::prompt::build_refute_prompt(&crate::prompt::RefutePromptInput {
         file: &f.file,
         line_start: f.line_start,
         line_end: f.line_end,
@@ -121,12 +121,12 @@ pub async fn run_verify_once(a: VerifyOnceArgs<'_>, cfg: &Config) -> i32 {
         body: &f.body,
         quote: &f.quote,
         source_context: &source_context,
-        // 与产品 `run_verify` 同参：判例摘要是 M21c 台账的空槽，repo_brief / spec 不进离线基线。
+        // 与产品 `run_refute` 同参：判例摘要是 M21c 台账的空槽，repo_brief / spec 不进离线基线。
         precedents: "",
         spec_docs: "",
         repo_brief: "",
     });
-    let hash = crate::prompt::verify_template_hash();
+    let hash = crate::prompt::refute_template_hash();
     if a.dump_prompt {
         let blocks: Vec<serde_json::Value> = prompt
             .blocks
@@ -145,7 +145,7 @@ pub async fn run_verify_once(a: VerifyOnceArgs<'_>, cfg: &Config) -> i32 {
         return 0;
     }
 
-    let (em, role_profile) = match pick_model(cfg, a.verifier) {
+    let (em, role_profile) = match pick_model(cfg, a.refuter) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
@@ -191,16 +191,16 @@ pub async fn run_verify_once(a: VerifyOnceArgs<'_>, cfg: &Config) -> i32 {
     match turn {
         Ok(t) => {
             // 解析与产品同一份：读不懂 → 保守 upheld（误驳会静默删掉一条真缺陷）。
-            let (verdict, reason, parsed) = match crate::provider::parse::parse_verify_output(&t.text) {
+            let (verdict, reason, parsed) = match crate::provider::parse::parse_refute_output(&t.text) {
                 Ok((v, r)) => (v, r, true),
-                Err(_) => (crate::domain::VerifyVerdict::Upheld, "verdict unparseable".to_string(), false),
+                Err(_) => (crate::domain::RefuteVerdict::Upheld, "verdict unparseable".to_string(), false),
             };
             println!(
                 "{}",
                 merge(serde_json::json!({
                     "ok": true,
                     "parsed": parsed,
-                    "verdict": if verdict == crate::domain::VerifyVerdict::Refuted { "refuted" } else { "upheld" },
+                    "verdict": if verdict == crate::domain::RefuteVerdict::Refuted { "refuted" } else { "upheld" },
                     "reason": reason,
                     "raw": t.text,
                     "input_tokens": t.input_tokens,
@@ -218,7 +218,7 @@ pub async fn run_verify_once(a: VerifyOnceArgs<'_>, cfg: &Config) -> i32 {
                     "ok": false,
                     "parsed": false,
                     "verdict": "upheld",
-                    "reason": "verifier call failed",
+                    "reason": "refuter call failed",
                     "error": format!("{e}"),
                 }))
             );
@@ -250,19 +250,19 @@ mod tests {
         assert_eq!((f.line_start, f.line_end), (40, 40));
     }
 
-    /// 选模型：同名模型优先取 verifier 角色条目（档位按角色配），没配 verifier 才回落别的角色并标明。
+    /// 选模型：同名模型优先取 refuter 角色条目（档位按角色配），没配 refuter 才回落别的角色并标明。
     #[test]
-    fn pick_model_prefers_the_verifier_role_entry() {
+    fn pick_model_prefers_the_refuter_role_entry() {
         let cfg: Config = serde_json::from_str(
             r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
                 "s":{"roles":{"scanner":{}}},
-                "v":{"roles":{"verifier":{}}}
+                "v":{"roles":{"refuter":{}}}
             }}}}"#,
         )
         .unwrap();
-        assert_eq!(pick_model(&cfg, Some("p/v")).unwrap().1, "verifier");
-        assert_eq!(pick_model(&cfg, Some("p/s")).unwrap().1, "scanner", "没配 verifier 角色 → 回落并标明档位来源");
-        assert_eq!(pick_model(&cfg, None).unwrap().0.name, "p/v", "缺省取 verifier 角色首个");
+        assert_eq!(pick_model(&cfg, Some("p/v")).unwrap().1, "refuter");
+        assert_eq!(pick_model(&cfg, Some("p/s")).unwrap().1, "scanner", "没配 refuter 角色 → 回落并标明档位来源");
+        assert_eq!(pick_model(&cfg, None).unwrap().0.name, "p/v", "缺省取 refuter 角色首个");
         assert!(pick_model(&cfg, Some("p/nope")).is_err());
     }
 }

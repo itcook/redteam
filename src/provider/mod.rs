@@ -94,7 +94,7 @@ impl ProviderError {
             _ => (0, 0, 0),
         }
     }
-    /// 见穿 `WithUsage` 包装取内层错误的引用——`verify.rs` 等按变体分派的调用点用它
+    /// 见穿 `WithUsage` 包装取内层错误的引用——`refute.rs` 等按变体分派的调用点用它
     /// 兼容新包装，不必对每个匹配点都补一层 `WithUsage` 分支。
     pub fn inner(&self) -> &ProviderError {
         match self {
@@ -178,7 +178,7 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
         .map(std::time::Duration::from_secs)
 }
 
-/// 首发 + 4 重试（bin 侧 build_registry 装 scan / reviewer / verifier 条目都用它，批 F-2）。
+/// 首发 + 4 重试（bin 侧 build_registry 装 scan / reviewer / refuter 条目都用它，批 F-2）。
 /// M21b 出口验收金丝雀：原 2 次重试 + 0.4 / 0.8 s 退避，一阵持续数秒的网关 503 一次打掉 11 格（每格 5–6 s 就放弃）；
 /// 抬到 4 并配 `backoff_for` 的瞬断长退避，能扛约一分钟的抖动。超时另封顶 `TIMEOUT_RETRY_CAP`。
 pub const DEFAULT_RETRY_BUDGET: u32 = 4;
@@ -240,7 +240,7 @@ pub(crate) trait AttemptPolicy: Send + Sync {
 
 /// 流式旁路的尝试复位（M21b 批 D-1，followup「接真 sink 前须处理」）：`timed_turn_with` 的重试复用同一
 /// backend 与同一 `IncrementalFindings`——断流那次的半截 JSON 会与重试输出拼进同一解析器，
-/// sink 是 no-op 时无害，接真 sink（批 D 的 verifier）后就会发出重试前的草稿对象。
+/// sink 是 no-op 时无害，接真 sink（批 D 的 refuter）后就会发出重试前的草稿对象。
 ///
 /// 本包装在**每次尝试开始**复位解析状态（已闭合对象与丢弃计数保留），其余回调纯委托给内层策略。
 /// 只在有内层策略时安装：`policy = None` 的路径（单测 / 无门）不能凭空多出一个 `on_rate_limited` 实现，

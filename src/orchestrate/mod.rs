@@ -74,7 +74,7 @@ pub fn enrich(raw: &RawFinding, model: &str) -> Finding {
         quote: raw.quote.clone(),
         previously_dismissed: false,
         cluster_id: None,
-        verify: None,
+        refute: None,
         origin: Origin::New,
         outside_window: false,
     }
@@ -432,7 +432,7 @@ fn scan_cell_notes(
         notes.push(format!("{unreadable} suspicions dropped: file unreadable"));
     }
     // 跨文件重定位救回的（B-3）：加了观测就得有出口，否则这一层在真实运行里不可见——
-    // 本批自己踩过（字段加完没人消费，和 `Phase::Verify` 同一类形状）。
+    // 本批自己踩过（字段加完没人消费，和 `Phase::Refute` 同一类形状）。
     if relocated > 0 {
         notes.push(format!("{relocated} suspicions relocated: quote found in another changed file"));
     }
@@ -601,7 +601,7 @@ mod scan_tests {
             "quote 真实、file 写错 → 该被重定位救回并改写归属: {anchored:?}"
         );
         // 救回来这件事要在 cell 记录里看得见——加了观测没出口等于这一层在真实运行里不可见
-        // （本批自己踩过：`relocated` 字段加完没人消费，和 `Phase::Verify` 同一类形状）。
+        // （本批自己踩过：`relocated` 字段加完没人消费，和 `Phase::Refute` 同一类形状）。
         assert!(
             res.cells.iter().any(|c| c.record.warn.as_deref().unwrap_or("").contains("relocated")),
             "重定位要进 cell notes: {:?}",

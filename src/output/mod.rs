@@ -68,7 +68,7 @@ fn render_md(r: &ReviewReport) -> String {
     let refuted = r.findings.iter().filter(|f| f.is_refuted()).count();
     if refuted > 0 {
         s.push_str(&format!(
-            "- Findings: {} (+{refuted} refuted by verifier — listed below, excluded from counts and verdict)\n",
+            "- Findings: {} (+{refuted} refuted by refuter — listed below, excluded from counts and verdict)\n",
             r.stats.total
         ));
     } else {
@@ -291,12 +291,12 @@ fn render_md(r: &ReviewReport) -> String {
                 if f.origin == crate::domain::Origin::Carried {
                     s.push_str("| Origin     | carried from an earlier round |\n");
                 }
-                if let Some(v) = &f.verify {
+                if let Some(v) = &f.refute {
                     let tag = match v.verdict {
-                        crate::domain::VerifyVerdict::Refuted => "refuted",
-                        crate::domain::VerifyVerdict::Upheld => "upheld",
+                        crate::domain::RefuteVerdict::Refuted => "refuted",
+                        crate::domain::RefuteVerdict::Upheld => "upheld",
                     };
-                    s.push_str(&format!("| Verify     | {tag} by {} |\n", v.model));
+                    s.push_str(&format!("| Refute     | {tag} by {} |\n", v.model));
                 }
                 if f.previously_dismissed {
                     s.push_str("| Dismissed  | previously dismissed (exempt from verdict) |\n");
@@ -414,7 +414,7 @@ mod tests {
             findings:vec![Finding{ id:"1".into(),severity:Severity::High,title:"boom".into(),body:"b".into(),
                 file:"a.rs".into(),line_start:3,line_end:5,confidence:0.9,recommendation:"fix".into(),
                 models:vec!["claude".into()],agreement:1, suspicion_agreement: 0,hard_constraint:false,
-                quote:"snippet".into(),cluster_id:None,verify:None,previously_dismissed:false,
+                quote:"snippet".into(),cluster_id:None,refute:None,previously_dismissed:false,
                 origin:Origin::New, outside_window: false}],
             clusters:vec![], run:RunMeta::default() }
     }
@@ -627,12 +627,12 @@ mod tests {
     #[test]
     fn md_headline_discloses_refuted_findings_that_are_still_listed() {
         let mut r = report();
-        r.findings[0].set_verdict(Verify {
-            verdict: VerifyVerdict::Refuted, model: "p/v".into(), note: "已有守卫".into(),
+        r.findings[0].set_refute(Refute {
+            verdict: RefuteVerdict::Refuted, model: "p/v".into(), note: "已有守卫".into(),
         });
         r.stats = Stats::from_findings(&r.findings);
         let md = render_md(&r);
-        assert!(md.contains("- Findings: 0 (+1 refuted by verifier"), "头条要说清: {}", &md[..md.len().min(400)]);
+        assert!(md.contains("- Findings: 0 (+1 refuted by refuter"), "头条要说清: {}", &md[..md.len().min(400)]);
         assert!(md.contains("### F1: boom"), "详情照列——审计不断链");
     }
 
@@ -842,18 +842,18 @@ mod tests {
         assert!(s.contains("share same root cause"), "cluster note must appear");
     }
     #[test]
-    fn md_marks_refuted_verify() {
-        use crate::domain::{Verify, VerifyVerdict};
+    fn md_marks_refuted_refute() {
+        use crate::domain::{Refute, RefuteVerdict};
         let mut r = report();
-        r.findings[0].verify = Some(Verify { verdict: VerifyVerdict::Refuted, model: "gpt".into(), note: "guarded".into() });
+        r.findings[0].refute = Some(Refute { verdict: RefuteVerdict::Refuted, model: "gpt".into(), note: "guarded".into() });
         let s = render(&r, Format::Md);
         assert!(s.to_lowercase().contains("refuted"), "md must mark refuted findings");
     }
     #[test]
-    fn md_marks_upheld_verify() {
-        use crate::domain::{Verify, VerifyVerdict};
+    fn md_marks_upheld_refute() {
+        use crate::domain::{Refute, RefuteVerdict};
         let mut r = report();
-        r.findings[0].verify = Some(Verify { verdict: VerifyVerdict::Upheld, model: "gpt".into(), note: String::new() });
+        r.findings[0].refute = Some(Refute { verdict: RefuteVerdict::Upheld, model: "gpt".into(), note: String::new() });
         let s = render(&r, Format::Md);
         assert!(s.to_lowercase().contains("upheld"), "md must mark upheld findings");
     }

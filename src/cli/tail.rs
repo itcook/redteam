@@ -1,5 +1,5 @@
-//! 尾段公共件（M21a 批 F-4 硬切后）：退出码映射与 model id 映射。旧 finding 尾段（anchor → dedup → verify → verdict →
-//! `assemble_report` / `TailCtx` / `CarryCtx` / `mark_dismissed`）随旧 fan-out 删除；M21b reviewer / verifier 尾段另起。
+//! 尾段公共件（M21a 批 F-4 硬切后）：退出码映射与 model id 映射。旧 finding 尾段（anchor → dedup → refute → verdict →
+//! `assemble_report` / `TailCtx` / `CarryCtx` / `mark_dismissed`）随旧 fan-out 删除；M21b reviewer / refuter 尾段另起。
 
 use crate::domain::Verdict;
 

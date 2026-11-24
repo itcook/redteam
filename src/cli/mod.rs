@@ -17,7 +17,7 @@ use std::path::Path;
 pub(crate) mod deny;
 mod incremental;
 pub(crate) mod second_pass;
-pub mod verify_once;
+pub mod refute_once;
 mod spec;
 mod tail;
 
@@ -341,7 +341,7 @@ pub async fn run_code_review(
     if let Some(s) = sink { s.on_meta(&model_names); }
     // --spec 参照段（D2）：从 pack 预算里扣掉它占用的字节。
     let (budget, spec_section, mut spec_warnings) = budget_and_spec(&roles, &args.spec);
-    // 仓库简介（M21d 批 B-1，design §10.5）：每轮读一次、scanner / reviewer / verifier 共用同一份
+    // 仓库简介（M21d 批 B-1，design §10.5）：每轮读一次、scanner / reviewer / refuter 共用同一份
     // ——稳定前缀两边逐字节相同才有 cache 可言。缺失 = 空串 = 与今日一致。
     // 老项目的 `.gitignore` 升级也挂在这条真实路径上（见 `upgrade_legacy_gitignore` 的注释）。
     crate::project::upgrade_legacy_gitignore(root);
@@ -387,7 +387,7 @@ pub async fn run_code_review(
         if let Some(s) = sink {
             s.on_deep_start(crate::state::DeepHeader { budget_cells });
         }
-        // 深挖内部的阶段钩子（M21c 批 C 的状态机盘点补）：复核尾段打 `Phase::Verify`。
+        // 深挖内部的阶段钩子（M21c 批 C 的状态机盘点补）：复核尾段打 `Phase::Refute`。
         let on_phase = |ph: crate::state::Phase, note: Option<String>| {
             if let Some(s) = sink {
                 s.on_phase(ph, note);
@@ -429,9 +429,9 @@ pub async fn run_code_review(
                 prior_findings: carried,
                 tools: resolve_tools(args, cfg),
                 backend_factory: Some(factory.as_ref()),
-                verify: Some(crate::orchestrate::deep::VerifyInput {
+                refute: Some(crate::orchestrate::deep::RefuteInput {
                     roles: &roles,
-                    enabled: cfg.review.verifiers.enabled,
+                    enabled: cfg.review.refuters.enabled,
                     // 与 verdict 同一份阈值（收口评审 #9）：旗标覆盖必须同时作用于两处。
                     block_threshold: thresholds.0,
                     conf_floor: thresholds.1,
@@ -668,12 +668,12 @@ fn overlay_deep(
     report.findings = findings.clone();
     report.stats = Stats::from_findings(&counted);
     // 本轮复核的驳回率（design §8.1「去留由数据决定」）：分母是**真跑成了的**条数——
-    // 被免验跳过的从没给过 verifier 机会，没跑成的（provider 挂了 / 判决读不懂）也没给出过证据，
-    // 两类算进分母都只会把率冲淡（收口评审 #6：verifier 全挂会读成「验了 N 条一条没驳」）。
+    // 被免验跳过的从没给过 refuter 机会，没跑成的（provider 挂了 / 判决读不懂）也没给出过证据，
+    // 两类算进分母都只会把率冲淡（收口评审 #6：refuter 全挂会读成「验了 N 条一条没驳」）。
     // 一条都没跑成 → None（不产键），不拿 0 冒充「验了没驳回」。
-    let verified = deep.meta.verify_triggered.saturating_sub(deep.meta.verify_failed);
-    let verify_ran = deep.meta.verify_triggered > 0;
-    report.run.refute_rate = (verified > 0).then(|| deep.meta.verify_refuted as f32 / verified as f32);
+    let verified = deep.meta.refute_triggered.saturating_sub(deep.meta.refute_failed);
+    let refute_ran = deep.meta.refute_triggered > 0;
+    report.run.refute_rate = (verified > 0).then(|| deep.meta.refute_refuted as f32 / verified as f32);
     report.run.deep = Some(deep.meta);
     report.run.warnings.extend(deep.warnings);
     if skipped > 0 {
@@ -694,8 +694,8 @@ fn overlay_deep(
     let h = crate::prompt::template_hashes();
     report.run.template_hashes.insert("reviewer_tail".into(), h.reviewer_tail.clone());
     // 复核真跑过才记它的模板哈希（prompt 漂移登记表；没跑过就记等于给报告塞噪音）。
-    if verify_ran {
-        report.run.template_hashes.insert("verifier_tail".into(), h.verifier_tail.clone());
+    if refute_ran {
+        report.run.template_hashes.insert("refuter_tail".into(), h.refuter_tail.clone());
     }
     let (block, floor) = verdict_thresholds(args, cfg);
     let verdict = crate::verdict::compute_verdict(&counted, block, floor);
@@ -722,7 +722,7 @@ fn overlay_deep(
     (report, exit_code(verdict, debt))
 }
 
-/// 把 scan-only 收口之外的格（reviewer / verifier）并进报告：coverage 按记录自身角色记（追加、不覆盖同角色已有项）——
+/// 把 scan-only 收口之外的格（reviewer / refuter）并进报告：coverage 按记录自身角色记（追加、不覆盖同角色已有项）——
 /// selected 全列，然后**失败优先**分桶：失败 → failed，成功且沿用 → reused，成功且本轮跑 → completed；
 /// usage、`run.cells` 摘要、顶层 `cells` 同步。
 ///
@@ -1475,7 +1475,7 @@ fn promote_dug_suspicions(
             //
             // 原来问的是「有任何 finding 落在该项区间内」，那会把三类不属于它的算进来：
             // 兄弟疑点的产出、往轮携带（`Origin::Carried`，根本不是本轮挖的）、
-            // 以及已被 verifier 驳回的那条。后果是把一条还没真挖出结果的台账行**提前**请出
+            // 以及已被 refuter 驳回的那条。后果是把一条还没真挖出结果的台账行**提前**请出
             // 激活池（方向偏安全，但语义是错的）。
             //
             // `produced` 是落地时记的「本项自己的输出」，前两类自然排除；第三类靠最终判决过滤
@@ -1489,7 +1489,7 @@ fn promote_dug_suspicions(
             }
             findings.iter().any(|f| {
                 it.produced.contains(&f.id)
-                    && f.verify.as_ref().is_none_or(|v| v.verdict != crate::domain::VerifyVerdict::Refuted)
+                    && f.refute.as_ref().is_none_or(|v| v.verdict != crate::domain::RefuteVerdict::Refuted)
             })
         })
         .flat_map(|it| it.arrivals.iter().filter_map(|a| a.strip_prefix("ledger:").map(str::to_string)))
@@ -1663,7 +1663,7 @@ pub async fn run_resume(
         roles.scanners.iter().find(|m| m.name == name).map(crate::orchestrate::ScanEntrySpec::from)
     };
     let family_of = |name: &str| -> String {
-        roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers)
+        roles.scanners.iter().chain(&roles.reviewers).chain(&roles.refuters)
             .find(|m| m.name == name).map(|m| m.family.clone()).unwrap_or_default()
     };
     let current_hash = crate::prompt::scan_template_hash();
@@ -1801,14 +1801,14 @@ pub async fn run_resume(
             // **判决在这里就贴上**（收口评审 #1）：下面「diff 重建不了」那条路会直接 `break 'deep`
             // 用这批 finding 造报告，走不到 run_deep 的回填；漏贴 = 往轮已被驳回的 finding
             // 在本轮报告里复活成拦路 blocking，往轮的驳回记录从 JSON 里消失。
-            // 往轮已判过的不重验（〔D17〕Q11）：verifier 格按 finding id 回填。
+            // 往轮已判过的不重验（〔D17〕Q11）：refuter 格按 finding id 回填。
             let known = crate::orchestrate::deep::known_verdicts(&deep_records);
             let prior_findings: Vec<crate::domain::Finding> = deep_records
                 .iter()
                 .flat_map(|r| r.output.findings().to_vec())
                 .map(|mut f| {
                     if let Some(v) = known.get(&f.id) {
-                        f.set_verdict(v.clone());
+                        f.set_refute(v.clone());
                     }
                     f
                 })
@@ -1836,8 +1836,8 @@ pub async fn run_resume(
                     };
                     // 这条路也要并复用账（收口评审 #1）：`restored_meta` 只填截断 / 队列深度 / 疑点数，复核四量恒 0。
                     // 而上面的 `prior_findings` 已按 `known` 回填了判决——不并的话，同一份报告里会出现
-                    // 「某 finding verdict=Refuted」而 `verify_triggered == 0`，正是出口验收第 6 项要杜绝的那种误判。
-                    crate::orchestrate::deep::fold_reused_verify(&mut deep.meta, &deep.reused_cells);
+                    // 「某 finding verdict=Refuted」而 `refute_triggered == 0`，正是出口验收第 6 项要杜绝的那种误判。
+                    crate::orchestrate::deep::fold_reused_refute(&mut deep.meta, &deep.reused_cells);
                     // 落账同理（收口评审 #9）：首跑崩在深挖收场之后、进程退出之前时，那批截断疑点从没被落过账。
                     promote_dug_suspicions(cwd, &deep.items, &deep.findings, &round_id, args.no_dismissed, &mut report.run.warnings);
                     persist_dormant_suspicions(cwd, &deep.items, &round_id, args.no_dismissed, &mut report.run.warnings);
@@ -1866,7 +1866,7 @@ pub async fn run_resume(
             // spec 段随重跑一起带回：resume 的 reviewer prompt 必须与首跑同构，缺了契约段
             // 同一 cell 两次判读口径就不一样。
             let (budget, spec_section, mut spec_warnings) = budget_and_spec(&roles, &args.spec);
-            // 仓库简介（M21d 批 B-1，design §10.5）：每轮读一次、scanner / reviewer / verifier 共用同一份
+            // 仓库简介（M21d 批 B-1，design §10.5）：每轮读一次、scanner / reviewer / refuter 共用同一份
             // ——稳定前缀两边逐字节相同才有 cache 可言。缺失 = 空串 = 与今日一致。
             let (repo_brief, brief_warnings) = spec::read_repo_brief(cwd, spec::BRIEF_BUDGET_BYTES);
             spec_warnings.extend(brief_warnings);
@@ -1943,9 +1943,9 @@ pub async fn run_resume(
                     prior_findings,
                     tools: resolve_tools(&args, cfg),
                     backend_factory: Some(factory.as_ref()),
-                    verify: Some(crate::orchestrate::deep::VerifyInput {
+                    refute: Some(crate::orchestrate::deep::RefuteInput {
                         roles: &roles,
-                        enabled: cfg.review.verifiers.enabled,
+                        enabled: cfg.review.refuters.enabled,
                         block_threshold: thresholds.0,
                         conf_floor: thresholds.1,
                         precedents: &ledger.cards,
@@ -1969,7 +1969,7 @@ pub async fn run_resume(
             // 复核账把**复用格**也算进来（M21c 批 A-4，M21b 第 6 项实测的债）：
             // 原先 meta 只统计本轮新验的，于是崩溃续跑后报告里「复核触发 0 / 驳回 0」——
             // 极端情况（杀在复核尾部、续跑无事可做）整组计数全空，出口验收若按报告字段判会误判成「一次没验」。
-            crate::orchestrate::deep::fold_reused_verify(&mut deep.meta, &deep.reused_cells);
+            crate::orchestrate::deep::fold_reused_refute(&mut deep.meta, &deep.reused_cells);
             // resume 也要落账（收口评审 #9）：`persist_dormant_suspicions` 原先只挂在 `run_code_review` 上，
             // 崩在深挖中途的作业续跑后再次产出的 Skipped 项就永远进不了跨轮台账。
             promote_dug_suspicions(cwd, &deep.items, &deep.findings, &round_id, args.no_dismissed, &mut report.run.warnings);
@@ -3056,9 +3056,9 @@ mod resume_tests {
         store.append_partial("j", &landed).unwrap();
         // 往轮已复核过这条 finding（A-4：复用格的复核账要并回 meta，否则续跑报告里「复核触发 0」）
         store.append_partial("j", &CellRecord::ok(
-            format!("verify[{fid}]@p/v"), "p/v",
-            crate::domain::CellOutput::Verify { verdicts: vec![crate::domain::VerifyEntry {
-                id: fid.clone(), verdict: crate::domain::VerifyVerdict::Upheld, note: "看过了".into(),
+            format!("refute[{fid}]@p/v"), "p/v",
+            crate::domain::CellOutput::Refute { verdicts: vec![crate::domain::RefuteEntry {
+                id: fid.clone(), verdict: crate::domain::RefuteVerdict::Upheld, note: "看过了".into(),
             }] },
         )).unwrap();
         store.put_queue_item("j", &rule_item("x.rs", ItemState::InFlight)).unwrap();
@@ -3069,11 +3069,11 @@ mod resume_tests {
         let (second, code2) = run_resume("j", &reg, &deep_cfg(), ws, &store).await;
 
         assert_eq!(rev.turn_count(), 0, "已有成功格的项不重挖");
-        // A-4：往轮的 verify 格是「复用」的，它的账必须并回 meta——否则续跑报告里「复核触发 0 / 驳回 0」，
+        // A-4：往轮的 refute 格是「复用」的，它的账必须并回 meta——否则续跑报告里「复核触发 0 / 驳回 0」，
         // 按报告字段判会误判成「一次没验」（M21b 出口验收第 6 项实测）。不可重建的那些要照实说。
         for r in [&first, &second] {
             let deep = r.run.deep.as_ref().expect("续跑有深挖段");
-            assert_eq!(deep.verify_triggered, 1, "复用的复核格要计入触发数: {deep:?}");
+            assert_eq!(deep.refute_triggered, 1, "复用的复核格要计入触发数: {deep:?}");
             assert!(r.run.warnings.iter().any(|w| w.contains("close_ms") && w.contains("不可重建")),
                     "不可重建的字段要照实说: {:?}", r.run.warnings);
         }
@@ -3203,10 +3203,10 @@ mod resume_tests {
 
     /// resume 的**第二条**收口路径（diff 重建不了）同样要并复用复核账、同样要落账（收口评审 #1 / #9）。
     /// 原先 A-4 只补了「diff 重建成功」那条：另一条用 `restored_meta` 造 meta，复核四量恒 0，
-    /// 于是报告里会出现「某 finding verdict=Refuted」而 `verify_triggered == 0` —— 正是出口验收第 6 项
+    /// 于是报告里会出现「某 finding verdict=Refuted」而 `refute_triggered == 0` —— 正是出口验收第 6 项
     /// 要杜绝的「按报告字段判会误判成一次没验」。落账同理：首跑崩在深挖收场之后时那批截断疑点从没落过账。
     #[tokio::test]
-    async fn resume_without_rebuildable_diff_still_folds_verify_and_records_ledger() {
+    async fn resume_without_rebuildable_diff_still_folds_refute_and_records_ledger() {
         use crate::orchestrate::queue::{ItemKind, ItemState, QueueItem};
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
@@ -3242,9 +3242,9 @@ mod resume_tests {
         let fid = fx.id.clone();
         store.append_partial("j", &CellRecord::ok("review[x.rs:rule:1-2]@p/r", "p/r",
             crate::domain::CellOutput::Review { findings: vec![fx], needs: vec![] })).unwrap();
-        store.append_partial("j", &CellRecord::ok(format!("verify[{fid}]@p/v"), "p/v",
-            crate::domain::CellOutput::Verify { verdicts: vec![crate::domain::VerifyEntry {
-                id: fid.clone(), verdict: crate::domain::VerifyVerdict::Upheld, note: "看过了".into() }] })).unwrap();
+        store.append_partial("j", &CellRecord::ok(format!("refute[{fid}]@p/v"), "p/v",
+            crate::domain::CellOutput::Refute { verdicts: vec![crate::domain::RefuteEntry {
+                id: fid.clone(), verdict: crate::domain::RefuteVerdict::Upheld, note: "看过了".into() }] })).unwrap();
         store.put_queue_item("j", &rule_item("x.rs", ItemState::Settled)).unwrap();
         let sus = crate::domain::Suspicion {
             file: "y.rs".into(), line_start: 5, line_end: 5, hint: "被截断的疑点".into(),
@@ -3268,7 +3268,7 @@ mod resume_tests {
         assert!(report.run.warnings.iter().any(|w| w.starts_with("resume deep: cannot rebuild diff")),
                 "前提：确实走了第二条路 {:?}", report.run.warnings);
         let deep = report.run.deep.as_ref().expect("有深挖段");
-        assert_eq!(deep.verify_triggered, 1, "复用的复核格要计入，否则 refute_rate 与判决自相矛盾: {deep:?}");
+        assert_eq!(deep.refute_triggered, 1, "复用的复核格要计入，否则 refute_rate 与判决自相矛盾: {deep:?}");
         let db = crate::db::ProjDb::open(ws).unwrap();
         let rows = db.suspicions_for_files(&["y.rs".into()]).unwrap();
         assert_eq!(rows.len(), 1, "被截断的疑点要进跨轮台账");
@@ -4119,16 +4119,16 @@ mod code_review_tests {
 
     /// 触发集与 verdict 同源，**含 CLI 覆盖**（2026-09-21 收口评审 #9）：`--conf-floor 0.3` 让一条
     /// 置信 0.4 的 finding 成为 blocking，它就必须同时进复核触发集。两处读不同的阈值时，
-    /// 这条会被 verdict 判成拦路、却永远不被复核——`verify.rs` 里写着的「与 compute_verdict 同源」当场失效。
+    /// 这条会被 verdict 判成拦路、却永远不被复核——`refute.rs` 里写着的「与 compute_verdict 同源」当场失效。
     #[tokio::test]
-    async fn cli_threshold_overrides_reach_the_verify_trigger_set() {
+    async fn cli_threshold_overrides_reach_the_refute_trigger_set() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
         let cfg = Config::from_json(
-            r#"{"review":{"verifiers":{"enabled":true}},"providers":{"p":{"kind":"openai","models":{
+            r#"{"review":{"refuters":{"enabled":true}},"providers":{"p":{"kind":"openai","models":{
                 "s":{"roles":{"scanner":{}}},
                 "r":{"roles":{"reviewer":{}}},
-                "v":{"roles":{"verifier":{}}}
+                "v":{"roles":{"refuter":{}}}
             }}}}"#,
         )
         .unwrap();
@@ -4148,9 +4148,9 @@ mod code_review_tests {
 
         let deep = report.run.deep.as_ref().expect("有 reviewer → 有 deep 段");
         assert_eq!(
-            deep.verify_triggered, 1,
+            deep.refute_triggered, 1,
             "0.4 在 --conf-floor 0.3 之上 → 既是 blocking 也该进触发集；skipped={:?}",
-            deep.verify_skipped
+            deep.refute_skipped
         );
         assert_eq!((report.verdict, code), (Verdict::Reject, 10), "同一条同时是 blocking");
     }
@@ -4460,7 +4460,7 @@ mod code_review_tests {
             id: file.into(), severity: crate::domain::Severity::Low, title: "t".into(), body: "b".into(),
             file: file.into(), line_start: 1, line_end: 1, confidence: 0.5, recommendation: "r".into(),
             models: vec![], agreement: 1, suspicion_agreement: 0, hard_constraint: false,
-            quote: String::new(), cluster_id: None, verify: None, previously_dismissed: false,
+            quote: String::new(), cluster_id: None, refute: None, previously_dismissed: false,
             origin: crate::domain::Origin::New, outside_window: false,
         };
         use crate::orchestrate::queue::ItemState;
@@ -4502,7 +4502,7 @@ mod code_review_tests {
             id: format!("{file}:{line}"), severity: crate::domain::Severity::Medium, title: "t".into(),
             body: "b".into(), file: file.into(), line_start: line, line_end: line, confidence: 0.8,
             recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
-            hard_constraint: false, quote: String::new(), cluster_id: None, verify: None,
+            hard_constraint: false, quote: String::new(), cluster_id: None, refute: None,
             previously_dismissed: false, origin: crate::domain::Origin::New, outside_window: false,
         };
         let deep = || crate::orchestrate::deep::DeepRun {
@@ -4556,7 +4556,7 @@ mod code_review_tests {
     }
 
     /// `refute_rate` 的分母是**真发出去验了的**条数，不是全部 blocking（批 D-5）：
-    /// 被免验跳过的从没给过 verifier 机会，算进分母只会把率冲淡；一条都没触发 → 不产这个键
+    /// 被免验跳过的从没给过 refuter 机会，算进分母只会把率冲淡；一条都没触发 → 不产这个键
     /// （拿 0 冒充「验了没驳回」会让「去留由数据决定」读到假数据）。
     #[test]
     fn refute_rate_counts_only_what_was_actually_verified() {
@@ -4567,10 +4567,10 @@ mod code_review_tests {
             findings: vec![],
             cells: vec![crate::state::CellRecord::ok("c", "m", crate::domain::CellOutput::Review { findings: vec![], needs: vec![] })],
             meta: crate::domain::DeepMeta {
-                verify_triggered: triggered,
-                verify_refuted: refuted,
-                verify_failed: failed,
-                verify_skipped: [("consensus".to_string(), skipped)].into_iter().collect(),
+                refute_triggered: triggered,
+                refute_refuted: refuted,
+                refute_failed: failed,
+                refute_skipped: [("consensus".to_string(), skipped)].into_iter().collect(),
                 ..Default::default()
             },
             warnings: vec![], reviewer_failed: false, reused_cells: vec![], items: vec![],
@@ -4581,7 +4581,7 @@ mod code_review_tests {
         assert_eq!(rep.run.refute_rate, Some(0.25), "4 条进了复核、驳回 1 条 → 25%（跳过的 9 条不进分母）");
         let (rep2, _) = overlay_deep(blank(), 0, deep_with(0, 0, 9, 0), &args(), &cfg, &reg, Some(&[]), std::time::Instant::now());
         assert_eq!(rep2.run.refute_rate, None, "一条都没触发复核 → 不产键");
-        // 收口评审 #6：没跑成的（provider 挂了 / 判决读不懂）也不进分母，否则「verifier 全挂」
+        // 收口评审 #6：没跑成的（provider 挂了 / 判决读不懂）也不进分母，否则「refuter 全挂」
         // 会读成「验了 N 条一条没驳」——而这个数正是下次复议「去留」时要读的。
         let (rep3, _) = overlay_deep(blank(), 0, deep_with(4, 1, 0, 2), &args(), &cfg, &reg, Some(&[]), std::time::Instant::now());
         assert_eq!(rep3.run.refute_rate, Some(0.5), "4 条派出去、2 条没跑成 → 分母是 2");
@@ -5459,7 +5459,7 @@ mod tests {
     /// 晋升判据按「**这个项**挖出来的」算，不是「这个区间里有」（schema 批 B-3，2026-10-04）。
     ///
     /// 旧判据是 `findings.iter().any(落在 it.spec.ranges 内)`，把三类不属于本项的也算进来：
-    /// 兄弟疑点的产出、往轮携带（`Origin::Carried`，根本不是本轮挖的）、已被 verifier 驳回的。
+    /// 兄弟疑点的产出、往轮携带（`Origin::Carried`，根本不是本轮挖的）、已被 refuter 驳回的。
     /// 后果是把一条还没真挖出结果的台账行**提前**请出激活池——它再也不会被重挖，
     /// 而报告里也没有对应的 finding，这条线索就此消失。
     #[test]
@@ -5485,11 +5485,11 @@ mod tests {
                 "models": ["m"], "agreement": 1, "hard_constraint": false, "quote": "q",
             })).unwrap();
             if let Some(v) = verdict {
-                f.verify = Some(crate::domain::Verify {
+                f.refute = Some(crate::domain::Refute {
                     verdict: if v == "refuted" {
-                        crate::domain::VerifyVerdict::Refuted
+                        crate::domain::RefuteVerdict::Refuted
                     } else {
-                        crate::domain::VerifyVerdict::Upheld
+                        crate::domain::RefuteVerdict::Upheld
                     },
                     model: "p/v".into(),
                     note: String::new(),
@@ -5506,7 +5506,7 @@ mod tests {
         promote_dug_suspicions(t.path(), &[item(&["f_mine"])], &[finding("f_sibling", None)], "sha1", false, &mut w);
         assert_eq!(st(&t), "dormant", "别的项挖出来的不算它的");
 
-        // ② 已被 verifier 驳回：是本项产出的，但判决不成立 → 不晋升
+        // ② 已被 refuter 驳回：是本项产出的，但判决不成立 → 不晋升
         let t2 = ledger_fixture("sha0", 0);
         activate_dormant(t2.path(), &["a.rs".to_string()], "sha1", false);
         promote_dug_suspicions(t2.path(), &[item(&["f_mine"])], &[finding("f_mine", Some("refuted"))], "sha1", false, &mut w);

@@ -49,7 +49,8 @@ def export_upheld(conn, dismissed_ids):
             continue
         head_sha = (report.get("run") or {}).get("head_sha") or ""
         for f in report.get("findings", []):
-            v = f.get("verify") or {}
+            # 0.8 术语分家：新报告写 refute，历史 results 行仍是 verify
+            v = f.get("refute") or f.get("verify") or {}
             if v.get("verdict") != "upheld":
                 continue
             out.append({

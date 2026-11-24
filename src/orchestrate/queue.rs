@@ -71,7 +71,7 @@ pub struct QueueItem {
     ///
     /// 给晰晋判据用。原来 `promote_dug_suspicions` 问的是「**有任何** finding 落在该项区间内」——
     /// 同一区间里的 finding 可能来自兄弟疑点、往轮携带（`Origin::Carried`）、
-    /// 或已被 verifier 驳回的那条，于是把一条还没真挖出结果的台账行提前请出激活池。
+    /// 或已被 refuter 驳回的那条，于是把一条还没真挖出结果的台账行提前请出激活池。
     /// 记在项上而不是给 `Finding` 加字段：后者要改 43 处构造点、还把归因细节泄进对外报告 JSON。
     /// 旧快照空 → `promote` 自动回落旧的区间判据（较宽，方向安全）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

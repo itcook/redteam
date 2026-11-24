@@ -44,7 +44,7 @@ mod tests {
             hard_constraint: hard,
             quote: "snippet".into(),
             cluster_id: None,
-            verify: None,
+            refute: None,
             previously_dismissed: false,
             origin: Origin::New,
             outside_window: false,
@@ -76,18 +76,18 @@ mod tests {
 
     #[test]
     fn refuted_finding_never_blocks_even_at_zero_floor() {
-        use crate::domain::{Verify, VerifyVerdict};
+        use crate::domain::{Refute, RefuteVerdict};
         let mut hi = f(Severity::High, 0.0, false);
-        hi.verify = Some(Verify { verdict: VerifyVerdict::Refuted, model: "beta".into(), note: String::new() });
+        hi.refute = Some(Refute { verdict: RefuteVerdict::Refuted, model: "beta".into(), note: String::new() });
         // conf_floor=0 退化配置：修复前 0.0>=0.0 会 blocking；修复后 refuted 被排除 → Approve。
         assert_eq!(compute_verdict(&[hi], Severity::Medium, 0.0), Verdict::Approve);
     }
 
     #[test]
     fn upheld_finding_still_blocks() {
-        use crate::domain::{Verify, VerifyVerdict};
+        use crate::domain::{Refute, RefuteVerdict};
         let mut hi = f(Severity::High, 0.9, false);
-        hi.verify = Some(Verify { verdict: VerifyVerdict::Upheld, model: "beta".into(), note: String::new() });
+        hi.refute = Some(Refute { verdict: RefuteVerdict::Upheld, model: "beta".into(), note: String::new() });
         assert_eq!(compute_verdict(&[hi], Severity::Medium, 0.5), Verdict::Reject);
     }
 

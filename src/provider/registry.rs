@@ -12,13 +12,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// 角色限定的注册键：`reasoningEffort` 是角色属性，同一模型在不同角色下必须是不同 backend，
-/// 否则 scanner 的档位会被 reviewer / verifier 静默复用。
+/// 否则 scanner 的档位会被 reviewer / refuter 静默复用。
 pub fn role_key(role: Role, name: &str) -> String {
     format!("{}:{}", role.as_str(), name)
 }
 
 /// provider 级在途门（design §12.3〔D13〕）：**唯一一道闸**。名额 = 门宽（provider `maxConcurrency`，缺省继承 `review.max_concurrency`），
-/// 同一 provider 下全部角色条目共享一把（scanner 与 M21b 的 reviewer / verifier 同门）。自管计数 + `Notify` 而非 tokio `Semaphore`：
+/// 同一 provider 下全部角色条目共享一把（scanner 与 M21b 的 reviewer / refuter 同门）。自管计数 + `Notify` 而非 tokio `Semaphore`：
 /// 撞 429 时门宽只降不升，收窄后多出的**已发**名额要在释放时丢弃（`Semaphore::forget_permits` 只能忘掉可用名额）。
 /// `peak` = 同时在途的 HTTP 请求峰值（RunMeta `provider_inflight_peak`，铁律 1）。
 pub struct InflightGate {
@@ -349,7 +349,7 @@ struct ScanEntry {
 }
 
 /// 按 route_key 路由的注册表（通用基建）。
-/// - `providers`：旧 `ReviewProvider` 表（finding 契约；M21b reviewer / verifier 沿用）。
+/// - `providers`：旧 `ReviewProvider` 表（finding 契约；M21b reviewer / refuter 沿用）。
 /// - `scan`：scanner 条目表（批 F-2）——`scan()` 先过所属 provider 的在途门再走 `run_scan_shot`。
 /// - `warnings`：建表时的告警（thinking 无映射等），调用方并入 RunMeta.warnings。
 #[derive(Default)]

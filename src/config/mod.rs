@@ -1,6 +1,6 @@
 //! 用户级唯一配置（design v9 §12〔D7 A8 / D12〕）：`$REDTEAM_HOME/config.json`（缺省 `~/.redteam/`）+ 同目录 `secrets.json`。
 //! 严格 JSON、键 camelCase、无注释。形状 = providers → models（按 id 做键）→ roles：模型固有字段只写一次，角色属性挂模型下；
-//! 某角色的活跃集 = 拥有该角色键的全部模型（列表即活跃集、无候补，D7 A3）。无项目层、无 `--models`（M21a 批 A 重做）。
+//! 某角色的活跃集 = 拥有该角色键的全部模型（列表即活跃集、无候补，D7 A3）。无项目层、无命令行选模型的旗。
 
 pub mod secrets;
 
@@ -61,17 +61,26 @@ impl ReasoningEffort {
     }
 }
 
-/// 角色（design §2 词汇）。批 B 的 domain 直接复用本枚举。作 `roles` 的 map 键时序列化为小写串。
+/// 角色（design §2 词汇 + 2026-11-23 术语分家〔P16〕）。批 B 的 domain 直接复用本枚举。作 `roles` 的 map 键时序列化为小写串。
+///
+/// 四角色分两条流程，不共用输出契约（P16.1）：
+/// - `scanner` / `reviewer` / `refuter` —— 评审管线（review）：疑点扫描 / 深挖 / **finding 验真**。
+/// - `verifier` —— hibot `verify` kind 的**修复验证**（fix diff → resolved/unresolved/regressed），
+///   review 管线不用它；选择时缺省回退 `reviewer`（[`RoleSets::fix_verifiers`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Role { Scanner, Reviewer, Verifier }
+pub enum Role { Scanner, Reviewer, Refuter, Verifier }
 
 impl Role {
-    pub const ALL: [Role; 3] = [Role::Scanner, Role::Reviewer, Role::Verifier];
+    pub const ALL: [Role; 4] = [Role::Scanner, Role::Reviewer, Role::Refuter, Role::Verifier];
+    /// 评审管线（review）的封闭角色集：`CellOutput` / `coverage` / phase 只认这三个。
+    /// fix 验证（[`Role::Verifier`]）另有自己的输出契约，**不在**这条管线里（P16.1 硬规则）。
+    pub const REVIEW_PIPELINE: [Role; 3] = [Role::Scanner, Role::Reviewer, Role::Refuter];
     pub fn parse(s: &str) -> Option<Role> {
         match s.trim() {
             "scanner" => Some(Role::Scanner),
             "reviewer" => Some(Role::Reviewer),
+            "refuter" => Some(Role::Refuter),
             "verifier" => Some(Role::Verifier),
             _ => None,
         }
@@ -80,11 +89,11 @@ impl Role {
         match self {
             Role::Scanner => "scanner",
             Role::Reviewer => "reviewer",
+            Role::Refuter => "refuter",
             Role::Verifier => "verifier",
         }
     }
 }
-
 /// 角色属性（`models.<id>.roles.<role>`）。将来的角色级旋钮只加在这里。
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -286,16 +295,16 @@ impl Default for ReviewersCfg {
     fn default() -> Self { ReviewersCfg { max_cells: d_max_cells(), reenqueue: false } }
 }
 
-/// `review.verifiers`：流式复核开关。**缺省关**——批 D-4 的离线基线按预登记阈值裁定
+/// `review.refuters`：评审内 finding 验真（refute）开关。**缺省关**——批 D-4 的离线基线按预登记阈值裁定
 /// （误驳 ≤ 5% ∧ 驳回 ≥ 30% 才默认开）：异族 deepseek-flash 驳回 31.2% / 误驳 12.0%、
 /// 同族 glm-5.3 驳回 18.8% / 误驳 8.0%，两臂的误驳都超门槛 → 默认关，要开显式写 `"enabled": true`。
 /// （数字为收口修掉「角色尾未 render」后的重跑值；修前那版见 research 的对照表。）
-/// 数字与归因见 `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`。
+/// 数字与归因见 `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`（历史文档，保留原名）。
 /// 缺省关 = `bool` 的 `Default`，故直接 derive：serde 缺省与 `Default` 只此一个来源，不会各说各话
-/// （`verifiers_enabled_defaults_off` 钉住两条路径同值）。
+/// （`refuters_enabled_defaults_off` 钉住两条路径同值）。
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VerifiersCfg {
+pub struct RefutersCfg {
     #[serde(default)]
     pub enabled: bool,
 }
@@ -381,7 +390,8 @@ pub struct ReviewConfig {
     #[serde(default)]
     pub reviewers: ReviewersCfg,
     #[serde(default)]
-    pub verifiers: VerifiersCfg,
+    /// 评审内 finding 验真开关（角色 `refuter`）。**缺省关**（数值依据见 `RefutersCfg`）。
+    pub refuters: RefutersCfg,
     #[serde(default)]
     pub grouping: GroupingCfg,
     #[serde(default)]
@@ -401,7 +411,7 @@ impl Default for ReviewConfig {
             tools: default_tools(),
             scanners: ScannersCfg::default(),
             reviewers: ReviewersCfg::default(),
-            verifiers: VerifiersCfg::default(),
+            refuters: RefutersCfg::default(),
             grouping: GroupingCfg::default(),
             pack: PackCfg::default(),
         }
@@ -417,11 +427,16 @@ pub struct Config {
     pub review: ReviewConfig,
 }
 
-/// 三角色活跃集（merged 视图）。顺序 = provider 名、model id 字典序（无语义，D12 K3）。
+/// 四角色活跃集（merged 视图）。顺序 = provider 名、model id 字典序（无语义，D12 K3）。
+///
+/// **显式集合与选择回退分开**：`verifiers` 只装配置里真实声明了 `roles.verifier` 的模型；
+/// “缺 verifier 时回退 reviewer”发生在选择点（[`RoleSets::fix_verifiers`]），不在这里预填充——
+/// 否则护栏（有 verifier 无 refuter）会把回退出来的条目误当成用户显式配置。
 #[derive(Clone, Debug, Default)]
 pub struct RoleSets {
     pub scanners: Vec<EffectiveModel>,
     pub reviewers: Vec<EffectiveModel>,
+    pub refuters: Vec<EffectiveModel>,
     pub verifiers: Vec<EffectiveModel>,
 }
 
@@ -430,12 +445,18 @@ impl RoleSets {
         match role {
             Role::Scanner => &self.scanners,
             Role::Reviewer => &self.reviewers,
+            Role::Refuter => &self.refuters,
             Role::Verifier => &self.verifiers,
         }
     }
-    /// 全部条目（scanner → reviewer → verifier 序）。
+    /// 全部条目（scanner → reviewer → refuter → verifier 序）。
     pub fn all(&self) -> impl Iterator<Item = &EffectiveModel> {
-        self.scanners.iter().chain(self.reviewers.iter()).chain(self.verifiers.iter())
+        self.scanners.iter().chain(self.reviewers.iter()).chain(self.refuters.iter()).chain(self.verifiers.iter())
+    }
+    /// fix 验证（kind=verify）的模型集：显式 `roles.verifier` 优先，**缺省回退 reviewer**（P16 用户裁决）。
+    /// 与 [`RoleSets::verifiers`] 的区别：后者是配置事实，本方法是选择策略。
+    pub fn fix_verifiers(&self) -> &[EffectiveModel] {
+        if self.verifiers.is_empty() { &self.reviewers } else { &self.verifiers }
     }
     /// 身份串 → 请求 id。
     pub fn id_of(&self, name: &str) -> Option<&str> {
@@ -520,6 +541,9 @@ impl Config {
                 }
             }
         }
+        if let Some(w) = cfg.verifier_role_guard_warning() {
+            warnings.push(w);
+        }
         if cfg.review.max_concurrency > MAX_CONCURRENCY_SANE as usize {
             warnings.push(format!("review.maxConcurrency = {} 像是填错字段（maxOutputTokens？）：它是 provider 在途上限的缺省；撞 429 时门会自动收敛，仍建议改回", cfg.review.max_concurrency));
         }
@@ -573,7 +597,7 @@ impl Config {
         })
     }
 
-    /// 三角色活跃集：每角色 = 拥有该角色键的全部模型。
+    /// 四角色活跃集：每角色 = 拥有该角色键的全部模型。
     pub fn active_roles(&self) -> RoleSets {
         let mut sets = RoleSets::default();
         for (pname, p) in &self.providers {
@@ -583,6 +607,7 @@ impl Config {
                         match role {
                             Role::Scanner => sets.scanners.push(em),
                             Role::Reviewer => sets.reviewers.push(em),
+                            Role::Refuter => sets.refuters.push(em),
                             Role::Verifier => sets.verifiers.push(em),
                         }
                     }
@@ -590,6 +615,25 @@ impl Config {
             }
         }
         sets
+    }
+
+    /// 护栏（0.8 术语硬切，R20）：存在 `roles.verifier` 但没有任何 `roles.refuter`。
+    ///
+    /// 硬切后 `verifier` 的语义已变（现在只指 fix 验证），旧本地配置里的 `roles.verifier`
+    /// 会静默从「验真角色」变成「fix 验证角色」，验真角色悄悄消失。未发布、不做兼容层，
+    /// 但这条变义必须可见——前台（`Config::load` 的 warnings）与后台/续跑（registry → 报告
+    /// `run.warnings`）都靠本方法同一份文案。
+    pub fn verifier_role_guard_warning(&self) -> Option<String> {
+        let roles = self.active_roles();
+        if roles.verifiers.is_empty() || !roles.refuters.is_empty() {
+            return None;
+        }
+        Some(
+            "检测到 roles.verifier 但没有任何 roles.refuter：评审内的验真角色已更名为 refuter，\
+             roles.verifier 现在只用于 verify kind 的修复验证（缺省回退 reviewer）。\
+             本次 review 的复核会按异族自动挑选；要显式指定验真模型，请把 roles.verifier 改成 roles.refuter。"
+                .to_string(),
+        )
     }
 
     /// key 解析链（§12.2）：模型 `apiKeyEnv`(env) → secrets.models[id] → provider `apiKeyEnv`(env) → secrets.apiKey。
@@ -713,14 +757,14 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     const PROVIDER: &[&str] = &["kind", "baseUrl", "apiKeyEnv", "maxConcurrency", "models"];
     const MODEL: &[&str] = &["displayName", "kind", "apiKeyEnv", "family", "contextWindow", "maxOutputTokens", "perTurnTimeoutSecs", "reasoning", "roles"];
     const ROLE_ATTRS: &[&str] = &["reasoningEffort"];
-    const REVIEW: &[&str] = &["blockThreshold", "confFloor", "maxConcurrency", "tools", "scanners", "reviewers", "verifiers", "grouping", "pack"];
+    const REVIEW: &[&str] = &["blockThreshold", "confFloor", "maxConcurrency", "tools", "scanners", "reviewers", "refuters", "grouping", "pack"];
     /// review 已删键：`risk`（D11 无模式旋钮）。
     const REVIEW_REMOVED: &[(&str, &str)] = &[("risk", "D11：无模式旋钮")];
     /// (节名, 已知键, 是否角色节)；角色节的已删键 `workers`（D13）在 shape_guard 里按缺省值拼文案。
     const REVIEW_SECTIONS: &[(&str, &[&str], bool)] = &[
         ("scanners", &["samples"], true),
         ("reviewers", &["maxCells", "reenqueue"], true),
-        ("verifiers", &["enabled"], true),
+        ("refuters", &["enabled"], true),
         ("grouping", &["minFiles", "bundleLineThreshold", "maxFilesPerGroup", "semantic"], false),
         ("pack", &["body", "anchorWindow", "findingWindow", "findingWindowEnforce", "sliceMinBytes"], false),
     ];
@@ -750,7 +794,7 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     let Some(top) = v.as_object() else {
         anyhow::bail!("config.json 顶层须是对象（{{\"providers\": …}}）");
     };
-    for k in ["scanners", "reviewers", "verifiers", "models"] {
+    for k in ["scanners", "reviewers", "refuters", "verifiers", "models"] {
         if top.contains_key(k) {
             errors.push(format!("顶层 {k:?}：角色列表已改为 providers.<name>.models.<id>.roles.<role>"));
         }
@@ -778,12 +822,12 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
                         check(&mut errors, &mut warnings, &mpath, mo, MODEL, "contextWindow / maxOutputTokens / perTurnTimeoutSecs / apiKeyEnv / displayName");
                         if let Some(roles) = mo.get("roles") {
                             let Some(ro) = roles.as_object() else {
-                                errors.push(format!("{mpath}.roles 须是对象（键为 scanner / reviewer / verifier）"));
+                                errors.push(format!("{mpath}.roles 须是对象（键为 scanner / reviewer / refuter / verifier）"));
                                 continue;
                             };
                             for (role, rv) in ro {
                                 if Role::parse(role).is_none() {
-                                    errors.push(format!("{mpath}.roles.{role}：角色取 scanner | reviewer | verifier"));
+                                    errors.push(format!("{mpath}.roles.{role}：角色取 scanner | reviewer | refuter | verifier"));
                                     continue;
                                 }
                                 if let Some(ra) = rv.as_object() {
@@ -799,6 +843,11 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
         }
     }
     if let Some(r) = top.get("review").and_then(|r| r.as_object()) {
+        // 0.8 术语分家：`review.verifiers` 已更名 `review.refuters`。硬切不欠别名，但静默忽略会让
+        // 显式开了验真的配置悄悄退回缺省关——宁可报错，让运维把键名改过来。
+        if r.contains_key("verifiers") {
+            errors.push("review.verifiers 已更名 review.refuters（0.8 术语分家：`verify` 留给 hibot 的修复验证 kind，评审内验真叫 refute）".into());
+        }
         check_keys(&mut errors, &mut warnings, "review", r, REVIEW, "blockThreshold / confFloor / maxConcurrency", REVIEW_REMOVED);
         // D13：角色级 workers 已删——专属提示（并发只看 provider 门、去哪调），不叠加通用「无定义」。
         let workers_why = format!("D13：并发只看 provider maxConcurrency，缺省 review.maxConcurrency = {}", default_concurrency());
@@ -1122,7 +1171,7 @@ mod tests {
       "models": {
         "gemini-3.8-flash": { "kind": "openai", "apiKeyEnv": "AGCT_GEMINI_API_KEY", "family": "gemini",
                               "contextWindow": 1048576, "maxOutputTokens": 65536, "reasoning": true,
-                              "roles": { "scanner": { "reasoningEffort": "low" }, "verifier": { "reasoningEffort": "high" } } }
+                              "roles": { "scanner": { "reasoningEffort": "low" }, "refuter": { "reasoningEffort": "high" } } }
       }
     }
   },
@@ -1130,22 +1179,22 @@ mod tests {
     "blockThreshold": "medium", "confFloor": 0.5, "maxConcurrency": 10,
     "scanners": { "samples": 1 },
     "reviewers": { "maxCells": "auto", "reenqueue": false },
-    "verifiers": { "enabled": true },
+    "refuters": { "enabled": true },
     "grouping": { "minFiles": 4, "bundleLineThreshold": 200, "maxFilesPerGroup": 10, "semantic": false },
     "pack": { "body": "slice", "anchorWindow": 30, "findingWindow": 30, "findingWindowEnforce": false, "sliceMinBytes": 8192 }
   }
 }"#;
 
-    /// 批 D-4：`review.verifiers.enabled` **缺省关**。这是本批唯一的产品面开关，
+    /// 批 D-4：`review.refuters.enabled` **缺省关**。这是本批唯一的产品面开关，
     /// 离线基线两臂的误驳率（12% / 20%）都远超预登记的 5% 门槛——翻默认值必须是有意动作，
-    /// 且「写了空 `verifiers` 段」与「整段缺失」必须同一个值（serde default 与 `Default` 不许各说各话）。
+    /// 且「写了空 `refuters` 段」与「整段缺失」必须同一个值（serde default 与 `Default` 不许各说各话）。
     #[test]
-    fn verifiers_enabled_defaults_off() {
-        assert!(!ReviewConfig::default().verifiers.enabled, "整段缺失 → 关");
-        let empty: Config = serde_json::from_str(r#"{"review":{"verifiers":{}}}"#).unwrap();
-        assert!(!empty.review.verifiers.enabled, "空 verifiers 段 → 同样关");
-        let on: Config = serde_json::from_str(r#"{"review":{"verifiers":{"enabled":true}}}"#).unwrap();
-        assert!(on.review.verifiers.enabled, "显式 true 照样开");
+    fn refuters_enabled_defaults_off() {
+        assert!(!ReviewConfig::default().refuters.enabled, "整段缺失 → 关");
+        let empty: Config = serde_json::from_str(r#"{"review":{"refuters":{}}}"#).unwrap();
+        assert!(!empty.review.refuters.enabled, "空 refuters 段 → 同样关");
+        let on: Config = serde_json::from_str(r#"{"review":{"refuters":{"enabled":true}}}"#).unwrap();
+        assert!(on.review.refuters.enabled, "显式 true 照样开");
     }
 
     #[test]
@@ -1155,12 +1204,12 @@ mod tests {
         // 顺序：provider 名字典序（agct < deepseek），再 id
         assert_eq!(roles.scanners.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["agct/gemini-3.8-flash", "deepseek/deepseek-v4-flash"]);
         assert_eq!(roles.reviewers.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["deepseek/deepseek-v4-pro"]);
-        assert_eq!(roles.verifiers.len(), 1);
+        assert_eq!(roles.refuters.len(), 1);
         let gem = &roles.scanners[0];
         assert_eq!(gem.kind, ProviderKind::Openai, "模型层 kind 覆盖 provider 层缺失");
         assert_eq!(gem.family, "gemini");
         assert_eq!(gem.reasoning_effort, Some(ReasoningEffort::Low));
-        assert_eq!(roles.verifiers[0].reasoning_effort, Some(ReasoningEffort::High), "同一模型不同角色不同档");
+        assert_eq!(roles.refuters[0].reasoning_effort, Some(ReasoningEffort::High), "同一模型不同角色不同档");
         let pro = &roles.reviewers[0];
         assert_eq!(pro.per_turn_timeout_secs, Some(1200));
         assert_eq!(pro.role, Role::Reviewer);
@@ -1224,8 +1273,8 @@ mod tests {
     #[test]
     fn removed_workers_keys_and_huge_max_concurrency_warn() {
         let (cfg, w) = Config::from_json_warned(r#"{"providers":{"p":{"kind":"openai","maxConcurrency":65536,"models":{"m":{"roles":{"scanner":{}}}}}},
-            "review":{"maxConcurrency":384000,"scanners":{"workers":4,"samples":1},"reviewers":{"workers":2},"verifiers":{"workers":2,"enabled":true}}}"#).unwrap();
-        for sec in ["scanners", "reviewers", "verifiers"] {
+            "review":{"maxConcurrency":384000,"scanners":{"workers":4,"samples":1},"reviewers":{"workers":2},"refuters":{"workers":2,"enabled":true}}}"#).unwrap();
+        for sec in ["scanners", "reviewers", "refuters"] {
             assert!(w.iter().any(|x| x.contains(&format!("review.{sec}.workers 已删除（D13")) && x.contains("review.maxConcurrency = 10")), "{sec}: {w:?}");
         }
         assert!(!w.iter().any(|x| x.contains("workers 无定义")), "专属提示不叠加通用 warning: {w:?}");
@@ -1251,13 +1300,44 @@ mod tests {
         let e6 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"name":"M","roles":{"scanner":{}}}}}}}"#).unwrap_err().to_string();
         assert!(e6.contains("name 已改名 displayName"), "{e6}");
         let e7 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"judge":{}}}}}}}"#).unwrap_err().to_string();
-        assert!(e7.contains("roles.judge") && e7.contains("scanner | reviewer | verifier"), "{e7}");
+        assert!(e7.contains("roles.judge") && e7.contains("scanner | reviewer | refuter | verifier"), "{e7}");
         let e8 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"contextWindow":"1M","roles":{"scanner":{}}}}}}}"#).unwrap_err().to_string();
         assert!(e8.contains("providers.p.models.m") && e8.contains("invalid type"), "形状错误带字段路径（评审 S3）: {e8}");
         let e9 = Config::from_json(r#"{"review":{"tools":"maybe"}}"#).unwrap_err().to_string();
         assert!(e9.contains("review：") || e9.contains("review:"), "{e9}");
+        // 0.8 术语分家：`review.verifiers` 硬切更名，不欠别名——但不得静默忽略（否则显式开的验真退回缺省关）。
+        let e10 = Config::from_json(r#"{"review":{"verifiers":{"enabled":true}}}"#).unwrap_err().to_string();
+        assert!(e10.contains("review.verifiers 已更名 review.refuters"), "{e10}");
         let bad = Config::from_json(r#"{"providers":{"p":{"kind":"openai",}}}"#).unwrap_err().to_string();
         assert!(bad.contains("line"), "解析错误须带行列: {bad}");
+    }
+
+    /// 0.8 护栏（R20）：有 `roles.verifier` 无 `roles.refuter` → 明确提示「验真角色已更名」。
+    /// 两者都在时不再提示（`verifier` 已是 fix 验证语义）。
+    #[test]
+    fn verifier_role_guard_warns_only_when_refuter_is_missing() {
+        let (_, w) = Config::from_json_warned(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"verifier":{}}}}}}}"#).unwrap();
+        assert!(w.iter().any(|x| x.contains("验真角色已更名为 refuter")), "{w:?}");
+        let (cfg, w2) = Config::from_json_warned(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"refuter":{}}}}}}}"#).unwrap();
+        assert!(w2.iter().all(|x| !x.contains("验真角色已更名")), "{w2:?}");
+        assert!(cfg.verifier_role_guard_warning().is_none());
+        let cfg3 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"refuter":{},"verifier":{}}}}}}}"#).unwrap();
+        assert!(cfg3.verifier_role_guard_warning().is_none(), "两个角色都有 → 无护栏提示");
+    }
+
+    /// 新 `verifier` 角色（fix 验证）：显式集合与回退分开——缺省回退 reviewer，但不写进 `verifiers`。
+    #[test]
+    fn fix_verifiers_fall_back_to_reviewers_without_faking_config() {
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{
+            "r":{"roles":{"reviewer":{}}},"v":{"roles":{"verifier":{}}}}}}}"#).unwrap();
+        let roles = cfg.active_roles();
+        assert_eq!(roles.reviewers.len(), 1);
+        assert_eq!(roles.verifiers.len(), 1);
+        assert_eq!(roles.fix_verifiers()[0].name, "p/v", "显式 verifier 优先");
+        let cfg2 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let roles2 = cfg2.active_roles();
+        assert!(roles2.verifiers.is_empty(), "回退不得写进显式集合");
+        assert_eq!(roles2.fix_verifiers()[0].name, "p/r", "缺省回退 reviewer");
     }
 
     #[test]

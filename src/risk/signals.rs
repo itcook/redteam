@@ -277,7 +277,12 @@ fn load_ledger(db: &Path, before: Option<&str>, upheld: &mut BTreeMap<String, u3
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&js) else { continue };
         let Some(arr) = v.get("findings").and_then(|x| x.as_array()) else { continue };
         for fd in arr {
-            let verdict = fd.pointer("/verify/verdict").and_then(|x| x.as_str());
+            // 0.8 术语分家：新报告写 `refute`，历史 results 行仍是 `verify`（proj.db 跨版本累积）。
+            // 这里读原始 JSON（不是反序列化），两种键都认，避免升级后历史 upheld 信号清零。
+            let verdict = fd
+                .pointer("/refute/verdict")
+                .or_else(|| fd.pointer("/verify/verdict"))
+                .and_then(|x| x.as_str());
             if verdict == Some("upheld") {
                 if let Some(f) = fd.get("file").and_then(|x| x.as_str()) {
                     *upheld.entry(f.to_string()).or_insert(0) += 1;

@@ -10,7 +10,7 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 
 用户参数：$ARGUMENTS
 - `--max-rounds <N>`（本命令专属，可选）：预算护栏；未给则**无轮数上限**——目标是 approve。
-- 其余参数**原样透传**给 `redteam review`（--base/--scope/--spec/--focus 等；模型集由 `~/.redteam/config.json` 的角色定，没有 `--models` 这类旗）。
+- 其余参数**原样透传**给 `redteam review`（--base/--scope/--spec/--focus 等；模型集由 `~/.redteam/config.json` 的角色定，命令行没有选模型的旗）。
   透传前先摘除上述专属参数。redteam 开启 `args_override_self`（同名 flag 重复后者胜），
   ship 管理的 `--background` 追加在用户参数之后即权威生效；唯一需连值摘除的是
   `--resume <值>`（它切同步补跑、打印全报告而非 job id，破坏循环）。凡摘除不得静默。
@@ -74,11 +74,11 @@ compaction 后模型记忆不可靠，唯一可信源是磁盘文件与 db 台�
      基础设施故障不消耗轮次、不触发停滞守卫。
 
 ## 内循环（逐条裁决）
-1. **分拣**：`verify == refuted` 一般跳过（redteam 已豁免，简报记一笔）。**例外需目检**：
+1. **分拣**：`refute == refuted` 一般跳过（redteam 已豁免，简报记一笔）。**例外需目检**：
    refute note 是判例引用、或 finding body 明确反驳某条驳回理由的 → 读一眼 note 与 body：
    反驳被正面回应 → 跳过；note 答非所问（打稻草人/复述原理由）→ 该条**照常裁决**，一句话
    记简报——机器证伪不当剥夺强异议的复裁通道。`run.resolution_disputed` 中的 id 不适用
-   refuted 跳过——即使其 verify=refuted，也按 §3 争议通道处理（销案争议优先于机器证伪）。
+   refuted 跳过——即使其 refute=refuted，也按 §3 争议通道处理（销案争议优先于机器证伪）。
    `previously_dismissed` 按台账状态分流（`${CODEX_PLUGIN_ROOT}/bin/redteam dismiss show
    <id>` 读 status）：`human-confirmed` 或已 `re-upheld` 的静默跳过；仅 `dismissed` 状态的**首次再现**
    进入刹车链（每 id 至多一次）。
@@ -104,7 +104,7 @@ compaction 后模型记忆不可靠，唯一可信源是磁盘文件与 db 台�
      生成即可，不引新依赖）；③ 跑测试枚举出全部失败变体，一次定性整类；④ 修复走类级
      （normalizer/单点归一），逐 case 补丁视为未完成；⑤ property 测试留在项目测试套件
      作回归资产。验证后仍不可判 → 攒到轮末批量 AskUserQuestion，不逐条打断。
-   - 先验：`agreement ≥ 2` 加强属实先验；upheld 孤证正常裁决（verify 是意见不是判决）。
+   - 先验：`agreement ≥ 2` 加强属实先验；upheld 孤证正常裁决（refute 是意见不是判决）。
 
 ## 收轮
 修复全落 → 跑测试命令至绿 → **单次 commit（仅修复，不含 .redteam/）**，消息
