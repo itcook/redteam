@@ -221,6 +221,15 @@ pub fn changed_files_since(dir: &std::path::Path, base: &str) -> anyhow::Result<
     Ok(split_diff_by_file(&full))
 }
 
+/// job 用：同 [`changed_files_since`]，但**禁 partial-clone 懒取**（缺对象必须是可判定的 error）。
+pub fn changed_files_since_local(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<FileChange>> {
+    let full = git_at_local(
+        dir,
+        &["diff", "--no-ext-diff", "--no-textconv", "-M", "--end-of-options", &format!("{base}..HEAD")],
+    )?;
+    Ok(split_diff_by_file(&full))
+}
+
 /// 2.6：本次 diff 所需对象是否齐全（两侧 tree **与 blob** 都在本地）。
 ///
 /// 不能只比 tree 的对象 ID：`--quiet` / `--no-patch` 可以只比较 tree 就提前退出，缺 blob 时仍报“有差异”。

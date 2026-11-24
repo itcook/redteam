@@ -42,7 +42,7 @@ pub fn from_patch(patch: &str) -> Result<Vec<FileChange>, JobFailure> {
 /// - git 不可得：`git: "unavailable"`（只披露，不影响本次评审用 patch 跑）。
 pub fn consistency(repo: &Path, merge_base: &str, patch: &[FileChange]) -> Value {
     let patch_digests = digest_map(patch);
-    let git_changes = match git::changed_files_since(repo, merge_base) {
+    let git_changes = match git::changed_files_since_local(repo, merge_base) {
         Ok(c) => c,
         Err(_) => {
             return json!({

@@ -223,13 +223,22 @@ async fn run_review(
         .filter(|s| crate::job::repo::is_full_sha(s))
         .ok_or_else(|| JobFailure::new("input_schema_mismatch", Some("merge_base".into())))?
         .to_string();
+    // 角色最小集（P2）：review = scanner + reviewer；refuter 可选。放在 prior 之前——
+    // spec 段的共享预算与生产 `budget_and_spec` 同一处计算（`spec_budget_bytes`）。
+    let roles = cfg.active_roles();
+    if roles.scanners.is_empty() {
+        return Err(JobFailure::new("missing_role", Some("scanner".into())));
+    }
+    if roles.reviewers.is_empty() {
+        return Err(JobFailure::new("missing_role", Some("reviewer".into())));
+    }
     // 2.3 prior_report（可选）：**只**读 summary.routing。历史 findings / 计数 / tier 一律不消费。
     let prior = match artifacts.get("prior_report") {
         Some(a) => {
             let text = a
                 .text()
                 .ok_or_else(|| JobFailure::new("input_schema_mismatch", Some("prior_report".into())))?;
-            crate::job::prior::parse(text, &repo)?
+            crate::job::prior::parse(text, &repo, crate::cli::spec_budget_bytes(&roles))?
         }
         None => crate::job::prior::PriorRouting::default(),
     };
@@ -248,14 +257,6 @@ async fn run_review(
     let mut extra_partial = Vec::new();
     if prior.specs_unreadable > 0 {
         extra_partial.push(JobFailure::new("routing_specs_unreadable", Some(prior.specs_unreadable.to_string())));
-    }
-    // 角色最小集（P2）：review = scanner + reviewer；refuter 可选。
-    let roles = cfg.active_roles();
-    if roles.scanners.is_empty() {
-        return Err(JobFailure::new("missing_role", Some("scanner".into())));
-    }
-    if roles.reviewers.is_empty() {
-        return Err(JobFailure::new("missing_role", Some("reviewer".into())));
     }
     // P2：job 模式 + 验真开启 + 未声明 refuter → 跳过验真；报告必须显式披露。
     let refute_skipped = (cfg.review.refuters.enabled && roles.refuters.is_empty()).then_some("no_refuter");

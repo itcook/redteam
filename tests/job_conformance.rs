@@ -959,7 +959,7 @@ async fn timeout_partial_report_keeps_run_facts_and_corrected_quote() {
         "input": {"head_sha": "h", "base_sha": "b"},
         "executor": {"name": "redteam", "version": "0.1.0"},
         "findings": [],
-        "summary": {"routing": {"focus": ["auth"], "specs": ["README.md"], "wall_clock_s": 120}},
+        "summary": {"routing": {"focus": ["auth"], "specs": ["README.md", "docs/missing.md"], "wall_clock_s": 120}},
         "usage": {"input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 0, "wall_clock_ms": 1},
         "extensions": {}
     })
@@ -987,6 +987,11 @@ async fn timeout_partial_report_keeps_run_facts_and_corrected_quote() {
     assert_eq!(r["status"], "partial", "{r}");
     assert!(r["status_reason"].as_str().unwrap().contains("wall-clock"), "{}", r["status_reason"]);
     assert_eq!(r["extensions"]["redteam"]["prior_routing"]["focus"], serde_json::json!(["auth"]));
+    // 中断报告同时保留准备阶段的 partial 原因（specs 不可读）与墙钟原因。
+    assert_eq!(r["extensions"]["redteam"]["prior_routing"]["specs_unreadable"], 1);
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "routing_specs_unreadable:1");
+    let reason = r["status_reason"].as_str().unwrap();
+    assert!(reason.contains("unreadable") && reason.contains("wall-clock"), "{reason}");
     assert_eq!(r["extensions"]["redteam"]["input_consistency"]["git"], "match");
     let f = &r["findings"][0];
     assert_eq!(f["quote"], fixed, "超时报告同样要用检出原文修正 quote");
@@ -1032,7 +1037,7 @@ async fn shallow_checkout_produces_valid_error_report() {
     assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:shallow", "{r}");
 }
 
-/// 2.6：base 与 head 无共同祖先 → `git merge-base` 不可算 → 合法 error 报告。
+/// 2.6：base 与 head 无共同祖先（两 commit 都在本地、merge-base 不可算）→ 合法 error 报告。
 #[tokio::test]
 async fn unrelated_histories_produce_valid_error_report() {
     let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
@@ -1045,8 +1050,23 @@ async fn unrelated_histories_produce_valid_error_report() {
     std::fs::write(orphan.join("x.txt"), "x\n").unwrap();
     git(&orphan, &["add", "."]);
     git(&orphan, &["commit", "-qm", "root"]);
-    let root = git(&orphan, &["rev-parse", "HEAD"]);
-    // 把 base 指向这条无关历史（object 在本地不可得）→ repo_incomplete:base。
+    // 本地 fetch 导入（无网络），HEAD 不动。
+    let out = std::process::Command::new("git")
+        .current_dir(&fx.repo)
+        .args(["fetch", "-q", orphan.to_str().unwrap(), "HEAD"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let root = git(&fx.repo, &["rev-parse", "FETCH_HEAD"]);
+    // 前置事实：两个 commit 都在本地，但 merge-base 不可算。
+    git(&fx.repo, &["rev-parse", "--verify", &format!("{root}^{{commit}}")]);
+    let mb = std::process::Command::new("git")
+        .current_dir(&fx.repo)
+        .args(["merge-base", &root, "HEAD"])
+        .output()
+        .unwrap();
+    assert!(!mb.status.success(), "fixture 必须真的没有共同祖先");
+
     let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
     m["pr"]["base_sha"] = serde_json::json!(root);
     std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
@@ -1054,5 +1074,36 @@ async fn unrelated_histories_produce_valid_error_report() {
     assert_eq!(code, 1);
     let r = read_report(&fx.job);
     assert_eq!(r["status"], "error");
-    assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:base", "{r}");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:merge_base", "{r}");
+}
+
+/// 1.5/2.3：准备阶段（registry 构造）耗尽 1s 预算 → 不进入任何模型派发，落 partial。
+#[tokio::test]
+async fn budget_exhausted_during_prep_makes_no_backend_calls() {
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let over = Box::new({
+        let (scan, review) = (scan.clone(), review.clone());
+        move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            // BackendOverride 在 `build_registry_with` 里**同步**调用：模拟准备阶段慢于预算。
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            match em.id.as_str() {
+                "s" => Some(Box::new(scan.clone())),
+                "r" => Some(Box::new(review.clone())),
+                _ => None,
+            }
+        }
+    }) as Box<redteam::cli::BackendOverride<'_>>;
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    m["limits"]["wall_clock_s"] = serde_json::json!(1);
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "partial", "{r}");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "wall_clock_exhausted");
+    assert!(r["findings"].as_array().unwrap().is_empty());
+    assert_eq!(scan.turn_count(), 0, "预算耗尽后不得再派发");
+    assert_eq!(review.turn_count(), 0, "预算耗尽后不得再派发");
 }

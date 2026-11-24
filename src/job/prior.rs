@@ -31,7 +31,7 @@ pub struct PriorRouting {
 
 /// 解析 `prior_report` 文本。JSON 非法 / 顶层不是对象 → `input_schema_mismatch:prior_report`。
 /// `summary` / `summary.routing` 缺失或不是对象 → 空投影（Q14：triage 非 ok 时没有 summary）。
-pub fn parse(text: &str, repo: &Path) -> Result<PriorRouting, JobFailure> {
+pub fn parse(text: &str, repo: &Path, spec_cap: usize) -> Result<PriorRouting, JobFailure> {
     let v: Value = serde_json::from_str(text)
         .map_err(|_| JobFailure::new("input_schema_mismatch", Some("prior_report".into())))?;
     if !v.is_object() {
@@ -65,20 +65,34 @@ pub fn parse(text: &str, repo: &Path) -> Result<PriorRouting, JobFailure> {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    let mut specs = Vec::new();
-    let mut specs_used = Vec::new();
+    // 先做 repo 约束与二进制拒收（词法/越界/敏感路径/非常规文件），再用**生产同一份 cap 与全量列表**
+    // 调真实 renderer，按它的实际接纳结果披露 `specs_used`（不另写一套近似检查）。
+    let mut candidates: Vec<(&str, String)> = Vec::new();
     let mut specs_unreadable = 0usize;
     for s in &declared {
-        match resolve_spec(repo, s) {
-            Some(abs) => {
-                specs_used.push((*s).to_string());
-                specs.push(abs);
-            }
+        match resolve_candidate(repo, s) {
+            Some(abs) => candidates.push((*s, abs)),
             None => {
                 // 诊断只走 stderr（报告里是 `<n>` 计数；声明路径原样点出来，方便对照 hibot 的 triage 报告）。
                 eprintln!("redteam: prior_report.routing.specs 不可读，跳过：{s}");
                 specs_unreadable += 1;
             }
+        }
+    }
+    let abs_all: Vec<String> = candidates.iter().map(|(_, a)| a.clone()).collect();
+    let rendered = crate::cli::spec::render_spec_section_reporting(&abs_all, spec_cap);
+    let accepted: std::collections::HashSet<&str> = rendered.accepted.iter().map(String::as_str).collect();
+    let rejected: std::collections::HashSet<&str> = rendered.rejected.iter().map(String::as_str).collect();
+    let mut specs = Vec::new();
+    let mut specs_used = Vec::new();
+    for (declared_path, abs) in &candidates {
+        if accepted.contains(abs.as_str()) {
+            specs_used.push((*declared_path).to_string());
+            specs.push(abs.clone());
+        } else if rejected.contains(abs.as_str()) {
+            // renderer 有明确拒收理由（PEM / 读失败 / 非 UTF-8 …）：与“预算耗尽未注入”区分开。
+            eprintln!("redteam: prior_report.routing.specs 被 renderer 拒收，跳过：{declared_path}");
+            specs_unreadable += 1;
         }
     }
 
@@ -102,8 +116,8 @@ pub fn parse(text: &str, repo: &Path) -> Result<PriorRouting, JobFailure> {
     })
 }
 
-/// spec 路径 → repo 内的绝对路径（可读常规文本）。任何一条不成立 → `None`（计入 unreadable）。
-fn resolve_spec(repo: &Path, declared: &str) -> Option<String> {
+/// spec 路径 → repo 内的绝对路径（只做词法/越界/敏感/二进制约束；可否注入交给 renderer）。
+fn resolve_candidate(repo: &Path, declared: &str) -> Option<String> {
     let p = Path::new(declared);
     // 只接受 repo 内的相对路径：绝对路径与 `..` 都越界（先做词法拒绝，连 canonicalize 都不必）。
     if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -131,12 +145,7 @@ fn resolve_spec(repo: &Path, declared: &str) -> Option<String> {
             return None;
         }
     }
-    // 「可读」的判据**复用实际 renderer**（不另写一套近似检查）：它统一处理常规文件、UTF-8、
-    // PEM/敏感路径拒读与预算截断。`used == 0` = 这份 spec 一个字节都没进评审上下文 → 不算已用。
-    let abs = real.to_string_lossy().to_string();
-    let (_section, used, _warnings) =
-        crate::cli::spec::render_spec_section_capped(std::slice::from_ref(&abs), 1 << 16);
-    (used > 0).then_some(abs)
+    Some(real.to_string_lossy().to_string())
 }
 
 #[cfg(test)]
@@ -151,6 +160,9 @@ mod tests {
         std::fs::write(repo.join("docs/auth.md"), "auth spec\n").unwrap();
         std::fs::write(repo.join("docs/bin.dat"), [0u8, 1, 2]).unwrap();
         std::fs::write(repo.join("docs/.env"), "SECRET=1\n").unwrap();
+        std::fs::write(repo.join("docs/a.md"), "a".repeat(200)).unwrap();
+        std::fs::write(repo.join("docs/b.md"), "b".repeat(200)).unwrap();
+        std::fs::write(repo.join("docs/normal-name.md"), "-----BEGIN PRIVATE KEY-----\nAAA\n-----END PRIVATE KEY-----\n").unwrap();
         (d, repo)
     }
 
@@ -177,7 +189,7 @@ mod tests {
             "convention_drift": "low", "fit": "ok",
             "routing": {"focus": ["auth", "  crypto  "], "specs": ["docs/auth.md", "docs/missing.md"], "wall_clock_s": 900}
         }));
-        let p = parse(&text, &repo).unwrap();
+        let p = parse(&text, &repo, 1 << 20).unwrap();
         assert_eq!(p.focus.as_deref(), Some("auth\ncrypto"));
         assert_eq!(p.specs.len(), 1, "只保留可读的那份");
         assert!(p.specs[0].ends_with("docs/auth.md") && Path::new(&p.specs[0]).is_absolute());
@@ -196,7 +208,7 @@ mod tests {
             triage(serde_json::json!({})),
             serde_json::json!({"schema": "hibot.audit.report.triage/1", "status": "partial", "findings": []}).to_string(),
         ] {
-            let p = parse(&text, &repo).unwrap();
+            let p = parse(&text, &repo, 1 << 20).unwrap();
             assert!(p.focus.is_none() && p.specs.is_empty() && p.wall_clock_s.is_none());
             assert_eq!(p.disclosure["present"], true);
         }
@@ -205,9 +217,9 @@ mod tests {
     #[test]
     fn bad_json_is_input_schema_mismatch() {
         let (_d, repo) = repo();
-        let e = parse("not json", &repo).unwrap_err();
+        let e = parse("not json", &repo, 1 << 20).unwrap_err();
         assert_eq!(e.full_code(), "input_schema_mismatch:prior_report");
-        let e2 = parse("[]", &repo).unwrap_err();
+        let e2 = parse("[]", &repo, 1 << 20).unwrap_err();
         assert_eq!(e2.full_code(), "input_schema_mismatch:prior_report");
     }
 
@@ -219,19 +231,40 @@ mod tests {
         let text = triage(serde_json::json!({"routing": {"specs": [
             "../outside.md", "/etc/passwd", "docs/bin.dat", "docs/absent.md", "docs/auth.md"
         ]}}));
-        let p = parse(&text, &repo).unwrap();
+        let p = parse(&text, &repo, 1 << 20).unwrap();
         assert_eq!(p.specs_unreadable, 4, "{p:?}");
         assert_eq!(p.specs.len(), 1);
         assert!(!p.disclosure.to_string().contains(&outside), "披露不出现越界路径以外的绝对路径");
     }
 
+    /// 全批 specs 共用**生产同一份 cap**：预算耗尽后未注入的文件不能记进 `specs_used`。
     #[test]
+    fn specs_share_the_production_budget_cap() {
+        let (_d, repo) = repo();
+        let text = triage(serde_json::json!({"routing": {"specs": ["docs/a.md", "docs/b.md"]}}));
+        let p = parse(&text, &repo, 150).unwrap();
+        assert_eq!(p.disclosure["specs_used"], serde_json::json!(["docs/a.md"]), "第二份因预算未注入");
+        assert_eq!(p.specs.len(), 1);
+        assert_eq!(p.specs_unreadable, 0, "预算截断不是“不可读”");
+        assert_eq!(p.specs_declared, 2);
+    }
+
+    /// 名字正常但内容是 PEM 私钥：由 renderer 的内容嗅探拒收，计入 unreadable。
+    #[test]
+    fn pem_content_is_rejected_even_with_a_normal_filename() {
+        let (_d, repo) = repo();
+        let text = triage(serde_json::json!({"routing": {"specs": ["docs/normal-name.md", "docs/auth.md"]}}));
+        let p = parse(&text, &repo, 1 << 20).unwrap();
+        assert_eq!(p.disclosure["specs_used"], serde_json::json!(["docs/auth.md"]));
+        assert_eq!(p.specs_unreadable, 1);
+    }
+
     /// 与 spec renderer 同一把尺：疑似密钥文件不算“已用”（会被下游拒读，披露必须一致）。
     #[test]
     fn sensitive_spec_paths_are_counted_unreadable() {
         let (_d, repo) = repo();
         let text = triage(serde_json::json!({"routing": {"specs": ["docs/.env", "docs/auth.md"]}}));
-        let p = parse(&text, &repo).unwrap();
+        let p = parse(&text, &repo, 1 << 20).unwrap();
         assert_eq!(p.specs_unreadable, 1);
         assert_eq!(p.specs.len(), 1);
         assert_eq!(p.disclosure["specs_used"], serde_json::json!(["docs/auth.md"]));
@@ -242,7 +275,7 @@ mod tests {
         let (_d, repo) = repo();
         for bad in [serde_json::json!(0), serde_json::json!(-5), serde_json::json!("900"), serde_json::json!(null)] {
             let text = triage(serde_json::json!({"routing": {"wall_clock_s": bad}}));
-            assert!(parse(&text, &repo).unwrap().wall_clock_s.is_none(), "{bad}");
+            assert!(parse(&text, &repo, 1 << 20).unwrap().wall_clock_s.is_none(), "{bad}");
         }
     }
 
@@ -251,7 +284,7 @@ mod tests {
         // 夹具只用普通目录；顺手确认 parse 不跑 git、不写盘。
         let (_d, repo) = repo();
         let before = std::fs::read_dir(&repo).unwrap().count();
-        let _ = parse(&triage(serde_json::json!({"routing": {"specs": ["docs/auth.md"]}})), &repo).unwrap();
+        let _ = parse(&triage(serde_json::json!({"routing": {"specs": ["docs/auth.md"]}})), &repo, 1 << 20).unwrap();
         assert_eq!(std::fs::read_dir(&repo).unwrap().count(), before);
         let _ = Command::new("git"); // 保持 api 形状（无 git 调用）
     }

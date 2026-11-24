@@ -610,32 +610,53 @@ mod tests {
     #[test]
     fn verbatim_span_handles_multibyte_last_char() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "src/u.rs", "fn f() {\n    let 名 = \"值\";\n}\n");
-        let (ls, le, q) = verbatim_span(dir.path(), "src/u.rs", "let 名 = \"值\";", 9).unwrap();
+        // quote 以中文字符结尾（不是 ASCII 分号/引号）：`end - 1` 落在字符中间。
+        write(dir.path(), "src/u.rs", "fn f() {\n    let x = 值\n}\n");
+        let (ls, le, q) = verbatim_span(dir.path(), "src/u.rs", "let x = 值", 9).unwrap();
         assert_eq!((ls, le), (2, 2));
-        assert_eq!(q, "let 名 = \"值\";");
+        assert_eq!(q, "let x = 值");
+        assert!(q.ends_with('值'));
     }
 
     /// CRLF 检出：原始字节切片含 `\r`，行范围内逐字校验不能被 `lines()` 吃掉。
     #[test]
     fn verbatim_span_supports_crlf_checkouts() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "src/crlf.rs", "fn f() {\r\n    let x  =  1;\r\n}\r\n");
-        let (ls, le, q) = verbatim_span(dir.path(), "src/crlf.rs", "let x = 1;", 1).unwrap();
-        assert_eq!((ls, le), (2, 2));
-        assert_eq!(q, "let x  =  1;", "CRLF 文件里的行内文本（不含换行）");
+        write(dir.path(), "src/crlf.rs", "fn f() {\r\n    let x  =  1;\r\n    let y = 2;\r\n}\r\n");
+        // 跨行 quote：返回的字节切片必须保留原始 `\r\n`（`lines()` 会吃掉 `\r`）。
+        let (ls, le, q) = verbatim_span(dir.path(), "src/crlf.rs", "let x = 1;\nlet y = 2;", 1).unwrap();
+        assert_eq!((ls, le), (2, 3));
+        assert!(q.contains("\r\n"), "多行 CRLF quote 必须保留 \\r\\n: {q:?}");
+        assert_eq!(q, "let x  =  1;\r\n    let y = 2;");
     }
 
-    /// 反例：**行号正确但空白错误**的原始报告 quote 必须判定失败。
+    /// 独立校验器：报告的行范围内是否**逐字**包含给定 quote（按原始字节切行，保留 CRLF）。
+    fn quote_within(content: &str, ls: u32, le: u32, quote: &str) -> bool {
+        let mut start = 0usize;
+        for _ in 1..ls {
+            start = content[start..].find('\n').map_or(content.len(), |i| start + i + 1);
+        }
+        let mut end = start;
+        for _ in ls..=le {
+            end = content[end..].find('\n').map_or(content.len(), |i| end + i);
+            if end < content.len() {
+                end += 1;
+            }
+        }
+        content[start..end.min(content.len())].contains(quote)
+    }
+
+    /// 反例：**行号正确但空白错误**的原始报告 quote 必须判定失败；修正后的才通过。
     #[test]
     fn report_quote_with_correct_lines_but_wrong_whitespace_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/w.rs", "fn f() {\n    let x  =  1;\n}\n");
+        let content = std::fs::read_to_string(dir.path().join("src/w.rs")).unwrap();
         let (ls, le, fixed) = verbatim_span(dir.path(), "src/w.rs", "let x  =  1;", 2).unwrap();
         assert_eq!((ls, le), (2, 2), "行号是对的");
         let report_quote = "let x = 1;";
-        // 校验式：报告的 quote 必须与检出切片逐字相等——只改行号的实现会在这里失败。
-        assert_ne!(report_quote, fixed, "行号对、空白错 -> 不得通过");
+        assert!(!quote_within(&content, ls, le, report_quote), "行号对、空白错 -> 必须判失败");
+        assert!(quote_within(&content, ls, le, &fixed), "修正后的 quote 才通过");
     }
 
     /// 多命中取最接近自报行号者（短 quote 在同文件复现时不能锚到首现）。

@@ -207,8 +207,13 @@ pub(crate) fn build_packs(
 /// 返回 (budget, spec_section, warnings)。
 pub(crate) fn budget_and_spec(roles: &RoleSets, spec: &[String]) -> (usize, String, Vec<String>) {
     let budget_raw = pack_budget_bytes(roles);
-    let (spec_section, spec_used, warnings) = render_spec_section_capped(spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
+    let (spec_section, spec_used, warnings) = render_spec_section_capped(spec, spec_budget_bytes(roles));
     (budget_raw.saturating_sub(spec_used), spec_section, warnings)
+}
+
+/// spec 段共享预算（全批 specs 一个 cap）——`budget_and_spec` 与 job 的 prior 披露共用这一处。
+pub(crate) fn spec_budget_bytes(roles: &RoleSets) -> usize {
+    SPEC_BUDGET_BYTES.min(pack_budget_bytes(roles) / 2)
 }
 
 /// cell 规划产物：分组 + 每组裸 pack 正文（`dossiers`）+ 每组跨组索引 + 每组装包形态（四者等长等序）+ 观测。
