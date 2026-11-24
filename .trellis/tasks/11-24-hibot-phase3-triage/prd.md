@@ -67,7 +67,7 @@ hibot audit 执行单元接入的 U4 单元（协调者 session `01a20ba0` 派�
 - **partial 语义**：slice 未全成 → `verification_complete=false`；未验证 claim 只披露，
   **不计入 `intent_undelivered`/blockers**（协调者 2026-11-24 裁）。
 - 模板：`triage-intent.md` 退役，新增 `triage-intent-claims.md` / `triage-intent-slice.md`；
-  模板哈希 `2c750615f126b5f3` → `ad41f9d1df42eb13`。
+  模板哈希 `2c750615f126b5f3` → `ad41f9d1df42eb13` → `f8e848e16e926990`（I0 排除 build/test/smoke 等验证性声明，避免虚增 undelivered）。
 
 ### tier2 白名单对照表（可复核）
 

@@ -7,8 +7,12 @@ Claims:
 
 - Only `body` and linked issues (`issue#N`) are claim sources. The PR title is a summary, not a
   claim. Comments are never claims.
-- Each claim must be a checkable assertion the author made. CI status, pre-existing failures and
-  lint output are observations, not claims.
+- Each claim must be a checkable assertion the author made about **what the change does**.
+- **Do NOT count verification/validation statements as claims**: build/test/smoke results, CI status,
+  "I ran X and it passed", performance measurements, reproduction steps. They are observations —
+  put them in `notes`, never in `claims`.
+- Prefer the author's top-level promises. Do not split one promise into multiple claims unless each
+  is independently deliverable; emit at most 20 claims.
 - Do not assign ids; the executor assigns `c1..cn` in the order you emit them.
 - If there is no stated intent, return an empty `claims` array.
 

@@ -138,6 +138,7 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                     &claims.claims,
                     &files,
                     wave_budget,
+                    (provider_cap / 2).max(1),
                 )
                 .await;
                 let assembled = assemble_intent(&claims, &r);

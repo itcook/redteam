@@ -525,6 +525,7 @@ pub async fn run_intent_slices(
     claims: &[Claim],
     files: &[(String, String)],
     cell_timeout: std::time::Duration,
+    concurrency: usize,
 ) -> AxisRun<IntentSliceOutput> {
     if files.is_empty() {
         // 空 diff：没有可验证的交付面；claims 由上层按“未兑现”处理。
@@ -538,52 +539,66 @@ pub async fn run_intent_slices(
         claims_text.push_str(&format!("{} [{}] {}\n", c.id, c.source, c.claim));
     }
     let header = format!("# Axis: intent slice\n{}", pr_header(pr));
-    let futs = shards.iter().map(|shard| {
-        let system = system.clone();
-        let tail = tail.clone();
-        let claims_text = claims_text.clone();
-        let header = header.clone();
-        let patch = patch_block(shard);
-        async move {
-            let cell_deadline = tokio::time::Instant::now() + cell_timeout;
-            let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
-                Ok(l) => l,
-                Err(e) => return Err((e, (0, 0, 0))),
-            };
-            let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
-            let blocks = vec![
-                block(header, false),
-                block(claims_text, false),
-                block(patch, true),
-                block(tail, false),
-            ];
-            match shot::run::<IntentSliceOutput>(&lease, system, blocks, "triage-intent-slice", budget).await {
-                Ok(call) => Ok(call),
-                Err(e) => Err((e.to_string(), e.burned_usage())),
+    // 公平性：intent slices 不能一次占满 provider 门（否则 security/drift 只剩 0–13s）。
+    // 按 `concurrency` 分块串行；每块共享本轴的 1/chunks 预算，总时长仍 ≤ cell_timeout。
+    let step = concurrency.max(1);
+    let ranges: Vec<(usize, usize)> = (0..shards.len())
+        .step_by(step)
+        .map(|s| (s, (s + step).min(shards.len())))
+        .collect();
+    let per_chunk = cell_timeout / (ranges.len().max(1) as u32);
+    let mut out = AxisRun { ok: true, ..Default::default() };
+    for (start, end) in ranges {
+        let futs = (start..end).map(|i| {
+            let shard = &shards[i];
+            let system = system.clone();
+            let tail = tail.clone();
+            let claims_text = claims_text.clone();
+            let header = header.clone();
+            let patch = patch_block(shard);
+            async move {
+                let cell_deadline = tokio::time::Instant::now() + per_chunk;
+                let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
+                    Ok(l) => l,
+                    Err(e) => return Err((e, (0, 0, 0))),
+                };
+                let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let blocks = vec![
+                    block(header, false),
+                    block(claims_text, false),
+                    block(patch, true),
+                    block(tail, false),
+                ];
+                match shot::run::<IntentSliceOutput>(&lease, system, blocks, "triage-intent-slice", budget).await {
+                    Ok(call) => Ok(call),
+                    Err(e) => Err((e.to_string(), e.burned_usage())),
+                }
+            }
+        });
+        let results = futures::future::join_all(futs).await;
+        for r in results {
+            match r {
+                Ok(call) => {
+                    out.cells += 1;
+                    out.usage.0 += call.input_tokens;
+                    out.usage.1 += call.output_tokens;
+                    out.usage.2 += call.cached_input_tokens;
+                    if let Some(n) = call.repair_note {
+                        out.repair_notes.push(n);
+                    }
+                    out.rows.push(call.output);
+                }
+                Err((msg, usage)) => {
+                    out.ok = false;
+                    out.usage.0 += usage.0;
+                    out.usage.1 += usage.1;
+                    out.usage.2 += usage.2;
+                    out.error.get_or_insert(msg);
+                }
             }
         }
-    });
-    let results = futures::future::join_all(futs).await;
-    let mut out = AxisRun { ok: true, ..Default::default() };
-    for r in results {
-        match r {
-            Ok(call) => {
-                out.cells += 1;
-                out.usage.0 += call.input_tokens;
-                out.usage.1 += call.output_tokens;
-                out.usage.2 += call.cached_input_tokens;
-                if let Some(n) = call.repair_note {
-                    out.repair_notes.push(n);
-                }
-                out.rows.push(call.output);
-            }
-            Err((msg, usage)) => {
-                out.ok = false;
-                out.usage.0 += usage.0;
-                out.usage.1 += usage.1;
-                out.usage.2 += usage.2;
-                out.error.get_or_insert(msg);
-            }
+        if !out.ok {
+            break; // 本块已超时：不再为后续块烧预算，尽快收敛为 partial。
         }
     }
     if out.cells == 0 && out.error.is_none() {
