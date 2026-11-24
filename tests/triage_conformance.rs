@@ -442,5 +442,10 @@ async fn slow_cell_is_capped_by_its_share_of_the_job_budget() {
     assert!(r.get("summary").is_none());
     assert!(r["status_reason"].as_str().unwrap().contains("triage axis"), "{r}");
     assert!(r["extensions"]["redteam"]["axes"].as_array().unwrap().iter().all(|a| a["ok"] == false));
+    // 超时诊断：必须带出 attempts / in_flight / finish_reason 线索，便于区分“慢/截断/网关”。
+    let intent = r["extensions"]["redteam"]["axes"].as_array().unwrap().iter().find(|a| a["axis"] == "intent").unwrap();
+    let err = intent["error"].as_str().unwrap_or_default();
+    assert!(err.contains("attempts="), "{err}");
+    assert!(err.contains("in_flight_ms="), "{err}");
 }
 
