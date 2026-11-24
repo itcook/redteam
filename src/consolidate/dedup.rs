@@ -1,4 +1,4 @@
-use crate::domain::{Finding, VerifyVerdict};
+use crate::domain::{Finding, RefuteVerdict};
 use std::collections::BTreeSet;
 
 pub const LINE_GAP: u32 = 3;
@@ -19,7 +19,7 @@ pub fn title_jaccard(a: &str, b: &str) -> f32 {
 /// Jaccard）——对「一方引 1 行、一方引整块」的不等长引用鲁棒。两个模型对同一 bug 即便标题
 /// 措辞不同，引用的代码行仍高度重叠，作为 title_jaccard 之外的合并补救信号。
 /// 任一 quote 为空（如 doc 遗漏类）→ 返回 0，不作 quote 信号。
-/// pub：判例机械预筛（verify::matches_precedent）复用同一相似度口径。
+/// pub：判例机械预筛（refute::matches_precedent）复用同一相似度口径。
 pub fn quote_overlap(a: &str, b: &str) -> f32 {
     let norm = |q: &str| -> BTreeSet<String> {
         q.lines()
@@ -65,12 +65,12 @@ fn merge_into(base: &mut Finding, other: &Finding) {
     // 原本这里完全不碰 `verify`——base 的判决直接胜出、other 的被静默丢，且 confidence 取 max 会与
     // 「refuted 归零」打架（可能留下「verdict 写着 REFUTED、confidence 却是 0.7」的自相矛盾记录）。
     // **UPHELD 优先**：方向与验收门槛一致——误驳（静默删掉真缺陷）比漏驳危险得多。
-    base.verify = match (base.verify.take(), other.verify.clone()) {
+    base.refute = match (base.refute.take(), other.refute.clone()) {
         (None, v) | (v, None) => v,
         (Some(a), Some(b)) => {
-            if a.verdict == VerifyVerdict::Upheld {
+            if a.verdict == RefuteVerdict::Upheld {
                 Some(a)
-            } else if b.verdict == VerifyVerdict::Upheld {
+            } else if b.verdict == RefuteVerdict::Upheld {
                 Some(b)
             } else {
                 Some(a)
@@ -110,7 +110,7 @@ mod tests {
         Finding { id:id.into(), severity:sev, title:title.into(), body:"b".into(), file:file.into(),
             line_start:ls, line_end:le, confidence:0.8, recommendation:"r".into(),
             models:vec![model.into()], agreement:1, suspicion_agreement: 0,
-            hard_constraint:false, quote:String::new(), cluster_id:None, verify:None,
+            hard_constraint:false, quote:String::new(), cluster_id:None, refute:None,
             previously_dismissed: false, origin: Origin::New, outside_window: false }
     }
 
@@ -119,27 +119,27 @@ mod tests {
     /// 两方都 REFUTED → 保持 refuted 且 confidence 归零（否则 max 会留下「REFUTED + 0.9」的自相矛盾记录）。
     #[test]
     fn verify_verdicts_merge_with_upheld_winning() {
-        use crate::domain::{Verify, VerifyVerdict};
-        let verdict = |v: VerifyVerdict, m: &str| Some(Verify { verdict: v, model: m.into(), note: String::new() });
-        let pair = |a: Option<Verify>, b: Option<Verify>| {
+        use crate::domain::{Refute, RefuteVerdict};
+        let verdict = |v: RefuteVerdict, m: &str| Some(Refute { verdict: v, model: m.into(), note: String::new() });
+        let pair = |a: Option<Refute>, b: Option<Refute>| {
             let mut x = f("1", "a.rs", 10, 12, "missing auth check", "claude", Severity::High);
             let mut y = f("2", "a.rs", 11, 13, "Missing auth check", "gpt", Severity::High);
-            (x.verify, y.verify) = (a, b);
+            (x.refute, y.refute) = (a, b);
             (x.confidence, y.confidence) = (0.9, 0.7);
             let out = dedup(vec![x, y]);
             assert_eq!(out.len(), 1, "前提：这两条本来就该并成一条");
-            (out[0].verify.clone(), out[0].confidence)
+            (out[0].refute.clone(), out[0].confidence)
         };
 
-        let (v, _) = pair(None, verdict(VerifyVerdict::Refuted, "p/v"));
-        assert_eq!(v.map(|v| v.verdict), Some(VerifyVerdict::Refuted), "base 没判决 → 继承 other 的");
+        let (v, _) = pair(None, verdict(RefuteVerdict::Refuted, "p/v"));
+        assert_eq!(v.map(|v| v.verdict), Some(RefuteVerdict::Refuted), "base 没判决 → 继承 other 的");
 
-        let (v, conf) = pair(verdict(VerifyVerdict::Refuted, "p/v"), verdict(VerifyVerdict::Upheld, "p/w"));
-        assert_eq!(v.map(|v| (v.verdict, v.model)), Some((VerifyVerdict::Upheld, "p/w".to_string())), "任一 UPHELD 即 UPHELD");
+        let (v, conf) = pair(verdict(RefuteVerdict::Refuted, "p/v"), verdict(RefuteVerdict::Upheld, "p/w"));
+        assert_eq!(v.map(|v| (v.verdict, v.model)), Some((RefuteVerdict::Upheld, "p/w".to_string())), "任一 UPHELD 即 UPHELD");
         assert_eq!(conf, 0.9, "守住的照常取 max");
 
-        let (v, conf) = pair(verdict(VerifyVerdict::Refuted, "p/v"), verdict(VerifyVerdict::Refuted, "p/w"));
-        assert_eq!(v.map(|v| v.verdict), Some(VerifyVerdict::Refuted));
+        let (v, conf) = pair(verdict(RefuteVerdict::Refuted, "p/v"), verdict(RefuteVerdict::Refuted, "p/w"));
+        assert_eq!(v.map(|v| v.verdict), Some(RefuteVerdict::Refuted));
         assert_eq!(conf, 0.0, "两方都驳回 → confidence 归零，不让 max 把它抬回来");
     }
 

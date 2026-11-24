@@ -74,7 +74,7 @@ pub fn enrich(raw: &RawFinding, model: &str) -> Finding {
         quote: raw.quote.clone(),
         previously_dismissed: false,
         cluster_id: None,
-        verify: None,
+        refute: None,
         origin: Origin::New,
         outside_window: false,
     }

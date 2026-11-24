@@ -701,7 +701,7 @@ mod tests {
             body: "b".into(), file: "src/a.rs".into(), line_start: 1, line_end: 1,
             confidence: 0.9, recommendation: "r".into(), models: vec![],
             agreement: 1, suspicion_agreement: 0, hard_constraint: false, quote: "q".into(), cluster_id: None,
-            verify: None, previously_dismissed: false, origin: Origin::New, outside_window: false,
+            refute: None, previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         let card = |id: &str, file: &str, title: &str, reason: &str| DismissCard {
             id: id.into(), status: "dismissed".into(), title: title.into(), file: file.into(),

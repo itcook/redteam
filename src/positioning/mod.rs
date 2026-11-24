@@ -243,7 +243,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
             file: file.into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), models: vec!["m".into()],
-            agreement: 1, suspicion_agreement: 0, hard_constraint: false, cluster_id: None, quote: quote.into(), verify: None,
+            agreement: 1, suspicion_agreement: 0, hard_constraint: false, cluster_id: None, quote: quote.into(), refute: None,
             previously_dismissed: false, origin: Origin::New, outside_window: false,
         }
     }
@@ -514,7 +514,7 @@ mod window_tests {
             id: format!("{file}:{line}"), severity: Severity::Medium, title: "t".into(), body: "b".into(),
             file: file.into(), line_start: line, line_end: line, confidence: 0.8, recommendation: "r".into(),
             models: vec![], agreement: 1, suspicion_agreement: 0, hard_constraint: false,
-            quote: String::new(), cluster_id: None, verify: None, previously_dismissed: false,
+            quote: String::new(), cluster_id: None, refute: None, previously_dismissed: false,
             origin, outside_window: false,
         }
     }

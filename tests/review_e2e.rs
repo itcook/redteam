@@ -444,7 +444,7 @@ fn result_md_three_states() {
             hard_constraint: false,
             quote: "db.write(token);".into(),
             cluster_id: None,
-            verify: None,
+            refute: None,
             previously_dismissed: false,
             origin: Origin::New, outside_window: false,
         }],

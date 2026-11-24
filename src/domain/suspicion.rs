@@ -6,7 +6,7 @@
 //! **注意 `Role::Verifier` 不属于本模块**：那是 hibot `verify` kind 的修复验证角色，有自己的
 //! 输入/输出契约（Phase 4 的 `fixverify/`），不得与本模块的 `CellOutput` 互相冒充（P16.1 硬规则 ①）。
 
-use super::finding::{Finding, NeedEntry, VerifyVerdict};
+use super::finding::{Finding, NeedEntry, RefuteVerdict};
 use serde::{Deserialize, Serialize};
 
 /// 角色枚举复用配置层定义（批 A `config::Role`：serde 小写、`parse` / `as_str` / `list_key`），domain 不另定义。
@@ -51,10 +51,10 @@ pub struct ScanOutput {
 
 /// verifier cell 的单条判决（design §8.1：`REFUTED | UPHELD` + 一句理由；analysis 先于 verdict 是 prompt 字段序，不在此）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VerifyEntry {
+pub struct RefuteEntry {
     /// 被判决的 finding id。
     pub id: String,
-    pub verdict: VerifyVerdict,
+    pub verdict: RefuteVerdict,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
 }
@@ -74,7 +74,7 @@ pub enum CellOutput {
         needs: Vec<NeedEntry>,
     },
     #[serde(rename = "refuter")]
-    Verify { verdicts: Vec<VerifyEntry> },
+    Refute { verdicts: Vec<RefuteEntry> },
 }
 
 impl CellOutput {
@@ -82,7 +82,7 @@ impl CellOutput {
         match self {
             CellOutput::Scan(_) => Role::Scanner,
             CellOutput::Review { .. } => Role::Reviewer,
-            CellOutput::Verify { .. } => Role::Refuter,
+            CellOutput::Refute { .. } => Role::Refuter,
         }
     }
 
@@ -94,7 +94,7 @@ impl CellOutput {
         match role {
             Role::Scanner => CellOutput::Scan(ScanOutput::default()),
             Role::Reviewer => CellOutput::Review { findings: vec![], needs: vec![] },
-            Role::Refuter => CellOutput::Verify { verdicts: vec![] },
+            Role::Refuter => CellOutput::Refute { verdicts: vec![] },
             Role::Verifier => unreachable!(
                 "Role::Verifier 不属于 review cell 管线（fix 验证的结果类型在 Phase 4 定义）"
             ),
@@ -133,7 +133,7 @@ impl CellOutput {
         match self {
             CellOutput::Scan(s) => &s.needs,
             CellOutput::Review { needs, .. } => needs,
-            CellOutput::Verify { .. } => &[],
+            CellOutput::Refute { .. } => &[],
         }
     }
 }
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn cell_output_three_variants_roundtrip() {
         let review = CellOutput::Review { findings: vec![finding("f1")], needs: vec![] };
-        let verify = CellOutput::Verify { verdicts: vec![VerifyEntry { id: "f1".into(), verdict: VerifyVerdict::Refuted, note: "guarded".into() }] };
+        let verify = CellOutput::Refute { verdicts: vec![RefuteEntry { id: "f1".into(), verdict: RefuteVerdict::Refuted, note: "guarded".into() }] };
         for (out, tag) in [(scan(), "scanner"), (review, "reviewer"), (verify, "refuter")] {
             let j = serde_json::to_string(&out).unwrap();
             let v: serde_json::Value = serde_json::from_str(&j).unwrap();
@@ -269,10 +269,10 @@ mod tests {
 
     #[test]
     fn verify_entry_empty_note_skipped_and_defaults() {
-        let e = VerifyEntry { id: "x".into(), verdict: VerifyVerdict::Upheld, note: String::new() };
+        let e = RefuteEntry { id: "x".into(), verdict: RefuteVerdict::Upheld, note: String::new() };
         let j = serde_json::to_string(&e).unwrap();
         assert!(!j.contains("note"), "{j}");
-        let back: VerifyEntry = serde_json::from_str(&j).unwrap();
+        let back: RefuteEntry = serde_json::from_str(&j).unwrap();
         assert_eq!(back, e);
     }
 }

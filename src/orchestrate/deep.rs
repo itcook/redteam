@@ -84,7 +84,7 @@ pub struct DeepInput<'a> {
     /// `None` → 不打（前台一次性跑没有 job 状态可写）。
     pub on_phase: Option<&'a dyn Fn(crate::state::Phase, Option<String>)>,
     /// 复核输入（批 D〔D17〕）：`None` = 本轮不复核，整段行为等价于批 C3 收口态。
-    pub verify: Option<VerifyInput<'a>>,
+    pub refute: Option<VerifyInput<'a>>,
     /// 在途入队通道（scanner 流式扇出，C2〔D15〕）：到达项走入口五态（到达键幂等）；通道关闭 = 关闭入口 → 收场 drain。`None` = 开跑即关闭。
     /// barrier 含「通道已关闭」：发送端未全部 drop 前，队列空也不收场。
     pub incoming: Option<mpsc::Receiver<crate::orchestrate::queue::DeepMsg>>,
@@ -121,7 +121,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         // **早退也要回填往轮判决**（收口评审 #1）：这条路上一格都不挖，findings 全部来自 `prior_findings`，
         // 而它们的判决只存在于往轮的 verifier 格里。漏填 = 上一轮已被驳回的 finding 在本轮报告里
         // 复活成拦路 blocking（`Stats` 与 `verdict` 都认它），往轮的驳回记录从 JSON 里彻底消失。
-        if let Some(vin) = input.verify.as_ref() {
+        if let Some(vin) = input.refute.as_ref() {
             apply_known(&mut prior_findings, vin.known);
         }
         // 早退也带选项观测（评审）：`restored_meta` 已按快照算好五量，否则这一轮的报告里它们凭空为 0。
@@ -236,12 +236,12 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     let mut verifying = FuturesUnordered::new();
     let mut verify_rotation = 0usize;
     // finding id → 判决：收场统一回填（判决可能在该格早已落地之后才回来）。
-    let mut verdicts: std::collections::BTreeMap<String, crate::domain::Verify> = Default::default();
+    let mut verdicts: std::collections::BTreeMap<String, crate::domain::Refute> = Default::default();
     // 本轮已派过复核的 finding id（在途 + 已回来）。
     let mut verify_seen: std::collections::BTreeSet<String> = Default::default();
     let mut verify_cells: Vec<CellRecord> = Vec::new();
     let mut verify_warnings: Vec<String> = Vec::new();
-    // 复核归零时刻（`verify_tail_ms` 的右端）；无复核则恒 0。
+    // 复核归零时刻（`refute_tail_ms` 的右端）；无复核则恒 0。
     let mut verify_zero_ms = 0u64;
     // 复核尾段的 `Phase::Verify` 只打一次（phase 是时间线上的一格，不是心跳）。
     let mut verify_phase_marked = false;
@@ -270,7 +270,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     // 覆盖面不止 carried：resume 的 `prior_findings` 同样过这道门。往轮已判的被 `known` 拦下
     // 记 `resumed`（不发请求），往轮**没验完**的（格成功、复核被 kill）这轮补验——那正是收场处
     // 注释自承、原本「留待 M21c 一并处理」的缺口。首跑 `prior_findings` 为空，整段不执行。
-    if let Some(vin) = input.verify.as_ref() {
+    if let Some(vin) = input.refute.as_ref() {
         for f in &prior_findings {
             let f_hunks: &[(usize, usize)] =
                 hunks_by_file.get(&f.file).map(Vec::as_slice).unwrap_or(&[]);
@@ -278,18 +278,18 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                 f, vin.precedents, vin.block_threshold, vin.conf_floor, vin.enabled, f_hunks,
             );
             if !d.is_verify() {
-                *meta.verify_skipped.entry(d.reason().to_string()).or_default() += 1;
+                *meta.refute_skipped.entry(d.reason().to_string()).or_default() += 1;
                 continue;
             }
             // 往轮判过的直接用、不重验（与格侧同一条规矩：同一条两次复核可能给出不同结论）。
             if let Some(v) = vin.known.get(&f.id) {
                 verdicts.insert(f.id.clone(), v.clone());
-                *meta.verify_skipped.entry("resumed".into()).or_default() += 1;
+                *meta.refute_skipped.entry("resumed".into()).or_default() += 1;
                 continue;
             }
             // 先占 `verify_seen`：本轮某个格若又报出同一条，记 `cached` 不重复派（格侧同款）。
             if !verify_seen.insert(f.id.clone()) {
-                *meta.verify_skipped.entry("cached".into()).or_default() += 1;
+                *meta.refute_skipped.entry("cached".into()).or_default() += 1;
                 continue;
             }
             // 异族选择要一个「作者」。往轮 finding 的作者只剩模型**名字**（`models`），按名查本轮
@@ -303,7 +303,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             match crate::consolidate::verify::pick_verifier(vin.roles, author, verify_rotation) {
                 Some((m, warn)) => {
                     verify_rotation += 1;
-                    meta.verify_triggered += 1;
+                    meta.refute_triggered += 1;
                     verifying.push(run_verify(&env, VerifyJob {
                         finding: f.clone(),
                         verifier: m,
@@ -311,7 +311,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                         warn,
                     }));
                 }
-                None => *meta.verify_skipped.entry("no_verifier".into()).or_default() += 1,
+                None => *meta.refute_skipped.entry("no_verifier".into()).or_default() += 1,
             }
         }
     }
@@ -404,7 +404,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         // 复核尾段开始：barrier 的条件**只差复核归零**这一项——深挖该收了，就剩复核还在跑。
         // `Phase::Verify` 在 M21b 批 C 占位、批 D 做了流式复核却没接上，于是后台作业跑在这一段时
         // `redteam status` 显示的还是 `deep`（M21c 批 C 的状态机盘点查出来的：全仓零产品写入）。
-        // 这一段是真实存在的——`verify_tail_ms = verify_zero_ms − drain_done_ms` 量的就是它。
+        // 这一段是真实存在的——`refute_tail_ms = verify_zero_ms − drain_done_ms` 量的就是它。
         if !verify_phase_marked
             && running.is_empty()
             && !verifying.is_empty()
@@ -469,7 +469,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                 // 该成员其他在途格照常跑完。只在「队列项 > 并发容量」时起作用——小队列 t=0 就全派出去了。
                 pool.remove(l.member, format!("deep: reviewer {} auth failed — removed from pool", members[l.member].name));
             }
-            if let Some(vin) = input.verify.as_ref() {
+            if let Some(vin) = input.refute.as_ref() {
                 for f in l.rec.output.findings() {
                     // `delta_hunks` 恒空片：它只喂 `decide` 的 carried 判据，而这条路上的 `f` 来自
                     // 本轮格的输出、`origin` 恒 `New`（`Origin::Carried` 的唯一产品写入点是
@@ -479,14 +479,14 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                         f, vin.precedents, vin.block_threshold, vin.conf_floor, vin.enabled, &[],
                     );
                     if !d.is_verify() {
-                        *meta.verify_skipped.entry(d.reason().to_string()).or_default() += 1;
+                        *meta.refute_skipped.entry(d.reason().to_string()).or_default() += 1;
                         continue;
                     }
                     // resume 回填（design §8.1〔D17〕Q11）：往轮判过的直接用，不重验——
                     // 同一条两次复核可能给出不同结论，重验会让 resume 前后 verdict 翻转。
                     if let Some(v) = vin.known.get(&f.id) {
                         verdicts.insert(f.id.clone(), v.clone());
-                        *meta.verify_skipped.entry("resumed".into()).or_default() += 1;
+                        *meta.refute_skipped.entry("resumed".into()).or_default() += 1;
                         continue;
                     }
                     // 本轮按 finding id 去重**派发**（〔D17〕Q11）：同一条被两个格各报一次（dedup 在收场才跑）
@@ -495,13 +495,13 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                     // （置信更低、或恰好压在共识行上），后到的那份照样能把它派出去；反过来先到的已经派了，
                     // 后到的记 `cached`。代价是跳过类按「格 × finding」计次——那是观测，派发才是行为。
                     if !verify_seen.insert(f.id.clone()) {
-                        *meta.verify_skipped.entry("cached".into()).or_default() += 1;
+                        *meta.refute_skipped.entry("cached".into()).or_default() += 1;
                         continue;
                     }
                     match crate::consolidate::verify::pick_verifier(vin.roles, &members[l.member], verify_rotation) {
                         Some((m, warn)) => {
                             verify_rotation += 1;
-                            meta.verify_triggered += 1;
+                            meta.refute_triggered += 1;
                             verifying.push(run_verify(&env, VerifyJob {
                                 finding: f.clone(),
                                 verifier: m,
@@ -510,7 +510,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
                             }));
                         }
                         // 一个模型都没有（scan-only 之外几乎不可能）：不拦 finding，按未复核收。
-                        None => *meta.verify_skipped.entry("no_verifier".into()).or_default() += 1,
+                        None => *meta.refute_skipped.entry("no_verifier".into()).or_default() += 1,
                     }
                 }
             }
@@ -520,19 +520,19 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         for v in verify_now {
             let VerifyDone { finding_id, verdict, ok, family, cell_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, warnings: ws } = v;
             if !ok {
-                meta.verify_failed += 1;
+                meta.refute_failed += 1;
             }
-            if verdict.verdict == crate::domain::VerifyVerdict::Refuted {
-                meta.verify_refuted += 1;
+            if verdict.verdict == crate::domain::RefuteVerdict::Refuted {
+                meta.refute_refuted += 1;
             }
-            let entry = crate::domain::VerifyEntry {
+            let entry = crate::domain::RefuteEntry {
                 id: finding_id.clone(),
                 verdict: verdict.verdict.clone(),
                 note: verdict.note.clone(),
             };
             // 逐条一格（〔D17〕Q7）：cell id 带 finding id，resume 据此认「这条已复核」；
             // 失败的复核同样落 ok 格——判决是保守 upheld，不是没判。
-            let mut rec = CellRecord::ok(&cell_id, &verdict.model, crate::domain::CellOutput::Verify { verdicts: vec![entry] })
+            let mut rec = CellRecord::ok(&cell_id, &verdict.model, crate::domain::CellOutput::Refute { verdicts: vec![entry] })
                 .with_family(&family);
             rec.duration_ms = duration_ms;
             rec.input_tokens = input_tokens;
@@ -634,7 +634,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         _ => a.item_id.cmp(&b.item_id),
     });
     // 往轮判决并入（resume）：本轮没重挖的 finding 从 `prior_findings` 进报告，它们的判决只在往轮 verifier 格里。
-    if let Some(vin) = input.verify.as_ref() {
+    if let Some(vin) = input.refute.as_ref() {
         for (id, v) in vin.known {
             verdicts.entry(id.clone()).or_insert_with(|| v.clone());
         }
@@ -642,7 +642,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
     // 判例门攒下的话一次并进 warnings（B-2）：豁免与重挖都要在报告里说清，否则「少了一格」无从解释。
     warnings.append(&mut gate.notes);
     // 复核尾部 = 队列排空（最后一格落地）→ 复核归零；复核全在排空前跑完则为 0。
-    meta.verify_tail_ms = verify_zero_ms.saturating_sub(meta.drain_done_ms);
+    meta.refute_tail_ms = verify_zero_ms.saturating_sub(meta.drain_done_ms);
     let mut findings = Vec::new();
     let mut cells = Vec::new();
     let mut bypass_missing: Vec<String> = Vec::new();
@@ -659,7 +659,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
         if !verdicts.is_empty() {
             for f in l.rec.output.findings_mut() {
                 if let Some(v) = verdicts.get(&f.id) {
-                    f.set_verdict(v.clone());
+                    f.set_refute(v.clone());
                 }
             }
         }
@@ -693,7 +693,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
 
     // 往轮 finding 同样回填判决：它们不经本轮的格，漏了就会在 resume 报告里复活成未判决。
     // 这里也是**主循环前那批复核的收端**——往轮没验完的（格成功、复核被 kill）在那里补派，
-    // 判决经 `verdicts` 回到这儿贴上（`set_verdict` 无条件覆盖，新判决胜过旧判决）。
+    // 判决经 `verdicts` 回到这儿贴上（`set_refute` 无条件覆盖，新判决胜过旧判决）。
     // 原「没有格就没有派发点」的缺口已由〔裁定 1′，2026-10-04〕的派发段补上。
     apply_known(&mut prior_findings, &verdicts);
     findings.extend(prior_findings);
@@ -941,17 +941,17 @@ pub struct VerifyInput<'a> {
     pub precedents: &'a [crate::db::DismissCard],
     /// 往轮已落盘的判决（resume 按 finding id 回填）：命中即直接应用、不重验——
     /// 同一条 finding 两次复核可能给出不同结论，重验会让 resume 前后 verdict 翻转。
-    pub known: &'a std::collections::BTreeMap<String, crate::domain::Verify>,
+    pub known: &'a std::collections::BTreeMap<String, crate::domain::Refute>,
 }
 
 /// 把已知判决贴回一批 finding（两条路共用：收场的 `prior_findings` 与空变更集早退）。
-fn apply_known(fs: &mut [Finding], known: &std::collections::BTreeMap<String, crate::domain::Verify>) {
+fn apply_known(fs: &mut [Finding], known: &std::collections::BTreeMap<String, crate::domain::Refute>) {
     if known.is_empty() {
         return;
     }
     for f in fs.iter_mut() {
         if let Some(v) = known.get(&f.id) {
-            f.set_verdict(v.clone());
+            f.set_refute(v.clone());
         }
     }
 }
@@ -967,21 +967,21 @@ fn apply_known(fs: &mut [Finding], known: &std::collections::BTreeMap<String, cr
 /// 只数**成功的** verify 格：失败的复核按设计保守 upheld，没产生判决，不该计入触发数。
 pub fn fold_reused_verify(meta: &mut crate::domain::DeepMeta, reused: &[CellRecord]) {
     for rec in reused.iter().filter(|r| r.ok) {
-        if let crate::domain::CellOutput::Verify { verdicts } = &rec.output {
-            meta.verify_triggered += verdicts.len() as u32;
-            meta.verify_refuted += verdicts.iter().filter(|v| v.verdict == crate::domain::VerifyVerdict::Refuted).count() as u32;
+        if let crate::domain::CellOutput::Refute { verdicts } = &rec.output {
+            meta.refute_triggered += verdicts.len() as u32;
+            meta.refute_refuted += verdicts.iter().filter(|v| v.verdict == crate::domain::RefuteVerdict::Refuted).count() as u32;
         }
     }
 }
 
-pub fn known_verdicts(cells: &[CellRecord]) -> std::collections::BTreeMap<String, crate::domain::Verify> {
+pub fn known_verdicts(cells: &[CellRecord]) -> std::collections::BTreeMap<String, crate::domain::Refute> {
     let mut out = std::collections::BTreeMap::new();
     for rec in cells.iter().filter(|r| r.ok) {
-        if let crate::domain::CellOutput::Verify { verdicts } = &rec.output {
+        if let crate::domain::CellOutput::Refute { verdicts } = &rec.output {
             for v in verdicts {
                 out.insert(
                     v.id.clone(),
-                    crate::domain::Verify { verdict: v.verdict.clone(), model: rec.model.clone(), note: v.note.clone() },
+                    crate::domain::Refute { verdict: v.verdict.clone(), model: rec.model.clone(), note: v.note.clone() },
                 );
             }
         }
@@ -1001,7 +1001,7 @@ struct VerifyJob<'b> {
 /// 一次复核的产出（未碰队列 / 未落盘）。
 struct VerifyDone {
     finding_id: String,
-    verdict: crate::domain::Verify,
+    verdict: crate::domain::Refute,
     /// 这次复核**真跑成了**吗：lease 失败 / 调用失败 / 判决读不懂都是 false。
     /// 判决仍按保守 upheld 收（本轮行为不变），但格按失败落盘——否则一次瞬时故障
     /// 会被 `known_verdicts`（只认 ok 格）固化成「已复核」，这条 finding 在该 job 余生不再被真验（收口评审 #5）。
@@ -1041,8 +1041,8 @@ async fn run_verify<'b>(env: &CellEnv<'b>, job: VerifyJob<'b>) -> VerifyDone {
     let t0 = tokio::time::Instant::now();
     let cell_id = format!("verify[{}]@{}", finding.id, verifier.name);
     let mut warnings: Vec<String> = warn.into_iter().collect();
-    let upheld = |note: &str| crate::domain::Verify {
-        verdict: crate::domain::VerifyVerdict::Upheld,
+    let upheld = |note: &str| crate::domain::Refute {
+        verdict: crate::domain::RefuteVerdict::Upheld,
         model: verifier.name.clone(),
         note: note.to_string(),
     };
@@ -1091,7 +1091,7 @@ async fn run_verify<'b>(env: &CellEnv<'b>, job: VerifyJob<'b>) -> VerifyDone {
             let usage = (t.input_tokens, t.output_tokens, t.cached_input_tokens);
             match crate::provider::parse::parse_verify_output(&t.text) {
                 Ok((v, note)) => (
-                    crate::domain::Verify { verdict: v, model: verifier.name.clone(), note },
+                    crate::domain::Refute { verdict: v, model: verifier.name.clone(), note },
                     usage,
                 ),
                 Err(e) => {
@@ -1107,7 +1107,7 @@ async fn run_verify<'b>(env: &CellEnv<'b>, job: VerifyJob<'b>) -> VerifyDone {
             (upheld("verifier call failed"), (0, 0, 0))
         }
     };
-    if !from_cell.is_empty() && verdict.verdict == crate::domain::VerifyVerdict::Refuted {
+    if !from_cell.is_empty() && verdict.verdict == crate::domain::RefuteVerdict::Refuted {
         warnings.push(format!("verify {cell_id}: refuted a finding from {from_cell}"));
     }
     VerifyDone {
@@ -2005,7 +2005,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Pending)]),
                 prior_findings: vec![], tools,
-                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, refute: None,
                 activated: &[],
                 precedents: &[],
                 on_phase: None,
@@ -2063,7 +2063,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(std::slice::from_ref(&item)),
                 prior_findings: vec![], tools: ToolsMode::Off,
-                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, refute: None,
                 activated: &[],
                 precedents: &[],
                 on_phase: None,
@@ -2134,7 +2134,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(std::slice::from_ref(&item)),
                 prior_findings: vec![], tools: ToolsMode::Off,
-                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, refute: None,
                 activated: &[],
                 precedents: &[],
                 on_phase: None,
@@ -2226,7 +2226,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("c.rs", ItemState::Pending)]),
                 prior_findings: vec![prior_f], tools: ToolsMode::Off,
-                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, refute: None,
                 activated: &[],
                 precedents: &[],
                 on_phase: None,
@@ -2254,7 +2254,7 @@ mod tests {
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::Settled)]),
                 prior_findings: vec![], tools: ToolsMode::Off,
-                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, refute: None,
                 activated: &[],
                 precedents: &[],
                 on_phase: None,
@@ -2294,7 +2294,7 @@ mod tests {
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&snap), prior_findings: vec![prior_f],
-                tools: ToolsMode::Off, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                tools: ToolsMode::Off, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, refute: None,
                 activated: &[],
                 precedents: &[],
                 on_phase: None,
@@ -2336,7 +2336,7 @@ mod tests {
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: None, restore: Some(&[snap_item("a.rs", ItemState::InFlight)]), prior_findings: vec![],
-                tools: ToolsMode::TwoStage, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+                tools: ToolsMode::TwoStage, backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, refute: None,
                 activated: &[],
                 precedents: &[],
                 on_phase: None,
@@ -2516,7 +2516,7 @@ mod tests {
         reopen_skipped: bool,
         route: Option<&'a RiskRoute>,
         /// `None` = 不复核（多数用例）；复核段用例自带 `VerifyInput`。
-        verify: Option<VerifyInput<'a>>,
+        refute: Option<VerifyInput<'a>>,
         /// 台账激活项（M21c 批 C）：默认空。
         activated: &'a [crate::orchestrate::ledger::Activated],
         /// 阶段钩子：默认 `None`；复核尾段用例自带。
@@ -2536,7 +2536,7 @@ mod tests {
                 reviewers: r.reviewers.unwrap_or(&single), budget_cells: r.budget,
                 pack: &Default::default(), spec_docs: "", repo_brief: r.repo_brief, target_label: "t",
                 snapshot: r.snapshot, restore: (!r.first_run).then_some(r.items), prior_findings: r.prior, tools: r.tools,
-                backend_factory: None, on_cell: r.on_cell, on_phase: r.on_phase, incoming: r.incoming, reopen_skipped: r.reopen_skipped, verify: r.verify,
+                backend_factory: None, on_cell: r.on_cell, on_phase: r.on_phase, incoming: r.incoming, reopen_skipped: r.reopen_skipped, refute: r.refute,
                 activated: r.activated,
                 precedents: r.precedents,
             },
@@ -2548,7 +2548,7 @@ mod tests {
     fn plain<'a>(reg: &'a crate::provider::registry::ProviderRegistry, root: &'a Path, bundles: &'a [Bundle], items: &'a [QueueItem]) -> Run<'a> {
         Run {
             reg, root, bundles, items, tools: ToolsMode::Off, incoming: None, on_cell: None, snapshot: None, sink: &(), reviewers: None,
-            budget: 16, first_run: false, scan_cells: &[], repo_brief: "", reopen_skipped: false, route: None, verify: None, prior: vec![],
+            budget: 16, first_run: false, scan_cells: &[], repo_brief: "", reopen_skipped: false, route: None, refute: None, prior: vec![],
             activated: &[],
             precedents: &[],
             on_phase: None,
@@ -2649,8 +2649,8 @@ mod tests {
         .unwrap();
         f.origin = crate::domain::Origin::Carried;
         if judged {
-            f.verify = Some(crate::domain::Verify {
-                verdict: crate::domain::VerifyVerdict::Upheld,
+            f.refute = Some(crate::domain::Refute {
+                verdict: crate::domain::RefuteVerdict::Upheld,
                 model: "p/r".into(),
                 note: "往轮判过".into(),
             });
@@ -2669,7 +2669,7 @@ mod tests {
         let roles = verify_roles();
         let known = Default::default();
         let run = run_with(Run {
-            verify: Some(vin(&roles, &known)),
+            refute: Some(vin(&roles, &known)),
             prior: vec![carried],
             ..plain(&reg, dir, &bundles, &pending_items(&["a"]))
         })
@@ -2697,11 +2697,11 @@ mod tests {
         let (run, got) = run_carried(dir.path(), carried_at(2, "    body();", true)).await;
 
         assert_eq!(
-            got.verify.as_ref().map(|v| &v.verdict),
-            Some(&crate::domain::VerifyVerdict::Refuted),
+            got.refute.as_ref().map(|v| &v.verdict),
+            Some(&crate::domain::RefuteVerdict::Refuted),
             "区域有 delta 的 carried 要重验、拿本轮的新判决（UPHELD = 还是往轮那个旧判决）"
         );
-        assert_eq!(run.meta.verify_skipped.get("carried"), None, "不该再记成 carried 免验");
+        assert_eq!(run.meta.refute_skipped.get("carried"), None, "不该再记成 carried 免验");
     }
 
     /// 判据 ② 的反向：区域没被本轮 delta 碰到 → 维持免验，沿用往轮判决。
@@ -2713,12 +2713,12 @@ mod tests {
         let (run, got) = run_carried(dir.path(), carried_at(3, "}", true)).await;
 
         assert_eq!(
-            got.verify.as_ref().map(|v| v.note.as_str()),
+            got.refute.as_ref().map(|v| v.note.as_str()),
             Some("往轮判过"),
             "区域没动过的 carried 不该重验——拿到 REFUTED 说明它白跑了一次 verifier"
         );
         assert_eq!(
-            run.meta.verify_skipped.get("carried"),
+            run.meta.refute_skipped.get("carried"),
             Some(&1),
             "免验要记进 `carried` 分类（--help 列着它，此前从不可达）"
         );
@@ -2733,11 +2733,11 @@ mod tests {
         let (run, got) = run_carried(dir.path(), carried_at(3, "}", false)).await;
 
         assert_eq!(
-            got.verify.as_ref().map(|v| &v.verdict),
-            Some(&crate::domain::VerifyVerdict::Refuted),
+            got.refute.as_ref().map(|v| &v.verdict),
+            Some(&crate::domain::RefuteVerdict::Refuted),
             "往轮没判过的 carried 要补验——None 说明判据 ① 没生效"
         );
-        assert_eq!(run.meta.verify_skipped.get("carried"), None, "没判过就不是「出生轮已复核」");
+        assert_eq!(run.meta.refute_skipped.get("carried"), None, "没判过就不是「出生轮已复核」");
     }
 
     /// 精确 id 命中判例 → `previously_dismissed` → **不再拦路**（断了很久的一条链）。
@@ -3456,7 +3456,7 @@ mod tests {
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
                 snapshot: Some(&snapshot), restore: Some(&items), prior_findings: vec![prior_same, prior_settled],
-                tools: ToolsMode::TwoStage, backend_factory: None, on_cell: Some(&on_cell), incoming: None, reopen_skipped: false, verify: None,
+                tools: ToolsMode::TwoStage, backend_factory: None, on_cell: Some(&on_cell), incoming: None, reopen_skipped: false, refute: None,
                 activated: &[],
                 precedents: &[],
                 on_phase: None,
@@ -4092,7 +4092,7 @@ mod tests {
             route: None, scan_cells: &cells, bundles: &[], root: Path::new("."),
             reviewers: &[], budget_cells: 0, pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
             snapshot: None, restore: None, prior_findings: vec![], tools: ToolsMode::Off,
-            backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, verify: None,
+            backend_factory: None, on_cell: None, incoming: None, reopen_skipped: false, refute: None,
             activated: &[],
             precedents: &[],
             on_phase: None,
@@ -4504,7 +4504,7 @@ mod tests {
 
     fn vin<'a>(
         roles: &'a crate::config::RoleSets,
-        known: &'a std::collections::BTreeMap<String, crate::domain::Verify>,
+        known: &'a std::collections::BTreeMap<String, crate::domain::Refute>,
     ) -> VerifyInput<'a> {
         VerifyInput {
             roles, enabled: true, block_threshold: crate::domain::Severity::Medium,
@@ -4544,13 +4544,13 @@ mod tests {
         let roles = verify_roles();
         let known = Default::default();
         let items = pending_items(&["a"]);
-        let run = run_with(Run { verify: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        let run = run_with(Run { refute: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
 
         let f = &run.findings[0];
-        let v = f.verify.as_ref().expect("判决必须回填到 finding");
-        assert_eq!(v.verdict, crate::domain::VerifyVerdict::Refuted);
+        let v = f.refute.as_ref().expect("判决必须回填到 finding");
+        assert_eq!(v.verdict, crate::domain::RefuteVerdict::Refuted);
         assert_eq!((v.model.as_str(), v.note.as_str()), ("p/v", "引用与文件对不上"));
-        assert_eq!((run.meta.verify_triggered, run.meta.verify_refuted), (1, 1));
+        assert_eq!((run.meta.refute_triggered, run.meta.refute_refuted), (1, 1));
         // 收口评审 #7：判决落地即归零 confidence——没有合并伙伴的被驳回 finding 也不能留下
         // 「verdict=refuted、confidence=0.9」这种自相矛盾的记录（下游按 confidence 排序 / 过滤会各拿各的答案）。
         assert_eq!(f.confidence, 0.0, "REFUTED → confidence 归零");
@@ -4559,9 +4559,9 @@ mod tests {
         assert_eq!((vc.model.as_str(), vc.family.as_str()), ("p/v", "v"));
         assert_eq!(
             vc.output,
-            crate::domain::CellOutput::Verify {
-                verdicts: vec![crate::domain::VerifyEntry {
-                    id: f.id.clone(), verdict: crate::domain::VerifyVerdict::Refuted, note: "引用与文件对不上".into(),
+            crate::domain::CellOutput::Refute {
+                verdicts: vec![crate::domain::RefuteEntry {
+                    id: f.id.clone(), verdict: crate::domain::RefuteVerdict::Refuted, note: "引用与文件对不上".into(),
                 }]
             }
         );
@@ -4594,7 +4594,7 @@ mod tests {
             it
         }];
         let run = run_with(Run {
-            verify: Some(vin(&roles, &known)),
+            refute: Some(vin(&roles, &known)),
             budget: 2,
             ..plain(&reg, dir.path(), &bundles, &items)
         })
@@ -4602,12 +4602,12 @@ mod tests {
 
         assert_eq!(run.cells.iter().filter(|c| c.output.role() == Role::Reviewer).count(), 2, "两格都跑了");
         assert_eq!(run.findings.len(), 1, "dedup 收成一条");
-        assert_eq!(run.meta.verify_triggered, 1, "同一 id 只派一次复核");
-        assert_eq!(run.meta.verify_skipped.get("cached"), Some(&1), "{:?}", run.meta.verify_skipped);
+        assert_eq!(run.meta.refute_triggered, 1, "同一 id 只派一次复核");
+        assert_eq!(run.meta.refute_skipped.get("cached"), Some(&1), "{:?}", run.meta.refute_skipped);
         assert_eq!(run.cells.iter().filter(|c| c.cell.starts_with("verify[")).count(), 1, "只落一格复核");
         assert_eq!(
-            run.findings[0].verify.as_ref().map(|v| v.verdict.clone()),
-            Some(crate::domain::VerifyVerdict::Refuted),
+            run.findings[0].refute.as_ref().map(|v| v.verdict.clone()),
+            Some(crate::domain::RefuteVerdict::Refuted),
             "判决照样落到合并后的那条上"
         );
     }
@@ -4639,17 +4639,17 @@ mod tests {
             it
         }];
         let run = run_with(Run {
-            verify: Some(vin(&roles, &known)),
+            refute: Some(vin(&roles, &known)),
             budget: 2,
             ..plain(&reg, dir.path(), &bundles, &items)
         })
         .await;
 
-        assert_eq!(run.meta.verify_triggered, 1, "高置信那份必须被派出去: {:?}", run.meta.verify_skipped);
-        assert_eq!(run.meta.verify_skipped.get("not_triggered"), Some(&1), "低置信那份记未触发");
+        assert_eq!(run.meta.refute_triggered, 1, "高置信那份必须被派出去: {:?}", run.meta.refute_skipped);
+        assert_eq!(run.meta.refute_skipped.get("not_triggered"), Some(&1), "低置信那份记未触发");
         assert_eq!(
-            run.findings[0].verify.as_ref().map(|v| v.verdict.clone()),
-            Some(crate::domain::VerifyVerdict::Refuted),
+            run.findings[0].refute.as_ref().map(|v| v.verdict.clone()),
+            Some(crate::domain::RefuteVerdict::Refuted),
             "判决落到合并后的那条上"
         );
     }
@@ -4674,14 +4674,14 @@ mod tests {
         let roles = verify_roles();
         let known = Default::default();
         let items = pending_items(&["a"]);
-        let run = run_with(Run { verify: Some(vin(&roles, &known)), ..plain(&reg, root, &bundles, &items) }).await;
+        let run = run_with(Run { refute: Some(vin(&roles, &known)), ..plain(&reg, root, &bundles, &items) }).await;
 
         assert!(
             run.warnings.iter().any(|w| w.contains("verify 读被拒") && w.contains("secret.env")),
             "拒读必须进报告 warnings: {:?}",
             run.warnings
         );
-        assert_eq!(run.meta.verify_triggered, 1, "照样复核——只是没有证据可给");
+        assert_eq!(run.meta.refute_triggered, 1, "照样复核——只是没有证据可给");
     }
 
     /// 没真跑成的复核按**失败格**落盘（收口评审 #5）：判决仍是保守 upheld（本轮行为不变），
@@ -4698,14 +4698,14 @@ mod tests {
         let roles = verify_roles();
         let known = Default::default();
         let items = pending_items(&["a"]);
-        let run = run_with(Run { verify: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        let run = run_with(Run { refute: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
 
         let vc = run.cells.iter().find(|c| c.cell.starts_with("verify[")).expect("失败也要留格");
         assert!(!vc.ok, "没跑成的复核不能落成 ok 格");
-        assert_eq!(run.meta.verify_failed, 1);
+        assert_eq!(run.meta.refute_failed, 1);
         assert_eq!(
-            run.findings[0].verify.as_ref().map(|v| v.verdict.clone()),
-            Some(crate::domain::VerifyVerdict::Upheld),
+            run.findings[0].refute.as_ref().map(|v| v.verdict.clone()),
+            Some(crate::domain::RefuteVerdict::Upheld),
             "本轮仍按保守 upheld 收"
         );
         assert!(known_verdicts(&run.cells).is_empty(), "失败格不进往轮判决，resume 要重验");
@@ -4724,12 +4724,12 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             models: vec!["p/r".into()], agreement: 1, suspicion_agreement: 0, hard_constraint: false,
             quote: "fn a() {".into(), previously_dismissed: false, origin: crate::domain::Origin::New, outside_window: false,
-            cluster_id: None, verify: None,
+            cluster_id: None, refute: None,
         };
-        let known: std::collections::BTreeMap<String, crate::domain::Verify> = [(
+        let known: std::collections::BTreeMap<String, crate::domain::Refute> = [(
             "F1".to_string(),
-            crate::domain::Verify {
-                verdict: crate::domain::VerifyVerdict::Refuted, model: "p/v".into(), note: "往轮已驳".into(),
+            crate::domain::Refute {
+                verdict: crate::domain::RefuteVerdict::Refuted, model: "p/v".into(), note: "往轮已驳".into(),
             },
         )]
         .into_iter()
@@ -4738,7 +4738,7 @@ mod tests {
         let items = vec![snap_item("a.rs", ItemState::Settled)];
         // bundles 为空 = 变更集为空（改动已提交 / diff 重建不了）→ 早退那条路
         let run = run_with(Run {
-            verify: Some(vin(&roles, &known)),
+            refute: Some(vin(&roles, &known)),
             prior: vec![prior],
             ..plain(&reg, dir.path(), &[], &items)
         })
@@ -4747,8 +4747,8 @@ mod tests {
         assert!(run.cells.is_empty(), "前提：这条路一格都不挖");
         let f = run.findings.iter().find(|f| f.id == "F1").expect("往轮 finding 照进报告");
         assert_eq!(
-            f.verify.as_ref().map(|v| v.verdict.clone()),
-            Some(crate::domain::VerifyVerdict::Refuted),
+            f.refute.as_ref().map(|v| v.verdict.clone()),
+            Some(crate::domain::RefuteVerdict::Refuted),
             "往轮判决必须跟着回来，否则它在本轮又成了 blocking"
         );
         assert!(f.is_refuted(), "`Stats` 与 verdict 都靠这个判定剔除它");
@@ -4847,17 +4847,17 @@ mod tests {
         let roles = verify_roles();
         let known = Default::default();
         let items = vec![item];
-        let run = run_with(Run { verify: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        let run = run_with(Run { refute: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
 
         assert_eq!(run.findings[0].suspicion_agreement, 2, "前提：这条压在共识簇上");
-        assert!(run.findings[0].verify.is_none(), "免验的不该有判决");
-        assert_eq!(run.meta.verify_triggered, 0);
-        assert_eq!(run.meta.verify_skipped.get("consensus"), Some(&1), "{:?}", run.meta.verify_skipped);
+        assert!(run.findings[0].refute.is_none(), "免验的不该有判决");
+        assert_eq!(run.meta.refute_triggered, 0);
+        assert_eq!(run.meta.refute_skipped.get("consensus"), Some(&1), "{:?}", run.meta.refute_skipped);
         assert!(!run.cells.iter().any(|c| c.cell.starts_with("verify[")), "不该有复核格");
     }
 
     /// barrier 等复核归零 + 尾部计时（design §2）：复核比最后一格晚 30s 才回来，
-    /// `run_deep` 必须等它，且 `verify_tail_ms` 记的正是「队列排空 → 复核归零」这段。
+    /// `run_deep` 必须等它，且 `refute_tail_ms` 记的正是「队列排空 → 复核归零」这段。
     #[tokio::test(start_paused = true)]
     async fn run_waits_for_verification_and_records_the_tail() {
         let dir = tempfile::tempdir().unwrap();
@@ -4880,18 +4880,18 @@ mod tests {
         let seen: std::sync::Mutex<Vec<(crate::state::Phase, Option<String>)>> = Default::default();
         let rec_phase = |ph: crate::state::Phase, note: Option<String>| seen.lock().unwrap().push((ph, note));
         let run = run_with(Run {
-            verify: Some(vin(&roles, &known)),
+            refute: Some(vin(&roles, &known)),
             on_phase: Some(&rec_phase),
             ..plain(&reg, dir.path(), &bundles, &items)
         })
         .await;
 
-        assert!(run.findings[0].verify.is_some(), "没等复核回来就收场了");
+        assert!(run.findings[0].refute.is_some(), "没等复核回来就收场了");
         assert!(t0.elapsed() >= Duration::from_secs(40), "墙钟得含复核尾部");
         assert!(
-            (29_000..=31_000).contains(&run.meta.verify_tail_ms),
+            (29_000..=31_000).contains(&run.meta.refute_tail_ms),
             "尾部 = 排空 → 归零（≈30s），不是整轮墙钟：tail={} drain={}",
-            run.meta.verify_tail_ms, run.meta.drain_done_ms
+            run.meta.refute_tail_ms, run.meta.drain_done_ms
         );
         let phases = seen.lock().unwrap().clone();
         assert_eq!(phases.len(), 1, "phase 是时间线上的一格，不是心跳: {phases:?}");
@@ -4927,14 +4927,14 @@ mod tests {
         let seen: std::sync::Mutex<Vec<(crate::state::Phase, Option<String>)>> = Default::default();
         let rec_phase = |ph: crate::state::Phase, note: Option<String>| seen.lock().unwrap().push((ph, note));
         let run = run_with(Run {
-            verify: Some(vin(&roles, &known)),
+            refute: Some(vin(&roles, &known)),
             on_phase: Some(&rec_phase),
             ..plain(&reg, dir.path(), &bundles, &items)
         })
         .await;
 
-        assert_eq!(run.meta.verify_triggered, 2, "夹具前提：两条复核");
-        assert!(run.meta.verify_tail_ms > 0, "夹具前提：有尾段");
+        assert_eq!(run.meta.refute_triggered, 2, "夹具前提：两条复核");
+        assert!(run.meta.refute_tail_ms > 0, "夹具前提：有尾段");
         let phases = seen.lock().unwrap().clone();
         assert_eq!(phases.len(), 1, "两条判决错开回来各唤醒一次主循环，阶段仍只打一次: {phases:?}");
         assert_eq!(phases[0].0, crate::state::Phase::Verify);
@@ -4953,11 +4953,11 @@ mod tests {
         let items = pending_items(&["a"]);
         let seen: std::sync::Mutex<Vec<(crate::state::Phase, Option<String>)>> = Default::default();
         let rec_phase = |ph: crate::state::Phase, note: Option<String>| seen.lock().unwrap().push((ph, note));
-        // `verify: None` = 整轮不复核
+        // `refute: None` = 整轮不复核
         let run = run_with(Run { on_phase: Some(&rec_phase), ..plain(&reg, dir.path(), &bundles, &items) }).await;
 
         assert!(!run.findings.is_empty(), "夹具前提：这一轮是挖出东西的");
-        assert_eq!(run.meta.verify_tail_ms, 0, "没有尾段");
+        assert_eq!(run.meta.refute_tail_ms, 0, "没有尾段");
         assert!(seen.lock().unwrap().is_empty(), "没尾段就不该打阶段: {:?}", seen.lock().unwrap());
     }
 
@@ -4974,11 +4974,11 @@ mod tests {
         let roles = verify_roles();
         let known = Default::default();
         let items = pending_items(&["a"]);
-        let run = run_with(Run { verify: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        let run = run_with(Run { refute: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
 
-        let v = run.findings[0].verify.as_ref().expect("读不懂也要落判决");
-        assert_eq!(v.verdict, crate::domain::VerifyVerdict::Upheld);
-        assert_eq!(run.meta.verify_refuted, 0);
+        let v = run.findings[0].refute.as_ref().expect("读不懂也要落判决");
+        assert_eq!(v.verdict, crate::domain::RefuteVerdict::Upheld);
+        assert_eq!(run.meta.refute_refuted, 0);
         assert!(
             run.warnings.iter().any(|w| w.contains("unparseable") && w.contains("conservatively upheld")),
             "{:?}", run.warnings
@@ -4999,19 +4999,19 @@ mod tests {
                 FakeChatBackend::new(vec![turn(&verdict_json("REFUTED"))]),
             );
             let known = Default::default();
-            run_with(Run { verify: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await
+            run_with(Run { refute: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await
         };
         // 落盘的 verifier 格 → 判决映射（resume 真路径就这一步）
         let known = known_verdicts(&first.cells);
         assert_eq!(known.len(), 1, "往轮判决必须能从格里重建");
 
         let reg = verify_reg(vec![turn(&blocking_cell("fn a() {"))], FakeChatBackend::new(vec![]));
-        let run = run_with(Run { verify: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
+        let run = run_with(Run { refute: Some(vin(&roles, &known)), ..plain(&reg, dir.path(), &bundles, &items) }).await;
 
-        let v = run.findings[0].verify.as_ref().expect("往轮判决要回填");
-        assert_eq!(v.verdict, crate::domain::VerifyVerdict::Refuted, "重验会让 resume 前后判决翻转");
-        assert_eq!(run.meta.verify_triggered, 0, "一次都不该再发");
-        assert_eq!(run.meta.verify_skipped.get("resumed"), Some(&1), "{:?}", run.meta.verify_skipped);
+        let v = run.findings[0].refute.as_ref().expect("往轮判决要回填");
+        assert_eq!(v.verdict, crate::domain::RefuteVerdict::Refuted, "重验会让 resume 前后判决翻转");
+        assert_eq!(run.meta.refute_triggered, 0, "一次都不该再发");
+        assert_eq!(run.meta.refute_skipped.get("resumed"), Some(&1), "{:?}", run.meta.refute_skipped);
         assert!(!run.cells.iter().any(|c| c.cell.starts_with("verify[")), "不该有新的复核格");
     }
 
@@ -5027,12 +5027,12 @@ mod tests {
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(),
             models: vec!["p/r".into()], agreement: 1, suspicion_agreement: 0, hard_constraint: false,
             quote: "fn a() {".into(), previously_dismissed: false, origin: crate::domain::Origin::New, outside_window: false,
-            cluster_id: None, verify: None,
+            cluster_id: None, refute: None,
         };
-        let known: std::collections::BTreeMap<String, crate::domain::Verify> = [(
+        let known: std::collections::BTreeMap<String, crate::domain::Refute> = [(
             "F1".to_string(),
-            crate::domain::Verify {
-                verdict: crate::domain::VerifyVerdict::Refuted, model: "p/v".into(), note: "往轮已驳".into(),
+            crate::domain::Refute {
+                verdict: crate::domain::RefuteVerdict::Refuted, model: "p/v".into(), note: "往轮已驳".into(),
             },
         )]
         .into_iter()
@@ -5040,14 +5040,14 @@ mod tests {
         let roles = verify_roles();
         let items = vec![snap_item("a.rs", ItemState::Settled)];
         let run = run_with(Run {
-            verify: Some(vin(&roles, &known)),
+            refute: Some(vin(&roles, &known)),
             prior: vec![prior],
             ..plain(&reg, dir.path(), &bundles, &items)
         })
         .await;
 
         let f = run.findings.iter().find(|f| f.id == "F1").expect("往轮 finding 照进报告");
-        assert_eq!(f.verify.as_ref().map(|v| v.verdict.clone()), Some(crate::domain::VerifyVerdict::Refuted));
+        assert_eq!(f.refute.as_ref().map(|v| v.verdict.clone()), Some(crate::domain::RefuteVerdict::Refuted));
     }
 
     /// 复用格的复核账要并回 meta（M21c 批 A-4，M21b 第 6 项实测的债）：
@@ -5055,27 +5055,27 @@ mod tests {
     /// 失败的复用格不计——它没产生判决（按设计保守 upheld）。
     #[test]
     fn reused_verify_cells_fold_into_the_meta() {
-        use crate::domain::{CellOutput, VerifyEntry, VerifyVerdict};
-        let verify = |cell: &str, ok: bool, vs: Vec<(&str, VerifyVerdict)>| {
-            let out = CellOutput::Verify {
-                verdicts: vs.into_iter().map(|(id, v)| VerifyEntry { id: id.into(), verdict: v, note: String::new() }).collect(),
+        use crate::domain::{CellOutput, RefuteEntry, RefuteVerdict};
+        let verify = |cell: &str, ok: bool, vs: Vec<(&str, RefuteVerdict)>| {
+            let out = CellOutput::Refute {
+                verdicts: vs.into_iter().map(|(id, v)| RefuteEntry { id: id.into(), verdict: v, note: String::new() }).collect(),
             };
             let mut rec = CellRecord::ok(cell, "p/v", out);
             rec.ok = ok;
             rec
         };
-        let mut meta = crate::domain::DeepMeta { verify_triggered: 2, verify_refuted: 1, ..Default::default() };
+        let mut meta = crate::domain::DeepMeta { refute_triggered: 2, refute_refuted: 1, ..Default::default() };
         fold_reused_verify(&mut meta, &[
-            verify("verify[a]@p/v", true, vec![("f1", VerifyVerdict::Upheld), ("f2", VerifyVerdict::Refuted)]),
-            verify("verify[b]@p/v", false, vec![("f3", VerifyVerdict::Refuted)]), // 失败格不计
+            verify("verify[a]@p/v", true, vec![("f1", RefuteVerdict::Upheld), ("f2", RefuteVerdict::Refuted)]),
+            verify("verify[b]@p/v", false, vec![("f3", RefuteVerdict::Refuted)]), // 失败格不计
             CellRecord::ok("review[x]@p/r", "p/r", CellOutput::empty(crate::domain::Role::Reviewer)), // 非复核格不计
         ]);
-        assert_eq!((meta.verify_triggered, meta.verify_refuted), (4, 2), "本轮 2/1 + 复用成功格 2/1");
+        assert_eq!((meta.refute_triggered, meta.refute_refuted), (4, 2), "本轮 2/1 + 复用成功格 2/1");
 
         // 没有复用格时不动账
-        let mut m2 = crate::domain::DeepMeta { verify_triggered: 3, verify_refuted: 0, ..Default::default() };
+        let mut m2 = crate::domain::DeepMeta { refute_triggered: 3, refute_refuted: 0, ..Default::default() };
         fold_reused_verify(&mut m2, &[]);
-        assert_eq!((m2.verify_triggered, m2.verify_refuted), (3, 0));
+        assert_eq!((m2.refute_triggered, m2.refute_refuted), (3, 0));
     }
 
 }

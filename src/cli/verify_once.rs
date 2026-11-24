@@ -54,7 +54,7 @@ fn claim_to_finding(c: Claim) -> Finding {
         origin: Origin::New,
         outside_window: false,
         cluster_id: None,
-        verify: None,
+        refute: None,
     }
 }
 
@@ -193,14 +193,14 @@ pub async fn run_verify_once(a: VerifyOnceArgs<'_>, cfg: &Config) -> i32 {
             // 解析与产品同一份：读不懂 → 保守 upheld（误驳会静默删掉一条真缺陷）。
             let (verdict, reason, parsed) = match crate::provider::parse::parse_verify_output(&t.text) {
                 Ok((v, r)) => (v, r, true),
-                Err(_) => (crate::domain::VerifyVerdict::Upheld, "verdict unparseable".to_string(), false),
+                Err(_) => (crate::domain::RefuteVerdict::Upheld, "verdict unparseable".to_string(), false),
             };
             println!(
                 "{}",
                 merge(serde_json::json!({
                     "ok": true,
                     "parsed": parsed,
-                    "verdict": if verdict == crate::domain::VerifyVerdict::Refuted { "refuted" } else { "upheld" },
+                    "verdict": if verdict == crate::domain::RefuteVerdict::Refuted { "refuted" } else { "upheld" },
                     "reason": reason,
                     "raw": t.text,
                     "input_tokens": t.input_tokens,

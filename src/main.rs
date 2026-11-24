@@ -44,8 +44,8 @@ enum Cmd {
     /// 会再派一个模型复查，被驳回的不计数、不拦路（记录仍在 findings 里，带 refute 字段）。
     /// 配 `review.refuters.enabled = true` 打开：没给模型配 refuter 角色时**自动挑一个异族**的 reviewer / scanner；
     /// 配了 refuter 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦（异族更准，见下）。
-    /// 观测在 `run.deep.verify_triggered` / `verify_skipped`（分类：not_triggered·disabled·carried·precedent·consensus·resumed·cached·no_verifier）/
-    /// `verify_refuted` / `verify_failed` / `verify_tail_ms` 与顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。
+    /// 观测在 `run.deep.refute_triggered` / `refute_skipped`（分类：not_triggered·disabled·carried·precedent·consensus·resumed·cached·no_verifier）/
+    /// `refute_refuted` / `refute_failed` / `refute_tail_ms` 与顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。
     /// 缺省关的依据：对本仓人裁台账的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 8%
     /// （预登记门槛 ≤ 5%），代价是静默少报；异族那臂驳回更多（31% vs 19%），误驳两臂分不出高下。
     /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的

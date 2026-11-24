@@ -147,7 +147,7 @@ fn matches_precedent(f: &Finding, c: &DismissCard) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerifyDecision {
     /// 该验。
-    Verify,
+    Refute,
     /// 低危 / 低置信：`verdict` 层本就不认它，复核它纯烧 token 无裁决增益。
     SkipNotTriggered,
     /// `review.refuters.enabled = false`（全局关）。
@@ -164,7 +164,7 @@ impl VerifyDecision {
     /// RunMeta 里的分类键（跳过原因分布）。
     pub fn reason(self) -> &'static str {
         match self {
-            VerifyDecision::Verify => "verify",
+            VerifyDecision::Refute => "verify",
             VerifyDecision::SkipNotTriggered => "not_triggered",
             VerifyDecision::SkipDisabled => "disabled",
             VerifyDecision::SkipCarried => "carried",
@@ -173,7 +173,7 @@ impl VerifyDecision {
         }
     }
     pub fn is_verify(self) -> bool {
-        self == VerifyDecision::Verify
+        self == VerifyDecision::Refute
     }
 }
 
@@ -217,7 +217,7 @@ pub fn decide(
     //
     // 两条都成立才免验；任一不成立就落到后续判定（该验就验）。
     if f.origin == crate::domain::Origin::Carried {
-        let judged = f.verify.is_some();
+        let judged = f.refute.is_some();
         let touched = delta_hunks
             .iter()
             .any(|&(a, b)| f.line_start as usize <= b && a <= f.line_end as usize);
@@ -231,7 +231,7 @@ pub fn decide(
     if f.suspicion_agreement >= 2 {
         return VerifyDecision::SkipConsensus;
     }
-    VerifyDecision::Verify
+    VerifyDecision::Refute
 }
 
 /// 选 verifier（design §8.1）：verifiers 活跃集非空 → 从中轮转；否则自动异族
@@ -432,8 +432,8 @@ mod tests {
         f.origin = crate::domain::Origin::Carried;
         f.line_start = line_start;
         f.line_end = line_end;
-        f.verify = Some(crate::domain::Verify {
-            verdict: crate::domain::VerifyVerdict::Upheld,
+        f.refute = Some(crate::domain::Refute {
+            verdict: crate::domain::RefuteVerdict::Upheld,
             model: "p/v".into(),
             note: String::new(),
         });
@@ -458,8 +458,8 @@ mod tests {
         let low_sev = finding("t", Severity::Low, 1, "alpha");
         assert_eq!(decide(&low_sev, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipNotTriggered);
         assert_eq!(decide(&blocking(0.4), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::SkipNotTriggered, "低于 floor 不触发");
-        assert_eq!(decide(&blocking(0.5), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Verify, "正好到 floor 就触发");
-        assert_eq!(decide(&blocking(0.9), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Verify);
+        assert_eq!(decide(&blocking(0.5), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Refute, "正好到 floor 就触发");
+        assert_eq!(decide(&blocking(0.9), &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Refute);
     }
 
     /// 跳过四类各自命中，且分类可读（「没触发」与「触发了被免验」在 RunMeta 里必须分得开）。
@@ -485,15 +485,15 @@ mod tests {
         // 判据 ①：出生轮压根没判过（复核被 kill / 那轮没开 verifier）→ 无条件重验，
         // 哪怕区域在 delta 之外。沿用一个不存在的判决 = 把「未复核」当「已复核」收。
         let mut never_judged = carried_judged(10, 12);
-        never_judged.verify = None;
+        never_judged.refute = None;
         assert_eq!(
             decide(&never_judged, &[], Severity::Medium, 0.5, true, &[]),
-            VerifyDecision::Verify,
+            VerifyDecision::Refute,
             "往轮没判过就不是「出生轮已复核」——这是 deep 收场处自承的那个缺口"
         );
         assert_eq!(
             decide(&never_judged, &[], Severity::Medium, 0.5, true, &[(50, 52)]),
-            VerifyDecision::Verify,
+            VerifyDecision::Refute,
             "判据 ① 不受区域影响：没判过，改没改过都得验"
         );
 
@@ -508,7 +508,7 @@ mod tests {
         // 本轮 hunk 盖住它所在的 10-12 行 → **不再免验**，落到后续判定（该验就验）
         assert_eq!(
             decide(&carried, &[], Severity::Medium, 0.5, true, &[(8, 14)]),
-            VerifyDecision::Verify,
+            VerifyDecision::Refute,
             "区域被改过，上轮判决可能已不适用——design §4 点名要防的那条漏报路径"
         );
         // 边界：hunk 紧贴但不相交（13-20 vs finding 10-12）→ 仍免验
@@ -536,7 +536,7 @@ mod tests {
         let mut model_axis = blocking(0.9);
         model_axis.agreement = 3;
         model_axis.suspicion_agreement = 1;
-        assert_eq!(decide(&model_axis, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Verify, "模型轴高也照验");
+        assert_eq!(decide(&model_axis, &[], Severity::Medium, 0.5, true, &[]), VerifyDecision::Refute, "模型轴高也照验");
 
         let mut region_axis = blocking(0.9);
         region_axis.agreement = 1;

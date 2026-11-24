@@ -117,46 +117,46 @@ pub struct Finding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub verify: Option<Verify>,
+    pub refute: Option<Refute>,
 }
 
 fn is_false(b: &bool) -> bool { !*b }
 fn is_zero(n: &u32) -> bool { *n == 0 }
 
-/// targeted-verify（S3-b）的判定：upheld=守住反驳（finding 成立）、refuted=被证伪。
+/// 评审内 finding 验真（refute）的判定：upheld=守住反驳（finding 成立）、refuted=被证伪。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum VerifyVerdict { Upheld, Refuted }
+pub enum RefuteVerdict { Upheld, Refuted }
 
 impl Finding {
-    /// 是否已被 verifier 驳回（批 D〔D17〕）：`verdict` 与 `Stats` 两处都靠它排除，
+    /// 是否已被 refuter 驳回（批 D〔D17〕）：`verdict` 与 `Stats` 两处都靠它排除，
     /// 判定只此一份——散在各处写 `matches!(v.verdict, Refuted)` 迟早漂。
     pub fn is_refuted(&self) -> bool {
-        self.verify.as_ref().is_some_and(|v| v.verdict == VerifyVerdict::Refuted)
+        self.refute.as_ref().is_some_and(|v| v.verdict == RefuteVerdict::Refuted)
     }
 
     /// 贴判决（**唯一入口**）：REFUTED 同时把 confidence 归零。
     /// 收口评审 #7：归零此前只写在 `dedup::merge_into` 里，于是「没有合并伙伴」的被驳回 finding
-    /// 会序列化成 `{"verify":{"verdict":"refuted"},"confidence":0.9}` ——正是 dedup 注释说要避免的
+    /// 会序列化成 `{"refute":{"verdict":"refuted"},"confidence":0.9}` ——正是 dedup 注释说要避免的
     /// 自相矛盾记录；同一逻辑状态给出两个答案，取决于有几个格碰巧报了它。
-    pub fn set_verdict(&mut self, v: Verify) {
-        let refuted = v.verdict == VerifyVerdict::Refuted;
-        self.verify = Some(v);
+    pub fn set_refute(&mut self, v: Refute) {
+        let refuted = v.verdict == RefuteVerdict::Refuted;
+        self.refute = Some(v);
         if refuted {
             self.confidence = 0.0;
         }
     }
 }
 
-/// 一条 finding 的 verify 结果（refute pass 产出）。
+/// 一条 finding 的 refute 结果（验真 pass 产出）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Verify {
-    pub verdict: VerifyVerdict,
+pub struct Refute {
+    pub verdict: RefuteVerdict,
     /// 执行 refute 的 model 名（交叉验证用哪个）。
     pub model: String,
     /// refute 理由（refuted 时为反驳要点；upheld 时可空）。
     /// `default` 关键：空 note 序列化时被 skip，反序列化（read_partial）必须容忍缺键回落空，
-    /// 否则含空-note verify 的 CellRecord 会被 filter_map 静默丢弃（数据丢失）。
+    /// 否则含空-note refute 的 CellRecord 会被 filter_map 静默丢弃（数据丢失）。
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub note: String,
 }
@@ -207,7 +207,7 @@ mod tests {
             id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
-            hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
+            hard_constraint: false, cluster_id: None, quote: "snippet".into(), refute: None,
             previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
@@ -215,35 +215,35 @@ mod tests {
     }
 
     #[test]
-    fn finding_serializes_verify_when_present_and_skips_when_none() {
+    fn finding_serializes_refute_when_present_and_skips_when_none() {
         let mut f = Finding {
             id: "x".into(), severity: Severity::High, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
-            hard_constraint: false, cluster_id: None, quote: "snippet".into(), verify: None,
+            hard_constraint: false, cluster_id: None, quote: "snippet".into(), refute: None,
             previously_dismissed: false, origin: Origin::New, outside_window: false,
         };
         // None → 不出现
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
-        assert!(v.get("verify").is_none(), "verify=None must be skipped");
+        assert!(v.get("refute").is_none(), "refute=None must be skipped");
         // Some(Refuted) → 出现，verdict 小写
-        f.verify = Some(Verify { verdict: VerifyVerdict::Refuted, model: "gpt".into(), note: "guarded above".into() });
+        f.refute = Some(Refute { verdict: RefuteVerdict::Refuted, model: "gpt".into(), note: "guarded above".into() });
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
-        assert_eq!(v["verify"]["verdict"], "refuted");
-        assert_eq!(v["verify"]["model"], "gpt");
-        assert_eq!(v["verify"]["note"], "guarded above");
+        assert_eq!(v["refute"]["verdict"], "refuted");
+        assert_eq!(v["refute"]["model"], "gpt");
+        assert_eq!(v["refute"]["note"], "guarded above");
     }
 
     #[test]
     fn verify_empty_note_roundtrips_after_skip() {
         // 空 note → skip_serializing 跳键；反序列化（read_partial 路径）须 default 回 ""，
         // 否则缺键报错 → 整条记录被 filter_map 静默丢弃（Critical 数据丢失回归防护）。
-        let v = Verify { verdict: VerifyVerdict::Upheld, model: "m".into(), note: String::new() };
+        let v = Refute { verdict: RefuteVerdict::Upheld, model: "m".into(), note: String::new() };
         let j = serde_json::to_string(&v).unwrap();
         assert!(!j.contains("note"), "空 note 应被 skip: {j}");
-        let back: Verify = serde_json::from_str(&j).unwrap();
+        let back: Refute = serde_json::from_str(&j).unwrap();
         assert_eq!(back.note, "", "缺 note 键须 default 回空");
-        assert_eq!(back.verdict, VerifyVerdict::Upheld);
+        assert_eq!(back.verdict, RefuteVerdict::Upheld);
     }
 
     #[test]
@@ -289,7 +289,7 @@ pub(crate) mod fixtures {
             origin: Origin::New,
             outside_window: false,
             cluster_id: None,
-            verify: None,
+            refute: None,
         }
     }
 
