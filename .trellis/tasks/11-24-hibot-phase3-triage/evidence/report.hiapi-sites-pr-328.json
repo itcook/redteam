@@ -1,0 +1,398 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-328",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "a9c7d081c466ffa2678d3107eb89f41222dfe7b4",
+    "base_sha": "57d84c743f486ef6fc5aad7ae60307e43711eb87"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:64fbe4f314abc11e648fc15ef7c5d625ba523b4ee0a4cd139f467a007f17a401",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": ".trellis/spec/content-api/backend/ingest-transcriber-guidelines.md",
+      "line_start": 12,
+      "line_end": 12,
+      "quote": "- `POST /admin/drafts/:id/revise` creates a pending revision from an accepted source; it never publishes or calls agents. The accepted source is immutable. A stable request key replays the same receipt before freshness checks; reuse with different content is a conflict.",
+      "title": "Structural drift: placement",
+      "body": "Standard: .trellis/spec/content-api/backend/ingest-transcriber-guidelines.md:1-12 (\"## Scenario: 新增一个 contentType 的 ingest 转写器\" / \"1. Scope / Trigger\" → \"agents 产线新增制品类型要直投 content-api ingest\")\nNote: This document is scoped to onboarding a new contentType ingest transcriber (producer-side ingest into the review queue); the inserted rules govern editorial revision/acceptance of already-accepted content (revise endpoint, revision acceptance, Showcase copy editing), which belongs to the review/revision spec rather than the ingest transcriber guidelines.",
+      "recommendation": "Align placement / naming / ownership with .trellis/spec/content-api/backend/ingest-transcriber-guidelines.md:1-12 (\"## Scenario: 新增一个 contentType 的 ingest 转写器\" / \"1. Scope / Trigger\" → \"agents 产线新增制品类型要直投 content-api ingest\").",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:bc5fd0f3ea318d965df3fba9c258102035581ff37e6c76e3962707a0058d615c",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/prisma/models/draft-revision.prisma",
+      "line_start": 2,
+      "line_end": 2,
+      "quote": "model IngestDraftAcceptance {",
+      "title": "Structural drift: naming",
+      "body": "Standard: apps/content-api/CLAUDE.md#数据建模规范（主键 String ULID / 公共列固定四个）\nNote: The new entity is keyed by `draftId String @id @map(\"draft_id\")` instead of the mandatory ULID primary key `id String @id @default(ulid())`, and it declares only draftId/entityId/createdAt — the fixed public columns `updatedAt` and `deletedAt` (and `id`) are absent.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#数据建模规范（主键 String ULID / 公共列固定四个）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:75d4f7f7b409d301ed3bc25444cab161d2fc04a72d4b689b3bf48ced41f4634f",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/prisma/models/draft-revision.prisma",
+      "line_start": 12,
+      "line_end": 12,
+      "quote": "model IngestDraftRevision {",
+      "title": "Structural drift: naming",
+      "body": "Standard: apps/content-api/CLAUDE.md#数据建模规范（主键 String ULID / 公共列固定四个）\nNote: Same deviation on the second new model: `draftId` is the `@id` rather than a ULID `id`, and the canonical public columns `updatedAt`/`deletedAt` are missing from an entity that is otherwise shaped like every other model in prisma/models.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#数据建模规范（主键 String ULID / 公共列固定四个）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:fd60ed5d801414641259d813a19f7c193b82182c0639f4c5fe54a67d03aa6413",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/src/modules/review/revision-target.ts",
+      "line_start": 10,
+      "line_end": 10,
+      "quote": "export type RevisionKind = 'blog' | 'faq' | 'changelog' | 'model' | 'family';",
+      "title": "Structural drift: ownership",
+      "body": "Standard: apps/content-api/CLAUDE.md#契约与 API 规范（契约单一源·决策 #6；不在 content-api 内重定义契约）\nNote: The revision target-kind vocabulary that appears in AdminDraftReviseResponse/AdminDraftUpdateResponse is re-declared locally as a hand-written string union (and mirrored again in model.ts as `as 'blog' | 'faq' | 'changelog' | 'model' | 'family'`). Contract shapes are supposed to come from @hiapi/content-sdk as the single source rather than be restated inside content-api.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#契约与 API 规范（契约单一源·决策 #6；不在 content-api 内重定义契约）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:64e55bbf937bce920da2bbd3c4b3b1a08a58b5c04aaa79029da7a1b1d0b5c304",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/src/modules/review/revision-target.ts",
+      "line_start": 30,
+      "line_end": 30,
+      "quote": "await tx.$queryRaw(Prisma.sql`SELECT id FROM ${table} WHERE id = ${id} FOR UPDATE`);",
+      "title": "Structural drift: ownership",
+      "body": "Standard: apps/content-api/CLAUDE.md#软删除铁律（dbUnscoped() 是唯一绕过通道: … raw 操作 …）\nNote: Raw SQL is issued through the transaction client obtained from db() (see also lockTarget's i18n lock and the `Prisma.raw(...)` table identifiers), bypassing the scoped-client filtering without going through dbUnscoped(), which the spec names as the only channel for raw operations.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#软删除铁律（dbUnscoped() 是唯一绕过通道: … raw 操作 …）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    }
+  ],
+  "summary": {
+    "blockers_count": 5,
+    "convention_drift": "structural",
+    "fit": "needs-scope-decision",
+    "intent_undelivered": 0,
+    "local_count": 5,
+    "risk": "high",
+    "routing": {
+      "focus": [
+        ".trellis/spec/content-api/backend/ingest-transcriber-guidelines.md",
+        "apps/content-api/prisma/models/draft-revision.prisma",
+        "apps/content-api/src/modules/review/revision-target.ts"
+      ],
+      "specs": [
+        "AGENTS.md",
+        "apps/content-api/CLAUDE.md"
+      ],
+      "wall_clock_s": 900
+    },
+    "scope_creep_count": 1,
+    "security_tier": 0,
+    "structural_count": 5
+  },
+  "usage": {
+    "input_tokens": 181935,
+    "output_tokens": 60723,
+    "cached_input_tokens": 1408,
+    "wall_clock_ms": 160918
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 512,
+            "input_tokens": 32183,
+            "output_tokens": 9358
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [
+              {
+                "conf": 0,
+                "file": "apps/content-api/prisma/migrations/20261120090000_draft_revisions/migration.sql",
+                "line": 19,
+                "reason": "unanchored"
+              }
+            ],
+            "dropped_total": 1,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 1
+          },
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/spec/content-api/backend",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/11-20-draft-revisions",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/11-20-draft-revisions/research",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/prisma/migrations/20261120090000_draft_revisions",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/prisma/models",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/src/modules/review",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/modules/review",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/utils",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/src",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/src/schema",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/tests/schema",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "repair_notes": [
+            "triage-drift: first turn parse failed (finish=length, text_len=0, head=\"\"); repaired"
+          ],
+          "rows": 11,
+          "usage": {
+            "cached_input_tokens": 768,
+            "input_tokens": 122140,
+            "output_tokens": 42514
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "notes": [
+            "The companion CLI work is stated to live in another repository (hiapi-cli PR #18) and is therefore not verifiable from this diff; only the server/SDK contract and documentation are present here.",
+            "All verification numbers (571 tests, 18 route-guard tests, typecheck, ESLint, migration replay) are author assertions in the PR body and task docs; no CI logs or job output were supplied with this request, so the claim about the corrected remote run 44669467061 cannot be confirmed from the diff alone.",
+            "Behavioral nuance worth flagging in review: ordinary (non-revision) acceptance of blog/faq/model-faq/changelog/model-info now also writes an `ingest_draft_acceptance` row and calls `revisionKind(draft)` inside the accept transaction, which additionally validates content-type mapping for every such accept.",
+            "Revision acceptance of blog content triggers a post-commit `purgeBlogPages(result.entityId, [draft.locale])`; this cache invalidation is described in the updated transcriber guidelines but not in the PR body.",
+            "The version precondition is mandatory only for Showcase edits and revision candidates; other PATCH targets remain unguarded unless the caller supplies `expectedUpdatedAt`.",
+            "`.trellis/tasks/11-20-draft-revisions/task.json` has no trailing newline (only formatting-level)."
+          ],
+          "ok": true,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 128,
+            "input_tokens": 27612,
+            "output_tokens": 8851
+          }
+        }
+      ],
+      "blockers": [
+        {
+          "category": "placement",
+          "file": ".trellis/spec/content-api/backend/ingest-transcriber-guidelines.md",
+          "kind": "structural",
+          "line_end": 12,
+          "line_start": 12,
+          "quote": "- `POST /admin/drafts/:id/revise` creates a pending revision from an accepted source; it never publishes or calls agents. The accepted source is immutable. A stable request key replays the same receipt before freshness checks; reuse with different content is a conflict."
+        },
+        {
+          "category": "naming",
+          "file": "apps/content-api/prisma/models/draft-revision.prisma",
+          "kind": "structural",
+          "line_end": 2,
+          "line_start": 2,
+          "quote": "model IngestDraftAcceptance {"
+        },
+        {
+          "category": "naming",
+          "file": "apps/content-api/prisma/models/draft-revision.prisma",
+          "kind": "structural",
+          "line_end": 12,
+          "line_start": 12,
+          "quote": "model IngestDraftRevision {"
+        },
+        {
+          "category": "ownership",
+          "file": "apps/content-api/src/modules/review/revision-target.ts",
+          "kind": "structural",
+          "line_end": 10,
+          "line_start": 10,
+          "quote": "export type RevisionKind = 'blog' | 'faq' | 'changelog' | 'model' | 'family';"
+        },
+        {
+          "category": "ownership",
+          "file": "apps/content-api/src/modules/review/revision-target.ts",
+          "kind": "structural",
+          "line_end": 30,
+          "line_start": 30,
+          "quote": "await tx.$queryRaw(Prisma.sql`SELECT id FROM ${table} WHERE id = ${id} FOR UPDATE`);"
+        }
+      ],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 900
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "2c750615f126b5f3"
+      }
+    }
+  }
+}

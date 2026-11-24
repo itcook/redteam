@@ -1,0 +1,130 @@
+{
+  "schema": "hibot.audit.pr-context/1",
+  "title": "fix: content-api 过载卡死——站点回源失败返回旧数据 + content-api 列表缓存与准入上限",
+  "body": "## 背景\n\n生产 content-api 多次「连接池卡死」（11-12、11-16 四次、11-17 两次），每次都靠重启恢复。根因已用生产日志和本地复现核实，是一种亚稳态过载：\n\n1. 站点 Worker 的快照 TTL 槽同时到期，突发回源。\n2. 热门 GET 列表接口（/announcement、/showcases、/models、/blog …）把 Prisma 池（max 5）压满，请求开始排队。\n3. 排队超过 15s，站点放弃（499），但服务端仍把每个被放弃的请求做完。\n4. 站点失败的结果不缓存，下一个请求马上又回源，全球各 isolate 一起这样，回源量放大 3–7 倍。\n5. 结果是 2xx 接近 0，只有流量回落或重启才能恢复。\n\n本 PR 在站点和 content-api 两侧各断一环。\n\n## 改动\n\n### 站点 `apps/site/src/lib/site-snapshot.ts`、`snapshot-edge-cache.ts`\n\n- 回源失败时（load 抛错、信封异常、15s 超时、在途等待超时都算），如果有**不超过 10 分钟**的旧数据就返回旧数据。\n  - edge 槽（模型卡、价格、筛选、活动、showcase 等）的旧数据存两份：L1 是 isolate 内的 Map；L2 是 Cache API 里的 `/__data/v1/stale/<key>` 条目，同 colo 的新 isolate 也能拿到。\n  - 横切槽（公告、弹窗）和 family 维动态槽（`edge:false`）只有 L1 旧值，冷 isolate 下没有旧值，走原来的 fail-soft 失败路径。\n  - L1 旧值最多 160 键（固定槽 135 键都留得住），超出先清 10 分钟以上的，再按数据时刻丢最旧的。回旧值时打一行 `[site-snapshot] 回源失败，返回旧数据`，同 key 15s 内只打一次。\n  - 返回旧值后 15s 内同 key 不再回源，窗口不越过 10 分钟上限。\n- 没有旧值时做 **10s 负缓存**：窗口内同 key 直接抛同一个错误，不回源。\n- 在途请求超时且有旧值时，直接返回旧值，不再重拉。\n- purge（`invalidateCatalogSnapshots`）不清旧值副本。purge 之前发出的回源成功后，不会顶掉 purge 之后装的降级槽，也不会重建 purge 刚删掉的 L2 数据条目。\n- 首页派生池（featured/cost/banner）按来源 cards 的数据时刻计龄，旧数据不会经派生池活过 10 分钟。\n\n### content-api\n\n- **`src/plugins/response-cache.ts`**：白名单内 26 个公开 GET 做进程内缓存。白名单逐条审计过，handler 都不读身份信息；读 Accept-Language 的路由，key 里带协商后的 locale。\n  - 默认 TTL 60s；`HIAPI_RESPONSE_CACHE_TTL_MS=0` 整体关闭，作紧急开关。\n  - 同一个 key 并发只执行一次（单飞）。\n    - 领头请求返回错误信封（404、422、500 等）时，等待者原样拿到同一个状态和 body，不进缓存。\n    - 等待者最多等 12s（`HIAPI_RESPONSE_CACHE_WAIT_MS`），超时回 503 `busy`，不会各自再查一遍。\n    - 只有拿不到可重放的响应时（handler 抛错没经过 mapResponse 等），等待者才回 503，并打一行 `[response-cache] 单飞领头失败`。\n  - LRU 上限 2000 条 / 64MB。\n  - 缓存状态和 `clearResponseCache` 在 `src/utils/response-cache.ts`，`plugins/response-cache.ts` 只注册钩子。领头失败的兜底挂在 `onAfterResponse`，全局 onError 仍只有 `envelope.ts` 一处。\n  - 只缓存 2xx 且 `code===0` 的响应；响应头带 `x-content-cache: HIT|MISS|COALESCED`。\n  - 缓存命中发生在 `clientAuthGuard`（onRequest）之后，未带 token 的请求仍然 401。\n  - 任何非 GET 请求成功后清空整个缓存。清缓存时摘掉在途单飞，清空后到达的请求会自己回源。\n  - 模型同步事件不逐条清，按 3s 窗口合并：有 purge 通道时，在 flush 发站点 purge 之前清一次；没配通道时，单独用一个 3s 计时器清。全量同步时不会逐事件把缓存清空。`purgeSitePaths` 发之前立即清。\n- **`src/plugins/inflight-limit.ts`**：在途请求超过 `HIAPI_MAX_INFLIGHT`（默认 64）时直接返回 503 `{code:503,message:\"busy\"}`；`=0` 关闭。\n  - 缓存命中不受限。\n  - 整个 `/internal/*` 面不受限，包括健康检查和 model-sync 的 hook、reconcile：被 503 的代价比过载更大，代价是这些请求不进 inflight 统计。\n  - 客户端中途断开时 handler 照常跑完，计数照常减（有真实 HTTP 测试）。\n- **`src/plugins/metrics.ts`**：每 60s 打一行 `[content-api] stats {json}`，内容是池 total/idle/waiting、在途数、503 数、缓存命中统计。\n- **`src/db/client.ts`**：PrismaPg 加 `keepAlive: true`、`query_timeout: 20000`，兜底 11-12 那次连接静默（根因未查清）。pg-boss 池不动。\n\n## 内容生效时间（行为变化）\n\n| 场景 | 生效 |\n|---|---|\n| 后台通过 HTTP 接口改内容（公告、博客、活动等） | 立即（写成功即清缓存） |\n| 模型同步 | content-api 直读最多晚 3s（和站点 purge 同一个 3s 窗口，发 purge 前先清）；站点看到的时间不变 |\n| 按路径 purge（`purgeSitePaths`） | 立即 |\n| 后台 job 直接写库（translation-publish、produce-converge、image-head webp 等） | 最多晚 60s |\n| 活动 / 公告到点开始或结束（按当前时间判断） | 最多晚 60s |\n| **只有 content-api 出错时**：模型卡、价格、活动等 edge 槽 | 数据最多是 10 分钟前的，叠 HTML 缓存 180s，最坏约 13 分钟；超过 10 分钟仍出错，按原来的方式报错 |\n| **只有 content-api 出错时**：公告、弹窗（只有 L1 旧值） | 热 isolate 同上；冷 isolate 没有旧值，按原来的方式报错 |\n| 蓝绿部署重叠期（两个实例各一份缓存） | 另一实例最多晚 60s |\n\n## 验证\n\n**本地过载复现**\n\n环境：Postgres 16 灌了接近生产量级的数据；TCP 代理每个方向加 12ms 延迟；池 max 5；负载按生产路由比例打，客户端 15s 超时，失败会放大回源。参数：base 25/s，amp 5，第 10s 突发 450。\n\n| 场景 | 成功率 | 超时 | p95 |\n|---|---|---|---|\n| 关掉缓存和准入闸（`TTL=0`、`MAX_INFLIGHT=0`） | 6.4%：第 35s 起 2xx=0，到结束都没恢复，池排队 1944 | 11579 | — |\n| 默认配置 | 100%（3225/3225），命中 86.7% | 0 | 179ms |\n| 默认配置 + 缓存全空 + 第 0s 突发 900 | 92.4%：前 5s 拒掉 222 个（503），之后全部成功 | 0 | 3.5s |\n\n**测试**\n\n- site：`site-snapshot` / `snapshot-edge-cache` 78 pass；snapshot、catalog、pricing、blog、announcement 等关联测试 275 pass。\n- content-api：`tests/plugins` 81 pass；model / showcase / announcement / blog / promotion / faq / changelog / playground / model-sync 等关联测试 0 fail。\n- 测试进程默认关掉缓存：`tests/support/clean-env.ts` 预置 `HIAPI_RESPONSE_CACHE_TTL_MS=0`。原因是既有用例普遍「写库后立刻 GET 断言」，开着缓存会出现假失败。所以全量测试基本不经过缓存路径。缓存路径的覆盖在 `tests/plugins/response-cache*.test.ts`：\n  - 单测用临时 app，覆盖 key、TTL、50 并发单飞、领头失败时等待者马上失败、写后清空、清空时摘掉在途单飞、准入。\n  - 集成测试用真实 app，覆盖鉴权先于缓存、18 条真实路由 miss→hit、命中不查库、真实路由单飞、POST 写后清空、purge 前清缓存。\n- `bun run test:full`：content-api 段 3132 pass / 1 fail。失败的是 `jobs/dispatch-sweeper` 的 RECOVER_STUCK 用例，在基线 bf5e967b 上同样失败，属于既有问题。\n- `@hiapi/content-api`、`@hiapi/site` typecheck 都是 0；改动文件 eslint 通过。\n- 合入前做过两轮对抗评审，共 5 条（P2），全部修复并补了回归测试。\n- 第一轮 PR 评审的修复在 7352ed82：spec 同步，测试 env 逐键还原，缓存状态移到 utils，去掉第二个全局 onError。\n- 第二轮的修复在 191b8178：purge 前在途回源不重建 L2；等待者原样拿领头的 4xx；补等待超时、客户端断开、L1 160 键上限的测试；同步事件按 3s 合并清缓存。\n\n## 未验证\n\n- 站点 L2 旧数据条目（Cache API）只在 mock 里测过，没在真实 Cloudflare 上验证。合并前不单独部署验证，合入 dev 后在 staging 回归时验证（停掉 content-api，看冷 isolate 能否拿到旧数据）。\n- 本地没有 `apps/site/.env`，整站构建（astro build）没跑，依赖构建产物的 10 个站点测试未验证。\n- 连接静默（乙类）只加了 keepAlive / query_timeout 兜底，没做故障注入。\n- 不在本 PR 范围：deadline/abort 透传、调大 Prisma 池。\n\n## 回滚 / 紧急开关\n\n- `HIAPI_RESPONSE_CACHE_TTL_MS=0`：关闭 content-api 缓存。\n- `HIAPI_MAX_INFLIGHT=0`：关闭准入闸。\n- 站点侧没有开关，回滚要 revert。\n",
+  "author": "shubing-lab",
+  "labels": [
+    "review: medium"
+  ],
+  "comments": [
+    {
+      "author": "shubing-lab",
+      "body": "感谢评审。修复在 7352ed82，逐条如下：\n\n**必须修**\n1. **spec**：已改 `ssr-runtime.md`。\n   - §6.5 改成「不驻留新鲜值」，指向失败路径。\n   - §9 预算分正常 / 失败两档，失败路径最坏约 13min（旧值 10min + HTML 180s）。新增「失败路径」小节，写了旧值副本、触发条件、15s 降级窗口、10s 负缓存、L1 160 键上限、日志去重。\n   - §9 / §10 的 purge 条款写明不清 stale。§10 补了 `stale/` 的 key 和 TTL。\n   - 顺手改了一处 dev 上就过时的表述：横切槽早已是 120s TTL，不是「永久驻留」。\n2. **测试 env**：\n   - integration 文件改成每用例快照、用后逐键还原全部改动的键（含 `SITE_PURGE_TOKEN`、`HIAPI_CONTENT_TO_SITE_BASE_URL`、`HIAPI_CF_*`），改用文件级重置档 `beforeAll(resetAndSeed)`。\n   - 新增一条真实路由单飞用例：5 个并发同 key，service 只进 1 次。\n   - `inflight-limit.test.ts` 不再裸 delete。\n   - `clean-env` 默认关缓存的原因和覆盖范围已写进 PR 描述。\n3. **描述收窄**：「新 isolate 也能拿到」限定为 edge 槽。行为表把公告、弹窗单列：只有 L1 旧值，冷 isolate 走原失败路径。这次不给横切槽补 L2。\n4. **反向依赖**：缓存状态、白名单、单飞和 `clearResponseCache` 移到 `src/utils/response-cache.ts`，`plugins/response-cache.ts` 只注册钩子，`site-purge` 改依赖 utils。\n\n**建议项**\n- 第二个全局 onError 已去掉，领头失败的兜底改挂 `onAfterResponse`。已验证这个钩子是必需的：去掉后「领头失败、等待者马上 503」的用例会超时。\n- 12s 等待和 503、L1 160 键上限、两阶段淘汰、15s 日志去重，都已写进描述和 spec。\n\n**Minor**\n- `inflight-limit.ts` 已就地说明为什么手写 Response：返回对象会走路由 response 校验，被判 422。\n- 测试 env 和重置档两条已在上面一并处理。\n- §10 的 `stale/` 已补。\n\n**验证**\n- `tests/plugins` 76 pass；plugins + model-sync 430 pass。\n- `test:full` content-api 段 3127 pass / 1 fail。失败的是 `dispatch-sweeper` RECOVER_STUCK，在基线 bf5e967b 上同样失败。\n- site `site-snapshot` / `snapshot-edge-cache` 76 pass。\n- 两边 typecheck 都是 0，eslint 通过。\n\n**L2 真机验证**：要部署 staging 或 preview 才能做，正在等确认，结果会补在这个 PR 里。\n",
+      "created_at": "2026-11-17T09:43:02Z",
+      "is_bot": false
+    },
+    {
+      "author": "shubing-lab",
+      "body": "感谢第二轮评审。修复在 191b8178，逐条如下：\n\n**阻塞**\n1. **purge 前在途回源复活 L2**：采纳。`edgeCachePut` 改在 `slot.gen === slotGeneration` 时才写，purge 前发出的回源不再重建 purge 刚删掉的数据 key。新增测试复现了你的 I2 场景，修复前失败、修复后通过。\n   - stale 副本照写：它只在回源失败时读，且按 spec 不受 purge 影响；在途读到的内容也不会比已有副本更旧。这一点写进了 §9 和代码注释。\n   - 守卫是在发起 put 前判定的，put 与并发 purge 的 delete 先后不定，这个残余窗口已写进 spec（dev 上的数据 key 也有同样的窗口）。\n2. **4xx 被折成 503**：采纳。领头返回错误信封时，等待者原样拿到同一个状态和 body，不进缓存。\n   - 实测错误路径上 mapResponse 收到的是 `ElysiaCustomStatusResponse`，此时 `set.status` 仍是 500，所以先拆包取真实状态。\n   - 只有拿不到可重放的响应时等待者才回 503，并打一行 `[response-cache] 单飞领头失败 … reason=`。\n   - 新增测试用真实 envelope + `/blog/:slug` 抛 NotFoundError：3 个并发全部 404、body 相同、handler 只进 1 次。\n3. **等待超时无测试**：已补。`HIAPI_RESPONSE_CACHE_WAIT_MS=1` + 慢领头：handler 只进 1 次，3 个等待者都是 503 COALESCED，领头完成后照常落缓存。\n4. **断连无测试**：已补。用真实 HTTP 服务器，在 handler 执行中途 abort。实测 handler 照常跑完，in-flight 归零，前提成立，不需要改双路径。\n\n**建议**\n- `/internal` 豁免：保留整个 `/internal` 面，注释改为写实。理由是这些入口带内部 token、频率低，被 503 的代价比过载大（探针摘流量，同步 hook 要靠对端重试）。\n- TTL=0：改注释，旁路不写头。\n- `wasServedFromCache`：已删。\n- `LAST_GOOD_CAP`：已补两阶段淘汰测试：先按 10 分钟老化，再按数据时刻丢最旧；全程 ≤160 键，最新键失败时仍能回旧值。\n- stale 可观测：这次不做，记为后续。原因是 SSR 页面响应头要把请求级标记一路带到 Astro 响应，改动面超出本 PR；目前有 `[site-snapshot] 回源失败，返回旧数据 ageMs=` 日志，可在 Workers 日志里计数。\n\n**讨论（collectSitePurge 逐事件清）**：采纳 3s 合并。\n- 有 purge 通道时，在 flush 里、slug 查询之前清一次；没配通道时单独用一个 3s 计时器；flush 时 env 被撤也照清。\n- 站点只在收到 purge 后才回源，所以站点看到新数据的时间不变。content-api 直读最多晚 3s。\n- 测试覆盖了两种通道：多个事件只在 flush 时清，且发 purge 时缓存已空。\n\n**验证**\n- content-api `tests/plugins` 81 pass；plugins + model-sync 435 pass。\n- `test:full` content-api 段 3132 pass / 1 fail。失败的是既有的 dispatch-sweeper RECOVER_STUCK。\n- site `site-snapshot` / `snapshot-edge-cache` 78 pass。\n- typecheck 0，eslint 通过。\n",
+      "created_at": "2026-11-17T11:28:44Z",
+      "is_bot": false
+    }
+  ],
+  "linked_issues": [],
+  "ci": {
+    "state": "failure",
+    "failing": [
+      "quality",
+      "test-content-api",
+      "test-site"
+    ]
+  },
+  "changed_files": [
+    {
+      "path": ".trellis/spec/site/frontend/ssr-runtime.md",
+      "additions": 18,
+      "deletions": 7,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/src/db/client.ts",
+      "additions": 49,
+      "deletions": 2,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/src/index.ts",
+      "additions": 15,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/src/modules/model-sync/site-purge.ts",
+      "additions": 35,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/src/plugins/inflight-limit.ts",
+      "additions": 77,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/src/plugins/metrics.ts",
+      "additions": 56,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/src/plugins/response-cache.ts",
+      "additions": 11,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/src/utils/response-cache.ts",
+      "additions": 472,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/tests/plugins/inflight-limit.test.ts",
+      "additions": 190,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/tests/plugins/metrics.test.ts",
+      "additions": 60,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/tests/plugins/response-cache.integration.test.ts",
+      "additions": 299,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/tests/plugins/response-cache.test.ts",
+      "additions": 503,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/tests/support/clean-env.ts",
+      "additions": 5,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "apps/site/src/lib/site-snapshot.ts",
+      "additions": 263,
+      "deletions": 18,
+      "status": "modified"
+    },
+    {
+      "path": "apps/site/src/lib/snapshot-edge-cache.ts",
+      "additions": 61,
+      "deletions": 9,
+      "status": "modified"
+    },
+    {
+      "path": "apps/site/tests/lib/site-snapshot.test.ts",
+      "additions": 351,
+      "deletions": 6,
+      "status": "modified"
+    }
+  ]
+}

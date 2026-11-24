@@ -1,0 +1,166 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "summary": {
+    "blockers_count": 0,
+    "convention_drift": "local",
+    "fit": "in-scope",
+    "intent_undelivered": 0,
+    "local_count": 1,
+    "risk": "low",
+    "routing": {
+      "focus": [],
+      "specs": [
+        "AGENTS.md"
+      ],
+      "wall_clock_s": 450
+    },
+    "scope_creep_count": 0,
+    "security_tier": 0,
+    "structural_count": 0
+  },
+  "usage": {
+    "input_tokens": 221236,
+    "output_tokens": 49380,
+    "cached_input_tokens": 1152,
+    "wall_clock_ms": 117954
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 1,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 384,
+            "input_tokens": 46928,
+            "output_tokens": 11364
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 1,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 512,
+            "input_tokens": 81226,
+            "output_tokens": 15136
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 1,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "notes": [
+            "The PR body asserts `go build ./...` and `go test ./service ./model ./router ./controller` pass; no CI output is included in the supplied evidence, so build/test status is unverified here.",
+            "The body also reports real end-to-end smoke tests against a live Feishu app and DeepSeek (deepseek-v4.1-flash); these cannot be verified from the diff.",
+            "The comment in setting/feishu_finance_agent_setting.go still mentions an 'HMAC keyring' although no HMAC path exists in this PR (the long-connection design removes the need for it) - likely a leftover comment from an earlier design.",
+            "Multiple Go module graph additions in go.sum (gogo/protobuf, old golang.org/x/* versions, goldmark, errcheck/gotool) are transitive dependencies of the new larksuite SDK and are not separate features."
+          ],
+          "ok": true,
+          "repair_notes": [
+            "triage-intent: first turn parse failed (finish=length, text_len=0, head=\"\"); repaired"
+          ],
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 256,
+            "input_tokens": 93082,
+            "output_tokens": 22880
+          }
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 900
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "ec9c5aa51d9d89a3"
+      }
+    }
+  }
+}
