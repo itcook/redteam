@@ -19,7 +19,7 @@ pub(crate) mod deny;
 mod incremental;
 pub(crate) mod second_pass;
 pub mod refute_once;
-mod spec;
+pub(crate) mod spec;
 mod tail;
 
 pub use incremental::run_incremental_review;
@@ -207,8 +207,13 @@ pub(crate) fn build_packs(
 /// 返回 (budget, spec_section, warnings)。
 pub(crate) fn budget_and_spec(roles: &RoleSets, spec: &[String]) -> (usize, String, Vec<String>) {
     let budget_raw = pack_budget_bytes(roles);
-    let (spec_section, spec_used, warnings) = render_spec_section_capped(spec, SPEC_BUDGET_BYTES.min(budget_raw / 2));
+    let (spec_section, spec_used, warnings) = render_spec_section_capped(spec, spec_budget_bytes(roles));
     (budget_raw.saturating_sub(spec_used), spec_section, warnings)
+}
+
+/// spec 段共享预算（全批 specs 一个 cap）——`budget_and_spec` 与 job 的 prior 披露共用这一处。
+pub(crate) fn spec_budget_bytes(roles: &RoleSets) -> usize {
+    SPEC_BUDGET_BYTES.min(pack_budget_bytes(roles) / 2)
 }
 
 /// cell 规划产物：分组 + 每组裸 pack 正文（`dossiers`）+ 每组跨组索引 + 每组装包形态（四者等长等序）+ 观测。
@@ -270,13 +275,19 @@ fn stage0_risk(
 ) -> (Option<RiskMeta>, Option<crate::risk::RiskRoute>) {
     let head = head.unwrap_or("HEAD");
     let base = args.base.as_deref().unwrap_or("HEAD");
-    let ledger = match args.dismissed.as_deref() {
-        Some(p) if Path::new(p).is_file() => Some(Path::new(p).to_path_buf()),
-        None if !args.no_dismissed => {
-            let p = crate::db::project_db_path(root);
-            p.exists().then_some(p)
+    // job 模式（2.4）：dismissed 是**指纹 CSV**，由 job 层自己解析；台账路径一行都不碰——
+    // 这条路上 `p.is_file()` 会把 CSV 当 sqlite 打开（`route_from_git` → `load_ledger`）。
+    let ledger = if args.job_mode {
+        None
+    } else {
+        match args.dismissed.as_deref() {
+            Some(p) if Path::new(p).is_file() => Some(Path::new(p).to_path_buf()),
+            None if !args.no_dismissed => {
+                let p = crate::db::project_db_path(root);
+                p.exists().then_some(p)
+            }
+            _ => None,
         }
-        _ => None,
     };
     let route = crate::risk::route_from_git(
         selected,
@@ -446,7 +457,8 @@ pub async fn run_code_review(
                 backend_factory: Some(factory.as_ref()),
                 refute: Some(crate::orchestrate::deep::RefuteInput {
                     roles: &roles,
-                    enabled: cfg.review.refuters.enabled,
+                    // P2：job 模式且没有显式 refuter → 不验真（本地模式仍自动异族回退）。
+                    enabled: cfg.refute_enabled(args.job_mode, &roles),
                     // 与 verdict 同一份阈值（收口评审 #9）：旗标覆盖必须同时作用于两处。
                     block_threshold: thresholds.0,
                     conf_floor: thresholds.1,
@@ -2053,7 +2065,7 @@ pub async fn run_resume(
                     backend_factory: Some(factory.as_ref()),
                     refute: Some(crate::orchestrate::deep::RefuteInput {
                         roles: &roles,
-                        enabled: cfg.review.refuters.enabled,
+                        enabled: cfg.refute_enabled(args.job_mode, &roles),
                         block_threshold: thresholds.0,
                         conf_floor: thresholds.1,
                         precedents: &ledger.cards,

@@ -46,6 +46,16 @@ struct Fixture {
 
 /// 建一个 base→head 的 git 仓；head 在 `src/app.js` 引入已知漏洞行。
 fn make_repo_and_job(kind: &str, config: &str, with_vuln: bool, with_partial_provider: bool) -> Fixture {
+    let body = if with_vuln {
+        "function find(id) {\n  return db.query('SELECT * FROM users WHERE id=' + id);\n}\n"
+    } else {
+        "function add(a, b) {\n  return a + b;\n}\n"
+    };
+    make_repo_and_job_with_body(kind, config, body, with_partial_provider)
+}
+
+/// 同上，但 `src/app.js` 的正文由调用方给（2.5 的空白差异用例需要自造源码）。
+fn make_repo_and_job_with_body(kind: &str, config: &str, body: &str, with_partial_provider: bool) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -57,11 +67,6 @@ fn make_repo_and_job(kind: &str, config: &str, with_vuln: bool, with_partial_pro
     git(&repo, &["commit", "-qm", "base"]);
     let base = git(&repo, &["rev-parse", "HEAD"]);
     std::fs::create_dir_all(repo.join("src")).unwrap();
-    let body = if with_vuln {
-        "function find(id) {\n  return db.query('SELECT * FROM users WHERE id=' + id);\n}\n"
-    } else {
-        "function add(a, b) {\n  return a + b;\n}\n"
-    };
     std::fs::write(repo.join("src/app.js"), body).unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "head"]);
@@ -198,6 +203,8 @@ async fn clean_fixture_is_ok_with_empty_findings_and_echoes_input() {
         assert!(r.get(k).is_some(), "missing {k}: {r}");
     }
     assert!(r["usage"]["input_tokens"].as_u64().unwrap() > 0);
+    // 报告不得含 cost（跨阶段不变式④）。
+    assert!(r["usage"].get("cost").is_none() && r["usage"].get("cost_usd").is_none(), "{r}");
     // job 模式零写 repo
     assert!(git(&fx.repo, &["status", "--porcelain"]).is_empty(), "repo 必须保持干净");
     assert!(!fx.repo.join(".redteam").exists(), "job 模式不得创建 .redteam");
@@ -506,4 +513,597 @@ async fn kind_mismatch_and_bad_manifest_are_reported_correctly() {
     let code = redteam::job::run::run_with(JobKind::Review, bad.path(), None).await;
     assert_eq!(code, 2);
     assert!(!bad.path().join("out/report.json").exists());
+}
+
+/// 改写已声明的输入并同步 manifest 里的 sha256（2.1/2.2 的对照夹具用）。
+fn update_input(job: &Path, key: &str, rel: &str, bytes: &[u8]) {
+    std::fs::write(job.join(rel), bytes).unwrap();
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(job.join("job.json")).unwrap()).unwrap();
+    let old = m["inputs"][key].clone();
+    let mut v = serde_json::json!({"path": rel, "sha256": sha256_hex(bytes)});
+    for k in ["schema", "format"] {
+        if !old[k].is_null() {
+            v[k] = old[k].clone();
+        }
+    }
+    m["inputs"][key] = v;
+    std::fs::write(job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+}
+
+/// 2.1：变更集来自 `inputs.diff_patch`，**不是** git 重新采集。patch 与 git 不一致只披露。
+#[tokio::test]
+async fn review_uses_diff_patch_not_git_as_change_source() {
+    let quote = "return a + b;";
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(quote, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(quote, "src/app.js", 2, "patch marker"))));
+    // git 的真实改动是「新建 src/app.js」；artifact patch 伪装成「给它加一行标记」。
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), false, false);
+    let fake = "diff --git a/src/app.js b/src/app.js\n\
+                index 1111111..2222222 100644\n\
+                --- a/src/app.js\n\
+                +++ b/src/app.js\n\
+                @@ -1,3 +1,4 @@\n\
+                 function add(a, b) {\n\
+                +  // PATCH_ONLY_MARKER\n\
+                   return a + b;\n\
+                 }\n";
+    update_input(&fx.job, "diff_patch", "input/diff.patch", fake.as_bytes());
+    let over = fake_override(scan.clone(), review);
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await;
+    assert_eq!(code, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok", "{r}");
+    // scanner 真正看到的确实来自 patch（git 的 diff 里没有这个标记）。
+    let prompt = format!("{:?}", scan.messages_at(0));
+    assert!(prompt.contains("PATCH_ONLY_MARKER"), "scan 输入必须来自 diff_patch: {prompt}");
+    // 不一致只披露，不改行为：评审照常出 finding。
+    let ic = &r["extensions"]["redteam"]["input_consistency"];
+    assert_eq!(ic["git"], "mismatch", "{r}");
+    assert_eq!(ic["differing"], serde_json::json!(["src/app.js"]), "{r}");
+    assert_eq!(r["findings"].as_array().unwrap().len(), 1, "只披露、不改行为: {r}");
+}
+
+/// 2.2：HEAD 必须等于 `pr.head_sha`；不匹配 → error（不是 partial/ok）。
+#[tokio::test]
+async fn head_must_match_manifest_head_sha() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), false, false);
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    // 检出停在 head，manifest 却说是 base —— 两个对象都在，但不是同一个提交。
+    m["pr"]["head_sha"] = serde_json::json!(fx.base);
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "head_sha_mismatch");
+}
+
+/// 2.2：`inputs.merge_base` 必须是 40 位 sha 的文本形态（短 sha 不在契约里）。
+#[tokio::test]
+async fn merge_base_must_be_a_full_sha() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), false, false);
+    update_input(&fx.job, "merge_base", "input/merge-base.sha", b"abc\n");
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:merge_base");
+}
+
+/// 声明 `prior_report` 输入（schema 固定 triage 报告）。
+fn add_prior_report(job: &Path, body: &str) {
+    let rel = "input/prior-report.json";
+    std::fs::write(job.join(rel), body).unwrap();
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(job.join("job.json")).unwrap()).unwrap();
+    m["inputs"]["prior_report"] = serde_json::json!({
+        "path": rel,
+        "sha256": sha256_hex(body.as_bytes()),
+        "schema": "hibot.audit.report.triage/1",
+    });
+    std::fs::write(job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+}
+
+/// 2.3：prior_report 只调**镜头与预算**，不改阻断阈值；specs 不可读 → partial 点名。
+#[tokio::test]
+async fn prior_report_only_adjusts_lens_and_budget() {
+    // 对照组：无 prior_report。
+    let scan_a = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review_a = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let fx_a = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let over_a = fake_override(scan_a, review_a);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx_a.job, Some(over_a.as_ref())).await, 0);
+    let base_report = read_report(&fx_a.job);
+    assert_eq!(base_report["status"], "ok", "{base_report}");
+    assert!(base_report["extensions"]["redteam"].get("prior_routing").is_none(), "没有 prior_report 时不写该键");
+
+    // 实验组：focus + 一份可读 spec + 一份不可读 spec + 建议预算。
+    let scan_b = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review_b = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let fx_b = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let prior = serde_json::json!({
+        "schema": "hibot.audit.report.triage/1",
+        "job_id": "T1", "kind": "triage", "status": "ok",
+        "input": {"head_sha": "h", "base_sha": "b"},
+        "executor": {"name": "redteam", "version": "0.1.0"},
+        // 历史 findings / 计数必须被忽略：它们不是本轮 review 的阻断项。
+        "findings": [{"fingerprint": "sha256:deadbeef"}],
+        "summary": {
+            "security_tier": "critical", "blockers_count": 9, "structural_count": 3, "local_count": 1,
+            "intent_undelivered": true, "scope_creep_count": 2, "risk": "high",
+            "convention_drift": "high", "fit": "poor",
+            "routing": {"focus": ["sql-injection-focus"], "specs": ["README.md", "docs/missing.md"], "wall_clock_s": 600}
+        },
+        "usage": {"input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 0, "wall_clock_ms": 1},
+        "extensions": {}
+    }).to_string();
+    add_prior_report(&fx_b.job, &prior);
+    let over_b = fake_override(scan_b.clone(), review_b);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx_b.job, Some(over_b.as_ref())).await, 0);
+    let r = read_report(&fx_b.job);
+
+    // specs 不可读 → partial + 点名（不是 ok）。
+    assert_eq!(r["status"], "partial", "{r}");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "routing_specs_unreadable:1");
+    // 镜头生效：focus 进了 scanner prompt。
+    let prompt = format!("{:?}", scan_b.messages_at(0));
+    assert!(prompt.contains("sql-injection-focus"), "routing.focus 必须进 prompt: {prompt}");
+    // 披露只含 routing 三件事。
+    let pr = &r["extensions"]["redteam"]["prior_routing"];
+    assert_eq!(pr["present"], true);
+    assert_eq!(pr["focus"], serde_json::json!(["sql-injection-focus"]));
+    assert_eq!(pr["specs_used"], serde_json::json!(["README.md"]));
+    assert_eq!(pr["specs_unreadable"], 1);
+    assert_eq!(pr["wall_clock_s"], 600);
+    // 阈值不变：findings 与无 prior 的对照完全一致（prior 不消费历史 findings / 计数 / tier）。
+    assert_eq!(r["findings"], base_report["findings"], "prior_report 不得改判定");
+    assert_eq!(r["extensions"]["redteam"]["stats"], base_report["extensions"]["redteam"]["stats"]);
+}
+
+/// 2.5：报告里的 quote 必须是**检出原文**——缩进/多空格被纠正，行号重锚；指纹按修正后的 quote 生成。
+#[tokio::test]
+async fn quote_is_corrected_from_the_checkout_before_fingerprint() {
+    // 源码里是多空格；模型报的是折叠后的单空格（上游行级归一能容忍，但 quote 不能原样进报告）。
+    let body = "function find(id) {\n  return db.query('SELECT  *  FROM users WHERE id=' + id);\n}\n";
+    let model_quote = "return db.query('SELECT * FROM users WHERE id=' + id);";
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(model_quote, "src/app.js", 9))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(model_quote, "src/app.js", 9, "SQL injection"))));
+    let fx = make_repo_and_job_with_body("review", &config_with(Some("en_US"), false), body, false);
+    let over = fake_override(scan, review);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok", "{r}");
+    let f = &r["findings"][0];
+    // 检出原文（首行缩进去掉、行内双空格保留）。
+    assert_eq!(f["quote"], "return db.query('SELECT  *  FROM users WHERE id=' + id);");
+    assert_eq!((f["line_start"].as_u64().unwrap(), f["line_end"].as_u64().unwrap()), (2, 2), "自报行号 9 要重锚");
+    assert_eq!(
+        f["fingerprint"],
+        fingerprint::of("src/app.js", f["quote"].as_str().unwrap(), f["title"].as_str().unwrap()),
+        "指纹必须按修正后的 quote 生成"
+    );
+}
+
+/// 2.5：逐字命不中的 finding 丢弃 + 计数 + partial（不得用空 findings 冒充 ok）。
+#[tokio::test]
+async fn unverifiable_quote_is_dropped_and_makes_partial() {
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json("return totally.fabricated();", "src/app.js", 2, "ghost"))));
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let over = fake_override(scan, review);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "partial", "{r}");
+    // 同一幻觉 finding 可能被多个 reviewer 格各丢弃一次（队列项 × 格），计数如实累加。
+    let code = r["extensions"]["redteam"]["status_code"].as_str().unwrap();
+    assert!(code.starts_with("quotes_dropped:"), "{r}");
+    assert!(r["extensions"]["redteam"]["dropped_unverified_quotes"].as_u64().unwrap() >= 1);
+    assert!(r["findings"].as_array().unwrap().is_empty(), "幻觉 quote 不得留进 findings");
+    assert!(r["status_reason"].as_str().unwrap().contains("quote not found verbatim"), "{}", r["status_reason"]);
+}
+
+/// 2.4：dismissed 命中 → 保留在 findings 里作审计、`refuted` 恒 false、不阻塞（status 仍 ok）。
+#[tokio::test]
+async fn dismissed_is_audited_but_never_refuted() {
+    let title = "SQL injection";
+    let fp = fingerprint::of("src/app.js", QUOTE, title);
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, title))));
+    // 复核开启且模型判 REFUTED：人的驳回仍优先——报告的 refuted 必须保持 false。
+    let refute = Arc::new(FakeChatBackend::repeating(turn(r#"{"verdict":"REFUTED","reason":"safe"}"#)));
+    let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
+    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+    cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+    let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
+    let csv = format!("fingerprint,actor,reason,created_at\n{fp},alice,\"false positive, see #12\",2026-11-20T10:00:00Z\n");
+    update_input(&fx.job, "dismissed", "input/dismissed.csv", csv.as_bytes());
+    let over = Box::new({
+        let (scan, review, refute) = (scan, review, refute);
+        move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            if em.provider != "p1" {
+                return None;
+            }
+            match em.id.as_str() {
+                "s" => Some(Box::new(scan.clone())),
+                "r" => Some(Box::new(review.clone())),
+                "v" => Some(Box::new(refute.clone())),
+                _ => None,
+            }
+        }
+    }) as Box<redteam::cli::BackendOverride<'_>>;
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok", "被驳回项不阻塞: {r}");
+    let f = &r["findings"][0];
+    assert_eq!(f["fingerprint"], fp, "指纹必须与 CSV 对得上");
+    assert_eq!(f["refuted"], false, "人的决定不是证据证伪");
+    let ledger = &f["extensions"]["redteam"]["ledger"];
+    assert_eq!(ledger["dismissed"], true);
+    assert_eq!(ledger["actor"], "alice");
+    assert_eq!(ledger["reason"], "false positive, see #12");
+    // 不阻塞：不计入任何计数口径（severity 统计也不认它）。
+    assert_eq!(r["extensions"]["redteam"]["stats"]["total"], 0, "被驳回项不计入计数: {r}");
+}
+
+/// 2.4：坏 CSV → error（不静默当空台账）。
+#[tokio::test]
+async fn malformed_dismissed_csv_is_an_error() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    update_input(
+        &fx.job,
+        "dismissed",
+        "input/dismissed.csv",
+        b"fingerprint,actor,reason,created_at\nnot-a-fingerprint,alice,b,2026-11-20T10:00:00Z\n",
+    );
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:dismissed");
+}
+
+/// P2（用户 2026-11-24 裁）：job + enabled + 无 refuter → 跳过验真并披露（不得静默）。
+#[tokio::test]
+async fn job_mode_without_refuter_skips_refute_and_discloses() {
+    let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
+    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
+    let over = fake_override(scan, review);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["extensions"]["redteam"]["refute_skipped"], "no_refuter", "{r}");
+    let deep = &r["extensions"]["redteam"]["run"]["deep"];
+    assert_eq!(deep["refute_triggered"].as_u64().unwrap_or(0), 0, "不得偷偷真跑");
+    assert_eq!(deep["refute_skipped"]["disabled"].as_u64().unwrap_or(0) >= 1, true, "{deep}");
+    assert_eq!(r["findings"][0]["refuted"], false, "跳过验真不得塞 refuted");
+}
+
+/// P2：job + enabled + 有 refuter → 真跑（refute_triggered > 0，且不披露 refute_skipped）。
+#[tokio::test]
+async fn job_mode_with_explicit_refuter_runs_refute() {
+    let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
+    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+    cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let refute = Arc::new(FakeChatBackend::repeating(turn(r#"{"verdict":"UPHELD","reason":"real SQL string concat"}"#)));
+    let over = Box::new({
+        let (scan, review, refute) = (scan.clone(), review.clone(), refute.clone());
+        move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            if em.provider != "p1" {
+                return None;
+            }
+            match em.id.as_str() {
+                "s" => Some(Box::new(scan.clone())),
+                "r" => Some(Box::new(review.clone())),
+                "v" => Some(Box::new(refute.clone())),
+                _ => None,
+            }
+        }
+    }) as Box<redteam::cli::BackendOverride<'_>>;
+    let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert!(r["extensions"]["redteam"].get("refute_skipped").is_none(), "{r}");
+    let deep = &r["extensions"]["redteam"]["run"]["deep"];
+    assert!(deep["refute_triggered"].as_u64().unwrap_or(0) >= 1, "有 refuter 必须真跑: {deep}");
+    assert!(refute.turn_count() >= 1, "refuter 后端必须被调用");
+    assert_eq!(r["findings"][0]["refuted"], false, "UPHELD 不算证伪");
+}
+
+/// 2.7：`language` 落地——scanner / reviewer / refuter 的 prompt 语言槽、模型产出（cell 与 finding 文本）、
+/// `status_reason` 三处一致；`run.warnings` / `extensions` 的机器字段不随语言变化。
+#[tokio::test]
+async fn language_is_consistent_across_prompts_findings_and_status_reason() {
+    let mut warnings_by_lang = Vec::new();
+    for (value, prompt_name, title, body, recommendation, reason_needle, hint) in [
+        (
+            "zh_CN",
+            "Simplified Chinese (简体中文)",
+            "SQL 注入",
+            "拼接 SQL 导致注入",
+            "改用参数化查询",
+            "规范文档不可读",
+            "SQL 注入风险",
+        ),
+        (
+            "en_US",
+            "English",
+            "SQL injection",
+            "string concatenation enables injection",
+            "use parameterized queries",
+            "spec files unreadable",
+            "sql injection risk",
+        ),
+    ] {
+        let scanner = format!(
+            r#"{{"suspicions":[{{"file":"src/app.js","line_start":2,"line_end":2,"hint":"{hint}","category":"L2","confidence":0.9,"quote":"{QUOTE}"}}],"needs":[],"scanned_areas":[]}}"#
+        );
+        let reviewer = serde_json::json!({
+            "findings": [{"severity":"high","title":title,"body":body,"file":"src/app.js",
+                          "line_start":2,"line_end":2,"confidence":0.9,
+                          "recommendation":recommendation,"quote":QUOTE}],
+            "needs": []
+        })
+        .to_string();
+        let refuter = serde_json::json!({"verdict": "UPHELD", "reason": reason_needle}).to_string();
+        let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner)));
+        let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer)));
+        let refute = Arc::new(FakeChatBackend::repeating(turn(&refuter)));
+
+        // 开启验真并显式声明 refuter（P2：job + enabled + 有 refuter → 真跑）。
+        let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some(value), false)).unwrap();
+        cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+        cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+        let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
+        // 用「声明了但读不到的 spec」制造 partial，才能断言 status_reason 的语言。
+        let prior = serde_json::json!({
+            "schema": "hibot.audit.report.triage/1", "job_id": "T1", "kind": "triage", "status": "ok",
+            "input": {"head_sha": "h", "base_sha": "b"},
+            "executor": {"name": "redteam", "version": "0.1.0"},
+            "findings": [],
+            "summary": {"routing": {"focus": [], "specs": ["docs/missing.md"], "wall_clock_s": 120}},
+            "usage": {"input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 0, "wall_clock_ms": 1},
+            "extensions": {}
+        })
+        .to_string();
+        add_prior_report(&fx.job, &prior);
+
+        let over = Box::new({
+            let (scan, review, refute) = (scan.clone(), review.clone(), refute.clone());
+            move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+                if em.provider != "p1" {
+                    return None;
+                }
+                match em.id.as_str() {
+                    "s" => Some(Box::new(scan.clone())),
+                    "r" => Some(Box::new(review.clone())),
+                    "v" => Some(Box::new(refute.clone())),
+                    _ => None,
+                }
+            }
+        }) as Box<redteam::cli::BackendOverride<'_>>;
+        assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+        let r = read_report(&fx.job);
+
+        let system_of = |b: &FakeChatBackend| match &b.messages_at(0)[0] {
+            redteam::provider::tool_loop::ChatMessage::System(s) => s.clone(),
+            other => panic!("首条须是 system: {other:?}"),
+        };
+        // ① 三类模型请求的语言槽
+        assert!(system_of(&scan).contains(prompt_name), "{value} scanner 语言槽缺失");
+        assert!(system_of(&review).contains(prompt_name), "{value} reviewer 语言槽缺失");
+        assert!(system_of(&refute).contains(prompt_name), "{value} refuter 语言槽缺失");
+        // ② 模型产出原样落地：cell hint + finding 文本
+        assert_eq!(
+            r["extensions"]["redteam"]["cells"][0]["output"]["suspicions"][0]["hint"],
+            hint,
+            "{r}"
+        );
+        assert_eq!(r["findings"][0]["title"], title);
+        assert_eq!(r["findings"][0]["body"], body);
+        assert_eq!(r["findings"][0]["recommendation"], recommendation);
+        // refuter 的实际判决正文（finding 级 extensions.refute.reason，附录 D）
+        assert_eq!(
+            r["findings"][0]["extensions"]["redteam"]["refute"]["reason"],
+            reason_needle,
+            "refuter 判决正文未随语言落地: {r}"
+        );
+        // ③ status_reason 随 language
+        assert_eq!(r["status"], "partial", "{r}");
+        let reason = r["status_reason"].as_str().unwrap();
+        assert!(reason.contains(reason_needle), "{value} 的 status_reason 语言不符: {reason}");
+        // 验真确实跑过（不是靠“跳过”凑出来的报告）
+        assert!(
+            r["extensions"]["redteam"]["run"]["deep"]["refute_triggered"].as_u64().unwrap_or(0) >= 1,
+            "{r}"
+        );
+        // 机器字段不随语言
+        assert_eq!(r["extensions"]["redteam"]["language"]["value"], value);
+        warnings_by_lang.push(
+            r["extensions"]["redteam"]["run"]["warnings"].as_array().cloned().unwrap_or_default(),
+        );
+    }
+    assert_eq!(warnings_by_lang[0], warnings_by_lang[1], "run.warnings 不得随 language 翻译");
+}
+
+/// 2.5/2.3/2.4 + 1.5：reviewer 已完成、后续 refute 调用挂起 → 超时收口落盘的真实报告
+/// 仍保留 prior、dismissed、修正后的 quote 与 partial 原因。
+#[tokio::test]
+async fn timeout_partial_report_keeps_run_facts_and_corrected_quote() {
+    let body = "function find(id) {\n  return db.query('SELECT  *  FROM users WHERE id=' + id);\n}\n";
+    let model_quote = "return db.query('SELECT * FROM users WHERE id=' + id);";
+    let fixed = "return db.query('SELECT  *  FROM users WHERE id=' + id);";
+    let title = "SQL injection";
+    let fp = fingerprint::of("src/app.js", fixed, title);
+
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(model_quote, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(model_quote, "src/app.js", 2, title))));
+    // 复核故意挂起：预算 1s 到点后必须收敛成 partial，而不是等它回。
+    let refute = Arc::new(
+        FakeChatBackend::repeating(turn(r#"{"verdict":"UPHELD","reason":"x"}"#))
+            .with_delay(std::time::Duration::from_secs(5)),
+    );
+    let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
+    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+    cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+    let fx = make_repo_and_job_with_body("review", &cfg.to_string(), body, false);
+    // 预算 1s
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    m["limits"]["wall_clock_s"] = serde_json::json!(1);
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    // prior + dismissed（指纹按**修正后**的 quote 算）
+    let prior = serde_json::json!({
+        "schema": "hibot.audit.report.triage/1", "job_id": "T1", "kind": "triage", "status": "ok",
+        "input": {"head_sha": "h", "base_sha": "b"},
+        "executor": {"name": "redteam", "version": "0.1.0"},
+        "findings": [],
+        "summary": {"routing": {"focus": ["auth"], "specs": ["README.md", "docs/missing.md"], "wall_clock_s": 120}},
+        "usage": {"input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 0, "wall_clock_ms": 1},
+        "extensions": {}
+    })
+    .to_string();
+    add_prior_report(&fx.job, &prior);
+    let csv = format!("fingerprint,actor,reason,created_at\n{fp},alice,false positive,2026-11-20T10:00:00Z\n");
+    update_input(&fx.job, "dismissed", "input/dismissed.csv", csv.as_bytes());
+
+    let over = Box::new({
+        let (scan, review, refute) = (scan, review, refute);
+        move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            if em.provider != "p1" {
+                return None;
+            }
+            match em.id.as_str() {
+                "s" => Some(Box::new(scan.clone())),
+                "r" => Some(Box::new(review.clone())),
+                "v" => Some(Box::new(refute.clone())),
+                _ => None,
+            }
+        }
+    }) as Box<redteam::cli::BackendOverride<'_>>;
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "partial", "{r}");
+    assert!(r["status_reason"].as_str().unwrap().contains("wall-clock"), "{}", r["status_reason"]);
+    assert_eq!(r["extensions"]["redteam"]["prior_routing"]["focus"], serde_json::json!(["auth"]));
+    // 中断报告同时保留准备阶段的 partial 原因（specs 不可读）与墙钟原因。
+    assert_eq!(r["extensions"]["redteam"]["prior_routing"]["specs_unreadable"], 1);
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "routing_specs_unreadable:1");
+    let reason = r["status_reason"].as_str().unwrap();
+    assert!(reason.contains("unreadable") && reason.contains("wall-clock"), "{reason}");
+    assert_eq!(r["extensions"]["redteam"]["input_consistency"]["git"], "match");
+    let f = &r["findings"][0];
+    assert_eq!(f["quote"], fixed, "超时报告同样要用检出原文修正 quote");
+    assert_eq!(f["fingerprint"], fp);
+    assert_eq!(f["refuted"], false);
+    assert_eq!(f["extensions"]["redteam"]["ledger"]["actor"], "alice");
+}
+
+/// 2.6：缺 blob（commit/tree/检出都在）经 `run_with` 落合法 error 报告。
+#[tokio::test]
+async fn missing_blob_produces_valid_error_report() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    // 删掉 head 侧 src/app.js 的 blob：diff 生成必须读它，commit/tree/检出文件都还在。
+    let blob = git(&fx.repo, &["rev-parse", "HEAD:src/app.js"]);
+    let p = fx.repo.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+    assert!(p.is_file(), "fixture 期望松散 blob: {}", p.display());
+    std::fs::remove_file(&p).unwrap();
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:merge_base", "{r}");
+    assert!(r["findings"].as_array().unwrap().is_empty());
+}
+
+/// 2.6：浅克隆经 `run_with` → 合法 error 报告（不是 partial/ok）。
+#[tokio::test]
+async fn shallow_checkout_produces_valid_error_report() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let shallow = fx.repo.parent().unwrap().join("repo-shallow");
+    let out = std::process::Command::new("git")
+        .args(["clone", "-q", "--depth", "1", &format!("file://{}", fx.repo.display()), shallow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    m["paths"]["repo"] = serde_json::json!("../repo-shallow");
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:shallow", "{r}");
+}
+
+/// 2.6：base 与 head 无共同祖先（两 commit 都在本地、merge-base 不可算）→ 合法 error 报告。
+#[tokio::test]
+async fn unrelated_histories_produce_valid_error_report() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    // 另起一条无共同祖先的根提交。
+    let orphan = fx.repo.parent().unwrap().join("repo-orphan");
+    std::fs::create_dir_all(&orphan).unwrap();
+    git(&orphan, &["init", "-q"]);
+    git(&orphan, &["config", "user.email", "t@example.com"]);
+    git(&orphan, &["config", "user.name", "t"]);
+    std::fs::write(orphan.join("x.txt"), "x\n").unwrap();
+    git(&orphan, &["add", "."]);
+    git(&orphan, &["commit", "-qm", "root"]);
+    // 本地 fetch 导入（无网络），HEAD 不动。
+    let out = std::process::Command::new("git")
+        .current_dir(&fx.repo)
+        .args(["fetch", "-q", orphan.to_str().unwrap(), "HEAD"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let root = git(&fx.repo, &["rev-parse", "FETCH_HEAD"]);
+    // 前置事实：两个 commit 都在本地，但 merge-base 不可算。
+    git(&fx.repo, &["rev-parse", "--verify", &format!("{root}^{{commit}}")]);
+    let mb = std::process::Command::new("git")
+        .current_dir(&fx.repo)
+        .args(["merge-base", &root, "HEAD"])
+        .output()
+        .unwrap();
+    assert!(!mb.status.success(), "fixture 必须真的没有共同祖先");
+
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    m["pr"]["base_sha"] = serde_json::json!(root);
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:merge_base", "{r}");
+}
+
+/// 1.5/2.3：准备阶段（registry 构造）耗尽 1s 预算 → 不进入任何模型派发，落 partial。
+#[tokio::test]
+async fn budget_exhausted_during_prep_makes_no_backend_calls() {
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let over = Box::new({
+        let (scan, review) = (scan.clone(), review.clone());
+        move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            // BackendOverride 在 `build_registry_with` 里**同步**调用：模拟准备阶段慢于预算。
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            match em.id.as_str() {
+                "s" => Some(Box::new(scan.clone())),
+                "r" => Some(Box::new(review.clone())),
+                _ => None,
+            }
+        }
+    }) as Box<redteam::cli::BackendOverride<'_>>;
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    m["limits"]["wall_clock_s"] = serde_json::json!(1);
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "partial", "{r}");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "wall_clock_exhausted");
+    assert!(r["findings"].as_array().unwrap().is_empty());
+    assert_eq!(scan.turn_count(), 0, "预算耗尽后不得再派发");
+    assert_eq!(review.turn_count(), 0, "预算耗尽后不得再派发");
 }

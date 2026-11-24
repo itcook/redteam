@@ -84,6 +84,11 @@ fn table(code: &str) -> Option<(&'static str, &'static str)> {
             "executor config contains secret field `{}`; supply credentials via env vars",
         ),
         "head_sha_mismatch" => ("检出 HEAD 与 manifest 不一致", "checkout HEAD differs from manifest"),
+        // 2.6：`what ∈ shallow|head|base|merge_base`（Phase 2 新增，附录 E）。
+        "repo_incomplete" => (
+            "检出缺少必需对象 `{}`（或是浅克隆）",
+            "checkout is missing required object `{}` (or is shallow)",
+        ),
         "invalid_fingerprint_input" => ("findings.json 中有非法指纹", "findings.json contains an invalid fingerprint"),
         "missing_role" => ("缺少 `{}` 角色且无可用回退", "missing role `{}` with no fallback"),
         "internal_panic" => ("内部错误：{}", "internal error: {}"),
@@ -126,6 +131,7 @@ fn takes_detail(code: &str) -> bool {
         code,
         "input_missing" | "input_checksum_mismatch" | "input_schema_mismatch" | "input_path_invalid"
             | "config_invalid" | "config_contains_secret" | "missing_role" | "kind_not_implemented"
+            | "repo_incomplete"
             | "scan_incomplete" | "review_incomplete" | "budget_truncated" | "triage_axis_failed"
             | "routing_specs_unreadable" | "verifications_inconclusive" | "quotes_dropped"
     )
@@ -142,7 +148,10 @@ impl JobFailure {
     pub fn status_text(&self, lang: &OutputLang) -> StatusText {
         let mut t = render_one(&self.code, self.detail.as_deref(), lang);
         if let Some(r) = &self.reason {
-            t.reason = r.clone();
+            // 原始诊断常来自第三方（配置解析器 / backend），不随 language——但人读句仍以本地化模板起头，
+            // 不能整句被英文诊断覆盖（2.7 语言一致性）。
+            let head = t.reason.trim_end_matches(['：', ':']).to_string();
+            t.reason = if head.is_empty() { r.clone() } else { format!("{head}: {r}") };
         }
         t
     }
@@ -206,6 +215,16 @@ mod tests {
         assert_eq!(t.code, "scan_incomplete:2/5");
         assert!(t.reason.contains("2/5") && t.reason.contains("3 items skipped"), "{t:?}");
         assert!(render_partial(&[], &en()).is_none());
+    }
+
+    #[test]
+    fn raw_diagnostic_does_not_bypass_localization() {
+        let f = JobFailure::with_reason("config_invalid", None, "unknown backend kind `google`");
+        let z = f.status_text(&zh());
+        assert!(z.reason.starts_with("executor config 不合法"), "{z:?}");
+        assert!(z.reason.contains("google"));
+        let e = f.status_text(&en());
+        assert!(e.reason.starts_with("invalid executor config"), "{e:?}");
     }
 
     #[test]

@@ -217,6 +217,10 @@ pub struct CellRecord {
     /// 其中 **429 重试**（限流退避，不是探索深度）。旧记录 0。
     #[serde(default)]
     pub rl_retries: u32,
+    /// **quote 锚定丢弃**的 finding 条数（hibot 2.5）：`anchor_review_findings` 在解析阶段就丢掉的那些。
+    /// 以前只活在 `warn` 文本里，报告出口无法聚合——空结果会被误报成 `ok`。旧记录 0。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub dropped_quote: u32,
     /// 胜出 call 的 tool-loop 迭代数（计 FINALIZE、不计 turn 级重试；单发单收=1）。
     /// 0＝失败/未观测（旧记录、整链失败、resume 格）。
     #[serde(default)]
@@ -235,6 +239,10 @@ pub struct CellRecord {
     pub template_hash: Option<String>,
 }
 
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
 fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
@@ -244,7 +252,7 @@ impl CellRecord {
     pub fn ok(cell: impl Into<String>, model: impl Into<String>, output: crate::domain::CellOutput) -> Self {
         Self {
             cell: cell.into(), model: model.into(), family: String::new(), ok: true, output, warn: None,
-            duration_ms: 0, queue_wait_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0, repair_rounds: 0, two_stage_rounds: 0, rl_retries: 0,
+            duration_ms: 0, queue_wait_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0, repair_rounds: 0, two_stage_rounds: 0, rl_retries: 0, dropped_quote: 0,
             max_turn_output_tokens: 0, tool_use: Default::default(), template_hash: None,
         }
     }

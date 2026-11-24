@@ -142,14 +142,40 @@ pub fn kind_not_implemented_verify(
     r
 }
 
+/// Phase 2 收集的报告期事实（不污染内部 `ReviewReport`）：只影响 hibot 信封。
+#[derive(Clone, Debug, Default)]
+pub struct ReviewExtras {
+    /// 2.1：`diff_patch` 与 git 采集的一致性与否（只披露）。
+    pub input_consistency: Option<Value>,
+    /// 2.3：`prior_report` 的 routing 投影（只披露 actual 用了什么）。
+    pub prior_routing: Option<Value>,
+    /// 2.5：本轮因 quote 无法逐字命中而丢弃的 finding 条数（含上游锚定阶段的）。>0 时才进 extensions。
+    pub dropped_unverified_quotes: u32,
+    /// 2.1–2.5 之外的额外 `partial` 原因（如 `quotes_dropped` / `routing_specs_unreadable`）。
+    pub extra_partial: Vec<JobFailure>,
+    /// 2.4：命中 `dismissed.csv` 的 finding 审计行（指纹 → actor/reason）。
+    pub ledger: std::collections::BTreeMap<String, crate::job::dismissed::Entry>,
+    /// P2：job 模式 + 验真开启 + 未声明 refuter → 跳过验真的披露（`"no_refuter"`）。
+    pub refute_skipped: Option<&'static str>,
+}
+
 /// review 的 `ReviewReport` → hibot 信封。
-pub fn review_report(manifest: &JobManifest, internal: &ReviewReport, cfg: &Config, lang: &OutputLang) -> HibotReport {
-    let (status, reasons) = derive_review_status(internal);
+pub fn review_report(
+    manifest: &JobManifest,
+    internal: &ReviewReport,
+    cfg: &Config,
+    lang: &OutputLang,
+    extras: &ReviewExtras,
+) -> HibotReport {
+    let (status, mut reasons) = derive_review_status(internal);
+    reasons.extend(extras.extra_partial.iter().cloned());
+    // 附录 E：`status_code` 只保留**主导**一条，按表从上到下优先级——不依赖拼接顺序。
+    reasons.sort_by_key(|f| code_rank(&f.code));
     let partial = render_partial(&reasons, lang);
     let mut r = HibotReport::base(manifest);
-    r.status = status;
+    r.status = if reasons.is_empty() { status } else { JobStatus::Partial };
     r.status_reason = partial.as_ref().map(|t| t.reason.clone());
-    r.findings = internal.findings.iter().map(map_finding).collect();
+    r.findings = internal.findings.iter().map(|f| map_finding(f, &extras.ledger)).collect();
     r.usage = UsageOut {
         input_tokens: internal.run.usage.input_tokens,
         output_tokens: internal.run.usage.output_tokens,
@@ -172,8 +198,39 @@ pub fn review_report(manifest: &JobManifest, internal: &ReviewReport, cfg: &Conf
     if let Some(t) = partial {
         redteam["status_code"] = json!(t.code);
     }
+    // 2.3：prior_report 的 routing 投影（只披露实际用了什么）。
+    if let Some(v) = &extras.prior_routing {
+        redteam["prior_routing"] = v.clone();
+    }
+    // 2.1：patch 与 git 的不一致只披露，不改行为。
+    if let Some(v) = &extras.input_consistency {
+        redteam["input_consistency"] = v.clone();
+    }
+    // P2：job 模式没有显式 refuter → 跳过验真，必须显式披露（不得静默、不得塞 refuted）。
+    if let Some(s) = extras.refute_skipped {
+        redteam["refute_skipped"] = json!(s);
+    }
+    // 2.5：quote 无法逐字命中的丢弃计数（>0 才披露）。
+    if extras.dropped_unverified_quotes > 0 {
+        redteam["dropped_unverified_quotes"] = json!(extras.dropped_unverified_quotes);
+    }
     r.extensions = json!({ "redteam": redteam });
     r
+}
+/// 附录 E 的 partial 优先级：`status_code` 取最靠前的一条（`render_partial` 取首条）。
+fn code_rank(code: &str) -> usize {
+    const ORDER: &[&str] = &[
+        "scan_incomplete",
+        "review_incomplete",
+        "no_reviewer_available",
+        "budget_truncated",
+        "triage_axis_failed",
+        "routing_specs_unreadable",
+        "verifications_inconclusive",
+        "wall_clock_exhausted",
+        "quotes_dropped",
+    ];
+    ORDER.iter().position(|c| *c == code).unwrap_or(ORDER.len())
 }
 
 fn language_json(lang: &OutputLang) -> Value {
@@ -190,7 +247,14 @@ fn concurrency_json(cfg: &Config) -> Value {
 }
 
 /// 内部 finding → hibot finding（指纹在这里**唯一**生成；refuted 是顶层契约字段）。
-pub fn map_finding(f: &crate::domain::Finding) -> HibotFinding {
+///
+/// `ledger` = 该指纹在 `dismissed.csv` 里的行：命中时挂 finding 级审计扩展，**不改 `refuted`**
+/// （人的驳回不是证据证伪，Q8）。
+pub fn map_finding(
+    f: &crate::domain::Finding,
+    ledger: &std::collections::BTreeMap<String, crate::job::dismissed::Entry>,
+) -> HibotFinding {
+    let fingerprint = fingerprint::of(&f.file, &f.quote, &f.title);
     let model = f.models.first().cloned().unwrap_or_default();
     let mut ext = serde_json::Map::new();
     if !matches!(f.origin, crate::domain::Origin::New) {
@@ -202,8 +266,19 @@ pub fn map_finding(f: &crate::domain::Finding) -> HibotFinding {
     if f.outside_window {
         ext.insert("outside_window".into(), json!(true));
     }
+    let dismissed = ledger.get(&fingerprint);
+    if let Some(e) = dismissed {
+        ext.insert(
+            "ledger".into(),
+            serde_json::json!({ "dismissed": true, "actor": e.actor, "reason": e.reason }),
+        );
+    } else if let Some(r) = &f.refute {
+        // 附录 D finding 级 `refute = {reason}`：复核判决正文（`refuted` 仍是顶层契约字段）。
+        // 被 dismissed 的条目只留人的决定——模型原始判决留在 cell 审计里，不再往 finding 上叠。
+        ext.insert("refute".into(), serde_json::json!({ "reason": r.note }));
+    }
     HibotFinding {
-        fingerprint: fingerprint::of(&f.file, &f.quote, &f.title),
+        fingerprint,
         severity: f.severity.as_str().to_string(),
         confidence: f.confidence,
         file: f.file.clone(),
@@ -213,7 +288,8 @@ pub fn map_finding(f: &crate::domain::Finding) -> HibotFinding {
         title: f.title.clone(),
         body: f.body.clone(),
         recommendation: f.recommendation.clone(),
-        refuted: f.is_refuted(),
+        // 人的驳回 ≠ 证据证伪：命中 ledger 的条目对外恒 refuted=false（正常与 partial 共用这一处）。
+        refuted: f.is_refuted() && dismissed.is_none(),
         source: SourceOut { executor: "redteam".into(), model, role: "reviewer".into() },
         extensions: if ext.is_empty() { Value::Null } else { json!({ "redteam": Value::Object(ext) }) },
     }
@@ -249,6 +325,9 @@ pub fn derive_review_status(r: &ReviewReport) -> (JobStatus, Vec<JobFailure>) {
 }
 
 /// 解析失败 / 超时时的 partial 报告（1.5）：findings 来自已完成的 cell。
+///
+/// Phase 2（2.5）：partial 路径与正常路径走**同一条**「重锚 → 指纹 → dismissed」链，
+/// 所以同样接受 [`ReviewExtras`]（丢弃计数 / ledger / 额外 partial 原因）。
 pub fn partial_report(
     manifest: &JobManifest,
     lang: &OutputLang,
@@ -257,18 +336,40 @@ pub fn partial_report(
     usage: UsageOut,
     cfg: &Config,
     truncated_items: u32,
+    extras: &ReviewExtras,
 ) -> HibotReport {
+    // `StatusText.code` 可能带 `<detail>`：拆回 JobFailure，再与额外原因一起按附录 E 优先级排序。
+    let base = reason.code.split(':').next().unwrap_or(reason.code.as_str()).to_string();
+    let detail = reason.code.split_once(':').map(|(_, d)| d.to_string());
+    let mut reasons = vec![JobFailure { code: base, detail, reason: Some(reason.reason.clone()) }];
+    reasons.extend(extras.extra_partial.iter().cloned());
+    reasons.sort_by_key(|f| code_rank(&f.code));
+    let partial = render_partial(&reasons, lang).unwrap_or_else(|| reason.clone());
     let mut r = HibotReport::base(manifest);
     r.status = JobStatus::Partial;
-    r.status_reason = Some(reason.reason.clone());
-    r.findings = findings.iter().map(map_finding).collect();
+    r.status_reason = Some(partial.reason.clone());
+    r.findings = findings.iter().map(|f| map_finding(f, &extras.ledger)).collect();
     r.usage = usage;
-    r.extensions = json!({ "redteam": {
+    let mut redteam = json!({
         "language": language_json(lang),
-        "status_code": reason.code,
+        "status_code": partial.code,
         "concurrency": concurrency_json(cfg),
         "budget": { "wall_clock_s": manifest.limits.wall_clock_s, "truncated_items": truncated_items },
-    }});
+    });
+    if let Some(s) = extras.refute_skipped {
+        redteam["refute_skipped"] = json!(s);
+    }
+    // 中断报告与正常报告共享同一份运行事实（2.3 / 2.1）。
+    if let Some(v) = &extras.prior_routing {
+        redteam["prior_routing"] = v.clone();
+    }
+    if let Some(v) = &extras.input_consistency {
+        redteam["input_consistency"] = v.clone();
+    }
+    if extras.dropped_unverified_quotes > 0 {
+        redteam["dropped_unverified_quotes"] = json!(extras.dropped_unverified_quotes);
+    }
+    r.extensions = json!({ "redteam": redteam });
     r
 }
 
@@ -324,7 +425,13 @@ mod tests {
         f.refute = Some(Refute { verdict: RefuteVerdict::Refuted, model: "p/r".into(), note: "".into() });
         let m = manifest();
         let rep = report(Verdict::Approve, vec![f.clone()], Coverage::default(), None);
-        let out = review_report(&m, &rep, &Config::default(), &crate::config::Language::EnUs.output());
+        let out = review_report(
+            &m,
+            &rep,
+            &Config::default(),
+            &crate::config::Language::EnUs.output(),
+            &ReviewExtras::default(),
+        );
         let hf = &out.findings[0];
         assert_eq!(hf.fingerprint, crate::job::fingerprint::of(&f.file, &f.quote, &f.title));
         assert!(hf.refuted, "refuted 是顶层契约字段");

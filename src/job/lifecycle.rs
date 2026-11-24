@@ -108,18 +108,42 @@ pub fn usage_from_cells(cells: &[CellRecord]) -> UsageOut {
 }
 
 /// SIGTERM / 墙钟耗尽：停止派发后写 partial（调用方已 drop 运行 future）。
+///
+/// `root` 给了就跑与正常路径同一条收口链（2.5：逐字重锚 → 指纹 → dismissed），
+/// 否则只说「已落地的 cell」——准备阶段就中断时还没有 findings。
 pub fn interrupted_report(
     manifest: &JobManifest,
     lang: &crate::config::OutputLang,
     cfg: &Config,
     sink: &JobDirCellSink,
+    root: Option<&std::path::Path>,
+    dismissed: &crate::job::dismissed::Dismissed,
+    base_extras: &crate::job::report::ReviewExtras,
 ) -> HibotReport {
     let (cells, _phases) = sink.snapshot();
     let findings = findings_from_cells(&cells);
+    let upstream = crate::job::quote::upstream_dropped(&cells);
+    let (mut findings, self_dropped) = match root {
+        Some(root) => {
+            let v = crate::job::quote::verify(findings, root);
+            (v.findings, v.dropped)
+        }
+        None => (findings, 0),
+    };
+    // 2.4：与正常路径同一条链——指纹 → dismissed（只标审计，不写 refuted）。
+    let ledger = crate::job::dismissed::apply(&mut findings, dismissed);
+    let dropped = self_dropped + upstream;
     let usage = usage_from_cells(&cells);
     let failure = JobFailure::new("wall_clock_exhausted", None);
     let text: StatusText = failure.status_text(lang);
-    partial_report(manifest, lang, &text, findings, usage, cfg, 0)
+    // 与正常路径共享本次运行事实（input_consistency / prior_routing / refute_skipped / 已有 partial 原因）。
+    let mut extras = base_extras.clone();
+    extras.dropped_unverified_quotes = dropped;
+    extras.ledger = ledger;
+    if dropped > 0 {
+        extras.extra_partial.push(JobFailure::new("quotes_dropped", Some(dropped.to_string())));
+    }
+    partial_report(manifest, lang, &text, findings, usage, cfg, 0, &extras)
 }
 
 /// 正常收口后的内部报告是否要落到 `out/` 之外？不：Phase 1 只写 `out/report.json`。
@@ -136,6 +160,18 @@ mod tests {
         let mut f = crate::domain::finding::fixtures::finding(id, Severity::High, 1, "m");
         f.id = id.into();
         f
+    }
+
+    fn manifest() -> JobManifest {
+        JobManifest::parse(r#"{
+          "schema":"hibot.audit.job.review/1","job_id":"J1","kind":"review",
+          "repo":{"id":1,"full_name":"o/r"},
+          "pr":{"number":7,"head_sha":"abcdef0","base_sha":"1234567"},
+          "executor":{"name":"redteam","version":"0.1.0"},
+          "limits":{"wall_clock_s":600},
+          "paths":{"repo":"../repo","out":"out","config":"config/executor.redteam.json"},
+          "inputs":{}
+        }"#).unwrap()
     }
 
     #[test]
@@ -195,9 +231,80 @@ mod tests {
           "inputs":{}
         }"#).unwrap();
         let lang = crate::config::Language::EnUs.output();
-        let r = interrupted_report(&manifest, &lang, &Config::default(), &sink);
+        let r = interrupted_report(
+            &manifest,
+            &lang,
+            &Config::default(),
+            &sink,
+            None,
+            &crate::job::dismissed::Dismissed::default(),
+            &crate::job::report::ReviewExtras::default(),
+        );
         assert_eq!(r.status, crate::job::status::JobStatus::Partial);
         assert!(r.status_reason.unwrap().contains("wall-clock budget"));
         assert_eq!(r.extensions["redteam"]["status_code"], "wall_clock_exhausted");
     }
+
+    /// 2.5/2.4 + 2.3：中断路径与正常路径走同一条收口链，并保留准备阶段拿到的运行事实。
+    #[test]
+    fn interrupted_report_shares_the_finalize_chain_and_run_facts() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.rs"), "fn f() {\n    let x  =  1;\n}\n").unwrap();
+        let sink = JobDirCellSink::new(d.path().join("out"));
+
+        let mut f = finding("f1");
+        f.file = "src/a.rs".into();
+        f.quote = "let x = 1;".into(); // 与检出空白不同：必须被检出原文纠正
+        f.title = "t".into();
+        f.line_start = 99;
+        sink.on_cell(CellRecord::ok("review[x]", "p/r", CellOutput::Review { findings: vec![f], needs: vec![] }));
+        // 复核判 REFUTED：由 `findings_from_cells` 回填到 finding 上。
+        sink.on_cell(CellRecord::ok(
+            "refute[f1]",
+            "p/v",
+            CellOutput::Refute {
+                verdicts: vec![crate::domain::RefuteEntry {
+                    id: "f1".into(),
+                    verdict: RefuteVerdict::Refuted,
+                    note: "safe".into(),
+                }],
+            },
+        ));
+
+        // dismissed 按**修正后**的 quote 生成的指纹命中。
+        let fp = crate::job::fingerprint::of("src/a.rs", "let x  =  1;", "t");
+        let csv = format!("fingerprint,actor,reason,created_at\n{fp},alice,false positive,2026-11-20T10:00:00Z\n");
+        let dismissed = crate::job::dismissed::parse(csv.as_bytes()).unwrap();
+        let base_extras = crate::job::report::ReviewExtras {
+            input_consistency: Some(serde_json::json!({"match": true, "files": 1})),
+            prior_routing: Some(serde_json::json!({"present": true})),
+            refute_skipped: Some("no_refuter"),
+            ..Default::default()
+        };
+        let lang = crate::config::Language::EnUs.output();
+        let r = interrupted_report(
+            &manifest(),
+            &lang,
+            &Config::default(),
+            &sink,
+            Some(&repo),
+            &dismissed,
+            &base_extras,
+        );
+
+        assert_eq!(r.status, crate::job::status::JobStatus::Partial);
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].quote, "let x  =  1;", "中断报告也要用检出原文修正 quote");
+        assert_eq!((r.findings[0].line_start, r.findings[0].line_end), (2, 2), "行号要重锚");
+        // 人的驳回优先：即使复核判了 REFUTED，对外仍是 refuted=false，且不叠 refute 扩展。
+        assert_eq!(r.findings[0].refuted, false);
+        assert!(r.findings[0].extensions["redteam"].get("refute").is_none());
+        assert_eq!(r.findings[0].extensions["redteam"]["ledger"]["dismissed"], true);
+        assert_eq!(r.extensions["redteam"]["input_consistency"]["match"], true);
+        assert_eq!(r.extensions["redteam"]["prior_routing"]["present"], true);
+        assert_eq!(r.extensions["redteam"]["refute_skipped"], "no_refuter");
+    }
+
 }
