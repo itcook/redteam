@@ -1,0 +1,196 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `security` incomplete; triage axis `drift` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:7ca6f9432daae2bf0ad0489da3f9fdc9e8f163910b7231192ee0e049fc4f6284",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_ws.go",
+      "line_start": 101,
+      "line_end": 106,
+      "quote": "if domain := feishuFinanceAgentWSDomain(cfg.OpenAPIBase); domain != \"\" {\n\t\topts = append(opts, larkws.WithDomain(domain))\n\t}\n\n\tclient := larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...)\n\treturn client.Start(context.Background())",
+      "title": "Security (surface 7): SSRF",
+      "body": "Reachability: env var FEISHU_FINANCE_AGENT_OPENAPI_BASE enters at setting/feishu_finance_agent_setting.go:32 (os.Getenv) -> returned by setting.GetFeishuFinanceAgentSetting() -> loaded as cfg in StartFeishuFinanceAgentWS at service/feishu_finance_agent_ws.go:35 -> passed through runFeishuFinanceAgentWS into runFeishuFinanceAgentWSSession(cfg) -> feishuFinanceAgentWSDomain(cfg.OpenAPIBase) at service/feishu_finance_agent_ws.go:111-119 only trims trailing '/' and '/open-apis' with no scheme or host allowlist -> larkws.WithDomain(domain) at service/feishu_finance_agent_ws.go:102 -> sink: larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...) at service/feishu_finance_agent_ws.go:105 followed by client.Start(context.Background()) at service/feishu_finance_agent_ws.go:106, which dials the configured host and authenticates the long connection with the app credentials\nNote: The outbound websocket/API destination is fully controlled by the FEISHU_FINANCE_AGENT_OPENAPI_BASE environment value and is not validated against a feishu.cn/larksuite.com allowlist; the SDK authenticates toward that domain using cfg.AppID/cfg.AppSecret, so a redirected or mistyped value sends the app credentials and all bot message/card traffic to an arbitrary host. Mitigation (recorded, does not break the path): the value comes from the deployment environment rather than an HTTP request, is unset by default (SDK then uses https://open.feishu.cn), and is documented for local smoke testing; note also that LLMBaseURL is a second env-controlled outbound endpoint but its HTTP sink (service/feishu_finance_agent_client.go) is not present in the supplied diff, so it is not rowed here.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.3",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:31923ba5c3fd7ca3068544a4dbb743cafe18d8b2beb004966633777b10657fa1",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "setting/feishu_finance_agent_setting.go",
+      "line_start": 9,
+      "line_end": 11,
+      "quote": "// FeishuFinanceAgentSetting 飞书「HiAPI推广助手」机器人配置，全部来自环境变量，\n// 不入库、不进代码仓库（App Secret / LLM Key / HMAC keyring 都属于部署密钥）。\ntype FeishuFinanceAgentSetting struct {",
+      "title": "Structural drift: placement",
+      "body": "Standard: AGENTS.md#architecture (setting/)\nNote: AGENTS.md defines setting/ as 'Configuration management (ratio, model, operation, system, performance)' — the gateway's documented config subdomains — and assigns environment-variable handling to common/ ('Shared utilities (JSON, crypto, Redis, env, ...)'). This new file adds a Feishu bot/agent integration configuration (app credentials, LLM base URL/key/model) populated entirely from FEISHU_FINANCE_AGENT_* environment variables, a concern outside the module's documented scope; whether env-sourced deployment-secret config belongs in setting/ or under common/ env utilities is a layer-placement question the doc does not cover.",
+      "recommendation": "Align placement / naming / ownership with AGENTS.md#architecture (setting/).",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.3",
+        "role": "scanner"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 64059,
+    "output_tokens": 111928,
+    "cached_input_tokens": 1792,
+    "wall_clock_ms": 622620
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 2,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-security` exceeded its 472.435929563s budget during repair",
+          "ok": false,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 1280,
+            "input_tokens": 45074,
+            "output_tokens": 68211
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 2,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-drift` exceeded its 394.561277021s budget during repair",
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": false,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 512,
+            "input_tokens": 18985,
+            "output_tokens": 43717
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-intent-claims` exceeded its 149.999984333s budget",
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        }
+      ],
+      "blockers": [
+        {
+          "category": "placement",
+          "file": "setting/feishu_finance_agent_setting.go",
+          "kind": "structural",
+          "line_end": 11,
+          "line_start": 9,
+          "quote": "// FeishuFinanceAgentSetting 飞书「HiAPI推广助手」机器人配置，全部来自环境变量，\n// 不入库、不进代码仓库（App Secret / LLM Key / HMAC keyring 都属于部署密钥）。\ntype FeishuFinanceAgentSetting struct {"
+        }
+      ],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:security",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

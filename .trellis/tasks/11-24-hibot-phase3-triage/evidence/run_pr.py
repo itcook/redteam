@@ -110,9 +110,10 @@ def main():
     ap.add_argument("--workspace", default=os.path.expanduser("~/hobby/.worktrees/redteam/hibot-audit-exec"))
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--evidence", default=None, help="copy report.json here")
+    ap.add_argument("--label", default="", help="evidence 文件名后缀，避免同一 PR 多次跑互相覆盖")
     args = ap.parse_args()
 
-    root = os.path.join(args.job_root, f"{args.name}-pr-{args.pr}")
+    root = os.path.join(args.job_root, f"{args.name}-pr-{args.pr}{args.label}")
     job = os.path.join(root, "job")
     shutil.rmtree(root, ignore_errors=True)
     for d in ("config", "input", "out"):
@@ -165,8 +166,8 @@ def main():
     report = json.load(open(report_path))
     if args.evidence:
         os.makedirs(args.evidence, exist_ok=True)
-        shutil.copyfile(report_path, os.path.join(args.evidence, f"report.{args.name}-pr-{args.pr}.json"))
-        shutil.copyfile(os.path.join(job, "input/pr-context.json"), os.path.join(args.evidence, f"pr-context.{args.name}-pr-{args.pr}.json"))
+        shutil.copyfile(report_path, os.path.join(args.evidence, f"report.{args.name}-pr-{args.pr}{args.label}.json"))
+        shutil.copyfile(os.path.join(job, "input/pr-context.json"), os.path.join(args.evidence, f"pr-context.{args.name}-pr-{args.pr}{args.label}.json"))
     summary = report.get("summary") or {}
     axes = report.get("extensions", {}).get("redteam", {}).get("axes", [])
     metrics = {

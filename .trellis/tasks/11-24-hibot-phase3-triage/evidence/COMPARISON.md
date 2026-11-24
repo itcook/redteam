@@ -62,3 +62,47 @@
 - usage 45,074 in / 61,696 out；原始报告：`report.hiapi-backend-pr-333-glm-partial.json`。
 - 与 DeepSeek + A2（安全轴 0 行）并列：**GLM 能召回两条安全行（含 injection），但仍未命中人工的 surface-4 特权写链路**。
 - 注：backend #333 的 A2（DeepSeek）原始报告已被本次 GLM 复跑覆盖；A2 数值来自覆盖前生成的 `metrics.jsonl` 与本文件上表。
+
+## GLM-5.3 墙钟优化验证（backend #333，32k output / 1200s）
+
+- 实际墙钟 **540.1s**（优化前同配置 1200.1s），`status=partial`。
+- 单格预算：security/intent 539.95s、drift 315.36s（排队时间计入本格）。
+- security 2 行 + 1 行 conf6 被丢（`dropped_rows` 披露）；drift 1 cell；intent 0 行（540s 内未返回）。
+- usage 60,093 in / 63,797 out；原始报告：`report.hiapi-backend-pr-333-glm-optimized.json`。
+
+## A 两阶段 intent · 模型 A/B（2026-11-24）
+
+> A 流程：I0 串行抽 claims/overlap + I1..In 按 diff 切片验证/scope creep；三轴模型取 `roles.reviewer`（high）。
+> 夹具：backend #333（人工 tier2）、sites #328（人工 tier0，clean）。
+
+### backend #333
+
+| 模型 | 墙钟 | status | tier | blockers | struct | intent | local | creep | intent 轴 |
+|---|---|---|---|---|---|---|---|---|---|
+| DeepSeek high（I0 修正前） | 282.0s | ok | 1 | 3 | 1 | 2 | 1 | 2 | 31 claims / 29 delivered（2 个验证性声明被误算，虚增 undelivered） |
+| **DeepSeek high（I0 修正后 + 公平性）** | **177.7s** | **ok** | **1** | **0** | **0** | **0** | **3** | **5** | 20 claims / 20 delivered / complete |
+| GLM-5.3 high | 622.8s | partial | — | — | — | — | — | — | I0 在 150s 内未返回（0 行） |
+| GLM-5.4 high | 4.4s | partial | — | — | — | — | — | — | **provider 404**（未进入模型） |
+
+- 人工基线：tier **2** / blockers 0 / structural 0 / local 3 / creep 6 / high。DeepSeek high 修正后除 tier2 外基本对齐。
+- 安全轴：surface 5（injection）与 surface 7（SSRF）各 1 行；无 surface 1/3/4 → tier1（人工的 surface-4 特权写仍未召回）。
+- 原始报告：`report.hiapi-backend-pr-333-deepseek-a2.json`、`...-deepseek-claims31.json`、`...-glm-a.json`、`...-glm54.json`。
+
+### sites #328（clean，精度）
+
+| 模型 | 墙钟 | status | tier | blockers | struct | intent | local | creep | 备注 |
+|---|---|---|---|---|---|---|---|---|---|
+| DeepSeek high | 114.8s | ok | 0 | 2 | 2 | 0 | 8 | 2 | intent 5 cells 全成；security 2 行均 <8 丢弃（conf 6/2） |
+| GLM-5.3 high（公平性修复后） | 425.5s | partial | — | — | — | — | — | — | security 4 cells 完成；drift 1/4、intent slice 166s 超时 |
+| GLM-5.4 high | — | — | — | — | — | — | — | — | 同 provider 404，未跑 |
+
+- **无「干净判 tier2」**：DeepSeek high 与 GLM-5.3 的安全轴都没有把 clean PR 判成 tier2。
+- 原始报告：`report.hiapi-sites-pr-328-deepseek-a.json`、`...-glm-a2.json`。
+
+### GLM-5.4 阻塞（provider 侧）
+
+- `agc` 网关 `/v1/messages` 与 `/chat/completions` 均返回
+  `404 Model "glm-5.4" is not available for this group`；
+  `/v1/models` 只列出 `glm-5.3` / `glm-5.3-flash`。
+- 用同一 key 试 Zhipu 官方 `https://open.bigmodel.cn/api/paas/v4` → `401 令牌已过期或验证不正确`。
+- 结论：secrets.json 里的 `glm-5.4` key 在当前 agc group 下不可用；需要正确的 baseUrl/group/model id（或换 key）后再跑。

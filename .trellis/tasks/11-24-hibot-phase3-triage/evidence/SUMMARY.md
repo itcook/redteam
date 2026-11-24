@@ -16,13 +16,13 @@
 
 | 目标 | 结果 |
 |---|---|
-| lib | 1095 passed |
+| lib | 1132 passed |
 | bin | 21 passed |
 | `capabilities` | 4 passed |
 | `job_conformance` | 23 passed |
 | `packaging` | 7 passed |
 | `review_e2e` | 24 passed |
-| `triage_conformance` | 6 passed |
+| `triage_conformance` | 9 passed |
 | `triage_prior_report` | 3 passed |
 | doc-tests | 0 |
 
@@ -32,7 +32,7 @@
 |---|---|---|
 | 3.1 输入 | `src/triage/input.rs`、`src/job/run.rs::run_triage`；缺 `pr_context`/`diff_patch`/`merge_base` → error | `triage_conformance::missing_pr_context_is_an_error_report`、`input::tests::*` |
 | 3.2 StandardsMap | `src/triage/standards.rs`（doc→linter→peer；no-standard 仅三者皆无；越界/二进制拒收） | `standards::tests::resolves_doc_first_then_linter_then_peer_and_no_standard` 等 4 条 |
-| 3.3 三轴 | `src/triage/lenses.rs` + 4 个模板；安全轴 7 面、conf<8 丢弃、无 source→sink 路径封顶 7；分片公式 `min(4,…)` | `lenses::tests::surfaces_and_tier2_whitelist_match_the_human_baseline`、`shard_formulas_are_the_grill_ones`、`triage_conformance::triage_ok_*` |
+| 3.3 三轴 | `src/triage/lenses.rs` + 5 个模板；安全轴 7 面、conf<8 丢弃、无 source→sink 路径封顶 7；意图两阶段（I0 claims/overlap + I1..In diff 切片）；三轴取 `roles.reviewer` | `surfaces_and_tier2_whitelist_match_the_human_baseline`、`shard_formulas_are_the_grill_ones`、`triage_conformance::triage_ok_*`、`intent_slice_delivers_claims_and_discloses_counts`、`unfinished_intent_slices_do_not_create_intent_blockers` |
 | 3.4 去重 | 安全/漂移 file+归一 quote+hint；意图按声明身份；无锚意图项不并入代码行 | `tally::tests::dedupe_is_per_axis_and_intent_without_anchor_is_not_merged_into_code_rows` |
 | 3.5 tally | 单点实现；tier2 白名单反例；risk/fit/routing/confidence | `tier2_only_for_surfaces_1_3_4_at_conf_8_and_sql_injection_is_not_promoted`、`risk_and_fit_tables_cover_every_rule`、`summary_is_the_nine_keys_plus_nested_routing` |
 | 3.6 blockers | 只披露；`findings`/`blockers` 形状不同；review 不读 blockers | `findings_and_blockers_are_distinct_arrays`、`triage_conformance::review_projection_reads_routing_only_not_blockers`、`triage_prior_report::prior_report_does_not_change_the_finding_set` |
@@ -44,7 +44,10 @@
 ## 3.8 真实对拍摘要
 
 - 5 个基线 PR：sites #277 / #235 / #328、cli #18、backend #333（tier2）。
-- 另有 1 次 sites #333 冒烟（无人工基线）；backend #333 共 3 次（A、GLM infra 失败、A2）。
+- 另有 1 次 sites #333 冒烟（无人工基线）；backend #333 多轮（A、GLM infra、A2、A 流程 A/B）。
+- **A 流程 A/B**：DeepSeek high 在 backend #333 为 177.7s / ok / tier1 / blockers0（人工 tier2 / blockers0），
+  intent 20/20 claims complete；sites #328 为 114.8s / ok / tier0 / blockers2。
+  GLM-5.3 high 仍 too slow（I0 150s 超时 / slice 166s 超时，partial）；GLM-5.4 因 provider 404 未跑。
 - **无「干净判 tier 2」**：4 个 tier0 PR 全部 tier0。
 - **tier2 漏报 1 例**：backend #333 人工 tier2，我们 tier0（DeepSeek A/A2 均 0 行；GLM 那次 infra 失败）。
 - 丢弃率：backend #333 A 轮安全轴 1 行候选、1 行 <8 被丢（100%）；A2 后 0 行候选。
@@ -65,6 +68,8 @@ intent 轴 `{ok:false, rows:0, error:"structured-output parse failed: finish_rea
 ## 已知限制
 
 - `risk` 的 `blockers≥3 → high` 是 grill 定案的 `[拟议]` 规则，与人工的 medium/high 判断有系统性差异（已记入 COMPARISON）。
-- 真实对拍只用了 DeepSeek Flash（GLM 一次 infra 失败后未再试，按协调者裁决）。
+- 真实对拍主模型为 DeepSeek Flash；GLM-5.3 在 A 流程下仍无法在 1200s 内完成（I0/slice 超时）；
+  GLM-5.4 在当前 agc group 返回 404（详见 COMPARISON.md）。
+- `triage` 现在取 `roles.reviewer`（2026-11-24 用户调整）；`config check --kind triage` 也要求 reviewer。
 - 3.8 的报告是单次运行；人工基线中 sites #328 本身有 3 次不同结论（blk1/1/4），差异表按全部列出。
 - `dropped_rows` 是诊断披露，不是契约必需字段；每轴最多 20 条样本。
