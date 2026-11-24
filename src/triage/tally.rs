@@ -795,4 +795,41 @@ mod tests {
         }
         assert!(s.get("focus").is_none(), "routing 不得提到顶层");
     }
+
+    /// 3.6 反例：findings 5 条 / blockers 2 条 —— blockers 只是披露面，不得把全部 findings 当阻塞项。
+    #[test]
+    fn findings_and_blockers_are_distinct_arrays() {
+        let (_d, root) = repo_with(&[
+            ("src/a.rs", "let a = 1;\nlet b = 2;\nlet c = 3;\nlet d = 4;\nlet e = 5;\n"),
+        ]);
+        let mut changed = BTreeSet::new();
+        changed.insert("src/a.rs".to_string());
+        let quotes = ["let a = 1;", "let b = 2;", "let c = 3;", "let d = 4;", "let e = 5;"];
+        let sec: Vec<SecurityRow> = quotes
+            .iter()
+            .enumerate()
+            .map(|(i, q)| SecurityRow {
+                base: Row { file: "src/a.rs".into(), line_start: (i + 1) as u32, line_end: (i + 1) as u32, quote: (*q).into(), confidence: 8, note: String::new() },
+                surface: 5,
+                reach: "request -> engine".into(),
+            })
+            .collect();
+        let intent = IntentOutput {
+            claims: vec![
+                Claim { claim: "claim one".into(), source: "body".into(), delivered: false, evidence: vec![], note: String::new() },
+                Claim { claim: "claim two".into(), source: "issue#1".into(), delivered: false, evidence: vec![], note: String::new() },
+            ],
+            ..Default::default()
+        };
+        let p = prepare(&root, &pr(), &changed, &sec, &[], Some(&intent));
+        let t = tally(&p, &StandardsMap::default(), 3600, false);
+        assert_eq!(t.findings.len(), 5, "5 条安全 finding");
+        assert_eq!(t.blockers.len(), 2, "只有 2 条意图阻塞项");
+        let findings = serde_json::to_value(&t.findings).unwrap();
+        for f in findings.as_array().unwrap() {
+            assert!(f.get("fingerprint").is_some() || f.get("id").is_some());
+            assert!(f.get("kind").is_none());
+        }
+        assert!(t.blockers.iter().all(|b| b.get("kind").is_some() && b.get("fingerprint").is_none()));
+    }
 }
