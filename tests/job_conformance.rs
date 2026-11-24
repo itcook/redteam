@@ -203,6 +203,8 @@ async fn clean_fixture_is_ok_with_empty_findings_and_echoes_input() {
         assert!(r.get(k).is_some(), "missing {k}: {r}");
     }
     assert!(r["usage"]["input_tokens"].as_u64().unwrap() > 0);
+    // 报告不得含 cost（跨阶段不变式④）。
+    assert!(r["usage"].get("cost").is_none() && r["usage"].get("cost_usd").is_none(), "{r}");
     // job 模式零写 repo
     assert!(git(&fx.repo, &["status", "--porcelain"]).is_empty(), "repo 必须保持干净");
     assert!(!fx.repo.join(".redteam").exists(), "job 模式不得创建 .redteam");
@@ -612,6 +614,7 @@ async fn prior_report_only_adjusts_lens_and_budget() {
     assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx_a.job, Some(over_a.as_ref())).await, 0);
     let base_report = read_report(&fx_a.job);
     assert_eq!(base_report["status"], "ok", "{base_report}");
+    assert!(base_report["extensions"]["redteam"].get("prior_routing").is_none(), "没有 prior_report 时不写该键");
 
     // 实验组：focus + 一份可读 spec + 一份不可读 spec + 建议预算。
     let scan_b = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));

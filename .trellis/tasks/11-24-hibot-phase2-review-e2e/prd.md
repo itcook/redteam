@@ -62,17 +62,41 @@ paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
 
 最终：`cargo test` 全绿、`make verify` 零 diff、Conventional Commits 按 2.x 分提交。
 
-## 待协调者确认（**提议，未裁决**）
+## 协调者裁决（2026-11-24，已落实）
 
-- **2.6 完整性检查**（按派单：detached、非 shallow、对象可得、merge-base 可算）：
-  判 `error` 的情形为「shallow / `pr.head_sha` 对象缺失 / `pr.base_sha` 对象缺失 / `merge_base` 对象缺失 /
-  `git merge-base <pr.base_sha> <pr.head_sha>` 不可算」。**不比较** `merge_base == pr.base_sha`（Q2 明令）。
-  detached 是 hibot 的输入保证；非 detached 不另判错（同一 commit 的分支检出语义等价），仅在 PRD 记录口径。
-- **提议新增机器码**：`repo_incomplete:<what>`（error，`what ∈ shallow|head|base|merge_base`）。附录 E 未定义完整性码。
-- **提议新增报告级扩展键**：`refute_skipped`（string，P2 裁决要求）、`input_consistency`（2.1 披露）、
-  `prior_routing`（2.3 披露）。附录 D 未定义这三个键。
-- **dismissed 审计位置**：附录 D 把 `ledger` 列在 **finding 级**；派单又说「被驳回项不复报」。
-  本单元按附录 D 实现为「保留条目 + finding 级 `extensions.redteam.ledger = {dismissed, actor, reason}`，
-  且 `refuted` 恒 false」，由 hibot 按指纹过滤 verdict/评论。若协调者要求改为从 `findings` 删除，
-  审计需改挂报告级。
-- **diff 不一致披露键**：`input_consistency {match, files, git, only_in_patch[], only_in_git[], differing[]}`。
+- **Q-A dismissed 审计位置 → 保留在 `findings[]` + finding 级 `ledger`**：条目带
+  `extensions.redteam.ledger = {dismissed, actor, reason}`，`refuted` 恒 false；不计入 blocking/verdict；
+  同指纹只保留一条（审计覆盖其上）。
+- **Q-B 四项提议全部采纳**：`repo_incomplete:<what>`（shallow|head|base|merge_base）、
+  `input_consistency`（三张表各 ≤20 + `*_total`、按路径字典序）、`prior_routing`、`refute_skipped`。
+- **2.6 只要求 merge-base 可算，不比较** `merge-base(base,head)` 与 `inputs.merge_base`。
+- **非 detached 不判错**（观测可加，不做门禁；本单元未加布尔）。
+- 附录 D/E 已按上述补行并标注 **Phase 2 新增**。
+
+## 结果（2026-11-24，待协调者验收）
+
+### 提交（`feature/hibot-audit-exec`，基线 `9f27a4a`）
+
+| commit | 内容 |
+|---|---|
+| `0d6a67d` | 2.1/2.2 变更集改吃 `diff_patch` + 投影与检出完整性（含 2.6 首落） |
+| `0078789` | 2.3 `prior_report` 只消费 `summary.routing` |
+| `49849ff` | 2.5 quote 逐字校验（重锚 → 检出原文修正 → 指纹 → 丢弃计数 → partial） |
+| `fdf3515` | 2.4 `dismissed.csv` 闭环（严格 RFC4180 + 指纹匹配 + finding 级审计） |
+| `3402c5c` | P2 job 模式无 refuter 时跳过验真并披露 |
+| `1c8def7` | 2.7 语言落地端到端用例 |
+| `dfb3362` | 出口 `capabilities/redteam.json` + 钉子测试 |
+
+### 关键实现
+
+- `src/job/projection.rs`（2.1）、`src/job/prior.rs`（2.3）、`src/job/dismissed.rs`（2.4）、
+  `src/job/quote.rs`（2.5）、`src/job/repo.rs`（2.6）；`positioning::verbatim_span` 为逐字重锚唯一实现。
+- `CellRecord.dropped_quote` 新增（上游解析阶段丢弃可聚合）；`review_shot` 的重复计数修正。
+- `Config::refute_enabled(job_mode, roles)` 为 P2 唯一判定点；`pick_refuter` 语义未改。
+- `stage0_risk` 在 `args.job_mode` 下直接不碰台账路径。
+
+### 验证
+
+- `cargo test`：1053 lib + 21 bin + 4 capabilities + 18 job_conformance + 7 packaging + 24 e2e，全绿。
+- `make verify`：exit 0（codex-skills 与 `dist/config.schema.json` 零 diff，packaging 7/7）。
+- capabilities 用 hibot `audit-capabilities.schema.json` 原位只读校验：PASS。

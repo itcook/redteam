@@ -572,6 +572,9 @@ Phase 1 内部硬序：1.1/1.2/1.3/1.4 → 1.5 → 1.6/1.7/1.8/**1.9**（1.9 的
 | `template_hashes` | `{scan, review, refute, triage, fix_verify}` | 按 kind | 只列本次用到的 |
 | `axes` | `[{axis, ok, rows, error?}]` | triage | 三轴各自用量/失败 |
 | `blockers` | `[{file?, line?, quote?, intent?}]` | triage | 传给 review 的“已确认项”（可无代码锚） |
+| `refute_skipped` | string | job 模式 + 验真开启 + 未声明 refuter | **Phase 2 新增**；值恒 `no_refuter`（不静默、不塞 `refuted`）；本地模式不写（仍自动异族回退） |
+| `input_consistency` | `{match, git, files, git_files, only_in_patch[]{≤20}, only_in_git[]{≤20}, differing[]{≤20}, *_total}` | 总是（review） | **Phase 2 新增**；`diff_patch` 与 `git diff merge_base..HEAD` 的比对，不一致**只披露**，排序字典序、各表封顶 20 |
+| `prior_routing` | `{present, focus[], specs_used[], specs_unreadable, wall_clock_s}` | 有 `prior_report` 时 | **Phase 2 新增**；只含 `summary.routing` 三件事，不含历史 findings / 计数 / tier |
 
 **finding 级（`finding.extensions.redteam`）**
 
@@ -610,6 +613,7 @@ Phase 1 内部硬序：1.1/1.2/1.3/1.4 → 1.5 → 1.6/1.7/1.8/**1.9**（1.9 的
 | `config_invalid:<pointer>` | executor config 在 `<pointer>` 处不合法 | invalid executor config at `<pointer>` |
 | `config_contains_secret:<pointer>` | executor config 含敏感字段 `<pointer>`；凭据只走环境变量 | executor config contains secret field `<pointer>`; supply credentials via env vars |
 | `head_sha_mismatch` | 检出 HEAD 与 manifest 不一致 | checkout HEAD differs from manifest |
+| `repo_incomplete:<what>` | 检出缺少必需对象 `<what>`（或是浅克隆）；`what ∈ shallow\|head\|base\|merge_base`（**Phase 2 新增**） | checkout is missing required object `<what>` (or is shallow) |
 | `invalid_fingerprint_input` | findings.json 中有非法指纹 | findings.json contains an invalid fingerprint |
 | `missing_role:<role>` | 缺少 `<role>` 角色且无可用回退 | missing role `<role>` with no fallback |
 | `internal_panic` | 内部错误：`<msg>` | internal error: `<msg>` |

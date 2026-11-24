@@ -277,7 +277,8 @@ async fn run_review(
                 lang,
                 &report::ReviewExtras {
                     input_consistency: Some(input_consistency),
-                    prior_routing: Some(prior.disclosure.clone()),
+                    // 没有 prior_report 时不写这个键（附录 D：有 prior_report 时）。
+                    prior_routing: (!prior.disclosure.is_null()).then(|| prior.disclosure.clone()),
                     dropped_unverified_quotes: dropped,
                     ledger,
                     refute_skipped,
