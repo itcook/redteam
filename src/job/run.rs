@@ -134,7 +134,9 @@ pub async fn run_with(
     };
     if remaining.is_zero() || early_signal {
         let sink = JobDirCellSink::new(out_dir.clone());
-        let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink, None, &dismissed);
+        let refute_skipped = (cfg.review.refuters.enabled && cfg.active_roles().refuters.is_empty())
+            .then_some("no_refuter");
+        let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink, None, &dismissed, refute_skipped);
         return finish(&out_dir, r);
     }
     match run_review(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, &dismissed, remaining, started, &mut sigterm, over).await {
@@ -209,6 +211,8 @@ async fn run_review(
     if roles.reviewers.is_empty() {
         return Err(JobFailure::new("missing_role", Some("reviewer".into())));
     }
+    // P2：job 模式 + 验真开启 + 未声明 refuter → 跳过验真；报告必须显式披露。
+    let refute_skipped = (cfg.review.refuters.enabled && roles.refuters.is_empty()).then_some("no_refuter");
     let args = ReviewArgs {
         job_mode: true,
         base: Some(base),
@@ -276,6 +280,7 @@ async fn run_review(
                     prior_routing: Some(prior.disclosure.clone()),
                     dropped_unverified_quotes: dropped,
                     ledger,
+                    refute_skipped,
                     extra_partial,
                     ..Default::default()
                 },
@@ -285,7 +290,7 @@ async fn run_review(
         Err(()) => {
             // 停止派发：drop 掉运行 future（tokio 取消），再用已落地 cell 组 partial。
             drop(run);
-            Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink, Some(&repo), dismissed))
+            Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink, Some(&repo), dismissed, refute_skipped))
         }
     }
 }

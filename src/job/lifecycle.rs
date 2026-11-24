@@ -118,6 +118,7 @@ pub fn interrupted_report(
     sink: &JobDirCellSink,
     root: Option<&std::path::Path>,
     dismissed: &crate::job::dismissed::Dismissed,
+    refute_skipped: Option<&'static str>,
 ) -> HibotReport {
     let (cells, _phases) = sink.snapshot();
     let findings = findings_from_cells(&cells);
@@ -138,6 +139,7 @@ pub fn interrupted_report(
     let mut extras = crate::job::report::ReviewExtras {
         dropped_unverified_quotes: dropped,
         ledger,
+        refute_skipped,
         ..Default::default()
     };
     if dropped > 0 {
@@ -219,7 +221,15 @@ mod tests {
           "inputs":{}
         }"#).unwrap();
         let lang = crate::config::Language::EnUs.output();
-        let r = interrupted_report(&manifest, &lang, &Config::default(), &sink, None, &crate::job::dismissed::Dismissed::default());
+        let r = interrupted_report(
+            &manifest,
+            &lang,
+            &Config::default(),
+            &sink,
+            None,
+            &crate::job::dismissed::Dismissed::default(),
+            None,
+        );
         assert_eq!(r.status, crate::job::status::JobStatus::Partial);
         assert!(r.status_reason.unwrap().contains("wall-clock budget"));
         assert_eq!(r.extensions["redteam"]["status_code"], "wall_clock_exhausted");

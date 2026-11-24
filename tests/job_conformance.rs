@@ -737,3 +737,54 @@ async fn malformed_dismissed_csv_is_an_error() {
     assert_eq!(r["status"], "error");
     assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:dismissed");
 }
+
+/// P2（用户 2026-11-24 裁）：job + enabled + 无 refuter → 跳过验真并披露（不得静默）。
+#[tokio::test]
+async fn job_mode_without_refuter_skips_refute_and_discloses() {
+    let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
+    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
+    let over = fake_override(scan, review);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["extensions"]["redteam"]["refute_skipped"], "no_refuter", "{r}");
+    let deep = &r["extensions"]["redteam"]["run"]["deep"];
+    assert_eq!(deep["refute_triggered"].as_u64().unwrap_or(0), 0, "不得偷偷真跑");
+    assert_eq!(deep["refute_skipped"]["disabled"].as_u64().unwrap_or(0) >= 1, true, "{deep}");
+    assert_eq!(r["findings"][0]["refuted"], false, "跳过验真不得塞 refuted");
+}
+
+/// P2：job + enabled + 有 refuter → 真跑（refute_triggered > 0，且不披露 refute_skipped）。
+#[tokio::test]
+async fn job_mode_with_explicit_refuter_runs_refute() {
+    let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
+    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+    cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let refute = Arc::new(FakeChatBackend::repeating(turn(r#"{"verdict":"UPHELD","reason":"real SQL string concat"}"#)));
+    let over = Box::new({
+        let (scan, review, refute) = (scan.clone(), review.clone(), refute.clone());
+        move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            if em.provider != "p1" {
+                return None;
+            }
+            match em.id.as_str() {
+                "s" => Some(Box::new(scan.clone())),
+                "r" => Some(Box::new(review.clone())),
+                "v" => Some(Box::new(refute.clone())),
+                _ => None,
+            }
+        }
+    }) as Box<redteam::cli::BackendOverride<'_>>;
+    let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert!(r["extensions"]["redteam"].get("refute_skipped").is_none(), "{r}");
+    let deep = &r["extensions"]["redteam"]["run"]["deep"];
+    assert!(deep["refute_triggered"].as_u64().unwrap_or(0) >= 1, "有 refuter 必须真跑: {deep}");
+    assert!(refute.turn_count() >= 1, "refuter 后端必须被调用");
+    assert_eq!(r["findings"][0]["refuted"], false, "UPHELD 不算证伪");
+}

@@ -155,6 +155,8 @@ pub struct ReviewExtras {
     pub extra_partial: Vec<JobFailure>,
     /// 2.4：命中 `dismissed.csv` 的 finding 审计行（指纹 → actor/reason）。
     pub ledger: std::collections::BTreeMap<String, crate::job::dismissed::Entry>,
+    /// P2：job 模式 + 验真开启 + 未声明 refuter → 跳过验真的披露（`"no_refuter"`）。
+    pub refute_skipped: Option<&'static str>,
 }
 
 /// review 的 `ReviewReport` → hibot 信封。
@@ -203,6 +205,10 @@ pub fn review_report(
     // 2.1：patch 与 git 的不一致只披露，不改行为。
     if let Some(v) = &extras.input_consistency {
         redteam["input_consistency"] = v.clone();
+    }
+    // P2：job 模式没有显式 refuter → 跳过验真，必须显式披露（不得静默、不得塞 refuted）。
+    if let Some(s) = extras.refute_skipped {
+        redteam["refute_skipped"] = json!(s);
     }
     // 2.5：quote 无法逐字命中的丢弃计数（>0 才披露）。
     if extras.dropped_unverified_quotes > 0 {
@@ -344,6 +350,9 @@ pub fn partial_report(
         "concurrency": concurrency_json(cfg),
         "budget": { "wall_clock_s": manifest.limits.wall_clock_s, "truncated_items": truncated_items },
     });
+    if let Some(s) = extras.refute_skipped {
+        redteam["refute_skipped"] = json!(s);
+    }
     if extras.dropped_unverified_quotes > 0 {
         redteam["dropped_unverified_quotes"] = json!(extras.dropped_unverified_quotes);
     }

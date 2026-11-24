@@ -779,6 +779,12 @@ impl Config {
         sets
     }
 
+    /// P2（用户 2026-11-24 裁）：**job 模式**下 `roles.refuters` 为空 → 不验真（不自动异族回退）。
+    /// 本地模式保持现状：`pick_refuter` 自动异族 + 同族 warning，`--help` 文案不动。
+    /// 这里只算「要不要验真」；不在 `pick_refuter` 里加分支（回退语义只服务本地路径）。
+    pub fn refute_enabled(&self, job_mode: bool, roles: &RoleSets) -> bool {
+        self.review.refuters.enabled && !(job_mode && roles.refuters.is_empty())
+    }
     /// 护栏（0.8 术语硬切，R20）：存在 `roles.verifier` 但没有任何 `roles.refuter`。
     ///
     /// 硬切后 `verifier` 的语义已变（现在只指 fix 验证），旧本地配置里的 `roles.verifier`
@@ -1528,6 +1534,33 @@ mod tests {
         assert!(!empty.review.refuters.enabled, "空 refuters 段 → 同样关");
         let on: Config = serde_json::from_str(r#"{"review":{"refuters":{"enabled":true}}}"#).unwrap();
         assert!(on.review.refuters.enabled, "显式 true 照样开");
+    }
+
+    /// P2 三条用例（用户 2026-11-24 裁）：job + enabled + 无 refuter → 跳过；job + 有 refuter → 真跑；
+    /// local + enabled + 无 refuter → 仍验真（自动异族回退）。
+    #[test]
+    fn job_mode_without_refuter_skips_refute_but_local_falls_back() {
+        let no_refuter: Config = serde_json::from_str(
+            r#"{"review":{"refuters":{"enabled":true}},"providers":{"p":{"kind":"openai","models":{
+                "s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#,
+        )
+        .unwrap();
+        let roles = no_refuter.active_roles();
+        assert!(roles.refuters.is_empty());
+        assert!(!no_refuter.refute_enabled(true, &roles), "job + enabled + 无 refuter → 跳过");
+        assert!(no_refuter.refute_enabled(false, &roles), "local + enabled + 无 refuter → 仍验真（自动异族）");
+
+        let with_refuter: Config = serde_json::from_str(
+            r#"{"review":{"refuters":{"enabled":true}},"providers":{"p":{"kind":"openai","models":{
+                "s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}},"v":{"roles":{"refuter":{}}}}}}}"#,
+        )
+        .unwrap();
+        let roles = with_refuter.active_roles();
+        assert_eq!(roles.refuters.len(), 1);
+        assert!(with_refuter.refute_enabled(true, &roles), "job + enabled + 有 refuter → 真跑");
+
+        let off: Config = serde_json::from_str(r#"{"providers":{}}"#).unwrap();
+        assert!(!off.refute_enabled(false, &off.active_roles()), "产品缺省关");
     }
 
     #[test]

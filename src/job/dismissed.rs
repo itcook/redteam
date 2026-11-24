@@ -131,7 +131,7 @@ fn validate_rfc4180(bytes: &[u8]) -> Result<(), JobFailure> {
     let mut st = St::FieldStart;
     let mut col = 0usize; // 当前记录已走过的分隔符数 → 字段数 = col + 1
     let mut i = 0usize;
-    let mut end_record = |col: usize| -> Result<(), JobFailure> {
+    let end_record = |col: usize| -> Result<(), JobFailure> {
         // 4 列固定（表头 + 数据行同形）。
         if col + 1 != HEADER.len() {
             return Err(bad());

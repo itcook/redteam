@@ -452,7 +452,8 @@ pub async fn run_code_review(
                 backend_factory: Some(factory.as_ref()),
                 refute: Some(crate::orchestrate::deep::RefuteInput {
                     roles: &roles,
-                    enabled: cfg.review.refuters.enabled,
+                    // P2：job 模式且没有显式 refuter → 不验真（本地模式仍自动异族回退）。
+                    enabled: cfg.refute_enabled(args.job_mode, &roles),
                     // 与 verdict 同一份阈值（收口评审 #9）：旗标覆盖必须同时作用于两处。
                     block_threshold: thresholds.0,
                     conf_floor: thresholds.1,
@@ -2059,7 +2060,7 @@ pub async fn run_resume(
                     backend_factory: Some(factory.as_ref()),
                     refute: Some(crate::orchestrate::deep::RefuteInput {
                         roles: &roles,
-                        enabled: cfg.review.refuters.enabled,
+                        enabled: cfg.refute_enabled(args.job_mode, &roles),
                         block_threshold: thresholds.0,
                         conf_floor: thresholds.1,
                         precedents: &ledger.cards,
