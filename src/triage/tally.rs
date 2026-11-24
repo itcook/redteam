@@ -629,18 +629,24 @@ mod tests {
     }
 
     #[test]
-    fn tier2_only_for_surfaces_1_3_4_at_conf_8_and_sql_injection_is_not_promoted() {
-        let sec = vec![AnchoredSecurity {
+    fn tier2_whitelist_secrets_and_code_exec_conf8_sql_injection_stays_tier1() {
+        let mut sec = vec![AnchoredSecurity {
             file: "a".into(), line_start: 1, line_end: 1, quote: "q".into(),
             surface: 5, confidence: 10, reach: "r".into(), note: String::new(),
         }];
         assert_eq!(security_tier(&sec), 1, "SQL 注入（面 5）不得升 2");
-        let mut t2 = sec.clone();
-        t2[0].surface = 4;
-        t2[0].confidence = 8;
-        assert_eq!(security_tier(&t2), 2);
-        t2[0].confidence = 7;
-        assert_eq!(security_tier(&t2), 1);
+        // 2026-11-24 用户裁决：secrets（面 2）conf≥8 → tier2。
+        sec[0].surface = 2;
+        sec[0].confidence = 8;
+        assert_eq!(security_tier(&sec), 2, "secrets conf=8 可升 2");
+        sec[0].confidence = 10;
+        assert_eq!(security_tier(&sec), 2, "secrets conf=10 可升 2");
+        sec[0].confidence = 7;
+        assert_eq!(security_tier(&sec), 1, "secrets conf=7 仍是 tier1");
+        // 面 4 仍按 conf≥8 升 2。
+        sec[0].surface = 4;
+        sec[0].confidence = 8;
+        assert_eq!(security_tier(&sec), 2);
         assert_eq!(security_tier(&[]), 0);
     }
 
