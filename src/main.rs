@@ -44,7 +44,7 @@ enum Cmd {
     /// 会再派一个模型复查，被驳回的不计数、不拦路（记录仍在 findings 里，带 refute 字段）。
     /// 配 `review.refuters.enabled = true` 打开：没给模型配 refuter 角色时**自动挑一个异族**的 reviewer / scanner；
     /// 配了 refuter 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦（异族更准，见下）。
-    /// 观测在 `run.deep.refute_triggered` / `refute_skipped`（分类：not_triggered·disabled·carried·precedent·consensus·resumed·cached·no_verifier）/
+    /// 观测在 `run.deep.refute_triggered` / `refute_skipped`（分类：not_triggered·disabled·carried·precedent·consensus·resumed·cached·no_refuter）/
     /// `refute_refuted` / `refute_failed` / `refute_tail_ms` 与顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。
     /// 缺省关的依据：对本仓人裁台账的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 8%
     /// （预登记门槛 ≤ 5%），代价是静默少报；异族那臂驳回更多（31% vs 19%），误驳两臂分不出高下。
@@ -179,20 +179,20 @@ enum Cmd {
         #[arg(long = "override")]
         override_cmd: Option<String>,
     },
-    /// 隐藏：复核单发离线跑（M21b 批 D-4，只读仓 / 零写库）——读一条 finding JSON，建**产品同一份**
-    /// 复核 prompt 发一轮，打印判决 JSON；`--dump-prompt` 只打印 prompt 不发请求。
-    /// `eval/verify_score.py` 靠它打离线基线（design §8.1「去留由数据决定」〔D17〕）；
+    /// 隐藏：验真单发离线跑（M21b 批 D-4，只读仓 / 零写库）——读一条 finding JSON，建**产品同一份**
+    /// 验真 prompt 发一轮，打印判决 JSON；`--dump-prompt` 只打印 prompt 不发请求。
+    /// `eval/refute_score.py` 靠它打离线基线（design §8.1「去留由数据决定」〔D17〕）；
     /// 输入形态是机器面（台账导出的 finding 行），不进 `--help` 的用户面。
     #[command(hide = true)]
-    VerifyOnce {
+    RefuteOnce {
         /// finding JSON 路径（`-` = stdin）：{file,line_start,line_end,severity,title,body,quote}
         finding: String,
         /// 证据树根（缺省当前目录）——历史锚点物化成临时树后指过来。
         #[arg(long)]
         root: Option<String>,
-        /// 复核模型 `provider/id`（缺省取配置里 verifier 角色的第一个）。
+        /// 验真模型 `provider/id`（缺省取配置里 refuter 角色的第一个）。
         #[arg(long)]
-        verifier: Option<String>,
+        refuter: Option<String>,
         /// 只打印 prompt，不发请求。
         #[arg(long)]
         dump_prompt: bool,
@@ -1180,13 +1180,13 @@ async fn main() {
             }
         }
         Cmd::Risk { base, head, dismissed, before } => run_risk(&base, head.as_deref(), dismissed.as_deref(), before.as_deref()),
-        Cmd::VerifyOnce { finding, root, verifier, dump_prompt } => {
+        Cmd::RefuteOnce { finding, root, refuter, dump_prompt } => {
             let cfg = load_config_warned();
-            redteam::cli::verify_once::run_verify_once(
-                redteam::cli::verify_once::VerifyOnceArgs {
+            redteam::cli::refute_once::run_refute_once(
+                redteam::cli::refute_once::RefuteOnceArgs {
                     finding: &finding,
                     root: root.as_deref(),
-                    verifier: verifier.as_deref(),
+                    refuter: refuter.as_deref(),
                     dump_prompt,
                 },
                 &cfg,
@@ -1686,7 +1686,7 @@ mod tests {
         }
     }
 
-    /// 批 D〔D17〕：**纯 verifier 模型也要进 registry**。漏注册时 `pick_verifier` 选中它，
+    /// 批 D〔D17〕：**纯 refuter 模型也要进 registry**。漏注册时 `pick_refuter` 选中它，
     /// 每条复核都会在 `lease()` 上拿到 Unavailable、静默落成「保守 upheld」——看起来跑了、其实一次没验。
     #[test]
     fn build_registry_registers_refuter_only_models() {
@@ -1710,7 +1710,7 @@ mod tests {
         );
     }
 
-    /// 批 D-5（收口评审 #8）：verifier 模型造不出 backend **不该拒跑整条命令**——复核缺省还关着，
+    /// 批 D-5（收口评审 #8）：refuter 模型造不出 backend **不该拒跑整条命令**——复核缺省还关着，
     /// 而 `kind: "google"` 一类尚不支持的 provider 在 backend 构造处返回 Err。
     /// reviewer 造不出仍是硬 Err（本轮的活真干不了）。
     #[test]
@@ -1723,7 +1723,7 @@ mod tests {
         )
         .unwrap();
         let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new("."))
-            .expect("verifier 造不出 backend 不该让整条 review 拒跑");
+            .expect("refuter 造不出 backend 不该让整条 review 拒跑");
         assert!(
             reg.has_for(redteam::config::Role::Scanner, "p/s")
                 && !reg.has_for(redteam::config::Role::Refuter, "g/v")
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     /// 同一模型兼任多角色：按角色键各注册一份 backend，档位互不覆盖。
-    /// dogfood 暴露的真问题：旧实现只留先注册的 scanner 档，reviewer / verifier 配 high 照样跑 medium。
+    /// dogfood 暴露的真问题：旧实现只留先注册的 scanner 档，reviewer / refuter 配 high 照样跑 medium。
     #[test]
     fn build_registry_keeps_role_scoped_reasoning_efforts() {
         let cfg: redteam::config::Config = serde_json::from_str(

@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 pub struct CarryOutcome {
-    /// 重锚成活的携带项（行号已更新、origin=Carried；severity/agreement/verify/
+    /// 重锚成活的携带项（行号已更新、origin=Carried；severity/agreement/refute/
     /// dismissed 状态原样——refuted/dismissed 本就不 blocking，携带无害）。
     pub carried: Vec<Finding>,
     /// 重锚失败被消灭的 id（使锚失效的改动必在本轮 delta 内，正被审；审计用）。

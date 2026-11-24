@@ -62,7 +62,7 @@ fn merge_into(base: &mut Finding, other: &Finding) {
     }
     base.hard_constraint = base.hard_constraint || other.hard_constraint;
     // 判决合并（批 D〔D17〕Q11）：流式复核发生在 dedup **之前**，同一个 bug 被两个格报出来时会各验一次。
-    // 原本这里完全不碰 `verify`——base 的判决直接胜出、other 的被静默丢，且 confidence 取 max 会与
+    // 原本这里完全不碰 `refute`——base 的判决直接胜出、other 的被静默丢，且 confidence 取 max 会与
     // 「refuted 归零」打架（可能留下「verdict 写着 REFUTED、confidence 却是 0.7」的自相矛盾记录）。
     // **UPHELD 优先**：方向与验收门槛一致——误驳（静默删掉真缺陷）比漏驳危险得多。
     base.refute = match (base.refute.take(), other.refute.clone()) {
@@ -118,7 +118,7 @@ mod tests {
     /// 会各验一次。base 无判决 → 继承 other；一方 UPHELD → UPHELD 胜（误驳会静默删掉真缺陷）；
     /// 两方都 REFUTED → 保持 refuted 且 confidence 归零（否则 max 会留下「REFUTED + 0.9」的自相矛盾记录）。
     #[test]
-    fn verify_verdicts_merge_with_upheld_winning() {
+    fn refute_verdicts_merge_with_upheld_winning() {
         use crate::domain::{Refute, RefuteVerdict};
         let verdict = |v: RefuteVerdict, m: &str| Some(Refute { verdict: v, model: m.into(), note: String::new() });
         let pair = |a: Option<Refute>, b: Option<Refute>| {

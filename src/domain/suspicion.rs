@@ -49,7 +49,7 @@ pub struct ScanOutput {
     pub scanned_areas: Vec<ScannedArea>,
 }
 
-/// verifier cell 的单条判决（design §8.1：`REFUTED | UPHELD` + 一句理由；analysis 先于 verdict 是 prompt 字段序，不在此）。
+/// refuter cell 的单条判决（design §8.1：`REFUTED | UPHELD` + 一句理由；analysis 先于 verdict 是 prompt 字段序，不在此）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RefuteEntry {
     /// 被判决的 finding id。

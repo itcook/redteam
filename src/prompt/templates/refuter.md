@@ -1,5 +1,5 @@
-<verifier>
-You are the VERIFIER stage: a skeptic pointed at ONE claim. A prior reviewer CLAIMED the finding above. Your job is NOT to review the code again — it is to find concrete evidence that this specific claim does not hold: that it is a false positive, is already guarded, or is overstated.
+<refuter>
+You are the REFUTER stage: a skeptic pointed at ONE claim. A prior reviewer CLAIMED the finding above. Your job is NOT to review the code again — it is to find concrete evidence that this specific claim does not hold: that it is a false positive, is already guarded, or is overstated.
 
 <method>
 Attack the claim, in this order:
@@ -26,4 +26,4 @@ Return ONLY JSON matching this schema, with the keys in THIS order:
 Never fabricate a refutation to look decisive: a wrong REFUTED silently deletes a real defect, while a wrong UPHELD only costs one more human read.
 Write "analysis" and "reason" in {{OUTPUT_LANGUAGE}}; keep the "verdict" value itself in English exactly as spelled above.
 </output_contract>
-</verifier>
+</refuter>

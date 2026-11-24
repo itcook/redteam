@@ -842,7 +842,7 @@ mod tests {
         assert!(s.contains("share same root cause"), "cluster note must appear");
     }
     #[test]
-    fn md_marks_refuted_verify() {
+    fn md_marks_refuted_refute() {
         use crate::domain::{Refute, RefuteVerdict};
         let mut r = report();
         r.findings[0].refute = Some(Refute { verdict: RefuteVerdict::Refuted, model: "gpt".into(), note: "guarded".into() });
@@ -850,7 +850,7 @@ mod tests {
         assert!(s.to_lowercase().contains("refuted"), "md must mark refuted findings");
     }
     #[test]
-    fn md_marks_upheld_verify() {
+    fn md_marks_upheld_refute() {
         use crate::domain::{Refute, RefuteVerdict};
         let mut r = report();
         r.findings[0].refute = Some(Refute { verdict: RefuteVerdict::Upheld, model: "gpt".into(), note: String::new() });

@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_empty_note_roundtrips_after_skip() {
+    fn refute_empty_note_roundtrips_after_skip() {
         // 空 note → skip_serializing 跳键；反序列化（read_partial 路径）须 default 回 ""，
         // 否则缺键报错 → 整条记录被 filter_map 静默丢弃（Critical 数据丢失回归防护）。
         let v = Refute { verdict: RefuteVerdict::Upheld, model: "m".into(), note: String::new() };

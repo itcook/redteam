@@ -11,7 +11,7 @@ const NEED_LINES_WINDOW: usize = 30;
 
 /// 补查证据单条段字节帽（Important 修复：此前无上限——长单行文件上 ±30 行窗可逼近
 /// read_capped 的 512KB 读帽，doc 线整文件 need 直接就是整文件，均绕开预算纪律）。
-/// 量级对齐 verify.rs::SNIPPET_FULL_FILE_CAP（64KB）。
+/// 量级对齐 refute.rs::SNIPPET_FULL_FILE_CAP（64KB）。
 const NEED_SECTION_BYTE_CAP: usize = 64_000;
 
 /// NeedEntry.lines 解析："a-b"（1-based、a<=b）→ Some((a,b))；缺失/坏格式 → None（整文件语义）。

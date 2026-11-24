@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""verifier 离线基线（M21b 批 D-4，design §8.1「去留由数据决定」〔D17〕）。
+"""refuter 离线基线（M21b 批 D-4，design §8.1「去留由数据决定」〔D17〕）。
 
 固定集 = 本仓自己的人裁台账导出（`fixtures/ledger-{dismissed,upheld}.jsonl`，见 export_ledger.py）：
   - `dismissed` = 人读后判定的误报 → **期望 REFUTED**（驳回率的分母）
   - `upheld`    = 人确认的真缺陷   → **期望 UPHELD**（误驳率的分母）
 
-三步：`build`（零网络，锚定 + 物化 + 生成用例）→ `run`（逐条调 `redteam verify-once`）→
+三步：`build`（零网络，锚定 + 物化 + 生成用例）→ `run`（逐条调 `redteam refute-once`）→
 `score`（混淆矩阵 + 两率 + 预登记阈值裁定）。prompt / provider / 判决解析全在产品二进制里，
 本脚本一行都不复刻——复刻一份，测的就不是产品了。零第三方依赖（照 harness.py 纪律）。
 
 用法：
-  python3 eval/verify_score.py build --repo . --out eval/out/verify-cases
-  python3 eval/verify_score.py run eval/out/verify-cases --verifier deepseek/deepseek-flash \
+  python3 eval/refute_score.py build --repo . --out eval/out/verify-cases
+  python3 eval/refute_score.py run eval/out/verify-cases --refuter deepseek/deepseek-flash \
       --bin ./target/release/redteam --out eval/out/verify-deepseek.json
-  python3 eval/verify_score.py score eval/out/verify-deepseek.json [--baseline prev.json]
-  python3 eval/verify_score.py selftest
+  python3 eval/refute_score.py score eval/out/verify-deepseek.json [--baseline prev.json]
+  python3 eval/refute_score.py selftest
 """
 import argparse
 import concurrent.futures
@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 
-# 预登记阈值（跑之前定死，D17 Q6）：两条同时满足才把 verifiers.enabled 的默认值打开。
+# 预登记阈值（跑之前定死，D17 Q6）：两条同时满足才把 refuters.enabled 的默认值打开。
 # 误驳（把真缺陷驳掉）会静默删证据，故门收得紧；驳回率低于 30% 则这一路只是在烧 token。
 MAX_FALSE_REFUTE = 0.05
 MIN_REFUTE = 0.30
@@ -154,10 +154,10 @@ def cmd_build(a):
 
 # ---------------- run：逐条过产品二进制 ----------------
 
-def one_case(binpath, case, verifier, timeout):
-    cmd = [binpath, "verify-once", case["finding"], "--root", case["root"]]
-    if verifier:
-        cmd += ["--verifier", verifier]
+def one_case(binpath, case, refuter, timeout):
+    cmd = [binpath, "refute-once", case["finding"], "--root", case["root"]]
+    if refuter:
+        cmd += ["--refuter", refuter]
     t0 = time.time()
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -185,7 +185,7 @@ def cmd_run(a):
     results = [None] * len(cases)
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.parallel) as ex:
-        futs = {ex.submit(one_case, a.bin, c, a.verifier, a.timeout): i for i, c in enumerate(cases)}
+        futs = {ex.submit(one_case, a.bin, c, a.refuter, a.timeout): i for i, c in enumerate(cases)}
         for fut in concurrent.futures.as_completed(futs):
             i = futs[fut]
             results[i] = fut.result()
@@ -193,7 +193,7 @@ def cmd_run(a):
             r = results[i]
             print(f"[{done}/{len(cases)}] {r['id']} {r['oracle']:9s} → {r.get('verdict')} "
                   f"({r.get('wall_s')}s)", file=sys.stderr)
-    payload = {"verifier": a.verifier, "bin": a.bin, "cases_dir": os.path.abspath(a.cases),
+    payload = {"refuter": a.refuter, "bin": a.bin, "cases_dir": os.path.abspath(a.cases),
                "template_hash": next((r.get("template_hash") for r in results if r.get("template_hash")), None),
                "config_sha256": a.config_sha256, "ran_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                "results": results}
@@ -248,7 +248,7 @@ def cmd_score(a):
     payload = json.load(open(a.run, encoding="utf-8"))
     t = tally(payload["results"])
     r = rates(t)
-    print(f"模型 {payload.get('verifier')} · 模板 {payload.get('template_hash')} · 跑于 {payload.get('ran_at')}")
+    print(f"模型 {payload.get('refuter')} · 模板 {payload.get('template_hash')} · 跑于 {payload.get('ran_at')}")
     print(f"混淆矩阵（行=人裁 oracle，列=复核判决）")
     print(f"  dismissed(期望 refuted): refuted {t['dismissed']['refuted']:3d} | upheld {t['dismissed']['upheld']:3d}")
     print(f"  upheld   (期望 upheld ): refuted {t['upheld']['refuted']:3d} | upheld {t['upheld']['upheld']:3d}")
@@ -256,14 +256,14 @@ def cmd_score(a):
     print(f"驳回率  {r['refute_rate']:.1%}  (n={r['n_dismissed']}, 95%CI {r['refute_ci'][0]:.1%}–{r['refute_ci'][1]:.1%})  门槛 ≥ {MIN_REFUTE:.0%}")
     print(f"误驳率  {r['false_refute_rate']:.1%}  (n={r['n_upheld']}, 95%CI {r['false_refute_ci'][0]:.1%}–{r['false_refute_ci'][1]:.1%})  门槛 ≤ {MAX_FALSE_REFUTE:.0%}")
     verdict = {True: "true", False: "false", None: "判不了（有一臂是空集）"}[r["pass"]]
-    print(f"预登记裁定：verifiers.enabled 默认 {verdict}")
+    print(f"预登记裁定：refuters.enabled 默认 {verdict}")
     if a.baseline:
         b = rates(tally(json.load(open(a.baseline, encoding="utf-8"))["results"]))
         print(f"对比基线：驳回 {b['refute_rate']:.1%} → {r['refute_rate']:.1%} · "
               f"误驳 {b['false_refute_rate']:.1%} → {r['false_refute_rate']:.1%}")
     if a.out:
         with open(a.out, "w", encoding="utf-8") as fh:
-            json.dump({"verifier": payload.get("verifier"), "tally": t, **r}, fh, ensure_ascii=False, indent=1)
+            json.dump({"refuter": payload.get("refuter"), "tally": t, **r}, fh, ensure_ascii=False, indent=1)
     return 0
 
 
@@ -312,10 +312,10 @@ def main():
     b.add_argument("--out", default="eval/out/verify-cases")
     b.set_defaults(fn=cmd_build)
 
-    r = sub.add_parser("run", help="逐条过 `redteam verify-once`")
+    r = sub.add_parser("run", help="逐条过 `redteam refute-once`")
     r.add_argument("cases", help="build 的产物目录")
     r.add_argument("--bin", default="./target/release/redteam")
-    r.add_argument("--verifier", required=True, help="provider/id")
+    r.add_argument("--refuter", required=True, help="provider/id")
     r.add_argument("--parallel", type=int, default=4)
     r.add_argument("--timeout", type=int, default=900)
     r.add_argument("--limit", type=int, default=0, help="只跑前 N 条（冒烟）")

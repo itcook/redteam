@@ -949,8 +949,8 @@ pub fn reasoning_effort_warning(em: &crate::config::EffectiveModel) -> Option<St
     ))
 }
 
-/// 建注册表时的 reasoningEffort 无映射 warnings（scanner → reviewer → verifier 序，同文案去重）。
-/// 同一模型跨角色各占一份角色键 backend，每个角色的档位都要单独披露（批 C1-3；批 D-5 并入 verifier，收口评审 runner-up）。
+/// 建注册表时的 reasoningEffort 无映射 warnings（scanner → reviewer → refuter 序，同文案去重）。
+/// 同一模型跨角色各占一份角色键 backend，每个角色的档位都要单独披露（批 C1-3；批 D-5 并入 refuter，收口评审 runner-up）。
 pub fn role_reasoning_effort_warnings(roles: &crate::config::RoleSets) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for w in roles.scanners.iter().chain(&roles.reviewers).chain(&roles.refuters).filter_map(reasoning_effort_warning) {

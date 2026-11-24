@@ -33,8 +33,8 @@ fn contains_pem_private_key(content: &str) -> bool {
 /// 实现收敛到 `prompt::neutralize_structure`（Task 4，dossier entries 同类风险共用一套）。
 fn neutralize_spec_delimiters(content: &str) -> String {
     // spec 与 brief 同在**稳定前缀**里，同样要与角色无关地中和：三张表标签集不同
-    // （`</diff>` / `</evidence>` / `</dossier>` 在 scan + reviewer 有、verifier 没有），
-    // 只中和 `</spec_docs>` 会让含 `</diff>` 的设计文档在 verifier 侧与另两侧字节不同、cache 前缀裂开。
+    // （`</diff>` / `</evidence>` / `</dossier>` 在 scan + reviewer 有、refuter 没有），
+    // 只中和 `</spec_docs>` 会让含 `</diff>` 的设计文档在 refuter 侧与另两侧字节不同、cache 前缀裂开。
     // B-1 只修了 brief 这一半，另一半在同一个 system 串里（2026-09-29 `/code-review` 指出）。
     crate::prompt::neutralize_for_stable_prefix(content)
 }
@@ -517,7 +517,7 @@ mod brief_tests {
     }
 
     /// `--spec` 与 brief 同在稳定前缀里，中和也要与角色无关：`</diff>` 在 scan + reviewer 表里有、
-    /// verifier 表里没有，只中和 `</spec_docs>` 会让含它的设计文档在 verifier 侧字节不同。
+    /// refuter 表里没有，只中和 `</spec_docs>` 会让含它的设计文档在 refuter 侧字节不同。
     #[test]
     fn spec_is_neutralized_role_independently_too() {
         let d = tempfile::tempdir().unwrap();
