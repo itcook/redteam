@@ -68,3 +68,10 @@ hibot audit 执行单元接入的 U2 单元（协调者 01a20ba0 派发）。计
 - 已知限制：`check_text` 仍另建严格扫描（未复用 `from_json_warned` 的内部单点，但两侧共用键表；
   后续可统一）；Phase 1 不写 `state.json`（D3）；triage 无 summary（D1）。
 - 临时行为（Phase 4 删除）：`kind_not_implemented:<kind>`（附录 E 已登记）。
+
+## 验收（2026-11-24，协调者通过）
+
+- 协调者独立复核全绿：`cargo build` 告警 0、`make verify` exit 0、`cargo test` 1013+21+7+7+24 全绿；
+  schema 生成幂等；CLI 冒烟（B1 / roles.gerbil / job-dir 互斥）符合预期；指纹与 P4 逐字一致。
+- 已 `git merge --no-ff` 合入 `hibot-executor` = `b1ff880`。
+- 临时项登记，Phase 3/4 派发时逐项删除：`kind_not_implemented:<kind>`、verify 的逐条 `inconclusive`。
