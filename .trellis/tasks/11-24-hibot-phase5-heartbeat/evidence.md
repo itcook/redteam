@@ -1,6 +1,6 @@
 # Phase 5 · 心跳逐项验收对照（U5）
 
-受测提交：`33f5248`（job 心跳收口）+ `b4e04c2`（registry retrying 回归），基线 `cd047e9`。
+受测提交：`3c63f89`（最终代码，含心跳收口与回归测试），基线 `cd047e9`。
 验证环境：worktree `~/hobby/.worktrees/redteam/hibot-heartbeat`，最终代码工作树 clean。
 
 ## 命令（原始日志与退出码见 `evidence/`）
@@ -8,12 +8,12 @@
 | 命令 | 退出码 | 原始日志 |
 |---|---|---|
 | `make verify` | 0（`evidence/make-verify.exit`） | `evidence/make-verify.log`（gen/schema 无 diff；packaging 7 passed） |
-| `cargo test` | 0（`evidence/cargo-test.exit`） | `evidence/cargo-test.log`（1090 + 21 + 4 + 25 + 7 + 24 passed, 0 failed） |
+| `cargo test` | 0（`evidence/cargo-test.exit`） | `evidence/cargo-test.log`（1091 + 21 + 4 + 25 + 7 + 24 passed, 0 failed） |
 
 `cargo test` 各测试目标的结果行：
 
 ```
-test result: ok. 1090 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 1091 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
