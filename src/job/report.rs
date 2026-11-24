@@ -115,10 +115,6 @@ pub fn error_report(manifest: &JobManifest, lang: &OutputLang, failure: &JobFail
     r
 }
 
-/// D1：triage/verify 在 Phase 1 没有分析实现——写 error + 临时码，禁止伪造 summary/findings。
-pub fn kind_not_implemented_report(manifest: &JobManifest, lang: &OutputLang) -> HibotReport {
-    error_report(manifest, lang, &JobFailure::new("kind_not_implemented", Some(manifest.kind.as_str().into())))
-}
 
 /// D1 + A 裁决（Phase 1）：未实现的 verify 对每个有效输入指纹输出 `inconclusive`（未核验），
 /// 整体 `status=error` + `kind_not_implemented`——满足逐条覆盖，又不伪造 resolved/unresolved。
@@ -292,6 +288,68 @@ pub fn map_finding(
         refuted: f.is_refuted() && dismissed.is_none(),
         source: SourceOut { executor: "redteam".into(), model, role: "reviewer".into() },
         extensions: if ext.is_empty() { Value::Null } else { json!({ "redteam": Value::Object(ext) }) },
+    }
+}
+
+/// triage 报告（`report.triage/1`，3.6/3.7）：`summary` 只在 `status=ok` 出现；
+/// `extensions.redteam.blockers[]` 是**给 hibot 的披露面**，review 不读它（`prior.rs` 只读 routing）。
+pub fn triage_report(
+    manifest: &JobManifest,
+    lang: &OutputLang,
+    cfg: &Config,
+    outcome: &crate::triage::TriageOutcome,
+    template_hash: &str,
+) -> HibotReport {
+    let reasons = outcome.reasons.clone();
+    let partial = render_partial(&reasons, lang);
+    let ok = outcome.summary.is_some() && reasons.is_empty();
+    let mut r = HibotReport::base(manifest);
+    r.status = if ok { JobStatus::Ok } else { JobStatus::Partial };
+    r.status_reason = partial.as_ref().map(|t| t.reason.clone());
+    r.findings = outcome.findings.iter().map(map_triage_finding).collect();
+    r.summary = if ok { outcome.summary.clone() } else { None };
+    r.usage = UsageOut {
+        input_tokens: outcome.usage.0,
+        output_tokens: outcome.usage.1,
+        cached_input_tokens: outcome.usage.2,
+        wall_clock_ms: 0,
+    };
+    let mut redteam = json!({
+        "language": language_json(lang),
+        "concurrency": concurrency_json(cfg),
+        "budget": { "wall_clock_s": manifest.limits.wall_clock_s, "truncated_items": 0 },
+        "template_hashes": { "triage": template_hash },
+        "axes": outcome.axes,
+        "blockers": outcome.blockers,
+    });
+    if let Some(t) = partial {
+        redteam["status_code"] = json!(t.code);
+    }
+    r.extensions = json!({ "redteam": redteam });
+    r
+}
+
+/// triage 的 finding → hibot 信封（`source.role = scanner`；指纹仍走唯一实现）。
+fn map_triage_finding(f: &crate::domain::Finding) -> HibotFinding {
+    let fingerprint = fingerprint::of(&f.file, &f.quote, &f.title);
+    HibotFinding {
+        fingerprint,
+        severity: f.severity.as_str().to_string(),
+        confidence: f.confidence,
+        file: f.file.clone(),
+        line_start: f.line_start,
+        line_end: f.line_end,
+        quote: f.quote.clone(),
+        title: f.title.clone(),
+        body: f.body.clone(),
+        recommendation: f.recommendation.clone(),
+        refuted: false,
+        source: SourceOut {
+            executor: "redteam".into(),
+            model: f.models.first().cloned().unwrap_or_default(),
+            role: "scanner".into(),
+        },
+        extensions: Value::Null,
     }
 }
 
@@ -489,7 +547,7 @@ mod tests {
           "paths":{"repo":"../repo","out":"out","config":"config/executor.redteam.json"},
           "inputs":{}
         }"#).unwrap();
-        let v = kind_not_implemented_report(&vm, &lang);
+        let v = kind_not_implemented_verify(&vm, &lang, &[]);
         assert_eq!(v.kind, "verify");
         assert_eq!(v.extensions["redteam"]["status_code"], "kind_not_implemented:verify");
         assert_eq!(v.verifications.as_deref(), Some(&[][..]), "verify 报告必须带 verifications（空也可）");

@@ -1,0 +1,198 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `drift` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:aee7fdcd531c1bead8154b6184c30dc3634381d67df8c0b123d263f6e81f65eb",
+      "severity": "medium",
+      "confidence": 0.9,
+      "file": "service/feishu_finance_agent_client.go",
+      "line_start": 286,
+      "line_end": 286,
+      "quote": "{\"role\": \"user\", \"content\": text},",
+      "title": "Security (surface 5): injection",
+      "body": "Reachability: Feishu event payload field `event.message.content` -> decoded at service/feishu_finance_agent.go:319 (`_ = common.UnmarshalJsonStr(msg.Content, &content)`) -> `text` built at line 320 and persisted as `RawText` at line 334 -> `parseFeishuFinanceAgentCommand(ctx, text)` at line 358 -> embedded verbatim as the user-role chat message at service/feishu_finance_agent_client.go:286 -> POSTed to the chat/completions endpoint at service/feishu_finance_agent_client.go:349; the LLM's structured output then determines target account, commission rate, withdrawal flag and gift-credit amount of the pending action executed via `model.AddAffPromotionUsers` / `model.GrantAdminCredits`.\nNote: Prompt injection: chat text is sent unescaped to the LLM as a user instruction, and the model's reply steers the proposed plan (which account gets promotion/commission/withdrawal changes and up to 1,000,000 gift credits). Realistic vector is indirect injection: a whitelisted Root operator pastes or replies to third-party/group content. Mitigations exist but do not break the path: sender whitelist + live Root role check (authorizeFeishuFinanceAgentOperator), 500-rune cap, strict json_schema plus server-side field validation (validateFeishuFinanceAgentCommandJSON), deterministic numeric bounds in buildFeishuFinanceAgentPlan, and a human confirmation card echoing the raw text with injection warnings (feishuFinanceAgentInjectionWarningText); the final gate is the operator noticing the mismatch on the card.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 93970,
+    "output_tokens": 100656,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 449736
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 2,
+            "dropped_rows": [
+              {
+                "conf": 6,
+                "file": "service/feishu_finance_agent_ws.go",
+                "line": 142,
+                "reason": "below_threshold",
+                "surface": 5
+              },
+              {
+                "conf": 3,
+                "file": "service/feishu_finance_agent_ws.go",
+                "line": 105,
+                "reason": "below_threshold",
+                "surface": 7
+              }
+            ],
+            "dropped_total": 2,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 3,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 45074,
+            "output_tokens": 29811
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 2,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-drift` exceeded its 123.840856262s budget",
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 12274,
+            "output_tokens": 6765
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 2,
+          "claims": 20,
+          "delivered": 9,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-intent-slice` exceeded its 321.553403803s budget during repair",
+          "notes": [
+            "Verification statements (not counted as claims): 20 new/updated tests covering plan building, full confirm flow, duplicate clicks, non-initiator/demoted Root, cancel/expiry, stranger handling, SDK event and card callback conversion, re-click while executing, crash recovery, fresh-record protection, json_schema-to-json_object fallback, command JSON field validation, injection warnings, replay re-authentication, fencing version, parsing recovery, and withdrawal current value; `go build ./...` and `go test ./service ./model ./router ./controller` reportedly pass; three command classes retested with a real DeepSeek model (`deepseek-v4.1-flash`); an end-to-end smoke with a real Feishu app and real model was reportedly completed locally.",
+            "Configuration is provided via environment variables `FEISHU_FINANCE_AGENT_APP_ID`, `FEISHU_FINANCE_AGENT_APP_SECRET`, `FEISHU_FINANCE_AGENT_LLM_BASE_URL`, `FEISHU_FINANCE_AGENT_LLM_API_KEY`, `FEISHU_FINANCE_AGENT_LLM_MODEL`, and optional `FEISHU_FINANCE_AGENT_OPENAPI_BASE`; the Feishu console must enable events `im.message.receive_v1` and `card.action.trigger` plus permissions `im:message:send_as_bot`, `im:message.p2p_msg:readonly`, `im:message.group_at_msg:readonly`.",
+            "Minor review-handling assertions not elevated to claims: model returns only raw quota with credit formatting moved to the service display layer; `ErrFeishuFinanceAgentBadCallback` is converted to an error toast at the WS card callback layer; the reply on parse failure was changed to '请重新发送指令' (please resend the command).",
+            "The author explicitly states the threat model requires Root-side acceptance before relying on it.",
+            "The author notes a local SQLite development issue with glebarez v1.10 restart DDL, stated as unrelated to this PR (production uses PostgreSQL).",
+            "No reviewer comments were supplied in the input, so maintainer overlap could not be assessed beyond the empty field.",
+            "This slice is the dependency/wiring/schema layer (go.mod, go.sum, main.go, model/*). Behavioral enforcement for c1, c4, c7-c9, c12-c16, c20 is expected in the service/* files covered by other slices and was intentionally not emitted here.",
+            "Comment-only references in model/feishu_finance_agent.go (lines 11-18) describe the end-to-end flow (c1), in-process execution without issued credentials (c4), and id-only card buttons (c7/c14); comments were not treated as delivery evidence on their own.",
+            "All 30 go.sum additions are checksums for larksuite/oapi-sdk-go/v3 and its transitive dependencies (gogo/protobuf, golang.org/x/*, gopkg.in-era x/*), consistent with claim c2; no unrelated dependency changes found in this slice, hence no scope creep."
+          ],
+          "ok": false,
+          "rows": 1,
+          "scope_creep": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 36622,
+            "output_tokens": 64080
+          },
+          "verification_complete": false
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:drift",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

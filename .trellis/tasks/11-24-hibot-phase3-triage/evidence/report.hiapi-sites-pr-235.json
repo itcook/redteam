@@ -1,0 +1,411 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-235",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "b27a36035f65418b245cd2b7fe739daf18162251",
+    "base_sha": "973d7369f2d08dd7d4e0279843dbad224df4be94"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:c9ffbea3cf3658ee20dfe0402b8c4696130fb40ca8515fd3c5ebeddf32f2a5f5",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/design.md",
+      "line_start": 197,
+      "line_end": 197,
+      "quote": "export const queryClient: QueryClient;              // 应用实例（__root.tsx 用）",
+      "title": "Structural drift: ownership",
+      "body": "Standard: .trellis/spec/apps/dashboard/frontend/api-layer-contract.md §1（禁止「在本模块里放**模块级单例**」）/ §2（`createTokenMutation(client: QueryClient)`，不要闭包模块单例）\nNote: The archived design declares a module-level `queryClient` export in `lib/query-client.ts`, which the shipped contract forbids: the application instance must be created by a factory/injection (`createQueryClient({ onAuthExpired })`) and passed explicitly, otherwise tests and production share one cache and invalidation assertions become meaningless.",
+      "recommendation": "Align placement / naming / ownership with .trellis/spec/apps/dashboard/frontend/api-layer-contract.md §1（禁止「在本模块里放**模块级单例**」）/ §2（`createTokenMutation(client: QueryClient)`，不要闭包模块单例）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:13d3df57ed6b08cd5613d8bb8f6d34ac93fc9ffa8d1c71825a94a120e7d43936",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/implement.md",
+      "line_start": 48,
+      "line_end": 48,
+      "quote": "- [ ] 3.3 `src/lib/api/keys.ts`：`norm()` + 各域 key 工厂（`auth`/`tokens`/`logs`/`usage`/`billing`/`referral`/`settings`/`storages`/`tickets`/`overview`/`system`）。",
+      "title": "Structural drift: other",
+      "body": "Standard: .trellis/spec/apps/dashboard/frontend/api-layer-contract.md §6（「**不排序、不剔除参数**」）/ design.md §1 被否掉的方案（`keys.ts` 里加通用 `norm()` 排序参数）\nNote: The implementation checklist still instructs adding a `norm()` key-normalization helper, contradicting the key-registry contract ('结构恒为 `[domain, resource, ...params]`', no sorting/no pruning) and the design's own rejected-scheme table; following implement.md would reintroduce the discarded normalization layer.",
+      "recommendation": "Align placement / naming / ownership with .trellis/spec/apps/dashboard/frontend/api-layer-contract.md §6（「**不排序、不剔除参数**」）/ design.md §1 被否掉的方案（`keys.ts` 里加通用 `norm()` 排序参数）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:11c498802d2b82ddd6739ab833b74e6f728ab2eaa11914e8b8537d1fa7c8fc54",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "CLAUDE.md",
+      "line_start": 50,
+      "line_end": 50,
+      "quote": "- **测试不入 `src/`**：统一放与 `src/` 同级的 **`tests/`**，子目录**镜像 `src/`**（`tests/blog/…` ↔ `src/blog/…`）；共享测试辅助（如 harness）放 `tests/` 根或 `tests/support/`。",
+      "title": "Structural drift: placement",
+      "body": "Standard: CLAUDE.md#工程规范 (test placement rule, context line of this hunk)\nNote: The repo rule keeps tests out of `src/` and puts them in a sibling `tests/` tree that mirrors `src/`. This PR's dashboard tests are co-located inside `src/` (e.g. `apps/dashboard/src/lib/api/http.test.ts`, `apps/dashboard/src/lib/api/keys.test.ts`, `apps/dashboard/src/lib/api/modules.test.ts`, `apps/dashboard/src/lib/api/api-map.test.ts`, `apps/dashboard/src/lib/query-client.test.ts`, `apps/dashboard/src/features/auth/auth-flow.test.ts`, `apps/dashboard/src/components/chrome/dashboard-header.test.ts`), crossing the source/test boundary the rule establishes. No diff content for those files was supplied, so the row is anchored on the standard line itself.",
+      "recommendation": "Align placement / naming / ownership with CLAUDE.md#工程规范 (test placement rule, context line of this hunk).",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:937ad3caa27a8f10f3ecbb3e0da26aa71a242cd26a0f275cff129375bfd866d5",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/dashboard/src/lib/site.ts",
+      "line_start": 37,
+      "line_end": 41,
+      "quote": "export function currentLocale(): SiteLocale {\n  if (typeof window === \"undefined\") return \"en\";\n  const first = window.location.pathname.split(\"/\").filter(Boolean)[0];\n  return first && isSiteLocale(first) ? first : \"en\";\n}",
+      "title": "Structural drift: ownership",
+      "body": "Standard: peer:apps/dashboard/src/routes/$locale/dashboard.tsx:69\nNote: Introduces a second, URL-string-based source for the current locale alongside the router-owned `$locale` param that the route module already resolves into `safeLocale` and passes to `createT(safeLocale)` / `useSignOut(safeLocale)`. Re-deriving the locale by splitting `window.location.pathname` (and silently defaulting to `en` for any non-locale prefix) moves locale resolution ownership out of the router parameter and into `lib`, creating two competing locale sources.",
+      "recommendation": "Align placement / naming / ownership with peer:apps/dashboard/src/routes/$locale/dashboard.tsx:69.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    }
+  ],
+  "summary": {
+    "blockers_count": 7,
+    "convention_drift": "structural",
+    "fit": "needs-scope-decision",
+    "intent_undelivered": 3,
+    "local_count": 4,
+    "risk": "high",
+    "routing": {
+      "focus": [
+        ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/design.md",
+        ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/implement.md",
+        "CLAUDE.md",
+        "apps/dashboard/src/lib/site.ts",
+        "intent:Pagination parameter names split three ways: `p`/`page_size`"
+      ],
+      "specs": [
+        "AGENTS.md"
+      ],
+      "wall_clock_s": 900
+    },
+    "scope_creep_count": 2,
+    "security_tier": 0,
+    "structural_count": 4
+  },
+  "usage": {
+    "input_tokens": 360968,
+    "output_tokens": 76068,
+    "cached_input_tokens": 1408,
+    "wall_clock_ms": 133079
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 512,
+            "input_tokens": 86498,
+            "output_tokens": 2806
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".docs/architectures",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/spec/apps/dashboard/frontend",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/11-12-dashboard-console-migration",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/workspace/Weilai",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/dashboard",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/dashboard/docs",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/dashboard/messages",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/dashboard/src/components/chrome",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/dashboard/src/features/auth",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/dashboard/src/lib",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/dashboard/src/lib/api",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/dashboard/src/routes",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/dashboard/src/routes/$locale",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "repair_notes": [
+            "triage-drift: first turn parse failed (finish=length, text_len=0, head=\"\"); repaired"
+          ],
+          "rows": 8,
+          "usage": {
+            "cached_input_tokens": 768,
+            "input_tokens": 193760,
+            "output_tokens": 62206
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "notes": [
+            "The PR label is `review: low`, but the diff adds ~4.5k lines of new production code (transport layer, 14 domain modules, 401 single point, guard state machine) plus ~1.4k lines of tests — the label appears inconsistent with the change size.",
+            "Internal figures disagree across the PR body (85 pass / 195 assertions, gzip 147,442 B / −0.03%), verification.md (109 pass / 246 assertions, 147,939 B / +0.31%) and the workspace journal (110 pass / 250 assertions). At least two of the three are stale.",
+            "api-map.test.ts hard-codes `expect(rows.length).toBe(60)`, so the doc/endpoint count claim is enforced by the test suite rather than review alone; adding an endpoint later requires updating both the table and this constant.",
+            "The `failed` guard state is documented in .trellis/spec/apps/dashboard/frontend/api-layer-contract.md §7 (three error destinations must not be merged), so the code matches that spec even though the PR body does not state it.",
+            "query-client.ts deliberately exposes no module-level singleton; the app instance is created via useState(() => createQueryClient({ onAuthExpired: handleSessionExpired })) in __root.tsx, matching the body's 'injected at the app layer' description.",
+            "No reviewer comments or linked issues were supplied, so maintainer overlap cannot be assessed and no claim uses an issue source."
+          ],
+          "ok": true,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 128,
+            "input_tokens": 80710,
+            "output_tokens": 11056
+          }
+        }
+      ],
+      "blockers": [
+        {
+          "category": "ownership",
+          "file": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/design.md",
+          "kind": "structural",
+          "line_end": 197,
+          "line_start": 197,
+          "quote": "export const queryClient: QueryClient;              // 应用实例（__root.tsx 用）"
+        },
+        {
+          "category": "other",
+          "file": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/implement.md",
+          "kind": "structural",
+          "line_end": 48,
+          "line_start": 48,
+          "quote": "- [ ] 3.3 `src/lib/api/keys.ts`：`norm()` + 各域 key 工厂（`auth`/`tokens`/`logs`/`usage`/`billing`/`referral`/`settings`/`storages`/`tickets`/`overview`/`system`）。"
+        },
+        {
+          "category": "placement",
+          "file": "CLAUDE.md",
+          "kind": "structural",
+          "line_end": 50,
+          "line_start": 50,
+          "quote": "- **测试不入 `src/`**：统一放与 `src/` 同级的 **`tests/`**，子目录**镜像 `src/`**（`tests/blog/…` ↔ `src/blog/…`）；共享测试辅助（如 harness）放 `tests/` 根或 `tests/support/`。"
+        },
+        {
+          "category": "ownership",
+          "file": "apps/dashboard/src/lib/site.ts",
+          "kind": "structural",
+          "line_end": 41,
+          "line_start": 37,
+          "quote": "export function currentLocale(): SiteLocale {\n  if (typeof window === \"undefined\") return \"en\";\n  const first = window.location.pathname.split(\"/\").filter(Boolean)[0];\n  return first && isSiteLocale(first) ? first : \"en\";\n}"
+        },
+        {
+          "claim": "Pagination parameter names split three ways: `p`/`page_size` for topup, redemptions, logs and aff; `page`/`page_size` for tickets; `page`/`size` for storages.",
+          "kind": "intent",
+          "note": "logs is implemented with `p`/`per_page`, not `p`/`page_size`: LogListParams declares `per_page`, api-map's logs.list row lists `p` and `per_page`, and modules.test.ts asserts per_page=20. Only callLogs/aff/topup/redemptions actually use `page_size`. The stated family grouping does not match the code.",
+          "source": "body"
+        },
+        {
+          "claim": "Verification results: typecheck 0 errors, tests 85 pass / 0 fail (195 assertions), build succeeds, dist gzip 147,442 B (baseline 147,486, −0.03%, gate +5%), bare-fetch audit 0 hits.",
+          "kind": "intent",
+          "note": "No CI output is in the diff, and the PR's own artifacts contradict the body's figures: verification.md reports 109 pass / 246 assertions and 147,939 B (+0.31%); the journal reports 110 pass / 250 assertions. The specific numbers in the body are therefore not corroborated anywhere in the diff.",
+          "source": "body"
+        },
+        {
+          "claim": "The invalidation matrix in modules.test.ts is table-driven and covers all 16 invalidation-carrying mutations (including 'invalidates only itself' negative cases), plus updateEmailPreferences write-back and logout clearing the whole cache.",
+          "kind": "intent",
+          "note": "The mechanism exists (CASES table with expectInvalidated/expectUntouched, write-back test, performSignOut clear assertion in auth-flow.test.ts), but the count is wrong: the code contains 20 invalidating mutations plus updateEmailPreferences, and the PR's own verification.md states 21 — not 16. The CASES table itself only holds 12 entries, the rest are individual tests.",
+          "source": "body"
+        }
+      ],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 900
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "2c750615f126b5f3"
+      }
+    }
+  }
+}

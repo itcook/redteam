@@ -1,0 +1,29 @@
+query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      title
+      body
+      author{login __typename}
+      labels(first:50){nodes{name}}
+      comments(first:100){nodes{author{login __typename} body createdAt}}
+      closingIssuesReferences(first:20){nodes{number title state body}}
+      commits(last:1){
+        nodes{
+          commit{
+            statusCheckRollup{
+              state
+              contexts(first:100){
+                nodes{
+                  __typename
+                  ... on CheckRun{name conclusion}
+                  ... on StatusContext{context state}
+                }
+              }
+            }
+          }
+        }
+      }
+      files(first:100){nodes{path additions deletions changeType}}
+    }
+  }
+}

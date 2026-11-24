@@ -1,8 +1,7 @@
 //! `capabilities/redteam.json` 的钉子（计划 §5 出口 / hibot 契约 §4）。
 //!
 //! 契约原话：`kinds` 是**声明，不是愿望**——hibot 只会派已声明的类型。
-//! 本仓 Phase 2 只完成 `review`，triage / verify 仍是 `kind_not_implemented`；
-//! 因此这里的断言是**硬编码的 `["review"]`**：等 Phase 3/4 落地时改这份文件与这条断言。
+//! Phase 3 完成后声明 `review` + `triage`；`verify` 仍等 Phase 4。
 
 use serde_json::Value;
 
@@ -19,8 +18,8 @@ fn declares_only_implemented_kinds() {
     assert_eq!(c["name"], "redteam");
     assert_eq!(
         c["kinds"],
-        serde_json::json!(["review"]),
-        "triage / verify 尚未实现（Phase 3/4）——提前声明即违约（hibot 只派已声明类型）"
+        serde_json::json!(["review", "triage"]),
+        "triage 已实现（Phase 3）；verify 尚未实现（Phase 4）——提前声明即违约（hibot 只派已声明类型）"
     );
 }
 

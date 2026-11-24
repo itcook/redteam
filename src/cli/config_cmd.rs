@@ -77,7 +77,7 @@ fn check(text: &str, kind: Option<JobKind>) -> (Option<Config>, Vec<Diag>, Vec<D
     let mut errors: Vec<Diag> = issues.into_iter().map(issue_diag).collect();
     let mut warnings = Vec::new();
     if let Some(c) = &cfg {
-        // 角色最小集（P2）：review = scanner + reviewer；triage = scanner；verify = verifier 或 reviewer。
+        // 角色最小集（P2）：review = scanner + reviewer；triage = reviewer（2026-11-24 起）；verify = verifier 或 reviewer。
         let roles = c.active_roles();
         match kind {
             Some(JobKind::Review) => {
@@ -89,8 +89,8 @@ fn check(text: &str, kind: Option<JobKind>) -> (Option<Config>, Vec<Diag>, Vec<D
                 }
             }
             Some(JobKind::Triage) => {
-                if roles.scanners.is_empty() {
-                    errors.push(missing_role("scanner"));
+                if roles.reviewers.is_empty() {
+                    errors.push(missing_role("reviewer"));
                 }
             }
             Some(JobKind::Verify) => {
@@ -174,10 +174,11 @@ mod tests {
     fn missing_roles_are_errors_per_kind() {
         let no_scanner = r#"{"providers":{"p":{"kind":"openai","models":{"r":{"roles":{"reviewer":{}}}}}}}"#;
         assert_eq!(run(no_scanner, Some("review")).0, 1);
-        assert_eq!(run(no_scanner, Some("triage")).0, 1);
+        assert_eq!(run(no_scanner, Some("triage")).0, 0, "triage 只需 reviewer");
         assert_eq!(run(no_scanner, Some("verify")).0, 0);
-        let neither = r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}}}}}}"#;
-        assert_eq!(run(neither, Some("verify")).0, 1, "verifier 与 reviewer 都缺");
+        let no_reviewer = r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}}}}}}"#;
+        assert_eq!(run(no_reviewer, Some("triage")).0, 1, "triage 缺 reviewer");
+        assert_eq!(run(no_reviewer, Some("verify")).0, 1, "verifier 与 reviewer 都缺");
     }
 
     #[test]

@@ -1037,8 +1037,26 @@ pub fn build_registry_with(
     cfg: &Config,
     over: Option<&BackendOverride<'_>>,
 ) -> Result<ProviderRegistry, String> {
+    build_registry_inner(args, cfg, over, true)
+}
+
+/// triage 专用：只用 `roles.reviewer`，因此**不因缺 scanner 而拒绝**（角色最小集在 `config check --kind triage`）。
+pub fn build_registry_for_triage(
+    args: &ReviewArgs,
+    cfg: &Config,
+    over: Option<&BackendOverride<'_>>,
+) -> Result<ProviderRegistry, String> {
+    build_registry_inner(args, cfg, over, false)
+}
+
+fn build_registry_inner(
+    args: &ReviewArgs,
+    cfg: &Config,
+    over: Option<&BackendOverride<'_>>,
+    require_scanner: bool,
+) -> Result<ProviderRegistry, String> {
     let roles = cfg.active_roles();
-    if roles.scanners.is_empty() {
+    if require_scanner && roles.scanners.is_empty() {
         return Err(NO_SCANNER_MSG.to_string());
     }
     let secrets = if args.job_mode { crate::config::secrets::Secrets::default() } else { crate::config::secrets::load_secrets() };

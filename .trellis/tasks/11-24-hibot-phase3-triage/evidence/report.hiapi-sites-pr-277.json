@@ -1,0 +1,321 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-277",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "191b8178baab3c47b876a2315644d84f9631fb17",
+    "base_sha": "6e6b3c3056b946c3a5e5389598060ba5c8ab1806"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:02e4aeda4d30fc9aa5928db69f1a3f5db874fc99d09a1897521f2c3a2487c4b4",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/src/db/client.ts",
+      "line_start": 26,
+      "line_end": 26,
+      "quote": "class StatsPrismaPg extends PrismaPg {",
+      "title": "Structural drift: other",
+      "body": "Standard: apps/content-api/CLAUDE.md#Prisma 7.5 操作规范\nNote: The module standard pins the adapter construction shape as `new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) })`. The diff instead routes the client through a hand-written subclass that overrides `connect()` and casts `underlyingDriver()` to read pool internals, replacing the documented PrismaPg instantiation idiom with a wrapper around non-public adapter internals within the db layer.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#Prisma 7.5 操作规范.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:85a6cc913f7cbcfe033a6a34fdbce93840f36cf73795549bfdc057117f64fef3",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/src/utils/response-cache.ts",
+      "line_start": 29,
+      "line_end": 29,
+      "quote": "import { ElysiaCustomStatusResponse, type Context } from 'elysia';",
+      "title": "Structural drift: placement",
+      "body": "Standard: apps/content-api/CLAUDE.md#文件组织（Elysia 最佳实践）— plugins/ = 自定义 Elysia 插件；utils/ = 跨切面 helper（errors.ts）\nNote: The resolved layout puts custom Elysia plugins under src/plugins/ and keeps src/utils/ for framework-agnostic cross-cutting helpers. Here the plugin body lives in utils: Elysia lifecycle handlers (cacheBeforeHandle / cacheMapResponse / cacheAfterResponse), the `Context['set']` typing, `ElysiaCustomStatusResponse` unwrapping and raw Response construction, leaving src/plugins/response-cache.ts as a registration-only shim. It also reuses the same basename (`response-cache.ts`) in two different layers.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#文件组织（Elysia 最佳实践）— plugins/ = 自定义 Elysia 插件；utils/ = 跨切面 helper（errors.ts）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:19b2ca78db4edbb7c321e9ee9c2f02c9f8911d608b39fd4c72f8d8c378285ac6",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/src/utils/response-cache.ts",
+      "line_start": 67,
+      "line_end": 67,
+      "quote": "const WHITELIST: readonly { pattern: string; negotiatesHeader: boolean }[] = [",
+      "title": "Structural drift: ownership",
+      "body": "Standard: apps/content-api/CLAUDE.md#契约与 API 规范（架构 §5.6 · 决策 #6）+ 文件组织（modules/<域>/index.ts = 路由）\nNote: A cross-cutting util hardcodes a route inventory (`/blog/:slug`, `/models/page/:modelSlug`, `/changelog/:id`, …) that duplicates the route surface owned by the module controllers and the content-sdk contract source. Nothing binds these `:param` patterns to the real routes, so the util becomes a second, silently drifting source of routing knowledge outside the module layer.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#契约与 API 规范（架构 §5.6 · 决策 #6）+ 文件组织（modules/<域>/index.ts = 路由）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    }
+  ],
+  "summary": {
+    "blockers_count": 3,
+    "convention_drift": "structural",
+    "fit": "needs-scope-decision",
+    "intent_undelivered": 0,
+    "local_count": 2,
+    "risk": "high",
+    "routing": {
+      "focus": [
+        "apps/content-api/src/db/client.ts",
+        "apps/content-api/src/utils/response-cache.ts"
+      ],
+      "specs": [
+        "apps/content-api/CLAUDE.md",
+        "AGENTS.md"
+      ],
+      "wall_clock_s": 900
+    },
+    "scope_creep_count": 0,
+    "security_tier": 0,
+    "structural_count": 3
+  },
+  "usage": {
+    "input_tokens": 242898,
+    "output_tokens": 75973,
+    "cached_input_tokens": 1280,
+    "wall_clock_ms": 116143
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 384,
+            "input_tokens": 48646,
+            "output_tokens": 5311
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/spec/site/frontend",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/src",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/src/db",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/src/modules/model-sync",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/src/plugins",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/src/utils",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/plugins",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/support",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/site/src/lib",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/site/tests/lib",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "repair_notes": [
+            "triage-drift: first turn parse failed (finish=length, text_len=0, head=\"\"); repaired"
+          ],
+          "rows": 5,
+          "usage": {
+            "cached_input_tokens": 768,
+            "input_tokens": 146009,
+            "output_tokens": 58383
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "notes": [
+            "No reviewer comments are included in the supplied evidence, so maintainer overlap cannot be assessed.",
+            "Author states that the site L2 stale entries (Cache API) were only exercised against a mock and not on real Cloudflare; the diff contains no production validation for it.",
+            "Author states that the full astro build was not run locally (no apps/site/.env), so the 10 site tests that depend on build artifacts are unverified; the diff adds site tests but these are unit-level with mocked caches.",
+            "Author states that the 'connection silence' failure mode is only mitigated with keepAlive/query_timeout and was not fault-injected; the diff shows only the two option additions in db/client.ts, consistent with that limitation.",
+            "Because tests/support/clean-env.ts forces HIAPI_RESPONSE_CACHE_TTL_MS=0, most existing content-api tests do not exercise the cache path; the author acknowledges this and compensates with tests/plugins/response-cache*.test.ts.",
+            "The response cache key is derived from method + pathname + canonicalized query plus negotiated locale; the whitelist's per-route audit (REPORT-api.md) is referenced but not present in the diff.",
+            "Small wording deviation: the body says 'any non-GET request' clears the cache, while the code clears for any method that is neither GET nor HEAD, and additionally attaches an `x-content-cache: BYPASS` header to shed 503 responses (not listed among the HIT|MISS|COALESCED markers)."
+          ],
+          "ok": true,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 128,
+            "input_tokens": 48243,
+            "output_tokens": 12279
+          }
+        }
+      ],
+      "blockers": [
+        {
+          "category": "other",
+          "file": "apps/content-api/src/db/client.ts",
+          "kind": "structural",
+          "line_end": 26,
+          "line_start": 26,
+          "quote": "class StatsPrismaPg extends PrismaPg {"
+        },
+        {
+          "category": "placement",
+          "file": "apps/content-api/src/utils/response-cache.ts",
+          "kind": "structural",
+          "line_end": 29,
+          "line_start": 29,
+          "quote": "import { ElysiaCustomStatusResponse, type Context } from 'elysia';"
+        },
+        {
+          "category": "ownership",
+          "file": "apps/content-api/src/utils/response-cache.ts",
+          "kind": "structural",
+          "line_end": 67,
+          "line_start": 67,
+          "quote": "const WHITELIST: readonly { pattern: string; negotiatesHeader: boolean }[] = ["
+        }
+      ],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 900
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "2c750615f126b5f3"
+      }
+    }
+  }
+}
