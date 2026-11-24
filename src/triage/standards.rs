@@ -296,13 +296,25 @@ fn resolve_peers(root: &Path, module: &str, changed: &[String]) -> Vec<String> {
 }
 
 /// 漂移轴 prompt 的 standards pack：每模块来源 + 文档/规则/兄弟文件的**内容摘录**。
-/// 模型没有工具，规则必须随 prompt 到场。`max_bytes` 是本 pack 的硬上限。
+/// 模型没有工具，规则必须随 prompt 到场。`PACK_MAX` 是本 pack 的硬上限。
 pub fn render_pack(map: &StandardsMap, root: &Path, lang_zh: bool) -> String {
+    render_pack_for(map, root, lang_zh, None)
+}
+
+/// 只渲染指定模块的 pack（drift 每个 shard 只带自己的模块，避免全量 pack 重复进每个 cell）。
+/// `only = None` 等价于全量。
+pub fn render_pack_for(map: &StandardsMap, root: &Path, lang_zh: bool, only: Option<&[String]>) -> String {
     if map.modules.is_empty() {
         return if lang_zh { "（无可解析模块）\n".into() } else { "(no resolved modules)\n".into() };
     }
+    let only: Option<BTreeSet<&str>> = only.map(|o| o.iter().map(String::as_str).collect());
     let mut out = String::new();
     for m in &map.modules {
+        if let Some(set) = &only {
+            if !set.contains(m.module.as_str()) {
+                continue;
+            }
+        }
         let header = match m.source {
             Some(s) => format!(
                 "## module `{}` (source={})\nchanged: {}\n",
@@ -501,5 +513,22 @@ mod tests {
         let map = build(&root, &["src/a.rs".to_string()]);
         assert!(map.modules[0].no_standard(), "越界文档不算标准");
         assert!(render_pack(&map, &root, false).contains("no-standard"));
+    }
+
+    /// C：drift 每个 shard 只带自己的模块（不再把全量 pack 复制进每个 cell）。
+    #[test]
+    fn pack_for_only_renders_requested_modules() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write(root, "src/a/AGENTS.md", "TOKEN_MODULE_A\n");
+        write(root, "src/b/AGENTS.md", "TOKEN_MODULE_B\n");
+        write(root, "src/a/x.rs", "x\n");
+        write(root, "src/b/y.rs", "y\n");
+        let map = build(root, &["src/a/x.rs".to_string(), "src/b/y.rs".to_string()]);
+        let only_a = render_pack_for(&map, root, false, Some(&["src/a".to_string()]));
+        assert!(only_a.contains("TOKEN_MODULE_A"));
+        assert!(!only_a.contains("TOKEN_MODULE_B"), "shard 不得带别的模块标准: {only_a}");
+        let all = render_pack(&map, root, false);
+        assert!(all.contains("TOKEN_MODULE_A") && all.contains("TOKEN_MODULE_B"));
     }
 }

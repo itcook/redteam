@@ -350,12 +350,16 @@ pub async fn run_drift(
     let shards = balanced_chunks(&modules, n);
     let lang_zh = lang.value.starts_with("zh");
     let system = shared_system(lang);
-    let pack = crate::triage::standards::render_pack(map, repo, lang_zh);
+    // 每个 shard 只带自己模块的标准包（否则全量 pack 会重复进每个 cell，白白放大输入与延迟）。
+    let packs: Vec<String> = shards
+        .iter()
+        .map(|s| crate::triage::standards::render_pack_for(map, repo, lang_zh, Some(s)))
+        .collect();
     let tail = DRIFT_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
-    let futs = shards.iter().map(|shard| {
+    let futs = shards.iter().enumerate().map(|(i, shard)| {
         let system = system.clone();
         let tail = tail.clone();
-        let pack = pack.clone();
+        let pack = packs[i].clone();
         let patch = patch_block(
             &shard
                 .iter()
