@@ -323,6 +323,8 @@ async fn run_review(
     };
     match outcome {
         Ok(Ok((mut internal, _code))) => {
+            // 分析结束、进入收尾（重锚/去重/报告投影）：finishing 覆盖这段，报告写入期间心跳继续。
+            heartbeat.set_phase(state::Phase::Finishing);
             // 2.5：重锚 → 用检出原文修正 quote/行号；失败即丢弃并计数（不静默）。
             // 指纹在 `map_finding` 里按修正后的 quote 生成；dismissed 匹配接在指纹之后（2.4）。
             let verified = crate::job::quote::verify(std::mem::take(&mut internal.findings), &repo);
@@ -365,10 +367,14 @@ async fn run_review(
                 },
             ))
         }
-        Ok(Err(e)) => Err(JobFailure::new("internal_panic", Some(e.to_string()))),
+        Ok(Err(e)) => {
+            heartbeat.set_phase(state::Phase::Finishing);
+            Err(JobFailure::new("internal_panic", Some(e.to_string())))
+        }
         Err(()) => {
             // 停止派发：drop 掉运行 future（tokio 取消），再用已落地 cell 组 partial。
             drop(run);
+            heartbeat.set_phase(state::Phase::Finishing);
             Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink, Some(&repo), dismissed, &base_extras))
         }
     }
@@ -413,11 +419,10 @@ fn seal_job_env() {
 }
 
 /// 原子写报告并返回退出码（partial 也算已写出 → 0；error → 1）。
-/// 写报告前先停心跳：最后一帧是 `finishing`（非终态），此后不再落 `state.json`。
+/// 报告写入期间心跳继续（`finishing` 覆盖整个收尾段）；报告落盘（或写失败）后再停写。
 fn finish(out_dir: &Path, report: report::HibotReport, heartbeat: &state::Heartbeat) -> i32 {
-    heartbeat.shutdown();
     let path = out_dir.join("report.json");
-    match io::atomic_write_json(&path, &report) {
+    let code = match io::atomic_write_json(&path, &report) {
         Ok(()) => {
             if report.status == JobStatus::Error { 1 } else { 0 }
         }
@@ -425,7 +430,10 @@ fn finish(out_dir: &Path, report: report::HibotReport, heartbeat: &state::Heartb
             eprintln!("error: {e}");
             1
         }
-    }
+    };
+    // 报告已写（或写失败）：停写并留下最后一帧 finishing。
+    heartbeat.shutdown();
+    code
 }
 
 fn install_sigterm() -> Option<tokio::signal::unix::Signal> {

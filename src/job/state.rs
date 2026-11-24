@@ -110,14 +110,11 @@ impl Heartbeat {
 
     /// 阶段单调前进（不跳段、不回退）；前进时立即落一帧。`preparing → running → finishing`。
     pub fn set_phase(&self, phase: Phase) {
+        let _write = self.inner.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.inner.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let cur = Phase::from_u8(self.inner.phase.load(Ordering::SeqCst));
-        if phase > cur {
-            self.inner.phase.store(phase.as_u8(), Ordering::SeqCst);
-            self.write_frame();
-        }
+        advance_locked(&self.inner, phase);
     }
 
     /// 绑定 provider 门表（registry 构造成功后调用）。未绑定（preparing / triage / verify）→ 不写 `llm` 段。
@@ -149,26 +146,13 @@ impl Heartbeat {
     /// 收尾：确保走到 `finishing`（若还在 `preparing` 先补一帧 `running`，保持不跳段），写最后一帧，
     /// 然后永久停写。幂等；之后调用任何写方法都不再落盘。
     pub fn shutdown(&self) {
-        if self.inner.stopped.load(Ordering::SeqCst) {
-            return;
-        }
-        // 在写锁内完成最后两帧并置 stopped：周期任务即使已通过入口检查，拿到锁后也会被二次闸拦下，
-        // 不会在 `finishing` 之后再补一帧（5.3「退出后不再写」）。
         {
             let _write = self.inner.write_lock.lock().unwrap_or_else(|e| e.into_inner());
             if self.inner.stopped.load(Ordering::SeqCst) {
                 return;
             }
-            if Phase::from_u8(self.inner.phase.load(Ordering::SeqCst)) == Phase::Preparing {
-                // 不跳段：preparing → running → finishing。
-                self.inner.phase.store(Phase::Running.as_u8(), Ordering::SeqCst);
-                write_frame_locked(&self.inner);
-            }
-            if Phase::from_u8(self.inner.phase.load(Ordering::SeqCst)) != Phase::Finishing {
-                self.inner.phase.store(Phase::Finishing.as_u8(), Ordering::SeqCst);
-                write_frame_locked(&self.inner);
-            }
-            // 先写后停：最后一帧 = finishing（非终态值）；之后任何路径都不再落盘。
+            // 阶段推进、最后一帧、stopped 在同一写锁边界：周期任务拿到锁后见 stopped 不再落盘。
+            advance_locked(&self.inner, Phase::Finishing);
             self.inner.stopped.store(true, Ordering::SeqCst);
         }
         if let Some(h) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -188,11 +172,29 @@ impl Heartbeat {
 
 impl Drop for Heartbeat {
     fn drop(&mut self) {
-        self.inner.stopped.store(true, Ordering::SeqCst);
+        // 持写锁置 stopped：等已经开始的同步写帧完成，Drop 返回后不会再有新帧。
+        {
+            let _write = self.inner.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.inner.stopped.store(true, Ordering::SeqCst);
+        }
         if let Some(h) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
             h.abort();
         }
     }
+}
+
+/// 调用方必须持 `write_lock`。阶段单调前进；`Preparing → Finishing` 先落一帧 `running`（不跳段）。
+fn advance_locked(inner: &Inner, target: Phase) {
+    let cur = Phase::from_u8(inner.phase.load(Ordering::SeqCst));
+    if target <= cur {
+        return;
+    }
+    if cur == Phase::Preparing && target == Phase::Finishing {
+        inner.phase.store(Phase::Running.as_u8(), Ordering::SeqCst);
+        write_frame_locked(inner);
+    }
+    inner.phase.store(target.as_u8(), Ordering::SeqCst);
+    write_frame_locked(inner);
 }
 
 fn write_frame(inner: &Inner) {
@@ -231,7 +233,7 @@ fn write_frame_locked(inner: &Inner) {
 
 /// `extensions.redteam.concurrency`：如实披露并发口径（P12：provider 子闸唯一，无 job 总闸）。
 fn concurrency_extension(snapshot: &LlmSnapshot) -> serde_json::Value {
-    let caps: BTreeMap<&str, u32> = snapshot
+    let caps: BTreeMap<&str, u64> = snapshot
         .providers
         .iter()
         .map(|p| (p.name.as_str(), p.max_concurrency))
@@ -369,6 +371,30 @@ mod tests {
         hb.shutdown();
     }
 
+    /// `set_phase(Finishing)` 从 preparing 直接调用也要补一帧 running（不跳段）。
+    #[tokio::test]
+    async fn set_phase_finishing_does_not_skip_running() {
+        let d = tempfile::tempdir().unwrap();
+        let hb = Heartbeat::start(d.path(), "J3b");
+        let frames = hb.frames();
+        hb.set_phase(Phase::Finishing);
+        assert_eq!(hb.frames(), frames + 2, "preparing→running→finishing 各一帧");
+        assert_eq!(read_state(d.path())["phase"], "finishing");
+        hb.shutdown();
+    }
+
+    /// 多线程 runtime 下，同步准备阶段阻塞一个 worker 时周期任务仍能写帧（真实 job 的 `#[tokio::main]` 形态）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_tick_runs_while_preparation_blocks_a_worker() {
+        let d = tempfile::tempdir().unwrap();
+        let hb = Heartbeat::start(d.path(), "J3c");
+        let frames = hb.frames();
+        // 模拟同步 registry 构造/输入校验：阻塞当前 worker，不 await。
+        std::thread::sleep(TICK + Duration::from_millis(400));
+        assert!(hb.frames() > frames, "周期任务应在另一个 worker 上落帧");
+        hb.shutdown();
+    }
+
     /// `at` 严格递增且采样间隔 ≤ 5s（真实时间；周期 2s）。
     #[tokio::test]
     async fn at_advances_within_five_seconds() {
@@ -382,14 +408,36 @@ mod tests {
         for w in stamps.windows(2) {
             assert!(w[1] > w[0], "at 必须递增: {:?}", stamps);
         }
-        // 解析回秒比较间隔（格式固定，字符串可直接切片到秒）。
-        let secs: Vec<u64> = stamps.iter().map(|s| hms_to_secs(s)).collect();
+        // 解析回 epoch 秒比较间隔（完整日期；跨午夜不下溢）。
+        let secs: Vec<i64> = stamps.iter().map(|s| parse_rfc3339_secs(s)).collect();
         assert!(secs.windows(2).all(|w| w[1] - w[0] <= 5 && w[1] > w[0]), "{stamps:?}");
     }
 
-    fn hms_to_secs(s: &str) -> u64 {
-        let (h, m, sec) = (&s[11..13], &s[14..16], &s[17..19]);
-        h.parse::<u64>().unwrap() * 3600 + m.parse::<u64>().unwrap() * 60 + sec.parse::<u64>().unwrap()
+    fn parse_rfc3339_secs(s: &str) -> i64 {
+        let y: i64 = s[0..4].parse().unwrap();
+        let m: u32 = s[5..7].parse().unwrap();
+        let d: u32 = s[8..10].parse().unwrap();
+        let h: i64 = s[11..13].parse().unwrap();
+        let mi: i64 = s[14..16].parse().unwrap();
+        let se: i64 = s[17..19].parse().unwrap();
+        days_from_civil(y, m, d) * 86_400 + h * 3_600 + mi * 60 + se
+    }
+
+    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+        let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// `at` 解析跨午夜/跨年不下溢（完整 epoch 秒，而非只取时分秒）。
+    #[test]
+    fn at_parser_handles_midnight() {
+        assert_eq!(parse_rfc3339_secs("2026-01-01T00:00:01Z") - parse_rfc3339_secs("2025-12-31T23:59:59Z"), 2);
+        assert_eq!(parse_rfc3339_secs("2026-03-01T00:00:00Z") - parse_rfc3339_secs("2026-02-28T23:59:59Z"), 1);
     }
 
     /// 心跳 `llm` 与 registry 快照逐字一致（同一函数）；provider 名是配置 key；429 退避只进 retrying。

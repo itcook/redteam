@@ -403,10 +403,10 @@ async fn triage_and_verify_are_schema_shaped_stubs() {
     assert!(r.get("summary").is_none(), "禁止伪造 summary");
 
     // verify：空输入 → error + verifications: []。
-    let job = make_verify_job(b"[]");
-    let code = redteam::job::run::run_with(JobKind::Verify, &job, None).await;
+    let vj = make_verify_job(b"[]");
+    let code = redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await;
     assert_eq!(code, 1);
-    let r = read_report(&job);
+    let r = read_report(&vj.job);
     assert_eq!(r["status"], "error");
     assert_eq!(r["schema"], "hibot.audit.report.verify/1");
     assert_eq!(r["verifications"], serde_json::json!([]));
@@ -422,10 +422,10 @@ async fn triage_and_verify_are_schema_shaped_stubs() {
         {"fingerprint": fp2, "severity":"low","confidence":0.5,"file":"b.rs","line_start":2,"line_end":2,
          "quote":"q2","title":"t2","body":"b","recommendation":"r"}
     ]).to_string();
-    let job = make_verify_job(findings.as_bytes());
-    let code = redteam::job::run::run_with(JobKind::Verify, &job, None).await;
+    let vj = make_verify_job(findings.as_bytes());
+    let code = redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await;
     assert_eq!(code, 1);
-    let r = read_report(&job);
+    let r = read_report(&vj.job);
     assert_eq!(r["status"], "error");
     let vs = r["verifications"].as_array().unwrap();
     assert_eq!(vs.len(), 2, "非空输入必须逐条覆盖: {r}");
@@ -435,24 +435,29 @@ async fn triage_and_verify_are_schema_shaped_stubs() {
 
     // verify：非法指纹 → error + invalid_fingerprint_input，且不产 verifications。
     let bad = serde_json::json!([{"fingerprint":"sha256:abc"}]).to_string();
-    let job = make_verify_job(bad.as_bytes());
-    let code = redteam::job::run::run_with(JobKind::Verify, &job, None).await;
+    let vj = make_verify_job(bad.as_bytes());
+    let code = redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await;
     assert_eq!(code, 1);
-    let r = read_report(&job);
+    let r = read_report(&vj.job);
     assert_eq!(r["extensions"]["redteam"]["status_code"], "invalid_fingerprint_input");
     assert_eq!(r["verifications"], serde_json::json!([]));
 
     // verify：findings JSON 非法 → input_schema_mismatch:findings。
-    let job = make_verify_job(b"not json");
-    let code = redteam::job::run::run_with(JobKind::Verify, &job, None).await;
+    let vj = make_verify_job(b"not json");
+    let code = redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await;
     assert_eq!(code, 1);
-    let r = read_report(&job);
+    let r = read_report(&vj.job);
     assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:findings");
 }
 
 
-/// 建一个合法的 verify job（空/非空 findings 都行）。
-fn make_verify_job(findings: &[u8]) -> std::path::PathBuf {
+/// 建一个合法的 verify job（空/非空 findings 都行）；`TempDir` 随结构体存活，测试结束自清理。
+struct VerifyJob {
+    _tmp: tempfile::TempDir,
+    job: std::path::PathBuf,
+}
+
+fn make_verify_job(findings: &[u8]) -> VerifyJob {
     let tmp = tempfile::tempdir().unwrap();
     let job = tmp.path().join("job");
     std::fs::create_dir_all(job.join("config")).unwrap();
@@ -477,16 +482,7 @@ fn make_verify_job(findings: &[u8]) -> std::path::PathBuf {
         "inputs": inputs,
     });
     std::fs::write(job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
-    // 保持 tmp 目录存活：把 job 移到一个泄漏的临时根（测试进程短命，可接受）。
-    // 唯一路径，避免并行测试互相 `remove_dir_all`（Phase 5 心跳用例增加了第二个调用者）。
-    static VERIFY_JOB_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let keep = std::env::temp_dir().join(format!(
-        "job-verify-{}-{}",
-        std::process::id(),
-        VERIFY_JOB_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    ));
-    std::fs::rename(&job, &keep).unwrap();
-    keep
+    VerifyJob { _tmp: tmp, job }
 }
 
 #[tokio::test]
@@ -1160,9 +1156,9 @@ async fn triage_and_verify_write_three_value_heartbeat() {
         "fingerprint": fp, "severity":"high", "confidence":0.9, "file":"a.rs",
         "line_start":1, "line_end":1, "quote":"q", "title":"t", "body":"b", "recommendation":"r"
     }]).to_string();
-    let job = make_verify_job(findings.as_bytes());
-    assert_eq!(redteam::job::run::run_with(JobKind::Verify, &job, None).await, 1);
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(job.join("out/state.json")).unwrap()).unwrap();
+    let vj = make_verify_job(findings.as_bytes());
+    assert_eq!(redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await, 1);
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(vj.job.join("out/state.json")).unwrap()).unwrap();
     assert_eq!(v["job_id"], "J-v");
     assert_eq!(v["phase"], "finishing");
     assert_eq!(v["progress"], serde_json::json!({"unit": "items", "done": 0, "total": 1}));

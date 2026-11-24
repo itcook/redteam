@@ -11,6 +11,7 @@ use crate::job::status::{JobFailure, StatusText};
 use crate::orchestrate::deep::known_verdicts;
 use crate::orchestrate::CellSink;
 use crate::state::{CellInput, CellRecord, Phase};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,16 +23,24 @@ pub struct JobDirCellSink {
     phases: Mutex<Vec<(Phase, Option<String>)>>,
     /// Phase 5：心跳（progress 的来源；`on_phase` 明确不挂——内部 `Phase` 枚举不是 job 三值）。
     heartbeat: Option<Arc<Heartbeat>>,
+    /// `manifest` 报过的 cell id：`progress.done` 只计这些（深挖 cell 不在集合内，不得推高 scan 进度）。
+    manifest_cells: Mutex<HashSet<String>>,
 }
 
 impl JobDirCellSink {
     pub fn new(out_dir: PathBuf) -> Self {
-        Self { out_dir, cells: Mutex::new(Vec::new()), phases: Mutex::new(Vec::new()), heartbeat: None }
+        Self { out_dir, cells: Mutex::new(Vec::new()), phases: Mutex::new(Vec::new()), heartbeat: None, manifest_cells: Mutex::new(HashSet::new()) }
     }
 
     /// 带心跳的 sink：`manifest` 设 progress.total（scan cells），`on_cell` 推进 done。
     pub fn with_heartbeat(out_dir: PathBuf, heartbeat: Arc<Heartbeat>) -> Self {
-        Self { out_dir, cells: Mutex::new(Vec::new()), phases: Mutex::new(Vec::new()), heartbeat: Some(heartbeat) }
+        Self {
+            out_dir,
+            cells: Mutex::new(Vec::new()),
+            phases: Mutex::new(Vec::new()),
+            heartbeat: Some(heartbeat),
+            manifest_cells: Mutex::new(HashSet::new()),
+        }
     }
 
     pub fn snapshot(&self) -> (Vec<CellRecord>, Vec<(Phase, Option<String>)>) {
@@ -44,7 +53,10 @@ impl JobDirCellSink {
 
 impl CellSink for JobDirCellSink {
     fn manifest(&self, inputs: &[CellInput]) {
-        // Phase 1 不落输入快照；Phase 5 只把 scan cells 总数报给心跳（progress 不参与判定）。
+        // Phase 1 不落输入快照；Phase 5 只把 scan cells 报给心跳（progress 不参与判定）。
+        // 同时记下 cell id 集合：`on_cell` 只对这些 id 推进 done（深挖 cell 是另一个集合）。
+        let ids: HashSet<String> = inputs.iter().map(|i| i.cell.clone()).collect();
+        *self.manifest_cells.lock().unwrap_or_else(|e| e.into_inner()) = ids;
         if let Some(hb) = &self.heartbeat {
             hb.set_progress_total("cells", inputs.len() as u64);
         }
@@ -52,7 +64,15 @@ impl CellSink for JobDirCellSink {
 
     fn on_cell(&self, rec: CellRecord) {
         if let Some(hb) = &self.heartbeat {
-            hb.bump_done();
+            // done 与 total 必须对应同一集合（scan cells）；reviewer/refuter cell 不计。
+            let in_manifest = self
+                .manifest_cells
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&rec.cell);
+            if in_manifest {
+                hb.bump_done();
+            }
         }
         // 锁中毒（另一个线程 panic）时取回内部数据继续记：静默丢弃会让 partial 少掉已完成成果。
         let mut v = self.cells.lock().unwrap_or_else(|e| e.into_inner());
@@ -319,6 +339,37 @@ mod tests {
         assert_eq!(r.extensions["redteam"]["input_consistency"]["match"], true);
         assert_eq!(r.extensions["redteam"]["prior_routing"]["present"], true);
         assert_eq!(r.extensions["redteam"]["refute_skipped"], "no_refuter");
+    }
+
+    /// Phase 5：progress.done 只计 manifest 报过的 scan cell；深挖 cell（reviewer/refuter）不得推高进度。
+    #[tokio::test]
+    async fn progress_counts_only_manifest_cells() {
+        let d = tempfile::tempdir().unwrap();
+        let hb = crate::job::state::Heartbeat::start(d.path(), "J-progress");
+        let sink = JobDirCellSink::with_heartbeat(d.path().to_path_buf(), Arc::clone(&hb));
+        let cell = |id: &str| CellInput {
+            cell: id.into(),
+            model: "p/s".into(),
+            prompt: String::new(),
+            scan: None,
+            template_hash: None,
+        };
+        sink.manifest(&[cell("g0@p/s#1"), cell("g1@p/s#1")]);
+        // 深挖先完成（不在 manifest 集合）：done 不动。
+        sink.on_cell(CellRecord::ok(
+            "review[f1]@p/r",
+            "p/r",
+            CellOutput::Review { findings: vec![], needs: vec![] },
+        ));
+        hb.attach_llm(std::collections::BTreeMap::new());
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(v["progress"], serde_json::json!({"unit": "cells", "done": 0, "total": 2}));
+        // scan cell 完成：done 前进。
+        sink.on_cell(CellRecord::ok("g0@p/s#1", "p/s", CellOutput::Scan(Default::default())));
+        hb.attach_llm(std::collections::BTreeMap::new());
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(v["progress"]["done"], 1);
+        hb.shutdown();
     }
 
 }
