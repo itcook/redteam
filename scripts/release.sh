@@ -98,7 +98,14 @@ elif [ "$DRY_RUN" = true ]; then
 fi
 
 info "门禁：make verify"
-make verify >/dev/null || die "make verify 未通过（门禁不过不发布）"
+# 门禁输出平时收起来；失败时原样打出来（否则只看到一个笼统的 die，难定位）。
+verify_log="$(mktemp)"
+if ! make verify >"$verify_log" 2>&1; then
+    cat "$verify_log" >&2
+    rm -f "$verify_log"
+    die "make verify 未通过（门禁不过不发布）"
+fi
+rm -f "$verify_log"
 
 # ---------------------------------------------------------------- 构建
 # 关键：**不跑 `make build`**——它会把新二进制写进入库的插件目录（5.9MB diff），
@@ -146,6 +153,8 @@ if [ ! -s "$NOTES" ]; then
     ' CHANGELOG.md >"$NOTES"
 fi
 [ -s "$NOTES" ] || echo "redteam v${VERSION}" >"$NOTES"
+# 提取出的段首通常是空行；去掉开头的空行，notes 从标题直接开始。
+awk 'NF { seen = 1 } seen' "$NOTES" >"$NOTES.trim" && mv "$NOTES.trim" "$NOTES"
 {
     printf '\n## 发布资产\n\n| 文件 | sha256 |\n|---|---|\n'
     while read -r hash name; do
