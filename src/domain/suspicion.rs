@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_entry_empty_note_skipped_and_defaults() {
+    fn refute_entry_empty_note_skipped_and_defaults() {
         let e = RefuteEntry { id: "x".into(), verdict: RefuteVerdict::Upheld, note: String::new() };
         let j = serde_json::to_string(&e).unwrap();
         assert!(!j.contains("note"), "{j}");

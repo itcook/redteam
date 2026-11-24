@@ -262,7 +262,7 @@ mod tests {
     }
 }
 
-/// 测试构造器（M21b 批 B 顺手项，followup 实现债）：verify / prompt / suspicion 三份合一——
+/// 测试构造器（M21b 批 B 顺手项，followup 实现债）：refute / prompt / suspicion 三份合一——
 /// 新增字段时只改这里，不再逐处补。`#[cfg(test)]` 保证不进生产二进制。
 #[cfg(test)]
 pub(crate) mod fixtures {

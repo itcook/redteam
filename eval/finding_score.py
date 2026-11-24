@@ -83,7 +83,7 @@ def cmd_candidates(a):
                 "lines_from": lines_from,
                 "severity": f.get("severity"),
                 "title": f.get("title"),
-                "refuted": bool((f.get("verify") or {}).get("verdict") == "refuted"),
+                "refuted": bool((f.get("refute") or f.get("verify") or {}).get("verdict") == "refuted"),
                 # 每个候选主题配上 oracle 里那几条的标题，确认时对着读机制
                 "candidates": [
                     {"topic": t,
@@ -232,7 +232,7 @@ def cmd_selftest(_a):
             {"id": "f2", "file": "src/a.rs", "line_start": 5, "line_end": 5, "title": "write", "quote": "not in file"},
             {"id": "f3", "file": "src/a.rs", "line_start": 9, "line_end": 9, "title": "noise", "quote": "noise();"},
             {"id": "f4", "file": "src/a.rs", "line_start": 7, "line_end": 7, "title": "tests", "quote": "y();",
-             "verify": {"verdict": "refuted", "model": "v", "note": "n"}},
+             "refute": {"verdict": "refuted", "model": "v", "note": "n"}},
             # 重复短句：报告行号（第 8 行 z();…）优先于 quote 的「第一次出现」——这里 quote 在第 6 行也出现
             {"id": "f5", "file": "src/a.rs", "line_start": 8, "line_end": 8, "title": "dup", "quote": "x();"},
         ]}
