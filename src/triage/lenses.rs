@@ -540,13 +540,14 @@ pub async fn run_intent_slices(
     }
     let header = format!("# Axis: intent slice\n{}", pr_header(pr));
     // 公平性：intent slices 不能一次占满 provider 门（否则 security/drift 只剩 0–13s）。
-    // 按 `concurrency` 分块串行；每块共享本轴的 1/chunks 预算，总时长仍 ≤ cell_timeout。
+    // 按 `concurrency` 分块串行；**每块都用完整单格预算**（与 security/drift 同权），
+    // 总时长由全局 deadline 兜底——不再把预算除以 chunks（那会让等门后的 slice 只剩零头）。
     let step = concurrency.max(1);
     let ranges: Vec<(usize, usize)> = (0..shards.len())
         .step_by(step)
         .map(|s| (s, (s + step).min(shards.len())))
         .collect();
-    let per_chunk = cell_timeout / (ranges.len().max(1) as u32);
+    let per_chunk = cell_timeout;
     let mut out = AxisRun { ok: true, ..Default::default() };
     for (start, end) in ranges {
         let futs = (start..end).map(|i| {
