@@ -105,6 +105,8 @@ impl From<&crate::config::EffectiveModel> for ScanEntrySpec {
 /// 扇出输入：`bundles` / `dossiers` / `others` 等长等序（`cli::plan_cells` 产物）；`entries` = 活跃 scanner 列表（design §5：每条对每组各跑
 /// 一次）；`samples` = 同模型多 lens 采样（`review.scanners.samples`）。并发无角色级旋钮：只受各 provider 在途门（唯一闸，D13）。
 pub struct ScanFanoutInput<'a> {
+    /// 输出语言（1.4：解析一次、随输入传下去）。
+    pub lang: crate::config::OutputLang,
     pub target_label: &'a str,
     pub bundles: &'a [Bundle],
     pub dossiers: &'a [String],
@@ -229,6 +231,7 @@ pub async fn run_scan_fanout(
         .enumerate()
         .map(|(g, b)| {
             build_scan_prompt(&ScanPromptInput {
+                lang: &input.lang,
                 target_label: input.target_label,
                 bundle: b,
                 user_focus: input.user_focus,
@@ -532,7 +535,7 @@ mod scan_tests {
         fn on_roles(&self, roles: &[Role]) { self.roles.lock().unwrap().extend_from_slice(roles); }
     }
     fn input<'a>(bundles: &'a [Bundle], dossiers: &'a [String], others: &'a [String], root: &'a std::path::Path, entries: &'a [ScanEntrySpec], samples: u32) -> ScanFanoutInput<'a> {
-        ScanFanoutInput { precedents: &[], target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", repo_brief: "", root, entries, samples }
+        ScanFanoutInput { lang: crate::config::Language::EnUs.output(), precedents: &[], target_label: "wt", bundles, dossiers, others, user_focus: "", spec_docs: "", repo_brief: "", root, entries, samples }
     }
 
     /// B-1 接线（M21d）：仓库简介要进**真实扇出**的 scanner 前缀。

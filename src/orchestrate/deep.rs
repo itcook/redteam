@@ -53,6 +53,8 @@ pub struct DeepRun {
 }
 
 pub struct DeepInput<'a> {
+    /// 输出语言（1.4）：reviewer / refute prompt 共用同一份。
+    pub lang: crate::config::OutputLang,
     pub route: Option<&'a RiskRoute>,
     pub scan_cells: &'a [ScanCellResult],
     pub bundles: &'a [Bundle],
@@ -379,6 +381,7 @@ pub async fn run_deep(registry: &ProviderRegistry, mut input: DeepInput<'_>, sin
             let wait_ms = item.enqueued_ms.map_or(0, |en| now_ms().saturating_sub(en));
             let file_diff = file_diff(input.bundles, &item.spec.file);
             let prompt = build_review_prompt(&ReviewPromptInput {
+            lang: &env.input.lang,
                 target_label: input.target_label,
                 file: &item.spec.file,
                 file_diff: &file_diff,
@@ -1060,6 +1063,7 @@ async fn run_refute<'b>(env: &CellEnv<'b>, job: RefuteJob<'b>) -> RefuteDone {
         }
     };
     let prompt = crate::prompt::build_refute_prompt(&crate::prompt::RefutePromptInput {
+        lang: &env.input.lang,
         file: &finding.file,
         line_start: finding.line_start,
         line_end: finding.line_end,
@@ -1648,6 +1652,7 @@ fn second_stage_prompt(
     };
     let file_diff = file_diff(input.bundles, &item.spec.file);
     let mut prompt2 = build_review_prompt(&ReviewPromptInput {
+        lang: &env.input.lang,
         target_label: input.target_label,
         file: &item.spec.file,
         file_diff: &file_diff,
@@ -2000,6 +2005,7 @@ mod tests {
         run_deep(
             reg,
             DeepInput {
+                lang: crate::config::Language::EnUs.output(),
                 route: None, scan_cells: &[], bundles, root,
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
@@ -2058,6 +2064,7 @@ mod tests {
         let run = run_deep(
             &reg,
             DeepInput {
+                lang: crate::config::Language::EnUs.output(),
                 route: None, scan_cells: &[], bundles: &bundles, root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
@@ -2129,6 +2136,7 @@ mod tests {
         let run = run_deep(
             &reg,
             DeepInput {
+                lang: crate::config::Language::EnUs.output(),
                 route: None, scan_cells: &[], bundles: &bundles, root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
@@ -2221,6 +2229,7 @@ mod tests {
         let run = run_deep(
             &reg,
             DeepInput {
+                lang: crate::config::Language::EnUs.output(),
                 route: None, scan_cells: &[], bundles: &[], root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
@@ -2249,6 +2258,7 @@ mod tests {
         let run = run_deep(
             &reg,
             DeepInput {
+                lang: crate::config::Language::EnUs.output(),
                 route: None, scan_cells: &[], bundles: &[], root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
@@ -2290,6 +2300,7 @@ mod tests {
         let run = run_deep(
             &reg,
             DeepInput {
+                lang: crate::config::Language::EnUs.output(),
                 route: None, scan_cells: &[], bundles: &bundles, root: dir.path(),
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
@@ -2332,6 +2343,7 @@ mod tests {
         let run = run_deep(
             &reg,
             DeepInput {
+                lang: crate::config::Language::EnUs.output(),
                 route: None, scan_cells: &[], bundles: &bundles, root,
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
@@ -2532,6 +2544,7 @@ mod tests {
         run_deep(
             r.reg,
             DeepInput {
+                lang: crate::config::Language::EnUs.output(),
                 route: r.route, scan_cells: r.scan_cells, bundles: r.bundles, root: r.root,
                 reviewers: r.reviewers.unwrap_or(&single), budget_cells: r.budget,
                 pack: &Default::default(), spec_docs: "", repo_brief: r.repo_brief, target_label: "t",
@@ -3452,6 +3465,7 @@ mod tests {
         let mut run = run_deep(
             &reg,
             DeepInput {
+                lang: crate::config::Language::EnUs.output(),
                 route: None, scan_cells: &[], bundles: &bundles, root,
                 reviewers: std::slice::from_ref(&reviewer), budget_cells: 4,
                 pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
@@ -4089,6 +4103,7 @@ mod tests {
             output: Some(out),
         }];
         let input = DeepInput {
+                lang: crate::config::Language::EnUs.output(),
             route: None, scan_cells: &cells, bundles: &[], root: Path::new("."),
             reviewers: &[], budget_cells: 0, pack: &Default::default(), spec_docs: "", repo_brief: "", target_label: "t",
             snapshot: None, restore: None, prior_findings: vec![], tools: ToolsMode::Off,

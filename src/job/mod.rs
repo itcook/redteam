@@ -1,0 +1,20 @@
+//! 外派（job）模式：按 hibot `hibot.audit.executor/1` 契约读 job 目录、写 `out/report.json`。
+//!
+//! 分工（计划 §4 Phase 1）：
+//! - [`manifest`]：`job.json` 解析与 kind / schema 校验（不可解析 → 无报告，见 1.8）。
+//! - [`artifact`]：`inputs.*` 的路径约束、sha256、schema/format 常量校验。
+//! - [`io`]：job 目录解析、越界判定、`*.tmp` → `rename` 原子写。
+//! - [`fingerprint`]：hibot 指纹的唯一实现（逐字按契约 §3.2）。
+//! - [`status`]：`ok/partial/error` + `status_reason` / `status_code` 对照表（随 `language`）。
+//!
+//! **硬规则**：job 模式只写 `paths.out`；不读 `$REDTEAM_HOME` / `secrets.json`；不依赖 cwd / stdin。
+
+pub mod artifact;
+pub mod fingerprint;
+pub mod executor_config;
+pub mod io;
+pub mod lifecycle;
+pub mod manifest;
+pub mod report;
+pub mod run;
+pub mod status;

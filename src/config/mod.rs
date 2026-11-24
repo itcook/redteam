@@ -5,13 +5,14 @@
 pub mod secrets;
 
 use crate::domain::Severity;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// 各变体的 `#[serde(alias = ...)]` 是别名的唯一真相源；`model::validate_setup` 的报错文案
 /// 手工抄了一份人读版本（serde alias 列表运行时不可反射）——改这里的别名记得同步改那边的文案。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     #[serde(alias = "claude")]
@@ -40,7 +41,7 @@ impl ProviderKind {
 
 /// 推理强度（角色属性：同一模型可在 scanner 位 low、reviewer 位 high）。backend 消费在批 F。
 /// 值原样透传给上游；`off` / `none` 不再建模——只有极少数模型支持关推理，需要时由模型默认行为决定。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReasoningEffort { Minimal, Low, Medium, High, Xhigh, Max, Ultra }
 
@@ -67,7 +68,7 @@ impl ReasoningEffort {
 /// - `scanner` / `reviewer` / `refuter` —— 评审管线（review）：疑点扫描 / 深挖 / **finding 验真**。
 /// - `verifier` —— hibot `verify` kind 的**修复验证**（fix diff → resolved/unresolved/regressed），
 ///   review 管线不用它；选择时缺省回退 `reviewer`（[`RoleSets::fix_verifiers`]）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role { Scanner, Reviewer, Refuter, Verifier }
 
@@ -95,7 +96,7 @@ impl Role {
     }
 }
 /// 角色属性（`models.<id>.roles.<role>`）。将来的角色级旋钮只加在这里。
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleAttrs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,7 +104,7 @@ pub struct RoleAttrs {
 }
 
 /// 模型（`providers.<name>.models.<id>`）：固有属性只写一次；`roles` 键即该模型参与的角色。
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfig {
     /// 人读显示名（`model list` / 将来报告用）；**不是**身份串——身份串固定为 `provider/id`〔D12 定案 3〕。
@@ -135,7 +136,7 @@ pub struct ModelConfig {
 }
 
 /// `providers.<name>`：通道层。`maxConcurrency` = 该 provider 在途上限（缺省继承 `review.maxConcurrency`；在途锁批 F 接线）。
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,7 +226,7 @@ impl EffectiveModel {
 }
 
 /// 评审工具档位（design 2026-07-13 §2.4）：off / two-stage（默认）/ on。M21b 定工具分层前保留不动。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolsMode { Off, TwoStage, On }
 
@@ -266,13 +267,39 @@ impl Serialize for MaxCells {
     }
 }
 
+/// `"auto" | N(≥1)`：手写 JSON Schema（schemars 的 untagged 表达不了这个枚举）。
+impl JsonSchema for MaxCells {
+    fn schema_name() -> String { "MaxCells".into() }
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::*;
+        Schema::Object(SchemaObject {
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![
+                    Schema::Object(SchemaObject {
+                        instance_type: Some(InstanceType::String.into()),
+                        enum_values: Some(vec![serde_json::json!("auto")]),
+                        ..Default::default()
+                    }),
+                    Schema::Object(SchemaObject {
+                        instance_type: Some(InstanceType::Integer.into()),
+                        number: Some(Box::new(NumberValidation { minimum: Some(1.0), ..Default::default() })),
+                        ..Default::default()
+                    }),
+                ]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
 /// `review.pack.body`：scanner 组 pack 装包形态；缺省 `slice`〔D8〕，pack 侧实现在批 E。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum PackBody { Full, Slice }
 
 /// 角色节（design §12.1〔D13〕）：无角色级 `workers`——并发只看 provider `maxConcurrency`（唯一闸，§12.3）。
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ScannersCfg {
     /// 同模型多 lens 采样并集（E3：方差对冲旋钮）。
@@ -283,7 +310,7 @@ impl Default for ScannersCfg {
     fn default() -> Self { ScannersCfg { samples: d_one() } }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewersCfg {
     #[serde(default = "d_max_cells")]
@@ -302,7 +329,7 @@ impl Default for ReviewersCfg {
 /// 数字与归因见 `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`（历史文档，保留原名）。
 /// 缺省关 = `bool` 的 `Default`，故直接 derive：serde 缺省与 `Default` 只此一个来源，不会各说各话
 /// （`refuters_enabled_defaults_off` 钉住两条路径同值）。
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RefutersCfg {
     #[serde(default)]
@@ -310,7 +337,7 @@ pub struct RefutersCfg {
 }
 
 /// `review.grouping`：ocr 双阈值门起步值（4 / 200 / 10，D3）；`semantic` 默认关（R8）。
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupingCfg {
     #[serde(default = "d_min_files")]
@@ -328,7 +355,7 @@ impl Default for GroupingCfg {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PackCfg {
     #[serde(default = "d_pack_body")]
@@ -371,7 +398,7 @@ fn d_anchor_window() -> u32 { 30 }
 fn d_finding_window() -> u32 { 30 }
 fn d_slice_min_bytes() -> u64 { 8192 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewConfig {
     #[serde(default = "default_block")]
@@ -418,13 +445,124 @@ impl Default for ReviewConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub review: ReviewConfig,
+    /// 输出语言（P15 / 计划 1.4）：顶层键，`zh_CN` | `en_US`。
+    /// 缺省（None）时：本地模式沿用 locale 探测，job 模式固定 `en_US` 且**不读 env**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
+}
+
+/// 输出语言枚举（serde 严格枚举：非法值 → 配置解析失败）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub enum Language {
+    #[serde(rename = "zh_CN")]
+    ZhCn,
+    #[serde(rename = "en_US")]
+    EnUs,
+}
+
+impl Language {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Language::ZhCn => "zh_CN",
+            Language::EnUs => "en_US",
+        }
+    }
+    /// prompt 里的语言名（中英双语名对模型的约束更强，沿用 dogfood 20260703 的结论）。
+    pub fn prompt_name(self) -> &'static str {
+        match self {
+            Language::ZhCn => "Simplified Chinese (简体中文)",
+            Language::EnUs => "English",
+        }
+    }
+    pub fn output(self) -> OutputLang {
+        OutputLang { value: self.as_str().to_string(), prompt_name: self.prompt_name().to_string(), source: LangSource::Config }
+    }
+}
+
+/// 语言取值的来源（`extensions.redteam.language.source`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LangSource { Config, Locale, Default }
+
+impl LangSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LangSource::Config => "config",
+            LangSource::Locale => "locale",
+            LangSource::Default => "default",
+        }
+    }
+}
+
+/// 解析一次、传给全部 prompt builder 与 status_reason 的输出语言（计划 P15：不再各处读 env）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputLang {
+    /// 机器值：`zh_CN` / `en_US`（locale 来源时为归一后的 locale 串）。
+    pub value: String,
+    /// prompt 里给模型看的语言名。
+    pub prompt_name: String,
+    pub source: LangSource,
+}
+
+impl Default for OutputLang {
+    fn default() -> Self { Language::EnUs.output() }
+}
+
+impl OutputLang {
+    /// 本地/手工路径：配置 > locale 探测 > English（与今日 locale 行为一致）。
+    pub fn resolve_local(cfg: &Config) -> Self {
+        if let Some(l) = cfg.language {
+            return l.output();
+        }
+        Self::from_env().unwrap_or_default()
+    }
+
+    /// job 路径：配置 > 缺省 `en_US`；**不读 env**（P15 顺序 3 / P6 可复现性）。
+    pub fn resolve_job(cfg: &Config) -> Self {
+        match cfg.language {
+            Some(l) => l.output(),
+            None => OutputLang { source: LangSource::Default, ..Language::EnUs.output() },
+        }
+    }
+
+    /// locale 探测（本地模式专用）：`LC_ALL` → `LC_MESSAGES` → `LANG`。
+    pub fn from_env() -> Option<Self> {
+        let raw = std::env::var("LC_ALL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var("LC_MESSAGES").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("LANG").ok().filter(|v| !v.is_empty()))?;
+        let lang_part = raw.split('.').next().unwrap_or("").trim();
+        if lang_part.is_empty() || lang_part == "C" || lang_part == "POSIX" {
+            return None;
+        }
+        let code = lang_part.split('_').next().unwrap_or("").to_lowercase();
+        let prompt_name = match code.as_str() {
+            "zh" => "Simplified Chinese (简体中文)",
+            "ja" => "Japanese (日本語)",
+            "ko" => "Korean (한국어)",
+            "fr" => "French (français)",
+            "de" => "German (Deutsch)",
+            "es" => "Spanish (español)",
+            _ => "English",
+        };
+        let value = match code.as_str() {
+            "zh" => "zh_CN",
+            "ja" => "ja",
+            "ko" => "ko",
+            "fr" => "fr",
+            "de" => "de",
+            "es" => "es",
+            _ => "en_US",
+        };
+        Some(OutputLang { value: value.to_string(), prompt_name: prompt_name.to_string(), source: LangSource::Locale })
+    }
 }
 
 /// 四角色活跃集（merged 视图）。顺序 = provider 名、model id 字典序（无语义，D12 K3）。
@@ -541,9 +679,6 @@ impl Config {
                 }
             }
         }
-        if let Some(w) = cfg.verifier_role_guard_warning() {
-            warnings.push(w);
-        }
         if cfg.review.max_concurrency > MAX_CONCURRENCY_SANE as usize {
             warnings.push(format!("review.maxConcurrency = {} 像是填错字段（maxOutputTokens？）：它是 provider 在途上限的缺省；撞 429 时门会自动收敛，仍建议改回", cfg.review.max_concurrency));
         }
@@ -630,8 +765,9 @@ impl Config {
         }
         Some(
             "检测到 roles.verifier 但没有任何 roles.refuter：评审内的验真角色已更名为 refuter，\
-             roles.verifier 现在只用于 verify kind 的修复验证（缺省回退 reviewer）。\
-             本次 review 的复核会按异族自动挑选；要显式指定验真模型，请把 roles.verifier 改成 roles.refuter。"
+             roles.verifier 现在只用于修复验证（缺省回退 reviewer）。本次 review 不会把它当作验真角色：\
+             复核若开启（review.refuters.enabled = true）将自动挑异族模型，没有异族时回退同族。\
+             要显式指定验真模型，请把 roles.verifier 改成 roles.refuter。"
                 .to_string(),
         )
     }
@@ -749,25 +885,26 @@ impl Config {
     }
 }
 
+const ROOT: &[&str] = &["providers", "review", "language"];
+const PROVIDER: &[&str] = &["kind", "baseUrl", "apiKeyEnv", "maxConcurrency", "models"];
+const MODEL: &[&str] = &["displayName", "kind", "apiKeyEnv", "family", "contextWindow", "maxOutputTokens", "perTurnTimeoutSecs", "reasoning", "roles"];
+const ROLE_ATTRS: &[&str] = &["reasoningEffort"];
+const REVIEW: &[&str] = &["blockThreshold", "confFloor", "maxConcurrency", "tools", "scanners", "reviewers", "refuters", "grouping", "pack"];
+/// review 已删键：`risk`（D11 无模式旋钮）。
+const REVIEW_REMOVED: &[(&str, &str)] = &[("risk", "D11：无模式旋钮")];
+/// (节名, 已知键, 是否角色节)；角色节的已删键 `workers`（D13）在 shape_guard 里按缺省值拼文案。
+const REVIEW_SECTIONS: &[(&str, &[&str], bool)] = &[
+    ("scanners", &["samples"], true),
+    ("reviewers", &["maxCells", "reenqueue"], true),
+    ("refuters", &["enabled"], true),
+    ("grouping", &["minFiles", "bundleLineThreshold", "maxFilesPerGroup", "semantic"], false),
+    ("pack", &["body", "anchorWindow", "findingWindow", "findingWindowEnforce", "sliceMinBytes"], false),
+];
+
 /// 形状守卫（解析前按 `Value` 走一遍已知层级）：旧形状 / snake_case / 改名键 / 非法角色 → **错误**并指向 D12 形状（不静默丢配置）；
 /// 已知层级下的无定义键 → **warning**（serde 默认忽略未知字段，评审 #4；不开 `deny_unknown_fields` 以保向前兼容）。
 /// provider 名 / model id 是用户键，不检查。新增配置字段时同步下面的已知键表（单测 `review_risk_and_roleless_model_warn` 兜底）。
 fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
-    const ROOT: &[&str] = &["providers", "review"];
-    const PROVIDER: &[&str] = &["kind", "baseUrl", "apiKeyEnv", "maxConcurrency", "models"];
-    const MODEL: &[&str] = &["displayName", "kind", "apiKeyEnv", "family", "contextWindow", "maxOutputTokens", "perTurnTimeoutSecs", "reasoning", "roles"];
-    const ROLE_ATTRS: &[&str] = &["reasoningEffort"];
-    const REVIEW: &[&str] = &["blockThreshold", "confFloor", "maxConcurrency", "tools", "scanners", "reviewers", "refuters", "grouping", "pack"];
-    /// review 已删键：`risk`（D11 无模式旋钮）。
-    const REVIEW_REMOVED: &[(&str, &str)] = &[("risk", "D11：无模式旋钮")];
-    /// (节名, 已知键, 是否角色节)；角色节的已删键 `workers`（D13）在 shape_guard 里按缺省值拼文案。
-    const REVIEW_SECTIONS: &[(&str, &[&str], bool)] = &[
-        ("scanners", &["samples"], true),
-        ("reviewers", &["maxCells", "reenqueue"], true),
-        ("refuters", &["enabled"], true),
-        ("grouping", &["minFiles", "bundleLineThreshold", "maxFilesPerGroup", "semantic"], false),
-        ("pack", &["body", "anchorWindow", "findingWindow", "findingWindowEnforce", "sliceMinBytes"], false),
-    ];
     /// 已知层级的键检查：snake_case → 错误（指引 camelCase 拼写）；`removed`（键 → 为什么没了 / 去哪调）命中 → 专属 warning；
     /// 其余未知 → 通用 warning。已删键统一走 `removed` 表，不另开分支（评审修：同一文件只留一种「已删键」手法）。
     fn check(errors: &mut Vec<String>, warnings: &mut Vec<String>, path: &str, obj: &serde_json::Map<String, serde_json::Value>, known: &[&str], hint: &str) {
@@ -868,10 +1005,180 @@ fn shape_guard(v: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     Ok(warnings)
 }
 
+/// 严格校验问题（job 模式 / `config check`）：位置用 **JSON Pointer**。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigIssue {
+    /// 机器码：`unknown_key` / `secret_field` / `legacy_shape` / `invalid_value`。
+    pub code: &'static str,
+    pub pointer: String,
+    pub message: String,
+}
+
+fn ptr_escape(s: &str) -> String {
+    s.replace('~', "~0").replace('/', "~1")
+}
+
+fn ptr_join(base: &str, key: &str) -> String {
+    format!("{base}/{}", ptr_escape(key))
+}
+
+/// 密钥类字段名（规范化后精确匹配，`apiKeyEnv` 不命中）。
+fn is_secret_key(k: &str) -> bool {
+    let n = k.to_ascii_lowercase().replace(['_', '-'], "");
+    matches!(n.as_str(), "apikey" | "token" | "secret" | "password" | "accesstoken" | "privatekey" | "clientsecret")
+}
+
+fn strict_unknown(out: &mut Vec<ConfigIssue>, base: &str, obj: &serde_json::Map<String, serde_json::Value>, known: &[&str]) {
+    for k in obj.keys() {
+        if !known.contains(&k.as_str()) {
+            // 密钥字段由 `strict_secrets` 单独报 `secret_field`，不再叠加一条 unknown_key。
+            if is_secret_key(k) {
+                continue;
+            }
+            out.push(ConfigIssue {
+                code: "unknown_key",
+                pointer: ptr_join(base, k),
+                message: format!("unknown key (known: {})", known.join(" / ")),
+            });
+        }
+    }
+}
+
+fn strict_secrets(v: &serde_json::Value, base: &str, out: &mut Vec<ConfigIssue>) {
+    match v {
+        serde_json::Value::Object(o) => {
+            for (k, child) in o {
+                let p = ptr_join(base, k);
+                if is_secret_key(k) {
+                    out.push(ConfigIssue {
+                        code: "secret_field",
+                        pointer: p.clone(),
+                        message: "executor config must not contain secrets; supply credentials via env vars".into(),
+                    });
+                }
+                strict_secrets(child, &p, out);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for (i, child) in a.iter().enumerate() {
+                strict_secrets(child, &format!("{base}/{i}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 严格扫描：未知键 / 密钥字段（形状与类型错误由 `check_text` 的 serde + validate 补齐）。
+pub fn strict_issues(v: &serde_json::Value) -> Vec<ConfigIssue> {
+    let mut out = Vec::new();
+    strict_secrets(v, "", &mut out);
+    let Some(top) = v.as_object() else {
+        out.push(ConfigIssue { code: "invalid_value", pointer: String::new(), message: "config root must be an object".into() });
+        return out;
+    };
+    strict_unknown(&mut out, "", top, ROOT);
+    if let Some(provs) = top.get("providers").and_then(|p| p.as_object()) {
+        for (pname, pv) in provs {
+            let Some(po) = pv.as_object() else { continue };
+            let base = format!("/providers/{}", ptr_escape(pname));
+            strict_unknown(&mut out, &base, po, PROVIDER);
+            if let Some(ms) = po.get("models").and_then(|m| m.as_object()) {
+                for (id, mv) in ms {
+                    let Some(mo) = mv.as_object() else { continue };
+                    let mbase = format!("{base}/models/{}", ptr_escape(id));
+                    strict_unknown(&mut out, &mbase, mo, MODEL);
+                    if let Some(ro) = mo.get("roles").and_then(|r| r.as_object()) {
+                        for (role, rv) in ro {
+                            if let Some(ra) = rv.as_object() {
+                                let rbase = format!("{mbase}/roles/{}", ptr_escape(role));
+                                strict_unknown(&mut out, &rbase, ra, ROLE_ATTRS);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(r) = top.get("review").and_then(|r| r.as_object()) {
+        strict_unknown(&mut out, "/review", r, REVIEW);
+        for (sec, known, _) in REVIEW_SECTIONS {
+            if let Some(so) = r.get(*sec).and_then(|s| s.as_object()) {
+                strict_unknown(&mut out, &ptr_join("/review", sec), so, known);
+            }
+        }
+    }
+    out
+}
+
+/// 严格校验（job 模式 / `config check`）：形状 + 未知键 + 密钥字段 + 语义，返回全部问题。
+/// 返回 `(Some(config), issues)`：issues 非空即不合法；`None` = 连 Config 都构不出来。
+pub fn check_text(text: &str) -> (Option<Config>, Vec<ConfigIssue>) {
+    let mut issues = Vec::new();
+    let v: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            issues.push(ConfigIssue { code: "invalid_value", pointer: String::new(), message: format!("JSON 解析失败：{e}") });
+            return (None, issues);
+        }
+    };
+    issues.extend(strict_issues(&v));
+    if let Err(e) = shape_guard(&v) {
+        issues.push(ConfigIssue { code: "legacy_shape", pointer: String::new(), message: e.to_string() });
+    }
+    match serde_json::from_value::<Config>(v.clone()) {
+        Ok(cfg) => {
+            if let Err(e) = cfg.validate() {
+                issues.push(ConfigIssue { code: "invalid_value", pointer: String::new(), message: e.to_string() });
+            }
+            (Some(cfg), issues)
+        }
+        Err(e) => {
+            let pointer = locate_shape_error(&v).map(|p| {
+                if p.starts_with('(') { String::new() } else { format!("/{}", p.replace('.', "/")) }
+            }).unwrap_or_default();
+            issues.push(ConfigIssue { code: "invalid_value", pointer, message: format!("配置形状错误：{e}") });
+            (None, issues)
+        }
+    }
+}
+
+/// 严格解析（任何 issue 都是错）。job 模式用它——未知键 = error（D4）。
+pub fn from_json_strict(text: &str) -> Result<Config, Vec<ConfigIssue>> {
+    match check_text(text) {
+        (Some(cfg), issues) if issues.is_empty() => Ok(cfg),
+        (_, issues) => Err(issues),
+    }
+}
+
+/// 生成 executor config 的 JSON Schema（P17 / 1.9）。
+///
+/// 身份固定：`$id: urn:redteam:config/1`、`title: redteam executor config`、`schemaVersion: 1`；
+/// **不嵌 crate 版本**（发布版本变化不该让 schema 漂移）。draft-07 由 schemars 决定。
+pub fn config_schema_json() -> serde_json::Value {
+    let mut v = serde_json::to_value(schemars::schema_for!(Config)).expect("schema serialize");
+    let o = v.as_object_mut().expect("schema object");
+    o.insert("$id".into(), serde_json::json!("urn:redteam:config/1"));
+    o.insert("title".into(), serde_json::json!("redteam executor config"));
+    o.insert("schemaVersion".into(), serde_json::json!(1));
+    v
+}
+
+/// 稳定文本形态（`dist/config.schema.json` 生成物与 `make verify` 对拍用）。
+pub fn render_config_schema() -> String {
+    let mut s = serde_json::to_string_pretty(&config_schema_json()).expect("schema");
+    s.push('\n');
+    s
+}
+
 /// `from_value` 的错误不带字段路径（serde_json 只在语法错误带行列）：按 model / provider / review 段逐个试解析，
 /// 定位第一处失败的路径（评审 S3）。
 fn locate_shape_error(v: &serde_json::Value) -> Option<String> {
     let top = v.as_object()?;
+    if let Some(l) = top.get("language") {
+        if serde_json::from_value::<Language>(l.clone()).is_err() {
+            return Some("language".into());
+        }
+    }
     if let Some(provs) = top.get("providers").and_then(|p| p.as_object()) {
         for (pname, pv) in provs {
             if let Some(ms) = pv.get("models").and_then(|m| m.as_object()) {
@@ -1316,13 +1623,79 @@ mod tests {
     /// 两者都在时不再提示（`verifier` 已是 fix 验证语义）。
     #[test]
     fn verifier_role_guard_warns_only_when_refuter_is_missing() {
-        let (_, w) = Config::from_json_warned(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"verifier":{}}}}}}}"#).unwrap();
-        assert!(w.iter().any(|x| x.contains("验真角色已更名为 refuter")), "{w:?}");
-        let (cfg, w2) = Config::from_json_warned(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"refuter":{}}}}}}}"#).unwrap();
-        assert!(w2.iter().all(|x| !x.contains("验真角色已更名")), "{w2:?}");
-        assert!(cfg.verifier_role_guard_warning().is_none());
-        let cfg3 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"refuter":{},"verifier":{}}}}}}}"#).unwrap();
-        assert!(cfg3.verifier_role_guard_warning().is_none(), "两个角色都有 → 无护栏提示");
+        // 护栏在 review 的 registry 接线处触发（见 main.rs 用例）；这里只测判定函数本身。
+        let stale = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"verifier":{}}}}}}}"#).unwrap();
+        let w = stale.verifier_role_guard_warning().expect("旧语义应触发护栏");
+        assert!(w.contains("验真角色已更名为 refuter"), "{w}");
+        let fresh = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"refuter":{}}}}}}}"#).unwrap();
+        assert!(fresh.verifier_role_guard_warning().is_none());
+        let both = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"refuter":{},"verifier":{}}}}}}}"#).unwrap();
+        assert!(both.verifier_role_guard_warning().is_none(), "两个角色都有 → 无护栏提示");
+    }
+
+    /// 1.4：顶层 `language` 严格枚举；缺省 None（本地走 locale、job 走 en_US）。
+    #[test]
+    fn language_is_strict_top_level_enum() {
+        let zh = Config::from_json(r#"{"language":"zh_CN"}"#).unwrap();
+        assert_eq!(zh.language, Some(Language::ZhCn));
+        let en = Config::from_json(r#"{"language":"en_US"}"#).unwrap();
+        assert_eq!(en.language, Some(Language::EnUs));
+        assert!(Config::from_json(r#"{"language":"fr_FR"}"#).is_err(), "非法值 → 配置解析失败");
+        // 宽松路径只 warning；严格路径（job / config check）才报错。
+        assert!(Config::from_json(r#"{"review":{"language":"zh_CN"}}"#).is_ok());
+        assert!(from_json_strict(r#"{"review":{"language":"zh_CN"}}"#).is_err(), "language 是顶层键，review 下无定义");
+        assert_eq!(Config::default().language, None);
+    }
+
+    /// job 路径不读 env；本地路径 config > locale > default。
+    #[test]
+    fn output_language_resolution_order() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("LC_ALL");
+            std::env::remove_var("LC_MESSAGES");
+            std::env::set_var("LANG", "zh_CN.UTF-8");
+        }
+        let none = Config::default();
+        assert_eq!(OutputLang::resolve_job(&none).value, "en_US");
+        assert_eq!(OutputLang::resolve_job(&none).source, LangSource::Default);
+        assert_eq!(OutputLang::resolve_local(&none).value, "zh_CN", "本地跟随 locale");
+        assert_eq!(OutputLang::resolve_local(&none).source, LangSource::Locale);
+
+        let cfg = Config::from_json(r#"{"language":"en_US"}"#).unwrap();
+        assert_eq!(OutputLang::resolve_job(&cfg).value, "en_US");
+        assert_eq!(OutputLang::resolve_job(&cfg).source, LangSource::Config, "配置优先于 job 缺省");
+        assert_eq!(OutputLang::resolve_local(&cfg).value, "en_US", "配置优先于 locale");
+        unsafe { std::env::remove_var("LANG"); }
+    }
+
+    /// 严格扫描：未知键 / 密钥字段进 issues，且指针可定位；本地 from_json_warned 维持 warning。
+    #[test]
+    fn strict_scan_finds_unknown_and_secret_keys() {
+        let text = r#"{"providers":{"p":{"kind":"openai","apiKey":"sk-x","models":{"m":{"roles":{"scanner":{}}},"extra":{} }}},"review":{"refuters":{"enabled":true},"unknown":1},"language":"en_US"}"#;
+        let (cfg, issues) = check_text(text);
+        assert!(cfg.is_some());
+        let ptrs: Vec<(&str, &str)> = issues.iter().map(|i| (i.code, i.pointer.as_str())).collect();
+        assert!(ptrs.contains(&("secret_field", "/providers/p/apiKey")), "{ptrs:?}");
+        assert!(ptrs.contains(&("unknown_key", "/review/unknown")), "{ptrs:?}");
+        assert!(from_json_strict(text).is_err());
+        // 本地宽松路径：未知键只 warning，不拦。
+        assert!(Config::from_json(text).is_ok());
+        // 合法严格配置通过（apiKeyEnv 不算密钥字段）。
+        let ok = r#"{"language":"zh_CN","providers":{"p":{"kind":"openai","apiKeyEnv":"P_KEY","models":{"m":{"roles":{"scanner":{}}}}}},"review":{"refuters":{"enabled":true}}}"#;
+        assert!(from_json_strict(ok).is_ok());
+    }
+
+    /// 严格路径也拦旧形状 / snake_case / 非法枚举。
+    #[test]
+    fn strict_scan_carries_shape_errors() {
+        let (_, issues) = check_text(r#"{"providers":{"p":{"kind":"openai","base_url":"x","models":{}}}}"#);
+        assert!(issues.iter().any(|i| i.code == "legacy_shape" || i.code == "unknown_key"), "{issues:?}");
+        let (_, issues2) = check_text(r#"{"language":"fr"}"#);
+        assert!(issues2.iter().any(|i| i.code == "invalid_value" && i.pointer == "/language"), "{issues2:?}");
+        let (_, issues3) = check_text("{not json");
+        assert_eq!(issues3.len(), 1);
+        assert_eq!(issues3[0].code, "invalid_value");
     }
 
     /// 新 `verifier` 角色（fix 验证）：显式集合与回退分开——缺省回退 reviewer，但不写进 `verifiers`。

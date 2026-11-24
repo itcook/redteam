@@ -1,4 +1,5 @@
 use crate::bundle::Bundle;
+use crate::config::OutputLang;
 
 /// 共享头（system，字节稳定 → cache 区；design §10.7〔D9〕）：协议 / 规则 / 立场 / 证据说明 / CI 跳过清单 / 免疫段 / bypass 类 /
 /// 输出语言 / 仓库简介槽 / spec 槽。三个角色尾共用，角色分化只在尾部。
@@ -12,32 +13,9 @@ const REVIEWER_TAIL_TPL: &str = include_str!("templates/reviewer.md");
 /// 契约 `analysis → verdict → reason`，analysis 在前且 verdict 写下不可撤回；存疑即 UPHELD。
 const REFUTER_TAIL_TPL: &str = include_str!("templates/refuter.md");
 
-/// Detect the preferred output language from locale environment variables.
-/// Reads LC_ALL → LC_MESSAGES → LANG in order, extracts the language prefix,
-/// and maps it to a human-readable language name.
+/// 本地模式的 locale 探测（兼容包装）：新代码应解析 [`OutputLang`] 后传参，不再调用本函数。
 pub fn output_language() -> String {
-    let raw = std::env::var("LC_ALL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var("LC_MESSAGES").ok().filter(|v| !v.is_empty()))
-        .or_else(|| std::env::var("LANG").ok().filter(|v| !v.is_empty()))
-        .unwrap_or_default();
-
-    // Extract language prefix: "zh_CN.UTF-8" → "zh_CN", "en_US" → "en_US", "C"/"POSIX" → ""
-    let lang_part = raw.split('.').next().unwrap_or("").trim();
-
-    // Map to a bilingual name (English + native)——纯英文语言名对部分模型约束力弱
-    // （dogfood 20260703 r1：DeepSeek 输出全文马来语违约），母语名加固遵从。
-    let lang_code = lang_part.split('_').next().unwrap_or("").to_lowercase();
-    match lang_code.as_str() {
-        "zh" => "Simplified Chinese (简体中文)".to_string(),
-        "ja" => "Japanese (日本語)".to_string(),
-        "ko" => "Korean (한국어)".to_string(),
-        "fr" => "French (français)".to_string(),
-        "de" => "German (Deutsch)".to_string(),
-        "es" => "Spanish (español)".to_string(),
-        _ => "English".to_string(),
-    }
+    OutputLang::from_env().unwrap_or_default().prompt_name
 }
 
 
@@ -145,6 +123,8 @@ pub fn refute_template_hash() -> String {
 
 /// `build_scan_prompt` 输入：全部注入段各自只有一个槽（注入互斥），全部经 `neutralize_structure`。
 pub struct ScanPromptInput<'a> {
+    /// 输出语言（1.4：解析一次、传进来；不再由 builder 读 env）。
+    pub lang: &'a OutputLang,
     pub target_label: &'a str,
     pub bundle: &'a Bundle,
     pub user_focus: &'a str,
@@ -178,7 +158,7 @@ pub fn build_scan_prompt(i: &ScanPromptInput<'_>) -> ScanPrompt {
         if s.trim().is_empty() { empty.to_string() } else { neutralize_structure(s, SCAN_STRUCTURAL_TAGS) }
     };
     let system = render(SHARED_HEAD_TPL, &[
-        ("{{OUTPUT_LANGUAGE}}", &output_language()),
+        ("{{OUTPUT_LANGUAGE}}", &i.lang.prompt_name),
         ("{{REPO_BRIEF}}", &slot(i.repo_brief, "(none)")),
         // `cli::spec` 产出自带 <spec_docs> 外壳（旧模板双壳属既有瑕疵）；共享头自己包裹槽位，故剥壳后再中和。
         ("{{SPEC_DOCS}}", &slot(unwrap_shell(i.spec_docs, "spec_docs").unwrap_or(i.spec_docs), "(none — no spec docs provided)")),
@@ -269,6 +249,7 @@ fn refute_template_parts() -> [&'static str; 4] {
 /// `build_refute_prompt` 输入（design §8.1）：一条 claim + 工作树快照 + 判例槽 + spec；
 /// 与 reviewer 同样「每段只有一个槽、全部经 `neutralize_structure`」。
 pub struct RefutePromptInput<'a> {
+    pub lang: &'a OutputLang,
     pub file: &'a str,
     pub line_start: u32,
     pub line_end: u32,
@@ -291,7 +272,7 @@ pub fn build_refute_prompt(i: &RefutePromptInput<'_>) -> ScanPrompt {
         if s.trim().is_empty() { empty.to_string() } else { neutralize_structure(s, REFUTER_STRUCTURAL_TAGS) }
     };
     let system = render(SHARED_HEAD_TPL, &[
-        ("{{OUTPUT_LANGUAGE}}", &output_language()),
+        ("{{OUTPUT_LANGUAGE}}", &i.lang.prompt_name),
         ("{{REPO_BRIEF}}", &slot(i.repo_brief, "(none)")),
         ("{{SPEC_DOCS}}", &slot(unwrap_shell(i.spec_docs, "spec_docs").unwrap_or(i.spec_docs), "(none — no spec docs provided)")),
     ]);
@@ -321,7 +302,7 @@ pub fn build_refute_prompt(i: &RefutePromptInput<'_>) -> ScanPrompt {
             // 角色尾**必须过 render**：refuter.md 是三个角色尾里唯一带占位符的（`{{OUTPUT_LANGUAGE}}`），
             // 原样推进去会把模板标记逐字发给模型（2026-09-21 收口评审实证：D-4 那批离线基线就是这么跑的）。
             PromptBlock {
-                text: render(REFUTER_TAIL_TPL, &[("{{OUTPUT_LANGUAGE}}", &output_language())]),
+                text: render(REFUTER_TAIL_TPL, &[("{{OUTPUT_LANGUAGE}}", &i.lang.prompt_name)]),
                 cache_boundary: false,
             },
         ],
@@ -331,6 +312,7 @@ pub fn build_refute_prompt(i: &RefutePromptInput<'_>) -> ScanPrompt {
 /// `build_review_prompt` 输入（design §7）：全部注入段各自只有一个槽（注入互斥），全部经 `neutralize_structure`；
 /// `cross_index` / `notes` / `dossier` 直接取 `pack::region::RegionPack` 对应字段。
 pub struct ReviewPromptInput<'a> {
+    pub lang: &'a OutputLang,
     pub target_label: &'a str,
     /// 区域所在文件（仓库相对路径）。
     pub file: &'a str,
@@ -365,7 +347,7 @@ pub fn build_review_prompt(i: &ReviewPromptInput<'_>) -> ScanPrompt {
         if s.trim().is_empty() { empty.to_string() } else { neutralize_structure(s, REVIEWER_STRUCTURAL_TAGS) }
     };
     let system = render(SHARED_HEAD_TPL, &[
-        ("{{OUTPUT_LANGUAGE}}", &output_language()),
+        ("{{OUTPUT_LANGUAGE}}", &i.lang.prompt_name),
         ("{{REPO_BRIEF}}", &slot(i.repo_brief, "(none)")),
         ("{{SPEC_DOCS}}", &slot(unwrap_shell(i.spec_docs, "spec_docs").unwrap_or(i.spec_docs), "(none — no spec docs provided)")),
     ]);
@@ -767,14 +749,23 @@ mod tests {
         Bundle::from_files(vec![FileChange { path: "src/auth.rs".into(), diff: "+let t = secret();".into() }])
     }
 
+    fn en() -> &'static OutputLang {
+        static EN: std::sync::OnceLock<OutputLang> = std::sync::OnceLock::new();
+        EN.get_or_init(|| crate::config::Language::EnUs.output())
+    }
+    fn zh() -> &'static OutputLang {
+        static ZH: std::sync::OnceLock<OutputLang> = std::sync::OnceLock::new();
+        ZH.get_or_init(|| crate::config::Language::ZhCn.output())
+    }
     fn scan_input<'a>(bundle: &'a Bundle, cross: &'a str, dossier: &'a str, spec: &'a str, brief: &'a str, focus: &'a str, precedents: &'a str) -> ScanPromptInput<'a> {
-        ScanPromptInput { target_label: "wt", bundle, user_focus: focus, cross_index: cross, precedents, dossier, spec_docs: spec, repo_brief: brief }
+        ScanPromptInput { lang: en(), target_label: "wt", bundle, user_focus: focus, cross_index: cross, precedents, dossier, spec_docs: spec, repo_brief: brief }
     }
 
     // ----------------------------- reviewer prompt（M21b 批 B）-----------------------------
 
     fn review_input<'a>(cross_index: &'a str, notes: &'a str, dossier: &'a str) -> ReviewPromptInput<'a> {
         ReviewPromptInput {
+            lang: en(),
             target_label: "src/a.rs (region 5-8)",
             file: "src/a.rs",
             file_diff: "@@ -6,2 +6,2 @@\n-x\n+y\n",
@@ -798,6 +789,7 @@ mod tests {
 
     fn refute_input() -> RefutePromptInput<'static> {
         RefutePromptInput {
+            lang: en(),
             file: "src/a.rs", line_start: 10, line_end: 12, severity: "medium",
             title: "claimed title", body: "harm chain", quote: "fn a() {",
             source_context: "10: fn a() {\n11:   body();\n12: }", precedents: "",
@@ -829,15 +821,8 @@ mod tests {
     /// 段序与包裹：claim → 快照 → 判例 → 角色尾（角色尾恒在最后，与 scanner / reviewer 同构）。
     #[test]
     fn refuter_prompt_block_order_and_empty_slots() {
-        let _g = ENV_LOCK.lock().unwrap();
-        // 语言槽要断言就得先把环境定死（否则开发机的 LANG 决定测试结果）。
-        // SAFETY: single-threaded access guaranteed by ENV_LOCK
-        unsafe {
-            std::env::remove_var("LC_ALL");
-            std::env::remove_var("LC_MESSAGES");
-            std::env::set_var("LANG", "zh_CN.UTF-8");
-        }
-        let p = build_refute_prompt(&refute_input());
+        // 语言槽断言直接用显式 OutputLang（1.4 起 builder 不再读 env）。
+        let p = build_refute_prompt(&RefutePromptInput { lang: zh(), ..refute_input() });
         let texts: Vec<&str> = p.blocks.iter().map(|b| b.text.as_str()).collect();
         assert!(texts[0].contains("<claimed_finding>") && texts[0].contains("claimed title"));
         assert!(texts[1].contains("<source_snapshot>") && texts[1].contains("body();"));

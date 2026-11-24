@@ -14,6 +14,7 @@ use crate::state::CellRecord;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+pub mod config_cmd;
 pub(crate) mod deny;
 mod incremental;
 pub(crate) mod second_pass;
@@ -67,6 +68,9 @@ pub struct ReviewArgs {
     /// `serde(default)` 保旧 args.json（resume / 后台 job）兼容。
     #[serde(default)]
     pub pack_only: bool,
+    /// job 模式（`--job-dir`）：语言不读 env、ledger 关闭、不写 repo。**不进 args.json**（job 模式不落库）。
+    #[serde(skip)]
+    pub job_mode: bool,
 }
 
 /// 台账加载产物（design 2026-07-03 #6 zero-config）：豁免 id 集 + 活跃判例卡 + 披露 meta。
@@ -318,6 +322,12 @@ pub async fn run_code_review(
     let ledger = load_ledger(args.dismissed.as_deref(), args.no_dismissed, root)?;
     let t0 = std::time::Instant::now();
 
+    // 1.4：语言解析一次——job 模式配置 > 缺省 en_US（**不读 env**）；本地模式配置 > locale。
+    let lang = if args.job_mode {
+        crate::config::OutputLang::resolve_job(cfg)
+    } else {
+        crate::config::OutputLang::resolve_local(cfg)
+    };
     let selected = select_files(changes);
     // 变更文件路径（A-2 披露用）：`selected` 随后被 `plan_cells` 消费掉，先留一份
     let changed_files: Vec<String> = selected.iter().map(|c| c.path.clone()).collect();
@@ -344,7 +354,10 @@ pub async fn run_code_review(
     // 仓库简介（M21d 批 B-1，design §10.5）：每轮读一次、scanner / reviewer / refuter 共用同一份
     // ——稳定前缀两边逐字节相同才有 cache 可言。缺失 = 空串 = 与今日一致。
     // 老项目的 `.gitignore` 升级也挂在这条真实路径上（见 `upgrade_legacy_gitignore` 的注释）。
-    crate::project::upgrade_legacy_gitignore(root);
+    // job 模式零写 repo（P7 / 不变式③）：跳过。
+    if !args.job_mode {
+        crate::project::upgrade_legacy_gitignore(root);
+    }
     let (repo_brief, brief_warnings) = spec::read_repo_brief(root, spec::BRIEF_BUDGET_BYTES.min(budget / 4));
     spec_warnings.extend(brief_warnings);
     // brief 与 spec 同进 system，预算待遇也要同：不扣的话，小窗 scanner 上 8KB 的 brief
@@ -355,6 +368,7 @@ pub async fn run_code_review(
     let CellPlan { bundles, dossiers, others, dossier_meta, stats, pack_stats, folded } =
         plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
     let input = ScanFanoutInput {
+        lang: lang.clone(),
         target_label: &target_label, bundles: &bundles, dossiers: &dossiers, others: &others,
         user_focus: &focus, spec_docs: &spec_section, repo_brief: &repo_brief, root,
         entries: &entries, samples: cfg.review.scanners.samples,
@@ -381,7 +395,7 @@ pub async fn run_code_review(
                 s.on_cell(rec.clone());
             }
         };
-        let factory = per_cell_backend_factory(cfg);
+        let factory = per_cell_backend_factory(cfg, args.job_mode);
         let budget_cells = risk.as_ref().map(|r| r.budget_cells).unwrap_or(4);
         // 队列头落在扇出之前（评审 #1 / #2 / #5）：resume 靠它区分「首跑 scan-only」与「深挖开过被 kill」，并沿用同一个 K。
         if let Some(s) = sink {
@@ -411,6 +425,7 @@ pub async fn run_code_review(
         let deep = run_deep(
             registry,
             DeepInput {
+                lang: lang.clone(),
                 activated: &activation.activated,
                 // 判例门（M21c 批 B-2）：与 scanner 注入同一份 cards，已过 `--no-dismissed`。
                 precedents: &ledger.cards,
@@ -569,11 +584,13 @@ fn read_dormant_leads(cwd: &Path, changed_files: &[String], round: &str, ledger_
 
 /// per-cell backend 工厂（流式旁路的挂点）：按 reviewer 条目取密钥另造实例并挂 delta 回调。
 /// 造不出来（缺密钥 / google 未支持）→ `None`，调用方退回共享 backend（无旁路，不致命）。
-fn per_cell_backend_factory(cfg: &Config) -> Box<crate::orchestrate::deep::PerCellBackend<'_>> {
+fn per_cell_backend_factory(cfg: &Config, job_mode: bool) -> Box<crate::orchestrate::deep::PerCellBackend<'_>> {
+    // job 模式凭据只走 env（P6）：不读 secrets.json。
+    let secrets = if job_mode { crate::config::secrets::Secrets::default() } else { crate::config::secrets::load_secrets() };
     Box::new(move |em, cb| {
         // 没密钥就别造：造出来也只会 401，而 registry 里的共享 backend（真跑时同一把密钥，
         // 测试时是 Fake）才是该用的那个。旁路缺席不影响正确性——终态 parse 才是权威。
-        let key = cfg.resolve_key(&em.provider, &em.id)?;
+        let key = cfg.resolve_key_with(&em.provider, &em.id, &secrets)?;
         if key.is_empty() {
             return None;
         }
@@ -985,6 +1002,93 @@ pub(crate) fn scanned_coverage(bundles: &[Bundle], cells: &[ScanCellResult]) -> 
     }).count();
     Some(hit as f32 / changed.len() as f32)
 }
+/// 构造 ProviderRegistry（前台 / worker / job 共用）：scanner / reviewer / refuter 各按 **角色键**
+/// `role:provider/id` 注册一份 backend（`reasoningEffort` 是角色属性，同一模型跨角色不能共用一份档位）——scanner 一律
+/// scan 单发（`--tools` 对 scanner 无效，K3）；provider 在途门 = `maxConcurrency` 缺省继承 `review.max_concurrency`
+/// （唯一闸，无角色级 workers）。scanners 为空 → 配置错误；返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
+///
+/// **job 模式凭据只走 env**（P6）：`args.job_mode` 时 secrets 传空，`resolve_key_with` 只读 `apiKeyEnv` 指向的环境变量。
+///
+/// **`roles.verifier`（fix 验证）不在这里注册**：它属 kind=verify 管线（Phase 4），review 既不用也不该
+/// 因它构造 backend；它的回退（缺省复用 reviewer）是选择策略（`RoleSets::fix_verifiers`），不是 review 的注册项。
+/// 测试/夹具接缝：按角色条目覆盖 backend 构造（返回 None 则走真实 `backend_from_config`）。
+/// 生产路径不传；集成测试用它注入确定性后端（计划 1.6），**不是**产品开关。
+pub type BackendOverride<'a> =
+    dyn Fn(&crate::config::EffectiveModel) -> Option<Box<dyn crate::provider::tool_loop::ChatBackend>> + 'a;
+
+pub fn build_registry(args: &ReviewArgs, cfg: &Config) -> Result<ProviderRegistry, String> {
+    build_registry_with(args, cfg, None)
+}
+
+pub fn build_registry_with(
+    args: &ReviewArgs,
+    cfg: &Config,
+    over: Option<&BackendOverride<'_>>,
+) -> Result<ProviderRegistry, String> {
+    let roles = cfg.active_roles();
+    if roles.scanners.is_empty() {
+        return Err(NO_SCANNER_MSG.to_string());
+    }
+    let secrets = if args.job_mode { crate::config::secrets::Secrets::default() } else { crate::config::secrets::load_secrets() };
+    let mut registry = ProviderRegistry::new();
+    // reasoningEffort 无映射 warnings 按角色条目统一给——同一模型跨角色各有各的档位，不能只报先注册的那条。
+    for w in crate::provider::backends::role_reasoning_effort_warnings(&roles) {
+        registry.push_warning(w);
+    }
+    for em in &roles.scanners {
+        let key = cfg.resolve_key_with(&em.provider, &em.id, &secrets).unwrap_or_default();
+        let backend = match over.and_then(|f| f(em)) {
+            Some(b) => b,
+            None => match crate::provider::backends::backend_from_config(em, key) {
+                Ok(b) => b,
+                Err(e) => return Err(format!("{e}")),
+            },
+        };
+        // 单轮超时（design §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`。
+        let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
+        // usize → u32 饱和而非截断（误填 2^32 以上的值不会被截成 0 / 小数）。
+        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
+        registry.insert_scan(crate::provider::registry::role_key(Role::Scanner, &em.name), &em.provider, cap, backend, per_turn, crate::provider::DEFAULT_RETRY_BUDGET);
+    }
+    // 0.8 护栏（R20）：旧配置里“验真角色”写作 `roles.verifier`，硬切后会静默变成 fix 验证角色。
+    // 这里把变义提示进 registry.warnings → 报告 run.warnings——后台 worker 的 stderr 是 /dev/null，
+    // 只靠 `Config::load` 的 eprintln 后台作业永远看不到。
+    if let Some(w) = cfg.verifier_role_guard_warning() {
+        if !registry.warnings().contains(&w) {
+            registry.push_warning(w);
+        }
+    }
+    // reviewer 与 refuter 各按角色键注册（同模型不同档位各占一份 backend，不互相覆盖）。批 D〔D17〕：
+    // refuter 必须在这里注册，否则 `pick_refuter` 选中一个纯 refuter 模型时 `registry.lease()` 直接
+    // Unavailable，每条复核都静默落成「保守 upheld」——看起来跑了、其实一次没验。
+    for (em, role) in roles
+        .reviewers
+        .iter()
+        .map(|m| (m, Role::Reviewer))
+        .chain(roles.refuters.iter().map(|m| (m, Role::Refuter)))
+    {
+        let key = cfg.resolve_key_with(&em.provider, &em.id, &secrets).unwrap_or_default();
+        let backend = match over.and_then(|f| f(em)) {
+            Some(b) => b,
+            None => match crate::provider::backends::backend_from_config(em, key) {
+                Ok(b) => b,
+            // reviewer 造不出 = 本轮的活干不了，硬 Err 照旧；**refuter 造不出只是这一路没得用**
+            // （复核缺省还关着），不该让整条 review 命令拒跑（收口评审 #8：
+            // 预置一个 kind=google 的 refuter 模型，整个 review 会以 "google not yet supported" 退出）。
+            Err(e) if role == Role::Refuter => {
+                registry.push_warning(format!("refuter {} 不可用（{e}）——本轮复核将跳过它", em.name));
+                continue;
+            }
+            Err(e) => return Err(format!("{e}")),
+            },
+        };
+        let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
+        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
+        registry.insert_scan(crate::provider::registry::role_key(role, &em.name), &em.provider, cap, backend, per_turn, crate::provider::DEFAULT_RETRY_BUDGET);
+    }
+    Ok(registry)
+}
+
 /// 评审分发（前台 main 与后台 worker 共用）：增量轮路由，否则 git changed_files → run_code_review。
 pub async fn run_review_dispatch(
     args: &ReviewArgs,
@@ -1100,6 +1204,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     if !gitignore.exists() {
         std::fs::write(&gitignore, crate::project::GITIGNORE_BODY)?;
     }
+    let lang = if args.job_mode { crate::config::OutputLang::resolve_job(cfg) } else { crate::config::OutputLang::resolve_local(cfg) };
     let mut cells = Vec::new();
     for (i, b) in bundles.iter().enumerate() {
         let dossier = dossiers.get(i).map(String::as_str).unwrap_or("");
@@ -1107,6 +1212,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
         let files: Vec<String> = b.files.iter().map(|f| f.path.clone()).collect();
         let precedents = crate::prompt::render_precedents_for_files(&files, &ledger.cards);
         let sp = crate::prompt::build_scan_prompt(&crate::prompt::ScanPromptInput {
+            lang: &lang,
             target_label: &target, bundle: b, user_focus: &focus, cross_index: other, precedents: &precedents,
             dossier, spec_docs: &spec_section, repo_brief: &repo_brief,
         });
@@ -1917,11 +2023,13 @@ pub async fn run_resume(
                     eprintln!("warn: job {job_id} resume reviewer cell 落盘失败（{}）: {e}", rec.cell);
                 }
             };
-            let factory = per_cell_backend_factory(cfg);
+            let factory = per_cell_backend_factory(cfg, args.job_mode);
             let thresholds = verdict_thresholds(&args, cfg);
+            let lang = if args.job_mode { crate::config::OutputLang::resolve_job(cfg) } else { crate::config::OutputLang::resolve_local(cfg) };
             let deep = run_deep(
                 registry,
                 DeepInput {
+                    lang: lang.clone(),
                     // resume 不重算激活（M21c 批 C）：同一个 job 续跑，HEAD 没变、delta 没变，
                     // 首跑已经激活过的项带着 `activated` / `force_dig` 标记从快照恢复。
                     // 这里重算会让同一轮的 `activations` 多加一次，把活锁守卫的门提前踩响。
@@ -2315,7 +2423,7 @@ mod job_tests {
             spec: vec![], focus: None,
             block_threshold: None, conf_floor: None,
             background: true, format: "json".into(),
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None, job_mode: false,
         }
     }
     /// 在 dir 建 git 仓库并 stage 一个含 content 的文件——doc 模式退场后（E10）run_job 测试改走
@@ -2855,7 +2963,7 @@ mod resume_tests {
             base: None, scope: "working-tree".into(), spec: vec![],
             focus: None,
             block_threshold: None, conf_floor: None, background: true,
-            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
+            format: "json".into(), resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None, job_mode: false,
         }
     }
     fn systems(b: &FakeChatBackend) -> Vec<String> {
@@ -4074,7 +4182,7 @@ mod code_review_tests {
             spec: vec![], focus: None,
             block_threshold: None, conf_floor: None,
             background: false, format: "json".into(),
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None, job_mode: false,
         }
     }
     fn registry(entries: &[(&str, &str)]) -> ProviderRegistry {
@@ -4920,7 +5028,7 @@ mod spec_tests {
             base: None, scope: "working-tree".into(), spec, focus: None,
             block_threshold: None, conf_floor: None,
             background: false, format: "json".into(),
-            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None,
+            resume: None, dismissed: None, no_dismissed: false, incremental_from: None, tools: None, test_command: None, job_mode: false,
         }
     }
     fn system_of(b: &FakeChatBackend) -> String {
