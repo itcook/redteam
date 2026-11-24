@@ -73,15 +73,25 @@ pub struct GateStat {
     pub completions: u64,
 }
 
+/// 一次锁内读出的门计数（心跳快照的最小一致单元）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateLoad {
+    pub in_flight: u32,
+    pub waiting: u32,
+    pub retrying: u32,
+    /// 配置帽（`cap_initial`，不随 429 收窄）。
+    pub cap: u32,
+}
+
 /// `out/state.json` 的 `llm` 段（契约 §3.6；P12：唯一来源 = 各 provider 的 `InflightGate`）。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct LlmSnapshot {
     /// Σ provider `active`（正在进行的 HTTP 请求；不含 429 退避等待者）。
-    pub in_flight: u32,
+    pub in_flight: u64,
     /// Σ provider 配置帽（P12 的“实际生效口径”；不随 429 收窄而变）。
-    pub max_concurrency: u32,
+    pub max_concurrency: u64,
     /// Σ provider 429 退避等待中请求数（不计入 `in_flight`）。
-    pub retrying: u32,
+    pub retrying: u64,
     pub providers: Vec<ProviderSnapshot>,
 }
 
@@ -89,8 +99,8 @@ pub struct LlmSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ProviderSnapshot {
     pub name: String,
-    pub in_flight: u32,
-    pub max_concurrency: u32,
+    pub in_flight: u64,
+    pub max_concurrency: u64,
 }
 
 /// 从门表生成心跳读数（`ProviderRegistry::snapshot` 与心跳任务共用同一函数——口径不漂移）。
@@ -99,20 +109,23 @@ pub fn snapshot_of_gates(gates: &BTreeMap<String, Arc<InflightGate>>) -> Option<
     if gates.is_empty() {
         return None;
     }
-    let providers: Vec<ProviderSnapshot> = gates
-        .iter()
-        .map(|(name, g)| ProviderSnapshot {
+    let mut in_flight = 0u64;
+    let mut max_concurrency = 0u64;
+    let mut retrying = 0u64;
+    let mut providers = Vec::with_capacity(gates.len());
+    for (name, gate) in gates {
+        // 每个 gate 一次锁内读全字段：同一请求的 retrying→active 转换不会拼出双计快照。
+        let load = gate.load();
+        in_flight += u64::from(load.in_flight);
+        max_concurrency += u64::from(load.cap);
+        retrying += u64::from(load.retrying);
+        providers.push(ProviderSnapshot {
             name: name.clone(),
-            in_flight: g.inflight(),
-            max_concurrency: g.configured_cap(),
-        })
-        .collect();
-    Some(LlmSnapshot {
-        in_flight: providers.iter().map(|p| p.in_flight).sum(),
-        max_concurrency: providers.iter().map(|p| p.max_concurrency).sum(),
-        retrying: gates.values().map(|g| g.retrying()).sum(),
-        providers,
-    })
+            in_flight: u64::from(load.in_flight),
+            max_concurrency: u64::from(load.cap),
+        });
+    }
+    Some(LlmSnapshot { in_flight, max_concurrency, retrying, providers })
 }
 
 impl InflightGate {
@@ -141,17 +154,27 @@ impl InflightGate {
         let s = self.lock();
         GateStat { cap: self.cap_initial, effective_cap: s.cap, rate_limited: s.rate_limited, peak: self.peak(), completions: s.completions }
     }
+    /// 一次锁内读全部门计数（心跳快照用）：同一请求的 `retrying → active` 转换不会拼出双计中间态。
+    pub fn load(&self) -> GateLoad {
+        let s = self.lock();
+        GateLoad {
+            in_flight: s.active,
+            waiting: s.waiting.len() as u32,
+            retrying: s.retrying,
+            cap: self.cap_initial,
+        }
+    }
     /// 在途 HTTP 请求数（心跳 `llm.in_flight` / `providers[].in_flight` 的唯一来源）。
     pub fn inflight(&self) -> u32 {
-        self.lock().active
+        self.load().in_flight
     }
     /// 阻塞等门者数（心跳不直接上报；用于诊断与 Phase 5 门槛测试）。
     pub fn waiting(&self) -> u32 {
-        self.lock().waiting.len() as u32
+        self.load().waiting
     }
     /// 429 退避等待中的请求数（不计入在途）。
     pub fn retrying(&self) -> u32 {
-        self.lock().retrying
+        self.load().retrying
     }
     /// 取名额：先非阻塞首试（有人排队就让位）；取不到登记为等门者排进 FIFO，轮到队头且 `held < cap` 才取。
     /// 取消安全：等门 future 在任何 await 点被 drop，`WaiterGuard` 把票号移出队列；它若是队头则唤醒其余等门者重检。
@@ -287,12 +310,18 @@ pub(crate) struct GateAttempts<'a> {
 /// 不占门名额、**不计入 `active`**——`state.json` 的 `llm.retrying` 与 `llm.in_flight` 互斥。
 struct RetryingGuard<'a> {
     gate: &'a InflightGate,
+    /// 仍在等待登记中；准入临界区完成 `retrying → active` 后置 false（Drop 不再重复减）。
+    registered: bool,
 }
 
 impl<'a> RetryingGuard<'a> {
     fn register(gate: &'a InflightGate) -> Self {
         gate.lock().retrying += 1;
-        RetryingGuard { gate }
+        RetryingGuard { gate, registered: true }
+    }
+    /// 准入已在同一临界区完成转换；此后 Drop 只负责释放引用。
+    fn release(&mut self) {
+        self.registered = false;
     }
 }
 
@@ -386,7 +415,7 @@ impl AttemptPolicy for GateAttempts<'_> {
             return false;
         }
         // 从这里起到返回（含取消）都是“退避等待中”：只计 `retrying`，不占 `active`。
-        let _retrying = RetryingGuard::register(self.gate);
+        let mut retrying = RetryingGuard::register(self.gate);
         let mut retry_after = retry_after.map(|d| d.min(RL_BACKOFF_CAP));
         loop {
             if others == 0 {
@@ -404,8 +433,12 @@ impl AttemptPolicy for GateAttempts<'_> {
             let mut s = self.gate.lock();
             if s.active < s.cap {
                 s.active += 1;
+                // 与 active 同一临界区完成 `retrying → active`：快照不会看到 1+1 的双计窗口。
+                s.retrying = s.retrying.saturating_sub(1);
                 self.reserved.store(true, Ordering::SeqCst);
                 drop(s);
+                // 临界区外只置标记，不再取 gate 锁（避免持锁 drop guard 的重入）。
+                retrying.release();
                 self.retries.fetch_add(1, Ordering::SeqCst);
                 self.waited_ms.fetch_add(t0.elapsed().as_millis() as u64, Ordering::SeqCst);
                 return true;
@@ -801,6 +834,79 @@ mod tests {
         b.gate_attempts().attempt_end(AttemptOutcome::Ok);
         assert_eq!(reg.snapshot().unwrap().in_flight, 0, "请求结束后归零");
         drop((a, b));
+    }
+
+    /// Phase 5.1：真实 `registry.scan()` 路径——两请求同时在途时 `in_flight==2`；
+    /// 429 退避期间 `retrying==1`、`in_flight==1`（另一个在途），全部结束后归零。
+    #[tokio::test]
+    async fn snapshot_observes_real_scan_inflight_and_retry_backoff() {
+        struct BarrierBackend {
+            entered: Arc<tokio::sync::Barrier>,
+            release: Arc<tokio::sync::Semaphore>,
+            first: AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl ChatBackend for BarrierBackend {
+            async fn turn(
+                &self,
+                _messages: &[crate::provider::tool_loop::ChatMessage],
+                _tools: &[crate::tools::ToolSpec],
+            ) -> Result<AssistantTurn, ProviderError> {
+                if !self.first.swap(true, Ordering::SeqCst) {
+                    self.entered.wait().await;
+                    let _permit = self.release.acquire().await.expect("semaphore");
+                }
+                Ok(scan_turn())
+            }
+        }
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan(
+            "p/rl",
+            "p",
+            2,
+            Box::new(FakeChatBackend::new_results(vec![Err(rate_limited()), Ok(scan_turn())])),
+            Duration::from_secs(5),
+            0,
+        );
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        reg.insert_scan(
+            "p/slow",
+            "p",
+            2,
+            Box::new(BarrierBackend { entered: Arc::clone(&entered), release: Arc::clone(&release), first: AtomicBool::new(false) }),
+            Duration::from_secs(5),
+            0,
+        );
+        let reg = Arc::new(reg);
+        let slow = {
+            let reg = Arc::clone(&reg);
+            tokio::spawn(async move { reg.scan("p/slow", &prompt()).await.map(|_| ()) })
+        };
+        entered.wait().await; // 慢请求已进入 backend.turn → active=1
+        let rl = {
+            let reg = Arc::clone(&reg);
+            tokio::spawn(async move { reg.scan("p/rl", &prompt()).await.map(|_| ()) })
+        };
+        // 等 429 进入退避：门收窄到 1、active=1 → 不能立即准入。
+        let mut waited = 0u64;
+        loop {
+            let snap = reg.snapshot().expect("gates");
+            if snap.retrying == 1 {
+                assert_eq!(snap.in_flight, 1, "退避者不计入在途，另一个请求仍在途: {snap:?}");
+                assert_eq!(snap.max_concurrency, 2, "配置帽不随 429 收窄: {snap:?}");
+                break;
+            }
+            assert!(waited < 2_000, "429 未进入退避: {snap:?}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            waited += 5;
+        }
+        release.add_permits(1);
+        let (s, r) = tokio::join!(slow, rl);
+        s.expect("slow join").expect("slow ok");
+        r.expect("rl join").expect("429 重试最终成功");
+        let snap = reg.snapshot().expect("gates");
+        assert_eq!((snap.in_flight, snap.retrying), (0, 0), "全部结束后归零: {snap:?}");
     }
 
     /// Phase 5.1：429 退避中 `retrying` 计数、不计入在途；取消（future drop）也归零（RAII）。
