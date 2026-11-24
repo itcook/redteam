@@ -37,10 +37,10 @@ impl JobFailure {
     pub fn new(code: impl Into<String>, detail: Option<String>) -> Self {
         Self { code: code.into(), detail }
     }
-    /// 完整机器码：有 detail 时 `code:detail`（附录 E 的形状）。
+    /// 完整机器码：**只有附录 E 里带 `<...>` 的码**才追加参数；任意诊断全文不进机器码。
     pub fn full_code(&self) -> String {
         match &self.detail {
-            Some(d) if !d.is_empty() => format!("{}:{}", self.code, d),
+            Some(d) if !d.is_empty() && takes_detail(&self.code) => format!("{}:{}", self.code, sanitize_detail(d)),
             _ => self.code.clone(),
         }
     }
@@ -106,7 +106,28 @@ fn render_one(code: &str, detail: Option<&str>, lang: &OutputLang) -> StatusText
         Some(d) if template.contains("{}") => template.replacen("{}", d, 1),
         _ => template.replace("{}", "").trim().to_string(),
     };
-    StatusText { code: match detail { Some(d) if !d.is_empty() => format!("{code}:{d}"), _ => code.to_string() }, reason }
+    let code = match detail {
+        Some(d) if !d.is_empty() && takes_detail(code) => format!("{code}:{}", sanitize_detail(d)),
+        _ => code.to_string(),
+    };
+    StatusText { code, reason }
+}
+
+/// 附录 E 里带参数的码；其余码（如 `internal_panic` / `config_unreadable`）不把诊断全文拼进 `status_code`。
+fn takes_detail(code: &str) -> bool {
+    matches!(
+        code,
+        "input_missing" | "input_checksum_mismatch" | "input_schema_mismatch" | "input_path_invalid"
+            | "config_invalid" | "config_contains_secret" | "missing_role" | "kind_not_implemented"
+            | "scan_incomplete" | "review_incomplete" | "budget_truncated" | "triage_axis_failed"
+            | "routing_specs_unreadable" | "verifications_inconclusive" | "quotes_dropped"
+    )
+}
+
+/// `status_code` 只允许一行短参数（JSON Pointer / key / 计数）；空白折叠、截断。
+fn sanitize_detail(d: &str) -> String {
+    let one = d.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.chars().count() <= 120 { one } else { one.chars().take(120).collect() }
 }
 
 impl JobFailure {
@@ -128,10 +149,12 @@ pub fn render_partial(entries: &[JobFailure], lang: &OutputLang) -> Option<Statu
         if !reason.is_empty() {
             reason.push_str("; ");
         }
-        if reason.len() + r.len() > 512 {
+        if reason.chars().count() + r.chars().count() > 512 {
             break;
         }
-        reason.push_str(&r);
+        if !r.is_empty() {
+            reason.push_str(&r);
+        }
     }
     Some(StatusText { code: first.code, reason })
 }
@@ -177,8 +200,10 @@ mod tests {
     #[test]
     fn unknown_code_falls_back_without_panicking() {
         let t = JobFailure::new("mystery", Some("x".into())).status_text(&en());
-        assert_eq!(t.code, "mystery:x");
+        assert_eq!(t.code, "mystery", "未知码不拼诊断参数");
         assert!(t.reason.contains('x'));
+        assert_eq!(JobFailure::new("internal_panic", Some("boom\nmore".into())).full_code(), "internal_panic");
+        assert_eq!(JobFailure::new("input_missing", Some("diff_patch".into())).full_code(), "input_missing:diff_patch");
         let _ = LangSource::Locale.as_str();
     }
 }

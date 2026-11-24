@@ -88,9 +88,10 @@ impl HibotReport {
                 head_sha: manifest.pr.head_sha.clone(),
                 base_sha: manifest.pr.base_sha.clone(),
             },
+            // 报告描述**实际执行单元**，不是 manifest 里的期待值（P3）。
             executor: ExecutorOut {
-                name: manifest.executor.name.clone(),
-                version: manifest.executor.version.clone(),
+                name: crate::job::manifest::CLI_NAME.to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
             },
             findings: Vec::new(),
             verifications: match manifest.kind {
@@ -119,6 +120,28 @@ pub fn kind_not_implemented_report(manifest: &JobManifest, lang: &OutputLang) ->
     error_report(manifest, lang, &JobFailure::new("kind_not_implemented", Some(manifest.kind.as_str().into())))
 }
 
+/// D1 + A 裁决（Phase 1）：未实现的 verify 对每个有效输入指纹输出 `inconclusive`（未核验），
+/// 整体 `status=error` + `kind_not_implemented`——满足逐条覆盖，又不伪造 resolved/unresolved。
+pub fn kind_not_implemented_verify(
+    manifest: &JobManifest,
+    lang: &OutputLang,
+    fingerprints: &[String],
+) -> HibotReport {
+    let mut r = error_report(manifest, lang, &JobFailure::new("kind_not_implemented", Some(manifest.kind.as_str().into())));
+    let evidence = if lang.value.starts_with("zh") {
+        "本执行单元尚未实现 verify（Phase 1）；未对该 finding 做任何修复核验"
+    } else {
+        "verify is not implemented by this execution unit (Phase 1); no fix verification was performed"
+    };
+    r.verifications = Some(
+        fingerprints
+            .iter()
+            .map(|fp| json!({"finding_fingerprint": fp, "status": "inconclusive", "evidence": evidence}))
+            .collect(),
+    );
+    r
+}
+
 /// review 的 `ReviewReport` → hibot 信封。
 pub fn review_report(manifest: &JobManifest, internal: &ReviewReport, cfg: &Config, lang: &OutputLang) -> HibotReport {
     let (status, reasons) = derive_review_status(internal);
@@ -140,7 +163,6 @@ pub fn review_report(manifest: &JobManifest, internal: &ReviewReport, cfg: &Conf
             "wall_clock_s": manifest.limits.wall_clock_s,
             "truncated_items": internal.run.deep.as_ref().map(|d| d.budget_skipped).unwrap_or(0),
         },
-        "verdict": internal.verdict.as_str(),
         "stats": internal.stats,
         "run": internal.run,
         "scan": internal.scan,
@@ -309,6 +331,10 @@ mod tests {
         assert_eq!(hf.source.role, "reviewer");
         assert_eq!(out.usage.wall_clock_ms, 1234);
         assert_eq!(out.schema, "hibot.audit.report.review/1");
+        // P3：verdict 丢弃；executor 描述实际执行单元（不是 manifest 的期待版本）。
+        assert!(out.extensions["redteam"].get("verdict").is_none(), "verdict 必须丢弃");
+        assert_eq!(out.executor.name, "redteam");
+        assert_eq!(out.executor.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

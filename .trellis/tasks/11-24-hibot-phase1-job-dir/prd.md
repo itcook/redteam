@@ -47,15 +47,24 @@ hibot audit 执行单元接入的 U2 单元（协调者 01a20ba0 派发）。计
 
 ## 结果（2026-11-24，待协调者验收）
 
-- 提交（`feature/hibot-audit-exec`）：097ebea（1.1–1.5/1.7/1.8）· 9fa3c2a（1.9 dist+Makefile）· b0a4c47（env 隔离 + 附录 E）· 后续 test(job) 小提交。
-- `cargo test`：1009 lib + 21 bin + 6 conformance + 7 packaging + 24 e2e 全绿；`make verify` exit 0（schema 零 diff）。
-- SIGTERM 手工证据：挂起的 provider 请求中注入 SIGTERM → 0.06s 退出、`status=partial`、`status_code=wall_clock_exhausted`。
-- 墙钟证据：`limits.wall_clock_s=1` → 1.79s 收口 partial（启动+1s 预算）。
-- B1（hibot 样例）：`config check ... --kind review` exit 1，原始输出：
-  `ERROR /review/verifiers unknown_key ...`、`ERROR / legacy_shape: ... review.verifiers 已更名 review.refuters ...`、`RESULT error 2 errors, 0 warnings`。
-  按 P16 应改为 `review.refuters.enabled`；协调者负责回执 hibot。
-- env 隔离：`seal_job_env` 清 `REDTEAM_*`（MAX_TOKENS/PER_TURN_SECS/DUMP_DIR/HOME）与 `LC_ALL/LC_MESSAGES/LANG`；
-  集成用例断言调用后这些变量消失；`job_mode_key_resolution_is_env_only` 证明凭据只走 env。
-- 1.6 覆盖说明：契约本地可校验项 1–4、6、7 均有断言；第 5 项（verify 覆盖）属 Phase 4，Phase 1 按 D1 断言
-  `verifications: []` + `kind_not_implemented`。
-- 遗留：D1 临时码已在计划附录 E 登记（Phase 3/4 删除）；`state.json` 心跳按 D3 留 Phase 5。
+- 提交（`feature/hibot-audit-exec`）：097ebea（1.1–1.5/1.7/1.8）· 9fa3c2a（1.9 dist+Makefile）· b0a4c47（env 隔离 + 附录 E）· e4c0d70（env 断言）+ 本轮修复提交。
+- `cargo test`：1010+ lib + 21 bin + 6 conformance + 7 packaging + 24 e2e；`make verify` exit 0（schema 零 diff）。
+- **verify 覆盖（协调者 2026-11-24 裁 A）**：非空 findings → 逐条 `inconclusive` + `status=error + kind_not_implemented`；
+  空输入 → `verifications: []`；非法指纹 → `invalid_fingerprint_input` 且不产 verifications；JSON 非法 → `input_schema_mismatch:findings`。
+  已补四类用例。
+- SIGTERM 手工证据（含已完成 finding）：reviewer 两格已落盘、refuter 请求挂起时注入 SIGTERM → 0.03s 退出、
+  `status=partial`、findings 去重后保留 2 条；空 partial 路径另测 0.06s。
+- 墙钟证据：`limits.wall_clock_s=1` → 1.79s 收口 partial（`wall_clock_exhausted`）。
+- 契约验证：本仓报告与 manifest 用 hibot 的 schema **原位只读**校验（draft 2020-12）→ manifest PASS / report PASS；
+  quote 在 head 检出逐字命中，指纹用独立预计算向量 + 逐条复算。
+- env 隔离（不变式⑦）：`seal_job_env` 清 `REDTEAM_*` 与 `LC_*`/`LANG`；
+  `job_mode_key_resolution_is_env_only` 证明 job 分支凭据只走 env；语言用例证明配置优先且 LANG 被清。
+  **未做**独立子进程诱饵配置测试（advisor 建议的理想证明），列为已知覆盖限制。
+- `partial` 夹具改为受控本地 HTTP 服务：同输入「缺 key → 401 → partial」与「注入 key → ok」对照，
+  不再依赖 `127.0.0.1:1` 必然失败；fake reviewer 走 registry（per-cell factory 无 key 时不接管）。
+- B1（hibot 样例）：`config check ... --kind review` exit 1：
+  `ERROR /review/verifiers unknown_key ...`、`ERROR / legacy_shape: ... review.verifiers 已更名 review.refuters ...`、
+  `RESULT error 2 errors, 0 warnings`。按 P16 应改为 `review.refuters.enabled`；协调者回执 hibot。
+- 已知限制：`check_text` 仍另建严格扫描（未复用 `from_json_warned` 的内部单点，但两侧共用键表；
+  后续可统一）；Phase 1 不写 `state.json`（D3）；triage 无 summary（D1）。
+- 临时行为（Phase 4 删除）：`kind_not_implemented:<kind>`（附录 E 已登记）。

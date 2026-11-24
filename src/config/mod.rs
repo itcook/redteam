@@ -511,7 +511,10 @@ pub struct OutputLang {
 }
 
 impl Default for OutputLang {
-    fn default() -> Self { Language::EnUs.output() }
+    /// **来源是 `Default`**（不是 `Config`）：job 模式无 `language` 键时上报 default。
+    fn default() -> Self {
+        OutputLang { value: "en_US".into(), prompt_name: "English".into(), source: LangSource::Default }
+    }
 }
 
 impl OutputLang {
@@ -1123,7 +1126,8 @@ pub fn check_text(text: &str) -> (Option<Config>, Vec<ConfigIssue>) {
     };
     issues.extend(strict_issues(&v));
     if let Err(e) = shape_guard(&v) {
-        issues.push(ConfigIssue { code: "legacy_shape", pointer: String::new(), message: e.to_string() });
+        // 聚合错误含多行：压成一行，保证 `config check` 的一行一条诊断格式。
+        issues.push(ConfigIssue { code: "legacy_shape", pointer: String::new(), message: e.to_string().replace('\n', " ") });
     }
     match serde_json::from_value::<Config>(v.clone()) {
         Ok(cfg) => {
@@ -1133,9 +1137,7 @@ pub fn check_text(text: &str) -> (Option<Config>, Vec<ConfigIssue>) {
             (Some(cfg), issues)
         }
         Err(e) => {
-            let pointer = locate_shape_error(&v).map(|p| {
-                if p.starts_with('(') { String::new() } else { format!("/{}", p.replace('.', "/")) }
-            }).unwrap_or_default();
+            let pointer = locate_shape_error(&v).unwrap_or_default();
             issues.push(ConfigIssue { code: "invalid_value", pointer, message: format!("配置形状错误：{e}") });
             (None, issues)
         }
@@ -1176,7 +1178,7 @@ fn locate_shape_error(v: &serde_json::Value) -> Option<String> {
     let top = v.as_object()?;
     if let Some(l) = top.get("language") {
         if serde_json::from_value::<Language>(l.clone()).is_err() {
-            return Some("language".into());
+            return Some("/language".into());
         }
     }
     if let Some(provs) = top.get("providers").and_then(|p| p.as_object()) {
@@ -1184,7 +1186,7 @@ fn locate_shape_error(v: &serde_json::Value) -> Option<String> {
             if let Some(ms) = pv.get("models").and_then(|m| m.as_object()) {
                 for (id, mv) in ms {
                     if serde_json::from_value::<ModelConfig>(mv.clone()).is_err() {
-                        return Some(format!("providers.{pname}.models.{id}"));
+                        return Some(format!("/providers/{}/models/{}", ptr_escape(pname), ptr_escape(id)));
                     }
                 }
             }
@@ -1193,13 +1195,13 @@ fn locate_shape_error(v: &serde_json::Value) -> Option<String> {
                 o.remove("models");
             }
             if serde_json::from_value::<ProviderConfig>(po).is_err() {
-                return Some(format!("providers.{pname}"));
+                return Some(format!("/providers/{}", ptr_escape(pname)));
             }
         }
     }
     if let Some(r) = top.get("review") {
         if serde_json::from_value::<ReviewConfig>(r.clone()).is_err() {
-            return Some("review".into());
+            return Some("/review".into());
         }
     }
     None
@@ -1609,7 +1611,7 @@ mod tests {
         let e7 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"judge":{}}}}}}}"#).unwrap_err().to_string();
         assert!(e7.contains("roles.judge") && e7.contains("scanner | reviewer | refuter | verifier"), "{e7}");
         let e8 = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"contextWindow":"1M","roles":{"scanner":{}}}}}}}"#).unwrap_err().to_string();
-        assert!(e8.contains("providers.p.models.m") && e8.contains("invalid type"), "形状错误带字段路径（评审 S3）: {e8}");
+        assert!(e8.contains("/providers/p/models/m") && e8.contains("invalid type"), "形状错误带字段路径（评审 S3）: {e8}");
         let e9 = Config::from_json(r#"{"review":{"tools":"maybe"}}"#).unwrap_err().to_string();
         assert!(e9.contains("review：") || e9.contains("review:"), "{e9}");
         // 0.8 术语分家：`review.verifiers` 硬切更名，不欠别名——但不得静默忽略（否则显式开的验真退回缺省关）。

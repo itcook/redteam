@@ -65,17 +65,22 @@ pub fn out_dir(job_dir: &Path, paths: &Paths) -> Result<PathBuf, JobFailure> {
     if raw.is_absolute() {
         return Err(JobFailure::new("input_path_invalid", Some("paths.out".into())));
     }
-    let candidate = job_dir.join(raw);
-    let canon = match candidate.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            std::fs::create_dir_all(&candidate)
-                .map_err(|_| JobFailure::new("input_path_invalid", Some("paths.out".into())))?;
-            candidate
-                .canonicalize()
-                .map_err(|_| JobFailure::new("input_path_invalid", Some("paths.out".into())))?
+    // **创建之前**先做词法校验：任何 `..` 一律拒——否则 `create_dir_all` 会在 job 外留下目录
+    // （检查失败也已经有副作用）。
+    let mut rel = PathBuf::new();
+    for c in raw.components() {
+        match c {
+            std::path::Component::Normal(part) => rel.push(part),
+            std::path::Component::CurDir => {}
+            _ => return Err(JobFailure::new("input_path_invalid", Some("paths.out".into()))),
         }
-    };
+    }
+    let candidate = job_dir.join(rel);
+    std::fs::create_dir_all(&candidate)
+        .map_err(|_| JobFailure::new("input_path_invalid", Some("paths.out".into())))?;
+    let canon = candidate
+        .canonicalize()
+        .map_err(|_| JobFailure::new("input_path_invalid", Some("paths.out".into())))?;
     if !canon.starts_with(job_dir) {
         return Err(JobFailure::new("input_path_invalid", Some("paths.out".into())));
     }
@@ -90,8 +95,13 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // 不跟随预置符号链接：先 unlink（只删链接本身）再 O_EXCL 创建；create_new 在 tmp 已存在时失败，
+    // 防「预置 report.json.tmp → /etc/xxx」把写入引到 job 外。
+    if tmp.symlink_metadata().is_ok() {
+        std::fs::remove_file(&tmp)?;
+    }
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(bytes)?;
         // 落盘后再 rename：SIGKILL 留下 tmp 而不是半截正式文件（tmp 不是终态信号）。
         f.sync_all()?;
@@ -118,6 +128,19 @@ mod tests {
         assert!(!d.path().join("report.json.tmp").exists());
         atomic_write(&p, b"{\"a\":2}").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"a\":2}");
+    }
+
+    #[test]
+    fn atomic_write_does_not_follow_preexisting_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let outside = d.path().join("outside.txt");
+        std::fs::write(&outside, b"keep").unwrap();
+        let target = d.path().join("report.json");
+        let tmp = d.path().join("report.json.tmp");
+        std::os::unix::fs::symlink(&outside, &tmp).unwrap();
+        atomic_write(&target, b"new").unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep", "不得截断 tmp 指向的外部文件");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
     }
 
     #[test]
@@ -161,6 +184,9 @@ mod tests {
         let out = out_dir(&job, &paths).unwrap();
         assert_eq!(out, job.join("out"));
         let bad = Paths { out: "../escape".into(), ..paths };
+        let outside = job.parent().unwrap().join("escape");
+        let _ = std::fs::remove_dir_all(&outside);
         assert!(out_dir(&job, &bad).is_err());
+        assert!(!outside.exists(), "越界拒绝不得先 create_dir_all 留下目录");
     }
 }

@@ -233,18 +233,114 @@ async fn known_vuln_fixture_finds_quote_and_fingerprint_is_stable() {
     assert_eq!(fps(&r), fps(&r2), "同一夹具两次运行的指纹集合必须一致");
 }
 
+
+/// 极简本地 HTTP 服务：正确 key → 返回 scanner JSON；无 key → 401。
+struct TestServer {
+    port: u16,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TestServer {
+    fn start(scan_body: String) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen2, stop2) = (seen.clone(), stop.clone());
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        loop {
+                            match s.read(&mut tmp) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&tmp[..n]);
+                                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let req = String::from_utf8_lossy(&buf).to_string();
+                        if let Ok(mut v) = seen2.lock() { v.push(req.clone()); }
+                        let authorized = req.to_lowercase().contains("authorization: bearer sk-test-key");
+                        let body = if authorized {
+                            serde_json::json!({
+                                "choices": [{"message": {"role": "assistant", "content": scan_body}, "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                            }).to_string()
+                        } else {
+                            r#"{"error":{"message":"unauthorized"}}"#.to_string()
+                        };
+                        let status = if authorized { "200 OK" } else { "401 Unauthorized" };
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
+        });
+        Self { port, seen, stop, handle: Some(handle) }
+    }
+    fn seen(&self) -> Vec<String> { self.seen.lock().map(|v| v.clone()).unwrap_or_default() }
+    fn stop(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() { let _ = h.join(); }
+    }
+}
+
 #[tokio::test]
 async fn partial_fixture_uses_missing_provider_key_and_reports_partial() {
-    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
-    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
-    let fx = make_repo_and_job("review", &config_with(Some("en_US"), true), true, false);
+    // 受控本地服务：带正确 key 的请求返回合法 scanner 输出；无 key 返回 401。
+    // 这样「缺 key → partial / 注入 key → ok」是同输入对照，不再靠 127.0.0.1:1 的必然失败。
+    let quote = QUOTE;
+    let server_body = scanner_json(quote, "src/app.js", 2);
+    let server = TestServer::start(server_body);
+    let config = format!(
+        r#"{{"language":"en_US","providers":{{
+          "p1":{{"kind":"openai","baseUrl":"http://127.0.0.1:1","apiKeyEnv":"P1_KEY","models":{{"s":{{"roles":{{"scanner":{{}}}}}},"r":{{"roles":{{"reviewer":{{}}}}}}}}}},
+          "p2":{{"kind":"openai","baseUrl":"http://127.0.0.1:{}","apiKeyEnv":"P2_KEY","models":{{"scan2":{{"roles":{{"scanner":{{}}}}}}}}}}
+        }}}}"#,
+        server.port
+    );
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(quote, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(quote, "src/app.js", 2, "SQL injection"))));
+    let fx = make_repo_and_job("review", &config, true, false);
     let over = fake_override(scan, review);
+
+    // 缺 key：p2 的请求无 Authorization → 401 → scanner 格失败 → partial。
+    std::env::remove_var("P2_KEY");
     let code = redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await;
     assert_eq!(code, 0, "partial 报告也是已写出 → 0");
     let r = read_report(&fx.job);
     assert_eq!(r["status"], "partial", "{r}");
     assert!(r["status_reason"].as_str().unwrap().contains("scan incomplete"), "{r}");
     assert_eq!(r["extensions"]["redteam"]["status_code"], "scan_incomplete:1/2");
+    let seen = server.seen();
+    assert!(!seen.is_empty(), "p2 必须真的发过请求");
+    assert!(seen.iter().all(|r| !r.contains("sk-test-key")), "缺 key 时不得携带任何密钥");
+
+    // 注入 key：同一夹具 → p2 成功 → ok（证明 partial 确实由缺 key 导致）。
+    std::env::set_var("P2_KEY", "sk-test-key");
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await;
+    std::env::remove_var("P2_KEY");
+    assert_eq!(code, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok", "注入 key 后必须恢复 ok: {r}");
+    assert!(server.seen().iter().any(|r| r.to_lowercase().contains("authorization: bearer sk-test-key")), "带 key 的请求必须可见");
+    server.stop();
 }
 
 #[tokio::test]
@@ -299,17 +395,68 @@ async fn triage_and_verify_are_schema_shaped_stubs() {
     assert_eq!(r["extensions"]["redteam"]["status_code"], "kind_not_implemented:triage");
     assert!(r.get("summary").is_none(), "禁止伪造 summary");
 
-    // verify：合法 manifest（空 findings 也合法）→ error + verifications: []。
+    // verify：空输入 → error + verifications: []。
+    let job = make_verify_job(b"[]");
+    let code = redteam::job::run::run_with(JobKind::Verify, &job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["schema"], "hibot.audit.report.verify/1");
+    assert_eq!(r["verifications"], serde_json::json!([]));
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "kind_not_implemented:verify");
+    assert!(r["findings"].as_array().unwrap().is_empty());
+
+    // verify：非空输入 → 逐条 inconclusive（协调者 2026-11-24 裁 A），整体 error。
+    let fp1 = "sha256:".to_string() + &"a".repeat(64);
+    let fp2 = "sha256:".to_string() + &"b".repeat(64);
+    let findings = serde_json::json!([
+        {"fingerprint": fp1, "severity":"high","confidence":0.9,"file":"a.rs","line_start":1,"line_end":1,
+         "quote":"q","title":"t","body":"b","recommendation":"r"},
+        {"fingerprint": fp2, "severity":"low","confidence":0.5,"file":"b.rs","line_start":2,"line_end":2,
+         "quote":"q2","title":"t2","body":"b","recommendation":"r"}
+    ]).to_string();
+    let job = make_verify_job(findings.as_bytes());
+    let code = redteam::job::run::run_with(JobKind::Verify, &job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&job);
+    assert_eq!(r["status"], "error");
+    let vs = r["verifications"].as_array().unwrap();
+    assert_eq!(vs.len(), 2, "非空输入必须逐条覆盖: {r}");
+    assert!(vs.iter().all(|v| v["status"] == "inconclusive"));
+    assert!(vs.iter().all(|v| v["evidence"].as_str().unwrap().len() > 0));
+    assert_eq!(vs[0]["finding_fingerprint"], fp1);
+
+    // verify：非法指纹 → error + invalid_fingerprint_input，且不产 verifications。
+    let bad = serde_json::json!([{"fingerprint":"sha256:abc"}]).to_string();
+    let job = make_verify_job(bad.as_bytes());
+    let code = redteam::job::run::run_with(JobKind::Verify, &job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&job);
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "invalid_fingerprint_input");
+    assert_eq!(r["verifications"], serde_json::json!([]));
+
+    // verify：findings JSON 非法 → input_schema_mismatch:findings。
+    let job = make_verify_job(b"not json");
+    let code = redteam::job::run::run_with(JobKind::Verify, &job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&job);
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:findings");
+}
+
+
+/// 建一个合法的 verify job（空/非空 findings 都行）。
+fn make_verify_job(findings: &[u8]) -> std::path::PathBuf {
     let tmp = tempfile::tempdir().unwrap();
     let job = tmp.path().join("job");
     std::fs::create_dir_all(job.join("config")).unwrap();
     std::fs::create_dir_all(job.join("input")).unwrap();
+    std::fs::create_dir_all(job.join("out")).unwrap();
     std::fs::write(job.join("config/executor.redteam.json"), config_with(Some("en_US"), false)).unwrap();
-    std::fs::write(job.join("input/findings.json"), "[]").unwrap();
+    std::fs::write(job.join("input/findings.json"), findings).unwrap();
     std::fs::write(job.join("input/diff.patch"), "").unwrap();
     std::fs::write(job.join("input/mb.sha"), "abc\n").unwrap();
     let inputs = serde_json::json!({
-        "findings": {"path":"input/findings.json","sha256":sha256_hex(b"[]"),"schema":"hibot.audit.findings/1"},
+        "findings": {"path":"input/findings.json","sha256":sha256_hex(findings),"schema":"hibot.audit.findings/1"},
         "diff_patch": {"path":"input/diff.patch","sha256":sha256_hex(b"")},
         "merge_base": {"path":"input/mb.sha","sha256":sha256_hex(b"abc\n")},
     });
@@ -323,14 +470,11 @@ async fn triage_and_verify_are_schema_shaped_stubs() {
         "inputs": inputs,
     });
     std::fs::write(job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
-    let code = redteam::job::run::run_with(JobKind::Verify, &job, None).await;
-    assert_eq!(code, 1);
-    let r = read_report(&job);
-    assert_eq!(r["status"], "error");
-    assert_eq!(r["schema"], "hibot.audit.report.verify/1");
-    assert_eq!(r["verifications"], serde_json::json!([]));
-    assert_eq!(r["extensions"]["redteam"]["status_code"], "kind_not_implemented:verify");
-    assert!(r["findings"].as_array().unwrap().is_empty());
+    // 保持 tmp 目录存活：把 job 移到一个泄漏的临时根（测试进程短命，可接受）。
+    let keep = std::env::temp_dir().join(format!("job-verify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&keep);
+    std::fs::rename(&job, &keep).unwrap();
+    keep
 }
 
 #[tokio::test]

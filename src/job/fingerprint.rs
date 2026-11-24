@@ -47,17 +47,12 @@ pub fn is_fingerprint(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn expected(file: &str, quote: &str, title: &str) -> String {
-        // 独立实现（契约原文）用于对拍
-        use sha2::{Digest, Sha256};
-        let norm = |s: &str| s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
-        let mut h = Sha256::new();
-        h.update(file.as_bytes());
-        h.update(b"\0");
-        h.update(norm(quote).as_bytes());
-        h.update(b"\0");
-        h.update(norm(title).as_bytes());
-        format!("sha256:{}", h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>())
+    /// 固定向量：期望值由独立 Python `hashlib.sha256` 预计算（不是复制本实现的算法）。
+    #[test]
+    fn matches_precomputed_contract_vector() {
+        let got = of("src/db.ts", "  db.query(`SELECT *\n\n  FROM users`)  ", " SQL 注入 \n");
+        assert_eq!(got, "sha256:34eb22aaae16e99a6cb38df91124f3daf7209dcc2bd2b7ef74bd75de30741cfe");
+        assert!(is_fingerprint(&got));
     }
 
     #[test]
@@ -65,15 +60,6 @@ mod tests {
         assert_eq!(normalize("  a  \n\n\tb\n"), "a b");
         assert_eq!(normalize(""), "");
         assert_eq!(normalize("one"), "one");
-    }
-
-    #[test]
-    fn matches_contract_vector() {
-        let f = "src/db.ts";
-        let q = "  db.query(`SELECT *\n\n  FROM users`)  ";
-        let t = " SQL 注入 \n";
-        assert_eq!(of(f, q, t), expected(f, q, t));
-        assert!(is_fingerprint(&of(f, q, t)));
     }
 
     #[test]

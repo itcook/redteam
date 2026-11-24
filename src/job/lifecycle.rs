@@ -28,8 +28,8 @@ impl JobDirCellSink {
 
     pub fn snapshot(&self) -> (Vec<CellRecord>, Vec<(Phase, Option<String>)>) {
         (
-            self.cells.lock().map(|v| v.clone()).unwrap_or_default(),
-            self.phases.lock().map(|v| v.clone()).unwrap_or_default(),
+            self.cells.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            self.phases.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         )
     }
 }
@@ -40,34 +40,44 @@ impl CellSink for JobDirCellSink {
     }
 
     fn on_cell(&self, rec: CellRecord) {
-        if let Ok(mut v) = self.cells.lock() {
-            v.push(rec.clone());
-        }
-        // 追加写：失败只 stderr（过程存档，不影响终态报告）。
+        // 锁中毒（另一个线程 panic）时取回内部数据继续记：静默丢弃会让 partial 少掉已完成成果。
+        let mut v = self.cells.lock().unwrap_or_else(|e| e.into_inner());
+        v.push(rec.clone());
+        drop(v);
+        // 追加写：失败要可见（过程存档失败同样意味着 partial 可能缺成果）。
         let path = self.out_dir.join(".cells.jsonl");
-        if let Ok(line) = serde_json::to_string(&rec) {
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .and_then(|mut f| writeln!(f, "{line}"));
+        match serde_json::to_string(&rec) {
+            Ok(line) => {
+                let res = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut f| writeln!(f, "{line}"));
+                if let Err(e) = res {
+                    eprintln!("warn: 写 {} 失败: {e}", path.display());
+                }
+            }
+            Err(e) => eprintln!("warn: cell 记录序列化失败: {e}"),
         }
     }
 
     fn on_phase(&self, phase: Phase, note: Option<String>) {
-        if let Ok(mut v) = self.phases.lock() {
-            v.push((phase, note));
-        }
+        self.phases.lock().unwrap_or_else(|e| e.into_inner()).push((phase, note));
     }
 }
 
 /// 从已落地的 cell 重建 partial findings：reviewer 格的 findings + refute 格的判决回填。
 pub fn findings_from_cells(cells: &[CellRecord]) -> Vec<Finding> {
     let verdicts = known_verdicts(cells);
-    let mut out = Vec::new();
+    let mut out: Vec<Finding> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for c in cells.iter().filter(|c| c.ok) {
         if let CellOutput::Review { findings, .. } = &c.output {
             for f in findings {
+                // 同一 finding 可能由多个格报出（不同队列项）：partial 也按 id 去重，避免重复计数。
+                if !seen.insert(f.id.clone()) {
+                    continue;
+                }
                 let mut f = f.clone();
                 if let Some(v) = verdicts.get(&f.id) {
                     f.set_refute(v.clone());
@@ -145,6 +155,20 @@ mod tests {
         assert!(fs[0].is_refuted(), "refute 格判决要回填到 partial finding");
         assert!(d.path().join(".cells.jsonl").exists(), "过程存档要落盘");
         let _ = (Refute { verdict: RefuteVerdict::Upheld, model: "x".into(), note: String::new() }, Role::Reviewer);
+    }
+
+    #[test]
+    fn duplicate_findings_across_cells_are_deduped_by_id() {
+        let d = tempfile::tempdir().unwrap();
+        let sink = JobDirCellSink::new(d.path().to_path_buf());
+        let a = CellRecord::ok("review[a]@p/r", "p/r", CellOutput::Review { findings: vec![finding("f1")], needs: vec![] });
+        let mut f2 = finding("f1");
+        f2.refute = None;
+        let b = CellRecord::ok("review[b]@p/r", "p/r", CellOutput::Review { findings: vec![f2], needs: vec![] });
+        sink.on_cell(a);
+        sink.on_cell(b);
+        let (cells, _) = sink.snapshot();
+        assert_eq!(findings_from_cells(&cells).len(), 1, "同一 finding id 只保留一条");
     }
 
     #[test]
