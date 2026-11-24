@@ -18,6 +18,9 @@ use std::time::Duration;
 
 /// 跑一个 job，返回进程退出码。
 pub async fn run(cli_kind: JobKind, job_dir_arg: &Path) -> i32 {
+    // 只在真实 CLI 入口清环境：job 进程单用途，清掉研发旋钮无副作用；
+    // 进程内测试并发调用 `run_with` 时不动全局 env（避免线程间 set/remove 竞争）。
+    seal_job_env();
     run_with(cli_kind, job_dir_arg, None).await
 }
 
@@ -27,7 +30,6 @@ pub async fn run_with(
     job_dir_arg: &Path,
     over: Option<&crate::cli::BackendOverride<'_>>,
 ) -> i32 {
-    seal_job_env();
     let job_dir = match io::canonical_job_dir(job_dir_arg) {
         Ok(d) => d,
         Err(e) => {
@@ -164,9 +166,10 @@ async fn run_review(
         test_command: None,
         pack_only: false,
     };
-    let registry = crate::cli::build_registry_with(&args, cfg, over).map_err(|e| {
-        JobFailure::new("internal_panic", Some(e))
-    })?;
+    // backend 构造失败来自 executor config（baseUrl/kind/密钥形态），是**配置问题**而非内部错误；
+    // 机器码用 config_invalid（无 pointer 时只给基础码），原始报错进 status_reason。
+    let registry = crate::cli::build_registry_with(&args, cfg, over)
+        .map_err(|e| JobFailure::with_reason("config_invalid", None, e))?;
 
     let sink = Arc::new(JobDirCellSink::new(out_dir.to_path_buf()));
     let run = Box::pin(crate::cli::run_review_dispatch(&args, &registry, cfg, &repo, Some(sink.as_ref())));

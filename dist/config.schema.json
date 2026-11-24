@@ -124,7 +124,15 @@
             "$ref": "#/definitions/RoleAttrs"
           },
           "default": {},
-          "type": "object"
+          "description": "角色 map：键必须显式枚举（P17：schema 也要拦住 `roles.gerbil` 这类拼写错误， 不能只靠运行期 serde 报错）。schemars 对 `BTreeMap<Role, _>` 只生成 `additionalProperties`，故手写键枚举（与 `MaxCells` 同理由）。",
+          "propertyNames": {
+            "enum": [
+              "scanner",
+              "reviewer",
+              "refuter",
+              "verifier"
+            ]
+          }
         }
       },
       "type": "object"

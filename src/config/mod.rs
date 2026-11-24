@@ -132,6 +132,10 @@ pub struct ModelConfig {
     #[serde(default)]
     pub reasoning: bool,
     #[serde(default)]
+    /// 角色 map：键必须显式枚举（P17：schema 也要拦住 `roles.gerbil` 这类拼写错误，
+    /// 不能只靠运行期 serde 报错）。schemars 对 `BTreeMap<Role, _>` 只生成
+    /// `additionalProperties`，故手写键枚举（与 `MaxCells` 同理由）。
+    #[schemars(schema_with = "roles_schema")]
     pub roles: BTreeMap<Role, RoleAttrs>,
 }
 
@@ -291,6 +295,26 @@ impl JsonSchema for MaxCells {
             ..Default::default()
         })
     }
+}
+
+/// `ModelConfig.roles` 的 schema：键只允许四角色（P17 / 1.9）。
+/// schemars 0.8 对 `BTreeMap<Role, _>` 只生成 `additionalProperties`（拿不到键类型），
+/// 手写 `propertyNames.enum` —— 与 `MaxCells` 手写同理，P17 允许。
+fn roles_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    use schemars::schema::*;
+    let attrs = gen.subschema_for::<RoleAttrs>();
+    let names = Schema::Object(SchemaObject {
+        enum_values: Some(Role::ALL.iter().map(|r| serde_json::json!(r.as_str())).collect()),
+        ..Default::default()
+    });
+    Schema::Object(SchemaObject {
+        object: Some(Box::new(ObjectValidation {
+            property_names: Some(Box::new(names)),
+            additional_properties: Some(Box::new(attrs)),
+            ..Default::default()
+        })),
+        ..Default::default()
+    })
 }
 
 /// `review.pack.body`：scanner 组 pack 装包形态；缺省 `slice`〔D8〕，pack 侧实现在批 E。

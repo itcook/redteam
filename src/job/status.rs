@@ -31,11 +31,18 @@ pub struct JobFailure {
     pub code: String,
     /// `<...>` 参数（附录 E 的 `<key>` / `<pointer>` 等）。
     pub detail: Option<String>,
+    /// 人读消息覆盖：用于"码是 A、但 reason 要保留原始诊断"的场景（如 backend 构造失败）。
+    pub reason: Option<String>,
 }
 
 impl JobFailure {
     pub fn new(code: impl Into<String>, detail: Option<String>) -> Self {
-        Self { code: code.into(), detail }
+        Self { code: code.into(), detail, reason: None }
+    }
+
+    /// 机器码与参数照旧，`status_reason` 用给定消息（例如 executor config 的原始报错）。
+    pub fn with_reason(code: impl Into<String>, detail: Option<String>, reason: impl Into<String>) -> Self {
+        Self { code: code.into(), detail, reason: Some(reason.into()) }
     }
     /// 完整机器码：**只有附录 E 里带 `<...>` 的码**才追加参数；任意诊断全文不进机器码。
     pub fn full_code(&self) -> String {
@@ -133,7 +140,11 @@ fn sanitize_detail(d: &str) -> String {
 impl JobFailure {
     /// 转成 `error` 报告用的 `status_reason` / `status_code`。
     pub fn status_text(&self, lang: &OutputLang) -> StatusText {
-        render_one(&self.code, self.detail.as_deref(), lang)
+        let mut t = render_one(&self.code, self.detail.as_deref(), lang);
+        if let Some(r) = &self.reason {
+            t.reason = r.clone();
+        }
+        t
     }
 }
 

@@ -10,7 +10,10 @@ use redteam::provider::tool_loop::{AssistantTurn, ChatBackend, FakeChatBackend};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// 串行化会改 process env 的用例（std::env 与并发线程不安全）。
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git").current_dir(dir).args(args).output().expect("git");
@@ -303,6 +306,7 @@ impl TestServer {
 
 #[tokio::test]
 async fn partial_fixture_uses_missing_provider_key_and_reports_partial() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 受控本地服务：带正确 key 的请求返回合法 scanner 输出；无 key 返回 401。
     // 这样「缺 key → partial / 注入 key → ok」是同输入对照，不再靠 127.0.0.1:1 的必然失败。
     let quote = QUOTE;
@@ -345,6 +349,7 @@ async fn partial_fixture_uses_missing_provider_key_and_reports_partial() {
 
 #[tokio::test]
 async fn job_language_comes_from_config_not_env() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 配置 zh_CN → prompt 用中文（不受 LANG 影响）。
     let scan = Arc::new(FakeChatBackend::repeating(turn(r#"{"suspicions":[],"needs":[],"scanned_areas":[]}"#)));
     let review = Arc::new(FakeChatBackend::repeating(turn(r#"{"findings":[],"needs":[]}"#)));
@@ -366,13 +371,8 @@ async fn job_language_comes_from_config_not_env() {
     let over2 = fake_override(scan2.clone(), review2);
     let old = std::env::var("LANG").ok();
     std::env::set_var("LANG", "zh_CN.UTF-8");
-    std::env::set_var("REDTEAM_HOME", "/nonexistent/decoy-home");
-    std::env::set_var("REDTEAM_MAX_TOKENS", "123");
     let code2 = redteam::job::run::run_with(JobKind::Review, &fx2.job, Some(over2.as_ref())).await;
-    // 环境隔离（不变式⑦）：job 进程启动即清掉这些旋钮，证明"零读 env"不是靠自觉。
-    assert!(std::env::var("LANG").is_err(), "LANG 必须被清掉");
-    assert!(std::env::var("REDTEAM_HOME").is_err(), "REDTEAM_HOME 必须被清掉");
-    assert!(std::env::var("REDTEAM_MAX_TOKENS").is_err(), "REDTEAM_MAX_TOKENS 必须被清掉");
+    // 语言决策不依赖 LANG（seal 只在真实 CLI 入口做，进程内测试不动全局 env）。
     match old { Some(v) => std::env::set_var("LANG", v), None => std::env::remove_var("LANG") }
     assert_eq!(code2, 0);
     let sys2 = match &scan2.messages_at(0)[0] {
@@ -475,6 +475,19 @@ fn make_verify_job(findings: &[u8]) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&keep);
     std::fs::rename(&job, &keep).unwrap();
     keep
+}
+
+#[tokio::test]
+async fn backend_construction_failure_is_config_invalid_not_internal_panic() {
+    // kind=google 的 backend 尚未支持：这是 executor config 的问题，不是内部错误。
+    let config = r#"{"language":"en_US","providers":{"p":{"kind":"google","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#;
+    let fx = make_repo_and_job("review", config, true, false);
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "config_invalid", "{r}");
+    assert!(r["status_reason"].as_str().unwrap().to_lowercase().contains("google"), "{r}");
 }
 
 #[tokio::test]

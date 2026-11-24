@@ -62,7 +62,7 @@ pub fn run_check(input: &str, kind: Option<&str>) -> i32 {
         }
     };
     let kind = kind.and_then(JobKind::parse);
-    let (cfg, errors, warnings) = check(text.as_str(), kind);
+    let (_cfg, errors, warnings) = check(text.as_str(), kind);
     for d in errors.iter().chain(warnings.iter()) {
         println!("{} {} {}: {}", d.level, ptr(&d.pointer), d.code, d.message);
     }
@@ -191,6 +191,12 @@ mod tests {
     }
 
     #[test]
+    fn unknown_role_key_fails_strict_check() {
+        let bad = r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"gerbil":{}}}}}}}"#;
+        assert_eq!(run(bad, Some("review")).0, 1);
+    }
+
+    #[test]
     fn schema_identity_is_stable() {
         let v = crate::config::config_schema_json();
         assert_eq!(v["$id"], "urn:redteam:config/1");
@@ -198,6 +204,8 @@ mod tests {
         assert_eq!(v["schemaVersion"], 1);
         assert!(v["properties"]["language"].is_object(), "language 必须进 schema");
         assert!(v["properties"]["review"].is_object());
+        let roles = &v["definitions"]["ModelConfig"]["properties"]["roles"]["propertyNames"]["enum"];
+        assert_eq!(roles, &serde_json::json!(["scanner", "reviewer", "refuter", "verifier"]), "roles 键必须枚举");
         assert!(crate::config::render_config_schema().ends_with('\n'));
     }
 }
