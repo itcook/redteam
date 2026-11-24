@@ -47,7 +47,9 @@
 - 另有 1 次 sites #333 冒烟（无人工基线）；backend #333 多轮（A、GLM infra、A2、A 流程 A/B）。
 - **A 流程 A/B**：DeepSeek high 在 backend #333 为 177.7s / ok / tier1 / blockers0（人工 tier2 / blockers0），
   intent 20/20 claims complete；sites #328 为 114.8s / ok / tier0 / blockers2。
-  GLM-5.3 high 仍 too slow（I0 150s 超时 / slice 166s 超时，partial）；GLM-5.4 因 provider 404 未跑。
+  GLM-5.3 high 仍 too slow（I0 150s 超时 / slice 166s 超时，partial）。
+  GLM-5.4 provider 修复后已跑通：backend #333 424–451s partial（I0 20 claims，slice 超时，9/20 delivered），
+  sites #328 397s partial（security 完整、drift 2/4、intent 11 claims/4 delivered）；clean PR 仍无 tier2。
 - **无「干净判 tier 2」**：4 个 tier0 PR 全部 tier0。
 - **tier2 漏报 1 例**：backend #333 人工 tier2，我们 tier0（DeepSeek A/A2 均 0 行；GLM 那次 infra 失败）。
 - 丢弃率：backend #333 A 轮安全轴 1 行候选、1 行 <8 被丢（100%）；A2 后 0 行候选。
@@ -69,7 +71,7 @@ intent 轴 `{ok:false, rows:0, error:"structured-output parse failed: finish_rea
 
 - `risk` 的 `blockers≥3 → high` 是 grill 定案的 `[拟议]` 规则，与人工的 medium/high 判断有系统性差异（已记入 COMPARISON）。
 - 真实对拍主模型为 DeepSeek Flash；GLM-5.3 在 A 流程下仍无法在 1200s 内完成（I0/slice 超时）；
-  GLM-5.4 在当前 agc group 返回 404（详见 COMPARISON.md）。
+  GLM-5.4 已可调用，但 slice 验证仍超时（partial；剩余预算未用于重试）。
 - `triage` 现在取 `roles.reviewer`（2026-11-24 用户调整）；`config check --kind triage` 也要求 reviewer。
 - 3.8 的报告是单次运行；人工基线中 sites #328 本身有 3 次不同结论（blk1/1/4），差异表按全部列出。
 - `dropped_rows` 是诊断披露，不是契约必需字段；每轴最多 20 条样本。

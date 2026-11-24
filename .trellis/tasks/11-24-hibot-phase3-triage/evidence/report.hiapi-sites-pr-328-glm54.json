@@ -1,0 +1,416 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-328",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `drift` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "a9c7d081c466ffa2678d3107eb89f41222dfe7b4",
+    "base_sha": "57d84c743f486ef6fc5aad7ae60307e43711eb87"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:5f21995ff7d6f922a54fe32258654aeadd3201eefc169094615a13a1a046a06a",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/prisma/models/draft-revision.prisma",
+      "line_start": 2,
+      "line_end": 2,
+      "quote": "model IngestDraftAcceptance {",
+      "title": "Structural drift: placement",
+      "body": "Standard: apps/content-api/CLAUDE.md#Prisma 7.5 操作规范 / 文件组织 — prisma/models/<域>.prisma，模型按业务域分（locale.prisma、blog.prisma…）\nNote: Both new models are ingest-domain entities (IngestDraftAcceptance, IngestDraftRevision → ingest_draft_acceptance / ingest_draft_revision) but are declared in a new feature-named file draft-revision.prisma instead of the existing ingest domain file prisma/models/ingest.prisma (which this same diff edits to add the back-relations), splitting one business domain across two model files.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#Prisma 7.5 操作规范 / 文件组织 — prisma/models/<域>.prisma，模型按业务域分（locale.prisma、blog.prisma…）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:200e3064e4513436629e62a655d5bb6e0f3cb90e45b5c6c9ce094f29bd21f2d5",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/prisma/models/draft-revision.prisma",
+      "line_start": 3,
+      "line_end": 3,
+      "quote": "draftId     String      @id @map(\"draft_id\")",
+      "title": "Structural drift: naming",
+      "body": "Standard: apps/content-api/CLAUDE.md#数据建模规范 — 主键 String ULID：`id String @id @default(ulid())`\nNote: Primary key is declared as `draftId` with no `@default(ulid())`, deviating from the mandated `id String @id @default(ulid())` primary-key pattern; the same deviation is repeated for IngestDraftRevision (line 13).",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#数据建模规范 — 主键 String ULID：`id String @id @default(ulid())`.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:df2c6fef8267240336bf9e89d797fb9fa3a14281dc3fb30a360c568d88cc7c53",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/prisma/models/draft-revision.prisma",
+      "line_start": 2,
+      "line_end": 5,
+      "quote": "model IngestDraftAcceptance {\n  draftId     String      @id @map(\"draft_id\")\n  entityId    String      @map(\"entity_id\")\n  createdAt   DateTime    @default(now()) @map(\"created_at\")",
+      "title": "Structural drift: other",
+      "body": "Standard: apps/content-api/CLAUDE.md#数据建模规范 — 公共列固定四个：id / createdAt / updatedAt / deletedAt，各模型重复声明\nNote: The model declares only a createdAt common column; the fixed set of four common columns (id / createdAt / updatedAt / deletedAt) that the standard says every model must repeat is not present — updatedAt and deletedAt are absent. IngestDraftRevision (lines 12-26) has the same gap.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#数据建模规范 — 公共列固定四个：id / createdAt / updatedAt / deletedAt，各模型重复声明.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:f38ceb75cd7492b081616b1e02e4aa7b4f3c731212c0c7c2517126d88e2ab7d6",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/src/modules/review/revision-target.ts",
+      "line_start": 91,
+      "line_end": 91,
+      "quote": "const row = await tx.modelFamilyInfo.findUnique({ where: { familyId_locale: { familyId: String(data.modelId), locale: draft.locale } } });",
+      "title": "Structural drift: ownership",
+      "body": "Standard: apps/content-api/CLAUDE.md#软删除铁律 — 软删模型的读用 findFirst 不用 findUnique\nNote: Reads of model tables use findUnique (also tx.modelEntity.findUnique and tx.modelInfo.findUnique at lines 94-95). Per 数据建模规范 every model carries deletedAt, and the soft-delete rule requires findFirst instead of findUnique for soft-deletable models; on the raw transaction client no `deletedAt: null` filter is injected, so a soft-deleted row could be resolved as the revision target.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#软删除铁律 — 软删模型的读用 findFirst 不用 findUnique.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:56b88b2c9ec5cf1b57b9141eb3d2ce83fd953b672a18ebd4e2e2e10828118d88",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/src/modules/review/revision-target.ts",
+      "line_start": 51,
+      "line_end": 52,
+      "quote": "? await tx.modelFamilyInfo.findFirst({ where: { id: entityId, locale: draft.locale } })\n          : await tx.modelInfo.findFirst({ where: { id: entityId, locale: draft.locale } });",
+      "title": "Structural drift: ownership",
+      "body": "Standard: apps/content-api/CLAUDE.md#软删除铁律 — 读操作严格只见存活行（deletedAt: null）\nNote: The `where` filter `{ locale: draft.locale, deletedAt: null }` is spread into the blog/faq/changelog branches but dropped for the family/model branches; on the raw tx client (no db() soft-delete extension) soft-deleted model_family_info / model_info rows can be selected as revision targets, inconsistent with the deletedAt handling in the sibling branches of the same function.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#软删除铁律 — 读操作严格只见存活行（deletedAt: null）.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:30a24a8fe5b59f9c6f63bede30aa6be812f816b5c9777382a075e37eecd1b8f9",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "apps/content-api/src/modules/review/revision-write.ts",
+      "line_start": 30,
+      "line_end": 30,
+      "quote": "await tx.blogI18n.update({ where: { id: target.rowId }, data });",
+      "title": "Structural drift: ownership",
+      "body": "Standard: apps/content-api/CLAUDE.md#文件组织 — src/modules/<域>/service.ts 业务逻辑按业务域归属\nNote: Blog/faq/changelog editorial writes (null coercion to []/Prisma.DbNull, media-ref normalization and binding reconciliation, direct tx.blogI18n/faqI18n/changelogI18n.update) are implemented inside the review module, while the model branch routes through the owning domain service (ModelContentService.transcribeInfoDraft); domain write logic for blog/faq/changelog content belongs to the owning module's service per the file-organization standard.",
+      "recommendation": "Align placement / naming / ownership with apps/content-api/CLAUDE.md#文件组织 — src/modules/<域>/service.ts 业务逻辑按业务域归属.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 73205,
+    "output_tokens": 65849,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 396654
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 1,
+            "dropped_rows": [
+              {
+                "conf": 6,
+                "file": "apps/content-api/src/modules/review/revision-target.ts",
+                "line": 33,
+                "reason": "below_threshold",
+                "surface": 5
+              }
+            ],
+            "dropped_total": 1,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 30280,
+            "output_tokens": 10295
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 2,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-drift` exceeded its 265.104083339s budget",
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/spec/content-api/backend",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/11-20-draft-revisions",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/11-20-draft-revisions/research",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/prisma/migrations/20261120090000_draft_revisions",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/prisma/models",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/src/modules/review",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/modules/review",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/utils",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/src",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/src/schema",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/tests/schema",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": false,
+          "rows": 10,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 29046,
+            "output_tokens": 37841
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 3,
+          "claims": 11,
+          "delivered": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-intent-slice` exceeded its 89.583391648s budget",
+          "notes": [
+            "Verification statements (not claims): 571 tests passed / 0 failed across 55 files and 2080 assertions; content-api/content-sdk/manage typecheck and changed-file ESLint passed; all 73 migrations replayed on a fresh PostgreSQL test database; independent code review findings fixed with no remaining blockers.",
+            "Cross-repo manual verification described: real Rust CLI to local HTTP API to PostgreSQL, covering Showcase in-place editing and FAQ derive/replay/accept, confirming original draft, publish time, and other languages preserved with no Agent jobs.",
+            "Remote CI status: first run 44658696801 did not start due to account limits; run 44669467061 actually executed with content-api failing on 1 item (new revise write route unregistered), quality missing dashboard generated route types, and site cancelled at checkout; author states later red results must not be attributed to account limits. After fix a9c7d081, targeted 18 tests / 0 failed / 30 assertions, ESLint, typecheck, and diff checks passed locally, but the full DB suite was not rerun this round; new CI was pushed and remote results are pending at the current head.",
+            "Review follow-up verification: added regression for same request ID reusing the original result with both old and new timestamps after a source version change; strengthened Blog derivation/accept assertions; targeted 13 tests / 97 assertions and ESLint passed.",
+            "Deployment ordering and rollback constraints stated: migrate 20261120090000_draft_revisions first, then deploy the API, then distribute the CLI; once any revision rows exist, rollback to old accept code that does not recognize revisions is not allowed (details in .trellis/tasks/11-20-draft-revisions/rollout.md).",
+            "Scope statement: this PR does not deploy and does not modify real content; staging acceptance of two Showcase items and accepted content is still pending after deployment; local regression is not equivalent to full-repo or production acceptance.",
+            "Cross-repo references (not part of this diff): companion CLI PR zimacode-network/hiapi-cli#18 and requirement issue zimacode-network/hiapi-cli#17.",
+            "No reviewer comments were supplied, so maintainer overlap could not be evaluated beyond the default.",
+            "This slice contains only .trellis planning/design/spec documentation files; no implementation code (apps/content-api/src/modules/review/*, packages/content-sdk/*, prisma migration, tests) is present in this slice, so no claim (c1-c11) can be anchored to concrete delivery evidence here. Delivery must be verified against the code slices.",
+            "The spec update in .trellis/spec/content-api/backend/ingest-transcriber-guidelines.md (added section 'Explicit editorial revisions') and design.md assert the behaviors described in c1-c11 (revise endpoint, version guards on update, locale-preserving transactional accept, Showcase allowlist, skipped generation/translation on revision accept). These are intent/spec statements, not delivery evidence; they corroborate intent only and were deliberately not emitted as delivered rows.",
+            "implement.md, cross-repo-e2e.md and validation references self-report test results ('571 pass / 0 fail', '13 pass / 0 fail', local CLI/API integration passes, 'zero agent jobs') and a still-pending remote CI and staging gate. Per untrusted-input rules these were treated as author narrative, not verified outcomes.",
+            "All files in this slice are traceable to the claimed feature (task scaffolding, design, research records, and a spec sync for the same revision workflow); no substantial unrelated changes were found in this slice. design.md/implement.md also document CLI-side contracts owned by the sibling hiapi-cli repository, which is cross-repo coordination documentation rather than a code change in this PR.",
+            "All test/CI results cited in validation.md (e.g., \"571 passed, 0 failed\", \"18 passed, 0 failed\") are author self-reports; the same file states the staging checklist has not run and earlier results are historical, so they should not be treated as verified evidence.",
+            "rollout.md line 5 documents the legacy/ambiguous-target verification behavior (c8) and the overview-refill exception (c9), but no implementing code for c8/c9/c10 appears in this slice; those claims are omitted rather than judged undelivered.",
+            "Line numbers for new files and hunks were computed from the supplied diff headers; quoted strings are verbatim from the diff."
+          ],
+          "ok": false,
+          "rows": 1,
+          "scope_creep": 2,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 13879,
+            "output_tokens": 17713
+          },
+          "verification_complete": false
+        }
+      ],
+      "blockers": [
+        {
+          "category": "placement",
+          "file": "apps/content-api/prisma/models/draft-revision.prisma",
+          "kind": "structural",
+          "line_end": 2,
+          "line_start": 2,
+          "quote": "model IngestDraftAcceptance {"
+        },
+        {
+          "category": "naming",
+          "file": "apps/content-api/prisma/models/draft-revision.prisma",
+          "kind": "structural",
+          "line_end": 3,
+          "line_start": 3,
+          "quote": "draftId     String      @id @map(\"draft_id\")"
+        },
+        {
+          "category": "other",
+          "file": "apps/content-api/prisma/models/draft-revision.prisma",
+          "kind": "structural",
+          "line_end": 5,
+          "line_start": 2,
+          "quote": "model IngestDraftAcceptance {\n  draftId     String      @id @map(\"draft_id\")\n  entityId    String      @map(\"entity_id\")\n  createdAt   DateTime    @default(now()) @map(\"created_at\")"
+        },
+        {
+          "category": "ownership",
+          "file": "apps/content-api/src/modules/review/revision-target.ts",
+          "kind": "structural",
+          "line_end": 91,
+          "line_start": 91,
+          "quote": "const row = await tx.modelFamilyInfo.findUnique({ where: { familyId_locale: { familyId: String(data.modelId), locale: draft.locale } } });"
+        },
+        {
+          "category": "ownership",
+          "file": "apps/content-api/src/modules/review/revision-target.ts",
+          "kind": "structural",
+          "line_end": 52,
+          "line_start": 51,
+          "quote": "? await tx.modelFamilyInfo.findFirst({ where: { id: entityId, locale: draft.locale } })\n          : await tx.modelInfo.findFirst({ where: { id: entityId, locale: draft.locale } });"
+        },
+        {
+          "category": "ownership",
+          "file": "apps/content-api/src/modules/review/revision-write.ts",
+          "kind": "structural",
+          "line_end": 30,
+          "line_start": 30,
+          "quote": "await tx.blogI18n.update({ where: { id: target.rowId }, data });"
+        }
+      ],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:drift",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

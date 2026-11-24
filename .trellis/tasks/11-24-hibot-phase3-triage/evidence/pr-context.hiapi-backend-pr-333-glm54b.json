@@ -1,0 +1,112 @@
+{
+  "schema": "hibot.audit.pr-context/1",
+  "title": "feat(feishu): HiAPI推广助手（后端直连飞书长连接）",
+  "body": "## 概述\n\n飞书「HiAPI推广助手」：在群聊里 @机器人（或私聊）发一句自然语言指令，机器人回复一张「当前值 → 改后值」确认卡片，管理员点「确认执行」后自动完成：\n\n- 加入推广用户\n- 设置单独分佣比例 + 返佣有效期\n- 开启/关闭提现\n- 赠送积分\n\n例：`user@example.com 送 10w 积分，10%分佣` → 卡片展示目标用户、现有分佣/提现/积分 → 确认后执行。\n\n## 架构\n\n- 后端通过飞书官方 Go SDK（`larksuite/oapi-sdk-go/v3`）**主动连接长连接**接收消息事件与卡片回调，不需要公网回调域名。\n- 未配置 `FEISHU_FINANCE_AGENT_APP_ID/APP_SECRET` 时不启动，对其它环境零影响。\n- 执行逻辑同进程直接调用现有 model 函数，不铸造任何 root token：\n  - `model.AddAffPromotionUsers`（推广 + 分佣 + 提现，同一事务）\n  - `model.GrantAdminCredits`（`request_id = feishu-<actionID>`，天然幂等）\n- 审计落表：`feishu_finance_agent_actions`（原文、计划、执行前状态、结果、操作人）与 `feishu_finance_agent_operators`（飞书 open_id → 现有 Root 用户白名单）。\n\n## 安全\n\n- 只有白名单 open_id 可用；每次确认实时校验该用户角色仍 ≥ Root、状态启用，降级后立即失效。\n- 只有发起人能确认；卡片 30 分钟过期；按钮只携带 action id，参数全部在服务端。\n- 陌生人私聊仅回复自己的 open_id（方便加白名单）；群里保持静默。\n- 分佣比例上限 50%，单次赠送上限 100 万积分，指令长度上限 500 字。\n\n## 可靠性\n\n- 消息先落库（`source_message_id` 唯一）再 ack，飞书重投不会重复处理。\n- `pending → executing` 条件更新抢占，双击/多实例并发只执行一次。\n- 飞书卡片回调 3 秒时限：2.5 秒未完成先回「执行中」，完成后通过 PatchMessage 更新卡片；再次点击直接返回真实结果。\n- 启动时重放 `updated_at` 超过 5 分钟的 `executing` 记录（所有写操作本身幂等）。\n- 长连接断线自动重连，连接/错误/重连均打日志。\n\n## 威胁模型（评审项 1 / 3）\n\n消息原文不可信：群里任何内容、以及操作员粘贴的第三方内容，都可能尝试注入解析模型。系统的信任边界是：\n\n1. LLM 只产出「计划」，不直接写库；计划先落库，卡片按钮只携带 action id，参数不从客户端回传。\n2. 唯一执行门是确认卡片：发起人（每次确认实时校验仍为 Root）必须逐项比对「当前值 → 改后值」并点击确认。\n3. 卡片始终回显指令原文；含链接 / @提及 / 引用块 / 代码块时追加注入警示，页脚提示核对原文与改后值。\n4. 服务端做确定性数值边界校验（比例 ≤50%、有效期 1–365 天、单次积分 ≤100 万）。\n\n因此注入即使改变了解析结果，也必须经过操作员肉眼核对并主动确认才会生效。**该模型需要 Root 侧确认接受。**\n\n## 评审处理（第二轮）\n\n| # | 处理 |\n|---|---|\n| 1 | 补威胁模型（代码注释 + 本 PR 描述）；确认卡对链接/@提及/引用块/代码块追加注入警示；页脚提示核对原文与改后值 |\n| 2 | `json_object` 降级路径补字段级校验：未知字段拒绝、8 个字段必须存在、类型严格匹配、整数字段拒绝小数；`intent` 必须合法，其余字段允许 null（追问场景模型会输出 null，语义等同未提及） |\n| 3 | 同第 1 项，已文档化并加卡片警示 |\n| 4 | `StartFeishuFinanceAgentWS()` 移入 main 的 Start* 接线块 |\n| 5 | model 只返回原始 quota，积分格式化移入 service 展示层 |\n| 6 | 修正 `ErrFeishuFinanceAgentBadCallback` 死注释，改为 WS 卡片回调层转 error toast |\n\n## 第二轮评审处理（恢复/重放管线）\n\n| 项 | 处理 |\n|---|---|\n| F5 | 恢复重放前重新鉴权（白名单 active + 实时 Root + 用户 id 一致）；不通过则转 `failed` 并在卡片注明「操作员已降级，跳过重放」 |\n| F2 | 执行权引入 fencing 代次 `exec_version`：claim 递增，终态写 `WHERE id AND status AND exec_version`；被接管的旧执行无法覆盖结果；恢复重放带 60s 超时 |\n| F1 | 维护循环每 5 分钟收敛：executing 卡死（100 行/批、最多 10 批）、parsing 卡单、结果卡片补更新 |\n| F3 | 落库失败返回 error 让飞书重投；parsing 纳入周期重试（仅 `plan_json` 为空，重跑不会重复出卡）；回复改为「请重新发送指令」 |\n| F6 | 提现策略在执行时重读数据库现值，parse 快照只用于卡片展示，不再覆盖确认间隙的管理员修改 |\n| S5+Q7 | 注入识别补充纯语言注入（如「忽略之前的指令」）；done/closed 卡片保留警示行 |\n| Q30 | 外层重试环包住「构造 + 连接」，构造期 panic 也会重启监听 |\n| F4 | 新增 `card_patched` 标记，patch 失败由维护循环重试；done 卡无可用按钮 |\n| Q13 | DB 故障不再伪装成「无权限」 |\n\n**激活方式**：`main.go` 的 Start* 接线块里 `StartFeishuFinanceAgentWS()` 同时启动长连接与维护循环。\n\n## 配置（部署环境注入）\n\n| 变量 | 说明 |\n|---|---|\n| `FEISHU_FINANCE_AGENT_APP_ID` | 飞书应用 App ID |\n| `FEISHU_FINANCE_AGENT_APP_SECRET` | 飞书应用 App Secret |\n| `FEISHU_FINANCE_AGENT_LLM_BASE_URL` | OpenAI 兼容地址，如 `https://host/v1` |\n| `FEISHU_FINANCE_AGENT_LLM_API_KEY` | 解析指令用模型 Key |\n| `FEISHU_FINANCE_AGENT_LLM_MODEL` | 模型名；不支持 `json_schema` 时自动降级 `json_object` |\n| `FEISHU_FINANCE_AGENT_OPENAPI_BASE` | 可选，测试用 |\n\n飞书后台：长连接接收 `im.message.receive_v1` 与 `card.action.trigger`；权限 `im:message:send_as_bot`、`im:message.p2p_msg:readonly`、`im:message.group_at_msg:readonly`。\n\n## 测试\n\n- 新增/更新 20 个测试：计划构建、完整确认流程、重复点击、非发起人/降级 Root、取消/过期、陌生人、SDK 事件与卡片回调转换、执行中再点、崩溃恢复、不抢跑新鲜记录、`json_schema → json_object` 降级、命令 JSON 字段级校验、注入警示、恢复重放鉴权、fencing 版本、parsing 恢复、提现现值。\n- `go build ./...`、`go test ./service ./model ./router ./controller` 全部通过。\n- 用真实 DeepSeek（`deepseek-v4.1-flash`）复测三类指令：执行、全字段、追问，全部通过。\n- 已在本地用真实飞书应用 + 真实模型完成端到端冒烟：消息 → 确认卡片 → 点确认 → 数据库核对推广/分佣/提现/积分/日志全部正确。\n\n## 注意\n\n- 同一飞书应用可同时运行多个后端实例：事件随机分发，靠数据库去重与状态抢占保证只执行一次。\n- 本地 SQLite 开发需注意 glebarez v1.10 的重启 DDL 问题（与本 PR 无关，生产使用 PostgreSQL）。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+  "author": "Zenty-Me",
+  "labels": [],
+  "comments": [
+    {
+      "author": "Zenty-Me",
+      "body": "## 评审意见已处理（1–6）\n\n- **#1/#3 威胁模型**：已在 `service/feishu_finance_agent.go` 顶部写明信任边界（LLM 只产出计划、确认卡是唯一执行门、参数不经客户端）；确认卡对**链接 / @提及 / 引用块 / 代码块**追加「可能存在提示注入」警示，页脚提示核对指令原文与改后值。PR 描述也补了威胁模型章节，请 Root 侧确认接受该模型。\n- **#2 降级校验**：`json_object` 路径现在与 strict schema 等价校验——未知字段拒绝、8 个字段必须存在、类型严格匹配、整数字段拒绝小数、`intent` 枚举校验。注意：追问场景 DeepSeek 会把 `target_account`/`add_promotion` 输出为 `null`，校验按「未提及」接受（否则会误杀追问）；`intent` 仍要求非空。\n- **#4**：`StartFeishuFinanceAgentWS()` 移入 main 的 Start* 接线块。\n- **#5**：model 只返回原始 `quota`，格式化移到 service 展示层。\n- **#6**：死注释已改为「WS 卡片回调层转 error toast」。\n\n本地已跑：`go build ./...`、`go test ./service ./model ./router ./controller` 全绿；新增 3 个测试（字段校验、注入标记、注入警示卡片），并用真实 DeepSeek 复测执行/全字段/追问三类指令通过。\n\nCI 不在本 PR 范围；评审轮请按你的计划机检复跑即可。",
+      "created_at": "2026-10-20T07:54:14Z",
+      "is_bot": false
+    },
+    {
+      "author": "Zenty-Me",
+      "body": "## 第二轮评审已处理（F5/F2 + F1/F3/F4/F6/S5/Q7/Q30/Q13）\n\n- **F5**：`feishuFinanceAgentRecoverExecutingAction` claim 后重新 `authorize`（白名单 active、实时 Root、用户 id 一致），不通过则版本化写 `failed` 并更新卡片，不重放冻结计划。新增测试 `TestFeishuFinanceAgentRecoverySkipsDemotedOperator`。\n- **F2**：新增 `exec_version` fencing 代次。`ClaimFeishuFinanceAgentAction` 在事务内 SELECT FOR UPDATE 后按旧版本条件更新并 +1；终态写改为 `TransitionFeishuFinanceAgentActionVersioned(id, from, version, …)`，被接管的旧执行写不进终态。恢复重放带 60s 超时。测试 `TestFeishuFinanceAgentExecutionFencingRejectsStaleWriter` 验证 v1 被 v2 接管后写失败。\n- **F1/F3/F4**：维护循环每 5 分钟跑 parsing 重试（仅 `plan_json=''`，不会重复出卡）、executing 重放（100 行分页×10 批）、`card_patched=false` 的终态卡片补更新；accept 落库失败 return err 让飞书重投；解析失败文案改为「请重新发送指令」。新增 `TestFeishuFinanceAgentRecoversStaleParsingAction`。\n- **F6**：`executeFeishuFinanceAgentPlan` 在执行时重读 `GetFeishuFinanceAgentTargetState`，提现渠道/门槛/限额/费率取数据库现值，快照仅用于卡片。测试 `TestFeishuFinanceAgentWithdrawalUsesCurrentValues`（快照 alipay/10，库内 bank/50，执行后为 bank/50/200/100bps）。\n- **S5/Q7**：新增语义注入模式（忽略之前/上述指令、ignore previous instructions、system prompt 等），done/closed 卡片保留警示行并有测试。\n- **Q30**：外层重试环包住 dispatcher/client 构造，构造期 panic 会 5s 后重试，不再被 sync.Once 永久静默。\n- **Q13**：`GetUserById` 的非 NotFound 错误向上返回，不再伪装成无权限。\n\n本地已复跑 `go build ./...`、`go test ./service ./model ./router ./controller` 全绿（飞书相关 20 个测试）。次要项（Q3/Q16/S4/Q5/Q9/Q20/Q22/Q23/Q44/Q45/Q33 与部分测试缺口）不在本轮阻塞范围，可按你的节奏后续处理。",
+      "created_at": "2026-10-20T10:11:41Z",
+      "is_bot": false
+    },
+    {
+      "author": "Zenty-Me",
+      "body": "## 第三轮 Approve 后的 follow-up 已处理并推送\n\n- **N1**：executing / parsing 两个 sweep 中，鉴权查询返回 DB 错误时只跳过本轮（保留行待下轮），只有「白名单失效 / 用户 id 变化 / 非 Root」才转终态 failed。DB 瞬态故障不再被误标。\n- **N2**：维护循环的 parsing / executing / card-patch 三条 sweep 各自加 recover，单条 panic 只记日志，不会杀死唯一循环。\n- **N3**：确认路径只在终态写成功（返回结果卡片）时标记 `card_patched=true`；终态写失败的行保持 executing，交给恢复重放与补卡 sweeper。\n- N4 为注记，未改。\n\n本地已复跑 `go build ./...` 与四个包全量测试，全绿。",
+      "created_at": "2026-10-21T01:57:56Z",
+      "is_bot": false
+    }
+  ],
+  "linked_issues": [],
+  "ci": {
+    "state": "pending",
+    "failing": []
+  },
+  "changed_files": [
+    {
+      "path": "go.mod",
+      "additions": 2,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "go.sum",
+      "additions": 30,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "main.go",
+      "additions": 3,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "model/feishu_finance_agent.go",
+      "additions": 308,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "model/main.go",
+      "additions": 2,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "service/feishu_finance_agent.go",
+      "additions": 929,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "service/feishu_finance_agent_card.go",
+      "additions": 213,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "service/feishu_finance_agent_client.go",
+      "additions": 373,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "service/feishu_finance_agent_client_test.go",
+      "additions": 81,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "service/feishu_finance_agent_test.go",
+      "additions": 331,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "service/feishu_finance_agent_ws.go",
+      "additions": 230,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "service/feishu_finance_agent_ws_test.go",
+      "additions": 271,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "setting/feishu_finance_agent_setting.go",
+      "additions": 46,
+      "deletions": 0,
+      "status": "added"
+    }
+  ]
+}

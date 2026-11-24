@@ -106,3 +106,20 @@
   `/v1/models` 只列出 `glm-5.3` / `glm-5.3-flash`。
 - 用同一 key 试 Zhipu 官方 `https://open.bigmodel.cn/api/paas/v4` → `401 令牌已过期或验证不正确`。
 - 结论：secrets.json 里的 `glm-5.4` key 在当前 agc group 下不可用；需要正确的 baseUrl/group/model id（或换 key）后再跑。
+
+## GLM-5.4 provider 修复后复跑（2026-11-24，补跑）
+
+> `/v1/models` 已列出 `glm-5.4`；同一 key/agc group 可调用。配置：reviewer high / 32k output / 1200s。
+
+| PR | 墙钟 | status | security | drift | intent | findings | 备注 |
+|---|---|---|---|---|---|---|---|
+| backend #333 | 424.4s | partial | ok（4 行，2 行 <8 丢） | 3/4 cells | I0 20 claims，slice 166s 超时，0 delivered | 2（surface 5/7） | 首次补跑 |
+| backend #333（per-chunk 满预算） | 451.0s | partial | ok（3 行，2 行 <8 丢） | 2/4 cells | I0 20 claims，9 delivered，slice 321s 超时（repair） | 1（surface 5） | 第二跑 |
+| sites #328 | 396.7s | partial | ok（1 行 <8 丢） | 2/4 cells（10 行→6 structural） | 11 claims / 4 delivered / 2 creep，slice 89.6s 超时 | 6（全 structural） | clean 精度仍通过（无 tier2） |
+
+- **5.4 的 I0 已能在 150s 内完成**（5.3 不能），20 claims 与人工 15 项的规模接近。
+- 但 slice 验证仍超时：backed #333 第二次跑到 451s 时，全局 1200s 预算还剩 ~749s 未用——
+  原因是 `run_intent_slices` 在 chunk 失败后 `break`，没有用剩余预算重试。
+- 建议下一步（需确认）：chunk 失败时用剩余预算重试（绝对 deadline 封顶），而不是立即收敛；
+  若首轮是 `max_tokens` 截断，再把 GLM 的 maxOutputTokens 提到 64k。
+- 原始报告：`report.hiapi-backend-pr-333-glm54.json` / `...-glm54b.json`、`report.hiapi-sites-pr-328-glm54.json`。
