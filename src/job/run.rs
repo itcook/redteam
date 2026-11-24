@@ -4,6 +4,23 @@
 //! - `0`：`ok` / `partial` 报告已写出；
 //! - `1`：`error` 报告已写出；
 //! - `2`：job.json 定位不到 / 不可解析（**不写报告**，runner 按 no-report=error）。
+//!
+//! # 2.0 数据流（Phase 2）
+//!
+//! ```text
+//! job.json ──manifest::load──► JobManifest ──validate──► kind / limits / paths
+//! inputs.diff_patch ──sha256 已校验──► split_diff_by_file ──► FileChange[]
+//! inputs.merge_base ──读内容──► base（diff 左端；**可能 ≠ pr.base_sha**，禁止断言相等）
+//! paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
+//!         └──► run_code_review(args, registry, cfg, changes, root, head, sink, carried)
+//!              （**不经** run_review_dispatch：那条路会重新采集 git diff）
+//!
+//! 收口：findings ──► 逐字重锚（quote = 检出原文切片）──► fingerprint ──► dismissed 匹配
+//!       ──► hibot 信封（extensions.redteam.*）+ status 判定
+//! ```
+//!
+//! 硬规则：`diff_patch` 是输入真相源，git 只用于证据收集（风险路由 / 分组 / 装包）；
+//! 两边都可得时只做一致性披露，不改行为。
 
 use crate::cli::ReviewArgs;
 use crate::config::{Config, OutputLang};
@@ -128,18 +145,22 @@ async fn run_review(
 ) -> Result<report::HibotReport, JobFailure> {
     let repo = io::resolve_repo(job_dir, &manifest.paths.repo)?;
     // 分析基准 = inputs.merge_base 的内容（diff 左端，可能 ≠ pr.base_sha；Q2）。
+    // 形态先校验：契约写的是「40 位 sha（纯文本）」——短 sha / 大写不属于该形态。
     let base = artifacts
         .text("merge_base")
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| crate::job::repo::is_full_sha(s))
         .ok_or_else(|| JobFailure::new("input_schema_mismatch", Some("merge_base".into())))?
         .to_string();
-    // HEAD 必须与 manifest 一致（Appendix E head_sha_mismatch；完整 sha 或前缀均可）。
-    let head = crate::evidence::git::head_sha_at(&repo)
-        .map_err(|_| JobFailure::new("head_sha_mismatch", None))?;
-    if !head.starts_with(&manifest.pr.head_sha) && !manifest.pr.head_sha.starts_with(&head) {
-        return Err(JobFailure::new("head_sha_mismatch", None));
-    }
+    // 2.6 完整性：非 shallow、HEAD == pr.head_sha（解析成完整 commit 再比）、base/merge_base
+    // 对象可得、merge-base 可算。缺必需对象 → error（不是披露后仍报 ok）。
+    let head = crate::job::repo::ensure_complete(&repo, &manifest.pr, &base)?;
+    // 2.1 输入真相源 = inputs.diff_patch（sha256 已由 artifact 层校验）；git 只做证据收集。
+    let patch = artifacts
+        .text("diff_patch")
+        .ok_or_else(|| JobFailure::new("input_schema_mismatch", Some("diff_patch".into())))?;
+    let changes = crate::job::projection::from_patch(patch)?;
+    let input_consistency = crate::job::projection::consistency(&repo, &base, &changes);
     // 角色最小集（P2）：review = scanner + reviewer；refuter 可选。
     let roles = cfg.active_roles();
     if roles.scanners.is_empty() {
@@ -172,7 +193,18 @@ async fn run_review(
         .map_err(|e| JobFailure::with_reason("config_invalid", None, e))?;
 
     let sink = Arc::new(JobDirCellSink::new(out_dir.to_path_buf()));
-    let run = Box::pin(crate::cli::run_review_dispatch(&args, &registry, cfg, &repo, Some(sink.as_ref())));
+    // 2.1 / 2.2：变更集来自已校验的 `inputs.diff_patch`，**不**再走 `run_review_dispatch`（它会重新 `git diff`）。
+    // `head` 是完整性检查解析出的完整 commit（逐字透传给风险路由的 stamp）。
+    let run = Box::pin(crate::cli::run_code_review(
+        &args,
+        &registry,
+        cfg,
+        changes,
+        &repo,
+        Some(head),
+        Some(sink.as_ref()),
+        vec![],
+    ));
     let mut run = run;
     let outcome: Result<_, ()> = tokio::select! {
         r = &mut run => Ok(r),
@@ -180,7 +212,13 @@ async fn run_review(
         _ = wait_sigterm(sigterm) => Err(()),
     };
     match outcome {
-        Ok(Ok((internal, _code))) => Ok(report::review_report(manifest, &internal, cfg, lang)),
+        Ok(Ok((internal, _code))) => Ok(report::review_report(
+            manifest,
+            &internal,
+            cfg,
+            lang,
+            &report::ReviewExtras { input_consistency: Some(input_consistency), ..Default::default() },
+        )),
         Ok(Err(e)) => Err(JobFailure::new("internal_panic", Some(e.to_string()))),
         Err(()) => {
             // 停止派发：drop 掉运行 future（tokio 取消），再用已落地 cell 组 partial。

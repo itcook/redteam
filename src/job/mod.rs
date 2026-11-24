@@ -7,6 +7,10 @@
 //! - [`fingerprint`]：hibot 指纹的唯一实现（逐字按契约 §3.2）。
 //! - [`status`]：`ok/partial/error` + `status_reason` / `status_code` 对照表（随 `language`）。
 //!
+//! Phase 2（review 端到端）：
+//! - [`projection`]：`inputs.diff_patch` → 变更集（输入真相源）+ 与 git 的一致性披露（2.1）。
+//! - [`repo`]：检出完整性（非 shallow / 对象可得 / merge-base 可算，2.6）。
+//!
 //! **硬规则**：job 模式只写 `paths.out`；不读 `$REDTEAM_HOME` / `secrets.json`；不依赖 cwd / stdin。
 
 pub mod artifact;
@@ -15,6 +19,8 @@ pub mod executor_config;
 pub mod io;
 pub mod lifecycle;
 pub mod manifest;
+pub mod projection;
 pub mod report;
+pub mod repo;
 pub mod run;
 pub mod status;

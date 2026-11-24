@@ -142,12 +142,30 @@ pub fn kind_not_implemented_verify(
     r
 }
 
+/// Phase 2 收集的报告期事实（不污染内部 `ReviewReport`）：只影响 hibot 信封。
+#[derive(Clone, Debug, Default)]
+pub struct ReviewExtras {
+    /// 2.1：`diff_patch` 与 git 采集的一致性与否（只披露）。
+    pub input_consistency: Option<Value>,
+    /// 2.1–2.5 之外的额外 `partial` 原因（如 `quotes_dropped` / `routing_specs_unreadable`）。
+    pub extra_partial: Vec<JobFailure>,
+}
+
 /// review 的 `ReviewReport` → hibot 信封。
-pub fn review_report(manifest: &JobManifest, internal: &ReviewReport, cfg: &Config, lang: &OutputLang) -> HibotReport {
-    let (status, reasons) = derive_review_status(internal);
+pub fn review_report(
+    manifest: &JobManifest,
+    internal: &ReviewReport,
+    cfg: &Config,
+    lang: &OutputLang,
+    extras: &ReviewExtras,
+) -> HibotReport {
+    let (status, mut reasons) = derive_review_status(internal);
+    reasons.extend(extras.extra_partial.iter().cloned());
+    // 附录 E：`status_code` 只保留**主导**一条，按表从上到下优先级——不依赖拼接顺序。
+    reasons.sort_by_key(|f| code_rank(&f.code));
     let partial = render_partial(&reasons, lang);
     let mut r = HibotReport::base(manifest);
-    r.status = status;
+    r.status = if reasons.is_empty() { status } else { JobStatus::Partial };
     r.status_reason = partial.as_ref().map(|t| t.reason.clone());
     r.findings = internal.findings.iter().map(map_finding).collect();
     r.usage = UsageOut {
@@ -172,8 +190,28 @@ pub fn review_report(manifest: &JobManifest, internal: &ReviewReport, cfg: &Conf
     if let Some(t) = partial {
         redteam["status_code"] = json!(t.code);
     }
+    // 2.1：patch 与 git 的不一致只披露，不改行为。
+    if let Some(v) = &extras.input_consistency {
+        redteam["input_consistency"] = v.clone();
+    }
     r.extensions = json!({ "redteam": redteam });
     r
+}
+
+/// 附录 E 的 partial 优先级：`status_code` 取最靠前的一条（`render_partial` 取首条）。
+fn code_rank(code: &str) -> usize {
+    const ORDER: &[&str] = &[
+        "scan_incomplete",
+        "review_incomplete",
+        "no_reviewer_available",
+        "budget_truncated",
+        "triage_axis_failed",
+        "routing_specs_unreadable",
+        "verifications_inconclusive",
+        "wall_clock_exhausted",
+        "quotes_dropped",
+    ];
+    ORDER.iter().position(|c| *c == code).unwrap_or(ORDER.len())
 }
 
 fn language_json(lang: &OutputLang) -> Value {
@@ -324,7 +362,13 @@ mod tests {
         f.refute = Some(Refute { verdict: RefuteVerdict::Refuted, model: "p/r".into(), note: "".into() });
         let m = manifest();
         let rep = report(Verdict::Approve, vec![f.clone()], Coverage::default(), None);
-        let out = review_report(&m, &rep, &Config::default(), &crate::config::Language::EnUs.output());
+        let out = review_report(
+            &m,
+            &rep,
+            &Config::default(),
+            &crate::config::Language::EnUs.output(),
+            &ReviewExtras::default(),
+        );
         let hf = &out.findings[0];
         assert_eq!(hf.fingerprint, crate::job::fingerprint::of(&f.file, &f.quote, &f.title));
         assert!(hf.refuted, "refuted 是顶层契约字段");

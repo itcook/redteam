@@ -507,3 +507,78 @@ async fn kind_mismatch_and_bad_manifest_are_reported_correctly() {
     assert_eq!(code, 2);
     assert!(!bad.path().join("out/report.json").exists());
 }
+
+/// 改写已声明的输入并同步 manifest 里的 sha256（2.1/2.2 的对照夹具用）。
+fn update_input(job: &Path, key: &str, rel: &str, bytes: &[u8]) {
+    std::fs::write(job.join(rel), bytes).unwrap();
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(job.join("job.json")).unwrap()).unwrap();
+    let old = m["inputs"][key].clone();
+    let mut v = serde_json::json!({"path": rel, "sha256": sha256_hex(bytes)});
+    for k in ["schema", "format"] {
+        if !old[k].is_null() {
+            v[k] = old[k].clone();
+        }
+    }
+    m["inputs"][key] = v;
+    std::fs::write(job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+}
+
+/// 2.1：变更集来自 `inputs.diff_patch`，**不是** git 重新采集。patch 与 git 不一致只披露。
+#[tokio::test]
+async fn review_uses_diff_patch_not_git_as_change_source() {
+    let quote = "return a + b;";
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(quote, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(quote, "src/app.js", 2, "patch marker"))));
+    // git 的真实改动是「新建 src/app.js」；artifact patch 伪装成「给它加一行标记」。
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), false, false);
+    let fake = "diff --git a/src/app.js b/src/app.js\n\
+                index 1111111..2222222 100644\n\
+                --- a/src/app.js\n\
+                +++ b/src/app.js\n\
+                @@ -1,3 +1,4 @@\n\
+                 function add(a, b) {\n\
+                +  // PATCH_ONLY_MARKER\n\
+                   return a + b;\n\
+                 }\n";
+    update_input(&fx.job, "diff_patch", "input/diff.patch", fake.as_bytes());
+    let over = fake_override(scan.clone(), review);
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await;
+    assert_eq!(code, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok", "{r}");
+    // scanner 真正看到的确实来自 patch（git 的 diff 里没有这个标记）。
+    let prompt = format!("{:?}", scan.messages_at(0));
+    assert!(prompt.contains("PATCH_ONLY_MARKER"), "scan 输入必须来自 diff_patch: {prompt}");
+    // 不一致只披露，不改行为：评审照常出 finding。
+    let ic = &r["extensions"]["redteam"]["input_consistency"];
+    assert_eq!(ic["git"], "mismatch", "{r}");
+    assert_eq!(ic["differing"], serde_json::json!(["src/app.js"]), "{r}");
+    assert_eq!(r["findings"].as_array().unwrap().len(), 1, "只披露、不改行为: {r}");
+}
+
+/// 2.2：HEAD 必须等于 `pr.head_sha`；不匹配 → error（不是 partial/ok）。
+#[tokio::test]
+async fn head_must_match_manifest_head_sha() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), false, false);
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    // 检出停在 head，manifest 却说是 base —— 两个对象都在，但不是同一个提交。
+    m["pr"]["head_sha"] = serde_json::json!(fx.base);
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "head_sha_mismatch");
+}
+
+/// 2.2：`inputs.merge_base` 必须是 40 位 sha 的文本形态（短 sha 不在契约里）。
+#[tokio::test]
+async fn merge_base_must_be_a_full_sha() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), false, false);
+    update_input(&fx.job, "merge_base", "input/merge-base.sha", b"abc\n");
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:merge_base");
+}

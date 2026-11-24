@@ -101,6 +101,37 @@ pub fn head_sha_at(dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(git_at(dir, &["rev-parse", "HEAD"])?.trim().to_string())
 }
 
+/// 2.6：浅克隆判定（`--is-shallow-repository`）。hibot 保证的是**非 shallow** 完整检出，
+/// 浅克隆下 base/merge-base 对象可能根本不在本地——那是 `error` 而不是「降级披露」。
+pub fn is_shallow_repository(dir: &std::path::Path) -> anyhow::Result<bool> {
+    Ok(git_at(dir, &["rev-parse", "--is-shallow-repository"])?.trim() == "true")
+}
+
+/// 2.6：把 rev 解析成**完整 commit sha**（`rev-parse --verify <rev>^{commit}`）。
+/// 对象缺失 / 不是 commit → Err（调用方归类为 `repo_incomplete`）。
+pub fn resolve_commit(dir: &std::path::Path, rev: &str) -> anyhow::Result<String> {
+    let spec = format!("{rev}^{{commit}}");
+    Ok(git_at(dir, &["rev-parse", "--verify", "--end-of-options", &spec])?.trim().to_string())
+}
+
+/// 2.6：`<rev>^{commit}` 对象本地是否可得。退出码表意（缺对象时 rev-parse 非 0），
+/// 不能用 [`git_at`] 的 success 判定——它会把「不存在」当成硬错误，无法与 git 自身故障区分。
+pub fn commit_exists(dir: &std::path::Path, rev: &str) -> anyhow::Result<bool> {
+    let spec = format!("{rev}^{{commit}}");
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "color.ui=false", "rev-parse", "--verify", "--quiet", "--end-of-options", &spec])
+        .output()?;
+    Ok(out.status.success())
+}
+
+/// 2.6：`git merge-base <a> <b>`（两对象不可算 → Err）。
+/// **只要求可算**：结果不用于和 `inputs.merge_base` 比相等（Q2：`merge_base` 是实际 diff 左端，
+/// 可能与 `pr.base_sha` 前进后的 merge-base 不同）。
+pub fn merge_base_of(dir: &std::path::Path, a: &str, b: &str) -> anyhow::Result<String> {
+    Ok(git_at(dir, &["merge-base", "--end-of-options", a, b])?.trim().to_string())
+}
+
 /// 任意 rev 的 blob 内容（`git show <rev>:<path>`；M21b 批 A `risk` 回放：读历史 commit 文件，不依赖工作树）。
 /// 文件在该 rev 不存在 / 二进制 / IO 失败 → Err（调用方跳过该文件）。
 pub fn show_blob(dir: &std::path::Path, rev: &str, path: &str) -> anyhow::Result<String> {
@@ -174,8 +205,11 @@ pub fn changed_files_since(dir: &std::path::Path, base: &str) -> anyhow::Result<
 }
 
 /// 按 "diff --git a/X b/Y" 边界切分整份 diff；path 取 b 侧（rename 挂新路径下）。
+///
+/// job 模式（2.1）直接把 runner 给的 `inputs.diff_patch` 交给它——这份 patch 是**输入真相源**，
+/// 不再用 git 重新采集一遍（`run_review_dispatch` 那条路会）。
 // ponytail: 路径含 " b/" 子串或引号转义的病态仓不在本项目威胁模型内，rfind 足够；真撞见再上引号解析。
-fn split_diff_by_file(full: &str) -> Vec<FileChange> {
+pub fn split_diff_by_file(full: &str) -> Vec<FileChange> {
     let mut out: Vec<FileChange> = Vec::new();
     for line in full.lines() {
         if let Some(rest) = line.strip_prefix("diff --git a/") {
