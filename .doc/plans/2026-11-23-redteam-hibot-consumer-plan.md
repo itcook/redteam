@@ -60,7 +60,7 @@
 
 **P1 · `--job-dir` 即外派模式，用 clap 参数组表达互斥**：`review` 拆 `LocalArgs`/`JobArgs { job_dir }`；`triage`/`verify` 只有 `JobArgs`；另有 `config` 子命令（`schema`/`check`）。**job 模式下不接受任何配置路径 flag**（hibot A1）：配置唯一来源 = manifest `paths.config`；业务 flag 一律拒收（clap 报错，不写 if）。
 
-**P2 · kind ↔ 角色最小集 + 角色枚举定稿**（用户裁决 + hibot 确认）：`review` → scanner + reviewer（refuter 可选，缺则跳过验真）；`triage` → 建议用 scanner 条目；`verify` → **`verifier` 可选，缺省回退 `reviewer`**（仅模型分配复用，不等于流程复用，见 P16.1）；`verifier` 与 `reviewer` 都缺才报配置错误。
+**P2 · kind ↔ 角色最小集 + 角色枚举定稿**（用户裁决 + hibot 确认）：`review` → scanner + reviewer（refuter 可选，缺则跳过验真）；`triage` → **reviewer 条目**（**2026-11-24 实施期改判**：三轴用 `roles.reviewer`、reasoning `high`；`config check --kind triage` 要求 reviewer，取代本文原「建议用 scanner 条目」）；`verify` → **`verifier` 可选，缺省回退 `reviewer`**（仅模型分配复用，不等于流程复用，见 P16.1）；`verifier` 与 `reviewer` 都缺才报配置错误。
 **role 枚举定稿：`scanner` / `reviewer` / `refuter` / `verifier`**（hibot 已据此改示例，且他们的 Profile 角色键与我们的枚举**同名、原样搬运**，不做改名映射）。
 
 **P3 · 报告信封独立成层，不动内部 `ReviewReport`**：`verdict` 丢弃；`stats`/`run.usage`/`run.duration_ms` → `usage`（不带 cost）；`scan`/`clusters`/`cells`/`run.*` → `extensions.redteam`。
