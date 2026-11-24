@@ -8,6 +8,7 @@
 use crate::config::OutputLang;
 use crate::prompt::PromptBlock;
 use crate::provider::registry::ProviderRegistry;
+use crate::triage::budget;
 use crate::triage::input::PrContext;
 use crate::triage::shot;
 use crate::triage::standards::StandardsMap;
@@ -203,11 +204,21 @@ pub struct AxisRun<R> {
     pub usage: (u64, u64, u64),
     pub cells: u32,
     pub repair_notes: Vec<String>,
+    /// 该轴从开始到返回的实际墙钟（`axes[].elapsed_ms`，用于校准预算 v1）。
+    pub elapsed_ms: u64,
 }
 
 impl<R> Default for AxisRun<R> {
     fn default() -> Self {
-        AxisRun { rows: Vec::new(), ok: false, error: None, usage: (0, 0, 0), cells: 0, repair_notes: Vec::new() }
+        AxisRun {
+            rows: Vec::new(),
+            ok: false,
+            error: None,
+            usage: (0, 0, 0),
+            cells: 0,
+            repair_notes: Vec::new(),
+            elapsed_ms: 0,
+        }
     }
 }
 
@@ -272,19 +283,6 @@ fn patch_block(files: &[(String, String)]) -> String {
     out
 }
 
-/// 安全轴分片：按 changed-file 顺序均分；`N = min(4, ceil(files/6))`（grill 定案）。
-pub fn security_shard_count(files: usize) -> usize {
-    if files == 0 {
-        return 1;
-    }
-    files.div_ceil(6).clamp(1, 4)
-}
-
-/// 漂移轴分片：按模块分片；`N = min(4, modules)`（grill 定案）。
-pub fn drift_shard_count(modules: usize) -> usize {
-    modules.clamp(1, 4)
-}
-
 /// 把 `items` 顺序均分成 `n` 段（保持相对顺序；空段不产生）。
 pub fn balanced_chunks<T: Clone>(items: &[T], n: usize) -> Vec<Vec<T>> {
     if items.is_empty() {
@@ -309,9 +307,11 @@ pub async fn run_security(
     lang: &OutputLang,
     pr: &PrContext,
     files: &[(String, String)],
-    cell_timeout: std::time::Duration,
+    shard_count: usize,
+    hard_deadline: std::time::Instant,
 ) -> AxisRun<SecurityRow> {
-    let shards = balanced_chunks(files, security_shard_count(files.len()));
+    let t0 = std::time::Instant::now();
+    let shards = balanced_chunks(files, shard_count.max(1));
     let system = shared_system(lang);
     let tail = SECURITY_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
     let futs = shards.iter().enumerate().map(|(i, shard)| {
@@ -319,8 +319,15 @@ pub async fn run_security(
         let tail = tail.clone();
         let header = pr_header(pr);
         let patch = patch_block(shard);
+        let cell_budget = budget::cell_timeout(budget::slice_kb(shard), 0.0);
         async move {
-            let cell_deadline = tokio::time::Instant::now() + cell_timeout;
+            let hard = tokio::time::Instant::from_std(hard_deadline);
+            let now = tokio::time::Instant::now();
+            let budget = cell_budget.min(hard.saturating_duration_since(now));
+            if budget.is_zero() {
+                return Err((i, "no budget left".to_string(), (0, 0, 0), 0));
+            }
+            let cell_deadline = now + budget;
             let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
                 Ok(l) => l,
                 Err(e) => return Err((i, e, (0, 0, 0), 0)),
@@ -363,6 +370,7 @@ pub async fn run_security(
     if out.cells == 0 && out.error.is_none() {
         out = AxisRun::failed("security axis produced no cells".into());
     }
+    out.elapsed_ms = t0.elapsed().as_millis() as u64;
     out
 }
 
@@ -373,8 +381,10 @@ pub async fn run_drift(
     map: &StandardsMap,
     repo: &std::path::Path,
     files: &[(String, String)],
-    cell_timeout: std::time::Duration,
+    shard_count: usize,
+    hard_deadline: std::time::Instant,
 ) -> AxisRun<DriftRow> {
+    let t0 = std::time::Instant::now();
     // 按模块分组（顺序 = changed 文件顺序的首次出现）。
     let mut modules: Vec<String> = Vec::new();
     let mut by_module: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
@@ -385,8 +395,7 @@ pub async fn run_drift(
         }
         by_module.entry(m).or_default().push((path.clone(), diff.clone()));
     }
-    let n = drift_shard_count(modules.len());
-    let shards = balanced_chunks(&modules, n);
+    let shards = balanced_chunks(&modules, shard_count.max(1));
     let lang_zh = lang.value.starts_with("zh");
     let system = shared_system(lang);
     // 每个 shard 只带自己模块的标准包（否则全量 pack 会重复进每个 cell，白白放大输入与延迟）。
@@ -399,15 +408,24 @@ pub async fn run_drift(
         let system = system.clone();
         let tail = tail.clone();
         let pack = packs[i].clone();
-        let patch = patch_block(
-            &shard
-                .iter()
-                .flat_map(|m| by_module.get(m).cloned().unwrap_or_default())
-                .collect::<Vec<_>>(),
+        let shard_files: Vec<(String, String)> = shard
+            .iter()
+            .flat_map(|m| by_module.get(m).cloned().unwrap_or_default())
+            .collect();
+        let patch = patch_block(&shard_files);
+        let cell_budget = budget::cell_timeout(
+            budget::slice_kb(&shard_files),
+            budget::kb(pack.len()) * budget::DRIFT_PER_PACK_KB_S,
         );
         let module_list = shard.join(", ");
         async move {
-            let cell_deadline = tokio::time::Instant::now() + cell_timeout;
+            let hard = tokio::time::Instant::from_std(hard_deadline);
+            let now = tokio::time::Instant::now();
+            let budget = cell_budget.min(hard.saturating_duration_since(now));
+            if budget.is_zero() {
+                return Err(("no budget left".to_string(), (0, 0, 0)));
+            }
+            let cell_deadline = now + budget;
             let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
                 Ok(l) => l,
                 Err(e) => return Err((e, (0, 0, 0))),
@@ -451,6 +469,7 @@ pub async fn run_drift(
     if out.cells == 0 && out.error.is_none() {
         out = AxisRun::failed("drift axis produced no cells".into());
     }
+    out.elapsed_ms = t0.elapsed().as_millis() as u64;
     out
 }
 
@@ -462,6 +481,7 @@ pub async fn run_intent_claims(
     pr: &PrContext,
     cell_timeout: std::time::Duration,
 ) -> AxisRun<IntentClaimsOutput> {
+    let t0 = std::time::Instant::now();
     let system = shared_system(lang);
     let tail = INTENT_CLAIMS_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
     let cell_deadline = tokio::time::Instant::now() + cell_timeout;
@@ -509,9 +529,14 @@ pub async fn run_intent_claims(
                 error: None,
                 usage: (call.input_tokens, call.output_tokens, call.cached_input_tokens),
                 repair_notes: call.repair_note.into_iter().collect(),
+                elapsed_ms: t0.elapsed().as_millis() as u64,
             }
         }
-        Err(e) => AxisRun::failed(e.to_string()),
+        Err(e) => {
+            let mut out = AxisRun::failed(e.to_string());
+            out.elapsed_ms = t0.elapsed().as_millis() as u64;
+            out
+        }
     }
 }
 
@@ -524,14 +549,18 @@ pub async fn run_intent_slices(
     pr: &PrContext,
     claims: &[Claim],
     files: &[(String, String)],
-    cell_timeout: std::time::Duration,
+    shard_count: usize,
     concurrency: usize,
+    hard_deadline: std::time::Instant,
 ) -> AxisRun<IntentSliceOutput> {
+    let t0 = std::time::Instant::now();
     if files.is_empty() {
         // 空 diff：没有可验证的交付面；claims 由上层按“未兑现”处理。
-        return AxisRun { ok: true, ..Default::default() };
+        let mut out = AxisRun { ok: true, ..Default::default() };
+        out.elapsed_ms = t0.elapsed().as_millis() as u64;
+        return out;
     }
-    let shards = balanced_chunks(files, security_shard_count(files.len()));
+    let shards = balanced_chunks(files, shard_count.max(1));
     let system = shared_system(lang);
     let tail = INTENT_SLICE_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
     let mut claims_text = String::from("# Claims (canonical ids; refer to them by id only)\n");
@@ -547,7 +576,16 @@ pub async fn run_intent_slices(
         .step_by(step)
         .map(|s| (s, (s + step).min(shards.len())))
         .collect();
-    let per_chunk = cell_timeout;
+    // per-cell 预算：本片 diff 规模 + claims 列表/输出开销。
+    let budgets: Vec<std::time::Duration> = shards
+        .iter()
+        .map(|shard| {
+            budget::cell_timeout(
+                budget::slice_kb(shard),
+                budget::INTENT_EXTRA_S + claims.len() as f64 * budget::INTENT_PER_CLAIM_S,
+            )
+        })
+        .collect();
     let mut out = AxisRun { ok: true, ..Default::default() };
     for (start, end) in ranges {
         let futs = (start..end).map(|i| {
@@ -557,8 +595,15 @@ pub async fn run_intent_slices(
             let claims_text = claims_text.clone();
             let header = header.clone();
             let patch = patch_block(shard);
+            let cell_budget = budgets[i];
             async move {
-                let cell_deadline = tokio::time::Instant::now() + per_chunk;
+                let hard = tokio::time::Instant::from_std(hard_deadline);
+                let now = tokio::time::Instant::now();
+                let budget = cell_budget.min(hard.saturating_duration_since(now));
+                if budget.is_zero() {
+                    return Err(("no budget left".to_string(), (0, 0, 0)));
+                }
+                let cell_deadline = now + budget;
                 let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
                     Ok(l) => l,
                     Err(e) => return Err((e, (0, 0, 0))),
@@ -605,6 +650,7 @@ pub async fn run_intent_slices(
     if out.cells == 0 && out.error.is_none() {
         out = AxisRun::failed("intent slices produced no cells".into());
     }
+    out.elapsed_ms = t0.elapsed().as_millis() as u64;
     out
 }
 
@@ -640,18 +686,6 @@ mod tests {
             assert!(!tier2_surface(id), "面 {id} 不得升 tier2");
         }
         assert_eq!(surface_key(4), "code-execution");
-    }
-
-    #[test]
-    fn shard_formulas_are_the_grill_ones() {
-        assert_eq!(security_shard_count(0), 1);
-        assert_eq!(security_shard_count(1), 1);
-        assert_eq!(security_shard_count(6), 1);
-        assert_eq!(security_shard_count(7), 2);
-        assert_eq!(security_shard_count(100), 4);
-        assert_eq!(drift_shard_count(0), 1);
-        assert_eq!(drift_shard_count(3), 3);
-        assert_eq!(drift_shard_count(9), 4);
     }
 
     #[test]

@@ -69,6 +69,17 @@ hibot audit 执行单元接入的 U4 单元（协调者 session `01a20ba0` 派�
 - 模板：`triage-intent.md` 退役，新增 `triage-intent-claims.md` / `triage-intent-slice.md`；
   模板哈希 `2c750615f126b5f3` → `ad41f9d1df42eb13` → `f8e848e16e926990`（I0 排除 build/test/smoke 等验证性声明，避免虚增 undelivered）。
 
+### 2026-11-24 budget v1（全默认；替代 grill 第 6 条的固定分片公式）
+
+> 规模只决定**预算包线**与分片数，不预测 LLM 实际耗时；常量锚点 = GLM-5.4 high 实测（censored）。
+
+- `cell_timeout = clamp((60 + 6*diff_kb + extra_s) * 1.15, 120, 600)` 秒
+  - security：`extra=0`；drift：`extra=pack_kb*1`；intent slice：`extra=20 + claims*0.5`
+- `i0_timeout = clamp(60 + 2*text_kb, 60, 180)` 秒；另与 `remaining*0.8` 取 min
+- 分片：`n = min(4, ceil(total_diff_kb/45), ceil(files/6))`；drift 再 `min(modules)`
+- 每个 cell 的预算独立按自己的 diff 规模算；`axes[].elapsed_ms` 落盘用于后续校准
+- 原 grill 的 `min(4, ceil(files/6))` / `min(4, modules)` 由本节替代。
+
 ### tier2 白名单对照表（可复核）
 
 | 面 | 名称 | 判据（摘要） | 可升 tier2 |

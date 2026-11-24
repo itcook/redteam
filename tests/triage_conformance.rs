@@ -260,6 +260,7 @@ async fn triage_ok_has_nine_keys_nested_routing_and_scanner_findings() {
     let axes = r["extensions"]["redteam"]["axes"].as_array().unwrap();
     assert_eq!(axes.len(), 3, "{r}");
     assert!(axes.iter().all(|a| a["ok"] == true), "{r}");
+    assert!(axes.iter().all(|a| a.get("elapsed_ms").is_some()), "预算校准字段: {r}");
 }
 
 #[tokio::test]

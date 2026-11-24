@@ -3,6 +3,7 @@
 //! 取消（SIGTERM / 墙钟）由调用方 `select!` 控制：已完成的轴通过 [`Progress`] 交给
 //! [`snapshot_finalize`] 收敛成 `partial`（不丢已完成成果；`summary` 只在三轴全成时生成）。
 
+pub mod budget;
 pub mod input;
 pub mod lenses;
 pub mod shot;
@@ -34,15 +35,6 @@ pub struct TriageRequest<'a> {
     pub deadline: std::time::Instant,
     /// 三轴使用的模型（`roles.scanner` 的第一条；grill：不新增配置块）。
     pub route_key: String,
-}
-
-/// 墙钟优化：单格超时 = 剩余预算 / 预计波次 × 0.9（下限 20s）。
-/// 波次 = ceil(cells / provider_cap)：provider 门是唯一并发闸（D72），单格不能吃掉整个 job 预算。
-pub fn cell_budget(remaining: std::time::Duration, cells: usize, provider_cap: usize) -> std::time::Duration {
-    let waves = cells.div_ceil(provider_cap.max(1)).max(1) as u32;
-    let per = remaining / waves;
-    // 不设固定下限：job 只剩几秒时，下限反而会把单格预算顶到剩余之外（由全局 deadline 兜底）。
-    per.mul_f32(0.9).min(remaining)
 }
 
 /// 三轴已完成的结果（取消后从这里取已完成部分）。
@@ -102,28 +94,28 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
         p.drift = Some(lenses::AxisRun { ok: true, ..Default::default() });
     }
 
-    // ── I0：串行、小输入（不喂 diff）；预算封顶 25% 且 ≤150s，避免它吃掉整轮 ──
+    // ── I0：串行、小输入（不喂 diff）；预算按文本规模（60–180s），并留 20% 全局余量 ──
     let remaining = req.deadline.saturating_duration_since(std::time::Instant::now());
-    let i0_budget = (remaining / 4).min(std::time::Duration::from_secs(150));
+    let i0_text_kb = budget::kb(
+        req.pr.body.len()
+            + req.pr.linked_issues.iter().map(|i| i.body.as_deref().unwrap_or("").len()).sum::<usize>()
+            + req.pr.comments.iter().filter(|c| !c.is_bot && c.author != req.pr.author).map(|c| c.body.len()).sum::<usize>(),
+    );
+    let i0_budget = budget::i0_timeout(i0_text_kb).min(remaining.mul_f64(0.8));
+    let i0_start = std::time::Instant::now();
     let claims_run = lenses::run_intent_claims(registry, &req.route_key, req.lang, req.pr, i0_budget).await;
+    let i0_elapsed = i0_start.elapsed().as_millis() as u64;
 
-    // I0 之后重算波次预算：cells = security + drift + intent slices（I0 已在波次之外）。
+    // 规模决定分片数：min(4, ceil(total_kb/45), ceil(files/6))；drift 再受 modules 限制。
+    let total_kb = budget::kb(files.iter().map(|(_, d)| d.len()).sum());
+    let n_sec = budget::shard_count(total_kb, files.len());
+    let modules: std::collections::BTreeSet<String> =
+        files.iter().map(|(p, _)| standards::module_of(p)).collect();
+    let n_drift = n_sec.min(modules.len().max(1));
     let provider_cap = registry
         .provider_of(&req.route_key)
         .and_then(|p| registry.cap_of(p))
         .unwrap_or(4) as usize;
-    let sec_cells = if files.is_empty() { 0 } else { lenses::security_shard_count(files.len()) };
-    let modules: std::collections::BTreeSet<String> =
-        files.iter().map(|(p, _)| standards::module_of(p)).collect();
-    let drift_cells = if files.is_empty() { 0 } else { lenses::drift_shard_count(modules.len()) };
-    let intent_slices = if claims_run.ok && !files.is_empty() {
-        lenses::security_shard_count(files.len())
-    } else {
-        0
-    };
-    let cells = (sec_cells + drift_cells + intent_slices).max(1);
-    let remaining = req.deadline.saturating_duration_since(std::time::Instant::now());
-    let wave_budget = cell_budget(remaining, cells, provider_cap);
 
     let claims = claims_run.rows.first().cloned().unwrap_or_default();
     if claims_run.ok {
@@ -137,8 +129,9 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                     req.pr,
                     &claims.claims,
                     &files,
-                    wave_budget,
+                    n_sec,
                     (provider_cap / 2).max(1),
+                    req.deadline,
                 )
                 .await;
                 let assembled = assemble_intent(&claims, &r);
@@ -147,6 +140,7 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                     error: r.error,
                     usage: (claims_run.usage.0 + r.usage.0, claims_run.usage.1 + r.usage.1, claims_run.usage.2 + r.usage.2),
                     cells: claims_run.cells + r.cells,
+                    elapsed_ms: i0_elapsed + r.elapsed_ms,
                     ..Default::default()
                 };
                 out.repair_notes.extend(claims_run.repair_notes.iter().cloned());
@@ -159,14 +153,14 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, wave_budget).await;
+                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline).await;
                 progress.lock().unwrap().security = Some(r);
             },
             async {
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, wave_budget).await;
+                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline).await;
                 progress.lock().unwrap().drift = Some(r);
             }
         );
@@ -180,6 +174,7 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                 error: claims_run.error.clone().or_else(|| Some("intent claims extraction failed".into())),
                 usage: claims_run.usage,
                 cells: claims_run.cells,
+                elapsed_ms: claims_run.elapsed_ms,
                 ..Default::default()
             });
         }
@@ -188,14 +183,14 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, wave_budget).await;
+                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline).await;
                 progress.lock().unwrap().security = Some(r);
             },
             async {
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, wave_budget).await;
+                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline).await;
                 progress.lock().unwrap().drift = Some(r);
             }
         );
@@ -273,7 +268,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
         usage.0 += a.usage.0;
         usage.1 += a.usage.1;
         usage.2 += a.usage.2;
-        axes.push(axis_json("security", a.ok, a.rows.len(), a.cells, a.error.as_deref(), a.usage, &a.repair_notes, Value::Null, None));
+        axes.push(axis_json("security", a.ok, a.rows.len(), a.cells, a.elapsed_ms, a.error.as_deref(), a.usage, &a.repair_notes, Value::Null, None));
         if !a.ok {
             reasons.push(JobFailure::new("triage_axis_failed", Some("security".into())));
         }
@@ -281,7 +276,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
         if completed {
             reasons.push(JobFailure::new("triage_axis_failed", Some("security".into())));
         }
-        axes.push(axis_json("security", false, 0, 0, Some("interrupted"), (0, 0, 0), &[], Value::Null, None));
+        axes.push(axis_json("security", false, 0, 0, 0, Some("interrupted"), (0, 0, 0), &[], Value::Null, None));
     }
     if let Some(a) = &p.drift {
         usage.0 += a.usage.0;
@@ -297,7 +292,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
             })).collect::<Vec<_>>(),
             "no_standard": map.no_standard,
         });
-        axes.push(axis_json("drift", a.ok, a.rows.len(), a.cells, a.error.as_deref(), a.usage, &a.repair_notes, standards, None));
+        axes.push(axis_json("drift", a.ok, a.rows.len(), a.cells, a.elapsed_ms, a.error.as_deref(), a.usage, &a.repair_notes, standards, None));
         if !a.ok {
             reasons.push(JobFailure::new("triage_axis_failed", Some("drift".into())));
         }
@@ -305,7 +300,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
         if completed {
             reasons.push(JobFailure::new("triage_axis_failed", Some("drift".into())));
         }
-        axes.push(axis_json("drift", false, 0, 0, Some("interrupted"), (0, 0, 0), &[], Value::Null, None));
+        axes.push(axis_json("drift", false, 0, 0, 0, Some("interrupted"), (0, 0, 0), &[], Value::Null, None));
     }
     if let Some(a) = &p.intent {
         usage.0 += a.usage.0;
@@ -318,7 +313,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
             "scope_creep": r.scope_creep.len(),
             "verification_complete": r.verification_complete,
         })).unwrap_or(Value::Null);
-        axes.push(axis_json("intent", a.ok, a.rows.len(), a.cells, a.error.as_deref(), a.usage, &a.repair_notes, disclosure, Some(notes)));
+        axes.push(axis_json("intent", a.ok, a.rows.len(), a.cells, a.elapsed_ms, a.error.as_deref(), a.usage, &a.repair_notes, disclosure, Some(notes)));
         if !a.ok {
             reasons.push(JobFailure::new("triage_axis_failed", Some("intent".into())));
         }
@@ -326,7 +321,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
         if completed {
             reasons.push(JobFailure::new("triage_axis_failed", Some("intent".into())));
         }
-        axes.push(axis_json("intent", false, 0, 0, Some("interrupted"), (0, 0, 0), &[], Value::Null, None));
+        axes.push(axis_json("intent", false, 0, 0, 0, Some("interrupted"), (0, 0, 0), &[], Value::Null, None));
     }
 
     // 已完成的轴照常参与 findings/blockers；缺失轴按空处理（但 summary 不会生成）。
@@ -375,6 +370,7 @@ fn axis_json(
     ok: bool,
     rows: usize,
     cells: u32,
+    elapsed_ms: u64,
     error: Option<&str>,
     usage: (u64, u64, u64),
     repair_notes: &[String],
@@ -386,6 +382,7 @@ fn axis_json(
         "ok": ok,
         "rows": rows,
         "cells": cells,
+        "elapsed_ms": elapsed_ms,
         "usage": { "input_tokens": usage.0, "output_tokens": usage.1, "cached_input_tokens": usage.2 },
     });
     if let Some(e) = error {
@@ -442,13 +439,4 @@ mod tests {
         assert_eq!(patch_pairs(&changes).len(), 1);
     }
 
-    /// 墙钟优化：单格预算 = 剩余 / 波次 × 0.9；下限 20s，上限不超过剩余。
-    #[test]
-    fn cell_budget_divides_by_provider_waves() {
-        use std::time::Duration;
-        assert_eq!(cell_budget(Duration::from_secs(1200), 8, 4), Duration::from_secs(540));
-        assert_eq!(cell_budget(Duration::from_secs(100), 8, 4), Duration::from_secs(45));
-        assert_eq!(cell_budget(Duration::from_secs(10), 1, 4), Duration::from_secs(9), "不超过剩余");
-        assert_eq!(cell_budget(Duration::from_secs(1200), 3, 0), Duration::from_secs(360), "cap=0 按 1 波、每格 1/3");
-    }
 }
