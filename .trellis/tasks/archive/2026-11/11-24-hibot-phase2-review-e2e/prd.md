@@ -73,9 +73,14 @@ paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
 - **非 detached 不判错**（观测可加，不做门禁；本单元未加布尔）。
 - 附录 D/E 已按上述补行并标注 **Phase 2 新增**。
 
-## 结果（2026-11-24，待协调者验收）
+## 结果（2026-11-24，**协调者已验收**）
 
-### 提交（`feature/hibot-audit-exec`，基线 `9f27a4a`）
+- 协调者独立复核（自跑）通过：`cargo build` 告警 0、`make verify` exit 0、
+  `cargo test` 1073+21+4+23+7+24 全绿、capabilities schema PASS、hibot 新样例
+  `config check --kind review` = `RESULT ok 0 errors, 0 warnings`。
+- **已合入 `hibot-executor` = `893f36c`**。本任务随后归档；本仓不改 `hibot-executor`、不另起分支。
+
+### 提交（`feature/hibot-audit-exec`，基线 `9f27a4a` → `b2ae720`）
 
 | commit | 内容 |
 |---|---|
