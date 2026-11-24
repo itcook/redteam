@@ -11,7 +11,13 @@
 secrets.toml
 **/secrets.toml
 *.key
+# R2 发布凭据（计划 §10 / 7.5：R2_STATIC_ENDPOINT / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY /
+# R2_BUCKET，可选 R2_BUCKET_DOMAIN）——只放本机，永不入库。
+/.env
+.env.local
 
+# 发布打包产物（scripts/release.sh 每次重建；入库的只有 dist/install.sh 与 dist/config.schema.json）
+/dist/release/
 # --- SDD 执行脚手架（进度账本，git 忽略的 scratch）---
 .superpowers/
 .gstack/
