@@ -150,7 +150,7 @@ pub enum VerifyDecision {
     Verify,
     /// 低危 / 低置信：`verdict` 层本就不认它，复核它纯烧 token 无裁决增益。
     SkipNotTriggered,
-    /// `review.verifiers.enabled = false`（全局关）。
+    /// `review.refuters.enabled = false`（全局关）。
     SkipDisabled,
     /// carried：出生轮已复核过。
     SkipCarried,
@@ -246,9 +246,9 @@ pub fn pick_verifier<'a>(
     rotation: usize,
 ) -> Option<(&'a EffectiveModel, Option<String>)> {
     let reviewer_family = reviewer.family.as_str();
-    if !roles.verifiers.is_empty() {
-        let n = roles.verifiers.len();
-        let picked = &roles.verifiers[rotation % n];
+    if !roles.refuters.is_empty() {
+        let n = roles.refuters.len();
+        let picked = &roles.refuters[rotation % n];
         // 显式声明也要如实告知（收口评审 #11）：轮到的这个若与产出该 finding 的 reviewer 同模型
         // （自己验自己）或同家族，判决的独立性就打了折。只 warning 不改选：用户显式配的，他有权这么配。
         // 注：离线基线只支持「异族驳回更多」（31% vs 19%），误驳两臂分不出高下——
@@ -444,7 +444,7 @@ mod tests {
         EffectiveModel {
             name: name.into(), display_name: None, id: name.rsplit('/').next().unwrap().into(),
             provider: name.split('/').next().unwrap().into(),
-            role: crate::config::Role::Verifier, kind: crate::config::ProviderKind::Openai,
+            role: crate::config::Role::Refuter, kind: crate::config::ProviderKind::Openai,
             base_url: None, context_window: 100_000, max_output_tokens: None,
             per_turn_timeout_secs: None, reasoning: false, reasoning_effort: None,
             family: family.into(), max_concurrency: None,
@@ -550,7 +550,8 @@ mod tests {
         let roles = RoleSets {
             scanners: vec![model("p/s", "deepseek")],
             reviewers: vec![model("p/r", "glm")],
-            verifiers: vec![model("p/v1", "kimi"), model("p/v2", "qwen")],
+            refuters: vec![model("p/v1", "kimi"), model("p/v2", "qwen")],
+            verifiers: vec![],
         };
         let rev = model("p/r", "glm");
         let names: Vec<&str> = (0..4).map(|i| pick_verifier(&roles, &rev, i).unwrap().0.name.as_str()).collect();
@@ -566,7 +567,8 @@ mod tests {
         let same = RoleSets {
             scanners: vec![],
             reviewers: vec![model("p/r", "glm")],
-            verifiers: vec![model("p/r", "glm")], // 现配置就是这个形状：一个模型兼两角色
+            refuters: vec![model("p/r", "glm")], // 现配置就是这个形状：一个模型兼两角色
+            verifiers: vec![],
         };
         let (m, warn) = pick_verifier(&same, &model("p/r", "glm"), 0).unwrap();
         assert_eq!(m.name, "p/r");
@@ -575,7 +577,8 @@ mod tests {
         let kin = RoleSets {
             scanners: vec![],
             reviewers: vec![model("p/r", "glm")],
-            verifiers: vec![model("p/r2", "glm")], // 不同模型、同家族
+            refuters: vec![model("p/r2", "glm")], // 不同模型、同家族
+            verifiers: vec![],
         };
         let (_, warn) = pick_verifier(&kin, &model("p/r", "glm"), 0).unwrap();
         assert!(warn.as_deref().is_some_and(|w| w.contains("同家族")), "同族也要说一声: {warn:?}");
@@ -587,6 +590,7 @@ mod tests {
         let roles = RoleSets {
             scanners: vec![model("p/s", "deepseek")],
             reviewers: vec![model("p/r", "glm"), model("p/r2", "kimi")],
+            refuters: vec![],
             verifiers: vec![],
         };
         assert_eq!(pick_verifier(&roles, &model("p/r", "glm"), 0).unwrap().0.name, "p/r2", "异族 reviewer 优先");
@@ -594,6 +598,7 @@ mod tests {
         let only_scanner_cross = RoleSets {
             scanners: vec![model("p/s", "deepseek")],
             reviewers: vec![model("p/r", "glm")],
+            refuters: vec![],
             verifiers: vec![],
         };
         assert_eq!(pick_verifier(&only_scanner_cross, &model("p/r", "glm"), 0).unwrap().0.name, "p/s", "没有异族 reviewer 就取 scanner 档");
@@ -605,6 +610,7 @@ mod tests {
         let roles = RoleSets {
             scanners: vec![model("p/s", "glm")],
             reviewers: vec![model("p/r", "glm")],
+            refuters: vec![],
             verifiers: vec![],
         };
         let (m, warn) = pick_verifier(&roles, &model("p/r", "glm"), 0).unwrap();

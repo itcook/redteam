@@ -4494,12 +4494,12 @@ mod tests {
     fn fake_verifier() -> crate::config::EffectiveModel {
         crate::config::EffectiveModel {
             name: "p/v".into(), id: "v".into(), family: "v".into(),
-            role: crate::config::Role::Verifier, ..fake_reviewer()
+            role: crate::config::Role::Refuter, ..fake_reviewer()
         }
     }
 
     fn verify_roles() -> crate::config::RoleSets {
-        crate::config::RoleSets { scanners: vec![], reviewers: vec![fake_reviewer()], verifiers: vec![fake_verifier()] }
+        crate::config::RoleSets { scanners: vec![], reviewers: vec![fake_reviewer()], refuters: vec![fake_verifier()], verifiers: vec![] }
     }
 
     fn vin<'a>(

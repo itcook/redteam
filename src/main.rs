@@ -40,10 +40,10 @@ enum Cmd {
     /// 见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
     /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口；深挖照跑、findings 仍在报告，本可 reject 的 blocking 条数见
     /// run.warnings）、10=reject（finding 达到 --block-threshold）。
-    /// 复核（verifier）**缺省关**：开了之后，每条 severity ≥ --block-threshold ∧ confidence ≥ --conf-floor 的 finding
-    /// 会再派一个模型复查，被驳回的不计数、不拦路（记录仍在 findings 里，带 verify 字段）。
-    /// 配 `review.verifiers.enabled = true` 打开：没给模型配 verifier 角色时**自动挑一个异族**的 reviewer / scanner；
-    /// 配了 verifier 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦（异族更准，见下）。
+    /// 复核（refuter）**缺省关**：开了之后，每条 severity ≥ --block-threshold ∧ confidence ≥ --conf-floor 的 finding
+    /// 会再派一个模型复查，被驳回的不计数、不拦路（记录仍在 findings 里，带 refute 字段）。
+    /// 配 `review.refuters.enabled = true` 打开：没给模型配 refuter 角色时**自动挑一个异族**的 reviewer / scanner；
+    /// 配了 refuter 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦（异族更准，见下）。
     /// 观测在 `run.deep.verify_triggered` / `verify_skipped`（分类：not_triggered·disabled·carried·precedent·consensus·resumed·cached·no_verifier）/
     /// `verify_refuted` / `verify_failed` / `verify_tail_ms` 与顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。
     /// 缺省关的依据：对本仓人裁台账的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 8%
@@ -333,7 +333,8 @@ enum ModelCmd {
         /// 请求体里的 model id（providers.<name>.models.<id>，如 deepseek-v4-flash）。
         #[arg(long)]
         model: String,
-        /// 角色，逗号分隔：scanner,reviewer,verifier（拥有该角色键的模型即活跃集，无候补）。
+        /// 角色，逗号分隔：scanner,reviewer,refuter,verifier（拥有该角色键的模型即活跃集，无候补）。
+        /// `refuter` = 评审内 finding 验真；`verifier` = fix 验证（kind=verify 用，缺省回退 reviewer）。
         #[arg(long)]
         role: String,
         /// 人读显示名（model list / 报告用）；身份串固定为 provider/id，不可配置。
@@ -509,10 +510,13 @@ fn resolve_result(
     }
 }
 
-/// 构造 ProviderRegistry（前台与 worker 共用）：scanner / reviewer / verifier 各按 **角色键**
+/// 构造 ProviderRegistry（前台与 worker 共用）：scanner / reviewer / refuter 各按 **角色键**
 /// `role:provider/id` 注册一份 backend（`reasoningEffort` 是角色属性，同一模型跨角色不能共用一份档位）——scanner 一律
 /// scan 单发（`--tools` 对 scanner 无效，K3）；provider 在途门 = `maxConcurrency` 缺省继承 `review.max_concurrency`（D7 A5；唯一闸，无角色级 workers，D13）；
 /// reasoningEffort 无映射的告警进 registry.warnings → RunMeta.warnings。scanners 为空 → 配置错误；返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
+///
+/// **`roles.verifier`（fix 验证）不在这里注册**：它属 kind=verify 管线（Phase 4），review 既不用也不该
+/// 因它构造 backend；它的回退（缺省复用 reviewer）是选择策略（`RoleSets::fix_verifiers`），不是 review 的注册项。
 fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<ProviderRegistry, String> {
     let roles = cfg.active_roles();
     if roles.scanners.is_empty() {
@@ -537,23 +541,31 @@ fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<Provi
         let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
         registry.insert_scan(role_key(redteam::config::Role::Scanner, &em.name), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
     }
-    // reviewer 与 verifier 各按角色键注册（同模型不同档位各占一份 backend，不互相覆盖）。批 D〔D17〕：
-    // verifier 必须在这里注册，否则 `pick_verifier` 选中一个纯 verifier 模型时 `registry.lease()` 直接
+    // 0.8 护栏（R20）：旧配置里“验真角色”写作 `roles.verifier`，硬切后会静默变成 fix 验证角色。
+    // 这里把变义提示进 registry.warnings → 报告 run.warnings——后台 worker 的 stderr 是 /dev/null，
+    // 只靠 `Config::load` 的 eprintln 后台作业永远看不到（前台由 load warnings 已经打过一份）。
+    if let Some(w) = cfg.verifier_role_guard_warning() {
+        if !registry.warnings().contains(&w) {
+            registry.push_warning(w);
+        }
+    }
+    // reviewer 与 refuter 各按角色键注册（同模型不同档位各占一份 backend，不互相覆盖）。批 D〔D17〕：
+    // refuter 必须在这里注册，否则 `pick_refuter` 选中一个纯 refuter 模型时 `registry.lease()` 直接
     // Unavailable，每条复核都静默落成「保守 upheld」——看起来跑了、其实一次没验。
     for (em, role) in roles
         .reviewers
         .iter()
         .map(|m| (m, redteam::config::Role::Reviewer))
-        .chain(roles.verifiers.iter().map(|m| (m, redteam::config::Role::Verifier)))
+        .chain(roles.refuters.iter().map(|m| (m, redteam::config::Role::Refuter)))
     {
         let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
         let backend = match backend_from_config(em, key) {
             Ok(b) => b,
-            // reviewer 造不出 = 本轮的活干不了，硬 Err 照旧；**verifier 造不出只是这一路没得用**
+            // reviewer 造不出 = 本轮的活干不了，硬 Err 照旧；**refuter 造不出只是这一路没得用**
             // （复核缺省还关着），不该让整条 review 命令拒跑（收口评审 #8：
-            // 预置一个 kind=google 的 verifier 模型，整个 review 会以 "google not yet supported" 退出）。
-            Err(e) if role == redteam::config::Role::Verifier => {
-                registry.push_warning(format!("verifier {} 不可用（{e}）——本轮复核将跳过它", em.name));
+            // 预置一个 kind=google 的 refuter 模型，整个 review 会以 "google not yet supported" 退出）。
+            Err(e) if role == redteam::config::Role::Refuter => {
+                registry.push_warning(format!("refuter {} 不可用（{e}）——本轮复核将跳过它", em.name));
                 continue;
             }
             Err(e) => return Err(format!("{e}")),
@@ -988,13 +1000,13 @@ async fn main() {
                         Some(x) if !roles.contains(&x) => roles.push(x),
                         Some(_) => {}
                         None => {
-                            eprintln!("error: --role 取 scanner | reviewer | verifier（逗号分隔，如 scanner,reviewer），收到 {r:?}");
+                            eprintln!("error: --role 取 scanner | reviewer | refuter | verifier（逗号分隔，如 scanner,reviewer），收到 {r:?}");
                             std::process::exit(1);
                         }
                     }
                 }
                 if roles.is_empty() {
-                    eprintln!("error: --role 至少给一个角色：scanner | reviewer | verifier");
+                    eprintln!("error: --role 至少给一个角色：scanner | reviewer | refuter | verifier");
                     std::process::exit(1);
                 }
                 let reasoning_effort = match reasoning_effort.as_deref() {
@@ -1677,12 +1689,12 @@ mod tests {
     /// 批 D〔D17〕：**纯 verifier 模型也要进 registry**。漏注册时 `pick_verifier` 选中它，
     /// 每条复核都会在 `lease()` 上拿到 Unavailable、静默落成「保守 upheld」——看起来跑了、其实一次没验。
     #[test]
-    fn build_registry_registers_verifier_only_models() {
+    fn build_registry_registers_refuter_only_models() {
         let cfg: redteam::config::Config = serde_json::from_str(
             r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
                 "s":{"roles":{"scanner":{}}},
                 "r":{"roles":{"reviewer":{}}},
-                "v":{"roles":{"verifier":{}}}
+                "v":{"roles":{"refuter":{}}}
             }}}}"#,
         )
         .unwrap();
@@ -1693,8 +1705,8 @@ mod tests {
             "scanner / reviewer 按角色键注册"
         );
         assert!(
-            reg.has_for(redteam::config::Role::Verifier, "p/v"),
-            "纯 verifier 模型必须能 lease，否则复核全程静默保守 upheld"
+            reg.has_for(redteam::config::Role::Refuter, "p/v"),
+            "纯 refuter 模型必须能 lease，否则复核全程静默保守 upheld"
         );
     }
 
@@ -1702,11 +1714,11 @@ mod tests {
     /// 而 `kind: "google"` 一类尚不支持的 provider 在 backend 构造处返回 Err。
     /// reviewer 造不出仍是硬 Err（本轮的活真干不了）。
     #[test]
-    fn build_registry_skips_unusable_verifier_instead_of_failing_the_run() {
+    fn build_registry_skips_unusable_refuter_instead_of_failing_the_run() {
         let cfg: redteam::config::Config = serde_json::from_str(
             r#"{"providers":{
                 "p":{"kind":"openai","baseUrl":"https://x","models":{"s":{"roles":{"scanner":{}}}}},
-                "g":{"kind":"google","baseUrl":"https://y","models":{"v":{"roles":{"verifier":{}}}}}
+                "g":{"kind":"google","baseUrl":"https://y","models":{"v":{"roles":{"refuter":{}}}}}
             }}"#,
         )
         .unwrap();
@@ -1714,10 +1726,10 @@ mod tests {
             .expect("verifier 造不出 backend 不该让整条 review 拒跑");
         assert!(
             reg.has_for(redteam::config::Role::Scanner, "p/s")
-                && !reg.has_for(redteam::config::Role::Verifier, "g/v")
+                && !reg.has_for(redteam::config::Role::Refuter, "g/v")
         );
         assert!(
-            reg.warnings().iter().any(|w| w.contains("verifier g/v 不可用")),
+            reg.warnings().iter().any(|w| w.contains("refuter g/v 不可用")),
             "跳过要可观测: {:?}",
             reg.warnings()
         );
@@ -1729,7 +1741,7 @@ mod tests {
     fn build_registry_keeps_role_scoped_reasoning_efforts() {
         let cfg: redteam::config::Config = serde_json::from_str(
             r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
-                "m":{"roles":{"scanner":{"reasoningEffort":"medium"},"reviewer":{"reasoningEffort":"high"},"verifier":{"reasoningEffort":"high"}}}
+                "m":{"roles":{"scanner":{"reasoningEffort":"medium"},"reviewer":{"reasoningEffort":"high"},"refuter":{"reasoningEffort":"high"}}}
             }}}}"#,
         )
         .unwrap();
@@ -1737,7 +1749,7 @@ mod tests {
         use redteam::config::Role;
         assert!(reg.has_for(Role::Scanner, "p/m"), "scanner 一份");
         assert!(reg.has_for(Role::Reviewer, "p/m"), "reviewer 自己一份（档位 high）");
-        assert!(reg.has_for(Role::Verifier, "p/m"), "verifier 自己一份（档位 high）");
+        assert!(reg.has_for(Role::Refuter, "p/m"), "refuter 自己一份（档位 high）");
         assert!(
             !reg.warnings().iter().any(|w| w.contains("reasoningEffort 不一致")),
             "角色键隔离后不该再有档位冲突告警: {:?}",

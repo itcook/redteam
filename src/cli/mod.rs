@@ -431,7 +431,7 @@ pub async fn run_code_review(
                 backend_factory: Some(factory.as_ref()),
                 verify: Some(crate::orchestrate::deep::VerifyInput {
                     roles: &roles,
-                    enabled: cfg.review.verifiers.enabled,
+                    enabled: cfg.review.refuters.enabled,
                     // 与 verdict 同一份阈值（收口评审 #9）：旗标覆盖必须同时作用于两处。
                     block_threshold: thresholds.0,
                     conf_floor: thresholds.1,
@@ -1663,7 +1663,7 @@ pub async fn run_resume(
         roles.scanners.iter().find(|m| m.name == name).map(crate::orchestrate::ScanEntrySpec::from)
     };
     let family_of = |name: &str| -> String {
-        roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers)
+        roles.scanners.iter().chain(&roles.reviewers).chain(&roles.refuters)
             .find(|m| m.name == name).map(|m| m.family.clone()).unwrap_or_default()
     };
     let current_hash = crate::prompt::scan_template_hash();
@@ -1945,7 +1945,7 @@ pub async fn run_resume(
                     backend_factory: Some(factory.as_ref()),
                     verify: Some(crate::orchestrate::deep::VerifyInput {
                         roles: &roles,
-                        enabled: cfg.review.verifiers.enabled,
+                        enabled: cfg.review.refuters.enabled,
                         block_threshold: thresholds.0,
                         conf_floor: thresholds.1,
                         precedents: &ledger.cards,
@@ -4119,16 +4119,16 @@ mod code_review_tests {
 
     /// 触发集与 verdict 同源，**含 CLI 覆盖**（2026-09-21 收口评审 #9）：`--conf-floor 0.3` 让一条
     /// 置信 0.4 的 finding 成为 blocking，它就必须同时进复核触发集。两处读不同的阈值时，
-    /// 这条会被 verdict 判成拦路、却永远不被复核——`verify.rs` 里写着的「与 compute_verdict 同源」当场失效。
+    /// 这条会被 verdict 判成拦路、却永远不被复核——`refute.rs` 里写着的「与 compute_verdict 同源」当场失效。
     #[tokio::test]
-    async fn cli_threshold_overrides_reach_the_verify_trigger_set() {
+    async fn cli_threshold_overrides_reach_the_refute_trigger_set() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
         let cfg = Config::from_json(
-            r#"{"review":{"verifiers":{"enabled":true}},"providers":{"p":{"kind":"openai","models":{
+            r#"{"review":{"refuters":{"enabled":true}},"providers":{"p":{"kind":"openai","models":{
                 "s":{"roles":{"scanner":{}}},
                 "r":{"roles":{"reviewer":{}}},
-                "v":{"roles":{"verifier":{}}}
+                "v":{"roles":{"refuter":{}}}
             }}}}"#,
         )
         .unwrap();

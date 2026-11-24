@@ -58,8 +58,8 @@ fn claim_to_finding(c: Claim) -> Finding {
     }
 }
 
-/// 选复核模型：显式 `--verifier` 优先按 `provider/id` 取；缺省取 verifier 角色首个。
-/// **优先 verifier 角色条目**（reasoningEffort 等档位按角色配）；该模型没配 verifier 角色时
+/// 选复核模型：显式 `--refuter` 优先按 `provider/id` 取；缺省取 `refuter` 角色首个。
+/// **优先 refuter 角色条目**（reasoningEffort 等档位按角色配）；该模型没配 refuter 角色时
 /// 回落它的其他角色条目，并在输出里标出用的是哪个角色的档位——离线基线与线上不同档必须看得见。
 fn pick_model(cfg: &Config, want: Option<&str>) -> Result<(EffectiveModel, &'static str), String> {
     // `active_roles()` 返回的是自有集合——取一份克隆，调用方不必跟着它的生命周期。
@@ -67,13 +67,13 @@ fn pick_model(cfg: &Config, want: Option<&str>) -> Result<(EffectiveModel, &'sta
     let find = |set: &[EffectiveModel], name: &str| set.iter().find(|m| m.name == name).cloned();
     match want {
         None => roles
-            .verifiers
+            .refuters
             .first()
-            .map(|m| (m.clone(), "verifier"))
-            .ok_or_else(|| "配置里没有 verifier 角色的模型；用 --verifier provider/id 指定".to_string()),
+            .map(|m| (m.clone(), "refuter"))
+            .ok_or_else(|| "配置里没有 refuter 角色的模型；用 --refuter provider/id 指定".to_string()),
         Some(name) => {
-            if let Some(m) = find(&roles.verifiers, name) {
-                return Ok((m, "verifier"));
+            if let Some(m) = find(&roles.refuters, name) {
+                return Ok((m, "refuter"));
             }
             if let Some(m) = find(&roles.reviewers, name) {
                 return Ok((m, "reviewer"));
@@ -250,19 +250,19 @@ mod tests {
         assert_eq!((f.line_start, f.line_end), (40, 40));
     }
 
-    /// 选模型：同名模型优先取 verifier 角色条目（档位按角色配），没配 verifier 才回落别的角色并标明。
+    /// 选模型：同名模型优先取 refuter 角色条目（档位按角色配），没配 refuter 才回落别的角色并标明。
     #[test]
-    fn pick_model_prefers_the_verifier_role_entry() {
+    fn pick_model_prefers_the_refuter_role_entry() {
         let cfg: Config = serde_json::from_str(
             r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
                 "s":{"roles":{"scanner":{}}},
-                "v":{"roles":{"verifier":{}}}
+                "v":{"roles":{"refuter":{}}}
             }}}}"#,
         )
         .unwrap();
-        assert_eq!(pick_model(&cfg, Some("p/v")).unwrap().1, "verifier");
-        assert_eq!(pick_model(&cfg, Some("p/s")).unwrap().1, "scanner", "没配 verifier 角色 → 回落并标明档位来源");
-        assert_eq!(pick_model(&cfg, None).unwrap().0.name, "p/v", "缺省取 verifier 角色首个");
+        assert_eq!(pick_model(&cfg, Some("p/v")).unwrap().1, "refuter");
+        assert_eq!(pick_model(&cfg, Some("p/s")).unwrap().1, "scanner", "没配 refuter 角色 → 回落并标明档位来源");
+        assert_eq!(pick_model(&cfg, None).unwrap().0.name, "p/v", "缺省取 refuter 角色首个");
         assert!(pick_model(&cfg, Some("p/nope")).is_err());
     }
 }

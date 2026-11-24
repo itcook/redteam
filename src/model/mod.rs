@@ -58,7 +58,7 @@ impl Availability {
 /// 并查配置的 model 是否在返回列表中。取代仅 GET base 的弱探测（会对 key/端点不匹配假阳性）。
 pub async fn check_all(cfg: &Config, prober: &dyn Prober) -> Vec<Availability> {
     let mut out = Vec::new();
-    // 按活跃集迭代（scanner → reviewer → verifier；探测用模型有效 kind：模型层 > provider 层）；
+    // 按活跃集迭代（scanner → reviewer → refuter → verifier；探测用模型有效 kind：模型层 > provider 层）；
     // 同一模型兼多角色各探一次（接受重复）。
     for em in cfg.active_roles().all() {
         let name = format!("{}:{}", em.role.as_str(), em.name);
@@ -81,7 +81,7 @@ pub async fn check_all(cfg: &Config, prober: &dyn Prober) -> Vec<Availability> {
     out
 }
 
-/// 退出码：至少一个 scanner 且全部可用→0；否则→1（供脚本/循环 SKILL 评审前预检；只配 reviewer / verifier 时 review 会因
+/// 退出码：至少一个 scanner 且全部可用→0；否则→1（供脚本/循环 SKILL 评审前预检；只配 reviewer / refuter / verifier 时 review 会因
 /// 无 scanner 失败，预检同步报 1，评审 S9）。
 pub fn check_exit_code(avs: &[Availability]) -> i32 {
     let has_scanner = avs.iter().any(|a| a.provider.starts_with("scanner:"));
@@ -162,7 +162,7 @@ pub fn render_model_list(cfg: &Config, avs: &[Availability], config_path: &str) 
         lines.push(format!("[{}] {}/{}{display}  [{}]  {status}", em.role.as_str(), em.provider, em.id, em.kind.as_str()));
     }
     if lines.is_empty() {
-        lines.push("(no model has roles.scanner / reviewer / verifier — `redteam model setup --provider X --model <id> --role scanner …`)".into());
+        lines.push("(no model has roles.scanner / reviewer / refuter / verifier — `redteam model setup --provider X --model <id> --role scanner …`)".into());
     }
     let mut out = lines.join("\n");
     out.push_str(&format!("\n\nconfig: {config_path}  (user-level only; REDTEAM_HOME overrides)"));

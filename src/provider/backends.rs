@@ -953,7 +953,7 @@ pub fn reasoning_effort_warning(em: &crate::config::EffectiveModel) -> Option<St
 /// 同一模型跨角色各占一份角色键 backend，每个角色的档位都要单独披露（批 C1-3；批 D-5 并入 verifier，收口评审 runner-up）。
 pub fn role_reasoning_effort_warnings(roles: &crate::config::RoleSets) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for w in roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers).filter_map(reasoning_effort_warning) {
+    for w in roles.scanners.iter().chain(&roles.reviewers).chain(&roles.refuters).filter_map(reasoning_effort_warning) {
         if !out.contains(&w) {
             out.push(w);
         }
@@ -1715,7 +1715,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
     fn anthropic_kind_glm_now_has_a_reasoning_effort_mapping() {
         let cfg = crate::config::Config::from_json(r#"{"providers":{"agc":{"kind":"openai","models":{
             "glm-5.3":{"kind":"anthropic","maxOutputTokens":32768,
-                "roles":{"reviewer":{"reasoningEffort":"high"},"verifier":{"reasoningEffort":"high"}}}}}}}"#).unwrap();
+                "roles":{"reviewer":{"reasoningEffort":"high"},"refuter":{"reasoningEffort":"high"}}}}}}}"#).unwrap();
         let roles = cfg.active_roles();
         assert_eq!(roles.reviewers[0].kind, crate::config::ProviderKind::Anthropic, "前提：模型级 kind 覆盖生效");
         assert!(role_reasoning_effort_warnings(&roles).is_empty(), "{:?}", role_reasoning_effort_warnings(&roles));

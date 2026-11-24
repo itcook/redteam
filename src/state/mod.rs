@@ -623,9 +623,9 @@ mod tests {
         let review = CellRecord::ok("bundle[a]@m", "agc/glm-5.3", CellOutput::review(vec![]));
         assert_eq!((review.role(), review.family.as_str()), (Role::Reviewer, ""), "未回填 family 为空串且不序列化");
         assert!(!serde_json::to_string(&review).unwrap().contains("family"));
-        let mut verify = CellRecord::failed("verify[f1]@kimi", "kimi", Role::Verifier, "timeout").with_family("kimi");
+        let mut verify = CellRecord::failed("verify[f1]@kimi", "kimi", Role::Refuter, "timeout").with_family("kimi");
         verify.template_hash = Some("deadbeef".into());
-        assert_eq!((verify.role(), verify.family.as_str(), verify.ok), (Role::Verifier, "kimi", false));
+        assert_eq!((verify.role(), verify.family.as_str(), verify.ok), (Role::Refuter, "kimi", false));
         for rec in [scan, review, verify] {
             let j = serde_json::to_string(&rec).unwrap();
             let v: serde_json::Value = serde_json::from_str(&j).unwrap();
@@ -802,16 +802,16 @@ mod tests {
         let store = JobStore::open(tmp.path()).unwrap();
         store.append_partial("j1", &CellRecord::ok("s", "deepseek-v4-flash", CellOutput::Scan(ScanOutput::default()))).unwrap();
         store.append_partial("j1", &CellRecord::ok("r", "glm-5.3", CellOutput::review(vec![]))).unwrap();
-        store.append_partial("j1", &CellRecord::failed("v", "kimi_k3", Role::Verifier, "x")).unwrap();
+        store.append_partial("j1", &CellRecord::failed("v", "kimi_k3", Role::Refuter, "x")).unwrap();
         let all = store.read_partial("j1");
         let by = |c: &str| all.iter().find(|r| r.cell == c).unwrap().clone();
         assert_eq!(by("s").role(), Role::Scanner);
         assert!(matches!(by("s").output, CellOutput::Scan(_)));
         assert_eq!(by("r").role(), Role::Reviewer);
-        assert_eq!(by("v").role(), Role::Verifier);
+        assert_eq!(by("v").role(), Role::Refuter);
         assert!(!by("v").ok);
         let db = store.db.lock().unwrap();
-        for (c, role) in [("s", "scanner"), ("r", "reviewer"), ("v", "verifier")] {
+        for (c, role) in [("s", "scanner"), ("r", "reviewer"), ("v", "refuter")] {
             assert_eq!(db.cell_role("j1", c).unwrap().as_deref(), Some(role), "cells.role 列 = 记录 role");
         }
     }

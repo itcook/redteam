@@ -1,7 +1,10 @@
 //! 疑点 schema 与按角色分叉的 cell 输出（design v8 §4 / §8.4，D11-7 R14）。
 //! scanner 不产 finding：产疑点索引（`suspicions`）+ 证据缺口（`needs`）+ 覆盖自报（`scanned_areas`）；
-//! reviewer 产 findings；verifier 产判决。一 cell 一条记录、类型上区分角色——杜绝「两个列表同时非空」的糊涂态
-//! （M15 翻转当天集成 bug 的温床）。字段级校验（quote 逐字、ranges 形状、confidence 区间）在 parse 层（D-1），本模块只定形状。
+//! reviewer 产 findings；**refuter**（评审内 finding 验真）产判决。一 cell 一条记录、类型上区分角色——
+//! 杜绝「两个列表同时非空」的糊涂态（M15 翻转当天集成 bug 的温床）。字段级校验（quote 逐字、ranges 形状、confidence 区间）在 parse 层（D-1），本模块只定形状。
+//!
+//! **注意 `Role::Verifier` 不属于本模块**：那是 hibot `verify` kind 的修复验证角色，有自己的
+//! 输入/输出契约（Phase 4 的 `fixverify/`），不得与本模块的 `CellOutput` 互相冒充（P16.1 硬规则 ①）。
 
 use super::finding::{Finding, NeedEntry, VerifyVerdict};
 use serde::{Deserialize, Serialize};
@@ -57,7 +60,7 @@ pub struct VerifyEntry {
 }
 
 /// 一 cell 一条、按角色分叉（D11-7）。`role` 作内部 tag：缺失即 serde 报错，不默认——记录类型在类型上说清。
-/// tag 值与 [`Role`] 的串一致（`scanner` / `reviewer` / `verifier`），是记录角色的**唯一真相源**：
+/// tag 值与 [`Role`] 的串一致（`scanner` / `reviewer` / `refuter`，只覆盖评审管线三员），是记录角色的**唯一真相源**：
 /// `CellRecord::role()` 与 `cells.role` 列都从 [`CellOutput::role`] 派生（评审裁定 2026-09-08，不另存字段）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role")]
@@ -70,7 +73,7 @@ pub enum CellOutput {
         #[serde(default)]
         needs: Vec<NeedEntry>,
     },
-    #[serde(rename = "verifier")]
+    #[serde(rename = "refuter")]
     Verify { verdicts: Vec<VerifyEntry> },
 }
 
@@ -79,16 +82,22 @@ impl CellOutput {
         match self {
             CellOutput::Scan(_) => Role::Scanner,
             CellOutput::Review { .. } => Role::Reviewer,
-            CellOutput::Verify { .. } => Role::Verifier,
+            CellOutput::Verify { .. } => Role::Refuter,
         }
     }
 
     /// 该角色的空输出（失败格占位：`ok=false` 的记录仍须带类型明确的 output）。
+    ///
+    /// 只接受评审管线角色（[`Role::REVIEW_PIPELINE`]）。`Role::Verifier` 是 fix 验证角色，
+    /// 它的结果类型在 Phase 4 才引入——这里显式拒绝，避免把修复验证结果伪装成评审验真输出。
     pub fn empty(role: Role) -> Self {
         match role {
             Role::Scanner => CellOutput::Scan(ScanOutput::default()),
             Role::Reviewer => CellOutput::Review { findings: vec![], needs: vec![] },
-            Role::Verifier => CellOutput::Verify { verdicts: vec![] },
+            Role::Refuter => CellOutput::Verify { verdicts: vec![] },
+            Role::Verifier => unreachable!(
+                "Role::Verifier 不属于 review cell 管线（fix 验证的结果类型在 Phase 4 定义）"
+            ),
         }
     }
 
@@ -167,7 +176,7 @@ mod tests {
     fn cell_output_three_variants_roundtrip() {
         let review = CellOutput::Review { findings: vec![finding("f1")], needs: vec![] };
         let verify = CellOutput::Verify { verdicts: vec![VerifyEntry { id: "f1".into(), verdict: VerifyVerdict::Refuted, note: "guarded".into() }] };
-        for (out, tag) in [(scan(), "scanner"), (review, "reviewer"), (verify, "verifier")] {
+        for (out, tag) in [(scan(), "scanner"), (review, "reviewer"), (verify, "refuter")] {
             let j = serde_json::to_string(&out).unwrap();
             let v: serde_json::Value = serde_json::from_str(&j).unwrap();
             assert_eq!(v["role"], tag, "tag 值须与 Role 串一致: {j}");
@@ -225,12 +234,24 @@ mod tests {
     #[test]
     fn role_tag_matches_config_role_strings() {
         // 复用 config::Role：serde 串、as_str、parse 与 CellOutput tag 三者同一张表。
-        for r in Role::ALL {
+        // 只遍历评审管线角色——`Role::Verifier` 是 fix 验证角色，不进 CellOutput（见 `verifier_is_not_a_review_cell_role`）。
+        for r in Role::REVIEW_PIPELINE {
             assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{}\"", r.as_str()));
             assert_eq!(Role::parse(r.as_str()), Some(r));
             let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&CellOutput::empty(r)).unwrap()).unwrap();
             assert_eq!(v["role"], r.as_str());
         }
+        // 四个配置角色都在 `ALL` 里（fix 验证的串也要能配置/解析）。
+        assert_eq!(Role::ALL.len(), 4);
+        assert_eq!(Role::parse("verifier"), Some(Role::Verifier));
+        assert_eq!(Role::Verifier.as_str(), "verifier");
+    }
+
+    /// fix 验证（`kind=verify`）不得冒充 review 的 cell 输出：它的结果类型在 Phase 4 才有。
+    #[test]
+    #[should_panic(expected = "Role::Verifier 不属于 review cell 管线")]
+    fn verifier_is_not_a_review_cell_role() {
+        let _ = CellOutput::empty(Role::Verifier);
     }
 
     #[test]
@@ -239,9 +260,9 @@ mod tests {
         assert_eq!(review.findings().len(), 1);
         assert!(scan().findings().is_empty());
         assert_eq!(scan().needs().len(), 1);
-        assert!(CellOutput::empty(Role::Verifier).findings().is_empty());
+        assert!(CellOutput::empty(Role::Refuter).findings().is_empty());
         assert_eq!(review.clone().into_findings().len(), 1);
-        for r in [Role::Scanner, Role::Reviewer, Role::Verifier] {
+        for r in [Role::Scanner, Role::Reviewer, Role::Refuter] {
             assert_eq!(CellOutput::empty(r).role(), r);
         }
     }
