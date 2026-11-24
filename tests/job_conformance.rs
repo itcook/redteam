@@ -708,10 +708,28 @@ async fn dismissed_is_audited_but_never_refuted() {
     let fp = fingerprint::of("src/app.js", QUOTE, title);
     let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
     let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, title))));
-    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    // 复核开启且模型判 REFUTED：人的驳回仍优先——报告的 refuted 必须保持 false。
+    let refute = Arc::new(FakeChatBackend::repeating(turn(r#"{"verdict":"REFUTED","reason":"safe"}"#)));
+    let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
+    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+    cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+    let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
     let csv = format!("fingerprint,actor,reason,created_at\n{fp},alice,\"false positive, see #12\",2026-11-20T10:00:00Z\n");
     update_input(&fx.job, "dismissed", "input/dismissed.csv", csv.as_bytes());
-    let over = fake_override(scan, review);
+    let over = Box::new({
+        let (scan, review, refute) = (scan, review, refute);
+        move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            if em.provider != "p1" {
+                return None;
+            }
+            match em.id.as_str() {
+                "s" => Some(Box::new(scan.clone())),
+                "r" => Some(Box::new(review.clone())),
+                "v" => Some(Box::new(refute.clone())),
+                _ => None,
+            }
+        }
+    }) as Box<redteam::cli::BackendOverride<'_>>;
     assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
     let r = read_report(&fx.job);
     assert_eq!(r["status"], "ok", "被驳回项不阻塞: {r}");

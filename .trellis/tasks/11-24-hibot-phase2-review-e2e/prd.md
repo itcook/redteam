@@ -86,6 +86,8 @@ paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
 | `3402c5c` | P2 job 模式无 refuter 时跳过验真并披露 |
 | `1c8def7` | 2.7 语言落地端到端用例 |
 | `dfb3362` | 出口 `capabilities/redteam.json` + 钉子测试 |
+| `be4c7f9` | 附录 D/E 补 Phase 2 新键/新码；无 prior 时不写 `prior_routing` |
+| `e9cb9cd` | 收口评审修正（dismissed 计数/判定、中断报告事实、绝对 deadline、quote 子串、完整性、patch 边界、2.3/2.7 证据） |
 
 ### 关键实现
 
@@ -97,6 +99,10 @@ paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
 
 ### 验证
 
-- `cargo test`：1053 lib + 21 bin + 4 capabilities + 18 job_conformance + 7 packaging + 24 e2e，全绿。
+- `cargo test`：1063 lib + 21 bin + 4 capabilities + 18 job_conformance + 7 packaging + 24 e2e，全绿（exit 0）。
 - `make verify`：exit 0（codex-skills 与 `dist/config.schema.json` 零 diff，packaging 7/7）。
 - capabilities 用 hibot `audit-capabilities.schema.json` 原位只读校验：PASS。
+- 原文日志：`evidence/cargo-test.log`、`evidence/make-verify.log`（含真实退出码，`make` 目标全部执行）。
+- 收口评审修正后补的判例：浅克隆 / base commit 对象被删 / 非 SHA revision / 带引号 patch 路径 /
+  行尾空格属于内容 / 行内子串 quote / 中断报告共享运行事实 / dismissed+REFUTED 仍 `refuted=false` /
+  非默认阈值下 prior 前后生效阈值相同 / 三类模型 prompt 语言槽。
