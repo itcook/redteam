@@ -16,7 +16,7 @@ pub(crate) const BRIEF_REL_PATH: &str = ".redteam/brief.md";
 /// 路径遍历信用户（user-arg），但内容敏感度不信任（防 secret exfil）。
 /// M18 批 1·1-2：denylist 判据本身已抽到 `deny::is_denylisted_path`（与 second_pass.rs 的
 /// `is_needs_denylisted` 共用单一真相源、语义=两清单并集），本函数只剩薄委托。
-fn is_sensitive_spec_path(path: &str) -> bool {
+pub(crate) fn is_sensitive_spec_path(path: &str) -> bool {
     super::deny::is_denylisted_path(path)
 }
 

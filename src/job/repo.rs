@@ -130,6 +130,19 @@ mod tests {
         assert_eq!(e.full_code(), "repo_incomplete:merge_base", "{e:?}");
     }
 
+    /// 2.6 反例：**blob 缺失**（commit/tree 都在、检出文件也在）→ error。
+    /// 这一条专门盯 `git diff --quiet` 的漏检：它只比 tree 的对象 ID，不读 blob。
+    #[test]
+    fn missing_blob_is_repo_incomplete() {
+        let (_d, repo, base, head) = repo();
+        let blob = git(&repo, &["rev-parse", &format!("{base}:a.txt")]);
+        let p = repo.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+        assert!(p.is_file(), "fixture 期望松散 blob: {}", p.display());
+        std::fs::remove_file(&p).unwrap();
+        let e = ensure_complete(&repo, &pr(&head, &base), &base).unwrap_err();
+        assert_eq!(e.full_code(), "repo_incomplete:merge_base", "{e:?}");
+    }
+
     /// 2.6 反例：浅克隆 → error（base 对象根本不在本地）。
     #[test]
     fn shallow_checkout_is_repo_incomplete() {

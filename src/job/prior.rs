@@ -74,7 +74,11 @@ pub fn parse(text: &str, repo: &Path) -> Result<PriorRouting, JobFailure> {
                 specs_used.push((*s).to_string());
                 specs.push(abs);
             }
-            None => specs_unreadable += 1,
+            None => {
+                // 诊断只走 stderr（报告里是 `<n>` 计数；声明路径原样点出来，方便对照 hibot 的 triage 报告）。
+                eprintln!("redteam: prior_report.routing.specs 不可读，跳过：{s}");
+                specs_unreadable += 1;
+            }
         }
     }
 
@@ -106,6 +110,10 @@ fn resolve_spec(repo: &Path, declared: &str) -> Option<String> {
         return None;
     }
     if declared.trim().is_empty() {
+        return None;
+    }
+    // 与 `render_spec_section_capped` 同一把尺：疑似密钥/凭据文件不进评审上下文，也不算“已用”。
+    if crate::cli::spec::is_sensitive_spec_path(declared) {
         return None;
     }
     let real = std::fs::canonicalize(repo.join(p)).ok()?;
@@ -143,6 +151,7 @@ mod tests {
         std::fs::create_dir_all(repo.join("docs")).unwrap();
         std::fs::write(repo.join("docs/auth.md"), "auth spec\n").unwrap();
         std::fs::write(repo.join("docs/bin.dat"), [0u8, 1, 2]).unwrap();
+        std::fs::write(repo.join("docs/.env"), "SECRET=1\n").unwrap();
         (d, repo)
     }
 
@@ -215,6 +224,18 @@ mod tests {
         assert_eq!(p.specs_unreadable, 4, "{p:?}");
         assert_eq!(p.specs.len(), 1);
         assert!(!p.disclosure.to_string().contains(&outside), "披露不出现越界路径以外的绝对路径");
+    }
+
+    #[test]
+    /// 与 spec renderer 同一把尺：疑似密钥文件不算“已用”（会被下游拒读，披露必须一致）。
+    #[test]
+    fn sensitive_spec_paths_are_counted_unreadable() {
+        let (_d, repo) = repo();
+        let text = triage(serde_json::json!({"routing": {"specs": ["docs/.env", "docs/auth.md"]}}));
+        let p = parse(&text, &repo).unwrap();
+        assert_eq!(p.specs_unreadable, 1);
+        assert_eq!(p.specs.len(), 1);
+        assert_eq!(p.disclosure["specs_used"], serde_json::json!(["docs/auth.md"]));
     }
 
     #[test]

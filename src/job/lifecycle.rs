@@ -260,6 +260,18 @@ mod tests {
         f.title = "t".into();
         f.line_start = 99;
         sink.on_cell(CellRecord::ok("review[x]", "p/r", CellOutput::Review { findings: vec![f], needs: vec![] }));
+        // 复核判 REFUTED：由 `findings_from_cells` 回填到 finding 上。
+        sink.on_cell(CellRecord::ok(
+            "refute[f1]",
+            "p/v",
+            CellOutput::Refute {
+                verdicts: vec![crate::domain::RefuteEntry {
+                    id: "f1".into(),
+                    verdict: RefuteVerdict::Refuted,
+                    note: "safe".into(),
+                }],
+            },
+        ));
 
         // dismissed 按**修正后**的 quote 生成的指纹命中。
         let fp = crate::job::fingerprint::of("src/a.rs", "let x  =  1;", "t");
@@ -286,7 +298,9 @@ mod tests {
         assert_eq!(r.findings.len(), 1);
         assert_eq!(r.findings[0].quote, "let x  =  1;", "中断报告也要用检出原文修正 quote");
         assert_eq!((r.findings[0].line_start, r.findings[0].line_end), (2, 2), "行号要重锚");
+        // 人的驳回优先：即使复核判了 REFUTED，对外仍是 refuted=false，且不叠 refute 扩展。
         assert_eq!(r.findings[0].refuted, false);
+        assert!(r.findings[0].extensions["redteam"].get("refute").is_none());
         assert_eq!(r.findings[0].extensions["redteam"]["ledger"]["dismissed"], true);
         assert_eq!(r.extensions["redteam"]["input_consistency"]["match"], true);
         assert_eq!(r.extensions["redteam"]["prior_routing"]["present"], true);

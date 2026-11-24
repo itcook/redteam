@@ -904,6 +904,12 @@ async fn language_is_consistent_across_prompts_findings_and_status_reason() {
         assert_eq!(r["findings"][0]["title"], title);
         assert_eq!(r["findings"][0]["body"], body);
         assert_eq!(r["findings"][0]["recommendation"], recommendation);
+        // refuter 的实际判决正文（finding 级 extensions.refute.reason，附录 D）
+        assert_eq!(
+            r["findings"][0]["extensions"]["redteam"]["refute"]["reason"],
+            reason_needle,
+            "refuter 判决正文未随语言落地: {r}"
+        );
         // ③ status_reason 随 language
         assert_eq!(r["status"], "partial", "{r}");
         let reason = r["status_reason"].as_str().unwrap();

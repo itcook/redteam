@@ -266,11 +266,16 @@ pub fn map_finding(
     if f.outside_window {
         ext.insert("outside_window".into(), json!(true));
     }
-    if let Some(e) = ledger.get(&fingerprint) {
+    let dismissed = ledger.get(&fingerprint);
+    if let Some(e) = dismissed {
         ext.insert(
             "ledger".into(),
             serde_json::json!({ "dismissed": true, "actor": e.actor, "reason": e.reason }),
         );
+    } else if let Some(r) = &f.refute {
+        // 附录 D finding 级 `refute = {reason}`：复核判决正文（`refuted` 仍是顶层契约字段）。
+        // 被 dismissed 的条目只留人的决定——模型原始判决留在 cell 审计里，不再往 finding 上叠。
+        ext.insert("refute".into(), serde_json::json!({ "reason": r.note }));
     }
     HibotFinding {
         fingerprint,
@@ -283,7 +288,8 @@ pub fn map_finding(
         title: f.title.clone(),
         body: f.body.clone(),
         recommendation: f.recommendation.clone(),
-        refuted: f.is_refuted(),
+        // 人的驳回 ≠ 证据证伪：命中 ledger 的条目对外恒 refuted=false（正常与 partial 共用这一处）。
+        refuted: f.is_refuted() && dismissed.is_none(),
         source: SourceOut { executor: "redteam".into(), model, role: "reviewer".into() },
         extensions: if ext.is_empty() { Value::Null } else { json!({ "redteam": Value::Object(ext) }) },
     }

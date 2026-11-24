@@ -19,7 +19,7 @@ pub(crate) mod deny;
 mod incremental;
 pub(crate) mod second_pass;
 pub mod refute_once;
-mod spec;
+pub(crate) mod spec;
 mod tail;
 
 pub use incremental::run_incremental_review;

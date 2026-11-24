@@ -88,6 +88,8 @@ paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
 | `dfb3362` | 出口 `capabilities/redteam.json` + 钉子测试 |
 | `be4c7f9` | 附录 D/E 补 Phase 2 新键/新码；无 prior 时不写 `prior_routing` |
 | `e9cb9cd` | 收口评审修正（dismissed 计数/判定、中断报告事实、绝对 deadline、quote 子串、完整性、patch 边界、2.3/2.7 证据） |
+| `3e6e4c0` | dismissed+REFUTED 判例 + 证据日志 |
+| 本轮 | 二轮收口：refuted 在共同映射点收口、verdict 重算保留 ScanOnly/窗口口径、deadline 溢出错误路径、diff 读 blob、2.3 走生产投影入口、2.7 refuter 判决正文 |
 
 ### 关键实现
 
@@ -99,7 +101,7 @@ paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
 
 ### 验证
 
-- `cargo test`：1063 lib + 21 bin + 4 capabilities + 18 job_conformance + 7 packaging + 24 e2e，全绿（exit 0）。
+- `cargo test`：1068 lib + 21 bin + 4 capabilities + 18 job_conformance + 7 packaging + 24 e2e，全绿（exit 0）。
 - `make verify`：exit 0（codex-skills 与 `dist/config.schema.json` 零 diff，packaging 7/7）。
 - capabilities 用 hibot `audit-capabilities.schema.json` 原位只读校验：PASS。
 - 原文日志：`evidence/cargo-test.log`、`evidence/make-verify.log`（含真实退出码，`make` 目标全部执行）。

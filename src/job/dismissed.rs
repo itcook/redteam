@@ -48,7 +48,8 @@ const HEADER: [&str; 4] = ["fingerprint", "actor", "reason", "created_at"];
 /// 契约身份字段相同 → 只保留首条，审计行覆盖其上。
 /// **不写 `refuted`**：`previously_dismissed` 只影响内部 blocking 计数，契约层仍是不参与判定的审计事实。
 pub fn apply(findings: &mut Vec<crate::domain::Finding>, ledger: &Dismissed) -> BTreeMap<String, Entry> {
-    let mut seen = std::collections::BTreeSet::new();
+    // 契约要求「按指纹精确匹配」：去重用 HashSet（审计元数据另存 BTreeMap）。
+    let mut seen = std::collections::HashSet::new();
     let mut hits = BTreeMap::new();
     findings.retain_mut(|f| {
         let fp = fingerprint::of(&f.file, &f.quote, &f.title);
@@ -85,7 +86,8 @@ pub fn parse(bytes: &[u8]) -> Result<Dismissed, JobFailure> {
         if rec.len() != HEADER.len() {
             return Err(bad());
         }
-        let fingerprint = rec[0].trim().to_string();
+        // **不 trim**：契约的 pattern 是精确形态，带空白的指纹属于坏格式而不是可原谅的输入。
+        let fingerprint = rec[0].to_string();
         let actor = rec[1].to_string();
         let reason = rec[2].to_string();
         let created_at = rec[3].to_string();

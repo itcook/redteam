@@ -67,7 +67,6 @@ pub async fn run_with(
         }
     };
     let started = std::time::Instant::now();
-    let budget = Duration::from_secs(manifest.limits.wall_clock_s);
     // 信号在入口安装：准备阶段（manifest/artifact/config）也计入预算，且早到的 SIGTERM 不会被丢掉。
     let mut sigterm = install_sigterm();
     let out_dir = match io::out_dir(&job_dir, &manifest.paths) {
@@ -127,7 +126,10 @@ pub async fn run_with(
         }
     };
     // 准备阶段已收到 SIGTERM 或预算已耗尽：直接写 partial（成果为空）。
-    let deadline = effective_deadline(started, budget, manifest.limits.wall_clock_s, None);
+    let deadline = match effective_deadline(started, manifest.limits.wall_clock_s, None) {
+        Ok(d) => d,
+        Err(e) => return finish(&out_dir, report::error_report(&manifest, &lang, &e)),
+    };
     let early_signal = match sigterm.as_mut() {
         Some(s) => tokio::time::timeout(Duration::from_millis(0), s.recv()).await.is_ok(),
         None => false,
@@ -140,7 +142,7 @@ pub async fn run_with(
         let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink, None, &dismissed, &base_extras);
         return finish(&out_dir, r);
     }
-    match run_review(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, &dismissed, budget, started, &mut sigterm, over).await {
+    match run_review(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, &dismissed, started, &mut sigterm, over).await {
         Ok(r) => finish(&out_dir, r),
         Err(e) => finish(&out_dir, report::error_report(&manifest, &lang, &e)),
     }
@@ -151,19 +153,44 @@ pub async fn run_with(
 /// 用**绝对时刻**而不是「剩余秒数」：准备阶段（完整性检查 / registry 构造）耗时不会被重复计入。
 fn effective_deadline(
     started: std::time::Instant,
-    budget: Duration,
     hard_cap_s: u64,
     suggested_s: Option<u64>,
-) -> std::time::Instant {
-    // `limits.wall_clock_s` 只校验了 >=1；极大值不能让 `Instant + Duration` 溢出。
-    let hard = started
-        .checked_add(budget)
-        .unwrap_or_else(|| started + Duration::from_secs(365 * 24 * 3600));
-    match suggested_s {
-        Some(s) => hard.min(started + Duration::from_secs(s.min(hard_cap_s))),
-        None => hard,
+) -> Result<std::time::Instant, JobFailure> {
+    // 先算一次有效秒数，再一次 `checked_add`：两条分支都不做“溢出就换个数”的兜底。
+    let secs = suggested_s.map_or(hard_cap_s, |s| hard_cap_s.min(s));
+    started.checked_add(Duration::from_secs(secs)).ok_or_else(|| {
+        JobFailure::new(
+            "job_manifest_unsupported",
+            Some("limits.wall_clock_s overflows Instant".into()),
+        )
+    })
+}
+/// 2.2 投影：job 模式的 `ReviewArgs`（**唯一构造点**——生产与门槛测试共用同一入口）。
+///
+/// 四个布尔恒 false（`background` / `resume` / `incremental_from` / `pack_only`）、`scope=branch`、
+/// `base=merge_base`；阈值字段保持 `None`（配置说了算，prior_report 不得改）。
+fn review_args(base: &str, prior: &crate::job::prior::PriorRouting) -> ReviewArgs {
+    ReviewArgs {
+        job_mode: true,
+        base: Some(base.to_string()),
+        scope: "branch".into(),
+        // 2.3：只调镜头（focus）与规范注入。
+        spec: prior.specs.clone(),
+        focus: prior.focus.clone(),
+        block_threshold: None,
+        conf_floor: None,
+        background: false,
+        format: "json".into(),
+        resume: None,
+        dismissed: None,
+        no_dismissed: true, // P7：五条台账路径全关
+        incremental_from: None,
+        tools: None,
+        test_command: None,
+        pack_only: false,
     }
 }
+
 // 参数各不同源（manifest / 路径 / 配置 / 语言 / 输入 / 预算 / 计时 / 信号 / 测试注入）：收拢 struct 不减少调用方负担。
 #[allow(clippy::too_many_arguments)]
 async fn run_review(
@@ -174,7 +201,6 @@ async fn run_review(
     lang: &OutputLang,
     artifacts: &artifact::Artifacts,
     dismissed: &crate::job::dismissed::Dismissed,
-    budget: Duration,
     started: std::time::Instant,
     sigterm: &mut Option<tokio::signal::unix::Signal>,
     over: Option<&crate::cli::BackendOverride<'_>>,
@@ -199,7 +225,7 @@ async fn run_review(
         None => crate::job::prior::PriorRouting::default(),
     };
     // 建议预算只能收紧，不能突破 manifest 硬上限；用**绝对截止时刻**，准备阶段耗时只计一次。
-    let deadline = effective_deadline(started, budget, manifest.limits.wall_clock_s, prior.wall_clock_s);
+    let deadline = effective_deadline(started, manifest.limits.wall_clock_s, prior.wall_clock_s)?;
     // 2.6 完整性：非 shallow、HEAD == pr.head_sha（解析成完整 commit 再比）、base/merge_base
     // 对象可得、merge-base 可算。缺必需对象 → error（不是披露后仍报 ok）。
     let head = crate::job::repo::ensure_complete(&repo, &manifest.pr, &base)?;
@@ -232,25 +258,7 @@ async fn run_review(
         extra_partial: extra_partial.clone(),
         ..Default::default()
     };
-    let args = ReviewArgs {
-        job_mode: true,
-        base: Some(base),
-        scope: "branch".into(),
-        // 2.3：只调镜头（focus）与规范注入；阈值（block_threshold / conf_floor）恒为配置值。
-        spec: prior.specs.clone(),
-        focus: prior.focus.clone(),
-        block_threshold: None,
-        conf_floor: None,
-        background: false,
-        format: "json".into(),
-        resume: None,
-        dismissed: None,
-        no_dismissed: true, // P7：五条台账路径全关
-        incremental_from: None,
-        tools: None,
-        test_command: None,
-        pack_only: false,
-    };
+    let args = review_args(&base, &prior);
     // backend 构造失败来自 executor config（baseUrl/kind/密钥形态），是**配置问题**而非内部错误；
     // 机器码用 config_invalid（无 pointer 时只给基础码），原始报错进 status_reason。
     let registry = crate::cli::build_registry_with(&args, cfg, over)
@@ -299,15 +307,19 @@ async fn run_review(
             internal.stats = crate::domain::Stats::from_findings(
                 &internal.findings.iter().filter(|f| !f.previously_dismissed).cloned().collect::<Vec<_>>(),
             );
-            // dismissed 的条目一律不写 refuted（人的决定 ≠ 证据证伪；模型若同时判 REFUTED 也以人的决定为准）。
-            for f in internal.findings.iter_mut().filter(|f| f.previously_dismissed) {
-                f.refute = None;
-            }
             // 内部 verdict 也要认这个事实（报告不携带 verdict，但内部 blocking 口径必须一致）。
-            // Incomplete 来自 coverage/budget（扫描/深挖不完整），不得被重算抹掉。
-            if internal.verdict != crate::domain::Verdict::Incomplete {
+            // 只重算 Approve/Reject 这两种「纯由 findings 决定」的结论：
+            // - Incomplete 来自 coverage/budget（扫描/深挖不完整）；
+            // - ScanOnly 来自 scan-only 形态；
+            // 两者都不能被一次重算抹掉。重算沿用 overlay_deep 的 counted 口径（窗外 finding 在 enforce 下不计）。
+            if matches!(internal.verdict, crate::domain::Verdict::Approve | crate::domain::Verdict::Reject) {
+                let counted: Vec<crate::domain::Finding> = if internal.run.finding_window_enforced {
+                    internal.findings.iter().filter(|f| !f.outside_window).cloned().collect()
+                } else {
+                    internal.findings.clone()
+                };
                 let (block, floor) = crate::cli::verdict_thresholds(&args, cfg);
-                internal.verdict = crate::verdict::compute_verdict(&internal.findings, block, floor);
+                internal.verdict = crate::verdict::compute_verdict(&counted, block, floor);
             }
             if dropped > 0 {
                 extra_partial.push(JobFailure::new("quotes_dropped", Some(dropped.to_string())));
@@ -462,48 +474,66 @@ mod tests {
     #[test]
     fn prior_budget_can_only_tighten() {
         let started = std::time::Instant::now();
-        let budget = Duration::from_secs(60);
-        let hard = started + budget;
         // 建议比硬上限大 → 不放宽。
-        assert_eq!(effective_deadline(started, budget, 60, Some(900)), hard);
+        assert_eq!(
+            effective_deadline(started, 60, Some(900)).unwrap(),
+            started + Duration::from_secs(60)
+        );
         // 建议更小 → 取建议。
-        assert_eq!(effective_deadline(started, budget, 60, Some(30)), started + Duration::from_secs(30));
+        assert_eq!(
+            effective_deadline(started, 60, Some(30)).unwrap(),
+            started + Duration::from_secs(30)
+        );
         // 建议与硬上限同时收紧：取更小的那个。
-        assert_eq!(effective_deadline(started, budget, 15, Some(900)), started + Duration::from_secs(15));
+        assert_eq!(
+            effective_deadline(started, 15, Some(900)).unwrap(),
+            started + Duration::from_secs(15)
+        );
         // 无建议 → 硬上限。
-        assert_eq!(effective_deadline(started, budget, 60, None), hard);
+        assert_eq!(
+            effective_deadline(started, 60, None).unwrap(),
+            started + Duration::from_secs(60)
+        );
     }
 
-    /// 2.3 出口验收：喂 prior_report 前后，**生效的**阻断阈值逐字节相同（用非默认配置，不只比 findings）。
+    /// 极大 `wall_clock_s` 不得 panic：走 manifest 错误路径。
+    #[test]
+    fn huge_wall_clock_overflows_into_a_manifest_error() {
+        let e = effective_deadline(std::time::Instant::now(), u64::MAX, None).unwrap_err();
+        assert_eq!(e.code, "job_manifest_unsupported");
+    }
+
+    /// 截止时刻已过 → 预算耗尽（调用方据此禁止进入模型派发）。
+    #[test]
+    fn past_deadline_means_exhausted() {
+        let now = std::time::Instant::now();
+        let past = now - Duration::from_secs(1);
+        assert!(past.saturating_duration_since(now).is_zero());
+        let future = now + Duration::from_secs(1);
+        assert!(!future.saturating_duration_since(now).is_zero());
+    }
+
+
+    /// 2.3 出口验收：走**生产投影入口**，prior_report 前后生效的阻断阈值逐字节相同（非默认配置）。
     #[test]
     fn prior_routing_cannot_change_blocking_thresholds() {
         let cfg: Config = serde_json::from_str(
             r#"{"review":{"blockThreshold":"low","confFloor":0.31},"providers":{}}"#,
         )
         .unwrap();
-        let mut args = ReviewArgs {
-            job_mode: true,
-            base: Some("0".repeat(40)),
-            scope: "branch".into(),
-            spec: vec![],
-            focus: None,
-            block_threshold: None,
-            conf_floor: None,
-            background: false,
-            format: "json".into(),
-            resume: None,
-            dismissed: None,
-            no_dismissed: true,
-            incremental_from: None,
-            tools: None,
-            test_command: None,
-            pack_only: false,
-        };
-        let before = crate::cli::verdict_thresholds(&args, &cfg);
+        let base = "0".repeat(40);
+        let before = crate::cli::verdict_thresholds(
+            &review_args(&base, &crate::job::prior::PriorRouting::default()),
+            &cfg,
+        );
         assert_eq!(before, (crate::domain::Severity::Low, 0.31), "基线是非默认阈值");
-        // prior 投影只写镜头与 spec，阈值字段保持 None。
-        args.focus = Some("auth".into());
-        args.spec = vec!["/abs/spec.md".into()];
+
+        let mut prior = crate::job::prior::PriorRouting::default();
+        prior.focus = Some("auth".into());
+        prior.specs = vec!["/abs/spec.md".into()];
+        let args = review_args(&base, &prior);
+        assert_eq!(args.spec, vec!["/abs/spec.md".to_string()], "投影确实生效");
+        assert!(args.focus.is_some());
         assert_eq!(crate::cli::verdict_thresholds(&args, &cfg), before);
     }
 
@@ -511,8 +541,7 @@ mod tests {
     #[test]
     fn deadline_is_absolute_not_recomputed_from_elapsed() {
         let started = std::time::Instant::now();
-        let budget = Duration::from_secs(600);
-        let d = effective_deadline(started, budget, 600, Some(10));
+        let d = effective_deadline(started, 600, Some(10)).unwrap();
         assert_eq!(d, started + Duration::from_secs(10));
         // 同一 deadline 在 3 秒后仍是起点 + 10s，而不是「剩余 7s + 当前」。
         assert_eq!(d.saturating_duration_since(started + Duration::from_secs(3)), Duration::from_secs(7));

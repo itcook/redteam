@@ -205,17 +205,33 @@ pub fn changed_files_since(dir: &std::path::Path, base: &str) -> anyhow::Result<
     Ok(split_diff_by_file(&full))
 }
 
-/// 2.6：本次 diff 所需对象是否齐全（两侧 tree/blob 都在本地）。
-/// `git diff --quiet` 以退出码表意（0=无差异 / 1=有差异，两者都算成功），其它 = 对象缺失或 git 故障。
+/// 2.6：本次 diff 所需对象是否齐全（两侧 tree **与 blob** 都在本地）。
+///
+/// 不能只比 tree 的对象 ID：`--quiet` / `--no-patch` 可以只比较 tree 就提前退出，缺 blob 时仍报“有差异”。
+/// 这里**完整生成一次 diff**（读完两侧 blob，丢弃输出），并关掉 textconv 与外部 diff，
+/// 同时禁掉 partial clone 的懒取（缺对象必须是 error，不能悄悄联网补）。
 pub fn diff_available(dir: &std::path::Path, base: &str) -> anyhow::Result<bool> {
     let range = format!("{base}..HEAD");
     let out = Command::new("git")
         .current_dir(dir)
-        .args(["-c", "color.ui=false", "--no-pager", "diff", "--no-ext-diff", "--quiet", "--end-of-options", &range])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "color.ui=false",
+            "--no-pager",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-M",
+            "--end-of-options",
+            &range,
+        ])
         .output()?;
-    match out.status.code() {
-        Some(0) | Some(1) => Ok(true),
-        _ => anyhow::bail!("git diff {range} failed: {}", String::from_utf8_lossy(&out.stderr)),
+    if out.status.success() {
+        Ok(true)
+    } else {
+        anyhow::bail!("git diff {range} failed: {}", String::from_utf8_lossy(&out.stderr))
     }
 }
 
