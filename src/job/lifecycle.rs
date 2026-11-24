@@ -54,23 +54,24 @@ impl JobDirCellSink {
 impl CellSink for JobDirCellSink {
     fn manifest(&self, inputs: &[CellInput]) {
         // Phase 1 不落输入快照；Phase 5 只把 scan cells 报给心跳（progress 不参与判定）。
-        // 同时记下 cell id 集合：`on_cell` 只对这些 id 推进 done（深挖 cell 是另一个集合）。
+        // 集合 = 尚未完成的 manifest cells；total 用去重后的 id 数。
         let ids: HashSet<String> = inputs.iter().map(|i| i.cell.clone()).collect();
+        let total = ids.len() as u64;
         *self.manifest_cells.lock().unwrap_or_else(|e| e.into_inner()) = ids;
         if let Some(hb) = &self.heartbeat {
-            hb.set_progress_total("cells", inputs.len() as u64);
+            hb.set_progress_total("cells", total);
         }
     }
 
     fn on_cell(&self, rec: CellRecord) {
         if let Some(hb) = &self.heartbeat {
-            // done 与 total 必须对应同一集合（scan cells）；reviewer/refuter cell 不计。
-            let in_manifest = self
+            // 集合 = 尚未完成的 manifest cells；`remove` 同时去重（重复完成通知不重复累加）。
+            let first_completion = self
                 .manifest_cells
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains(&rec.cell);
-            if in_manifest {
+                .remove(&rec.cell);
+            if first_completion {
                 hb.bump_done();
             }
         }
@@ -369,6 +370,16 @@ mod tests {
         hb.attach_llm(std::collections::BTreeMap::new());
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("state.json")).unwrap()).unwrap();
         assert_eq!(v["progress"]["done"], 1);
+        // 同一个 scan cell 的重复完成通知：集合已 remove，不得重复累加。
+        sink.on_cell(CellRecord::ok("g0@p/s#1", "p/s", CellOutput::Scan(Default::default())));
+        hb.attach_llm(std::collections::BTreeMap::new());
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(v["progress"]["done"], 1, "重复完成通知不重复累加");
+        // 第二个 scan 完成 → done 达到 total。
+        sink.on_cell(CellRecord::ok("g1@p/s#1", "p/s", CellOutput::Scan(Default::default())));
+        hb.attach_llm(std::collections::BTreeMap::new());
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!((v["progress"]["done"].as_u64(), v["progress"]["total"].as_u64()), (Some(2), Some(2)));
         hb.shutdown();
     }
 

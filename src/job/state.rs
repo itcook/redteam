@@ -21,6 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const SCHEMA: &str = "hibot.audit.state/1";
 /// 覆写周期：契约上限 5s，取 2s 给写盘与调度抖动留余量。
 pub const TICK: Duration = Duration::from_secs(2);
+/// 周期线程的停止轮询粒度（`shutdown` 的停写延迟上界）。
+const POLL: Duration = Duration::from_millis(100);
 
 /// job 视角的阶段（附录 F）。**没有终态值**：进程退出即停写。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -73,7 +75,7 @@ struct Inner {
 /// 心跳句柄。`Arc` 可克隆给 `JobDirCellSink`（progress）与 `run_review`（llm）。
 pub struct Heartbeat {
     inner: Arc<Inner>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Heartbeat {
@@ -94,17 +96,21 @@ impl Heartbeat {
         });
         hb.write_frame();
         let inner = Arc::clone(&hb.inner);
-        let task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(TICK);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // interval 的第一次 tick 立即完成；首帧已在 start 里同步写，跳过。
-            tick.tick().await;
-            loop {
-                tick.tick().await;
+        let worker = std::thread::Builder::new()
+            .name("redteam-heartbeat".into())
+            .spawn(move || loop {
+                // 停止用短睡眠轮询：`shutdown` 持写锁置 stopped 后，线程最多一个周期退出；
+                // 不依赖 async worker，同步准备阶段阻塞 runtime 时仍按 ≤TICK 写帧。
+                for _ in 0..(TICK.as_millis() / POLL.as_millis()) {
+                    if inner.stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(POLL);
+                }
                 write_frame(&inner);
-            }
-        });
-        *hb.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+            })
+            .ok();
+        *hb.task.lock().unwrap_or_else(|e| e.into_inner()) = worker;
         hb
     }
 
@@ -155,8 +161,9 @@ impl Heartbeat {
             advance_locked(&self.inner, Phase::Finishing);
             self.inner.stopped.store(true, Ordering::SeqCst);
         }
-        if let Some(h) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            h.abort();
+        // join 周期线程：它最多一个 POLL 后看到 stopped 退出；join 返回即保证之后不再写。
+        if let Some(t) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = t.join();
         }
     }
 
@@ -177,8 +184,8 @@ impl Drop for Heartbeat {
             let _write = self.inner.write_lock.lock().unwrap_or_else(|e| e.into_inner());
             self.inner.stopped.store(true, Ordering::SeqCst);
         }
-        if let Some(h) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            h.abort();
+        if let Some(t) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = t.join();
         }
     }
 }
@@ -308,8 +315,9 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::registry::ProviderRegistry;
-    use crate::provider::tool_loop::FakeChatBackend;
+    use crate::prompt::{PromptBlock, ScanPrompt};
+    use crate::provider::registry::{LlmSnapshot, ProviderRegistry};
+    use crate::provider::tool_loop::{AssistantTurn, ChatBackend, FakeChatBackend};
 
     fn read_state(dir: &Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(dir.join("state.json")).expect("state.json 存在")).expect("合法 JSON")
@@ -383,15 +391,19 @@ mod tests {
         hb.shutdown();
     }
 
-    /// 多线程 runtime 下，同步准备阶段阻塞一个 worker 时周期任务仍能写帧（真实 job 的 `#[tokio::main]` 形态）。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn periodic_tick_runs_while_preparation_blocks_a_worker() {
+    /// 单 async worker + 同步准备阻塞 >5s：心跳线程独立于 runtime，仍按周期落帧（契约 ≤5s）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn periodic_tick_survives_long_blocking_preparation() {
         let d = tempfile::tempdir().unwrap();
         let hb = Heartbeat::start(d.path(), "J3c");
         let frames = hb.frames();
-        // 模拟同步 registry 构造/输入校验：阻塞当前 worker，不 await。
-        std::thread::sleep(TICK + Duration::from_millis(400));
-        assert!(hb.frames() > frames, "周期任务应在另一个 worker 上落帧");
+        let first_at = read_state(d.path())["at"].as_str().unwrap().to_string();
+        // 模拟同步 registry 构造/输入校验卡住整个 runtime（current_thread → 单 worker）。
+        std::thread::sleep(Duration::from_millis(5_200));
+        let second_at = read_state(d.path())["at"].as_str().unwrap().to_string();
+        assert!(hb.frames() >= frames + 2, "阻塞 5.2s 应至少落两帧: {} -> {}", frames, hb.frames());
+        let gap = parse_rfc3339_secs(&second_at) - parse_rfc3339_secs(&first_at);
+        assert!(gap <= 5, "心跳间隔 ≤5s: first {first_at}, second {second_at}, gap {gap}s");
         hb.shutdown();
     }
 
@@ -399,11 +411,20 @@ mod tests {
     #[tokio::test]
     async fn at_advances_within_five_seconds() {
         let d = tempfile::tempdir().unwrap();
-        let _hb = Heartbeat::start(d.path(), "J4");
+        let hb = Heartbeat::start(d.path(), "J4");
         let mut stamps = Vec::new();
-        for _ in 0..3 {
+        // 每次采样等下一次落帧（不依赖周期相位）；间隔上限 5s。
+        for i in 0..3 {
+            if i > 0 {
+                let before = hb.frames();
+                let mut waited = 0u64;
+                while hb.frames() == before {
+                    assert!(waited < 5_000, "5s 内没有新帧");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    waited += 50;
+                }
+            }
             stamps.push(read_state(d.path())["at"].as_str().unwrap().to_string());
-            tokio::time::sleep(Duration::from_millis(2_100)).await;
         }
         for w in stamps.windows(2) {
             assert!(w[1] > w[0], "at 必须递增: {:?}", stamps);
@@ -520,5 +541,139 @@ mod tests {
     fn phase_ordering_is_total() {
         assert!(Phase::Preparing < Phase::Running && Phase::Running < Phase::Finishing);
         assert_eq!(Phase::from_u8(Phase::Finishing.as_u8()), Phase::Finishing);
+    }
+
+    // ── 真实 scan 路径：两请求停在 turn 内 → 落盘 llm 与 registry 快照逐字一致 ──
+
+    fn scan_prompt() -> ScanPrompt {
+        ScanPrompt { system: "h".into(), blocks: vec![PromptBlock { text: "b".into(), cache_boundary: false }] }
+    }
+
+    fn scan_ok() -> AssistantTurn {
+        AssistantTurn {
+            text: r#"{"suspicions":[],"needs":[],"scanned_areas":[]}"#.into(),
+            tool_calls: vec![],
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            finish_reason: Some("stop".into()),
+            reasoning_tokens: None,
+        }
+    }
+
+    fn rate_limited() -> crate::provider::ProviderError {
+        crate::provider::ProviderError::RateLimited { retry_after: None }
+    }
+
+    /// 可控 backend：首次 turn 停在 `entered` 等 `release`；`fail_first` 时首次返回 429，之后成功。
+    struct BlockingBackend {
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Semaphore>,
+        first: AtomicBool,
+        fail_first: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatBackend for BlockingBackend {
+        async fn turn(
+            &self,
+            _messages: &[crate::provider::tool_loop::ChatMessage],
+            _tools: &[crate::tools::ToolSpec],
+        ) -> Result<AssistantTurn, crate::provider::ProviderError> {
+            if !self.first.swap(true, Ordering::SeqCst) {
+                self.entered.wait().await;
+                let _permit = self.release.acquire().await.expect("semaphore");
+                if self.fail_first {
+                    return Err(rate_limited());
+                }
+            }
+            Ok(scan_ok())
+        }
+    }
+
+    fn assert_state_llm_eq(dir: &Path, snap: &LlmSnapshot) {
+        let v = read_state(dir);
+        assert_eq!(v["llm"], serde_json::to_value(snap).unwrap(), "落盘 llm 与 registry 快照逐字一致");
+    }
+
+    async fn wait_for_retrying(reg: &ProviderRegistry) {
+        for _ in 0..400 {
+            if reg.snapshot().map(|s| s.retrying == 1).unwrap_or(false) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("429 未进入退避: {:?}", reg.snapshot());
+    }
+
+    /// 两请求同时停在 backend 内 → `in_flight==2` 且落盘 llm == registry 快照；
+    /// 释放 429 方后进入稳定退避 → `(in_flight, retrying)==(1,1)`，再次逐字比较。
+    #[tokio::test]
+    async fn llm_snapshot_matches_registry_while_two_requests_are_in_turn() {
+        let d = tempfile::tempdir().unwrap();
+        let hb = Heartbeat::start(d.path(), "J-real");
+        let slow_entered = Arc::new(tokio::sync::Barrier::new(2));
+        let slow_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let rl_entered = Arc::new(tokio::sync::Barrier::new(2));
+        let rl_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan(
+            "p/slow",
+            "p",
+            2,
+            Box::new(BlockingBackend {
+                entered: Arc::clone(&slow_entered),
+                release: Arc::clone(&slow_release),
+                first: AtomicBool::new(false),
+                fail_first: false,
+            }),
+            Duration::from_secs(5),
+            0,
+        );
+        reg.insert_scan(
+            "p/rl",
+            "p",
+            2,
+            Box::new(BlockingBackend {
+                entered: Arc::clone(&rl_entered),
+                release: Arc::clone(&rl_release),
+                first: AtomicBool::new(false),
+                fail_first: true,
+            }),
+            Duration::from_secs(5),
+            0,
+        );
+        let reg = Arc::new(reg);
+        hb.attach_llm(reg.gate_handles());
+
+        let slow = {
+            let reg = Arc::clone(&reg);
+            tokio::spawn(async move { reg.scan("p/slow", &scan_prompt()).await.map(|_| ()) })
+        };
+        slow_entered.wait().await;
+        let rl = {
+            let reg = Arc::clone(&reg);
+            tokio::spawn(async move { reg.scan("p/rl", &scan_prompt()).await.map(|_| ()) })
+        };
+        rl_entered.wait().await;
+        // 两个 backend 都停在 turn 内 → 在途 2；心跳帧与 registry 快照逐字一致。
+        let snap = reg.snapshot().expect("gates");
+        assert_eq!(snap.in_flight, 2, "真实 scan 两请求在途: {snap:?}");
+        hb.attach_llm(reg.gate_handles());
+        assert_state_llm_eq(d.path(), &snap);
+
+        // 放行 429 方：首次 turn 返回 429 → 门收窄、进入退避；另一个仍在途。
+        rl_release.add_permits(1);
+        wait_for_retrying(&reg).await;
+        let snap = reg.snapshot().expect("gates");
+        assert_eq!((snap.in_flight, snap.retrying), (1, 1), "稳定退避: {snap:?}");
+        hb.attach_llm(reg.gate_handles());
+        assert_state_llm_eq(d.path(), &snap);
+
+        slow_release.add_permits(1);
+        let (s, r) = tokio::join!(slow, rl);
+        s.expect("slow join").expect("slow ok");
+        r.expect("rl join").expect("429 重试最终成功");
+        hb.shutdown();
     }
 }

@@ -421,6 +421,9 @@ fn seal_job_env() {
 /// 原子写报告并返回退出码（partial 也算已写出 → 0；error → 1）。
 /// 报告写入期间心跳继续（`finishing` 覆盖整个收尾段）；报告落盘（或写失败）后再停写。
 fn finish(out_dir: &Path, report: report::HibotReport, heartbeat: &state::Heartbeat) -> i32 {
+    // 所有出口（含配置/输入错误、triage/verify、准备期超时）都在写报告前进入 finishing；
+    // 正常 review 已在收尾链起点提前进入（幂等）。
+    heartbeat.set_phase(state::Phase::Finishing);
     let path = out_dir.join("report.json");
     let code = match io::atomic_write_json(&path, &report) {
         Ok(()) => {
