@@ -34,18 +34,33 @@ pub async fn run<T: DeserializeOwned>(
     system: String,
     blocks: Vec<PromptBlock>,
     label: &str,
+    cell_timeout: std::time::Duration,
 ) -> Result<ShotCall<T>, ProviderError> {
+    // 墙钟优化：`cell_timeout` 是**整格**预算（含重试与 repair），外层 envelope 封顶；
+    // provider 单轮上限仍由 `lease.per_turn()` 管，不动重试语义。
+    let cell_deadline = tokio::time::Instant::now() + cell_timeout;
     let mut messages = vec![ChatMessage::System(system), ChatMessage::UserBlocks(blocks)];
     let policy = lease.gate_attempts();
-    let turn = timed_turn_with(
-        lease.backend(),
-        &messages,
-        &[],
-        lease.per_turn(),
-        lease.retry_budget(),
-        Some(&policy),
+    let turn = match tokio::time::timeout_at(
+        cell_deadline,
+        timed_turn_with(
+            lease.backend(),
+            &messages,
+            &[],
+            lease.per_turn(),
+            lease.retry_budget(),
+            Some(&policy),
+        ),
     )
-    .await?;
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(ProviderError::Timeout(format!(
+                "triage cell `{label}` exceeded its {cell_timeout:?} budget"
+            )))
+        }
+    };
     let (mut in_tok, mut out_tok, mut cached) = (turn.input_tokens, turn.output_tokens, turn.cached_input_tokens);
 
     if let Some(v) = extract_json_object(&turn.text) {
@@ -71,15 +86,26 @@ pub async fn run<T: DeserializeOwned>(
         messages.push(ChatMessage::Assistant { text: turn.text.clone(), tool_calls: vec![] });
     }
     messages.push(ChatMessage::User(REPAIR_PROMPT_TRIAGE.to_string()));
-    let repair = timed_turn_final_with(
-        lease.backend(),
-        &messages,
-        lease.per_turn(),
-        lease.retry_budget(),
-        Some(&policy),
+    let repair = match tokio::time::timeout_at(
+        cell_deadline,
+        timed_turn_final_with(
+            lease.backend(),
+            &messages,
+            lease.per_turn(),
+            lease.retry_budget(),
+            Some(&policy),
+        ),
     )
     .await
-    .map_err(|e| e.attach_usage((in_tok, out_tok, cached)))?;
+    {
+        Ok(r) => r.map_err(|e| e.attach_usage((in_tok, out_tok, cached)))?,
+        Err(_) => {
+            return Err(ProviderError::Timeout(format!(
+                "triage cell `{label}` exceeded its {cell_timeout:?} budget during repair"
+            ))
+            .attach_usage((in_tok, out_tok, cached)))
+        }
+    };
     in_tok += repair.input_tokens;
     out_tok += repair.output_tokens;
     cached += repair.cached_input_tokens;

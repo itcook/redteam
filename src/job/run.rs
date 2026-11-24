@@ -441,19 +441,36 @@ async fn run_triage(
     };
     // Phase 5：triage 与 review 同用一张 provider 门表（`llm` 段）；阶段 preparing → running → finishing。
     heartbeat.attach_llm(registry.gate_handles());
+    let deadline = match effective_deadline(started, manifest.limits.wall_clock_s, None) {
+        Ok(d) => d,
+        Err(e) => return report::error_report(manifest, lang, &e),
+    };
+    // 墙钟优化：按"剩余预算 / 预计波次"给每格封顶，单格不能吃掉整个 job 预算。
+    // 预计波次 = ceil(cells / provider 门宽)；cells 与 `triage::run` 的分片公式同源。
+    let files: Vec<&crate::evidence::git::FileChange> = changes.iter().filter(|c| !c.diff.trim().is_empty()).collect();
+    let modules: std::collections::BTreeSet<String> = files
+        .iter()
+        .map(|c| crate::triage::standards::module_of(&c.path))
+        .collect();
+    let cells = crate::triage::lenses::security_shard_count(files.len())
+        + crate::triage::lenses::drift_shard_count(modules.len())
+        + 1;
+    let provider_cap = registry
+        .provider_of(&route_key)
+        .and_then(|p| registry.cap_of(p))
+        .unwrap_or(4) as usize;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let cell_timeout = crate::triage::cell_budget(remaining, cells, provider_cap);
     let req = crate::triage::TriageRequest {
         repo: &repo,
         pr: &pr,
         changes: &changes,
         lang,
         manifest_cap_s: manifest.limits.wall_clock_s,
+        cell_timeout,
         route_key,
     };
     let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::triage::Progress::default()));
-    let deadline = match effective_deadline(started, manifest.limits.wall_clock_s, None) {
-        Ok(d) => d,
-        Err(e) => return report::error_report(manifest, lang, &e),
-    };
     // Phase 5：三 kind 都走心跳；进入模型派发即 running（triage 的 manifest 没有 item 清单，不伪造 progress）。
     heartbeat.set_phase(state::Phase::Running);
     let mut fut = Box::pin(crate::triage::run(&registry, &req, progress.clone()));

@@ -179,6 +179,20 @@ impl<R> AxisRun<R> {
     }
 }
 
+
+/// 墙钟优化：拿 provider 门也计入本格预算；排队等到截止 = 该格失败（不无限等门）。
+async fn lease_with_budget<'a>(
+    registry: &'a ProviderRegistry,
+    route_key: &str,
+    deadline: tokio::time::Instant,
+) -> Result<crate::provider::registry::ScanLease<'a>, String> {
+    match tokio::time::timeout_at(deadline, registry.lease_for(crate::domain::Role::Scanner, route_key)).await {
+        Ok(Ok(l)) => Ok(l),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("provider gate wait exceeded the cell budget".into()),
+    }
+}
+
 /// 三轴共享的制度头（稳定、可缓存；不含任何 run 特有内容）。
 pub const SYSTEM_TPL: &str = include_str!("../prompt/templates/triage-system.md");
 pub const SECURITY_TPL: &str = include_str!("../prompt/templates/triage-security.md");
@@ -256,6 +270,7 @@ pub async fn run_security(
     lang: &OutputLang,
     pr: &PrContext,
     files: &[(String, String)],
+    cell_timeout: std::time::Duration,
 ) -> AxisRun<SecurityRow> {
     let shards = balanced_chunks(files, security_shard_count(files.len()));
     let system = shared_system(lang);
@@ -266,16 +281,18 @@ pub async fn run_security(
         let header = pr_header(pr);
         let patch = patch_block(shard);
         async move {
-            let lease = match registry.lease_for(crate::domain::Role::Scanner, route_key).await {
+            let cell_deadline = tokio::time::Instant::now() + cell_timeout;
+            let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
                 Ok(l) => l,
-                Err(e) => return Err((i, e.to_string(), (0, 0, 0), 0)),
+                Err(e) => return Err((i, e, (0, 0, 0), 0)),
             };
+            let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
             let blocks = vec![
                 block(format!("# Axis: security\n{header}"), false),
                 block(patch, true),
                 block(tail, false),
             ];
-            match shot::run::<SecurityOutput>(&lease, system, blocks, "triage-security").await {
+            match shot::run::<SecurityOutput>(&lease, system, blocks, "triage-security", budget).await {
                 Ok(call) => Ok((i, call)),
                 Err(e) => Err((i, e.to_string(), e.burned_usage(), 0)),
             }
@@ -317,6 +334,7 @@ pub async fn run_drift(
     map: &StandardsMap,
     repo: &std::path::Path,
     files: &[(String, String)],
+    cell_timeout: std::time::Duration,
 ) -> AxisRun<DriftRow> {
     // 按模块分组（顺序 = changed 文件顺序的首次出现）。
     let mut modules: Vec<String> = Vec::new();
@@ -346,17 +364,19 @@ pub async fn run_drift(
         );
         let module_list = shard.join(", ");
         async move {
-            let lease = match registry.lease_for(crate::domain::Role::Scanner, route_key).await {
+            let cell_deadline = tokio::time::Instant::now() + cell_timeout;
+            let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
                 Ok(l) => l,
-                Err(e) => return Err((e.to_string(), (0, 0, 0))),
+                Err(e) => return Err((e, (0, 0, 0))),
             };
+            let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
             let blocks = vec![
                 block(format!("# Axis: convention drift\nmodules in this shard: {module_list}\n"), false),
                 block(pack, false),
                 block(patch, true),
                 block(tail, false),
             ];
-            match shot::run::<DriftOutput>(&lease, system, blocks, "triage-drift").await {
+            match shot::run::<DriftOutput>(&lease, system, blocks, "triage-drift", budget).await {
                 Ok(call) => Ok(call),
                 Err(e) => Err((e.to_string(), e.burned_usage())),
             }
@@ -397,13 +417,16 @@ pub async fn run_intent(
     lang: &OutputLang,
     pr: &PrContext,
     files: &[(String, String)],
+    cell_timeout: std::time::Duration,
 ) -> AxisRun<IntentOutput> {
     let system = shared_system(lang);
     let tail = INTENT_TPL.replace("{{OUTPUT_LANG}}", &lang.prompt_name);
-    let lease = match registry.lease_for(crate::domain::Role::Scanner, route_key).await {
+    let cell_deadline = tokio::time::Instant::now() + cell_timeout;
+    let lease = match lease_with_budget(registry, route_key, cell_deadline).await {
         Ok(l) => l,
-        Err(e) => return AxisRun::failed(e.to_string()),
+        Err(e) => return AxisRun::failed(e),
     };
+    let budget = cell_deadline.saturating_duration_since(tokio::time::Instant::now());
     let mut claims = String::from("# Stated intent sources (author assertions only)\n");
     claims.push_str(&format!("## PR body\n{}\n", if pr.body.trim().is_empty() { "(empty)" } else { pr.body.as_str() }));
     for issue in &pr.linked_issues {
@@ -421,7 +444,7 @@ pub async fn run_intent(
         block(patch_block(files), true),
         block(tail, false),
     ];
-    match shot::run::<IntentOutput>(&lease, system, blocks, "triage-intent").await {
+    match shot::run::<IntentOutput>(&lease, system, blocks, "triage-intent", budget).await {
         Ok(call) => AxisRun {
             cells: 1,
             rows: vec![call.output],

@@ -345,3 +345,43 @@ fn review_projection_reads_routing_only_not_blockers() {
     // 投影结构里没有 blockers/finding 载体：blockers 只经 routing.focus 影响 review。
     assert!(p.disclosure.get("blockers").is_none());
 }
+
+/// 墙钟优化：单格预算 = 剩余/波次 × 0.9 —— 5s 慢 backend 在 2s 墙钟下必须 <3.5s 收敛为 partial。
+#[derive(Clone)]
+struct SlowBackend {
+    inner: Arc<TriageFake>,
+    delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl ChatBackend for SlowBackend {
+    async fn turn(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> Result<AssistantTurn, ProviderError> {
+        tokio::time::sleep(self.delay).await;
+        <TriageFake as ChatBackend>::turn(&self.inner, messages, tools).await
+    }
+}
+
+#[tokio::test]
+async fn slow_cell_is_capped_by_its_share_of_the_job_budget() {
+    let fx = make_job(&config(), "body", true);
+    let mpath = fx.job.join("job.json");
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(&mpath).unwrap()).unwrap();
+    m["limits"]["wall_clock_s"] = serde_json::json!(2);
+    std::fs::write(&mpath, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+
+    let slow = SlowBackend { inner: good_fake(), delay: std::time::Duration::from_secs(5) };
+    let over: Box<redteam::cli::BackendOverride<'_>> = Box::new(move |_em: &EffectiveModel| {
+        Some(Box::new(slow.clone()) as Box<dyn ChatBackend>)
+    });
+    let t0 = std::time::Instant::now();
+    let code = redteam::job::run::run_with(JobKind::Triage, &fx.job, Some(over.as_ref())).await;
+    let elapsed = t0.elapsed();
+    assert_eq!(code, 0);
+    assert!(elapsed < std::time::Duration::from_millis(3500), "单格封顶后必须提前收敛: {elapsed:?}");
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "partial", "{r}");
+    assert!(r.get("summary").is_none());
+    assert!(r["status_reason"].as_str().unwrap().contains("triage axis"), "{r}");
+    assert!(r["extensions"]["redteam"]["axes"].as_array().unwrap().iter().all(|a| a["ok"] == false));
+}
+

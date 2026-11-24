@@ -30,8 +30,19 @@ pub struct TriageRequest<'a> {
     pub lang: &'a OutputLang,
     /// manifest 的墙钟硬上限（秒）；`routing.wall_clock_s` 由它派生。
     pub manifest_cap_s: u64,
+    /// 单格预算（墙钟优化）：shot 取 `min(lease.per_turn(), cell_timeout)`。
+    pub cell_timeout: std::time::Duration,
     /// 三轴使用的模型（`roles.scanner` 的第一条；grill：不新增配置块）。
     pub route_key: String,
+}
+
+/// 墙钟优化：单格超时 = 剩余预算 / 预计波次 × 0.9（下限 20s）。
+/// 波次 = ceil(cells / provider_cap)：provider 门是唯一并发闸（D72），单格不能吃掉整个 job 预算。
+pub fn cell_budget(remaining: std::time::Duration, cells: usize, provider_cap: usize) -> std::time::Duration {
+    let waves = cells.div_ceil(provider_cap.max(1)).max(1) as u32;
+    let per = remaining / waves;
+    // 不设固定下限：job 只剩几秒时，下限反而会把单格预算顶到剩余之外（由全局 deadline 兜底）。
+    per.mul_f32(0.9).min(remaining)
 }
 
 /// 三轴已完成的结果（取消后从这里取已完成部分）。
@@ -89,24 +100,25 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
         p.drift = Some(lenses::AxisRun { ok: true, ..Default::default() });
     }
 
-    let (sec, drift, intent) = tokio::join!(
+    // 先 poll intent（单 cell）：它不会因为分片把 provider 门占满而排在最后一波。
+    let (intent, sec, drift) = tokio::join!(
+        async {
+            let r = lenses::run_intent(registry, &req.route_key, req.lang, req.pr, &files, req.cell_timeout).await;
+            progress.lock().unwrap().intent = Some(r);
+        },
         async {
             if files.is_empty() {
                 return;
             }
-            let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files).await;
+            let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, req.cell_timeout).await;
             progress.lock().unwrap().security = Some(r);
         },
         async {
             if files.is_empty() {
                 return;
             }
-            let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files).await;
+            let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, req.cell_timeout).await;
             progress.lock().unwrap().drift = Some(r);
-        },
-        async {
-            let r = lenses::run_intent(registry, &req.route_key, req.lang, req.pr, &files).await;
-            progress.lock().unwrap().intent = Some(r);
         }
     );
     let _ = (sec, drift, intent);
@@ -304,5 +316,15 @@ mod tests {
         ];
         assert_eq!(changed_files(&changes).len(), 1);
         assert_eq!(patch_pairs(&changes).len(), 1);
+    }
+
+    /// 墙钟优化：单格预算 = 剩余 / 波次 × 0.9；下限 20s，上限不超过剩余。
+    #[test]
+    fn cell_budget_divides_by_provider_waves() {
+        use std::time::Duration;
+        assert_eq!(cell_budget(Duration::from_secs(1200), 8, 4), Duration::from_secs(540));
+        assert_eq!(cell_budget(Duration::from_secs(100), 8, 4), Duration::from_secs(45));
+        assert_eq!(cell_budget(Duration::from_secs(10), 1, 4), Duration::from_secs(9), "不超过剩余");
+        assert_eq!(cell_budget(Duration::from_secs(1200), 3, 0), Duration::from_secs(360), "cap=0 按 1 波、每格 1/3");
     }
 }
