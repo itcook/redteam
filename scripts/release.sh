@@ -61,7 +61,7 @@ fi
 PRERELEASE=false
 case "$VERSION" in *-*) PRERELEASE=true ;; esac
 
-info "版本 ${VERSION}（prerelease=$PRERELEASE, dry-run=$DRY_RUN, no-push=$NO_PUSH）"
+info "版本 ${VERSION}（prerelease=${PRERELEASE}, dry-run=${DRY_RUN}, no-push=${NO_PUSH}）"
 
 # ---------------------------------------------------------------- 前置检查
 if [ "$DRY_RUN" = true ]; then
@@ -112,7 +112,7 @@ BIN="target/${TARGET}/release/redteam"
 [ -x "$BIN" ] || die "缺少构建产物: $BIN"
 built_version="$("$BIN" --version | awk '{print $2}')"
 [ "$built_version" = "$BASE_VERSION" ] \
-    || die "二进制报告 $built_version，期望 $BASE_VERSION（Cargo.toml 与构建产物不同源）"
+    || die "二进制报告 ${built_version}，期望 ${BASE_VERSION}（Cargo.toml 与构建产物不同源）"
 
 # ---------------------------------------------------------------- 打包
 rm -rf "$DIST"
@@ -210,7 +210,7 @@ else
     done
     if [ -n "$missing" ]; then
         R2_ENABLED=false
-        info "缺少 R2 凭据（$missing），跳过 R2 镜像（不影响 GitHub Release）"
+        info "缺少 R2 凭据（${missing}），跳过 R2 镜像（不影响 GitHub Release）"
     elif ! command -v aws >/dev/null; then
         R2_ENABLED=false
         info "缺少 aws CLI，跳过 R2 镜像（不影响 GitHub Release）"
