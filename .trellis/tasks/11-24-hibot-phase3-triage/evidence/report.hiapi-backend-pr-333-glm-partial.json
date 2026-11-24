@@ -1,0 +1,155 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "wall-clock budget exhausted or terminated; results flushed",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:aee7fdcd531c1bead8154b6184c30dc3634381d67df8c0b123d263f6e81f65eb",
+      "severity": "medium",
+      "confidence": 0.9,
+      "file": "service/feishu_finance_agent_client.go",
+      "line_start": 286,
+      "line_end": 286,
+      "quote": "{\"role\": \"user\", \"content\": text},",
+      "title": "Security (surface 5): injection",
+      "body": "Reachability: Source: Feishu IM message content parsed at service/feishu_finance_agent.go:319 (`_ = common.UnmarshalJsonStr(msg.Content, &content)`); text extracted at :320 (`text := strings.TrimSpace(feishuMentionPlaceholder.ReplaceAllString(content.Text, \"\"))`), stored as action.RawText at :334, then passed to the LLM parser at :359 (`cmd, err := parseFeishuFinanceAgentCommand(ctx, text)`). Chain: parseFeishuFinanceAgentCommandLLM (service/feishu_finance_agent_client.go:279) receives the raw text with no neutralization and embeds it as the user-role chat message at :286 (`{\"role\": \"user\", \"content\": text}`). Sink: the payload is serialized and sent to the interpreting engine at :349 (`req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.LLMBaseURL+\"/chat/completions\", bytes.NewReader(raw))`) via :355 `feishuFinanceAgentHTTP().Do(req)`.\nNote: Prompt injection into the LLM command parser: any whitelisted-operator message (including pasted third-party content in groups, as the PR's own threat-model comment at service/feishu_finance_agent.go:31 acknowledges) is concatenated into the chat-completions prompt and can attempt to override the system prompt to steer intent, target_account, commission rate or gift_credits toward arbitrary users/amounts. Mitigations present but do not remove the path: strict json_schema (with field-level fallback validation for json_object), deterministic server-side bounds in buildFeishuFinanceAgentPlan (gift capped at feishuFinanceAgentMaxGiftCredits=1,000,000, rate at 5000 bps, window 1-365 days), regex injection-hint warnings rendered on the confirmation card, and execution only after a Root-operator card confirmation with re-auth; the parsed plan is persisted server-side (plan_json) and buttons carry only action_id.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.3",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:ff38a4d9ea946ec4e615e67f5fcce0bdbcda2ad3ccb9a7c8d61410a1c4aa2e9d",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_ws.go",
+      "line_start": 101,
+      "line_end": 102,
+      "quote": "if domain := feishuFinanceAgentWSDomain(cfg.OpenAPIBase); domain != \"\" {\n\t\topts = append(opts, larkws.WithDomain(domain))",
+      "title": "Security (surface 7): SSRF",
+      "body": "Reachability: env var FEISHU_FINANCE_AGENT_OPENAPI_BASE read at setting/feishu_finance_agent_setting.go:32 (os.Getenv) -> FeishuFinanceAgentSetting.OpenAPIBase -> loaded via setting.GetFeishuFinanceAgentSetting() at service/feishu_finance_agent_ws.go:35 -> runFeishuFinanceAgentWSSession cfg.OpenAPIBase -> feishuFinanceAgentWSDomain() at service/feishu_finance_agent_ws.go:111-118 (strips trailing \"/open-apis\") -> larkws.WithDomain(domain) at service/feishu_finance_agent_ws.go:102 -> larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...).Start() at service/feishu_finance_agent_ws.go:105-106 dials the outbound WebSocket to the env-chosen host\nNote: The outbound long-connection endpoint can be redirected to an arbitrary host via the FEISHU_FINANCE_AGENT_OPENAPI_BASE deployment variable; a rogue endpoint then receives the AppID/AppSecret during the SDK auth handshake and terminates all Feishu events and card callbacks. The source is operator-controlled deployment config (setting/feishu_finance_agent_setting.go:15 documents it as a local smoke-testing affordance), not end-user request input, so exploitation requires control of the process environment; row recorded because the source->sink->chain path is fully concrete in the supplied diff.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.3",
+        "role": "scanner"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 45074,
+    "output_tokens": 61696,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 1200009
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 2,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 45074,
+            "output_tokens": 61696
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "interrupted",
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "interrupted",
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "wall_clock_exhausted",
+      "template_hashes": {
+        "triage": "2c750615f126b5f3"
+      }
+    }
+  }
+}

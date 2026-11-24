@@ -51,3 +51,14 @@
 4. **漂移计数**：sites #235 总量与人工精确一致（7=7），但构成不同（我们 4 struct+3 intent，人工 3 struct+4 intent）；sites #277 我们 3 blockers vs 人工 8（欠报 5）。
 5. **安全轴丢弃率**：backend #333 A 轮 1 行候选、1 行 <8 被丢（100%）；A2/A2 后 0 行候选。sites #328 漂移轴 1 行 unanchored 被丢（已披露在 `axes[].dropped.dropped_rows`）。
 
+
+## GLM-5.3 复跑（backend #333，第 9/10 次；32k output / 1200s）
+
+- `status=partial`（1200s 墙钟耗尽；drift/intent 两轴 interrupted）。
+- 安全轴：**2 行**，`dropped_rows=[]`；两行均非 tier2 白名单面：
+  - surface 5（injection），`service/feishu_finance_agent_client.go:286`，conf 9/10；
+  - surface 7（SSRF），`service/feishu_finance_agent_ws.go:101–102`，conf 8/10。
+  → 若 drift/intent 完成，`security_tier` 应为 **1**（无面 1/3/4 行），仍不是人工的 tier2。
+- usage 45,074 in / 61,696 out；原始报告：`report.hiapi-backend-pr-333-glm-partial.json`。
+- 与 DeepSeek + A2（安全轴 0 行）并列：**GLM 能召回两条安全行（含 injection），但仍未命中人工的 surface-4 特权写链路**。
+- 注：backend #333 的 A2（DeepSeek）原始报告已被本次 GLM 复跑覆盖；A2 数值来自覆盖前生成的 `metrics.jsonl` 与本文件上表。
