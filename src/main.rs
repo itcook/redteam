@@ -1746,6 +1746,39 @@ mod tests {
         );
     }
 
+    /// 0.8 护栏（R20）接线：旧配置的 `roles.verifier`（原“验真角色”）必须让后台作业也看得见。
+    /// worker 的 stderr 是 /dev/null，只有 registry.warnings → 报告 run.warnings 这条路。
+    #[test]
+    fn build_registry_surfaces_verifier_role_rename_guard() {
+        let stale: redteam::config::Config = serde_json::from_str(
+            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
+                "s":{"roles":{"scanner":{}}},
+                "m":{"roles":{"verifier":{}}}
+            }}}}"#,
+        )
+        .unwrap();
+        let reg = build_registry(&plain_review_args(), &stale, std::path::Path::new(".")).unwrap();
+        assert!(
+            reg.warnings().iter().any(|w| w.contains("验真角色已更名为 refuter")),
+            "旧语义的 verifier 角色必须进报告 warnings: {:?}",
+            reg.warnings()
+        );
+        // 新语义（显式 refuter，或两者都有）不报这条。
+        let fresh: redteam::config::Config = serde_json::from_str(
+            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
+                "s":{"roles":{"scanner":{}}},
+                "m":{"roles":{"refuter":{},"verifier":{}}}
+            }}}}"#,
+        )
+        .unwrap();
+        let reg2 = build_registry(&plain_review_args(), &fresh, std::path::Path::new(".")).unwrap();
+        assert!(
+            !reg2.warnings().iter().any(|w| w.contains("验真角色已更名")),
+            "新语义不该触发护栏: {:?}",
+            reg2.warnings()
+        );
+    }
+
     /// 同一模型兼任多角色：按角色键各注册一份 backend，档位互不覆盖。
     /// dogfood 暴露的真问题：旧实现只留先注册的 scanner 档，reviewer / refuter 配 high 照样跑 medium。
     #[test]
