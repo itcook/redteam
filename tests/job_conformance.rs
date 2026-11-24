@@ -1011,3 +1011,48 @@ async fn missing_blob_produces_valid_error_report() {
     assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:merge_base", "{r}");
     assert!(r["findings"].as_array().unwrap().is_empty());
 }
+
+/// 2.6：浅克隆经 `run_with` → 合法 error 报告（不是 partial/ok）。
+#[tokio::test]
+async fn shallow_checkout_produces_valid_error_report() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let shallow = fx.repo.parent().unwrap().join("repo-shallow");
+    let out = std::process::Command::new("git")
+        .args(["clone", "-q", "--depth", "1", &format!("file://{}", fx.repo.display()), shallow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    m["paths"]["repo"] = serde_json::json!("../repo-shallow");
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:shallow", "{r}");
+}
+
+/// 2.6：base 与 head 无共同祖先 → `git merge-base` 不可算 → 合法 error 报告。
+#[tokio::test]
+async fn unrelated_histories_produce_valid_error_report() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    // 另起一条无共同祖先的根提交。
+    let orphan = fx.repo.parent().unwrap().join("repo-orphan");
+    std::fs::create_dir_all(&orphan).unwrap();
+    git(&orphan, &["init", "-q"]);
+    git(&orphan, &["config", "user.email", "t@example.com"]);
+    git(&orphan, &["config", "user.name", "t"]);
+    std::fs::write(orphan.join("x.txt"), "x\n").unwrap();
+    git(&orphan, &["add", "."]);
+    git(&orphan, &["commit", "-qm", "root"]);
+    let root = git(&orphan, &["rev-parse", "HEAD"]);
+    // 把 base 指向这条无关历史（object 在本地不可得）→ repo_incomplete:base。
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    m["pr"]["base_sha"] = serde_json::json!(root);
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:base", "{r}");
+}

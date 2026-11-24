@@ -3,17 +3,17 @@ cargo run --quiet -- config schema --out dist/config.schema.json
 git diff --exit-code plugins/redteam/codex-skills/
 git diff --exit-code dist/config.schema.json
 cargo test --test packaging
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
      Running tests/packaging.rs (target/debug/deps/packaging-747ce17f5cfd9ea6)
 
 running 7 tests
 test binary_layout_and_launcher ... ok
+test manifests_valid_and_named ... ok
 test codex_skills_have_name_and_no_claude_var ... ok
 test commands_frontmatter_and_invocation_policy ... ok
-test manifests_valid_and_named ... ok
 test launcher_resolves_on_this_platform ... ok
 test codex_skills_in_sync_with_commands ... ok
 test launcher_errors_when_binary_missing ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 

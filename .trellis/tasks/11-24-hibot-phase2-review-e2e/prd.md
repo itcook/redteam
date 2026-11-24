@@ -101,7 +101,7 @@ paths.repo ──► root（只读检出；HEAD 必须 = pr.head_sha）
 
 ### 验证
 
-- `cargo test`：1072 lib + 21 bin + 4 capabilities + 20 job_conformance + 7 packaging + 24 e2e，全绿（exit 0）。
+- `cargo test`：1072 lib + 21 bin + 4 capabilities + 22 job_conformance + 7 packaging + 24 e2e，全绿（exit 0）。
 - `make verify`：exit 0（codex-skills 与 `dist/config.schema.json` 零 diff，packaging 7/7）。
 - capabilities 用 hibot `audit-capabilities.schema.json` 原位只读校验：PASS。
 - 原文日志：`evidence/cargo-test.log`、`evidence/make-verify.log`；命令、退出码与提交 SHA 记在 `evidence/SUMMARY.md`

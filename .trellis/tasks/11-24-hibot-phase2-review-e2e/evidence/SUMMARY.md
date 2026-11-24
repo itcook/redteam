@@ -19,7 +19,7 @@
 | lib | 1072 passed |
 | bin | 21 passed |
 | `capabilities` | 4 passed |
-| `job_conformance` | 20 passed |
+| `job_conformance` | 22 passed |
 | `packaging` | 7 passed |
 | `review_e2e` | 24 passed |
 | doc-tests | 0 |
