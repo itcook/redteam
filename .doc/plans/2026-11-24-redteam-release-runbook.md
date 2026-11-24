@@ -90,8 +90,12 @@ shasum -a 256 dist/release/redteam-*-aarch64-apple-darwin.tar.gz
 cat dist/release/SHA256SUMS
 ```
 
-> 插件渠道（marketplace）的 `plugins/redteam/bin/darwin/aarch64/redteam` **不是** release 资产：
-> 它由 `make build` 重建、单独提交（`build: 重建二进制`）。发布时不要顺手把它提交进版本准备。
+> **发布包里的 `redteam` 二进制来自 `target/aarch64-apple-darwin/release/redteam`**
+> （release.sh 的 `cargo build --release --locked --target` 产物），不是 `plugins/redteam/bin/` 里入库的那份。
+>
+> 插件渠道（marketplace）的 `plugins/redteam/bin/darwin/aarch64/redteam` **不是** release 资产，
+> 由 `make build` 重建、单独提交（`build: 重建二进制`）——插件渠道另行 `make build`。
+> 发布时不要顺手把它提交进版本准备。
 
 ## 4. 安装验证
 
