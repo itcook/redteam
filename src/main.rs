@@ -345,7 +345,7 @@ enum ModelCmd {
         #[arg(long)]
         model: String,
         /// 角色，逗号分隔：scanner,reviewer,refuter,verifier（拥有该角色键的模型即活跃集，无候补）。
-        /// `refuter` = 评审内 finding 验真；`verifier` = fix 验证（kind=verify 用，缺省回退 reviewer）。
+        /// `refuter` = 评审内 finding 验真；`verifier` = 修复验证（独立管线，review 不使用；缺省回退 reviewer）。
         #[arg(long)]
         role: String,
         /// 人读显示名（model list / 报告用）；身份串固定为 provider/id，不可配置。

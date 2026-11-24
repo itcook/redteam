@@ -1,6 +1,6 @@
 //! 用户级唯一配置（design v9 §12〔D7 A8 / D12〕）：`$REDTEAM_HOME/config.json`（缺省 `~/.redteam/`）+ 同目录 `secrets.json`。
 //! 严格 JSON、键 camelCase、无注释。形状 = providers → models（按 id 做键）→ roles：模型固有字段只写一次，角色属性挂模型下；
-//! 某角色的活跃集 = 拥有该角色键的全部模型（列表即活跃集、无候补，D7 A3）。无项目层、无 `--models`（M21a 批 A 重做）。
+//! 某角色的活跃集 = 拥有该角色键的全部模型（列表即活跃集、无候补，D7 A3）。无项目层、无命令行选模型的旗。
 
 pub mod secrets;
 
