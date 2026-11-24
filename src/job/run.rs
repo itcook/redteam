@@ -127,30 +127,41 @@ pub async fn run_with(
         }
     };
     // 准备阶段已收到 SIGTERM 或预算已耗尽：直接写 partial（成果为空）。
-    let remaining = budget.saturating_sub(started.elapsed());
+    let deadline = effective_deadline(started, budget, manifest.limits.wall_clock_s, None);
     let early_signal = match sigterm.as_mut() {
         Some(s) => tokio::time::timeout(Duration::from_millis(0), s.recv()).await.is_ok(),
         None => false,
     };
-    if remaining.is_zero() || early_signal {
+    if deadline.saturating_duration_since(std::time::Instant::now()).is_zero() || early_signal {
         let sink = JobDirCellSink::new(out_dir.clone());
         let refute_skipped = (cfg.review.refuters.enabled && cfg.active_roles().refuters.is_empty())
             .then_some("no_refuter");
-        let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink, None, &dismissed, refute_skipped);
+        let base_extras = report::ReviewExtras { refute_skipped, ..Default::default() };
+        let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink, None, &dismissed, &base_extras);
         return finish(&out_dir, r);
     }
-    match run_review(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, &dismissed, remaining, started, &mut sigterm, over).await {
+    match run_review(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, &dismissed, budget, started, &mut sigterm, over).await {
         Ok(r) => finish(&out_dir, r),
         Err(e) => finish(&out_dir, report::error_report(&manifest, &lang, &e)),
     }
 }
 
 /// 2.3：`prior_report.summary.routing.wall_clock_s` 是**建议**预算——只能收紧，不能放宽。
-/// 生效值 = min(manifest 硬上限下的剩余, 建议预算 − 已耗时)。
-fn effective_remaining(remaining: Duration, elapsed: Duration, hard_cap_s: u64, suggested_s: Option<u64>) -> Duration {
+/// 2.3：绝对截止时刻 = min(manifest 硬上限, `prior_report` 建议预算)。
+/// 用**绝对时刻**而不是「剩余秒数」：准备阶段（完整性检查 / registry 构造）耗时不会被重复计入。
+fn effective_deadline(
+    started: std::time::Instant,
+    budget: Duration,
+    hard_cap_s: u64,
+    suggested_s: Option<u64>,
+) -> std::time::Instant {
+    // `limits.wall_clock_s` 只校验了 >=1；极大值不能让 `Instant + Duration` 溢出。
+    let hard = started
+        .checked_add(budget)
+        .unwrap_or_else(|| started + Duration::from_secs(365 * 24 * 3600));
     match suggested_s {
-        Some(s) => remaining.min(Duration::from_secs(s.min(hard_cap_s)).saturating_sub(elapsed)),
-        None => remaining,
+        Some(s) => hard.min(started + Duration::from_secs(s.min(hard_cap_s))),
+        None => hard,
     }
 }
 // 参数各不同源（manifest / 路径 / 配置 / 语言 / 输入 / 预算 / 计时 / 信号 / 测试注入）：收拢 struct 不减少调用方负担。
@@ -163,7 +174,7 @@ async fn run_review(
     lang: &OutputLang,
     artifacts: &artifact::Artifacts,
     dismissed: &crate::job::dismissed::Dismissed,
-    remaining: Duration,
+    budget: Duration,
     started: std::time::Instant,
     sigterm: &mut Option<tokio::signal::unix::Signal>,
     over: Option<&crate::cli::BackendOverride<'_>>,
@@ -187,8 +198,8 @@ async fn run_review(
         }
         None => crate::job::prior::PriorRouting::default(),
     };
-    // 建议预算只能收紧，不能突破 manifest 硬上限（已跑掉的时间照扣）。
-    let remaining = effective_remaining(remaining, started.elapsed(), manifest.limits.wall_clock_s, prior.wall_clock_s);
+    // 建议预算只能收紧，不能突破 manifest 硬上限；用**绝对截止时刻**，准备阶段耗时只计一次。
+    let deadline = effective_deadline(started, budget, manifest.limits.wall_clock_s, prior.wall_clock_s);
     // 2.6 完整性：非 shallow、HEAD == pr.head_sha（解析成完整 commit 再比）、base/merge_base
     // 对象可得、merge-base 可算。缺必需对象 → error（不是披露后仍报 ok）。
     let head = crate::job::repo::ensure_complete(&repo, &manifest.pr, &base)?;
@@ -213,6 +224,14 @@ async fn run_review(
     }
     // P2：job 模式 + 验真开启 + 未声明 refuter → 跳过验真；报告必须显式披露。
     let refute_skipped = (cfg.review.refuters.enabled && roles.refuters.is_empty()).then_some("no_refuter");
+    // 正常与中断两条收口路径共享同一份运行事实（否则 SIGTERM 报告会丢 input_consistency / prior_routing）。
+    let base_extras = report::ReviewExtras {
+        input_consistency: Some(input_consistency.clone()),
+        prior_routing: (!prior.disclosure.is_null()).then(|| prior.disclosure.clone()),
+        refute_skipped,
+        extra_partial: extra_partial.clone(),
+        ..Default::default()
+    };
     let args = ReviewArgs {
         job_mode: true,
         base: Some(base),
@@ -236,7 +255,17 @@ async fn run_review(
     // 机器码用 config_invalid（无 pointer 时只给基础码），原始报错进 status_reason。
     let registry = crate::cli::build_registry_with(&args, cfg, over)
         .map_err(|e| JobFailure::with_reason("config_invalid", None, e))?;
-
+    // 预算已耗尽（含 registry 构造耗时）→ 不进模型派发，直接落 partial。
+    if deadline.saturating_duration_since(std::time::Instant::now()).is_zero() {
+        let text = JobFailure::new("wall_clock_exhausted", None).status_text(lang);
+        let usage = report::UsageOut {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            wall_clock_ms: started.elapsed().as_millis() as u64,
+        };
+        return Ok(report::partial_report(manifest, lang, &text, vec![], usage, cfg, 0, &base_extras));
+    }
     let sink = Arc::new(JobDirCellSink::new(out_dir.to_path_buf()));
     // 2.1 / 2.2：变更集来自已校验的 `inputs.diff_patch`，**不**再走 `run_review_dispatch`（它会重新 `git diff`）。
     // `head` 是完整性检查解析出的完整 commit（逐字透传给风险路由的 stamp）。
@@ -253,7 +282,7 @@ async fn run_review(
     let mut run = run;
     let outcome: Result<_, ()> = tokio::select! {
         r = &mut run => Ok(r),
-        _ = tokio::time::sleep(remaining) => Err(()),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(()),
         _ = wait_sigterm(sigterm) => Err(()),
     };
     match outcome {
@@ -265,8 +294,21 @@ async fn run_review(
             internal.findings = verified.findings;
             // 2.4：指纹 → dismissed（顺序固定：重锚/修正 quote 之后）。命中只标审计、不写 refuted。
             let ledger = crate::job::dismissed::apply(&mut internal.findings, dismissed);
-            // 被丢弃的 finding 不再计入严重度统计（否则「丢光了」仍报原计数）。
-            internal.stats = crate::domain::Stats::from_findings(&internal.findings);
+            // 被丢弃的 finding 不再计入严重度统计（否则「丢光了」仍报原计数）；
+            // dismissed 命中的也不计入任何计数口径（协调者 Q-A 第 2 条：只作留在 findings 里的事实）。
+            internal.stats = crate::domain::Stats::from_findings(
+                &internal.findings.iter().filter(|f| !f.previously_dismissed).cloned().collect::<Vec<_>>(),
+            );
+            // dismissed 的条目一律不写 refuted（人的决定 ≠ 证据证伪；模型若同时判 REFUTED 也以人的决定为准）。
+            for f in internal.findings.iter_mut().filter(|f| f.previously_dismissed) {
+                f.refute = None;
+            }
+            // 内部 verdict 也要认这个事实（报告不携带 verdict，但内部 blocking 口径必须一致）。
+            // Incomplete 来自 coverage/budget（扫描/深挖不完整），不得被重算抹掉。
+            if internal.verdict != crate::domain::Verdict::Incomplete {
+                let (block, floor) = crate::cli::verdict_thresholds(&args, cfg);
+                internal.verdict = crate::verdict::compute_verdict(&internal.findings, block, floor);
+            }
             if dropped > 0 {
                 extra_partial.push(JobFailure::new("quotes_dropped", Some(dropped.to_string())));
             }
@@ -276,14 +318,10 @@ async fn run_review(
                 cfg,
                 lang,
                 &report::ReviewExtras {
-                    input_consistency: Some(input_consistency),
-                    // 没有 prior_report 时不写这个键（附录 D：有 prior_report 时）。
-                    prior_routing: (!prior.disclosure.is_null()).then(|| prior.disclosure.clone()),
                     dropped_unverified_quotes: dropped,
                     ledger,
-                    refute_skipped,
                     extra_partial,
-                    ..Default::default()
+                    ..base_extras
                 },
             ))
         }
@@ -291,7 +329,7 @@ async fn run_review(
         Err(()) => {
             // 停止派发：drop 掉运行 future（tokio 取消），再用已落地 cell 组 partial。
             drop(run);
-            Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink, Some(&repo), dismissed, refute_skipped))
+            Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink, Some(&repo), dismissed, &base_extras))
         }
     }
 }
@@ -420,21 +458,64 @@ mod tests {
         assert_eq!(v["job_id"], "J1");
     }
 
-    /// 2.3：建议预算只能收紧，不能放宽；已耗时照扣。
+    /// 2.3：建议预算只能收紧，不能放宽；截止时刻是绝对的（准备阶段耗时不重复计入）。
     #[test]
     fn prior_budget_can_only_tighten() {
-        // `remaining` 已是「manifest 硬上限 − 已耗时」（60 − 10）。
-        let rem = Duration::from_secs(50);
-        let elapsed = Duration::from_secs(10);
-        // 建议比硬上限大 → 不放宽，仍用硬上限剩余。
-        assert_eq!(effective_remaining(rem, elapsed, 60, Some(900)), rem);
-        // 建议更小 → 用建议 − 已耗时。
-        assert_eq!(effective_remaining(rem, elapsed, 60, Some(30)), Duration::from_secs(20));
-        // 建议已耗尽 → 零（调用方按墙钟耗尽收口）。
-        assert_eq!(effective_remaining(rem, elapsed, 60, Some(5)), Duration::ZERO);
+        let started = std::time::Instant::now();
+        let budget = Duration::from_secs(60);
+        let hard = started + budget;
+        // 建议比硬上限大 → 不放宽。
+        assert_eq!(effective_deadline(started, budget, 60, Some(900)), hard);
+        // 建议更小 → 取建议。
+        assert_eq!(effective_deadline(started, budget, 60, Some(30)), started + Duration::from_secs(30));
         // 建议与硬上限同时收紧：取更小的那个。
-        assert_eq!(effective_remaining(rem, elapsed, 15, Some(900)), Duration::from_secs(5));
-        // 无建议 → 原剩余。
-        assert_eq!(effective_remaining(rem, elapsed, 60, None), rem);
+        assert_eq!(effective_deadline(started, budget, 15, Some(900)), started + Duration::from_secs(15));
+        // 无建议 → 硬上限。
+        assert_eq!(effective_deadline(started, budget, 60, None), hard);
     }
+
+    /// 2.3 出口验收：喂 prior_report 前后，**生效的**阻断阈值逐字节相同（用非默认配置，不只比 findings）。
+    #[test]
+    fn prior_routing_cannot_change_blocking_thresholds() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"review":{"blockThreshold":"low","confFloor":0.31},"providers":{}}"#,
+        )
+        .unwrap();
+        let mut args = ReviewArgs {
+            job_mode: true,
+            base: Some("0".repeat(40)),
+            scope: "branch".into(),
+            spec: vec![],
+            focus: None,
+            block_threshold: None,
+            conf_floor: None,
+            background: false,
+            format: "json".into(),
+            resume: None,
+            dismissed: None,
+            no_dismissed: true,
+            incremental_from: None,
+            tools: None,
+            test_command: None,
+            pack_only: false,
+        };
+        let before = crate::cli::verdict_thresholds(&args, &cfg);
+        assert_eq!(before, (crate::domain::Severity::Low, 0.31), "基线是非默认阈值");
+        // prior 投影只写镜头与 spec，阈值字段保持 None。
+        args.focus = Some("auth".into());
+        args.spec = vec!["/abs/spec.md".into()];
+        assert_eq!(crate::cli::verdict_thresholds(&args, &cfg), before);
+    }
+
+    /// 2.3：截断后的截止时刻不会因准备工作耗时被“补回去”（与旧 remaining 语义的差异）。
+    #[test]
+    fn deadline_is_absolute_not_recomputed_from_elapsed() {
+        let started = std::time::Instant::now();
+        let budget = Duration::from_secs(600);
+        let d = effective_deadline(started, budget, 600, Some(10));
+        assert_eq!(d, started + Duration::from_secs(10));
+        // 同一 deadline 在 3 秒后仍是起点 + 10s，而不是「剩余 7s + 当前」。
+        assert_eq!(d.saturating_duration_since(started + Duration::from_secs(3)), Duration::from_secs(7));
+    }
+
 }

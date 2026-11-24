@@ -30,6 +30,13 @@ pub fn is_full_sha(s: &str) -> bool {
 /// 检查顺序即错误码优先级：浅克隆 → HEAD 可解析 → HEAD == `pr.head_sha`（解析成完整 commit 再比）
 /// → `pr.base_sha` 对象 → `inputs.merge_base` 对象 → merge-base 可算。
 pub fn ensure_complete(repo: &Path, pr: &PrRef, merge_base: &str) -> Result<String, JobFailure> {
+    // manifest 的 `pr.head_sha` / `pr.base_sha` 是契约 SHA，不是 revision 表达式（`HEAD` / 分支名一律拒）。
+    if !is_full_sha(&pr.head_sha) || !is_full_sha(&pr.base_sha) {
+        return Err(JobFailure::new(
+            "job_manifest_unsupported",
+            Some("pr.head_sha / pr.base_sha must be 40-hex sha".into()),
+        ));
+    }
     if git::is_shallow_repository(repo).map_err(|_| incomplete("shallow"))? {
         return Err(incomplete("shallow"));
     }
@@ -44,6 +51,8 @@ pub fn ensure_complete(repo: &Path, pr: &PrRef, merge_base: &str) -> Result<Stri
     git::resolve_commit(repo, merge_base).map_err(|_| incomplete("merge_base"))?;
     // 只要求可算；**不**与 inputs.merge_base 比相等（Q2）。
     git::merge_base_of(repo, &pr.base_sha, &pr.head_sha).map_err(|_| incomplete("merge_base"))?;
+    // commit 对象存在不等于 diff 可算：两侧 tree/blob 也可能缺。只验本次 diff 所需对象（不做全仓历史扫描）。
+    git::diff_available(repo, merge_base).map_err(|_| incomplete("merge_base"))?;
     Ok(head)
 }
 
@@ -96,12 +105,43 @@ mod tests {
         let (_d, repo, base, head) = repo();
         let got = ensure_complete(&repo, &pr(&head, &base), &base).unwrap();
         assert_eq!(got, head);
-        // 前缀 sha 也能解析（rev-parse 的宽容），但比较的是完整 commit。
-        let short = &head[..8];
-        assert_eq!(
-            ensure_complete(&repo, &pr(short, &base), &base).unwrap(),
-            head
-        );
+    }
+
+    /// 契约的 `pr.*` 是 40 位 SHA；`HEAD` / 分支名 / 短 sha 这类 revision 表达式一律拒。
+    #[test]
+    fn non_sha_revisions_in_manifest_are_rejected() {
+        let (_d, repo, base, head) = repo();
+        for bad in ["HEAD", "main", &head[..8]] {
+            let e = ensure_complete(&repo, &pr(bad, &base), &base).unwrap_err();
+            assert_eq!(e.code, "job_manifest_unsupported", "{bad}");
+        }
+    }
+
+    /// 2.6 反例：base 的 commit 对象被删（真实缺对象）→ error，不是 partial/ok。
+    #[test]
+    fn missing_base_commit_object_is_repo_incomplete() {
+        let (_d, repo, base, head) = repo();
+        // 松散对象路径（刚提交、未 gc）。
+        let p = repo.join(".git/objects").join(&base[..2]).join(&base[2..]);
+        assert!(p.is_file(), "fixture 期望松散对象: {}", p.display());
+        std::fs::remove_file(&p).unwrap();
+        // pr.base_sha 指向 head（存在），merge_base 指向被删的 base。
+        let e = ensure_complete(&repo, &pr(&head, &head), &base).unwrap_err();
+        assert_eq!(e.full_code(), "repo_incomplete:merge_base", "{e:?}");
+    }
+
+    /// 2.6 反例：浅克隆 → error（base 对象根本不在本地）。
+    #[test]
+    fn shallow_checkout_is_repo_incomplete() {
+        let (d, repo, base, head) = repo();
+        let shallow = d.path().join("shallow");
+        let out = Command::new("git")
+            .args(["clone", "-q", "--depth", "1", &format!("file://{}", repo.display()), shallow.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let e = ensure_complete(&shallow, &pr(&head, &base), &base).unwrap_err();
+        assert_eq!(e.full_code(), "repo_incomplete:shallow", "{e:?}");
     }
 
     #[test]

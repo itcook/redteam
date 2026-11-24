@@ -200,8 +200,23 @@ pub fn rename_map(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<(Stri
 /// （R1 经济性被击穿）。单次全量 diff + 按 `diff --git` 边界切分则天然保留 rename 元数据。
 pub fn changed_files_since(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<FileChange>> {
     // `--end-of-options`：同 rename_map，base 拼进 range 字符串的位置参数防注入。
-    let full = git_at(dir, &["diff", "-M", "--end-of-options", &format!("{base}..HEAD")])?;
+    // `--no-ext-diff`：外部 diff 驱动会把输出换成别的格式（或执行任意程序）。
+    let full = git_at(dir, &["diff", "--no-ext-diff", "-M", "--end-of-options", &format!("{base}..HEAD")])?;
     Ok(split_diff_by_file(&full))
+}
+
+/// 2.6：本次 diff 所需对象是否齐全（两侧 tree/blob 都在本地）。
+/// `git diff --quiet` 以退出码表意（0=无差异 / 1=有差异，两者都算成功），其它 = 对象缺失或 git 故障。
+pub fn diff_available(dir: &std::path::Path, base: &str) -> anyhow::Result<bool> {
+    let range = format!("{base}..HEAD");
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "color.ui=false", "--no-pager", "diff", "--no-ext-diff", "--quiet", "--end-of-options", &range])
+        .output()?;
+    match out.status.code() {
+        Some(0) | Some(1) => Ok(true),
+        _ => anyhow::bail!("git diff {range} failed: {}", String::from_utf8_lossy(&out.stderr)),
+    }
 }
 
 /// 按 "diff --git a/X b/Y" 边界切分整份 diff；path 取 b 侧（rename 挂新路径下）。

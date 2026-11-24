@@ -353,6 +353,13 @@ pub fn partial_report(
     if let Some(s) = extras.refute_skipped {
         redteam["refute_skipped"] = json!(s);
     }
+    // 中断报告与正常报告共享同一份运行事实（2.3 / 2.1）。
+    if let Some(v) = &extras.prior_routing {
+        redteam["prior_routing"] = v.clone();
+    }
+    if let Some(v) = &extras.input_consistency {
+        redteam["input_consistency"] = v.clone();
+    }
     if extras.dropped_unverified_quotes > 0 {
         redteam["dropped_unverified_quotes"] = json!(extras.dropped_unverified_quotes);
     }

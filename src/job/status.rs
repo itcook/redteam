@@ -148,7 +148,10 @@ impl JobFailure {
     pub fn status_text(&self, lang: &OutputLang) -> StatusText {
         let mut t = render_one(&self.code, self.detail.as_deref(), lang);
         if let Some(r) = &self.reason {
-            t.reason = r.clone();
+            // 原始诊断常来自第三方（配置解析器 / backend），不随 language——但人读句仍以本地化模板起头，
+            // 不能整句被英文诊断覆盖（2.7 语言一致性）。
+            let head = t.reason.trim_end_matches(['：', ':']).to_string();
+            t.reason = if head.is_empty() { r.clone() } else { format!("{head}: {r}") };
         }
         t
     }
@@ -212,6 +215,16 @@ mod tests {
         assert_eq!(t.code, "scan_incomplete:2/5");
         assert!(t.reason.contains("2/5") && t.reason.contains("3 items skipped"), "{t:?}");
         assert!(render_partial(&[], &en()).is_none());
+    }
+
+    #[test]
+    fn raw_diagnostic_does_not_bypass_localization() {
+        let f = JobFailure::with_reason("config_invalid", None, "unknown backend kind `google`");
+        let z = f.status_text(&zh());
+        assert!(z.reason.starts_with("executor config 不合法"), "{z:?}");
+        assert!(z.reason.contains("google"));
+        let e = f.status_text(&en());
+        assert!(e.reason.starts_with("invalid executor config"), "{e:?}");
     }
 
     #[test]

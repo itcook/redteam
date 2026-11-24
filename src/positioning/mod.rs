@@ -122,15 +122,60 @@ pub fn anchor_near(root: &Path, file: &str, quote: &str, old_line: u32) -> Optio
 /// - quote 是检出原文的**字节切片**（首 token 到末 token），不是模型报的文本；
 /// - 行号是该切片在检出中的真实行范围。
 ///
-/// 定位器是「空白无关的 token 序列匹配」：整段 quote 的每个 token 必须与文件里的一段连续 token
-/// **逐字相等**。所以：
-/// - 缩进 / 多空格 / 换行差异 → 命中，并被检出原文纠正；
-/// - 首行真实、后续行虚构 → 整段 token 序列对不上 → `None`（不得把幻觉换成别处的真代码）；
-/// - 多命中 → 取最接近模型自报行号的那处（与 `locate_quote_near` 同口径）。
+/// 定位器两级：先找**逐字子串**（模型的 quote 常常是行内片段，如 `danger()` 落在
+/// `return danger();` 里），找不到再退回「空白无关的 token 序列匹配」（缩进/多空格/换行差异）。
+/// 两条路都要求**整段 quote 的内容**匹配：首行真实、后续行虚构时 token 序列对不上 → `None`
+/// （不得把幻觉换成别处的真代码）。多命中取最接近模型自报行号的那处。
+///
+/// 命中后 quote = 检出原文的**字节切片**，行号 = 该切片的真实行范围；最后再断言 slice 确实落在
+/// 报告的行范围内（与 hibot 的 `line_start..line_end` 复核同口径）。
 ///
 /// 与 `anchor_review_findings` 的差别：后者只改行号、保留模型 quote；这里连 quote 一起换成检出原文。
 pub fn verbatim_span(root: &Path, file: &str, quote: &str, hint_line: u32) -> Option<(u32, u32, String)> {
     let content = safe_read(root, file)?;
+    let trimmed = quote.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let hit = literal_span(&content, trimmed, hint_line).or_else(|| token_span(&content, trimmed, hint_line))?;
+    let (start, end) = hit;
+    if start >= end || end > content.len() {
+        return None;
+    }
+    let (ls, le) = (line_at(&content, start), line_at(&content, end - 1));
+    let quote = content[start..end].to_string();
+    // 独立断言：报告的行范围内必须逐字包含这个 quote（不只依赖构造过程）。
+    let lines: Vec<&str> = content.lines().collect();
+    let block = lines[(ls - 1) as usize..(le as usize).min(lines.len())].join("\n");
+    if !block.contains(&quote) {
+        return None;
+    }
+    Some((ls, le, quote))
+}
+
+/// 1-based 行号（`byte` 必须是字符边界）。
+fn line_at(content: &str, byte: usize) -> u32 {
+    1 + content[..byte].bytes().filter(|b| *b == b'\n').count() as u32
+}
+
+/// 逐字子串：命中多处时取起点行最接近 `hint_line` 的。
+fn literal_span(content: &str, quote: &str, hint_line: u32) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, u32)> = None;
+    let mut from = 0usize;
+    while let Some(pos) = content[from..].find(quote) {
+        let start = from + pos;
+        let distance = (i64::from(line_at(content, start)) - i64::from(hint_line)).unsigned_abs() as u32;
+        match best {
+            Some((_, d)) if d <= distance => {}
+            _ => best = Some((start, distance)),
+        }
+        from = start + quote.len();
+    }
+    best.map(|(start, _)| (start, start + quote.len()))
+}
+
+/// 空白无关的 token 序列匹配：返回文件里那段连续 token 的字节区间。
+fn token_span(content: &str, quote: &str, hint_line: u32) -> Option<(usize, usize)> {
     let want: Vec<&str> = quote.split_whitespace().collect();
     if want.is_empty() {
         return None;
@@ -157,7 +202,7 @@ pub fn verbatim_span(root: &Path, file: &str, quote: &str, hint_line: u32) -> Op
     if want.len() > toks.len() {
         return None;
     }
-    let mut best: Option<(usize, u32)> = None; // (窗口起点, 与 hint 的行距)
+    let mut best: Option<(usize, u32)> = None;
     for i in 0..=(toks.len() - want.len()) {
         let hit = want.iter().enumerate().all(|(k, w)| {
             let (s, e, _) = toks[i + k];
@@ -173,10 +218,9 @@ pub fn verbatim_span(root: &Path, file: &str, quote: &str, hint_line: u32) -> Op
         }
     }
     let (i, _) = best?;
-    let start = toks[i].0;
-    let end = toks[i + want.len() - 1].1;
-    Some((toks[i].2, toks[i + want.len() - 1].2, content[start..end].to_string()))
+    Some((toks[i].0, toks[i + want.len() - 1].1))
 }
+
 
 /// scanner 疑点锚定结果（批 D-1）：`dropped` = 被丢总数（quote 不在文件 + 文件不可读），`dropped_unreadable` 单列文件不可读
 /// （不存在 / 越界 / 二进制），F 写 cell warn 时分开说，不把「读不到」误诊成「quote 幻觉」（评审 #10）。
@@ -548,6 +592,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/c.rs", "if (x) {\n    y();\n}\n");
         assert!(verbatim_span(dir.path(), "src/c.rs", "if (x) {\n    fabricated();\n}", 1).is_none());
+    }
+
+    /// 合法子串：模型的 quote 常常只是行内片段（`danger()` 落在 `return danger();` 里）。
+    #[test]
+    fn verbatim_span_accepts_inline_substrings() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/e.rs", "fn f() {\n    return danger();\n}\n");
+        let (ls, le, q) = verbatim_span(dir.path(), "src/e.rs", "danger()", 1).unwrap();
+        assert_eq!((ls, le, q.as_str()), (2, 2, "danger()"));
+        assert!(verbatim_span(dir.path(), "src/e.rs", "danger(1)", 1).is_none(), "内容不符仍要拒绝");
     }
 
     /// 多命中取最接近自报行号者（短 quote 在同文件复现时不能锚到首现）。

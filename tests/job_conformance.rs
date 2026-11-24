@@ -722,6 +722,8 @@ async fn dismissed_is_audited_but_never_refuted() {
     assert_eq!(ledger["dismissed"], true);
     assert_eq!(ledger["actor"], "alice");
     assert_eq!(ledger["reason"], "false positive, see #12");
+    // 不阻塞：不计入任何计数口径（severity 统计也不认它）。
+    assert_eq!(r["extensions"]["redteam"]["stats"]["total"], 0, "被驳回项不计入计数: {r}");
 }
 
 /// 2.4：坏 CSV → error（不静默当空台账）。
@@ -792,28 +794,51 @@ async fn job_mode_with_explicit_refuter_runs_refute() {
     assert_eq!(r["findings"][0]["refuted"], false, "UPHELD 不算证伪");
 }
 
-/// 2.7：`language` 落地——模型产出（prompt 语言槽）、finding 文本、`status_reason` 三处一致；
-/// `run.warnings` / `extensions` 的机器字段不随语言变化。
+/// 2.7：`language` 落地——scanner / reviewer / refuter 的 prompt 语言槽、模型产出（cell 与 finding 文本）、
+/// `status_reason` 三处一致；`run.warnings` / `extensions` 的机器字段不随语言变化。
 #[tokio::test]
 async fn language_is_consistent_across_prompts_findings_and_status_reason() {
     let mut warnings_by_lang = Vec::new();
-    for (value, prompt_name, title, reason_needle, hint) in [
-        ("zh_CN", "Simplified Chinese (简体中文)", "SQL 注入", "规范文档不可读", "SQL 注入风险"),
-        ("en_US", "English", "SQL injection", "spec files unreadable", "sql injection risk"),
+    for (value, prompt_name, title, body, recommendation, reason_needle, hint) in [
+        (
+            "zh_CN",
+            "Simplified Chinese (简体中文)",
+            "SQL 注入",
+            "拼接 SQL 导致注入",
+            "改用参数化查询",
+            "规范文档不可读",
+            "SQL 注入风险",
+        ),
+        (
+            "en_US",
+            "English",
+            "SQL injection",
+            "string concatenation enables injection",
+            "use parameterized queries",
+            "spec files unreadable",
+            "sql injection risk",
+        ),
     ] {
         let scanner = format!(
             r#"{{"suspicions":[{{"file":"src/app.js","line_start":2,"line_end":2,"hint":"{hint}","category":"L2","confidence":0.9,"quote":"{QUOTE}"}}],"needs":[],"scanned_areas":[]}}"#
         );
         let reviewer = serde_json::json!({
-            "findings": [{"severity":"high","title":title,"body":"body","file":"src/app.js",
+            "findings": [{"severity":"high","title":title,"body":body,"file":"src/app.js",
                           "line_start":2,"line_end":2,"confidence":0.9,
-                          "recommendation":"parameterize","quote":QUOTE}],
+                          "recommendation":recommendation,"quote":QUOTE}],
             "needs": []
         })
         .to_string();
+        let refuter = serde_json::json!({"verdict": "UPHELD", "reason": reason_needle}).to_string();
         let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner)));
         let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer)));
-        let fx = make_repo_and_job("review", &config_with(Some(value), false), true, false);
+        let refute = Arc::new(FakeChatBackend::repeating(turn(&refuter)));
+
+        // 开启验真并显式声明 refuter（P2：job + enabled + 有 refuter → 真跑）。
+        let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some(value), false)).unwrap();
+        cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+        cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+        let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
         // 用「声明了但读不到的 spec」制造 partial，才能断言 status_reason 的语言。
         let prior = serde_json::json!({
             "schema": "hibot.audit.report.triage/1", "job_id": "T1", "kind": "triage", "status": "ok",
@@ -826,25 +851,51 @@ async fn language_is_consistent_across_prompts_findings_and_status_reason() {
         })
         .to_string();
         add_prior_report(&fx.job, &prior);
-        let over = fake_override(scan.clone(), review);
+
+        let over = Box::new({
+            let (scan, review, refute) = (scan.clone(), review.clone(), refute.clone());
+            move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+                if em.provider != "p1" {
+                    return None;
+                }
+                match em.id.as_str() {
+                    "s" => Some(Box::new(scan.clone())),
+                    "r" => Some(Box::new(review.clone())),
+                    "v" => Some(Box::new(refute.clone())),
+                    _ => None,
+                }
+            }
+        }) as Box<redteam::cli::BackendOverride<'_>>;
         assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
         let r = read_report(&fx.job);
 
-        // ① prompt 语言槽
-        let sys = match &scan.messages_at(0)[0] {
+        let system_of = |b: &FakeChatBackend| match &b.messages_at(0)[0] {
             redteam::provider::tool_loop::ChatMessage::System(s) => s.clone(),
             other => panic!("首条须是 system: {other:?}"),
         };
-        assert!(sys.contains(prompt_name), "{value} 的语言槽缺失: {sys}");
-        // ② finding 文本（模型按其语言产出，报告原样落地）
-        assert_eq!(r["findings"][0]["title"], title, "{r}");
-        let cell_hint = r["extensions"]["redteam"]["cells"][0]["output"]["suspicions"][0]["hint"].clone();
-        assert_eq!(cell_hint, hint, "cell 输出随 language: {r}");
+        // ① 三类模型请求的语言槽
+        assert!(system_of(&scan).contains(prompt_name), "{value} scanner 语言槽缺失");
+        assert!(system_of(&review).contains(prompt_name), "{value} reviewer 语言槽缺失");
+        assert!(system_of(&refute).contains(prompt_name), "{value} refuter 语言槽缺失");
+        // ② 模型产出原样落地：cell hint + finding 文本
+        assert_eq!(
+            r["extensions"]["redteam"]["cells"][0]["output"]["suspicions"][0]["hint"],
+            hint,
+            "{r}"
+        );
+        assert_eq!(r["findings"][0]["title"], title);
+        assert_eq!(r["findings"][0]["body"], body);
+        assert_eq!(r["findings"][0]["recommendation"], recommendation);
         // ③ status_reason 随 language
         assert_eq!(r["status"], "partial", "{r}");
         let reason = r["status_reason"].as_str().unwrap();
         assert!(reason.contains(reason_needle), "{value} 的 status_reason 语言不符: {reason}");
-        // 机器字段不随语言：language 披露 + 同一份 warnings
+        // 验真确实跑过（不是靠“跳过”凑出来的报告）
+        assert!(
+            r["extensions"]["redteam"]["run"]["deep"]["refute_triggered"].as_u64().unwrap_or(0) >= 1,
+            "{r}"
+        );
+        // 机器字段不随语言
         assert_eq!(r["extensions"]["redteam"]["language"]["value"], value);
         warnings_by_lang.push(
             r["extensions"]["redteam"]["run"]["warnings"].as_array().cloned().unwrap_or_default(),

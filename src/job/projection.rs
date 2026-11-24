@@ -15,10 +15,17 @@ use std::path::Path;
 /// 披露列表的封顶（协调者 2026-11-24 裁：各 ≤20 项 + `*_total`，按路径字典序）。
 const MAX_DISCLOSED: usize = 20;
 
-/// patch → 逐文件变更。**非空 patch 切不出任何文件 = 形态不支持**（例如 `--no-prefix`），
-/// 必须报错而不是静默退化成「零变更的 ok」。
+/// patch → 逐文件变更。**每个 `diff --git` 边界都必须被识别**：
+/// - 非空 patch 切不出任何文件（例如 `--no-prefix`）→ 形态不支持；
+/// - 边界数与解析出的文件数不符（例如带引号转义的路径 `diff --git "a/x y" "b/x y"`）→ 形态不支持。
+///
+/// 两者都必须报错：静默把后一份 diff 并进前一个文件，会让评审看错变更集却仍报 `ok`。
 pub fn from_patch(patch: &str) -> Result<Vec<FileChange>, JobFailure> {
+    let boundaries = patch.lines().filter(|l| l.starts_with("diff --git ")).count();
     let changes = git::split_diff_by_file(patch);
+    if boundaries != changes.len() {
+        return Err(JobFailure::new("input_schema_mismatch", Some("diff_patch".into())));
+    }
     if changes.is_empty() && !patch.trim().is_empty() {
         return Err(JobFailure::new(
             "input_schema_mismatch",
@@ -101,7 +108,8 @@ fn digest_map(changes: &[FileChange]) -> BTreeMap<String, String> {
         .iter()
         .map(|c| {
             let mut h = Sha256::new();
-            h.update(c.diff.trim_end().as_bytes());
+            // 只抹掉**换行**（patch 文件末尾多一个 \n 属于搬运差异）；行尾空格是内容，不能动。
+            h.update(c.diff.trim_end_matches('\n').as_bytes());
             (
                 c.path.clone(),
                 h.finalize().iter().map(|b| format!("{b:02x}")).collect(),
@@ -131,6 +139,20 @@ mod tests {
             e.full_code(),
             "input_schema_mismatch:diff_patch",
             "无 diff --git 头 = 形态不支持"
+        );
+    }
+
+    /// 带引号转义路径（Git 对空格/非 ASCII 的默认输出形态）目前不支持：必须报错，
+    /// 不能把它的 diff 静默并进前一个文件。
+    #[test]
+    fn quoted_path_boundaries_are_rejected_not_silently_merged() {
+        let patch = concat!(
+            "diff --git a/a.js b/a.js\n@@ -1 +1 @@\n-x\n+y\n",
+            "diff --git \"a/x y\" \"b/x y\"\n@@ -1 +1 @@\n-p\n+q\n",
+        );
+        assert_eq!(
+            from_patch(patch).unwrap_err().full_code(),
+            "input_schema_mismatch:diff_patch"
         );
     }
 
@@ -208,6 +230,16 @@ mod tests {
         assert_eq!(v["differing"], json!(["a.js"]));
         assert_eq!(v["only_in_patch_total"], 1);
         assert_eq!(v["differing_total"], 1);
+    }
+
+    /// 行尾空格是内容：不能像换行那样被抹掉，否则“只差尾随空格”的两份 diff 会被当成一致。
+    #[test]
+    fn trailing_spaces_are_part_of_the_digest() {
+        let with = digest_map(&[change("a.js", "+x \n")]);
+        let without = digest_map(&[change("a.js", "+x\n")]);
+        assert_ne!(with["a.js"], without["a.js"]);
+        let one_newline = digest_map(&[change("a.js", "+x \n\n")]);
+        assert_eq!(with["a.js"], one_newline["a.js"], "只差末尾换行算搬运差异");
     }
 
     #[test]

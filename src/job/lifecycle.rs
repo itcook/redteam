@@ -118,7 +118,7 @@ pub fn interrupted_report(
     sink: &JobDirCellSink,
     root: Option<&std::path::Path>,
     dismissed: &crate::job::dismissed::Dismissed,
-    refute_skipped: Option<&'static str>,
+    base_extras: &crate::job::report::ReviewExtras,
 ) -> HibotReport {
     let (cells, _phases) = sink.snapshot();
     let findings = findings_from_cells(&cells);
@@ -136,12 +136,10 @@ pub fn interrupted_report(
     let usage = usage_from_cells(&cells);
     let failure = JobFailure::new("wall_clock_exhausted", None);
     let text: StatusText = failure.status_text(lang);
-    let mut extras = crate::job::report::ReviewExtras {
-        dropped_unverified_quotes: dropped,
-        ledger,
-        refute_skipped,
-        ..Default::default()
-    };
+    // 与正常路径共享本次运行事实（input_consistency / prior_routing / refute_skipped / 已有 partial 原因）。
+    let mut extras = base_extras.clone();
+    extras.dropped_unverified_quotes = dropped;
+    extras.ledger = ledger;
     if dropped > 0 {
         extras.extra_partial.push(JobFailure::new("quotes_dropped", Some(dropped.to_string())));
     }
@@ -162,6 +160,18 @@ mod tests {
         let mut f = crate::domain::finding::fixtures::finding(id, Severity::High, 1, "m");
         f.id = id.into();
         f
+    }
+
+    fn manifest() -> JobManifest {
+        JobManifest::parse(r#"{
+          "schema":"hibot.audit.job.review/1","job_id":"J1","kind":"review",
+          "repo":{"id":1,"full_name":"o/r"},
+          "pr":{"number":7,"head_sha":"abcdef0","base_sha":"1234567"},
+          "executor":{"name":"redteam","version":"0.1.0"},
+          "limits":{"wall_clock_s":600},
+          "paths":{"repo":"../repo","out":"out","config":"config/executor.redteam.json"},
+          "inputs":{}
+        }"#).unwrap()
     }
 
     #[test]
@@ -228,10 +238,59 @@ mod tests {
             &sink,
             None,
             &crate::job::dismissed::Dismissed::default(),
-            None,
+            &crate::job::report::ReviewExtras::default(),
         );
         assert_eq!(r.status, crate::job::status::JobStatus::Partial);
         assert!(r.status_reason.unwrap().contains("wall-clock budget"));
         assert_eq!(r.extensions["redteam"]["status_code"], "wall_clock_exhausted");
     }
+
+    /// 2.5/2.4 + 2.3：中断路径与正常路径走同一条收口链，并保留准备阶段拿到的运行事实。
+    #[test]
+    fn interrupted_report_shares_the_finalize_chain_and_run_facts() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.rs"), "fn f() {\n    let x  =  1;\n}\n").unwrap();
+        let sink = JobDirCellSink::new(d.path().join("out"));
+
+        let mut f = finding("f1");
+        f.file = "src/a.rs".into();
+        f.quote = "let x = 1;".into(); // 与检出空白不同：必须被检出原文纠正
+        f.title = "t".into();
+        f.line_start = 99;
+        sink.on_cell(CellRecord::ok("review[x]", "p/r", CellOutput::Review { findings: vec![f], needs: vec![] }));
+
+        // dismissed 按**修正后**的 quote 生成的指纹命中。
+        let fp = crate::job::fingerprint::of("src/a.rs", "let x  =  1;", "t");
+        let csv = format!("fingerprint,actor,reason,created_at\n{fp},alice,false positive,2026-11-20T10:00:00Z\n");
+        let dismissed = crate::job::dismissed::parse(csv.as_bytes()).unwrap();
+        let base_extras = crate::job::report::ReviewExtras {
+            input_consistency: Some(serde_json::json!({"match": true, "files": 1})),
+            prior_routing: Some(serde_json::json!({"present": true})),
+            refute_skipped: Some("no_refuter"),
+            ..Default::default()
+        };
+        let lang = crate::config::Language::EnUs.output();
+        let r = interrupted_report(
+            &manifest(),
+            &lang,
+            &Config::default(),
+            &sink,
+            Some(&repo),
+            &dismissed,
+            &base_extras,
+        );
+
+        assert_eq!(r.status, crate::job::status::JobStatus::Partial);
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].quote, "let x  =  1;", "中断报告也要用检出原文修正 quote");
+        assert_eq!((r.findings[0].line_start, r.findings[0].line_end), (2, 2), "行号要重锚");
+        assert_eq!(r.findings[0].refuted, false);
+        assert_eq!(r.findings[0].extensions["redteam"]["ledger"]["dismissed"], true);
+        assert_eq!(r.extensions["redteam"]["input_consistency"]["match"], true);
+        assert_eq!(r.extensions["redteam"]["prior_routing"]["present"], true);
+        assert_eq!(r.extensions["redteam"]["refute_skipped"], "no_refuter");
+    }
+
 }
