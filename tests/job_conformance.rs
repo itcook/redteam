@@ -582,3 +582,71 @@ async fn merge_base_must_be_a_full_sha() {
     assert_eq!(r["status"], "error");
     assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:merge_base");
 }
+
+/// 声明 `prior_report` 输入（schema 固定 triage 报告）。
+fn add_prior_report(job: &Path, body: &str) {
+    let rel = "input/prior-report.json";
+    std::fs::write(job.join(rel), body).unwrap();
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(job.join("job.json")).unwrap()).unwrap();
+    m["inputs"]["prior_report"] = serde_json::json!({
+        "path": rel,
+        "sha256": sha256_hex(body.as_bytes()),
+        "schema": "hibot.audit.report.triage/1",
+    });
+    std::fs::write(job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+}
+
+/// 2.3：prior_report 只调**镜头与预算**，不改阻断阈值；specs 不可读 → partial 点名。
+#[tokio::test]
+async fn prior_report_only_adjusts_lens_and_budget() {
+    // 对照组：无 prior_report。
+    let scan_a = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review_a = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let fx_a = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let over_a = fake_override(scan_a, review_a);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx_a.job, Some(over_a.as_ref())).await, 0);
+    let base_report = read_report(&fx_a.job);
+    assert_eq!(base_report["status"], "ok", "{base_report}");
+
+    // 实验组：focus + 一份可读 spec + 一份不可读 spec + 建议预算。
+    let scan_b = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review_b = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
+    let fx_b = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let prior = serde_json::json!({
+        "schema": "hibot.audit.report.triage/1",
+        "job_id": "T1", "kind": "triage", "status": "ok",
+        "input": {"head_sha": "h", "base_sha": "b"},
+        "executor": {"name": "redteam", "version": "0.1.0"},
+        // 历史 findings / 计数必须被忽略：它们不是本轮 review 的阻断项。
+        "findings": [{"fingerprint": "sha256:deadbeef"}],
+        "summary": {
+            "security_tier": "critical", "blockers_count": 9, "structural_count": 3, "local_count": 1,
+            "intent_undelivered": true, "scope_creep_count": 2, "risk": "high",
+            "convention_drift": "high", "fit": "poor",
+            "routing": {"focus": ["sql-injection-focus"], "specs": ["README.md", "docs/missing.md"], "wall_clock_s": 600}
+        },
+        "usage": {"input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 0, "wall_clock_ms": 1},
+        "extensions": {}
+    }).to_string();
+    add_prior_report(&fx_b.job, &prior);
+    let over_b = fake_override(scan_b.clone(), review_b);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx_b.job, Some(over_b.as_ref())).await, 0);
+    let r = read_report(&fx_b.job);
+
+    // specs 不可读 → partial + 点名（不是 ok）。
+    assert_eq!(r["status"], "partial", "{r}");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "routing_specs_unreadable:1");
+    // 镜头生效：focus 进了 scanner prompt。
+    let prompt = format!("{:?}", scan_b.messages_at(0));
+    assert!(prompt.contains("sql-injection-focus"), "routing.focus 必须进 prompt: {prompt}");
+    // 披露只含 routing 三件事。
+    let pr = &r["extensions"]["redteam"]["prior_routing"];
+    assert_eq!(pr["present"], true);
+    assert_eq!(pr["focus"], serde_json::json!(["sql-injection-focus"]));
+    assert_eq!(pr["specs_used"], serde_json::json!(["README.md"]));
+    assert_eq!(pr["specs_unreadable"], 1);
+    assert_eq!(pr["wall_clock_s"], 600);
+    // 阈值不变：findings 与无 prior 的对照完全一致（prior 不消费历史 findings / 计数 / tier）。
+    assert_eq!(r["findings"], base_report["findings"], "prior_report 不得改判定");
+    assert_eq!(r["extensions"]["redteam"]["stats"], base_report["extensions"]["redteam"]["stats"]);
+}

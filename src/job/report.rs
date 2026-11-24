@@ -147,6 +147,8 @@ pub fn kind_not_implemented_verify(
 pub struct ReviewExtras {
     /// 2.1：`diff_patch` 与 git 采集的一致性与否（只披露）。
     pub input_consistency: Option<Value>,
+    /// 2.3：`prior_report` 的 routing 投影（只披露 actual 用了什么）。
+    pub prior_routing: Option<Value>,
     /// 2.1–2.5 之外的额外 `partial` 原因（如 `quotes_dropped` / `routing_specs_unreadable`）。
     pub extra_partial: Vec<JobFailure>,
 }
@@ -189,6 +191,10 @@ pub fn review_report(
     });
     if let Some(t) = partial {
         redteam["status_code"] = json!(t.code);
+    }
+    // 2.3：prior_report 的 routing 投影（只披露实际用了什么）。
+    if let Some(v) = &extras.prior_routing {
+        redteam["prior_routing"] = v.clone();
     }
     // 2.1：patch 与 git 的不一致只披露，不改行为。
     if let Some(v) = &extras.input_consistency {

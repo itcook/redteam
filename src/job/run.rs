@@ -126,12 +126,22 @@ pub async fn run_with(
         let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink);
         return finish(&out_dir, r);
     }
-    match run_review(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, remaining, &mut sigterm, over).await {
+    match run_review(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, remaining, started, &mut sigterm, over).await {
         Ok(r) => finish(&out_dir, r),
         Err(e) => finish(&out_dir, report::error_report(&manifest, &lang, &e)),
     }
 }
 
+/// 2.3：`prior_report.summary.routing.wall_clock_s` 是**建议**预算——只能收紧，不能放宽。
+/// 生效值 = min(manifest 硬上限下的剩余, 建议预算 − 已耗时)。
+fn effective_remaining(remaining: Duration, elapsed: Duration, hard_cap_s: u64, suggested_s: Option<u64>) -> Duration {
+    match suggested_s {
+        Some(s) => remaining.min(Duration::from_secs(s.min(hard_cap_s)).saturating_sub(elapsed)),
+        None => remaining,
+    }
+}
+// 参数各不同源（manifest / 路径 / 配置 / 语言 / 输入 / 预算 / 计时 / 信号 / 测试注入）：收拢 struct 不减少调用方负担。
+#[allow(clippy::too_many_arguments)]
 async fn run_review(
     manifest: &JobManifest,
     job_dir: &Path,
@@ -140,6 +150,7 @@ async fn run_review(
     lang: &OutputLang,
     artifacts: &artifact::Artifacts,
     remaining: Duration,
+    started: std::time::Instant,
     sigterm: &mut Option<tokio::signal::unix::Signal>,
     over: Option<&crate::cli::BackendOverride<'_>>,
 ) -> Result<report::HibotReport, JobFailure> {
@@ -152,6 +163,18 @@ async fn run_review(
         .filter(|s| crate::job::repo::is_full_sha(s))
         .ok_or_else(|| JobFailure::new("input_schema_mismatch", Some("merge_base".into())))?
         .to_string();
+    // 2.3 prior_report（可选）：**只**读 summary.routing。历史 findings / 计数 / tier 一律不消费。
+    let prior = match artifacts.get("prior_report") {
+        Some(a) => {
+            let text = a
+                .text()
+                .ok_or_else(|| JobFailure::new("input_schema_mismatch", Some("prior_report".into())))?;
+            crate::job::prior::parse(text, &repo)?
+        }
+        None => crate::job::prior::PriorRouting::default(),
+    };
+    // 建议预算只能收紧，不能突破 manifest 硬上限（已跑掉的时间照扣）。
+    let remaining = effective_remaining(remaining, started.elapsed(), manifest.limits.wall_clock_s, prior.wall_clock_s);
     // 2.6 完整性：非 shallow、HEAD == pr.head_sha（解析成完整 commit 再比）、base/merge_base
     // 对象可得、merge-base 可算。缺必需对象 → error（不是披露后仍报 ok）。
     let head = crate::job::repo::ensure_complete(&repo, &manifest.pr, &base)?;
@@ -161,6 +184,11 @@ async fn run_review(
         .ok_or_else(|| JobFailure::new("input_schema_mismatch", Some("diff_patch".into())))?;
     let changes = crate::job::projection::from_patch(patch)?;
     let input_consistency = crate::job::projection::consistency(&repo, &base, &changes);
+    // 2.3：specs 声明了但读不到的数目 → `partial` + `routing_specs_unreadable:<n>`（点名，不静默）。
+    let mut extra_partial = Vec::new();
+    if prior.specs_unreadable > 0 {
+        extra_partial.push(JobFailure::new("routing_specs_unreadable", Some(prior.specs_unreadable.to_string())));
+    }
     // 角色最小集（P2）：review = scanner + reviewer；refuter 可选。
     let roles = cfg.active_roles();
     if roles.scanners.is_empty() {
@@ -173,8 +201,9 @@ async fn run_review(
         job_mode: true,
         base: Some(base),
         scope: "branch".into(),
-        spec: vec![],
-        focus: None,
+        // 2.3：只调镜头（focus）与规范注入；阈值（block_threshold / conf_floor）恒为配置值。
+        spec: prior.specs.clone(),
+        focus: prior.focus.clone(),
         block_threshold: None,
         conf_floor: None,
         background: false,
@@ -217,7 +246,12 @@ async fn run_review(
             &internal,
             cfg,
             lang,
-            &report::ReviewExtras { input_consistency: Some(input_consistency), ..Default::default() },
+            &report::ReviewExtras {
+                input_consistency: Some(input_consistency),
+                prior_routing: Some(prior.disclosure.clone()),
+                extra_partial,
+                ..Default::default()
+            },
         )),
         Ok(Err(e)) => Err(JobFailure::new("internal_panic", Some(e.to_string()))),
         Err(()) => {
@@ -350,5 +384,23 @@ mod tests {
         assert_eq!(v["extensions"]["redteam"]["status_code"], "internal_panic", "机器码不拼诊断全文");
         assert!(v["status_reason"].as_str().unwrap().contains("boom"));
         assert_eq!(v["job_id"], "J1");
+    }
+
+    /// 2.3：建议预算只能收紧，不能放宽；已耗时照扣。
+    #[test]
+    fn prior_budget_can_only_tighten() {
+        // `remaining` 已是「manifest 硬上限 − 已耗时」（60 − 10）。
+        let rem = Duration::from_secs(50);
+        let elapsed = Duration::from_secs(10);
+        // 建议比硬上限大 → 不放宽，仍用硬上限剩余。
+        assert_eq!(effective_remaining(rem, elapsed, 60, Some(900)), rem);
+        // 建议更小 → 用建议 − 已耗时。
+        assert_eq!(effective_remaining(rem, elapsed, 60, Some(30)), Duration::from_secs(20));
+        // 建议已耗尽 → 零（调用方按墙钟耗尽收口）。
+        assert_eq!(effective_remaining(rem, elapsed, 60, Some(5)), Duration::ZERO);
+        // 建议与硬上限同时收紧：取更小的那个。
+        assert_eq!(effective_remaining(rem, elapsed, 15, Some(900)), Duration::from_secs(5));
+        // 无建议 → 原剩余。
+        assert_eq!(effective_remaining(rem, elapsed, 60, None), rem);
     }
 }
