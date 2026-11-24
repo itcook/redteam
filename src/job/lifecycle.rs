@@ -108,18 +108,35 @@ pub fn usage_from_cells(cells: &[CellRecord]) -> UsageOut {
 }
 
 /// SIGTERM / 墙钟耗尽：停止派发后写 partial（调用方已 drop 运行 future）。
+///
+/// `root` 给了就跑与正常路径同一条收口链（2.5：逐字重锚 → 指纹 → dismissed），
+/// 否则只说「已落地的 cell」——准备阶段就中断时还没有 findings。
 pub fn interrupted_report(
     manifest: &JobManifest,
     lang: &crate::config::OutputLang,
     cfg: &Config,
     sink: &JobDirCellSink,
+    root: Option<&std::path::Path>,
 ) -> HibotReport {
     let (cells, _phases) = sink.snapshot();
     let findings = findings_from_cells(&cells);
+    let upstream = crate::job::quote::upstream_dropped(&cells);
+    let (findings, self_dropped) = match root {
+        Some(root) => {
+            let v = crate::job::quote::verify(findings, root);
+            (v.findings, v.dropped)
+        }
+        None => (findings, 0),
+    };
+    let dropped = self_dropped + upstream;
     let usage = usage_from_cells(&cells);
     let failure = JobFailure::new("wall_clock_exhausted", None);
     let text: StatusText = failure.status_text(lang);
-    partial_report(manifest, lang, &text, findings, usage, cfg, 0)
+    let mut extras = crate::job::report::ReviewExtras { dropped_unverified_quotes: dropped, ..Default::default() };
+    if dropped > 0 {
+        extras.extra_partial.push(JobFailure::new("quotes_dropped", Some(dropped.to_string())));
+    }
+    partial_report(manifest, lang, &text, findings, usage, cfg, 0, &extras)
 }
 
 /// 正常收口后的内部报告是否要落到 `out/` 之外？不：Phase 1 只写 `out/report.json`。
@@ -195,7 +212,7 @@ mod tests {
           "inputs":{}
         }"#).unwrap();
         let lang = crate::config::Language::EnUs.output();
-        let r = interrupted_report(&manifest, &lang, &Config::default(), &sink);
+        let r = interrupted_report(&manifest, &lang, &Config::default(), &sink, None);
         assert_eq!(r.status, crate::job::status::JobStatus::Partial);
         assert!(r.status_reason.unwrap().contains("wall-clock budget"));
         assert_eq!(r.extensions["redteam"]["status_code"], "wall_clock_exhausted");

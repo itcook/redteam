@@ -123,7 +123,7 @@ pub async fn run_with(
     };
     if remaining.is_zero() || early_signal {
         let sink = JobDirCellSink::new(out_dir.clone());
-        let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink);
+        let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink, None);
         return finish(&out_dir, r);
     }
     match run_review(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, remaining, started, &mut sigterm, over).await {
@@ -241,23 +241,36 @@ async fn run_review(
         _ = wait_sigterm(sigterm) => Err(()),
     };
     match outcome {
-        Ok(Ok((internal, _code))) => Ok(report::review_report(
-            manifest,
-            &internal,
-            cfg,
-            lang,
-            &report::ReviewExtras {
-                input_consistency: Some(input_consistency),
-                prior_routing: Some(prior.disclosure.clone()),
-                extra_partial,
-                ..Default::default()
-            },
-        )),
+        Ok(Ok((mut internal, _code))) => {
+            // 2.5：重锚 → 用检出原文修正 quote/行号；失败即丢弃并计数（不静默）。
+            // 指纹在 `map_finding` 里按修正后的 quote 生成；dismissed 匹配接在指纹之后（2.4）。
+            let verified = crate::job::quote::verify(std::mem::take(&mut internal.findings), &repo);
+            let dropped = verified.dropped + crate::job::quote::upstream_dropped(&internal.cells);
+            internal.findings = verified.findings;
+            // 被丢弃的 finding 不再计入严重度统计（否则「丢光了」仍报原计数）。
+            internal.stats = crate::domain::Stats::from_findings(&internal.findings);
+            if dropped > 0 {
+                extra_partial.push(JobFailure::new("quotes_dropped", Some(dropped.to_string())));
+            }
+            Ok(report::review_report(
+                manifest,
+                &internal,
+                cfg,
+                lang,
+                &report::ReviewExtras {
+                    input_consistency: Some(input_consistency),
+                    prior_routing: Some(prior.disclosure.clone()),
+                    dropped_unverified_quotes: dropped,
+                    extra_partial,
+                    ..Default::default()
+                },
+            ))
+        }
         Ok(Err(e)) => Err(JobFailure::new("internal_panic", Some(e.to_string()))),
         Err(()) => {
             // 停止派发：drop 掉运行 future（tokio 取消），再用已落地 cell 组 partial。
             drop(run);
-            Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink))
+            Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink, Some(&repo)))
         }
     }
 }

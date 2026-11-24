@@ -118,6 +118,66 @@ pub fn anchor_near(root: &Path, file: &str, quote: &str, old_line: u32) -> Optio
     locate_quote_near(&content, quote, old_line)
 }
 
+/// hibot 2.5：**逐字**重锚。返回 `(line_start, line_end, quote)`：
+/// - quote 是检出原文的**字节切片**（首 token 到末 token），不是模型报的文本；
+/// - 行号是该切片在检出中的真实行范围。
+///
+/// 定位器是「空白无关的 token 序列匹配」：整段 quote 的每个 token 必须与文件里的一段连续 token
+/// **逐字相等**。所以：
+/// - 缩进 / 多空格 / 换行差异 → 命中，并被检出原文纠正；
+/// - 首行真实、后续行虚构 → 整段 token 序列对不上 → `None`（不得把幻觉换成别处的真代码）；
+/// - 多命中 → 取最接近模型自报行号的那处（与 `locate_quote_near` 同口径）。
+///
+/// 与 `anchor_review_findings` 的差别：后者只改行号、保留模型 quote；这里连 quote 一起换成检出原文。
+pub fn verbatim_span(root: &Path, file: &str, quote: &str, hint_line: u32) -> Option<(u32, u32, String)> {
+    let content = safe_read(root, file)?;
+    let want: Vec<&str> = quote.split_whitespace().collect();
+    if want.is_empty() {
+        return None;
+    }
+    // token 流：(起始字节, 结束字节, 1-based 行号)
+    let mut toks: Vec<(usize, usize, u32)> = Vec::new();
+    let mut line = 1u32;
+    let mut start: Option<usize> = None;
+    for (i, ch) in content.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(s) = start.take() {
+                toks.push((s, i, line));
+            }
+            if ch == '\n' {
+                line += 1;
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        toks.push((s, content.len(), line));
+    }
+    if want.len() > toks.len() {
+        return None;
+    }
+    let mut best: Option<(usize, u32)> = None; // (窗口起点, 与 hint 的行距)
+    for i in 0..=(toks.len() - want.len()) {
+        let hit = want.iter().enumerate().all(|(k, w)| {
+            let (s, e, _) = toks[i + k];
+            &content[s..e] == *w
+        });
+        if !hit {
+            continue;
+        }
+        let distance = (i64::from(toks[i].2) - i64::from(hint_line)).unsigned_abs() as u32;
+        match best {
+            Some((_, d)) if d <= distance => {}
+            _ => best = Some((i, distance)),
+        }
+    }
+    let (i, _) = best?;
+    let start = toks[i].0;
+    let end = toks[i + want.len() - 1].1;
+    Some((toks[i].2, toks[i + want.len() - 1].2, content[start..end].to_string()))
+}
+
 /// scanner 疑点锚定结果（批 D-1）：`dropped` = 被丢总数（quote 不在文件 + 文件不可读），`dropped_unreadable` 单列文件不可读
 /// （不存在 / 越界 / 二进制），F 写 cell warn 时分开说，不把「读不到」误诊成「quote 幻觉」（评审 #10）。
 #[derive(Clone, Debug, PartialEq)]
@@ -459,6 +519,45 @@ mod tests {
         // 两处同型块（首行 1 与 5），old_line=6 → 就近选 5，跨度 3 行
         assert_eq!(anchor_near(dir.path(), "a.rs", "if x {\n    bad();\n}", 6), Some((5, 7)));
     }
+
+    /// 2.5：quote 由检出原文纠正——缩进 / 多空格 / 差一行都命中，返回的 quote 是文件字节切片。
+    #[test]
+    fn verbatim_span_corrects_whitespace_and_line_numbers_from_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "fn main() {\n    let token  =   secret();\n    ok();\n}\n";
+        write(dir.path(), "src/a.rs", body);
+        // 模型报的 quote 行内空格被折叠、还差一行；输出必须是检出原文（双空格保留）。
+        let (ls, le, q) = verbatim_span(dir.path(), "src/a.rs", "let token = secret();", 1).unwrap();
+        assert_eq!((ls, le), (2, 2));
+        assert_eq!(q, "let token  =   secret();", "quote 必须换成检出原文，而不是只改行号");
+    }
+
+    /// 多行：后续行缩进同样以检出为准（只改行号的实现会漏掉这一层）。
+    #[test]
+    fn verbatim_span_keeps_inner_indentation_of_later_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/b.rs", "fn f() {\n    if (x) {\n        y();\n    }\n}\n");
+        let (ls, le, q) = verbatim_span(dir.path(), "src/b.rs", "if (x) {\n  y();\n}", 2).unwrap();
+        assert_eq!((ls, le), (2, 4));
+        assert_eq!(q, "if (x) {\n        y();\n    }");
+    }
+
+    /// 反例：首行真实、后续行虚构——整段 token 序列对不上就是幻觉，必须失败（不得换成别处真代码）。
+    #[test]
+    fn verbatim_span_rejects_partially_fabricated_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/c.rs", "if (x) {\n    y();\n}\n");
+        assert!(verbatim_span(dir.path(), "src/c.rs", "if (x) {\n    fabricated();\n}", 1).is_none());
+    }
+
+    /// 多命中取最接近自报行号者（短 quote 在同文件复现时不能锚到首现）。
+    #[test]
+    fn verbatim_span_picks_the_hit_nearest_the_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/d.rs", "x.unwrap();\na();\nx.unwrap();\n");
+        assert_eq!(verbatim_span(dir.path(), "src/d.rs", "x.unwrap();", 1).unwrap().0, 1);
+        assert_eq!(verbatim_span(dir.path(), "src/d.rs", "x.unwrap();", 3).unwrap().0, 3);
+    }
 }
 
 /// finding 锚点到最近改动行的距离后滤（design §10.4，M21d 批 B-2）。
@@ -561,4 +660,5 @@ mod window_tests {
         assert_eq!(mark_outside_window(&mut fs, &bs, 100), 0);
         assert!(!fs[0].outside_window, "放宽后要复位");
     }
+
 }

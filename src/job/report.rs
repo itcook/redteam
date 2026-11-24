@@ -149,6 +149,8 @@ pub struct ReviewExtras {
     pub input_consistency: Option<Value>,
     /// 2.3：`prior_report` 的 routing 投影（只披露 actual 用了什么）。
     pub prior_routing: Option<Value>,
+    /// 2.5：本轮因 quote 无法逐字命中而丢弃的 finding 条数（含上游锚定阶段的）。>0 时才进 extensions。
+    pub dropped_unverified_quotes: u32,
     /// 2.1–2.5 之外的额外 `partial` 原因（如 `quotes_dropped` / `routing_specs_unreadable`）。
     pub extra_partial: Vec<JobFailure>,
 }
@@ -200,10 +202,13 @@ pub fn review_report(
     if let Some(v) = &extras.input_consistency {
         redteam["input_consistency"] = v.clone();
     }
+    // 2.5：quote 无法逐字命中的丢弃计数（>0 才披露）。
+    if extras.dropped_unverified_quotes > 0 {
+        redteam["dropped_unverified_quotes"] = json!(extras.dropped_unverified_quotes);
+    }
     r.extensions = json!({ "redteam": redteam });
     r
 }
-
 /// 附录 E 的 partial 优先级：`status_code` 取最靠前的一条（`render_partial` 取首条）。
 fn code_rank(code: &str) -> usize {
     const ORDER: &[&str] = &[
@@ -293,6 +298,9 @@ pub fn derive_review_status(r: &ReviewReport) -> (JobStatus, Vec<JobFailure>) {
 }
 
 /// 解析失败 / 超时时的 partial 报告（1.5）：findings 来自已完成的 cell。
+///
+/// Phase 2（2.5）：partial 路径与正常路径走**同一条**「重锚 → 指纹 → dismissed」链，
+/// 所以同样接受 [`ReviewExtras`]（丢弃计数 / ledger / 额外 partial 原因）。
 pub fn partial_report(
     manifest: &JobManifest,
     lang: &OutputLang,
@@ -301,18 +309,30 @@ pub fn partial_report(
     usage: UsageOut,
     cfg: &Config,
     truncated_items: u32,
+    extras: &ReviewExtras,
 ) -> HibotReport {
+    // `StatusText.code` 可能带 `<detail>`：拆回 JobFailure，再与额外原因一起按附录 E 优先级排序。
+    let base = reason.code.split(':').next().unwrap_or(reason.code.as_str()).to_string();
+    let detail = reason.code.split_once(':').map(|(_, d)| d.to_string());
+    let mut reasons = vec![JobFailure { code: base, detail, reason: Some(reason.reason.clone()) }];
+    reasons.extend(extras.extra_partial.iter().cloned());
+    reasons.sort_by_key(|f| code_rank(&f.code));
+    let partial = render_partial(&reasons, lang).unwrap_or_else(|| reason.clone());
     let mut r = HibotReport::base(manifest);
     r.status = JobStatus::Partial;
-    r.status_reason = Some(reason.reason.clone());
+    r.status_reason = Some(partial.reason.clone());
     r.findings = findings.iter().map(map_finding).collect();
     r.usage = usage;
-    r.extensions = json!({ "redteam": {
+    let mut redteam = json!({
         "language": language_json(lang),
-        "status_code": reason.code,
+        "status_code": partial.code,
         "concurrency": concurrency_json(cfg),
         "budget": { "wall_clock_s": manifest.limits.wall_clock_s, "truncated_items": truncated_items },
-    }});
+    });
+    if extras.dropped_unverified_quotes > 0 {
+        redteam["dropped_unverified_quotes"] = json!(extras.dropped_unverified_quotes);
+    }
+    r.extensions = json!({ "redteam": redteam });
     r
 }
 

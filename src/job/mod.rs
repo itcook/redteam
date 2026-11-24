@@ -22,6 +22,7 @@ pub mod lifecycle;
 pub mod manifest;
 pub mod prior;
 pub mod projection;
+pub mod quote;
 pub mod report;
 pub mod repo;
 pub mod run;

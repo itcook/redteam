@@ -46,6 +46,16 @@ struct Fixture {
 
 /// 建一个 base→head 的 git 仓；head 在 `src/app.js` 引入已知漏洞行。
 fn make_repo_and_job(kind: &str, config: &str, with_vuln: bool, with_partial_provider: bool) -> Fixture {
+    let body = if with_vuln {
+        "function find(id) {\n  return db.query('SELECT * FROM users WHERE id=' + id);\n}\n"
+    } else {
+        "function add(a, b) {\n  return a + b;\n}\n"
+    };
+    make_repo_and_job_with_body(kind, config, body, with_partial_provider)
+}
+
+/// 同上，但 `src/app.js` 的正文由调用方给（2.5 的空白差异用例需要自造源码）。
+fn make_repo_and_job_with_body(kind: &str, config: &str, body: &str, with_partial_provider: bool) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -57,11 +67,6 @@ fn make_repo_and_job(kind: &str, config: &str, with_vuln: bool, with_partial_pro
     git(&repo, &["commit", "-qm", "base"]);
     let base = git(&repo, &["rev-parse", "HEAD"]);
     std::fs::create_dir_all(repo.join("src")).unwrap();
-    let body = if with_vuln {
-        "function find(id) {\n  return db.query('SELECT * FROM users WHERE id=' + id);\n}\n"
-    } else {
-        "function add(a, b) {\n  return a + b;\n}\n"
-    };
     std::fs::write(repo.join("src/app.js"), body).unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "head"]);
@@ -649,4 +654,46 @@ async fn prior_report_only_adjusts_lens_and_budget() {
     // 阈值不变：findings 与无 prior 的对照完全一致（prior 不消费历史 findings / 计数 / tier）。
     assert_eq!(r["findings"], base_report["findings"], "prior_report 不得改判定");
     assert_eq!(r["extensions"]["redteam"]["stats"], base_report["extensions"]["redteam"]["stats"]);
+}
+
+/// 2.5：报告里的 quote 必须是**检出原文**——缩进/多空格被纠正，行号重锚；指纹按修正后的 quote 生成。
+#[tokio::test]
+async fn quote_is_corrected_from_the_checkout_before_fingerprint() {
+    // 源码里是多空格；模型报的是折叠后的单空格（上游行级归一能容忍，但 quote 不能原样进报告）。
+    let body = "function find(id) {\n  return db.query('SELECT  *  FROM users WHERE id=' + id);\n}\n";
+    let model_quote = "return db.query('SELECT * FROM users WHERE id=' + id);";
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(model_quote, "src/app.js", 9))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(model_quote, "src/app.js", 9, "SQL injection"))));
+    let fx = make_repo_and_job_with_body("review", &config_with(Some("en_US"), false), body, false);
+    let over = fake_override(scan, review);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok", "{r}");
+    let f = &r["findings"][0];
+    // 检出原文（首行缩进去掉、行内双空格保留）。
+    assert_eq!(f["quote"], "return db.query('SELECT  *  FROM users WHERE id=' + id);");
+    assert_eq!((f["line_start"].as_u64().unwrap(), f["line_end"].as_u64().unwrap()), (2, 2), "自报行号 9 要重锚");
+    assert_eq!(
+        f["fingerprint"],
+        fingerprint::of("src/app.js", f["quote"].as_str().unwrap(), f["title"].as_str().unwrap()),
+        "指纹必须按修正后的 quote 生成"
+    );
+}
+
+/// 2.5：逐字命不中的 finding 丢弃 + 计数 + partial（不得用空 findings 冒充 ok）。
+#[tokio::test]
+async fn unverifiable_quote_is_dropped_and_makes_partial() {
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json("return totally.fabricated();", "src/app.js", 2, "ghost"))));
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let over = fake_override(scan, review);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "partial", "{r}");
+    // 同一幻觉 finding 可能被多个 reviewer 格各丢弃一次（队列项 × 格），计数如实累加。
+    let code = r["extensions"]["redteam"]["status_code"].as_str().unwrap();
+    assert!(code.starts_with("quotes_dropped:"), "{r}");
+    assert!(r["extensions"]["redteam"]["dropped_unverified_quotes"].as_u64().unwrap() >= 1);
+    assert!(r["findings"].as_array().unwrap().is_empty(), "幻觉 quote 不得留进 findings");
+    assert!(r["status_reason"].as_str().unwrap().contains("quote not found verbatim"), "{}", r["status_reason"]);
 }

@@ -1370,6 +1370,8 @@ fn land(
             rec.repair_rounds = c.repair_rounds;
             rec.two_stage_rounds = c.two_stage_rounds;
             rec.rl_retries = rl_retries;
+            // hibot 2.5：解析阶段丢弃的 finding 数要能被报告出口聚合（以前只活在 warn 文本里）。
+            rec.dropped_quote = c.stats.dropped_quote;
             rec.queue_wait_ms = rl_wait_ms;
             rec.template_hash = Some(review_template_hash());
             // 二阶段失败（评审修 #2）：首轮 finding 留在格里（报告与 resume 的 prior findings 都从这里取），但格按失败落盘——
