@@ -391,15 +391,15 @@ async fn job_language_comes_from_config_not_env() {
 }
 
 #[tokio::test]
-async fn triage_and_verify_are_schema_shaped_stubs() {
-    // triage：合法 manifest + 必需输入 → error + kind_not_implemented，无 summary。
+async fn triage_rejects_bad_pr_context_and_verify_is_a_stub() {
+    // triage：Phase 3 已实现；本夹具的 pr_context 只有 schema（缺 title/author/…）→ error，不伪造 summary。
     let fx = make_repo_and_job("triage", &config_with(Some("en_US"), false), false, true);
     let code = redteam::job::run::run_with(JobKind::Triage, &fx.job, None).await;
     assert_eq!(code, 1, "error 报告 → 1");
     let r = read_report(&fx.job);
     assert_eq!(r["status"], "error");
     assert_eq!(r["kind"], "triage");
-    assert_eq!(r["extensions"]["redteam"]["status_code"], "kind_not_implemented:triage");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:pr_context");
     assert!(r.get("summary").is_none(), "禁止伪造 summary");
 
     // verify：空输入 → error + verifications: []。

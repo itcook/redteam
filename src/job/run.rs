@@ -100,18 +100,21 @@ pub async fn run_with(
         Err(e) => return finish(&out_dir, report::error_report(&manifest, &lang, &e)),
     };
 
-    // D1：triage / verify 还没有分析实现——命令面存在，写 error + 临时码，禁止伪造产物。
-    // verify 例外（协调者 2026-11-24 裁 A）：必须逐条覆盖输入指纹，故对每条输出 `inconclusive`
-    // （未核验），整体仍 error——不伪造 resolved/unresolved。
-    if manifest.kind != JobKind::Review {
-        let r = match manifest.kind {
-            JobKind::Verify => match verify_fingerprints(&artifacts) {
+    // Phase 3：triage 有分析实现；verify 仍是 Phase 1 的 stub（协调者 2026-11-24 裁 A：
+    // 必须逐条覆盖输入指纹，故对每条输出 `inconclusive`，整体仍 error——不伪造 resolved/unresolved）。
+    match manifest.kind {
+        JobKind::Triage => {
+            let r = run_triage(&manifest, &job_dir, &out_dir, &cfg, &lang, &artifacts, started, &mut sigterm, over).await;
+            return finish(&out_dir, r);
+        }
+        JobKind::Verify => {
+            let r = match verify_fingerprints(&artifacts) {
                 Ok(fps) => report::kind_not_implemented_verify(&manifest, &lang, &fps),
                 Err(e) => report::error_report(&manifest, &lang, &e),
-            },
-            _ => report::kind_not_implemented_report(&manifest, &lang),
-        };
-        return finish(&out_dir, r);
+            };
+            return finish(&out_dir, r);
+        }
+        JobKind::Review => {}
     }
 
     // 2.4：dismissed.csv 是 review 的必需输入——坏格式 → error（不静默当成空台账）。
@@ -353,6 +356,119 @@ async fn run_review(
             drop(run);
             Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink, Some(&repo), dismissed, &base_extras))
         }
+    }
+}
+
+/// 3.1–3.7：triage 作业。输入校验与 review 同源（`diff_patch` 是真相源、repo 只读、
+/// merge_base 是 diff 左端），失败仍写合法报告；墙钟/SIGTERM 用已完成的轴收敛成 `partial`。
+#[allow(clippy::too_many_arguments)]
+async fn run_triage(
+    manifest: &JobManifest,
+    job_dir: &Path,
+    _out_dir: &Path,
+    cfg: &Config,
+    lang: &OutputLang,
+    artifacts: &artifact::Artifacts,
+    started: std::time::Instant,
+    sigterm: &mut Option<tokio::signal::unix::Signal>,
+    over: Option<&crate::cli::BackendOverride<'_>>,
+) -> report::HibotReport {
+    let repo = match io::resolve_repo(job_dir, &manifest.paths.repo) {
+        Ok(r) => r,
+        Err(e) => return report::error_report(manifest, lang, &e),
+    };
+    let base = match artifacts
+        .text("merge_base")
+        .map(str::trim)
+        .filter(|s| crate::job::repo::is_full_sha(s))
+    {
+        Some(s) => s.to_string(),
+        None => return report::error_report(manifest, lang, &JobFailure::new("input_schema_mismatch", Some("merge_base".into()))),
+    };
+    let pr = match artifacts.text("pr_context").map(str::to_string).map(|t| crate::triage::input::parse(&t)) {
+        Some(Ok(pr)) => pr,
+        Some(Err(e)) => return report::error_report(manifest, lang, &e),
+        None => return report::error_report(manifest, lang, &JobFailure::new("input_schema_mismatch", Some("pr_context".into()))),
+    };
+    let patch = match artifacts.text("diff_patch") {
+        Some(t) => t,
+        None => return report::error_report(manifest, lang, &JobFailure::new("input_schema_mismatch", Some("diff_patch".into()))),
+    };
+    let changes = match crate::job::projection::from_patch(patch) {
+        Ok(c) => c,
+        Err(e) => return report::error_report(manifest, lang, &e),
+    };
+    // 2.6 同源完整性：非 shallow、head == pr.head_sha、base/merge_base 对象可得、merge-base 可算。
+    let _head = match crate::job::repo::ensure_complete(&repo, &manifest.pr, &base) {
+        Ok(h) => h,
+        Err(e) => return report::error_report(manifest, lang, &e),
+    };
+    let route_key = match crate::triage::scanner_route(cfg) {
+        Some(m) => m.name,
+        None => return report::error_report(manifest, lang, &JobFailure::new("missing_role", Some("scanner".into()))),
+    };
+    // backend 构造失败 = 配置问题（与 review 同一口径）。
+    let registry = match crate::cli::build_registry_with(&triage_args(&base), cfg, over) {
+        Ok(r) => r,
+        Err(e) => return report::error_report(manifest, lang, &JobFailure::with_reason("config_invalid", None, e)),
+    };
+    let req = crate::triage::TriageRequest {
+        repo: &repo,
+        pr: &pr,
+        changes: &changes,
+        lang,
+        manifest_cap_s: manifest.limits.wall_clock_s,
+        route_key,
+    };
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::triage::Progress::default()));
+    let deadline = match effective_deadline(started, manifest.limits.wall_clock_s, None) {
+        Ok(d) => d,
+        Err(e) => return report::error_report(manifest, lang, &e),
+    };
+    let mut fut = Box::pin(crate::triage::run(&registry, &req, progress.clone()));
+    let outcome: Result<_, ()> = tokio::select! {
+        out = &mut fut => Ok(out),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(()),
+        _ = wait_sigterm(sigterm) => Err(()),
+    };
+    match outcome {
+        Ok(out) => {
+            let mut r = report::triage_report(manifest, lang, cfg, &out, &crate::triage::template_hash());
+            r.usage.wall_clock_ms = started.elapsed().as_millis() as u64;
+            r
+        }
+        Err(()) => {
+            // 停止派发：drop 掉运行 future（tokio 取消），再用已完成轴收敛成 partial。
+            drop(fut);
+            let snapshot = progress.lock().unwrap();
+            let mut out = crate::triage::snapshot_finalize(&req, &snapshot, false);
+            out.reasons.push(JobFailure::new("wall_clock_exhausted", None));
+            let mut r = report::triage_report(manifest, lang, cfg, &out, &crate::triage::template_hash());
+            r.usage.wall_clock_ms = started.elapsed().as_millis() as u64;
+            r
+        }
+    }
+}
+
+/// triage 的 `ReviewArgs`：job 模式、`base=merge_base`、无业务 flag（P1/P13）。
+fn triage_args(base: &str) -> ReviewArgs {
+    ReviewArgs {
+        base: Some(base.to_string()),
+        scope: "branch".into(),
+        spec: Vec::new(),
+        focus: None,
+        block_threshold: None,
+        conf_floor: None,
+        background: false,
+        format: "json".into(),
+        resume: None,
+        dismissed: None,
+        no_dismissed: true,
+        incremental_from: None,
+        tools: None,
+        test_command: None,
+        pack_only: false,
+        job_mode: true,
     }
 }
 
