@@ -832,7 +832,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            // 建 registry（复用 build_registry：resolve_models + 构造 ProviderRegistry）
+            // 建 registry（复用 build_registry：active_roles 角色活跃集 + 构造 ProviderRegistry）
             let registry = match build_registry(&args, &cfg, &cwd) {
                 Ok(x) => x,
                 Err(e) => {
