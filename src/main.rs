@@ -2,10 +2,7 @@ use redteam::cli::{parse_format, ReviewArgs};
 use redteam::config::Config;
 use redteam::model::Prober as _;
 use redteam::output::render;
-use redteam::provider::backends::backend_from_config;
-use redteam::provider::registry::{role_key, ProviderRegistry};
 use clap::{Parser, Subcommand};
-use std::path::Path;
 
 #[derive(Parser)]
 // args_override_self：同名 flag 重复时后者胜（而非报错）——ship 等编排方把自己管理的
@@ -126,6 +123,27 @@ enum Cmd {
         /// --format 对本模式无效（固定文本行，机读看 summary.json）。
         #[arg(long, conflicts_with_all = ["background", "resume", "incremental_from"])]
         pack_only: bool,
+        /// 外派模式：`--job-dir <dir>`（出现即拒绝一切业务 flag）。读 job.json / paths.config，
+        /// 写 <dir>/out/report.json；不读 stdin、不依赖 cwd、不碰 ~/.redteam。
+        #[arg(long, conflicts_with_all = ["base", "scope", "spec", "focus", "test_command", "block_threshold", "conf_floor", "tools", "background", "format", "resume", "dismissed", "no_dismissed", "incremental_from", "pack_only"])]
+        job_dir: Option<String>,
+    },
+    /// 配置契约：`schema`（从类型生成 JSON Schema）/ `check`（形状 + 语义校验）。
+    Config {
+        #[command(subcommand)]
+        action: ConfigCmd,
+    },
+    /// triage（外派）：读 job 目录，写 hibot `report.triage/1`（Phase 1 仅命令面）。
+    Triage {
+        /// job 目录（必需）：manifest `hibot.audit.job.triage/1`。
+        #[arg(long)]
+        job_dir: String,
+    },
+    /// verify（外派）：读 job 目录，写 hibot `report.verify/1`（Phase 1 仅命令面）。
+    Verify {
+        /// job 目录（必需）：manifest `hibot.audit.job.verify/1`。
+        #[arg(long)]
+        job_dir: String,
     },
     /// 查询作业状态：无 id 列本项目全部；有 id 打印该作业 JSON。
     Status {
@@ -399,6 +417,25 @@ enum ModelCmd {
     Check,
 }
 
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// 生成 executor config 的 JSON Schema（draft-07；`$id: urn:redteam:config/1`）。
+    Schema {
+        /// 写到文件（缺省打印到 stdout）。入库生成物是 dist/config.schema.json。
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// 校验 executor config：形状 + 未知键 + 密钥字段 + 语义（可选按 kind 查角色）。
+    /// 诊断只走 stdout；退出码 0/1；WARN 不影响退出码。
+    Check {
+        /// 文件路径，或直接给 JSON 文本（以 `{` 开头）。
+        input: String,
+        /// 按 kind 校验角色最小集：triage | review | verify。
+        #[arg(long, value_parser = ["triage", "review", "verify"])]
+        kind: Option<String>,
+    },
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -521,72 +558,6 @@ fn resolve_result(
     }
 }
 
-/// 构造 ProviderRegistry（前台与 worker 共用）：scanner / reviewer / refuter 各按 **角色键**
-/// `role:provider/id` 注册一份 backend（`reasoningEffort` 是角色属性，同一模型跨角色不能共用一份档位）——scanner 一律
-/// scan 单发（`--tools` 对 scanner 无效，K3）；provider 在途门 = `maxConcurrency` 缺省继承 `review.max_concurrency`（D7 A5；唯一闸，无角色级 workers，D13）；
-/// reasoningEffort 无映射的告警进 registry.warnings → RunMeta.warnings。scanners 为空 → 配置错误；返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
-///
-/// **`roles.verifier`（fix 验证）不在这里注册**：它属 kind=verify 管线（Phase 4），review 既不用也不该
-/// 因它构造 backend；它的回退（缺省复用 reviewer）是选择策略（`RoleSets::fix_verifiers`），不是 review 的注册项。
-fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<ProviderRegistry, String> {
-    let roles = cfg.active_roles();
-    if roles.scanners.is_empty() {
-        return Err(redteam::cli::NO_SCANNER_MSG.to_string());
-    }
-    let mut registry = ProviderRegistry::new();
-    // reasoningEffort 无映射 warnings 按角色条目统一给——同一模型跨角色各有各的档位，不能只报先注册的那条。
-    for w in redteam::provider::backends::role_reasoning_effort_warnings(&roles) {
-        registry.push_warning(w);
-    }
-    for em in &roles.scanners {
-        let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
-        let backend = match backend_from_config(em, key) {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(format!("{e}"));
-            }
-        };
-        // 单轮超时（design §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`。
-        let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
-        // usize → u32 饱和而非截断（评审修：误填 2^32 以上的值不会被截成 0 / 小数）。
-        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
-        registry.insert_scan(role_key(redteam::config::Role::Scanner, &em.name), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
-    }
-    // 0.8 护栏（R20）：旧配置里“验真角色”写作 `roles.verifier`，硬切后会静默变成 fix 验证角色。
-    // 这里把变义提示进 registry.warnings → 报告 run.warnings——后台 worker 的 stderr 是 /dev/null，
-    // 只靠 `Config::load` 的 eprintln 后台作业永远看不到（前台由 load warnings 已经打过一份）。
-    if let Some(w) = cfg.verifier_role_guard_warning() {
-        if !registry.warnings().contains(&w) {
-            registry.push_warning(w);
-        }
-    }
-    // reviewer 与 refuter 各按角色键注册（同模型不同档位各占一份 backend，不互相覆盖）。批 D〔D17〕：
-    // refuter 必须在这里注册，否则 `pick_refuter` 选中一个纯 refuter 模型时 `registry.lease()` 直接
-    // Unavailable，每条复核都静默落成「保守 upheld」——看起来跑了、其实一次没验。
-    for (em, role) in roles
-        .reviewers
-        .iter()
-        .map(|m| (m, redteam::config::Role::Reviewer))
-        .chain(roles.refuters.iter().map(|m| (m, redteam::config::Role::Refuter)))
-    {
-        let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
-        let backend = match backend_from_config(em, key) {
-            Ok(b) => b,
-            // reviewer 造不出 = 本轮的活干不了，硬 Err 照旧；**refuter 造不出只是这一路没得用**
-            // （复核缺省还关着），不该让整条 review 命令拒跑（收口评审 #8：
-            // 预置一个 kind=google 的 refuter 模型，整个 review 会以 "google not yet supported" 退出）。
-            Err(e) if role == redteam::config::Role::Refuter => {
-                registry.push_warning(format!("refuter {} 不可用（{e}）——本轮复核将跳过它", em.name));
-                continue;
-            }
-            Err(e) => return Err(format!("{e}")),
-        };
-        let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
-        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
-        registry.insert_scan(role_key(role, &em.name), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
-    }
-    Ok(registry)
-}
 
 #[tokio::main]
 async fn main() {
@@ -620,7 +591,13 @@ async fn main() {
             no_dismissed,
             incremental_from,
             pack_only,
+            job_dir,
         } => {
+            // 外派模式：不加载用户配置（唯一来源是 job 的 paths.config），不读 cwd / stdin。
+            if let Some(dir) = job_dir {
+                let code = redteam::job::run::run(redteam::job::manifest::JobKind::Review, std::path::Path::new(&dir)).await;
+                std::process::exit(code);
+            }
             let cfg = if pack_only { load_config_no_secrets_or_exit() } else { load_config_or_exit() };
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
@@ -648,7 +625,7 @@ async fn main() {
                     Ok(a) => a,
                     Err(e) => { eprintln!("error: bad args for job {job_id}: {e}"); std::process::exit(1); }
                 };
-                let registry = match build_registry(&orig_args, &cfg, &cwd) {
+                let registry = match redteam::cli::build_registry(&orig_args, &cfg) {
                     Ok(x) => x,
                     Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 };
@@ -680,6 +657,7 @@ async fn main() {
                 (None, false) => "working-tree".to_string(),
             };
             let args = ReviewArgs {
+                job_mode: false,
                 base: base.clone(), scope, spec, focus,
                 block_threshold, conf_floor, tools, background, format,
                 resume: None, dismissed, no_dismissed, incremental_from, test_command, pack_only,
@@ -777,7 +755,7 @@ async fn main() {
             }
 
             // 前台路径：构造 registry 后调 run_review_dispatch。
-            let registry = match build_registry(&args, &cfg, &cwd) {
+            let registry = match redteam::cli::build_registry(&args, &cfg) {
                 Ok(x) => x,
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             };
@@ -856,7 +834,7 @@ async fn main() {
                 }
             };
             // 建 registry（复用 build_registry：active_roles 角色活跃集 + 构造 ProviderRegistry）
-            let registry = match build_registry(&args, &cfg, &cwd) {
+            let registry = match redteam::cli::build_registry(&args, &cfg) {
                 Ok(x) => x,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -1203,6 +1181,16 @@ async fn main() {
                 &cfg,
             )
             .await
+        }
+        Cmd::Config { action } => match action {
+            ConfigCmd::Schema { out } => redteam::cli::config_cmd::run_schema(out.as_deref()),
+            ConfigCmd::Check { input, kind } => redteam::cli::config_cmd::run_check(&input, kind.as_deref()),
+        },
+        Cmd::Triage { job_dir } => {
+            redteam::job::run::run(redteam::job::manifest::JobKind::Triage, std::path::Path::new(&job_dir)).await
+        }
+        Cmd::Verify { job_dir } => {
+            redteam::job::run::run(redteam::job::manifest::JobKind::Verify, std::path::Path::new(&job_dir)).await
         }
     };
     std::process::exit(code);
@@ -1679,7 +1667,7 @@ mod tests {
     }
 
     fn plain_review_args() -> redteam::cli::ReviewArgs {
-        redteam::cli::ReviewArgs { pack_only: false,
+        redteam::cli::ReviewArgs { pack_only: false, job_mode: false,
             base: None,
             scope: "working-tree".into(),
             spec: vec![],
@@ -1709,7 +1697,7 @@ mod tests {
             }}}}"#,
         )
         .unwrap();
-        let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new(".")).unwrap();
+        let reg = redteam::cli::build_registry(&plain_review_args(), &cfg).unwrap();
         assert!(
             reg.has_for(redteam::config::Role::Scanner, "p/s")
                 && reg.has_for(redteam::config::Role::Reviewer, "p/r"),
@@ -1733,7 +1721,7 @@ mod tests {
             }}"#,
         )
         .unwrap();
-        let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new("."))
+        let reg = redteam::cli::build_registry(&plain_review_args(), &cfg)
             .expect("refuter 造不出 backend 不该让整条 review 拒跑");
         assert!(
             reg.has_for(redteam::config::Role::Scanner, "p/s")
@@ -1757,7 +1745,7 @@ mod tests {
             }}}}"#,
         )
         .unwrap();
-        let reg = build_registry(&plain_review_args(), &stale, std::path::Path::new(".")).unwrap();
+        let reg = redteam::cli::build_registry(&plain_review_args(), &stale).unwrap();
         assert!(
             reg.warnings().iter().any(|w| w.contains("验真角色已更名为 refuter")),
             "旧语义的 verifier 角色必须进报告 warnings: {:?}",
@@ -1771,7 +1759,7 @@ mod tests {
             }}}}"#,
         )
         .unwrap();
-        let reg2 = build_registry(&plain_review_args(), &fresh, std::path::Path::new(".")).unwrap();
+        let reg2 = redteam::cli::build_registry(&plain_review_args(), &fresh).unwrap();
         assert!(
             !reg2.warnings().iter().any(|w| w.contains("验真角色已更名")),
             "新语义不该触发护栏: {:?}",
@@ -1789,7 +1777,7 @@ mod tests {
             }}}}"#,
         )
         .unwrap();
-        let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new(".")).unwrap();
+        let reg = redteam::cli::build_registry(&plain_review_args(), &cfg).unwrap();
         use redteam::config::Role;
         assert!(reg.has_for(Role::Scanner, "p/m"), "scanner 一份");
         assert!(reg.has_for(Role::Reviewer, "p/m"), "reviewer 自己一份（档位 high）");
@@ -1810,7 +1798,7 @@ mod tests {
         let cfg = Config::default();
         let cwd = std::path::Path::new(".");
         let args = plain_review_args();
-        let result = build_registry(&args, &cfg, cwd);
+        let result = redteam::cli::build_registry(&args, &cfg);
         assert!(result.is_err(), "无 scanner 时 build_registry 应返回 Err");
         let msg = result.err().unwrap();
         assert!(

@@ -52,3 +52,14 @@ hibot × redteam audit 执行单元接入的 U1 单元（协调 session 01a20b82
 ## 提交
 
 Conventional Commits；0.8 **分层提交**（配置 → 报告 → 内部符号 → 文档），每层可独立构建。
+
+## 结果（2026-11-24，验收通过）
+
+- 协调者（01a20ba0）独立复核全绿，已 `git merge --no-ff` 合入 `hibot-executor` = `b11bb29`。
+- 提交：本分支 `e750bc0..ff47049` 共 11 个（0.1 / 0.8 四层 / 0.4 / 测试 / 风险双读 / 任务卡）。
+- **P2 口径裁决（协调者 2026-11-24）**：方案 A——本单元仅改名，`pick_refuter` 自动异族回退**保留不改**；
+  「refuter 缺则跳过验真」列为 Phase 2 的显式决策点，不得漏成默认行为。
+- 计划外修复保留：`risk/signals.rs` 与 eval 脚本对历史 `results` JSON 双读（`refute` 优先、`verify` 回退）
+  ——读历史数据、非 schema 别名；不修会让升级后 `ledgerUpheld` 恒 0。
+- 移交后续：本机 `~/.redteam/config.json` 的 `verifier`→`refuter` 手改与入库二进制重建，
+  协调者裁「U2 完成后 / Phase 7 版本同源时统一处理」。

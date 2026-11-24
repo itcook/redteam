@@ -112,7 +112,9 @@ pub async fn run_refute_once(a: RefuteOnceArgs<'_>, cfg: &Config) -> i32 {
     //    路径由维护者的固定集给定、不是模型在线输出，而那棵树根本不是 git 仓（守卫会一律拒）；
     // ② `spec_docs` 恒空：离线基线不注入 spec，两臂同条件可比优先。
     let source_context = crate::consolidate::refute::source_snippet(root, &f);
+    let lang = crate::config::OutputLang::resolve_local(cfg);
     let prompt = crate::prompt::build_refute_prompt(&crate::prompt::RefutePromptInput {
+        lang: &lang,
         file: &f.file,
         line_start: f.line_start,
         line_end: f.line_end,

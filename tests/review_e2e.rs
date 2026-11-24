@@ -25,7 +25,7 @@ fn scan_and_review_registry(scan: &str, review: &str) -> ProviderRegistry {
     reg
 }
 fn args_wt() -> ReviewArgs {
-    ReviewArgs { pack_only: false,
+    ReviewArgs { job_mode: false, pack_only: false,
         base: None, scope: "working-tree".into(),
         spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
@@ -194,7 +194,7 @@ async fn incremental_from_is_refused_by_preflight_guards() {
     use redteam::cli::run_review_dispatch;
     let dir = tempfile::tempdir().unwrap();
     let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
-    let args = ReviewArgs { base: Some("main".into()), scope: "branch".into(), incremental_from: Some("prior1".into()), ..args_wt() };
+    let args = ReviewArgs { job_mode: false, base: Some("main".into()), scope: "branch".into(), incremental_from: Some("prior1".into()), ..args_wt() };
     let err = run_review_dispatch(&args, &ProviderRegistry::new(), &cfg, dir.path(), None).await.unwrap_err();
     assert!(err.to_string().contains("--incremental-from"), "报错要指出是哪个 flag: {err}");
     assert!(!dir.path().join(".redteam").join(redteam::db::DB_FILE).exists(), "拒跑不该建库");
@@ -226,7 +226,7 @@ async fn background_job_smoke_full_lifecycle_single_store() {
     let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap();
     let reg = scan_registry(&[("p/alpha", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"unvalidated write","category":"L1","confidence":0.9,"quote":"db.write(token);"}],"scanned_areas":[{"file":"src/a.rs","ranges":["1-3"]}]}"#)]);
 
-    let args = ReviewArgs { pack_only: false,
+    let args = ReviewArgs { job_mode: false, pack_only: false,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
         background: true, format: "json".into(), resume: None, dismissed: None,
@@ -564,7 +564,7 @@ fn pack_only_writes_packs_and_reports_bytes() {
     std::fs::write(dir.path().join("src/b.rs"), "fn beta() { alpha_marker(); }\n").unwrap();
     git(dir.path(), &["add", "-A"]); // working-tree scope：staged 新文件即证据
 
-    let args = ReviewArgs {
+    let args = ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: Some("预算试跑".into()),
         block_threshold: None, conf_floor: None, background: false,
@@ -606,7 +606,7 @@ fn pack_only_empty_changes_reports_zero_cells() {
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
     git(&["init", "-q", "-b", "main"]);
-    let args = ReviewArgs {
+    let args = ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false,
@@ -653,7 +653,7 @@ fn pack_only_two_groups_cross_index_lists_other_group_only() {
         std::fs::write(p, body).unwrap();
     }
     git(dir.path(), &["add", "-A"]);
-    let args = ReviewArgs {
+    let args = ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false,
@@ -877,7 +877,7 @@ fn pack_only_slices_large_file_and_reports_shape() {
     std::fs::write(dir.path().join("src/big.rs"), &modified).unwrap();
     git(dir.path(), &["add", "-A"]);
 
-    let args = ReviewArgs {
+    let args = ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false,
@@ -942,7 +942,7 @@ fn pack_only_injects_precedents_and_honors_no_dismissed() {
     .unwrap();
     drop(db);
 
-    let args = |no_dismissed: bool| ReviewArgs {
+    let args = |no_dismissed: bool| ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false,
@@ -1023,7 +1023,7 @@ async fn incremental_round_carries_prior_findings_into_the_merged_set() {
     let rev1 = r#"{"findings":[{"severity":"high","title":"unvalidated write","body":"b","file":"src/old.rs","line_start":2,"line_end":2,"confidence":0.9,"recommendation":"r","quote":"db.write(token);"},{"severity":"high","title":"stray call","body":"b","file":"src/old.rs","line_start":3,"line_end":3,"confidence":0.9,"recommendation":"r","quote":"more();"}],"needs":[]}"#;
     let reg1 = scan_and_review_registry(scan1, rev1);
 
-    let args1 = ReviewArgs {
+    let args1 = ReviewArgs { job_mode: false,
         base: Some("main".into()), scope: "branch".into(), background: true,
         ..args_wt()
     };
@@ -1060,7 +1060,7 @@ async fn incremental_round_carries_prior_findings_into_the_merged_set() {
 
     // r2 的 scanner 在 new.rs 上什么都不报 → 新发为 0，合并集里只剩携带项
     let reg2 = scan_and_review_registry(r#"{"suspicions":[],"scanned_areas":[]}"#, r#"{"findings":[],"needs":[]}"#);
-    let args2 = ReviewArgs {
+    let args2 = ReviewArgs { job_mode: false,
         base: Some("main".into()), scope: "branch".into(),
         incremental_from: Some(job1.into()), ..args_wt()
     };

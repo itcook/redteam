@@ -7,6 +7,7 @@ pub mod domain;
 pub mod diffsym;
 pub mod evidence;
 pub mod hash;
+pub mod job;
 pub mod model;
 pub mod orchestrate;
 pub mod output;

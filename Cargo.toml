@@ -13,10 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "0.8"
+# job 模式：artifact sha256（计划 1.1）与 dismissed.csv 解析（计划 2.4，D5 本轮先入依赖）。纯 Rust，无 OpenSSL。
+sha2 = "0.10"
+csv = "1"
 futures = "0.3"
 anyhow = "1"
 thiserror = "1"
