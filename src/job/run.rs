@@ -27,6 +27,7 @@ pub async fn run_with(
     job_dir_arg: &Path,
     over: Option<&crate::cli::BackendOverride<'_>>,
 ) -> i32 {
+    seal_job_env();
     let job_dir = match io::canonical_job_dir(job_dir_arg) {
         Ok(d) => d,
         Err(e) => {
@@ -155,6 +156,20 @@ async fn run_review(
             // 停止派发：drop 掉运行 future（tokio 取消），再用已落地 cell 组 partial。
             drop(run);
             Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink))
+        }
+    }
+}
+
+/// job 模式的环境隔离（P6 规则④ / 不变式⑦）：语言、密钥、并发全部来自 `paths.config`。
+/// 进程级研发旋钮在 job 进程内清掉，杜绝任何下游代码（backend / 超时公式 / 诊断落盘）读 env。
+fn seal_job_env() {
+    // SAFETY: job 进程是单用途进程；启动即清，不与其它线程并发读写这些变量。
+    unsafe {
+        for k in [
+            "REDTEAM_MAX_TOKENS", "REDTEAM_PER_TURN_SECS", "REDTEAM_DUMP_DIR", "REDTEAM_HOME",
+            "LC_ALL", "LC_MESSAGES", "LANG",
+        ] {
+            std::env::remove_var(k);
         }
     }
 }

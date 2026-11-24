@@ -5081,6 +5081,26 @@ mod spec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 1.2 验收：job 模式的 key 解析只走 env（显式传入空 `Secrets`），不读 secrets.json。
+    /// `build_registry` 的 job 分支正是用 `Secrets::default()` 调 `resolve_key_with`。
+    #[test]
+    fn job_mode_key_resolution_is_env_only() {
+        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","apiKeyEnv":"JOB_TEST_UNSET_KEY","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let em = &cfg.active_roles().scanners[0];
+        assert!(std::env::var("JOB_TEST_UNSET_KEY").is_err(), "前提：env 未注入");
+        assert!(
+            cfg.resolve_key_with(&em.provider, &em.id, &crate::config::secrets::Secrets::default()).is_none(),
+            "空 Secrets = env-only：env 未注入就必须无 key"
+        );
+        // 反证：secrets 里同 provider 有 key 时会被解析链读到——所以 job 分支必须传空。
+        let mut s = crate::config::secrets::Secrets::default();
+        s.providers.insert("p".into(), crate::config::secrets::ProviderSecrets {
+            api_key: Some("sk-decoy".into()),
+            models: Default::default(),
+        });
+        assert_eq!(cfg.resolve_key_with(&em.provider, &em.id, &s).as_deref(), Some("sk-decoy"));
+    }
+
     #[test]
     fn review_args_ignores_legacy_unknown_keys() {
         // 旧 args.json（--background 落盘）带已退役字段（E8-I 的 "lenses"、E10 移除的

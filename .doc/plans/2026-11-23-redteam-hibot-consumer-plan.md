@@ -613,6 +613,7 @@ Phase 1 内部硬序：1.1/1.2/1.3/1.4 → 1.5 → 1.6/1.7/1.8/**1.9**（1.9 的
 | `invalid_fingerprint_input` | findings.json 中有非法指纹 | findings.json contains an invalid fingerprint |
 | `missing_role:<role>` | 缺少 `<role>` 角色且无可用回退 | missing role `<role>` with no fallback |
 | `internal_panic` | 内部错误：`<msg>` | internal error: `<msg>` |
+| `kind_not_implemented:<kind>` | kind `<kind>` 在本执行单元中尚未实现（**临时码**，Phase 3/4 实现后删除） | kind `<kind>` is not implemented yet (**temporary**; removed in Phase 3/4) |
 
 **partial**
 
