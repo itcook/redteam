@@ -6,24 +6,32 @@ use crate::config::Config;
 use crate::domain::{CellOutput, Finding, Usage};
 use crate::job::manifest::JobManifest;
 use crate::job::report::{partial_report, HibotReport, UsageOut};
+use crate::job::state::Heartbeat;
 use crate::job::status::{JobFailure, StatusText};
 use crate::orchestrate::deep::known_verdicts;
 use crate::orchestrate::CellSink;
 use crate::state::{CellInput, CellRecord, Phase};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// job 模式的成果保存：内存 + 周期落 `out/.cells.jsonl`；SIGTERM / 超时据此组 partial。
 pub struct JobDirCellSink {
     out_dir: PathBuf,
     cells: Mutex<Vec<CellRecord>>,
     phases: Mutex<Vec<(Phase, Option<String>)>>,
+    /// Phase 5：心跳（progress 的来源；`on_phase` 明确不挂——内部 `Phase` 枚举不是 job 三值）。
+    heartbeat: Option<Arc<Heartbeat>>,
 }
 
 impl JobDirCellSink {
     pub fn new(out_dir: PathBuf) -> Self {
-        Self { out_dir, cells: Mutex::new(Vec::new()), phases: Mutex::new(Vec::new()) }
+        Self { out_dir, cells: Mutex::new(Vec::new()), phases: Mutex::new(Vec::new()), heartbeat: None }
+    }
+
+    /// 带心跳的 sink：`manifest` 设 progress.total（scan cells），`on_cell` 推进 done。
+    pub fn with_heartbeat(out_dir: PathBuf, heartbeat: Arc<Heartbeat>) -> Self {
+        Self { out_dir, cells: Mutex::new(Vec::new()), phases: Mutex::new(Vec::new()), heartbeat: Some(heartbeat) }
     }
 
     pub fn snapshot(&self) -> (Vec<CellRecord>, Vec<(Phase, Option<String>)>) {
@@ -35,11 +43,17 @@ impl JobDirCellSink {
 }
 
 impl CellSink for JobDirCellSink {
-    fn manifest(&self, _inputs: &[CellInput]) {
-        // Phase 1 不落输入快照（Phase 5 的 state 心跳与 resume 不在本单元）。
+    fn manifest(&self, inputs: &[CellInput]) {
+        // Phase 1 不落输入快照；Phase 5 只把 scan cells 总数报给心跳（progress 不参与判定）。
+        if let Some(hb) = &self.heartbeat {
+            hb.set_progress_total("cells", inputs.len() as u64);
+        }
     }
 
     fn on_cell(&self, rec: CellRecord) {
+        if let Some(hb) = &self.heartbeat {
+            hb.bump_done();
+        }
         // 锁中毒（另一个线程 panic）时取回内部数据继续记：静默丢弃会让 partial 少掉已完成成果。
         let mut v = self.cells.lock().unwrap_or_else(|e| e.into_inner());
         v.push(rec.clone());
