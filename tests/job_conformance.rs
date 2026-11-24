@@ -270,7 +270,13 @@ async fn job_language_comes_from_config_not_env() {
     let over2 = fake_override(scan2.clone(), review2);
     let old = std::env::var("LANG").ok();
     std::env::set_var("LANG", "zh_CN.UTF-8");
+    std::env::set_var("REDTEAM_HOME", "/nonexistent/decoy-home");
+    std::env::set_var("REDTEAM_MAX_TOKENS", "123");
     let code2 = redteam::job::run::run_with(JobKind::Review, &fx2.job, Some(over2.as_ref())).await;
+    // 环境隔离（不变式⑦）：job 进程启动即清掉这些旋钮，证明"零读 env"不是靠自觉。
+    assert!(std::env::var("LANG").is_err(), "LANG 必须被清掉");
+    assert!(std::env::var("REDTEAM_HOME").is_err(), "REDTEAM_HOME 必须被清掉");
+    assert!(std::env::var("REDTEAM_MAX_TOKENS").is_err(), "REDTEAM_MAX_TOKENS 必须被清掉");
     match old { Some(v) => std::env::set_var("LANG", v), None => std::env::remove_var("LANG") }
     assert_eq!(code2, 0);
     let sys2 = match &scan2.messages_at(0)[0] {
