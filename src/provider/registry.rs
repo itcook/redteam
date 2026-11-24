@@ -327,8 +327,11 @@ impl<'a> RetryingGuard<'a> {
 
 impl Drop for RetryingGuard<'_> {
     fn drop(&mut self) {
-        let mut s = self.gate.lock();
-        s.retrying = s.retrying.saturating_sub(1);
+        // 只有仍在登记中的 guard 才减：准入已在同一临界区完成 `retrying → active`。
+        if self.registered {
+            let mut s = self.gate.lock();
+            s.retrying = s.retrying.saturating_sub(1);
+        }
     }
 }
 
@@ -926,6 +929,29 @@ mod tests {
         drop(fut);
         assert_eq!(gate.retrying(), 0, "取消也减一，不泄漏");
         assert!(snapshot_of_gates(&BTreeMap::new()).is_none(), "无门 → 不伪造 llm 段");
+    }
+
+    /// Phase 5.1 回归：两个 429 等待者，一人准入（`retrying → active` 已同锁转换）后另一个仍应为 1；
+    /// 取消剩下那个才归零；已准入的 guard drop 不得重复减。
+    #[test]
+    fn retrying_guard_does_not_double_decrement_after_admission() {
+        let gate = InflightGate::new(2);
+        let mut admitted = RetryingGuard::register(&gate);
+        let cancelled = RetryingGuard::register(&gate);
+        assert_eq!(gate.retrying(), 2);
+        // 准入临界区：active+1 与 retrying-1 同一把锁完成。
+        {
+            let mut s = gate.lock();
+            s.active += 1;
+            s.retrying -= 1;
+        }
+        admitted.release();
+        assert_eq!(gate.retrying(), 1, "另一个等待者仍在退避");
+        drop(cancelled);
+        assert_eq!(gate.retrying(), 0, "取消的等待者减一");
+        drop(admitted);
+        assert_eq!(gate.retrying(), 0, "已准入的 guard 不再减（不偷减别人的计数）");
+        assert_eq!(gate.inflight(), 1, "准入预占的在途保留");
     }
 
     /// D13 ①：门宽 3；p/b 两格慢 OK 先在途（200 ms），p/a 首发 429 → 门宽收敛到在途接受数 2 → 等到一次完成再准入重试 → OK；
