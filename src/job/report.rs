@@ -153,6 +153,8 @@ pub struct ReviewExtras {
     pub dropped_unverified_quotes: u32,
     /// 2.1–2.5 之外的额外 `partial` 原因（如 `quotes_dropped` / `routing_specs_unreadable`）。
     pub extra_partial: Vec<JobFailure>,
+    /// 2.4：命中 `dismissed.csv` 的 finding 审计行（指纹 → actor/reason）。
+    pub ledger: std::collections::BTreeMap<String, crate::job::dismissed::Entry>,
 }
 
 /// review 的 `ReviewReport` → hibot 信封。
@@ -171,7 +173,7 @@ pub fn review_report(
     let mut r = HibotReport::base(manifest);
     r.status = if reasons.is_empty() { status } else { JobStatus::Partial };
     r.status_reason = partial.as_ref().map(|t| t.reason.clone());
-    r.findings = internal.findings.iter().map(map_finding).collect();
+    r.findings = internal.findings.iter().map(|f| map_finding(f, &extras.ledger)).collect();
     r.usage = UsageOut {
         input_tokens: internal.run.usage.input_tokens,
         output_tokens: internal.run.usage.output_tokens,
@@ -239,7 +241,14 @@ fn concurrency_json(cfg: &Config) -> Value {
 }
 
 /// 内部 finding → hibot finding（指纹在这里**唯一**生成；refuted 是顶层契约字段）。
-pub fn map_finding(f: &crate::domain::Finding) -> HibotFinding {
+///
+/// `ledger` = 该指纹在 `dismissed.csv` 里的行：命中时挂 finding 级审计扩展，**不改 `refuted`**
+/// （人的驳回不是证据证伪，Q8）。
+pub fn map_finding(
+    f: &crate::domain::Finding,
+    ledger: &std::collections::BTreeMap<String, crate::job::dismissed::Entry>,
+) -> HibotFinding {
+    let fingerprint = fingerprint::of(&f.file, &f.quote, &f.title);
     let model = f.models.first().cloned().unwrap_or_default();
     let mut ext = serde_json::Map::new();
     if !matches!(f.origin, crate::domain::Origin::New) {
@@ -251,8 +260,14 @@ pub fn map_finding(f: &crate::domain::Finding) -> HibotFinding {
     if f.outside_window {
         ext.insert("outside_window".into(), json!(true));
     }
+    if let Some(e) = ledger.get(&fingerprint) {
+        ext.insert(
+            "ledger".into(),
+            serde_json::json!({ "dismissed": true, "actor": e.actor, "reason": e.reason }),
+        );
+    }
     HibotFinding {
-        fingerprint: fingerprint::of(&f.file, &f.quote, &f.title),
+        fingerprint,
         severity: f.severity.as_str().to_string(),
         confidence: f.confidence,
         file: f.file.clone(),
@@ -321,7 +336,7 @@ pub fn partial_report(
     let mut r = HibotReport::base(manifest);
     r.status = JobStatus::Partial;
     r.status_reason = Some(partial.reason.clone());
-    r.findings = findings.iter().map(map_finding).collect();
+    r.findings = findings.iter().map(|f| map_finding(f, &extras.ledger)).collect();
     r.usage = usage;
     let mut redteam = json!({
         "language": language_json(lang),

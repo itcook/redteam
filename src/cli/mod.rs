@@ -270,13 +270,19 @@ fn stage0_risk(
 ) -> (Option<RiskMeta>, Option<crate::risk::RiskRoute>) {
     let head = head.unwrap_or("HEAD");
     let base = args.base.as_deref().unwrap_or("HEAD");
-    let ledger = match args.dismissed.as_deref() {
-        Some(p) if Path::new(p).is_file() => Some(Path::new(p).to_path_buf()),
-        None if !args.no_dismissed => {
-            let p = crate::db::project_db_path(root);
-            p.exists().then_some(p)
+    // job 模式（2.4）：dismissed 是**指纹 CSV**，由 job 层自己解析；台账路径一行都不碰——
+    // 这条路上 `p.is_file()` 会把 CSV 当 sqlite 打开（`route_from_git` → `load_ledger`）。
+    let ledger = if args.job_mode {
+        None
+    } else {
+        match args.dismissed.as_deref() {
+            Some(p) if Path::new(p).is_file() => Some(Path::new(p).to_path_buf()),
+            None if !args.no_dismissed => {
+                let p = crate::db::project_db_path(root);
+                p.exists().then_some(p)
+            }
+            _ => None,
         }
-        _ => None,
     };
     let route = crate::risk::route_from_git(
         selected,

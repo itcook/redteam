@@ -117,22 +117,29 @@ pub fn interrupted_report(
     cfg: &Config,
     sink: &JobDirCellSink,
     root: Option<&std::path::Path>,
+    dismissed: &crate::job::dismissed::Dismissed,
 ) -> HibotReport {
     let (cells, _phases) = sink.snapshot();
     let findings = findings_from_cells(&cells);
     let upstream = crate::job::quote::upstream_dropped(&cells);
-    let (findings, self_dropped) = match root {
+    let (mut findings, self_dropped) = match root {
         Some(root) => {
             let v = crate::job::quote::verify(findings, root);
             (v.findings, v.dropped)
         }
         None => (findings, 0),
     };
+    // 2.4：与正常路径同一条链——指纹 → dismissed（只标审计，不写 refuted）。
+    let ledger = crate::job::dismissed::apply(&mut findings, dismissed);
     let dropped = self_dropped + upstream;
     let usage = usage_from_cells(&cells);
     let failure = JobFailure::new("wall_clock_exhausted", None);
     let text: StatusText = failure.status_text(lang);
-    let mut extras = crate::job::report::ReviewExtras { dropped_unverified_quotes: dropped, ..Default::default() };
+    let mut extras = crate::job::report::ReviewExtras {
+        dropped_unverified_quotes: dropped,
+        ledger,
+        ..Default::default()
+    };
     if dropped > 0 {
         extras.extra_partial.push(JobFailure::new("quotes_dropped", Some(dropped.to_string())));
     }
@@ -212,7 +219,7 @@ mod tests {
           "inputs":{}
         }"#).unwrap();
         let lang = crate::config::Language::EnUs.output();
-        let r = interrupted_report(&manifest, &lang, &Config::default(), &sink, None);
+        let r = interrupted_report(&manifest, &lang, &Config::default(), &sink, None, &crate::job::dismissed::Dismissed::default());
         assert_eq!(r.status, crate::job::status::JobStatus::Partial);
         assert!(r.status_reason.unwrap().contains("wall-clock budget"));
         assert_eq!(r.extensions["redteam"]["status_code"], "wall_clock_exhausted");

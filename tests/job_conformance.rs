@@ -697,3 +697,43 @@ async fn unverifiable_quote_is_dropped_and_makes_partial() {
     assert!(r["findings"].as_array().unwrap().is_empty(), "幻觉 quote 不得留进 findings");
     assert!(r["status_reason"].as_str().unwrap().contains("quote not found verbatim"), "{}", r["status_reason"]);
 }
+
+/// 2.4：dismissed 命中 → 保留在 findings 里作审计、`refuted` 恒 false、不阻塞（status 仍 ok）。
+#[tokio::test]
+async fn dismissed_is_audited_but_never_refuted() {
+    let title = "SQL injection";
+    let fp = fingerprint::of("src/app.js", QUOTE, title);
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, title))));
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    let csv = format!("fingerprint,actor,reason,created_at\n{fp},alice,\"false positive, see #12\",2026-11-20T10:00:00Z\n");
+    update_input(&fx.job, "dismissed", "input/dismissed.csv", csv.as_bytes());
+    let over = fake_override(scan, review);
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok", "被驳回项不阻塞: {r}");
+    let f = &r["findings"][0];
+    assert_eq!(f["fingerprint"], fp, "指纹必须与 CSV 对得上");
+    assert_eq!(f["refuted"], false, "人的决定不是证据证伪");
+    let ledger = &f["extensions"]["redteam"]["ledger"];
+    assert_eq!(ledger["dismissed"], true);
+    assert_eq!(ledger["actor"], "alice");
+    assert_eq!(ledger["reason"], "false positive, see #12");
+}
+
+/// 2.4：坏 CSV → error（不静默当空台账）。
+#[tokio::test]
+async fn malformed_dismissed_csv_is_an_error() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    update_input(
+        &fx.job,
+        "dismissed",
+        "input/dismissed.csv",
+        b"fingerprint,actor,reason,created_at\nnot-a-fingerprint,alice,b,2026-11-20T10:00:00Z\n",
+    );
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:dismissed");
+}

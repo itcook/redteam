@@ -11,10 +11,13 @@
 //! - [`projection`]：`inputs.diff_patch` → 变更集（输入真相源）+ 与 git 的一致性披露（2.1）。
 //! - [`repo`]：检出完整性（非 shallow / 对象可得 / merge-base 可算，2.6）。
 //! - [`prior`]：`prior_report` 只读 `summary.routing`（focus / specs / 预算，2.3）。
+//! - [`dismissed`]：`dismissed.csv` 严格 RFC4180 解析与指纹匹配（2.4）。
+//! - [`quote`]：quote 逐字重锚与丢弃计数（2.5）。
 //!
 //! **硬规则**：job 模式只写 `paths.out`；不读 `$REDTEAM_HOME` / `secrets.json`；不依赖 cwd / stdin。
 
 pub mod artifact;
+pub mod dismissed;
 pub mod fingerprint;
 pub mod executor_config;
 pub mod io;
