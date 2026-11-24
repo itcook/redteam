@@ -123,3 +123,15 @@
 - 建议下一步（需确认）：chunk 失败时用剩余预算重试（绝对 deadline 封顶），而不是立即收敛；
   若首轮是 `max_tokens` 截断，再把 GLM 的 maxOutputTokens 提到 64k。
 - 原始报告：`report.hiapi-backend-pr-333-glm54.json` / `...-glm54b.json`、`report.hiapi-sites-pr-328-glm54.json`。
+
+## GLM-5.4 slice 超时根因（诊断跑，2026-11-24）
+
+- run：backend #333，`-glm54diag`，451.4s，partial。
+- 轴错误原文：
+  - drift：`timeout: triage cell `triage-drift` exceeded its 154.958681816s budget (attempts=1 last_call_ms=None in_flight_ms=Some(154960) last_finish=None last_text_len=None last_error=None)`
+  - intent slice：`timeout: triage cell `triage-intent-slice` exceeded its 320.849922316s budget (attempts=1 last_call_ms=None in_flight_ms=Some(320853) last_finish=None last_text_len=None last_error=None)`
+- 判读：`attempts=1`、`last_error=None`、`last_finish=None` → **单次调用在预算到期时仍在飞**；
+  没有网关错误、没有重试、没有 `max_tokens` 截断/解析结果。根因是**模型/网关单次响应耗时超过单格预算**，
+  不是我们的重试链或输出上限。
+- 结论：要拿完整 intent，需要给 slice 更大的单格预算（把 intent 的预算份额提高/减少波次），
+  或换更快的模型/更低 reasoning；单纯“用剩余预算重试”只在单次调用能在重试预算内返回时才有意义。
