@@ -3,7 +3,8 @@
   "name": "redteam",
   "version": "0.1.0",
   "kinds": [
-    "review"
+    "review",
+    "triage"
   ],
   "form": "cli",
   "invoke": "redteam review --job-dir <dir>",
