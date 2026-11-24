@@ -10,7 +10,7 @@ description: Loop adversarial review until verdict=approve — adjudicate, fix, 
 
 用户参数：$ARGUMENTS
 - `--max-rounds <N>`（本命令专属，可选）：预算护栏；未给则**无轮数上限**——目标是 approve。
-- 其余参数**原样透传**给 `redteam review`（--base/--scope/--spec/--focus 等；模型集由 `~/.redteam/config.json` 的角色定，没有 `--models` 这类旗）。
+- 其余参数**原样透传**给 `redteam review`（--base/--scope/--spec/--focus 等；模型集由 `~/.redteam/config.json` 的角色定，命令行没有选模型的旗）。
   透传前先摘除上述专属参数。redteam 开启 `args_override_self`（同名 flag 重复后者胜），
   ship 管理的 `--background` 追加在用户参数之后即权威生效；唯一需连值摘除的是
   `--resume <值>`（它切同步补跑、打印全报告而非 job id，破坏循环）。凡摘除不得静默。

@@ -11,7 +11,7 @@ use std::path::Path;
 // args_override_self：同名 flag 重复时后者胜（而非报错）——ship 等编排方把自己管理的
 // flag 追加在用户参数之后即权威生效，无需依赖 prompt 层把用户重复参数「摘干净」
 // （r5 dogfood 1c72b790：LLM 摘参不可靠，机制化消灭「重复即崩」类）。
-#[command(name = "redteam", version, about = "redteam：模型无关的对抗式代码评审器——风险路由 → 疑点扫描 → 深挖 → 流式复核", args_override_self = true,
+#[command(name = "redteam", version, about = "redteam：模型无关的对抗式代码评审器——风险路由 → 疑点扫描 → 深挖 → finding（可选验真）", args_override_self = true,
     after_help = "快速上手：\n  \
     1. redteam init                                              # 项目内建 .redteam/ 骨架（状态与内容，无配置）\n  \
     2. redteam model setup --provider X --model <id> --role scanner # 给至少一个模型配 scanner 角色（key 见 --key-store）\n  \
@@ -26,34 +26,41 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// 发起对抗式评审：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目（× samples）并行扇出
-    /// → 疑点并集（agreement = 家族数）→ **深挖**（风险 H0 区、scanner 疑点与 scanner needs〔只接变更集内、带行锚的〕
-    /// 进同一条优先级队列，reviewer 按 provider 门空位消费，预算随风险分、必挖集不截；配多个 reviewer 条目时按空闲轮转分摊、
-    /// 每项只交一个条目，鉴权失败的条目移出、它已失败的格不改派）→ dedup → finding 报告与 verdict。
-    /// 队列项的身份是**代码结构**而非报告行：疑点落在哪个 def（文档落在哪个标题节）就成那一项，格名里的区间即该块，
-    /// 同块的多条疑点并成一格；派发按分层序——H0 最先，然后每个候选文件先保底一格，其余按〔项内共识 → 风险档 → 疑点条数
-    /// → 代码优先 → 自评置信〕排，自评置信只做同分裂解。scanner 与深挖时间重叠：H0 区开跑即挖、
-    /// scanner 每格完成即入队（扫描期非必挖项少挖约 1/4 预算，留给后到的疑点），scanner 全部返回后按剩余预算收场。**finding 只由深挖产出**；
-    /// 没配 reviewer 角色则退化为 scan-only（疑点索引 + 覆盖自报，不产 finding）。
-    /// 退出码：0=干净 approve 或 scan-only 完成、1=命令自身失败（参数/IO/配置错误）、2=approve 但带债
-    /// （reviewer cell 失败——含二阶段补查轮失败、首轮 finding 保留；预算截断；reviewer 条目全部出局致队列项未挖。
-    /// 见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
-    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口；深挖照跑、findings 仍在报告，本可 reject 的 blocking 条数见
-    /// run.warnings）、10=reject（finding 达到 --block-threshold）。
-    /// 复核（refuter）**缺省关**：开了之后，每条 severity ≥ --block-threshold ∧ confidence ≥ --conf-floor 的 finding
-    /// 会再派一个模型复查，被驳回的不计数、不拦路（记录仍在 findings 里，带 refute 字段）。
-    /// 配 `review.refuters.enabled = true` 打开：没给模型配 refuter 角色时**自动挑一个异族**的 reviewer / scanner；
-    /// 配了 refuter 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦（异族更准，见下）。
-    /// 观测在 `run.deep.refute_triggered` / `refute_skipped`（分类：not_triggered·disabled·carried·precedent·consensus·resumed·cached·no_refuter）/
-    /// `refute_refuted` / `refute_failed` / `refute_tail_ms` 与顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。
-    /// 缺省关的依据：对本仓人裁台账的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 8%
-    /// （预登记门槛 ≤ 5%），代价是静默少报；异族那臂驳回更多（31% vs 19%），误驳两臂分不出高下。
-    /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
-    /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
-    /// 自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit 可读；误填超大 maxConcurrency 也能自愈）。
+    /// 发起对抗式评审：证据收集 → 疑点扫描 → 深挖 → finding 报告与 verdict（可选验真）。
+    ///
+    /// 流水线：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目（× samples）并行扇出
+    /// → 疑点并集（agreement = 家族数）→ **深挖** → dedup → finding 报告与 verdict。
+    ///
+    /// 要点：
+    /// - **finding 只由深挖产出**：风险 H0 区、scanner 疑点与 scanner needs（只接变更集内、带行锚的）进同一条
+    ///   优先级队列，reviewer 按 provider 并发门消费，预算随风险分、必挖集不截；多个 reviewer 条目按空闲轮转，
+    ///   每项只交一个条目，鉴权失败的条目移出、它已失败的格不改派。没配 reviewer 角色则退化为 scan-only
+    ///   （疑点索引 + 覆盖自报，不产 finding）。
+    /// - 队列项的身份是**代码结构**而非报告行：疑点落在哪个 def（文档落在哪个标题节）就成那一项，同块的多条
+    ///   疑点并成一格。派发按分层序：H0 最先，然后每个候选文件先保底一格，其余按
+    ///   〔项内共识 → 风险档 → 疑点条数 → 代码优先 → 自评置信〕排。
+    /// - scanner 与深挖时间重叠：H0 区开跑即挖、scanner 每格完成即入队，scanner 全部返回后按剩余预算收场。
+    /// - **验真（refuter，缺省关）**：开启后，每条 severity ≥ --block-threshold ∧ confidence ≥ --conf-floor 的
+    ///   finding 会再派一个模型复查；被驳回的不计数、不拦路（记录仍在 findings 里，带 refute 字段）。
+    ///   配 `review.refuters.enabled = true` 打开：没给模型配 refuter 角色时自动挑一个异族的 reviewer / scanner；
+    ///   配了 refuter 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦。
+    ///   观测在 `run.deep.refute_triggered` / `refute_skipped`（分类：not_triggered·disabled·carried·precedent·
+    ///   consensus·resumed·cached·no_refuter）/ `refute_refuted` / `refute_failed` / `refute_tail_ms` 与
+    ///   顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。缺省关的依据：人裁台账离线基线里两个候选模型把已确认的
+    ///   真缺陷驳掉 12% / 8%（预登记门槛 ≤ 5%），代价是静默少报；异族那臂驳回更多（31% vs 19%）。
+    /// - 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10）：路由到同一 provider 的
+    ///   cell 超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings / 每 cell `queue_wait_ms`）；撞 429 时该
+    ///   provider 门宽自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit）。
+    ///
+    /// 退出码：0=干净 approve 或 scan-only 完成、1=命令自身失败（参数/IO/配置错误）、
+    /// 2=approve 但带债（reviewer cell 失败——含二阶段补查轮失败、首轮 finding 保留；预算截断；reviewer 条目
+    /// 全部出局致队列项未挖。见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
+    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口；深挖照跑、findings 仍在报告，本可 reject 的
+    /// blocking 条数见 run.warnings）、10=reject（finding 达到 --block-threshold）。
+    ///
     /// **诊断**：置 `REDTEAM_DUMP_DIR=<目录>` 时，凡是解析失败的那一轮（scanner / reviewer 的首轮与修复轮）
     /// 会把模型原文整段落盘到该目录，文件名带队列项文件、模型与轮次；不置则零行为。报错本身恒带 serde 根因
-    /// （原因 / 行列 / 全文字符数 / 出错处前后片段），原文落盘是给「报错看不出为什么」的场合用的。
+    /// （原因 / 行列 / 全文字符数 / 出错处前后片段）。
     Review {
         /// diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]
@@ -81,9 +88,9 @@ enum Cmd {
         /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定。无 reviewer 的 scan-only 路径记录不消费。
         #[arg(long)]
         conf_floor: Option<f32>,
-        /// 工具档位：off | two-stage | on。scanner 恒单发（无工具、needs 只记录不补跑，M21b 深挖队列消费）；本旗对 scanner 无效。
+        /// 工具档位：off | two-stage（默认）| on。scanner 恒单发（无工具、needs 只记录不补跑）；本旗对 scanner 无效。
         /// reviewer：two-stage = needs 触发一轮证据补查（读守卫 + 字节帽，拒绝进 warnings）；
-        /// on 目前等同 two-stage——真工具循环 M21c 才落地，先不让它比 two-stage 弱。缺省读 config [review].tools。
+        /// on 目前与 two-stage 等价（更强的工具循环尚未落地）。缺省读 config `review.tools`。
         #[arg(long, value_parser = ["off", "two-stage", "on"])]
         tools: Option<String>,
         /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。
@@ -92,28 +99,27 @@ enum Cmd {
         /// 输出格式：json（默认）| md。
         #[arg(long, default_value = "json", value_parser = ["json", "md"])]
         format: String,
-        /// R2.3：补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
-        /// （base 等从该作业落盘的 args.json 里重建；模型集按当前配置的 scanner 重建，M21b 起读队列快照）。
+        /// 补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
+        /// （base 等从该作业落盘的 args.json 里重建；模型集按当前配置的 scanner 重建，并接着读该作业的队列快照）。
         /// 配了 reviewer 时接着深挖：补跑出的疑点与已完成 scanner 格的疑点幂等入队（已挖过的不重挖）、快照为空则按当前 diff
         /// 重建风险 H0 区、补跑过 scanner 则被预算截掉的项重选；补跑后 scanner 仍缺格 → incomplete（深挖照跑）。
         #[arg(long)]
         resume: Option<String>,
         /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：
-        /// 项目存在 .redteam/proj.db 即自动加载，run.ledger 披露。当前只披露不消费
-        /// （判例前移进 scanner prompt 与豁免 / refute 裁决在 M21c 疑点台账起）。
+        /// 项目存在 .redteam/proj.db 即自动加载，run.ledger 披露；豁免、判例注入与 refute 判例裁决都读它。
         #[arg(long)]
         dismissed: Option<String>,
         /// 本次评审完全关闭台账（豁免/预筛/判例注入全停）。
         #[arg(long)]
         no_dismissed: bool,
-        /// 增量轮（M13）：以指定作业的评审为基线只审 fix delta。仅 branch scope（须 --base），且**工作树须干净**
+        /// 增量轮：以指定作业的评审为基线只审 fix delta。仅 branch scope（须 --base），且**工作树须干净**
         /// （未提交改动会让携带项的锚点失效却不在被审 delta 里）。上轮未被 delta 覆盖的 finding 由 redteam 重锚定
         /// 携带进本轮，verdict 是合并集口径（携带 ∪ 新发）；`resolve` 过的不再携带，但 quote 仍锚得上的会报
         /// 「⚠️ Disputed」（假修复）。四道守卫（谱系 / 同族 / 健康基线 / 空 delta）**显式报错拒跑、不静默降级全量**。
         /// 不支持与 --background 同用（前台跑）。
         #[arg(long)]
         incremental_from: Option<String>,
-        /// 预算仪表（M21a）：只收集证据 → 分组 → 装包 → 落盘 .redteam/packs/<job>/cell-<n>.md（= 真实发出的 scanner prompt：
+        /// 预算仪表：只收集证据 → 分组 → 装包 → 落盘 .redteam/packs/<job>/cell-<n>.md（= 真实发出的 scanner prompt：
         /// 共享头 system + 参考 / 证据 / diff / 角色尾四块）与 summary.json，每 cell 打印字节（含 system 段）与估算 token（÷3.5）、
         /// 分组统计与装包形态（body=slice|full 随 `review.pack.body`，缺省 slice：切片 / 折叠行 / 文件外片段计数）；不建 registry、
         /// 不调 provider，无模型配置也能跑，退出码 0。与 --background / --resume / --incremental-from 互斥；
@@ -132,8 +138,9 @@ enum Cmd {
         #[arg(long)]
         cells: bool,
     },
-    /// 取回作业的评审结果（持久存储于 .redteam/proj.db，永不过期、可重复取）。
-    /// 任一终态可取（failed/timed_out 有部分报告也放行）；未终态是命令自身失败，退出码 1。
+    /// 取回作业的评审结果（持久存储于 .redteam/proj.db）。
+    ///
+    /// 任一终态可取（failed/timed_out 有部分报告也放行，永不过期、可重复取）；未终态是命令自身失败，退出码 1。
     Result {
         /// 作业 id（review --background 的输出）。
         job_id: String,
@@ -171,9 +178,11 @@ enum Cmd {
     },
     /// 幂等创建项目级 .redteam/ 骨架（.gitignore、rounds/、proj.db；配置在用户级 ~/.redteam/config.json，项目层无配置文件）。
     Init,
-    /// 打印生效的测试命令（ship 循环第 2 步用）：--override > Cargo.toml→`cargo test` > package.json 有
-    /// scripts.test→`npm test` > Makefile 有 test 目标→`make test` > go.mod→`go test ./...`；推不出 →
-    /// stderr 提示、退出码 2（调用方转 AskUser）。
+    /// 打印生效的测试命令（ship 循环第 2 步用）。
+    ///
+    /// 推断链：--override > Cargo.toml→`cargo test` > package.json 有 scripts.test→`npm test`
+    /// > Makefile 有 test 目标→`make test` > go.mod→`go test ./...`；推不出 → stderr 提示、退出码 2
+    /// （调用方转 AskUser）。
     TestCommand {
         /// 覆盖推断（与 `review --test-command` 同义）。
         #[arg(long = "override")]
@@ -197,9 +206,11 @@ enum Cmd {
         #[arg(long)]
         dump_prompt: bool,
     },
-    /// 风险路由只读回放（M21b 批 A，零 provider / 零副作用）：跑阶段 0（成区 → 四类信号 → H0/R/档位）
-    /// 打印 JSON——供 `eval/risk_replay.py compare` 对拍 Python v4 参考实现（θ 与权重改动必过的回归门，D11）。
-    /// 读 `merge-base(base,head)...head` 与 head commit 内容（不依赖工作树），可回放任意历史 diff。
+    /// 风险路由只读回放（零 provider / 零副作用）。
+    ///
+    /// 跑阶段 0（成区 → 四类信号 → H0/R/档位）打印 JSON——供 `eval/risk_replay.py compare` 对拍参考实现
+    /// （θ 与权重改动必过的回归门）。读 `merge-base(base,head)...head` 与 head commit 内容（不依赖工作树），
+    /// 可回放任意历史 diff。
     Risk {
         /// diff 基线（分支名/commit）。
         #[arg(long)]
