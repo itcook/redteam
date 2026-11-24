@@ -31,7 +31,8 @@ pub fn surface_key(id: u8) -> &'static str {
 
 /// tier2 白名单：只有这三个面能升 2（grill 定案 / 契约 §3.5）。
 pub fn tier2_surface(id: u8) -> bool {
-    matches!(id, 1 | 3 | 4)
+    // 2026-11-24 用户裁决：secrets（面 2）也可升 tier2（直接挡下班 review）；面 5–7 恒 tier1。
+    matches!(id, 1 | 2 | 3 | 4)
 }
 
 pub fn surface_title(id: u8, zh: bool) -> String {
@@ -699,11 +700,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn surfaces_and_tier2_whitelist_match_the_human_baseline() {
+    fn surfaces_and_tier2_whitelist_match_the_decision() {
         assert_eq!(SURFACES.len(), 7);
-        assert!(tier2_surface(1) && tier2_surface(3) && tier2_surface(4));
-        for id in [2, 5, 6, 7] {
-            assert!(!tier2_surface(id), "面 {id} 不得升 tier2");
+        for id in [1, 2, 3, 4] {
+            assert!(tier2_surface(id), "面 {id} 可升 tier2");
+        }
+        for id in [5, 6, 7] {
+            assert!(!tier2_surface(id), "面 {id} 恒 tier1");
         }
         assert_eq!(surface_key(4), "code-execution");
     }

@@ -15,7 +15,7 @@ hibot audit 执行单元接入的 U4 单元（协调者 session `01a20ba0` 派�
    必须同时给出「source→sink 可达路径」+ 逐字行；给不出路径的封顶 7（即被 `<8` 丢弃）。
    不做第二模型复核；tier2 误升率由 3.8 人工基线度量。
 2. **tier2 边界**：面 1/3/4 ∧ `confidence ≥ 8` → tier2；一行命中多面按"任一面命中"；
-   **secrets（面 2）即使 conf=10 也只给 tier1**（照契约与基线）；面 4 要求"用户可控输入可达"，
+   **secrets（面 2）conf≥8 也升 tier2**（2026-11-24 用户裁决：secrets 直接挡下班 review）；面 4 要求"用户可控输入可达"，
    不可达不算该面。severity：tier2 候选 `high`、其余安全行 `medium`；`confidence = conf/10`。
 3. **`risk` / `fit`**：`risk` 照计划字面（tier≥1 ∨ blockers≥3 → high；blockers≥1 ∨ scope_creep>0 → medium；
    else low）。`fit` 用**混合口径**（替代原 `[拟议]`）：
@@ -88,10 +88,12 @@ hibot audit 执行单元接入的 U4 单元（协调者 session `01a20ba0` 派�
 | 面 | 名称 | 判据（摘要） | 可升 tier2 |
 |---|---|---|---|
 | 1 | supply-chain | 安装/构建钩子联网、不可信/未锁依赖、lockfile 换源 | **是** |
-| 2 | secrets | diff 中新增凭据/密钥/token/PEM/连接串 | 否（只 tier1） |
+| 2 | secrets | diff 中新增凭据/密钥/token/PEM/连接串 | **是（conf≥8）** |
 | 3 | CI/CD 投毒 | workflow/pipeline 以 elevated scope 跑 PR 受控输入，或向 fork PR 暴露长期密钥 | **是** |
 | 4 | 代码执行 / 不安全反序列化 | shell/进程 spawn、eval/动态 import、可执行代码的反序列化，且**用户可控输入可达** | **是** |
 | 5 | 注入 | 用户输入拼进 SQL/NoSQL/LDAP/XPath/shell 解释器 | 否（tier1） |
+
+> **2026-11-24 用户裁决**：`security_tier=2` = 分诊不通过、直接挡下班 review；因此 secrets（面 2）与面 1/3/4 同权，conf≥8 可升 tier2。面 5–7 恒 tier1。
 | 6 | 路径穿越 | 用户可控路径进文件 API 且无规范化 | 否（tier1） |
 | 7 | SSRF | 出站请求的 host/protocol 用户可控 | 否（tier1） |
 
