@@ -76,15 +76,29 @@ pub fn changed_files(dir: &std::path::Path, base: Option<&str>, branch_scope: bo
 pub fn changed_files_at(dir: &std::path::Path, base: &str, head: &str) -> anyhow::Result<Vec<FileChange>> {
     let merge_base = git_at(dir, &["merge-base", "--end-of-options", base, head])?.trim().to_string();
     let range = format!("{merge_base}...{head}");
-    let full = git_at(dir, &["diff", "--no-ext-diff", "-M", "--end-of-options", &range])?;
+    let full = git_at(dir, &["diff", "--no-ext-diff", "--no-textconv", "-M", "--end-of-options", &range])?;
     Ok(split_diff_by_file(&full))
 }
 
 /// 指定目录跑 git（M13 增量基建：hermetic 测试可用 tempdir 仓库，不依赖进程 cwd）。
 /// ANSI 关死同 `git()`（color.diff 必须显式 false，命令行 -c 恒优先于文件 config）。
 fn git_at(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
-        .current_dir(dir)
+    git_at_with(dir, args, false)
+}
+
+/// 同 [`git_at`]，但 job 的完整性探测额外**禁掉 partial-clone 懒取**：
+/// 缺对象必须是可判定的 error，不能悄悄联网补（`GIT_NO_LAZY_FETCH`）；顺带禁交互式凭据提示。
+fn git_at_local(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
+    git_at_with(dir, args, true)
+}
+
+fn git_at_with(dir: &std::path::Path, args: &[&str], no_fetch: bool) -> anyhow::Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir);
+    if no_fetch {
+        cmd.env("GIT_NO_LAZY_FETCH", "1").env("GIT_TERMINAL_PROMPT", "0");
+    }
+    let out = cmd
         // core.quotePath=false：非 ASCII 路径原样输出，不转成引号转义串——
         // split_diff_by_file 的 strip_prefix 与 rename_map 的相等匹配都依赖裸路径。
         .args(["-c", "color.ui=false", "-c", "color.diff=false", "-c", "core.quotePath=false"])
@@ -104,14 +118,14 @@ pub fn head_sha_at(dir: &std::path::Path) -> anyhow::Result<String> {
 /// 2.6：浅克隆判定（`--is-shallow-repository`）。hibot 保证的是**非 shallow** 完整检出，
 /// 浅克隆下 base/merge-base 对象可能根本不在本地——那是 `error` 而不是「降级披露」。
 pub fn is_shallow_repository(dir: &std::path::Path) -> anyhow::Result<bool> {
-    Ok(git_at(dir, &["rev-parse", "--is-shallow-repository"])?.trim() == "true")
+    Ok(git_at_local(dir, &["rev-parse", "--is-shallow-repository"])?.trim() == "true")
 }
 
 /// 2.6：把 rev 解析成**完整 commit sha**（`rev-parse --verify <rev>^{commit}`）。
 /// 对象缺失 / 不是 commit → Err（调用方归类为 `repo_incomplete`）。
 pub fn resolve_commit(dir: &std::path::Path, rev: &str) -> anyhow::Result<String> {
     let spec = format!("{rev}^{{commit}}");
-    Ok(git_at(dir, &["rev-parse", "--verify", "--end-of-options", &spec])?.trim().to_string())
+    Ok(git_at_local(dir, &["rev-parse", "--verify", "--end-of-options", &spec])?.trim().to_string())
 }
 
 /// 2.6：`<rev>^{commit}` 对象本地是否可得。退出码表意（缺对象时 rev-parse 非 0），
@@ -120,6 +134,8 @@ pub fn commit_exists(dir: &std::path::Path, rev: &str) -> anyhow::Result<bool> {
     let spec = format!("{rev}^{{commit}}");
     let out = Command::new("git")
         .current_dir(dir)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .args(["-c", "color.ui=false", "rev-parse", "--verify", "--quiet", "--end-of-options", &spec])
         .output()?;
     Ok(out.status.success())
@@ -129,7 +145,7 @@ pub fn commit_exists(dir: &std::path::Path, rev: &str) -> anyhow::Result<bool> {
 /// **只要求可算**：结果不用于和 `inputs.merge_base` 比相等（Q2：`merge_base` 是实际 diff 左端，
 /// 可能与 `pr.base_sha` 前进后的 merge-base 不同）。
 pub fn merge_base_of(dir: &std::path::Path, a: &str, b: &str) -> anyhow::Result<String> {
-    Ok(git_at(dir, &["merge-base", "--end-of-options", a, b])?.trim().to_string())
+    Ok(git_at_local(dir, &["merge-base", "--end-of-options", a, b])?.trim().to_string())
 }
 
 /// 任意 rev 的 blob 内容（`git show <rev>:<path>`；M21b 批 A `risk` 回放：读历史 commit 文件，不依赖工作树）。
@@ -201,7 +217,7 @@ pub fn rename_map(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<(Stri
 pub fn changed_files_since(dir: &std::path::Path, base: &str) -> anyhow::Result<Vec<FileChange>> {
     // `--end-of-options`：同 rename_map，base 拼进 range 字符串的位置参数防注入。
     // `--no-ext-diff`：外部 diff 驱动会把输出换成别的格式（或执行任意程序）。
-    let full = git_at(dir, &["diff", "--no-ext-diff", "-M", "--end-of-options", &format!("{base}..HEAD")])?;
+    let full = git_at(dir, &["diff", "--no-ext-diff", "--no-textconv", "-M", "--end-of-options", &format!("{base}..HEAD")])?;
     Ok(split_diff_by_file(&full))
 }
 

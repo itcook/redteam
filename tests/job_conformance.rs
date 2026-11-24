@@ -927,3 +927,87 @@ async fn language_is_consistent_across_prompts_findings_and_status_reason() {
     }
     assert_eq!(warnings_by_lang[0], warnings_by_lang[1], "run.warnings 不得随 language 翻译");
 }
+
+/// 2.5/2.3/2.4 + 1.5：reviewer 已完成、后续 refute 调用挂起 → 超时收口落盘的真实报告
+/// 仍保留 prior、dismissed、修正后的 quote 与 partial 原因。
+#[tokio::test]
+async fn timeout_partial_report_keeps_run_facts_and_corrected_quote() {
+    let body = "function find(id) {\n  return db.query('SELECT  *  FROM users WHERE id=' + id);\n}\n";
+    let model_quote = "return db.query('SELECT * FROM users WHERE id=' + id);";
+    let fixed = "return db.query('SELECT  *  FROM users WHERE id=' + id);";
+    let title = "SQL injection";
+    let fp = fingerprint::of("src/app.js", fixed, title);
+
+    let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(model_quote, "src/app.js", 2))));
+    let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(model_quote, "src/app.js", 2, title))));
+    // 复核故意挂起：预算 1s 到点后必须收敛成 partial，而不是等它回。
+    let refute = Arc::new(
+        FakeChatBackend::repeating(turn(r#"{"verdict":"UPHELD","reason":"x"}"#))
+            .with_delay(std::time::Duration::from_secs(5)),
+    );
+    let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
+    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+    cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+    let fx = make_repo_and_job_with_body("review", &cfg.to_string(), body, false);
+    // 预算 1s
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();
+    m["limits"]["wall_clock_s"] = serde_json::json!(1);
+    std::fs::write(fx.job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    // prior + dismissed（指纹按**修正后**的 quote 算）
+    let prior = serde_json::json!({
+        "schema": "hibot.audit.report.triage/1", "job_id": "T1", "kind": "triage", "status": "ok",
+        "input": {"head_sha": "h", "base_sha": "b"},
+        "executor": {"name": "redteam", "version": "0.1.0"},
+        "findings": [],
+        "summary": {"routing": {"focus": ["auth"], "specs": ["README.md"], "wall_clock_s": 120}},
+        "usage": {"input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 0, "wall_clock_ms": 1},
+        "extensions": {}
+    })
+    .to_string();
+    add_prior_report(&fx.job, &prior);
+    let csv = format!("fingerprint,actor,reason,created_at\n{fp},alice,false positive,2026-11-20T10:00:00Z\n");
+    update_input(&fx.job, "dismissed", "input/dismissed.csv", csv.as_bytes());
+
+    let over = Box::new({
+        let (scan, review, refute) = (scan, review, refute);
+        move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            if em.provider != "p1" {
+                return None;
+            }
+            match em.id.as_str() {
+                "s" => Some(Box::new(scan.clone())),
+                "r" => Some(Box::new(review.clone())),
+                "v" => Some(Box::new(refute.clone())),
+                _ => None,
+            }
+        }
+    }) as Box<redteam::cli::BackendOverride<'_>>;
+    assert_eq!(redteam::job::run::run_with(JobKind::Review, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "partial", "{r}");
+    assert!(r["status_reason"].as_str().unwrap().contains("wall-clock"), "{}", r["status_reason"]);
+    assert_eq!(r["extensions"]["redteam"]["prior_routing"]["focus"], serde_json::json!(["auth"]));
+    assert_eq!(r["extensions"]["redteam"]["input_consistency"]["git"], "match");
+    let f = &r["findings"][0];
+    assert_eq!(f["quote"], fixed, "超时报告同样要用检出原文修正 quote");
+    assert_eq!(f["fingerprint"], fp);
+    assert_eq!(f["refuted"], false);
+    assert_eq!(f["extensions"]["redteam"]["ledger"]["actor"], "alice");
+}
+
+/// 2.6：缺 blob（commit/tree/检出都在）经 `run_with` 落合法 error 报告。
+#[tokio::test]
+async fn missing_blob_produces_valid_error_report() {
+    let fx = make_repo_and_job("review", &config_with(Some("en_US"), false), true, false);
+    // 删掉 head 侧 src/app.js 的 blob：diff 生成必须读它，commit/tree/检出文件都还在。
+    let blob = git(&fx.repo, &["rev-parse", "HEAD:src/app.js"]);
+    let p = fx.repo.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+    assert!(p.is_file(), "fixture 期望松散 blob: {}", p.display());
+    std::fs::remove_file(&p).unwrap();
+    let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "repo_incomplete:merge_base", "{r}");
+    assert!(r["findings"].as_array().unwrap().is_empty());
+}

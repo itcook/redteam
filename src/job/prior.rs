@@ -121,23 +121,22 @@ fn resolve_spec(repo: &Path, declared: &str) -> Option<String> {
     if !real.starts_with(&root) || !real.is_file() {
         return None;
     }
-    // 可读常规文本：能打开、前 8KB 无 NUL、UTF-8 起始段合法（render_spec_section_capped 会再读一遍并自行限流）。
-    let mut buf = Vec::new();
+    // 二进制拒收（NUL）：renderer 只用 `String::from_utf8` 判定，NUL 是合法 UTF-8，会被原样注入。
     {
         use std::io::Read;
+        let mut head = Vec::new();
         let f = std::fs::File::open(&real).ok()?;
-        f.take(8192).read_to_end(&mut buf).ok()?;
-    }
-    if buf.contains(&0) {
-        return None;
-    }
-    if let Err(e) = std::str::from_utf8(&buf) {
-        // 8KB 截断可能切在多字节字符中间：只容忍「末尾不完整」这一种。
-        if e.error_len().is_some() {
+        f.take(8192).read_to_end(&mut head).ok()?;
+        if head.contains(&0) {
             return None;
         }
     }
-    Some(real.to_string_lossy().to_string())
+    // 「可读」的判据**复用实际 renderer**（不另写一套近似检查）：它统一处理常规文件、UTF-8、
+    // PEM/敏感路径拒读与预算截断。`used == 0` = 这份 spec 一个字节都没进评审上下文 → 不算已用。
+    let abs = real.to_string_lossy().to_string();
+    let (_section, used, _warnings) =
+        crate::cli::spec::render_spec_section_capped(std::slice::from_ref(&abs), 1 << 16);
+    (used > 0).then_some(abs)
 }
 
 #[cfg(test)]

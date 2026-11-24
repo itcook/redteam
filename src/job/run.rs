@@ -165,6 +165,15 @@ fn effective_deadline(
         )
     })
 }
+/// 收口后的 counted 集合（stats 与 verdict 共用）：dismissed 不计，enforce 时窗外不计。
+fn counted_findings(findings: &[crate::domain::Finding], window_enforced: bool) -> Vec<crate::domain::Finding> {
+    findings
+        .iter()
+        .filter(|f| !f.previously_dismissed && !(window_enforced && f.outside_window))
+        .cloned()
+        .collect()
+}
+
 /// 2.2 投影：job 模式的 `ReviewArgs`（**唯一构造点**——生产与门槛测试共用同一入口）。
 ///
 /// 四个布尔恒 false（`background` / `resume` / `incremental_from` / `pack_only`）、`scope=branch`、
@@ -302,22 +311,22 @@ async fn run_review(
             internal.findings = verified.findings;
             // 2.4：指纹 → dismissed（顺序固定：重锚/修正 quote 之后）。命中只标审计、不写 refuted。
             let ledger = crate::job::dismissed::apply(&mut internal.findings, dismissed);
-            // 被丢弃的 finding 不再计入严重度统计（否则「丢光了」仍报原计数）；
-            // dismissed 命中的也不计入任何计数口径（协调者 Q-A 第 2 条：只作留在 findings 里的事实）。
-            internal.stats = crate::domain::Stats::from_findings(
-                &internal.findings.iter().filter(|f| !f.previously_dismissed).cloned().collect::<Vec<_>>(),
-            );
+            // 统计与 verdict 共用同一份 counted 集合（与 overlay_deep 的口径一致）：
+            // - 被丢弃的 finding 已不在数组里；
+            // - dismissed 命中的不计任何计数（协调者 Q-A 第 2 条）；
+            // - `finding_window_enforced` 时窗外的也不计。
+            let counted = counted_findings(&internal.findings, internal.run.finding_window_enforced);
+            internal.stats = crate::domain::Stats::from_findings(&counted);
+            internal.run.doc_findings = counted
+                .iter()
+                .filter(|f| crate::risk::signals::is_doc_path(&f.file))
+                .count() as u32;
             // 内部 verdict 也要认这个事实（报告不携带 verdict，但内部 blocking 口径必须一致）。
             // 只重算 Approve/Reject 这两种「纯由 findings 决定」的结论：
             // - Incomplete 来自 coverage/budget（扫描/深挖不完整）；
             // - ScanOnly 来自 scan-only 形态；
             // 两者都不能被一次重算抹掉。重算沿用 overlay_deep 的 counted 口径（窗外 finding 在 enforce 下不计）。
             if matches!(internal.verdict, crate::domain::Verdict::Approve | crate::domain::Verdict::Reject) {
-                let counted: Vec<crate::domain::Finding> = if internal.run.finding_window_enforced {
-                    internal.findings.iter().filter(|f| !f.outside_window).cloned().collect()
-                } else {
-                    internal.findings.clone()
-                };
                 let (block, floor) = crate::cli::verdict_thresholds(&args, cfg);
                 internal.verdict = crate::verdict::compute_verdict(&counted, block, floor);
             }
@@ -513,6 +522,30 @@ mod tests {
         assert!(!future.saturating_duration_since(now).is_zero());
     }
 
+
+    /// 2.5/2.4：counted 集合的口径——窗内 dismissed、窗外 enforced、普通有效项三者混合。
+    #[test]
+    fn counted_set_excludes_dismissed_and_enforced_outside_window() {
+        use crate::domain::{Finding, Origin, Severity};
+        let mk = |sev, dismissed: bool, outside: bool| Finding {
+            id: "x".into(), severity: sev, title: "t".into(), body: "b".into(), file: "src/a.rs".into(),
+            line_start: 1, line_end: 1, confidence: 0.9, recommendation: "r".into(), models: vec![],
+            agreement: 1, suspicion_agreement: 0, hard_constraint: false, cluster_id: None,
+            quote: "q".into(), refute: None, previously_dismissed: dismissed,
+            origin: Origin::New, outside_window: outside,
+        };
+        let fs = vec![
+            mk(Severity::Critical, true, false),  // 窗内但被驳回
+            mk(Severity::High, false, true),      // 窗外高危（enforce 下不计）
+            mk(Severity::Medium, false, false),   // 普通有效项
+        ];
+        assert_eq!(counted_findings(&fs, true).len(), 1);
+        assert_eq!(counted_findings(&fs, false).len(), 2, "未 enforce 时窗外项照常计");
+        let counted = counted_findings(&fs, true);
+        assert_eq!(crate::domain::Stats::from_findings(&counted).total, 1);
+        let v = crate::verdict::compute_verdict(&counted, Severity::High, 0.5);
+        assert_ne!(v, crate::domain::Verdict::Reject, "驳回/窗外项不得把结论推到 reject: {v:?}");
+    }
 
     /// 2.3 出口验收：走**生产投影入口**，prior_report 前后生效的阻断阈值逐字节相同（非默认配置）。
     #[test]
