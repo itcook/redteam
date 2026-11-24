@@ -50,6 +50,9 @@ struct GateState {
     /// 阻塞等门者的登记票号，按登记先后排队（design §12.3「单把 FIFO」〔D15〕）。非空时非阻塞试取一律让位；
     /// 只有队头能取——`notify_one` 加「已登记即可取」会让刚登记的新等门者抢走已被唤醒、尚未被 poll 的队头的门位。
     waiting: VecDeque<u64>,
+    /// 429 退避等待中的请求数（`on_rate_limited` 进入等待 → 准入或放弃时减一；不计入 `active`）。
+    /// 心跳 `llm.retrying` 的唯一来源。
+    retrying: u32,
     next_ticket: u64,
 }
 
@@ -70,12 +73,54 @@ pub struct GateStat {
     pub completions: u64,
 }
 
+/// `out/state.json` 的 `llm` 段（契约 §3.6；P12：唯一来源 = 各 provider 的 `InflightGate`）。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LlmSnapshot {
+    /// Σ provider `active`（正在进行的 HTTP 请求；不含 429 退避等待者）。
+    pub in_flight: u32,
+    /// Σ provider 配置帽（P12 的“实际生效口径”；不随 429 收窄而变）。
+    pub max_concurrency: u32,
+    /// Σ provider 429 退避等待中请求数（不计入 `in_flight`）。
+    pub retrying: u32,
+    pub providers: Vec<ProviderSnapshot>,
+}
+
+/// 单 provider 的心跳读数；`name` = 配置 provider key（不是 apiType、不是模型 id）。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ProviderSnapshot {
+    pub name: String,
+    pub in_flight: u32,
+    pub max_concurrency: u32,
+}
+
+/// 从门表生成心跳读数（`ProviderRegistry::snapshot` 与心跳任务共用同一函数——口径不漂移）。
+/// 未建门（triage/verify 或无 scanner）→ None：`llm` 是可选段，不伪造 0 帽。
+pub fn snapshot_of_gates(gates: &BTreeMap<String, Arc<InflightGate>>) -> Option<LlmSnapshot> {
+    if gates.is_empty() {
+        return None;
+    }
+    let providers: Vec<ProviderSnapshot> = gates
+        .iter()
+        .map(|(name, g)| ProviderSnapshot {
+            name: name.clone(),
+            in_flight: g.inflight(),
+            max_concurrency: g.configured_cap(),
+        })
+        .collect();
+    Some(LlmSnapshot {
+        in_flight: providers.iter().map(|p| p.in_flight).sum(),
+        max_concurrency: providers.iter().map(|p| p.max_concurrency).sum(),
+        retrying: gates.values().map(|g| g.retrying()).sum(),
+        providers,
+    })
+}
+
 impl InflightGate {
     fn new(cap: u32) -> Self {
         let cap = cap.max(1);
         InflightGate {
             cap_initial: cap,
-            state: Mutex::new(GateState { cap, held: 0, active: 0, rate_limited: 0, completions: 0, waiting: VecDeque::new(), next_ticket: 0 }),
+            state: Mutex::new(GateState { cap, held: 0, active: 0, rate_limited: 0, retrying: 0, completions: 0, waiting: VecDeque::new(), next_ticket: 0 }),
             slot_free: Notify::new(),
             completed: Notify::new(),
             peak: AtomicU32::new(0),
@@ -95,6 +140,18 @@ impl InflightGate {
     pub fn stat(&self) -> GateStat {
         let s = self.lock();
         GateStat { cap: self.cap_initial, effective_cap: s.cap, rate_limited: s.rate_limited, peak: self.peak(), completions: s.completions }
+    }
+    /// 在途 HTTP 请求数（心跳 `llm.in_flight` / `providers[].in_flight` 的唯一来源）。
+    pub fn inflight(&self) -> u32 {
+        self.lock().active
+    }
+    /// 阻塞等门者数（心跳不直接上报；用于诊断与 Phase 5 门槛测试）。
+    pub fn waiting(&self) -> u32 {
+        self.lock().waiting.len() as u32
+    }
+    /// 429 退避等待中的请求数（不计入在途）。
+    pub fn retrying(&self) -> u32 {
+        self.lock().retrying
     }
     /// 取名额：先非阻塞首试（有人排队就让位）；取不到登记为等门者排进 FIFO，轮到队头且 `held < cap` 才取。
     /// 取消安全：等门 future 在任何 await 点被 drop，`WaiterGuard` 把票号移出队列；它若是队头则唤醒其余等门者重检。
@@ -226,6 +283,26 @@ pub(crate) struct GateAttempts<'a> {
     waited_ms: AtomicU64,
 }
 
+/// 429 退避等待登记（RAII）：进入等待即 +1，准入成功或放弃 -1；future 被取消（drop）同样 -1。
+/// 不占门名额、**不计入 `active`**——`state.json` 的 `llm.retrying` 与 `llm.in_flight` 互斥。
+struct RetryingGuard<'a> {
+    gate: &'a InflightGate,
+}
+
+impl<'a> RetryingGuard<'a> {
+    fn register(gate: &'a InflightGate) -> Self {
+        gate.lock().retrying += 1;
+        RetryingGuard { gate }
+    }
+}
+
+impl Drop for RetryingGuard<'_> {
+    fn drop(&mut self) {
+        let mut s = self.gate.lock();
+        s.retrying = s.retrying.saturating_sub(1);
+    }
+}
+
 impl<'a> GateAttempts<'a> {
     pub(crate) fn new(gate: &'a InflightGate) -> Self {
         Self::with_backoff_base(gate, RL_BACKOFF_BASE)
@@ -308,6 +385,8 @@ impl AttemptPolicy for GateAttempts<'_> {
         if nth > limit {
             return false;
         }
+        // 从这里起到返回（含取消）都是“退避等待中”：只计 `retrying`，不占 `active`。
+        let _retrying = RetryingGuard::register(self.gate);
         let mut retry_after = retry_after.map(|d| d.min(RL_BACKOFF_CAP));
         loop {
             if others == 0 {
@@ -425,6 +504,14 @@ impl ProviderRegistry {
     /// 每 provider 门的观测快照。
     pub fn gate_stats(&self) -> BTreeMap<String, GateStat> {
         self.gates.iter().map(|(p, g)| (p.clone(), g.stat())).collect()
+    }
+    /// 心跳读数（与 `snapshot_of_gates` 同一实现；provider 名为配置 key）。
+    pub fn snapshot(&self) -> Option<LlmSnapshot> {
+        snapshot_of_gates(&self.gates)
+    }
+    /// 心跳持有的门句柄（`Arc` 共享）：每帧现读，不复制计数。
+    pub fn gate_handles(&self) -> BTreeMap<String, Arc<InflightGate>> {
+        self.gates.clone()
     }
     /// 排队告警（扇出与 resume 共用，D13 按 provider 计）：路由到同一 provider 的格数 > 其**有效**门宽即排队，墙钟 = 排队 + 最长格。
     /// 门未收窄时指向唯一旋钮 `providers.<p>.maxConcurrency`；已因 429 收窄则说明是收窄所致（不再劝「调大」，与 429 告警不打架）。
@@ -690,6 +777,51 @@ mod tests {
         assert_eq!(peaks.get("q"), Some(&3), "{peaks:?}");
     }
 
+    /// Phase 5.1：心跳读数只看 `InflightGate.active`（HTTP 请求），不看门名额（held）；provider 名 = 配置 key。
+    #[tokio::test]
+    async fn snapshot_counts_active_requests_by_provider_key() {
+        let mut reg = ProviderRegistry::new();
+        reg.insert_scan("p/a", "p", 4, Box::new(FakeChatBackend::repeating(scan_turn())), Duration::from_secs(5), 0);
+        reg.insert_scan("q/c", "q", 3, Box::new(FakeChatBackend::repeating(scan_turn())), Duration::from_secs(5), 0);
+        let empty = reg.snapshot().expect("gates 非空");
+        assert_eq!((empty.in_flight, empty.max_concurrency, empty.retrying), (0, 7, 0));
+        let a = reg.try_lease("p/a").unwrap().expect("门有空位");
+        let b = reg.try_lease("q/c").unwrap().expect("门有空位");
+        assert_eq!(reg.snapshot().unwrap().in_flight, 0, "只占门名额、未发 HTTP → 不算在途");
+        a.gate_attempts().attempt_begin();
+        b.gate_attempts().attempt_begin();
+        let snap = reg.snapshot().unwrap();
+        assert_eq!((snap.in_flight, snap.max_concurrency, snap.retrying), (2, 7, 0));
+        let names: Vec<&str> = snap.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["p", "q"], "provider 名 = 配置 key，不是 route_key / apiType / 模型 id");
+        assert_eq!(snap.providers[0].max_concurrency, 4, "单 provider 帽");
+        // 心跳读数与快照同一函数：state 与 registry 逐字一致。
+        assert_eq!(snapshot_of_gates(&reg.gate_handles()), Some(snap.clone()));
+        a.gate_attempts().attempt_end(AttemptOutcome::Ok);
+        b.gate_attempts().attempt_end(AttemptOutcome::Ok);
+        assert_eq!(reg.snapshot().unwrap().in_flight, 0, "请求结束后归零");
+        drop((a, b));
+    }
+
+    /// Phase 5.1：429 退避中 `retrying` 计数、不计入在途；取消（future drop）也归零（RAII）。
+    #[tokio::test]
+    async fn retrying_counts_backoff_waiters_without_inflight_and_cancel_is_clean() {
+        let gate = Arc::new(InflightGate::new(2));
+        let policy = GateAttempts::with_backoff_base(&gate, Duration::from_secs(60));
+        policy.attempt_begin();
+        policy.attempt_end(AttemptOutcome::RateLimited);
+        let mut fut = Box::pin(policy.on_rate_limited(1, None));
+        assert!(futures::poll!(&mut fut).is_pending(), "无他人在途 → 退避探测（前 60s 不醒）");
+        assert_eq!(gate.retrying(), 1);
+        assert_eq!(gate.inflight(), 0, "退避等待者不计入在途");
+        let nets = BTreeMap::from([("p".to_string(), Arc::clone(&gate))]);
+        let snap = snapshot_of_gates(&nets).expect("有门就有 llm 段");
+        assert_eq!((snap.in_flight, snap.retrying, snap.providers[0].name.as_str()), (0, 1, "p"));
+        drop(fut);
+        assert_eq!(gate.retrying(), 0, "取消也减一，不泄漏");
+        assert!(snapshot_of_gates(&BTreeMap::new()).is_none(), "无门 → 不伪造 llm 段");
+    }
+
     /// D13 ①：门宽 3；p/b 两格慢 OK 先在途（200 ms），p/a 首发 429 → 门宽收敛到在途接受数 2 → 等到一次完成再准入重试 → OK；
     /// 三格全成功，RunMeta / warnings 记 429 × 1、3 → 2；ScanCall 回填 429 重试次数与等待时长。
     #[tokio::test]
@@ -806,11 +938,13 @@ mod tests {
         let mut waiter = Box::pin(gate.enter());
         assert!(futures::poll!(&mut waiter).is_pending(), "门满 → 登记排队");
         assert_eq!(gate.waiters(), 1);
+        assert_eq!(gate.waiting(), 1, "公开读数与测试辅助一致");
         drop(held);
         assert!(gate.try_enter().is_none(), "有人排队 → 非阻塞首试让位");
         let permit = futures::poll!(&mut waiter);
         assert!(permit.is_ready(), "等门者取到");
         assert_eq!(gate.waiters(), 0);
+        assert_eq!(gate.waiting(), 0);
         drop(permit);
         assert!(gate.try_enter().is_some(), "队空后首试照取");
     }
