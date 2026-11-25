@@ -3,6 +3,9 @@
 //! 规模只决定**预算包线**与分片数，不预测 LLM 实际耗时：跑得快就提前结束，预算只是上限。
 //! 常量锚点 = GLM-5.4 high 的实测（censored：34KB slice >172s、64KB slice >321s）。
 //! 全部标 `[经验值 v1]`，后续用 `axes[].elapsed_ms` 的真实数据校准。
+//!
+//! v2（2026-11-25）：新增**整轮**预算包线 [`total_estimate_s`]（B2 经验系数），
+//! 只用于把 deadline 收到 `min(manifest, started + estimate)`；仍不预测模型耗时。
 
 use std::time::Duration;
 
@@ -25,6 +28,18 @@ pub const INTENT_EXTRA_S: f64 = 20.0;
 pub const INTENT_PER_CLAIM_S: f64 = 0.5;
 /// drift 除 diff 外的 standards pack 处理成本。
 pub const DRIFT_PER_PACK_KB_S: f64 = 1.0;
+
+/// ── 整轮预算包线 v2（2026-11-25 用户批准 B2）──
+///
+/// `base + per_diff_kb×diff_kb + per_file×files + per_text_kb×text_kb`。
+/// `per_diff_kb` 在 B1 档复用单 cell 的 [`PER_KB_S`]（6.0），B2 档上调到 7.5；其余为经验系数。
+/// 这是**包线**，不是耗时预测：跑得快照常提前结束，manifest 仍是硬上限。
+pub const TOTAL_BASE_S: f64 = 220.0;
+pub const TOTAL_PER_KB_S: f64 = 7.5;
+pub const TOTAL_PER_FILE_S: f64 = 7.5;
+pub const TOTAL_PER_TEXT_KB_S: f64 = 2.5;
+/// 整轮包线下限；manifest 更小时以 manifest 为准。
+pub const TOTAL_MIN_S: f64 = 900.0;
 
 /// 总预算放大系数：1200s 为基准（1.0），最多 1.5×（1800s）。
 /// 只放大 per-cell 包线；实际完成时间仍由模型决定。
@@ -76,6 +91,21 @@ pub fn slice_kb(files: &[(String, String)]) -> f64 {
     kb(files.iter().map(|(_, d)| d.len()).sum())
 }
 
+/// 整轮预算包线：`clamp(BASE + PER_KB×diff + PER_FILE×files + PER_TEXT_KB×text, MIN, manifest)`。
+///
+/// `TOTAL_MIN_S` 也受 manifest 约束（manifest 更小时取 manifest），因此结果恒 ≤ manifest。
+/// 用 `ceil` 向上取整：包线只收紧，不因小数舍入少给时间。
+pub fn total_estimate_s(diff_kb: f64, files: usize, text_kb: f64, manifest_cap_s: u64) -> u64 {
+    let raw = TOTAL_BASE_S
+        + TOTAL_PER_KB_S * diff_kb
+        + TOTAL_PER_FILE_S * files as f64
+        + TOTAL_PER_TEXT_KB_S * text_kb;
+    // 先把浮点包线上取整成 u64，再与 manifest 取 min：不把 u64 manifest 转 f64，
+    // 避免 >2^53 时舍入导致结果超过硬上限。
+    let estimate = raw.max(TOTAL_MIN_S).ceil() as u64;
+    estimate.min(manifest_cap_s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +151,33 @@ mod tests {
         assert_eq!(shard_count(10.0, 2), 1);
         assert_eq!(shard_count(500.0, 100), 4, "上限 4");
         assert_eq!(shard_count(0.0, 0), 1);
+    }
+
+    #[test]
+    fn total_estimate_matches_the_b2_calibration() {
+        // B2 = 220 + 7.5×diff_kb + 7.5×files + 2.5×text_kb（2026-11-25 用户批准）。
+        // 输入是归档的历史 diff_patch / pr_context 的真实字节数（evidence/budget-candidates.md）。
+        // backend #333：1312.09… → 1313；GLM-5.4 唯一 ok 轮实测 1050.1s（1.25×）。
+        assert_eq!(total_estimate_s(kb(133444), 13, kb(7054), 1800), 1313);
+        // cli #18：1026.64… → 1027。
+        assert_eq!(total_estimate_s(kb(80796), 28, kb(1996), 1800), 1027);
+        // sites #235：2594.02… → 被 manifest 截断到 1800。
+        assert_eq!(total_estimate_s(kb(259197), 62, kb(4345), 1800), 1800);
+        // sites #277：1469.09… → 1470；sites #328：1132.57… → 1133。
+        assert_eq!(total_estimate_s(kb(151212), 16, kb(8840), 1800), 1470);
+        assert_eq!(total_estimate_s(kb(92751), 30, kb(3374), 1800), 1133);
+    }
+
+    #[test]
+    fn total_estimate_floor_and_manifest_cap() {
+        assert_eq!(total_estimate_s(0.0, 0, 0.0, 1800), 900, "小 PR 取下限");
+        assert_eq!(total_estimate_s(1.0, 1, 0.3, 1800), 900, "小 PR 取下限");
+        assert_eq!(total_estimate_s(1.0, 1, 0.3, 600), 600, "manifest 小于下限时取 manifest");
+        assert_eq!(total_estimate_s(10_000.0, 500, 100.0, 1800), 1800, "大 PR 等于 manifest");
+        assert_eq!(total_estimate_s(0.0, 0, 0.0, u64::MAX), 900, "u64::MAX 不做 f64 截断");
+        assert_eq!(total_estimate_s(f64::MAX, 0, 0.0, u64::MAX), u64::MAX, "溢出饱和到 manifest");
+        // >2^53 的 manifest 不能被 f64 舍入抬高：旧实现会返回 cap+1。
+        let cap = (1_u64 << 53) + 3;
+        assert_eq!(total_estimate_s(f64::MAX, 0, 0.0, cap), cap);
     }
 }

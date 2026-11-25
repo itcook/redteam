@@ -1,0 +1,418 @@
+{
+  "schema": "hibot.audit.pr-context/1",
+  "title": "feat(dashboard): 请求封装层（60 端点契约 + queryOptions 工厂）",
+  "body": "## 背景\n\nDashboard 迁移的分页任务遗漏了「请求封装」这一层，本 PR 补上。目标：把 9 个业务页面的 backend 调用收成一层可复用封装，让下一阶段的页面实现只写 UI——不再各自拼 `fetch`、各自定义返回类型、各自猜缓存失效。\n\n**本 PR 不含任何页面消费实现**（9 个路由仍是占位页）。\n\n## 范围\n\n- 60 个封装端点（9 页依赖闭包 57 个 + 1 个配套读端点 + 2 个共享端点 `auth.self`/`auth.logout`），15 个分组\n- 契约清单落在 `apps/dashboard/docs/api-map.md`（method / path / handler / DTO / **信封族** / **返回形态** / 分页 / 鉴权）\n\n## 分层\n\n```\nsrc/lib/\n  query-client.ts    QueryClient 工厂 + 401 单点（副作用由应用层注入）\n  api/\n    http.ts          唯一 fetch 出口：apiData / apiEnvelope 双入口、query 序列化、\n                     FormData、cache、signal、两种信封族\n    errors.ts        ApiError（kind/status/code/retryAfter）+ 5 个谓词\n    keys.ts          全域 queryKey 注册表（跨域失效的唯一来源）\n    invalidate.ts    mutation 失效统一入口\n    <14 个域模块>     system/auth/tokens/mcp/models/logs/usage/billing/\n                     referral/settings/storages/tickets/telegram/overview\n    index.ts         单一 re-export\nsrc/features/auth/\n  session-expiry.ts  会话失效副作用（清登录态 + 清缓存 + 跳登录）\n```\n\n封装单元是 `queryOptions()` / `mutationOptions()` 工厂（纯对象）：组件 `useQuery(...)` 与 Router loader 的 `ensureQueryData(...)` 共用同一个对象，测试不需要 React 环境。\n\n**需要失效缓存的 mutation 显式接收 `QueryClient`**（`createTokenMutation(client)`）——工厂若闭包模块单例，测试新建的 client 会去失效另一个缓存。不失效任何 key 的纯写（revealTokenKey / stripe×3 / attribution）不接收。\n\n## 对账中发现的坑（都写进了 api-map 与单测）\n\n| # | 坑 |\n|---|---|\n| 1 | `/api/user/storages*` 是 `{code,message,data}`，不是 `{success,...}`；统一按 `success` 判会漏抓业务失败 |\n| 2 | 分页元数据都在 `data` 内（`common.PageInfo`），但**参数名分三套**：`p`/`page_size`（topup、redemptions、logs、aff）、`page`/`page_size`（tickets）、`page`/`size`（storages） |\n| 3 | `tokens.list` 服务端本来分页、`getFullKey` 是 **POST**、`/api/pricing` 的载荷在顶层（`data[]` 与 `vendors[]` 是兄弟） |\n| 4 | 改密是 `PUT /api/user/self/password`（不是 `/api/user/setting`）；重置发信是 `GET /api/reset_password` |\n| 5 | MCP connections 可能返回**裸数组**，也可能 `{success,data}` |\n| 6 | **4 个周报邮件端点已被 backend 删除**（`88cfb1f3b`），interim 仍在调用 → 不封装 |\n\n## 同时收口的三处裸调用\n\n`__root.tsx` 的 site-config、`session.ts` 的 self、`use-sign-out.ts` 的 logout 全部改走域函数；Header 的搜索索引也改走 `system.searchIndexRequest`。`src/lib/api/` 之外已无裸 `fetch`。\n\n## 验证\n\n| | |\n|---|---|\n| `bun --filter @hiapi/dashboard typecheck` | 0 error |\n| `bun --filter @hiapi/dashboard test` | **85 pass / 0 fail**（195 断言） |\n| `bun --filter @hiapi/dashboard build` | 成功 |\n| dist gzip | 147,442 B（基线 147,486 → **−0.03%**，门禁 +5%） |\n| 裸 `fetch` 审计 | 0 处 |\n\n失效矩阵：`modules.test.ts` 表驱动覆盖**全部 16 个带失效集的 mutation**（含「只失效自身」负例），另测 `updateEmailPreferences` 写回缓存、`logout` 清空整个 cache。\n\n## 不在本 PR\n\n- 9 个页面本身（下一阶段各页子任务）\n- 2FA（backend 已实现但前端从未上线，且有账号锁死风险 → backend issue [#440](https://github.com/zimacode-network/hiapi-backend/issues/440)）\n- 工单详情/回复、发票、playground、task/progress、notice（不在 9 项菜单内，需要时按同一模式补）\n\n## Trellis\n\n任务 `11-14-dashboard-request-encapsulation`（父任务 `11-12-dashboard-console-migration`），规划 / 设计 / 执行 / 验收四份产物在 `.trellis/tasks/11-14-dashboard-request-encapsulation/`；常量约定在 `.trellis/spec/apps/dashboard/frontend/`（`index.md` + `api-layer-contract.md`）。\n",
+  "author": "weil-ai",
+  "labels": [
+    "review: low"
+  ],
+  "comments": [
+    {
+      "author": "weil-ai",
+      "body": "## Re: blocker #2 — `CLAUDE.md` 请求层口径冲突\n\n### 结论：是**旧规划没跟上落地**，不是实现选错。已按实际选型改文档（`845ea4db`），没有把实现改回 Refine。\n\n### 冲突怎么来的\n\n- 决策日志 `2026-06-05-decision-log.md` 的 **#4 / #5** 写的是规划期的假设：\n  - #4「Astro(SSR) 公开站 + **React(Refine+heroui)** 面板」\n  - #5「请求库：site=Alova；**dashboard/admin=Refine dataProvider**」\n  - 理由是「避免 Alova 与 Refine(React Query) 双缓存」——**前提就是 Refine 自带 React Query**。\n- 而 dashboard 的实际选型在 **2026-11-12 脚手架落地时就定了**（父任务 `11-12-dashboard-console-migration` R2）：TanStack Router + TanStack Query + Radix，`CLAUDE.md` 与决策日志都没同步。\n\n### 事实核对（所以不该改实现）\n\n| 检查 | 结果 |\n|---|---|\n| `apps/dashboard/package.json` 有 `@refinedev/*` 吗 | **没有**（只有 `@tanstack/react-query` / `react-router` / `radix-ui`） |\n| `apps/manage/package.json` 有 `@refinedev/*` 吗 | **没有**（只有 `@heroui/react`） |\n| `apps/manage/src` 里有 `@refinedev` import 吗 | **零处**（`main.tsx` 是裸 `createRoot` + `App`） |\n| 本 PR 引入 Refine 了吗 | 没有，零新依赖 |\n\n也就是说 **Refine 在仓内从头到尾没装过**，只存在于规划文本里。把实现改回 Refine 要重写已合入的脚手架、路由、Header 共享包接入，而且 `11-12` R2 明确「不引入 HeroUI / Radix 为组件基线」——那才是真的冲突。所以这里必须改文档。\n\n### 改了什么\n\n**`CLAUDE.md`**\n- 服务表：`apps/manage` 去掉 Refine；`apps/dashboard` → `React + TanStack Router/Query + Radix（脚手架已落地，业务页面未实现）`\n- §请求层：`site = Alova`；**dashboard = TanStack Query + 自建 `apps/dashboard/src/lib/api`**（指向本 PR 的契约 spec）；`manage 未接业务、无请求层`\n- §UI 库：`dashboard = Radix 原语 + 自建样式（不引 HeroUI）`，`manage = heroui` —— 原句把 dashboard 也算成 heroui，同样与本 PR 的 PRD（R2「不引入 HeroUI」）相反\n\n**决策日志 #4 / #5**：追加「2026-11-14 修订」子条目，**保留原文**可追溯，写清「dashboard 部分被取代、Refine 从未安装、被否方案 = 为迎合旧文改实现」。\n\n**架构文档**（`2026-06-11-website-rebuild-architecture.md`，决策日志标注的「现行」文档）：§2.1 服务表、§2.3 请求层、§4.1 Dashboard 三处同一口径修正 —— 只改 CLAUDE.md 会留下另一半矛盾。\n\n### 有意没动的\n\n- 架构文档里 **manage 的 Refine 表述**（§2.1 / §4.2）：manage 是「未接业务的技术验证脚手架」，Refine 属于它的规划，我只有「还没装」的证据，没有「已放弃」的证据，不擅自改规划。\n- 架构文档里 dashboard 的部署域名 `dash.hiapi.ai` 已过时（实际是 `console-staging.hiapi.ai` + 同源子路径 `{site}/{locale}/dashboard*`），但那是另一个口径问题，不在本 PR 范围。\n\n---\n\n其余 blocker（新 spec 层缺 `index.md`、mutation 失效断言覆盖不足、`lib → features` 反向依赖、描述与产物口径不一致）我按顺序接着处理，处理完再 ping。\n",
+      "created_at": "2026-11-14T08:27:20Z",
+      "is_bot": false
+    },
+    {
+      "author": "weil-ai",
+      "body": "四个 blocker 已全部处理（`6664128d` + `1d33ced7`），另外自查出一个同类契约错误。逐条对齐：\n\n## #1 新 spec 层缺 `index.md` → 已补\n\n新增 `.trellis/spec/apps/dashboard/frontend/index.md`，按 `site/frontend/index.md` 体例：\n**Pre-Development Checklist**（7 条，含「先查 api-map 再写代码」「无裸 fetch」）+ **Quality Check**（三条本地门禁命令 + 跨包回归要求）+ Guidelines Index 登记 `api-layer-contract.md`。现在 `trellis-before-dev` 能发现这一层。\n\n## #3 mutation 失效断言覆盖不足 → 已补到全覆盖\n\n改成表驱动，`modules.test.ts` 的「失效矩阵」覆盖**全部 16 个带失效集的 mutation**：\n\n`updateToken` / `removeStorage` / `setAffCode` / `submitAffApplication` / `updateWithdrawalProfile` / `initTelegramBind` / `unbindTelegram` / `updateAutoRecharge` / `updateBillingProfile` / `revokeAllMcpConnections` / `updateSelf` / `changePassword` + 原有 8 个。\n\n每条断言「必失效集合」与「**不应被波及**的 key」两组（防止顺手多失效）。另外单独测了两种非 invalidate 语义：`updateEmailPreferences` 写回缓存、`logout` 清空整个 cache。\n\n测试 71 → 85。\n\n## #4 `lib → features` 反向依赖 → 已解\n\n选「注入回调」而不是搬文件（`query-client` 是 API 基础设施，搬进 `features/auth` 会让 `__root.tsx` 反向依赖业务域）：\n\n- `createQueryClient({ onAuthExpired })`：`lib/` 只判断「什么时候该跳」，不 import `@/features`\n- 副作用实现移到 `features/auth/session-expiry.ts`（清登录态 + 清缓存 + 跳登录）\n- 顺带把 401 幂等位从模块级改为 **per-client**（原来多实例测试会互相污染）\n- `useAuthGuard` 的 `locale` 参数随之删除（locale 由当前路径推断）\n\n`grep -rn \"@/features\" src/lib/` 现在 0 命中。\n\n## #5 描述与产物口径 → 已改\n\n- PR body：「mutation 工厂显式接收 `QueryClient`」→ 限定为「**需要失效缓存的** mutation 接收；不失效的纯写（revealTokenKey / stripe×3 / attribution）不接收」\n- 「顺带修了两个静默失败」→ 删掉该措辞，改为如实描述：`apiData` 的结构检查是**本 PR 自建实现的自纠**，`useAuthGuard` 的 401 漏清缓存是既有缺陷\n- `implement.md` 4.8 收窄为「tickets 仅 list + create，详情/回复在 `tickets/[id]` 子页」\n- `design.md §2` 目录树补 `mcp.ts` / `models.ts`\n\n## 另外：自查出一个同类错误（比 #3 更严重）\n\n顺着你指出的「返回形态」问题把**所有分页端点回源核了一遍**，发现 `billing.getTopupRecords` 接错了：\n\n- backend `GetUserTopUps` 是 `common.ApiSuccess(c, pageInfo)` → 元数据在 `data` **内**\n- 翻页参数走 `GetPageQuery` 的 **`p` / `page_size`**\n\n我原实现按「扁平分页」用 `apiEnvelope` + `page`/`per_page` → **永远拿第 1 页，`total` 是 undefined**。（interim 传的 `page`/`size` 后端也不认，同一个 bug，没照抄。）\n\n同时修正：\n- `api-map` 里同样错的 `logs.list` / `callLogs.list` 返回形态（`body` → `data`）\n- `api-map` D5「`/api/pricing` 是裸响应」→ 它**有** `success`，只是载荷在顶层（`data[]` 与 `vendors[]` 兄弟），`models.ts` 注释同步\n- `api-map` D2 改为「分页一律在 `data` 内，差异只在参数名」\n\n这也说明 `data` vs `body` 的分类确实只能靠回源。现在有测试锁住 topup 的参数与形状。\n\n## 非阻塞项也顺手做了\n\n- `apiRequest` 支持 `cache`，`apiFetch` 不再静默丢 `cache`/`mode`/`keepalive`；mcp 改用 `cache: \"no-store\"` 而不是手写 header\n- 删除未使用导出：`balanceKeys()`、`billingKeys.invoice()`、`referralKeys.agent()`\n- README §结构 登记 `docs/api-map.md`、`lib/api`、`lib/query-client`、`session-expiry`\n\n## 当前状态\n\n```\ntypecheck 0 error ｜ 85 pass / 0 fail ｜ build ok\ndist gzip 147,442 B（基线 147,486 → −0.03%）\n```\n\nCI 仍是基础设施故障（三个 job 2 秒 `steps: []`），按你的建议合并前等恢复后重跑。\n",
+      "created_at": "2026-11-14T08:32:50Z",
+      "is_bot": false
+    },
+    {
+      "author": "weil-ai",
+      "body": "二审 4 个 Critical + 5 个 Important 全部处理（`efa89e0d`）。逐条核实结果与修法：\n\n## Critical\n\n### 1. affiliate 申请端点确实无法工作 → 已改 multipart\n\n核实：backend `controller/aff_agent.go:55` `ParseMultipartForm`，`:69` 要求 `len(form.File) == 1 && len(form.File[\"proof\"]) == 1`，字段从 `form.Value[...]` 读。发 JSON 在解析阶段就 400，测试 stub 的是 fetch 所以全绿——这是「用 stub 测 URL」的盲区。\n\n修法：`submitAffApplicationMutation` 改以 `buildAffApplicationForm(body)` 构造 FormData：\n- `proof` 文件必填；\n- `channels` / `account_links` **同名多次 append**（后端读成 `[]string`）；\n- 其余单值；\n- 断言 `body instanceof FormData`、`getAll(\"channels\")` 顺序正确、**没有手写 content-type**。\n\n另外核了其余 referral 写入，都是 `ShouldBindJSON`，只有 application 是 multipart。\n\n### 2. data-less 200 被当成已登录 → 已恢复 403\n\n`apiData` 为 void 端点放行缺 `data`，`authSelfQuery` 又没有存在性检查。修法：`authSelfQuery` 在 `!user || typeof user.id !== \"number\"` 时抛 `ApiError(403)` —— 与迁移前 `!body.data → 403` 一致。补了两条回归（`{success:true}` 与 `data:null`）。\n\n### 3. 业务失败一律落 403 死胡同 → 已拆成三态\n\n- `forbidden` 现在**只认 403**（复用 `isForbidden`）；\n- 新增 `failed` 态：面板内渲染「加载失败 + 重试 + 登出」，`retry` 调 `query.refetch()`；\n- 分类逻辑抽成纯函数 `classifyGuardError(error, hasCookie)`，5 条单测覆盖（401 / 403 / business / 形状异常 / 无 cookie）。\n\n`isForbidden` 现在有调用者了，两个「forbidden」定义不再打架。\n\n### 4. 401 单点无测试 → 已补 `query-client.test.ts`\n\n六条：只认 401、并发两个 401 只调一次、`skipAuthRedirect` 退出、403 不触发、业务失败不触发、**两个 client 各有自己的闩**。probe 走真实 `apiData`，不是手搓错误。\n\n## Important\n\n| 项 | 处理 |\n|---|---|\n| `apiEnvelope` 接受非对象 2xx | 现在也拒绝（`null` 放行）；200 HTML 不再变成「字段不存在」 |\n| site-config 单次失败废掉单位切换器 | `retry: 0` → `retry: 1` + `refetchOnWindowFocus: true` |\n| overview 失效契约只在注释里 | `updateSelf` / `setAffCode` 现在连带 `overviewKeys.summary()`，矩阵断言同步（含「不应被波及」） |\n| api-map 返回形态 6 行写反 | 已改（`tokens.list` / `redemptionRecords` / 4 个 referral 行 → `data`；`redeemCode` → `body`），并新增 **`api-map.test.ts`**：扫源码里所有 `apiEnvelope` 调用点，与文档比对，改一边不改另一边就红 |\n| 读端点测试缺 fan-in 等风险面 | 补了 overview 双请求 + 单腿失败、siteConfig envelope、userModels、aff×3、telegram×2、callLogs |\n\n顺带（你的非阻塞项）：`BALANCE_KEYS` 三处重复收敛到 `invalidate.ts`；删 `logoutMutation`（与 `performSignOut` 两套登出合一）、删 `goToSignIn`（与 session-expiry 重复）；`keys.test` 补 `modelKeys`/`mcpKeys`。\n\n## 有意保留的\n\n- storages 族的**字符串 `code`** 仍被当成功（backend 只发数字 code）；\n- **重定向闩不释放**（生产必注入回调且必跳转，当前无触发路径）；\n- `updateEmailPreferences` 缺 `data` 时留旧缓存（backend 恒回 view）；\n- `apiJson` 仍跳过业务失败检查 —— 它已 `@deprecated` 且零调用，保留只为兼容窗口。\n\n## 现状\n\n```\ntypecheck 0 error ｜ 110 pass / 0 fail（8 文件 / 250 断言） ｜ build ok\ndist gzip 147,939 B（基线 147,486 → +0.31%，门禁 +5%）\n```\n\nCI 仍是仓库级基础设施故障（三个 job 2 秒 `steps: []`），按你的要求等恢复后重跑再合。\n",
+      "created_at": "2026-11-14T09:28:11Z",
+      "is_bot": false
+    },
+    {
+      "author": "weil-ai",
+      "body": "三处非阻塞文档残留已修（`b27a3603`），并顺带核准了数字：\n\n| 位置 | 原写法 | 改为 |\n|---|---|---|\n| `verification.md` 交付物表 | `createQueryClient()` + 应用单例 + `handleAuthExpired` | `createQueryClient({ onAuthExpired })` 注入 + per-client 闩；**无模块级单例**，应用实例在 `__root.tsx` 用 `useState` 创建 |\n| `verification.md` AC#7 | 「16 个带失效集的 mutation」+ logout 断言算在 `modules.test.ts` | 21 个带缓存语义的 mutation（20 失效 + `updateEmailPreferences` 写回）；登出断言在 `features/auth/auth-flow.test.ts` |\n| `api-layer-contract.md` 分层表 | 「应用实例 … 单例」 | 「工厂 + per-client 闩」，禁止列改回「在本模块里放模块级单例」 |\n\n核准口径：域模块共 27 个 mutation，其中 **6 个纯写不失效任何 key**（`revealTokenKey` / stripe×3 / `recordProductAttribution` / `requestPasswordReset`）——正好对上 PR body 里「不失效的纯写不接收 client」那句。\n\n复跑：typecheck 0 / 110 pass / 250 expect。文档改动不影响代码。\n",
+      "created_at": "2026-11-14T09:38:02Z",
+      "is_bot": false
+    }
+  ],
+  "linked_issues": [],
+  "ci": {
+    "state": "failure",
+    "failing": [
+      "quality",
+      "test-content-api",
+      "test-site"
+    ]
+  },
+  "changed_files": [
+    {
+      "path": ".docs/architectures/2026-06-05-decision-log.md",
+      "additions": 2,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": ".docs/architectures/2026-06-11-website-rebuild-architecture.md",
+      "additions": 3,
+      "deletions": 3,
+      "status": "modified"
+    },
+    {
+      "path": ".trellis/spec/apps/dashboard/frontend/api-layer-contract.md",
+      "additions": 134,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/spec/apps/dashboard/frontend/index.md",
+      "additions": 56,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-12-dashboard-console-migration/prd.md",
+      "additions": 3,
+      "deletions": 2,
+      "status": "modified"
+    },
+    {
+      "path": ".trellis/tasks/11-12-dashboard-console-migration/task.json",
+      "additions": 2,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/check.jsonl",
+      "additions": 4,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/design.md",
+      "additions": 274,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/implement.jsonl",
+      "additions": 5,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/implement.md",
+      "additions": 138,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/prd.md",
+      "additions": 138,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/task.json",
+      "additions": 28,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/archive/2026-11/11-14-dashboard-request-encapsulation/verification.md",
+      "additions": 81,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/workspace/Weilai/index.md",
+      "additions": 3,
+      "deletions": 2,
+      "status": "modified"
+    },
+    {
+      "path": ".trellis/workspace/Weilai/journal-2.md",
+      "additions": 50,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "CLAUDE.md",
+      "additions": 4,
+      "deletions": 4,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/README.md",
+      "additions": 7,
+      "deletions": 2,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/docs/api-map.md",
+      "additions": 209,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/messages/de.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/messages/en.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/messages/es.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/messages/fr.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/messages/it.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/messages/ja.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/messages/ko.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/messages/pt.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/messages/ru.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/messages/zh.json",
+      "additions": 3,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/src/components/chrome/DashboardHeader.tsx",
+      "additions": 3,
+      "deletions": 6,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/src/components/chrome/dashboard-header.test.ts",
+      "additions": 15,
+      "deletions": 5,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/src/features/auth/auth-flow.test.ts",
+      "additions": 158,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/features/auth/session-expiry.ts",
+      "additions": 21,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/features/auth/session.ts",
+      "additions": 49,
+      "deletions": 38,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/src/features/auth/use-sign-out.ts",
+      "additions": 23,
+      "deletions": 13,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/api-map.test.ts",
+      "additions": 68,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/auth.ts",
+      "additions": 117,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/billing.ts",
+      "additions": 285,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/errors.ts",
+      "additions": 74,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/http.test.ts",
+      "additions": 260,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/http.ts",
+      "additions": 234,
+      "deletions": 23,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/index.ts",
+      "additions": 28,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/invalidate.ts",
+      "additions": 23,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/keys.test.ts",
+      "additions": 101,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/keys.ts",
+      "additions": 193,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/logs.ts",
+      "additions": 95,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/mcp.ts",
+      "additions": 65,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/models.ts",
+      "additions": 46,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/modules.test.ts",
+      "additions": 722,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/overview.ts",
+      "additions": 37,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/referral.ts",
+      "additions": 298,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/settings.ts",
+      "additions": 61,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/storages.ts",
+      "additions": 134,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/system.ts",
+      "additions": 61,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/telegram.ts",
+      "additions": 68,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/tickets.ts",
+      "additions": 84,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/tokens.ts",
+      "additions": 106,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/api/usage.ts",
+      "additions": 63,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/query-client.test.ts",
+      "additions": 110,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/query-client.ts",
+      "additions": 67,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/dashboard/src/lib/site.ts",
+      "additions": 15,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/src/routes/$locale/dashboard.tsx",
+      "additions": 27,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/dashboard/src/routes/__root.tsx",
+      "additions": 25,
+      "deletions": 35,
+      "status": "modified"
+    }
+  ]
+}

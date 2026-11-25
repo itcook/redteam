@@ -438,7 +438,9 @@ async fn run_triage(
     };
     // Phase 5：triage 与 review 同用一张 provider 门表（`llm` 段）；阶段 preparing → running → finishing。
     heartbeat.attach_llm(registry.gate_handles());
-    let deadline = match effective_deadline(started, manifest.limits.wall_clock_s, None) {
+    // 整轮 deadline 由规模预算与 manifest 硬上限共同限定（B2，2026-11-25 用户批准）。
+    let estimate_s = crate::triage::total_estimate(&pr, &changes, manifest.limits.wall_clock_s);
+    let deadline = match effective_deadline(started, manifest.limits.wall_clock_s, Some(estimate_s)) {
         Ok(d) => d,
         Err(e) => return report::error_report(manifest, lang, &e),
     };
@@ -449,6 +451,7 @@ async fn run_triage(
         changes: &changes,
         lang,
         manifest_cap_s: manifest.limits.wall_clock_s,
+        estimate_s,
         deadline,
         route_keys,
         route_names,

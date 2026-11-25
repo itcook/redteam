@@ -31,7 +31,9 @@ pub struct TriageRequest<'a> {
     pub lang: &'a OutputLang,
     /// manifest 的墙钟硬上限（秒）；`routing.wall_clock_s` 由它派生。
     pub manifest_cap_s: u64,
-    /// 绝对截止时刻（manifest 墙钟）：I0 与波次预算都从这里扣除已用时间。
+    /// 整轮预算包线（秒，2026-11-25 用户批准 B2）：只收紧 deadline，不改变 manifest 硬上限。
+    pub estimate_s: u64,
+    /// 绝对截止时刻（规模预算与 manifest 共同限定）：I0 与波次预算都从这里扣除已用时间。
     pub deadline: std::time::Instant,
     /// 三轴使用的模型池（`settings.triage.models`，顺序即轮转序）。
     /// 轴序 security → drift → intent 依次取池；I0/claims 与报告身份固定用第 1 条。
@@ -61,6 +63,8 @@ pub struct TriageOutcome {
     pub reasons: Vec<JobFailure>,
     /// 合并到 findings 的 model 身份（报告 `source.model`）。
     pub route_key: String,
+    /// 本次实际采用的整轮预算包线（秒）；写入 `extensions.redteam.budget.estimate_s`。
+    pub estimate_s: u64,
 }
 
 /// 轴 → 池下标（security=0 / drift=1 / intent=2），与并发完成顺序无关。
@@ -90,6 +94,28 @@ fn patch_pairs(changes: &[FileChange]) -> Vec<(String, String)> {
         .filter(|c| !c.diff.trim().is_empty())
         .map(|c| (c.path.clone(), c.diff.clone()))
         .collect()
+}
+
+/// 整轮预算的规模口径：PR 文本（`title + body + linked issues` 的 title/body）与
+/// **非空 diff** 的字节/文件数；空 diff 文件不计（与 [`patch_pairs`] 一致）。
+pub fn total_estimate(pr: &PrContext, changes: &[FileChange], manifest_cap_s: u64) -> u64 {
+    let mut diff_bytes = 0usize;
+    let mut files = 0usize;
+    for c in changes {
+        // 空/纯空白 diff 不计（与 `patch_pairs` 同口径，但不克隆整份 diff）。
+        if c.diff.trim().is_empty() {
+            continue;
+        }
+        diff_bytes += c.diff.len();
+        files += 1;
+    }
+    let text_bytes = pr.title.len()
+        + pr.body.len()
+        + pr.linked_issues
+            .iter()
+            .map(|i| i.title.len() + i.body.as_deref().unwrap_or("").len())
+            .sum::<usize>();
+    budget::total_estimate_s(budget::kb(diff_bytes), files, budget::kb(text_bytes), manifest_cap_s)
 }
 
 /// 跑三轴（并发，只受 provider 门约束）。`progress` 在每轴完成时更新，取消后仍可取快照。
@@ -389,6 +415,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
         usage,
         reasons,
         route_key: req.route_identity().to_string(),
+        estimate_s: req.estimate_s,
     }
 }
 
@@ -472,6 +499,53 @@ mod tests {
         ];
         assert_eq!(changed_files(&changes).len(), 1);
         assert_eq!(patch_pairs(&changes).len(), 1);
+    }
+
+    #[test]
+    fn total_estimate_counts_title_issues_and_non_empty_diffs() {
+        let title = "题".repeat(2_000); // 6 KB（UTF-8 3B/字）
+        let issue_title = "议".repeat(2_000); // 6 KB
+        let issue_body = "i".repeat(50 * 1024); // 50 KB
+        let json = format!(
+            r#"{{"schema":"hibot.audit.pr-context/1","title":"{title}","body":"hello","author":"a","labels":[],"comments":[],"linked_issues":[{{"number":1,"title":"{issue_title}","state":"open","body":"{issue_body}"}}],"ci":{{"state":"success","failing":[]}},"changed_files":[{{"path":"a.rs"}}]}}"#
+        );
+        let pr = input::parse(&json).unwrap();
+        let big = format!("diff --git a/a.rs b/a.rs\n{}", "x".repeat(100 * 1024));
+        let changes = vec![
+            FileChange { path: "a.rs".into(), diff: big.clone() },
+            FileChange { path: "b.bin".into(), diff: "\n".into() },
+        ];
+        let base = total_estimate(&pr, &changes, 1800);
+        assert!((900..1800).contains(&base), "避开下限/上限遮蔽: {base}");
+
+        // 每项单独去掉都会让包线下降 >10s（6KB 文本 ≈ 14.6s，50KB ≈ 125s）；
+        // 1 字节 title 做不到这种辨识力。
+        let mut no_title = pr.clone();
+        no_title.title.clear();
+        assert!(base - total_estimate(&no_title, &changes, 1800) >= 10, "title 计入");
+
+        let mut no_issue_title = pr.clone();
+        no_issue_title.linked_issues[0].title.clear();
+        assert!(base - total_estimate(&no_issue_title, &changes, 1800) >= 10, "linked issue title 计入");
+
+        let mut no_issue_body = pr.clone();
+        no_issue_body.linked_issues[0].body = None;
+        assert!(base - total_estimate(&no_issue_body, &changes, 1800) >= 100, "linked issue body 计入");
+
+        // 空/纯空白 diff 的文件不计。
+        let mut with_empty = changes.clone();
+        with_empty.push(FileChange { path: "c.bin".into(), diff: " \n".into() });
+        assert_eq!(total_estimate(&pr, &with_empty, 1800), base);
+    }
+
+    #[test]
+    fn total_estimate_never_exceeds_manifest() {
+        let pr = input::parse(
+            r#"{"schema":"hibot.audit.pr-context/1","title":"t","body":"b","author":"a","labels":[],"comments":[],"linked_issues":[],"ci":{"state":"success","failing":[]},"changed_files":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(total_estimate(&pr, &[], 600), 600, "manifest 小于下限");
+        assert_eq!(total_estimate(&pr, &[], 1800), 900, "空 diff 取包线下限");
     }
 
 }
