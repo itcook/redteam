@@ -1,0 +1,104 @@
+{
+  "settings": {
+    "language": "en_US",
+    "review": {
+      "blockThreshold": "medium",
+      "confFloor": 0.5,
+      "maxConcurrency": 10,
+      "tools": "two-stage",
+      "refuters": {
+        "enabled": true
+      },
+      "roles": {
+        "scanner": {
+          "models": [
+            {
+              "provider": "deepseek",
+              "id": "deepseek-chat",
+              "reasoningEffort": "medium"
+            }
+          ]
+        },
+        "reviewer": {
+          "models": [
+            {
+              "provider": "glm",
+              "id": "glm-5",
+              "reasoningEffort": "high"
+            }
+          ]
+        },
+        "refuter": {
+          "models": [
+            {
+              "provider": "deepseek",
+              "id": "deepseek-chat",
+              "reasoningEffort": "medium"
+            }
+          ]
+        }
+      }
+    },
+    "triage": {
+      "models": [
+        {
+          "provider": "deepseek",
+          "id": "deepseek-chat-anthropic",
+          "reasoningEffort": "high"
+        }
+      ]
+    },
+    "verify": {
+      "models": [
+        {
+          "provider": "deepseek",
+          "id": "deepseek-chat",
+          "reasoningEffort": "high"
+        }
+      ]
+    }
+  },
+  "providers": {
+    "deepseek": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKeyEnv": "HIBOT_LLM_DEEPSEEK_KEY",
+      "maxConcurrency": 20,
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "displayName": "DeepSeek Chat",
+          "family": "deepseek",
+          "contextWindow": 128000,
+          "maxOutputTokens": 32768,
+          "perTurnTimeoutSecs": 600,
+          "reasoning": true
+        },
+        {
+          "id": "deepseek-chat-anthropic",
+          "displayName": "DeepSeek Chat",
+          "family": "glm",
+          "contextWindow": 128000,
+          "maxOutputTokens": 32768,
+          "perTurnTimeoutSecs": 600,
+          "reasoning": true,
+          "api": "anthropic-messages"
+        }
+      ]
+    },
+    "glm": {
+      "api": "openai-completions",
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+      "apiKeyEnv": "HIBOT_LLM_GLM_KEY",
+      "maxConcurrency": 10,
+      "models": [
+        {
+          "id": "glm-5",
+          "family": "glm",
+          "contextWindow": 200000,
+          "reasoning": true
+        }
+      ]
+    }
+  }
+}
