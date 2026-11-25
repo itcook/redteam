@@ -73,3 +73,23 @@
 2. 模型对「非确定性交互回归」（#400 A→B affinity 回退）不敏感：证据已在 prompt 里仍判 resolved。
    候选：在 `<symbol_blast_radius>` 里显式提示「同一请求内的回退/重选路径也要看」。
 3. `missing_role` 诊断 pointer 落在 `/providers`（Phase 4 遗留 followup，未动）。
+
+## 合并与收尾（2026-11-25）
+
+- 协调者独立复核通过并合入：`hibot-executor = 42e42fa`（本分支 `24fae6c` 全量入库）。
+- 复核点：预算常量与 `SCALED_CAP_S=300`；B-lite 三项上限且省略数按**全量候选**算；`reanchor` 两处都只做逐字子串；
+  `escape_raw_controls` 只改字符串内控制字符；`material` 只含 hunks/related/blast/snapshot（`fix_scope` 不进池）；
+  #400 夹具约 40K 且脚本不进 CI；真跑 4/6 一致且两处差异如实披露、`expected` 未改。
+
+## 经验（协调者点名写进交付记录）
+
+1. **删临时占位代码前先核它的隐性职责**：Phase 4 的 verify stub 除了报 `kind_not_implemented`，还用逐条
+   `inconclusive` 维持了契约 §3.3 的覆盖不变量；删掉后作业级 error 变成空数组即违约 → 补
+   `error_report_covering`（只补 `verifications`、不改 status）。
+2. **真跑是唯一能暴露「模型输出形态」的关口**：单测/合成夹具全绿，但 deepseek-flash 会把带裸换行的代码
+   塞进 JSON `quote`，serde 直接判死、repair 也救不回来 → `escape_raw_controls` 在解析前只改写字符串内的
+   控制字符（不动已转义序列）。
+3. **人工基线不能按跑出来的结果改**：`expected.json` 的值只来自人工评审正文；两个「异」原样记录
+   （affinity 非确定性回归没被模型识别、文档类修复被判 resolved），它们才是后续改进的输入。
+
+**Trellis 收尾**：本任务 finish + archive（提交见 `chore(task): archive 11-25-hibot-verify-enhance`）。
