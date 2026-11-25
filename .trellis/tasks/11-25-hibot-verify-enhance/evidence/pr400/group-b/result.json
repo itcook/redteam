@@ -1,0 +1,59 @@
+{
+  "group": "group-b",
+  "status": "ok",
+  "same": 2,
+  "diff": 1,
+  "rows": [
+    {
+      "fingerprint": "sha256:87cf69a3ba26fc30d2d843dcd224b95aeba27c4459d35b4bab36984b9788ffc4",
+      "expected": "unresolved",
+      "actual": "resolved",
+      "verdict": "异",
+      "note": "人工第 3 轮：Q2 主路径修好，但边界（已切到 llm 的漂移协议）未覆盖——同一 finding 仍未闭合。",
+      "evidence": "migration.go 中该错误信息已从只提示“run rebind-evidence before switching”改为明确给出真实恢复步骤：先 rebind-evidence，再重新保存正在切换的协议（re-save the pr"
+    },
+    {
+      "fingerprint": "sha256:19a4af28aca6a88e1c08b9026d929d7246a894ebbef4fba542d8551282292475",
+      "expected": "resolved",
+      "actual": "resolved",
+      "verdict": "同",
+      "note": "人工第 3 轮：Q7 已关闭（strict 分支改读 DB 实时行）。",
+      "evidence": "execution.go 的 channelAllowed 在 strict 分支内先用 model.DB.WithContext(ctx).First(&fresh, channel.Id) 按主键重新读取数据库中的渠道行，并以 chan"
+    },
+    {
+      "fingerprint": "sha256:7b89ce343543519a644bfcedb721696a3277d01cc8cb52cc16e90ab93489cf01",
+      "expected": "resolved",
+      "actual": "resolved",
+      "verdict": "同",
+      "note": "人工第 3 轮：Q1 已关闭（WithdrawChannelForRequest 把被拒渠道移出本请求 allowed 集，-count=100 通过）。",
+      "evidence": "严格校验失败分支现在在 `channel = nil` 之前调用 `llmconfig.WithdrawChannelForRequest(c, snap, channel.Id)`，将刚被拒绝的渠道从本请求的候选集中撤回；若撤回失败则直接"
+    }
+  ],
+  "extensions": {
+    "calls": 3,
+    "counts": {
+      "inconclusive": 0,
+      "regressed": 0,
+      "resolved": 3,
+      "unresolved": 0
+    },
+    "duplicate_fingerprints": 0,
+    "latency_ms": {
+      "max": 23580,
+      "total": 52522
+    },
+    "model_failures": 0,
+    "quote_rejected": 0,
+    "rate_limit": {
+      "retries": 0,
+      "wait_ms": 0
+    },
+    "warnings": []
+  },
+  "usage": {
+    "input_tokens": 9576,
+    "output_tokens": 9425,
+    "cached_input_tokens": 1536,
+    "wall_clock_ms": 23763
+  }
+}

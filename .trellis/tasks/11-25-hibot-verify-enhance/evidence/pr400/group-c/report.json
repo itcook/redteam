@@ -1,0 +1,72 @@
+{
+  "schema": "hibot.audit.report.verify/1",
+  "job_id": "pr400-group-c",
+  "kind": "verify",
+  "status": "ok",
+  "input": {
+    "head_sha": "7c036382badbd812be7673fc93fdd9d545d50ef7",
+    "base_sha": "a88eb64584d964cc000c440a830226c66328527a"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "verifications": [
+    {
+      "evidence": "修复把 service/llmconfig/migration.go 中 validateEffectiveMigrationChannels 的错误提示从「无条件两步（先 rebind-evidence 再重存待切换协议）」改为按来源分情况描述：对使用或正在切换到 llm 的协议提示重新保存它，对仍留在 legacy 的协议提示运行 rebind-evidence。这样当另一个已在 llm 来源上的协议漂移时，提示会指向重新保存该协议本身，正好覆盖了原 finding 指出的缺口；原误导性文案已消失。该改动仅是错误信息文本，未触及控制流，未引入新问题。",
+      "finding_fingerprint": "sha256:9ef71ed55f91ac702a4e28c96904802173681f9c721d53beb1151c353f38a93f",
+      "quote": "refresh evidence first: re-save it if it uses or is switching to llm, run rebind-evidence if it stays on legacy",
+      "status": "resolved"
+    }
+  ],
+  "usage": {
+    "input_tokens": 2798,
+    "output_tokens": 2283,
+    "cached_input_tokens": 512,
+    "wall_clock_ms": 17013
+  },
+  "extensions": {
+    "redteam": {
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 900
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 10
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "zh_CN"
+      },
+      "template_hashes": {
+        "fix_verify": "3a1cfc364de35f6b"
+      },
+      "verifier": "deepseek/deepseek-flash",
+      "verify": {
+        "calls": 1,
+        "counts": {
+          "inconclusive": 0,
+          "regressed": 0,
+          "resolved": 1,
+          "unresolved": 0
+        },
+        "duplicate_fingerprints": 0,
+        "latency_ms": {
+          "max": 16846,
+          "total": 16846
+        },
+        "model_failures": 0,
+        "quote_rejected": 0,
+        "rate_limit": {
+          "retries": 0,
+          "wait_ms": 0
+        },
+        "warnings": []
+      }
+    }
+  }
+}

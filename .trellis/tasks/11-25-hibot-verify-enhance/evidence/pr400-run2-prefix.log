@@ -1,0 +1,44 @@
+=== group-a ===
+→ worktree 54f4c944da97ccd775de51e3525e86e611b2cd83
+Preparing worktree (detached HEAD 54f4c944d)
+→ redteam verify（deepseek/deepseek-flash）
+→ 退出码 0
+
+== group-a · status=partial · 同 0 / 异 2 ==
+sha256:697a6db64a34  expected=regressed    actual=resolved     异
+    expected: 人工第 2 轮：分诊阻塞已修，但同时引入 🔴1（affinity 严格拒绝不是终态，回退重选被拒渠道）——按四态语义是 regressed。证据应出现在 symbol_blast_radius 段（distributor.go 引用 PinnedChannelAllowed，±40 行快照覆盖 :158→:174 回退）。
+    actual  : 修复通过新增 strict 参数把指纹校验恢复回来：ChannelAllowed 引入内部 channelAllowed(..., strict)，并新增 PinnedChannelAllowed 走 strict=true，在 Reque
+sha256:7db89c45c867  expected=resolved     actual=inconclusive 异
+    expected: 人工第 2 轮：迁移 forward switch 改回 VerifiedChannelIDs，阻塞已修。
+    actual  : 模型输出无法解析，未能核验：invalid JSON: control character (\u0000-\u001F) found while parsing a string at line 1 column 660
+usage: wall_clock_ms=8922 tokens in/out=19376/2685
+verify: {"calls": 3, "counts": {"inconclusive": 1, "regressed": 0, "resolved": 1, "unresolved": 0}, "duplicate_fingerprints": 0, "latency_ms": {"max": 8749, "total": 16060}, "model_failures": 1, "quote_rejected": 0, "rate_limit": {"retries": 0, "wait_ms": 0}, "warnings": []}
+→ /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400/group-a/result.json
+=== group-b ===
+→ worktree a88eb64584d964cc000c440a830226c66328527a
+Preparing worktree (detached HEAD a88eb6458)
+→ redteam verify（deepseek/deepseek-flash）
+→ 退出码 0
+
+== group-b · status=partial · 同 1 / 异 2 ==
+sha256:87cf69a3ba26  expected=unresolved   actual=resolved     异
+    expected: 人工第 3 轮：Q2 主路径修好，但边界（已切到 llm 的漂移协议）未覆盖——同一 finding 仍未闭合。
+    actual  : 修复采纳了建议中的第二个方案：把 validateEffectiveMigrationChannels 中误导性的错误文案改为指向真实恢复步骤，明确要求先刷新证据（rebind-evidence）后再重新保存被切换的协议，使按提示重试不再必
+sha256:19a4af28aca6  expected=resolved     actual=resolved     同
+sha256:7b89ce343543  expected=resolved     actual=inconclusive 异
+    expected: 人工第 3 轮：Q1 已关闭（WithdrawChannelForRequest 把被拒渠道移出本请求 allowed 集，-count=100 通过）。
+    actual  : 补丁在 `service.InvalidateChannelAffinityFailure` 之后、`channel = nil` 之前新增了 `llmconfig.WithdrawChannelForRequest(c, snap, ch
+usage: wall_clock_ms=19945 tokens in/out=9183/8459
+verify: {"calls": 3, "counts": {"inconclusive": 1, "regressed": 0, "resolved": 2, "unresolved": 0}, "duplicate_fingerprints": 0, "latency_ms": {"max": 19766, "total": 48711}, "model_failures": 0, "quote_rejected": 0, "rate_limit": {"retries": 0, "wait_ms": 0}, "warnings": []}
+→ /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400/group-b/result.json
+=== group-c ===
+→ worktree 7c036382badbd812be7673fc93fdd9d545d50ef7
+Preparing worktree (detached HEAD 7c036382b)
+→ redteam verify（deepseek/deepseek-flash）
+→ 退出码 0
+
+== group-c · status=ok · 同 1 / 异 0 ==
+sha256:9ef71ed55f91  expected=resolved     actual=resolved     同
+usage: wall_clock_ms=5672 tokens in/out=2687/989
+verify: {"calls": 1, "counts": {"inconclusive": 0, "regressed": 0, "resolved": 1, "unresolved": 0}, "duplicate_fingerprints": 0, "latency_ms": {"max": 5518, "total": 5518}, "model_failures": 0, "quote_rejected": 0, "rate_limit": {"retries": 0, "wait_ms": 0}, "warnings": []}
+→ /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400/group-c/result.json

@@ -1,0 +1,41 @@
+=== group-c ===
+→ 源仓是浅克隆：建完整（blob-filtered）克隆 /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400-repo
+→ worktree 7c036382badbd812be7673fc93fdd9d545d50ef7
+Preparing worktree (detached HEAD 7c036382)
+→ redteam verify（deepseek/deepseek-flash）
+→ 退出码 0
+
+== group-c · status=ok · 同 1 / 异 0 ==
+sha256:9ef71ed55f91  expected=resolved     actual=resolved     同
+usage: wall_clock_ms=5824 tokens in/out=2687/1009
+verify: {"calls": 1, "counts": {"inconclusive": 0, "regressed": 0, "resolved": 1, "unresolved": 0}, "duplicate_fingerprints": 0, "latency_ms": {"max": 5640, "total": 5640}, "model_failures": 0, "quote_rejected": 0, "rate_limit": {"retries": 0, "wait_ms": 0}, "warnings": []}
+→ /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400/group-c/result.json
+=== group-a ===
+→ worktree 54f4c944da97ccd775de51e3525e86e611b2cd83
+Preparing worktree (detached HEAD 54f4c944d)
+→ redteam verify（deepseek/deepseek-flash）
+→ 退出码 0
+
+== group-a · status=partial · 同 0 / 异 2 ==
+sha256:697a6db64a34  expected=regressed    actual=resolved     异
+    expected: 人工第 2 轮：分诊阻塞已修，但同时引入 🔴1（affinity 严格拒绝不是终态，回退重选被拒渠道）——按四态语义是 regressed。证据应出现在 symbol_blast_radius 段（distributor.go 引用 PinnedChannelAllowed，±40 行快照覆盖 :158→:174 回退）。
+    actual  : 修复后 ChannelAllowed 改为委托 channelAllowed(..., false)，另新增 PinnedChannelAllowed 委托 channelAllowed(..., true)，在 strict 分支中增加 
+sha256:7db89c45c867  expected=resolved     actual=inconclusive 异
+    expected: 人工第 2 轮：迁移 forward switch 改回 VerifiedChannelIDs，阻塞已修。
+    actual  : 模型调用失败，未能核验：bad request: http 400 Bad Request
+usage: wall_clock_ms=42736 tokens in/out=6646/1109
+verify: {"calls": 3, "counts": {"inconclusive": 1, "regressed": 0, "resolved": 1, "unresolved": 0}, "duplicate_fingerprints": 0, "latency_ms": {"max": 42604, "total": 49156}, "model_failures": 1, "quote_rejected": 0, "rate_limit": {"retries": 0, "wait_ms": 0}, "warnings": []}
+→ /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400/group-a/result.json
+=== group-b ===
+→ worktree a88eb64584d964cc000c440a830226c66328527a
+Preparing worktree (detached HEAD a88eb6458)
+→ redteam verify（deepseek/deepseek-flash）
+→ 退出码 0
+
+== group-b · status=ok · 同 3 / 异 0 ==
+sha256:87cf69a3ba26  expected=unresolved   actual=unresolved   同
+sha256:19a4af28aca6  expected=resolved     actual=resolved     同
+sha256:7b89ce343543  expected=resolved     actual=resolved     同
+usage: wall_clock_ms=39566 tokens in/out=12038/10942
+verify: {"calls": 4, "counts": {"inconclusive": 0, "regressed": 0, "resolved": 2, "unresolved": 1}, "duplicate_fingerprints": 0, "latency_ms": {"max": 39398, "total": 54905}, "model_failures": 0, "quote_rejected": 0, "rate_limit": {"retries": 0, "wait_ms": 0}, "warnings": []}
+→ /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400/group-b/result.json

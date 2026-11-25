@@ -1,0 +1,43 @@
+{
+  "group": "group-c",
+  "status": "ok",
+  "same": 1,
+  "diff": 0,
+  "rows": [
+    {
+      "fingerprint": "sha256:9ef71ed55f91ac702a4e28c96904802173681f9c721d53beb1151c353f38a93f",
+      "expected": "resolved",
+      "actual": "resolved",
+      "verdict": "同",
+      "note": "人工第 4 轮：Q2 边界本轮关闭（错误文案与文档三处改为按协议来源给恢复步骤，并补了复现测试）。",
+      "evidence": "修复把 service/llmconfig/migration.go 中 validateEffectiveMigrationChannels 的错误提示从「无条件两步（先 rebind-evidence 再重存待切换协议）」改为按来源分情"
+    }
+  ],
+  "extensions": {
+    "calls": 1,
+    "counts": {
+      "inconclusive": 0,
+      "regressed": 0,
+      "resolved": 1,
+      "unresolved": 0
+    },
+    "duplicate_fingerprints": 0,
+    "latency_ms": {
+      "max": 16846,
+      "total": 16846
+    },
+    "model_failures": 0,
+    "quote_rejected": 0,
+    "rate_limit": {
+      "retries": 0,
+      "wait_ms": 0
+    },
+    "warnings": []
+  },
+  "usage": {
+    "input_tokens": 2798,
+    "output_tokens": 2283,
+    "cached_input_tokens": 512,
+    "wall_clock_ms": 17013
+  }
+}

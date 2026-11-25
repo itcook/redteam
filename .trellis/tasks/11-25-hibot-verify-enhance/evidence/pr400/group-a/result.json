@@ -1,0 +1,51 @@
+{
+  "group": "group-a",
+  "status": "ok",
+  "same": 1,
+  "diff": 1,
+  "rows": [
+    {
+      "fingerprint": "sha256:697a6db64a341b98e313f7e9eaf2bb1b15991a0b553ad40813886afce781c3a2",
+      "expected": "regressed",
+      "actual": "resolved",
+      "verdict": "异",
+      "note": "人工第 2 轮：分诊阻塞已修，但同时引入 🔴1（affinity 严格拒绝不是终态，回退重选被拒渠道）——按四态语义是 regressed。证据应出现在 symbol_blast_radius 段（distributor.go 引用 PinnedChannelAllowed，±40 行快照覆盖 :158→:174 回退）。",
+      "evidence": "修复把 ChannelAllowed 拆成带 strict 参数的 channelAllowed，并新增 PinnedChannelAllowed（strict=true）在比对存储指纹后才放行；service/llmconfig/exec"
+    },
+    {
+      "fingerprint": "sha256:7db89c45c86767f14a69cdc975e148b524102f6f2990c9525030aa5d08e0b508",
+      "expected": "resolved",
+      "actual": "resolved",
+      "verdict": "同",
+      "note": "人工第 2 轮：迁移 forward switch 改回 VerifiedChannelIDs，阻塞已修。",
+      "evidence": "修复引入严格/宽松两条路径：execution.go 新增 VerifiedChannelIDs，经 allowedChannelIDs(..., strict=true) 在计算当前指纹后额外要求 current == fp（`if er"
+    }
+  ],
+  "extensions": {
+    "calls": 2,
+    "counts": {
+      "inconclusive": 0,
+      "regressed": 0,
+      "resolved": 2,
+      "unresolved": 0
+    },
+    "duplicate_fingerprints": 0,
+    "latency_ms": {
+      "max": 12572,
+      "total": 22833
+    },
+    "model_failures": 0,
+    "quote_rejected": 0,
+    "rate_limit": {
+      "retries": 0,
+      "wait_ms": 0
+    },
+    "warnings": []
+  },
+  "usage": {
+    "input_tokens": 13038,
+    "output_tokens": 3987,
+    "cached_input_tokens": 1024,
+    "wall_clock_ms": 12838
+  }
+}
