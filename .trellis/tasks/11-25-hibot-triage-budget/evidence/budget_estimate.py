@@ -150,7 +150,7 @@ def estimate_a(files, pr, manifest_cap):
     text_kb = kb(i0_text_bytes(pr))
     i0 = scaled_i0(text_kb, f)
     if not files:
-        return i0 + CLOSE_OUT_S, dict(i0=i0, n_sec=0, n_drift=0)
+        return math.ceil(i0 + CLOSE_OUT_S), dict(i0=i0, n_sec=0, n_drift=0)
     total_kb = kb(sum(w for _, w in files))
     n_sec = shard_count(total_kb, len(files))
     modules = sorted({module_of(p) for p, _ in files})
@@ -170,12 +170,12 @@ def estimate_a(files, pr, manifest_cap):
     intent_cells = sum(scaled_cell(kb(sum(w for _, w in shard)), intent_extra, f) for shard in sec_shards)
 
     total = i0 + sec_cells + drift_cells + intent_cells + CLOSE_OUT_S
-    return total, dict(i0=i0, n_sec=n_sec, n_drift=n_drift, sec=sec_cells, drift=drift_cells, intent=intent_cells)
+    return math.ceil(total), dict(i0=i0, n_sec=n_sec, n_drift=n_drift, sec=sec_cells, drift=drift_cells, intent=intent_cells)
 
 
 def estimate_b(diff_kb, n_files, text_kb, coeff, manifest_cap):
     raw = coeff["base"] + coeff["per_diff_kb"] * diff_kb + coeff["per_file"] * n_files + coeff["per_text_kb"] * text_kb
-    return raw, min(manifest_cap, max(B_MIN_TOTAL, raw))
+    return raw, math.ceil(min(manifest_cap, max(B_MIN_TOTAL, raw)))
 
 SAMPLE_JOBS = {
     "backend#333": ("backend", 333, "report.glm54-1800c.json", 1050.125),
@@ -236,8 +236,8 @@ def main():
     for r in rows:
         out.append(
             f"| {r['label']} | {kb(r['diff_bytes']):.1f} | {r['files']} | {r['modules']} | {r['text_b']} "
-            f"| {r['a1800']:.0f} | {min(TARGET_MANIFEST, r['a1800']):.0f} | {min(r['hist_cap'], r['a_hist']):.0f}（cap {r['hist_cap']}） "
-            f"| {r['b1_raw']:.0f} | {r['b1']:.0f} | {r['b2_raw']:.0f} | {r['b2']:.0f} "
+            f"| {r['a1800']} | {min(TARGET_MANIFEST, r['a1800'])} | {min(r['hist_cap'], r['a_hist'])}（cap {r['hist_cap']}） "
+            f"| {r['b1_raw']:.1f} | {r['b1']} | {r['b2_raw']:.1f} | {r['b2']} "
             f"| {r['deepseek_s']:.1f}s ({r['status']}) | {(str(round(r['glm_s'], 1)) + 's') if r['glm_s'] else '—'} |"
         )
     out.append("")
@@ -245,8 +245,8 @@ def main():
     out.append("|---|---|---|---|---|---|---|")
     for e in examples:
         out.append(
-            f"| {e['name']} | {e['a']:.0f} | {min(TARGET_MANIFEST, e['a']):.0f} "
-            f"| {e['b1_raw']:.0f} | {e['b1']:.0f} | {e['b2_raw']:.0f} | {e['b2']:.0f} |"
+            f"| {e['name']} | {e['a']} | {min(TARGET_MANIFEST, e['a'])} "
+            f"| {e['b1_raw']:.1f} | {e['b1']} | {e['b2_raw']:.1f} | {e['b2']} |"
         )
     out.append("")
     out.append("A 明细（manifest=1800）：")

@@ -8,27 +8,27 @@ git diff --exit-code plugins/redteam/.claude-plugin/plugin.json plugins/redteam/
 git diff --exit-code dist/config.schema.json
 cargo test --test packaging --test version
    Compiling redteam v0.1.0 (/Users/weilai/hobby/.worktrees/redteam/hibot-triage-budget)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.06s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.44s
      Running tests/packaging.rs (target/debug/deps/packaging-ae21f53326bf35a6)
 
 running 7 tests
 test binary_layout_and_launcher ... ok
 test manifests_valid_and_named ... ok
-test codex_skills_have_name_and_no_claude_var ... ok
 test commands_frontmatter_and_invocation_policy ... ok
+test codex_skills_have_name_and_no_claude_var ... ok
 test launcher_resolves_on_this_platform ... ok
 test codex_skills_in_sync_with_commands ... ok
 test launcher_errors_when_binary_missing ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 
      Running tests/version.rs (target/debug/deps/version-0344a79a6a20b2cf)
 
 running 4 tests
-test plugin_manifests_share_the_crate_version ... ok
 test changelog_starts_with_unreleased ... ok
 test capabilities_share_the_crate_version ... ok
+test plugin_manifests_share_the_crate_version ... ok
 test binary_reports_the_crate_version ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
 
