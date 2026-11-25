@@ -1,6 +1,6 @@
 # executor config v2（破坏性重排）设计
 
-> 状态：**已批准 · T-B 实施中**（2026-11-25 协调者裁决 8 条；设计为准） · 基线 `a494e39`
+> 状态：**已批准 · T-B 已交付；v2.0.1 增量已合入**（2026-11-25 协调者裁决 8 条；设计为准） · 基线 `a494e39`
 > 任务：`.trellis/tasks/11-25-config-v2/`（PRD / 样例 / schema 草案 / hibot 交付清单）
 > 范围：`src/config/mod.rs` 的**全部现存配置键**（`Config` / `ProviderConfig` / `ModelConfig` /
 > `ReviewConfig` / `ScannersCfg` / `ReviewersCfg` / `RefutersCfg` / `GroupingCfg` / `PackCfg` /
@@ -115,13 +115,15 @@ contextWindow 128K 且下限 32K、maxOutputTokens 32768、perTurn 公式）—�
 | `apiKeyEnv` | `apiKeyEnv` | 不变 |
 | `maxConcurrency` | `maxConcurrency` | 不变（缺省继承 `settings.review.maxConcurrency`） |
 | `models`（对象，键 = id） | `models`（数组，元素带 `id`） | 形状变更；数组顺序 = `model list` 展示序 |
+| —（新增） | `models[].api` | **v2.0.1**：条目级覆盖 provider 的 `api`（可选；缺省继承）。`baseUrl` 仍只在 provider 级——同 provider 要不同端点请拆 provider |
 
 ### 2.3 `providers.<p>.models.<id>` → `providers.<p>.models[]`
 
 | v1 | v2 | 处置 |
 |---|---|---|
 | `displayName` | `displayName` | 不变 |
-| `kind` | — | **删除**；迁移方法见 §2.6（不是简单删键） |
+| —（新增） | `api` | **v2.0.1**：条目级覆盖；有效 api = `model.api ?? provider.api` |
+| `kind` | `api`（可选） | **改名**：该条目的 `api` 覆盖 provider（v2.0.1 起）；迁移方法见 §2.6 |
 | `apiKeyEnv` | `apiKeyEnv` | 保留（模型级 key env，解析链不变） |
 | `family` | `family` | 保留（agreement 归族 / reasoning 参数形状 / 同族告警都靠它） |
 | `contextWindow` | `contextWindow` | 不变（缺省 128000，下限 32000） |
@@ -186,13 +188,12 @@ contextWindow 128K 且下限 32K、maxOutputTokens 32768、perTurn 公式）—�
 1. 对每个旧模型算有效 API：`effective = model.kind.or(provider.kind)`（v1 的真实语义
    `[核实 src/config/mod.rs:741]`）。
 2. 同一 provider 下所有模型 `effective` 相同 → 把该值写到 `providers.<p>.api`，模型层 `kind` 直接删。
-3. 同一 provider 下存在**不同** `effective` → 必须在 v2 **拆成多个 provider**（每个 API 一个），
-   原 provider 名可留给多数派或主 API；另一组用新名（如 `<p>-anthropic`）。
-   同时：
-   - 角色池条目 `{provider,id}` 的 `provider` 改成新名；
-   - `provider/id` 身份串随之变化（台账/报告/`secrets.json` 的 provider 键都要跟）；
-   - `baseUrl` / `maxConcurrency` / `apiKeyEnv` 需要各自复制或调整；
-   - 迁移提示必须显式说明这四点，不能静默拆。
+3. 同一 provider 下存在**不同** `effective` → **不需要拆 provider**（v2.0.1 起）：把不同于
+   `providers.<p>.api` 的那些模型写成条目级 `api` 即可（`models[]` 元素可覆盖）。迁移提示按
+   `model.kind → model.api = "<api>"` 给值，并在提示里注明「同一 provider 可混多种 api」。
+   - `baseUrl` 仍是 provider 唯一端点：同一 provider 下确实需要不同端点时，才拆 provider；
+   - `provider/id` 身份串、`secrets.json` 键、`maxConcurrency` / `apiKeyEnv` 均不因 api 覆盖而变化。
+   - 历史文案（「混协议必须拆 provider」）是 **v2.0.0 → v2.0.1 的修正**，不再使用。
 4. v1 别名（`gpt` 等）在 v2 解析期仍**不接受**，只用于迁移提示。
 
 ### 2.7 不变的部分
@@ -221,7 +222,9 @@ contextWindow 128K 且下限 32K、maxOutputTokens 32768、perTurn 公式）—�
 - `openai-completions`：OpenAI Chat Completions 形状（现 `Openai` + `OpenaiCompatible` 合流）。
 - `anthropic-messages`：Anthropic Messages 形状（现 `Anthropic`）。
 - `openai-responses`：**仅预留**。`config check` 报 `api_not_implemented` ERROR；`Config::validate`
-  同样拒绝（本地也不允许带着未实现 api 启动）。
+  同样拒绝（本地也不允许带着未实现 api 启动）。条目级 `api` 同样适用（pointer `/providers/<p>/models/<i>/api`）。
+- **有效 api（v2.0.1）**：`effective = models[].api ?? provider.api`。backend 构造、reasoning 参数形状、
+  模型探测全部读有效值；`baseUrl` / `maxConcurrency` / 凭据链不受条目级 `api` 影响。
 - `google` 删除：json 值不在枚举内 → `legacy_shape` 专属文案「google 已移除；api 三值 …；hibot 不渲染
   google 模型」。
 - 内部类型建议改名 `ProviderKind` → `ProviderApi`（变体 `OpenaiCompletions` / `AnthropicMessages` /
@@ -421,6 +424,9 @@ agreement 结构性下降。**这是迁移影响，不推翻轮转决定**；补
    `language`→`settings.language`、`review.refuters.enabled`→`settings.review.refuters.enabled`、
    新增 `settings.triage/verify.models`。
 6. `config check` 新码表（§4）。
+7. **v2.0.1 增量**（2026-11-25，`schemaVersion` 仍为 2）：`models[]` 条目可覆盖 `api` / `apiKey`；
+   schema 产物重新生成、sha256 更新（见任务目录 `hibot-delivery-v2.0.1.md`）；迁移口径从「混协议拆 provider」
+   改为「`model.kind → model.api`」。
 
 ---
 
