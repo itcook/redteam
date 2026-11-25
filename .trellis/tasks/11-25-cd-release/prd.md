@@ -68,3 +68,52 @@
 - `bash -n` 通过；workflow YAML 可解析。
 - 单测覆盖 R2/GitHub URL 差异、`R2_PREFIX` 空值/带斜杠边界。
 - 回报：提交、测试原文、产物清单、workflow 触发与 secrets/vars 清单、`--prepare-only` 幂等性。
+
+## 实施与验收记录（2026-11-25）
+
+### 提交（feature/cd-release）
+
+```
+c0f54cb docs: 同步发布入口（默认 CI / --local-publish）与双向回验说明
+583046a fix(ci): R2 凭据映射、按 sha 固定构建、发布后回验
+3ef6d69 fix(release): 默认交棒 CI、.env 延迟到发布阶段、严格模式互斥
+661ff2e ci(release): job id 改为 check_r2（表达式安全），同步 runbook
+d7cb4fd ci(release): 缓存键跨 tag 复用，去掉未使用的 sha 输出
+dc126e4 chore(task): 建立 U9 CD 发布任务（PRD / 验收）
+18d4208 build: 重建二进制（R2 基址变更）
+e2dccf3 docs: 发布 runbook / README 补 CI 路径与 R2 新布局
+2902daa ci(release): push tag v* 构建 → GitHub Release → R2 镜像
+5fdb921 feat(update): R2 下载基址切到 release.hibot.sh/executor/audit/redteam
+d4e9eed feat(release): R2 前缀收敛到 executor/audit/redteam，新增 --prepare-only
+```
+
+### 门禁
+
+- `make verify`：packaging 9 + version 4，全绿。
+- `cargo test`：EXIT=0；1189 + 其余集成测试，0 failed / 0 warning。
+- `bash -n scripts/release.sh`、`sh -n dist/install.sh`：通过。
+- workflow：PyYAML 解析五个 job；所有 `run` 块 `bash -n` 通过；离线桩测（aws/curl）验证
+  R2 凭据映射、对象 key/content-type/no-cache、custom 前缀归一化、稳定版 vs prerelease 的 latest、
+  check_r2 四键缺失跳过与 warning、GitHub/R2 回验失败传播。
+
+### 产物（`--prepare-only`，两次均 EXIT=0）
+
+```
+config.schema.json                       18449 B   246d2c97…（两次一致）
+install.sh                                7345 B
+redteam-0.1.0-aarch64-apple-darwin.tar.gz
+release-notes.md
+SHA256SUMS                                 193 B
+```
+
+### 幂等性与副作用
+
+- 两次运行前后：HEAD 不变、`git for-each-ref` 36 个 ref 零差异、工作区零差异、产物文件集合一致。
+- **tar.gz 逐字节不稳定**（两次 sha 不同）：`tar -czf` 会写入打包时 mtime，属既有行为；
+  schema 与 `SHA256SUMS` 内容可重复。未扩大为可重现构建。
+- 验收过程中曾创建并**本地删除**测试 tag `v9.9.9`、`v0.1.0`（均未推送、无远端/Release/R2 副作用）；
+  最终 `git tag -l` 无残留。
+
+### 未做
+
+- 未打正式 tag、未推送、未建 Release、未上传 R2；未验证真实 Actions 运行与真实 R2 凭据。
