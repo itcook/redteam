@@ -3,7 +3,7 @@
   "name": "hibot-phase4-verify",
   "title": "hibot Phase 4 verify kind（fix 验证，与 refute 零共享）",
   "description": "计划 §7 4.0–4.7：新模块 src/fixverify/（不动 consolidate::refute）、四态、覆盖不变量、删除/改名、空输入、capabilities 增量、删除 Phase 1 临时码",
-  "status": "in_progress",
+  "status": "completed",
   "dev_type": null,
   "scope": null,
   "package": null,

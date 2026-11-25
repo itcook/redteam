@@ -106,3 +106,19 @@ config v2 已合入：verify 模型取 `settings.verify.models[]`（轮转池，
    （协调者记为 followup，不返工）。
 3. `install_panic_report_hook` 的 panic 路径仍用 `error_report`（空 `verifications`）：panic hook 里再解析
    findings 有二次失败风险，本轮不动；若 hibot 严格要求 panic 报告也覆盖，再单独评估。
+
+## 合并前状态（2026-11-25 收尾）
+
+协调者一次性合并分支 HEAD（含代码提交与两个 bookkeeping 提交），不重跑门禁：
+
+| 提交 | 内容 |
+|---|---|
+| `75dcd97` | feat(fixverify)：4.0–4.3/4.6 |
+| `60ce92d` | feat(verify)：job 接线 + 报告信封 + capabilities + 删除 Phase 1 临时码（4.4/4.7） |
+| `dde0b33` | test(verify)：4.5 合成夹具 |
+| `f10f224` | fix(verify)：作业级 error 覆盖（契约 §3.3，协调者裁 (a)） |
+| `7503afd` | chore(task)：移回未归档状态（修正 f10f224 误带归档文件） |
+
+- 代码在 `f10f224` 定稿；此后的提交只动 `.trellis/` 文档与任务状态。
+- 已推送 `origin/feature/hibot-audit-exec`（不 force）；合入 `hibot-executor` 由协调者执行。
+- 归档后的 followup 仍有效：`missing_role` 诊断 pointer（`/providers`）、panic hook 路径的空 `verifications`。
