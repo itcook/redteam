@@ -397,7 +397,7 @@ async fn job_language_comes_from_config_not_env() {
 }
 
 #[tokio::test]
-async fn triage_rejects_bad_pr_context_and_verify_is_a_stub() {
+async fn triage_rejects_bad_pr_context_and_verify_validates_its_inputs() {
     // triage：Phase 3 已实现；本夹具的 pr_context 只有 schema（缺 title/author/…）→ error，不伪造 summary。
     let fx = make_repo_and_job("triage", &config_with(Some("en_US"), false), false, true);
     let code = redteam::job::run::run_with(JobKind::Triage, &fx.job, None).await;
@@ -408,43 +408,26 @@ async fn triage_rejects_bad_pr_context_and_verify_is_a_stub() {
     assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:pr_context");
     assert!(r.get("summary").is_none(), "禁止伪造 summary");
 
-    // verify：空输入 → error + verifications: []。
+    // verify（4.6 / Q6）：空 findings 集合 → 报告 ok、`verifications: []`、不伪造判决。
     let vj = make_verify_job(b"[]");
     let code = redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await;
-    assert_eq!(code, 1);
+    assert_eq!(code, 0, "空输入是合法的 ok 报告");
     let r = read_report(&vj.job);
-    assert_eq!(r["status"], "error");
+    assert_eq!(r["status"], "ok");
     assert_eq!(r["schema"], "hibot.audit.report.verify/1");
+    assert_eq!(r["kind"], "verify");
     assert_eq!(r["verifications"], serde_json::json!([]));
-    assert_eq!(r["extensions"]["redteam"]["status_code"], "kind_not_implemented:verify");
-    assert!(r["findings"].as_array().unwrap().is_empty());
+    assert!(r["findings"].as_array().unwrap().is_empty(), "verify 不产 finding");
+    assert!(r.get("status_reason").is_none(), "ok 不必带 status_reason");
+    assert_eq!(r["input"]["head_sha"], git(&vj.repo, &["rev-parse", "HEAD"]), "回显 manifest pr.head_sha");
 
-    // verify：非空输入 → 逐条 inconclusive（协调者 2026-11-24 裁 A），整体 error。
-    let fp1 = "sha256:".to_string() + &"a".repeat(64);
-    let fp2 = "sha256:".to_string() + &"b".repeat(64);
-    let findings = serde_json::json!([
-        {"fingerprint": fp1, "severity":"high","confidence":0.9,"file":"a.rs","line_start":1,"line_end":1,
-         "quote":"q","title":"t","body":"b","recommendation":"r"},
-        {"fingerprint": fp2, "severity":"low","confidence":0.5,"file":"b.rs","line_start":2,"line_end":2,
-         "quote":"q2","title":"t2","body":"b","recommendation":"r"}
-    ]).to_string();
-    let vj = make_verify_job(findings.as_bytes());
-    let code = redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await;
-    assert_eq!(code, 1);
-    let r = read_report(&vj.job);
-    assert_eq!(r["status"], "error");
-    let vs = r["verifications"].as_array().unwrap();
-    assert_eq!(vs.len(), 2, "非空输入必须逐条覆盖: {r}");
-    assert!(vs.iter().all(|v| v["status"] == "inconclusive"));
-    assert!(vs.iter().all(|v| v["evidence"].as_str().unwrap().len() > 0));
-    assert_eq!(vs[0]["finding_fingerprint"], fp1);
-
-    // verify：非法指纹 → error + invalid_fingerprint_input，且不产 verifications。
+    // verify：非法指纹 → error + invalid_fingerprint_input，且不产 verifications（4.1）。
     let bad = serde_json::json!([{"fingerprint":"sha256:abc"}]).to_string();
     let vj = make_verify_job(bad.as_bytes());
     let code = redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await;
     assert_eq!(code, 1);
     let r = read_report(&vj.job);
+    assert_eq!(r["status"], "error");
     assert_eq!(r["extensions"]["redteam"]["status_code"], "invalid_fingerprint_input");
     assert_eq!(r["verifications"], serde_json::json!([]));
 
@@ -454,41 +437,84 @@ async fn triage_rejects_bad_pr_context_and_verify_is_a_stub() {
     assert_eq!(code, 1);
     let r = read_report(&vj.job);
     assert_eq!(r["extensions"]["redteam"]["status_code"], "input_schema_mismatch:findings");
+
+    // verify：verify 池为空 → error / missing_role:verifier（v2 不再回退 reviewer）。
+    let vj = make_verify_job_with_config(b"[]", &config_with(Some("en_US"), false));
+    let code = redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await;
+    assert_eq!(code, 1);
+    let r = read_report(&vj.job);
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "missing_role:verifier");
 }
 
 
-/// 建一个合法的 verify job（空/非空 findings 都行）；`TempDir` 随结构体存活，测试结束自清理。
+/// 建一个合法的 verify job（真实 base→head 仓 + 真 diff/merge_base，空/非空 findings 都行）；
+/// `TempDir` 随结构体存活，测试结束自清理。
 struct VerifyJob {
     _tmp: tempfile::TempDir,
     job: std::path::PathBuf,
+    repo: std::path::PathBuf,
 }
 
 fn make_verify_job(findings: &[u8]) -> VerifyJob {
+    make_verify_job_with_config(findings, &config_with_verify())
+}
+
+/// verify 专用配置：`settings.verify.models` 一个条目（v2 形状），provider 指向必然连不上的地址——
+/// 夹具只在「会真的发请求」时才需要 fake。
+fn config_with_verify() -> String {
+    serde_json::json!({
+        "settings": {"language": "en_US", "verify": {"models": [{"provider": "p1", "id": "v"}]}},
+        "providers": {
+            "p1": {"api": "openai-completions", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
+                   "models": [{"id": "v"}]}
+        }
+    })
+    .to_string()
+}
+
+fn make_verify_job_with_config(findings: &[u8], config: &str) -> VerifyJob {
     let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("src/app.js"), format!("function find(id) {{\n  {QUOTE}\n}}\n")).unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("src/app.js"), "function find(id) {\n  return db.query('SELECT * FROM users WHERE id=?', [id]);\n}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "head"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let diff = git(&repo, &["diff", &format!("{base}..{head}")]);
+
     let job = tmp.path().join("job");
     std::fs::create_dir_all(job.join("config")).unwrap();
     std::fs::create_dir_all(job.join("input")).unwrap();
     std::fs::create_dir_all(job.join("out")).unwrap();
-    std::fs::write(job.join("config/executor.redteam.json"), config_with(Some("en_US"), false)).unwrap();
+    std::fs::write(job.join("config/executor.redteam.json"), config).unwrap();
     std::fs::write(job.join("input/findings.json"), findings).unwrap();
-    std::fs::write(job.join("input/diff.patch"), "").unwrap();
-    std::fs::write(job.join("input/mb.sha"), "abc\n").unwrap();
+    let patch = format!("{diff}\n");
+    std::fs::write(job.join("input/diff.patch"), &patch).unwrap();
+    let mb = format!("{base}\n");
+    std::fs::write(job.join("input/mb.sha"), &mb).unwrap();
     let inputs = serde_json::json!({
         "findings": {"path":"input/findings.json","sha256":sha256_hex(findings),"schema":"hibot.audit.findings/1"},
-        "diff_patch": {"path":"input/diff.patch","sha256":sha256_hex(b"")},
-        "merge_base": {"path":"input/mb.sha","sha256":sha256_hex(b"abc\n")},
+        "diff_patch": {"path":"input/diff.patch","sha256":sha256_hex(patch.as_bytes())},
+        "merge_base": {"path":"input/mb.sha","sha256":sha256_hex(mb.as_bytes())},
     });
     let m = serde_json::json!({
         "schema": "hibot.audit.job.verify/1", "job_id": "J-v", "kind": "verify",
         "repo": {"id":1,"full_name":"o/r"},
-        "pr": {"number":7,"head_sha":"abcdef0","base_sha":"1234567"},
+        "pr": {"number":7,"head_sha":head,"base_sha":base},
         "executor": {"name":"redteam","version":"0.1.0"},
         "limits": {"wall_clock_s":60},
         "paths": {"repo":"../repo","out":"out","config":"config/executor.redteam.json"},
         "inputs": inputs,
     });
     std::fs::write(job.join("job.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
-    VerifyJob { _tmp: tmp, job }
+    VerifyJob { _tmp: tmp, job, repo }
 }
 
 #[tokio::test]
@@ -1150,7 +1176,7 @@ async fn heartbeat_state_file_reports_gate_snapshot_and_stops_after_exit() {
     assert_eq!(std::fs::read(&path).unwrap(), before, "退出后不再写 state.json");
 }
 
-/// Phase 5.2：triage / verify 也有三值心跳（分析未实现，不伪造 progress/llm）。
+/// Phase 5.2：triage / verify 也有三值心跳（triage 分析前错误不伪造 progress/llm；verify 逐条计数）。
 #[tokio::test]
 async fn triage_and_verify_write_three_value_heartbeat() {
     let fx = make_repo_and_job("triage", &config_with(Some("en_US"), false), false, true);
@@ -1163,14 +1189,19 @@ async fn triage_and_verify_write_three_value_heartbeat() {
 
     let fp = "sha256:".to_string() + &"a".repeat(64);
     let findings = serde_json::json!([{
-        "fingerprint": fp, "severity":"high", "confidence":0.9, "file":"a.rs",
-        "line_start":1, "line_end":1, "quote":"q", "title":"t", "body":"b", "recommendation":"r"
+        "fingerprint": fp, "severity":"high", "confidence":0.9, "file":"gone.rs",
+        "line_start":1, "line_end":1, "quote":"db.query(id)", "title":"t", "body":"b", "recommendation":"r"
     }]).to_string();
+    // 文件不在修复 diff 中、也不在检出里 → 该条 `inconclusive`（不发请求），仍完成整套心跳/计数。
     let vj = make_verify_job(findings.as_bytes());
-    assert_eq!(redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await, 1);
+    assert_eq!(redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await, 0, "partial 也是合法报告");
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(vj.job.join("out/state.json")).unwrap()).unwrap();
     assert_eq!(v["job_id"], "J-v");
     assert_eq!(v["phase"], "finishing");
-    assert_eq!(v["progress"], serde_json::json!({"unit": "items", "done": 0, "total": 1}));
+    assert_eq!(v["progress"], serde_json::json!({"unit": "items", "done": 1, "total": 1}));
+    assert!(v["llm"].is_object(), "verify 建 registry → 心跳带 llm 快照");
+    let r = read_report(&vj.job);
+    assert_eq!(r["status"], "partial");
+    assert_eq!(r["verifications"][0]["status"], "inconclusive", "无法定位不得落 unresolved");
 }
 

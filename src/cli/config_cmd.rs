@@ -207,6 +207,9 @@ mod tests {
         let no_reviewer = r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"}]}}}"#;
         assert_eq!(run(no_reviewer, Some("triage")).0, 1, "triage 缺 triage 池");
         assert_eq!(run(no_reviewer, Some("verify")).0, 1, "verifier 池缺");
+        // 4.0 / 验收 6：空 `settings.verify.models` 的诊断码必须是 `missing_role:verifier`（不回退 reviewer）。
+        let (_, errs, _) = check(no_reviewer, Some(JobKind::Verify));
+        assert!(errs.iter().any(|d| d.code == "missing_role:verifier"), "{errs:?}");
     }
 
     #[test]

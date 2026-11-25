@@ -6,6 +6,7 @@ pub mod db;
 pub mod domain;
 pub mod diffsym;
 pub mod evidence;
+pub mod fixverify;
 pub mod hash;
 pub mod job;
 pub mod model;

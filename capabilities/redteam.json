@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "kinds": [
     "review",
-    "triage"
+    "triage",
+    "verify"
   ],
   "form": "cli",
   "invoke": "redteam review --job-dir <dir>",

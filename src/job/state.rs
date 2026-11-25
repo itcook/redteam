@@ -129,7 +129,7 @@ impl Heartbeat {
         self.write_frame();
     }
 
-    /// 设置进度总量（review：scan cells 数；triage/verify 未实现分析，不设）。
+    /// 设置进度总量（review：scan cells 数；verify：待核验 finding 条数；triage 无可计数项不设）。
     pub fn set_progress_total(&self, unit: &'static str, total: u64) {
         let mut p = self.inner.progress.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = p.as_mut() {
