@@ -117,3 +117,9 @@ SHA256SUMS                                 193 B
 ### 未做
 
 - 未打正式 tag、未推送、未建 Release、未上传 R2；未验证真实 Actions 运行与真实 R2 凭据。
+
+### 后续调整（同日）
+
+- 用户决定只保留唯一公开源：`DEFAULT_FROM=r2`、`install.sh` 默认 `REDTEAM_FROM=r2`；
+  README 安装/自更新命令去掉源参数。GitHub Release 保留为 `--from github` 备源。
+- 插件二进制已重建（默认源编进二进制）；本地用假 R2 服务验证默认安装与 `update --check`。
