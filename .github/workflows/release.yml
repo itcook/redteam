@@ -1,0 +1,391 @@
+# U9 · CD：tag → GitHub Release + R2 镜像
+#
+# 触发：push tag `v*`（正式/预发布都走这里）或 workflow_dispatch（手填 tag）。
+# 产物单一来源：本工作流只调用 `scripts/release.sh <tag> --prepare-only`，打包/SHA256SUMS/
+# release-notes 的逻辑全在脚本里，CI 不复制一份。
+#
+# 需要的仓库配置：
+#   secrets.R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_STATIC_ENDPOINT / R2_BUCKET
+#   vars.R2_PREFIX        默认 executor/audit/redteam
+#   vars.R2_BUCKET_DOMAIN 默认 release.hibot.sh
+#
+# 回验：GitHub Release 由 action 发布；R2 上传后按公开基址 HEAD 200 + tar.gz/schema sha 比对。
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（vX.Y.Z 或 vX.Y.Z-rc.N）'
+        required: true
+        type: string
+
+# 发布只写 Release；读取仓库内容用默认 GITHUB_TOKEN。
+permissions:
+  contents: write
+
+# 同一 tag 不并发发布；不同 tag 互不阻塞。
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  R2_PREFIX: ${{ vars.R2_PREFIX || 'executor/audit/redteam' }}
+  R2_BUCKET_DOMAIN: ${{ vars.R2_BUCKET_DOMAIN || 'release.hibot.sh' }}
+
+jobs:
+  # ---------------------------------------------------------------- 校验
+  prepare:
+    name: 校验 tag 与版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - id: meta
+        name: 校验 tag 形态 / 版本同源 / 指向 HEAD
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$REF_NAME}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+            echo "::error::非法 tag：$tag（应形如 v0.1.0 / v0.1.0-rc.1）"
+            exit 1
+          fi
+          version="${tag#v}"
+          base="${version%%-*}"
+          cargo_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "$cargo_version" != "$version" ] && [ "$cargo_version" != "$base" ]; then
+            echo "::error::Cargo.toml 版本（$cargo_version）与 tag（$tag）不一致；先 bump Cargo.toml"
+            exit 1
+          fi
+          # tag 必须指向本次 checkout 的提交：产物构建自 HEAD，tag 必须同源。
+          head_sha="$(git rev-parse HEAD)"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            tag_sha="$(git rev-parse "$tag^{commit}")"
+            if [ "$tag_sha" != "$head_sha" ]; then
+              echo "::error::tag $tag 指向 ${tag_sha:0:7}，但 checkout 的 HEAD 是 ${head_sha:0:7}"
+              exit 1
+            fi
+          elif [ -n "${INPUT_TAG:-}" ]; then
+            echo "::error::tag $tag 在仓库中不存在"
+            exit 1
+          fi
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          echo "tag=$tag（version=$version, prerelease=$prerelease, sha=${head_sha:0:7}）"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "sha=$head_sha"
+          } >>"$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- 构建 + 打包
+  build:
+    name: 构建 macOS arm64 产物
+    needs: prepare
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 构建与 prepare 验的是同一个 commit（tag 可移动，不能按 tag 重新解析）。
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 校验 tag 仍指向该 commit
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          if [ "$head_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::checkout HEAD $head_sha 与 prepare 的 $EXPECTED_SHA 不一致"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::找不到 tag $TAG（fetch-tags 未生效？）"
+            exit 1
+          fi
+          tag_sha="$(git rev-parse "$TAG^{commit}")"
+          if [ "$tag_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::tag $TAG 在 prepare 后被移动：$tag_sha != $EXPECTED_SHA"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: 门禁（版本同源 / 派生物零漂移 / packaging）
+        run: make verify
+
+      - name: 产出发行产物（--prepare-only，零发布副作用）
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: bash scripts/release.sh "$TAG" --prepare-only --skip-verify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------- GitHub Release
+  release:
+    name: 发布 GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: redteam ${{ needs.prepare.outputs.tag }}
+          body_path: dist/release/release-notes.md
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/release/*.tar.gz
+            dist/release/SHA256SUMS
+            dist/release/install.sh
+            dist/release/config.schema.json
+
+      - name: 回验 GitHub Release 资产
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          asset="$(basename "$(ls dist/release/*.tar.gz)")"
+          sha256() { # file
+            if command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "$1" | awk '{print $1}'
+            else
+              sha256sum "$1" | awk '{print $1}'
+            fi
+          }
+          fail=0
+          check_url() {
+            local code attempt=1
+            while :; do
+              code="$(curl -s -o /dev/null -w '%{http_code}' -L -I "$1" || true)"
+              if [ "$code" = "200" ]; then
+                echo "  ok   $1"
+                return
+              fi
+              if [ "$attempt" -ge 3 ]; then
+                echo "  FAIL $1 (HTTP $code)"
+                fail=1
+                return
+              fi
+              attempt=$((attempt + 1))
+              sleep 3
+            done
+          }
+          check_asset() { # local_path url
+            local want tmp attempt=1
+            want="$(sha256 "$1")"
+            tmp="$(mktemp)"
+            while :; do
+              if curl -fsSL "$2" -o "$tmp" 2>/dev/null && [ "$(sha256 "$tmp")" = "$want" ]; then
+                echo "  ok   $2 (sha256 匹配)"
+                break
+              fi
+              if [ "$attempt" -ge 3 ]; then
+                echo "  FAIL $2（下载失败或 sha 不一致）"
+                fail=1
+                break
+              fi
+              attempt=$((attempt + 1))
+              sleep 3
+            done
+            rm -f "$tmp"
+          }
+          check_url "$base/$asset"
+          check_url "$base/SHA256SUMS"
+          check_url "$base/install.sh"
+          check_url "$base/config.schema.json"
+          check_asset "dist/release/$asset" "$base/$asset"
+          check_asset dist/release/config.schema.json "$base/config.schema.json"
+          [ "$fail" = 0 ] || { echo "::error::GitHub Release 回验失败"; exit 1; }
+  # ---------------------------------------------------------------- R2 凭据检查
+  check_r2:
+    name: 检查 R2 凭据
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_STATIC_ENDPOINT: ${{ secrets.R2_STATIC_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for name in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_STATIC_ENDPOINT R2_BUCKET; do
+            eval "value=\${$name:-}"
+            [ -n "$value" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::缺少 R2 secrets（${missing}），跳过 R2 镜像（不阻塞发布）"
+            echo "enabled=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >>"$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------- R2 镜像 + 回验
+  r2:
+    name: 镜像到 R2 并回验
+    needs: [prepare, build, check_r2]
+    if: needs.check_r2.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release
+
+      - name: 上传并回验
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_STATIC_ENDPOINT: ${{ secrets.R2_STATIC_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          prefix="${R2_PREFIX:-executor/audit/redteam}"
+          prefix="$(printf '%s' "$prefix" \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | tr -s '/' \
+            | sed 's#^/*##; s#/*$##')"
+          [ -n "$prefix" ] || prefix="executor/audit/redteam"
+          public_base="https://${R2_BUCKET_DOMAIN:-release.hibot.sh}/${prefix}"
+          asset="$(basename "$(ls dist/release/*.tar.gz)")"
+
+          sha256() { # file
+            if command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "$1" | awk '{print $1}'
+            else
+              sha256sum "$1" | awk '{print $1}'
+            fi
+          }
+
+          put() { # local_path remote_key content_type
+            # AWS CLI 只读 AWS_*；R2_* 是本仓的命名，必须显式映射。
+            AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+            AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+              aws s3 cp "$1" "s3://${R2_BUCKET}/${prefix}/$2" \
+                --endpoint-url "$R2_STATIC_ENDPOINT" \
+                --content-type "$3" --cache-control no-cache
+          }
+
+          fail=0
+          check_url() {
+            local code attempt=1
+            while :; do
+              code="$(curl -s -o /dev/null -w '%{http_code}' -L -I "$1" || true)"
+              if [ "$code" = "200" ]; then
+                echo "  ok   $1"
+                return
+              fi
+              if [ "$attempt" -ge 3 ]; then
+                echo "  FAIL $1 (HTTP $code)"
+                fail=1
+                return
+              fi
+              attempt=$((attempt + 1))
+              sleep 3
+            done
+          }
+
+          check_asset() { # local_path url
+            local want tmp attempt=1
+            want="$(sha256 "$1")"
+            tmp="$(mktemp)"
+            while :; do
+              if curl -fsSL "$2" -o "$tmp" 2>/dev/null && [ "$(sha256 "$tmp")" = "$want" ]; then
+                echo "  ok   $2 (sha256 匹配)"
+                break
+              fi
+              if [ "$attempt" -ge 3 ]; then
+                echo "  FAIL $2（下载失败或 sha 不一致）"
+                fail=1
+                break
+              fi
+              attempt=$((attempt + 1))
+              sleep 3
+            done
+            rm -f "$tmp"
+          }
+
+          echo "==> 上传到 s3://${R2_BUCKET}/${prefix}/"
+          put "dist/release/${asset}" "v${version}/${asset}" application/gzip
+          put dist/release/SHA256SUMS "v${version}/SHA256SUMS" text/plain
+          put dist/release/config.schema.json "v${version}/config.schema.json" application/json
+          put dist/release/install.sh install.sh text/plain
+          put dist/release/config.schema.json config.schema.json application/json
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "==> prerelease：不更新 ${prefix}/latest"
+          else
+            printf 'v%s\n' "$version" >dist/release/latest
+            put dist/release/latest latest text/plain
+          fi
+
+          echo "==> 回验 ${public_base}"
+          check_asset "dist/release/${asset}" "${public_base}/v${version}/${asset}"
+          check_asset dist/release/config.schema.json "${public_base}/v${version}/config.schema.json"
+          check_url "${public_base}/v${version}/SHA256SUMS"
+          check_url "${public_base}/install.sh"
+          check_url "${public_base}/config.schema.json"
+          check_asset dist/release/config.schema.json "${public_base}/config.schema.json"
+          if [ "$PRERELEASE" != "true" ]; then
+            check_url "${public_base}/latest"
+            have_latest=""
+            for attempt in 1 2 3; do
+              have_latest="$(curl -fsSL "${public_base}/latest" || true)"
+              if [ "$have_latest" = "v${version}" ]; then break; fi
+              sleep 3
+            done
+            if [ "$have_latest" = "v${version}" ]; then
+              echo "  ok   latest → v${version}"
+            else
+              echo "  FAIL latest 内容为 '${have_latest}'，期望 v${version}"
+              fail=1
+            fi
+          fi
+          [ "$fail" = 0 ] || { echo "::error::R2 回验失败"; exit 1; }
