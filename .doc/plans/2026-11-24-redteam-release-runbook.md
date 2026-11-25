@@ -8,6 +8,13 @@
 >
 > 对应计划：`.doc/plans/2026-11-23-redteam-hibot-consumer-plan.md` §10 Phase 7。
 
+## 分支模型
+
+- `main`：稳定线，**发布 tag 打在 main**；GitHub 默认分支
+- `dev`：开发集成分支；功能分支先合 dev，验证后再快进 main
+- CI：`.github/workflows/ci.yml` 在 push / PR 到 `main` 时跑 `make verify` + `cargo test`
+- 发布：`.github/workflows/release.yml` 由 tag 触发，与分支无关
+
 ## 0. 前提
 
 | 项 | 要求 |
