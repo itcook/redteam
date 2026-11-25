@@ -46,7 +46,6 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
-      sha: ${{ steps.meta.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,7 +90,6 @@ jobs:
             echo "tag=$tag"
             echo "version=$version"
             echo "prerelease=$prerelease"
-            echo "sha=$head_sha"
           } >>"$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------- 构建 + 打包
@@ -112,7 +110,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ needs.prepare.outputs.sha }}
+          key: release
 
       - name: 门禁（版本同源 / 派生物零漂移 / packaging）
         run: make verify
