@@ -398,6 +398,6 @@ cat <<EOF
 EOF
 if [ "$R2_ENABLED" = true ]; then
     cat <<EOF
-  curl -fsSL ${PUBLIC_BASE}/install.sh | REDTEAM_FROM=r2 sh
+  curl -fsSL ${PUBLIC_BASE}/install.sh | sh
 EOF
 fi
