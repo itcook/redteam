@@ -444,6 +444,23 @@ async fn triage_rejects_bad_pr_context_and_verify_validates_its_inputs() {
     assert_eq!(code, 1);
     let r = read_report(&vj.job);
     assert_eq!(r["extensions"]["redteam"]["status_code"], "missing_role:verifier");
+    assert_eq!(r["verifications"], serde_json::json!([]), "空输入集合 → 空数组是唯一合法例外");
+
+    // 同上但 findings 非空：作业级 error 仍须逐条覆盖（契约 §3.3；协调者 2026-11-25 裁 (a)）。
+    let one = serde_json::json!([{
+        "fingerprint": "sha256:".to_string() + &"d".repeat(64),
+        "severity":"high", "confidence":0.9, "file":"src/app.js", "line_start":2, "line_end":2,
+        "quote": QUOTE, "title":"t", "body":"b", "recommendation":"r"
+    }]).to_string();
+    let vj = make_verify_job_with_config(one.as_bytes(), &config_with(Some("en_US"), false));
+    assert_eq!(redteam::job::run::run_with(JobKind::Verify, &vj.job, None).await, 1);
+    let r = read_report(&vj.job);
+    assert_eq!(r["status"], "error", "补条目不得改 partial");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "missing_role:verifier");
+    let vs = r["verifications"].as_array().unwrap();
+    assert_eq!(vs.len(), 1, "findings 可解析 ⇒ 逐条覆盖: {r}");
+    assert_eq!(vs[0]["status"], "inconclusive", "缺角色 = 未核验，不是判决");
+    assert!(vs[0]["evidence"].as_str().unwrap().contains("missing_role:verifier"));
 }
 
 

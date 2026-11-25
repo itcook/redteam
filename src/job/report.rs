@@ -105,13 +105,46 @@ impl HibotReport {
     }
 }
 
-/// 错误 / 未实现报告：结构合法、`status=error`、带 reason。
+/// 错误报告：结构合法、`status=error`、带 reason。
+///
+/// `verify` 的 `verifications` 在 [`HibotReport::base`] 里置空数组；**findings 已解析时**作业级错误
+/// 必须改用 [`error_report_covering`]，否则会违反契约 §3.3 的逐条覆盖（空数组仅当输入集合为空）。
 pub fn error_report(manifest: &JobManifest, lang: &OutputLang, failure: &JobFailure) -> HibotReport {
     let text = failure.status_text(lang);
     let mut r = HibotReport::base(manifest);
     r.status = JobStatus::Error;
     r.status_reason = Some(text.reason);
     r.extensions = json!({ "redteam": { "language": language_json(lang), "status_code": text.code } });
+    r
+}
+
+/// `verify` 的作业级错误报告：**findings 已成功解析**时逐条输出 `inconclusive`。
+///
+/// 契约 §3.3 / §8.1：`verifications` 必须逐条覆盖输入指纹集合，**空数组仅当集合为空**。作业级失败
+/// （检出缺对象 / 缺角色 / registry 构造失败）意味着一条也没核验——那正是 `inconclusive` 的定义，
+/// 不是判决。证据句绑定真实 `status_code` 并随 `language`，`status` 仍为 `error`（不因补条目改 partial）。
+/// `findings` 本身无法解析时不给指纹（空数组是唯一合法例外）。
+pub fn error_report_covering(
+    manifest: &JobManifest,
+    lang: &OutputLang,
+    failure: &JobFailure,
+    fingerprints: &[String],
+) -> HibotReport {
+    let mut r = error_report(manifest, lang, failure);
+    if manifest.kind == JobKind::Verify && !fingerprints.is_empty() {
+        let code = failure.full_code();
+        let text = if lang.value.starts_with("zh") {
+            format!("作业在核验前失败（{code}），该 finding 未核验")
+        } else {
+            format!("job failed before verification ({code}); this finding was not verified")
+        };
+        r.verifications = Some(
+            fingerprints
+                .iter()
+                .map(|fp| json!({"finding_fingerprint": fp, "status": "inconclusive", "evidence": text}))
+                .collect(),
+        );
+    }
     r
 }
 
@@ -656,5 +689,28 @@ mod tests {
         assert_eq!(r.extensions["redteam"]["verify"]["model_failures"], 1);
         assert_eq!(r.extensions["redteam"]["template_hashes"]["fix_verify"], "h1");
         assert_eq!(r.usage.output_tokens, 4);
+
+        // 作业级 error + findings 可解析 → 逐条 inconclusive（契约 §3.3），status 仍 error、证据随 language。
+        let failure = JobFailure::new("missing_role", Some("verifier".into()));
+        let covered = error_report_covering(&vm, &lang, &failure, &[fp('a'), fp('b')]);
+        assert_eq!(covered.status, JobStatus::Error, "补条目不得改 partial");
+        assert_eq!(covered.extensions["redteam"]["status_code"], "missing_role:verifier");
+        let vs = covered.verifications.unwrap();
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0]["status"], "inconclusive");
+        assert_eq!(vs[0]["evidence"], "作业在核验前失败（missing_role:verifier），该 finding 未核验");
+
+        let en = crate::config::Language::EnUs.output();
+        let covered_en = error_report_covering(&vm, &en, &failure, &[fp('a')]);
+        assert_eq!(
+            covered_en.verifications.unwrap()[0]["evidence"],
+            "job failed before verification (missing_role:verifier); this finding was not verified"
+        );
+
+        // 空集合 → 仍是空数组（唯一合法例外）；其它 kind 不产 verifications。
+        let empty = error_report_covering(&vm, &lang, &failure, &[]);
+        assert_eq!(empty.verifications.as_deref(), Some(&[][..]));
+        let review = error_report_covering(&m, &lang, &failure, &[fp('a')]);
+        assert!(review.verifications.is_none(), "review 报告不带 verifications");
     }
 }
