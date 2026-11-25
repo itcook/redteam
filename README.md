@@ -16,6 +16,39 @@
 
 退出码：`0` 干净 / `2` approve 带债 / `3` incomplete（扫描有结构性缺口）/ `10` reject / `1` 命令自身失败。
 
+## 作为 hibot 执行单元（`--job-dir`）
+
+`redteam triage|review|verify --job-dir <dir>` 按契约读 `job.json` / `inputs`、写 `out/report.json`
+（作业模式不读 stdin、不依赖 cwd、不碰 `~/.redteam`）。三 kind 的实现口径：
+
+- **triage**：三轴（security / drift / intent）并发；产出 `summary` + findings + `blockers`。
+- **review**：扫描 → 深挖 → 可选验真；finding 为唯一产出。
+- **verify**（修复核验）：**只核验 anchored finding**（file + quote + line）的修复——即 review 的 blocking
+  findings。triage 的修复不走 verify：每个 head 重跑 triage（`flow.md:18`）；intent claim 没有代码锚，
+  `verifications[]` 只能按指纹挂，塞进来只会造假锚点。若 hibot 将来把 triage 的结构性项导出为 findings，
+  同一管道可用——**指纹只从输入文件取**，执行单元不从其它字段复算或映射。
+
+verify 的执行形态：
+- **两阶段**：prepare（同步装配证据/prompt/规模预算）→ dispatch（只发 LLM）。证据 = 该文件 hunk 块 +
+  跨文件 related hunks + **变更符号的调用点段（B-lite）** + post-fix ±60 行快照 + 可选 `prior_report` 佐证。
+- **并发**：`buffer_unordered(k)`，`k = min(Σ providers.<p>.maxConcurrency, n)`；provider 门是硬上限。
+  墙钟只记录（`extensions.redteam.verify.latency_ms`），不设 KPI。
+- **预算**：单条按规模 `clamp((60 + 4×kb)×1.15, 60, 240)s`（乘 manifest 系数后 ≤300s，再与模型 per-turn、
+  剩余墙钟取 min）；整体只有 `limits.wall_clock_s`。
+- **四态**：`resolved / unresolved / regressed / inconclusive`，证据必填；quote 先查材料、再查整个 post-fix
+  检出（严格字面重锚），都不命中才降级；模型失败/无法定位/证据不足 → `inconclusive`（**绝不塞进
+  `unresolved`**），出现即整体 `partial` + `status_reason`。解析失败只补**一次** repair 轮。
+- **真实夹具**：`tests/fixtures/verify/pr400/`（`hiapi-backend#400` 的三组 fix→verify，带人工判决）+
+  `scripts/verify-pr400.sh`；**不进 `cargo test` 门禁**，脚本手动跑并对拍。
+
+### 与本地增量轮的「修复」口径差异
+
+本地 `--incremental-from` 的按轮携带（`src/consolidate/carry.rs`）用**确定性**规则判「修复」：
+rename 迁移 → 已 resolve 的排除 → quote 锚得上就携带（行号重锚），锚不上就视为已修；人说修了但 quote 仍在
+记为「⚠️ Disputed」。**job 模式的 verify 不用 carry**：它按逐条 finding 让模型看证据判四态。
+两套口径并存是有意的：本地增量轮要的是「快、可复现的携带」，hibot 复验要的是「对单条 finding 的可解释判决」。
+真实数据（#400）攒够之前不做统一。
+
 ## 角色
 
 配置在 `~/.redteam/config.json` 的 `settings` 下按角色声明模型池——池里的模型按声明顺序轮转
