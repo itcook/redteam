@@ -123,3 +123,12 @@ SHA256SUMS                                 193 B
 - 用户决定只保留唯一公开源：`DEFAULT_FROM=r2`、`install.sh` 默认 `REDTEAM_FROM=r2`；
   README 安装/自更新命令去掉源参数。GitHub Release 保留为 `--from github` 备源。
 - 插件二进制已重建（默认源编进二进制）；本地用假 R2 服务验证默认安装与 `update --check`。
+
+### 最终验收（协调方，2026-11-25）
+
+- run `45597481250`：prepare / build / GitHub Release / check_r2 / R2 镜像+回验全部 success。
+- GitHub Release `v0.1.0` 四资产齐全，`prerelease=false`；R2 `latest=v0.1.0`，版本路径与前缀根关键对象均 200。
+- tar.gz 下载 sha 与 `SHA256SUMS` 一致（`f0e1ae8d…8d39`）；schema 两处均 `246d2c97…514a`。
+- `curl …/install.sh | sh`（R2 默认源）安装成功，`redteam update --check` → 已是最新。
+- 首次构建因 `macos-14` 拿不到 runner 被取消；修复 `98d963a`（build 改用 `macos-latest`）后通过。
+- 收尾：任务归档，分支由协调方合入 dev 后删除 worktree。
