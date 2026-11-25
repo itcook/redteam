@@ -56,7 +56,7 @@ git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1    # 预发布
 2. **build**（`macos-14`，arm64）：`make verify` → `scripts/release.sh <tag> --prepare-only --skip-verify`，
    上传 tar.gz / SHA256SUMS / release-notes / install.sh / config.schema.json；
 3. **release**：`softprops/action-gh-release@v2` 发布（rc 标 prerelease）；
-4. **check-r2 → r2**：R2 四键齐全才镜像（缺失只告警、不阻塞），上传后按公开基址 HEAD 200 + sha 回验。
+4. **check_r2 → r2**：R2 四键齐全才镜像（缺失只告警、不阻塞），上传后按公开基址 HEAD 200 + sha 回验。
 
 也可在 Actions → release → Run workflow 手填 tag（需要目标分支已包含本 workflow）。
 

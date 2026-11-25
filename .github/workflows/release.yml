@@ -153,7 +153,7 @@ jobs:
             dist/release/config.schema.json
 
   # ---------------------------------------------------------------- R2 凭据检查
-  check-r2:
+  check_r2:
     name: 检查 R2 凭据
     needs: [prepare, release]
     runs-on: ubuntu-latest
@@ -184,8 +184,8 @@ jobs:
   # ---------------------------------------------------------------- R2 镜像 + 回验
   r2:
     name: 镜像到 R2 并回验
-    needs: [prepare, build, check-r2]
-    if: needs.check-r2.outputs.enabled == 'true'
+    needs: [prepare, build, check_r2]
+    if: needs.check_r2.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
