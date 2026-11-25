@@ -4,19 +4,30 @@
 # 通道（计划 §10 / 7.0）：GitHub Release 是公开发布面（standalone 安装 / `redteam update` 默认源）；
 # R2 只是可选镜像。插件渠道（marketplace）由 `make build` + 单独提交二进制维护，不走本脚本。
 #
+# 重活交给 CI：`.github/workflows/release.yml` 在 `push tag v*` 时调用本脚本的 `--prepare-only`
+# 产出交付资产，再发 GitHub Release、镜像 R2。本脚本的完整发布模式保留为本机兜底。
+#
 # 用法：
 #   scripts/release.sh v0.1.0                  # 完整发布（正式版）
 #   scripts/release.sh v0.1.0-rc.1             # 预发布（GitHub 标 prerelease，R2 不更新 latest）
+#   scripts/release.sh v0.1.0 --prepare-only   # 只产出发行产物（CI build 用），不碰 git/Release/R2
 #   scripts/release.sh v0.1.0 --dry-run        # 只做前置检查 + 构建 + 打包，不碰 git/Release/R2
 #   scripts/release.sh v0.1.0 --no-push        # 本地打 tag，不推、不建 Release、不上传 R2
 #   scripts/release.sh v0.1.0 --skip-r2        # 只发 GitHub Release
+#   scripts/release.sh v0.1.0 --skip-verify    # 调用方已跑过 make verify（CI build job）
+#   scripts/release.sh v0.1.0 --print-config   # 打印归一化后的 R2 前缀与公开基址后退出（调试）
 #
 # 前置：
 #   - 工作区干净（已跟踪文件无改动；--dry-run 只警告）
 #   - 已存在 tag 时必须指向 HEAD（产物来自 HEAD，tag 必须与它同一份源码）
-#   - `gh auth status` 正常（非 dry-run / no-push）
+#   - `gh auth status` 正常（完整发布 / --no-push）
 #   - R2（可选）：环境变量或 .env 里的 R2_STATIC_ENDPOINT / R2_ACCESS_KEY_ID /
-#     R2_SECRET_ACCESS_KEY / R2_BUCKET（可选 R2_BUCKET_DOMAIN）；缺失时自动跳过镜像
+#     R2_SECRET_ACCESS_KEY / R2_BUCKET；可选 R2_PREFIX（默认 executor/audit/redteam）、
+#     R2_BUCKET_DOMAIN（默认 release.hibot.sh）。缺失时自动跳过镜像。
+#
+# R2 对象布局（公开基址 https://${R2_BUCKET_DOMAIN}/${R2_PREFIX}）：
+#   v{VERSION}/{asset}   v{VERSION}/SHA256SUMS   v{VERSION}/config.schema.json
+#   config.schema.json   install.sh              latest（仅正式版）
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -25,26 +36,64 @@ ROOT="$(pwd)"
 REPO="${REDTEAM_REPO:-itcook/redteam}"
 TARGET="aarch64-apple-darwin"
 DIST="$ROOT/dist/release"
-R2_PREFIX="redteam"
+DEFAULT_R2_PREFIX="executor/audit/redteam"
+DEFAULT_R2_BUCKET_DOMAIN="release.hibot.sh"
 
 die() { echo "错误: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
+# R2 前缀归一化：去首尾空白 / 首尾斜杠、折叠重复斜杠；空值（含只剩斜杠/空白）回默认。
+# 上传 key 与公开回验 URL 共用这一份结果，避免「传得上去、验不着」。
+normalize_r2_prefix() {
+    local prefix
+    prefix="$(printf '%s' "$1" \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | tr -s '/' \
+        | sed 's#^/*##; s#/*$##')"
+    [ -n "$prefix" ] || prefix="$DEFAULT_R2_PREFIX"
+    printf '%s' "$prefix"
+}
+
+# .env 里的 R2 凭据（可选，不入库）；提前加载，上传与回验共用同一份配置。
+# REDTEAM_NO_DOTENV=1 供测试/CI 跳过它（避免本机 .env 干扰断言）。
+if [ -f .env ] && [ "${REDTEAM_NO_DOTENV:-0}" != "1" ]; then
+    set -a; . ./.env; set +a
+fi
+R2_PREFIX="$(normalize_r2_prefix "${R2_PREFIX:-}")"
+R2_BUCKET_DOMAIN="${R2_BUCKET_DOMAIN:-$DEFAULT_R2_BUCKET_DOMAIN}"
+PUBLIC_BASE="https://${R2_BUCKET_DOMAIN}/${R2_PREFIX}"
+
 # ---------------------------------------------------------------- 参数
 TAG_ARG="${1:-}"
-[ -n "$TAG_ARG" ] || die "用法: scripts/release.sh vX.Y.Z[-pre] [--dry-run] [--no-push] [--skip-r2]"
+[ -n "$TAG_ARG" ] || die "用法: scripts/release.sh vX.Y.Z[-pre] [--prepare-only] [--dry-run] [--no-push] [--skip-r2] [--skip-verify] [--print-config]"
 shift
 DRY_RUN=false
 NO_PUSH=false
 SKIP_R2=false
+PREPARE_ONLY=false
+SKIP_VERIFY=false
+PRINT_CONFIG=false
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         --no-push) NO_PUSH=true ;;
         --skip-r2) SKIP_R2=true ;;
+        --prepare-only|--ci) PREPARE_ONLY=true ;;
+        --skip-verify) SKIP_VERIFY=true ;;
+        --print-config) PRINT_CONFIG=true ;;
         *) die "未知参数: $arg" ;;
     esac
 done
+
+# 调试/测试入口：只打印归一化结果，不做任何检查与写入。
+if [ "$PRINT_CONFIG" = true ]; then
+    printf 'R2_PREFIX=%s\nPUBLIC_BASE=%s\n' "$R2_PREFIX" "$PUBLIC_BASE"
+    exit 0
+fi
+
+if [ "$PREPARE_ONLY" = true ] && { [ "$NO_PUSH" = true ] || [ "$SKIP_R2" = true ]; }; then
+    die "--prepare-only 不发布，不能与 --no-push / --skip-r2 同用"
+fi
 
 # ---------------------------------------------------------------- 版本校验
 case "$TAG_ARG" in
@@ -61,7 +110,7 @@ fi
 PRERELEASE=false
 case "$VERSION" in *-*) PRERELEASE=true ;; esac
 
-info "版本 ${VERSION}（prerelease=${PRERELEASE}, dry-run=${DRY_RUN}, no-push=${NO_PUSH}）"
+info "版本 ${VERSION}（prerelease=${PRERELEASE}, dry-run=${DRY_RUN}, prepare-only=${PREPARE_ONLY}, no-push=${NO_PUSH}）"
 
 # ---------------------------------------------------------------- 前置检查
 if [ "$DRY_RUN" = true ]; then
@@ -80,7 +129,7 @@ command -v shasum >/dev/null || die "缺少 shasum"
 [ -f dist/install.sh ] || die "缺少 dist/install.sh（发布资产）"
 [ -f dist/config.schema.json ] || die "缺少 dist/config.schema.json（发布资产，hibot 契约）"
 
-if [ "$DRY_RUN" = false ] && [ "$NO_PUSH" = false ]; then
+if [ "$DRY_RUN" = false ] && [ "$NO_PUSH" = false ] && [ "$PREPARE_ONLY" = false ]; then
     command -v gh >/dev/null || die "缺少 gh"
     gh auth status >/dev/null 2>&1 || die "gh 未登录（gh auth login）"
 fi
@@ -93,19 +142,25 @@ if git rev-parse -q --verify "refs/tags/$TAG_ARG" >/dev/null; then
         die "tag $TAG_ARG 指向 ${tag_commit:0:7}，但 HEAD 是 ${head_commit:0:7}：产物会来自 HEAD 而 tag 指向别处。先把 tag 移到 HEAD（git tag -f）或换版本号"
     fi
     info "tag 已存在且指向 HEAD: $TAG_ARG"
-elif [ "$DRY_RUN" = true ]; then
-    info "tag $TAG_ARG 不存在（dry-run 不创建）"
+elif [ "$DRY_RUN" = true ] || [ "$PREPARE_ONLY" = true ]; then
+    reason="dry-run"
+    if [ "$PREPARE_ONLY" = true ]; then reason="--prepare-only"; fi
+    info "tag $TAG_ARG 不存在（${reason} 不创建）"
 fi
 
-info "门禁：make verify"
-# 门禁输出平时收起来；失败时原样打出来（否则只看到一个笼统的 die，难定位）。
-verify_log="$(mktemp)"
-if ! make verify >"$verify_log" 2>&1; then
-    cat "$verify_log" >&2
+if [ "$SKIP_VERIFY" = true ]; then
+    info "门禁：--skip-verify（调用方已跑过 make verify）"
+else
+    info "门禁：make verify"
+    # 门禁输出平时收起来；失败时原样打出来（否则只看到一个笼统的 die，难定位）。
+    verify_log="$(mktemp)"
+    if ! make verify >"$verify_log" 2>&1; then
+        cat "$verify_log" >&2
+        rm -f "$verify_log"
+        die "make verify 未通过（门禁不过不发布）"
+    fi
     rm -f "$verify_log"
-    die "make verify 未通过（门禁不过不发布）"
 fi
-rm -f "$verify_log"
 
 # ---------------------------------------------------------------- 构建
 # 关键：**不跑 `make build`**——它会把新二进制写进入库的插件目录（5.9MB diff），
@@ -168,6 +223,11 @@ ls -l "$DIST" | awk 'NR>1 {printf "  %-52s %10d B  %5.2f MiB\n", $9, $5, $5/1048
 printf '\nSHA256SUMS：\n'
 sed 's/^/  /' "$DIST/SHA256SUMS"
 
+if [ "$PREPARE_ONLY" = true ]; then
+    info "--prepare-only：产物已就绪于 ${DIST}（未创建/推送 tag、未建 Release、未上传 R2）"
+    exit 0
+fi
+
 if [ "$DRY_RUN" = true ]; then
     info "dry-run：已跳过 tag / GitHub Release / R2 上传"
     exit 0
@@ -209,9 +269,6 @@ if [ "$SKIP_R2" = true ]; then
     R2_ENABLED=false
     info "--skip-r2：跳过 R2 上传"
 else
-    if [ -f .env ]; then
-        set -a; . ./.env; set +a
-    fi
     missing=""
     for v in R2_STATIC_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
         eval "value=\${$v:-}"
@@ -238,10 +295,12 @@ if [ "$R2_ENABLED" = true ]; then
     }
 
     info "上传到 R2（bucket=$R2_BUCKET, prefix=${R2_PREFIX}/）"
-    r2_put "$DIST/$ASSET" "releases/v$VERSION/$ASSET"
-    r2_put "$DIST/SHA256SUMS" "releases/v$VERSION/SHA256SUMS" text/plain
-    r2_put "$DIST/config.schema.json" "releases/v$VERSION/config.schema.json" application/json
+    r2_put "$DIST/$ASSET" "v$VERSION/$ASSET"
+    r2_put "$DIST/SHA256SUMS" "v$VERSION/SHA256SUMS" text/plain
+    r2_put "$DIST/config.schema.json" "v$VERSION/config.schema.json" application/json
+    # 前缀根：install.sh 与 schema 是「当前版」的稳定入口（hibot 契约拿 schema 不看版本号）。
     r2_put "$DIST/install.sh" "install.sh" text/plain
+    r2_put "$DIST/config.schema.json" "config.schema.json" application/json
     if [ "$PRERELEASE" = true ]; then
         info "prerelease：不更新 ${R2_PREFIX}/latest"
     else
@@ -296,11 +355,11 @@ check_url "$GH_BASE/install.sh"
 check_url "$GH_BASE/SHA256SUMS"
 
 if [ "$R2_ENABLED" = true ]; then
-    PUBLIC_BASE="https://${R2_BUCKET_DOMAIN:-static.hiapi.ai}/${R2_PREFIX}"
-    check_asset "$DIST/$ASSET" "$PUBLIC_BASE/releases/v$VERSION/$ASSET"
-    check_asset "$DIST/config.schema.json" "$PUBLIC_BASE/releases/v$VERSION/config.schema.json"
-    check_url "$PUBLIC_BASE/releases/v$VERSION/SHA256SUMS"
+    check_asset "$DIST/$ASSET" "$PUBLIC_BASE/v$VERSION/$ASSET"
+    check_asset "$DIST/config.schema.json" "$PUBLIC_BASE/v$VERSION/config.schema.json"
+    check_url "$PUBLIC_BASE/v$VERSION/SHA256SUMS"
     check_url "$PUBLIC_BASE/install.sh"
+    check_url "$PUBLIC_BASE/config.schema.json"
     [ "$PRERELEASE" = true ] || check_url "$PUBLIC_BASE/latest"
 fi
 [ "$fail" = 0 ] || die "有下载回验失败，见上方 FAIL 行"
@@ -312,3 +371,8 @@ cat <<EOF
   curl -fsSL https://github.com/${REPO}/releases/download/${TAG_ARG}/install.sh | sh
   REDTEAM_VERSION=${TAG_ARG} curl -fsSL https://github.com/${REPO}/releases/download/${TAG_ARG}/install.sh | sh
 EOF
+if [ "$R2_ENABLED" = true ]; then
+    cat <<EOF
+  curl -fsSL ${PUBLIC_BASE}/install.sh | REDTEAM_FROM=r2 sh
+EOF
+fi

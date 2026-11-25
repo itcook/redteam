@@ -22,7 +22,7 @@ REPO="${REDTEAM_REPO:-itcook/redteam}"
 TARGET="aarch64-apple-darwin"
 REQUIRED_OS="Darwin"
 REQUIRED_ARCH="arm64"
-R2_DEFAULT_BASE="https://static.hiapi.ai/redteam"
+R2_DEFAULT_BASE="https://release.hibot.sh/executor/audit/redteam"
 GITHUB_DEFAULT_BASE="https://github.com/${REPO}/releases/download"
 
 VERSION="${REDTEAM_VERSION:-latest}"
@@ -148,11 +148,8 @@ fi
 PLAIN_VERSION="${VERSION#v}"
 ASSET="redteam-${PLAIN_VERSION}-${TARGET}.tar.gz"
 
-if [ "$FROM" = "r2" ]; then
-    RELEASE_BASE="${BASE_URL}/releases/${VERSION}"
-else
-    RELEASE_BASE="${BASE_URL}/${VERSION}"
-fi
+# 版本目录：GitHub 与 R2 同形 `{base}/{VERSION}`（R2 公开前缀已含产品路径，没有历史 releases 段）。
+RELEASE_BASE="${BASE_URL}/${VERSION}"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/redteam-install.XXXXXX")" || err "无法创建临时目录"
 STAGED=""
