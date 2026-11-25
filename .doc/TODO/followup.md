@@ -155,3 +155,59 @@ pack——用数据回答「变更集外什么值得给」，不回已安乐死�
 
 **关联**：T49 缓存前缀稳定性（帽越大 cache-miss 代价越大，gpt-5.6 cache write 1.25x 官方条款）；
 T27-余 真 tokenizer 校准（3B/tok 记账保守度影响悬崖余量计算）。
+
+## T54 · hibot audit exec 遗留：`partial_fixture` 间歇失败 ⏳（2026-11-25 交付期记录；根因未定位）
+
+- 现象：`tests/job_conformance.rs::partial_fixture_uses_missing_provider_key_and_reports_partial`
+  在全量并行 `cargo test` 中偶发失败；单跑该测试、单跑该 test binary、以及重跑全量均通过。
+- 已排除：v2/Phase 4/Phase 6 代码变更（多轮对照无规律）；`cargo test --no-fail-fast` 在 main CI 全绿。
+- 待查：该夹具用本地端口构造 401，并行时端口/临时目录竞争、`seal_job_env` 进程级环境变量、`partial` 计数时序；
+  可改成不依赖本地端口的确定性失败方式。
+- 影响：CI 误报；hibot 联调时可能误判为执行单元回归。
+- 证据：各阶段 `evidence/cargo-test.log`（`.trellis/tasks/archive/2026-11/`）。
+
+## T55 · 诊断 pointer 口径（`config check` / WARN） ⏳（2026-11-25）
+
+- `missing_role:<role>` 的 pointer 落在 `/providers`；对 `settings.verify.models` / `settings.triage.models` /
+  `settings.review.roles.<role>.models` 这类池缺失应指向对应池路径。
+- `providers.<p>.models[{id}] 未被任何角色池引用` 在 v2 数组结构下写法不对：应为 `models[<index>]` 或 `models["id"]`。
+- 影响：hibot 渲染/运维按 pointer 定位时被误导；仅诊断质量，不影响判定。
+- 落点：`src/config/mod.rs`（check/guard 的 pointer 拼接）、`src/cli/config_cmd.rs`；补断言。
+
+## T56 · verify 增强的两条 followup ⏳（2026-11-25 U7 增强期记录）
+
+- **文档类修复**：`<fix_scope>` 只给文件名；当实质修复落在 `.md`/文档时，模型只读代码文件就判 `resolved`
+  （#400 b/Q2）。候选：doc-only 场景给受限摘录（仍不进 quote 校验池），或在 prompt 明确“文档类修复需看文件内容”。
+- **非确定性交互**：模型对“同一请求内回退/重选”不敏感（#400 a/affinity：`:158` 拒绝 → `:174` 回退）。
+  B-lite 已把引用行与快照放进 prompt，但模型仍判 resolved。候选：blast 段显式提示“回看同一请求内的回退路径”。
+- 约束：不改人工基线（`expected` 不随跑出结果调整）；真实模型稳定性只观测、不作门禁。
+- 证据：`.trellis/tasks/archive/2026-11/11-25-hibot-verify-enhance/`、`scripts/verify-pr400.sh`。
+
+## T57 · config 本地子命令优化 & 交互式配置 ⏳（2026-11-25 用户提出）
+
+- 现状：`config schema|check` 面向 executor 契约；本地配置仍靠手写 `~/.redteam/config.json`，
+  `model setup` 只覆盖部分字段，v2 的 `settings.*`/角色池/`models[].api` 没有友好的编辑入口。
+- 目标：本地模式（非 job）提供 `config init` / `config edit`（编辑器）/ `config validate`，
+  以及交互式向导：provider(`api`/`baseUrl`/凭据 env) → `models[]`（含 `api`/`thinkingLevelMap`）
+  → `settings.{triage,review.roles,verify}.models` → `language`。
+- 约束：不改变 job/executor 契约；密钥只写 `secrets.json` 或环境变量（`apiKey` 仅本地可选，job 仍 `secret_field`）；
+  若新增本地专用键需单独评审（可能牵动 schemaVersion 语义）。
+- 关联：v2.0.1 已支持 `models[].api/apiKey` 覆盖；向导需覆盖这两项与 v1→v2 迁移提示。
+
+## T58 · triage / verify 独立运行适配与改造 ⏳（2026-11-25 用户提出）
+
+- 现状：`triage` / `verify` 只有 `--job-dir` 外派形态，本地无法直接对当前分支/PR 跑；
+  本地 review 则支持 `--base/--scope/--spec` 等。
+- 目标：提供本地入口（如 `triage --base main`、`verify --findings <file> --base <sha>`），
+  复用同一管线与报告层，明确与本地 review 的配置、台账（dismissed/resolve）与增量轮边界。
+- 约束：不破坏 job 模式与契约；不引入第二套判定/解析；verify 仍需 anchored findings、指纹覆盖不变量；
+  本地台账默认关闭（与 job 一致），除非显式打开。
+- 关联：T57 的本地配置入口、`settings.verify.models`。
+
+## T59 · hibot runner 端到端（外部依赖） ⏳（2026-11-25 Phase 6 记录）
+
+- 现状：hibot `apps/` 为空、M0/M1 未开始；已完成的是**手工 job 目录**联调（三 kind、schema/指纹/quote/覆盖/心跳）。
+- 触发：hibot M0/M1 落地后，跑 runner → job 目录 → 执行单元 → report 接纳/上传全链路。
+- 本仓不需改契约；若联调暴露问题按新阶段处理。
+- 证据：`.trellis/tasks/archive/2026-11/11-25-hibot-phase6-acceptance/delivery/hibot-handoff.md`。
+
