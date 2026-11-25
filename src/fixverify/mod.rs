@@ -209,6 +209,7 @@ pub async fn run(
             key: req.routes[idx % req.routes.len()].1.clone(),
             prompt,
             budget: budget::scaled_item_timeout(size_kb, factor),
+            file_content: ev.file_content,
         });
     }
     // ── Phase 2 dispatch（异步：只发请求，受 provider 门约束）──
@@ -223,7 +224,7 @@ pub async fn run(
             p.usage.0 += item.usage.0;
             p.usage.1 += item.usage.1;
             p.usage.2 += item.usage.2;
-            p.calls += u32::from(item.call);
+            p.calls += item.calls;
             p.failures += u32::from(item.failed);
             p.quote_rejected += u32::from(item.quote_rejected);
             p.latency_total_ms += item.latency_ms;
@@ -295,12 +296,15 @@ struct Prepared {
     prompt: prompt::FixVerifyPrompt,
     /// 规模预算（尚未与模型 per-turn / 剩余墙钟取 min）。
     budget: std::time::Duration,
+    /// post-fix 检出原文（quote 严格重锚用；删除/不可读 → None）。
+    file_content: Option<String>,
 }
 
 struct ItemRun {
     verification: Verification,
     usage: (u64, u64, u64),
-    call: bool,
+    /// 本轮真正发出的模型调用数（1 = 正常；2 = 多了一轮 repair）。
+    calls: u32,
     failed: bool,
     quote_rejected: bool,
     latency_ms: u64,
@@ -313,7 +317,7 @@ fn decided(finding: &input::InputFinding, evidence: String) -> ItemRun {
     ItemRun {
         verification: Verification::inconclusive(&finding.fingerprint, evidence),
         usage: (0, 0, 0),
-        call: false,
+        calls: 0,
         failed: false,
         quote_rejected: false,
         latency_ms: 0,
@@ -322,7 +326,10 @@ fn decided(finding: &input::InputFinding, evidence: String) -> ItemRun {
     }
 }
 
-/// 一条 finding 的派发：过 provider 门 → 单轮调用（挂 `AttemptPolicy`：心跳在途/429 计量）→ 四态校验。
+/// 一条 finding 的派发：过 provider 门 → 单轮调用（挂 `AttemptPolicy`）→ 解析 → 四态校验。
+///
+/// 解析失败只补**一次** repair 轮（把上一轮原文挂回 assistant 位 + 明确"只要 JSON"）：hibot 侧
+/// 任一 `inconclusive` 要阻塞一整轮，一次 repair 比丢掉这条判决便宜得多。
 async fn dispatch_one(registry: &ProviderRegistry, req: &FixVerifyRequest<'_>, item: Prepared) -> ItemRun {
     let finding = &req.findings[item.idx];
     let lease = match registry.lease(&item.key).await {
@@ -337,119 +344,149 @@ async fn dispatch_one(registry: &ProviderRegistry, req: &FixVerifyRequest<'_>, i
             }
         }
     };
-    // 墙钟是硬上限：剩余不足就不再把这条推上去（缺口留给 finalize 补 inconclusive）。
-    let remaining = req.deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return decided(
-            finding,
-            msg(req.lang, "墙钟预算耗尽，这一条未开始核验", "the wall clock was exhausted before this finding was checked"),
-        );
-    }
-    // 单条预算 = min(规模预算, 模型 per-turn, 剩余墙钟)。
-    let per_turn = item
-        .budget
-        .min(lease.per_turn())
-        .min(remaining.max(std::time::Duration::from_secs(1)));
     let policy = lease.gate_attempts();
-    let messages = vec![
+    let mut messages = vec![
         ChatMessage::System(item.prompt.system.clone()),
         ChatMessage::User(item.prompt.user.clone()),
     ];
-    let t0 = Instant::now();
-    let turn = crate::provider::timed_turn_with(
-        lease.backend(),
-        &messages,
-        &[],
-        per_turn,
-        lease.retry_budget(),
-        Some(&policy),
-    )
-    .await;
-    let latency_ms = t0.elapsed().as_millis() as u64;
-    let rl_retries = policy.retries();
-    let rl_wait_ms = policy.waited_ms();
-    let (usage, text) = match turn {
-        Ok(t) => ((t.input_tokens, t.output_tokens, t.cached_input_tokens), t.text),
-        Err(e) => {
-            return ItemRun {
-                call: true,
-                failed: true,
-                latency_ms,
-                rl_retries,
-                rl_wait_ms,
-                ..decided(
-                    finding,
-                    msg(req.lang, &format!("模型调用失败，未能核验：{e}"), &format!("the model call failed; nothing was verified: {e}")),
-                )
+    let mut usage = (0u64, 0u64, 0u64);
+    let mut calls = 0u32;
+    let mut latency_ms = 0u64;
+    let mut judgment: Option<prompt::Judgment> = None;
+    let mut parse_err: Option<String> = None;
+    // 两轮上限：首轮 + 一次 repair。
+    for attempt in 0..2 {
+        let remaining = req.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break; // 缺口留给 finalize 补 inconclusive
+        }
+        // 单条预算 = min(规模预算, 模型 per-turn, 剩余墙钟)。
+        let per_turn = item
+            .budget
+            .min(lease.per_turn())
+            .min(remaining.max(std::time::Duration::from_secs(1)));
+        let t0 = Instant::now();
+        let turn = crate::provider::timed_turn_with(
+            lease.backend(),
+            &messages,
+            &[],
+            per_turn,
+            lease.retry_budget(),
+            Some(&policy),
+        )
+        .await;
+        latency_ms += t0.elapsed().as_millis() as u64;
+        match turn {
+            Ok(t) => {
+                calls += 1;
+                usage.0 += t.input_tokens;
+                usage.1 += t.output_tokens;
+                usage.2 += t.cached_input_tokens;
+                match prompt::parse(&t.text) {
+                    Ok(j) => {
+                        judgment = Some(j);
+                        break;
+                    }
+                    Err(e) => {
+                        parse_err = Some(e);
+                        if attempt == 1 {
+                            break;
+                        }
+                        messages.push(ChatMessage::Assistant { text: t.text, tool_calls: Vec::new() });
+                        messages.push(ChatMessage::User(prompt::REPAIR_PROMPT.to_string()));
+                    }
+                }
+            }
+            Err(e) => {
+                calls += 1;
+                return ItemRun {
+                    calls,
+                    latency_ms,
+                    failed: true,
+                    rl_retries: policy.retries(),
+                    rl_wait_ms: policy.waited_ms(),
+                    ..decided(
+                        finding,
+                        msg(req.lang, &format!("模型调用失败，未能核验：{e}"), &format!("the model call failed; nothing was verified: {e}")),
+                    )
+                };
             }
         }
-    };
-    let judgment = match prompt::parse(&text) {
-        Ok(j) => j,
-        Err(e) => {
-            return ItemRun {
-                usage,
-                call: true,
-                failed: true,
-                latency_ms,
-                rl_retries,
-                rl_wait_ms,
-                ..decided(
-                    finding,
-                    msg(req.lang, &format!("模型输出无法解析，未能核验：{e}"), &format!("the model output could not be parsed; nothing was verified: {e}")),
-                )
-            }
-        }
+    }
+    let Some(judgment) = judgment else {
+        let (text, failed) = match parse_err {
+            Some(e) => (
+                msg(req.lang, &format!("模型输出无法解析，未能核验：{e}"), &format!("the model output could not be parsed; nothing was verified: {e}")),
+                true,
+            ),
+            None => (
+                msg(req.lang, "墙钟预算耗尽，这一条未完成核验", "the wall clock was exhausted before this finding was checked"),
+                false,
+            ),
+        };
+        return ItemRun {
+            usage,
+            calls,
+            latency_ms,
+            failed,
+            rl_retries: policy.retries(),
+            rl_wait_ms: policy.waited_ms(),
+            ..decided(finding, text)
+        };
     };
     // 证据不足（模型没给证据）→ inconclusive：契约要求 evidence 非空，不能替模型编。
     if judgment.evidence.trim().is_empty() {
         return ItemRun {
             usage,
-            call: true,
+            calls,
             latency_ms,
-            rl_retries,
-            rl_wait_ms,
+            rl_retries: policy.retries(),
+            rl_wait_ms: policy.waited_ms(),
             ..decided(
                 finding,
                 msg(req.lang, "模型未给出证据，未能核验", "the model returned no evidence; nothing was verified"),
             )
         };
     }
-    // quote 必须逐字命中提供材料；不命中就降级——不把伪造的锚点当证据。
-    if let Some(q) = &judgment.quote {
-        if !evidence::quote_is_verbatim(q, &item.prompt.material) {
-            return ItemRun {
-                usage,
-                call: true,
-                quote_rejected: true,
-                latency_ms,
-                rl_retries,
-                rl_wait_ms,
-                ..decided(
-                    finding,
-                    msg(
-                        req.lang,
-                        &format!("模型给出的 quote 未能在提供的材料中逐字命中（`{}`），未能核验", one_line(q)),
-                        &format!("the model's quote was not found verbatim in the provided material (`{}`); nothing was verified", one_line(q)),
-                    ),
-                )
-            };
-        }
-    }
+    // quote 必须逐字存在：先查材料，再查**整个 post-fix 文件**（严格字面重锚）；都不命中才降级。
+    let quote = match judgment.quote.as_deref() {
+        Some(q) => match evidence::reanchor(q, &item.prompt.material, item.file_content.as_deref()) {
+            Some(v) => Some(v),
+            None => {
+                return ItemRun {
+                    usage,
+                    calls,
+                    latency_ms,
+                    quote_rejected: true,
+                    rl_retries: policy.retries(),
+                    rl_wait_ms: policy.waited_ms(),
+                    ..decided(
+                        finding,
+                        msg(
+                            req.lang,
+                            &format!("模型给出的 quote 未能在提供的材料或检出中逐字命中（`{}`），未能核验", one_line(q)),
+                            &format!("the model's quote was not found verbatim in the material or the checkout (`{}`); nothing was verified", one_line(q)),
+                        ),
+                    )
+                }
+            }
+        },
+        None => None,
+    };
     ItemRun {
         verification: Verification {
             finding_fingerprint: finding.fingerprint.clone(),
             status: judgment.status,
             evidence: judgment.evidence,
-            quote: judgment.quote,
+            quote,
         },
         usage,
-        call: true,
+        calls,
         failed: false,
         quote_rejected: false,
         latency_ms,
-        rl_retries,
-        rl_wait_ms,
+        rl_retries: policy.retries(),
+        rl_wait_ms: policy.waited_ms(),
     }
 }
 

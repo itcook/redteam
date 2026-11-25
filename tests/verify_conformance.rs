@@ -506,6 +506,70 @@ async fn broken_findings_are_the_only_case_allowed_to_leave_verifications_empty(
     assert_eq!(r["verifications"], serde_json::json!([]), "findings 坏 → 无指纹可覆盖");
 }
 
+// ───────────── 降级策略：严格重锚 + 一次 repair（Phase 4 增强） ─────────────
+
+#[tokio::test]
+async fn quote_outside_the_snapshot_window_is_accepted_by_strict_reanchor() {
+    // quote 是真的（检出里逐字存在），只是落在 ±60 行窗口外 → 重锚后仍算通过，不再误降级。
+    let marker = "const marker = 'UNIQUE_MARKER_STRING';";
+    let mut before = format!("function find(id) {{\n  {VULN}\n}}\n");
+    while before.lines().count() < 200 {
+        before.push_str("// padding\n");
+    }
+    before.push_str(marker);
+    before.push('\n');
+    let mut after = format!("function find(id) {{\n  {FIXED}\n}}\n");
+    while after.lines().count() < 200 {
+        after.push_str("// padding\n");
+    }
+    after.push_str(marker);
+    after.push('\n');
+
+    let f = finding("src/app.js", VULN, 2, "sql injection window");
+    let router = Arc::new(Router::new(vec![(needle_of(&f), verdict("resolved", "已参数化", Some(marker)))]));
+    let findings = findings_json(&[f]);
+    let base: [(&str, &str); 1] = [("src/app.js", &before)];
+    let fx = make_job(&base, |repo| {
+        std::fs::write(repo.join("src/app.js"), &after).unwrap();
+    }, &findings);
+    let r = run(&fx, router).await;
+    assert_eq!(r["status"], "ok", "窗口外的逐字 quote 不该降级: {r}");
+    assert_eq!(r["verifications"][0]["status"], "resolved");
+    assert_eq!(r["verifications"][0]["quote"].as_str().unwrap(), marker);
+    assert_eq!(r["extensions"]["redteam"]["verify"]["quote_rejected"], 0);
+}
+
+#[tokio::test]
+async fn one_repair_round_recovers_a_json_object() {
+    use redteam::provider::tool_loop::FakeChatBackend;
+    let good = verdict("resolved", "已参数化", Some(FIXED));
+    let fake = Arc::new(FakeChatBackend::new(vec![turn("I cannot decide from this."), turn(&good)]));
+    let f = finding("src/app.js", VULN, 2, "sql injection repair");
+    let findings = findings_json(&[f]);
+    let base: [(&str, &str); 1] = [("src/app.js", &format!("function find(id) {{\n  {VULN}\n}}\n"))];
+    let fx = make_job(&base, |repo| {
+        std::fs::write(repo.join("src/app.js"), format!("function find(id) {{\n  {FIXED}\n}}\n")).unwrap();
+    }, &findings);
+    let over = {
+        let fake = fake.clone();
+        Box::new(move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            (em.provider == "p1" && em.id == "v").then(|| Box::new(fake.clone()) as Box<dyn ChatBackend>)
+        }) as Box<redteam::cli::BackendOverride<'static>>
+    };
+    assert_eq!(redteam::job::run::run_with(JobKind::Verify, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["verifications"][0]["status"], "resolved");
+    assert_eq!(fake.turn_count(), 2, "首轮 + 一次 repair");
+    assert_eq!(r["extensions"]["redteam"]["verify"]["calls"], 2, "calls 要如实计两轮");
+    // repair 轮的输入：system + user + 上一轮原文 + 「只要 JSON」指令。
+    let second = fake.messages_at(1);
+    assert_eq!(second.len(), 4, "{second:?}");
+    assert!(matches!(second[2], ChatMessage::Assistant { .. }), "上一轮原文要挂回 assistant 位");
+    let ChatMessage::User(repair) = &second[3] else { panic!("最后一轮必须是 repair 指令") };
+    assert!(repair.contains("NOT a single JSON object"), "{repair}");
+}
+
 // ─────────── B-lite：真实回归形状（hiapi#400 A→B 的骨架） ───────────
 
 #[tokio::test]

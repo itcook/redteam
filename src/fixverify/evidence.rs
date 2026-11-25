@@ -277,6 +277,21 @@ pub fn quote_is_verbatim(quote: &str, material: &str) -> bool {
     !q.is_empty() && material.contains(q)
 }
 
+/// quote 的**严格字面重锚**：先在发给模型的材料里找，再在 post-fix 检出原文里找。
+///
+/// 两处都只做逐字子串匹配（不归一化空白、不做 token 匹配、不跨行重组）——命中即"在检出里逐字存在"，
+/// 不再误伤"quote 落在 ±60 行窗口外"的合法证据；改过空白的 quote 仍然不命中（照旧降级）。
+pub fn reanchor(quote: &str, material: &str, file: Option<&str>) -> Option<String> {
+    let q = quote.trim();
+    if q.is_empty() {
+        return None;
+    }
+    if material.contains(q) {
+        return Some(q.to_string());
+    }
+    file.filter(|f| f.contains(q)).map(|_| q.to_string())
+}
+
 /// 跨文件线索：finding 原 quote 里第一行足够长的代码。
 fn clue_of(quote: &str) -> Option<&str> {
     quote

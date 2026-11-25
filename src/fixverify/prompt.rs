@@ -17,6 +17,12 @@ const TEMPLATE: &str = include_str!("../prompt/templates/fix-verify.md");
 /// system / user 两段的分界（编译期常量里的固定标记；自测钉住它存在）。
 const USER_MARKER: &str = "\n<<<USER>>>\n";
 
+/// 解析失败后的一轮修复指令（一次，不循环）：只要那个 JSON 对象。
+pub const REPAIR_PROMPT: &str = "Your previous reply was NOT a single JSON object, so it could not be read. \
+Reply again with ONLY the JSON object required by <verification_contract>: \
+{\"status\": \"resolved|unresolved|regressed|inconclusive\", \"evidence\": \"<one short paragraph>\", \"quote\": \"<verbatim excerpt, optional>\"}. \
+No prose before or after it, no markdown fence.";
+
 /// 注入内容可能伪造的闭合标签：模板里所有包裹注入槽的段名。
 const STRUCTURAL_TAGS: &[&str] = &[
     "finding",
@@ -203,6 +209,7 @@ mod tests {
             related: String::new(),
             blast: String::new(),
             snapshot: "src/app.js:1-3 (post-fix snapshot)\nfunction find(id) {\n  return db.query('SELECT * FROM users WHERE id=?', [id]);\n}".into(),
+            file_content: Some("function find(id) {\n  return db.query('SELECT * FROM users WHERE id=?', [id]);\n}".into()),
             note: None,
             warnings: Vec::new(),
         }
