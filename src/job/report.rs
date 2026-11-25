@@ -317,7 +317,7 @@ pub fn triage_report(
     let mut redteam = json!({
         "language": language_json(lang),
         "concurrency": concurrency_json(cfg),
-        "budget": { "wall_clock_s": manifest.limits.wall_clock_s, "truncated_items": 0 },
+        "budget": { "wall_clock_s": manifest.limits.wall_clock_s, "estimate_s": outcome.estimate_s, "truncated_items": 0 },
         "template_hashes": { "triage": template_hash },
         "axes": outcome.axes,
         "blockers": outcome.blockers,
