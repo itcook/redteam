@@ -103,6 +103,7 @@ fn verdict(status: &str, evidence: &str, quote: Option<&str>) -> String {
 struct Fixture {
     _tmp: tempfile::TempDir,
     job: PathBuf,
+    repo: PathBuf,
 }
 
 /// base 提交 → `mutate` 改工作树 → head 提交；再把它做成一个 verify job（真 diff / 真 merge_base）。
@@ -123,7 +124,7 @@ fn make_job(base_files: &[(&str, &str)], mutate: impl FnOnce(&Path), findings: &
     let base = git(&repo, &["rev-parse", "HEAD"]);
     mutate(&repo);
     git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "head"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "head"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
     let diff = git(&repo, &["diff", &format!("{base}..{head}")]);
 
@@ -152,7 +153,7 @@ fn make_job(base_files: &[(&str, &str)], mutate: impl FnOnce(&Path), findings: &
         "inputs": inputs,
     });
     std::fs::write(job.join("job.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
-    Fixture { _tmp: tmp, job }
+    Fixture { _tmp: tmp, job, repo }
 }
 
 const CONFIG: &str = r#"{
@@ -439,6 +440,48 @@ async fn provider_auth_failure_is_inconclusive_partial_never_unresolved() {
     assert_eq!(r["extensions"]["redteam"]["status_code"], "verifications_inconclusive:1");
     assert!(r["status_reason"].as_str().unwrap().contains("1 findings inconclusive"));
     assert_eq!(r["extensions"]["redteam"]["verify"]["model_failures"], 1);
+}
+
+// ───────────── 作业级失败的覆盖（契约 §3.3，协调者 2026-11-25 裁 (a)） ─────────────
+
+#[tokio::test]
+async fn job_level_error_still_covers_every_fingerprint_as_inconclusive() {
+    // findings 可解析 + 检出消失 → 作业级 error，但覆盖不破：每条都是「未核验」。
+    let f1 = finding("src/app.js", VULN, 2, "sql injection repo gone a");
+    let f2 = finding("src/other.js", VULN, 2, "sql injection repo gone b");
+    let router = Arc::new(Router::new(vec![]));
+    let findings = findings_json(&[f1.clone(), f2.clone()]);
+    let fx = make_job(&[("src/app.js", &format!("function find(id) {{\n  {VULN}\n}}\n"))], |_repo| {}, &findings);
+    std::fs::remove_dir_all(&fx.repo).unwrap();
+    let over = override_for(router);
+    let code = redteam::job::run::run_with(JobKind::Verify, &fx.job, Some(over.as_ref())).await;
+    assert_eq!(code, 1, "error 报告 → 1");
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error", "补条目不得把状态改成 partial");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "input_path_invalid:paths.repo");
+    assert!(r["status_reason"].as_str().unwrap().contains("paths.repo"));
+    let vs = r["verifications"].as_array().unwrap();
+    assert_eq!(vs.len(), 2, "findings 可解析 ⇒ 逐条覆盖: {r}");
+    assert!(vs.iter().all(|v| v["status"] == "inconclusive"), "作业失败不得冒充 resolved/unresolved");
+    let ev = vs[0]["evidence"].as_str().unwrap();
+    assert!(ev.contains("job failed before verification") && ev.contains("input_path_invalid:paths.repo"), "{ev}");
+    assert_eq!(vs[0]["finding_fingerprint"].as_str().unwrap(), f1["fingerprint"].as_str().unwrap());
+    assert_eq!(vs[1]["finding_fingerprint"].as_str().unwrap(), f2["fingerprint"].as_str().unwrap());
+}
+
+#[tokio::test]
+async fn broken_findings_are_the_only_case_allowed_to_leave_verifications_empty() {
+    // findings 本身坏 → 给不出指纹集合 → 空数组（唯一合法例外），且仍是 error。
+    let router = Arc::new(Router::new(vec![]));
+    let findings = findings_json(&[serde_json::json!({"fingerprint": "sha256:not-a-fingerprint"})]);
+    let fx = make_job(&[("src/app.js", &format!("function find(id) {{\n  {VULN}\n}}\n"))], |_repo| {}, &findings);
+    let over = override_for(router);
+    let code = redteam::job::run::run_with(JobKind::Verify, &fx.job, Some(over.as_ref())).await;
+    assert_eq!(code, 1);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "error");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "invalid_fingerprint_input");
+    assert_eq!(r["verifications"], serde_json::json!([]), "findings 坏 → 无指纹可覆盖");
 }
 
 // ───────────────────── 流程隔离（4.0） ─────────────────────
