@@ -1,6 +1,6 @@
 # redteam × hibot · Phase 6 交付包（一页）
 
-> 执行单元 `redteam 0.1.0`（分支 `feature/hibot-audit-exec`，基线 `bc71ac3` + 本单元 4 个提交）
+> 执行单元 `redteam 0.1.0`（分支 `feature/hibot-audit-exec`，基线 `bc71ac3` + 本单元 7 个提交（含 `fix(job)`））
 > 日期 2026-11-25 · runner 真调尚未可用（hibot `apps/` 为空），本包是**手工 job 目录联调**的证据。
 
 ## 1. 怎么跑
@@ -30,7 +30,7 @@ HIBOT_SCHEMA_DIR=~/hibot/.docs/audit/schema scripts/acceptance-matrix.sh
 |---|---|---|---|---|
 | triage | `ok` | 40s | 0 findings（intent 轴 1 行，未达 blocker） | 35968 / 11985 / 26240 |
 | verify | `ok` | 9s | 2/2 逐条 `resolved`；counts 四态正确 | 10486 / 2550 / 10109 |
-| review | `partial`（`wall_clock_exhausted`） | 600s（外部上限，SIGTERM 收敛） | 11 findings（high 2 / medium 5 / low 4） | 223265 / 329531 / 55296 |
+| review | `partial`（`wall_clock_exhausted`） | 600s（外部上限，SIGTERM 收敛） | 13 findings | 231096 / 390305 / 176256（`wall_clock_ms`=598987） |
 
 每份报告都过了：hibot `report.<kind>-1.json` schema（`$id` registry）、finding 指纹复算、
 finding/verification quote 在检出原文逐字命中、verify 输入指纹集合 == 输出集合、`state.json` 三帧 + 终帧 `finishing`。
@@ -50,13 +50,13 @@ finding/verification quote 在检出原文逐字命中、verify 输入指纹集�
 注意：`pr.base_sha == inputs.merge_base` 是 hibot 为可执行性做的取舍（契约允许「可不同」，相等合法）；
 报告 `input.base_sha` 原样回显该值，**不**当作回归。
 
-## 4. 真跑观察（非阻塞，供 hibot 参考）
+## 4. 真跑观察（已修复）
 
-- review 在 600s 外部上限被 SIGTERM 时，引擎按契约收敛出合法 `partial` 报告（11 findings 全部过指纹/quote 校验），
+- review 在 600s 外部上限被 SIGTERM 时，引擎按契约收敛出合法 `partial` 报告（13 findings 全部过指纹/quote 校验），
   `status_code = wall_clock_exhausted`——**中断路径可用**；hibot 侧可按 `report.json` 直接消费。
-- 观察 1：SIGTERM / 预算耗尽路径的 `status_reason` 会把同一句渲染两遍（`…: …`）；常规 partial 无此问题。
-- 观察 2：中断路径的 `usage.wall_clock_ms` 取「最长 cell 时长」（本次 442775ms），不是 job 墙钟（600s）；
-  hibot 若要 job 延迟，建议用 `state.json.at` 的首末帧或自己的计时，不要用 `usage.wall_clock_ms`。
+- 修复 1：SIGTERM / 预算耗尽路径的 `status_reason` 曾把同一句渲染两遍；现在每条原因只出现一次。
+- 修复 2：中断路径的 `usage.wall_clock_ms` 曾取「最长 cell 时长」；现在与正常路径同口径，是 job 墙钟
+  （本次 598987ms ≈ 600s）。hibot 可直接用它估 job 延迟。
 
 ## 5. 已知限制
 

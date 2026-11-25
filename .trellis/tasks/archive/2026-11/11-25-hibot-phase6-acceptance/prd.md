@@ -93,6 +93,7 @@
   verify `ok` 9s（2/2 resolved）、review `partial`（600s 外部上限，`wall_clock_exhausted`，11 findings）；
   校验 `evidence/real-run/check.log` **83 PASS / 0 FAIL**。
 - D：README job 模式章节 + `--help` 三处修正；证据 `evidence/D-help/help.txt`。
-- 门禁：`cargo test` 全绿（1180+21+3+7+25+7+24+10+3+15+4+4）；`make verify` 通过。
-- 真跑观察（未改产品代码）：中断路径 `status_reason` 重复一次；中断路径 `usage.wall_clock_ms` 取最长 cell。
+- 门禁（修复后）：`cargo test` 全绿（1183+21+3+7+26+7+24+10+3+15+4+4）；`make verify` 通过。
+- 真跑观察 → 已修（`6eb31f5` `fix(job)`）：中断路径 `status_reason` 不再重复；`usage.wall_clock_ms` 改用 job 级 elapsed。
+  修复后重跑 review（600s 上限）：`partial` + 单句 reason + `wall_clock_ms=598987` + 13 findings；`check.log` 87 PASS / 0 FAIL。
 - 证据索引：`evidence/REPORT.md`；hibot 一页交付包：`delivery/hibot-handoff.md`。

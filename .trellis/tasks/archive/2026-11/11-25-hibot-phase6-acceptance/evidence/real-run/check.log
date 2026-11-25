@@ -21,7 +21,7 @@ PASS review: 报告过 hibot schema
 PASS review: head_sha 回显一致
 PASS review: base_sha 回显一致
 PASS review: findings[0] 指纹可复算
-PASS review: findings[0] quote 逐字命中 (service/checkout_recovery.go)
+PASS review: findings[0] quote 逐字命中 (service/checkout_recovery_ops.go)
 PASS review: findings[1] 指纹可复算
 PASS review: findings[1] quote 逐字命中 (service/checkout_recovery.go)
 PASS review: findings[2] 指纹可复算
@@ -31,17 +31,21 @@ PASS review: findings[3] quote 逐字命中 (service/checkout_recovery.go)
 PASS review: findings[4] 指纹可复算
 PASS review: findings[4] quote 逐字命中 (service/checkout_recovery.go)
 PASS review: findings[5] 指纹可复算
-PASS review: findings[5] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[5] quote 逐字命中 (service/checkout_recovery.go)
 PASS review: findings[6] 指纹可复算
-PASS review: findings[6] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[6] quote 逐字命中 (model/checkout_recovery.go)
 PASS review: findings[7] 指纹可复算
-PASS review: findings[7] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[7] quote 逐字命中 (model/checkout_recovery.go)
 PASS review: findings[8] 指纹可复算
-PASS review: findings[8] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[8] quote 逐字命中 (model/checkout_recovery.go)
 PASS review: findings[9] 指纹可复算
-PASS review: findings[9] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[9] quote 逐字命中 (model/checkout_recovery.go)
 PASS review: findings[10] 指纹可复算
 PASS review: findings[10] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[11] 指纹可复算
+PASS review: findings[11] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[12] 指纹可复算
+PASS review: findings[12] quote 逐字命中 (service/checkout_recovery_ops.go)
 PASS review: partial/error 必须有人读 reason
 PASS review: usage 无 cost
 PASS review: 采到 3 帧 state.json

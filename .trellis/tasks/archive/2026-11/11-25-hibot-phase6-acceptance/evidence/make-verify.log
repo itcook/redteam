@@ -19,15 +19,15 @@ test launcher_resolves_on_this_platform ... ok
 test codex_skills_in_sync_with_commands ... ok
 test launcher_errors_when_binary_missing ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
 
      Running tests/version.rs (target/debug/deps/version-0344a79a6a20b2cf)
 
 running 4 tests
+test changelog_starts_with_unreleased ... ok
 test capabilities_share_the_crate_version ... ok
 test plugin_manifests_share_the_crate_version ... ok
-test changelog_starts_with_unreleased ... ok
 test binary_reports_the_crate_version ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s
 

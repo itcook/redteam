@@ -10,7 +10,10 @@
 | `e2ee553` | feat(capabilities)：`invoke` 改 kind 通用形状 + 契约钉子 |
 | `bd0160d` | test(acceptance)：18 组合验收矩阵 + hibot schema 证据脚本 |
 | `aae1626` | docs(cli)：job 模式配置/凭据/语言/输出/退出码；修 `--help` 的 Phase 1 残留 |
-| `4dfea1a` | test(acceptance)：兼容示例 job 的 fallback 准备脚本（非产品路径） |
+| `b21b7de` | test(acceptance)：兼容示例 job 的 fallback 准备脚本（非产品路径） |
+| `7d22c97` | chore(task)：Phase 6 交付记录与证据 |
+| `59ff3de` | chore(task)：archive 11-25-hibot-phase6-acceptance |
+| `6eb31f5` | fix(job)：中断报告不再重复 `status_reason`；`usage.wall_clock_ms` 改用 job 级 elapsed |
 
 ## A. capabilities（计划 §9.1）
 
@@ -51,12 +54,12 @@
 |---|---|---|---|---|---|
 | triage | ok | 40s | 0 findings | 35968 / 11985 / 26240 | `evidence/real-run/triage/` |
 | verify | ok | 9s | 2/2 resolved | 10486 / 2550 / 10109 | `evidence/real-run/verify/` |
-| review | partial（`wall_clock_exhausted`） | 600s（外部上限，SIGTERM 收敛） | 11 findings（high 2 / medium 5 / low 4） | 223265 / 329531 / 55296 | `evidence/real-run/review/` |
+| review | partial（`wall_clock_exhausted`） | 600s（外部上限，SIGTERM 收敛） | 13 findings | 231096 / 390305 / 176256（`usage.wall_clock_ms`=598987） | `evidence/real-run/review/` |
 
 - review 真跑在**外部 600s 上限**被 SIGTERM：引擎按契约收敛出合法 `partial` 报告（11 findings，
   schema/指纹/quote 全过，`status_code=wall_clock_exhausted`），说明中断路径可用。
 - 校验：`python3 evidence/real-run/check-real.py --root evidence/real-run --jobs target/phase6-official --schema-dir ~/hibot/.docs/audit/schema --checker scripts/hibot-schema-check.py`
-  → `evidence/real-run/check.log`（**83 PASS / 0 FAIL**：schema + 指纹复算 + quote 逐字 + verify 覆盖 + 心跳三帧）。
+  → `evidence/real-run/check.log`（**87 PASS / 0 FAIL**：schema + 指纹复算 + quote 逐字 + verify 覆盖 + 心跳三帧）。
 - 交付包（给 hibot 的一页）：`delivery/hibot-handoff.md`。
 
 ### 示例数据的三个缺陷（已由 hibot `91834c2` 修复）
@@ -69,13 +72,18 @@
 
 兼容工具（保留作 fallback/对照，不作主证据）：`scripts/prepare-hibot-example-fallback.sh`。
 
-### 真跑暴露的两条观察（不改产品代码，已报协调者）
+### 真跑暴露的两条缺陷（已修复，`fix(job)`）
 
-1. **SIGTERM 路径的 `status_reason` 重复一遍**：`partial_report` 把已渲染的 `StatusText.reason` 作为
-   `JobFailure.reason` 覆盖再交给 `status_text`，得到「…results flushed: …results flushed」。
-   常规 partial（scan / triage_axis / verify inconclusive）不受影响；只影响中断 / 预算耗尽路径。
-2. **中断路径的 `usage.wall_clock_ms` 是「最长 cell 时长」**（本次 442775ms），不是 job 墙钟（600s）；
-   正常路径是 `run.duration_ms`。两边都可解释（`usage_from_cells` 取 max），但 hibot 若拿它算 job 延迟会偏小。
+1. **SIGTERM / 预算耗尽路径 `status_reason` 重复拼接**：`partial_report` 把已渲染的 `StatusText.reason`
+   塞回 `JobFailure.reason` 覆盖，`status_text` 再拼一次 → `…results flushed: …results flushed`。
+   修复：`partial_report` 只拆回 code/detail 交给 `render_partial` 重新渲染（不再覆盖 reason）。
+   测试：`job::report::tests::partial_report_*`（en/zh、带 detail、多原因）；job_conformance 的 SIGTERM 用例。
+2. **中断路径 `usage.wall_clock_ms` 取「最长 cell 时长」**：本次修复前 442775ms，而 job 墙钟 600s。
+   修复：`interrupted_report` 增加 `wall_clock_ms` 参数，由调用方传 `started.elapsed()`，与正常路径同口径。
+   测试：`interrupted_report_*` 单测（4321/9876 断言）+ SIGTERM 集成用例（`(20..10_000)` 区间，变异验证会红）。
+
+修复后重跑 review（同一官方 job）：`status=partial`、`status_reason` 单句、`usage.wall_clock_ms=598987`（≈600s），
+13 findings 全部过 schema/指纹/quote，`check.log` 87 PASS / 0 FAIL。
 
 ## D. 文档收尾（计划 §9.5）
 
@@ -87,7 +95,7 @@
 ## 门禁原文
 
 - `make verify`：`sync-version --check` 通过、gen/schema 零 diff、packaging 7 passed、version 4 passed。
-- `cargo test`：lib 1180 + bin 21 + acceptance_matrix 3 + capabilities 7 + job_conformance 25 +
+- `cargo test`：lib 1183 + bin 21 + acceptance_matrix 3 + capabilities 7 + job_conformance 26 +
   packaging 7 + review_e2e 24 + triage_conformance 10 + triage_prior_report 3 + verify_conformance 15 +
   verify_fixtures 4 + version 4，**全绿 0 失败**（`evidence/cargo-test.log`）。
 
