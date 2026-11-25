@@ -11,6 +11,7 @@
 //!
 //! 覆盖不变量（4.1 / 4.6）：输出指纹集合 == 输入指纹集合；输入集合为空时输出空数组合法。
 
+pub mod budget;
 pub mod evidence;
 pub mod input;
 pub mod prompt;
@@ -20,6 +21,7 @@ use crate::job::state::Heartbeat;
 use crate::job::status::JobFailure;
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::tool_loop::ChatMessage;
+use futures::StreamExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -108,6 +110,10 @@ pub struct FixVerifyRequest<'a> {
     pub prior: Option<&'a input::PriorEvidence>,
     /// verifier 轮转池：`(身份串, route key)`。
     pub routes: Vec<(String, String)>,
+    /// 派发窗口 `min(Σ provider 帽, n)`：只是「同时活着的 future 数」，provider 门仍是硬上限。
+    pub max_parallel: usize,
+    /// manifest 墙钟（秒）：只用于规模预算的放大系数。
+    pub wall_clock_s: u64,
     /// 绝对截止时刻（manifest 墙钟）。
     pub deadline: Instant,
     /// 输入里重复的指纹条数（报告披露用；集合语义只核一次）。
@@ -122,6 +128,12 @@ pub struct Progress {
     calls: u32,
     failures: u32,
     quote_rejected: u32,
+    /// 逐条模型调用耗时（毫秒）：只记录，不设 KPI。
+    latency_total_ms: u64,
+    latency_max_ms: u64,
+    /// provider 门 429 排队重试（`AttemptPolicy` 计数；与心跳 `llm.retrying` 同源）。
+    rl_retries: u32,
+    rl_wait_ms: u64,
 }
 
 /// 报告层需要的全部素材。
@@ -135,6 +147,10 @@ pub struct Outcome {
     pub failures: u32,
     pub quote_rejected: u32,
     pub duplicates: usize,
+    /// `(总耗时, 单条最大耗时)` 毫秒：只记录（用户裁：不设墙钟 KPI）。
+    pub latency: (u64, u64),
+    /// `(429 排队重试次数, 等待毫秒)`：来自 provider 门的 `AttemptPolicy`。
+    pub rate_limit: (u32, u64),
     /// 首个 verifier 身份（`provider/id`），报告披露用。
     pub verifier: String,
 }
@@ -146,19 +162,51 @@ pub fn same_fingerprint_set(findings: &[input::InputFinding], out: &[Verificatio
     want == got && out.len() == want.len()
 }
 
-/// 逐条核验（串行：条数少、确定性优先）。墙钟到期即停，剩余条目由 [`finalize`] 补
-/// `inconclusive`——覆盖不变量不因取消而破。
+/// 两阶段执行：**prepare**（同步）装配证据 / prompt / 规模预算，**dispatch**（异步、受限并发）只发请求。
+///
+/// 并发窗口 `k = min(Σ provider 帽, n)` 只是「同时活着的 future 数」；每个 provider 的真实上限仍由
+/// `InflightGate` 强制（`registry.lease`），**任何 provider 都不会被撑破**。墙钟到期或 SIGTERM 时整个
+/// stream 被 drop：在飞请求取消、permit 归还，已完成条目保留，缺口由 [`finalize`] 补 `inconclusive`
+/// ——覆盖不变量不因取消而破。
 pub async fn run(
     registry: &ProviderRegistry,
     req: &FixVerifyRequest<'_>,
     heartbeat: &Heartbeat,
     progress: Arc<Mutex<Progress>>,
 ) -> Outcome {
+    let factor = budget::time_factor(req.wall_clock_s);
+    // ── Phase 1 prepare（同步：读文件、装配证据、量规模；async 阶段不再碰 fs）──
+    let mut prepared = Vec::with_capacity(req.findings.len());
     for (idx, finding) in req.findings.iter().enumerate() {
         if Instant::now() >= req.deadline {
             break;
         }
-        let item = verify_one(registry, req, idx, finding).await;
+        let ev = evidence::build(req.repo, req.lang, finding, req.fixes);
+        if !ev.located {
+            // 无法定位 → inconclusive（不是 unresolved：我们并不知道缺陷还在），不发请求。
+            let text = ev.note.unwrap_or_else(|| {
+                msg(req.lang, "无法定位该 finding 的代码，未能核验", "the finding could not be located; nothing was verified")
+            });
+            progress.lock().unwrap().done.push(Verification::inconclusive(&finding.fingerprint, text));
+            heartbeat.bump_done();
+            continue;
+        }
+        let prior = req.prior.and_then(|p| p.get(&finding.fingerprint));
+        let prompt = prompt::build(&prompt::FixVerifyPromptInput { lang: req.lang, finding, evidence: &ev, prior });
+        let size_kb = budget::kb(prompt.system.len() + prompt.user.len());
+        prepared.push(Prepared {
+            idx,
+            key: req.routes[idx % req.routes.len()].1.clone(),
+            prompt,
+            budget: budget::scaled_item_timeout(size_kb, factor),
+        });
+    }
+    // ── Phase 2 dispatch（异步：只发请求，受 provider 门约束）──
+    let k = req.max_parallel.max(1).min(prepared.len().max(1));
+    let mut stream = futures::stream::iter(prepared)
+        .map(|item| dispatch_one(registry, req, item))
+        .buffer_unordered(k);
+    while let Some(item) = stream.next().await {
         {
             let mut p = progress.lock().unwrap();
             p.done.push(item.verification);
@@ -168,6 +216,10 @@ pub async fn run(
             p.calls += u32::from(item.call);
             p.failures += u32::from(item.failed);
             p.quote_rejected += u32::from(item.quote_rejected);
+            p.latency_total_ms += item.latency_ms;
+            p.latency_max_ms = p.latency_max_ms.max(item.latency_ms);
+            p.rl_retries += item.rl_retries;
+            p.rl_wait_ms += item.rl_wait_ms;
         }
         heartbeat.bump_done();
     }
@@ -219,8 +271,19 @@ fn finalize(req: &FixVerifyRequest<'_>, progress: &Progress, completed: bool) ->
         failures: progress.failures,
         quote_rejected: progress.quote_rejected,
         duplicates: req.duplicates,
+        latency: (progress.latency_total_ms, progress.latency_max_ms),
+        rate_limit: (progress.rl_retries, progress.rl_wait_ms),
         verifier: req.routes.first().map(|(name, _)| name.clone()).unwrap_or_default(),
     }
+}
+
+/// prepare 阶段的产物：dispatch 只需要「发给谁 + 发什么 + 给多久」。
+struct Prepared {
+    idx: usize,
+    key: String,
+    prompt: prompt::FixVerifyPrompt,
+    /// 规模预算（尚未与模型 per-turn / 剩余墙钟取 min）。
+    budget: std::time::Duration,
 }
 
 struct ItemRun {
@@ -229,64 +292,84 @@ struct ItemRun {
     call: bool,
     failed: bool,
     quote_rejected: bool,
+    latency_ms: u64,
+    rl_retries: u32,
+    rl_wait_ms: u64,
 }
 
-async fn verify_one(
-    registry: &ProviderRegistry,
-    req: &FixVerifyRequest<'_>,
-    idx: usize,
-    finding: &input::InputFinding,
-) -> ItemRun {
-    let no_call = |evidence: String| ItemRun {
+/// 未发请求就定论的条目（无法定位等）。
+fn decided(finding: &input::InputFinding, evidence: String) -> ItemRun {
+    ItemRun {
         verification: Verification::inconclusive(&finding.fingerprint, evidence),
         usage: (0, 0, 0),
         call: false,
         failed: false,
         quote_rejected: false,
-    };
-    let ev = evidence::build(req.repo, req.lang, finding, req.fixes);
-    if !ev.located {
-        // 无法定位 → inconclusive（不是 unresolved：我们并不知道缺陷还在）。
-        return no_call(ev.note.unwrap_or_else(|| {
-            msg(req.lang, "无法定位该 finding 的代码，未能核验", "the finding could not be located; nothing was verified")
-        }));
+        latency_ms: 0,
+        rl_retries: 0,
+        rl_wait_ms: 0,
     }
-    let prior = req.prior.and_then(|p| p.get(&finding.fingerprint));
-    let prompt = prompt::build(&prompt::FixVerifyPromptInput { lang: req.lang, finding, evidence: &ev, prior });
-    let (_, key) = &req.routes[idx % req.routes.len()];
-    let messages = vec![ChatMessage::System(prompt.system.clone()), ChatMessage::User(prompt.user.clone())];
+}
 
-    let lease = match registry.lease(key).await {
+/// 一条 finding 的派发：过 provider 门 → 单轮调用（挂 `AttemptPolicy`：心跳在途/429 计量）→ 四态校验。
+async fn dispatch_one(registry: &ProviderRegistry, req: &FixVerifyRequest<'_>, item: Prepared) -> ItemRun {
+    let finding = &req.findings[item.idx];
+    let lease = match registry.lease(&item.key).await {
         Ok(l) => l,
         Err(e) => {
             return ItemRun {
-                verification: Verification::inconclusive(
-                    &finding.fingerprint,
-                    msg(req.lang, &format!("模型不可用，未能核验：{e}"), &format!("the model is unavailable; nothing was verified: {e}")),
-                ),
-                usage: (0, 0, 0),
-                call: false,
                 failed: true,
-                quote_rejected: false,
+                ..decided(
+                    finding,
+                    msg(req.lang, &format!("模型不可用，未能核验：{e}"), &format!("the model is unavailable; nothing was verified: {e}")),
+                )
             }
         }
     };
-    // 墙钟是硬上限：单轮超时不超过剩余预算太多（免得多睡一个 per-turn）。
+    // 墙钟是硬上限：剩余不足就不再把这条推上去（缺口留给 finalize 补 inconclusive）。
     let remaining = req.deadline.saturating_duration_since(Instant::now());
-    let per_turn = lease.per_turn().min(remaining.max(std::time::Duration::from_secs(1)));
-    let turn = crate::provider::timed_turn_final(lease.backend(), &messages, per_turn, lease.retry_budget()).await;
+    if remaining.is_zero() {
+        return decided(
+            finding,
+            msg(req.lang, "墙钟预算耗尽，这一条未开始核验", "the wall clock was exhausted before this finding was checked"),
+        );
+    }
+    // 单条预算 = min(规模预算, 模型 per-turn, 剩余墙钟)。
+    let per_turn = item
+        .budget
+        .min(lease.per_turn())
+        .min(remaining.max(std::time::Duration::from_secs(1)));
+    let policy = lease.gate_attempts();
+    let messages = vec![
+        ChatMessage::System(item.prompt.system.clone()),
+        ChatMessage::User(item.prompt.user.clone()),
+    ];
+    let t0 = Instant::now();
+    let turn = crate::provider::timed_turn_with(
+        lease.backend(),
+        &messages,
+        &[],
+        per_turn,
+        lease.retry_budget(),
+        Some(&policy),
+    )
+    .await;
+    let latency_ms = t0.elapsed().as_millis() as u64;
+    let rl_retries = policy.retries();
+    let rl_wait_ms = policy.waited_ms();
     let (usage, text) = match turn {
         Ok(t) => ((t.input_tokens, t.output_tokens, t.cached_input_tokens), t.text),
         Err(e) => {
             return ItemRun {
-                verification: Verification::inconclusive(
-                    &finding.fingerprint,
-                    msg(req.lang, &format!("模型调用失败，未能核验：{e}"), &format!("the model call failed; nothing was verified: {e}")),
-                ),
-                usage: (0, 0, 0),
                 call: true,
                 failed: true,
-                quote_rejected: false,
+                latency_ms,
+                rl_retries,
+                rl_wait_ms,
+                ..decided(
+                    finding,
+                    msg(req.lang, &format!("模型调用失败，未能核验：{e}"), &format!("the model call failed; nothing was verified: {e}")),
+                )
             }
         }
     };
@@ -294,46 +377,51 @@ async fn verify_one(
         Ok(j) => j,
         Err(e) => {
             return ItemRun {
-                verification: Verification::inconclusive(
-                    &finding.fingerprint,
-                    msg(req.lang, &format!("模型输出无法解析，未能核验：{e}"), &format!("the model output could not be parsed; nothing was verified: {e}")),
-                ),
                 usage,
                 call: true,
                 failed: true,
-                quote_rejected: false,
+                latency_ms,
+                rl_retries,
+                rl_wait_ms,
+                ..decided(
+                    finding,
+                    msg(req.lang, &format!("模型输出无法解析，未能核验：{e}"), &format!("the model output could not be parsed; nothing was verified: {e}")),
+                )
             }
         }
     };
     // 证据不足（模型没给证据）→ inconclusive：契约要求 evidence 非空，不能替模型编。
     if judgment.evidence.trim().is_empty() {
         return ItemRun {
-            verification: Verification::inconclusive(
-                &finding.fingerprint,
-                msg(req.lang, "模型未给出证据，未能核验", "the model returned no evidence; nothing was verified"),
-            ),
             usage,
             call: true,
-            failed: false,
-            quote_rejected: false,
+            latency_ms,
+            rl_retries,
+            rl_wait_ms,
+            ..decided(
+                finding,
+                msg(req.lang, "模型未给出证据，未能核验", "the model returned no evidence; nothing was verified"),
+            )
         };
     }
     // quote 必须逐字命中提供材料；不命中就降级——不把伪造的锚点当证据。
     if let Some(q) = &judgment.quote {
-        if !evidence::quote_is_verbatim(q, &prompt.material) {
+        if !evidence::quote_is_verbatim(q, &item.prompt.material) {
             return ItemRun {
-                verification: Verification::inconclusive(
-                    &finding.fingerprint,
+                usage,
+                call: true,
+                quote_rejected: true,
+                latency_ms,
+                rl_retries,
+                rl_wait_ms,
+                ..decided(
+                    finding,
                     msg(
                         req.lang,
                         &format!("模型给出的 quote 未能在提供的材料中逐字命中（`{}`），未能核验", one_line(q)),
                         &format!("the model's quote was not found verbatim in the provided material (`{}`); nothing was verified", one_line(q)),
                     ),
-                ),
-                usage,
-                call: true,
-                failed: false,
-                quote_rejected: true,
+                )
             };
         }
     }
@@ -348,6 +436,9 @@ async fn verify_one(
         call: true,
         failed: false,
         quote_rejected: false,
+        latency_ms,
+        rl_retries,
+        rl_wait_ms,
     }
 }
 
@@ -393,6 +484,8 @@ mod tests {
             fixes,
             prior: None,
             routes: vec![("p/v".into(), "verifier:p/v".into())],
+            max_parallel: 4,
+            wall_clock_s: 1200,
             deadline: Instant::now() + std::time::Duration::from_secs(60),
             duplicates: 0,
         }
