@@ -1021,8 +1021,8 @@ pub(crate) fn scanned_coverage(bundles: &[Bundle], cells: &[ScanCellResult]) -> 
 ///
 /// **job 模式凭据只走 env**（P6）：`args.job_mode` 时 secrets 传空，`resolve_key_with` 只读 `apiKeyEnv` 指向的环境变量。
 ///
-/// **`settings.verify` 池不在这里注册**：它属 kind=verify 管线（Phase 4），review 既不用也不该
-/// 因它构造 backend；v2 起 verify **不再回退 reviewer**（空池即 `missing_role:verifier`）。
+/// **`settings.verify` 池只在 kind=verify 管线注册**（[`build_registry_for_verify`]）：review/triage
+/// 既不使用也不该因它构造 backend；v2 起 verify **不再回退 reviewer**（空池即 `missing_role:verifier`）。
 /// 测试/夹具接缝：按角色条目覆盖 backend 构造（返回 None 则走真实 `backend_from_config`）。
 /// 生产路径不传；集成测试用它注入确定性后端（计划 1.6），**不是**产品开关。
 pub type BackendOverride<'a> =
@@ -1036,6 +1036,8 @@ pub fn build_registry(args: &ReviewArgs, cfg: &Config) -> Result<ProviderRegistr
 enum RegistryMode {
     Review,
     Triage,
+    /// Phase 4：`settings.verify.models`（`Role::Verifier`）。
+    Verify,
 }
 
 pub fn build_registry_with(
@@ -1053,6 +1055,15 @@ pub fn build_registry_for_triage(
     over: Option<&BackendOverride<'_>>,
 ) -> Result<ProviderRegistry, String> {
     build_registry_inner(args, cfg, over, RegistryMode::Triage)
+}
+
+/// verify 专用：只用 `settings.verify.models`，因此**不因缺 scanner 而拒绝**（角色最小集在 `config check --kind verify`）。
+pub fn build_registry_for_verify(
+    args: &ReviewArgs,
+    cfg: &Config,
+    over: Option<&BackendOverride<'_>>,
+) -> Result<ProviderRegistry, String> {
+    build_registry_inner(args, cfg, over, RegistryMode::Verify)
 }
 
 /// 构造 ProviderRegistry（前台 / worker / triage 共用）：按角色池注册 backend。
@@ -1073,6 +1084,7 @@ fn build_registry_inner(
     let warnings = match mode {
         RegistryMode::Review => crate::provider::backends::role_reasoning_effort_warnings(&roles),
         RegistryMode::Triage => crate::provider::backends::reasoning_warnings_for(roles.triage.iter()),
+        RegistryMode::Verify => crate::provider::backends::reasoning_warnings_for(roles.verifiers.iter()),
     };
     for w in warnings {
         registry.push_warning(w);
@@ -1147,6 +1159,14 @@ fn build_registry_inner(
             }
             for em in &roles.triage {
                 register(&mut registry, cfg, &secrets, over, em, Role::Triage, false, cap_of(em), args.job_mode)?;
+            }
+        }
+        RegistryMode::Verify => {
+            if roles.verifiers.is_empty() {
+                return Err("no verify model configured: settings.verify.models 为空".to_string());
+            }
+            for em in &roles.verifiers {
+                register(&mut registry, cfg, &secrets, over, em, Role::Verifier, false, cap_of(em), args.job_mode)?;
             }
         }
     }

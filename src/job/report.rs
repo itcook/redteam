@@ -116,27 +116,6 @@ pub fn error_report(manifest: &JobManifest, lang: &OutputLang, failure: &JobFail
 }
 
 
-/// D1 + A 裁决（Phase 1）：未实现的 verify 对每个有效输入指纹输出 `inconclusive`（未核验），
-/// 整体 `status=error` + `kind_not_implemented`——满足逐条覆盖，又不伪造 resolved/unresolved。
-pub fn kind_not_implemented_verify(
-    manifest: &JobManifest,
-    lang: &OutputLang,
-    fingerprints: &[String],
-) -> HibotReport {
-    let mut r = error_report(manifest, lang, &JobFailure::new("kind_not_implemented", Some(manifest.kind.as_str().into())));
-    let evidence = if lang.value.starts_with("zh") {
-        "本执行单元尚未实现 verify（Phase 1）；未对该 finding 做任何修复核验"
-    } else {
-        "verify is not implemented by this execution unit (Phase 1); no fix verification was performed"
-    };
-    r.verifications = Some(
-        fingerprints
-            .iter()
-            .map(|fp| json!({"finding_fingerprint": fp, "status": "inconclusive", "evidence": evidence}))
-            .collect(),
-    );
-    r
-}
 
 /// Phase 2 收集的报告期事实（不污染内部 `ReviewReport`）：只影响 hibot 信封。
 #[derive(Clone, Debug, Default)]
@@ -327,6 +306,78 @@ pub fn triage_report(
     }
     r.extensions = json!({ "redteam": redteam });
     r
+}
+
+/// verify 报告（`report.verify/1`，契约 §3.3 / 计划 4.4 / 4.6）：
+/// `verifications` 逐条覆盖输入指纹集合（空集合 → 空数组）；出现 `inconclusive` ⇒ `partial` +
+/// `status_reason`（主导码 `verifications_inconclusive`，附录 E 优先序由 `code_rank` 排）。
+pub fn verify_report(
+    manifest: &JobManifest,
+    lang: &OutputLang,
+    cfg: &Config,
+    outcome: &crate::fixverify::Outcome,
+    template_hash: &str,
+) -> HibotReport {
+    let mut reasons = outcome.reasons.clone();
+    reasons.sort_by_key(|f| code_rank(&f.code));
+    let partial = render_partial(&reasons, lang);
+    let mut r = HibotReport::base(manifest);
+    r.status = if reasons.is_empty() { JobStatus::Ok } else { JobStatus::Partial };
+    r.status_reason = partial.as_ref().map(|t| t.reason.clone());
+    // verify 不产 finding：判决全在 `verifications` 里（契约 `findings` 可为空数组）。
+    r.findings = Vec::new();
+    r.verifications = Some(
+        outcome
+            .verifications
+            .iter()
+            .map(|v| {
+                let mut item = json!({
+                    "finding_fingerprint": v.finding_fingerprint,
+                    "status": v.status,
+                    "evidence": v.evidence,
+                });
+                if let Some(q) = &v.quote {
+                    item["quote"] = json!(q);
+                }
+                item
+            })
+            .collect(),
+    );
+    r.usage = UsageOut {
+        input_tokens: outcome.usage.0,
+        output_tokens: outcome.usage.1,
+        cached_input_tokens: outcome.usage.2,
+        wall_clock_ms: 0,
+    };
+    let mut redteam = json!({
+        "language": language_json(lang),
+        "concurrency": concurrency_json(cfg),
+        "budget": { "wall_clock_s": manifest.limits.wall_clock_s, "truncated_items": 0 },
+        "template_hashes": { "fix_verify": template_hash },
+        "verifier": outcome.verifier,
+        "verify": {
+            "counts": counts_by_status(&outcome.verifications),
+            "calls": outcome.calls,
+            "model_failures": outcome.failures,
+            "quote_rejected": outcome.quote_rejected,
+            "duplicate_fingerprints": outcome.duplicates,
+        },
+    });
+    if let Some(t) = partial {
+        redteam["status_code"] = json!(t.code);
+    }
+    r.extensions = json!({ "redteam": redteam });
+    r
+}
+
+fn counts_by_status(verifications: &[crate::fixverify::Verification]) -> Value {
+    let mut counts = json!({ "resolved": 0, "unresolved": 0, "regressed": 0, "inconclusive": 0 });
+    for v in verifications {
+        let key = v.status.as_str();
+        let next = counts[key].as_u64().unwrap_or(0) + 1;
+        counts[key] = json!(next);
+    }
+    counts
 }
 
 /// triage 的 finding → hibot 信封（`source.role = scanner`；指纹仍走唯一实现）。
@@ -530,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn error_and_kind_not_implemented_reports_are_schema_shaped() {
+    fn error_and_verify_reports_are_schema_shaped() {
         let m = manifest();
         let lang = crate::config::Language::ZhCn.output();
         let e = error_report(&m, &lang, &JobFailure::new("input_missing", Some("diff_patch".into())));
@@ -547,10 +598,63 @@ mod tests {
           "paths":{"repo":"../repo","out":"out","config":"config/executor.redteam.json"},
           "inputs":{}
         }"#).unwrap();
-        let v = kind_not_implemented_verify(&vm, &lang, &[]);
-        assert_eq!(v.kind, "verify");
-        assert_eq!(v.extensions["redteam"]["status_code"], "kind_not_implemented:verify");
-        assert_eq!(v.verifications.as_deref(), Some(&[][..]), "verify 报告必须带 verifications（空也可）");
-        assert!(v.findings.is_empty(), "禁止伪造 findings");
+        let cfg = Config::default();
+
+        // 4.6：空输入 → `verifications: []` 合法，报告 ok，不伪造判决。
+        let empty = crate::fixverify::Outcome {
+            verifications: Vec::new(),
+            usage: (1, 2, 3),
+            reasons: Vec::new(),
+            calls: 0,
+            failures: 0,
+            quote_rejected: 0,
+            duplicates: 0,
+            verifier: "p/v".into(),
+        };
+        let ok = verify_report(&vm, &lang, &cfg, &empty, "h1");
+        assert_eq!(ok.status, JobStatus::Ok);
+        assert!(ok.status_reason.is_none());
+        assert_eq!(ok.verifications.as_deref(), Some(&[][..]), "verify 报告必须带 verifications（空也可）");
+        assert!(ok.findings.is_empty(), "禁止伪造 findings");
+        assert_eq!(ok.usage.input_tokens, 1);
+
+        // 4.4：inconclusive ⇒ partial + status_reason（主导码 verifications_inconclusive）。
+        let fp = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        let out = crate::fixverify::Outcome {
+            verifications: vec![
+                crate::fixverify::Verification {
+                    finding_fingerprint: fp('a'),
+                    status: crate::fixverify::FixVerifyStatus::Resolved,
+                    evidence: "已改为参数化查询".into(),
+                    quote: Some("db.query('x', [id])".into()),
+                },
+                crate::fixverify::Verification {
+                    finding_fingerprint: fp('b'),
+                    status: crate::fixverify::FixVerifyStatus::Inconclusive,
+                    evidence: "模型调用失败，未能核验".into(),
+                    quote: None,
+                },
+            ],
+            usage: (10, 4, 2),
+            reasons: vec![JobFailure::new("verifications_inconclusive", Some("1".into()))],
+            calls: 2,
+            failures: 1,
+            quote_rejected: 0,
+            duplicates: 0,
+            verifier: "p/v".into(),
+        };
+        let r = verify_report(&vm, &lang, &cfg, &out, "h1");
+        assert_eq!(r.status, JobStatus::Partial);
+        assert!(r.status_reason.as_deref().unwrap().contains("1 条 finding 未能核验"), "{:?}", r.status_reason);
+        assert_eq!(r.extensions["redteam"]["status_code"], "verifications_inconclusive:1");
+        let vs = r.verifications.unwrap();
+        assert_eq!(vs[0]["status"], "resolved");
+        assert_eq!(vs[0]["quote"], "db.query('x', [id])");
+        assert_eq!(vs[1]["status"], "inconclusive");
+        assert!(vs[1].get("quote").is_none(), "无 quote 时不写该键");
+        assert_eq!(r.extensions["redteam"]["verify"]["counts"]["inconclusive"], 1);
+        assert_eq!(r.extensions["redteam"]["verify"]["model_failures"], 1);
+        assert_eq!(r.extensions["redteam"]["template_hashes"]["fix_verify"], "h1");
+        assert_eq!(r.usage.output_tokens, 4);
     }
 }

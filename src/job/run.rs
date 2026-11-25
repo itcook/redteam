@@ -103,8 +103,8 @@ pub async fn run_with(
         Err(e) => return finish(&out_dir, report::error_report(&manifest, &lang, &e), &heartbeat),
     };
 
-    // Phase 3：triage 有分析实现；verify 仍是 Phase 1 的 stub（协调者 2026-11-24 裁 A：
-    // 必须逐条覆盖输入指纹，故对每条输出 `inconclusive`，整体仍 error——不伪造 resolved/unresolved）。
+    // Phase 3：triage 与 Phase 4：verify 各有独立管线（输入校验、角色、报告信封分开）；
+    // review 走下方默认路径。
     match manifest.kind {
         JobKind::Triage => {
             let r = run_triage(
@@ -114,15 +114,10 @@ pub async fn run_with(
             return finish(&out_dir, r, &heartbeat);
         }
         JobKind::Verify => {
-            let r = match verify_fingerprints(&artifacts) {
-                Ok(fps) => {
-                    // Phase 5：分析未实现，但输入项数可知；progress.unit 固定 items。
-                    heartbeat.set_progress_total("items", fps.len() as u64);
-                    report::kind_not_implemented_verify(&manifest, &lang, &fps)
-                }
-                Err(e) => report::error_report(&manifest, &lang, &e),
-            };
-            heartbeat.set_phase(state::Phase::Running);
+            let r = run_verify(
+                &manifest, &job_dir, &cfg, &lang, &artifacts, started, &mut sigterm, &heartbeat, over,
+            )
+            .await;
             return finish(&out_dir, r, &heartbeat);
         }
         JobKind::Review => {}
@@ -508,28 +503,116 @@ fn triage_args(base: &str) -> ReviewArgs {
     }
 }
 
-/// verify 输入指纹集合（契约 §3.3 / Q6）：非法指纹 → `invalid_fingerprint_input`。
-fn verify_fingerprints(artifacts: &artifact::Artifacts) -> Result<Vec<String>, JobFailure> {
-    let text = artifacts
-        .text("findings")
-        .ok_or_else(|| JobFailure::new("input_schema_mismatch", Some("findings".into())))?;
-    let v: serde_json::Value = serde_json::from_str(text)
-        .map_err(|_| JobFailure::new("input_schema_mismatch", Some("findings".into())))?;
-    let arr = v
-        .as_array()
-        .ok_or_else(|| JobFailure::new("input_schema_mismatch", Some("findings".into())))?;
-    let mut out = Vec::with_capacity(arr.len());
-    for item in arr {
-        let fp = item
-            .get("fingerprint")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| JobFailure::new("invalid_fingerprint_input", None))?;
-        if !crate::job::fingerprint::is_fingerprint(fp) {
-            return Err(JobFailure::new("invalid_fingerprint_input", None));
+/// Phase 4：`verify` 作业。输入校验与其它 kind 同源（`diff_patch` 是真相源、merge_base 是 diff
+/// 左端、检出完整）；**空 `findings` 合法**（`verifications: []` + `ok`），指纹非法是输入错误。
+/// 单条失败/无法定位 → 该条 `inconclusive`（不是 `unresolved`）；出现即整体 `partial` + reason。
+#[allow(clippy::too_many_arguments)]
+async fn run_verify(
+    manifest: &JobManifest,
+    job_dir: &Path,
+    cfg: &Config,
+    lang: &OutputLang,
+    artifacts: &artifact::Artifacts,
+    started: std::time::Instant,
+    sigterm: &mut Option<tokio::signal::unix::Signal>,
+    heartbeat: &state::Heartbeat,
+    over: Option<&crate::cli::BackendOverride<'_>>,
+) -> report::HibotReport {
+    let repo = match io::resolve_repo(job_dir, &manifest.paths.repo) {
+        Ok(r) => r,
+        Err(e) => return report::error_report(manifest, lang, &e),
+    };
+    let base = match artifacts
+        .text("merge_base")
+        .map(str::trim)
+        .filter(|s| crate::job::repo::is_full_sha(s))
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return report::error_report(
+                manifest,
+                lang,
+                &JobFailure::new("input_schema_mismatch", Some("merge_base".into())),
+            )
         }
-        out.push(fp.to_string());
+    };
+    let patch = match artifacts.text("diff_patch") {
+        Some(t) => t,
+        None => return report::error_report(manifest, lang, &JobFailure::new("input_schema_mismatch", Some("diff_patch".into()))),
+    };
+    let changes = match crate::job::projection::from_patch(patch) {
+        Ok(c) => c,
+        Err(e) => return report::error_report(manifest, lang, &e),
+    };
+    // 4.1 / Q6：findings 是逐条清单；坏指纹是 error（不逐条降级），空集合合法。
+    let (findings, duplicates) = match artifacts
+        .text("findings")
+        .map(crate::fixverify::input::parse_findings)
+    {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return report::error_report(manifest, lang, &e),
+        None => return report::error_report(manifest, lang, &JobFailure::new("input_schema_mismatch", Some("findings".into()))),
+    };
+    // prior_report 可选：坏了不能用（可选输入不等于可损坏）。
+    let prior = match artifacts.text("prior_report").map(crate::fixverify::input::parse_prior) {
+        Some(Ok(p)) => Some(p),
+        Some(Err(e)) => return report::error_report(manifest, lang, &e),
+        None => None,
+    };
+    // 2.6 同源完整性：非 shallow、HEAD == pr.head_sha、base/merge_base 对象可得、merge-base 可算。
+    if let Err(e) = crate::job::repo::ensure_complete(&repo, &manifest.pr, &base) {
+        return report::error_report(manifest, lang, &e);
     }
-    Ok(out)
+    let routes = crate::fixverify::verifier_routes(cfg);
+    if routes.is_empty() {
+        return report::error_report(manifest, lang, &JobFailure::new("missing_role", Some("verifier".into())));
+    }
+    let registry = match crate::cli::build_registry_for_verify(&verify_args(&base), cfg, over) {
+        Ok(r) => r,
+        Err(e) => return report::error_report(manifest, lang, &JobFailure::with_reason("config_invalid", None, e)),
+    };
+    heartbeat.attach_llm(registry.gate_handles());
+    let deadline = match effective_deadline(started, manifest.limits.wall_clock_s, None) {
+        Ok(d) => d,
+        Err(e) => return report::error_report(manifest, lang, &e),
+    };
+    // Phase 5：progress.unit 固定 items（逐条核验）。
+    heartbeat.set_progress_total("items", findings.len() as u64);
+    heartbeat.set_phase(state::Phase::Running);
+    let fixes = crate::fixverify::input::parse_changes(&changes);
+    let req = crate::fixverify::FixVerifyRequest {
+        repo: &repo,
+        lang,
+        findings: &findings,
+        fixes: &fixes,
+        prior: prior.as_ref(),
+        routes,
+        deadline,
+        duplicates,
+    };
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::fixverify::Progress::default()));
+    let mut fut = Box::pin(crate::fixverify::run(&registry, &req, heartbeat, progress.clone()));
+    let outcome = tokio::select! {
+        out = &mut fut => out,
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            drop(fut);
+            let snapshot = progress.lock().unwrap();
+            crate::fixverify::snapshot_finalize(&req, &snapshot)
+        }
+        _ = wait_sigterm(sigterm) => {
+            drop(fut);
+            let snapshot = progress.lock().unwrap();
+            crate::fixverify::snapshot_finalize(&req, &snapshot)
+        }
+    };
+    let mut r = report::verify_report(manifest, lang, cfg, &outcome, &crate::fixverify::prompt::template_hash());
+    r.usage.wall_clock_ms = started.elapsed().as_millis() as u64;
+    r
+}
+
+/// verify 的 `ReviewArgs`：job 模式、`base=merge_base`（fix diff 左端）、无业务 flag（P1/P13）。
+fn verify_args(base: &str) -> ReviewArgs {
+    triage_args(base)
 }
 
 /// job 模式的环境隔离（P6 规则④ / 不变式⑦）：语言、密钥、并发全部来自 `paths.config`。

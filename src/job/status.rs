@@ -92,10 +92,6 @@ fn table(code: &str) -> Option<(&'static str, &'static str)> {
         "invalid_fingerprint_input" => ("findings.json 中有非法指纹", "findings.json contains an invalid fingerprint"),
         "missing_role" => ("缺少 `{}` 角色且无可用回退", "missing role `{}` with no fallback"),
         "internal_panic" => ("内部错误：{}", "internal error: {}"),
-        "kind_not_implemented" => (
-            "kind `{}` 在本执行单元中尚未实现（Phase 1 只有 review）",
-            "kind `{}` is not implemented by this executor yet (Phase 1 ships review only)",
-        ),
         // partial
         "scan_incomplete" => ("扫描不完整：{} 个 cell 失败", "scan incomplete: {} cells failed"),
         "review_incomplete" => ("深挖不完整：{} 个 cell 失败", "review incomplete: {} cells failed"),
@@ -130,7 +126,7 @@ fn takes_detail(code: &str) -> bool {
     matches!(
         code,
         "input_missing" | "input_checksum_mismatch" | "input_schema_mismatch" | "input_path_invalid"
-            | "config_invalid" | "config_contains_secret" | "missing_role" | "kind_not_implemented"
+            | "config_invalid" | "config_contains_secret" | "missing_role"
             | "repo_incomplete"
             | "scan_incomplete" | "review_incomplete" | "budget_truncated" | "triage_axis_failed"
             | "routing_specs_unreadable" | "verifications_inconclusive" | "quotes_dropped"
