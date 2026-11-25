@@ -41,7 +41,30 @@ fn form_and_delivery_follow_the_contract() {
     assert_eq!(req["repo_checkout"], true, "评审要读检出");
     assert_eq!(req["pr_context"], false, "review 不依赖 pr-context（Q4）");
     assert_eq!(req["network"], "provider-only", "只调模型 provider");
-    assert!(c["invoke"].as_str().unwrap().contains("--job-dir"));
+    // invoke 是给人看的调用形状示例：三 kind 同一入口，不得只写一个 kind（Phase 6 / 9.1）。
+    let invoke = c["invoke"].as_str().expect("invoke must be a string");
+    for kind in ["triage", "review", "verify"] {
+        assert!(invoke.contains(kind), "invoke 必须覆盖 {kind}：{invoke}");
+    }
+    assert!(invoke.contains("--job-dir"), "invoke 必须写明 job 模式入口：{invoke}");
+}
+
+/// `requires` 是对**所有声明 kind** 的要求（hibot B4）：形状固定，多一个键就是多一条隐性派活门槛。
+#[test]
+fn requires_is_exactly_the_contract_set() {
+    let c = capabilities();
+    assert_eq!(
+        c["requires"],
+        serde_json::json!({"repo_checkout": true, "pr_context": false, "network": "provider-only"}),
+        "requires 必须恰为 {{repo_checkout:true, pr_context:false, network:provider-only}}"
+    );
+}
+
+#[test]
+fn limits_declare_a_positive_wall_clock() {
+    let c = capabilities();
+    let secs = c["limits"]["max_wall_clock_s"].as_u64().expect("limits.max_wall_clock_s 必须是整数");
+    assert!(secs >= 1, "limits.max_wall_clock_s 必须 ≥ 1（hibot 契约 minimum:1），实际 {secs}");
 }
 
 #[test]

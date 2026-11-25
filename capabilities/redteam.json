@@ -8,7 +8,7 @@
     "verify"
   ],
   "form": "cli",
-  "invoke": "redteam review --job-dir <dir>",
+  "invoke": "redteam <triage|review|verify> --job-dir <dir>",
   "config_delivery": "job_native",
   "requires": {
     "repo_checkout": true,

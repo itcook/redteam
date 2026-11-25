@@ -1222,3 +1222,93 @@ async fn triage_and_verify_write_three_value_heartbeat() {
     assert_eq!(r["verifications"][0]["status"], "inconclusive", "无法定位不得落 unresolved");
 }
 
+/// SIGTERM：引擎按契约收敛出 partial 报告——原因只出现一次、墙钟是 **job 级**（不是 max cell）。
+///
+/// provider 指向「只 accept、永不回包」的本地服务，review 会卡在请求上；心跳落盘即证明信号处理器已安装。
+#[test]
+fn sigterm_flushes_partial_report_with_job_wall_clock() {
+    use std::process::{Command as StdCommand, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let server = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while !stop2.load(AtomicOrdering::Relaxed) {
+            match listener.accept() {
+                Ok((s, _)) => held.push(s),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        drop(held);
+    });
+
+    let config = serde_json::json!({
+        "settings": {"language": "en_US", "review": {"roles": {
+            "scanner": {"models": [{"provider": "p1", "id": "s"}]},
+            "reviewer": {"models": [{"provider": "p1", "id": "r"}]}
+        }}},
+        "providers": {"p1": {"api": "openai-completions",
+            "baseUrl": format!("http://127.0.0.1:{port}"), "apiKeyEnv": "P1_KEY",
+            "models": [{"id": "s"}, {"id": "r"}]}}
+    })
+    .to_string();
+    let fx = make_repo_and_job("review", &config, true, false);
+
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_redteam"))
+        .args(["review", "--job-dir"])
+        .arg(&fx.job)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn redteam review");
+
+    // 首帧心跳 = manifest 可解析 + 信号处理器已安装（早于模型派发）。
+    let state = fx.job.join("out/state.json");
+    let mut ready = false;
+    for _ in 0..200 {
+        if state.is_file() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(ready, "心跳未落盘：子进程没走到 run_with");
+    std::thread::sleep(std::time::Duration::from_millis(150)); // 让它真的发出至少一个在途请求
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+
+    let mut status = None;
+    for _ in 0..400 {
+        if let Some(st) = child.try_wait().unwrap() {
+            status = Some(st);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    stop.store(true, AtomicOrdering::Relaxed);
+    server.join().unwrap();
+
+    let st = status.expect("SIGTERM 后 10s 内未退出");
+    assert_eq!(st.code(), Some(0), "partial 报告已写出 → 退出码 0（不是被信号杀死）");
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "partial");
+    assert_eq!(r["extensions"]["redteam"]["status_code"], "wall_clock_exhausted");
+    let reason = r["status_reason"].as_str().unwrap();
+    assert_eq!(
+        reason.matches("wall-clock budget exhausted or terminated").count(),
+        1,
+        "中断原因只出现一次（不得 `…: …` 重复）: {reason}"
+    );
+    let wall = r["usage"]["wall_clock_ms"].as_u64().unwrap();
+    assert!(
+        (20..10_000).contains(&wall),
+        "中断报告要用 job 墙钟（实际 {wall}ms）：旧口径取 max cell，零完成 cell 时为 0"
+    );
+    assert!(!fx.repo.join(".redteam").exists(), "job 模式不得写检出");
+}

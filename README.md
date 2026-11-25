@@ -49,6 +49,30 @@ rename 迁移 → 已 resolve 的排除 → quote 锚得上就携带（行号重
 两套口径并存是有意的：本地增量轮要的是「快、可复现的携带」，hibot 复验要的是「对单条 finding 的可解释判决」。
 真实数据（#400）攒够之前不做统一。
 
+### 配置投递、凭据与语言
+job 模式（`config_delivery: job_native`）只读 manifest 的 `paths.config`（契约固定 `config/executor.redteam.json`）：
+**没有 `--config` flag**，也不读 `~/.redteam/config.json`、不读 stdin、不依赖 cwd、不写 `~/.redteam`。
+投递前可自检：`redteam config check <file> --kind triage|review|verify`（形状 + 未知键 + 明文密钥 + 角色最小集）。
+- **凭据只走环境变量**：配置里只写 `apiKeyEnv`（模型条目可覆盖 provider 级），job 模式**不读** `secrets.json`；
+  配置含 `apiKey` 一类明文字段会在 `config check` 与 job 入口被拒（`config_contains_secret:<pointer>`）。
+- **报告语言**：`settings.language`（`zh_CN` / `en_US`，缺省 `en_US`，**不读 `LANG`**）决定 prompt 里的语言指令、
+  `status_reason` 与 verify 证据等人读文本；机器字段（`status_code` / `kind` / `verify.counts` / `template_hashes` /
+  `warnings`）不随语言。
+
+### 输出与退出码
+- 只写 `paths.out`：`report.json`（原子写，**终态唯一真相**）+ `state.json`（可选心跳，每 2s 一帧覆写；
+  `phase ∈ preparing|running|finishing`，**不写终态**；`llm.in_flight` / `progress` 从运行态现读，缺失视为允许）。
+- 退出码（本地调试便利，hibot 不读）：`0` = `ok` / `partial` 报告已写出；`1` = `error` 报告已写出；
+  `2` = `job.json` 定位不到或不可解析（**不写报告**，runner 按 no-report=error）。
+
+### 临时限制（v1）
+- **runner 真调尚未接入**（hibot M0/M1 未开始）：当前验收走手工 job 目录联调 + `scripts/acceptance-matrix.sh`
+  （3 kind × 3 夹具 × 2 语言 = 18 组合，`HIBOT_SCHEMA_DIR` 存在时逐份过 hibot 契约 schema）。
+- `verify` 只核验**有代码锚**的 finding（triage 的 intent 项没有代码锚，不进 verify）；不产 finding。
+- job 模式开验真但未声明 `refuter` 时**跳过并披露**（`extensions.redteam.refute_skipped = "no_refuter"`），
+  不静默、也不塞 `refuted`。
+- 报告**不含 cost**（`usage` 只有 token 与墙钟；成本统计归 hibot 侧）。
+
 ## 角色
 
 配置在 `~/.redteam/config.json` 的 `settings` 下按角色声明模型池——池里的模型按声明顺序轮转
@@ -106,6 +130,7 @@ make build     # 编译 darwin-arm64 release 并放到 plugins/redteam/bin/darwi
 make gen       # 从 commands/ 重生成 codex-skills/
 make verify    # gen 后要求零 diff
 cargo test     # lib + bin + e2e + packaging
+scripts/acceptance-matrix.sh   # hibot 验收矩阵（18 组合；HIBOT_SCHEMA_DIR 存在时逐份过契约 schema）
 ```
 
 二进制随仓分发（marketplace 要它），所以 `make build` 之后工作树会有 5MB 级 diff，按仓内惯例单独提交（`build: 重建二进制`）。

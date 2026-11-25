@@ -148,7 +148,9 @@ pub async fn run_with(
         let refute_skipped = (cfg.settings.review.refuters.enabled && cfg.active_roles().refuters.is_empty())
             .then_some("no_refuter");
         let base_extras = report::ReviewExtras { refute_skipped, ..Default::default() };
-        let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink, None, &dismissed, &base_extras);
+        let r = lifecycle::interrupted_report(
+            &manifest, &lang, &cfg, &sink, None, &dismissed, &base_extras, started.elapsed().as_millis() as u64,
+        );
         return finish(&out_dir, r, &heartbeat);
     }
     match run_review(
@@ -375,7 +377,10 @@ async fn run_review(
             // 停止派发：drop 掉运行 future（tokio 取消），再用已落地 cell 组 partial。
             drop(run);
             heartbeat.set_phase(state::Phase::Finishing);
-            Ok(lifecycle::interrupted_report(manifest, lang, cfg, &sink, Some(&repo), dismissed, &base_extras))
+            Ok(lifecycle::interrupted_report(
+                manifest, lang, cfg, &sink, Some(&repo), dismissed, &base_extras,
+                started.elapsed().as_millis() as u64,
+            ))
         }
     }
 }
