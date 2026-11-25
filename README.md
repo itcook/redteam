@@ -137,9 +137,9 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 R2 布局：`v{version}/{asset}`、`v{version}/SHA256SUMS`、`v{version}/config.schema.json`、
-`install.sh`、`config.schema.json`、`latest`（仅正式版更新）。本机兜底发布仍是
-`scripts/release.sh v0.1.0`（完整流程与 secrets/vars 见
-`.doc/plans/2026-11-24-redteam-release-runbook.md`）。
+`install.sh`、`config.schema.json`、`latest`（仅正式版更新）。`scripts/release.sh v0.1.0` 默认只推 tag、
+由 CI 发布；要在本机完成 Release + R2，用 `--local-publish`（需先停掉同 tag 的 Actions run）。
+完整流程与 secrets/vars 见 `.doc/plans/2026-11-24-redteam-release-runbook.md`。
 
 ## 从源码构建
 

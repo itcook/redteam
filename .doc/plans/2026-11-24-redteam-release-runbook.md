@@ -60,19 +60,36 @@ git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1    # 预发布
 
 也可在 Actions → release → Run workflow 手填 tag（需要目标分支已包含本 workflow）。
 
-### 2.2 本机兜底发布与预演
+### 2.2 本机入口与预演
 
 ```bash
-scripts/release.sh v0.1.0                 # 正式版
-scripts/release.sh v0.1.0-rc.1            # 预发布
-scripts/release.sh v0.1.0 --prepare-only  # 只产出发行产物（要求工作区干净，零副作用）
-scripts/release.sh v0.1.0 --dry-run       # 预演（允许脏工作区，零副作用）
-scripts/release.sh v0.1.0 --skip-r2       # 只发 GitHub Release
-scripts/release.sh v0.1.0 --no-push       # 只建本地 tag（不推、不发 Release、不传 R2）
+scripts/release.sh v0.1.0                  # 推 tag，由 CI 发布（默认；脚本到此退出）
+scripts/release.sh v0.1.0 --local-publish  # 本机完成 Release + R2（先停掉同 tag 的 Actions run）
+scripts/release.sh v0.1.0-rc.1             # 预发布
+scripts/release.sh v0.1.0 --prepare-only   # 只产出发行产物（要求工作区干净，零副作用）
+scripts/release.sh v0.1.0 --dry-run        # 预演（允许脏工作区，零副作用）
+scripts/release.sh v0.1.0 --skip-r2        # 本机发布但只发 GitHub Release
+scripts/release.sh v0.1.0 --no-push        # 只建本地 tag（不推、不发 Release、不传 R2）
 ```
 
+> **默认不双发**：推 tag 后 CI 会建 Release + 镜像 R2；本机若继续发，两套归档哈希不同，
+> 会交叉覆盖同名资产与 `SHA256SUMS`。所以默认发布路径下脚本推送 tag 后即退出；
+> 只有 `--local-publish` 才在本机继续（调用方负责先停掉/不触发同 tag 的 workflow）。
+
 `--prepare-only` 与 `--dry-run` 都只落在 `dist/release/`；CI 用前者（干净工作区 + 门禁），
-本地快速预演用后者。
+本地快速预演用后者。`--prepare-only` / `--dry-run` 不读 `.env`（不执行本机配置里的任意 shell），
+`.env` 只在真正发布阶段加载。`--skip-verify` 只能与 `--prepare-only` 同用。
+
+脚本会自己拒绝这些情况：
+
+- 工作区有未提交改动（dry-run 除外；prepare-only 总是要求干净）；
+- `--prepare-only` 与 `--dry-run` / `--no-push` / `--skip-r2` 同用；
+- `--skip-verify` 未与 `--prepare-only` 同用；
+- tag 已存在但不指向 `HEAD`（产物来自 HEAD，tag 必须同源）；
+- tag 与 `Cargo.toml` 版本不一致；
+- `gh` 未登录；
+- `make verify` 不绿；
+- 构建出的二进制 `--version` 与 Cargo 版本不一致。
 
 脚本会自己拒绝这些情况：
 
@@ -85,9 +102,9 @@ scripts/release.sh v0.1.0 --no-push       # 只建本地 tag（不推、不发 R
 
 ### 2.3 发布后回验（脚本内自动做）
 
-- GitHub：四个资产 HEAD 200；归档与 `config.schema.json` 下载回来比 SHA256。
-- R2（启用时）：同上，外加 `install.sh`、前缀根 `config.schema.json`、`latest`（正式版）。
-- 任一失败 → 退出码非 0（发布不静默成功）。
+- GitHub Release（CI）：四个资产 HEAD 200；归档与 `config.schema.json` 下载回来比 SHA256。
+- R2（启用时）：同样回验版本目录的归档 / `SHA256SUMS` / schema，外加 `install.sh`、前缀根 `config.schema.json`、`latest`（正式版）。
+- 任一失败 → 步骤失败（发布不静默成功）。
 
 ## 3. 产物核对清单
 
