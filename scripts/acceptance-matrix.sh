@@ -24,7 +24,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --out)        OUT=${2:?--out 需要目录}; shift 2 ;;
     --schema-dir) SCHEMAS=${2:?--schema-dir 需要目录}; shift 2 ;;
-    -h|--help)    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)    sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "error: 未知参数 $1" >&2; exit 2 ;;
   esac
 done
