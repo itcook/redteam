@@ -29,6 +29,11 @@ Path (post-fix): {{CHANGE_PATH}}
 {{RENAMED_FROM}}
 </change>
 {{PRIOR_BLOCK}}
+<fix_scope>
+Every file the fix changed (this finding's file may be only one of them). It is scope information, not code evidence: if the substance of the fix looks absent from the material below, it may live in one of these files — return `inconclusive` and say so instead of assuming nothing changed.
+{{FIX_SCOPE}}
+</fix_scope>
+
 <fix_diff>
 The hunks of this file in the fix diff (post-fix side paths). If this file has no hunks, the fix did not touch it.
 {{HUNKS}}

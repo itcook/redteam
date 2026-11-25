@@ -179,6 +179,7 @@ pub async fn run(
     progress: Arc<Mutex<Progress>>,
 ) -> Outcome {
     let factor = budget::time_factor(req.wall_clock_s);
+    let fix_scope = fix_scope_lines(req.fixes);
     // ── Phase 1 prepare（同步：读文件、装配证据、量规模；async 阶段不再碰 fs）──
     let mut prepared = Vec::with_capacity(req.findings.len());
     for (idx, finding) in req.findings.iter().enumerate() {
@@ -202,7 +203,13 @@ pub async fn run(
             }
         }
         let prior = req.prior.and_then(|p| p.get(&finding.fingerprint));
-        let prompt = prompt::build(&prompt::FixVerifyPromptInput { lang: req.lang, finding, evidence: &ev, prior });
+        let prompt = prompt::build(&prompt::FixVerifyPromptInput {
+            lang: req.lang,
+            finding,
+            evidence: &ev,
+            prior,
+            fix_scope: &fix_scope,
+        });
         let size_kb = budget::kb(prompt.system.len() + prompt.user.len());
         prepared.push(Prepared {
             idx,
@@ -324,6 +331,22 @@ fn decided(finding: &input::InputFinding, evidence: String) -> ItemRun {
         rl_retries: 0,
         rl_wait_ms: 0,
     }
+}
+
+/// fix 改到的全部文件（`- <kind> <path>`，按路径序，封顶 40）：进 prompt 的 `<fix_scope>`，
+/// 让模型知道「证据之外还改了什么」（文档/其它文件里的实质修复不该被当成「没改」）。
+fn fix_scope_lines(fixes: &[input::FileFix]) -> String {
+    const MAX_FILES: usize = 40;
+    let mut paths: Vec<&input::FileFix> = fixes.iter().collect();
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut out = String::new();
+    for f in paths.iter().take(MAX_FILES) {
+        out.push_str(&format!("- {} {}\n", f.kind.as_str(), f.path));
+    }
+    if paths.len() > MAX_FILES {
+        out.push_str(&format!("… (+{} more files)\n", paths.len() - MAX_FILES));
+    }
+    out.trim_end().to_string()
 }
 
 /// 一条 finding 的派发：过 provider 门 → 单轮调用（挂 `AttemptPolicy`）→ 解析 → 四态校验。
@@ -541,6 +564,22 @@ mod tests {
 
     fn v(fp: &str, status: FixVerifyStatus) -> Verification {
         Verification { finding_fingerprint: fp.into(), status, evidence: "e".into(), quote: None }
+    }
+
+    #[test]
+    fn fix_scope_lists_changed_files_and_caps_at_40() {
+        let fixes: Vec<input::FileFix> = (0..45)
+            .map(|i| input::FileFix {
+                path: format!("src/f{i:02}.rs"),
+                old_path: None,
+                kind: input::FixChange::Modified,
+                diff: String::new(),
+            })
+            .collect();
+        let scope = fix_scope_lines(&fixes);
+        assert_eq!(scope.lines().filter(|l| l.starts_with("- modified ")).count(), 40);
+        assert!(scope.ends_with("… (+5 more files)"), "{scope}");
+        assert!(scope.starts_with("- modified src/f00.rs"), "按路径序: {scope}");
     }
 
     #[test]
