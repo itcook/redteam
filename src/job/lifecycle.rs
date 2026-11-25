@@ -154,6 +154,9 @@ pub fn interrupted_report(
     root: Option<&std::path::Path>,
     dismissed: &crate::job::dismissed::Dismissed,
     base_extras: &crate::job::report::ReviewExtras,
+    // job 墙钟（`started.elapsed().as_millis()`）：与正常路径 `run.duration_ms` 同口径，
+    // 不用 `usage_from_cells` 的 max-cell（它只汇总 token，不代表 job 延迟）。
+    wall_clock_ms: u64,
 ) -> HibotReport {
     let (cells, _phases) = sink.snapshot();
     let findings = findings_from_cells(&cells);
@@ -168,7 +171,8 @@ pub fn interrupted_report(
     // 2.4：与正常路径同一条链——指纹 → dismissed（只标审计，不写 refuted）。
     let ledger = crate::job::dismissed::apply(&mut findings, dismissed);
     let dropped = self_dropped + upstream;
-    let usage = usage_from_cells(&cells);
+    let mut usage = usage_from_cells(&cells);
+    usage.wall_clock_ms = wall_clock_ms;
     let failure = JobFailure::new("wall_clock_exhausted", None);
     let text: StatusText = failure.status_text(lang);
     // 与正常路径共享本次运行事实（input_consistency / prior_routing / refute_skipped / 已有 partial 原因）。
@@ -274,9 +278,17 @@ mod tests {
             None,
             &crate::job::dismissed::Dismissed::default(),
             &crate::job::report::ReviewExtras::default(),
+            4321,
         );
         assert_eq!(r.status, crate::job::status::JobStatus::Partial);
-        assert!(r.status_reason.unwrap().contains("wall-clock budget"));
+        let reason = r.status_reason.clone().unwrap();
+        assert!(reason.contains("wall-clock budget"));
+        assert_eq!(
+            reason.matches("wall-clock budget exhausted or terminated").count(),
+            1,
+            "中断原因只出现一次（不得 `…: …` 重复）: {reason}"
+        );
+        assert_eq!(r.usage.wall_clock_ms, 4321, "中断路径的墙钟是 job 墙钟，不是 max cell");
         assert_eq!(r.extensions["redteam"]["status_code"], "wall_clock_exhausted");
     }
 
@@ -327,10 +339,13 @@ mod tests {
             Some(&repo),
             &dismissed,
             &base_extras,
+            // 有已落地 cell（时长 0）时也必须用 job 墙钟，而不是 max cell。
+            9876,
         );
 
         assert_eq!(r.status, crate::job::status::JobStatus::Partial);
         assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.usage.wall_clock_ms, 9876, "中断路径用 job 墙钟");
         assert_eq!(r.findings[0].quote, "let x  =  1;", "中断报告也要用检出原文修正 quote");
         assert_eq!((r.findings[0].line_start, r.findings[0].line_end), (2, 2), "行号要重锚");
         // 人的驳回优先：即使复核判了 REFUTED，对外仍是 refuted=false，且不叠 refute 扩展。

@@ -488,7 +488,9 @@ pub fn partial_report(
     // `StatusText.code` 可能带 `<detail>`：拆回 JobFailure，再与额外原因一起按附录 E 优先级排序。
     let base = reason.code.split(':').next().unwrap_or(reason.code.as_str()).to_string();
     let detail = reason.code.split_once(':').map(|(_, d)| d.to_string());
-    let mut reasons = vec![JobFailure { code: base, detail, reason: Some(reason.reason.clone()) }];
+    // 调用方给的 `reason` 已经渲染过一次；这里只拆回 code/detail 交给 `render_partial` 重新渲染。
+    // 若再塞进 `JobFailure.reason`，`status_text` 会在模板前把同一句拼一次（`…: …` 重复）。
+    let mut reasons = vec![JobFailure { code: base, detail, reason: None }];
     reasons.extend(extras.extra_partial.iter().cloned());
     reasons.sort_by_key(|f| code_rank(&f.code));
     let partial = render_partial(&reasons, lang).unwrap_or_else(|| reason.clone());
@@ -723,5 +725,49 @@ mod tests {
         assert_eq!(empty.verifications.as_deref(), Some(&[][..]));
         let review = error_report_covering(&m, &lang, &failure, &[fp('a')]);
         assert!(review.verifications.is_none(), "review 报告不带 verifications");
+    }
+
+    /// 中断 / 预算耗尽路径：`partial_report` 只重渲染一次，不得把同一句拼两遍。
+    #[test]
+    fn partial_report_renders_each_reason_exactly_once() {
+        let m = manifest();
+        let lang = crate::config::Language::EnUs.output();
+        let text = JobFailure::new("wall_clock_exhausted", None).status_text(&lang);
+        let extras = ReviewExtras {
+            extra_partial: vec![JobFailure::new("quotes_dropped", Some("2".into()))],
+            ..Default::default()
+        };
+        let usage = UsageOut { input_tokens: 1, output_tokens: 2, cached_input_tokens: 3, wall_clock_ms: 42 };
+        let r = partial_report(&m, &lang, &text, vec![], usage, &Config::default(), 0, &extras);
+        let reason = r.status_reason.clone().unwrap();
+        assert_eq!(reason.matches("wall-clock budget exhausted or terminated").count(), 1, "{reason}");
+        assert_eq!(reason.matches("findings dropped: quote not found verbatim").count(), 1, "{reason}");
+        // 两条原因 → 恰一个 `; ` 连接符（模板自带的分号不算分隔符）。
+        assert_eq!(reason.matches("results flushed; ").count(), 1, "{reason}");
+        assert_eq!(r.extensions["redteam"]["status_code"], "wall_clock_exhausted");
+        assert_eq!(r.usage.wall_clock_ms, 42, "partial_report 不覆盖调用方给的墙钟");
+    }
+
+    /// 带 `<detail>` 的码（如 `scan_incomplete:1/2`）拆回 detail 后重渲染，句子不得重复。
+    #[test]
+    fn partial_report_rehydrates_detail_without_duplication() {
+        let lang = crate::config::Language::EnUs.output();
+        let text = JobFailure::new("scan_incomplete", Some("1/2".into())).status_text(&lang);
+        let usage = UsageOut { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, wall_clock_ms: 1 };
+        let r = partial_report(&manifest(), &lang, &text, vec![], usage, &Config::default(), 0, &ReviewExtras::default());
+        assert_eq!(r.status_reason.as_deref(), Some("scan incomplete: 1/2 cells failed"));
+        assert_eq!(r.extensions["redteam"]["status_code"], "scan_incomplete:1/2");
+    }
+
+    /// 中文同样只出现一次（语言只换模板，不换拼接规则）。
+    #[test]
+    fn partial_report_does_not_duplicate_in_chinese() {
+        let lang = crate::config::Language::ZhCn.output();
+        let text = JobFailure::new("wall_clock_exhausted", None).status_text(&lang);
+        let usage = UsageOut { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, wall_clock_ms: 1 };
+        let r = partial_report(&manifest(), &lang, &text, vec![], usage, &Config::default(), 0, &ReviewExtras::default());
+        let reason = r.status_reason.unwrap();
+        assert_eq!(reason.matches("达到墙钟预算或收到终止信号，已收敛落盘").count(), 1, "{reason}");
+        assert!(!reason.contains("："), "不得出现「模板：模板」的重复拼接: {reason}");
     }
 }
