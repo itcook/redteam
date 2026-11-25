@@ -115,11 +115,13 @@ redteam review --base main                                     # 评审当前分
 首期仅 **macOS arm64**：
 
 ```sh
-curl -fsSL https://github.com/itcook/redteam/releases/latest/download/install.sh | sh
-redteam update --check     # 只检查；redteam update 升级到最新正式版
-```
+curl -fsSL https://release.hibot.sh/executor/audit/redteam/install.sh | REDTEAM_FROM=r2 sh
+redteam update --from r2 --check     # 只检查；--from r2 走 R2 镜像（默认是 GitHub Release）
+redteam update --from r2             # 升级到最新正式版
 
 安装脚本会校验 `SHA256SUMS`、原子替换旧版本，并拒绝非 macOS arm64 平台。
+默认下载源是 GitHub Release；上面的命令用 `REDTEAM_FROM=r2` / `--from r2` 指向 R2 镜像
+（`https://release.hibot.sh/executor/audit/redteam`）。
 插件渠道（下面的 `plugins/redteam/`）走 marketplace / `git pull`，不用 `install.sh`；
 `redteam update` 在插件目录下默认拒写（`--force` 才覆盖）。
 
