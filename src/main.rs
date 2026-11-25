@@ -154,13 +154,15 @@ enum Cmd {
         #[arg(long)]
         base_url: Option<String>,
     },
-    /// triage（外派）：读 job 目录，写 hibot `report.triage/1`（Phase 1 仅命令面）。
+    /// triage（外派）：读 job 目录，写 hibot `report.triage/1`。三轴（security / drift / intent）并发，
+    /// 产出 `summary` + findings + `extensions.redteam.blockers`；轴失败 ⇒ `partial` + `triage_axis_failed:<axis>`。
     Triage {
         /// job 目录（必需）：manifest `hibot.audit.job.triage/1`。
         #[arg(long)]
         job_dir: String,
     },
-    /// verify（外派）：读 job 目录，写 hibot `report.verify/1`（Phase 1 仅命令面）。
+    /// verify（外派）：读 job 目录，写 hibot `report.verify/1`。逐条核验 anchored finding 的修复，
+    /// 四态 `resolved / unresolved / regressed / inconclusive`；出现 inconclusive ⇒ `partial` + `status_reason`。
     Verify {
         /// job 目录（必需）：manifest `hibot.audit.job.verify/1`。
         #[arg(long)]
@@ -441,7 +443,7 @@ enum ModelCmd {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
-    /// 生成 executor config 的 JSON Schema（draft-07；`$id: urn:redteam:config/1`）。
+    /// 生成 executor config 的 JSON Schema（draft-07；`$id: urn:redteam:config/2`，`schemaVersion: 2`）。
     Schema {
         /// 写到文件（缺省打印到 stdout）。入库生成物是 dist/config.schema.json。
         #[arg(long)]
