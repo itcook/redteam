@@ -1,0 +1,36 @@
+# 常规 CI：main 的 push / PR 跑门禁 + 全量测试。
+#
+# 发布由 release.yml 负责（tag 触发），本文件不参与发布。
+# main = 稳定线（发布 tag 打在这里）；dev = 开发集成分支。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: make verify（版本同源 / 派生物零漂移 / packaging）
+        run: make verify
+
+      - name: cargo test（全量）
+        run: cargo test --no-fail-fast
