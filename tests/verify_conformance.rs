@@ -506,6 +506,41 @@ async fn broken_findings_are_the_only_case_allowed_to_leave_verifications_empty(
     assert_eq!(r["verifications"], serde_json::json!([]), "findings 坏 → 无指纹可覆盖");
 }
 
+// ─────────── B-lite：真实回归形状（hiapi#400 A→B 的骨架） ───────────
+
+#[tokio::test]
+async fn symbol_blast_radius_puts_the_real_regression_site_in_the_prompt() {
+    // #400 第 1 轮分诊 blocker 锚在 execution.go；修复同时改了 distributor.go 的调用点，
+    // 而第 2 轮抓到的回归（严格拒绝后回退重选）就在那个调用点后面。B-lite 必须把它带进 prompt。
+    let exec_base = "package service\n\nfunc PinnedChannelAllowed(c *gin.Context) bool {\n\treturn old(c)\n}\n";
+    let exec_head = "package service\n\nfunc PinnedChannelAllowed(c *gin.Context) bool {\n\tfresh, err := load(c)\n\treturn strict(fresh, err)\n}\n";
+    let dist_base = "package middleware\n\nfunc Distribute() {\n\tallowed, e := llmconfig.ChannelAllowed(c, snap, channel)\n\tif e != nil || !allowed {\n\t\tabort()\n\t}\n\tfallback, _ := pick()\n\t_ = fallback\n}\n";
+    let dist_head = "package middleware\n\nfunc Distribute() {\n\tallowed, e := llmconfig.PinnedChannelAllowed(c, snap, channel)\n\tif e != nil || !allowed {\n\t\tabort()\n\t}\n\tfallback, _ := pick()\n\t_ = fallback\n}\n";
+    let base: [(&str, &str); 2] = [("service/execution.go", exec_base), ("middleware/distributor.go", dist_base)];
+    let f = finding("service/execution.go", "return old(c)", 4, "严格检查被放宽");
+    let router = Arc::new(Router::new(vec![(
+        needle_of(&f),
+        verdict("resolved", "严格半已改读实时行", Some("return strict(fresh, err)")),
+    )]));
+    let findings = findings_json(&[f]);
+    let fx = make_job(&base, |repo| {
+        std::fs::write(repo.join("service/execution.go"), exec_head).unwrap();
+        std::fs::write(repo.join("middleware/distributor.go"), dist_head).unwrap();
+    }, &findings);
+    let r = run(&fx, router.clone()).await;
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["verifications"][0]["status"], "resolved");
+    assert_eq!(r["extensions"]["redteam"]["verify"]["warnings"], serde_json::json!([]));
+    let seen = router.seen();
+    let prompt = &seen[0];
+    assert!(prompt.contains("### middleware/distributor.go (changed by the fix)"), "{prompt}");
+    assert!(
+        prompt.contains("- PinnedChannelAllowed referenced at middleware/distributor.go:4"),
+        "必须带符号名 + 引用处 file:line: {prompt}"
+    );
+    assert!(prompt.contains("(post-fix snapshot)"), "必须附该 hunk 的 ±N 快照: {prompt}");
+}
+
 // ───────────────── 并行与观测（Phase 4 增强） ─────────────────
 
 #[tokio::test]

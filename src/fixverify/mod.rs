@@ -134,6 +134,8 @@ pub struct Progress {
     /// provider 门 429 排队重试（`AttemptPolicy` 计数；与心跳 `llm.retrying` 同源）。
     rl_retries: u32,
     rl_wait_ms: u64,
+    /// 证据降级原因（`symbol_blast_radius_skipped:*` 等），集合语义去重。
+    warnings: std::collections::BTreeSet<String>,
 }
 
 /// 报告层需要的全部素材。
@@ -151,6 +153,8 @@ pub struct Outcome {
     pub latency: (u64, u64),
     /// `(429 排队重试次数, 等待毫秒)`：来自 provider 门的 `AttemptPolicy`。
     pub rate_limit: (u32, u64),
+    /// 证据降级原因（去重排序）；报告披露用，不参与 status。
+    pub warnings: Vec<String>,
     /// 首个 verifier 身份（`provider/id`），报告披露用。
     pub verifier: String,
 }
@@ -190,6 +194,12 @@ pub async fn run(
             progress.lock().unwrap().done.push(Verification::inconclusive(&finding.fingerprint, text));
             heartbeat.bump_done();
             continue;
+        }
+        {
+            let mut p = progress.lock().unwrap();
+            for w in &ev.warnings {
+                p.warnings.insert(w.clone());
+            }
         }
         let prior = req.prior.and_then(|p| p.get(&finding.fingerprint));
         let prompt = prompt::build(&prompt::FixVerifyPromptInput { lang: req.lang, finding, evidence: &ev, prior });
@@ -273,6 +283,7 @@ fn finalize(req: &FixVerifyRequest<'_>, progress: &Progress, completed: bool) ->
         duplicates: req.duplicates,
         latency: (progress.latency_total_ms, progress.latency_max_ms),
         rate_limit: (progress.rl_retries, progress.rl_wait_ms),
+        warnings: progress.warnings.iter().cloned().collect(),
         verifier: req.routes.first().map(|(name, _)| name.clone()).unwrap_or_default(),
     }
 }

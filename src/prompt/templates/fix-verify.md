@@ -39,6 +39,11 @@ Hunks from OTHER files that appear to carry the same code as the finding's quote
 {{RELATED}}
 </related_hunks>
 
+<symbol_blast_radius>
+Other files that the fix also changed and that reference symbols changed in THIS file. Each reference is listed as `- <symbol> referenced at <path>:<line>`, followed by that hunk's post-fix snapshot. A fix that changes a symbol's behaviour can break these call sites even when the finding itself is fixed — check them before answering `resolved`.
+{{BLAST}}
+</symbol_blast_radius>
+
 <post_fix_snapshot>
 Verbatim content of the post-fix checkout around the finding's location (line numbers in the header; the body carries no numbering).
 {{SNAPSHOT}}
