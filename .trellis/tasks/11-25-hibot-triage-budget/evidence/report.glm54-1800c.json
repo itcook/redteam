@@ -1,0 +1,207 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "summary": {
+    "blockers_count": 0,
+    "convention_drift": "local",
+    "fit": "in-scope",
+    "intent_undelivered": 0,
+    "local_count": 3,
+    "risk": "medium",
+    "routing": {
+      "focus": [],
+      "specs": [
+        "AGENTS.md"
+      ],
+      "wall_clock_s": 1350
+    },
+    "scope_creep_count": 1,
+    "security_tier": 0,
+    "structural_count": 0
+  },
+  "usage": {
+    "input_tokens": 167103,
+    "output_tokens": 186035,
+    "cached_input_tokens": 33088,
+    "wall_clock_ms": 1050125
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 2,
+            "dropped_rows": [
+              {
+                "conf": 7,
+                "file": "service/feishu_finance_agent.go",
+                "line": 359,
+                "reason": "below_threshold",
+                "surface": 5
+              },
+              {
+                "conf": 7,
+                "file": "service/feishu_finance_agent_client_test.go",
+                "line": 41,
+                "reason": "below_threshold",
+                "surface": 5
+              }
+            ],
+            "dropped_total": 2,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 217128,
+          "ok": true,
+          "rows": 2,
+          "usage": {
+            "cached_input_tokens": 13376,
+            "input_tokens": 45074,
+            "output_tokens": 29259
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 617778,
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 3,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 51913,
+            "output_tokens": 39575
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 4,
+          "claims": 20,
+          "delivered": 20,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 1049997,
+          "notes": [
+            "Verification statements (not claims): author reports 20 new/updated tests covering plan building, full confirmation flow, duplicate clicks, non-initiator/demoted Root, cancel/expiry, strangers, SDK event and card-callback conversion, re-click during execution, crash recovery, json_schema → json_object fallback, JSON field validation, injection warnings, replay re-auth, fencing version, parsing recovery, and withdrawal current-value; states go build ./... and go test ./service ./model ./router ./controller all pass.",
+            "Author reports retesting three command types (execute, all-fields, follow-up) with a real DeepSeek model (deepseek-v4.1-flash) and completing a local end-to-end smoke with a real Feishu app and real model (message → confirmation card → confirm → DB verification); these are observations, not claims.",
+            "Author explicitly requests Root-side acceptance of the documented threat model ('该模型需要 Root 侧确认接受'); this is a request for sign-off, not a checkable claim.",
+            "Deployment prerequisites are documented as configuration: Feishu app must receive im.message.receive_v1 and card.action.trigger over long connection with permissions im:message:send_as_bot, im:message.p2p_msg:readonly, im:message.group_at_msg:readonly; env vars FEISHU_FINANCE_AGENT_APP_ID/APP_SECRET/LLM_BASE_URL/LLM_API_KEY/LLM_MODEL (plus optional FEISHU_FINANCE_AGENT_OPENAPI_BASE) are injected in the deployment environment.",
+            "Author notes a pre-existing local SQLite/glebarez v1.10 restart DDL issue unrelated to this PR (production uses PostgreSQL).",
+            "No reviewer comments (non-bot, non-author) were supplied, so maintainer overlap cannot be flagged; PR body ends with 'Generated with Claude Code', indicating AI-assisted authorship.",
+            "This slice contains only go.mod, model/main.go and service/feishu_finance_agent.go; claims c3, c18, c19 (env-gated startup, LLM client config/fallback validation, quota formatting move) have no evidence here and are expected in other slices.",
+            "go.mod also adds github.com/gogo/protobuf v1.3.2 (indirect, line 107), consistent with the Feishu SDK dependency; not treated as scope creep.",
+            "All comments and strings in the diff were treated as data; no embedded instructions were followed.",
+            "All line numbers refer to the new files in this slice (hunks start at line 1) and were derived by counting the supplied diff; each note describes the anchored code verbatim.",
+            "c3, c4 and c20 have no evidence in this slice; their implementations (setting/, model/, service core, main.go) are covered by other slices.",
+            "go.sum additions besides the larksuite SDK pin are /go.mod hashes of transitive build dependencies, traceable to c2.",
+            "All line numbers for the new files are exact positions within their '+1,N' hunks; the main.go additions occupy lines 147-149 per the hunk header.",
+            "Claims c4, c8, c9, c16, c17, c19 are not assessable from this slice; their implementation appears to live in service/feishu_finance_agent.go, service/feishu_finance_agent_card.go and model/main.go, which are covered by other slices. They are omitted, not marked undelivered.",
+            "Minor observation: the setting file comment mentions 'HMAC keyring' as a deployment secret, but no HMAC field exists in FeishuFinanceAgentSetting (the ws comment states HMAC forwarding is no longer needed) — stale wording, not a functional issue.",
+            "Exported test-only helpers ResetFeishuFinanceAgentClientsForTest and SetFeishuFinanceAgentSettingForTest exist in this slice; treated as ordinary test seams, not scope creep.",
+            "Resilience details not spelled out in any claim but within the feature footprint: outer restart loop (5s sleep) around the WS session, panic recovery, larkws.WithAutoReconnect(true), and larkws.WithDomain derived from OpenAPIBase."
+          ],
+          "ok": true,
+          "repair_notes": [
+            "triage-intent-slice: first turn parse failed (finish=max_tokens, text_len=0, head=\"\"); repaired"
+          ],
+          "rows": 1,
+          "scope_creep": 1,
+          "usage": {
+            "cached_input_tokens": 19712,
+            "input_tokens": 70116,
+            "output_tokens": 117201
+          },
+          "verification_complete": true
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1800
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

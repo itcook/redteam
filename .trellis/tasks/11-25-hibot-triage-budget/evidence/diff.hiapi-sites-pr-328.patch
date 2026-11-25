@@ -1,0 +1,1360 @@
+diff --git a/.trellis/spec/content-api/backend/ingest-transcriber-guidelines.md b/.trellis/spec/content-api/backend/ingest-transcriber-guidelines.md
+index 69e559fe..c32f9b16 100644
+--- a/.trellis/spec/content-api/backend/ingest-transcriber-guidelines.md
++++ b/.trellis/spec/content-api/backend/ingest-transcriber-guidelines.md
+@@ -7,6 +7,16 @@
+ 
+ ## Scenario: 新增一个 contentType 的 ingest 转写器
+ 
++### Explicit editorial revisions (CLI issue 17, 2026-11-20)
++
++- `POST /admin/drafts/:id/revise` creates a pending revision from an accepted source; it never publishes or calls agents. The accepted source is immutable. A stable request key replays the same receipt before freshness checks; reuse with different content is a conflict.
++- `ingest_draft_acceptance` records successful accepted-draft/entity associations. `ingest_draft_revision` stores trusted target identity, a formal-content baseline and the initial candidate baseline. These controls must never come from producer `source`, `data`, or `parentDraftId`. Legacy sources require an unambiguous verified target, or a verified explicit target ID.
++- Revision acceptance runs under the existing review transaction and target row locks. Compare the current formal fingerprint, update only the selected locale and editorial fields, preserve publication time, other locales and operational identity. Do not call full-replacement CRUD (which can delete other locales) or create-only transcribers (which duplicate FAQ/changelog or collide on blog slug).
++- Model-info revisions still use the model content validation/normalization path. Sources owned by the specialized overview-refill workflow must use that workflow, not generic revision. Generic revision acceptance skips production-converge, translation and topic dispatch; retain post-commit cache invalidation.
++- Revision candidates use `update` with a draft version guard. AI `modify` and rejected-candidate derivation are explicitly rejected; create a new revision from the accepted original instead, so trusted target metadata cannot be dropped.
++- Pending Showcase copy editing is a separate `title`/`introduce` allowlist. Preserve the entire historical input, prompt, artifact, media and schema hash, even when current route schema differs. All forbidden keys fail atomically. New guarded updates advance `updatedAt` by at least one millisecond.
++- Regression anchor: `tests/modules/review/draft-revise.test.ts`, plus SDK `ingest-update-modify.test.ts`. Live staging verification is a separate deployment gate, not implied by local tests.
++
+ ### 1. Scope / Trigger
+ 
+ - Trigger: agents 产线新增制品类型要直投 content-api ingest 并经 review 队列落域实体（判例：playground-example / model-info / model-cover / model-poster / model-api-params / **blog（2026-10-06·S0）**）。
+diff --git a/.trellis/tasks/11-20-draft-revisions/check.jsonl b/.trellis/tasks/11-20-draft-revisions/check.jsonl
+new file mode 100644
+index 00000000..dbae1f1b
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/check.jsonl
+@@ -0,0 +1,2 @@
++{"file": ".trellis/tasks/11-20-draft-revisions/design.md", "reason": "Cross-repository acceptance contract"}
++{"file": ".trellis/spec/content-api/backend/ingest-transcriber-guidelines.md", "reason": "Final package quality review"}
+diff --git a/.trellis/tasks/11-20-draft-revisions/design.md b/.trellis/tasks/11-20-draft-revisions/design.md
+new file mode 100644
+index 00000000..6c7a158d
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/design.md
+@@ -0,0 +1,30 @@
++# Design
++## Wire contract
++PATCH /admin/drafts/:id adds optional expectedUpdatedAt (ISO). CLI update reads info to supply it unless --if-unmodified-since provided.
++POST /admin/drafts/:id/revise body: data (merge patch), expectedUpdatedAt (required ISO), idempotencyKey (required opaque 1..128), targetEntityId (optional ULID for legacy ambiguity).
++CLI: content draft revise --id ID --data JSON|@FILE|- --request-id KEY [--if-unmodified-since ISO] [--target-entity-id ID].
++Revision source version defaults to info. Replay checked before freshness, stable request ID required.
++Server mutation result: {draft: IngestDraftDetail, derivedFrom?: string, affectsPublishedContent: false, reused?: boolean}.
++CLI adds environment, sourceDraftId, draftId and status.
++
++## Storage and acceptance
++Persist trusted target/baseline/patch metadata separately from caller source/data. Record new accepted draft -> entity associations. Resolve legacy target only unambiguously; explicit target must be validated.
++Lock target, compare baseline, update original locale in accept transaction. Do not reuse full-replacement CRUD deleting other locales.
++Apply intended changes against current formal baseline, avoiding unrelated stale-data overwrite. Identity/operational fields stay protected.
++Revision descendants preserve trusted metadata or reject unsafe derivation explicitly.
++Showcase has a separate narrow editor; no media clearing, agent dispatch or current-schema acceptance check.
++
++## Rollout
++Migration/API before CLI. PR review only; no production deploy. Staging end-to-end proof follows deployment.
++
++## Tradeoffs and compatibility
++- A distinct revise command makes accepted-to-pending intent explicit; update never silently overwrites accepted content.
++- Caller-owned request IDs survive timeout/restart. Server replay lookup precedes source freshness checks; its fingerprint contains data and targetEntityId, deliberately excluding expectedUpdatedAt. The timestamp protects new operations, while a replay returns the prior result even if the source version changed. Different patch/target with the same key conflicts.
++- The CLI keeps a small local nonblank/length request-ID check for immediate usage errors; the SDK/API remains authoritative and validates all HTTP clients independently.
++- CLI auto-fetch only guards concurrent changes after that read. --if-unmodified-since is required to protect a version reviewed earlier by a human.
++- Old APIs may reject expectedUpdatedAt or lack revise. If a partially upgraded API commits a write but returns a receipt without affectsPublishedContent=false, the new CLI exits 1 with readback guidance; it never retries without the version guard. Deploy API first.
++- Trusted revision metadata is separate from caller-owned source/data to prevent forged target bindings. Additional tables are additive; existing drafts need no destructive backfill. Legacy resolution is deliberately conservative.
++- Narrow per-locale writes preserve other translations; full CRUD replacement and ordinary create-only accept were rejected because they can delete locales or duplicate content.
++
++## Rollback shape
++CLI can revert independently, retaining all content. Once revision rows exist, old create-only API accept is unsafe even if no revision has yet been accepted: disable mutation or roll forward; retain receipts/mappings. After acceptance, corrections require a new reviewed revision, not destructive history rollback. See implement.md and the sites rollout record for release gates.
+diff --git a/.trellis/tasks/11-20-draft-revisions/implement.jsonl b/.trellis/tasks/11-20-draft-revisions/implement.jsonl
+new file mode 100644
+index 00000000..9a8d6b8c
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/implement.jsonl
+@@ -0,0 +1,2 @@
++{"file": ".trellis/tasks/11-20-draft-revisions/design.md", "reason": "Shared API contract and safety invariants"}
++{"file": ".trellis/spec/content-api/backend/ingest-transcriber-guidelines.md", "reason": "Existing package contracts"}
+diff --git a/.trellis/tasks/11-20-draft-revisions/implement.md b/.trellis/tasks/11-20-draft-revisions/implement.md
+new file mode 100644
+index 00000000..092c65e4
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/implement.md
+@@ -0,0 +1,46 @@
++# Implementation
++- [x] API/SDK, trusted revision metadata, Showcase edits and guarded acceptance.
++- [x] CLI commands, concurrency flags, receipts, help and regression tests (hiapi-cli PR #18).
++- [x] Quality checks and independent full-change review; no remaining blocking findings.
++- [ ] Scoped commits and linked PRs, with actual verification limits.
++
++User approved implementation and review PRs on 2026-11-20 after feasibility exploration.
++
++API implementation: dedicated acceptance associations and revision receipts; editorial-field allowlists;
++versioned Showcase edits; replay-safe revise endpoint; transactional original-entity acceptance.
++Candidate updates retain trusted metadata. AI modify/rejected derivation on revision candidates fail closed.
++Existing specialized overview-refill sources retain their dedicated workflow.
++Local validation and staging deployment verification remain separate, pending recorded evidence.
++
++## Ordered verification and review gates
++1. Implement additive migration and SDK contract; regenerate Prisma and replay migrations on a fresh isolated database.
++2. Implement protected Showcase editing, trusted revision metadata and atomic original-entity acceptance; verify source records and non-target locales are unchanged.
++3. Run affected tests, typechecks and lint below. Baseline: 571 pass / 0 fail (55 files, 2080 assertions), 73 fresh migrations applied. Subsequent review-only regression: 13 pass / 0 fail, 97 assertions; production code unchanged.
++4. Independently review all changed code. Initial null-body and legacy matching findings fixed. PR #328 remains under weil-ai review; do not equate local review with remote approval.
++5. Verify real CLI/API integration (local Showcase and FAQ passed; API blog acceptance test also passes). After deployment, execute staging blog AND FAQ plus both named Showcase cases in rollout.md and the CLI checklist.
++6. Deploy migration -> API -> CLI, only after review. Source task tree and cross-child release gate live in the CLI parent/child records linked in prd.md.
++
++## Commands (repository root, local test database)
++```sh
++bun test apps/content-api/tests/modules/review apps/content-api/tests/modules/blog apps/content-api/tests/modules/faq apps/content-api/tests/modules/changelog apps/content-api/tests/modules/model/transcribe-info.test.ts apps/content-api/tests/modules/model/content-core.test.ts packages/content-sdk/tests/schema/ingest-update-modify.test.ts packages/content-sdk/tests/schema/ingest-blog.test.ts packages/content-sdk/tests/schema/ingest-batch5.test.ts packages/content-sdk/tests/schema/ingest-model.test.ts --timeout 30000
++bun run --filter @hiapi/content-api --filter @hiapi/content-sdk --filter @hiapi/manage typecheck
++bunx eslint apps/content-api/src/modules/review/{admin,model,modify-service,service,update-service,revision-rules,revision-service,revision-target,revision-write}.ts apps/content-api/tests/db-harness.ts apps/content-api/tests/modules/review/{draft-update,draft-revise}.test.ts packages/content-sdk/src/{index,schema/ingest}.ts packages/content-sdk/tests/schema/ingest-update-modify.test.ts --max-warnings 0
++git diff --check
++```
++Run `bunx --bun prisma generate` and `bunx --bun prisma migrate deploy` from apps/content-api against an isolated local database. Integration test harness also automatically applies migrations to its own test database. validation.md is supplemental execution evidence; this implement.md owns commands and gates.
++
++## Rollback points
++- Before any new revision rows, application rollback may leave additive tables intact.
++- Once a pending revision exists, never expose it to older create-only accept code. Disable mutations or roll forward; keep trusted receipts and mappings.
++- After acceptance, fix via another reviewed revision and retain original history/publication metadata. Do not drop the migration or delete content as automatic rollback.
++- Failed/stale accept must leave the revision pending and formal content unchanged in one transaction.
++
++## Remote checks
++The initial Actions run 44658696801 did not start because of billing/spending limits.
++The subsequent run 44669467061 did execute: content-api had one failing test because
++`POST /admin/drafts/:id/revise` was missing from `STAFF_WRITE_ROUTES`; quality failed
++on missing generated dashboard route types; site stopped during checkout before tests ran.
++The 2026-11-23 review follow-up registers the route and merges dev at `57d84c74`,
++including the existing dashboard artifact-generation CI step. New remote results must
++be checked on the updated PR head; the earlier billing explanation does not describe them.
++Live staging remains pending.
+diff --git a/.trellis/tasks/11-20-draft-revisions/prd.md b/.trellis/tasks/11-20-draft-revisions/prd.md
+new file mode 100644
+index 00000000..91cb6dc4
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/prd.md
+@@ -0,0 +1,25 @@
++# Showcase copy and accepted content revisions
++
++## Goal
++
++Implement the content-api/SDK/migration child of hiapi-cli issue 17: version guards, idempotent pending revisions and original-entity acceptance.
++
++Cross-repository coordinator: https://github.com/Zenty-Me/hiapi-cli/tree/feat/draft-revisions/.trellis/tasks/11-20-draft-revisions
++Authoritative child tracking record: https://github.com/Zenty-Me/hiapi-cli/tree/feat/draft-revisions/.trellis/tasks/11-20-draft-revisions-sites
++The CLI repository holds the parent/children task.json tree. This record owns sites implementation and local validation; CLI command implementation belongs to its sibling. Deployment dependency: sites migration/API must precede CLI distribution.
++
++## Requirements
++
++- Implement issue #17: narrow pending Showcase copy patches and explicit accepted-content pending revisions.
++- Preserve generated inputs/media, original accepted records, formal entities and other languages.
++- Guard stale writes and idempotent retries; no generation, publication or visibility changes on edits.
++
++## Acceptance Criteria
++
++- [ ] CLI/API tests cover original-entity acceptance, replay, conflicts, forbidden fields and locale preservation.
++- [ ] Submit linked review PRs. Document backend-first rollout and staging verification status.
++
++## Notes
++
++- Independent acceptance: Showcase restrictions, revision target/replay integrity, original blog/FAQ/changelog/model-info acceptance, locale preservation, migration and API/SDK tests.
++- Staging blog and FAQ integration remains a shared parent release gate; local results do not claim deployment.
+diff --git a/.trellis/tasks/11-20-draft-revisions/research/cross-repo-e2e.md b/.trellis/tasks/11-20-draft-revisions/research/cross-repo-e2e.md
+new file mode 100644
+index 00000000..88583c0f
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/research/cross-repo-e2e.md
+@@ -0,0 +1,18 @@
++# Real CLI / API integration evidence
++
++Date: 2026-11-20. Local only, separate PostgreSQL database `hiapi_issue17_e2e_test`.
++Built Rust CLI calls the actual Elysia HTTP app over loopback; staff introspection uses the project's test identity stub. No external credentials or services are used.
++
++Passed end-to-end:
++- Pending Showcase update automatically reads a version, patches title, and returns environment/status/IDs and affectsPublishedContent=false.
++- Info readback preserves input/prompt/artifact/media/historical hash.
++- A mixed title+forbidden prompt patch fails atomically.
++- Accepted FAQ creates a new pending revision with trusted formal target association; original accepted record and formal content remain unchanged.
++- Same request ID reuses the same pending revision.
++- Accept updates the existing FAQ entity and preserves original publication time and another language.
++- Original accepted record is unchanged after revision acceptance; one revision receipt exists; zero agent jobs.
++
++The isolated database successfully replayed all 73 migrations, including the additive revision migration.
++This is a real cross-repository local integration run, not evidence of deployed staging behavior.
++
++Reproduction driver and raw log are local-only `.pi/local-cli-e2e.ts` and WSL `/var/tmp/hiapi-issue17-e2e.log`.
+diff --git a/.trellis/tasks/11-20-draft-revisions/research/feasibility.md b/.trellis/tasks/11-20-draft-revisions/research/feasibility.md
+new file mode 100644
+index 00000000..79344f22
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/research/feasibility.md
+@@ -0,0 +1,12 @@
++# Feasibility findings
++
++- CLI baseline is v0.4.0; local original checkout was eight commits behind origin/main. Implementation uses an isolated current worktree.
++- API update explicitly rejects accepted drafts and Showcase. Shared edit rules also control agent modify, so copy-only Showcase editing must not accidentally enable agent generation.
++- Existing rejected derivation provides parentDraftId and deterministic payload keys, but has no caller version precondition.
++- Blog, FAQ and changelog normal acceptance creates new entities; a revision cannot reuse that path. IngestDraftTarget identifies model associations, not the resulting formal blog/FAQ.
++- Full FAQ/changelog PUT treats translations as the complete final array and soft-deletes omitted locales. Revision acceptance requires a narrow transactional write.
++- Existing model-info acceptance invokes generation-related hooks and specialized overview receipts. Revision handling must avoid new generation while respecting content validation.
++- Read-only staging lookup confirmed Showcase 01M7RTXGZRFWQ77M85SN2VDREE pending with original media and FAQ 01M7RSYN4H4FHP9891TNPRVKAY accepted with the reported wording.
++- Original sites checkout has unrelated user changes. All edits stay in the feature worktree.
++
++Prisma concurrency reference consulted via Context7: conditional version match/update and affected-row checks prevent stale writes; row locks must be held inside the transaction that compares and writes. Installed ORM is 7.5.0, so existing project transaction APIs remain authoritative over newer-version examples.
+diff --git a/.trellis/tasks/11-20-draft-revisions/rollout.md b/.trellis/tasks/11-20-draft-revisions/rollout.md
+new file mode 100644
+index 00000000..aba560ca
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/rollout.md
+@@ -0,0 +1,22 @@
++# Rollout and staging acceptance
++
++Deploy the additive `20261120090000_draft_revisions` migration before the API code. Deploy API before distributing the companion CLI: the new CLI refuses to fall back to an unguarded write against older APIs.
++
++New acceptance mappings are recorded transactionally. Legacy accepted content is resolved only when identity/content associations can be verified; ambiguous targets require an explicit verified entity ID. Specialized overview-refill revisions remain on their existing source-proof workflow.
++
++## Staging checklist (after reviewed deployment)
++
++1. Read and save both pending Showcase snapshots: `01M7RTXMTT8R8EWNS5Q5Q404TM` and `01M7RTXGZRFWQ77M85SN2VDREE`.
++2. Apply approved title/introduce patches with their saved `updatedAt` using `--if-unmodified-since`, always `-e staging`.
++3. Read each draft back. Verify pending, same ID, expected copy, and identical input/prompt/artifact/media/hash/model/route/source. No jobs created.
++4. Read accepted FAQ `01M7RSYN4H4FHP9891TNPRVKAY` and its formal FAQ/locale. Save original publication timestamp, entity count, other translations and model visibility state.
++5. Propose the correction to say long images support only auto using a stable request ID. Confirm original accepted record and formal content remain unchanged; inspect trusted target association on the new pending draft.
++6. Replay the same operation and confirm the same draft ID. On a dedicated fixture, confirm changed payload with the same key fails, and stale versions fail atomically.
++7. After explicitly reviewing the correction, accept the staging revision. Verify same FAQ entity, corrected target locale, unchanged original accepted draft, publication timestamp, other locales, model/route visibility and no generation jobs.
++8. Exercise blog acceptance on isolated staging content: unchanged slug/entity ID, preserved other locales, and no duplicate article. Change the formal target between revise and accept to verify 409 leaves the revision pending.
++
++This implementation session submits review PRs. It does not deploy the migration/API, publish production content, accept the user's real staging FAQ, or claim this checklist has run. Local PostgreSQL integration evidence is recorded separately.
++
++## Rollback
++
++Rollback application code only before any new revision rows exist, keeping additive tables for audit. Once revision rows exist, do not expose them to older accept code: it lacks revision routing and would treat them as create-only drafts. Disable review mutations or roll forward the API fix. Do not drop trusted receipts/mappings while pending revision drafts exist.
+diff --git a/.trellis/tasks/11-20-draft-revisions/task.json b/.trellis/tasks/11-20-draft-revisions/task.json
+new file mode 100644
+index 00000000..688d0f97
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/task.json
+@@ -0,0 +1,26 @@
++{
++  "id": "draft-revisions",
++  "name": "draft-revisions",
++  "title": "Showcase copy and accepted content revisions",
++  "description": "Implement hiapi-cli issue 17 across CLI and content-api with version guards, idempotent pending revisions and original-entity acceptance.",
++  "status": "in_progress",
++  "dev_type": null,
++  "scope": null,
++  "package": null,
++  "priority": "P2",
++  "creator": "codex",
++  "assignee": "codex",
++  "createdAt": "2026-11-20",
++  "completedAt": null,
++  "branch": "feat/draft-revisions",
++  "base_branch": "dev",
++  "worktree_path": null,
++  "commit": null,
++  "pr_url": null,
++  "subtasks": [],
++  "children": [],
++  "parent": null,
++  "relatedFiles": [],
++  "notes": "",
++  "meta": {}
++}
+\ No newline at end of file
+diff --git a/.trellis/tasks/11-20-draft-revisions/validation.md b/.trellis/tasks/11-20-draft-revisions/validation.md
+new file mode 100644
+index 00000000..7782ef7f
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/validation.md
+@@ -0,0 +1,63 @@
++# Local validation (2026-11-20)
++
++Environment: Bun 1.4.4, locked Prisma 7.5.0, TypeScript 5.9.3, PostgreSQL 16 in WSL Ubuntu.
++Sources synchronized from this worktree to `/var/tmp/hiapi-issue17-sites` for Linux filesystem performance.
++No production/staging credentials or databases were used. Test database: `hiapi_issue17_test`.
++
++## Results
++
++- Fresh database replay: all 73 migrations, including `20261120090000_draft_revisions`, applied successfully.
++- Initial focused revision integration + SDK suite: 23 passed, 0 failed.
++- Broad associated regression below: **571 passed, 0 failed**, 2080 assertions, 55 files, 612.83 seconds.
++- Isolated SDK update/modify/revise contract file: 11 passed, 0 failed (fresh process; no external FormatRegistry setup).
++- `bun run --filter @hiapi/content-api --filter @hiapi/content-sdk --filter @hiapi/manage typecheck`: all exited 0.
++- ESLint on all changed TypeScript production/test files: exited 0 with `--max-warnings 0`.
++- `git diff --check`: passed.
++
++```sh
++bun test apps/content-api/tests/modules/review \
++  apps/content-api/tests/modules/blog apps/content-api/tests/modules/faq \
++  apps/content-api/tests/modules/changelog \
++  apps/content-api/tests/modules/model/transcribe-info.test.ts \
++  apps/content-api/tests/modules/model/content-core.test.ts \
++  packages/content-sdk/tests/schema/ingest-update-modify.test.ts \
++  packages/content-sdk/tests/schema/ingest-blog.test.ts \
++  packages/content-sdk/tests/schema/ingest-batch5.test.ts \
++  packages/content-sdk/tests/schema/ingest-model.test.ts --timeout 30000
++```
++
++The test harness change only explicitly lists the two new receipt tables in its existing TRUNCATE operation;
++foreign-key CASCADE from `ingest_draft` also removes these rows. No harness lifecycle/concurrency changes.
++
++These are associated regressions, not a claim of all-repository tests. Live staging verification remains a deployment gate.
++
++## Review follow-up
++
++`bun test apps/content-api/tests/modules/review/draft-revise.test.ts --timeout 30000`:
++13 passed, 0 failed, 97 assertions. Changed-file ESLint and `git diff --check` passed.
++The added regression proves same-key replay with either an old or refetched source timestamp
++after an out-of-band source version change; a new request still enforces freshness and a changed
++patch still conflicts. Blog assertions now explicitly snapshot the accepted source and formal
++content before proposing, then verify no pre-accept write, same entity/translation IDs, no duplicate,
++and preserved publication time/other locale after accept. No production code changed in this follow-up.
++
++## PR #328 requested changes — 2026-11-23
++
++- Added `POST /admin/drafts/:id/revise` to `STAFF_WRITE_ROUTES`. The actual route already
++  had `userGuard()`; no runtime authorization or content mutation logic changed.
++- Merged dev `57d84c74` without conflicts, including the dashboard generated-artifact
++  CI prerequisite added by `5e09d9fe`.
++- Tested the merged source in a fresh WSL directory using Bun 1.4.4 and generated
++  Prisma 7.5.0 client; no live credentials or database needed for this check.
++- `bun test apps/content-api/tests/utils/write-routes-guard.test.ts apps/content-api/tests/utils/user-guard.test.ts --timeout 30000`:
++  **18 passed, 0 failed, 30 assertions**.
++- Changed-file ESLint with `--max-warnings 0`: passed.
++- content-api `tsc --noEmit --incremental`: passed, explicitly executed with Bun because
++  the host's default Node command resolves to Windows Node from WSL.
++- `git diff --check`: passed.
++
++The previous remote run 44669467061 had exactly one content-api failure (the missing
++registration), dashboard route-type errors in quality, and a cancelled site checkout.
++The initial billing failure was a different run and must not be reported as current CI.
++This follow-up did not rerun the full database suite locally; CI on the pushed head is
++the next full-suite check. Earlier 571-test and 13-test results above are historical.
+diff --git a/apps/content-api/prisma/migrations/20261120090000_draft_revisions/migration.sql b/apps/content-api/prisma/migrations/20261120090000_draft_revisions/migration.sql
+new file mode 100644
+index 00000000..1e2fd976
+--- /dev/null
++++ b/apps/content-api/prisma/migrations/20261120090000_draft_revisions/migration.sql
+@@ -0,0 +1,22 @@
++CREATE TABLE "ingest_draft_acceptance" (
++  "draft_id" TEXT NOT NULL PRIMARY KEY,
++  "entity_id" TEXT NOT NULL,
++  "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  CONSTRAINT "ingest_draft_acceptance_draft_id_fkey" FOREIGN KEY ("draft_id") REFERENCES "ingest_draft"("id") ON DELETE CASCADE ON UPDATE CASCADE
++);
++
++CREATE TABLE "ingest_draft_revision" (
++  "draft_id" TEXT NOT NULL PRIMARY KEY,
++  "source_draft_id" TEXT NOT NULL,
++  "request_key" TEXT NOT NULL,
++  "request_fingerprint" TEXT NOT NULL,
++  "target_kind" TEXT NOT NULL,
++  "target_entity_id" TEXT NOT NULL,
++  "target_fingerprint" TEXT NOT NULL,
++  "base_data" JSONB NOT NULL,
++  "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  CONSTRAINT "ingest_draft_revision_draft_id_fkey" FOREIGN KEY ("draft_id") REFERENCES "ingest_draft"("id") ON DELETE CASCADE ON UPDATE CASCADE,
++  CONSTRAINT "ingest_draft_revision_target_kind_check" CHECK ("target_kind" IN ('blog', 'faq', 'changelog', 'model', 'family'))
++);
++CREATE UNIQUE INDEX "ingest_draft_revision_request_key_key" ON "ingest_draft_revision"("request_key");
++CREATE INDEX "ingest_draft_revision_source_draft_id_idx" ON "ingest_draft_revision"("source_draft_id");
+diff --git a/apps/content-api/prisma/models/draft-revision.prisma b/apps/content-api/prisma/models/draft-revision.prisma
+new file mode 100644
+index 00000000..7602f6b4
+--- /dev/null
++++ b/apps/content-api/prisma/models/draft-revision.prisma
+@@ -0,0 +1,26 @@
++/// Server-owned acceptance association. Never supplied through ingest data/source.
++model IngestDraftAcceptance {
++  draftId     String      @id @map("draft_id")
++  entityId    String      @map("entity_id")
++  createdAt   DateTime    @default(now()) @map("created_at")
++  draft       IngestDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
++
++  @@map("ingest_draft_acceptance")
++}
++
++/// Immutable revision receipt. The candidate content lives in its ordinary pending draft.
++model IngestDraftRevision {
++  draftId            String      @id @map("draft_id")
++  sourceDraftId      String      @map("source_draft_id")
++  requestKey         String      @unique @map("request_key")
++  requestFingerprint String      @map("request_fingerprint")
++  targetKind         String      @map("target_kind")
++  targetEntityId     String      @map("target_entity_id")
++  targetFingerprint  String      @map("target_fingerprint")
++  baseData           Json        @map("base_data")
++  createdAt          DateTime    @default(now()) @map("created_at")
++  draft              IngestDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
++
++  @@index([sourceDraftId])
++  @@map("ingest_draft_revision")
++}
+diff --git a/apps/content-api/prisma/models/ingest.prisma b/apps/content-api/prisma/models/ingest.prisma
+index 1f029073..88b1d932 100644
+--- a/apps/content-api/prisma/models/ingest.prisma
++++ b/apps/content-api/prisma/models/ingest.prisma
+@@ -16,6 +16,8 @@ model IngestDraft {
+   localeRef      Locale   @relation(fields: [locale], references: [code])
+   targets        IngestDraftTarget[]
+   agentJobs      AgentJob[]
++  acceptance     IngestDraftAcceptance?
++  revision       IngestDraftRevision?
+ 
+   @@index([parentDraftId])
+   @@map("ingest_draft")
+diff --git a/apps/content-api/src/modules/review/admin.ts b/apps/content-api/src/modules/review/admin.ts
+index e9afb893..8e39870c 100644
+--- a/apps/content-api/src/modules/review/admin.ts
++++ b/apps/content-api/src/modules/review/admin.ts
+@@ -10,6 +10,8 @@ import {
+   AdminDraftModifyResponse,
+   AdminDraftUpdateRequest,
+   AdminDraftUpdateResponse,
++  AdminDraftReviseRequest,
++  AdminDraftReviseResponse,
+   AdminDraftCountQuery,
+   AdminDraftCountResponse,
+   AdminDraftDetailResponse,
+@@ -24,7 +26,8 @@ import {
+ import { ReviewService } from "./service";
+ import { DraftUpdateService } from "./update-service";
+ import { DraftModifyService } from "./modify-service";
+-import { toDetail } from "./model";
++import { DraftRevisionService } from "./revision-service";
++import { DRAFT_DETAIL_INCLUDE, toDetail } from "./model";
+ import { db } from "../../db/client";
+ import {
+   ConflictError,
+@@ -105,7 +108,7 @@ export const adminDrafts = new Elysia()
+   .get(
+     "/admin/drafts/:id",
+     async ({ params }) => {
+-      const row = await db().ingestDraft.findUnique({ where: { id: params.id } });
++      const row = await db().ingestDraft.findUnique({ where: { id: params.id }, include: DRAFT_DETAIL_INCLUDE });
+       if (!row) throw new NotFoundError(`draft 不存在：${params.id}`);
+       return ok(toDetail(row));
+     },
+@@ -128,7 +131,8 @@ export const adminDrafts = new Elysia()
+       console.info(
+         `[admin-drafts] update id=${params.id} staff=${staffId === undefined ? "unknown" : `staff:${staffId}`} derived=${derivedFrom ?? "-"}`,
+       );
+-      return ok({ draft: toDetail(row), ...(derivedFrom !== undefined ? { derivedFrom } : {}) });
++      const revision = await db().ingestDraftRevision.findUnique({ where: { draftId: row.id } });
++      return ok({ draft: toDetail({ ...row, revision }), ...(derivedFrom !== undefined ? { derivedFrom } : {}), affectsPublishedContent: false as const });
+     },
+     {
+       params: ReviewDraftParams,
+@@ -141,6 +145,21 @@ export const adminDrafts = new Elysia()
+       },
+     },
+   )
++  .post(
++    "/admin/drafts/:id/revise",
++    async ({ params, body }) => {
++      const { row, derivedFrom, reused } = await DraftRevisionService.revise(params.id, body);
++      const revision = await db().ingestDraftRevision.findUnique({ where: { draftId: row.id } });
++      return ok({ draft: toDetail({ ...row, revision }), derivedFrom, reused, affectsPublishedContent: false as const });
++    },
++    {
++      params: ReviewDraftParams,
++      body: AdminDraftReviseRequest,
++      beforeHandle: userGuard(),
++      response: { 200: AdminDraftReviseResponse, ...ERROR_RESPONSES },
++      detail: { summary: "从 accepted 内容派生待审修订（幂等；不发布、不生成；accept 更新原实体）", tags: ["admin-drafts"] },
++    },
++  )
+   .post(
+     "/admin/drafts/:id/modify",
+     async ({ params, body, request, set }) => {
+diff --git a/apps/content-api/src/modules/review/model.ts b/apps/content-api/src/modules/review/model.ts
+index 3e96d971..2f609e96 100644
+--- a/apps/content-api/src/modules/review/model.ts
++++ b/apps/content-api/src/modules/review/model.ts
+@@ -1,5 +1,5 @@
+ // review 域常量 + 读投影（审核面·R3 PG-1/13）。校验 schema 住 content-sdk schema/ingest.ts。
+-import type { AgentJob, IngestDraft } from '../../../generated/prisma/client';
++import type { AgentJob, IngestDraft, IngestDraftRevision, IngestDraftAcceptance } from '../../../generated/prisma/client';
+ import type { AdminDraftJobStatus } from '@hiapi/content-sdk';
+ import { toSummary } from '../ingest/model';
+ import { toJsonObject } from '../playground/model';
+@@ -23,7 +23,9 @@ export function toJobDetail(job: AgentJob) {
+ 
+ /** 行 → 审核读投影（摘要 ⊕ data/source/media 全文 + updatedAt·PG-13）。media 非数组（含 null）省略；
+  *  parentDraftId 仅在派生草稿（update rejected / modify 回投）时有值，风格同 media（null 省略）。 */
+-export function toDetail(row: IngestDraft) {
++export const DRAFT_DETAIL_INCLUDE = { revision: true, acceptance: true } as const;
++
++export function toDetail(row: IngestDraft & { revision?: IngestDraftRevision | null; acceptance?: IngestDraftAcceptance | null }) {
+   return {
+     ...toSummary(row),
+     data: toJsonObject(row.data),
+@@ -31,5 +33,11 @@ export function toDetail(row: IngestDraft) {
+     ...(Array.isArray(row.media) ? { media: row.media as unknown[] } : {}),
+     ...(row.parentDraftId !== null ? { parentDraftId: row.parentDraftId } : {}),
+     updatedAt: row.updatedAt.toISOString(),
++    ...(row.acceptance ? { acceptedEntityId: row.acceptance.entityId } : {}),
++    ...(row.revision ? { revision: {
++      sourceDraftId: row.revision.sourceDraftId,
++      targetEntityId: row.revision.targetEntityId,
++      targetKind: row.revision.targetKind as 'blog' | 'faq' | 'changelog' | 'model' | 'family',
++    } } : {}),
+   };
+ }
+diff --git a/apps/content-api/src/modules/review/modify-service.ts b/apps/content-api/src/modules/review/modify-service.ts
+index c2112f2c..b1bbdd38 100644
+--- a/apps/content-api/src/modules/review/modify-service.ts
++++ b/apps/content-api/src/modules/review/modify-service.ts
+@@ -53,6 +53,9 @@ export abstract class DraftModifyService {
+             if (!draft) throw new NotFoundError(`draft 不存在：${id}`);
+ 
+             assertModifiable(draft);
++            if (await tx.ingestDraftRevision.findUnique({ where: { draftId: id } })) {
++              throw new ConflictError('正式内容修订不支持 AI modify；请用 update，或从原稿重新 revise');
++            }
+             const rule = DRAFT_EDIT_RULES[draft.contentType]!;
+             const data = toJsonObject(draft.data);
+             const unit = resolveModifyUnit(draft.contentType, data);
+diff --git a/apps/content-api/src/modules/review/revision-rules.ts b/apps/content-api/src/modules/review/revision-rules.ts
+new file mode 100644
+index 00000000..4ccf3608
+--- /dev/null
++++ b/apps/content-api/src/modules/review/revision-rules.ts
+@@ -0,0 +1,48 @@
++import { Value } from '@sinclair/typebox/value';
++import type { IngestDraft } from '../../../generated/prisma/client';
++import { ConflictError, UnprocessableError } from '../../utils/errors';
++import { DRAFT_EDIT_RULES, mergeJsonPatch } from './draft-rules';
++import { canonicalJson } from '../model-watch/detect';
++
++export function revisionFields(type: string, data: Record<string, unknown>): readonly string[] {
++  switch (type) {
++    case 'blog': return ['title', 'subtitle', 'bodyHtml', 'summary', 'takeaways', 'keywords', 'heroStats', 'seo', 'readingTime'];
++    case 'faq': case 'model-faq': return ['question', 'answer'];
++    case 'changelog': return ['title', 'bodyHtml'];
++    case 'model-info': return data.granularity === 'family' ? ['brief'] : ['overview'];
++    default: throw new UnprocessableError(`contentType 不支持 revise：${type}`);
++  }
++}
++
++export function assertDraftVersion(row: IngestDraft, expected?: string, required = false): void {
++  if (!expected && required) throw new UnprocessableError('该操作需要 expectedUpdatedAt（先读取 draft info）');
++  if (expected !== undefined) {
++    const time = Date.parse(expected);
++    if (!Number.isFinite(time)) throw new UnprocessableError('expectedUpdatedAt 须为 ISO 8601');
++    if (row.updatedAt.getTime() !== time) throw new ConflictError('draft 版本已变化，请回读后重试');
++  }
++}
++
++export function reviseData(type: string, base: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
++  const fields = revisionFields(type, base);
++  if (!Object.keys(patch).length) throw new UnprocessableError('修订补丁不能为空');
++  for (const key of Object.keys(patch)) {
++    if (!fields.includes(key)) throw new UnprocessableError(`修订不可修改字段：${key}；可写字段：${fields.join(', ')}`);
++    if (type === 'model-info' && patch[key] === null) throw new UnprocessableError('模型介绍修订不可删除内容字段');
++  }
++  const merged = mergeJsonPatch(base, patch);
++  const rule = DRAFT_EDIT_RULES[type]!;
++  if (!Value.Check(rule.schema, merged)) throw new UnprocessableError('修订 data 不符合内容契约');
++  if (canonicalJson(merged) === canonicalJson(base)) throw new UnprocessableError('修订没有实际变更');
++  return merged;
++}
++
++/** Diff the complete reviewed candidate, including deletions of optional editorial fields. */
++export function revisionChanges(type: string, base: Record<string, unknown>, candidate: Record<string, unknown>): Record<string, unknown> {
++  const changes: Record<string, unknown> = {};
++  for (const key of new Set([...Object.keys(base), ...Object.keys(candidate)])) {
++    if (canonicalJson(base[key] ?? null) !== canonicalJson(candidate[key] ?? null)) changes[key] = candidate[key] ?? null;
++  }
++  reviseData(type, base, changes);
++  return changes;
++}
+diff --git a/apps/content-api/src/modules/review/revision-service.ts b/apps/content-api/src/modules/review/revision-service.ts
+new file mode 100644
+index 00000000..f46da2c3
+--- /dev/null
++++ b/apps/content-api/src/modules/review/revision-service.ts
+@@ -0,0 +1,66 @@
++import type { AdminDraftReviseRequest } from '@hiapi/content-sdk';
++import { Prisma, type IngestDraft } from '../../../generated/prisma/client';
++import { db } from '../../db/client';
++import { ConflictError, NotFoundError, UnprocessableError } from '../../utils/errors';
++import { withDeadlockRetry } from '../media/retry';
++import type { Tx } from '../media/service';
++import { refreshDraftTargets } from '../ingest/targets';
++import { toJsonObject } from '../playground/model';
++import { assertDraftVersion, reviseData, revisionChanges } from './revision-rules';
++import { readRevisionTarget, resolveRevisionTarget, revisionHash, revisionKind } from './revision-target';
++import { applyRevision } from './revision-write';
++
++export abstract class DraftRevisionService {
++  static async revise(id: string, body: AdminDraftReviseRequest) {
++    const requestKey = revisionHash([id, body.idempotencyKey]);
++    const requestFingerprint = revisionHash({ data: body.data, targetEntityId: body.targetEntityId ?? null });
++    const result = await withDeadlockRetry(() => db().$transaction(async (rawTx) => {
++      const tx = rawTx as Tx;
++      await tx.$queryRaw`SELECT id FROM ingest_draft WHERE id = ${id} FOR UPDATE`;
++      const source = await tx.ingestDraft.findUnique({ where: { id } });
++      if (!source) throw new NotFoundError(`draft 不存在：${id}`);
++      const replay = await tx.ingestDraftRevision.findUnique({ where: { requestKey }, include: { draft: true } });
++      if (replay) {
++        if (replay.requestFingerprint !== requestFingerprint) throw new ConflictError('idempotencyKey 已用于不同修订请求');
++        return { row: replay.draft, derivedFrom: id, reused: true };
++      }
++      if (source.status !== 'accepted') throw new ConflictError('revise 只接受 accepted 原稿；pending/rejected 请用 update');
++      assertDraftVersion(source, body.expectedUpdatedAt, true);
++      revisionKind(source);
++      const origin = toJsonObject(source.source);
++      if (origin.overviewRefill !== undefined) {
++        throw new UnprocessableError('该介绍由专用 overview 修订流程管理，请继续使用该流程');
++      }
++      if (Array.isArray(source.media) && source.media.length) throw new UnprocessableError('该内容修订不接受 draft.media');
++      const entityId = await resolveRevisionTarget(tx, source, body.targetEntityId);
++      const target = await readRevisionTarget(tx, source, entityId);
++      const data = reviseData(source.contentType, target.data, body.data);
++      const row = await tx.ingestDraft.create({ data: {
++        contentType: source.contentType, locale: source.locale, source: source.source as Prisma.InputJsonValue,
++        data: data as Prisma.InputJsonValue, media: source.media === null ? Prisma.DbNull : source.media as Prisma.InputJsonValue,
++        parentDraftId: source.id, status: 'pending', idempotencyKey: `revision:${requestKey}`,
++      } });
++      await tx.ingestDraftRevision.create({ data: {
++        draftId: row.id, sourceDraftId: id, requestKey, requestFingerprint,
++        targetKind: target.kind, targetEntityId: entityId, targetFingerprint: target.fingerprint,
++        baseData: target.data as Prisma.InputJsonValue,
++      } });
++      return { row, derivedFrom: id, reused: false };
++    }, { timeout: 30_000 }), { owns: true });
++    await refreshDraftTargets(result.row);
++    return result;
++  }
++
++  /** Called inside the existing pending -> accepted transaction. */
++  static async accept(draft: IngestDraft, tx: Tx): Promise<{ entityId: string } | null> {
++    const receipt = await tx.ingestDraftRevision.findUnique({ where: { draftId: draft.id } });
++    if (!receipt) return null;
++    const target = await readRevisionTarget(tx, draft, receipt.targetEntityId);
++    if (target.kind !== receipt.targetKind || target.fingerprint !== receipt.targetFingerprint) {
++      throw new ConflictError('正式内容已变化，请从原稿重新派生修订；当前修订仍为 pending');
++    }
++    const changes = revisionChanges(draft.contentType, toJsonObject(receipt.baseData), toJsonObject(draft.data));
++    await applyRevision(tx, draft, target, changes);
++    return { entityId: receipt.targetEntityId };
++  }
++}
+diff --git a/apps/content-api/src/modules/review/revision-target.ts b/apps/content-api/src/modules/review/revision-target.ts
+new file mode 100644
+index 00000000..346ce908
+--- /dev/null
++++ b/apps/content-api/src/modules/review/revision-target.ts
+@@ -0,0 +1,110 @@
++import { createHash } from 'node:crypto';
++import { Prisma, type IngestDraft } from '../../../generated/prisma/client';
++import { ConflictError } from '../../utils/errors';
++import type { Tx } from '../media/service';
++import { canonicalJson } from '../model-watch/detect';
++import { toJsonObject } from '../playground/model';
++import { revisionFields } from './revision-rules';
++import { sanitizeRichText } from '../media/codec';
++
++export type RevisionKind = 'blog' | 'faq' | 'changelog' | 'model' | 'family';
++export interface RevisionTarget {
++  kind: RevisionKind;
++  entityId: string;
++  rowId: string;
++  fingerprint: string;
++  data: Record<string, unknown>;
++}
++export const revisionHash = (value: unknown) => createHash('sha256').update(canonicalJson(value)).digest('hex');
++
++export function revisionKind(draft: IngestDraft): RevisionKind {
++  revisionFields(draft.contentType, toJsonObject(draft.data));
++  if (draft.contentType === 'model-info') return toJsonObject(draft.data).granularity === 'family' ? 'family' : 'model';
++  return draft.contentType === 'model-faq' ? 'faq' : draft.contentType as RevisionKind;
++}
++
++/** Parameterized values; table identifiers come only from the closed mapping below. */
++async function lockTarget(tx: Tx, kind: RevisionKind, id: string, locale: string): Promise<void> {
++  if (kind === 'model' || kind === 'family') {
++    const table = Prisma.raw(kind === 'model' ? 'model_info' : 'model_family_info');
++    await tx.$queryRaw(Prisma.sql`SELECT id FROM ${table} WHERE id = ${id} FOR UPDATE`);
++    return;
++  }
++  const table = Prisma.raw(kind);
++  const i18n = Prisma.raw(`${kind}_i18n`);
++  const fk = Prisma.raw(`${kind}_id`);
++  await tx.$queryRaw(Prisma.sql`SELECT id FROM ${table} WHERE id = ${id} FOR UPDATE`);
++  await tx.$queryRaw(Prisma.sql`SELECT id FROM ${i18n} WHERE ${fk} = ${id} AND locale = ${locale} AND deleted_at IS NULL FOR UPDATE`);
++}
++
++export async function readRevisionTarget(tx: Tx, draft: IngestDraft, entityId: string): Promise<RevisionTarget> {
++  const kind = revisionKind(draft);
++  await lockTarget(tx, kind, entityId, draft.locale);
++  const where = { locale: draft.locale, deletedAt: null };
++  const row = kind === 'blog'
++    ? await tx.blogI18n.findFirst({ where: { ...where, blogId: entityId, blog: { deletedAt: null } }, include: { blog: true } })
++    : kind === 'faq'
++      ? await tx.faqI18n.findFirst({ where: { ...where, faqId: entityId, faq: { deletedAt: null } }, include: { faq: true } })
++      : kind === 'changelog'
++        ? await tx.changelogI18n.findFirst({ where: { ...where, changelogId: entityId, changelog: { deletedAt: null } }, include: { changelog: true } })
++        : kind === 'family'
++          ? await tx.modelFamilyInfo.findFirst({ where: { id: entityId, locale: draft.locale } })
++          : await tx.modelInfo.findFirst({ where: { id: entityId, locale: draft.locale } });
++  if (!row) throw new ConflictError('修订目标不存在、已删除或缺少指定语言');
++  const data = toJsonObject(row);
++  const base = { ...toJsonObject(draft.data) };
++  for (const field of revisionFields(draft.contentType, base)) {
++    if (data[field] === null || data[field] === undefined) delete base[field];
++    else base[field] = data[field];
++  }
++  return { kind, entityId, rowId: row.id, fingerprint: revisionHash(JSON.parse(JSON.stringify(row))), data: base };
++}
++
++async function verifiedIdentityIds(tx: Tx, kind: string, ids: string[], data: Record<string, unknown>): Promise<string[]> {
++  if (!ids.length) return [];
++  const models = typeof data.modelRef === 'string' ? [data.modelRef] : data.modelRefs as string[] ?? [];
++  const families = typeof data.familyRef === 'string' ? [data.familyRef] : data.familyRefs as string[] ?? [];
++  const signature = (refs: string[]) => canonicalJson([...new Set(refs)].sort());
++  const [modelRows, familyRows] = await Promise.all([
++    tx.entityModel.findMany({ where: { entityType: kind, entityId: { in: ids } }, select: { entityId: true, model: { select: { slug: true } } } }),
++    tx.entityFamily.findMany({ where: { entityType: kind, entityId: { in: ids } }, select: { entityId: true, family: { select: { slug: true } } } }),
++  ]);
++  return ids.filter((id) =>
++    signature(modelRows.filter((r) => r.entityId === id).map((r) => r.model.slug)) === signature(models) &&
++    signature(familyRows.filter((r) => r.entityId === id).map((r) => r.family.slug)) === signature(families));
++}
++
++/** Legacy accepted drafts lack persisted entity IDs. Never choose the first ambiguous match. */
++export async function resolveRevisionTarget(tx: Tx, draft: IngestDraft, explicit?: string): Promise<string> {
++  const recorded = await tx.ingestDraftAcceptance.findUnique({ where: { draftId: draft.id } });
++  if (recorded) {
++    if (explicit && explicit !== recorded.entityId) throw new ConflictError('targetEntityId 与已记录的接受结果不一致');
++    return recorded.entityId;
++  }
++  const kind = revisionKind(draft);
++  const data = toJsonObject(draft.data);
++  let ids: string[];
++  if (kind === 'blog') {
++    const rows = await tx.blogI18n.findMany({ where: { locale: draft.locale, slug: String(data.slug), deletedAt: null, blog: { deletedAt: null } }, select: { blogId: true }, take: 2 });
++    ids = rows.map((r) => r.blogId);
++  } else if (kind === 'family') {
++    const row = await tx.modelFamilyInfo.findUnique({ where: { familyId_locale: { familyId: String(data.modelId), locale: draft.locale } } });
++    ids = row ? [row.id] : [];
++  } else if (kind === 'model') {
++    const model = await tx.modelEntity.findUnique({ where: { familyId_name: { familyId: String(data.modelId), name: String(data.modelName) } } });
++    const row = model && await tx.modelInfo.findUnique({ where: { modelId_locale: { modelId: model.id, locale: draft.locale } } });
++    ids = row ? [row.id] : [];
++  } else {
++    const rows = kind === 'faq'
++      ? await tx.faqI18n.findMany({ where: { ...(explicit ? { faqId: explicit } : {}), locale: draft.locale, deletedAt: null, faq: { deletedAt: null }, question: String(data.question), ...(!explicit ? { answer: String(data.answer) } : {}) }, select: { faqId: true }, take: 101 })
++      : await tx.changelogI18n.findMany({ where: { ...(explicit ? { changelogId: explicit } : {}), locale: draft.locale, deletedAt: null, changelog: { deletedAt: null }, title: String(data.title), ...(!explicit ? { bodyHtml: sanitizeRichText(String(data.bodyHtml)) } : {}) }, select: { changelogId: true }, take: 101 });
++    if (rows.length > 100) throw new ConflictError('旧草稿候选过多，请显式指定 targetEntityId');
++    ids = await verifiedIdentityIds(tx, kind, rows.map((r) => 'faqId' in r ? r.faqId : r.changelogId), data);
++  }
++  if (explicit) {
++    if (!ids.includes(explicit)) throw new ConflictError('targetEntityId 无法与旧草稿身份及内容关联核实');
++    return explicit;
++  }
++  if (ids.length !== 1) throw new ConflictError('旧草稿目标不存在或不唯一；核对后显式提供 targetEntityId');
++  return ids[0]!;
++}
+diff --git a/apps/content-api/src/modules/review/revision-write.ts b/apps/content-api/src/modules/review/revision-write.ts
+new file mode 100644
+index 00000000..53662e86
+--- /dev/null
++++ b/apps/content-api/src/modules/review/revision-write.ts
+@@ -0,0 +1,46 @@
++import { Prisma, type IngestDraft } from '../../../generated/prisma/client';
++import { UnprocessableError } from '../../utils/errors';
++import { MediaService, type Tx } from '../media/service';
++import { normalizeMediaRefs, sanitizeRichText } from '../media/codec';
++import { ModelContentService } from '../model/content';
++import { toJsonObject } from '../playground/model';
++import type { RevisionTarget } from './revision-target';
++
++/** Editorial writes only: no base updates, locale replacement, publication or generation. */
++export async function applyRevision(tx: Tx, draft: IngestDraft, target: RevisionTarget, changes: Record<string, unknown>): Promise<void> {
++  if (target.kind === 'blog') {
++    const data = { ...changes } as Prisma.BlogI18nUpdateInput;
++    for (const key of ['summary', 'takeaways', 'keywords'] as const) {
++      if (changes[key] === null) data[key] = [];
++    }
++    for (const key of ['heroStats', 'seo'] as const) {
++      if (changes[key] === null) data[key] = Prisma.DbNull;
++    }
++    if (typeof changes.bodyHtml === 'string') {
++      const normalized = normalizeMediaRefs(changes.bodyHtml, new Map(), {
++        allowDirectMediaLinks: true, allowBucketUrlsOutsideMediaSrc: true, allowBucketUrlsInMediaSrc: true,
++      });
++      data.bodyHtml = normalized.html;
++      const refs = normalized.ids.length ? await MediaService.getByIds(normalized.ids, tx) : [];
++      if (refs.length !== normalized.ids.length) throw new UnprocessableError('修订正文含不存在或非法的媒体引用');
++      await MediaService.reconcileBindingsBatch([{
++        entityType: 'blog', entityId: target.entityId, role: 'inline', locale: draft.locale, mediaIds: normalized.ids,
++      }], tx);
++    }
++    await tx.blogI18n.update({ where: { id: target.rowId }, data });
++  } else if (target.kind === 'faq') {
++    await tx.faqI18n.update({ where: { id: target.rowId }, data: changes as Prisma.FaqI18nUpdateInput });
++  } else if (target.kind === 'changelog') {
++    await tx.changelogI18n.update({ where: { id: target.rowId }, data: {
++      ...(typeof changes.title === 'string' ? { title: changes.title } : {}),
++      ...(typeof changes.bodyHtml === 'string' ? { bodyHtml: sanitizeRichText(changes.bodyHtml) } : {}),
++    } });
++  } else {
++    const original = toJsonObject(draft.data);
++    // Reuse the existing model guard and HTML/media pipeline, but pass only editorial content.
++    const data = { modelId: original.modelId, granularity: original.granularity,
++      ...(original.modelName !== undefined ? { modelName: original.modelName } : {}), ...changes };
++    const result = await ModelContentService.transcribeInfoDraft({ ...draft, data }, tx);
++    if (result.entityId !== target.entityId) throw new UnprocessableError('修订模型身份与正式内容不一致');
++  }
++}
+diff --git a/apps/content-api/src/modules/review/service.ts b/apps/content-api/src/modules/review/service.ts
+index e266c75a..0b66ab4b 100644
+--- a/apps/content-api/src/modules/review/service.ts
++++ b/apps/content-api/src/modules/review/service.ts
+@@ -11,7 +11,7 @@ import { withDeadlockRetry } from '../media/retry';
+ import type { Tx } from '../media/service';
+ import type { IngestDraft, Prisma } from '../../../generated/prisma/client';
+ import { toSummary } from '../ingest/model';
+-import { toDetail } from './model';
++import { DRAFT_DETAIL_INCLUDE, toDetail } from './model';
+ import type { IngestDraftStatus } from '@hiapi/content-sdk';
+ import { enqueueProduceConverge } from '../../jobs/produce-converge';
+ import { enqueueTranslationSweep } from '../../jobs/translation-dispatch';
+@@ -23,6 +23,9 @@ import { validateReferenceInput, type ValidatedReferenceInput } from '../showcas
+ import { collectSitePurge, purgeShowcasePages } from '../model-sync/site-purge';
+ import { OverviewRevisionService } from '../model/overview-revision';
+ import { enqueueVideoCoverSweepForShowcase } from '../../jobs/video-cover';
++import { DraftRevisionService } from './revision-service';
++import { revisionKind } from './revision-target';
++import { purgeBlogPages } from '../model-sync/site-purge';
+ 
+ import type { TranscriberContext } from './types';
+ 
+@@ -90,7 +93,7 @@ export abstract class ReviewService {
+     const size = opts.size ?? 20;
+     const where = draftWhere(opts);
+     const [rows, total] = await Promise.all([
+-      db().ingestDraft.findMany({ where, orderBy: { createdAt: 'desc' }, skip: (page - 1) * size, take: size }),
++      db().ingestDraft.findMany({ where, orderBy: { createdAt: 'desc' }, skip: (page - 1) * size, take: size, include: DRAFT_DETAIL_INCLUDE }),
+       db().ingestDraft.count({ where }),
+     ]);
+     return { total, page, size, items: rows.map(toDetail) };
+@@ -139,7 +142,7 @@ export abstract class ReviewService {
+     // 2026-11-10（draft update/modify）：草稿 data 不再不可变——PATCH /admin/drafts/:id 可原地改 pending 草稿。
+     // 故事务外读 → 事务内、且条件 flip 之后重读：flip 先拿行锁，锁后读到的必是已提交的最新 data；
+     // 并发 update 在本事务提交后看到 status=accepted → 409（不会把旧 data 转写进实体表）。
+-    const { result, pendingOperationIds, draft } = await withDeadlockRetry(() => db().$transaction(async (rawTx) => {
++    const { result, pendingOperationIds, draft, revised } = await withDeadlockRetry(() => db().$transaction(async (rawTx) => {
+       const tx = rawTx as Tx;
+       const flipped = await tx.ingestDraft.updateMany({ where: { id, status: 'pending' }, data: { status: 'accepted' } });
+       if (flipped.count === 0) {
+@@ -156,12 +159,19 @@ export abstract class ReviewService {
+       if (!transcriber) {
+         throw new UnprocessableError(`contentType 暂无转写器，不可 accept：${draft.contentType}（PG-2）`);
+       }
+-      const transcribed = await transcriber(draft, tx, { publishedAt, showcaseReferences, overviewRevisionVerification });
++      const revision = await DraftRevisionService.accept(draft, tx);
++      const transcribed: { entityId: string; pendingOperationIds?: string[] } = revision ??
++        await transcriber(draft, tx, { publishedAt, showcaseReferences, overviewRevisionVerification });
++      if (['blog', 'faq', 'model-faq', 'changelog', 'model-info'].includes(draft.contentType)) {
++        revisionKind(draft); // Keep the supported mapping set aligned with revision target kinds.
++        await tx.ingestDraftAcceptance.create({ data: { draftId: draft.id, entityId: transcribed.entityId } });
++      }
+       const row = await tx.ingestDraft.findUniqueOrThrow({ where: { id } });
+       return {
+         result: { ...toSummary(row), entityId: transcribed.entityId },
+         pendingOperationIds: transcribed.pendingOperationIds ?? [],
+         draft: row,
++        revised: revision !== null,
+       };
+     // 2026-11-05：accept 的转写器含媒体处理（blog/showcase 需读 entityMedia / 展开 refs），
+     // 5s 默认事务超时在真实内容上稳定超时（批量运维 accept 实测 5.7–6.6s）。给 60s 余量。
+@@ -169,6 +179,10 @@ export abstract class ReviewService {
+     if (draft.contentType === 'showcase') await purgeShowcasePages(result.entityId);
+     await purgeSiteForModelInfoDraft(draft, opts?.purgeSiteImpl); // 提交后清正文缓存；失败不撤销审核
+     await refreshDraftTargets(draft); // 投影补 id（post-commit·内部吞异常·不影响 accept）
++    if (revised) {
++      if (draft.contentType === 'blog') await purgeBlogPages(result.entityId, [draft.locale]);
++      return result; // Editorial acceptance does not trigger generation, translation or topic automation.
++    }
+     await enqueueConvergeForModelDraft(draft, opts?.enqueueImpl); // 提交后·绝不抛
+     if (draft.contentType === 'showcase') {
+       await (opts?.enqueueOverviewRefillImpl ?? OverviewRefillService.notifyShowcase)(result.entityId).catch((e) =>
+diff --git a/apps/content-api/src/modules/review/update-service.ts b/apps/content-api/src/modules/review/update-service.ts
+index b3dbea15..4b6ea3ff 100644
+--- a/apps/content-api/src/modules/review/update-service.ts
++++ b/apps/content-api/src/modules/review/update-service.ts
+@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
+ import { Value } from '@sinclair/typebox/value';
+ import { Prisma } from '../../../generated/prisma/client';
+ import type { IngestDraft } from '../../../generated/prisma/client';
+-import type { AdminDraftUpdateRequest } from '@hiapi/content-sdk';
++import { AdminShowcaseCopyPatch, type AdminDraftUpdateRequest } from '@hiapi/content-sdk';
+ import { db } from '../../db/client';
+ import { ConflictError, NotFoundError, UnprocessableError } from '../../utils/errors';
+ import { withDeadlockRetry } from '../media/retry';
+@@ -19,6 +19,7 @@ import { refreshDraftTargets } from '../ingest/targets';
+ import { canonicalJson } from '../model-watch/detect';
+ import { toJsonObject } from '../playground/model';
+ import { DRAFT_EDIT_RULES, identityChanged, mergeJsonPatch } from './draft-rules';
++import { assertDraftVersion, reviseData, revisionChanges } from './revision-rules';
+ 
+ export interface DraftUpdateOutcome {
+   row: IngestDraft;
+@@ -50,6 +51,28 @@ export abstract class DraftUpdateService {
+             if (row.status === 'accepted') {
+               throw new ConflictError(`draft 已 accepted，不可 update：${id}`);
+             }
++            const revision = await tx.ingestDraftRevision.findUnique({ where: { draftId: id } });
++            assertDraftVersion(row, body.expectedUpdatedAt, row.contentType === 'showcase' || revision !== null);
++            const updatedAt = new Date(Math.max(Date.now(), row.updatedAt.getTime() + 1));
++            if (revision) {
++              if (row.status !== 'pending') throw new ConflictError('已驳回的修订请从 accepted 原稿重新 revise');
++              if (!body.data || body.media !== undefined || body.locale !== undefined) {
++                throw new UnprocessableError('修订草稿只支持 data 文案补丁，不可更换媒体或语言');
++              }
++              const merged = reviseData(row.contentType, toJsonObject(row.data), body.data);
++              revisionChanges(row.contentType, toJsonObject(revision.baseData), merged);
++              const updated = await tx.ingestDraft.update({ where: { id }, data: { data: merged as Prisma.InputJsonValue, updatedAt } });
++              return { row: updated };
++            }
++            if (row.contentType === 'showcase') {
++              if (row.status !== 'pending') throw new ConflictError('Showcase 文案编辑仅支持 pending 草稿');
++              if (body.media !== undefined || body.locale !== undefined || !Value.Check(AdminShowcaseCopyPatch, body.data)) {
++                throw new UnprocessableError('Showcase 仅可修改 title/introduce；其他字段、media、locale 均不可写');
++              }
++              const data = { ...toJsonObject(row.data), ...body.data };
++              const updated = await tx.ingestDraft.update({ where: { id }, data: { data: data as Prisma.InputJsonValue, updatedAt } });
++              return { row: updated };
++            }
+             if (body.locale !== undefined && body.locale !== 'zh') {
+               throw new UnprocessableError('update 首版只支持 locale=zh（翻译稿走 translate）');
+             }
+@@ -106,6 +129,7 @@ export abstract class DraftUpdateService {
+                 where: { id },
+                 data: {
+                   data: merged as Prisma.InputJsonValue,
++                  updatedAt,
+                   ...(media !== undefined ? { media } : {}),
+                 },
+               });
+diff --git a/apps/content-api/tests/db-harness.ts b/apps/content-api/tests/db-harness.ts
+index 0ce3f92c..6d24adfc 100644
+--- a/apps/content-api/tests/db-harness.ts
++++ b/apps/content-api/tests/db-harness.ts
+@@ -187,7 +187,7 @@ export function prepareTestDb(): Promise<void> {
+ /** TRUNCATE 全表 + seed = 确定性基线（resetAndSeed 与 parallel baseline 预置共用）。 */
+ async function resetAndSeedDb(client: PrismaClient): Promise<void> {
+   await client.$executeRawUnsafe(
+-    'TRUNCATE TABLE "blog_review_action", "blog_review_card_item", "blog_review_card", "ingest_draft", "agent_job", "media_derivative", "image_process_operation", "entity_media", "showcase_reference", "media_resource", "media_reference_state", "media", "entity_family", "entity_model", "model_entity", "model_produce_state", "model_family_badge", "model_badge_i18n", "model_badge", "model_provider", "ability_category_i18n", "ability_category", "model_ability_i18n", "model_branch_info", "model_family_info", "model_info", "model_pricing_policy", "model_pricing", "model_route_ability", "model_api_param_i18n", "api_doc_i18n", "api_doc", "model_route", "playground_example_i18n", "playground_example", "model_playground_config_i18n", "model_playground_config", "model_branch", "model_ability", "model_family", "model_sync_state", "entity_tag", "tag_i18n", "tag", "blog_category_i18n", "blog_category", "blog_i18n", "blog", "changelog_category_i18n", "changelog_category", "changelog_i18n", "changelog", "faq_category_i18n", "faq_category", "faq_i18n", "faq", "showcase_i18n", "showcase", "promotion_category_i18n", "promotion_category", "promotion_i18n", "promotion", "promotion_sync_state", "announcement_history", "announcement_i18n", "announcement", "dispatch_logs", "model_watch_events", "model_watch_dispatches", "topic_signals", "topics", "signals", "collector_baselines", "keyword_pool_entries", "locale" CASCADE',
++    'TRUNCATE TABLE ingest_draft_revision, ingest_draft_acceptance, "blog_review_action", "blog_review_card_item", "blog_review_card", "ingest_draft", "agent_job", "media_derivative", "image_process_operation", "entity_media", "showcase_reference", "media_resource", "media_reference_state", "media", "entity_family", "entity_model", "model_entity", "model_produce_state", "model_family_badge", "model_badge_i18n", "model_badge", "model_provider", "ability_category_i18n", "ability_category", "model_ability_i18n", "model_branch_info", "model_family_info", "model_info", "model_pricing_policy", "model_pricing", "model_route_ability", "model_api_param_i18n", "api_doc_i18n", "api_doc", "model_route", "playground_example_i18n", "playground_example", "model_playground_config_i18n", "model_playground_config", "model_branch", "model_ability", "model_family", "model_sync_state", "entity_tag", "tag_i18n", "tag", "blog_category_i18n", "blog_category", "blog_i18n", "blog", "changelog_category_i18n", "changelog_category", "changelog_i18n", "changelog", "faq_category_i18n", "faq_category", "faq_i18n", "faq", "showcase_i18n", "showcase", "promotion_category_i18n", "promotion_category", "promotion_i18n", "promotion", "promotion_sync_state", "announcement_history", "announcement_i18n", "announcement", "dispatch_logs", "model_watch_events", "model_watch_dispatches", "topic_signals", "topics", "signals", "collector_baselines", "keyword_pool_entries", "locale" CASCADE',
+   );
+   // seed 事务包裹：45 次串行写合为单次 commit，实测 2.33s → 0.73s（Phase 0 timing-probe2-tx）；
+   // 显式 timeout 抬过 Prisma itx 默认 5s——高负载（多 worker 满载/慢盘）下防把原本必过的重置误杀成超时。
+diff --git a/apps/content-api/tests/modules/review/draft-revise.test.ts b/apps/content-api/tests/modules/review/draft-revise.test.ts
+new file mode 100644
+index 00000000..0d5d4f46
+--- /dev/null
++++ b/apps/content-api/tests/modules/review/draft-revise.test.ts
+@@ -0,0 +1,245 @@
++import { beforeEach, describe, expect, test } from 'bun:test';
++import { dbUnscoped } from '../../../src/db/client';
++import { ReviewService } from '../../../src/modules/review/service';
++import { DraftRevisionService } from '../../../src/modules/review/revision-service';
++import { DraftUpdateService } from '../../../src/modules/review/update-service';
++import { DraftModifyService } from '../../../src/modules/review/modify-service';
++import { ConflictError, UnprocessableError } from '../../../src/utils/errors';
++import { resetAndSeed } from '../../db-harness';
++import { seedModelFixtures, SEED } from '../model/fixtures';
++import { handle, json } from '../../support/http';
++import { staffCookie } from '../../support/auth';
++
++beforeEach(async () => { await resetAndSeed(); await seedModelFixtures(); });
++const c = () => dbUnscoped();
++const seed = (contentType: string, data: object, extra: object = {}) => c().ingestDraft.create({ data: {
++  contentType, locale: 'zh', data, source: { producer: 'test', contractVersion: 'v1' },
++  idempotencyKey: crypto.randomUUID(), ...extra,
++} });
++const faqData = { question: '长图比例如何设置？', answer: '不支持', modelRef: 'gpt-4', familyRef: 'gpt-4', sequence: 7 };
++const blogData = { slug: 'revision-blog', title: '旧标题', bodyHtml: '<p>旧正文</p>', summary: ['旧摘要'], modelRefs: ['gpt-4'] };
++async function accepted(type = 'faq', data: object = faqData, extra: object = {}) {
++  const row = await seed(type, data, extra);
++  const result = await ReviewService.accept(row.id);
++  return { row: await c().ingestDraft.findUniqueOrThrow({ where: { id: row.id } }), entityId: result.entityId };
++}
++const propose = (row: { id: string; updatedAt: Date }, data: Record<string, unknown>, key = crypto.randomUUID(), targetEntityId?: string) =>
++  DraftRevisionService.revise(row.id, { data, expectedUpdatedAt: row.updatedAt.toISOString(), idempotencyKey: key, targetEntityId });
++
++describe('Showcase 文案补丁', () => {
++  test('仅改展示文案；保留历史输入、媒体和 hash，并检测并发版本', async () => {
++    const data = { title: '旧标题', introduce: '旧介绍', prompt: 'original', input: { prompt: 'original' },
++      artifact: 'https://static.hiapi.ai/artifact.png', inputSchemaHash: 'historical-hash', modelRef: 'gpt-4', routeKey: '' };
++    const media = [{ role: 'artifact', ref: { artifactId: '123', url: data.artifact } }];
++    const row = await seed('showcase', data, { media });
++    const result = await DraftUpdateService.update(row.id, { data: { title: '新标题', introduce: '新介绍' }, expectedUpdatedAt: row.updatedAt.toISOString() });
++    expect(result.row.id).toBe(row.id);
++    expect(result.row.status).toBe('pending');
++    expect(result.row.data).toEqual({ ...data, title: '新标题', introduce: '新介绍' });
++    expect(result.row.media).toEqual(media);
++    expect(result.row.source).toEqual(row.source);
++    expect(result.row.updatedAt.getTime()).toBeGreaterThan(row.updatedAt.getTime());
++    await expect(DraftUpdateService.update(row.id, { data: { title: 'stale' }, expectedUpdatedAt: row.updatedAt.toISOString() })).rejects.toBeInstanceOf(ConflictError);
++    expect(await c().agentJob.count()).toBe(0);
++  });
++
++  test('保护字段和 media/locale 整体拒绝，不部分更新', async () => {
++    const row = await seed('showcase', { title: '旧', introduce: '介绍', prompt: 'original' });
++    for (const body of [
++      { data: { title: '新', prompt: 'edited' } }, { data: { input: {} } }, { data: { inputSchemaHash: 'new' } },
++      { data: { title: null } }, { data: { title: '新' }, media: null }, { data: { title: '新' }, locale: 'zh' as const },
++    ]) {
++      await expect(DraftUpdateService.update(row.id, { ...body, expectedUpdatedAt: row.updatedAt.toISOString() })).rejects.toBeInstanceOf(UnprocessableError);
++      expect(await c().ingestDraft.findUnique({ where: { id: row.id } })).toEqual(row);
++    }
++  });
++});
++
++describe('accepted 内容修订', () => {
++  test('FAQ 派生、编辑、接受更新原实体，保留原稿、发布时间与另一语言；不触发作业', async () => {
++    const { row, entityId } = await accepted();
++    const original = await c().faqI18n.findFirstOrThrow({ where: { faqId: entityId, locale: 'zh' } });
++    const en = await c().faqI18n.create({ data: { faqId: entityId, locale: 'en', question: 'Ratio?', answer: 'auto only', publishedAt: new Date() } });
++    const beforeCount = await c().faq.count();
++    const revision = await propose(row, { answer: '仅支持 auto' });
++    expect(revision.row.parentDraftId).toBe(row.id);
++    expect(revision.row.status).toBe('pending');
++    expect(await c().ingestDraft.findUnique({ where: { id: row.id } })).toEqual(row);
++    expect(await c().faqI18n.findUnique({ where: { id: original.id } })).toEqual(original);
++    const edited = await DraftUpdateService.update(revision.row.id, {
++      data: { answer: '长图仅支持 auto' }, expectedUpdatedAt: revision.row.updatedAt.toISOString(),
++    });
++    let jobs = 0;
++    const result = await ReviewService.accept(edited.row.id, {
++      enqueueImpl: async () => { jobs++; }, enqueueTranslationImpl: async () => { jobs++; }, enqueueImageImpl: async () => { jobs++; },
++    });
++    expect(result.entityId).toBe(entityId);
++    expect(await c().faq.count()).toBe(beforeCount);
++    expect((await c().faqI18n.findUniqueOrThrow({ where: { id: original.id } })).answer).toBe('长图仅支持 auto');
++    expect((await c().faqI18n.findUniqueOrThrow({ where: { id: original.id } })).publishedAt).toEqual(original.publishedAt);
++    expect(await c().faqI18n.findUnique({ where: { id: en.id } })).toEqual(en);
++    expect(await c().ingestDraft.findUnique({ where: { id: row.id } })).toEqual(row);
++    expect(jobs).toBe(0);
++  });
++
++  test('同 key 并发重放复用同一稿；编辑和接受后仍复用；不同 payload 冲突', async () => {
++    const { row } = await accepted();
++    const key = crypto.randomUUID();
++    const [a, b] = await Promise.all([propose(row, { answer: 'auto' }, key), propose(row, { answer: 'auto' }, key)]);
++    expect(a.row.id).toBe(b.row.id);
++    await DraftUpdateService.update(a.row.id, { data: { answer: 'auto only' }, expectedUpdatedAt: a.row.updatedAt.toISOString() });
++    expect((await propose(row, { answer: 'auto' }, key)).row.data).toMatchObject({ answer: 'auto only' });
++    await ReviewService.accept(a.row.id);
++    expect((await propose(row, { answer: 'auto' }, key)).row.status).toBe('accepted');
++    await expect(propose(row, { answer: 'different' }, key)).rejects.toBeInstanceOf(ConflictError);
++    expect(await c().ingestDraftRevision.count()).toBe(1);
++  });
++
++  test('请求重放先于版本校验：源版本变化和重新读取版本都返回原修订', async () => {
++    const { row, entityId } = await accepted();
++    const key = crypto.randomUUID();
++    const data = { answer: 'auto only' };
++    const revision = await propose(row, data, key, entityId);
++    // Simulate an out-of-band version change; ordinary API edits of accepted sources remain forbidden.
++    const changed = await c().ingestDraft.update({
++      where: { id: row.id }, data: { updatedAt: new Date(row.updatedAt.getTime() + 1000) },
++    });
++    const staleReplay = await propose(row, data, key, entityId);
++    const refreshedReplay = await propose(changed, data, key, entityId);
++    expect(staleReplay.reused).toBe(true);
++    expect(refreshedReplay.reused).toBe(true);
++    expect(staleReplay.row.id).toBe(revision.row.id);
++    expect(refreshedReplay.row.id).toBe(revision.row.id);
++    expect(await c().ingestDraftRevision.count()).toBe(1);
++    expect(await c().ingestDraft.count({ where: { parentDraftId: row.id } })).toBe(1);
++    // A new operation still checks freshness, and an existing key still rejects changed intent.
++    await expect(propose(row, data, crypto.randomUUID(), entityId)).rejects.toBeInstanceOf(ConflictError);
++    await expect(propose(changed, { answer: 'different' }, key, entityId)).rejects.toBeInstanceOf(ConflictError);
++  });
++
++  test('英文原稿修订保留中文译文，驳回后同 key 回读已有 rejected 稿', async () => {
++    const { row, entityId } = await accepted('faq', { ...faqData, question: 'Ratio?', answer: 'unsupported' }, { locale: 'en' });
++    const zh = await c().faqI18n.create({ data: { faqId: entityId, locale: 'zh', question: '中文', answer: '保留', publishedAt: new Date() } });
++    const key = crypto.randomUUID();
++    const revision = await propose(row, { answer: 'auto only' }, key);
++    await ReviewService.reject(revision.row.id);
++    const replay = await propose(row, { answer: 'auto only' }, key);
++    expect(replay.row.id).toBe(revision.row.id);
++    expect(replay.row.status).toBe('rejected');
++    const next = await propose(row, { answer: 'auto only' });
++    await ReviewService.accept(next.row.id);
++    expect(await c().faqI18n.findUnique({ where: { id: zh.id } })).toEqual(zh);
++    expect((await c().faqI18n.findFirstOrThrow({ where: { faqId: entityId, locale: 'en' } })).answer).toBe('auto only');
++  });
++
++  test('并发正式内容更新使 accept 回滚且稿留 pending', async () => {
++    const { row, entityId } = await accepted();
++    const revision = await propose(row, { answer: '修订' });
++    await c().faqI18n.updateMany({ where: { faqId: entityId, locale: 'zh' }, data: { answer: '其他编辑' } });
++    await expect(ReviewService.accept(revision.row.id)).rejects.toBeInstanceOf(ConflictError);
++    expect((await c().ingestDraft.findUniqueOrThrow({ where: { id: revision.row.id } })).status).toBe('pending');
++    expect((await c().faqI18n.findFirstOrThrow({ where: { faqId: entityId, locale: 'zh' } })).answer).toBe('其他编辑');
++  });
++
++  test('旧 FAQ 无映射时精确定位；歧义必须显式指定且校验', async () => {
++    const { row, entityId } = await accepted();
++    await c().ingestDraftAcceptance.delete({ where: { draftId: row.id } });
++    expect((await propose(row, { answer: 'auto' })).row.status).toBe('pending');
++    const other = await accepted();
++    await expect(propose(row, { answer: 'ambiguous' })).rejects.toBeInstanceOf(ConflictError);
++    expect((await propose(row, { answer: 'explicit' }, crypto.randomUUID(), entityId)).row.status).toBe('pending');
++    const unrelated = await accepted('faq', { ...faqData, question: '不同问题' });
++    await expect(propose(row, { answer: 'wrong' }, crypto.randomUUID(), unrelated.entityId)).rejects.toBeInstanceOf(ConflictError);
++    expect(other.entityId).not.toBe(entityId);
++  });
++
++  test('博客修订原实体、保留其他语言和未修改的当前字段、HTML 安全处理', async () => {
++    const { row, entityId } = await accepted('blog', blogData);
++    await c().ingestDraftAcceptance.delete({ where: { draftId: row.id } });
++    await c().blogI18n.updateMany({ where: { blogId: entityId, locale: 'zh' }, data: { subtitle: '正式内容后续补充' } });
++    const en = await c().blogI18n.create({ data: { blogId: entityId, locale: 'en', slug: 'revision-blog-en', title: 'English', bodyHtml: '<p>English</p>', publishedAt: new Date() } });
++    const original = await c().blogI18n.findFirstOrThrow({ where: { blogId: entityId, locale: 'zh' } });
++    const count = await c().blog.count();
++    const revision = await propose(row, { title: '新标题', bodyHtml: '<script>alert(1)</script><p>修订正文</p>' });
++    expect(revision.row.data).toMatchObject({ subtitle: '正式内容后续补充' });
++    expect(revision.row.status).toBe('pending');
++    expect(revision.row.parentDraftId).toBe(row.id);
++    expect(await c().ingestDraft.findUnique({ where: { id: row.id } })).toEqual(row);
++    expect(await c().blogI18n.findUnique({ where: { id: original.id } })).toEqual(original);
++    expect(await c().blogI18n.findUnique({ where: { id: en.id } })).toEqual(en);
++    expect(await c().blog.count()).toBe(count);
++    const acceptedRevision = await ReviewService.accept(revision.row.id);
++    expect(acceptedRevision.entityId).toBe(entityId);
++    const result = await c().blogI18n.findFirstOrThrow({ where: { blogId: entityId, locale: 'zh' } });
++    expect(result.id).toBe(original.id);
++    expect(result.title).toBe('新标题');
++    expect(result.subtitle).toBe('正式内容后续补充');
++    expect(result.bodyHtml).toBe('<p>修订正文</p>');
++    expect(result.publishedAt).toEqual(original.publishedAt);
++    expect(await c().blog.count()).toBe(count);
++    expect(await c().blogI18n.findUnique({ where: { id: en.id } })).toEqual(en);
++    expect(await c().ingestDraft.findUnique({ where: { id: row.id } })).toEqual(row);
++  });
++
++  test('旧 changelog 不会按相同标题或部分模型关联误选其他内容', async () => {
++    const originalData = { title: '更新公告', bodyHtml: '<p>原始版本</p>', modelRefs: ['gpt-4'] };
++    const { row, entityId } = await accepted('changelog', originalData);
++    await c().ingestDraftAcceptance.delete({ where: { draftId: row.id } });
++    await c().changelog.update({ where: { id: entityId }, data: { deletedAt: new Date() } });
++    const unrelated = await accepted('changelog', { ...originalData, bodyHtml: '<p>另一篇公告</p>' });
++    await expect(propose(row, { title: '修订' })).rejects.toBeInstanceOf(ConflictError);
++    const partial = await accepted('changelog', { ...originalData, modelRefs: ['gpt-4', 'gpt-4-image'] });
++    await expect(propose(row, { title: '修订' })).rejects.toBeInstanceOf(ConflictError);
++    await expect(propose(row, { title: '修订' }, crypto.randomUUID(), partial.entityId)).rejects.toBeInstanceOf(ConflictError);
++    expect((await c().changelogI18n.findFirstOrThrow({ where: { changelogId: unrelated.entityId } })).bodyHtml).toBe('<p>另一篇公告</p>');
++  });
++
++  test('model-info 与 changelog 更新原目标，不触及可见性或发布时间', async () => {
++    const model = await accepted('model-info', { modelId: SEED.familyGpt, granularity: 'family', brief: '原简介' });
++    await expect(propose(model.row, { brief: null })).rejects.toBeInstanceOf(UnprocessableError);
++    expect(await c().ingestDraftRevision.count()).toBe(0);
++    const family = await c().modelFamily.findUniqueOrThrow({ where: { id: SEED.familyGpt } });
++    const revision = await propose(model.row, { brief: '修订简介' });
++    expect((await ReviewService.accept(revision.row.id)).entityId).toBe(model.entityId);
++    expect((await c().modelFamilyInfo.findUniqueOrThrow({ where: { id: model.entityId } })).brief).toBe('修订简介');
++    expect(await c().modelFamily.findUnique({ where: { id: SEED.familyGpt } })).toEqual(family);
++    const overview = await accepted('model-info', { modelId: SEED.familyGpt, modelName: 'gpt-4', granularity: 'model', overview: '<p>旧介绍</p>' });
++    const candidate = await propose(overview.row, { overview: '<p>新介绍</p><script>bad()</script>' });
++    expect((await ReviewService.accept(candidate.row.id)).entityId).toBe(overview.entityId);
++    expect((await c().modelInfo.findUniqueOrThrow({ where: { id: overview.entityId } })).overview).toBe('<p>新介绍</p>');
++    const log = await accepted('changelog', { title: '旧日志', bodyHtml: '<p>旧</p>', modelRefs: ['gpt-4'] });
++    const original = await c().changelogI18n.findFirstOrThrow({ where: { changelogId: log.entityId } });
++    const edited = await propose(log.row, { bodyHtml: '<p>新</p>' });
++    expect((await ReviewService.accept(edited.row.id)).entityId).toBe(log.entityId);
++    expect((await c().changelogI18n.findUniqueOrThrow({ where: { id: original.id } })).publishedAt).toEqual(original.publishedAt);
++  });
++
++  test('版本、身份字段、AI modify 和 rejected 派生不能绕过修订保护', async () => {
++    const { row } = await accepted();
++    await expect(propose({ ...row, updatedAt: new Date(0) }, { answer: 'x' })).rejects.toBeInstanceOf(ConflictError);
++    await expect(propose(row, { modelRef: 'another', answer: 'x' })).rejects.toBeInstanceOf(UnprocessableError);
++    const revision = await propose(row, { answer: 'new' });
++    await expect(DraftModifyService.modify(revision.row.id, '改写', 1)).rejects.toBeInstanceOf(ConflictError);
++    expect(await c().agentJob.count()).toBe(0);
++    await ReviewService.reject(revision.row.id);
++    const rejected = await c().ingestDraft.findUniqueOrThrow({ where: { id: revision.row.id } });
++    await expect(DraftUpdateService.update(rejected.id, { data: { answer: 'retry' }, expectedUpdatedAt: rejected.updatedAt.toISOString() })).rejects.toBeInstanceOf(ConflictError);
++  });
++
++  test('HTTP 回执包含派生链与不影响正式内容；重放保持同 ID', async () => {
++    const { row, entityId } = await accepted();
++    const input = { data: { answer: '仅 auto' }, expectedUpdatedAt: row.updatedAt.toISOString(), idempotencyKey: crypto.randomUUID() };
++    const response = await handle(json('POST', `/admin/drafts/${row.id}/revise`, input));
++    expect(response.status).toBe(200);
++    const body = await response.json() as { data: { affectsPublishedContent: boolean; derivedFrom: string; draft: { id: string; status: string } } };
++    expect(body.data.affectsPublishedContent).toBe(false);
++    expect(body.data.derivedFrom).toBe(row.id);
++    expect(body.data.draft.status).toBe('pending');
++    const replay = await handle(json('POST', `/admin/drafts/${row.id}/revise`, input));
++    expect((await replay.json() as typeof body).data.draft.id).toBe(body.data.draft.id);
++    const info = await handle(json('GET', `/admin/drafts/${body.data.draft.id}`, undefined, { cookie: staffCookie() }));
++    expect((await info.json() as { data: { revision: unknown } }).data.revision).toEqual({ sourceDraftId: row.id, targetEntityId: entityId, targetKind: 'faq' });
++    const list = await handle(json('GET', `/admin/drafts?parentDraftId=${row.id}`, undefined, { cookie: staffCookie() }));
++    expect((await list.json() as { data: { items: Array<{ revision: { targetEntityId: string } }> } }).data.items[0]!.revision.targetEntityId).toBe(entityId);
++  });
++});
+diff --git a/apps/content-api/tests/modules/review/draft-update.test.ts b/apps/content-api/tests/modules/review/draft-update.test.ts
+index db7bda8e..dc15f8a3 100644
+--- a/apps/content-api/tests/modules/review/draft-update.test.ts
++++ b/apps/content-api/tests/modules/review/draft-update.test.ts
+@@ -264,14 +264,14 @@ describe('PATCH /admin/drafts/:id · 校验与身份', () => {
+     expect(body.message).toContain('data 校验失败');
+   });
+ 
+-  test('不支持的 contentType → 422（showcase 提示 maintain 面）', async () => {
++  test('Showcase 必须带版本；其他不支持的 contentType 仍 422', async () => {
+     const sc = await mkDraft({
+       contentType: 'showcase',
+       data: { slug: 's', type: 'image', title: 't', artifact: 'https://static.hiapi.ai/a.png', modelRef: 'gpt-4', routeKey: '' },
+     });
+     const r1 = await patch(sc.id, { data: { title: 'x' } });
+     expect(r1.status).toBe(422);
+-    expect(((await r1.json()) as { message: string }).message).toContain('maintain');
++    expect(((await r1.json()) as { message: string }).message).toContain('expectedUpdatedAt');
+ 
+     const pg = await mkDraft({ contentType: 'playground-example', data: { originFullName: 'x' } });
+     const r2 = await patch(pg.id, { data: { originFullName: 'y' } });
+diff --git a/apps/content-api/tests/utils/write-routes-guard.test.ts b/apps/content-api/tests/utils/write-routes-guard.test.ts
+index 73fb7261..71b2d88f 100644
+--- a/apps/content-api/tests/utils/write-routes-guard.test.ts
++++ b/apps/content-api/tests/utils/write-routes-guard.test.ts
+@@ -74,6 +74,7 @@ const STAFF_WRITE_ROUTES: ReadonlyArray<{ method: string; path: string }> = [
+   // draft update/modify（2026-11-10：人工修订 + AI 定向改写）
+   { method: "PATCH", path: "/admin/drafts/:id" },
+   { method: "POST", path: "/admin/drafts/:id/modify" },
++  { method: "POST", path: "/admin/drafts/:id/revise" },
+   { method: "POST", path: "/admin/drafts/:id/reject" },
+   { method: "POST", path: "/admin/drafts/batch" },
+   // 翻译缺口修复 B1（2026-11-11）：人工 requeue（admin only）
+diff --git a/packages/content-sdk/src/index.ts b/packages/content-sdk/src/index.ts
+index 5e7e0369..409d7b7e 100644
+--- a/packages/content-sdk/src/index.ts
++++ b/packages/content-sdk/src/index.ts
+@@ -397,6 +397,9 @@ export {
+   AdminDraftUpdateRequest,
+   AdminDraftUpdateResult,
+   AdminDraftUpdateResponse,
++  AdminDraftReviseRequest,
++  AdminDraftReviseResponse,
++  AdminShowcaseCopyPatch,
+   AdminDraftModifyRequest,
+   AdminDraftModifyResult,
+   AdminDraftModifyResponse,
+diff --git a/packages/content-sdk/src/schema/ingest.ts b/packages/content-sdk/src/schema/ingest.ts
+index 1ed73cde..37e03d96 100644
+--- a/packages/content-sdk/src/schema/ingest.ts
++++ b/packages/content-sdk/src/schema/ingest.ts
+@@ -579,6 +579,12 @@ export const IngestDraftDetail = Type.Composite([
+     // 派生链（2026-11-10·R4 可追溯）：update/modify 产出的草稿指回原稿；无派生时为 undefined。
+     parentDraftId: Type.Optional(UlidString),
+     updatedAt: Type.String({ description: 'ISO 8601' }),
++    acceptedEntityId: Type.Optional(UlidString),
++    revision: Type.Optional(Type.Object({
++      sourceDraftId: UlidString,
++      targetEntityId: UlidString,
++      targetKind: Type.Union(['blog', 'faq', 'changelog', 'model', 'family'].map((kind) => Type.Literal(kind))),
++    }, { additionalProperties: false })),
+   }),
+ ]);
+ export type IngestDraftDetail = Static<typeof IngestDraftDetail>;
+@@ -668,8 +674,14 @@ export const AdminDraftBatchResponse = ApiOk(AdminDraftBatchResult);
+ /** 更新请求（PATCH）：至少一项（cross-field 由控制器 422）。
+  *  data = RFC 7386 merge patch（只改传入字段·null 删键·数组整体替换）；
+  *  media = 整体替换，null = 清空；locale 首版只允许 zh。 */
++const DraftVersionTimestamp = Type.String({
++  pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?(?:Z|[+-]\\d{2}:\\d{2})$',
++  description: 'Expected draft updatedAt (ISO 8601); stale edits return 409',
++});
++
+ export const AdminDraftUpdateRequest = Type.Object(
+   {
++    expectedUpdatedAt: Type.Optional(DraftVersionTimestamp),
+     data: Type.Optional(
+       Type.Record(Type.String(), Type.Unknown(), {
+         description: 'RFC 7386 merge patch（对象；null 值 = 删键）',
+@@ -689,10 +701,26 @@ export type AdminDraftUpdateRequest = Static<typeof AdminDraftUpdateRequest>;
+ export const AdminDraftUpdateResult = Type.Object({
+   draft: IngestDraftDetail,
+   derivedFrom: Type.Optional(UlidString),
++  affectsPublishedContent: Type.Literal(false),
++  reused: Type.Optional(Type.Boolean()),
+ });
+ export type AdminDraftUpdateResult = Static<typeof AdminDraftUpdateResult>;
+ export const AdminDraftUpdateResponse = ApiOk(AdminDraftUpdateResult);
+ 
++/** Explicit accepted -> pending revision; replay the same key after an uncertain result. */
++export const AdminDraftReviseRequest = Type.Object({
++  data: Type.Record(Type.String(), Type.Unknown()),
++  expectedUpdatedAt: DraftVersionTimestamp,
++  idempotencyKey: Type.String({ minLength: 1, maxLength: 128, pattern: '\\S' }),
++  targetEntityId: Type.Optional(UlidString),
++}, { additionalProperties: false });
++export type AdminDraftReviseRequest = Static<typeof AdminDraftReviseRequest>;
++export const AdminDraftReviseResponse = AdminDraftUpdateResponse;
++
++export const AdminShowcaseCopyPatch = Type.Partial(Type.Pick(IngestShowcaseData, ['title', 'introduce']), {
++  additionalProperties: false, minProperties: 1,
++});
++
+ /** 改写请求：prompt 1..4000（CLI ≤4000 与后端一致；blog 整篇重写成本见 CLI help）。 */
+ export const AdminDraftModifyRequest = Type.Object(
+   { prompt: Type.String({ minLength: 1, maxLength: 4000 }) },
+diff --git a/packages/content-sdk/tests/schema/ingest-update-modify.test.ts b/packages/content-sdk/tests/schema/ingest-update-modify.test.ts
+index 637572f2..508eab1f 100644
+--- a/packages/content-sdk/tests/schema/ingest-update-modify.test.ts
++++ b/packages/content-sdk/tests/schema/ingest-update-modify.test.ts
+@@ -12,6 +12,8 @@ import {
+   AdminDraftModifyResponse,
+   AdminDraftUpdateRequest,
+   AdminDraftUpdateResponse,
++  AdminDraftReviseRequest,
++  AdminShowcaseCopyPatch,
+   IngestDraftDetail,
+   IngestDraftInput,
+ } from '../../src/schema/ingest';
+@@ -131,6 +133,7 @@ describe('响应形状', () => {
+             parentDraftId: ULID2, // R4 可追溯
+           },
+           derivedFrom: ULID2,
++          affectsPublishedContent: false,
+         },
+       }),
+     ).toBe(true);
+@@ -177,3 +180,30 @@ describe('响应形状', () => {
+     expect(ADMIN_DRAFT_JOB_STATUSES).toEqual(['queued', 'running', 'succeeded', 'failed']);
+   });
+ });
++
++describe('显式修订与 Showcase 文案契约', () => {
++  test('revise 需稳定请求 key 和版本，不能注入 source/status/target metadata', () => {
++    const input = { data: { answer: 'auto' }, expectedUpdatedAt: '2026-11-20T00:00:00.000Z', idempotencyKey: 'review-17' };
++    expect(Value.Check(AdminDraftReviseRequest, input)).toBe(true);
++    expect(Value.Check(AdminDraftReviseRequest, { ...input, targetEntityId: ULID })).toBe(true);
++    for (const key of ['data', 'expectedUpdatedAt', 'idempotencyKey']) {
++      const missing: Record<string, unknown> = { ...input };
++      delete missing[key];
++      expect(Value.Check(AdminDraftReviseRequest, missing)).toBe(false);
++    }
++    for (const key of ['source', 'status', 'targetFingerprint', 'baseData']) {
++      expect(Value.Check(AdminDraftReviseRequest, { ...input, [key]: 'injected' })).toBe(false);
++    }
++    expect(Value.Check(AdminDraftReviseRequest, { ...input, idempotencyKey: ' ' })).toBe(false);
++    expect(Value.Check(AdminDraftReviseRequest, { ...input, expectedUpdatedAt: 'yesterday' })).toBe(false);
++  });
++
++  test('Showcase 只准 title/introduce，空补丁与任意其他字段均拒绝', () => {
++    expect(Value.Check(AdminShowcaseCopyPatch, { title: '标题', introduce: '介绍' })).toBe(true);
++    expect(Value.Check(AdminShowcaseCopyPatch, {})).toBe(false);
++    expect(Value.Check(AdminShowcaseCopyPatch, { title: null })).toBe(false);
++    for (const key of ['prompt', 'input', 'artifact', 'inputSchemaHash', 'modelRef', 'routeKey', 'media']) {
++      expect(Value.Check(AdminShowcaseCopyPatch, { title: '合法文案', [key]: 'forbidden' })).toBe(false);
++    }
++  });
++});
