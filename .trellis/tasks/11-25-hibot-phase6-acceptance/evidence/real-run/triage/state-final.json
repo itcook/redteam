@@ -1,0 +1,28 @@
+{
+  "schema": "hibot.audit.state/1",
+  "job_id": "01JEXAMPLETRIAGE0001",
+  "phase": "finishing",
+  "at": "2026-11-25T09:12:06Z",
+  "llm": {
+    "in_flight": 0,
+    "max_concurrency": 4,
+    "retrying": 0,
+    "providers": [
+      {
+        "name": "deepseek",
+        "in_flight": 0,
+        "max_concurrency": 4
+      }
+    ]
+  },
+  "extensions": {
+    "redteam": {
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      }
+    }
+  }
+}

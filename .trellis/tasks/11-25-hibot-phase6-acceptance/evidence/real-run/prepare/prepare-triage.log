@@ -1,0 +1,10 @@
+Preparing worktree (detached HEAD 0ad5acd17)
+kind    : triage
+job dir : /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-official/triage/job
+repo dir: /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-official/triage/repo  (detached 0ad5acd17d5ceb2341af3ed5f038da60258c192a, base 179c7e02c8da9dfc52300854a9526cf1bdf4f74f)
+
+手工调用：
+  redteam triage --job-dir "/Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-official/triage/job"
+
+清理检出：
+  git -C "/Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-real/full" worktree remove --force "/Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-official/triage/repo"

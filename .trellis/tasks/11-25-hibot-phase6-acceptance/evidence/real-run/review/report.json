@@ -1,0 +1,262 @@
+{
+  "schema": "hibot.audit.report.review/1",
+  "job_id": "01JEXAMPLEREVIEW0001",
+  "kind": "review",
+  "status": "partial",
+  "status_reason": "wall-clock budget exhausted or terminated; results flushed: wall-clock budget exhausted or terminated; results flushed",
+  "input": {
+    "head_sha": "0ad5acd17d5ceb2341af3ed5f038da60258c192a",
+    "base_sha": "179c7e02c8da9dfc52300854a9526cf1bdf4f74f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:e0c647d64cb04184809374b5506a7dc9b72067c81db072e662c542ad54d94d44",
+      "severity": "high",
+      "confidence": 0.62,
+      "file": "service/checkout_recovery.go",
+      "line_start": 508,
+      "line_end": 513,
+      "quote": "if err := scheduleCheckoutRecovery(ctx, VerifyCheckoutRecoveryPayment, time.Now().UTC()); err != nil {\n\t\t\t\t\t\tif recoveryDeliveryRunConsumed(err) {\n\t\t\t\t\t\t\tnextDelivery = time.Now().Add(deliveryInterval)\n\t\t\t\t\t\t}\n\t\t\t\t\t\treturn \"\", err\n\t\t\t\t\t}",
+      "title": "Enqueue-phase deadline now burns the 30-minute delivery slot (and can re-scan the same page forever) even though nothing was sent",
+      "body": "StartCheckoutRecoveryTask runs three phases on one 65s ctx: preview (20s), scheduleCheckoutRecovery (a full page of up to 30 candidates, each one verified against Stripe via evaluateRecoveryCandidate(..., verify)), and only then RunOnce (up to 25 sends, estimated at ~45s by the new comment). The enqueue phase and the send phase therefore compete for the same 45s and the enqueue phase alone can exhaust it (30 Stripe round trips, each potentially paginating up to 3x100 sessions per the spec). When scheduleCheckoutRecovery returns DeadlineExceeded, the new code sets nextDelivery = now+30m and returns, so RunOnce is skipped entirely. Two harms follow. (a) Regression in self-healing: before this diff only a nil error from RunOnce advanced nextDelivery, so a schedule error was retried on the next 1-minute tick. Nothing is being sent during a failed enqueue, so the pace argument in the comment does not apply; the change converts a transient slow Stripe/DB response into a 30-minute delivery stall with zero sends. (b) If the deadline escapes from inside the enqueue loop (the loop's `return err` paths, e.g. a ctx-bound call in evaluateRecoveryCandidate), the function returns *before* the final `model.DB...Update(\"scan_cursor\", cursor)`, so the cursor stays at the previous position. The next run re-lists and re-verifies exactly the same page with exactly the same cost, times out again, burns another 30-minute slot, and never reaches RunOnce: the recovery queue makes no progress and sends no mail at all. Even in the non-livelock variant, a page that overruns makes every run enqueue up to 30 rows and send 0, so the queue grows while the throughput the comment promises (\"about 50 per hour\") collapses toward zero. Recommendation: persist the scan cursor as each row is consumed (or in a defer) so an early return never loses progress; do not set nextDelivery when the enqueue phase is what failed (pass a flag or return a distinct error/whether any send was attempted); and give the enqueue and send phases separate deadlines instead of one shared recoveryTickTimeout.",
+      "recommendation": "Move the scan_cursor persistence so it cannot be skipped on an early return (defer or per-row update), and only consume the 30-minute slot when the deadline was hit inside RunOnce after at least one send attempt (or return a distinct 'enqueue_deadline' error that does not advance nextDelivery). Split the tick context into a preview sub-budget, an enqueue sub-budget, and a send sub-budget so the enqueue page of 30 Stripe verifications cannot starve RunOnce.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:f7a91a3580d241bb737cf584c9c1a934c71475ec4bec5ab09306e77e9c406e6c",
+      "severity": "medium",
+      "confidence": 0.55,
+      "file": "service/checkout_recovery.go",
+      "line_start": 381,
+      "line_end": 382,
+      "quote": "sendCtx, cancel := context.WithTimeout(ctx, 20*time.Second)\n\t\tresult, sendErr := w.Transport.Send(sendCtx, request, row.IdempotencyKey)",
+      "title": "MaxPerRun=25 inside a 45s shared budget truncates the in-flight send into provider_outcome_unknown, suppressing a never-contacted recipient for 30 days",
+      "body": "RunOnce only guards the *start* of each iteration (`if ctx.Err() != nil { return sent, ctx.Err() }`) and gives each provider call `context.WithTimeout(ctx, 20*time.Second)`, i.e. min(remaining tick budget, 20s). The new pacing sets MaxPerRun = recoveryMaxSendPerRun = 25 while the whole delivery slice is 45s and must also cover the enqueue phase (up to 30 Stripe verifications) and the preview's 20s. Each iteration is sequential: claim, build, Stripe verify, second local re-check, BeginCheckoutRecoverySendForRevision, then Transport.Send. The budget is calibrated to the work, so runs will routinely reach the deadline boundary with a row already claimed and marked `sending`; the loop-top guard does not prevent a send from being *started* with only a few hundred ms of ctx left, and the send then fails with context.DeadlineExceeded. That error is not a *ResendSendError, so it falls through to FinishCheckoutRecovery(..., RecoveryStatusUnknown, \"provider_outcome_unknown\", ...). Per the design, sending rows carry a contact timestamp and unknown rows hold the 30-day cooldown and are never retried (\"Do not manually reset an unknown row\"). The result: a user who was never contacted (the request was cancelled before it left) is silently excluded from checkout recovery for 30 days. Before this change MaxPerRun was 10 against a 40s budget, so the last send comfortably finished inside the deadline; raising the per-run count to 25 without reserving time for the send makes this false-unknown outcome part of normal operation.",
+      "recommendation": "Before claiming/beginning the send, check the remaining tick budget (`if dl, ok := ctx.Deadline(); ok && time.Until(dl) < sendTimeout+margin { break }`) and leave the row queued instead of converting it to unknown; or give the provider call its own 20s budget derived from context.WithoutCancel(ctx) so a started send is not truncated by the tick deadline (the 90s sending lease leaves room for 65s + 20s). Alternatively lower recoveryMaxSendPerRun so the send phase fits inside recoveryDeliveryBudget together with the enqueue phase.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:e8d6bed816fc5c338bfae01cb211a81c297843bd9f150bc6ab36fdcac0416d22",
+      "severity": "medium",
+      "confidence": 0.55,
+      "file": "service/checkout_recovery.go",
+      "line_start": 523,
+      "line_end": 523,
+      "quote": "return fmt.Sprintf(\"sent=%d\", sent), err",
+      "title": "Designed deadline cut-off is still returned as a heartbeat error, so every normal pacing run reports a failure",
+      "body": "The diff introduces recoveryDeliveryRunConsumed precisely to classify context.DeadlineExceeded as a normal, expected end of a delivery run (comment: 'A deadline still consumes the slot: unsent rows stay queued for the next run'). But after using that classification to set nextDelivery, the handler still returns the raw error to RunWithHeartbeat: `return fmt.Sprintf(\"sent=%d\", sent), err`. Under the design's own pacing (25 sends + an enqueue page of 30 Stripe verifications against a 65s tick), hitting the deadline is the expected steady state, so CheckoutRecovery will be recorded as failed roughly every 30-minute delivery run even though nothing is wrong. That is exactly the signal an operator needs for genuine failures (Stripe outage, DB errors, provider rejections): it becomes indistinguishable from pacing noise, and any alert on the heartbeat fires constantly and gets muted. The schedule branch has the same problem in a worse form: it returns `\"\", err` with an empty status when the only thing that happened is a consumed slot. The code already computes the distinction, it just discards it at the boundary.",
+      "recommendation": "When recoveryDeliveryRunConsumed(err) is true, return a non-error status string (e.g. \"deadline reached, sent=%d\") and nil so the heartbeat stays green for the designed outcome; keep propagating only non-deadline errors. Do the same for the schedule branch instead of returning \"\".",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:af03eade7617e654d8a8b6153ede3515ac50c924eb8e2adb5d0e7bbd17fcfd83",
+      "severity": "high",
+      "confidence": 0.65,
+      "file": "service/checkout_recovery.go",
+      "line_start": 381,
+      "line_end": 383,
+      "quote": "sendCtx, cancel := context.WithTimeout(ctx, 20*time.Second)\n\t\tresult, sendErr := w.Transport.Send(sendCtx, request, row.IdempotencyKey)\n\t\tcancel()",
+      "title": "Tick deadline turns a never-dispatched send into a terminal `unknown` row and burns the 30-day contact cooldown",
+      "body": "Harm chain: (1) `model.BeginCheckoutRecoverySendForRevision` (service/checkout_recovery.go:378) is called before the provider call; per the model layer it flips status to `sending` and sets `contacted_at = COALESCE(contacted_at, now)`. There is no `ctx.Err()` check between the loop-top check at line 292 and this Begin/Send pair. (2) If the tick context is already expired at line 381, `context.WithTimeout(ctx, 20*time.Second)` produces an immediately cancelled `sendCtx`; `resendHTTPTransport.Send` then fails in `http.NewRequestWithContext`/`client.Do` with a bare `context.Canceled`/`context.DeadlineExceeded`, which is *not* a `*ResendSendError`, so the code falls into the `provider_outcome_unknown` branch (line 392) and calls `FinishCheckoutRecovery(..., RecoveryStatusUnknown, ...)`. (3) `unknown` rows are never reclaimed (`ClaimCheckoutRecovery` only reclaims `claimed` with an expired lease and `sending` with an expired lease), `TopUpID` is a `uniqueIndex` so the same order can never be re-enqueued, and `RecoveryCooldownActive` treats `contacted_at >= now-30d` as an active reservation for *both* the user and the normalized address. The result: a customer whose recovery email was due silently never gets it, the address is excluded for 30 days, and the spec forbids manual recovery (\"Do not manually reset an unknown row to pending or delete contact history\"). This contradicts the spec's own statement that \"unsent rows stay queued\". (4) THIS change makes this state routine rather than an edge case: `MaxPerRun` went 10 -> 25, and the 45s delivery phase must also cover `scheduleCheckoutRecovery`, which now verifies up to 30 candidates against Stripe before the first send. The comment's assumption (\"each send verifies Stripe and calls Resend (about one second), so a run needs roughly 45 seconds\") ignores the 30-row enqueue pass entirely and ignores that each send performs *two* candidate evaluations, the first with `w.Verify` (`VerifyCheckoutRecoveryPayment` wraps a 20s deadline and may walk up to 20 related intents). With a real backlog the 65s tick is exhausted mid-loop on most runs, so one row per run is converted into a permanent `unknown` with a consumed cooldown. The previous 10-send cap left ~20s of headroom inside the old 40s tick; 25 sends + 30 enqueue verifications do not fit in 45s.",
+      "recommendation": "Three-part fix: (a) before `BeginCheckoutRecoverySendForRevision`, re-check `ctx.Err()` and, if non-nil, return without touching the row so it stays `claimed` with an expiring lease and is legitimately reclaimed; (b) distinguish 'never dispatched' from genuine provider uncertainty — if `sendCtx.Err() != nil` before/without a response (or `errors.Is(sendErr, context.Canceled)` while `errors.As(sendErr, &resendErr)` is false), call `ScheduleCheckoutRecoveryRetry` with a bounded reason like `delivery_budget_exhausted` instead of `FinishCheckoutRecovery(unknown)`, preserving both the queued row and the cooldown; only mark `unknown` when an HTTP response round trip may have occurred; (c) size `recoveryDeliveryBudget` to the actual work (per-send remaining-budget check, or fold the 30 enqueue verifications plus 25 sends into a derived budget) so the loop stops cleanly before the tick context expires.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:a12f8b6408ab3a88f9afc85f96ec987525966b5ec3cfbfbbd176a61260b3627e",
+      "severity": "low",
+      "confidence": 0.6,
+      "file": "service/checkout_recovery.go",
+      "line_start": 287,
+      "line_end": 289,
+      "quote": "if max <= 0 || max > 25 {\n\t\tmax = 10\n\t}",
+      "title": "New MaxPerRun constant is not used in the Range guard, so raising it silently collapses throughput to 10",
+      "body": "`NewCheckoutRecoveryWorker` now sets `MaxPerRun: recoveryMaxSendPerRun` (25), but the sanity guard in `RunOnce` was left hard-coded at the same literal: `if max <= 0 || max > 25 { max = 10 }`. The two numbers are now coupled only by coincidence. If anyone tunes pacing by editing `recoveryMaxSendPerRun` (the obvious knob, now documented as the pace constant near line 30) to anything above 25 — e.g. 30 to shorten the backlog drain after a pause/restart — the worker's explicit value is rejected by the stale literal and silently downgraded to 10, cutting live send throughput by 60% with no error, no log, and no observable signal other than send volume (nothing in the shown code asserts `MaxPerRun`'s effective value). The fallback literal 10 also no longer matches the declared cap, so a caller passing 0 gets a different pace than the declared maximum.",
+      "recommendation": "Derive the guard from the constant instead of duplicating it, e.g. `if max <= 0 || max > recoveryMaxSendPerRun { max = recoveryMaxSendPerRun }` (or reject and log an out-of-range `MaxPerRun` rather than silently clamping), so the pacing knob has exactly one definition.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:008683447d55e8dbf5e992799c59cd04a01c60324ebd16f74263717d429626a4",
+      "severity": "medium",
+      "confidence": 0.65,
+      "file": "service/checkout_recovery_ops.go",
+      "line_start": 363,
+      "line_end": 365,
+      "quote": "deadline := time.Now().Add(recoveryPreviewTickBudget)\n\tcomplete := false\n\tfor !complete && ctx.Err() == nil && time.Now().Before(deadline) {",
+      "title": "Preview 20s budget is advisory only: one in-flight verify or non-ctx DB read can eat the whole tick and starve the delivery run",
+      "body": "`deadline` is only compared at loop boundaries (before a page fetch at line 365 and before each row at line 375). The work started between those checks is bounded by the *tick* ctx (65s), not by `deadline` (20s): `evaluateRecoveryCandidate` receives `ctx`, and inside it the Stripe verifier propagates its own 20s timeout, while `model.CheckCheckoutRecoveryCandidate`, `model.GetEmailPreference` and `model.RecoveryCooldownActive(model.DB, ...)` are called with no ctx at all, so they cannot be cancelled at 20s or even at 65s. Concrete harm chain: a preview with pages of candidates calls Stripe per row; the 20th row starts a verification at t=19.9s and the verifier hangs to its 20s timeout, so the preview phase runs to ~40s (uncancellable DB reads can push it further). The tick ctx is `recoveryTickTimeout = recoveryPreviewTickBudget + recoveryDeliveryBudget` = 65s and the delivery/enqueue phase shares that same ctx in the same tick, so delivery is left with ~25s or nothing - directly falsifying the comment this constant is justified by ('a building preview cannot squeeze delivery into a deadline error'). Because `recoveryDeliveryRunConsumed` returns true for `context.DeadlineExceeded`, the truncated run still burns its 30-minute slot ('A delivery run that hits the deadline still consumes its 30-minute slot'), so while a large preview is churning, up to four consecutive slots (the 2h preview lifetime) can pass without a single message, delaying every queued recovery row by 30 minutes each - the opposite of the documented 'about 50 per hour' pace. Nothing is logged, so the operator sees only a slow drip. The change caused this by introducing a per-tick preview loop whose budget is enforced only by `time.Now()` comparisons instead of a deadline-scoped context.",
+      "recommendation": "Derive a budgeted child context for preview work: `previewCtx, cancel := context.WithDeadline(ctx, deadline); defer cancel()`, and pass `previewCtx` both to `ListCheckoutRecoveryCandidatePageContext` and to `evaluateRecoveryCandidate`. Make the per-candidate reads cancellable (`model.DB.WithContext(previewCtx)` in `RecoveryCooldownActive`, ctx-taking variants of `CheckCheckoutRecoveryCandidate`/`GetEmailPreference`). That way a hung Stripe call is cancelled at the 20s preview boundary and the 45s delivery budget really is reserved.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:7aefc91798464c664992b6b92e1e76ff1e47b12b5c8852b3cc3e3bd402bcb14f",
+      "severity": "low",
+      "confidence": 0.4,
+      "file": "service/checkout_recovery_ops.go",
+      "line_start": 403,
+      "line_end": 406,
+      "quote": "if processed < len(rows) {\n\t\t\tbreak\n\t\t}\n\t\tcomplete = len(rows) < recoveryPreviewPageSize",
+      "title": "A page fetch that overruns the budget leaves the cursor untouched: the preview makes zero progress on every tick and dies with a misleading `expired_or_configuration_changed`",
+      "body": "The deadline is checked before the fetch and again only before each row, so a slow first fetch is indistinguishable from an empty page. If `ListCheckoutRecoveryCandidatePageContext` returns after `deadline` (slow DB, lock wait on the topups/users join, or a paused connection), the inner loop breaks on its first iteration, `processed` stays 0, `processed < len(rows)` breaks the outer loop, and the function falls through to `persistRecoveryPreviewProgress(p, dto, owner, \"building\", nil)` with an unchanged `p.Cursor` and `p.ScannedCount`. Nothing records that the tick did no work, and the next tick repeats the identical fetch from the same cursor. If the condition persists, the preview never advances a single row; when `now.Sub(p.CreatedAt) > recoveryPreviewLifetime` it is failed with the code `expired_or_configuration_changed`, which tells the operator that the configuration changed rather than that the job never got a row in. Since live delivery can only be enabled from a complete, fresh preview, this is a silent hard stop on the release path with the wrong diagnosis. The change created this: before it, a page always processed up to 10 orders with no time-based early break, so 'fetched a page but processed none' was not reachable.",
+      "recommendation": "Treat budget exhaustion as an explicit state instead of an implicit no-op: run the fetch under the deadline-scoped preview context so a stuck fetch is cancelled at the budget, and when `processed == 0 && len(rows) > 0` (or the fetch itself hit the deadline) record a distinct `error_code`/metric such as `preview_budget_exhausted` so the eventual failure is diagnosable and does not masquerade as a configuration change.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:2071f6e070026e9312633158c4a744b7433aaaa83e983b37266cc04b1a8adf44",
+      "severity": "medium",
+      "confidence": 0.4,
+      "file": "service/checkout_recovery_ops.go",
+      "line_start": 426,
+      "line_end": 429,
+      "quote": "if rejected := int(total) - p.ScannedCount; rejected > 0 {\n\t\t\tdto.ReasonCounts[\"ineligible\"] += rejected\n\t\t\tp.ScannedCount = int(total)\n\t\t}",
+      "title": "`ineligible` back-fill silently assumes total >= scanned: a filter mismatch between the count and candidate queries still produces a 'complete' preview",
+      "body": "On completion the code forces `scanned_count` to the manual-Stripe window count and books the remainder as `ineligible`, but the guard is one-sided. If `CountCheckoutRecoveryManualStripeContext` ever returns fewer rows than the candidate pages already scanned, `rejected` is <= 0 and the branch is skipped: the preview is still marked `complete` with a matching fingerprint, yet its `scanned_count` exceeds the window total and its `ineligible` bucket is short - exactly the invariant the spec states ('manual Stripe orders in the window that never became candidates are counted once as ineligible, so scanned_count still covers the whole window'). That mismatch is not hypothetical drift from far away: `ListCheckoutRecoveryCandidatePageContext` (candidate SQL, with its user/topup joins and any suppression or status filters) and `CountCheckoutRecoveryManualStripeContext` (window count) both live in model/checkout_recovery.go and are touched in this same changeset, so any future edit to one filter - soft-deleted users, status sets, payment_channel predicate, or a JOIN that fans a topup out into two rows counted twice by the paging query - lands here. The result is an approval gate (`ApproveCheckoutRecovery` requires a complete, fresh preview) that passes on internally inconsistent evidence, with no error, log, or failed state to notice it by.",
+      "recommendation": "Fail closed on the invariant: `rejected := int(total) - p.ScannedCount; if rejected < 0 { return/transition to failed with error_code \"preview_count_mismatch\" and log both numbers }`, and only then apply the back-fill when `rejected > 0`. Keep the two queries deriving their window predicate from one shared helper so the subset relationship is structural rather than assumed.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:d2f0b03f61bf103425b2a3b240c1685e93c904d08a40cc972fc9b93875934ae6",
+      "severity": "medium",
+      "confidence": 0.6,
+      "file": "service/checkout_recovery_ops.go",
+      "line_start": 383,
+      "line_end": 387,
+      "quote": "// Keep this tick's progress; the next tick retries from the failed order.\n\t\t\t\tif persistErr := persistRecoveryPreviewProgress(p, dto, owner, \"building\", nil); persistErr != nil {\n\t\t\t\t\treturn persistErr\n\t\t\t\t}\n\t\t\t\treturn err",
+      "title": "A single order whose verification keeps returning an error blocks the preview forever (the preview never leaves the same cursor)",
+      "body": "In the new per-row path, `p.Cursor` advances only AFTER `evaluateRecoveryCandidate` succeeds (line 390 `p.Cursor = rows[i].TopUp.Id`). When evaluate returns a non-context error, the code persists progress and returns the error while `p.Cursor` still points at the *previous* row, so the failing order is the first row of every subsequent page query. Nothing in the loop skips or quarantines a row that fails repeatedly, so each tick burns its 20s budget on the same order and the run never advances. The same error class is handled very differently in `RunOnce` (service/checkout_recovery.go), which explicitly treats `model.ErrEmailLocaleUnavailable` from `evaluateRecoveryCandidate` as retryable and moves on (`ScheduleCheckoutRecoveryRetry(... \"email_locale_unavailable\" ...); continue`); the evidence that this exact sentinel can come out of evaluateRecoveryCandidate is the existence of that branch. A user with a durable condition that makes evaluate error (the locale sentinel, GetEmailPreference failure, a suppression-query failure) therefore makes the 30-day preview permanently un-completable: it stalls on that row until `now.Sub(p.CreatedAt) > recoveryPreviewLifetime` (2h) marks it `expired_or_configuration_changed`, and re-requesting a preview hits the same row again. Because `ErrRecoveryPreviewUnavailable`/`CheckoutRecoveryApprovalCurrent` require a fresh complete preview, live delivery can never be enabled while that order exists — the operator loses the ability to approve at all, with only a generic error.",
+      "recommendation": "Give the preview a per-row quarantine: on a non-context error for row i, increment a per-run failure counter/record the row id in the preview DTO, advance `p.Cursor = rows[i].TopUp.Id` so the next tick skips the poisoned row, count it under a distinct reason (e.g. `preview_verify_failed`), and only abort the tick after N consecutive row failures. Mirror `RunOnce`'s `ErrEmailLocaleUnavailable` handling instead of treating it as fatal.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:b62904d2ea3c477d8665a94a351098a8d30053fe6425e21aabb34e828b43abbb",
+      "severity": "medium",
+      "confidence": 0.4,
+      "file": "service/checkout_recovery_ops.go",
+      "line_start": 426,
+      "line_end": 429,
+      "quote": "if rejected := int(total) - p.ScannedCount; rejected > 0 {\n\t\t\tdto.ReasonCounts[\"ineligible\"] += rejected\n\t\t\tp.ScannedCount = int(total)\n\t\t}",
+      "title": "The `ineligible` window reconciliation is one-directional: if the count query and the candidate query diverge the correction silently no-ops and the preview is still approved as complete",
+      "body": "The spec promises that on completion `scanned_count` covers the whole window and that orders that never became candidates are counted once as `ineligible`. The implementation derives that delta as `int(total) - p.ScannedCount` and only acts when it is > 0. Two failure modes are silent: (a) if the two SQL sets ever diverge in the other direction — `CountCheckoutRecoveryManualStripeContext` counts fewer rows than the candidate page query returned (different window boundary handling, different joins on users/email, an order edited between the page scan and the count) — `rejected` is <= 0, no correction happens, `p.ScannedCount` stays LARGER than the window total and is persisted as authoritative; (b) when `total == p.ScannedCount` the code assumes every window order was a candidate, which is only true if the filters are provably a subset relation, and that relation is not checked or asserted anywhere. In both cases the run proceeds to `state = \"complete\"` and becomes approvable, so the admin sees a complete 30-day preview whose `scanned_count`/`ineligible` numbers are inconsistent with the window they claim to cover — the audit evidence used to decide \"the owner reviewed the real 30-day preview\" before enabling live customer mail is wrong, and the error is not surfaced anywhere.",
+      "recommendation": "Make the reconciliation total or fail loudly: if `int(total) < p.ScannedCount`, do not mark complete — return an error / fail the run with a distinct reason (`preview_count_mismatch`) so the divergence is visible, or change the count query to `COUNT(*)` over exactly the same predicate source as the candidate page query so the subset relation is enforced by construction. Also record both numbers (`window_total`, `scanned_count`) in the preview evidence so an approver can see them.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    },
+    {
+      "fingerprint": "sha256:68fc784bed10aa2a39c8b2cb2706fc3f4a206c6656ed279a2ea7d21b8674b470",
+      "severity": "low",
+      "confidence": 0.5,
+      "file": "service/checkout_recovery_ops.go",
+      "line_start": 366,
+      "line_end": 366,
+      "quote": "rows, err := model.ListCheckoutRecoveryCandidatePageContext(ctx, p.AsOf, p.StartAt, p.Cursor, recoveryPreviewPageSize)",
+      "title": "A page-query error discards the entire tick's verified progress, contradicting the per-row error path that deliberately persists",
+      "body": "The per-row error branch was written specifically to keep this tick's progress (persist then return). The page-fetch branch immediately above it does the opposite: on a non-context error from `ListCheckoutRecoveryCandidatePageContext` it `return err` without calling `persistRecoveryPreviewProgress`, so every row verified in the pages already processed during this tick (each costing a Stripe round trip) is thrown away — `p.Cursor`/`p.ScannedCount`/`dto.ReasonCounts` were mutated in memory only. The next tick restarts from the last persisted cursor and re-verifies those same orders against Stripe again. Under a transient DB blip that recurs (connection resets on a large window), the preview can spend several ticks re-doing the same pages and never finish inside the 2-hour lifetime, turning the preview into a permanent failure; the same inconsistency also makes the two error paths behave differently for no documented reason, which will mislead whoever maintains the retry logic.",
+      "recommendation": "Use the same pattern as the per-row branch: on a non-context page error, call `persistRecoveryPreviewProgress(p, dto, owner, \"building\", nil)` (persisting the cursor at the last successfully processed row) before returning err, so the next tick resumes instead of re-verifying already-paid Stripe calls.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "reviewer"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 223265,
+    "output_tokens": 329531,
+    "cached_input_tokens": 55296,
+    "wall_clock_ms": 442775
+  },
+  "extensions": {
+    "redteam": {
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 3600
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "input_consistency": {
+        "differing_total": 0,
+        "files": 7,
+        "git": "match",
+        "git_files": 7,
+        "match": true,
+        "only_in_git_total": 0,
+        "only_in_patch_total": 0
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "prior_routing": {
+        "focus": [
+          "billing",
+          "concurrency",
+          "retry-budget"
+        ],
+        "present": true,
+        "specs_unreadable": 0,
+        "specs_used": [
+          "docs/specs/2026-10-13-checkout-recovery-email.md"
+        ],
+        "wall_clock_s": 3600
+      },
+      "status_code": "wall_clock_exhausted"
+    }
+  }
+}

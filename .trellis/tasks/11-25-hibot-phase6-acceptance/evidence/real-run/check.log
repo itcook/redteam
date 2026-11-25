@@ -1,0 +1,85 @@
+PASS triage: 报告过 hibot schema
+PASS triage: head_sha 回显一致
+PASS triage: base_sha 回显一致
+PASS triage: ok 不写 status_reason
+PASS triage: ok 不写 status_code
+PASS triage: usage 无 cost
+PASS triage: 采到 3 帧 state.json
+PASS triage: frame-1.json schema
+PASS triage: frame-1.json job_id
+PASS triage: frame-1.json phase ∈ ('preparing', 'running', 'finishing')
+PASS triage: frame-2.json schema
+PASS triage: frame-2.json job_id
+PASS triage: frame-2.json phase ∈ ('preparing', 'running', 'finishing')
+PASS triage: frame-3.json schema
+PASS triage: frame-3.json job_id
+PASS triage: frame-3.json phase ∈ ('preparing', 'running', 'finishing')
+PASS triage: 心跳 phase 单调前进
+PASS triage: 终帧 finishing
+PASS triage: 墙钟已记录
+PASS review: 报告过 hibot schema
+PASS review: head_sha 回显一致
+PASS review: base_sha 回显一致
+PASS review: findings[0] 指纹可复算
+PASS review: findings[0] quote 逐字命中 (service/checkout_recovery.go)
+PASS review: findings[1] 指纹可复算
+PASS review: findings[1] quote 逐字命中 (service/checkout_recovery.go)
+PASS review: findings[2] 指纹可复算
+PASS review: findings[2] quote 逐字命中 (service/checkout_recovery.go)
+PASS review: findings[3] 指纹可复算
+PASS review: findings[3] quote 逐字命中 (service/checkout_recovery.go)
+PASS review: findings[4] 指纹可复算
+PASS review: findings[4] quote 逐字命中 (service/checkout_recovery.go)
+PASS review: findings[5] 指纹可复算
+PASS review: findings[5] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[6] 指纹可复算
+PASS review: findings[6] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[7] 指纹可复算
+PASS review: findings[7] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[8] 指纹可复算
+PASS review: findings[8] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[9] 指纹可复算
+PASS review: findings[9] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: findings[10] 指纹可复算
+PASS review: findings[10] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS review: partial/error 必须有人读 reason
+PASS review: usage 无 cost
+PASS review: 采到 3 帧 state.json
+PASS review: frame-1.json schema
+PASS review: frame-1.json job_id
+PASS review: frame-1.json phase ∈ ('preparing', 'running', 'finishing')
+PASS review: frame-2.json schema
+PASS review: frame-2.json job_id
+PASS review: frame-2.json phase ∈ ('preparing', 'running', 'finishing')
+PASS review: frame-3.json schema
+PASS review: frame-3.json job_id
+PASS review: frame-3.json phase ∈ ('preparing', 'running', 'finishing')
+PASS review: 心跳 phase 单调前进
+PASS review: 终帧 finishing
+PASS review: 墙钟已记录
+PASS verify: 报告过 hibot schema
+PASS verify: head_sha 回显一致
+PASS verify: base_sha 回显一致
+PASS verify: 输入指纹集合 == 输出集合
+PASS verify: 输出无重复指纹
+PASS verify: counts 之和 == verifications 条数
+PASS verify: verifications[0] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS verify: verifications[1] quote 逐字命中 (service/checkout_recovery_ops.go)
+PASS verify: ok 不写 status_reason
+PASS verify: ok 不写 status_code
+PASS verify: usage 无 cost
+PASS verify: 采到 3 帧 state.json
+PASS verify: frame-1.json schema
+PASS verify: frame-1.json job_id
+PASS verify: frame-1.json phase ∈ ('preparing', 'running', 'finishing')
+PASS verify: frame-2.json schema
+PASS verify: frame-2.json job_id
+PASS verify: frame-2.json phase ∈ ('preparing', 'running', 'finishing')
+PASS verify: frame-3.json schema
+PASS verify: frame-3.json job_id
+PASS verify: frame-3.json phase ∈ ('preparing', 'running', 'finishing')
+PASS verify: 心跳 phase 单调前进
+PASS verify: 终帧 finishing
+PASS verify: 墙钟已记录
+
+ALL PASS

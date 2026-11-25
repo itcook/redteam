@@ -1,0 +1,12 @@
+
+running 7 tests
+test limits_declare_a_positive_wall_clock ... ok
+test form_and_delivery_follow_the_contract ... ok
+test requires_is_exactly_the_contract_set ... ok
+test declares_the_config_schema_command ... ok
+test declares_only_implemented_kinds ... ok
+test version_matches_the_crate ... ok
+test config_schema_version_matches_capabilities ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
