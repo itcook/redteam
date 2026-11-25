@@ -123,6 +123,24 @@ redteam update --check     # 只检查；redteam update 升级到最新正式版
 插件渠道（下面的 `plugins/redteam/`）走 marketplace / `git pull`，不用 `install.sh`；
 `redteam update` 在插件目录下默认拒写（`--force` 才覆盖）。
 
+## 发布（维护者）
+
+发布由 CI 驱动：推一个 `vX.Y.Z` tag → `.github/workflows/release.yml` 在 macOS arm64 上构建、
+发 GitHub Release，并把产物镜像到 R2（<https://release.hibot.sh/executor/audit/redteam>）。
+
+```sh
+# 1) 版本准备：改 Cargo.toml（唯一真相）→ make gen → 更新 CHANGELOG
+# 2) 本地预演（零副作用，产物在 dist/release/）
+scripts/release.sh v0.1.0 --prepare-only
+# 3) 提交后打 tag 并推送（这一步会触发发布）
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+R2 布局：`v{version}/{asset}`、`v{version}/SHA256SUMS`、`v{version}/config.schema.json`、
+`install.sh`、`config.schema.json`、`latest`（仅正式版更新）。本机兜底发布仍是
+`scripts/release.sh v0.1.0`（完整流程与 secrets/vars 见
+`.doc/plans/2026-11-24-redteam-release-runbook.md`）。
+
 ## 从源码构建
 
 ```sh

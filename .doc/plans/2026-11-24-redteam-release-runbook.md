@@ -13,11 +13,12 @@
 | 项 | 要求 |
 |---|---|
 | 仓库 | `itcook/redteam`（public；`gh auth status` 需对它有权限） |
-| 工具链 | `cargo`（含 `aarch64-apple-darwin` target）、`tar`、`shasum`、`curl`、`gh` |
-| R2（可选） | `.env` 或环境变量：`R2_STATIC_ENDPOINT` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET`，可选 `R2_BUCKET_DOMAIN`。**`.env` 不入库**（`.gitignore` 已挡） |
+| 工具链 | `cargo`（含 `aarch64-apple-darwin` target）、`tar`、`shasum`、`curl`、`gh`、`aws`（仅 R2 镜像） |
+| R2（可选） | `.env` 或环境变量：`R2_STATIC_ENDPOINT` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET`，可选 `R2_PREFIX`（默认 `executor/audit/redteam`）/ `R2_BUCKET_DOMAIN`（默认 `release.hibot.sh`）。**`.env` 不入库**（`.gitignore` 已挡） |
+| CI 配置 | secrets 同左四键；vars：`R2_PREFIX` / `R2_BUCKET_DOMAIN`（不设则用默认值） |
 | 工作区 | 已跟踪文件干净；`make verify` 绿 |
 
-R2 缺失时 release.sh 会自动跳过镜像（GitHub Release 不受影响）；`--skip-r2` 是显式跳过。
+R2 缺失时 release.sh / CI 都会自动跳过镜像（GitHub Release 不受影响）；`--skip-r2` 是显式跳过。
 
 ## 1. 版本准备
 
@@ -36,27 +37,42 @@ make verify          # 版本同源 + codex-skills/schema 防漂移 + packaging/
 5. 提交并合到发布分支；**确认 `git status --porcelain --untracked-files=no` 为空**。
 
 > 预发布（rc）：tag 用 `v0.1.0-rc.1`，`Cargo.toml` 仍写 `0.1.0`（release.sh 按 base 版本比对）。
-> 预发布：GitHub Release 标 prerelease；R2 **不更新** `latest`；`releases/latest` 不会指向 rc。
+> 预发布：GitHub Release 标 prerelease；R2 **不更新** `latest`（`latest` 只指向正式版）。
 
 ## 2. 发布
 
-### 2.1 先演练（零副作用）
+### 2.1 CI 发布（正式路径）
+
+推 tag 即发布：
 
 ```bash
-scripts/release.sh v0.1.0 --dry-run
+git tag v0.1.0 && git push origin v0.1.0              # 正式版
+git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1    # 预发布
 ```
 
-只做：前置检查 → `make verify` → `make gen` → 构建 → 打包。**不建 tag、不推、不建 Release、不碰 R2。**
-产物落在 `dist/release/`。
+`.github/workflows/release.yml` 分四段：
 
-### 2.2 正式发布
+1. **prepare**（ubuntu）：校验 tag 形态（`vX.Y.Z[-pre]`）、与 `Cargo.toml` 同源、指向 HEAD，判定 prerelease；
+2. **build**（`macos-14`，arm64）：`make verify` → `scripts/release.sh <tag> --prepare-only --skip-verify`，
+   上传 tar.gz / SHA256SUMS / release-notes / install.sh / config.schema.json；
+3. **release**：`softprops/action-gh-release@v2` 发布（rc 标 prerelease）；
+4. **check-r2 → r2**：R2 四键齐全才镜像（缺失只告警、不阻塞），上传后按公开基址 HEAD 200 + sha 回验。
+
+也可在 Actions → release → Run workflow 手填 tag（需要目标分支已包含本 workflow）。
+
+### 2.2 本机兜底发布与预演
 
 ```bash
 scripts/release.sh v0.1.0                 # 正式版
 scripts/release.sh v0.1.0-rc.1            # 预发布
+scripts/release.sh v0.1.0 --prepare-only  # 只产出发行产物（要求工作区干净，零副作用）
+scripts/release.sh v0.1.0 --dry-run       # 预演（允许脏工作区，零副作用）
 scripts/release.sh v0.1.0 --skip-r2       # 只发 GitHub Release
 scripts/release.sh v0.1.0 --no-push       # 只建本地 tag（不推、不发 Release、不传 R2）
 ```
+
+`--prepare-only` 与 `--dry-run` 都只落在 `dist/release/`；CI 用前者（干净工作区 + 门禁），
+本地快速预演用后者。
 
 脚本会自己拒绝这些情况：
 
@@ -70,7 +86,7 @@ scripts/release.sh v0.1.0 --no-push       # 只建本地 tag（不推、不发 R
 ### 2.3 发布后回验（脚本内自动做）
 
 - GitHub：四个资产 HEAD 200；归档与 `config.schema.json` 下载回来比 SHA256。
-- R2（启用时）：同上，外加 `install.sh`、`latest`。
+- R2（启用时）：同上，外加 `install.sh`、前缀根 `config.schema.json`、`latest`（正式版）。
 - 任一失败 → 退出码非 0（发布不静默成功）。
 
 ## 3. 产物核对清单
@@ -80,7 +96,7 @@ scripts/release.sh v0.1.0 --no-push       # 只建本地 tag（不推、不发 R
 | `redteam-X.Y.Z-aarch64-apple-darwin.tar.gz` | `redteam` 二进制 + `README.md` + `LICENSE`（install/update 都消费它） |
 | `SHA256SUMS` | 覆盖归档与 `config.schema.json`（方案 B：schema 可校验） |
 | `install.sh` | standalone 安装脚本（`dist/install.sh` 原样发布） |
-| `config.schema.json` | **hibot Phase 6 契约资产**：`$id: urn:redteam:config/1`，`schemaVersion: 1`；release notes 里同时列出 sha256 |
+| `config.schema.json` | **hibot Phase 6 契约资产**：`$id: urn:redteam:config/2`，`schemaVersion: 2`；release notes 里同时列出 sha256 |
 
 核对命令：
 
@@ -113,10 +129,10 @@ HOME="$tmp" curl -fsSL https://github.com/itcook/redteam/releases/download/v0.1.
 
 ```bash
 # 本地造一个 R2 布局的目录，改一位哈希后用 --from r2 装
-mkdir -p /tmp/fake/redteam/releases/v0.1.0
+mkdir -p /tmp/fake/redteam/v0.1.0
 cp dist/release/redteam-0.1.0-aarch64-apple-darwin.tar.gz \
-   dist/release/SHA256SUMS /tmp/fake/redteam/releases/v0.1.0/
-sed -i '' 's/^./0/' /tmp/fake/redteam/releases/v0.1.0/SHA256SUMS     # 破坏一位
+   dist/release/SHA256SUMS /tmp/fake/redteam/v0.1.0/
+sed -i '' 's/^./0/' /tmp/fake/redteam/v0.1.0/SHA256SUMS     # 破坏一位
 printf 'v0.1.0\n' > /tmp/fake/redteam/latest
 REDTEAM_INSTALL_DIR=$(mktemp -d) \
 REDTEAM_BASE_URL=file:///tmp/fake/redteam REDTEAM_FROM=r2 \
@@ -142,20 +158,24 @@ REDTEAM_BASE_URL=file:///tmp/fake/redteam REDTEAM_FROM=r2 \
 本地演练（不起网络）：按 R2 布局准备一个目录 + `python3 -m http.server`，然后
 
 ```bash
-redteam update --from r2 --base-url http://127.0.0.1:PORT/redteam --check
+redteam update --from r2 --base-url http://127.0.0.1:PORT/executor/audit/redteam --check
 ```
 
 ## 5. R2 镜像（可选）
 
-布局（桶沿用 `hiapi-static`）：
+布局（桶沿用 `hiapi-static`；公开基址 `https://release.hibot.sh/executor/audit/redteam`
+= `${R2_BUCKET_DOMAIN}/${R2_PREFIX}`）：
 
 ```
-redteam/install.sh
-redteam/latest                       # 仅正式版更新；内容 vX.Y.Z
-redteam/releases/vX.Y.Z/redteam-X.Y.Z-aarch64-apple-darwin.tar.gz
-redteam/releases/vX.Y.Z/SHA256SUMS
-redteam/releases/vX.Y.Z/config.schema.json
+executor/audit/redteam/vX.Y.Z/redteam-X.Y.Z-aarch64-apple-darwin.tar.gz
+executor/audit/redteam/vX.Y.Z/SHA256SUMS
+executor/audit/redteam/vX.Y.Z/config.schema.json
+executor/audit/redteam/install.sh          # 前缀根：当前版稳定入口
+executor/audit/redteam/config.schema.json  # 前缀根：hibot 契约不看版本号
+executor/audit/redteam/latest              # 仅正式版更新；内容 vX.Y.Z
 ```
+
+**没有 `releases/` 段**（子域已经叫 `release`，产品路径进了前缀）。
 
 所有对象 `--cache-control no-cache`（CDN 会供旧对象；版本化路径也会被重发覆盖）。
 
@@ -166,7 +186,7 @@ redteam/releases/vX.Y.Z/config.schema.json
 ```bash
 printf 'v0.0.9\n' > /tmp/latest
 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-  aws s3 cp /tmp/latest s3://$R2_BUCKET/redteam/latest \
+  aws s3 cp /tmp/latest s3://$R2_BUCKET/executor/audit/redteam/latest \
     --endpoint-url "$R2_STATIC_ENDPOINT" --content-type text/plain --cache-control no-cache
 ```
 
@@ -181,13 +201,14 @@ AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
   「仍要打开」。安装脚本**不会**替用户去掉 quarantine 标记（安全默认）。
 - **插件二进制入库的 diff**：`make build` 会重写 `plugins/redteam/bin/darwin/aarch64/redteam`
   （5.9MB），必须单独提交；发布脚本刻意不跑 `make build`，避免把未审二进制混进发布提交。
-- **无 CI**：发布在本机执行；门禁靠 `make verify` + release.sh 的前置检查。
+- **CI**：`.github/workflows/release.yml` 是正式路径；本机 release.sh 保留为兜底与预演入口。
 - **仅 macOS arm64**：其他平台 `install.sh` / `update` 明确报错。
 
 ## 8. 本地自证（零真实发布）
 
 ```bash
 make verify
+scripts/release.sh v0.1.0 --prepare-only        # 零副作用产物（要求工作区干净）
 scripts/release.sh v0.1.0 --dry-run             # 产物齐全，不碰远端
 scripts/release.sh v0.0.9 --dry-run             # 应报 Cargo 版本不一致
 git tag v9.9.9 HEAD~1 2>/dev/null || true       # 造一个指向非 HEAD 的 tag
