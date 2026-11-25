@@ -1,6 +1,6 @@
 //! triage 整轮预算：归档输入的端到端对拍（2026-11-25）。
 //!
-//! 读 `.trellis/tasks/11-25-hibot-triage-budget/evidence/` 的历史 `diff_patch` / `pr_context`，
+//! 读 `tests/fixtures/triage-budget/` 的历史 `diff_patch` / `pr_context`（稳定路径，不依赖活动任务目录），
 //! 走 `projection::from_patch` → `input::parse` → `triage::total_estimate`，
 //! 断言与 `evidence/budget_estimate.py` 的 B2 列一致。
 //!
@@ -21,8 +21,7 @@ const CASES: &[(&str, &str, u64)] = &[
 
 #[test]
 fn archived_prs_match_the_b2_estimate() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".trellis/tasks/11-25-hibot-triage-budget/evidence");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/triage-budget");
     for (repo, pr, expected) in CASES {
         let patch = std::fs::read_to_string(root.join(format!("diff.hiapi-{repo}-pr-{pr}.patch")))
             .unwrap_or_else(|e| panic!("read patch {repo}#{pr}: {e}"));

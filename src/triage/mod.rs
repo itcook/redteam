@@ -33,7 +33,7 @@ pub struct TriageRequest<'a> {
     pub manifest_cap_s: u64,
     /// 整轮预算包线（秒，2026-11-25 用户批准 B2）：只收紧 deadline，不改变 manifest 硬上限。
     pub estimate_s: u64,
-    /// 绝对截止时刻（manifest 墙钟）：I0 与波次预算都从这里扣除已用时间。
+    /// 绝对截止时刻（规模预算与 manifest 共同限定）：I0 与波次预算都从这里扣除已用时间。
     pub deadline: std::time::Instant,
     /// 三轴使用的模型（`roles.scanner` 的第一条；grill：不新增配置块）。
     pub route_key: String,

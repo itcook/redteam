@@ -1,7 +1,7 @@
 # triage 整轮预算包线：公式候选与真实数据对照（2026-11-25）
 
-> 本文是**待批准**的候选方案，不含实现。所有数值由同目录 `budget_estimate.py` 生成，可离线复跑。
-> 这些数是**预算包线对照**，不是耗时预测。
+> 2026-11-25 用户批准 **B2**；本文保留候选对照与裁决记录。所有数值由同目录 `budget_estimate.py` 生成，
+> 可离线复跑（输出同时写入 `budget-estimate-output.md`）。这些数是**预算包线对照**，不是耗时预测。
 
 ## 1. 现状（先核过的代码）
 
@@ -19,12 +19,13 @@
 
 ## 2. 数据来源与口径
 
-原始输入全部归档在本目录，与 `/tmp/hibot-triage-eval/jobs` 的历史运行逐字节一致（已核对 SHA256）：
+patch / pr-context 归档在 `tests/fixtures/triage-budget/`（稳定路径，任务归档后测试仍可跑）；
+其余证据在本目录。两者与 `/tmp/hibot-triage-eval/jobs` 的历史运行逐字节一致（已核对 SHA256）：
 
 | 文件 | 用途 |
 |---|---|
-| `diff.hiapi-<repo>-pr-<n>.patch` | 历史运行的精确 `diff_patch`（`git diff merge_base..head`） |
-| `pr-context.hiapi-<repo>-pr-<n>.json` | 历史运行的精确 `pr_context` |
+| `tests/fixtures/triage-budget/diff.hiapi-<repo>-pr-<n>.patch` | 历史运行的精确 `diff_patch`（`git diff merge_base..head`） |
+| `tests/fixtures/triage-budget/pr-context.hiapi-<repo>-pr-<n>.json` | 历史运行的精确 `pr_context` |
 | `manifest.hiapi-<repo>-pr-<n>.json` | 历史 manifest（`limits.wall_clock_s`） |
 | `metrics.phase3-8.jsonl` | 5 个 DeepSeek ok 轮的整轮墙钟 |
 | `report.glm54-1800c.json` | backend #333 GLM-5.4 在 1800s + 1.5× 下唯一 ok 轮（1050.125s） |
@@ -143,11 +144,13 @@ A 明细（`m = 1800`）：
 1. **公式**：B2（规模连续保守档）。
 2. **下限**：`min(manifest, 900)`。
 3. **报告**：写入 `extensions.redteam.budget.estimate_s`。
-4. **接受**“多数大 PR 仍顶到 manifest”：这是包线语义的自然结果，不为好看调低系数。
+4. **验证方式**：单测 + 归档脚本对拍，不重跑模型。
+
+大 PR 顶到 manifest 是包线语义的自然结果（非独立批准项），不为好看调低系数。
 
 ## 8. 复跑方式
 
 ```bash
 cd .trellis/tasks/11-25-hibot-triage-budget/evidence
-python3 budget_estimate.py
+python3 budget_estimate.py   # 读 tests/fixtures/triage-budget/，并写 budget-estimate-output.md
 ```

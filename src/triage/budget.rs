@@ -176,5 +176,8 @@ mod tests {
         assert_eq!(total_estimate_s(10_000.0, 500, 100.0, 1800), 1800, "大 PR 等于 manifest");
         assert_eq!(total_estimate_s(0.0, 0, 0.0, u64::MAX), 900, "u64::MAX 不做 f64 截断");
         assert_eq!(total_estimate_s(f64::MAX, 0, 0.0, u64::MAX), u64::MAX, "溢出饱和到 manifest");
+        // >2^53 的 manifest 不能被 f64 舍入抬高：旧实现会返回 cap+1。
+        let cap = (1_u64 << 53) + 3;
+        assert_eq!(total_estimate_s(f64::MAX, 0, 0.0, cap), cap);
     }
 }

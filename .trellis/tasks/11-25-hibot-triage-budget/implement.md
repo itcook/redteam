@@ -21,8 +21,9 @@
 - `src/job/run.rs`：triage 分支先算 `estimate_s`，再
   `effective_deadline(started, manifest.limits.wall_clock_s, Some(estimate_s))`（仍以原始 `started` 计算绝对时刻）。
 - `src/job/report.rs`：`extensions.redteam.budget` 增加 `estimate_s`；单测覆盖正常与 partial 两条路径。
-- `tests/triage_budget_archive.rs`：读 5 份归档 patch / pr-context，走
+- `tests/triage_budget_archive.rs`：读 `tests/fixtures/triage-budget/` 的 5 份历史 patch / pr-context，走
   `projection::from_patch` → `input::parse` → `triage::total_estimate`，断言 1313 / 1027 / 1800 / 1470 / 1133。
+  夹具路径稳定，不依赖 Trellis 任务目录（归档后测试仍可跑）。
 
 ## 未改（边界）
 
@@ -34,10 +35,10 @@
 
 - `make verify`：PASS（生成物同步 + packaging/version；**不含 fmt/clippy**）。
 - `cargo test`：最后一次全量 **PASS**（lib 1141 + 集成全部通过，`evidence/cargo-test.log`）。
-  已知 flaky：`job_conformance::partial_fixture_uses_missing_provider_key_and_reports_partial` 在全量并行时
-  首次运行失败、重跑通过；单独跑该测试与单独跑 `--test job_conformance`（25/25）均通过，基线全量也通过。
-  失败日志与对照见 `evidence/cargo-test-flaky-attempt1.log`、`cargo-test-baseline.log`、
-  `cargo-test-job-conformance-only.log`；该测试属 review 路径，本次未改 review 逻辑。
+  review 的 `job_conformance::partial_fixture_uses_missing_provider_key_and_reports_partial` 曾多次间歇性失败；
+  **根因尚未定位**。单独跑该测试、单独跑 `--test job_conformance`（25/25）、以及暂存对照（`a67ae1d`，
+  仍含 B2 实现、非原始基线）均通过。失败与对照日志见 `evidence/cargo-test-flaky-attempt1.log`、
+  `cargo-test-baseline.log`、`cargo-test-job-conformance-only.log`。
 - 对拍：`evidence/budget_estimate.py` 用真实字节 + `ceil`，B2 列与 Rust 单测/集成测试一致
   （1313 / 1027 / 1800 / 1470 / 1133；见 `evidence/budget-candidates.md` 第 5 节）。
-- `cargo fmt --check`：仓库基线即有全仓差异（未做全仓格式化）；本次未将其作为门槛。
+- 格式检查（已观察事实）：`cargo fmt --check` 返回 1，包含本次未修改文件的格式差异；未做全仓格式化。

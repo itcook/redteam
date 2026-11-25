@@ -58,7 +58,8 @@
 ## 验收
 
 - `make verify` 通过（生成物同步 + packaging/version 测试；**不含 fmt/clippy**）。
-- `cargo test` 相关用例通过，新增用例覆盖上述边界。已知 `job_conformance` 的 partial fixture 在全量并行时有既有 flaky（单跑与基线均通过，详见 `implement.md`）。
+- `cargo test` 相关用例通过，新增用例覆盖上述边界。`job_conformance` 的 review partial fixture 曾多次间歇性失败、
+  根因尚未定位（最终全量通过；详见 `implement.md`）。
 - 用 5 个归档 PR 的真实输入（`diff.patch` + `pr-context.json`）复核：`tests/triage_budget_archive.rs`
   断言 1313 / 1027 / 1800 / 1470 / 1133，与 `evidence/budget_estimate.py`（ceil）一致。
 - `git diff --stat` 只含上述文件的改动。

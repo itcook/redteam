@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """triage 整轮预算包线候选：A（串行求和）与 B（规模连续）对照计算。
 
-数据来源（全部归档在本目录，可离线复核）：
-- diff.hiapi-<repo>-pr-<n>.patch   历史运行的精确 diff_patch（与 /tmp/hibot-triage-eval/jobs 原件逐字节一致）
-- pr-context.hiapi-<repo>-pr-<n>.json  历史运行的精确 pr_context
+数据来源（可离线复核）：
+- `tests/fixtures/triage-budget/diff.*.patch`   历史运行的精确 diff_patch（与 /tmp/hibot-triage-eval/jobs 原件逐字节一致）
+- `tests/fixtures/triage-budget/pr-context.*.json`  历史运行的精确 pr_context（同上）
 - manifest.hiapi-<repo>-pr-<n>.json   历史运行的 manifest（limits.wall_clock_s）
 - metrics.phase3-8.jsonl           5 个 DeepSeek ok 轮的整轮墙钟
 - report.glm54-1800c.json          backend #333 GLM-5.4 在 1800s + 1.5x 下唯一 ok 轮（1050.125s）
@@ -23,6 +23,19 @@ import math
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _repo_root(start):
+    cur = start
+    while cur != os.path.dirname(cur):
+        if os.path.exists(os.path.join(cur, ".git")):
+            return cur
+        cur = os.path.dirname(cur)
+    return start
+
+
+# 稳定的测试夹具路径：Trellis 任务归档后测试仍可跑。
+FIXTURES = os.path.join(_repo_root(HERE), "tests", "fixtures", "triage-budget")
 
 # ---- src/triage/budget.rs 常量（v1） ----
 BASE_CELL_S = 60.0
@@ -197,11 +210,11 @@ def main():
 
     rows = []
     for label, (repo, pr, _, glm_s) in SAMPLE_JOBS.items():
-        patch = parse_patch(os.path.join(HERE, f"diff.hiapi-{repo}-pr-{pr}.patch"))
-        prc = json.load(open(os.path.join(HERE, f"pr-context.hiapi-{repo}-pr-{pr}.json"), encoding="utf-8"))
+        patch = parse_patch(os.path.join(FIXTURES, f"diff.hiapi-{repo}-pr-{pr}.patch"))
+        prc = json.load(open(os.path.join(FIXTURES, f"pr-context.hiapi-{repo}-pr-{pr}.json"), encoding="utf-8"))
         man = json.load(open(os.path.join(HERE, f"manifest.hiapi-{repo}-pr-{pr}.json"), encoding="utf-8"))
         hist_cap = man["limits"]["wall_clock_s"]
-        diff_bytes = os.path.getsize(os.path.join(HERE, f"diff.hiapi-{repo}-pr-{pr}.patch"))
+        diff_bytes = os.path.getsize(os.path.join(FIXTURES, f"diff.hiapi-{repo}-pr-{pr}.patch"))
         text_b = pr_text_bytes(prc)
         a1800, detail = estimate_a(patch, prc, TARGET_MANIFEST)
         a_hist, _ = estimate_a(patch, prc, hist_cap)
@@ -256,7 +269,10 @@ def main():
             f"- {r['label']}: i0={d['i0']:.0f}s n_sec={d['n_sec']} n_drift={d['n_drift']} "
             f"Σsec={d.get('sec', 0):.0f} Σdrift={d.get('drift', 0):.0f} Σintent={d.get('intent', 0):.0f} + 收口 {CLOSE_OUT_S:.0f}s"
         )
-    print("\n".join(out))
+    report = "\n".join(out) + "\n"
+    with open(os.path.join(HERE, "budget-estimate-output.md"), "w", encoding="utf-8") as f:
+        f.write(report)
+    print(report, end="")
 
 
 if __name__ == "__main__":
