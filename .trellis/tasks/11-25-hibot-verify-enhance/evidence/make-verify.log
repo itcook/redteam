@@ -7,19 +7,19 @@ git diff --exit-code plugins/redteam/codex-skills/
 git diff --exit-code plugins/redteam/.claude-plugin/plugin.json plugins/redteam/.codex-plugin/plugin.json capabilities/redteam.json
 git diff --exit-code dist/config.schema.json
 cargo test --test packaging --test version
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
      Running tests/packaging.rs (target/debug/deps/packaging-ae21f53326bf35a6)
 
 running 7 tests
 test binary_layout_and_launcher ... ok
-test commands_frontmatter_and_invocation_policy ... ok
-test codex_skills_have_name_and_no_claude_var ... ok
 test manifests_valid_and_named ... ok
+test codex_skills_have_name_and_no_claude_var ... ok
+test commands_frontmatter_and_invocation_policy ... ok
 test launcher_resolves_on_this_platform ... ok
 test codex_skills_in_sync_with_commands ... ok
 test launcher_errors_when_binary_missing ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
 
      Running tests/version.rs (target/debug/deps/version-0344a79a6a20b2cf)
 
@@ -29,5 +29,5 @@ test capabilities_share_the_crate_version ... ok
 test plugin_manifests_share_the_crate_version ... ok
 test binary_reports_the_crate_version ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
 

@@ -46,3 +46,30 @@
 4. `test(verify): hiapi-backend#400 三组真实夹具 + 脚本`
 5. `chore(verify): #400 真跑记录与对拍`
 6. `docs(verify): 作用域/预算/与 carry 口径差异`
+
+## 交付记录（2026-11-25）
+
+| 提交 | 内容 |
+|---|---|
+| `1fff878` | 两阶段 prepare/dispatch + 受限并发 + provider 门计量（含 `budget.rs`） |
+| `459ffd7` | B-lite：变更符号的跨文件证据（符号名 + 引用处 file:line + ±40 行快照） |
+| `f38b0c7` | B-lite 体积/数量上限（≤3 文件 / ≤6 引用 / ≤12KB，超了留省略标记）——协调者追加 |
+| `5828594` | quote 严格重锚 + 解析失败一次 repair |
+| `a0540df` | #400 三组真实夹具 + `scripts/verify-pr400.sh` + 夹具完整性测试 |
+| `9920206` | 真跑暴露的两处缺口：宽容解析（字符串内裸控制字符）+ `<fix_scope>`（修到哪些文件） |
+| `063eeb2` | 真跑记录与对拍（`evidence/`） |
+| `304280e` | README：job 三 kind 口径 / verify 执行形态 / 与 carry 的口径差异 |
+
+**验收**：`make verify` exit 0；`cargo test` exit 0（lib 1175 / verify_conformance 15 / verify_fixtures 4 /
+其余全绿）；`cargo build --all-targets` 0 warning。
+
+**真跑（deepseek-flash）**：4/6 同（详见 `evidence/pr400-real-run.md`）；两处「异」都是模型判决差异
+（affinity 回归未被识别＝能力边界；Q2 文档类修复判 resolved＝文档证据弱点），不是基础设施失败。
+首轮暴露的「裸控制字符 → JSON 解析失败」已修（同一 finding 修复后判出 resolved）。
+
+**followup**（不阻塞本批）
+1. 文档类修复（findings 的实质在 docs）仍是弱点：`<fix_scope>` 只让模型知道「还改了哪些文件」，
+   不提供文档内容。候选：给 `.md` 变更加一个受限摘录（仅 doc-only 修复时）。
+2. 模型对「非确定性交互回归」（#400 A→B affinity 回退）不敏感：证据已在 prompt 里仍判 resolved。
+   候选：在 `<symbol_blast_radius>` 里显式提示「同一请求内的回退/重选路径也要看」。
+3. `missing_role` 诊断 pointer 落在 `/providers`（Phase 4 遗留 followup，未动）。
