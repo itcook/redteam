@@ -12,7 +12,7 @@
 3. **深挖**：H0 区、scanner 疑点、scanner 提出的证据需求进同一条优先级队列，reviewer 模型按 provider 并发门消费，
    预算随风险分封顶、必挖集不截。**finding 只由深挖产出**——没配 reviewer 角色就退化成 scan-only（只给疑点索引）。
 4. **验真（refute，缺省关）**：finding 落地即可派另一个模型复查；被驳回的不计数、不拦路，但记录在案
-   （finding 的 `refute` 字段）。`settings.review.refuters.enabled = true` 打开；没配 `refuter` 角色时自动挑异族模型。
+   （finding 的 `refute` 字段）。`settings.review.refuters.enabled = true` 打开；本地模式没配 `refuter` 池时自动挑异族模型（job 模式跳过并披露）。
 
 退出码：`0` 干净 / `2` approve 带债 / `3` incomplete（扫描有结构性缺口）/ `10` reject / `1` 命令自身失败。
 
@@ -27,10 +27,11 @@
 | `reviewer` | `settings.review.roles.reviewer.models[]` | 深挖、产出 finding |
 | `refuter` | `settings.review.roles.refuter.models[]` | 评审内 finding 验真（可选；`settings.review.refuters.enabled` 打开后生效） |
 | `verifier` | `settings.verify.models[]` | 修复验证（独立管线，review 不使用；**不再回退 reviewer**） |
-| `triager` | `settings.triage.models[]` | hibot `triage` kind（独立管线） |
+| `triage` | `settings.triage.models[]` | hibot `triage` kind（独立管线） |
 
 条目形状：`{ "provider": "<providers 键>", "id": "<models.id>", "reasoningEffort": "high" }`。
-模型固有属性（`api`/`baseUrl`/`family`/`contextWindow`/…）写在 `providers.<name>.models[]`；
+provider 级通道写在 `providers.<name>`（`api` / `baseUrl` / `apiKeyEnv` / `maxConcurrency`）；
+模型固有属性（`id`/`family`/`contextWindow`/`maxOutputTokens`/…）写在 `providers.<name>.models[]`；
 `language` 在 `settings.language`。v2 是破坏性重排，旧 v1 配置会报错并逐字段给迁移提示。
 
 ## 快速开始

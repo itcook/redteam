@@ -415,7 +415,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn parse_failures_of_both_turns_are_dumped_when_dir_is_set() {
-        let _g = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::config::ENV_LOCK.lock().unwrap();
         let dump = tempfile::tempdir().unwrap();
         // SAFETY: ENV_LOCK 串行化（仓内既定约定；set_var 与**任意**线程的 env 访问都是竞争，
         // 不只是读同一个键——收口评审 #4）

@@ -36,8 +36,8 @@ pub struct TriageRequest<'a> {
     /// 三轴使用的模型池（`settings.triage.models`，顺序即轮转序）。
     /// 轴序 security → drift → intent 依次取池；I0/claims 与报告身份固定用第 1 条。
     pub route_keys: Vec<String>,
-    /// 报告身份（`provider/id`，池首条）：`source.model` / `f.models` 只认它，不认注册表 role key。
-    pub route_name: String,
+    /// 报告身份（`provider/id`），与 `route_keys` 等长等序：`source.model` / `f.models` 只认身份串。
+    pub route_names: Vec<String>,
 }
 
 /// 三轴已完成的结果（取消后从这里取已完成部分）。
@@ -63,13 +63,20 @@ pub struct TriageOutcome {
     pub route_key: String,
 }
 
+/// 轴 → 池下标（security=0 / drift=1 / intent=2），与并发完成顺序无关。
+pub(crate) fn axis_route<'a>(keys: &'a [String], axis: usize) -> &'a str {
+    &keys[axis % keys.len()]
+}
+
 impl TriageRequest<'_> {
-    /// 轴 → 池下标（security=0 / drift=1 / intent=2），与并发完成顺序无关。
     fn route_for(&self, axis: usize) -> &str {
-        &self.route_keys[axis % self.route_keys.len()]
+        axis_route(&self.route_keys, axis)
     }
     fn route_identity(&self) -> &str {
-        &self.route_name
+        &self.route_names[0]
+    }
+    fn identity_for(&self, axis: usize) -> &str {
+        &self.route_names[axis % self.route_names.len()]
     }
 }
 
@@ -126,12 +133,10 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
     let modules: std::collections::BTreeSet<String> =
         files.iter().map(|(p, _)| standards::module_of(p)).collect();
     let n_drift = n_sec.min(modules.len().max(1));
-    let provider_cap = req
-        .route_keys
-        .iter()
-        .filter_map(|k| registry.provider_of(k))
-        .filter_map(|p| registry.cap_of(p))
-        .max()
+    // intent slices 只受 intent 轴所用 provider 的门约束（不是全池最大值）。
+    let intent_cap = registry
+        .provider_of(req.route_for(2))
+        .and_then(|p| registry.cap_of(p))
         .unwrap_or(4) as usize;
 
     let claims = claims_run.rows.first().cloned().unwrap_or_default();
@@ -147,7 +152,7 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                     &claims.claims,
                     &files,
                     n_sec,
-                    (provider_cap / 2).max(1),
+                    (intent_cap / 2).max(1),
                     req.deadline,
                     budget_factor,
                 )
@@ -366,8 +371,13 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
     }
 
     let mut findings = tallied.findings;
-    for f in &mut findings {
-        f.models = vec![req.route_identity().to_string()];
+    // 归因到实际产出轴：安全轴 → 池[0]，结构性漂移 → 池[1]（intent 不产 findings，只产 blockers/claims）。
+    // `tally::tally` 的 findings 顺序 = 全部安全 finding 后接结构性漂移 finding。
+    let sec_n = prepared.security.len();
+    let sec_route = req.identity_for(0).to_string();
+    let drift_route = req.identity_for(1).to_string();
+    for (i, f) in findings.iter_mut().enumerate() {
+        f.models = vec![if i < sec_n { sec_route.clone() } else { drift_route.clone() }];
     }
     let blockers = tallied.blockers;
     TriageOutcome {
@@ -439,12 +449,12 @@ pub fn template_hash() -> String {
 
 /// 三轴使用的模型：`roles.reviewer` 的第一条（2026-11-24 用户调整：triage 用 reviewer 的思考档位，
 /// 不再用 scanner；确定性顺序 = 配置的 BTreeMap 顺序）。
-/// triage 模型池 → 注册表 route key（`triager:<provider>/<id>`）；空池 → 空 vec（由调用方报 `missing_role:triage`）。
+/// triage 模型池 → 注册表 route key（`triage:<provider>/<id>`）；空池 → 空 vec（由调用方报 `missing_role:triage`）。
 pub fn triage_routes(cfg: &crate::config::Config) -> Vec<(crate::config::EffectiveModel, String)> {
     cfg.triage_models()
         .into_iter()
         .map(|em| {
-            let key = crate::provider::registry::role_key(crate::config::Role::Triager, &em.name);
+            let key = crate::provider::registry::role_key(crate::config::Role::Triage, &em.name);
             (em, key)
         })
         .collect()

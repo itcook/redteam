@@ -1072,7 +1072,7 @@ fn build_registry_inner(
     // reasoningEffort 无映射 warnings 按角色条目统一给——同一模型跨角色各有各的档位，不能只报先注册的那条。
     let warnings = match mode {
         RegistryMode::Review => crate::provider::backends::role_reasoning_effort_warnings(&roles),
-        RegistryMode::Triage => crate::provider::backends::reasoning_warnings_for(roles.triagers.iter()),
+        RegistryMode::Triage => crate::provider::backends::reasoning_warnings_for(roles.triage.iter()),
     };
     for w in warnings {
         registry.push_warning(w);
@@ -1081,6 +1081,7 @@ fn build_registry_inner(
         // usize → u32 饱和而非截断（误填 2^32 以上的值不会被截成 0 / 小数）。
         em.max_concurrency.unwrap_or(u32::try_from(cfg.settings.review.max_concurrency).unwrap_or(u32::MAX))
     };
+    #[allow(clippy::too_many_arguments)]
     fn register(
         registry: &mut ProviderRegistry,
         cfg: &Config,
@@ -1090,8 +1091,15 @@ fn build_registry_inner(
         role: Role,
         soft: bool,
         cap: u32,
+        env_only: bool,
     ) -> Result<(), String> {
-        let key = cfg.resolve_key_with(&em.provider, &em.id, secrets).unwrap_or_default();
+        // job 模式**只读 env**：不碰 config 内联槽 / secrets.json（即使 Config 是直接构造进来的）。
+        let key = if env_only {
+            cfg.resolve_key_env_only(&em.provider, &em.id)
+        } else {
+            cfg.resolve_key_with(&em.provider, &em.id, secrets)
+        }
+        .unwrap_or_default();
         let backend = match over.and_then(|f| f(em)) {
             Some(b) => b,
             None => match crate::provider::backends::backend_from_config(em, key) {
@@ -1119,7 +1127,7 @@ fn build_registry_inner(
     match mode {
         RegistryMode::Review => {
             for em in &roles.scanners {
-                register(&mut registry, cfg, &secrets, over, em, Role::Scanner, false, cap_of(em))?;
+                register(&mut registry, cfg, &secrets, over, em, Role::Scanner, false, cap_of(em), args.job_mode)?;
             }
             // reviewer 与 refuter 各按角色键注册（同模型不同档位各占一份 backend，不互相覆盖）。
             // 批 D〔D17〕：refuter 必须在这里注册，否则 `pick_refuter` 选中一个纯 refuter 模型时
@@ -1130,15 +1138,15 @@ fn build_registry_inner(
                 .map(|m| (m, Role::Reviewer))
                 .chain(roles.refuters.iter().map(|m| (m, Role::Refuter)))
             {
-                register(&mut registry, cfg, &secrets, over, em, role, role == Role::Refuter, cap_of(em))?;
+                register(&mut registry, cfg, &secrets, over, em, role, role == Role::Refuter, cap_of(em), args.job_mode)?;
             }
         }
         RegistryMode::Triage => {
-            if roles.triagers.is_empty() {
+            if roles.triage.is_empty() {
                 return Err("no triage model configured: settings.triage.models 为空".to_string());
             }
-            for em in &roles.triagers {
-                register(&mut registry, cfg, &secrets, over, em, Role::Triager, false, cap_of(em))?;
+            for em in &roles.triage {
+                register(&mut registry, cfg, &secrets, over, em, Role::Triage, false, cap_of(em), args.job_mode)?;
             }
         }
     }

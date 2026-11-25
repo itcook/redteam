@@ -8,7 +8,7 @@
 > `model setup` 写盘、`config check` 诊断码、hibot 渲染器契约。
 > 不在范围：Phase 4 verify 实现、Phase 5/7、`~/hibot` 任何改动、`dev` 分支。
 >
-> 证据等级：`[核实]` 已读源码 · `[文档]` 任务书/契约文字 · `[推定]` 推断 · `[待裁定]` 进 §9
+> 证据等级：`[核实]` 已读源码 · `[文档]` 任务书/契约文字 · `[推定]` 推断 · `[裁决]` §9 已定
 
 ---
 
@@ -282,8 +282,8 @@ agreement 结构性下降。**这是迁移影响，不推翻轮转决定**；补
   2. `map[level]` 为字符串，但 family 形状**没有强度槽**（kimi / qwen 只有开关）→
      按 family 形状**原样发送**（只有开关），并给 warning `reasoning_effort_unmapped`；
      **不发明** `reasoning_effort`（Kimi 同发会 400）。
-  3. `map[level]` 为 `null` → **整组推理参数都不发**（含结构开关）+ warning `reasoning_effort_suppressed`
-     ——这是给「该档位下显式关推理」的语义，不只是关强度。
+  3. `map[level]` 为 `null` → **省略请求里的整组推理参数**（含结构开关）+ warning
+     `reasoning_effort_suppressed`；这是「不发送参数」，**不保证上游默认推理关闭**（模型可能默认开）。
   4. map 存在但缺该档键 → 等同 `null`（map 存在即权威，避免「半张表」隐式回落）。
   5. family 表对该 `(api,family,id)` 完全无形状 → 仍不发 + warning（map 只能翻译值，不能创造形状）。
 - `reasoning: bool` 保留（语义：思考 token 计入输出额度）。`[核实]` 当前**只有解析、无消费点**
@@ -397,7 +397,7 @@ agreement 结构性下降。**这是迁移影响，不推翻轮转决定**；补
   「null 抑制整组」两个入口。
 - `cli::build_registry_*`：按 settings 池注册（scanner/reviewer/refuter/triage/verifier 各自 role_key）。
 - `consolidate::refute::pick_refuter`：入参改「refuter 池」（或保留 RoleSets，但池来源变更）；
-  若采纳 Q6 默认则删自动异族回退分支。
+  保留本地自动异族回退 / job 跳过的分叉（Q6 裁决）。
 - `triage::triage_route` / `TriageRequest`：改为「轴 → 池下标」映射（Q4）。
 - `job::run` verify：**只读配置契约**，不实现 Phase 4；`capabilities.kinds` 不加 `verify`。
 - `config_schema_json`：`/2` + `schemaVersion: 2`；`capabilities/redteam.json` 同步。
@@ -449,7 +449,7 @@ agreement 结构性下降。**这是迁移影响，不推翻轮转决定**；补
 | Q4 | triage 轮转粒度 | 按轴（security → drift → intent）；I0/claims 用池首条 |
 | Q5 | `model setup` 的 baseUrl 推断 | 显式 `--base-url` > 已知供应商默认 > 其余报错 |
 | Q6 | refuter 空池 + `enabled=true` | **本地**保留自动异族回退；**job** 跳过并记 `refute_skipped="no_refuter"`（见 §3.6） |
-| Q7 | triage 缺角码名 | **`missing_role:triage`**（不造 `triager`） |
+| Q7 | triage 缺角码名 | **`missing_role:triage`**；对外角色名统一 `triage` |
 | Q8 | `redteam config migrate` | 不提供；硬切 + 逐字段提示 |
 
 > Q2 的本地内联 `apiKey` 是**新增契约**：它只在本机 `$REDTEAM_HOME/config.json` 生效；

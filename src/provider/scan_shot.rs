@@ -133,7 +133,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn scan_dump_labels_carry_the_model() {
-        let _g = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::config::ENV_LOCK.lock().unwrap();
         let dump = tempfile::tempdir().unwrap();
         // SAFETY: ENV_LOCK 串行化（仓内既定约定）
         unsafe { std::env::set_var("REDTEAM_DUMP_DIR", dump.path()); }

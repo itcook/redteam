@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn write_secret_both_levels_chmod_and_refuse_on_unparseable() {
-        let _g = super::super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = super::super::ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: ENV_LOCK 串行化 env 变更
         unsafe { std::env::set_var("REDTEAM_HOME", dir.path()); }

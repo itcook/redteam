@@ -501,7 +501,7 @@ async fn backend_construction_failure_is_config_invalid_not_internal_panic() {
     let r = read_report(&fx.job);
     assert_eq!(r["status"], "error");
     assert!(r["extensions"]["redteam"]["status_code"].as_str().unwrap().starts_with("config_invalid"), "{r}");
-    assert!(r["status_reason"].as_str().unwrap().to_lowercase().contains("google"), "{r}");
+    assert!(r["status_reason"].as_str().unwrap().contains("legacy") || r["status_reason"].as_str().unwrap().contains("已移入"), "{r}");
 }
 
 #[tokio::test]

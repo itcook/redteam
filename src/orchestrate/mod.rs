@@ -894,6 +894,32 @@ mod scan_tests {
         assert!(res3.warnings.is_empty(), "门宽 ≥ 格数无排队告警: {:?}", res3.warnings);
     }
 
+    /// v2 轮转：两模型 × 多组，`samples=1` 时按 `(group, sample)` 稳定交替；计划格数/身份与 resume 反解一致。
+    #[tokio::test]
+    async fn scan_rotation_alternates_models_per_group_and_sample() {
+        let repo = repo();
+        let mut reg = ProviderRegistry::new();
+        let turn = turn(&scan_json(""), None, 300);
+        reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn.clone())), Duration::from_secs(5), 0);
+        reg.insert_scan("q/b", "q", 8, Box::new(FakeChatBackend::repeating(turn)), Duration::from_secs(5), 0);
+        let b = bundles(3);
+        let entries = vec![entry("p/a", "alpha", false), entry("q/b", "beta", false)];
+        // samples = 1：三组交替 a, b, a（不是 v1 的 3×2 扇出）
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
+        let plan: Vec<(usize, &str, u32)> = res.cells.iter().map(|c| (c.group, c.route_key.as_str(), c.sample)).collect();
+        assert_eq!(plan, vec![(0, "p/a", 1), (1, "q/b", 1), (2, "p/a", 1)], "稳定 (group, sample) 轮转");
+        assert_eq!(res.cells.len(), 3, "轮转不复制格");
+        // samples = 2：每组两个 sample 各取一个模型（a/#1, b/#2）
+        let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 2), None, None).await;
+        let plan2: Vec<(usize, &str, u32)> = res2.cells.iter().map(|c| (c.group, c.route_key.as_str(), c.sample)).collect();
+        assert_eq!(plan2, vec![(0, "p/a", 1), (0, "q/b", 2), (1, "p/a", 1), (1, "q/b", 2), (2, "p/a", 1), (2, "q/b", 2)]);
+        // 记录 / manifest 的 model 与分配一致；resume 反解出的 (group, route_key, sample) 同一份。
+        for c in &res2.cells {
+            assert_eq!(c.record.model, c.route_key, "记录 model 必须就是本格分配的模型");
+            assert_eq!(parse_scan_cell_id(&c.cell_id), Some((c.group, c.route_key.clone(), c.sample)), "{}", c.cell_id);
+        }
+    }
+
     /// prd AC2：失败格——未注册条目 Unavailable、Auth 带 usage → failed 列表 + warning + 烧掉的 usage 入账；成功格不受影响。
     #[tokio::test]
     async fn scan_fanout_failed_cells_recorded_with_burned_usage() {

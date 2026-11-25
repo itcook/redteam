@@ -435,7 +435,7 @@ async fn run_triage(
         return report::error_report(manifest, lang, &JobFailure::new("missing_role", Some("triage".into())));
     }
     let route_keys: Vec<String> = routes.iter().map(|(_, k)| k.clone()).collect();
-    let route_name = routes[0].0.name.clone();
+    let route_names: Vec<String> = routes.iter().map(|(em, _)| em.name.clone()).collect();
     // backend 构造失败 = 配置问题（与 review 同一口径）。
     let registry = match crate::cli::build_registry_for_triage(&triage_args(&base), cfg, over) {
         Ok(r) => r,
@@ -456,7 +456,7 @@ async fn run_triage(
         manifest_cap_s: manifest.limits.wall_clock_s,
         deadline,
         route_keys,
-        route_name,
+        route_names,
     };
     let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::triage::Progress::default()));
     // Phase 5：三 kind 都走心跳；进入模型派发即 running（triage 的 manifest 没有 item 清单，不伪造 progress）。

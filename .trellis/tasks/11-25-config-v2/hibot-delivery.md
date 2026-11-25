@@ -8,7 +8,7 @@
 
 | # | 交付物 | 位置 | sha256 |
 |---|---|---|---|
-| 1 | v2 schema（正式生成物，draft-07） | `dist/config.schema.json`（副本：`.trellis/tasks/11-25-config-v2/config-v2.schema.json`） | `b3215f366de3e1bdbbc5cc25fda1d683d3b031ad43ad2c73cb96843aee07df17` |
+| 1 | v2 schema（正式生成物，draft-07） | `dist/config.schema.json`（副本：`.trellis/tasks/11-25-config-v2/config-v2.schema.json`） | `9884be3d8805fc58ec8712ac9bb85c8fc2829b259dd4e940829815bec2e2150b` |
 | 2 | v2 样例（`models[]` 长度 1） | `.trellis/tasks/11-25-config-v2/config-v2.sample.json` | `159a0f19b465dd4934f8ac86eb50c8c676b3159026ca56b2e3ef046d595172b2` |
 | 3 | v1 基线（hibot `audit-pr-468` 副本，只读源） | `.trellis/tasks/11-25-config-v2/config-v1.before.json` | `6147620f423d15e729358970c9db0ec55ca9539d7715ed76d92bd8120f82ffd2` |
 | 4 | v1→v2 全键映射表 | 设计文档 §2 / §5 | — |
@@ -17,12 +17,12 @@
 
 其它事实：
 
-- `dist/config.schema.json` 的 `$id = urn:redteam:config/2`、`schemaVersion = 2`。
+- `dist/config.schema.json` 的 `$id = urn:redteam:config/2`、`schemaVersion = 2`、`additionalProperties: false`、无 `apiKey` 属性。
 - `capabilities/redteam.json` 的 `extensions.config_schema.schemaVersion = 2`；
   `tests/capabilities.rs` 断言它与 schema 产物相等且等于 2。
 - **配置文件本身不含 `schemaVersion` 字段**（schema 元数据 ≠ 实例字段；设计 §3.9 / Q3）。
 - 样例已通过 `config check --kind review|triage|verify`（0 error）。
-- schema 的 `additionalProperties` 采用 schemars 默认（允许）；**严格未知键以 `config check` 为准**（job 模式 unknown_key = ERROR）。
+- schema 收紧为 `additionalProperties: false`（与 job 模式 unknown_key = ERROR 一致），并**隐藏 `apiKey` 槽**（executor 契约不含明文密钥；本地反序列化仍支持，但 job/`config check` 出现即 `secret_field`）。
 
 ## 2. 给 hibot 的破坏性变更摘要
 
@@ -88,8 +88,8 @@
 | `missing_role:<role>` | ERROR | `review` 缺 scanner/reviewer；`triage` 缺 triage；`verify` 缺 verifier |
 | `model_unused` | WARN | provider 下的模型未被任何池引用 |
 | `refuter_no_models` | WARN | `enabled=true` 且池空（job 将跳过复核） |
-| `reasoning_effort_unmapped` | WARN | 选了档，但 family 形状无强度槽（kimi/qwen）或形状未知 |
-| `reasoning_effort_suppressed` | WARN | `thinkingLevelMap[level] = null` 或缺档键 |
+| `reasoning_effort_unmapped` | WARN | 选了档，但 family 形状无强度槽（kimi/qwen）或形状未知（**config check 会输出**） |
+| `reasoning_effort_suppressed` | WARN | `thinkingLevelMap[level] = null` 或缺档键（省略参数，不保证上游关闭推理；**config check 会输出**） |
 
 ## 6. 裁决记录（2026-11-25）
 

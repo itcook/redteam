@@ -236,7 +236,7 @@ async fn lease_with_budget<'a>(
     route_key: &str,
     deadline: tokio::time::Instant,
 ) -> Result<crate::provider::registry::ScanLease<'a>, String> {
-    match tokio::time::timeout_at(deadline, registry.lease_for(crate::domain::Role::Reviewer, route_key)).await {
+    match tokio::time::timeout_at(deadline, registry.lease(route_key)).await {
         Ok(Ok(l)) => Ok(l),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("provider gate wait exceeded the cell budget".into()),

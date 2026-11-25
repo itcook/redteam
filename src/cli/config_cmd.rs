@@ -128,6 +128,22 @@ fn check(text: &str, kind: Option<JobKind>) -> (Option<Config>, Vec<Diag>, Vec<D
                 message: "refuters.enabled = true but roles.refuter.models is empty; job mode will skip refute".into(),
             });
         }
+        // reasoningEffort 在配置期能判定的问题（无强度槽 / map 抑制）——与运行期 warning 同一份判断。
+        let pools: [(&str, &crate::config::RolePool, crate::config::Role); 5] = [
+            ("/settings/review/roles/scanner", &c.settings.review.roles.scanner, crate::config::Role::Scanner),
+            ("/settings/review/roles/reviewer", &c.settings.review.roles.reviewer, crate::config::Role::Reviewer),
+            ("/settings/review/roles/refuter", &c.settings.review.roles.refuter, crate::config::Role::Refuter),
+            ("/settings/triage", &c.settings.triage, crate::config::Role::Triage),
+            ("/settings/verify", &c.settings.verify, crate::config::Role::Verifier),
+        ];
+        for (base, pool, role) in pools {
+            for (idx, r) in pool.models.iter().enumerate() {
+                let Some(em) = c.effective(&r.provider, &r.id, role, r.reasoning_effort) else { continue };
+                if let Some((code, message)) = crate::provider::backends::reasoning_effort_warning_code(&em) {
+                    warnings.push(Diag { level: "WARN", pointer: format!("{base}/models/{idx}"), code: code.into(), message });
+                }
+            }
+        }
         if c.settings.review.max_concurrency > MAX_CONCURRENCY_SANE as usize {
             warnings.push(Diag {
                 level: "WARN",
@@ -205,8 +221,18 @@ mod tests {
 
     #[test]
     fn unknown_role_key_fails_strict_check() {
-        let bad = r#"{"settings":{"review":{}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#;
+        // 真实非法角色键（不是靠空池 missing_role 通过）。
+        let bad = r#"{"settings":{"review":{"roles":{"gerbil":{"models":[]}}}},"providers":{}}"#;
+        let (_cfg, errors, _warnings) = check(bad, Some(JobKind::Review));
+        assert!(
+            errors.iter().any(|d| d.code == "unknown_key" && d.pointer == "/settings/review/roles/gerbil"),
+            "{errors:?}"
+        );
         assert_eq!(run(bad, Some("review")).0, 1);
+        // 合法角色键但空池 → 才是 missing_role。
+        let empty = r#"{"settings":{"review":{"roles":{"scanner":{"models":[]},"reviewer":{"models":[]}}}},"providers":{}}"#;
+        let (_c, errs, _) = check(empty, Some(JobKind::Review));
+        assert!(errs.iter().any(|d| d.code == "missing_role:scanner"), "{errs:?}");
     }
 
     #[test]

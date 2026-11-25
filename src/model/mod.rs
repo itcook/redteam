@@ -186,7 +186,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn check_all_authed_probe_truth_table() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("ALPHA_KEY", "k"); std::env::remove_var("BETA_KEY"); }
         let cfg = cfg_with(
             r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"alpha_p","id":"a"}]},"reviewer":{"models":[{"provider":"beta_p","id":"b"}]}}}},"providers":{"alpha_p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"a","displayName":"alpha","apiKeyEnv":"ALPHA_KEY"}]},"beta_p":{"api":"openai-completions","apiKeyEnv":"BETA_KEY","baseUrl":"https://x","models":[{"id":"b","displayName":"beta"}]}}}"#,

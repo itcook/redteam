@@ -90,7 +90,7 @@ impl ReasoningEffort {
 /// 五角色分三条流程：
 /// - `scanner` / `reviewer` / `refuter` —— 评审管线（review）。
 /// - `verifier` —— hibot `verify` kind 的修复验证（Phase 4；v2 起**不再回退 reviewer**）。
-/// - `triager` —— hibot `triage` kind（2026-11-24 起不复用 reviewer）。
+/// - `triage` —— hibot `triage` kind（2026-11-24 起不复用 reviewer）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -98,11 +98,11 @@ pub enum Role {
     Reviewer,
     Refuter,
     Verifier,
-    Triager,
+    Triage,
 }
 
 impl Role {
-    pub const ALL: [Role; 5] = [Role::Scanner, Role::Reviewer, Role::Refuter, Role::Verifier, Role::Triager];
+    pub const ALL: [Role; 5] = [Role::Scanner, Role::Reviewer, Role::Refuter, Role::Verifier, Role::Triage];
     /// 评审管线（review）的封闭角色集：`CellOutput` / `coverage` / phase 只认这三个。
     pub const REVIEW_PIPELINE: [Role; 3] = [Role::Scanner, Role::Reviewer, Role::Refuter];
     pub fn parse(s: &str) -> Option<Role> {
@@ -111,7 +111,7 @@ impl Role {
             "reviewer" => Some(Role::Reviewer),
             "refuter" => Some(Role::Refuter),
             "verifier" => Some(Role::Verifier),
-            "triager" | "triage" => Some(Role::Triager),
+            "triage" => Some(Role::Triage),
             _ => None,
         }
     }
@@ -121,13 +121,13 @@ impl Role {
             Role::Reviewer => "reviewer",
             Role::Refuter => "refuter",
             Role::Verifier => "verifier",
-            Role::Triager => "triager",
+            Role::Triage => "triage",
         }
     }
 }
 
 /// `reasoningEffort` 的模型级翻译表（`models[].thinkingLevelMap`）：我方档位 → provider 实际强度值。
-/// 键缺失与 `null` 同义（显式抑制该档位的整组推理参数）；整键缺省 → 回退内置 family 表。
+/// 键缺失与 `null` 同义：省略该档位的整组推理参数（不保证上游默认推理关闭）；整键缺省 → 回退内置 family 表。
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThinkingLevelMap {
@@ -729,7 +729,7 @@ pub struct RoleSets {
     pub reviewers: Vec<EffectiveModel>,
     pub refuters: Vec<EffectiveModel>,
     pub verifiers: Vec<EffectiveModel>,
-    pub triagers: Vec<EffectiveModel>,
+    pub triage: Vec<EffectiveModel>,
 }
 
 impl RoleSets {
@@ -739,17 +739,17 @@ impl RoleSets {
             Role::Reviewer => &self.reviewers,
             Role::Refuter => &self.refuters,
             Role::Verifier => &self.verifiers,
-            Role::Triager => &self.triagers,
+            Role::Triage => &self.triage,
         }
     }
-    /// 全部条目（scanner → reviewer → refuter → verifier → triager 序）。
+    /// 全部条目（scanner → reviewer → refuter → verifier → triage 序）。
     pub fn all(&self) -> impl Iterator<Item = &EffectiveModel> {
         self.scanners
             .iter()
             .chain(self.reviewers.iter())
             .chain(self.refuters.iter())
             .chain(self.verifiers.iter())
-            .chain(self.triagers.iter())
+            .chain(self.triage.iter())
     }
     /// 身份串 → 请求 id。
     pub fn id_of(&self, name: &str) -> Option<&str> {
@@ -926,13 +926,13 @@ impl Config {
             reviewers: self.pool_models(&self.settings.review.roles.reviewer, Role::Reviewer),
             refuters: self.pool_models(&self.settings.review.roles.refuter, Role::Refuter),
             verifiers: self.pool_models(&self.settings.verify, Role::Verifier),
-            triagers: self.pool_models(&self.settings.triage, Role::Triager),
+            triage: self.pool_models(&self.settings.triage, Role::Triage),
         }
     }
 
     /// triage 池（按轴轮转的候选；顺序 = 声明顺序）。
     pub fn triage_models(&self) -> Vec<EffectiveModel> {
-        self.pool_models(&self.settings.triage, Role::Triager)
+        self.pool_models(&self.settings.triage, Role::Triage)
     }
 
     /// P2（用户 2026-11-24 裁）+ Q6（2026-11-25 裁）：job 模式池空 → 不验真；本地模式保留自动异族回退。
@@ -968,6 +968,23 @@ impl Config {
             }
         }
         ps.and_then(|s| s.api_key.clone())
+    }
+
+    /// job 模式专用：**只读 env**（模型 apiKeyEnv → provider apiKeyEnv），不读内联 / secrets。
+    /// job 配置在 `check_text` 已拒绝 apiKey 键；这里再保证解析路径本身不会碰内联槽（defense in depth）。
+    pub fn resolve_key_env_only(&self, provider: &str, id: &str) -> Option<String> {
+        let (p, m) = self.model(provider, id)?;
+        if let Some(var) = &m.api_key_env {
+            if let Some(v) = env_nonempty(var) {
+                return Some(v);
+            }
+        }
+        if let Some(var) = &p.api_key_env {
+            if let Some(v) = env_nonempty(var) {
+                return Some(v);
+            }
+        }
+        None
     }
 
     /// provider 维度 key（`model list --remote` 用）：provider 内联 → provider env → secrets.apiKey；不回退模型级 key。
@@ -1065,9 +1082,8 @@ impl Config {
         out
     }
 
-    /// 结构校验（load 后必调）：api 已实现、baseUrl 非空、名称/数值范围、模型唯一、池引用存在。
-    /// **不**校验 review/triage/verify 三池齐全（最小集只在 `config check --kind`）。
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// 结构校验（不含语义问题；供 `check_text` 单行上报）。
+    pub fn structural_errors(&self) -> Vec<String> {
         let mut errs: Vec<String> = Vec::new();
         for (pname, p) in &self.providers {
             if pname.is_empty() || pname.contains('/') {
@@ -1117,6 +1133,13 @@ impl Config {
         if !(0.0..=1.0).contains(&r.conf_floor) {
             errs.push(format!("settings.review.confFloor {} 须在 0.0..=1.0（评审 S2）", r.conf_floor));
         }
+        errs
+    }
+
+    /// 结构校验（load 后必调）：结构 + 语义（未知模型 / 重复 / 未实现 api）。
+    /// **不**校验 review/triage/verify 三池齐全（最小集只在 `config check --kind`）。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut errs = self.structural_errors();
         for p in self.semantic_problems() {
             errs.push(p.message);
         }
@@ -1175,6 +1198,130 @@ fn legacy_model_keys(errors: &mut Vec<String>, mpath: &str, mo: &serde_json::Map
     }
     if mo.contains_key("roles") {
         errors.push(format!("{mpath}.roles 已删除：角色改为 settings.review.roles.<role>.models[] 条目（verifier → settings.verify.models[]）"));
+    }
+}
+
+fn push_legacy(out: &mut Vec<ConfigIssue>, ptr: impl Into<String>, msg: impl Into<String>) {
+    out.push(ConfigIssue { code: "legacy_shape", pointer: ptr.into(), message: msg.into() });
+}
+
+/// v1 形状 → **逐字段**迁移诊断（`config check` 用；每条带准确 JSON Pointer）。
+/// 与 `shape_guard` 的聚合文案同源，但拆成一条一键，避免 hibot 只看到根指针。
+fn legacy_field_issues(v: &serde_json::Value) -> Vec<ConfigIssue> {
+    let mut out: Vec<ConfigIssue> = Vec::new();
+    let Some(top) = v.as_object() else { return out };
+    if top.contains_key("language") {
+        push_legacy(&mut out, "/language", "language 已移入 settings.language");
+    }
+    if let Some(review) = top.get("review").and_then(|r| r.as_object()) {
+        push_legacy(
+            &mut out,
+            "/review",
+            "review 已整节移入 settings.review（角色池在 settings.review.roles.<role>.models[]）",
+        );
+        for k in review.keys() {
+            let target = match k.as_str() {
+                "blockThreshold" | "confFloor" | "maxConcurrency" | "tools" => format!("settings.review.{k}"),
+                "scanners" => "settings.review.scanners".into(),
+                "reviewers" => "settings.review.reviewers".into(),
+                "refuters" => "settings.review.refuters".into(),
+                "grouping" => "settings.review.grouping".into(),
+                "pack" => "settings.review.pack".into(),
+                "verifiers" => "settings.review.refuters / settings.review.roles.refuter.models".into(),
+                "risk" => "已删除（D11：无模式旋钮）".into(),
+                _ => "settings.review（该键在 v2 无定义）".into(),
+            };
+            push_legacy(&mut out, format!("/review/{}", ptr_escape(k)), format!("review.{k} → {target}"));
+        }
+        for (section, keys, _) in REVIEW_SECTIONS {
+            if let Some(so) = review.get(*section).and_then(|s| s.as_object()) {
+                for k in so.keys() {
+                    let target = if keys.contains(&k.as_str()) {
+                        format!("settings.review.{section}.{k}")
+                    } else {
+                        format!("settings.review.{section}（该键在 v2 无定义）")
+                    };
+                    push_legacy(
+                        &mut out,
+                        format!("/review/{section}/{}", ptr_escape(k)),
+                        format!("review.{section}.{k} → {target}"),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(provs) = top.get("providers").and_then(|p| p.as_object()) {
+        for (pname, pv) in provs {
+            let Some(po) = pv.as_object() else { continue };
+            let ppath = format!("/providers/{}", ptr_escape(pname));
+            if let Some(kind) = po.get("kind").and_then(|k| k.as_str()) {
+                let target: String = legacy_api_hint(kind)
+                    .map(|api| format!("providers.{pname}.api = {api:?}"))
+                    .unwrap_or_else(|| "api 三值：openai-completions | anthropic-messages | openai-responses（最后一个仅预留）；google 已移除".into());
+                push_legacy(&mut out, format!("{ppath}/kind"), format!("kind 已改名为 api（v2 无别名）：{target}"));
+            } else if po.contains_key("kind") {
+                push_legacy(&mut out, format!("{ppath}/kind"), "kind 已改名为 api（v2 三值，无别名）");
+            }
+            match po.get("models") {
+                Some(serde_json::Value::Object(ms)) => {
+                    let ids: Vec<&str> = ms.keys().map(String::as_str).collect();
+                    push_legacy(
+                        &mut out,
+                        format!("{ppath}/models"),
+                        format!(
+                            "models 是对象（v1）：v2 改为数组，元素带 id（如 [{{\"id\": {:?}, …}}]；原有模型：{}）",
+                            ids.first().unwrap_or(&"<id>"),
+                            ids.join(" / ")
+                        ),
+                    );
+                    for (mid, mv) in ms {
+                        if let Some(mo) = mv.as_object() {
+                            legacy_model_field_issues(&mut out, &format!("{ppath}/models/{}", ptr_escape(mid)), mo);
+                        }
+                    }
+                }
+                Some(serde_json::Value::Array(ms)) => {
+                    for (idx, mv) in ms.iter().enumerate() {
+                        if let Some(mo) = mv.as_object() {
+                            legacy_model_field_issues(&mut out, &format!("{ppath}/models/{idx}"), mo);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn legacy_model_field_issues(out: &mut Vec<ConfigIssue>, mpath: &str, mo: &serde_json::Map<String, serde_json::Value>) {
+    if mo.contains_key("name") {
+        push_legacy(out, format!("{mpath}/name"), "name 已改名 displayName（身份串固定为 provider/id，不可配置）");
+    }
+    if let Some(kind) = mo.get("kind") {
+        let eff = kind.as_str().unwrap_or("<kind>");
+        push_legacy(
+            out,
+            format!("{mpath}/kind"),
+            format!("kind 已删除：api 只在 provider 层（本模型有效 api = model.kind.or(provider.kind) = {eff:?}）；同一 provider 混多种 api 需拆 provider"),
+        );
+    }
+    if let Some(roles) = mo.get("roles") {
+        push_legacy(
+            out,
+            format!("{mpath}/roles"),
+            "roles 已删除：角色改为 settings.review.roles.<role>.models[] 条目（verifier → settings.verify.models[]）",
+        );
+        if let Some(ro) = roles.as_object() {
+            for role in ro.keys() {
+                let target = match role.as_str() {
+                    "scanner" | "reviewer" | "refuter" => format!("settings.review.roles.{role}.models[]"),
+                    "verifier" => "settings.verify.models[]".into(),
+                    _ => "scanner | reviewer | refuter | verifier | triage".into(),
+                };
+                push_legacy(out, format!("{mpath}/roles/{}", ptr_escape(role)), format!("roles.{role} → {target}"));
+            }
+        }
     }
 }
 
@@ -1531,16 +1678,30 @@ pub fn check_text(text: &str) -> (Option<Config>, Vec<ConfigIssue>) {
         }
     };
     issues.extend(strict_issues(&v));
-    let legacy = shape_guard(&v).err();
-    if let Some(e) = &legacy {
-        // 聚合错误含多行：压成一行，保证 `config check` 的一行一条诊断格式。
-        issues.push(ConfigIssue { code: "legacy_shape", pointer: String::new(), message: e.to_string().replace('\n', " ") });
-    }
+    let field_issues = legacy_field_issues(&v);
+    let legacy = if field_issues.is_empty() {
+        match shape_guard(&v) {
+            Ok(_) => None,
+            Err(e) => {
+                // 非 v1-键类形状错误（类型 / 未知角色等）：仍聚合一条，单行输出。
+                issues.push(ConfigIssue { code: "legacy_shape", pointer: String::new(), message: e.to_string().replace('\n', " ") });
+                Some(())
+            }
+        }
+    } else {
+        issues.extend(field_issues);
+        Some(())
+    };
     match serde_json::from_value::<Config>(v.clone()) {
         Ok(cfg) => {
-            match cfg.validate() {
-                Ok(()) => {}
-                Err(e) => issues.push(ConfigIssue { code: "invalid_value", pointer: String::new(), message: e.to_string() }),
+            let structural = cfg.structural_errors();
+            if !structural.is_empty() {
+                // 单行（hibot 一行一条诊断）；逐条语义问题随后单独上报。
+                issues.push(ConfigIssue {
+                    code: "invalid_value",
+                    pointer: String::new(),
+                    message: structural.join(" "),
+                });
             }
             for p in cfg.semantic_problems() {
                 issues.push(ConfigIssue { code: p.code, pointer: p.pointer, message: p.message });
@@ -1572,10 +1733,28 @@ pub fn from_json_strict(text: &str) -> Result<Config, Vec<ConfigIssue>> {
 /// **不嵌 crate 版本**（发布版本变化不该让 schema 漂移）。draft-07 由 schemars 决定。
 pub fn config_schema_json() -> serde_json::Value {
     let mut v = serde_json::to_value(schemars::schema_for!(Config)).expect("schema serialize");
-    let o = v.as_object_mut().expect("schema object");
-    o.insert("$id".into(), serde_json::json!("urn:redteam:config/2"));
-    o.insert("title".into(), serde_json::json!("redteam executor config"));
-    o.insert("schemaVersion".into(), serde_json::json!(2));
+    {
+        let o = v.as_object_mut().expect("schema object");
+        o.insert("$id".into(), serde_json::json!("urn:redteam:config/2"));
+        o.insert("title".into(), serde_json::json!("redteam executor config"));
+        o.insert("schemaVersion".into(), serde_json::json!(2));
+        // executor 契约不含明文密钥：schema 里隐藏本地内联槽（本地反序列化仍支持 apiKey，
+        // 由 `check_text` 的 `secret_field` 在 job 模式拒绝）。同时把结构体对象收紧为
+        // `additionalProperties:false`——job 模式对未知键就是 ERROR，schema 应与之一致。
+        o.insert("additionalProperties".into(), serde_json::json!(false));
+    }
+    if let Some(defs) = v.get_mut("definitions").and_then(|d| d.as_object_mut()) {
+        for (name, def) in defs.iter_mut() {
+            if let Some(props) = def.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                if name == "ProviderConfig" || name == "ModelConfig" {
+                    props.remove("apiKey");
+                }
+                if def.get("additionalProperties").is_none() {
+                    def.as_object_mut().unwrap().insert("additionalProperties".into(), serde_json::json!(false));
+                }
+            }
+        }
+    }
     v
 }
 
@@ -1795,6 +1974,19 @@ pub fn write_setup(patch: &SetupPatch) -> anyhow::Result<PathBuf> {
 
     // provider 层：api / baseUrl / 凭据 / 并发。
     let api = patch.api.unwrap_or(patch.api_if_new);
+    if !is_new_provider {
+        if let Some(explicit) = patch.api {
+            if let Some(current) = po.get("api").and_then(|v| v.as_str()) {
+                if current != explicit.as_str() {
+                    anyhow::bail!(
+                        "providers.{} 当前 api = {current}：v2 的 api 是 provider 级共享通道，单模型无法覆盖；\
+                         如确需更换通道，请拆成多个 provider（每个 api 一个）后改角色池引用，不要静默改掉其他模型",
+                        patch.provider
+                    );
+                }
+            }
+        }
+    }
     if is_new_provider || patch.api.is_some() {
         po.insert("api".into(), serde_json::json!(api.as_str()));
     }
@@ -1868,7 +2060,7 @@ pub fn write_setup(patch: &SetupPatch) -> anyhow::Result<PathBuf> {
             Role::Reviewer => ("review", Some("reviewer")),
             Role::Refuter => ("review", Some("refuter")),
             Role::Verifier => ("verify", None),
-            Role::Triager => ("triage", None),
+            Role::Triage => ("triage", None),
         };
         let pool = if let Some(r) = pool_path.1 {
             let review = so.entry("review").or_insert_with(|| serde_json::json!({}));
@@ -1901,8 +2093,19 @@ pub fn write_setup(patch: &SetupPatch) -> anyhow::Result<PathBuf> {
     // 写前完整校验（#4）
     let text = serde_json::to_string_pretty(&root)?;
     Config::from_json(&text).map_err(|e| anyhow::anyhow!("合并后配置无效，未写入：{e}"))?;
-    write_atomic(&path, &(text + "\n"), None)?;
+    // 含内联密钥的配置保持 0600：否则一次 `model setup` 会把原本受限的文件换成默认权限。
+    let sensitive = has_secret_key(&root);
+    write_atomic(&path, &(text + "\n"), sensitive.then_some(0o600))?;
     Ok(path)
+}
+
+/// 配置树里是否含明文密钥槽（`apiKey`，递归）。
+fn has_secret_key(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(o) => o.iter().any(|(k, child)| k == "apiKey" || has_secret_key(child)),
+        serde_json::Value::Array(a) => a.iter().any(has_secret_key),
+        _ => false,
+    }
 }
 
 /// 原子落盘（评审 #6）：同目录临时文件 + rename；`mode` 给定时临时文件即以该权限创建。
@@ -1994,7 +2197,7 @@ mod tests {
         assert_eq!(roles.scanners.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["deepseek/flash"]);
         assert_eq!(roles.reviewers[0].name, "deepseek/pro");
         assert_eq!(roles.refuters[0].name, "agct/gemini");
-        assert_eq!(roles.triagers[0].name, "deepseek/pro");
+        assert_eq!(roles.triage[0].name, "deepseek/pro");
         assert_eq!(roles.verifiers[0].name, "deepseek/pro");
         assert_eq!(roles.reviewers[0].reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(roles.scanners[0].reasoning_effort, Some(ReasoningEffort::Low));
@@ -2158,6 +2361,67 @@ mod tests {
     }
 
     #[test]
+    fn v1_full_shape_hints_every_key() {
+        let v1 = r#"{
+          "language": "en_US",
+          "providers": {"p": {"kind": "openai-compatible", "baseUrl": "https://x", "apiKeyEnv": "K", "maxConcurrency": 2,
+            "models": {"m": {"displayName": "M", "family": "deepseek", "contextWindow": 128000, "maxOutputTokens": 4096,
+              "perTurnTimeoutSecs": 60, "reasoning": true, "roles": {"scanner": {"reasoningEffort": "low"}, "verifier": {}}}}}},
+          "review": {"blockThreshold": "medium", "confFloor": 0.5, "maxConcurrency": 10, "tools": "two-stage",
+            "scanners": {"samples": 1}, "reviewers": {"maxCells": "auto", "reenqueue": false}, "refuters": {"enabled": true},
+            "grouping": {"minFiles": 4, "bundleLineThreshold": 200, "maxFilesPerGroup": 10, "semantic": false},
+            "pack": {"body": "slice", "anchorWindow": 30, "findingWindow": 30, "findingWindowEnforce": false, "sliceMinBytes": 8192}}
+        }"#;
+        let (cfg, issues) = check_text(v1);
+        assert!(cfg.is_none());
+        let legacy: Vec<&ConfigIssue> = issues.iter().filter(|i| i.code == "legacy_shape").collect();
+        let ptrs: Vec<&str> = legacy.iter().map(|i| i.pointer.as_str()).collect();
+        for ptr in [
+            "/language",
+            "/review",
+            "/review/blockThreshold",
+            "/review/scanners/samples",
+            "/review/reviewers/maxCells",
+            "/review/reviewers/reenqueue",
+            "/review/refuters/enabled",
+            "/review/grouping/minFiles",
+            "/review/pack/sliceMinBytes",
+            "/providers/p/kind",
+            "/providers/p/models",
+            "/providers/p/models/m/roles",
+            "/providers/p/models/m/roles/scanner",
+            "/providers/p/models/m/roles/verifier",
+        ] {
+            assert!(ptrs.contains(&ptr), "缺 pointer {ptr}: {ptrs:?}");
+        }
+        // 逐字段目标路径出现，且不叠 unknown_key（同一批旧键交给 legacy_shape）。
+        let blob = legacy.iter().map(|i| i.message.as_str()).collect::<Vec<_>>().join("\n");
+        for needle in ["settings.review.refuters.enabled", "settings.review.reviewers.maxCells", "openai-completions", "settings.verify.models[]"] {
+            assert!(blob.contains(needle), "缺 {needle}:\n{blob}");
+        }
+        assert!(!issues.iter().any(|i| i.code == "unknown_key"), "{issues:?}");
+        // CLI 诊断必须单行。
+        assert!(legacy.iter().all(|i| !i.message.contains('\n')), "{legacy:?}");
+    }
+
+    #[test]
+    fn kind_aliases_each_get_a_concrete_target() {
+        for (alias, needle) in [
+            ("gpt", "openai-completions"),
+            ("openai_compatible", "openai-completions"),
+            ("compatible", "openai-completions"),
+            ("claude", "anthropic-messages"),
+            ("gemini", "google 已移除"),
+        ] {
+            let json = format!(
+                r#"{{"providers":{{"p":{{"kind":"{alias}","baseUrl":"https://x","models":[]}}}}}}"#
+            );
+            let e = Config::from_json(&json).unwrap_err().to_string();
+            assert!(e.contains(needle), "alias={alias} 缺 {needle}:\n{e}");
+        }
+    }
+
+    #[test]
     fn removed_keys_still_warn_but_do_not_fail() {
         let (c, w) = Config::from_json_warned(
             r#"{"settings":{"review":{"risk":{"mode":"x"},"reviewers":{"workers":2},"scanners":{"samples":1}}},"providers":{}}"#,
@@ -2191,7 +2455,13 @@ mod tests {
         assert!(issues.iter().any(|i| i.code == "secret_field"), "{issues:?}");
         // 空串同样拒绝
         let empty = text.replace("sk-local", "");
-        assert!(check_text(&empty).1.iter().any(|i| i.code == "secret_field"));
+        assert!(check_text(&empty).1.iter().any(|i| i.code == "secret_field"), "空串同样拒绝");
+        let null_key = text.replace("\"apiKey\":\"sk-local\"", "\"apiKey\":null");
+        assert!(check_text(&null_key).1.iter().any(|i| i.code == "secret_field"), "null 同样拒绝");
+        let model_level = r#"{"settings":{"review":{"roles":{"reviewer":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m","apiKey":"sk-model"}]}}}"#;
+        let issues = check_text(model_level).1;
+        assert!(issues.iter().any(|i| i.code == "secret_field" && i.pointer == "/providers/p/models/0/apiKey"), "{issues:?}");
+        assert!(issues.iter().all(|i| !i.message.contains("sk-model")), "不得回显密钥值");
     }
 
     #[test]
@@ -2247,24 +2517,20 @@ mod tests {
     fn legacy_paths_still_detected() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        let home = d.path().join("home");
-        std::fs::create_dir_all(home.join(".config/redteam")).unwrap();
-        std::fs::write(home.join(".config/redteam/config.toml"), "[x]\n").unwrap();
-        std::fs::write(home.join(".config/redteam/secrets.toml"), "[x]\n").unwrap();
-        let old_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", &home); std::env::set_var("REDTEAM_HOME", home.join(".redteam")); }
+        let rh = d.path().join("rh");
+        std::fs::create_dir_all(&rh).unwrap();
+        std::fs::write(rh.join("config.toml"), "[x]\n").unwrap();
+        std::fs::write(rh.join("secrets.toml"), "[x]\n").unwrap();
+        let old_rh = std::env::var_os("REDTEAM_HOME");
+        unsafe { std::env::set_var("REDTEAM_HOME", &rh); }
         let cs = legacy_config_paths_present();
         let ss = legacy_secrets_paths_present();
-        assert!(cs.iter().any(|p| p.ends_with("config.toml")), "{cs:?}");
-        assert!(ss.iter().any(|p| p.ends_with("secrets.toml")), "{ss:?}");
+        assert!(cs.iter().any(|p| p == &rh.join("config.toml")), "{cs:?}");
+        assert!(ss.iter().any(|p| p == &rh.join("secrets.toml")), "{ss:?}");
         let notices = legacy_migration_notices();
         assert!(notices.iter().any(|n| n.contains("config.toml")), "{notices:?}");
         unsafe {
-            std::env::remove_var("REDTEAM_HOME");
-            match old_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
+            match old_rh { Some(h) => std::env::set_var("REDTEAM_HOME", h), None => std::env::remove_var("REDTEAM_HOME") }
         }
     }
 
@@ -2289,7 +2555,7 @@ mod tests {
         p.reasoning_effort = Some(ReasoningEffort::High);
         write_setup(&p).unwrap();
 
-        let mut p2 = patch("deepseek", "flash", &[Role::Verifier, Role::Triager]);
+        let mut p2 = patch("deepseek", "flash", &[Role::Verifier, Role::Triage]);
         p2.max_output_tokens = Some(4096);
         write_setup(&p2).unwrap();
 
@@ -2339,6 +2605,133 @@ mod tests {
         assert!(e.contains("合并后配置无效") && e.contains("settings.language"), "{e}");
         let raw = std::fs::read_to_string(d.path().join("config.json")).unwrap();
         assert!(raw.contains("\"language\""), "拒写不覆写");
+        unsafe { std::env::remove_var("REDTEAM_HOME"); }
+    }
+
+    #[test]
+    fn schema_hides_inline_api_key_and_denies_unknown() {
+        let v = config_schema_json();
+        assert!(v["definitions"]["ProviderConfig"]["properties"].get("apiKey").is_none(), "executor schema 不得暴露 provider.apiKey");
+        assert!(v["definitions"]["ModelConfig"]["properties"].get("apiKey").is_none(), "executor schema 不得暴露 model.apiKey");
+        assert_eq!(v["additionalProperties"], false);
+        assert_eq!(v["definitions"]["ProviderConfig"]["additionalProperties"], false);
+        assert_eq!(v["definitions"]["ModelConfig"]["additionalProperties"], false);
+        assert_eq!(v["definitions"]["ProviderConfig"]["required"], serde_json::json!(["api", "baseUrl"]));
+        assert_eq!(v["definitions"]["ModelConfig"]["required"], serde_json::json!(["id"]));
+    }
+
+    #[test]
+    fn job_env_only_never_reads_inline_or_secrets() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("P_ONLY_ENV", "env-value"); std::env::remove_var("M_ONLY_ENV"); }
+        let c = cfg(
+            r#"{"settings":{"review":{"roles":{"reviewer":{"models":[{"provider":"p","id":"m","apiKeyEnv":"M_ONLY_ENV"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","apiKey":"provider-inline","models":[{"id":"m","apiKey":"model-inline"}]}}}"#,
+        );
+        let mut secrets = secrets::Secrets::default();
+        let mut ps = secrets::ProviderSecrets::default();
+        ps.models.insert("m".into(), "secret-model".into());
+        ps.api_key = Some("secret-provider".into());
+        secrets.providers.insert("p".into(), ps);
+        // 本地链读到内联
+        assert_eq!(c.resolve_key_with("p", "m", &secrets).as_deref(), Some("model-inline"));
+        // job 链：模型 env 未设 → provider env 未设 → None（不碰内联/secrets）
+        assert_eq!(c.resolve_key_env_only("p", "m"), None);
+        c.providers.get("p").unwrap();
+        let mut c2 = c.clone();
+        c2.providers.get_mut("p").unwrap().api_key_env = Some("P_ONLY_ENV".into());
+        assert_eq!(c2.resolve_key_env_only("p", "m").as_deref(), Some("env-value"));
+        unsafe { std::env::remove_var("P_ONLY_ENV"); }
+    }
+
+    #[test]
+    fn write_setup_preserves_0600_and_inline_key() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("REDTEAM_HOME", d.path()); }
+        let path = d.path().join("config.json");
+        let text = r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","apiKey":"sk-local","models":[{"id":"m"}]}}}"#;
+        std::fs::write(&path, text).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut p = patch("p", "m2", &[Role::Reviewer]);
+        p.api_key_env = Some("P2_KEY".into());
+        write_setup(&p).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(v["providers"]["p"]["apiKey"], "sk-local", "内联密钥不得被写盘抹掉");
+        assert!(v["providers"]["p"]["models"].as_array().unwrap().iter().any(|m| m["id"] == "m2"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "含内联密钥的配置重写后必须仍是 0600");
+        }
+        unsafe { std::env::remove_var("REDTEAM_HOME"); }
+    }
+
+    #[test]
+    fn write_setup_refuses_cross_api_on_existing_provider() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("REDTEAM_HOME", d.path()); }
+        let path = d.path().join("config.json");
+        std::fs::write(&path, r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
+        let mut p = patch("p", "m", &[Role::Scanner]);
+        p.api = Some(ProviderApi::AnthropicMessages);
+        let e = write_setup(&p).unwrap_err().to_string();
+        assert!(e.contains("共享通道") && e.contains("拆成多个 provider"), "{e}");
+        // 未变 api 的显式写法允许
+        let mut same = patch("p", "m", &[Role::Scanner]);
+        same.api = Some(ProviderApi::OpenaiCompletions);
+        assert!(write_setup(&same).is_ok());
+        unsafe { std::env::remove_var("REDTEAM_HOME"); }
+    }
+
+    #[test]
+    fn per_turn_priority_model_env_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("REDTEAM_PER_TURN_SECS"); }
+        let mut em = EffectiveModel {
+            name: "p/m".into(), display_name: None, id: "m".into(), provider: "p".into(), role: Role::Reviewer,
+            api: ProviderApi::OpenaiCompletions, base_url: Some("https://x".into()), context_window: 128_000,
+            max_output_tokens: Some(1000), per_turn_timeout_secs: None, reasoning: false, reasoning_effort: None,
+            thinking_level_map: None, family: "m".into(), max_concurrency: None,
+        };
+        assert_eq!(em.per_turn_secs(), 1000 / 20 + 60, "公式");
+        unsafe { std::env::set_var("REDTEAM_PER_TURN_SECS", "77"); }
+        assert_eq!(em.per_turn_secs(), 77, "env");
+        em.per_turn_timeout_secs = Some(99);
+        assert_eq!(em.per_turn_secs(), 99, "模型字段优先");
+        unsafe { std::env::remove_var("REDTEAM_PER_TURN_SECS"); }
+    }
+
+    #[test]
+    fn home_resolution_and_relative_home_errors() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_rh = std::env::var_os("REDTEAM_HOME");
+        unsafe { std::env::set_var("REDTEAM_HOME", "/abs/rh"); }
+        assert_eq!(redteam_home().unwrap(), PathBuf::from("/abs/rh"));
+        unsafe { std::env::set_var("REDTEAM_HOME", "relative"); }
+        assert!(redteam_home().unwrap_err().to_string().contains("绝对路径"));
+        unsafe {
+            match old_rh { Some(h) => std::env::set_var("REDTEAM_HOME", h), None => std::env::remove_var("REDTEAM_HOME") }
+        }
+    }
+
+    #[test]
+    fn load_no_secrets_skips_invalid_secrets_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("REDTEAM_HOME", d.path()); }
+        std::fs::write(d.path().join("config.json"), r#"{"providers":{},"settings":{}}"#).unwrap();
+        std::fs::write(d.path().join("secrets.json"), "{ not json").unwrap();
+        let (_, msgs) = Config::load_no_secrets().unwrap();
+        assert!(!msgs.iter().any(|m| m.contains("secrets.json")), "{msgs:?}");
+        let (_, msgs2) = Config::load_with_messages().unwrap();
+        assert!(msgs2.iter().any(|m| m.contains("secrets.json")), "{msgs2:?}");
         unsafe { std::env::remove_var("REDTEAM_HOME"); }
     }
 

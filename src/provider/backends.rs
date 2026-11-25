@@ -1016,32 +1016,46 @@ fn substitute(pairs: Vec<(&'static str, Value)>, slot: EffortSlot, value: &str) 
         .collect()
 }
 
-/// 配置了 reasoningEffort 但无法按预期发送 → 一条 warning；否则 None。
-pub fn reasoning_effort_warning(em: &crate::config::EffectiveModel) -> Option<String> {
+/// 配置了 reasoningEffort 但无法按预期发送 → `(config check 码, 人读文案)`；否则 None。
+pub fn reasoning_effort_warning_code(em: &crate::config::EffectiveModel) -> Option<(&'static str, String)> {
     let level = em.reasoning_effort?;
     let plan = reasoning_plan(em.api, &em.family, &em.id, level, em.thinking_level_map.as_ref());
     let body = format!("{}（api {}，family {}）", em.name, em.api.as_str(), em.family);
     match plan.warning? {
-        ReasoningWarning::Unmapped => Some(format!(
-            "reasoningEffort {} 对 {} {} 无参数映射，未发送；已知映射：anthropic-messages+claude·glm / openai-completions+deepseek·glm·kimi·gpt-5·o 系·gemini·qwen",
-            level.as_str(),
-            em.role.as_str(),
-            body
+        ReasoningWarning::Unmapped => Some((
+            "reasoning_effort_unmapped",
+            format!(
+                "reasoningEffort {} 对 {} {} 无参数映射，未发送；已知映射：anthropic-messages+claude·glm / openai-completions+deepseek·glm·kimi·gpt-5·o 系·gemini·qwen",
+                level.as_str(),
+                em.role.as_str(),
+                body
+            ),
         )),
-        ReasoningWarning::Suppressed => Some(format!(
-            "reasoningEffort {} 对 {} {}：thinkingLevelMap 的该档位为 null / 缺失，整组推理参数未发送（含结构开关）",
-            level.as_str(),
-            em.role.as_str(),
-            body
+        ReasoningWarning::Suppressed => Some((
+            "reasoning_effort_suppressed",
+            format!(
+                "reasoningEffort {} 对 {} {}：thinkingLevelMap 的该档位为 null / 缺失，省略请求里的推理参数（不保证上游默认推理关闭）",
+                level.as_str(),
+                em.role.as_str(),
+                body
+            ),
         )),
-        ReasoningWarning::NoEffortSlot => Some(format!(
-            "reasoningEffort {} 对 {} {}：该家族只有开关、没有强度槽；已按形状发送开关，强度值 {} 未应用",
-            level.as_str(),
-            em.role.as_str(),
-            body,
-            level.as_str()
+        ReasoningWarning::NoEffortSlot => Some((
+            "reasoning_effort_unmapped",
+            format!(
+                "reasoningEffort {} 对 {} {}：该家族只有开关、没有强度槽；已按形状发送开关，强度值 {} 未应用",
+                level.as_str(),
+                em.role.as_str(),
+                body,
+                level.as_str()
+            ),
         )),
     }
+}
+
+/// 配置了 reasoningEffort 但无法按预期发送 → 一条 warning；否则 None。
+pub fn reasoning_effort_warning(em: &crate::config::EffectiveModel) -> Option<String> {
+    reasoning_effort_warning_code(em).map(|(_, m)| m)
 }
 
 /// 任意角色条目的 reasoningEffort warnings（同文案去重）。
@@ -1168,7 +1182,7 @@ mod tests {
 
     #[test]
     fn http_timeout_covers_per_turn() {
-        let _g = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::config::ENV_LOCK.lock().unwrap();
         // SAFETY: ENV_LOCK 串行化
         unsafe { std::env::remove_var("REDTEAM_HTTP_TIMEOUT_SECS"); }
         assert_eq!(crate::provider::http_timeout_for(100), 300, "短轮：缺省 300 罩得住");

@@ -95,8 +95,8 @@ impl CellOutput {
             Role::Scanner => CellOutput::Scan(ScanOutput::default()),
             Role::Reviewer => CellOutput::Review { findings: vec![], needs: vec![] },
             Role::Refuter => CellOutput::Refute { verdicts: vec![] },
-            Role::Verifier | Role::Triager => unreachable!(
-                "Role::Verifier / Role::Triager 不属于 review cell 管线（fix 验证 / triage 的结果类型另行定义）"
+            Role::Verifier | Role::Triage => unreachable!(
+                "Role::Verifier / Role::Triage 不属于 review cell 管线（fix 验证 / triage 的结果类型另行定义）"
             ),
         }
     }
@@ -245,8 +245,8 @@ mod tests {
         assert_eq!(Role::ALL.len(), 5);
         assert_eq!(Role::parse("verifier"), Some(Role::Verifier));
         assert_eq!(Role::Verifier.as_str(), "verifier");
-        assert_eq!(Role::parse("triager"), Some(Role::Triager));
-        assert_eq!(Role::Triager.as_str(), "triager");
+        assert_eq!(Role::parse("triage"), Some(Role::Triage));
+        assert_eq!(Role::Triage.as_str(), "triage");
     }
 
     /// fix 验证（`kind=verify`）不得冒充 review 的 cell 输出：它的结果类型在 Phase 4 才有。

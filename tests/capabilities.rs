@@ -62,4 +62,10 @@ fn config_schema_version_matches_capabilities() {
     assert_eq!(schema["schemaVersion"], *cap, "dist/config.schema.json 与 capabilities 必须同版本");
     assert_eq!(schema["schemaVersion"], 2, "v2 硬切");
     assert_eq!(schema["$id"], "urn:redteam:config/2");
+    // executor 契约不含明文密钥槽；未知键在 schema 层也被拒绝（与 job 模式一致）。
+    for def in ["ProviderConfig", "ModelConfig"] {
+        assert!(schema["definitions"][def]["properties"].get("apiKey").is_none(), "{def} 不得暴露 apiKey");
+        assert_eq!(schema["definitions"][def]["additionalProperties"], false, "{def}");
+    }
+    assert_eq!(schema["additionalProperties"], false);
 }
