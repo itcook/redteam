@@ -20,6 +20,12 @@ const RELATED_BYTE_CAP: usize = 8_000;
 const RELATED_FILES_MAX: usize = 2;
 /// 跨文件线索的最小长度：太短的 quote 行（`}` / `return`）会在无关文件里到处命中。
 const CLUE_MIN_CHARS: usize = 12;
+/// B-lite：其它文件 hunk 引用「本文件被改符号名」时的快照半径（行）。
+const BLAST_RADIUS: u32 = 40;
+/// B-lite 的体积边界：最多 3 个引用文件 / 6 处引用 / 整段 12KB；超出在段尾留省略标记。
+const BLAST_FILES_MAX: usize = 3;
+const BLAST_REFS_MAX: usize = 6;
+const BLAST_BYTE_CAP: usize = 12_000;
 
 /// 一条 finding 的全部证据。
 #[derive(Clone, Debug)]
@@ -31,9 +37,15 @@ pub struct Evidence {
     pub renamed_from: Option<String>,
     pub hunks: String,
     pub related: String,
+    /// B-lite：其它文件 hunk 里引用「本文件被改符号名」的段（符号名 + 引用处 file:line + ±N 快照）。
+    pub blast: String,
     pub snapshot: String,
+    /// post-fix 检出原文（≤512KB；quote 严格重锚用；删除/不可读 → None）。
+    pub file_content: Option<String>,
     /// 无法定位的原因（人读，随 `language`）。
     pub note: Option<String>,
+    /// 证据降级原因（机器可读，进 `extensions.redteam.verify.warnings`）；不猜。
+    pub warnings: Vec<String>,
 }
 
 fn zh(lang: &OutputLang) -> bool {
@@ -54,27 +66,46 @@ pub fn build(root: &Path, lang: &OutputLang, finding: &InputFinding, fixes: &[Fi
     let path = hit.map(|f| f.path.clone()).unwrap_or_else(|| finding.file.clone());
     let kind = hit.map(|f| f.kind).unwrap_or(FixChange::Modified);
     let renamed_from = hit.and_then(|f| f.old_path.clone());
+    // 只读一次：快照、符号提取、重锚都用这份原文（prepare 阶段同步做，async 阶段不再碰 fs）。
+    let content = crate::positioning::safe_read(root, &path);
+
     // 只留该文件的 hunk 块（`@@` 起）：`diff --git` / `index` / `---` / `+++` 是 patch 级头，
     // 本文件路径与变更形态已经由 `<change>` 告知；删掉它们也顺带保证「不喂整 PR」可被断言。
+    let blocks = hit.map(|f| hunk_blocks(&f.diff)).unwrap_or_default();
     let hunks = match hit {
-        Some(f) => {
-            let blocks = hunk_blocks(&f.diff);
-            if blocks.is_empty() {
-                "(no content hunks in the fix diff: this file was renamed/deleted verbatim)".to_string()
-            } else {
-                take_bytes(&blocks.join("\n"), HUNKS_BYTE_CAP)
-            }
+        Some(_) if blocks.is_empty() => {
+            "(no content hunks in the fix diff: this file was renamed/deleted verbatim)".to_string()
         }
+        Some(_) => take_bytes(&blocks.join("\n"), HUNKS_BYTE_CAP),
         None => "(this file has no hunks in the fix diff)".to_string(),
     };
+
+    // B-lite：本文件被改的符号名 → 其它文件 hunk 里引用它们的段。
+    // 取不到符号（语言不支持 / 改动不在 def 内 / 全被 ref_worthy 滤掉）就**不发该段**并留 warning，
+    // 绝不靠猜补位——否则「没证据」会被读成「没问题」。
+    let mut warnings = Vec::new();
+    let symbols = match (hit, &content) {
+        (Some(f), Some(c)) if !blocks.is_empty() => {
+            let syms = changed_symbols(&f.path, c, &f.diff);
+            if crate::diffsym::lang_for(&f.path).is_none() {
+                warnings.push(format!("symbol_blast_radius_skipped:unsupported_language:{}", f.path));
+            } else if syms.is_empty() {
+                warnings.push(format!("symbol_blast_radius_skipped:no_symbols:{}", f.path));
+            }
+            syms
+        }
+        _ => Vec::new(),
+    };
+    let blast = blast_radius(root, fixes, &path, &symbols);
+
     let clue = clue_of(&finding.quote);
     let related = related_hunks(fixes, &path, clue);
 
     // post-fix 检出：删除式修复没有文件可读，但 diff 的 `-` 行仍是证据。
-    let snapshot = match crate::positioning::safe_read(root, &path) {
-        Some(content) => {
+    let snapshot = match &content {
+        Some(c) => {
             let (s, e) = finding.span();
-            snapshot_window(&content, &path, s, e)
+            snapshot_window(c, &path, s, e)
         }
         None if kind == FixChange::Deleted => {
             "(absent from the post-fix checkout: the fix deleted this file; the removed lines are in <fix_diff>)".to_string()
@@ -92,20 +123,184 @@ pub fn build(root: &Path, lang: &OutputLang, finding: &InputFinding, fixes: &[Fi
                 renamed_from,
                 hunks,
                 related,
+                blast,
                 snapshot: "(unreadable)".to_string(),
+                file_content: None,
                 note: Some(note),
+                warnings,
             };
         }
         None => "(unreadable in the post-fix checkout — it may be binary or oversized)".to_string(),
     };
 
-    Evidence { located: true, path, kind, renamed_from, hunks, related, snapshot, note: None }
+    Evidence { located: true, path, kind, renamed_from, hunks, related, blast, snapshot, file_content: content, note: None, warnings }
+}
+
+/// 本文件在 fix diff 里**被改的符号名**（diffsym 的 def 解析；Go/Rust/TS 支持）。
+fn changed_symbols(path: &str, content: &str, diff: &str) -> Vec<String> {
+    let Some(lang) = crate::diffsym::lang_for(path) else { return Vec::new() };
+    let defs = crate::diffsym::compile_defs(lang);
+    let lines: Vec<&str> = content.lines().collect();
+    let all = crate::diffsym::all_defs(&lines, &defs);
+    let mut out: Vec<String> = crate::diffsym::changed_defs(diff, &all)
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|n| crate::diffsym::ref_worthy(n))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// B-lite：其它文件 hunk 里引用了 `symbols` 的段（每条：符号名 + 引用处 `path:line` + 该 hunk 的 ±N 快照）。
+///
+/// 只看 **fix diff 里被改的其它文件**（hibot 的 fix job 只改 findings 命中文件；未进 diff 的调用点由
+/// CI 兜底编译错误）。排序固定（文件按 path、hunk 按序、符号名排序）→ 同输入同输出。
+///
+/// 体积边界（2026-11-25 协调者裁）：≤3 个引用文件、≤6 处引用、整段 ≤12KB；超出在段尾写
+/// `… (+K more references omitted)`。K 按**全量候选**计数（不因截断而失真）。截断只影响本段，
+/// 被选中的引用行仍进 quote 校验池。
+fn blast_radius(root: &Path, fixes: &[FileFix], own_path: &str, symbols: &[String]) -> String {
+    if symbols.is_empty() {
+        return String::new();
+    }
+    // 测试文件不进 blast：它们不改运行时行为，排在生产调用点前面只会挤掉真正的证据。
+    let mut ordered: Vec<&FileFix> = fixes
+        .iter()
+        .filter(|f| f.path != own_path && f.kind != FixChange::Deleted && !is_test_path(&f.path))
+        .collect();
+    ordered.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // 1) 候选：只看 diff 文本（不读文件），得到「哪些文件/哪些 hunk 引用了哪些符号」+ 全量引用数。
+    struct Cand {
+        path: String,
+        hunks: Vec<(u32, u32, Vec<String>)>,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    let mut total_refs = 0usize;
+    for fix in ordered {
+        let blocks = hunk_blocks(&fix.diff);
+        let hunks = crate::diffsym::parse_hunks(&fix.diff);
+        if blocks.len() != hunks.len() {
+            continue;
+        }
+        let mut c = Cand { path: fix.path.clone(), hunks: Vec::new() };
+        for (block, h) in blocks.iter().zip(hunks.iter()) {
+            let syms: Vec<String> = symbols.iter().filter(|sym| mentions(block, sym)).cloned().collect();
+            if syms.is_empty() {
+                continue;
+            }
+            total_refs += syms.len();
+            let hs = (h.start + 1).max(1) as u32;
+            let he = (h.start + h.count.max(1)) as u32;
+            c.hunks.push((hs, he, syms));
+        }
+        if !c.hunks.is_empty() {
+            cands.push(c);
+        }
+    }
+
+    // 2) 只给前 3 个引用文件读内容；**文件间轮转**（先每个文件第 1 个命中 hunk，再第 2 个……），
+    //    避免一个文件的大快照把别的文件里真正的修复点挤掉。≤6 处引用 / ≤12KB，超了停。
+    let mut out = String::new();
+    let mut included = 0usize;
+    let mut started: Vec<bool> = vec![false; cands.len().min(BLAST_FILES_MAX)];
+    let max_hunks = cands.iter().take(BLAST_FILES_MAX).map(|c| c.hunks.len()).max().unwrap_or(0);
+    'sections: for round in 0..max_hunks {
+        for (ci, c) in cands.iter().take(BLAST_FILES_MAX).enumerate() {
+            if included >= BLAST_REFS_MAX {
+                break 'sections;
+            }
+            let Some((hs, he, syms)) = c.hunks.get(round) else { continue };
+            let Some(content) = crate::positioning::safe_read(root, &c.path) else { continue };
+            let lines: Vec<&str> = content.lines().collect();
+            let take = (BLAST_REFS_MAX - included).min(syms.len());
+            let mut section = String::new();
+            if !started[ci] {
+                section.push_str(&format!("### {} (changed by the fix)\n", c.path));
+                started[ci] = true;
+            }
+            for sym in syms.iter().take(take) {
+                match line_in_hunk(&lines, sym, *hs, *he) {
+                    Some(line) => section.push_str(&format!("- {sym} referenced at {}:{line}\n", c.path)),
+                    None => section.push_str(&format!("- {sym} referenced in this hunk ({})\n", c.path)),
+                }
+            }
+            section.push_str(&snapshot_window_with(&content, &c.path, *hs, *he, BLAST_RADIUS));
+            section.push('\n');
+            if out.len() + section.len() > BLAST_BYTE_CAP {
+                break 'sections;
+            }
+            out.push_str(&section);
+            included += take;
+        }
+    }
+    let omitted = total_refs.saturating_sub(included);
+    if omitted > 0 {
+        out.push_str(&format!("… (+{omitted} more references omitted)\n"));
+    }
+    out.trim_end().to_string()
+}
+
+/// 测试文件（Go/Rust/TS 的常见形态）：blast 只看生产代码。
+fn is_test_path(path: &str) -> bool {
+    const SUFFIXES: &[&str] = &["_test.go", "_test.rs", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx", "_spec.rb"];
+    const SEGMENTS: &[&str] = &["/tests/", "/test/", "/__tests__/", "/spec/"];
+    SUFFIXES.iter().any(|s| path.ends_with(s)) || SEGMENTS.iter().any(|s| path.contains(s))
+}
+
+/// 引用处行号：**只在 hunk 的新文件范围内**找（1-based）。
+///
+/// 不回退全文：那会把「符号在文件别处出现」当成引用位置，给出 hunk 外的假坐标——
+/// 段里要的是「这条引用在哪个 hunk」，不是「这个符号在文件里还出现过」。
+fn line_in_hunk(lines: &[&str], sym: &str, hs: u32, he: u32) -> Option<u32> {
+    let lo = (hs as usize).saturating_sub(1);
+    let hi = (he as usize).min(lines.len());
+    lines
+        .get(lo..hi)
+        .and_then(|w| w.iter().position(|l| mentions(l, sym)))
+        .map(|i| (lo + i + 1) as u32)
+}
+
+/// 标识符边界匹配（避免 `Pin` 命中 `Pinned`）。
+fn mentions(text: &str, name: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(i) = text[from..].find(name) {
+        let start = from + i;
+        let end = start + name.len();
+        let before_ok = text[..start].chars().next_back().is_none_or(|c| !is_ident(c));
+        let after_ok = text[end..].chars().next().is_none_or(|c| !is_ident(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// quote 的逐字校验：**内部逐字**，只忽略整体首尾空白（换行搬运差异）。
 pub fn quote_is_verbatim(quote: &str, material: &str) -> bool {
     let q = quote.trim();
     !q.is_empty() && material.contains(q)
+}
+
+/// quote 的**严格字面重锚**：先在发给模型的材料里找，再在 post-fix 检出原文里找。
+///
+/// 两处都只做逐字子串匹配（不归一化空白、不做 token 匹配、不跨行重组）——命中即"在检出里逐字存在"，
+/// 不再误伤"quote 落在 ±60 行窗口外"的合法证据；改过空白的 quote 仍然不命中（照旧降级）。
+pub fn reanchor(quote: &str, material: &str, file: Option<&str>) -> Option<String> {
+    let q = quote.trim();
+    if q.is_empty() {
+        return None;
+    }
+    if material.contains(q) {
+        return Some(q.to_string());
+    }
+    file.filter(|f| f.contains(q)).map(|_| q.to_string())
 }
 
 /// 跨文件线索：finding 原 quote 里第一行足够长的代码。
@@ -126,6 +321,11 @@ fn take_bytes(s: &str, cap: usize) -> String {
 
 /// ±[`SNAPSHOT_RADIUS`] 行原文（无行号前缀，保证多行 quote 可逐字命中）。
 fn snapshot_window(content: &str, path: &str, start: u32, end: u32) -> String {
+    snapshot_window_with(content, path, start, end, SNAPSHOT_RADIUS)
+}
+
+/// 同上，半径可指定（B-lite 用更小的 ±[`BLAST_RADIUS`]）。
+fn snapshot_window_with(content: &str, path: &str, start: u32, end: u32, radius: u32) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let n = lines.len();
     if n == 0 {
@@ -136,8 +336,8 @@ fn snapshot_window(content: &str, path: &str, start: u32, end: u32) -> String {
         let lo = n.saturating_sub(120).max(1);
         (lo, n, format!(" — claimed lines {start}-{end} are beyond the file (now {n} lines)"))
     } else {
-        let hi = ((end as usize).saturating_add(SNAPSHOT_RADIUS as usize)).min(n);
-        ((start.saturating_sub(SNAPSHOT_RADIUS).max(1)) as usize, hi, String::new())
+        let hi = ((end as usize).saturating_add(radius as usize)).min(n);
+        ((start.saturating_sub(radius).max(1)) as usize, hi, String::new())
     };
     let body = lines[lo - 1..hi].join("\n");
     let body = take_bytes(&body, SNAPSHOT_BYTE_CAP);
@@ -295,6 +495,133 @@ mod tests {
         assert!(!quote_is_verbatim("let x =  1;", material), "内部空白改动必须失败");
         assert!(!quote_is_verbatim("let x = 1;\n  }", material), "改空白/缩进必须失败");
         assert!(!quote_is_verbatim("   ", material));
+    }
+
+    fn fix(path: &str, diff: &str) -> FileFix {
+        FileFix { path: path.into(), old_path: None, kind: FixChange::Modified, diff: diff.into() }
+    }
+
+    /// B-lite 的复现格式：符号名 + 引用处 file:line + 该 hunk 的 ±N 快照。
+    #[test]
+    fn blast_radius_names_the_symbol_its_reference_and_a_snapshot() {
+        let dir = repo(&[
+            (
+                "service/execution.go",
+                "package service\n\nfunc PinnedChannelAllowed(c *gin.Context) bool {\n\tfresh, err := load(c)\n\treturn strict(fresh, err)\n}\n",
+            ),
+            (
+                "middleware/distributor.go",
+                "package middleware\n\nfunc Distribute() {\n\tallowed, e := llmconfig.PinnedChannelAllowed(c, snap, channel)\n\tif e != nil || !allowed {\n\t\tabort()\n\t}\n\tfallback, _ := pick()\n\t_ = fallback\n}\n",
+            ),
+            ("service/other.go", "package service\n\nfunc unrelated() {}\n"),
+        ]);
+        let fixes = vec![
+            fix(
+                "service/execution.go",
+                "@@ -3,3 +3,4 @@\n func PinnedChannelAllowed(c *gin.Context) bool {\n-\treturn old(c)\n+\tfresh, err := load(c)\n+\treturn strict(fresh, err)\n }\n",
+            ),
+            fix(
+                "middleware/distributor.go",
+                "@@ -3,2 +3,3 @@\n func Distribute() {\n-\tallowed, e := llmconfig.ChannelAllowed(c, snap, channel)\n+\tallowed, e := llmconfig.PinnedChannelAllowed(c, snap, channel)\n \tif e != nil || !allowed {\n",
+            ),
+            fix("service/other.go", "@@ -3,1 +3,2 @@\n func unrelated() {}\n+// touched\n"),
+        ];
+        let ev = build(dir.path(), &OutputLang::default(), &finding("service/execution.go", "return old(c)", 4), &fixes);
+        assert!(ev.located);
+        assert!(ev.blast.contains("### middleware/distributor.go (changed by the fix)"), "{}", ev.blast);
+        assert!(
+            ev.blast.contains("- PinnedChannelAllowed referenced at middleware/distributor.go:4"),
+            "引用处必须带 file:line: {}",
+            ev.blast
+        );
+        assert!(ev.blast.contains("(post-fix snapshot)"), "必须附该 hunk 的快照: {}", ev.blast);
+        assert!(!ev.blast.contains("service/other.go"), "无关文件不得入选: {}", ev.blast);
+        assert!(ev.warnings.is_empty(), "{:?}", ev.warnings);
+    }
+
+    fn exec_fix() -> FileFix {
+        fix(
+            "service/execution.go",
+            "@@ -3,3 +3,4 @@\n func PinnedChannelAllowed(c *gin.Context) bool {\n-\treturn old(c)\n+\tfresh, err := load(c)\n+\treturn strict(fresh, err)\n }\n",
+        )
+    }
+
+    const EXEC_HEAD: &str = "package service\n\nfunc PinnedChannelAllowed(c *gin.Context) bool {\n\tfresh, err := load(c)\n\treturn strict(fresh, err)\n}\n";
+
+    #[test]
+    fn blast_radius_caps_files_and_reports_omitted_references() {
+        let mut files: Vec<(String, String)> = vec![("service/execution.go".to_string(), EXEC_HEAD.to_string())];
+        let mut fixes = vec![exec_fix()];
+        for name in ["m/a.go", "m/b.go", "m/c.go", "m/d.go"] {
+            files.push((
+                name.to_string(),
+                "package m\n\nfunc call() {\n\tPinnedChannelAllowed(c, snap, ch)\n}\n".to_string(),
+            ));
+            fixes.push(fix(name, &format!("@@ -3,2 +3,3 @@\n func call() {{\n-\told(c, snap, ch)\n+\tPinnedChannelAllowed(c, snap, ch)\n }}\n")));
+        }
+        let mut refs: Vec<(&str, &str)> = files.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        refs.sort_by(|a, b| a.0.cmp(b.0));
+        let dir = repo(&refs);
+        let ev = build(dir.path(), &OutputLang::default(), &finding("service/execution.go", "return old(c)", 4), &fixes);
+        assert!(ev.blast.contains("### m/a.go"), "{}", ev.blast);
+        assert!(ev.blast.contains("### m/b.go"), "{}", ev.blast);
+        assert!(ev.blast.contains("### m/c.go"), "{}", ev.blast);
+        assert!(!ev.blast.contains("### m/d.go"), "第 4 个引用文件必须被截: {}", ev.blast);
+        assert!(ev.blast.ends_with("… (+1 more references omitted)"), "省略数必须按全量算: {}", ev.blast);
+    }
+
+    #[test]
+    fn blast_radius_caps_references_per_finding() {
+        let mut lines: Vec<String> = (1..=60).map(|i| format!("// filler {i}")).collect();
+        let mut diff = String::new();
+        for i in 0..8 {
+            let n = 1 + i * 5;
+            lines[(n - 1) as usize] = "\tallowed := llmconfig.PinnedChannelAllowed(c, snap, ch)".to_string();
+            diff.push_str(&format!(
+                "@@ -{n},1 +{n},1 @@\n-\told(c, snap, ch)\n+\tallowed := llmconfig.PinnedChannelAllowed(c, snap, ch)\n"
+            ));
+        }
+        let body = lines.join("\n") + "\n";
+        let dir = repo(&[("service/execution.go", EXEC_HEAD), ("m/callers.go", &body)]);
+        let fixes = vec![exec_fix(), fix("m/callers.go", &diff)];
+        let ev = build(dir.path(), &OutputLang::default(), &finding("service/execution.go", "return old(c)", 4), &fixes);
+        let refs = ev.blast.matches("referenced at m/callers.go:").count();
+        assert_eq!(refs, 6, "每 finding 最多 6 处引用: {}", ev.blast);
+        assert!(ev.blast.ends_with("… (+2 more references omitted)"), "{}", ev.blast);
+    }
+
+    #[test]
+    fn blast_radius_is_byte_capped() {
+        // 引用落在“又长又密”的文件中段：±40 行快照 ~24KB > 12KB 帽 → 一个引用都收不下，只留省略标记。
+        let pad = format!("// {}\n", "p".repeat(300));
+        let mut lines: Vec<String> = (0..200).map(|_| pad.trim_end().to_string()).collect();
+        lines[99] = "\tallowed := llmconfig.PinnedChannelAllowed(c, snap, ch)".to_string();
+        let body = lines.join("\n") + "\n";
+        let dir = repo(&[("service/execution.go", EXEC_HEAD), ("m/big.go", &body)]);
+        let fixes = vec![
+            exec_fix(),
+            fix("m/big.go", "@@ -100,1 +100,2 @@\n-\told(c, snap, ch)\n+\tallowed := llmconfig.PinnedChannelAllowed(c, snap, ch)\n"),
+        ];
+        let ev = build(dir.path(), &OutputLang::default(), &finding("service/execution.go", "return old(c)", 4), &fixes);
+        assert!(ev.blast.len() < 13_000, "整段受 12KB 帽约束: {} bytes", ev.blast.len());
+        assert!(ev.blast.contains("… (+1 more references omitted)"), "{}", ev.blast);
+    }
+
+    #[test]
+    fn blast_radius_degrades_with_a_warning_instead_of_guessing() {
+        // ① 不支持的语言：不发该段，留 warning。
+        let dir = repo(&[("docs/plan.md", "# plan\n\nold line\n")]);
+        let fixes = vec![fix("docs/plan.md", "@@ -3,1 +3,1 @@\n-old line\n+new line\n")];
+        let ev = build(dir.path(), &OutputLang::default(), &finding("docs/plan.md", "old line", 3), &fixes);
+        assert!(ev.blast.is_empty(), "{}", ev.blast);
+        assert_eq!(ev.warnings, vec!["symbol_blast_radius_skipped:unsupported_language:docs/plan.md"]);
+
+        // ② 支持的语言但改在 def 外（注释行）→ 同样不发段 + warning。
+        let dir = repo(&[("a.go", "package a\n\n// note\nfunc f() {}\n")]);
+        let fixes = vec![fix("a.go", "@@ -3,1 +3,2 @@\n // note\n+// more\n")];
+        let ev = build(dir.path(), &OutputLang::default(), &finding("a.go", "// note", 3), &fixes);
+        assert!(ev.blast.is_empty(), "{}", ev.blast);
+        assert_eq!(ev.warnings, vec!["symbol_blast_radius_skipped:no_symbols:a.go"]);
     }
 
     #[test]

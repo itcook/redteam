@@ -587,6 +587,21 @@ Phase 1 内部硬序：1.1/1.2/1.3/1.4 → 1.5 → 1.6/1.7/1.8/**1.9**（1.9 的
 | `refute_skipped` | string | job 模式 + 验真开启 + 未声明 refuter | **Phase 2 新增**；值恒 `no_refuter`（不静默、不塞 `refuted`）；本地模式不写（仍自动异族回退） |
 | `input_consistency` | `{match, git, files, git_files, only_in_patch[]{≤20}, only_in_git[]{≤20}, differing[]{≤20}, *_total}` | 总是（review） | **Phase 2 新增**；`diff_patch` 与 `git diff merge_base..HEAD` 的比对，不一致**只披露**，排序字典序、各表封顶 20 |
 | `prior_routing` | `{present, focus[], specs_used[], specs_unreadable, wall_clock_s}` | 有 `prior_report` 时 | **Phase 2 新增**；只含 `summary.routing` 三件事，不含历史 findings / 计数 / tier |
+| `verifier` | string | verify | **Phase 4 新增**；实际执行核验的首个模型身份（`provider/id`） |
+| `verify` | object | verify | **Phase 4 新增**；逐条核验的统计与观测，键见下表 |
+
+**`extensions.redteam.verify.*`（verify 专用）**
+
+| key | 类型 | 何时出现 | 说明 |
+|---|---|---|---|
+| `counts` | `{resolved, unresolved, regressed, inconclusive}` | verify | 四态计数 |
+| `calls` | int | verify | 模型调用次数（含解析失败后的 repair 轮） |
+| `model_failures` | int | verify | 调用/解析失败导致 `inconclusive` 的条数 |
+| `quote_rejected` | int | verify | quote 未逐字命中而降级的条数 |
+| `duplicate_fingerprints` | int | verify | 输入里重复指纹条数（集合语义只核一次） |
+| `latency_ms` | `{total, max}` | verify | **2026-11-25 Phase 4 增强新增、非契约必需**：逐条调用耗时（毫秒）；只记录，不设墙钟 KPI |
+| `rate_limit` | `{retries, wait_ms}` | verify | **2026-11-25 Phase 4 增强新增、非契约必需**：provider 门的 429 排队重试次数/等待毫秒（与心跳 `llm.retrying` 同源） |
+| `warnings` | `[string]` | verify | **2026-11-25 Phase 4 增强新增、非契约必需**：证据降级原因，去重排序、不猜（如 `symbol_blast_radius_skipped:unsupported_language:<path>` / `:no_symbols:<path>`）；不参与 status |
 
 **finding 级（`finding.extensions.redteam`）**
 

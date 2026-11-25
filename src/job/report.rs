@@ -394,6 +394,11 @@ pub fn verify_report(
             "model_failures": outcome.failures,
             "quote_rejected": outcome.quote_rejected,
             "duplicate_fingerprints": outcome.duplicates,
+            // 墙钟只记录、不设 KPI（用户 2026-11-25 裁）：总耗时与单条最大耗时。
+            "latency_ms": { "total": outcome.latency.0, "max": outcome.latency.1 },
+            "rate_limit": { "retries": outcome.rate_limit.0, "wait_ms": outcome.rate_limit.1 },
+            // 证据降级原因（如 B-lite 取不到符号名）：披露、不猜、不参与 status。
+            "warnings": outcome.warnings,
         },
     });
     if let Some(t) = partial {
@@ -642,6 +647,9 @@ mod tests {
             failures: 0,
             quote_rejected: 0,
             duplicates: 0,
+            latency: (0, 0),
+            rate_limit: (0, 0),
+            warnings: Vec::new(),
             verifier: "p/v".into(),
         };
         let ok = verify_report(&vm, &lang, &cfg, &empty, "h1");
@@ -674,6 +682,9 @@ mod tests {
             failures: 1,
             quote_rejected: 0,
             duplicates: 0,
+            latency: (1234, 900),
+            rate_limit: (2, 500),
+            warnings: vec!["symbol_blast_radius_skipped:no_symbols:a.rs".into()],
             verifier: "p/v".into(),
         };
         let r = verify_report(&vm, &lang, &cfg, &out, "h1");

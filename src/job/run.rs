@@ -584,6 +584,17 @@ async fn run_verify(
         Ok(r) => r,
         Err(e) => return fail(JobFailure::with_reason("config_invalid", None, e)),
     };
+    // 派发窗口 = Σ 各 verifier provider 的 maxConcurrency（同一 provider 只算一次）；
+    // 它只是「同时活着的 future 数」，每个 provider 的硬上限仍由 InflightGate 强制。
+    let mut caps: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for (_, key) in &routes {
+        if let Some(p) = registry.provider_of(key) {
+            if let Some(c) = registry.cap_of(p) {
+                caps.insert(p.to_string(), c);
+            }
+        }
+    }
+    let max_parallel = (caps.values().sum::<u32>().max(1) as usize).min(findings.len().max(1));
     heartbeat.attach_llm(registry.gate_handles());
     let deadline = match effective_deadline(started, manifest.limits.wall_clock_s, None) {
         Ok(d) => d,
@@ -600,6 +611,8 @@ async fn run_verify(
         fixes: &fixes,
         prior: prior.as_ref(),
         routes,
+        max_parallel,
+        wall_clock_s: manifest.limits.wall_clock_s,
         deadline,
         duplicates,
     };

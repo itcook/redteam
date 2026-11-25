@@ -1,0 +1,41 @@
+{
+  "schema": "hibot.audit.job.verify/1",
+  "job_id": "pr400-group-b",
+  "kind": "verify",
+  "repo": {
+    "id": 400,
+    "full_name": "zimacode-network/hiapi-backend"
+  },
+  "pr": {
+    "number": 400,
+    "head_sha": "a88eb64584d964cc000c440a830226c66328527a",
+    "base_sha": "54f4c944da97ccd775de51e3525e86e611b2cd83"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "limits": {
+    "wall_clock_s": 900
+  },
+  "paths": {
+    "repo": "../repo",
+    "out": "out",
+    "config": "config/executor.redteam.json"
+  },
+  "inputs": {
+    "findings": {
+      "path": "input/findings.json",
+      "sha256": "33396d187a1b23c06a2f5d6274cbea55496defd204eeeacee3e52db7bc013622",
+      "schema": "hibot.audit.findings/1"
+    },
+    "diff_patch": {
+      "path": "input/diff.patch",
+      "sha256": "102c335b512e3c5d3b6404b20bf4221514089d3adbd65863ae4ab2593daf8754"
+    },
+    "merge_base": {
+      "path": "input/merge-base.sha",
+      "sha256": "7a2c61572ae830ccb473dcb0cd7aaa95d7adcf87ee8fa699a5dddbaa61208a42"
+    }
+  }
+}

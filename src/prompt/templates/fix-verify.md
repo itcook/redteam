@@ -29,6 +29,11 @@ Path (post-fix): {{CHANGE_PATH}}
 {{RENAMED_FROM}}
 </change>
 {{PRIOR_BLOCK}}
+<fix_scope>
+Every file the fix changed (this finding's file may be only one of them). It is scope information, not code evidence: if the substance of the fix looks absent from the material below, it may live in one of these files — return `inconclusive` and say so instead of assuming nothing changed.
+{{FIX_SCOPE}}
+</fix_scope>
+
 <fix_diff>
 The hunks of this file in the fix diff (post-fix side paths). If this file has no hunks, the fix did not touch it.
 {{HUNKS}}
@@ -38,6 +43,11 @@ The hunks of this file in the fix diff (post-fix side paths). If this file has n
 Hunks from OTHER files that appear to carry the same code as the finding's quote (cross-file fix). Only these hunks are evidence outside the finding's file.
 {{RELATED}}
 </related_hunks>
+
+<symbol_blast_radius>
+Other files that the fix also changed and that reference symbols changed in THIS file. Each reference is listed as `- <symbol> referenced at <path>:<line>`, followed by that hunk's post-fix snapshot. A fix that changes a symbol's behaviour can break these call sites even when the finding itself is fixed — check them before answering `resolved`.
+{{BLAST}}
+</symbol_blast_radius>
 
 <post_fix_snapshot>
 Verbatim content of the post-fix checkout around the finding's location (line numbers in the header; the body carries no numbering).

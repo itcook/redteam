@@ -1,0 +1,59 @@
+[
+  {
+    "fingerprint": "sha256:7b89ce343543519a644bfcedb721696a3277d01cc8cb52cc16e90ab93489cf01",
+    "severity": "high",
+    "confidence": 0.9,
+    "file": "middleware/distributor.go",
+    "line_start": 158,
+    "line_end": 158,
+    "quote": "\t\t\t\t\t\tallowed, e := llmconfig.PinnedChannelAllowed(c, snap, channel)",
+    "title": "affinity 严格拒绝不是终态，同请求回退会重新选中刚被拒绝的渠道",
+    "body": "PinnedChannelAllowed 拒绝漂移渠道后只做 InvalidateChannelAffinityFailure + channel = nil；随后的 CacheGetRandomSatisfiedChannel 经 channel_select 使用非严格 AllowedChannelIDs，刚被拒绝的渠道仍在等权池中。实测 head 上 -count=50 有 19 次失败（expected 902, actual 901）。",
+    "recommendation": "严格检查失败后把该渠道加入本请求的排除集（或让回退使用严格 allowed 集），补显式渠道 id 严格分支的直接测试。",
+    "extensions": {
+      "redteam": {
+        "fixture": {
+          "provenance": "hiapi-backend#400 第 2 轮 🔴1（第三轮记为 Q1）"
+        }
+      }
+    }
+  },
+  {
+    "fingerprint": "sha256:87cf69a3ba26fc30d2d843dcd224b95aeba27c4459d35b4bab36984b9788ffc4",
+    "severity": "high",
+    "confidence": 0.9,
+    "file": "service/llmconfig/migration.go",
+    "line_start": 563,
+    "line_end": 563,
+    "quote": "\t\t\treturn invalid(fmt.Errorf(\"no verified channels remain for %s; run rebind-evidence before switching\", p.ProtocolType))",
+    "title": "先跑 rebind-evidence 再切对协议切换无效",
+    "body": "失败的 switch 事务回滚后协议仍是 legacy，rebind 只写回 migration_legacy_snapshot；下一次切换先把 source 改成 llm，而 llm 源保留原来的 readiness_evidence_json，VerifiedChannelIDs 读到的仍是 key 轮换前的 native evidence——按文档重试会得到同一错误。真实出口是重新保存协议或重新发布，error 与文档都没说。已在 native 的协议漂移也会阻塞无关 switch 且被 rebind 跳过，属同一指引缺口。",
+    "recommendation": "让 rebind 同时刷新该校验读取的 native evidence，或把 error/文档改成真实恢复步骤（按来源描述），并补「按文档恢复后重试切换成功」的测试。",
+    "extensions": {
+      "redteam": {
+        "fixture": {
+          "provenance": "hiapi-backend#400 第 2 轮 🟡2（第三轮记为 Q2）"
+        }
+      }
+    }
+  },
+  {
+    "fingerprint": "sha256:19a4af28aca6a88e1c08b9026d929d7246a894ebbef4fba542d8551282292475",
+    "severity": "high",
+    "confidence": 0.9,
+    "file": "service/llmconfig/execution.go",
+    "line_start": 280,
+    "line_end": 280,
+    "quote": "\tcurrent, err := CurrentChannelFingerprint(channel, snapshot.ModelName, snapshot.Protocol.ProtocolType, snapshot.Protocol.ProfileKey)",
+    "title": "affinity 的严格比较读取缓存行，编辑后的渠道可被静默沿用",
+    "body": "PinnedChannelAllowed 的严格半用 model.CacheGetChannel 返回的内存副本计算指纹，而 allowed 集由 AllowedChannelIDs 读 DB 新行且非严格；当编辑已落库、InitChannelCache 尚未刷新时，严格半用旧行通过、成员集用新行放行，请求继续使用旧渠道。",
+    "recommendation": "严格比较前重新读取渠道行，或让严格半与成员集共用同一份 DB 读取结果；补缓存未刷新的单测。",
+    "extensions": {
+      "redteam": {
+        "fixture": {
+          "provenance": "hiapi-backend#400 第 2 轮 🟡3（第三轮记为 Q7）"
+        }
+      }
+    }
+  }
+]

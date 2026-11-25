@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const VULN: &str = "return db.query('SELECT * FROM users WHERE id=' + id);";
 const FIXED: &str = "return db.query('SELECT * FROM users WHERE id=?', [id]);";
@@ -108,6 +109,15 @@ struct Fixture {
 
 /// base 提交 → `mutate` 改工作树 → head 提交；再把它做成一个 verify job（真 diff / 真 merge_base）。
 fn make_job(base_files: &[(&str, &str)], mutate: impl FnOnce(&Path), findings: &str) -> Fixture {
+    make_job_with_config(base_files, mutate, findings, CONFIG)
+}
+
+fn make_job_with_config(
+    base_files: &[(&str, &str)],
+    mutate: impl FnOnce(&Path),
+    findings: &str,
+    config: &str,
+) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -132,7 +142,7 @@ fn make_job(base_files: &[(&str, &str)], mutate: impl FnOnce(&Path), findings: &
     std::fs::create_dir_all(job.join("config")).unwrap();
     std::fs::create_dir_all(job.join("input")).unwrap();
     std::fs::create_dir_all(job.join("out")).unwrap();
-    std::fs::write(job.join("config/executor.redteam.json"), CONFIG).unwrap();
+    std::fs::write(job.join("config/executor.redteam.json"), config).unwrap();
     std::fs::write(job.join("input/findings.json"), findings).unwrap();
     let patch = format!("{diff}\n");
     std::fs::write(job.join("input/diff.patch"), &patch).unwrap();
@@ -166,6 +176,18 @@ const CONFIG: &str = r#"{
            "models": [{"id": "v"}]}
   }
 }"#;
+
+/// 带 provider 帽的配置（并发窗口测试用）：其它字段与 CONFIG 等价。
+fn config_with_cap(cap: u32) -> String {
+    serde_json::json!({
+        "settings": {"language": "en_US", "verify": {"models": [{"provider": "p1", "id": "v"}]}},
+        "providers": {
+            "p1": {"api": "openai-completions", "baseUrl": "http://127.0.0.1:1",
+                   "apiKeyEnv": "P1_KEY", "maxConcurrency": cap, "models": [{"id": "v"}]}
+        }
+    })
+    .to_string()
+}
 
 fn finding(file: &str, quote: &str, line: u32, title: &str) -> serde_json::Value {
     serde_json::json!({
@@ -482,6 +504,174 @@ async fn broken_findings_are_the_only_case_allowed_to_leave_verifications_empty(
     assert_eq!(r["status"], "error");
     assert_eq!(r["extensions"]["redteam"]["status_code"], "invalid_fingerprint_input");
     assert_eq!(r["verifications"], serde_json::json!([]), "findings 坏 → 无指纹可覆盖");
+}
+
+// ───────────── 降级策略：严格重锚 + 一次 repair（Phase 4 增强） ─────────────
+
+#[tokio::test]
+async fn quote_outside_the_snapshot_window_is_accepted_by_strict_reanchor() {
+    // quote 是真的（检出里逐字存在），只是落在 ±60 行窗口外 → 重锚后仍算通过，不再误降级。
+    let marker = "const marker = 'UNIQUE_MARKER_STRING';";
+    let mut before = format!("function find(id) {{\n  {VULN}\n}}\n");
+    while before.lines().count() < 200 {
+        before.push_str("// padding\n");
+    }
+    before.push_str(marker);
+    before.push('\n');
+    let mut after = format!("function find(id) {{\n  {FIXED}\n}}\n");
+    while after.lines().count() < 200 {
+        after.push_str("// padding\n");
+    }
+    after.push_str(marker);
+    after.push('\n');
+
+    let f = finding("src/app.js", VULN, 2, "sql injection window");
+    let router = Arc::new(Router::new(vec![(needle_of(&f), verdict("resolved", "已参数化", Some(marker)))]));
+    let findings = findings_json(&[f]);
+    let base: [(&str, &str); 1] = [("src/app.js", &before)];
+    let fx = make_job(&base, |repo| {
+        std::fs::write(repo.join("src/app.js"), &after).unwrap();
+    }, &findings);
+    let r = run(&fx, router).await;
+    assert_eq!(r["status"], "ok", "窗口外的逐字 quote 不该降级: {r}");
+    assert_eq!(r["verifications"][0]["status"], "resolved");
+    assert_eq!(r["verifications"][0]["quote"].as_str().unwrap(), marker);
+    assert_eq!(r["extensions"]["redteam"]["verify"]["quote_rejected"], 0);
+}
+
+#[tokio::test]
+async fn one_repair_round_recovers_a_json_object() {
+    use redteam::provider::tool_loop::FakeChatBackend;
+    let good = verdict("resolved", "已参数化", Some(FIXED));
+    let fake = Arc::new(FakeChatBackend::new(vec![turn("I cannot decide from this."), turn(&good)]));
+    let f = finding("src/app.js", VULN, 2, "sql injection repair");
+    let findings = findings_json(&[f]);
+    let base: [(&str, &str); 1] = [("src/app.js", &format!("function find(id) {{\n  {VULN}\n}}\n"))];
+    let fx = make_job(&base, |repo| {
+        std::fs::write(repo.join("src/app.js"), format!("function find(id) {{\n  {FIXED}\n}}\n")).unwrap();
+    }, &findings);
+    let over = {
+        let fake = fake.clone();
+        Box::new(move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            (em.provider == "p1" && em.id == "v").then(|| Box::new(fake.clone()) as Box<dyn ChatBackend>)
+        }) as Box<redteam::cli::BackendOverride<'static>>
+    };
+    assert_eq!(redteam::job::run::run_with(JobKind::Verify, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["verifications"][0]["status"], "resolved");
+    assert_eq!(fake.turn_count(), 2, "首轮 + 一次 repair");
+    assert_eq!(r["extensions"]["redteam"]["verify"]["calls"], 2, "calls 要如实计两轮");
+    // repair 轮的输入：system + user + 上一轮原文 + 「只要 JSON」指令。
+    let second = fake.messages_at(1);
+    assert_eq!(second.len(), 4, "{second:?}");
+    assert!(matches!(second[2], ChatMessage::Assistant { .. }), "上一轮原文要挂回 assistant 位");
+    let ChatMessage::User(repair) = &second[3] else { panic!("最后一轮必须是 repair 指令") };
+    assert!(repair.contains("NOT a single JSON object"), "{repair}");
+}
+
+// ─────────── B-lite：真实回归形状（hiapi#400 A→B 的骨架） ───────────
+
+#[tokio::test]
+async fn symbol_blast_radius_puts_the_real_regression_site_in_the_prompt() {
+    // #400 第 1 轮分诊 blocker 锚在 execution.go；修复同时改了 distributor.go 的调用点，
+    // 而第 2 轮抓到的回归（严格拒绝后回退重选）就在那个调用点后面。B-lite 必须把它带进 prompt。
+    let exec_base = "package service\n\nfunc PinnedChannelAllowed(c *gin.Context) bool {\n\treturn old(c)\n}\n";
+    let exec_head = "package service\n\nfunc PinnedChannelAllowed(c *gin.Context) bool {\n\tfresh, err := load(c)\n\treturn strict(fresh, err)\n}\n";
+    let dist_base = "package middleware\n\nfunc Distribute() {\n\tallowed, e := llmconfig.ChannelAllowed(c, snap, channel)\n\tif e != nil || !allowed {\n\t\tabort()\n\t}\n\tfallback, _ := pick()\n\t_ = fallback\n}\n";
+    let dist_head = "package middleware\n\nfunc Distribute() {\n\tallowed, e := llmconfig.PinnedChannelAllowed(c, snap, channel)\n\tif e != nil || !allowed {\n\t\tabort()\n\t}\n\tfallback, _ := pick()\n\t_ = fallback\n}\n";
+    let base: [(&str, &str); 2] = [("service/execution.go", exec_base), ("middleware/distributor.go", dist_base)];
+    let f = finding("service/execution.go", "return old(c)", 4, "严格检查被放宽");
+    let router = Arc::new(Router::new(vec![(
+        needle_of(&f),
+        verdict("resolved", "严格半已改读实时行", Some("return strict(fresh, err)")),
+    )]));
+    let findings = findings_json(&[f]);
+    let fx = make_job(&base, |repo| {
+        std::fs::write(repo.join("service/execution.go"), exec_head).unwrap();
+        std::fs::write(repo.join("middleware/distributor.go"), dist_head).unwrap();
+    }, &findings);
+    let r = run(&fx, router.clone()).await;
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["verifications"][0]["status"], "resolved");
+    assert_eq!(r["extensions"]["redteam"]["verify"]["warnings"], serde_json::json!([]));
+    let seen = router.seen();
+    let prompt = &seen[0];
+    assert!(prompt.contains("### middleware/distributor.go (changed by the fix)"), "{prompt}");
+    assert!(
+        prompt.contains("- PinnedChannelAllowed referenced at middleware/distributor.go:4"),
+        "必须带符号名 + 引用处 file:line: {prompt}"
+    );
+    assert!(prompt.contains("(post-fix snapshot)"), "必须附该 hunk 的 ±N 快照: {prompt}");
+}
+
+// ───────────────── 并行与观测（Phase 4 增强） ─────────────────
+
+#[tokio::test]
+async fn fan_out_respects_provider_max_concurrency() {
+    use redteam::provider::tool_loop::FakeChatBackend;
+    let line = db_line("t_shared");
+    let body = file_with(&line);
+    let base: [(&str, &str); 3] = [("src/a.js", &body), ("src/b.js", &body), ("src/c.js", &body)];
+    let findings = findings_json(&[
+        finding("src/a.js", &line, 2, "a"),
+        finding("src/b.js", &line, 2, "b"),
+        finding("src/c.js", &line, 2, "c"),
+    ]);
+    // provider 帽 3 → 三条同时在飞（峰值 3）；帽 1 → 串行（峰值 1）。门是硬上限。
+    for (cap, want) in [(3u32, 3usize), (1u32, 1usize)] {
+        let fake = Arc::new(
+            FakeChatBackend::repeating(turn(&verdict("unresolved", "still there", Some(&line))))
+                .with_delay(Duration::from_millis(120)),
+        );
+        let over = {
+            let f = fake.clone();
+            Box::new(move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+                (em.provider == "p1" && em.id == "v").then(|| Box::new(f.clone()) as Box<dyn ChatBackend>)
+            }) as Box<redteam::cli::BackendOverride<'static>>
+        };
+        let fx = make_job_with_config(&base, |_repo| {}, &findings, &config_with_cap(cap));
+        assert_eq!(redteam::job::run::run_with(JobKind::Verify, &fx.job, Some(over.as_ref())).await, 0);
+        assert_eq!(fake.peak_inflight(), want, "cap={cap}：峰值并发必须等于 provider 帽");
+        assert_eq!(fake.turn_count(), 3, "每条 finding 一次调用");
+        let r = read_report(&fx.job);
+        assert_eq!(r["status"], "ok");
+        assert!(
+            r["extensions"]["redteam"]["verify"]["latency_ms"]["total"].as_u64().unwrap() > 0,
+            "墙钟必须记录（不设 KPI，但不能是 0）: {r}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_retries_are_counted_through_the_provider_gate() {
+    use redteam::provider::tool_loop::FakeChatBackend;
+    // 一次 429 + 一次成功：AttemptPolicy 必须记账（心跳 `retrying` 与这里同源）。
+    let fake = Arc::new(FakeChatBackend::new_results(vec![
+        Err(ProviderError::RateLimited { retry_after: Some(Duration::from_millis(1)) }),
+        Ok(turn(&verdict("resolved", "已参数化", Some(FIXED)))),
+    ]));
+    let f = finding("src/app.js", VULN, 2, "sql injection rate limit");
+    let findings = findings_json(&[f]);
+    let before = format!("function find(id) {{\n  {VULN}\n}}\n");
+    let repo_base: [(&str, &str); 1] = [("src/app.js", &before)];
+    let fx = make_job(&repo_base, |repo| {
+        std::fs::write(repo.join("src/app.js"), format!("function find(id) {{\n  {FIXED}\n}}\n")).unwrap();
+    }, &findings);
+    let over = {
+        let fake = fake.clone();
+        Box::new(move |em: &EffectiveModel| -> Option<Box<dyn ChatBackend>> {
+            (em.provider == "p1" && em.id == "v").then(|| Box::new(fake.clone()) as Box<dyn ChatBackend>)
+        }) as Box<redteam::cli::BackendOverride<'static>>
+    };
+    assert_eq!(redteam::job::run::run_with(JobKind::Verify, &fx.job, Some(over.as_ref())).await, 0);
+    let r = read_report(&fx.job);
+    assert_eq!(r["status"], "ok");
+    assert_eq!(fake.turn_count(), 2, "429 后重试一次");
+    assert!(
+        r["extensions"]["redteam"]["verify"]["rate_limit"]["retries"].as_u64().unwrap() >= 1,
+        "429 必须经 AttemptPolicy 记账: {r}"
+    );
 }
 
 // ───────────────────── 流程隔离（4.0） ─────────────────────

@@ -1,0 +1,84 @@
+{
+  "schema": "hibot.audit.report.verify/1",
+  "job_id": "pr400-group-b",
+  "kind": "verify",
+  "status": "ok",
+  "input": {
+    "head_sha": "a88eb64584d964cc000c440a830226c66328527a",
+    "base_sha": "54f4c944da97ccd775de51e3525e86e611b2cd83"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "verifications": [
+    {
+      "evidence": "严格校验失败分支现在在 `channel = nil` 之前调用 `llmconfig.WithdrawChannelForRequest(c, snap, channel.Id)`，将刚被拒绝的渠道从本请求的候选集中撤回；若撤回失败则直接返回 503，不再继续走非严格的随机回退。因此随后 `CacheGetRandomSatisfiedChannel` 不会重新选中该渠道，原缺陷已被消除。",
+      "finding_fingerprint": "sha256:7b89ce343543519a644bfcedb721696a3277d01cc8cb52cc16e90ab93489cf01",
+      "quote": "if e := llmconfig.WithdrawChannelForRequest(c, snap, channel.Id); e != nil {",
+      "status": "resolved"
+    },
+    {
+      "evidence": "migration.go 中该错误信息已从只提示“run rebind-evidence before switching”改为明确给出真实恢复步骤：先 rebind-evidence，再重新保存正在切换的协议（re-save the protocol being switched）。这消除了原先把“跑完 rebind 后直接重试切换”当作恢复路径的误导；改动仅为错误文案，未引入新的代码问题。",
+      "finding_fingerprint": "sha256:87cf69a3ba26fc30d2d843dcd224b95aeba27c4459d35b4bab36984b9788ffc4",
+      "quote": "return invalid(fmt.Errorf(\"no verified channels remain for %s; refresh evidence first (rebind-evidence, then re-save the protocol being switched)\", p.ProtocolType))",
+      "status": "resolved"
+    },
+    {
+      "evidence": "execution.go 的 channelAllowed 在 strict 分支内先用 model.DB.WithContext(ctx).First(&fresh, channel.Id) 按主键重新读取数据库中的渠道行，并以 channel = &fresh 覆盖入参，之后的状态/模型列表检查以及 CurrentChannelFingerprint 都针对这条最新 DB 行计算；记录不存在时返回 false, nil 转入普通选路。因此当编辑已落库而 InitChannelCache 尚未刷新时，严格比较不会再被内存缓存旧行蒙混通过，原缺陷路径被消除。middleware/distributor.go 中 !allowed 分支调用 WithdrawChannelForRequest 并将 channel 置 nil 回退到普通选择，与新增函数签名一致，未见由本次改动引入的新问题。",
+      "finding_fingerprint": "sha256:19a4af28aca6a88e1c08b9026d929d7246a894ebbef4fba542d8551282292475",
+      "quote": "channel = &fresh",
+      "status": "resolved"
+    }
+  ],
+  "usage": {
+    "input_tokens": 9576,
+    "output_tokens": 9425,
+    "cached_input_tokens": 1536,
+    "wall_clock_ms": 23763
+  },
+  "extensions": {
+    "redteam": {
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 900
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 10
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "zh_CN"
+      },
+      "template_hashes": {
+        "fix_verify": "3a1cfc364de35f6b"
+      },
+      "verifier": "deepseek/deepseek-flash",
+      "verify": {
+        "calls": 3,
+        "counts": {
+          "inconclusive": 0,
+          "regressed": 0,
+          "resolved": 3,
+          "unresolved": 0
+        },
+        "duplicate_fingerprints": 0,
+        "latency_ms": {
+          "max": 23580,
+          "total": 52522
+        },
+        "model_failures": 0,
+        "quote_rejected": 0,
+        "rate_limit": {
+          "retries": 0,
+          "wait_ms": 0
+        },
+        "warnings": []
+      }
+    }
+  }
+}
