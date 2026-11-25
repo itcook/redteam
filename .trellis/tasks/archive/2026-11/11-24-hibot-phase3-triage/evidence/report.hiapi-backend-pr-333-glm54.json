@@ -1,0 +1,215 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `drift` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:30e32b313c1bd8f07df0f0fdd92524e8459a7f071aaabcdfb3ebcb40fabf22b2",
+      "severity": "medium",
+      "confidence": 0.9,
+      "file": "service/feishu_finance_agent_client.go",
+      "line_start": 284,
+      "line_end": 287,
+      "quote": "messages := []map[string]string{\n\t\t{\"role\": \"system\", \"content\": feishuFinanceAgentSystemPrompt},\n\t\t{\"role\": \"user\", \"content\": text},\n\t}",
+      "title": "Security (surface 5): injection",
+      "body": "Reachability: Feishu event field `event.message.content` enters at service/feishu_finance_agent.go:319-320 (`_ = common.UnmarshalJsonStr(msg.Content, &content)`; `text := strings.TrimSpace(feishuMentionPlaceholder.ReplaceAllString(content.Text, \"\"))`) and is persisted as `action.RawText` (feishu_finance_agent.go:334); service/feishu_finance_agent.go:350 `text := action.RawText` -> line 359 `cmd, err := parseFeishuFinanceAgentCommand(ctx, text)` -> service/feishu_finance_agent_client.go:286 `{'role': 'user', 'content': text}` -> chat/completions POST at client.go:349; the LLM's JSON reply is decoded into `feishuFinanceAgentCommand` (client.go:330-334), expanded into a plan by `buildFeishuFinanceAgentPlan` (feishu_finance_agent.go:177), and applied through the write path `executeFeishuFinanceAgentPlan` (`model.AddAffPromotionUsers`, `model.GrantAdminCredits`) once the confirm card is clicked.\nNote: Prompt injection: attacker-influenced text (the operator may paste third-party content, or injected text rides along in an @-mention group message) is concatenated verbatim as the user turn of the LLM prompt, and the model's structured output selects the target account, commission rate (up to 50%), withdrawal toggle and up to 1,000,000 gift credits that the single write path applies. Mitigations exist but do not remove the path: sender whitelist plus live Root re-check (`authorizeFeishuFinanceAgentOperator`), the requirement that the target account literally appear in the raw text (`feishuFinanceAgentTargetMentioned`), deterministic server-side numeric bounds, a 30-minute TTL, and a human confirm card that echoes the raw text with regex-based injection hints — a successful injection only has to survive the operator's glance at the card.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:be184f928d30caa2b3ecb99effb70d4d1918f02b06c4db724c6ae3ef2dade641",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_ws.go",
+      "line_start": 101,
+      "line_end": 105,
+      "quote": "if domain := feishuFinanceAgentWSDomain(cfg.OpenAPIBase); domain != \"\" {\n\t\topts = append(opts, larkws.WithDomain(domain))\n\t}\n\n\tclient := larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...)",
+      "title": "Security (surface 7): SSRF",
+      "body": "Reachability: env var FEISHU_FINANCE_AGENT_OPENAPI_BASE read at setting/feishu_finance_agent_setting.go:32 -> setting.GetFeishuFinanceAgentSetting() -> cfg.OpenAPIBase -> StartFeishuFinanceAgentWS -> runFeishuFinanceAgentWSSession -> feishuFinanceAgentWSDomain(cfg.OpenAPIBase) -> larkws.WithDomain(domain) at line 102 -> larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...) at line 105 -> client.Start dials the configured host\nNote: The outbound websocket host is taken verbatim from a deployment env var with no allowlist or scheme/host validation. AppID/AppSecret are presented to whatever host is configured, so a malicious or misconfigured FEISHU_FINANCE_AGENT_OPENAPI_BASE exfiltrates the app secret and lets an impostor endpoint feed forged message/card-callback events into a flow that grants credits and changes commission settings. The same env-controlled-base pattern exists for FEISHU_FINANCE_AGENT_LLM_BASE_URL (LLMAPIKey would be sent to that base), but its sink in service/feishu_finance_agent_client.go is not part of the supplied diff. Source is deploy-time env, not remote input, which bounds practical exploitability.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 66984,
+    "output_tokens": 67641,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 424356
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 2,
+            "dropped_rows": [
+              {
+                "conf": 5,
+                "file": "service/feishu_finance_agent_client.go",
+                "line": 349,
+                "reason": "below_threshold",
+                "surface": 7
+              },
+              {
+                "conf": 6,
+                "file": "service/feishu_finance_agent_ws.go",
+                "line": 142,
+                "reason": "below_threshold",
+                "surface": 5
+              }
+            ],
+            "dropped_total": 2,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 4,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 45074,
+            "output_tokens": 38449
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-drift` exceeded its 166.213227131s budget",
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": false,
+          "rows": 3,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 18985,
+            "output_tokens": 19203
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 1,
+          "claims": 20,
+          "delivered": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-intent-slice` exceeded its 166.214225398s budget",
+          "notes": [
+            "Verification statements (not claims): author reports 20 new/updated tests covering plan building, full confirmation flow, duplicate clicks, non-initiator/demoted Root, cancel/expiry, strangers, SDK event and card-callback conversion, re-click during executing, crash recovery, not racing fresh records, json_schema→json_object fallback, JSON field-level validation, injection warnings, replay re-authorization, fencing version, parsing recovery, and withdrawal current value.",
+            "Verification statements (not claims): author states `go build ./...` and `go test ./service ./model ./router ./controller` pass; three command types were retested with a real DeepSeek model (deepseek-v4.1-flash); a local end-to-end smoke test with a real Feishu app and real model confirmed promotion/commission/withdrawal/credits/log results in the database.",
+            "Activation detail stated: StartFeishuFinanceAgentWS() is wired into main.go's Start* block and starts both the long connection and the maintenance loop (first-round review item 4).",
+            "Minor first-round fixes stated but not elevated to claims: model returns only raw quota with credit formatting moved to the service display layer (item 5); ErrFeishuFinanceAgentBadCallback dead comment corrected so the WS card-callback layer converts it to an error toast (item 6).",
+            "Deployment prerequisites (configuration, not code behavior): the Feishu app must subscribe to im.message.receive_v1 and card.action.trigger and hold permissions im:message:send_as_bot, im:message.p2p_msg:readonly, im:message.group_at_msg:readonly; FEISHU_FINANCE_AGENT_OPENAPI_BASE is an optional test-only override.",
+            "The PR body explicitly states the threat model (LLM output untrusted, confirmation card as the sole execution gate) needs acceptance from the Root side.",
+            "Author notes an unrelated local SQLite development issue with glebarez v1.10 restart DDL (production uses PostgreSQL).",
+            "PR body footer states it was generated with Claude Code."
+          ],
+          "ok": false,
+          "rows": 1,
+          "scope_creep": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 2925,
+            "output_tokens": 9989
+          },
+          "verification_complete": false
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:drift",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

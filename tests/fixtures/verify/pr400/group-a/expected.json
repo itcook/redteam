@@ -1,0 +1,10 @@
+{
+  "sha256:697a6db64a341b98e313f7e9eaf2bb1b15991a0b553ad40813886afce781c3a2": {
+    "status": "regressed",
+    "note": "人工第 2 轮：分诊阻塞已修，但同时引入 🔴1（affinity 严格拒绝不是终态，回退重选被拒渠道）——按四态语义是 regressed。证据应出现在 symbol_blast_radius 段（distributor.go 引用 PinnedChannelAllowed，±40 行快照覆盖 :158→:174 回退）。"
+  },
+  "sha256:7db89c45c86767f14a69cdc975e148b524102f6f2990c9525030aa5d08e0b508": {
+    "status": "resolved",
+    "note": "人工第 2 轮：迁移 forward switch 改回 VerifiedChannelIDs，阻塞已修。"
+  }
+}

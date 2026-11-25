@@ -60,7 +60,7 @@
 
 **P1 · `--job-dir` 即外派模式，用 clap 参数组表达互斥**：`review` 拆 `LocalArgs`/`JobArgs { job_dir }`；`triage`/`verify` 只有 `JobArgs`；另有 `config` 子命令（`schema`/`check`）。**job 模式下不接受任何配置路径 flag**（hibot A1）：配置唯一来源 = manifest `paths.config`；业务 flag 一律拒收（clap 报错，不写 if）。
 
-**P2 · kind ↔ 角色最小集 + 角色枚举定稿**（用户裁决 + hibot 确认）：`review` → scanner + reviewer（refuter 可选，缺则跳过验真）；`triage` → 建议用 scanner 条目；`verify` → **`verifier` 可选，缺省回退 `reviewer`**（仅模型分配复用，不等于流程复用，见 P16.1）；`verifier` 与 `reviewer` 都缺才报配置错误。
+**P2 · kind ↔ 角色最小集 + 角色枚举定稿**（用户裁决 + hibot 确认）：`review` → scanner + reviewer（refuter 可选，缺则跳过验真）；`triage` → **reviewer 条目**（**2026-11-24 实施期改判**：三轴用 `roles.reviewer`、reasoning `high`；`config check --kind triage` 要求 reviewer，取代本文原「建议用 scanner 条目」）；`verify` → **`verifier` 可选，缺省回退 `reviewer`**（仅模型分配复用，不等于流程复用，见 P16.1）；`verifier` 与 `reviewer` 都缺才报配置错误。
 **role 枚举定稿：`scanner` / `reviewer` / `refuter` / `verifier`**（hibot 已据此改示例，且他们的 Profile 角色键与我们的枚举**同名、原样搬运**，不做改名映射）。
 
 **P3 · 报告信封独立成层，不动内部 `ReviewReport`**：`verdict` 丢弃；`stats`/`run.usage`/`run.duration_ms` → `usage`（不带 cost）；`scan`/`clusters`/`cells`/`run.*` → `extensions.redteam`。
@@ -225,8 +225,9 @@
 | 1.8 | **错误路径的报告可写性**（hibot B5 已裁）：① **仅 manifest 不可解析** → 不写 `report.json`（runner 按无报告=error），**禁止伪造 job_id/SHA/零值 summary**；② triage 的 `summary` **只在 `status=ok` 时必需**，`partial` 可省、`error` 不写摘要；③ verify 的 `verifications` **仅当输入指纹集合为空时允许空数组**，其余必须逐条覆盖 | `src/job/report.rs` | 三 kind 各一条：manifest 损坏→无报告非零退出；triage error→有报告但无 summary；verify 空输入→有报告且 `verifications: []` |
 | 1.9 | **配置契约外化**（P17）：`config schema` + `config check <path|json> --kind`；生成物入库 `dist/config.schema.json`，`make verify` 零 diff；job 模式未知键与密钥类字段 → error。**生成 schema 的硬前提（hibot 要求，四条缺一不可）**：① 顶层 `language` 已入 `Config`（1.4）；② `review.verifiers{enabled}` 已在（**已具备**）；③ `roles` 枚举已含 `scanner`/`reviewer`/`refuter`/`verifier`（**依赖 0.8 改名**）；④ provider `kind` 为 kebab-case（**已具备**，`openai-compatible`）。**否则 hibot 示例会被判 error** | `src/config/`（derive + schema 生成）、`src/cli/`、`dist/config.schema.json`、`tests/packaging.rs`、**`Makefile`**（`verify` 加 `git diff --exit-code dist/`） | 四条前提齐备后才生成；合法样例通过；未知键/错枚举/错类型/密钥字段四类各报错；`--kind review` 缺 scanner 报错；**退出码二值 + WARN 不影响退出码 + 诊断只走 stdout**（hibot 三点要求）；**用 hibot 示例跑一遍并回报**（B1） |
 
----
+> **2026-11-25 修订（config v2，取代 1.9 的 v1 形状）**：`providers.*.kind` → `api`（三值 `openai-completions`/`anthropic-messages`/`openai-responses`，`google` 删除，`baseUrl` 必填）；`language` 移入 `settings.language`；角色从 `models[].roles` 移到 `settings.{review.roles,triage,verify}.models[]`（轮转池，长度 1 合法）；`apiKey` 仅限本地、job 模式出现即 `secret_field`；`review.*` 整节移入 `settings.review`。schema `$id: urn:redteam:config/2`、`schemaVersion: 2`（capabilities 同值，有相等断言）。硬切无别名，旧结构 `config check` 逐字段报迁移 Pointer。设计见 `.doc/design/2026-11-25-redteam-config-v2-design.md`。
 
+---
 ## 5. Phase 2 · review 端到端（解锁 hibot M2）
 
 **2.0 数据流（先写清再实现）**
@@ -260,14 +261,25 @@ paths.repo ──► root（只读检出，HEAD 必须等于 pr.head_sha）
 |---|---|---|---|
 | 3.1 | **输入**：`pr_context`+`diff_patch`+`merge_base`（必需）；repo 检出按 Q4 冻结结果 | `src/triage/mod.rs` | 输入缺失 → `error` |
 | 3.2 | **`StandardsMap`**：逐模块 doc→linter→peer；`no-standard` 仅三者皆无 | `src/triage/standards.rs` | 三种 source 各命中 |
-| 3.3 | **三轴 lens + 扇出**：安全轴读 patch（7 类 sink 面，行内置信度 **0–10**，<8 丢弃）；漂移轴；意图轴。每轴 × N 并发，走 provider 子闸（**无 job 总闸**，见 Q15/D72）。三轴的行文本与 blockers 说明随 P15 语言 | `src/triage/lenses.rs`、`src/prompt/templates/triage-*.md` | 三轴各 1 fake backend → 行数正确；某轴失败 → `partial` 点名；`en_US` 下无中文残留（除引用原文） |
+| 3.3 | **三轴 lens + 扇出**：安全轴读 patch（7 类 sink 面，行内置信度 **0–10**，<8 丢弃；给不出 source→sink 路径的封顶 7）；漂移轴；**意图轴两阶段**（I0 串行抽 claims/overlap，I1..In 按 diff 切片验证 + scope creep，N 同安全）。分片：**scale-based `n = min(4, ceil(total_diff_kb/45), ceil(files/6))`**（2026-11-24 budget v1；drift 再受 modules 限制），per-cell 预算按各自 diff 规模计算；三轴模型取 **`roles.reviewer`**（2026-11-24 用户调整）；I0 之后三轴并行，走 provider 子闸（**无 job 总闸**，见 Q15/D72）。三轴的行文本与 blockers 说明随 P15 语言 | `src/triage/lenses.rs`、`src/prompt/templates/triage-*.md` | 四类 fake（security/drift/claims/slice）→ 行数正确；某轴失败 → `partial` 点名；slice 未全成 → 未验证 claim 不计 blockers；`en_US` 下无中文残留（除引用原文） |
 | 3.4 | **去重按轴分开**：安全/漂移按 `file+quote 归一+hint`；**意图未兑现项可能无代码锚 → 按声明身份去重**，不硬推 file+quote | `src/triage/tally.rs` | 无锚意图项不被误并；跨分片只计一次 |
-| 3.5 | **确定性 tally 与字段生成**（单点实现 + 表驱动单测）：<br>· `blockers = structural + intent_undelivered`（local 不计）<br>· `security_tier`：**2 仅限 supply-chain/CI 投毒/代码执行且 confidence≥8**；其它安全问题 1；无 0<br>· `convention_drift`：structural>0→structural；仅 local→local；否则 none<br>· `risk` `[拟议]`：tier≥1 ∨ blockers≥3 → high；blockers≥1 ∨ scope_creep>0 → medium；否则 low<br>· `fit` `[拟议]`：有声明未兑现 → needs-scope-decision；scope_creep>0 且无声明 → possibly-redundant；否则 in-scope<br>· **`summary.routing`**：`focus`=top blockers 类别/文件、`specs`=StandardsMap doc、`wall_clock_s`=三档且 ≤ manifest<br>· report `confidence` 0..1：**8/10→0.8**，单点函数 | `src/triage/tally.rs` | 覆盖需求 §4.1 每条口径；`blockers != structural+intent` 断言失败；tier2 白名单有反例（SQL 注入不升 2） |
-| 3.6 | **blockers 传给 review**：`extensions.redteam.blockers[]` 给可定位列表；**禁止把全部 findings 当阻塞项** | `src/job/report.rs`、`src/cli/mod.rs` | findings 5 条 / blockers 2 条 → review 只吸收 2 条 |
+| 3.5 | **确定性 tally 与字段生成**（单点实现 + 表驱动单测）：<br>· `blockers = structural + intent_undelivered`（local 不计）<br>· `security_tier`：**2 仅限 supply-chain/secrets/CI 投毒/代码执行且 confidence≥8**（secrets 为 2026-11-24 用户裁决）；其它安全问题 1；无 0<br>· `convention_drift`：structural>0→structural；仅 local→local；否则 none<br>· `risk`：tier≥1 ∨ blockers≥3 → high；blockers≥1 ∨ scope_creep>0 → medium；否则 low<br>· `fit`（**2026-11-24 grill 定案，替代原 `[拟议]`**）：结构性漂移含 placement/naming/ownership/versioning 破坏 **或** 有声明未兑现 → needs-scope-decision；维护者（非作者、非 bot）评论指出重复且无未兑现 → possibly-redundant；否则 in-scope<br>· **`summary.routing`**：`focus`=top blockers 类别/文件（≤5）、`specs`=StandardsMap 的 **doc 来源**相对路径（去重、≤8）、`wall_clock_s`=risk 三档 high 100%/medium 75%/low 50%（下限 300s，≤ manifest）<br>· report `confidence` 0..1：**8/10→0.8**，单点函数 | `src/triage/tally.rs` | 覆盖需求 §4.1 每条口径；`blockers != structural+intent` 断言失败；tier2 白名单有反例（SQL 注入不升 2） |
+| 3.6 | **blockers 仅披露**：`extensions.redteam.blockers[]` 给 hibot 一个可定位列表（structural + intent 未兑现，可无锚）；**禁止把全部 findings 当阻塞项**；review 侧唯一输入仍是 `summary.routing`，**不读 blockers 数组**（blockers 只经 `routing.focus` 影响 review） | `src/job/report.rs` | findings 5 条 / blockers 2 条 → 两个数组不同；review 不读 blockers（断言） |
 | 3.7 | **输出契约**：`findings[]` = 安全 tier≥1 + 结构性漂移（带指纹）；**`summary` = 九键 + `routing`（内嵌，不得提到顶层）**；`extensions.axes[]` | `src/job/report.rs` | schema 合法；`routing` 仅在 `summary` 内（用例断言）；无 verdict 类字段；语言随 P15 |
-| 3.8 | **对拍**：3–5 个真实 PR vs 人工 pr-triage | `.next/private/`、`eval/` | 差异表；无"干净判成 tier 2" |
+| 3.8 | **对拍**：5 个真实 PR（sites #277/#235/#328、cli #18、backend #333[tier2]）vs 人工 pr-triage（2026-11-24 修正：原拟 sites #275/#333 无人工产物，系聚合扫描串仓）；≤8 次真跑、单次 ≤10min、≤400k in/40k out，连续 2 次 infra 失败即停 | `.trellis/tasks/11-24-hibot-phase3-triage/evidence/` | 机读差异表；无"干净判成 tier 2" |
 | 3.9 | **回归 Phase 2.3（顺序补偿）**：hibot B7 已把 `prior_report` 改为可选，但 M3 起由 orchestrator 保证 triage 前置——本项用**真 triage 报告**重跑 2.3 全部用例 | `tests/`、`.next/private/` | 真 triage 报告驱动 review：focus/specs/预算生效、阻断阈值不变 |
 | 3.10 | **capabilities 增量：加 `triage`**（9.1 的按阶段声明） | `capabilities/redteam.json` | `kinds` = `["review","triage"]`，不含 `verify` |
+
+### 2026-11-24 grill 定案（用户"全默认"；完整表述见任务 PRD）
+
+1. 安全轴：7 面照 pr-triage 原文；模型自评 0–10 + 必须给 source→sink 可达路径与逐字行，给不出路径封顶 7（丢弃）；不做第二模型复核。
+2. tier2 = 面 1/2/3/4 ∧ conf≥8（多面任中；**secrets 面为 2026-11-24 用户裁决**）；面 4 要求用户可控输入可达；面 5–7 恒 tier1；severity tier2 候选 high、其余 medium；confidence=conf/10。
+3. `risk` 照本节公式；`fit` 用混合口径（见 3.5）。
+4. 意图声明只取 PR body + linked issues；title 仅摘要；comments 不作声明；`is_bot` 不作作者意图；维护者评论只用于 fit/重复；linked issue > body。
+5. `StandardsMap` 见 3.2；`routing.specs` 只放 doc 来源相对路径（≤8），linter/peer 只进 `extensions.axes`。
+6. 分片/预算见 3.3/3.5；不加 triage 配置块（复用 `roles.reviewer`；2026-11-24 用户调整，triage 用 reviewer 的思考档位）。
+7. 3.6 为披露面：review 不读 blockers，阻断阈值仍由配置决定。
+8. 3.8 清单与上限见 3.8。
 
 ---
 
@@ -570,8 +582,26 @@ Phase 1 内部硬序：1.1/1.2/1.3/1.4 → 1.5 → 1.6/1.7/1.8/**1.9**（1.9 的
 | `dropped_unverified_quotes` | int | >0 时 | 2.5 丢弃计数 |
 | `budget` | `{wall_clock_s, truncated_items}` | 总是 | `truncated_items` 含队列项与 cell |
 | `template_hashes` | `{scan, review, refute, triage, fix_verify}` | 按 kind | 只列本次用到的 |
-| `axes` | `[{axis, ok, rows, error?}]` | triage | 三轴各自用量/失败 |
+| `axes` | `[{axis, ok, rows, error?, dropped{…, dropped_total, dropped_rows[]}}]` | triage | 三轴各自用量/失败；**Phase 3 新增 `dropped_rows`（诊断用，每轴 ≤20 条，不进契约必需字段）** |
 | `blockers` | `[{file?, line?, quote?, intent?}]` | triage | 传给 review 的“已确认项”（可无代码锚） |
+| `refute_skipped` | string | job 模式 + 验真开启 + 未声明 refuter | **Phase 2 新增**；值恒 `no_refuter`（不静默、不塞 `refuted`）；本地模式不写（仍自动异族回退） |
+| `input_consistency` | `{match, git, files, git_files, only_in_patch[]{≤20}, only_in_git[]{≤20}, differing[]{≤20}, *_total}` | 总是（review） | **Phase 2 新增**；`diff_patch` 与 `git diff merge_base..HEAD` 的比对，不一致**只披露**，排序字典序、各表封顶 20 |
+| `prior_routing` | `{present, focus[], specs_used[], specs_unreadable, wall_clock_s}` | 有 `prior_report` 时 | **Phase 2 新增**；只含 `summary.routing` 三件事，不含历史 findings / 计数 / tier |
+| `verifier` | string | verify | **Phase 4 新增**；实际执行核验的首个模型身份（`provider/id`） |
+| `verify` | object | verify | **Phase 4 新增**；逐条核验的统计与观测，键见下表 |
+
+**`extensions.redteam.verify.*`（verify 专用）**
+
+| key | 类型 | 何时出现 | 说明 |
+|---|---|---|---|
+| `counts` | `{resolved, unresolved, regressed, inconclusive}` | verify | 四态计数 |
+| `calls` | int | verify | 模型调用次数（含解析失败后的 repair 轮） |
+| `model_failures` | int | verify | 调用/解析失败导致 `inconclusive` 的条数 |
+| `quote_rejected` | int | verify | quote 未逐字命中而降级的条数 |
+| `duplicate_fingerprints` | int | verify | 输入里重复指纹条数（集合语义只核一次） |
+| `latency_ms` | `{total, max}` | verify | **2026-11-25 Phase 4 增强新增、非契约必需**：逐条调用耗时（毫秒）；只记录，不设墙钟 KPI |
+| `rate_limit` | `{retries, wait_ms}` | verify | **2026-11-25 Phase 4 增强新增、非契约必需**：provider 门的 429 排队重试次数/等待毫秒（与心跳 `llm.retrying` 同源） |
+| `warnings` | `[string]` | verify | **2026-11-25 Phase 4 增强新增、非契约必需**：证据降级原因，去重排序、不猜（如 `symbol_blast_radius_skipped:unsupported_language:<path>` / `:no_symbols:<path>`）；不参与 status |
 
 **finding 级（`finding.extensions.redteam`）**
 
@@ -610,9 +640,11 @@ Phase 1 内部硬序：1.1/1.2/1.3/1.4 → 1.5 → 1.6/1.7/1.8/**1.9**（1.9 的
 | `config_invalid:<pointer>` | executor config 在 `<pointer>` 处不合法 | invalid executor config at `<pointer>` |
 | `config_contains_secret:<pointer>` | executor config 含敏感字段 `<pointer>`；凭据只走环境变量 | executor config contains secret field `<pointer>`; supply credentials via env vars |
 | `head_sha_mismatch` | 检出 HEAD 与 manifest 不一致 | checkout HEAD differs from manifest |
+| `repo_incomplete:<what>` | 检出缺少必需对象 `<what>`（或是浅克隆）；`what ∈ shallow\|head\|base\|merge_base`（**Phase 2 新增**） | checkout is missing required object `<what>` (or is shallow) |
 | `invalid_fingerprint_input` | findings.json 中有非法指纹 | findings.json contains an invalid fingerprint |
 | `missing_role:<role>` | 缺少 `<role>` 角色且无可用回退 | missing role `<role>` with no fallback |
 | `internal_panic` | 内部错误：`<msg>` | internal error: `<msg>` |
+| ~~`kind_not_implemented:<kind>`~~ | ~~kind `<kind>` 尚未实现~~ —— **已删除（Phase 4）**：三 kind 全部实现，临时码与 verify stub 一并移除 | ~~not implemented yet~~ — **removed (Phase 4)** |
 
 **partial**
 

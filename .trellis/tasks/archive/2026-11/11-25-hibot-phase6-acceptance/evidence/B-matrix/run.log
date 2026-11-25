@@ -1,0 +1,54 @@
+== 1/3 跑矩阵（18 组合，fake backend）
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running tests/acceptance_matrix.rs (target/debug/deps/acceptance_matrix-1df3bef36c9fe2fd)
+
+running 3 tests
+test verify_matrix_covers_three_fixtures_in_two_languages ... ok
+test triage_matrix_covers_three_fixtures_in_two_languages ... ok
+test review_matrix_covers_three_fixtures_in_two_languages ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.97s
+
+== 2/3 核对产物：18 份 report + 18 份 state
+OK: 18 组 × 2 份产物齐全
+== 3/3 hibot schema 校验
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/capabilities/redteam.json (https://hibot.sh/schema/audit/capabilities-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/clean/en_US/report.json (https://hibot.sh/schema/audit/report.review-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/clean/zh_CN/report.json (https://hibot.sh/schema/audit/report.review-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/known-vuln/en_US/report.json (https://hibot.sh/schema/audit/report.review-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/known-vuln/zh_CN/report.json (https://hibot.sh/schema/audit/report.review-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/partial/en_US/report.json (https://hibot.sh/schema/audit/report.review-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/partial/zh_CN/report.json (https://hibot.sh/schema/audit/report.review-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/clean/en_US/report.json (https://hibot.sh/schema/audit/report.triage-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/clean/zh_CN/report.json (https://hibot.sh/schema/audit/report.triage-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/known-vuln/en_US/report.json (https://hibot.sh/schema/audit/report.triage-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/known-vuln/zh_CN/report.json (https://hibot.sh/schema/audit/report.triage-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/partial/en_US/report.json (https://hibot.sh/schema/audit/report.triage-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/partial/zh_CN/report.json (https://hibot.sh/schema/audit/report.triage-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/clean/en_US/report.json (https://hibot.sh/schema/audit/report.verify-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/clean/zh_CN/report.json (https://hibot.sh/schema/audit/report.verify-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/known-vuln/en_US/report.json (https://hibot.sh/schema/audit/report.verify-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/known-vuln/zh_CN/report.json (https://hibot.sh/schema/audit/report.verify-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/partial/en_US/report.json (https://hibot.sh/schema/audit/report.verify-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/partial/zh_CN/report.json (https://hibot.sh/schema/audit/report.verify-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/clean/en_US/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/clean/zh_CN/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/known-vuln/en_US/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/known-vuln/zh_CN/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/partial/en_US/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/review/partial/zh_CN/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/clean/en_US/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/clean/zh_CN/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/known-vuln/en_US/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/known-vuln/zh_CN/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/partial/en_US/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/triage/partial/zh_CN/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/clean/en_US/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/clean/zh_CN/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/known-vuln/en_US/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/known-vuln/zh_CN/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/partial/en_US/state.json (https://hibot.sh/schema/audit/state-1.json)
+PASS /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/verify/partial/zh_CN/state.json (https://hibot.sh/schema/audit/state-1.json)
+OK: capabilities + 18 报告 + 18 心跳全部过 hibot schema
+
+done: /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out（schema 日志 /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/.trellis/tasks/11-25-hibot-phase6-acceptance/evidence/B-matrix/out/schema-check.log）

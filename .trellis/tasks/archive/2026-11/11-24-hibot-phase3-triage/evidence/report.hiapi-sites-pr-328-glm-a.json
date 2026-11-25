@@ -1,0 +1,250 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-328",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `security` incomplete; triage axis `drift` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "a9c7d081c466ffa2678d3107eb89f41222dfe7b4",
+    "base_sha": "57d84c743f486ef6fc5aad7ae60307e43711eb87"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "usage": {
+    "input_tokens": 38223,
+    "output_tokens": 137407,
+    "cached_input_tokens": 4608,
+    "wall_clock_ms": 398746
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-security` exceeded its 13.260284868s budget",
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 256,
+            "input_tokens": 5680,
+            "output_tokens": 20089
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-drift` exceeded its 0ns budget",
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/spec/content-api/backend",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/11-20-draft-revisions",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/11-20-draft-revisions/research",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/prisma/migrations/20261120090000_draft_revisions",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/prisma/models",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/src/modules/review",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/modules/review",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/utils",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/src",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/src/schema",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/tests/schema",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 2,
+          "claims": 15,
+          "delivered": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-intent-slice` exceeded its 343.406299327s budget during repair",
+          "notes": [
+            "Verification statements (not claims): 571 tests passed / 0 failed across 55 files with 2080 assertions; content-api/content-sdk/manage typecheck and ESLint on changed files passed; all 73 migrations replayed successfully on a fresh PostgreSQL test database.",
+            "Author reports an independent code review pass whose findings were fixed with no remaining blockers.",
+            "Author reports a real Rust CLI -> local HTTP API -> PostgreSQL integration run covering Showcase in-place editing and FAQ derive/replay/accept of the original entity, confirming the original draft, publish time, and other languages are preserved with no Agent jobs.",
+            "Remote CI status as described: initial run 44658696801 never started due to account limits; later run 44669467061 did run — content-api had 1 failure (the new revise write route was not registered), quality lacked dashboard generated route types, and site was cancelled at checkout; the author corrected that later red runs must not be attributed to account limits.",
+            "2026-11-23 review fix commit a9c7d081: registered POST /admin/drafts/:id/revise, merged latest dev 57d84c74 (including 5e09d9fe dashboard route tree and paraglide pre-generation); 18 targeted tests / 0 failed / 30 assertions, ESLint, typecheck and diff check passed; the full database test suite was not re-run locally in that round.",
+            "Follow-up review work added a regression for the same request ID replaying the original result with both old and new timestamps after a source version change, and strengthened Blog assertions around derivation/accept preserving original drafts, formal entities, translation IDs, other languages, and publish times; 13 targeted tests / 97 assertions and ESLint passed.",
+            "Deployment order stated: run migration 20261120090000_draft_revisions first, then deploy the API, then distribute the CLI; once any pending revision exists the system cannot directly roll back to old accept code that does not recognize revisions; rollback constraints and staging checklist are in .trellis/tasks/11-20-draft-revisions/rollout.md.",
+            "Cross-repo references: companion CLI PR zimacode-network/hiapi-cli#18 and requirement issue zimacode-network/hiapi-cli#17.",
+            "Actual staging acceptance of the two Showcase items and accepted content is still pending after deployment; the author states local regression is not equivalent to full-repo or production acceptance.",
+            "Cross-repo parent-child task records, implementation commands, review gates, and rollback points were completed in the .trellis task files included in this PR.",
+            "The PR title is a summary; no linked issue bodies were supplied in this request, so no issue-derived claims are emitted.",
+            "The target_kind CHECK constraint also allows 'family', which is not named in c2's enumeration (blog, FAQ/model-faq, changelog, model-info); reviewers should confirm whether 'family' is intended coverage or extra scope (its meaning is defined in revision-target.ts, not in this slice).",
+            "DraftRevisionService.revise (revision-service.ts), write/acceptance routing (revision-write.ts, update-service.ts, revision-rules.ts) and list readback (service.ts) are outside this slice; no claim was omitted as undelivered on that basis, per triage rules.",
+            "c3 and c10 are only supported in this slice by descriptive strings (route summary '不发布、不生成；accept 更新原实体') and the hardcoded affectsPublishedContent constant, which are assertions rather than mechanisms, so they were not marked delivered here."
+          ],
+          "ok": false,
+          "rows": 1,
+          "scope_creep": 2,
+          "usage": {
+            "cached_input_tokens": 4352,
+            "input_tokens": 32543,
+            "output_tokens": 117318
+          },
+          "verification_complete": false
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:security",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

@@ -1,0 +1,170 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "01JEXAMPLETRIAGE0001",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "0ad5acd17d5ceb2341af3ed5f038da60258c192a",
+    "base_sha": "179c7e02c8da9dfc52300854a9526cf1bdf4f74f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "summary": {
+    "blockers_count": 0,
+    "convention_drift": "none",
+    "fit": "in-scope",
+    "intent_undelivered": 0,
+    "local_count": 0,
+    "risk": "medium",
+    "routing": {
+      "focus": [],
+      "specs": [
+        "AGENTS.md"
+      ],
+      "wall_clock_s": 450
+    },
+    "scope_creep_count": 2,
+    "security_tier": 0,
+    "structural_count": 0
+  },
+  "usage": {
+    "input_tokens": 35968,
+    "output_tokens": 11985,
+    "cached_input_tokens": 26240,
+    "wall_clock_ms": 39249
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 3755,
+          "ok": true,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 9472,
+            "input_tokens": 9666,
+            "output_tokens": 504
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 35461,
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "docs/specs",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 15488,
+            "input_tokens": 15720,
+            "output_tokens": 6762
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 2,
+          "claims": 4,
+          "delivered": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 22092,
+          "notes": [
+            "The PR body's 验证 section reports verification results only (go vet / go test ./service/ ./model/ ./controller/ all passing) and is not counted as a claim.",
+            "The production numbers in the 为什么 section (1274 manual Stripe orders in a 30-day window, ~10 raw orders checked per minute, ~127 minutes to scan, 2-hour preview validity) are observations/motivation, not claims about the change.",
+            "The PR title is a summary and is not treated as a claim source.",
+            "No non-bot, non-author reviewer comments were supplied, so maintainer overlap could not be assessed.",
+            "Claims were evaluated only against this slice; absence of other files here is not treated as non-delivery."
+          ],
+          "ok": true,
+          "rows": 1,
+          "scope_creep": 2,
+          "usage": {
+            "cached_input_tokens": 1280,
+            "input_tokens": 10582,
+            "output_tokens": 4719
+          },
+          "verification_complete": true
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 600
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

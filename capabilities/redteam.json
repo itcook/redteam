@@ -1,0 +1,27 @@
+{
+  "schema": "hibot.audit.executor/1",
+  "name": "redteam",
+  "version": "0.1.0",
+  "kinds": [
+    "review",
+    "triage",
+    "verify"
+  ],
+  "form": "cli",
+  "invoke": "redteam <triage|review|verify> --job-dir <dir>",
+  "config_delivery": "job_native",
+  "requires": {
+    "repo_checkout": true,
+    "pr_context": false,
+    "network": "provider-only"
+  },
+  "limits": {
+    "max_wall_clock_s": 3600
+  },
+  "extensions": {
+    "config_schema": {
+      "command": "redteam config schema",
+      "schemaVersion": 2
+    }
+  }
+}

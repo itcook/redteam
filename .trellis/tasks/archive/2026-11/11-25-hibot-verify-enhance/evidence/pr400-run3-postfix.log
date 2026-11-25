@@ -1,0 +1,40 @@
+=== group-a ===
+→ worktree 54f4c944da97ccd775de51e3525e86e611b2cd83
+Preparing worktree (detached HEAD 54f4c944d)
+→ redteam verify（deepseek/deepseek-flash）
+→ 退出码 0
+
+== group-a · status=ok · 同 1 / 异 1 ==
+sha256:697a6db64a34  expected=regressed    actual=resolved     异
+    expected: 人工第 2 轮：分诊阻塞已修，但同时引入 🔴1（affinity 严格拒绝不是终态，回退重选被拒渠道）——按四态语义是 regressed。证据应出现在 symbol_blast_radius 段（distributor.go 引用 PinnedChannelAllowed，±40 行快照覆盖 :158→:174 回退）。
+    actual  : 修复把 ChannelAllowed 拆成带 strict 参数的 channelAllowed，并新增 PinnedChannelAllowed（strict=true）在比对存储指纹后才放行；service/llmconfig/exec
+sha256:7db89c45c867  expected=resolved     actual=resolved     同
+usage: wall_clock_ms=12838 tokens in/out=13038/3987
+verify: {"calls": 2, "counts": {"inconclusive": 0, "regressed": 0, "resolved": 2, "unresolved": 0}, "duplicate_fingerprints": 0, "latency_ms": {"max": 12572, "total": 22833}, "model_failures": 0, "quote_rejected": 0, "rate_limit": {"retries": 0, "wait_ms": 0}, "warnings": []}
+→ /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400/group-a/result.json
+=== group-b ===
+→ worktree a88eb64584d964cc000c440a830226c66328527a
+Preparing worktree (detached HEAD a88eb6458)
+→ redteam verify（deepseek/deepseek-flash）
+→ 退出码 0
+
+== group-b · status=ok · 同 2 / 异 1 ==
+sha256:87cf69a3ba26  expected=unresolved   actual=resolved     异
+    expected: 人工第 3 轮：Q2 主路径修好，但边界（已切到 llm 的漂移协议）未覆盖——同一 finding 仍未闭合。
+    actual  : migration.go 中该错误信息已从只提示“run rebind-evidence before switching”改为明确给出真实恢复步骤：先 rebind-evidence，再重新保存正在切换的协议（re-save the pr
+sha256:19a4af28aca6  expected=resolved     actual=resolved     同
+sha256:7b89ce343543  expected=resolved     actual=resolved     同
+usage: wall_clock_ms=23763 tokens in/out=9576/9425
+verify: {"calls": 3, "counts": {"inconclusive": 0, "regressed": 0, "resolved": 3, "unresolved": 0}, "duplicate_fingerprints": 0, "latency_ms": {"max": 23580, "total": 52522}, "model_failures": 0, "quote_rejected": 0, "rate_limit": {"retries": 0, "wait_ms": 0}, "warnings": []}
+→ /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400/group-b/result.json
+=== group-c ===
+→ worktree 7c036382badbd812be7673fc93fdd9d545d50ef7
+Preparing worktree (detached HEAD 7c036382b)
+→ redteam verify（deepseek/deepseek-flash）
+→ 退出码 0
+
+== group-c · status=ok · 同 1 / 异 0 ==
+sha256:9ef71ed55f91  expected=resolved     actual=resolved     同
+usage: wall_clock_ms=17013 tokens in/out=2798/2283
+verify: {"calls": 1, "counts": {"inconclusive": 0, "regressed": 0, "resolved": 1, "unresolved": 0}, "duplicate_fingerprints": 0, "latency_ms": {"max": 16846, "total": 16846}, "model_failures": 0, "quote_rejected": 0, "rate_limit": {"retries": 0, "wait_ms": 0}, "warnings": []}
+→ /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/pr400/group-c/result.json

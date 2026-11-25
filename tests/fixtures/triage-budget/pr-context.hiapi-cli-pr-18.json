@@ -1,0 +1,198 @@
+{
+  "schema": "hibot.audit.pr-context/1",
+  "title": "feat(content): 支持 Showcase 文案编辑和 accepted 待审修订",
+  "body": "运营可以只修改待审 Showcase 的标题/介绍，并通过显式 `draft revise` 从已接受内容派生 pending 修订稿。原 accepted 记录和正式内容在派生时保持不变，后续 accept 由配套 API 更新原实体及指定语言。\r\n\r\n- `update`/`revise` 自动读取草稿版本，支持 `--if-unmodified-since` 固定已审阅版本；冲突不会自动覆盖重试。\r\n- `revise --request-id` 支持稳定幂等回放；JSON 返回环境、原稿/结果稿 ID、状态和正式内容影响标志，超时及 5xx 提示先回读。\r\n- 帮助与文档说明状态差异、历史实体定位、允许字段、专用 overview 来源限制及 backend-first 部署顺序。\r\n\r\n关联 #17。配套 API PR：https://github.com/zimacode-network/hiapi-sites/pull/328 。必须先部署 API 及迁移，再分发本 CLI。此 PR 不发布新版本，也不自动接受真实内容。\r\n\r\n验证：`scripts/check.sh` 通过（encoding、fmt、clippy、230 tests）；独立审查无剩余阻断项。真实 Rust CLI → 本地 Elysia HTTP → PostgreSQL 联调通过，覆盖 Showcase 原地修订及 FAQ 派生/重放/接受后更新原实体、保留原稿/发布时间/其他语言、零 Agent 作业。\r\n\r\n验证环境为 WSL Ubuntu/Rust 1.91，移除 root DAC 权限绕过并串行运行测试；修复了原有错误平台测试在 Linux 下误用本机平台的夹具。Windows 专属测试未运行。部署后的 staging 两份 Showcase、Blog 和 FAQ 验收尚待执行，见 `docs/staging-integration-checklist.md`。\r\n\r\n评审跟进：补齐跨仓父任务及 CLI/sites 子任务、实施命令/评审门/回滚点；明确异常回执可能已写入、503 专用回读范围与先幂等回执后版本检查的重放语义。配套 API 已加强 Blog 原实体/语言保留和源版本变化后的重放数据库回归（13 tests、97 assertions）。CLI 完整门禁在本轮修改后再次通过。\r\n",
+  "author": "Zenty-Me",
+  "labels": [
+    "review: medium"
+  ],
+  "comments": [
+    {
+      "author": "Zenty-Me",
+      "body": "@weil-ai 请帮忙评审这个 PR。配套内容 API PR：https://github.com/zimacode-network/hiapi-sites/pull/328 。当前账号没有本仓 RequestReviews 权限，因此在此邀请评审。",
+      "created_at": "2026-11-20T02:14:35Z",
+      "is_bot": false
+    },
+    {
+      "author": "Zenty-Me",
+      "body": "@weil-ai 已按分诊意见推送 `389ef0d`，请继续完整评审。对应三项必改：\n\n1. 父任务及子任务 `implement.md` 已补齐有序实施步骤、可复现验证命令、评审门和回滚点；`validation.md` 仅保留为历史证据。\n2. 原任务改为跨仓协调父任务，新增 CLI / sites 子任务并建立双向 task.json 关系。sites 子任务链接实际仓库的实施记录，验收和故障归属分别明确。\n3. Blog 在本次范围内。§6.6 已补 staging 隔离样本的「派生 → 正式内容不变 → 审核接受只更新原目标语言」命令和期望表；issue 中 production ID 明确仅作参考。配套 API 原有 blog 集成测试进一步加强，证明原 accepted 稿、正式实体/译文 ID、其他语言、发布时间和数量保持，见 hiapi-sites#328 的 `21c22a6e`。\n\n其他意见也已处理：503 回读范围限定 update/revise/modify；说明成功写入但回执缺字段会退出 1、必须回读；统一键列宽、中文测试分节、spec 分隔；补设计 tradeoffs/兼容/回滚。\n\n关于 replay：已核实并增加数据库回归。服务端先查回执，再对新请求检查版本；指纹仅含 data/targetEntityId，不含 expectedUpdatedAt。同 key 同补丁在源时间戳变化后，无论旧/新时间戳都返回同一修订；新 key + 旧版本、同 key + 不同补丁仍 409。首次操作可显式传已审核时间戳。保留 request-id 的轻量本地非空/长度校验以即时报告 usage error，服务端仍独立执行权威契约校验，理由已写入 design.md。\n\n验证：本轮 CLI scripts/check.sh 完整通过（fmt、clippy、230 Linux tests）；API 定向 13 tests / 97 assertions、ESLint 通过。最终独立复查未发现新增代码阻塞项。Windows 专属测试未运行；实际 staging 仍待部署验收，没有将本地验证写成线上完成。\r\n",
+      "created_at": "2026-11-20T03:42:09Z",
+      "is_bot": false
+    }
+  ],
+  "linked_issues": [],
+  "ci": {
+    "state": "pending",
+    "failing": []
+  },
+  "changed_files": [
+    {
+      "path": ".trellis/spec/backend/error-handling.md",
+      "additions": 15,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-cli/check.jsonl",
+      "additions": 1,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-cli/design.md",
+      "additions": 7,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-cli/implement.jsonl",
+      "additions": 1,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-cli/implement.md",
+      "additions": 25,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-cli/prd.md",
+      "additions": 15,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-cli/task.json",
+      "additions": 26,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-sites/check.jsonl",
+      "additions": 1,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-sites/design.md",
+      "additions": 7,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-sites/implement.jsonl",
+      "additions": 1,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-sites/implement.md",
+      "additions": 18,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-sites/prd.md",
+      "additions": 17,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions-sites/task.json",
+      "additions": 28,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/check.jsonl",
+      "additions": 2,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/design.md",
+      "additions": 30,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/implement.jsonl",
+      "additions": 2,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/implement.md",
+      "additions": 44,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/prd.md",
+      "additions": 31,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/task.json",
+      "additions": 29,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/validation.md",
+      "additions": 35,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "README.md",
+      "additions": 46,
+      "deletions": 5,
+      "status": "modified"
+    },
+    {
+      "path": "docs/staging-integration-checklist.md",
+      "additions": 63,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "src/cli.rs",
+      "additions": 103,
+      "deletions": 4,
+      "status": "modified"
+    },
+    {
+      "path": "src/commands/content.rs",
+      "additions": 54,
+      "deletions": 6,
+      "status": "modified"
+    },
+    {
+      "path": "src/content/draft.rs",
+      "additions": 71,
+      "deletions": 5,
+      "status": "modified"
+    },
+    {
+      "path": "tests/cli_binary.rs",
+      "additions": 160,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "tests/content_cli.rs",
+      "additions": 240,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "tests/update_cli.rs",
+      "additions": 6,
+      "deletions": 1,
+      "status": "modified"
+    }
+  ]
+}

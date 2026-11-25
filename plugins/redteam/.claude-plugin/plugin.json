@@ -1,7 +1,7 @@
 {
   "name": "redteam",
   "description": "模型无关的对抗式代码/文档评审工具（redteam）",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "author": {
     "name": "S.Kai",
     "email": "laiwei@me.com"

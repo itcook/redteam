@@ -1,0 +1,149 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "J-matrix-triage",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "f1feb520e9ee6b3651d7463a8a80e4a4885b24fd",
+    "base_sha": "16b53e6d642cf504c55df1b12253e93c2bc1cfef"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "summary": {
+    "blockers_count": 0,
+    "convention_drift": "none",
+    "fit": "in-scope",
+    "intent_undelivered": 0,
+    "local_count": 0,
+    "risk": "low",
+    "routing": {
+      "focus": [],
+      "specs": [
+        "src/AGENTS.md"
+      ],
+      "wall_clock_s": 120
+    },
+    "scope_creep_count": 0,
+    "security_tier": 0,
+    "structural_count": 0
+  },
+  "usage": {
+    "input_tokens": 40,
+    "output_tokens": 8,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 91
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 0,
+          "ok": true,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 10,
+            "output_tokens": 2
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 0,
+          "modules": [
+            {
+              "doc": "src/AGENTS.md",
+              "linters": [],
+              "module": "src",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 10,
+            "output_tokens": 2
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 2,
+          "claims": 0,
+          "delivered": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 0,
+          "ok": true,
+          "rows": 1,
+          "scope_creep": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 20,
+            "output_tokens": 4
+          },
+          "verification_complete": true
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 120
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "p1": 10
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "zh_CN"
+      },
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

@@ -1,0 +1,267 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:30e32b313c1bd8f07df0f0fdd92524e8459a7f071aaabcdfb3ebcb40fabf22b2",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_client.go",
+      "line_start": 284,
+      "line_end": 287,
+      "quote": "messages := []map[string]string{\n\t\t{\"role\": \"system\", \"content\": feishuFinanceAgentSystemPrompt},\n\t\t{\"role\": \"user\", \"content\": text},\n\t}",
+      "title": "Security (surface 5): injection",
+      "body": "Reachability: Feishu event field `event.message.content` is decoded at service/feishu_finance_agent.go:319 (`common.UnmarshalJsonStr(msg.Content, &content)`) into `text` (line 320) and persisted as `action.RawText`; `runFeishuFinanceAgentAction` re-reads it at service/feishu_finance_agent.go:350 and passes it to `parseFeishuFinanceAgentCommand(ctx, text)` at line 359, which enters `parseFeishuFinanceAgentCommandLLM` and is placed verbatim as the `user` chat message at service/feishu_finance_agent_client.go:287; the messages slice is then POSTed to the model endpoint at service/feishu_finance_agent_client.go:350. The model's JSON answer (intent/target_account/commission/gift_credits) directly drives privileged writes in `executeFeishuFinanceAgentPlan` (`AddAffPromotionUsers`, `GrantAdminCredits`).\nNote: Untrusted natural-language message content (any Feishu user who can reach the bot, or third-party text an operator pastes) is fed into the LLM parser as instructions; there is no delimiter/role separation between data and instructions. Mitigations present: deterministic numeric bounds and defaulting in `buildFeishuFinanceAgentPlan`, live Root re-authorization, originator-only confirmation, injection-hint warnings, and buttons carrying only a server-side action id. These constrain the blast radius but do not remove the influence of attacker-controlled text on the privileged action the operator later confirms.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:7ca6f9432daae2bf0ad0489da3f9fdc9e8f163910b7231192ee0e049fc4f6284",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_ws.go",
+      "line_start": 101,
+      "line_end": 106,
+      "quote": "if domain := feishuFinanceAgentWSDomain(cfg.OpenAPIBase); domain != \"\" {\n\t\topts = append(opts, larkws.WithDomain(domain))\n\t}\n\n\tclient := larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...)\n\treturn client.Start(context.Background())",
+      "title": "Security (surface 7): SSRF",
+      "body": "Reachability: Env var `FEISHU_FINANCE_AGENT_OPENAPI_BASE` read at setting/feishu_finance_agent_setting.go:32 -> `cfg.OpenAPIBase` -> `feishuFinanceAgentWSDomain` at service/feishu_finance_agent_ws.go:101 -> `larkws.WithDomain` at service/feishu_finance_agent_ws.go:102 -> `client.Start` at service/feishu_finance_agent_ws.go:106 opens an outbound WebSocket to the derived host.\nNote: The outbound WebSocket host is derived from the deployment env var `FEISHU_FINANCE_AGENT_OPENAPI_BASE`; `feishuFinanceAgentWSDomain` only trims a trailing slash and `/open-apis`, so any host/scheme in that env value is accepted. An attacker who can set or influence that env value can redirect the SDK's outbound long connection to an arbitrary host. This is config-controlled rather than a remote request field, but the source-to-sink path is concrete.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:d738d9c1123fc2ec5ce033a9a051550e6ca1c798d15ba6905589ce706a2da249",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent.go",
+      "line_start": 256,
+      "line_end": 256,
+      "quote": "if errors.Is(err, gorm.ErrRecordNotFound) {",
+      "title": "Structural drift: ownership",
+      "body": "Standard: AGENTS.md#architecture\nNote: The service layer imports gorm.io/gorm and branches on gorm.ErrRecordNotFound, making business logic depend on the model layer's ORM error instead of a model-layer domain error; this crosses the documented Service -> Model ownership boundary.",
+      "recommendation": "Align placement / naming / ownership with AGENTS.md#architecture.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    }
+  ],
+  "summary": {
+    "blockers_count": 3,
+    "convention_drift": "structural",
+    "fit": "needs-scope-decision",
+    "intent_undelivered": 2,
+    "local_count": 1,
+    "risk": "high",
+    "routing": {
+      "focus": [
+        "injection@service/feishu_finance_agent_client.go",
+        "ssrf@service/feishu_finance_agent_ws.go",
+        "service/feishu_finance_agent.go",
+        "intent:`go build ./...` and `go test ./service ./model ./router ./c",
+        "intent:The three command types (execute, all-fields, follow-up) wer"
+      ],
+      "specs": [
+        "AGENTS.md"
+      ],
+      "wall_clock_s": 1200
+    },
+    "scope_creep_count": 2,
+    "security_tier": 1,
+    "structural_count": 1
+  },
+  "usage": {
+    "input_tokens": 204282,
+    "output_tokens": 162368,
+    "cached_input_tokens": 72320,
+    "wall_clock_ms": 281861
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "repair_notes": [
+            "triage-security: first turn parse failed (finish=length, text_len=0, head=\"\"); repaired"
+          ],
+          "rows": 2,
+          "usage": {
+            "cached_input_tokens": 68992,
+            "input_tokens": 69707,
+            "output_tokens": 63794
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 2,
+          "usage": {
+            "cached_input_tokens": 2688,
+            "input_tokens": 55330,
+            "output_tokens": 36628
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 4,
+          "claims": 31,
+          "delivered": 29,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "notes": [
+            "No linked issues were provided; all claims come from the PR body.",
+            "No non-bot, non-author reviewer comments were provided, so maintainer overlap cannot be assessed and is left unflagged.",
+            "The PR body is written in Chinese and describes an incremental multi-round review history (round 1 and round 2 fix tables), so several claims are responses to prior review feedback rather than product intent.",
+            "The PR body itself marks the threat model as requiring Root-side acceptance, i.e. the author explicitly defers that decision to maintainers.",
+            "The diff is large and mostly new code (13 files, roughly 2800 added lines, 0 deletions outside go.mod/go.sum/main.go/model/main.go), which affects review effort rather than being a claim.",
+            "No CI status, build logs or test output are included in this request; the build/test claims are author assertions only.",
+            "This slice covers only go.mod, go.sum, main.go, model/feishu_finance_agent.go and model/main.go; setting/feishu_finance_agent_setting.go and all service/test files listed in the PR were not included, so their claims are omitted rather than judged undelivered.",
+            "go.sum gains many legacy golang.org/x and gogo/protobuf hashes; these are transitive module-graph entries pulled in by the new Lark SDK and do not appear to be unstated functionality.",
+            "service/feishu_finance_agent_ws.go lines 50-52 log 'websocket stopped, restarting in 5s' for both the nil-error and context.Canceled branches, so an intentional shutdown is reported as a restart; worth a reviewer's eye, but no claim covers shutdown semantics.",
+            "All conclusions for this slice rest on the four new files only; delivery of c3, c15, c17, c26, c30 and c31 must be judged from the service/model/main slices."
+          ],
+          "ok": true,
+          "repair_notes": [
+            "triage-intent-slice: first turn parse failed (finish=length, text_len=7116, head=\"{\\n  \\\"delivered\\\": [\\n    {\\n      \\\"id\\\": \\\"c3\\\",\\n      \\\"evidence\\\": [\\n        {\\\"file\\\": \"); repaired"
+          ],
+          "rows": 1,
+          "scope_creep": 2,
+          "usage": {
+            "cached_input_tokens": 640,
+            "input_tokens": 79245,
+            "output_tokens": 61946
+          },
+          "verification_complete": true
+        }
+      ],
+      "blockers": [
+        {
+          "category": "ownership",
+          "file": "service/feishu_finance_agent.go",
+          "kind": "structural",
+          "line_end": 256,
+          "line_start": 256,
+          "quote": "if errors.Is(err, gorm.ErrRecordNotFound) {"
+        },
+        {
+          "claim": "`go build ./...` and `go test ./service ./model ./router ./controller` all pass.",
+          "kind": "intent",
+          "note": "Author-reported verification; no CI output supplied in this request",
+          "source": "body"
+        },
+        {
+          "claim": "The three command types (execute, all-fields, follow-up) were re-tested against a real DeepSeek model (deepseek-v4.1-flash) and all passed, and a local end-to-end smoke test with a real Feishu app and real model verified promotion/commission/withdrawal/credits/audit rows in the database.",
+          "kind": "intent",
+          "note": "Author-reported manual verification; not reproducible from this request",
+          "source": "body"
+        }
+      ],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "ad41f9d1df42eb13"
+      }
+    }
+  }
+}

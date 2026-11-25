@@ -369,7 +369,8 @@ class Replayer:
                 if self.before and created >= self.before:
                     continue
                 for fd in json.loads(js).get("findings", []):
-                    if (fd.get("verify") or {}).get("verdict") == "upheld":
+                    # 0.8 术语分家：新报告写 refute，历史 results 行仍是 verify
+                    if (fd.get("refute") or fd.get("verify") or {}).get("verdict") == "upheld":
                         self._ledger_cache["upheld"][fd["file"]].append(created)
         sig = []
         if self._ledger_cache["upheld"].get(path):

@@ -1,0 +1,41 @@
+{
+  "schema": "hibot.audit.job.triage/1",
+  "job_id": "eval-pr-235",
+  "kind": "triage",
+  "repo": {
+    "id": 1,
+    "full_name": "zimacode-network/hiapi-sites"
+  },
+  "pr": {
+    "number": 235,
+    "head_sha": "b27a36035f65418b245cd2b7fe739daf18162251",
+    "base_sha": "973d7369f2d08dd7d4e0279843dbad224df4be94"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "limits": {
+    "wall_clock_s": 900
+  },
+  "paths": {
+    "repo": "../repo",
+    "out": "out",
+    "config": "config/executor.redteam.json"
+  },
+  "inputs": {
+    "diff_patch": {
+      "path": "input/diff.patch",
+      "sha256": "f0a9f04022156b8e6b4b782d62d0e308b135c73ce66927cbdc6b80fd4707727a"
+    },
+    "merge_base": {
+      "path": "input/merge-base.sha",
+      "sha256": "711f5f3c93c82d81700901ffc2835dfa928cb0b1693013220a12c3929c2a2570"
+    },
+    "pr_context": {
+      "path": "input/pr-context.json",
+      "sha256": "50ba6b96d264a6989ad32b01bb83a7c02b00239736a83289900bcfb58e8797bc",
+      "schema": "hibot.audit.pr-context/1"
+    }
+  }
+}

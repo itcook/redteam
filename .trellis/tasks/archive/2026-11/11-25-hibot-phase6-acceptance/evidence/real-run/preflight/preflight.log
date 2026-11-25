@@ -1,0 +1,26 @@
+PASS triage: repo/.git 存在
+PASS triage: rev-parse HEAD == manifest head
+PASS triage: head 对象可查
+PASS triage: base 对象可查
+PASS triage: diff 首行 diff --git
+PASS triage: diff sha256 == manifest
+PASS triage: git status 空
+PASS triage: 非 shallow
+PASS review: repo/.git 存在
+PASS review: rev-parse HEAD == manifest head
+PASS review: head 对象可查
+PASS review: base 对象可查
+PASS review: diff 首行 diff --git
+PASS review: diff sha256 == manifest
+PASS review: git status 空
+PASS review: 非 shallow
+PASS verify: repo/.git 存在
+PASS verify: rev-parse HEAD == manifest head
+PASS verify: head 对象可查
+PASS verify: base 对象可查
+PASS verify: diff 首行 diff --git
+PASS verify: diff sha256 == manifest
+PASS verify: git status 空
+PASS verify: 非 shallow
+
+ALL PASS

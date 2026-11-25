@@ -1,0 +1,205 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "J-matrix-triage",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "783dfe64edb79998ace4d15704db492b645d7f89",
+    "base_sha": "ecef50b364f4be5f62e94b515e38311712f3633f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:1e71e9f0e348a65f1e8ef2f01c639a169cd7310a8a39d8b604fb5ccf7f8ed74a",
+      "severity": "high",
+      "confidence": 0.9,
+      "file": "src/app.js",
+      "line_start": 6,
+      "line_end": 6,
+      "quote": "return eval(cmd);",
+      "title": "Security (surface 4): code execution / unsafe deserialization",
+      "body": "Reachability: HTTP body field cmd -> eval at line 6\nNote: eval on request input",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "p1/t",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:a81f1a23fc1ee371dfbc6633e145249b7f16c30206d08b438652deb29896bdfa",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "src/app.js",
+      "line_start": 5,
+      "line_end": 5,
+      "quote": "function run(cmd) {",
+      "title": "Structural drift: placement",
+      "body": "Standard: src/AGENTS.md#layout\nNote: entrypoint helper added to app.js",
+      "recommendation": "Align placement / naming / ownership with src/AGENTS.md#layout.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "p1/t",
+        "role": "scanner"
+      }
+    }
+  ],
+  "summary": {
+    "blockers_count": 2,
+    "convention_drift": "structural",
+    "fit": "needs-scope-decision",
+    "intent_undelivered": 1,
+    "local_count": 0,
+    "risk": "high",
+    "routing": {
+      "focus": [
+        "code-execution@src/app.js",
+        "src/app.js",
+        "intent:add input validation"
+      ],
+      "specs": [
+        "src/AGENTS.md"
+      ],
+      "wall_clock_s": 120
+    },
+    "scope_creep_count": 1,
+    "security_tier": 2,
+    "structural_count": 1
+  },
+  "usage": {
+    "input_tokens": 40,
+    "output_tokens": 8,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 94
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 0,
+          "ok": true,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 10,
+            "output_tokens": 2
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 0,
+          "modules": [
+            {
+              "doc": "src/AGENTS.md",
+              "linters": [],
+              "module": "src",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 10,
+            "output_tokens": 2
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 2,
+          "claims": 1,
+          "delivered": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 0,
+          "ok": true,
+          "rows": 1,
+          "scope_creep": 1,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 20,
+            "output_tokens": 4
+          },
+          "verification_complete": true
+        }
+      ],
+      "blockers": [
+        {
+          "category": "placement",
+          "file": "src/app.js",
+          "kind": "structural",
+          "line_end": 5,
+          "line_start": 5,
+          "quote": "function run(cmd) {"
+        },
+        {
+          "claim": "add input validation",
+          "kind": "intent",
+          "note": "",
+          "source": "body"
+        }
+      ],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 120
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "p1": 10
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

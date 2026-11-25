@@ -1,0 +1,78 @@
+{
+  "schema": "hibot.audit.report.verify/1",
+  "job_id": "01JEXAMPLEVERIFY0001",
+  "kind": "verify",
+  "status": "ok",
+  "input": {
+    "head_sha": "e448b19c141e96078a692db3b44a52a8548653d5",
+    "base_sha": "0ad5acd17d5ceb2341af3ed5f038da60258c192a"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "verifications": [
+    {
+      "evidence": "The page-query error branch in ProcessCheckoutRecoveryPreview no longer returns the raw error. It now persists the accumulated cursor/counts and releases the lease through persistRecoveryPreviewProgress before returning, joining any persistence error with the original query error. That removes the reported loss of completed pages and progress on a non-budget page failure.",
+      "finding_fingerprint": "sha256:0ab7e9ab805659f7923c68c8a7c0c3b193f091780b247047691ca4de15076e4a",
+      "quote": "return errors.Join(err, persistRecoveryPreviewProgress(p, dto, owner, \"building\", nil))",
+      "status": "resolved"
+    },
+    {
+      "evidence": "The soft wall-clock check is replaced by a hard sub-context: `budget, cancelBudget := context.WithTimeout(ctx, recoveryPreviewTickBudget)` with `defer cancelBudget()`, and the loop condition is now `for !complete && budget.Err() == nil`. Crucially, the per-candidate Stripe verification now carries that deadline (`evaluateRecoveryCandidate(budget, ...)`), as do the paging query (`ListCheckoutRecoveryCandidatePageContext(budget, ...)`) and the final count (`CountCheckoutRecoveryManualStripeContext(budget, ...)`), so no single slow call can run past the 20s budget. Budget expiry is handled as a normal stop at every site (break, persist \"building\", return nil so delivery still runs), with an explicit guard treating a budget-expiry-folded `payment_unknown` as an interrupted call rather than a result, which also prevents a bogus reason count from being recorded. The rewrite of the two persist-then-return blocks into `errors.Join(err, persistRecoveryPreviewProgress(...))` keeps the same behaviour (both errors surfaced; state still persisted on ctx cancellation). No new defect is introduced by the changed lines.",
+      "finding_fingerprint": "sha256:57e03f71c73e241222d28f9e531b1f5aab16c4ceb9d40d7c8d73e437fe7691ea",
+      "quote": "budget, cancelBudget := context.WithTimeout(ctx, recoveryPreviewTickBudget)",
+      "status": "resolved"
+    }
+  ],
+  "usage": {
+    "input_tokens": 10486,
+    "output_tokens": 2550,
+    "cached_input_tokens": 10109,
+    "wall_clock_ms": 9483
+  },
+  "extensions": {
+    "redteam": {
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "fix_verify": "3a1cfc364de35f6b"
+      },
+      "verifier": "deepseek/deepseek-flash",
+      "verify": {
+        "calls": 2,
+        "counts": {
+          "inconclusive": 0,
+          "regressed": 0,
+          "resolved": 2,
+          "unresolved": 0
+        },
+        "duplicate_fingerprints": 0,
+        "latency_ms": {
+          "max": 9351,
+          "total": 14511
+        },
+        "model_failures": 0,
+        "quote_rejected": 0,
+        "rate_limit": {
+          "retries": 0,
+          "wait_ms": 0
+        },
+        "warnings": []
+      }
+    }
+  }
+}

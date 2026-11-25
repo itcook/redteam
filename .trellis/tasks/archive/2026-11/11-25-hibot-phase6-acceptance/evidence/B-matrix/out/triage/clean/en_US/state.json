@@ -1,0 +1,28 @@
+{
+  "schema": "hibot.audit.state/1",
+  "job_id": "J-matrix-triage",
+  "phase": "finishing",
+  "at": "2026-11-25T09:08:29Z",
+  "llm": {
+    "in_flight": 0,
+    "max_concurrency": 10,
+    "retrying": 0,
+    "providers": [
+      {
+        "name": "p1",
+        "in_flight": 0,
+        "max_concurrency": 10
+      }
+    ]
+  },
+  "extensions": {
+    "redteam": {
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "p1": 10
+        }
+      }
+    }
+  }
+}

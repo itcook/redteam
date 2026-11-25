@@ -1,0 +1,10 @@
+Preparing worktree (detached HEAD e448b19c1)
+kind    : verify
+job dir : /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-official/verify/job
+repo dir: /Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-official/verify/repo  (detached e448b19c141e96078a692db3b44a52a8548653d5, base 0ad5acd17d5ceb2341af3ed5f038da60258c192a)
+
+手工调用：
+  redteam verify --job-dir "/Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-official/verify/job"
+
+清理检出：
+  git -C "/Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-real/full" worktree remove --force "/Users/weilai/hobby/.worktrees/redteam/hibot-audit-exec/target/phase6-official/verify/repo"

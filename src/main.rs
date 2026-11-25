@@ -2,16 +2,13 @@ use redteam::cli::{parse_format, ReviewArgs};
 use redteam::config::Config;
 use redteam::model::Prober as _;
 use redteam::output::render;
-use redteam::provider::backends::backend_from_config;
-use redteam::provider::registry::{role_key, ProviderRegistry};
 use clap::{Parser, Subcommand};
-use std::path::Path;
 
 #[derive(Parser)]
 // args_override_self：同名 flag 重复时后者胜（而非报错）——ship 等编排方把自己管理的
 // flag 追加在用户参数之后即权威生效，无需依赖 prompt 层把用户重复参数「摘干净」
 // （r5 dogfood 1c72b790：LLM 摘参不可靠，机制化消灭「重复即崩」类）。
-#[command(name = "redteam", version, about = "redteam：模型无关的对抗式代码评审器——风险路由 → 疑点扫描 → 深挖 → 流式复核", args_override_self = true,
+#[command(name = "redteam", version, about = "redteam：模型无关的对抗式代码评审器——风险路由 → 疑点扫描 → 深挖 → finding（可选验真）", args_override_self = true,
     after_help = "快速上手：\n  \
     1. redteam init                                              # 项目内建 .redteam/ 骨架（状态与内容，无配置）\n  \
     2. redteam model setup --provider X --model <id> --role scanner # 给至少一个模型配 scanner 角色（key 见 --key-store）\n  \
@@ -26,34 +23,41 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// 发起对抗式评审：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目（× samples）并行扇出
-    /// → 疑点并集（agreement = 家族数）→ **深挖**（风险 H0 区、scanner 疑点与 scanner needs〔只接变更集内、带行锚的〕
-    /// 进同一条优先级队列，reviewer 按 provider 门空位消费，预算随风险分、必挖集不截；配多个 reviewer 条目时按空闲轮转分摊、
-    /// 每项只交一个条目，鉴权失败的条目移出、它已失败的格不改派）→ dedup → finding 报告与 verdict。
-    /// 队列项的身份是**代码结构**而非报告行：疑点落在哪个 def（文档落在哪个标题节）就成那一项，格名里的区间即该块，
-    /// 同块的多条疑点并成一格；派发按分层序——H0 最先，然后每个候选文件先保底一格，其余按〔项内共识 → 风险档 → 疑点条数
-    /// → 代码优先 → 自评置信〕排，自评置信只做同分裂解。scanner 与深挖时间重叠：H0 区开跑即挖、
-    /// scanner 每格完成即入队（扫描期非必挖项少挖约 1/4 预算，留给后到的疑点），scanner 全部返回后按剩余预算收场。**finding 只由深挖产出**；
-    /// 没配 reviewer 角色则退化为 scan-only（疑点索引 + 覆盖自报，不产 finding）。
-    /// 退出码：0=干净 approve 或 scan-only 完成、1=命令自身失败（参数/IO/配置错误）、2=approve 但带债
-    /// （reviewer cell 失败——含二阶段补查轮失败、首轮 finding 保留；预算截断；reviewer 条目全部出局致队列项未挖。
-    /// 见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
-    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口；深挖照跑、findings 仍在报告，本可 reject 的 blocking 条数见
-    /// run.warnings）、10=reject（finding 达到 --block-threshold）。
-    /// 复核（verifier）**缺省关**：开了之后，每条 severity ≥ --block-threshold ∧ confidence ≥ --conf-floor 的 finding
-    /// 会再派一个模型复查，被驳回的不计数、不拦路（记录仍在 findings 里，带 verify 字段）。
-    /// 配 `review.verifiers.enabled = true` 打开：没给模型配 verifier 角色时**自动挑一个异族**的 reviewer / scanner；
-    /// 配了 verifier 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦（异族更准，见下）。
-    /// 观测在 `run.deep.verify_triggered` / `verify_skipped`（分类：not_triggered·disabled·carried·precedent·consensus·resumed·cached·no_verifier）/
-    /// `verify_refuted` / `verify_failed` / `verify_tail_ms` 与顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。
-    /// 缺省关的依据：对本仓人裁台账的离线基线里，两个候选模型把人已确认的真缺陷驳掉的比例是 12% / 8%
-    /// （预登记门槛 ≤ 5%），代价是静默少报；异族那臂驳回更多（31% vs 19%），误驳两臂分不出高下。
-    /// 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10；无角色级 workers，D13）：路由到同一 provider 的
-    /// cell 数超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings 提示；每 cell `queue_wait_ms` 可读）；撞 429 时该 provider 门宽
-    /// 自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit 可读；误填超大 maxConcurrency 也能自愈）。
+    /// 发起对抗式评审：证据收集 → 疑点扫描 → 深挖 → finding 报告与 verdict（可选验真）。
+    ///
+    /// 流水线：证据收集 → 引用图分组 → 改动中心切片装包 → 每组对每个 scanner 条目（× samples）并行扇出
+    /// → 疑点并集（agreement = 家族数）→ **深挖** → dedup → finding 报告与 verdict。
+    ///
+    /// 要点：
+    /// - **finding 只由深挖产出**：风险 H0 区、scanner 疑点与 scanner needs（只接变更集内、带行锚的）进同一条
+    ///   优先级队列，reviewer 按 provider 并发门消费，预算随风险分、必挖集不截；多个 reviewer 条目按空闲轮转，
+    ///   每项只交一个条目，鉴权失败的条目移出、它已失败的格不改派。没配 reviewer 角色则退化为 scan-only
+    ///   （疑点索引 + 覆盖自报，不产 finding）。
+    /// - 队列项的身份是**代码结构**而非报告行：疑点落在哪个 def（文档落在哪个标题节）就成那一项，同块的多条
+    ///   疑点并成一格。派发按分层序：H0 最先，然后每个候选文件先保底一格，其余按
+    ///   〔项内共识 → 风险档 → 疑点条数 → 代码优先 → 自评置信〕排。
+    /// - scanner 与深挖时间重叠：H0 区开跑即挖、scanner 每格完成即入队，scanner 全部返回后按剩余预算收场。
+    /// - **验真（refuter，缺省关）**：开启后，每条 severity ≥ --block-threshold ∧ confidence ≥ --conf-floor 的
+    ///   finding 会再派一个模型复查；被驳回的不计数、不拦路（记录仍在 findings 里，带 refute 字段）。
+    ///   配 `review.refuters.enabled = true` 打开：没给模型配 refuter 角色时自动挑一个异族的 reviewer / scanner；
+    ///   配了 refuter 角色就按你配的轮转——挑中与产出者同模型 / 同家族时只发 warning 不拦。
+    ///   观测在 `run.deep.refute_triggered` / `refute_skipped`（分类：not_triggered·disabled·carried·precedent·
+    ///   consensus·resumed·cached·no_refuter）/ `refute_refuted` / `refute_failed` / `refute_tail_ms` 与
+    ///   顶层 `run.refute_rate`（= 驳回 ÷ 真跑成的）。缺省关的依据：人裁台账离线基线里两个候选模型把已确认的
+    ///   真缺陷驳掉 12% / 8%（预登记门槛 ≤ 5%），代价是静默少报；异族那臂驳回更多（31% vs 19%）。
+    /// - 并发 = 各 provider `maxConcurrency`（缺省继承 `review.maxConcurrency` = 10）：路由到同一 provider 的
+    ///   cell 超过其上限即排队，墙钟 = 排队 + 最长格（run.warnings / 每 cell `queue_wait_ms`）；撞 429 时该
+    ///   provider 门宽自动收敛到网关真实上限并让撞门的请求排队重试（run.warnings / run.provider_rate_limit）。
+    ///
+    /// 退出码：0=干净 approve 或 scan-only 完成、1=命令自身失败（参数/IO/配置错误）、
+    /// 2=approve 但带债（reviewer cell 失败——含二阶段补查轮失败、首轮 finding 保留；预算截断；reviewer 条目
+    /// 全部出局致队列项未挖。见 run.warnings、run.coverage.failed 与 run.deep.budget_skipped）、
+    /// 3=incomplete（任一 scanner cell 失败，疑点集有结构性缺口；深挖照跑、findings 仍在报告，本可 reject 的
+    /// blocking 条数见 run.warnings）、10=reject（finding 达到 --block-threshold）。
+    ///
     /// **诊断**：置 `REDTEAM_DUMP_DIR=<目录>` 时，凡是解析失败的那一轮（scanner / reviewer 的首轮与修复轮）
     /// 会把模型原文整段落盘到该目录，文件名带队列项文件、模型与轮次；不置则零行为。报错本身恒带 serde 根因
-    /// （原因 / 行列 / 全文字符数 / 出错处前后片段），原文落盘是给「报错看不出为什么」的场合用的。
+    /// （原因 / 行列 / 全文字符数 / 出错处前后片段）。
     Review {
         /// diff 基线（分支名/commit）；缺省按 --scope 收集当前改动。
         #[arg(long)]
@@ -81,9 +85,9 @@ enum Cmd {
         /// finding 置信度下限（默认 0.5）：低于此值不参与 reject 判定。无 reviewer 的 scan-only 路径记录不消费。
         #[arg(long)]
         conf_floor: Option<f32>,
-        /// 工具档位：off | two-stage | on。scanner 恒单发（无工具、needs 只记录不补跑，M21b 深挖队列消费）；本旗对 scanner 无效。
+        /// 工具档位：off | two-stage（默认）| on。scanner 恒单发（无工具、needs 只记录不补跑）；本旗对 scanner 无效。
         /// reviewer：two-stage = needs 触发一轮证据补查（读守卫 + 字节帽，拒绝进 warnings）；
-        /// on 目前等同 two-stage——真工具循环 M21c 才落地，先不让它比 two-stage 弱。缺省读 config [review].tools。
+        /// on 目前与 two-stage 等价（更强的工具循环尚未落地）。缺省读 config `review.tools`。
         #[arg(long, value_parser = ["off", "two-stage", "on"])]
         tools: Option<String>,
         /// 后台作业模式：立即返回 job id，用 status/result 跟进（40min deadline 兜底）。
@@ -92,34 +96,77 @@ enum Cmd {
         /// 输出格式：json（默认）| md。
         #[arg(long, default_value = "json", value_parser = ["json", "md"])]
         format: String,
-        /// R2.3：补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
-        /// （base 等从该作业落盘的 args.json 里重建；模型集按当前配置的 scanner 重建，M21b 起读队列快照）。
+        /// 补跑指定作业的差集 cell（不重收集证据），前台同步执行；忽略其余 review flag
+        /// （base 等从该作业落盘的 args.json 里重建；模型集按当前配置的 scanner 重建，并接着读该作业的队列快照）。
         /// 配了 reviewer 时接着深挖：补跑出的疑点与已完成 scanner 格的疑点幂等入队（已挖过的不重挖）、快照为空则按当前 diff
         /// 重建风险 H0 区、补跑过 scanner 则被预算截掉的项重选；补跑后 scanner 仍缺格 → incomplete（深挖照跑）。
         #[arg(long)]
         resume: Option<String>,
         /// 台账来源覆盖：db 文件路径 或 16-hex id 逗号列表（csv 仅豁免）。缺省 zero-config：
-        /// 项目存在 .redteam/proj.db 即自动加载，run.ledger 披露。当前只披露不消费
-        /// （判例前移进 scanner prompt 与豁免 / refute 裁决在 M21c 疑点台账起）。
+        /// 项目存在 .redteam/proj.db 即自动加载，run.ledger 披露；豁免、判例注入与 refute 判例裁决都读它。
         #[arg(long)]
         dismissed: Option<String>,
         /// 本次评审完全关闭台账（豁免/预筛/判例注入全停）。
         #[arg(long)]
         no_dismissed: bool,
-        /// 增量轮（M13）：以指定作业的评审为基线只审 fix delta。仅 branch scope（须 --base），且**工作树须干净**
+        /// 增量轮：以指定作业的评审为基线只审 fix delta。仅 branch scope（须 --base），且**工作树须干净**
         /// （未提交改动会让携带项的锚点失效却不在被审 delta 里）。上轮未被 delta 覆盖的 finding 由 redteam 重锚定
         /// 携带进本轮，verdict 是合并集口径（携带 ∪ 新发）；`resolve` 过的不再携带，但 quote 仍锚得上的会报
         /// 「⚠️ Disputed」（假修复）。四道守卫（谱系 / 同族 / 健康基线 / 空 delta）**显式报错拒跑、不静默降级全量**。
         /// 不支持与 --background 同用（前台跑）。
         #[arg(long)]
         incremental_from: Option<String>,
-        /// 预算仪表（M21a）：只收集证据 → 分组 → 装包 → 落盘 .redteam/packs/<job>/cell-<n>.md（= 真实发出的 scanner prompt：
+        /// 预算仪表：只收集证据 → 分组 → 装包 → 落盘 .redteam/packs/<job>/cell-<n>.md（= 真实发出的 scanner prompt：
         /// 共享头 system + 参考 / 证据 / diff / 角色尾四块）与 summary.json，每 cell 打印字节（含 system 段）与估算 token（÷3.5）、
         /// 分组统计与装包形态（body=slice|full 随 `review.pack.body`，缺省 slice：切片 / 折叠行 / 文件外片段计数）；不建 registry、
         /// 不调 provider，无模型配置也能跑，退出码 0。与 --background / --resume / --incremental-from 互斥；
         /// --format 对本模式无效（固定文本行，机读看 summary.json）。
         #[arg(long, conflicts_with_all = ["background", "resume", "incremental_from"])]
         pack_only: bool,
+        /// 外派模式：`--job-dir <dir>`（出现即拒绝一切业务 flag）。读 job.json / paths.config，
+        /// 写 <dir>/out/report.json；不读 stdin、不依赖 cwd、不碰 ~/.redteam。
+        #[arg(long, conflicts_with_all = ["base", "scope", "spec", "focus", "test_command", "block_threshold", "conf_floor", "tools", "background", "format", "resume", "dismissed", "no_dismissed", "incremental_from", "pack_only"])]
+        job_dir: Option<String>,
+    },
+    /// 配置契约：`schema`（从类型生成 JSON Schema）/ `check`（形状 + 语义校验）。
+    Config {
+        #[command(subcommand)]
+        action: ConfigCmd,
+    },
+    /// 自更新（standalone 安装）：默认检查并升级到最新正式版。
+    ///
+    /// 插件目录（`plugins/redteam/bin/`）下的二进制默认拒写——插件版随插件更新；
+    /// `--check` 只读（不取锁、不下载归档）；失败不覆盖旧件。
+    Update {
+        /// 只检查，不写任何文件。
+        #[arg(long)]
+        check: bool,
+        /// 指定版本（`vX.Y.Z` 或 `X.Y.Z`）。
+        #[arg(long)]
+        version: Option<String>,
+        /// 即使已是最新也重装。
+        #[arg(long)]
+        force: bool,
+        /// 下载源：github | r2（默认 github）。
+        #[arg(long, value_parser = ["github", "r2"])]
+        from: Option<String>,
+        /// 下载基址（覆盖默认；本地测试用）。
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    /// triage（外派）：读 job 目录，写 hibot `report.triage/1`。三轴（security / drift / intent）并发，
+    /// 产出 `summary` + findings + `extensions.redteam.blockers`；轴失败 ⇒ `partial` + `triage_axis_failed:<axis>`。
+    Triage {
+        /// job 目录（必需）：manifest `hibot.audit.job.triage/1`。
+        #[arg(long)]
+        job_dir: String,
+    },
+    /// verify（外派）：读 job 目录，写 hibot `report.verify/1`。逐条核验 anchored finding 的修复，
+    /// 四态 `resolved / unresolved / regressed / inconclusive`；出现 inconclusive ⇒ `partial` + `status_reason`。
+    Verify {
+        /// job 目录（必需）：manifest `hibot.audit.job.verify/1`。
+        #[arg(long)]
+        job_dir: String,
     },
     /// 查询作业状态：无 id 列本项目全部；有 id 打印该作业 JSON。
     Status {
@@ -132,8 +179,9 @@ enum Cmd {
         #[arg(long)]
         cells: bool,
     },
-    /// 取回作业的评审结果（持久存储于 .redteam/proj.db，永不过期、可重复取）。
-    /// 任一终态可取（failed/timed_out 有部分报告也放行）；未终态是命令自身失败，退出码 1。
+    /// 取回作业的评审结果（持久存储于 .redteam/proj.db）。
+    ///
+    /// 任一终态可取（failed/timed_out 有部分报告也放行，永不过期、可重复取）；未终态是命令自身失败，退出码 1。
     Result {
         /// 作业 id（review --background 的输出）。
         job_id: String,
@@ -171,35 +219,39 @@ enum Cmd {
     },
     /// 幂等创建项目级 .redteam/ 骨架（.gitignore、rounds/、proj.db；配置在用户级 ~/.redteam/config.json，项目层无配置文件）。
     Init,
-    /// 打印生效的测试命令（ship 循环第 2 步用）：--override > Cargo.toml→`cargo test` > package.json 有
-    /// scripts.test→`npm test` > Makefile 有 test 目标→`make test` > go.mod→`go test ./...`；推不出 →
-    /// stderr 提示、退出码 2（调用方转 AskUser）。
+    /// 打印生效的测试命令（ship 循环第 2 步用）。
+    ///
+    /// 推断链：--override > Cargo.toml→`cargo test` > package.json 有 scripts.test→`npm test`
+    /// > Makefile 有 test 目标→`make test` > go.mod→`go test ./...`；推不出 → stderr 提示、退出码 2
+    /// （调用方转 AskUser）。
     TestCommand {
         /// 覆盖推断（与 `review --test-command` 同义）。
         #[arg(long = "override")]
         override_cmd: Option<String>,
     },
-    /// 隐藏：复核单发离线跑（M21b 批 D-4，只读仓 / 零写库）——读一条 finding JSON，建**产品同一份**
-    /// 复核 prompt 发一轮，打印判决 JSON；`--dump-prompt` 只打印 prompt 不发请求。
-    /// `eval/verify_score.py` 靠它打离线基线（design §8.1「去留由数据决定」〔D17〕）；
+    /// 隐藏：验真单发离线跑（M21b 批 D-4，只读仓 / 零写库）——读一条 finding JSON，建**产品同一份**
+    /// 验真 prompt 发一轮，打印判决 JSON；`--dump-prompt` 只打印 prompt 不发请求。
+    /// `eval/refute_score.py` 靠它打离线基线（design §8.1「去留由数据决定」〔D17〕）；
     /// 输入形态是机器面（台账导出的 finding 行），不进 `--help` 的用户面。
     #[command(hide = true)]
-    VerifyOnce {
+    RefuteOnce {
         /// finding JSON 路径（`-` = stdin）：{file,line_start,line_end,severity,title,body,quote}
         finding: String,
         /// 证据树根（缺省当前目录）——历史锚点物化成临时树后指过来。
         #[arg(long)]
         root: Option<String>,
-        /// 复核模型 `provider/id`（缺省取配置里 verifier 角色的第一个）。
+        /// 验真模型 `provider/id`（缺省取配置里 refuter 角色的第一个）。
         #[arg(long)]
-        verifier: Option<String>,
+        refuter: Option<String>,
         /// 只打印 prompt，不发请求。
         #[arg(long)]
         dump_prompt: bool,
     },
-    /// 风险路由只读回放（M21b 批 A，零 provider / 零副作用）：跑阶段 0（成区 → 四类信号 → H0/R/档位）
-    /// 打印 JSON——供 `eval/risk_replay.py compare` 对拍 Python v4 参考实现（θ 与权重改动必过的回归门，D11）。
-    /// 读 `merge-base(base,head)...head` 与 head commit 内容（不依赖工作树），可回放任意历史 diff。
+    /// 风险路由只读回放（零 provider / 零副作用）。
+    ///
+    /// 跑阶段 0（成区 → 四类信号 → H0/R/档位）打印 JSON——供 `eval/risk_replay.py compare` 对拍参考实现
+    /// （θ 与权重改动必过的回归门）。读 `merge-base(base,head)...head` 与 head commit 内容（不依赖工作树），
+    /// 可回放任意历史 diff。
     Risk {
         /// diff 基线（分支名/commit）。
         #[arg(long)]
@@ -333,23 +385,25 @@ enum ModelCmd {
         /// 请求体里的 model id（providers.<name>.models.<id>，如 deepseek-v4-flash）。
         #[arg(long)]
         model: String,
-        /// 角色，逗号分隔：scanner,reviewer,verifier（拥有该角色键的模型即活跃集，无候补）。
+        /// 角色，逗号分隔：scanner,reviewer,refuter,verifier,triage（模型加入对应池；顺序即轮转序）。
+        /// `refuter` = 评审内 finding 验真；`verifier` = 修复验证（独立管线，**不回退 reviewer**）；
+        /// `triage` = hibot triage kind（独立池）。
         #[arg(long)]
         role: String,
         /// 人读显示名（model list / 报告用）；身份串固定为 provider/id，不可配置。
         #[arg(long)]
         display_name: Option<String>,
-        /// 协议类型：openai | anthropic（含 claude/gpt/gemini 等别名）。新建 provider 时写 provider 层（缺省按名 / base_url 推断）；
-        /// provider 已存在时写模型层，不动共享的 provider 层。
+        /// 通道 API（v2 三值，无别名）：openai-completions | anthropic-messages | openai-responses（预留）。
+        /// 新建 provider 时写 provider 层（缺省按名 / base_url 推断）；provider 已存在时覆盖 provider.api（v2 无模型级 api）。
         #[arg(long)]
-        kind: Option<String>,
-        /// API 端点 base URL（anthropic 网关须带 /v1）。
+        api: Option<String>,
+        /// API 端点 base URL（v2 必填；新建 provider 时缺省仅对已知供应商推断，其余必须显式给）。
         #[arg(long)]
         base_url: Option<String>,
         /// key 环境变量名：新建 provider 时写 provider 层（缺省 `<PROVIDER>_API_KEY`）；provider 已存在时写模型层。
         #[arg(long)]
         api_key_env: Option<String>,
-        /// 该 provider 同时在途请求上限（缺省继承 review.maxConcurrency）。
+        /// 该 provider 同时在途请求上限（缺省继承 settings.review.maxConcurrency）。
         #[arg(long)]
         max_concurrency: Option<u32>,
         /// API key（配合 --key-store 决定去处；不落 config.json）。
@@ -385,6 +439,25 @@ enum ModelCmd {
     },
     /// 轻量可用性预检（退出码全可用 0 / 有不可用非 0）。
     Check,
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// 生成 executor config 的 JSON Schema（draft-07；`$id: urn:redteam:config/2`，`schemaVersion: 2`）。
+    Schema {
+        /// 写到文件（缺省打印到 stdout）。入库生成物是 dist/config.schema.json。
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// 校验 executor config：形状 + 未知键 + 密钥字段 + 语义（可选按 kind 查角色）。
+    /// 诊断只走 stdout；退出码 0/1；WARN 不影响退出码。
+    Check {
+        /// 文件路径，或直接给 JSON 文本（以 `{` 开头）。
+        input: String,
+        /// 按 kind 校验角色最小集：triage | review | verify。
+        #[arg(long, value_parser = ["triage", "review", "verify"])]
+        kind: Option<String>,
+    },
 }
 
 fn now_secs() -> u64 {
@@ -509,61 +582,6 @@ fn resolve_result(
     }
 }
 
-/// 构造 ProviderRegistry（前台与 worker 共用）：scanner / reviewer / verifier 各按 **角色键**
-/// `role:provider/id` 注册一份 backend（`reasoningEffort` 是角色属性，同一模型跨角色不能共用一份档位）——scanner 一律
-/// scan 单发（`--tools` 对 scanner 无效，K3）；provider 在途门 = `maxConcurrency` 缺省继承 `review.max_concurrency`（D7 A5；唯一闸，无角色级 workers，D13）；
-/// reasoningEffort 无映射的告警进 registry.warnings → RunMeta.warnings。scanners 为空 → 配置错误；返回 Err(消息) 代替直接 process::exit，调用方决定如何处理。
-fn build_registry(_args: &ReviewArgs, cfg: &Config, _cwd: &Path) -> Result<ProviderRegistry, String> {
-    let roles = cfg.active_roles();
-    if roles.scanners.is_empty() {
-        return Err(redteam::cli::NO_SCANNER_MSG.to_string());
-    }
-    let mut registry = ProviderRegistry::new();
-    // reasoningEffort 无映射 warnings 按角色条目统一给——同一模型跨角色各有各的档位，不能只报先注册的那条。
-    for w in redteam::provider::backends::role_reasoning_effort_warnings(&roles) {
-        registry.push_warning(w);
-    }
-    for em in &roles.scanners {
-        let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
-        let backend = match backend_from_config(em, key) {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(format!("{e}"));
-            }
-        };
-        // 单轮超时（design §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`。
-        let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
-        // usize → u32 饱和而非截断（评审修：误填 2^32 以上的值不会被截成 0 / 小数）。
-        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
-        registry.insert_scan(role_key(redteam::config::Role::Scanner, &em.name), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
-    }
-    // reviewer 与 verifier 各按角色键注册（同模型不同档位各占一份 backend，不互相覆盖）。批 D〔D17〕：
-    // verifier 必须在这里注册，否则 `pick_verifier` 选中一个纯 verifier 模型时 `registry.lease()` 直接
-    // Unavailable，每条复核都静默落成「保守 upheld」——看起来跑了、其实一次没验。
-    for (em, role) in roles
-        .reviewers
-        .iter()
-        .map(|m| (m, redteam::config::Role::Reviewer))
-        .chain(roles.verifiers.iter().map(|m| (m, redteam::config::Role::Verifier)))
-    {
-        let key = cfg.resolve_key(&em.provider, &em.id).unwrap_or_default();
-        let backend = match backend_from_config(em, key) {
-            Ok(b) => b,
-            // reviewer 造不出 = 本轮的活干不了，硬 Err 照旧；**verifier 造不出只是这一路没得用**
-            // （复核缺省还关着），不该让整条 review 命令拒跑（收口评审 #8：
-            // 预置一个 kind=google 的 verifier 模型，整个 review 会以 "google not yet supported" 退出）。
-            Err(e) if role == redteam::config::Role::Verifier => {
-                registry.push_warning(format!("verifier {} 不可用（{e}）——本轮复核将跳过它", em.name));
-                continue;
-            }
-            Err(e) => return Err(format!("{e}")),
-        };
-        let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
-        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
-        registry.insert_scan(role_key(role, &em.name), &em.provider, cap, backend, per_turn, redteam::provider::DEFAULT_RETRY_BUDGET);
-    }
-    Ok(registry)
-}
 
 #[tokio::main]
 async fn main() {
@@ -597,7 +615,13 @@ async fn main() {
             no_dismissed,
             incremental_from,
             pack_only,
+            job_dir,
         } => {
+            // 外派模式：不加载用户配置（唯一来源是 job 的 paths.config），不读 cwd / stdin。
+            if let Some(dir) = job_dir {
+                let code = redteam::job::run::run(redteam::job::manifest::JobKind::Review, std::path::Path::new(&dir)).await;
+                std::process::exit(code);
+            }
             let cfg = if pack_only { load_config_no_secrets_or_exit() } else { load_config_or_exit() };
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
@@ -625,7 +649,7 @@ async fn main() {
                     Ok(a) => a,
                     Err(e) => { eprintln!("error: bad args for job {job_id}: {e}"); std::process::exit(1); }
                 };
-                let registry = match build_registry(&orig_args, &cfg, &cwd) {
+                let registry = match redteam::cli::build_registry(&orig_args, &cfg) {
                     Ok(x) => x,
                     Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 };
@@ -657,6 +681,7 @@ async fn main() {
                 (None, false) => "working-tree".to_string(),
             };
             let args = ReviewArgs {
+                job_mode: false,
                 base: base.clone(), scope, spec, focus,
                 block_threshold, conf_floor, tools, background, format,
                 resume: None, dismissed, no_dismissed, incremental_from, test_command, pack_only,
@@ -754,7 +779,7 @@ async fn main() {
             }
 
             // 前台路径：构造 registry 后调 run_review_dispatch。
-            let registry = match build_registry(&args, &cfg, &cwd) {
+            let registry = match redteam::cli::build_registry(&args, &cfg) {
                 Ok(x) => x,
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             };
@@ -832,8 +857,8 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            // 建 registry（复用 build_registry：resolve_models + 构造 ProviderRegistry）
-            let registry = match build_registry(&args, &cfg, &cwd) {
+            // 建 registry（复用 build_registry：active_roles 角色活跃集 + 构造 ProviderRegistry）
+            let registry = match redteam::cli::build_registry(&args, &cfg) {
                 Ok(x) => x,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -981,20 +1006,20 @@ async fn main() {
                 }
                 redteam::model::check_exit_code(&avs)
             }
-            ModelCmd::Setup { provider, model, role, display_name, kind, base_url, api_key_env, max_concurrency, key, key_store, model_key, context_window, max_output_tokens, per_turn_timeout_secs, reasoning, reasoning_effort } => {
+            ModelCmd::Setup { provider, model, role, display_name, api, base_url, api_key_env, max_concurrency, key, key_store, model_key, context_window, max_output_tokens, per_turn_timeout_secs, reasoning, reasoning_effort } => {
                 let mut roles: Vec<redteam::config::Role> = Vec::new();
                 for r in role.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     match redteam::config::Role::parse(r) {
                         Some(x) if !roles.contains(&x) => roles.push(x),
                         Some(_) => {}
                         None => {
-                            eprintln!("error: --role 取 scanner | reviewer | verifier（逗号分隔，如 scanner,reviewer），收到 {r:?}");
+                            eprintln!("error: --role 取 scanner | reviewer | refuter | verifier | triage（逗号分隔，如 scanner,reviewer），收到 {r:?}");
                             std::process::exit(1);
                         }
                     }
                 }
                 if roles.is_empty() {
-                    eprintln!("error: --role 至少给一个角色：scanner | reviewer | verifier");
+                    eprintln!("error: --role 至少给一个角色：scanner | reviewer | refuter | verifier | triage");
                     std::process::exit(1);
                 }
                 let reasoning_effort = match reasoning_effort.as_deref() {
@@ -1013,11 +1038,11 @@ async fn main() {
                     eprintln!("error: --key-store secrets requires --key");
                     std::process::exit(1);
                 }
-                let kind_if_new = redteam::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
-                // 写入前守卫：kind/base_url 不合法则提示并拒绝写入，不污染配置。kind 检查用原始 --kind 字符串
-                // （若显式给出，哪怕非法）——`derive_kind` 内非法显式值已落回推断链、不会原样带出来。
-                let kind_for_validate = kind.as_deref().unwrap_or_else(|| kind_if_new.as_str());
-                if let Err(e) = redteam::model::validate_setup(kind_for_validate, base_url.as_deref()) {
+                let api_if_new = redteam::model::derive_api(&provider, api.as_deref(), base_url.as_deref());
+                // 写入前守卫：api/base_url 不合法则提示并拒绝写入，不污染配置。api 检查用原始 --api 字符串
+                // （若显式给出，哪怕非法）——`derive_api` 内非法显式值已落回推断链、不会原样带出来。
+                let api_for_validate = api.as_deref().unwrap_or_else(|| api_if_new.as_str());
+                if let Err(e) = redteam::model::validate_setup(api_for_validate, base_url.as_deref()) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -1027,7 +1052,7 @@ async fn main() {
                 let env_configured = api_key_env.is_some()
                     || match existing.providers.get(&provider) {
                         None => true,
-                        Some(p) => p.api_key_env.is_some() || p.models.get(&model).is_some_and(|m| m.api_key_env.is_some()),
+                        Some(p) => p.api_key_env.is_some() || p.models.iter().any(|m| m.id == model && m.api_key_env.is_some()),
                     };
                 if key_store == "env" && key.is_some() && !env_configured {
                     eprintln!(
@@ -1035,14 +1060,13 @@ async fn main() {
                     );
                     std::process::exit(1);
                 }
-                // design v9 §12.1 形状：providers.<provider>.models.<id>.roles.<role>；三层只写显式给出的字段，
-                // 已存在的 provider 不被 --kind / --api-key-env 改写（这两项落模型层，评审 #3 / #5）；写前完整校验（#4）。
+                // v2 形状：provider.api/baseUrl + models[]，角色写 settings 池；三层只写显式给出的字段，写前完整校验（#4）。
                 let patch = redteam::config::SetupPatch {
                     provider: provider.clone(),
                     model_id: model.clone(),
                     roles: roles.clone(),
                     display_name: display_name.clone(),
-                    kind: kind.as_deref().and_then(redteam::config::ProviderKind::parse),
+                    api: api.as_deref().and_then(redteam::config::ProviderApi::parse),
                     base_url: base_url.clone(),
                     api_key_env: api_key_env.clone(),
                     max_concurrency,
@@ -1051,15 +1075,15 @@ async fn main() {
                     per_turn_timeout_secs,
                     reasoning,
                     reasoning_effort,
-                    kind_if_new,
+                    api_if_new,
                     api_key_env_if_new: Some(redteam::model::derive_api_key_env(&provider)),
                 };
                 let path = match redteam::config::write_setup(&patch) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("error: failed to write config: {e}");
-                        if e.to_string().contains("缺 kind") {
-                            eprintln!("提示：加 --kind openai|anthropic（provider 已存在时写入该模型层）");
+                        if e.to_string().contains("baseUrl") {
+                            eprintln!("提示：v2 的 baseUrl 必填，加 --base-url https://<host>[/v1]");
                         }
                         std::process::exit(1);
                     }
@@ -1070,7 +1094,7 @@ async fn main() {
                     eprintln!("error: provider missing from just-written config (unexpected)");
                     std::process::exit(1);
                 };
-                let env_name = pc.models.get(&model).and_then(|m| m.api_key_env.clone()).or_else(|| pc.api_key_env.clone());
+                let env_name = pc.models.iter().find(|m| m.id == model).and_then(|m| m.api_key_env.clone()).or_else(|| pc.api_key_env.clone());
                 // key 去处：env(默认，打印 export) / secrets(写 secrets.json；--model-key 写模型级)
                 match key_store.as_str() {
                     "secrets" => {
@@ -1087,13 +1111,13 @@ async fn main() {
                         (None, _) => println!("notice: providers.{provider} 未配置 apiKeyEnv；key 可放 secrets.json（--key-store secrets [--model-key]）或补 --api-key-env"),
                     },
                 }
-                let em = cfg.effective(&provider, &model, roles[0]);
-                let probe_kind = em.as_ref().map(|e| e.kind).unwrap_or_else(|| provider_probe_kind(pc));
+                let em = cfg.effective(&provider, &model, roles[0], reasoning_effort);
+                let probe_api = em.as_ref().map(|e| e.api).unwrap_or_else(|| provider_probe(pc));
                 let shown = display_name.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
                 println!(
-                    "configured {provider}/{model}{shown} roles=[{}] (kind={}, apiKeyEnv={}) → {}",
+                    "configured {provider}/{model}{shown} roles=[{}] (api={}, apiKeyEnv={}) → {}",
                     roles.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(","),
-                    probe_kind.as_str(),
+                    probe_api.as_str(),
                     env_name.as_deref().unwrap_or("-"),
                     path.display()
                 );
@@ -1105,7 +1129,7 @@ async fn main() {
                 let prober = redteam::model::probe::HttpProber::new();
                 let probe_key = cfg.resolve_key(&provider, &model);
                 let probe_result = prober
-                    .list_models(&redteam::model::effective_base(pc.base_url.as_deref(), probe_kind), probe_key.as_deref(), probe_kind)
+                    .list_models(&redteam::model::effective_base(Some(&pc.base_url), probe_api), probe_key.as_deref(), probe_api)
                     .await
                     .map_err(|e| e.to_string());
                 println!("{}", format_probe_outcome(&provider, &model, &probe_result));
@@ -1125,10 +1149,10 @@ async fn main() {
                             Some(p) => p,
                             None => { eprintln!("no such provider: {prov}"); std::process::exit(1); }
                         };
-                        let kind = provider_probe_kind(pc);
-                        let base = redteam::model::effective_base(pc.base_url.as_deref(), kind);
+                        let api = provider_probe(pc);
+                        let base = redteam::model::effective_base(Some(&pc.base_url), api);
                         let key = cfg.resolve_provider_key(&prov);
-                        match prober.list_models(&base, key.as_deref(), kind).await {
+                        match prober.list_models(&base, key.as_deref(), api).await {
                             Ok(models) => {
                                 for m in models { println!("{m}"); }
                                 0
@@ -1168,18 +1192,43 @@ async fn main() {
             }
         }
         Cmd::Risk { base, head, dismissed, before } => run_risk(&base, head.as_deref(), dismissed.as_deref(), before.as_deref()),
-        Cmd::VerifyOnce { finding, root, verifier, dump_prompt } => {
+        Cmd::RefuteOnce { finding, root, refuter, dump_prompt } => {
             let cfg = load_config_warned();
-            redteam::cli::verify_once::run_verify_once(
-                redteam::cli::verify_once::VerifyOnceArgs {
+            redteam::cli::refute_once::run_refute_once(
+                redteam::cli::refute_once::RefuteOnceArgs {
                     finding: &finding,
                     root: root.as_deref(),
-                    verifier: verifier.as_deref(),
+                    refuter: refuter.as_deref(),
                     dump_prompt,
                 },
                 &cfg,
             )
             .await
+        }
+        Cmd::Config { action } => match action {
+            ConfigCmd::Schema { out } => redteam::cli::config_cmd::run_schema(out.as_deref()),
+            ConfigCmd::Check { input, kind } => redteam::cli::config_cmd::run_check(&input, kind.as_deref()),
+        },
+        Cmd::Update { check, version, force, from, base_url } => {
+            let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("redteam"));
+            let options = redteam::update::UpdateOptions {
+                check,
+                version,
+                force,
+                from: from.unwrap_or_else(|| redteam::update::DEFAULT_FROM.to_string()),
+                base_url,
+            };
+            // 自更新错误必须保留 `{e:#}` 上下文链（下载/校验/自检哪一步失败要能一眼看出）。
+            match redteam::update::run(&options, &exe).await {
+                Ok(outcome) => { println!("{}", outcome.render()); 0 }
+                Err(error) => { eprintln!("error: {error:#}"); 1 }
+            }
+        }
+        Cmd::Triage { job_dir } => {
+            redteam::job::run::run(redteam::job::manifest::JobKind::Triage, std::path::Path::new(&job_dir)).await
+        }
+        Cmd::Verify { job_dir } => {
+            redteam::job::run::run(redteam::job::manifest::JobKind::Verify, std::path::Path::new(&job_dir)).await
         }
     };
     std::process::exit(code);
@@ -1208,7 +1257,7 @@ fn run_risk(base: &str, head: Option<&str>, dismissed: Option<&str>, before: Opt
         _ => None,
     };
     let route = redteam::risk::replay_from_git(
-        &changes, &cwd, base, &head, ledger.as_deref(), before, cfg.review.reviewers.max_cells,
+        &changes, &cwd, base, &head, ledger.as_deref(), before, cfg.settings.review.reviewers.max_cells,
     );
     let out = serde_json::json!({
         "schema": "risk-v1",
@@ -1229,11 +1278,9 @@ fn run_risk(base: &str, head: Option<&str>, dismissed: Option<&str>, before: Opt
     }
 }
 
-/// provider 级探测（`model list --remote` / setup 后探测）用的协议：provider 层 kind > 任一模型的 kind > openai-compatible。
-fn provider_probe_kind(pc: &redteam::config::ProviderConfig) -> redteam::config::ProviderKind {
-    pc.kind
-        .or_else(|| pc.models.values().find_map(|m| m.kind))
-        .unwrap_or(redteam::config::ProviderKind::OpenaiCompatible)
+/// provider 级探测（`model list --remote` / setup 后探测）用的协议：v2 只有 provider 层 api。
+fn provider_probe(pc: &redteam::config::ProviderConfig) -> redteam::config::ProviderApi {
+    pc.api
 }
 
 /// T26：`model setup` 落盘后自动 probe 该 provider 的结果文案——纯函数，网络调用
@@ -1656,7 +1703,7 @@ mod tests {
     }
 
     fn plain_review_args() -> redteam::cli::ReviewArgs {
-        redteam::cli::ReviewArgs { pack_only: false,
+        redteam::cli::ReviewArgs { pack_only: false, job_mode: false,
             base: None,
             scope: "working-tree".into(),
             spec: vec![],
@@ -1674,70 +1721,71 @@ mod tests {
         }
     }
 
-    /// 批 D〔D17〕：**纯 verifier 模型也要进 registry**。漏注册时 `pick_verifier` 选中它，
+    /// 批 D〔D17〕：**纯 refuter 模型也要进 registry**。漏注册时 `pick_refuter` 选中它，
     /// 每条复核都会在 `lease()` 上拿到 Unavailable、静默落成「保守 upheld」——看起来跑了、其实一次没验。
     #[test]
-    fn build_registry_registers_verifier_only_models() {
+    fn build_registry_registers_refuter_only_models() {
         let cfg: redteam::config::Config = serde_json::from_str(
-            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
-                "s":{"roles":{"scanner":{}}},
-                "r":{"roles":{"reviewer":{}}},
-                "v":{"roles":{"verifier":{}}}
-            }}}}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]},"refuter":{"models":[{"provider":"p","id":"v"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"},{"id":"v"}]}}}"#,
         )
         .unwrap();
-        let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new(".")).unwrap();
+        let reg = redteam::cli::build_registry(&plain_review_args(), &cfg).unwrap();
         assert!(
             reg.has_for(redteam::config::Role::Scanner, "p/s")
                 && reg.has_for(redteam::config::Role::Reviewer, "p/r"),
             "scanner / reviewer 按角色键注册"
         );
         assert!(
-            reg.has_for(redteam::config::Role::Verifier, "p/v"),
-            "纯 verifier 模型必须能 lease，否则复核全程静默保守 upheld"
+            reg.has_for(redteam::config::Role::Refuter, "p/v"),
+            "纯 refuter 模型必须能 lease，否则复核全程静默保守 upheld"
         );
     }
 
-    /// 批 D-5（收口评审 #8）：verifier 模型造不出 backend **不该拒跑整条命令**——复核缺省还关着，
+    /// 批 D-5（收口评审 #8）：refuter 模型造不出 backend **不该拒跑整条命令**——复核缺省还关着，
     /// 而 `kind: "google"` 一类尚不支持的 provider 在 backend 构造处返回 Err。
     /// reviewer 造不出仍是硬 Err（本轮的活真干不了）。
     #[test]
-    fn build_registry_skips_unusable_verifier_instead_of_failing_the_run() {
+    fn build_registry_skips_unusable_refuter_instead_of_failing_the_run() {
         let cfg: redteam::config::Config = serde_json::from_str(
-            r#"{"providers":{
-                "p":{"kind":"openai","baseUrl":"https://x","models":{"s":{"roles":{"scanner":{}}}}},
-                "g":{"kind":"google","baseUrl":"https://y","models":{"v":{"roles":{"verifier":{}}}}}
-            }}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"refuter":{"models":[{"provider":"g","id":"v"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"}]},"g":{"api":"openai-responses","baseUrl":"https://y","models":[{"id":"v"}]}}}"#,
         )
         .unwrap();
-        let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new("."))
-            .expect("verifier 造不出 backend 不该让整条 review 拒跑");
+        let reg = redteam::cli::build_registry(&plain_review_args(), &cfg)
+            .expect("refuter 造不出 backend 不该让整条 review 拒跑");
         assert!(
             reg.has_for(redteam::config::Role::Scanner, "p/s")
-                && !reg.has_for(redteam::config::Role::Verifier, "g/v")
+                && !reg.has_for(redteam::config::Role::Refuter, "g/v")
         );
         assert!(
-            reg.warnings().iter().any(|w| w.contains("verifier g/v 不可用")),
+            reg.warnings().iter().any(|w| w.contains("refuter g/v 不可用")),
             "跳过要可观测: {:?}",
             reg.warnings()
         );
     }
 
-    /// 同一模型兼任多角色：按角色键各注册一份 backend，档位互不覆盖。
-    /// dogfood 暴露的真问题：旧实现只留先注册的 scanner 档，reviewer / verifier 配 high 照样跑 medium。
+    /// v2 硬切：v1 的模型级 `roles`（含 `verifier`）必须报 `legacy_shape` 并指向 settings 池。
+    #[test]
+    fn v1_model_roles_are_rejected_with_a_migration_hint() {
+        let err = redteam::config::Config::from_json(
+            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{"m":{"roles":{"verifier":{}}}}}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("roles 已删除"), "{err}");
+        assert!(err.contains("settings.review.roles") && err.contains("settings.verify.models"), "{err}");
+    }
+
     #[test]
     fn build_registry_keeps_role_scoped_reasoning_efforts() {
         let cfg: redteam::config::Config = serde_json::from_str(
-            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
-                "m":{"roles":{"scanner":{"reasoningEffort":"medium"},"reviewer":{"reasoningEffort":"high"},"verifier":{"reasoningEffort":"high"}}}
-            }}}}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m","reasoningEffort":"medium"}]},"reviewer":{"models":[{"provider":"p","id":"m","reasoningEffort":"high"}]},"refuter":{"models":[{"provider":"p","id":"m","reasoningEffort":"high"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#,
         )
         .unwrap();
-        let reg = build_registry(&plain_review_args(), &cfg, std::path::Path::new(".")).unwrap();
+        let reg = redteam::cli::build_registry(&plain_review_args(), &cfg).unwrap();
         use redteam::config::Role;
         assert!(reg.has_for(Role::Scanner, "p/m"), "scanner 一份");
         assert!(reg.has_for(Role::Reviewer, "p/m"), "reviewer 自己一份（档位 high）");
-        assert!(reg.has_for(Role::Verifier, "p/m"), "verifier 自己一份（档位 high）");
+        assert!(reg.has_for(Role::Refuter, "p/m"), "refuter 自己一份（档位 high）");
         assert!(
             !reg.warnings().iter().any(|w| w.contains("reasoningEffort 不一致")),
             "角色键隔离后不该再有档位冲突告警: {:?}",
@@ -1752,9 +1800,8 @@ mod tests {
 
         // 空配置：无 scanner 角色 → 角色集为空 → Err
         let cfg = Config::default();
-        let cwd = std::path::Path::new(".");
         let args = plain_review_args();
-        let result = build_registry(&args, &cfg, cwd);
+        let result = redteam::cli::build_registry(&args, &cfg);
         assert!(result.is_err(), "无 scanner 时 build_registry 应返回 Err");
         let msg = result.err().unwrap();
         assert!(

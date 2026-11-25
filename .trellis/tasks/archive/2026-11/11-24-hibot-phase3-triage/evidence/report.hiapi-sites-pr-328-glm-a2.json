@@ -1,0 +1,280 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-328",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `drift` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "a9c7d081c466ffa2678d3107eb89f41222dfe7b4",
+    "base_sha": "57d84c743f486ef6fc5aad7ae60307e43711eb87"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:40ffe278b886c7d06aed2eee7211645f39d7fecf638e133e67155082862153fe",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": ".trellis/spec/content-api/backend/ingest-transcriber-guidelines.md",
+      "line_start": 10,
+      "line_end": 10,
+      "quote": "### Explicit editorial revisions (CLI issue 17, 2026-11-20)",
+      "title": "Structural drift: placement",
+      "body": "Standard: peer:.trellis/spec/content-api/backend/ingest-transcriber-guidelines.md (scenario scoping: '## Scenario: 新增一个 contentType 的 ingest 转写器' / '### 1. Scope / Trigger')\nNote: The added section documents editorial revision of already-accepted drafts (POST /admin/drafts/:id/revise, ingest_draft_revision, revision acceptance), but it is nested under the scenario whose declared scope is ingesting new contentTypes ('Trigger: agents 产线新增制品类型要直投 content-api ingest 并经 review 队列落域实体'). The file organizes layer guidance by scenario; rules for a different workflow are placed inside an unrelated scenario instead of a section of their own.",
+      "recommendation": "Align placement / naming / ownership with peer:.trellis/spec/content-api/backend/ingest-transcriber-guidelines.md (scenario scoping: '## Scenario: 新增一个 contentType 的 ingest 转写器' / '### 1. Scope / Trigger').",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.3",
+        "role": "scanner"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 42907,
+    "output_tokens": 53488,
+    "cached_input_tokens": 14336,
+    "wall_clock_ms": 424516
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 1,
+            "dropped_rows": [
+              {
+                "conf": 4,
+                "file": "apps/content-api/src/modules/review/revision-target.ts",
+                "line": 33,
+                "reason": "below_threshold",
+                "surface": 5
+              }
+            ],
+            "dropped_total": 1,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 1,
+          "usage": {
+            "cached_input_tokens": 12544,
+            "input_tokens": 30280,
+            "output_tokens": 20955
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-drift` exceeded its 166.183748185s budget",
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/spec/content-api/backend",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/11-20-draft-revisions",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": ".trellis/tasks/11-20-draft-revisions/research",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/prisma/migrations/20261120090000_draft_revisions",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/prisma/models",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/src/modules/review",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/modules/review",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "apps/content-api/CLAUDE.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "apps/content-api/tests/utils",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/src",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/src/schema",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [
+                "eslint.config.js"
+              ],
+              "module": "packages/content-sdk/tests/schema",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": false,
+          "rows": 4,
+          "usage": {
+            "cached_input_tokens": 256,
+            "input_tokens": 10368,
+            "output_tokens": 22979
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 1,
+          "claims": 17,
+          "delivered": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-intent-slice` exceeded its 166.178711196s budget",
+          "notes": [
+            "Verification statements (observations, not claims): author reports 571 tests passed / 0 failed (55 files, 2080 assertions); content-api/content-sdk/manage typechecks and ESLint on changed files passed; all 73 migrations replayed successfully on a fresh PostgreSQL test database.",
+            "Author reports that issues found by an independent code review were fixed with no remaining blockers.",
+            "Author reports real Rust CLI -> local HTTP API -> PostgreSQL integration passed, including Showcase in-place editing and FAQ derive/replay/accept on the original entity, confirming the original draft, publish time, and other languages are preserved with no Agent jobs.",
+            "Remote CI status per author: initial run 44658696801 never started due to account quota; run 44669467061 executed checks with content-api failing 1 item (new revise write route not registered), quality missing dashboard generation route types, and site cancelled at checkout; the author corrects that later red runs must not be attributed to account quota.",
+            "2026-11-23 review fix (commit a9c7d081): author states a conflict-free merge into latest dev 57d84c74 (including 5e09d9fe dashboard route tree and paraglide pre-generation); targeted 18 tests / 0 failed / 30 assertions, ESLint on modified files, content-api typecheck, and diff checks passed; the earlier 571-test and 13-test runs are historical and the full database suite was not re-run locally in that round; new CI was pushed with remote results to be judged at the current head.",
+            "Review follow-up: author states regression tests were added for same request ID replay with old/new timestamps after source version changes, and Blog derivation/acceptance assertions were strengthened for original drafts, formal entities, translation IDs, other languages, and publish time; targeted 13 tests / 97 assertions and ESLint passed.",
+            "Author caveats: actual staging acceptance of two Showcase items and accepted content is still pending post-deployment; local regression is not equivalent to full-repo or production acceptance.",
+            "Linked references (no issue text supplied in this request): companion CLI PR https://github.com/zimacode-network/hiapi-cli/pull/18 and requirement issue https://github.com/zimacode-network/hiapi-cli/issues/17; rollout constraints and staging checklist are stated to live in `.trellis/tasks/11-20-draft-revisions/rollout.md`.",
+            "Author states cross-repo parent-child task records, implementation commands, review gates, and rollback points were completed; the diff adds `.trellis/tasks/11-20-draft-revisions` documentation (prd, design, implement, validation, rollout, research) plus the Prisma migration and model changes."
+          ],
+          "ok": false,
+          "rows": 1,
+          "scope_creep": 0,
+          "usage": {
+            "cached_input_tokens": 1536,
+            "input_tokens": 2259,
+            "output_tokens": 9554
+          },
+          "verification_complete": false
+        }
+      ],
+      "blockers": [
+        {
+          "category": "placement",
+          "file": ".trellis/spec/content-api/backend/ingest-transcriber-guidelines.md",
+          "kind": "structural",
+          "line_end": 10,
+          "line_start": 10,
+          "quote": "### Explicit editorial revisions (CLI issue 17, 2026-11-20)"
+        }
+      ],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:drift",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

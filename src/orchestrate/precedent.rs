@@ -28,7 +28,7 @@ const QUOTE_OVERLAP_MIN: f32 = 0.5;
 
 /// 一条疑点撞上哪张判例卡（取第一张命中的，卡序由调用方保证确定）。
 ///
-/// 判据只用 **file 相同 ∧ quote 重叠**〔本批自定〕：`consolidate::verify` 那个 finding 版用
+/// 判据只用 **file 相同 ∧ quote 重叠**〔本批自定〕：`consolidate::refute` 那个 finding 版用
 /// `title_jaccard`，而 `Suspicion` 没有 title——`hint` 是 <50 token 的一句话提示，与 finding title
 /// 不同质，拿它算 jaccard 会制造虚假相关。两个版本因此不共用实现，不是重复。
 pub fn matches<'a>(s: &Suspicion, cards: &'a [DismissCard]) -> Option<&'a DismissCard> {

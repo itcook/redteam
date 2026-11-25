@@ -1565,8 +1565,8 @@ mod tests {
         assert_eq!((d.body, d.anchor_window, d.slice_min_bytes), (PackBody::Slice, 30, 8192), "= config 缺省〔D8〕");
         let f = PackOpts::full();
         assert_eq!((f.body, f.anchor_window), (PackBody::Full, 30));
-        let cfg = crate::config::Config::from_json(r#"{"review":{"pack":{"body":"full","anchorWindow":5,"sliceMinBytes":1}}}"#).unwrap();
-        let o = PackOpts::from(&cfg.review.pack);
+        let cfg = crate::config::Config::from_json(r#"{"settings":{"review":{"pack":{"body":"full","anchorWindow":5,"sliceMinBytes":1}}},"providers":{}}"#).unwrap();
+        let o = PackOpts::from(&cfg.settings.review.pack);
         assert_eq!((o.body, o.anchor_window, o.slice_min_bytes), (PackBody::Full, 5, 1));
     }
 

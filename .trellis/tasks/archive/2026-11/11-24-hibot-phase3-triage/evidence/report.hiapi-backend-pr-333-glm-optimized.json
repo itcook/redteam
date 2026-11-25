@@ -1,0 +1,177 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `security` incomplete; triage axis `drift` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:ff38a4d9ea946ec4e615e67f5fcce0bdbcda2ad3ccb9a7c8d61410a1c4aa2e9d",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_ws.go",
+      "line_start": 101,
+      "line_end": 102,
+      "quote": "if domain := feishuFinanceAgentWSDomain(cfg.OpenAPIBase); domain != \"\" {\n\t\topts = append(opts, larkws.WithDomain(domain))",
+      "title": "Security (surface 7): SSRF",
+      "body": "Reachability: env FEISHU_FINANCE_AGENT_OPENAPI_BASE read at setting/feishu_finance_agent_setting.go:32 -> GetFeishuFinanceAgentSetting() -> cfg.OpenAPIBase -> StartFeishuFinanceAgentWS (service/feishu_finance_agent_ws.go:35) -> runFeishuFinanceAgentWS -> runFeishuFinanceAgentWSSession -> feishuFinanceAgentWSDomain(cfg.OpenAPIBase) at service/feishu_finance_agent_ws.go:101 -> larkws.WithDomain(domain) at :102 -> larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...) at :105 -> client.Start(context.Background()) at :106 dials the configured host for the authenticated long connection\nNote: Outbound WebSocket host is fully controlled by the FEISHU_FINANCE_AGENT_OPENAPI_BASE deployment variable; the code comment in setting/feishu_finance_agent_setting.go:15 documents this as a hook to point at a fake service during local smoke testing. Source, sink and full intermediate chain are all present in the supplied diff. Caveat recorded: the source is deployment env (operator-controlled), not end-user request input, and the unset default is the official https://open.feishu.cn; whoever can set the env redirects the bot's AppID/AppSecret-authenticated channel to an arbitrary host.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.3",
+        "role": "scanner"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 60093,
+    "output_tokens": 63797,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 540092
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 2,
+          "dropped": {
+            "below_threshold": 1,
+            "dropped_rows": [
+              {
+                "conf": 6,
+                "file": "setting/feishu_finance_agent_setting.go",
+                "line": 33,
+                "reason": "below_threshold",
+                "surface": 7
+              }
+            ],
+            "dropped_total": 1,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-security` exceeded its 539.951474343s budget during repair",
+          "ok": false,
+          "rows": 2,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 45074,
+            "output_tokens": 60102
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-drift` exceeded its 315.362260843s budget",
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 15019,
+            "output_tokens": 3695
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "error": "timeout: triage cell `triage-intent` exceeded its 539.951451843s budget",
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:security",
+      "template_hashes": {
+        "triage": "2c750615f126b5f3"
+      }
+    }
+  }
+}

@@ -86,8 +86,8 @@ pub struct DossierMeta {
 
 /// coverage 五集合（design §8.4，D11-7）：每集合按 role 分组的 cell 列表（计数 = 长度），五集合不相交、并 = 全集。
 /// selected=计划跑；completed=本轮跑成；reused=resume / 增量复用上轮；failed=重试耗尽（无候补）；waived=预算截断 / 规则豁免。
-/// 分级：scanner cell 失败 → verdict 硬 Incomplete；reviewer 失败 → 带债 approve；verifier 失败 → 保守 upheld。
-/// 本批只定形状（全 default），填值在 F-5（scanner）/ M21b（reviewer / verifier）。
+/// 分级：scanner cell 失败 → verdict 硬 Incomplete；reviewer 失败 → 带债 approve；refuter 失败 → 保守 upheld。
+/// 本批只定形状（全 default），填值在 F-5（scanner）/ M21b（reviewer / refuter）。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Coverage {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -217,7 +217,7 @@ pub struct CellSummary {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cell: String,
     pub model: String,
-    /// 角色串（`scanner` / `reviewer` / `verifier`），批 F-5 填；旧 JSON 空。
+    /// 角色串（`scanner` / `reviewer` / `refuter`），批 F-5 填；旧 JSON 空。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub role: String,
     pub ok: bool,
@@ -411,8 +411,8 @@ pub struct RunMeta {
     /// v4（D13）：每 provider 的 429 收敛记录——只含本轮撞过 429 的 provider；空不序列化（旧消费者零噪音）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_rate_limit: BTreeMap<String, RateLimitMeta>,
-    /// v4：本轮复核的驳回率 = `verify_refuted / (verify_triggered − verify_failed)`（design §8.1「去留由数据决定」）。
-    /// 分母只含**真跑成了的**条数：被跳过的（区域共识 / carried / 判例 / 开关关）从没给过 verifier 机会，
+    /// v4：本轮复核的驳回率 = `refute_refuted / (refute_triggered − refute_failed)`（design §8.1「去留由数据决定」）。
+    /// 分母只含**真跑成了的**条数：被跳过的（区域共识 / carried / 判例 / 开关关）从没给过 refuter 机会，
     /// 没跑成的（provider 挂了 / 判决读不懂）也没给出过证据——两类进分母都只会冲淡率。
     /// None = 本轮没有任何一条真跑成的复核（不拿 0 冒充「验了没驳回」）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -492,26 +492,26 @@ pub struct DeepMeta {
     /// 最后一格落地时刻（队列排空；无格 0、有格至少 1）。
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub drain_done_ms: u64,
-    /// 复核尾部（批 D 前恒 0）。
+    /// 验真尾部（deep 队列排空 → 复核归零的毫秒；无复核恒 0）。
     #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub verify_tail_ms: u64,
-    // ── 批 D-3 复核观测（design §8.1〔D17〕）：判决在深挖循环里产生，故与 verify_tail_ms 同层；为零不序列化 ──
+    pub refute_tail_ms: u64,
+    // ── 批 D-3 复核观测（design §8.1〔D17〕）：判决在深挖循环里产生，故与 refute_tail_ms 同层；为零不序列化 ──
     /// 进了复核的 finding 数（触发且未被跳过）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub verify_triggered: u32,
+    pub refute_triggered: u32,
     /// 跳过分布：`not_triggered` / `disabled` / `carried` / `precedent` / `consensus`
     /// ——「没触发」与「触发了被免验」必须分得开，否则「复核为什么没跑」无从归因。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub verify_skipped: BTreeMap<String, u32>,
-    /// 被驳回条数（`Stats` 与 `verdict` 剔除的正是这批）。注意它数的是**本轮 verifier 给出的驳回判决**，
+    pub refute_skipped: BTreeMap<String, u32>,
+    /// 被驳回条数（`Stats` 与 `verdict` 剔除的正是这批）。注意它数的是**本轮 refuter 给出的驳回判决**，
     /// 不等于「报告里少了几条」：dedup 可能把一条 REFUTED 与一条 UPHELD 并成 upheld（UPHELD 优先），
-    /// resume 沿用往轮判决时也不进这个计数（记 `verify_skipped["resumed"]`）。
+    /// resume 沿用往轮判决时也不进这个计数（记 `refute_skipped["resumed"]`）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub verify_refuted: u32,
+    pub refute_refuted: u32,
     /// 派出去了但**没跑成**的条数（lease 失败 / 调用失败 / 判决读不懂）：判决按保守 upheld 收，
-    /// 但它们不是证据——`refute_rate` 的分母要减掉它们，否则「verifier 全挂」会读成「验了 N 条一条没驳」。
+    /// 但它们不是证据——`refute_rate` 的分母要减掉它们，否则「refuter 全挂」会读成「验了 N 条一条没驳」。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub verify_failed: u32,
+    pub refute_failed: u32,
     /// 收场前派出的格数（扫描期额度 K − F 下，非必挖项受限）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub scan_phase_dispatched: u32,
@@ -602,7 +602,7 @@ mod tests {
         Finding { id: "x".into(), severity: sev, title: "t".into(), body: "b".into(),
             file: "a.rs".into(), line_start: 1, line_end: 1, confidence: 0.9,
             recommendation: "r".into(), models: vec![], agreement: 1, suspicion_agreement: 0,
-            hard_constraint: false, quote: "snippet".into(), cluster_id: None, verify: None,
+            hard_constraint: false, quote: "snippet".into(), cluster_id: None, refute: None,
             previously_dismissed: false, origin: Origin::New, outside_window: false }
     }
     #[test]
@@ -614,11 +614,11 @@ mod tests {
     /// 两处口径不一致时，用户会看到「2 个 high」却拿到 Approve。记录仍在 `findings` 数组里。
     #[test]
     fn stats_exclude_refuted_findings() {
-        let verdict = |v: VerifyVerdict| Some(Verify { verdict: v, model: "p/v".into(), note: String::new() });
+        let verdict = |v: RefuteVerdict| Some(Refute { verdict: v, model: "p/v".into(), note: String::new() });
         let mut refuted = f(Severity::High);
-        refuted.verify = verdict(VerifyVerdict::Refuted);
+        refuted.refute = verdict(RefuteVerdict::Refuted);
         let mut upheld = f(Severity::High);
-        upheld.verify = verdict(VerifyVerdict::Upheld);
+        upheld.refute = verdict(RefuteVerdict::Upheld);
         let s = Stats::from_findings(&[refuted, upheld, f(Severity::Low)]);
         assert_eq!((s.high, s.low, s.total), (1, 1, 2), "驳回的那条既不计 high 也不计 total");
     }
@@ -632,7 +632,7 @@ mod tests {
         let m = DeepMeta { close_ms: 400, scan_phase_dispatched: 6, fill_block_max_ms: 2, ..m };
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!((v["close_ms"].as_u64(), v["scan_phase_dispatched"].as_u64(), v["fill_block_max_ms"].as_u64()), (Some(400), Some(6), Some(2)));
-        assert!(v.get("verify_tail_ms").is_none() && v.get("queue_split_clusters").is_none());
+        assert!(v.get("refute_tail_ms").is_none() && v.get("queue_split_clusters").is_none());
     }
 
     /// C3 选项观测同规矩（design C3 §7〔D16〕）：旧报告缺键照读、全零不产键、非零才出现。

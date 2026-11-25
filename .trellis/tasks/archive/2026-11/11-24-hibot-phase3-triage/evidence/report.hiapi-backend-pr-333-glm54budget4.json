@@ -1,0 +1,196 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `drift` incomplete; triage axis `intent` incomplete",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:9ed556eef603710390a07c8aba118c75db76e9e43fb4e7f9ed65903bd81cc066",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent.go",
+      "line_start": 359,
+      "line_end": 359,
+      "quote": "cmd, err := parseFeishuFinanceAgentCommand(ctx, text)",
+      "title": "Security (surface 5): injection",
+      "body": "Reachability: Feishu im.message.receive_v1 field `event.message.content` -> unmarshaled at service/feishu_finance_agent.go:319-320 -> persisted as `action.RawText` (line 334, re-read at line 350) -> passed to the LLM command parser `parseFeishuFinanceAgentCommand(ctx, text)` at line 359 -> LLM-derived fields (TargetAccount, CommissionRatePercent, GiftCredits, WithdrawEnabled) become `feishuFinanceAgentPlan` at line 392 -> executed as privileged writes `model.AddAffPromotionUsers` at line 686 and `model.GrantAdminCredits` at line 695 once a root operator confirms via `HandleFeishuFinanceAgentCard` (line 449); the stale-parsing sweep also re-feeds stored RawText to the LLM at line 867\nNote: Prompt injection into an LLM engine that parameterizes root-level financial writes: chat text (including third-party content the whitelisted operator pastes or quotes, as the file's own threat-model comment at line 31 acknowledges) decides the target account, commission rate and credit amount, so an injected instruction can make the stored plan diverge from the operator's stated intent. Mitigations exist but do not break the path: sender whitelist + live root-role check (lines 299, 474, 262), 500-rune cap (line 324), deterministic numeric bounds in buildFeishuFinanceAgentPlan (lines 177-238), injection-hint regexes surfaced as a warning on the card (lines 57-93, 400), and a human confirm step on a current->new value card; execution itself is limited to the two idempotent model calls.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "agc/glm-5.4",
+        "role": "scanner"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 112834,
+    "output_tokens": 85336,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 494828
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 1,
+            "dropped_rows": [
+              {
+                "conf": 7,
+                "file": "service/feishu_finance_agent_client_test.go",
+                "line": 41,
+                "reason": "below_threshold",
+                "surface": 5
+              }
+            ],
+            "dropped_total": 1,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 272096,
+          "ok": true,
+          "rows": 2,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 45074,
+            "output_tokens": 35412
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 2,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 418068,
+          "error": "timeout: triage cell `triage-drift` exceeded its 169.777734375s budget (attempts=1 last_call_ms=None in_flight_ms=Some(169779) last_finish=None last_text_len=None last_error=None)",
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 45202,
+            "output_tokens": 12084
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 2,
+          "claims": 20,
+          "delivered": 16,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 467526,
+          "error": "timeout: triage cell `triage-intent-slice` exceeded its 390.934863281s budget (attempts=1 last_call_ms=None in_flight_ms=Some(390936) last_finish=None last_text_len=None last_error=None)",
+          "notes": [
+            "Verification statements (not claims): the author reports 20 new/updated tests covering plan building, full confirmation flow, double-click, non-initiator/demoted Root, cancel/expiry, strangers, SDK event and card callback conversion, click-while-executing, crash recovery, fresh-record protection, json_schema-to-json_object fallback, command JSON field validation, injection warnings, replay re-authorization, fencing version, parsing recovery, and withdrawal current values.",
+            "Verification statements (not claims): go build ./... and go test on service/model/router/controller reportedly pass; a real DeepSeek model (deepseek-v4.1-flash) was used to retest three command types; a local end-to-end smoke with a real Feishu app and real model reportedly verified promotion/commission/withdrawal/credits/logs in the database.",
+            "Deployment configuration is via environment variables FEISHU_FINANCE_AGENT_APP_ID, FEISHU_FINANCE_AGENT_APP_SECRET, FEISHU_FINANCE_AGENT_LLM_BASE_URL, FEISHU_FINANCE_AGENT_LLM_API_KEY, FEISHU_FINANCE_AGENT_LLM_MODEL, and optional FEISHU_FINANCE_AGENT_OPENAPI_BASE (test only); the Feishu app must subscribe to im.message.receive_v1 and card.action.trigger with scopes im:message:send_as_bot, im:message.p2p_msg:readonly, and im:message.group_at_msg:readonly.",
+            "The author explicitly states the threat model (untrusted message text mitigated by human confirmation of the card) requires Root-side acceptance before relying on it.",
+            "The author notes an unrelated local SQLite issue with glebarez v1.10 restart DDL and states production uses PostgreSQL.",
+            "The PR body ends with 'Generated with Claude Code', indicating AI-assisted authorship.",
+            "No reviewer comments were supplied in this phase, so maintainer overlap cannot be assessed beyond the author's own summary tables of prior review rounds.",
+            "This slice is card rendering plus tests only; core processing, WS, model and settings code live in other slices, so several entries rest on test-observable behavior.",
+            "go.sum adds github.com/larksuite/oapi-sdk-go/v3 v3.12.1 plus many 2019-2021-era transitive go.mod hashes (golang.org/x/*, gogo/protobuf, goldmark, errcheck, gotool); dependency provenance should be checked with the go.mod slice.",
+            "Minor wording mismatch for c8: button values carry action_id plus a decision field (confirm/cancel), slightly more than 'only the action id'.",
+            "Not observable in this slice: c10's 500-char command cap, c13's 2.5s/3s constants and invalid-callback toast, c14's 5-minute threshold, c15's 60s replay timeout, c16's loop cadence/batch sizes/plan_json condition."
+          ],
+          "ok": false,
+          "rows": 1,
+          "scope_creep": 1,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 22558,
+            "output_tokens": 37840
+          },
+          "verification_complete": false
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "agc": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:drift",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

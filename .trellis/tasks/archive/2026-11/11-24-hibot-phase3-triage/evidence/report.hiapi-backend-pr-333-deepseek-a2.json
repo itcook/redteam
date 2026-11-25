@@ -1,0 +1,231 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:fbcee557e3e3afa7abe26b323cbe67297cae1dd8be1daebce7e0e6c520119af6",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_client.go",
+      "line_start": 284,
+      "line_end": 286,
+      "quote": "messages := []map[string]string{\n\t\t{\"role\": \"system\", \"content\": feishuFinanceAgentSystemPrompt},\n\t\t{\"role\": \"user\", \"content\": text},",
+      "title": "Security (surface 5): injection",
+      "body": "Reachability: Feishu event payload field `event.message.content` -> service/feishu_finance_agent.go:320 `text := strings.TrimSpace(feishuMentionPlaceholder.ReplaceAllString(content.Text, \"\"))` -> persisted as `action.RawText` at service/feishu_finance_agent.go:334 -> service/feishu_finance_agent.go:359 `parseFeishuFinanceAgentCommand(ctx, text)` -> this `messages` slice places that raw text in the `user` role of the LLM chat completion (sink) -> LLM-returned `feishuFinanceAgentCommand` -> `buildFeishuFinanceAgentPlan` at service/feishu_finance_agent.go:392 -> plan_json stored on the action -> on card confirm, `executeFeishuFinanceAgentPlan` calls `model.AddAffPromotionUsers` at service/feishu_finance_agent.go:686 and `model.GrantAdminCredits` at service/feishu_finance_agent.go:695 -> credits/commission/withdraw changes are written for `plan.TargetUserID`.\nNote: Free-form chat text is fed to an LLM that is then trusted to emit the structured command driving privileged financial writes (grant up to 1,000,000 credits, set commission rate/withdraw flag, enroll a user in promotion). A crafted or pasted instruction (or prompt-injected third-party content the operator copies in) can therefore steer the plan to a different target/number than intended. Mitigations present but they do not break the code path: sender must be whitelisted + Root and re-verified at confirm time, `feishuFinanceAgentTargetMentioned` requires the account string to literally appear in the raw text, numeric values are clamped (0-50% commission, 1-1,000,000 credits, 1-365 day window), the plan is persisted and shown as a before/after confirm card only the initiator can press, and the card adds an injection warning for links/mentions/quotes/code blocks or semantic injection patterns.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:39be96c5dff3fa43848c505cca0e663cee81cde31de6a0ac5cec4ea99204045f",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_ws.go",
+      "line_start": 101,
+      "line_end": 103,
+      "quote": "if domain := feishuFinanceAgentWSDomain(cfg.OpenAPIBase); domain != \"\" {\n\t\topts = append(opts, larkws.WithDomain(domain))\n\t}",
+      "title": "Security (surface 7): SSRF",
+      "body": "Reachability: env var FEISHU_FINANCE_AGENT_OPENAPI_BASE read at setting/feishu_finance_agent_setting.go:32 (field OpenAPIBase) -> setting.GetFeishuFinanceAgentSetting() at service/feishu_finance_agent_ws.go:35 -> runFeishuFinanceAgentWS(cfg) at line 41 -> runFeishuFinanceAgentWSSession(cfg) at line 50 -> cfg.OpenAPIBase at line 101 -> feishuFinanceAgentWSDomain() at lines 111-118 -> larkws.WithDomain(domain) outbound websocket endpoint at line 102\nNote: The websocket endpoint host is taken from a configuration value after only whitespace/`/open-apis` trimming; there is no scheme or host allowlist, so the long-lived connection (and the AppID/AppSecret passed to larkws.NewClient at line 105 for tenant_access_token exchange) goes to whatever host the environment variable names. Reachability depends on who can set the deployment's env vars, and the same OpenAPIBase also drives the HTTP client in service/feishu_finance_agent_client.go (not shown in this diff).",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    }
+  ],
+  "summary": {
+    "blockers_count": 0,
+    "convention_drift": "local",
+    "fit": "in-scope",
+    "intent_undelivered": 0,
+    "local_count": 3,
+    "risk": "high",
+    "routing": {
+      "focus": [
+        "injection@service/feishu_finance_agent_client.go",
+        "ssrf@service/feishu_finance_agent_ws.go"
+      ],
+      "specs": [
+        "AGENTS.md"
+      ],
+      "wall_clock_s": 1200
+    },
+    "scope_creep_count": 5,
+    "security_tier": 1,
+    "structural_count": 0
+  },
+  "usage": {
+    "input_tokens": 154928,
+    "output_tokens": 103972,
+    "cached_input_tokens": 106368,
+    "wall_clock_ms": 177536
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 1,
+            "dropped_rows": [
+              {
+                "conf": 7,
+                "file": "setting/feishu_finance_agent_setting.go",
+                "line": 32,
+                "reason": "below_threshold",
+                "surface": 7
+              }
+            ],
+            "dropped_total": 1,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "ok": true,
+          "rows": 3,
+          "usage": {
+            "cached_input_tokens": 46848,
+            "input_tokens": 47360,
+            "output_tokens": 31214
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 4,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 3,
+          "usage": {
+            "cached_input_tokens": 54528,
+            "input_tokens": 55330,
+            "output_tokens": 23827
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 4,
+          "claims": 20,
+          "delivered": 20,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "notes": [
+            "Author reports verification rather than claimed behavior: 20 added/updated tests, `go build ./...` and `go test ./service ./model ./router ./controller` pass, re-testing of three instruction classes with real DeepSeek (`deepseek-v4.1-flash`), and a local end-to-end smoke with a real Feishu app confirming promotion/commission/withdrawal/credit/audit rows in the database.",
+            "Author states the threat model requires explicit Root-side acceptance — an open decision request rather than a deliverable, so it is not counted as a claim.",
+            "Author notes multiple backend instances can share one Feishu app, with events randomly distributed and DB dedup plus state claiming guaranteeing single execution.",
+            "Author notes local SQLite development is affected by a glebarez v1.10 restart DDL issue unrelated to this PR; production uses PostgreSQL.",
+            "Deployment requires Feishu console setup (long-connection subscriptions for `im.message.receive_v1` and `card.action.trigger`; permissions `im:message:send_as_bot`, `im:message.p2p_msg:readonly`, `im:message.group_at_msg:readonly`) plus the environment variables listed in the PR body.",
+            "No non-bot, non-author reviewer comments were supplied with this request, so maintainer overlap could not be assessed.",
+            "This slice contains only go.mod, go.sum, main.go, model/feishu_finance_agent.go and model/main.go; claims about card rendering, LLM parsing/validation, numeric bounds, callback timing, withdrawal policy, and end-to-end execution (c3, c6, c7, c8, c11, c14, c15, c17, c20) have no anchors here and are intentionally omitted, not judged undelivered.",
+            "go.sum changes are transitive checksum churn pulled in by the new larksuite SDK and gogo/protobuf indirect dependency; no creep identified.",
+            "model/feishu_finance_agent.go also adds generic helpers (UpdateFeishuFinanceAgentAction, TransitionFeishuFinanceAgentAction, GetFeishuFinanceAgentTargetState, ResolveFeishuFinanceAgentTarget) that map to the persisted-plan/audit and pre-execution-state claims rather than to unstated features.",
+            "This slice covers only service/feishu_finance_agent.go, service/feishu_finance_agent_card.go, service/feishu_finance_agent_client.go and service/feishu_finance_agent_client_test.go; claims c1, c2, c4 and c16 rely on files (ws, model, setting, main) not present here and were therefore omitted, not judged undelivered.",
+            "Line numbers are derived by counting the added lines of these new files starting at line 1 and may be off by a small offset.",
+            "This slice covers only setting/feishu_finance_agent_setting.go, service/feishu_finance_agent_ws.go and two test files; implementation for c3, c4, c13, c15 and c16 lives in files outside this slice and is not judged here.",
+            "Most `delivered` entries for behavioral claims rest on tests in this slice rather than on production code in the same slice; the linked implementation files should be checked in the review stage.",
+            "The wire-level claims about the SDK long connection (c1) and the disabled-by-default startup path (c2) are backed by production code in this slice."
+          ],
+          "ok": true,
+          "rows": 1,
+          "scope_creep": 5,
+          "usage": {
+            "cached_input_tokens": 4992,
+            "input_tokens": 52238,
+            "output_tokens": 48931
+          },
+          "verification_complete": true
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

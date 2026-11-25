@@ -1,0 +1,14 @@
+{
+  "sha256:87cf69a3ba26fc30d2d843dcd224b95aeba27c4459d35b4bab36984b9788ffc4": {
+    "status": "unresolved",
+    "note": "人工第 3 轮：Q2 主路径修好，但边界（已切到 llm 的漂移协议）未覆盖——同一 finding 仍未闭合。"
+  },
+  "sha256:19a4af28aca6a88e1c08b9026d929d7246a894ebbef4fba542d8551282292475": {
+    "status": "resolved",
+    "note": "人工第 3 轮：Q7 已关闭（strict 分支改读 DB 实时行）。"
+  },
+  "sha256:7b89ce343543519a644bfcedb721696a3277d01cc8cb52cc16e90ab93489cf01": {
+    "status": "resolved",
+    "note": "人工第 3 轮：Q1 已关闭（WithdrawChannelForRequest 把被拒渠道移出本请求 allowed 集，-count=100 通过）。"
+  }
+}

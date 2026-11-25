@@ -1,4 +1,4 @@
-use crate::config::{ProviderKind, ReasoningEffort};
+use crate::config::{ProviderApi, ReasoningEffort, ThinkingLevelMap};
 use crate::provider::parse::error_body_to_provider_error;
 use crate::provider::tool_loop::{AssistantTurn, ChatBackend, ChatMessage};
 use crate::provider::ProviderError;
@@ -910,10 +910,13 @@ fn backend_from_config_inner(
 ) -> Result<Box<dyn ChatBackend>, ProviderError> {
     // 整请求超时罩住单轮（评审 M2）：慢模型 per_turn 1200s 时 reqwest 不再在 300s 先切断。
     let http_secs = crate::provider::http_timeout_for(em.per_turn_secs());
-    // 批 F-2：角色条目 reasoningEffort 首个消费者——按 (kind, family) 查表；无映射 → 不发（warning 由 `reasoning_effort_warning` 给调用方）。
-    let reasoning_params = em.reasoning_effort.and_then(|e| reasoning_effort_params(em.kind, &em.family, &em.id, e));
-    match em.kind {
-        ProviderKind::Anthropic => {
+    // 批 F-2：角色条目 reasoningEffort 首个消费者——family 表定形状，thinkingLevelMap 翻译强度值。
+    let plan = em.reasoning_effort.map(|e| {
+        reasoning_plan(em.api, &em.family, &em.id, e, em.thinking_level_map.as_ref())
+    });
+    let reasoning_params = plan.as_ref().map(|p| p.params.clone());
+    match em.api {
+        ProviderApi::AnthropicMessages => {
             let b = AnthropicBackend::new(em.id.clone(), em.base_url.clone(), api_key)
                 .with_max_tokens(em.max_output_tokens)
                 .with_http_timeout(http_secs)
@@ -923,7 +926,7 @@ fn backend_from_config_inner(
                 None => b,
             }))
         }
-        ProviderKind::Openai | ProviderKind::OpenaiCompatible => {
+        ProviderApi::OpenaiCompletions => {
             let b = OpenAiBackend::new(em.id.clone(), em.base_url.clone(), api_key)
                 .with_max_tokens(em.max_output_tokens)
                 .with_http_timeout(http_secs)
@@ -933,32 +936,142 @@ fn backend_from_config_inner(
                 None => b,
             }))
         }
-        ProviderKind::Google => Err(ProviderError::Unavailable("google not yet supported".into())),
+        ProviderApi::OpenaiResponses => Err(ProviderError::Unavailable("openai-responses not yet supported".into())),
     }
 }
 
-/// 配置了 reasoningEffort 但 (kind, family) 无参数映射 → 一条 warning（进 RunMeta.warnings，铁律 1 可观测）；否则 None。
-pub fn reasoning_effort_warning(em: &crate::config::EffectiveModel) -> Option<String> {
+/// reasoning 参数计划：`params` 实际发送；`warning` 供 `reasoning_effort_warning` 披露（铁律 1 可观测）。
+#[derive(Clone, Debug)]
+pub(crate) struct ReasoningPlan {
+    pub params: Vec<(&'static str, Value)>,
+    pub warning: Option<ReasoningWarning>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReasoningWarning {
+    /// 家族无形状（或 gpt-4 旧系）→ 不发参数。
+    Unmapped,
+    /// `thinkingLevelMap` 该档为 null/缺键 → 整组推理参数都不发（含结构开关）。
+    Suppressed,
+    /// 家族只有开关、没有强度槽（kimi/qwen）→ 按形状发送开关，强度值无法应用。
+    NoEffortSlot,
+}
+
+#[derive(Clone, Copy)]
+enum EffortSlot {
+    Top(&'static str),
+    Nested(&'static str, &'static str),
+}
+
+struct Shape {
+    pairs: Vec<(&'static str, Value)>,
+    effort_slot: Option<EffortSlot>,
+}
+
+/// 推理强度 → 请求体参数计划（角色属性 `reasoningEffort` 的唯一消费者）。
+///
+/// 规则（设计 §3.5）：
+/// - `thinkingLevelMap` 缺省 → 完全沿用内置 family 表（值原样透传）。
+/// - map 命中字符串且有强度槽 → 用翻译值替换强度槽；结构参数仍由 family 表决定。
+/// - map 命中字符串但无强度槽（kimi/qwen）→ 发送形状里的开关 + warning，不发明 `reasoning_effort`。
+/// - map 为 null / 缺键 → 整组推理参数都不发 + warning（显式关推理）。
+/// - family 表无形状 → 不发 + warning（map 只能翻译值，不能创造形状）。
+pub(crate) fn reasoning_plan(
+    api: ProviderApi,
+    family: &str,
+    id: &str,
+    effort: ReasoningEffort,
+    map: Option<&ThinkingLevelMap>,
+) -> ReasoningPlan {
+    let Some(shape) = shape_for(api, family, id, effort.as_str()) else {
+        return ReasoningPlan { params: Vec::new(), warning: Some(ReasoningWarning::Unmapped) };
+    };
+    match map {
+        None => ReasoningPlan { params: shape.pairs, warning: None },
+        Some(m) => match m.value(effort) {
+            None => ReasoningPlan { params: Vec::new(), warning: Some(ReasoningWarning::Suppressed) },
+            Some(v) => match shape.effort_slot {
+                Some(slot) => ReasoningPlan { params: substitute(shape.pairs, slot, v), warning: None },
+                None => ReasoningPlan { params: shape.pairs, warning: Some(ReasoningWarning::NoEffortSlot) },
+            },
+        },
+    }
+}
+
+fn substitute(pairs: Vec<(&'static str, Value)>, slot: EffortSlot, value: &str) -> Vec<(&'static str, Value)> {
+    pairs
+        .into_iter()
+        .map(|(k, mut v)| {
+            match slot {
+                EffortSlot::Top(key) if k == key => v = json!(value),
+                EffortSlot::Nested(obj, field) if k == obj => {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert(field.to_string(), json!(value));
+                    }
+                }
+                _ => {}
+            }
+            (k, v)
+        })
+        .collect()
+}
+
+/// 配置了 reasoningEffort 但无法按预期发送 → `(config check 码, 人读文案)`；否则 None。
+pub fn reasoning_effort_warning_code(em: &crate::config::EffectiveModel) -> Option<(&'static str, String)> {
     let level = em.reasoning_effort?;
-    if reasoning_effort_params(em.kind, &em.family, &em.id, level).is_some() {
-        return None;
+    let plan = reasoning_plan(em.api, &em.family, &em.id, level, em.thinking_level_map.as_ref());
+    let body = format!("{}（api {}，family {}）", em.name, em.api.as_str(), em.family);
+    match plan.warning? {
+        ReasoningWarning::Unmapped => Some((
+            "reasoning_effort_unmapped",
+            format!(
+                "reasoningEffort {} 对 {} {} 无参数映射，未发送；已知映射：anthropic-messages+claude·glm / openai-completions+deepseek·glm·kimi·gpt-5·o 系·gemini·qwen",
+                level.as_str(),
+                em.role.as_str(),
+                body
+            ),
+        )),
+        ReasoningWarning::Suppressed => Some((
+            "reasoning_effort_suppressed",
+            format!(
+                "reasoningEffort {} 对 {} {}：thinkingLevelMap 的该档位为 null / 缺失，省略请求里的推理参数（不保证上游默认推理关闭）",
+                level.as_str(),
+                em.role.as_str(),
+                body
+            ),
+        )),
+        ReasoningWarning::NoEffortSlot => Some((
+            "reasoning_effort_unmapped",
+            format!(
+                "reasoningEffort {} 对 {} {}：该家族只有开关、没有强度槽；已按形状发送开关，强度值 {} 未应用",
+                level.as_str(),
+                em.role.as_str(),
+                body,
+                level.as_str()
+            ),
+        )),
     }
-    Some(format!(
-        "reasoningEffort {} 对 {} {}（kind {:?}，family {}）无参数映射，未发送；已知映射：anthropic+claude·glm / openai+deepseek·glm·kimi·gpt-5·o 系·gemini·qwen",
-        level.as_str(), em.role.as_str(), em.name, em.kind, em.family
-    ))
 }
 
-/// 建注册表时的 reasoningEffort 无映射 warnings（scanner → reviewer → verifier 序，同文案去重）。
-/// 同一模型跨角色各占一份角色键 backend，每个角色的档位都要单独披露（批 C1-3；批 D-5 并入 verifier，收口评审 runner-up）。
-pub fn role_reasoning_effort_warnings(roles: &crate::config::RoleSets) -> Vec<String> {
+/// 配置了 reasoningEffort 但无法按预期发送 → 一条 warning；否则 None。
+pub fn reasoning_effort_warning(em: &crate::config::EffectiveModel) -> Option<String> {
+    reasoning_effort_warning_code(em).map(|(_, m)| m)
+}
+
+/// 任意角色条目的 reasoningEffort warnings（同文案去重）。
+pub fn reasoning_warnings_for<'a>(models: impl Iterator<Item = &'a crate::config::EffectiveModel>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for w in roles.scanners.iter().chain(&roles.reviewers).chain(&roles.verifiers).filter_map(reasoning_effort_warning) {
+    for w in models.filter_map(reasoning_effort_warning) {
         if !out.contains(&w) {
             out.push(w);
         }
     }
     out
+}
+
+/// 建注册表时的 reasoningEffort warnings（scanner → reviewer → refuter 序，同文案去重）。
+pub fn role_reasoning_effort_warnings(roles: &crate::config::RoleSets) -> Vec<String> {
+    reasoning_warnings_for(roles.scanners.iter().chain(&roles.reviewers).chain(&roles.refuters))
 }
 
 /// 家族串（`EffectiveModel.family`：配置 `family` 或 model id 首段小写，如 `qwen3` / `glm` / `deepseek` / `gpt`）+ model id → 映射表键。
@@ -978,41 +1091,44 @@ fn family_class(family: &str, id: &str) -> &'static str {
     else if f.starts_with("claude") || f == "anthropic" { "claude" }
     else { "unknown" }
 }
-/// 推理强度 → 请求体参数对（角色属性 `reasoningEffort` 的唯一消费者）。
-/// 按 (kind, family, id) 查**参数形状**——各家参数名互斥（Kimi 同发 `thinking` 与 `reasoning_effort` 即 400；
-/// gpt-4 系不认 `reasoning_effort`）。值一律原样透传（`minimal|low|medium|high|xhigh|max|ultra`），
-/// 不做厂商级强度翻译，交由上游自行归一。`None` = 无映射（调用方不发 + warning）。
+/// 参数形状（family 表）：参数名互斥（Kimi 同发 `thinking` 与 `reasoning_effort` 即 400；
+/// gpt-4 系不认 `reasoning_effort`）。`effort` 先填入强度槽，map 命中时再替换。
 /// Anthropic 走新版 `thinking{type:"adaptive"}` + `output_config.effort`（2026-11 beta Messages 文档）。
-pub(crate) fn reasoning_effort_params(
-    kind: ProviderKind,
-    family: &str,
-    id: &str,
-    effort: ReasoningEffort,
-) -> Option<Vec<(&'static str, Value)>> {
+fn shape_for(api: ProviderApi, family: &str, id: &str, effort: &str) -> Option<Shape> {
     let class = family_class(family, id);
-    match kind {
-        ProviderKind::Anthropic => match class {
+    let shape = |pairs: Vec<(&'static str, Value)>, slot: Option<EffortSlot>| Some(Shape { pairs, effort_slot: slot });
+    match api {
+        ProviderApi::AnthropicMessages => match class {
             // adaptive：由模型自己决定何时/思考多少；强度交给 output_config.effort。
-            "claude" | "glm" => Some(vec![
-                ("thinking", json!({ "type": "adaptive" })),
-                ("output_config", json!({ "effort": effort.as_str() })),
-            ]),
+            "claude" | "glm" => shape(
+                vec![
+                    ("thinking", json!({ "type": "adaptive" })),
+                    ("output_config", json!({ "effort": effort })),
+                ],
+                Some(EffortSlot::Nested("output_config", "effort")),
+            ),
             _ => None,
         },
-        ProviderKind::Openai | ProviderKind::OpenaiCompatible => match class {
-            "deepseek" | "glm" => Some(vec![
-                ("thinking", json!({ "type": "enabled" })),
-                ("reasoning_effort", json!(effort.as_str())),
-            ]),
+        ProviderApi::OpenaiCompletions => match class {
+            "deepseek" | "glm" => shape(
+                vec![
+                    ("thinking", json!({ "type": "enabled" })),
+                    ("reasoning_effort", json!(effort)),
+                ],
+                Some(EffortSlot::Top("reasoning_effort")),
+            ),
             // Kimi 同发 thinking 与 reasoning_effort 会 400：只发开关，强度由模型默认。
-            "kimi" => Some(vec![("thinking", json!({ "type": "enabled" }))]),
-            "openai" | "gemini" => Some(vec![("reasoning_effort", json!(effort.as_str()))]),
+            "kimi" => shape(vec![("thinking", json!({ "type": "enabled" }))], None),
+            "openai" | "gemini" => shape(
+                vec![("reasoning_effort", json!(effort))],
+                Some(EffortSlot::Top("reasoning_effort")),
+            ),
             // DashScope Qwen 只认 enable_thinking，没有强度字段。
-            "qwen" => Some(vec![("enable_thinking", json!(true))]),
+            "qwen" => shape(vec![("enable_thinking", json!(true))], None),
             // gpt-4 系不认 reasoning_effort；未知家族不乱发。
             _ => None,
         },
-        ProviderKind::Google => None,
+        ProviderApi::OpenaiResponses => None,
     }
 }
 
@@ -1083,12 +1199,12 @@ mod tests {
     }
 
     /// 09-04 分离后 backend_from_config 吃 EffectiveModel——测试构造辅助。
-    fn eff(kind: crate::config::ProviderKind) -> crate::config::EffectiveModel {
+    fn eff(api: crate::config::ProviderApi) -> crate::config::EffectiveModel {
         crate::config::EffectiveModel {
-            name: "t".into(), display_name: None, id: "m".into(), provider: "p".into(), role: crate::config::Role::Scanner, kind,
+            name: "t".into(), display_name: None, id: "m".into(), provider: "p".into(), role: crate::config::Role::Scanner, api,
             base_url: None, context_window: 128_000, max_output_tokens: None,
             per_turn_timeout_secs: None, reasoning: false, reasoning_effort: None,
-            family: "m".into(), max_concurrency: None,
+            thinking_level_map: None, family: "m".into(), max_concurrency: None,
         }
     }
 
@@ -1618,57 +1734,108 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
 
     #[test]
     fn from_config_maps_kind_to_backend() {
-        let anth = eff(ProviderKind::Anthropic);
+        let anth = eff(ProviderApi::AnthropicMessages);
         assert!(backend_from_config(&anth, "k".into()).is_ok());
-        let goog = eff(ProviderKind::Google);
+        let resp = eff(ProviderApi::OpenaiResponses);
         assert!(matches!(
-            backend_from_config(&goog, "k".into()),
+            backend_from_config(&resp, "k".into()),
             Err(ProviderError::Unavailable(_))
         ));
     }
 
-    /// 推理强度映射表——每个 (kind, family) 一断言：值原样透传，无映射 None。
+    fn plan_params(
+        api: crate::config::ProviderApi,
+        family: &str,
+        id: &str,
+        effort: ReasoningEffort,
+        map: Option<&ThinkingLevelMap>,
+    ) -> Option<serde_json::Map<String, Value>> {
+        let plan = reasoning_plan(api, family, id, effort, map);
+        if plan.params.is_empty() {
+            None
+        } else {
+            Some(serde_json::Map::from_iter(plan.params.into_iter().map(|(k, v)| (k.to_string(), v))))
+        }
+    }
+
+    fn json_of(m: Option<serde_json::Map<String, Value>>) -> Option<String> {
+        m.map(|m| serde_json::to_string(&m).unwrap())
+    }
+
+    /// 推理强度映射表——每个 (api, family) 一断言：值原样透传；map 缺省 → family 表。
     #[test]
-    fn reasoning_effort_params_table_by_kind_and_family() {
-        use crate::config::ProviderKind::*;
+    fn reasoning_effort_params_table_by_api_and_family() {
+        use crate::config::ProviderApi::*;
         use ReasoningEffort::*;
-        let get = |kind, fam: &str, effort| reasoning_effort_params(kind, fam, fam, effort);
-        let get_id = |kind, fam: &str, id: &str, effort| reasoning_effort_params(kind, fam, id, effort);
-        let pairs = |v: Option<Vec<(&'static str, Value)>>| v.map(|v| serde_json::to_string(&serde_json::Map::from_iter(v.into_iter().map(|(k, x)| (k.to_string(), x)))).unwrap());
-        // OpenAI 兼容：值原样透传（七档全收，不做厂商级翻译）
-        assert_eq!(pairs(get(Openai, "deepseek", Low)).unwrap(), r#"{"reasoning_effort":"low","thinking":{"type":"enabled"}}"#);
-        assert_eq!(pairs(get(Openai, "deepseek", Medium)).unwrap(), r#"{"reasoning_effort":"medium","thinking":{"type":"enabled"}}"#);
-        assert_eq!(pairs(get(Openai, "deepseek", Ultra)).unwrap(), r#"{"reasoning_effort":"ultra","thinking":{"type":"enabled"}}"#);
-        assert_eq!(pairs(get_id(OpenaiCompatible, "glm", "glm-5.3", Xhigh)).unwrap(), r#"{"reasoning_effort":"xhigh","thinking":{"type":"enabled"}}"#);
-        assert!(get_id(Openai, "gpt", "gpt-4.1", Minimal).is_none(), "gpt-4 系不认 reasoning_effort → 无映射");
-        assert_eq!(pairs(get_id(Openai, "gpt", "gpt-5.6", Minimal)).unwrap(), r#"{"reasoning_effort":"minimal"}"#);
-        assert_eq!(pairs(get_id(Openai, "o3", "o3-mini", Max)).unwrap(), r#"{"reasoning_effort":"max"}"#);
-        assert_eq!(pairs(get(Openai, "glm", Medium)).unwrap(), r#"{"reasoning_effort":"medium","thinking":{"type":"enabled"}}"#);
-        assert_eq!(pairs(get(Openai, "kimi", High)).unwrap(), r#"{"thinking":{"type":"enabled"}}"#, "Kimi 不发 reasoning_effort");
-        assert_eq!(pairs(get(Openai, "openai", Ultra)).unwrap(), r#"{"reasoning_effort":"ultra"}"#, "显式 family=openai 视为推理型");
-        assert_eq!(pairs(get(Openai, "gemini", Xhigh)).unwrap(), r#"{"reasoning_effort":"xhigh"}"#);
-        assert_eq!(pairs(get(Openai, "qwen3", Low)).unwrap(), r#"{"enable_thinking":true}"#, "family 取 id 首段 qwen3 也命中");
-        // Anthropic：adaptive + output_config.effort（2026-11 beta Messages 文档）
-        assert_eq!(pairs(get(Anthropic, "claude", Medium)).unwrap(), r#"{"output_config":{"effort":"medium"},"thinking":{"type":"adaptive"}}"#);
-        assert_eq!(pairs(get(Anthropic, "claude", Max)).unwrap(), r#"{"output_config":{"effort":"max"},"thinking":{"type":"adaptive"}}"#);
-        assert_eq!(pairs(get_id(Anthropic, "glm", "glm-5.3", Ultra)).unwrap(), r#"{"output_config":{"effort":"ultra"},"thinking":{"type":"adaptive"}}"#);
-        assert!(get(Openai, "grok", Low).is_none() && get(Google, "gemini", Low).is_none());
+        let get = |api, fam: &str, effort| json_of(plan_params(api, fam, fam, effort, None));
+        let get_id = |api, fam: &str, id: &str, effort| json_of(plan_params(api, fam, id, effort, None));
+        // openai-completions：值原样透传（七档全收，不做厂商级翻译）
+        assert_eq!(get(OpenaiCompletions, "deepseek", Low).unwrap(), r#"{"reasoning_effort":"low","thinking":{"type":"enabled"}}"#);
+        assert_eq!(get(OpenaiCompletions, "deepseek", Medium).unwrap(), r#"{"reasoning_effort":"medium","thinking":{"type":"enabled"}}"#);
+        assert_eq!(get(OpenaiCompletions, "deepseek", Ultra).unwrap(), r#"{"reasoning_effort":"ultra","thinking":{"type":"enabled"}}"#);
+        assert_eq!(get_id(OpenaiCompletions, "glm", "glm-5.3", Xhigh).unwrap(), r#"{"reasoning_effort":"xhigh","thinking":{"type":"enabled"}}"#);
+        assert!(get_id(OpenaiCompletions, "gpt", "gpt-4.1", Minimal).is_none(), "gpt-4 系不认 reasoning_effort → 无映射");
+        assert_eq!(get_id(OpenaiCompletions, "gpt", "gpt-5.6", Minimal).unwrap(), r#"{"reasoning_effort":"minimal"}"#);
+        assert_eq!(get_id(OpenaiCompletions, "o3", "o3-mini", Max).unwrap(), r#"{"reasoning_effort":"max"}"#);
+        assert_eq!(get(OpenaiCompletions, "glm", Medium).unwrap(), r#"{"reasoning_effort":"medium","thinking":{"type":"enabled"}}"#);
+        assert_eq!(get(OpenaiCompletions, "kimi", High).unwrap(), r#"{"thinking":{"type":"enabled"}}"#, "Kimi 不发 reasoning_effort");
+        assert_eq!(get(OpenaiCompletions, "openai", Ultra).unwrap(), r#"{"reasoning_effort":"ultra"}"#, "显式 family=openai 视为推理型");
+        assert_eq!(get(OpenaiCompletions, "gemini", Xhigh).unwrap(), r#"{"reasoning_effort":"xhigh"}"#);
+        assert_eq!(get(OpenaiCompletions, "qwen3", Low).unwrap(), r#"{"enable_thinking":true}"#, "family 取 id 首段 qwen3 也命中");
+        // anthropic-messages：adaptive + output_config.effort（2026-11 beta Messages 文档）
+        assert_eq!(get(AnthropicMessages, "claude", Medium).unwrap(), r#"{"output_config":{"effort":"medium"},"thinking":{"type":"adaptive"}}"#);
+        assert_eq!(get(AnthropicMessages, "claude", Max).unwrap(), r#"{"output_config":{"effort":"max"},"thinking":{"type":"adaptive"}}"#);
+        assert_eq!(get_id(AnthropicMessages, "glm", "glm-5.3", Ultra).unwrap(), r#"{"output_config":{"effort":"ultra"},"thinking":{"type":"adaptive"}}"#);
+        assert!(get(OpenaiCompletions, "grok", Low).is_none() && get(OpenaiResponses, "gemini", Low).is_none());
+    }
+
+    /// thinkingLevelMap：字符串替换强度槽；null/缺键抑制整组；无形状 → 仍不发；无强度槽 → 发开关 + warning。
+    #[test]
+    fn thinking_level_map_translates_and_suppresses() {
+        use crate::config::ProviderApi::*;
+        use ReasoningEffort::*;
+        let m = ThinkingLevelMap { high: Some("xhigh".into()), ..Default::default() };
+        let plan = reasoning_plan(OpenaiCompletions, "deepseek", "deepseek-chat", High, Some(&m));
+        assert_eq!(plan.warning, None);
+        assert_eq!(json_of(Some(serde_json::Map::from_iter(plan.params.into_iter().map(|(k, v)| (k.to_string(), v))))).unwrap(),
+                   r#"{"reasoning_effort":"xhigh","thinking":{"type":"enabled"}}"#);
+        // anthropic 嵌套槽
+        let m = ThinkingLevelMap { medium: Some("minimal".into()), ..Default::default() };
+        let plan = reasoning_plan(AnthropicMessages, "claude", "claude-x", Medium, Some(&m));
+        assert_eq!(plan.warning, None);
+        assert_eq!(json_of(Some(serde_json::Map::from_iter(plan.params.into_iter().map(|(k, v)| (k.to_string(), v))))).unwrap(),
+                   r#"{"output_config":{"effort":"minimal"},"thinking":{"type":"adaptive"}}"#);
+        // null / 缺键 → 整组抑制 + warning
+        let plan = reasoning_plan(OpenaiCompletions, "deepseek", "deepseek-chat", High, Some(&ThinkingLevelMap::default()));
+        assert!(plan.params.is_empty());
+        assert_eq!(plan.warning, Some(ReasoningWarning::Suppressed));
+        let m = ThinkingLevelMap { high: None, ..Default::default() };
+        assert_eq!(reasoning_plan(OpenaiCompletions, "deepseek", "d", High, Some(&m)).warning, Some(ReasoningWarning::Suppressed));
+        // 无强度槽（kimi）：按形状发开关 + warning
+        let m = ThinkingLevelMap { high: Some("high".into()), ..Default::default() };
+        let plan = reasoning_plan(OpenaiCompletions, "kimi", "kimi-k2", High, Some(&m));
+        assert_eq!(plan.warning, Some(ReasoningWarning::NoEffortSlot));
+        assert_eq!(json_of(Some(serde_json::Map::from_iter(plan.params.into_iter().map(|(k, v)| (k.to_string(), v))))).unwrap(),
+                   r#"{"thinking":{"type":"enabled"}}"#);
+        // family 无形状：map 也不能创造形状
+        let plan = reasoning_plan(OpenaiCompletions, "grok", "grok-4", High, Some(&m));
+        assert!(plan.params.is_empty());
+        assert_eq!(plan.warning, Some(ReasoningWarning::Unmapped));
     }
 
     /// thinking × tools 共存（2026-09-12 按官方文档更正：「Thinking works alongside tool use」）。
-    /// 新版 adaptive 写法同样与 tools 共存：只发 thinking + output_config，不设 tool_choice。
     #[test]
     fn anthropic_thinking_survives_tools_in_body() {
         let msgs = vec![ChatMessage::System("sys".into()), ChatMessage::User("go".into())];
         let tool = crate::tools::ToolSpec { name: "read", description: "d", parameters: serde_json::json!({}) };
-        let th = reasoning_effort_params(ProviderKind::Anthropic, "claude", "claude-x", ReasoningEffort::Low).unwrap();
-        let with_tools = build_anthropic_tools_body_ext("claude-x", &msgs, &[tool], MAX_TOKENS, Some(&th));
+        let plan = reasoning_plan(ProviderApi::AnthropicMessages, "claude", "claude-x", ReasoningEffort::Low, None);
+        let with_tools = build_anthropic_tools_body_ext("claude-x", &msgs, &[tool], MAX_TOKENS, Some(&plan.params));
         assert_eq!(with_tools["thinking"]["type"], "adaptive", "工具在场不该丢用户配的推理档");
         assert_eq!(with_tools["output_config"]["effort"], "low");
         assert_eq!(with_tools["tools"].as_array().unwrap().len(), 1);
         assert!(with_tools.get("tool_choice").is_none(), "不设 tool_choice → 默认 auto，与 thinking 相容");
         assert!(with_tools.get("temperature").is_none() && with_tools.get("top_p").is_none());
-        let no_tools = build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, Some(&th));
+        let no_tools = build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, Some(&plan.params));
         assert_eq!(no_tools["thinking"]["type"], "adaptive");
         assert_eq!(no_tools["output_config"]["effort"], "low");
     }
@@ -1680,14 +1847,14 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         let base_a = build_anthropic_tools_body("claude-x", &msgs, &[], MAX_TOKENS);
         assert_eq!(base_a, build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, None));
         assert_eq!(base_a, build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, Some(&[])));
-        let th = reasoning_effort_params(ProviderKind::Anthropic, "claude", "claude-x", ReasoningEffort::Low).unwrap();
-        let a = build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, Some(&th));
+        let plan = reasoning_plan(ProviderApi::AnthropicMessages, "claude", "claude-x", ReasoningEffort::Low, None);
+        let a = build_anthropic_tools_body_ext("claude-x", &msgs, &[], MAX_TOKENS, Some(&plan.params));
         assert_eq!(a["thinking"]["type"], "adaptive");
         assert_eq!(a["output_config"]["effort"], "low");
         let base_o = build_openai_tools_body("m", &msgs, &[], false, None);
         assert_eq!(base_o, build_openai_tools_body_ext("m", &msgs, &[], false, None, None));
-        let th = reasoning_effort_params(ProviderKind::Openai, "deepseek", "deepseek-v4-flash", ReasoningEffort::Low).unwrap();
-        let o = build_openai_tools_body_ext("m", &msgs, &[], false, None, Some(&th));
+        let plan = reasoning_plan(ProviderApi::OpenaiCompletions, "deepseek", "deepseek-v4-flash", ReasoningEffort::Low, None);
+        let o = build_openai_tools_body_ext("m", &msgs, &[], false, None, Some(&plan.params));
         assert_eq!(o["thinking"]["type"], "enabled");
         assert_eq!(o["reasoning_effort"], "low");
         assert!(o.get("stream").is_some() && o.get("max_tokens").is_some(), "既有键不受影响: {o}");
@@ -1696,7 +1863,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
     /// backend_from_config 注入推理强度参数；无映射 family 给 warning、有映射不给；未配不给。
     #[test]
     fn backend_from_config_injects_reasoning_effort_and_warns_when_unmapped() {
-        let mut em = eff(ProviderKind::Openai);
+        let mut em = eff(ProviderApi::OpenaiCompletions);
         em.family = "deepseek".into();
         em.reasoning_effort = Some(ReasoningEffort::Low);
         assert!(backend_from_config(&em, "k".into()).is_ok());
@@ -1706,30 +1873,19 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         assert!(w.contains("reasoningEffort low") && w.contains("grok"), "{w}");
         em.reasoning_effort = None;
         assert!(reasoning_effort_warning(&em).is_none(), "未配档位不告警");
+        // 预留 api 不可用
+        let resp = eff(ProviderApi::OpenaiResponses);
+        assert!(matches!(backend_from_config(&resp, "k".into()), Err(ProviderError::Unavailable(_))));
     }
 
-    /// 兼任多角色的模型：每个角色各占一份角色键 backend，无映射档位逐角色披露、带角色名；同文案去重。
-    /// M21b 出口验收 D1 的模型（glm-5.3 走 anthropic）：现在走 adaptive + output_config.effort，
-    /// 不再按 budget_tokens 换算，档位值原样透传。
-    #[test]
-    fn anthropic_kind_glm_now_has_a_reasoning_effort_mapping() {
-        let cfg = crate::config::Config::from_json(r#"{"providers":{"agc":{"kind":"openai","models":{
-            "glm-5.3":{"kind":"anthropic","maxOutputTokens":32768,
-                "roles":{"reviewer":{"reasoningEffort":"high"},"verifier":{"reasoningEffort":"high"}}}}}}}"#).unwrap();
-        let roles = cfg.active_roles();
-        assert_eq!(roles.reviewers[0].kind, crate::config::ProviderKind::Anthropic, "前提：模型级 kind 覆盖生效");
-        assert!(role_reasoning_effort_warnings(&roles).is_empty(), "{:?}", role_reasoning_effort_warnings(&roles));
-        let em = &roles.reviewers[0];
-        let p = reasoning_effort_params(em.kind, &em.family, &em.id, em.reasoning_effort.unwrap()).unwrap();
-        assert_eq!(p[0].1, json!({ "type": "adaptive" }));
-        assert_eq!(p[1].1, json!({ "effort": "high" }), "high 原样透传到 output_config.effort");
-    }
-
+    /// 模型级 thinkingLevelMap 从配置读到 EffectiveModel；兼任多角色的档位逐角色披露。
     #[test]
     fn role_reasoning_effort_warnings_cover_dual_role_reviewer() {
-        let cfg = crate::config::Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{
-            "grok-4":{"roles":{"scanner":{"reasoningEffort":"high"},"reviewer":{"reasoningEffort":"low"}}},
-            "deepseek-v4":{"roles":{"scanner":{"reasoningEffort":"low"}}}}}}}"#).unwrap();
+        let cfg = crate::config::Config::from_json(r#"{
+          "settings":{"review":{"roles":{
+            "scanner":{"models":[{"provider":"p","id":"grok-4","reasoningEffort":"high"}]},
+            "reviewer":{"models":[{"provider":"p","id":"grok-4","reasoningEffort":"low"}]}}}},
+          "providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"grok-4"}]}}}"#).unwrap();
         let ws = role_reasoning_effort_warnings(&cfg.active_roles());
         assert_eq!(ws.len(), 2, "{ws:?}");
         assert!(ws[0].contains("reasoningEffort high 对 scanner p/grok-4"), "{ws:?}");
@@ -1737,6 +1893,12 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         let mut roles = cfg.active_roles();
         roles.reviewers = roles.scanners.clone();
         assert_eq!(role_reasoning_effort_warnings(&roles).len(), 1, "同文案去重");
+        // thinkingLevelMap 从配置读入
+        let cfg2 = crate::config::Config::from_json(r#"{
+          "settings":{"review":{"roles":{"reviewer":{"models":[{"provider":"p","id":"m","reasoningEffort":"high"}]}}}},
+          "providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m","family":"deepseek","thinkingLevelMap":{"high":"max"}}]}}}"#).unwrap();
+        let em = &cfg2.active_roles().reviewers[0];
+        assert_eq!(em.thinking_level_map.as_ref().and_then(|m| m.high.as_deref()), Some("max"));
     }
 
     /// 批 F-2：openai 响应的 reasoning_tokens 进 AssistantTurn（非流式 + 流式）；anthropic 恒 None。

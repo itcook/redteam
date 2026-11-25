@@ -1,0 +1,204 @@
+{
+  "schema": "hibot.audit.pr-context/1",
+  "title": "feat(content): 支持 Showcase 文案补丁与 accepted 内容待审修订",
+  "body": "待审 Showcase 现在可以只修改 title/introduce；已接受的 blog、FAQ/model-faq、changelog、model-info 可以通过显式 revise 派生 pending 修订稿。派生和编辑不触碰正式内容，后续 accept 在事务中更新原实体的指定语言，保留原 accepted 记录、其他语言和发布时间。\r\r\n\r\r\n- PATCH 增加版本条件，Showcase 严格拒绝输入、prompt、产物、媒体、hash、身份等越界字段；不触发 Agent。\r\r\n- 新增服务端可信的接受关联与修订凭据：稳定幂等回放、目标版本指纹、原实体锁、来源追踪及 info/list 回读。旧稿只做可验证的目标定位，歧义要求显式核实。\r\r\n- 修订接受跳过生成/翻译自动化；普通接受保持原语义。专用 overview-refill 来源继续使用已有来源证明流程。\r\r\n- 修订稿只开放文案字段；AI modify 和 rejected 派生不能丢失修订保护，需从 accepted 原稿重新 revise。\r\r\n\r\r\n配套 CLI：https://github.com/zimacode-network/hiapi-cli/pull/18\r\r\n需求：https://github.com/zimacode-network/hiapi-cli/issues/17\r\r\n\r\r\n验证：571 tests passed / 0 failed（55 文件、2080 断言）；content-api/content-sdk/manage typecheck 和变更文件 ESLint 通过；全新 PostgreSQL 测试库成功重放全部 73 个迁移。独立代码审查发现的问题已修复，无剩余阻断项。真实 Rust CLI → 本地 HTTP API → PostgreSQL 联调通过，包括 Showcase 原地编辑及 FAQ 派生/重放/接受原实体，确认原稿、发布时间、其他语言保留且无 Agent 作业。\r\r\n\r\r\n部署顺序：先迁移 `20261120090000_draft_revisions`，再部署 API，最后分发 CLI。已有 pending 修订后不能直接回退到不识别修订的旧 accept 代码；回滚约束与 staging 清单见 `.trellis/tasks/11-20-draft-revisions/rollout.md`。\r\r\n\r\r\n本 PR 不部署、不修改真实内容。实际 staging 两份 Showcase 和 accepted 内容的验收尚待部署后执行；本地回归不等于全仓或线上验收。\r\r\n\r\r\n远端 CI（已更正）：最初 run 44658696801 因账户限额未启动；后续 run 44669467061 实际执行了检查。content-api 仅 1 项失败（新增 revise 写路由未登记）；quality 缺 dashboard 生成路由类型；site 在 checkout 被取消，测试未执行。不能再把后续红灯归因于账户限额。\r\n\r\n2026-11-23 审阅修复（`a9c7d081`）：已登记 `POST /admin/drafts/:id/revise`，路由已有的 userGuard 保持不变；无冲突合入最新 dev `57d84c74`，包含 `5e09d9fe` 的 dashboard 路由树和 paraglide 前置生成。针对性 18 tests / 0 failed / 30 assertions、修改文件 ESLint、content-api 类型检查和 diff 检查均通过。此前 571 项和 13 项回归为历史记录，本轮未在本地重跑全量数据库测试。已推送触发新 CI，远端结果以当前 head 为准。\r\n\r\n评审跟进：补充同 request ID 在源版本变化后使用新旧时间戳均复用原结果的回归；加强 Blog 派生前后/接受前后的原稿、正式实体和译文 ID、其他语言及发布时间断言。本轮定向 13 tests / 97 assertions 与 ESLint 通过。跨仓父子任务与实施命令、评审门、回滚点已补齐；任何 revision 行产生后均不可退回旧 create-only accept。\r\r\n",
+  "author": "Zenty-Me",
+  "labels": [
+    "review: medium"
+  ],
+  "comments": [
+    {
+      "author": "Zenty-Me",
+      "body": "@weil-ai 补充了配套 CLI #18 分诊意见涉及的跨仓验证，已推送 `21c22a6e`：\n\n- 新增数据库回归：同 request ID、补丁和目标在源 `updatedAt` 被外部修改后，使用旧时间戳或重新读取的新时间戳都回到同一修订。实现原本已按“回执查找 → 新请求版本检查”执行，指纹只含 `data/targetEntityId`；生产代码未改。\n- 加强已有 blog 用例，明确断言派生后原 accepted 记录、正式文章、其他语言均不变；接受后保持正式实体和译文行 ID、发布时间、其他语言与文章数量。\n- 补齐实施计划的验证命令、评审门、回滚约束，以及 CLI 父任务/各仓子交付的定位。\n\n本轮：13 tests passed / 0 failed、97 assertions；变更测试 ESLint 与 diff 检查通过。原有 571 项关联回归保持为上一轮全范围验证记录，本轮生产代码未变。实际 staging 验收仍待部署，不将本地证据表述为线上完成。\n",
+      "created_at": "2026-11-20T03:37:20Z",
+      "is_bot": false
+    }
+  ],
+  "linked_issues": [],
+  "ci": {
+    "state": "success",
+    "failing": []
+  },
+  "changed_files": [
+    {
+      "path": ".trellis/spec/content-api/backend/ingest-transcriber-guidelines.md",
+      "additions": 10,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/check.jsonl",
+      "additions": 2,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/design.md",
+      "additions": 30,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/implement.jsonl",
+      "additions": 2,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/implement.md",
+      "additions": 46,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/prd.md",
+      "additions": 25,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/research/cross-repo-e2e.md",
+      "additions": 18,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/research/feasibility.md",
+      "additions": 12,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/rollout.md",
+      "additions": 22,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/task.json",
+      "additions": 26,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": ".trellis/tasks/11-20-draft-revisions/validation.md",
+      "additions": 63,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/prisma/migrations/20261120090000_draft_revisions/migration.sql",
+      "additions": 22,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/prisma/models/draft-revision.prisma",
+      "additions": 26,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/prisma/models/ingest.prisma",
+      "additions": 2,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/src/modules/review/admin.ts",
+      "additions": 22,
+      "deletions": 3,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/src/modules/review/model.ts",
+      "additions": 10,
+      "deletions": 2,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/src/modules/review/modify-service.ts",
+      "additions": 3,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/src/modules/review/revision-rules.ts",
+      "additions": 48,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/src/modules/review/revision-service.ts",
+      "additions": 66,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/src/modules/review/revision-target.ts",
+      "additions": 110,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/src/modules/review/revision-write.ts",
+      "additions": 46,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/src/modules/review/service.ts",
+      "additions": 18,
+      "deletions": 4,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/src/modules/review/update-service.ts",
+      "additions": 25,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/tests/db-harness.ts",
+      "additions": 1,
+      "deletions": 1,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/tests/modules/review/draft-revise.test.ts",
+      "additions": 245,
+      "deletions": 0,
+      "status": "added"
+    },
+    {
+      "path": "apps/content-api/tests/modules/review/draft-update.test.ts",
+      "additions": 2,
+      "deletions": 2,
+      "status": "modified"
+    },
+    {
+      "path": "apps/content-api/tests/utils/write-routes-guard.test.ts",
+      "additions": 1,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "packages/content-sdk/src/index.ts",
+      "additions": 3,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "packages/content-sdk/src/schema/ingest.ts",
+      "additions": 28,
+      "deletions": 0,
+      "status": "modified"
+    },
+    {
+      "path": "packages/content-sdk/tests/schema/ingest-update-modify.test.ts",
+      "additions": 30,
+      "deletions": 0,
+      "status": "modified"
+    }
+  ]
+}

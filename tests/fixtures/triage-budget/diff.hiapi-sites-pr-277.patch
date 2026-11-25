@@ -1,0 +1,2980 @@
+diff --git a/.trellis/spec/site/frontend/ssr-runtime.md b/.trellis/spec/site/frontend/ssr-runtime.md
+index d5dfe20e..a109b4b1 100644
+--- a/.trellis/spec/site/frontend/ssr-runtime.md
++++ b/.trellis/spec/site/frontend/ssr-runtime.md
+@@ -76,7 +76,7 @@ declare namespace App {
+ ## 6.5 C 轨接真约定（09-23-site-content-api）
+ 
+ - **双时机装配**：SSR 页 `siteClientFromRuntime`（§4 不变）；prerender 页构建期 `siteClientFromBuildEnv()`（构建进程 env——本地 `apps/site/.env`（bun 自动加载）、Workers Builds 构建环境变量；缺 env → throw fail fast，构建非零退出）。
+-- **横切快照单例**（`src/lib/site-snapshot.ts`）：announcement/popup（locale 分槽）+ `_names`/models nameMap（全站一份）——prerender 构建期烘静态、SSR 首请求驻留（部署周期级一致）；rejected promise 清槽重试。
++- **横切快照单例**（`src/lib/site-snapshot.ts`）：announcement/popup（locale 分槽）+ `_names`/models nameMap（全站一份）——prerender 构建期烘静态、SSR 首请求驻留（部署周期级一致）；回源失败**不驻留新鲜值**——有 ≤10 分钟旧值时回旧值并装 15s 降级窗口，无旧值装 10s 负缓存槽（失败路径详见 §9「失败路径」，2026-11-17 起取代旧的「rejected promise 清槽重试」）。
+ - **P1 列表分页**：prerender 列表页全量数据分组 SSR（`data-page` 卡片组）+ 客户端显隐切片（零水合渐进增强；PostGrid/ModelsCatalog/FaqList 同构）。
+ - **models 详情**：迭代拉全 (branch, ability) 槽位（`pendingScopes` 揭示式）+ playground bundles → `lib/model-detail-assembly` 反构 DetailFamily 束（`lib/model-detail` 类型+投影为站点架构，自 mock 迁入）；originName/api 从 bundle 的 upstreamSlug/schema 派生。
+ - **搜索索引**：`scripts/fetch-search-index.ts` 构建前置（build script 链）生成 `src/data/search-index.gen.json`（入仓兜底快照，diff-touch；`--check` 结构校验链入 typecheck）。
+@@ -176,13 +176,24 @@ wrangler deploy --env production                      # 不再依赖 --var 记
+ 
+ ## 9. 目录面 SSR 与 sync→purge 自动链（catalog-ssr，10-02-catalog-ssr）
+ 
+-「运营数据变化 ≠ 重新部署」的完整落地：目录三面（`/{l}` 首页、`/{l}/models`、`/{l}/pricing`）prerender=false + 快照短 TTL + content-api 落库后自动 purge。**三层新鲜度预算（叠加上界）**：快照槽 120s + HTML 缓存 180s ≈ 5min；快照层是 content 通道唯一缓存层（client.ts `cacheFor: null`——alova 3.5.5 默认 GET 300s 内存缓存，实例复用形态下会叠层，显式关闭）。
++「运营数据变化 ≠ 重新部署」的完整落地：目录三面（`/{l}` 首页、`/{l}/models`、`/{l}/pricing`）prerender=false + 快照短 TTL + content-api 落库后自动 purge。**三层新鲜度预算（叠加上界）**：正常路径 = 快照槽 120s + HTML 缓存 180s ≈ 5min；**失败路径**（content-api 回源出错时）= 快照旧值 ≤10min + HTML 缓存 180s ≈ **13min worst case**（见下「失败路径」）；快照层是 content 通道唯一缓存层（client.ts `cacheFor: null`——alova 3.5.5 默认 GET 300s 内存缓存，实例复用形态下会叠层，显式关闭）。
+ 
+ ### 快照层（site-snapshot.ts）
+ 
+-- **目录数据槽一律 120s TTL**（cards/names/pricing/filters/promotions/bundles:{locale}/showcases/nameMap）；横切槽（announcement/apiDoc/popup）永久驻留不变（非目录面）。bundles 槽 **locale 维**（`bundles:{locale}`——旧 locale-less 槽丢 localized 标签是已修复缺陷）。
+-- **列表拉取一律 fetchAll 分页**（size=100 契约——单页截断在第 101 个 family 起静默丢数据，回归面）。**信封 code!==0 → throw**（业务空 = code:0 + items:[] 合法缓存；异常信封不得归一空集烘「空目录」）；分页中途失败整体不驻留。
+-- `invalidateCatalogSnapshots()` = purge 端点鉴权通过后的联动入口（清本 isolate 槽；不消除在途旧渲染；跨 isolate 靠各自 TTL）。
++- **目录数据槽一律 120s TTL**（cards/names/pricing/filters/promotions/bundles:{locale}/showcases/nameMap）——指**回源成功**装的新鲜槽；失败路径装的降级槽 / 负缓存槽 TTL 另算（≤15s / 10s，见「失败路径」）。横切 locale 槽（announcement/popup）同 120s TTL、只留 L1、独立 Map（purge 不清）。bundles 槽 **locale 维**（`bundles:{locale}`——旧 locale-less 槽丢 localized 标签是已修复缺陷）。
++- **列表拉取一律 fetchAll 分页**（size=100 契约——单页截断在第 101 个 family 起静默丢数据，回归面）。**信封 code!==0 → throw**（业务空 = code:0 + items:[] 合法缓存；异常信封不得归一空集烘「空目录」）；分页中途失败**不驻留新鲜值**（部分页不得当完整目录缓存），随后按「失败路径」回旧值或负缓存。
++- `invalidateCatalogSnapshots()` = purge 端点鉴权通过后的联动入口（清本 isolate 槽并推进槽世代；不消除在途旧渲染；跨 isolate 靠各自 TTL）。**不清旧值副本**（L1 `lastGood` 与 L2 `__data/v1/stale/*`）：故障期 purge 后仍要有旧值可回；purge 前发出的回源成功后，不会顶掉 purge 后装的降级槽，也不写 L2 数据条目（槽世代守卫；否则 purge 刚删的 key 会被旧内容重建一个 TTL）；它仍照写 stale 副本（只在失败时读，不比已有副本更旧）。残余窗口：守卫在发起 put 前判定，put 与并发 purge 的 delete 先后不定。
++
++### 失败路径：stale-on-error + 负缓存（2026-11-17，content-api 过载修复 sites#277）
++
++旧语义「rejected 不驻留、清槽重试」在 content-api 过载时会放大回源（每个请求都重拉，全球各 isolate 一起，3–7 倍），把 content-api 压在排队卡死状态（11-16/11-17 生产判例）。现语义：
++
++- **旧值副本**：每次回源成功另记 last-good。L1 = isolate 模块 Map，上限 160 键（固定槽 135 键全留得住），超限先清 10 分钟以上的、再按数据取得时刻丢最旧的；L2 = `__data/v1/stale/<key>`（见 §10），**仅 edge 槽**写。横切槽（announcement/popup）与 family 维动态槽（`edge:false`）**只有 L1 旧值**——冷 isolate 下没有旧值，走原有 fail-soft 失败路径。
++- **触发**：load 抛错、信封异常、分页中途失败、15s 在途等待超时，都算失败。
++- **有 ≤10 分钟旧值**（`STALE_MAX_MS`，按**数据取得时刻**计龄；首页派生池 featured/cost/banner 继承来源 cards 的数据时刻，不经派生重新计龄）→ 返回旧值，槽里装降级窗口 `min(15s, 旧值剩余寿命)`，窗口内同 key 不回源；窗口过后下一个请求再试一次（单飞语义不变）。在途超时且有旧值 → 直接回旧值、不再重拉。
++- **无可用旧值** → 装 10s 负缓存槽（`settled: true` 的失败槽），窗口内同 key 直接抛同一错误、不回源。
++- **可观测**：回旧值打 `[site-snapshot] 回源失败，返回旧数据 key= ageMs= reason=`，同 key 15s 内只打一次。
++- **新鲜度边界**：正常路径预算不变（120s + 180s）；只在 content-api 出错时，edge 槽数据最多是 10 分钟前的，叠 HTML 缓存 180s ≈ 13min；超过 10 分钟仍出错按原逻辑报错。
+ - **全量快照 + 页面切片**（2026-10-29 showcases 真分页）：槽仍拉全量（`fetchAllPages`，不改按页拉——避免每翻一页打一次 content-api）；切片在**页面层**（`planShowcasesPage` + `slice`），快照层不感知分页。
+ 
+ ### 缓存分族（ssr-cache.ts §8 表扩容）
+@@ -225,10 +236,10 @@ applyEvent/applyLlmEvent **事务提交后成功分支**（与 enqueue 并列）
+ ## 10. 快照数据槽 L2 边缘缓存（10-27-site-ssr-latency）
+ 
+ - **双层**：L1 = isolate 模块 Map（原有）；L2 = Workers Cache API（`caches.default`，**同 colo 内**跨 isolate 共享，不跨 colo）。isolate 更换后 L1 即冷（频率未单独测量），L2 把「每个 isolate 首次请求」收敛为「每个 colo 每 TTL 首次请求」。
+-- **key/TTL**：`${origin}/__data/v1/${encodeURIComponent(slotKey)}`（与 HTML 缓存层同源；`v1` = 缓存格式版本）；值为 `{ v, e }` envelope（`e` = 绝对过期时间）；TTL 同时写在响应 `cache-control: max-age=`，命中时 L1 取剩余窗口（不延长数据新鲜度预算）。值必须 JSON 可往返（Map/Set 不得入 L2）。
++- **key/TTL**：`${origin}/__data/v1/${encodeURIComponent(slotKey)}`（与 HTML 缓存层同源；`v1` = 缓存格式版本）；**旧值副本**另写 `${origin}/__data/v1/stale/${encodeURIComponent(slotKey)}`（2026-11-17，§9「失败路径」）：信封 `e` = 写入时刻（即回源成功时）+ 10min，`max-age` 同为 10min，与数据槽 TTL 无关；只在回源失败时读，命中按 `e - 10min` 反推数据时刻计龄；只有 edge 槽写；值为 `{ v, e }` envelope（`e` = 绝对过期时间）；TTL 同时写在响应 `cache-control: max-age=`，命中时 L1 取剩余窗口（不延长数据新鲜度预算）。值必须 JSON 可往返（Map/Set 不得入 L2）。
+ - **origin 注入**：middleware 最早一行 `context.locals.origin = url.origin`；构建期（prerender）/无全局 `caches` → 读写均短路，行为与旧内存槽完全一致。
+ - **fail-open**：match / put / JSON parse 失败一律回源；写优先交 `ctx.waitUntil`（不阻塞响应），无 ctx 时 await。
+-- **purge 语义**：`invalidateCatalogSnapshots(origin)` 清 L1 + 删除本 isolate 已知的 L2 key（`knownEdgeKeys`）；跨 isolate/colo 靠 TTL 兜底（与 HTML purge 单 colo 语义一致）。
++- **purge 语义**：`invalidateCatalogSnapshots(origin)` 清 L1 + 删除本 isolate 已知的 L2 数据 key（`knownEdgeKeys`）；跨 isolate/colo 靠 TTL 兜底（与 HTML purge 单 colo 语义一致）。**`stale/` 旧值条目故意不删**（故障期要有旧值可回，10min 自然过期；只在回源失败时被读，不影响正常路径新鲜度）。
+ - **判例（HTML 缓存 TTL）**：`storeInCache` 曾把存储副本写成 `cache-control: max-age=0`——Cache API 依响应头判过期，条目实际立即失效（本地连续 MISS 的根因，生产靠运行时默认行为才偶然 HIT）。存储副本必须写分族 TTL（`max-age=<ttl>`）；浏览器侧仍由 `withCacheHeader` 无条件写 `max-age=0, must-revalidate`（两件事互不影响）。回填可交 `ctx.waitUntil` 移出响应关键路径。
+ - **判例（workerd）**：`application/json` 的 Cache API `put/match` 正常（cache-probe workerd 实证：`max-age` 生效、JSON 原样读回）。HIT/性能验收仍以生产/预览域 `wrangler tail` 的 `wallTime`/`cpuTime` 为准。
+ - **接入面**：`site-snapshot` 全部 `ttlListSlot` 槽（cards/pricing/filters/showcases/changelog/faq/blog 等）+ `credit-rate`。横切槽（announcement/apiDoc/popup）不纳入；popup 已由 BaseLayout 收敛到「仅首页拉取」。
+diff --git a/apps/content-api/src/db/client.ts b/apps/content-api/src/db/client.ts
+index e48ba026..44900733 100644
+--- a/apps/content-api/src/db/client.ts
++++ b/apps/content-api/src/db/client.ts
+@@ -10,6 +10,39 @@ import { softDeleteExtension } from './soft-delete';
+ let base: PrismaClient | null = null;
+ let scoped: ReturnType<typeof buildScoped> | null = null;
+ 
++/** PG 池快照（指标行用）；未拿到池时返回原因而不是抛。 */
++export interface PoolStats {
++  total: number;
++  idle: number;
++  waiting: number;
++}
++
++/**
++ * PrismaPg 的包装：只为**拿到内部的 pg Pool**（`underlyingDriver()`）以暴露 total/idle/waiting。
++ * Prisma 7.5 的 PrismaClient 不把 adapter 暴露在外（无 `_engine` 上的 adapter 字段），
++ * 唯一可靠途径是在工厂 connect() 时截住返回的 adapter 实例。
++ * 语义零改动：provider / adapterName 原样转发，connect/connectToShadowDb 直接代理。
++ */
++class StatsPrismaPg extends PrismaPg {
++  /** 首次 connect 后可得（惰性——先 connect 才有 Pool，且 Pool 在进程生命周期内保持同一实例）。 */
++  private pool: { totalCount: number; idleCount: number; waitingCount: number } | null = null;
++
++  override async connect() {
++    const adapter = await super.connect();
++    this.pool = adapter.underlyingDriver() as unknown as typeof this.pool;
++    return adapter;
++  }
++
++  /** 池快照；尚未 connect 过返回 null（指标行会写明原因）。 */
++  stats(): PoolStats | null {
++    const pool = this.pool;
++    if (pool === null) return null;
++    return { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount };
++  }
++}
++
++let adapter: StatsPrismaPg | null = null;
++
+ function baseClient(): PrismaClient {
+   return (base ??= new PrismaClient({
+     // 池上限 5（2026-09-28 缩容）：Prisma 5 + pg-boss 3 = 8/实例，蓝绿部署重叠 16。
+@@ -18,14 +51,28 @@ function baseClient(): PrismaClient {
+     // 不设则 pg 默认 max=10 + pg-boss 默认 10 超限 → 列表类并发查询抛 EMAXCONNSESSION（2026-09-23 生产判例）。
+     // 取连接等待上限 5s（2026-11-09 生产判例）：pg 默认 0 = 无限排队——长任务占满池时 HTTP 请求全部挂起、
+     // site 跟着无限等。超时抛错走既有错误路径（HTTP 500 / pg-boss 任务失败后按策略重试），不再挂死。
+-    adapter: new PrismaPg({
++    //
++    // keepAlive / query_timeout（2026-11-17 过载兜底·乙类）：11-12 曾出现 8 条连接同时静默 4 分钟、
++    // 每个请求精确 5001ms 取连接超时。keepAlive 让内核探测死连接；query_timeout 是**客户端侧**读超时
++    // （20s，落在 DB 级 statement_timeout 15s 之上，只兜「连接静默、服务端永不回包」——正常慢查询仍由
++    // 服务端的 15s statement_timeout 先终止）。两者均为 pg 8.x 的 PoolConfig/ClientConfig 字段
++    //（pg/lib/connection-parameters.js: query_timeout / keepAlive，Bun 下为 TCP socket 层 setKeepAlive）。
++    adapter: (adapter = new StatsPrismaPg({
+       connectionString: process.env.DATABASE_URL,
+       max: 5,
+       idleTimeoutMillis: 30_000,
+       connectionTimeoutMillis: 5_000,
+-    }),
++      keepAlive: true,
++      query_timeout: 20_000,
++    })),
+   }));
+ }
++
++/** Prisma 连接池快照（指标行用）。未构造 client / 未 connect 过 → null。 */
++export function dbPoolStats(): PoolStats | null {
++  return adapter?.stats() ?? null;
++}
++
+ // 经 $extends 套上软删读过滤。
+ function buildScoped() {
+   return baseClient().$extends(softDeleteExtension);
+diff --git a/apps/content-api/src/index.ts b/apps/content-api/src/index.ts
+index e544d4e7..7d428d72 100644
+--- a/apps/content-api/src/index.ts
++++ b/apps/content-api/src/index.ts
+@@ -7,6 +7,9 @@ import { Elysia } from "elysia";
+ import { openapi } from "@elysiajs/openapi";
+ import { cors } from "@elysiajs/cors";
+ import { envelope } from "./plugins/envelope";
++import { responseCache } from "./plugins/response-cache";
++import { inflightLimit } from "./plugins/inflight-limit";
++import { metrics, startStatsLogger, stopStatsLogger } from "./plugins/metrics";
+ import { auth } from "./modules/auth";
+ import { blog } from "./modules/blog";
+ import { changelog } from "./modules/changelog";
+@@ -86,6 +89,14 @@ export const app = new Elysia()
+     }),
+   )
+   .use(envelope)
++  // 过载两道闸（顺序即语义，勿调换）：
++  //  1) responseCache：全局 onBeforeHandle 命中即短路 —— 命中请求**不会**进入 inflightLimit 的计数，
++  //     也不会打到 DB（这是容量提升的主要来源）；单飞把同 key 并发压成一次执行。
++  //  2) inflightLimit：未命中缓存的请求才计入 in-flight，超 HIAPI_MAX_INFLIGHT 直接 503（/internal 豁免）。
++  // 两者都排在 clientAuthGuard（onRequest，鉴权先于计数/缓存）之后：未带 client token 的请求拿不到缓存内容。
++  .use(responseCache)
++  .use(inflightLimit)
++  .use(metrics)
+   .use(auth)
+   .use(blog)
+   .use(changelog)
+@@ -140,8 +151,12 @@ if (import.meta.main) {
+     `[content-api] listening on http://localhost:${port}  (OpenAPI: /openapi/json)`,
+   );
+ 
++  // 60s 指标行（pool/in-flight/缓存）：过载时第一眼能看到的数字，`[content-api] stats {json}`。
++  startStatsLogger();
++
+   const shutdown = async (signal: string) => {
+     console.info(`[content-api] ${signal} received, draining jobs…`); // stopJobs 先置 stopped → readiness 即刻 503
++    stopStatsLogger();
+     await stopJobs();
+     process.exit(0);
+   };
+diff --git a/apps/content-api/src/modules/model-sync/site-purge.ts b/apps/content-api/src/modules/model-sync/site-purge.ts
+index 8ee96dd6..530ae0d3 100644
+--- a/apps/content-api/src/modules/model-sync/site-purge.ts
++++ b/apps/content-api/src/modules/model-sync/site-purge.ts
+@@ -19,6 +19,7 @@
+ // 通道：站点在 CF zone 内（生产 hiapi.ai）且配了 HIAPI_CF_ZONE_ID / HIAPI_CF_PURGE_TOKEN → CF zone purge（全球）；
+ // 否则（staging workers.dev 不在 zone 内）→ site `/internal/purge`（单 colo，其余 colo 由 TTL 分族兜底）。
+ import { dbUnscoped } from "../../db/client"; // 同步域统一入口（同步实体不入软删层·S5——与 service.ts 同口径）
++import { clearResponseCache } from "../../utils/response-cache";
+ 
+ /** site 全部 locale（单一事实源 = apps/site/src/i18n/locales.ts LOCALES；改动须两处同步）。 */
+ const SITE_LOCALES = ["en", "es", "de", "fr", "it", "ja", "ko", "pt", "ru", "zh"] as const;
+@@ -31,6 +32,8 @@ const FETCH_TIMEOUT_MS = 10_000;
+ let pending = new Set<string>();
+ let timer: ReturnType<typeof setTimeout> | null = null;
+ let flushing = false;
++/** 无 purge 通道时（env 未配）合并清本进程缓存用的计时器，窗口同 FLUSH_DELAY_MS。 */
++let clearTimer: ReturnType<typeof setTimeout> | null = null;
+ let warnedNoEnv = false;
+ 
+ // —— 可注入测试依赖（fetch / familyId→slug 查询；生产零调用）——
+@@ -76,6 +79,8 @@ export function __resetSitePurgeForTest(): void {
+   if (timer !== null) clearTimeout(timer);
+   timer = null;
+   flushing = false;
++  if (clearTimer !== null) clearTimeout(clearTimer);
++  clearTimer = null;
+   warnedNoEnv = false;
+   fetchImpl = fetch;
+   queryImpl = defaultQuery;
+@@ -129,6 +134,15 @@ function sendBatch(env: PurgeConfig, paths: string[]): Promise<Response> {
+   });
+ }
+ 
++function scheduleCacheClear(): void {
++  if (clearTimer !== null) return;
++  clearTimer = setTimeout(() => {
++    clearTimer = null;
++    clearResponseCache();
++  }, FLUSH_DELAY_MS);
++  clearTimer.unref?.();
++}
++
+ function scheduleFlush(): void {
+   if (timer !== null) return;
+   timer = setTimeout(() => {
+@@ -141,9 +155,18 @@ function scheduleFlush(): void {
+ /**
+  * 落库成功通知入口（applyEvent/applyLlmEvent 事务提交后调用；familyIds = 事务内旧 ∪ 新 family 并集）。
+  * 同步入集 + 起 timer，永不抛、永不阻塞调用方。
++ *
++ * 本进程响应缓存跟同步事件失效，但**按 3s 窗口合并**，不逐事件清（sites#277 评审）：
++ *   - 有 purge 通道：flush 发 purge 前统一清一次（站点只在收到 purge 后才回源，提前清对站点无收益）；
++ *   - 无 purge 通道（env 未配）：单独起一个同窗口的清空计时器。
++ * 全量同步时一次清一批事件，不会把 26 条路由的缓存逐事件清空、摘在途单飞；代价是同步落库到
++ * content-api 直读可见最多晚 3s（另有世代守卫：窗口内开始的旧读在清空后不会落缓存）。
+  */
+ export function collectSitePurge(familyIds: string[]): void {
+-  if (envConfig() === null) return;
++  if (envConfig() === null) {
++    scheduleCacheClear();
++    return;
++  }
+   for (const id of familyIds) pending.add(id);
+   scheduleFlush();
+ }
+@@ -151,8 +174,14 @@ export function collectSitePurge(familyIds: string[]): void {
+ /**
+  * 直接按路径清缓存（2026-11-11 B2）：复用同一两条通道与批量上限，失败只 warn（site TTL 兜底）。
+  * 与 collectSitePurge 的聚合队列不同——调用方已算出最终路径，立即分批发送。
++ *
++ * ⚠️ 无论站点 purge 能不能发出去，**先清本进程缓存**（2026-11-17 过载修复）：
++ *   - 能发：站点收到 purge 会立刻回源，留着旧条目等于「清了站点缓存」却不生效；
++ *   - 发不出（env 未配 / 路径空）：本缓存若不清，旧内容会继续服务到 TTL——清掉后至少本进程立即回源取新数据。
++ * 故 clear 放在所有 early-return 之前。
+  */
+ export async function purgeSitePaths(paths: readonly string[]): Promise<void> {
++  clearResponseCache();
+   const env = envConfig();
+   if (env === null) return;
+   const unique = [...new Set(paths)];
+@@ -227,6 +256,8 @@ async function flush(): Promise<void> {
+   }
+   const env = envConfig();
+   if (env === null) {
++    // 收集时有通道、flush 时 env 被撤：事件照样要让本进程缓存失效。
++    if (pending.size > 0) clearResponseCache();
+     pending = new Set();
+     return;
+   }
+@@ -236,6 +267,9 @@ async function flush(): Promise<void> {
+   try {
+     // 空批次直接收（无事件即无 purge——手动/让路触发的空 flush 不发固定面，防无意义失效）
+     if (batch.size === 0) return;
++    // 先清本进程缓存（2026-11-17）：放在 slug 查询之前——过载时查询可能排队很久，失效不该跟着等；
++    // 事件对应的数据已提交，清空后的回读拿到的就是新数据，站点随后收到 purge 回源也是新的。
++    clearResponseCache();
+     // 事件面：familyId → slug（查无记 warn 跳过；查询失败事件面置空但固定面照发）
+     const segments = new Set<string>();
+     try {
+diff --git a/apps/content-api/src/plugins/inflight-limit.ts b/apps/content-api/src/plugins/inflight-limit.ts
+new file mode 100644
+index 00000000..562de445
+--- /dev/null
++++ b/apps/content-api/src/plugins/inflight-limit.ts
+@@ -0,0 +1,77 @@
++// 准入上限插件（P1·过载修复第二环）
++//
++// 根因链第 4 环「白干活」：突发把池压满后，排队超过站点 15s 放弃，但服务端仍把每个请求做完 ——
++// 吞吐占满、有效产出接近 0。本地复现 S5b 证明：in-flight 超阈值直接 503，能把「有效产出 0」变成
++// 「按容量出活」（2xx 稳定在容量上限、p50 < 1s）。
++//
++// 计数口径（Elysia 1.4.28 实测行为，改动前必读）：
++//   - 计数在全局 `onBeforeHandle` +1：clientAuthGuard 是 onRequest，故**鉴权先于计数**（401 不占名额）；
++//   - 减在全局 `onAfterResponse`：-**handler 抛错**（走 onError）后仍触发；-**客户端中途断开**后仍触发
++//     （实测：handler 会照常跑完，随后 mapResponse/afterResponse 补触发）→ 不会因断开泄漏计数；
++//   - **onRequest 阶段短路**（鉴权 401/503、CORS preflight）时 onBeforeHandle 根本不跑，故不 +1；
++//   - 缓存命中（responseCache 的 onBeforeHandle 先于本插件注册）已短路，本插件不跑 → 命中不受限。
++//   - 本插件自身超限返回 503 时**不 +1**，故不会重复扣减。
++//
++// 豁免：整个 `/internal/*` 面——健康检查（Railway / backend 门控）与 model-sync 的 hook、reconcile 等内部入口。
++//   理由：都带内部 token、频率低；被 503 的代价比过载更糟（健康探针失败会摘流量，同步 hook 被拒要靠对端重试）。
++//   代价：这些请求不进 inflight/shed 统计。缓存命中不受限由上面的注册顺序天然满足。
++//
++// env：HIAPI_MAX_INFLIGHT（默认 64；与 Prisma 池 max 5 的关系是「排队深度」而非并发度）。
++import { Elysia } from 'elysia';
++import { apiError } from '@hiapi/content-sdk';
++
++/** 计数在案的请求（每个只能在 afterResponse 里减一次）。 */
++const counted = new WeakSet<Request>();
++
++let inflight = 0;
++let shed = 0;
++let peak = 0;
++
++function maxInflight(): number {
++  const raw = process.env.HIAPI_MAX_INFLIGHT;
++  if (raw === undefined || raw === '') return 64;
++  const n = Number(raw);
++  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 64;
++}
++
++export function inflightStats(): { inflight: number; peak: number; shed: number; max: number } {
++  return { inflight, peak, shed, max: maxInflight() };
++}
++
++/** 测试复位。 */
++export function __resetInflightForTest(): void {
++  inflight = 0;
++  shed = 0;
++  peak = 0;
++}
++
++const HEALTH_PREFIX = '/internal';
++
++export const inflightLimit = new Elysia({ name: 'inflight-limit' })
++  .onBeforeHandle({ as: 'global' }, ({ request, set }) => {
++    const { pathname } = new URL(request.url);
++    // 整个 /internal 面不受准入限制（理由见文件头）。
++    if (pathname === HEALTH_PREFIX || pathname.startsWith(`${HEALTH_PREFIX}/`)) return undefined;
++    const max = maxInflight();
++    if (max > 0 && inflight >= max) {
++      shed++;
++      // 为什么手写 Response 而不是 `set.status = 503; return apiError(...)`：onBeforeHandle 返回普通对象
++      // 会被当成 handler 结果走路由的 response 校验，503 不在各路由声明的分支里 → 被判 422。
++      // 返回 Response 跳过校验，body 仍用 apiError() 构造，信封形态与 envelope 插件一致。
++      set.status = 503;
++      set.headers['x-content-cache'] = 'BYPASS';
++      return new Response(JSON.stringify(apiError(503, 'busy')), {
++        status: 503,
++        headers: { 'content-type': 'application/json;charset=utf-8', 'x-content-cache': 'BYPASS' },
++      });
++    }
++    inflight++;
++    if (inflight > peak) peak = inflight;
++    counted.add(request);
++    return undefined;
++  })
++  .onAfterResponse({ as: 'global' }, ({ request }) => {
++    if (!counted.has(request)) return;
++    counted.delete(request);
++    if (inflight > 0) inflight--;
++  });
+diff --git a/apps/content-api/src/plugins/metrics.ts b/apps/content-api/src/plugins/metrics.ts
+new file mode 100644
+index 00000000..4a2a80b8
+--- /dev/null
++++ b/apps/content-api/src/plugins/metrics.ts
+@@ -0,0 +1,56 @@
++// 指标行插件（P1）：每 60s 打**一行** JSON，覆盖过载排查需要的最小集合。
++// 为什么会卡死时看不到东西（11-17 复盘）：没有任何进程内指标，只能靠外部抓 5432 流量反推。
++//
++// 内容：pool（Prisma 池 total/idle/waiting）+ in-flight（当前/峰值/503 数）+ 响应缓存（hits/misses/
++// coalesced/entries/bytes/evictions）+ ttl/maxInflight 生效值。
++// 拿不到池时 `pool` 写 `{ error: "<原因>" }` 而不是省略（否则线上分不清「0 连接」和「读不到」）。
++//
++// 只在 main 入口启用（见 src/index.ts），测试进程不装定时器；`logStatsLine()` 导出供测试断言格式。
++import { Elysia } from 'elysia';
++import { dbPoolStats } from '../db/client';
++import { responseCacheStats } from '../utils/response-cache';
++import { inflightStats } from './inflight-limit';
++
++const INTERVAL_MS = 60_000;
++
++/** 组装一行指标（纯函数，便于测试）。 */
++export function statsSnapshot(): Record<string, unknown> {
++  const pool = dbPoolStats();
++  return {
++    ts: new Date().toISOString(),
++    pool: pool === null ? { error: 'not connected yet' } : { total: pool.total, idle: pool.idle, waiting: pool.waiting },
++    inflight: inflightStats(),
++    cache: responseCacheStats(),
++  };
++}
++
++/** 打一行 `[content-api] stats {json}`。 */
++export function logStatsLine(): void {
++  try {
++    console.info(`[content-api] stats ${JSON.stringify(statsSnapshot())}`);
++  } catch (e) {
++    console.error('[content-api] stats line failed', e);
++  }
++}
++
++let timer: ReturnType<typeof setInterval> | null = null;
++
++/** 启动 60s 指标（main 入口用；幂等）。`.unref()` 不阻进程退出。 */
++export function startStatsLogger(): void {
++  if (timer !== null) return;
++  timer = setInterval(logStatsLine, INTERVAL_MS);
++  timer.unref?.();
++}
++
++/** 停止（测试 / 排水用）。 */
++export function stopStatsLogger(): void {
++  if (timer === null) return;
++  clearInterval(timer);
++  timer = null;
++}
++
++/**
++ * 空插件占位：指标不挂任何 HTTP 生命周期，仅由 index.ts 的 main 段调 startStatsLogger()。
++ * 保留导出以便组装处 `.use(metrics)` 读起来连贯（与其它插件同构），无运行时副作用。
++ */
++export const metrics = new Elysia({ name: 'metrics' });
+diff --git a/apps/content-api/src/plugins/response-cache.ts b/apps/content-api/src/plugins/response-cache.ts
+new file mode 100644
+index 00000000..22212c82
+--- /dev/null
++++ b/apps/content-api/src/plugins/response-cache.ts
+@@ -0,0 +1,11 @@
++// 响应缓存插件：只做钩子注册。缓存状态、白名单、单飞与 clearResponseCache 在 src/utils/response-cache.ts
++// （业务域如 modules/model-sync/site-purge.ts 只依赖 utils，不依赖本插件）。
++//
++// 注册顺序即语义：本插件须在 inflightLimit 之前 .use()，缓存命中在更早的 onBeforeHandle 短路，不占准入名额。
++import { Elysia } from 'elysia';
++import { cacheAfterResponse, cacheBeforeHandle, cacheMapResponse } from '../utils/response-cache';
++
++export const responseCache = new Elysia({ name: 'response-cache' })
++  .onBeforeHandle({ as: 'global' }, (ctx) => cacheBeforeHandle(ctx))
++  .mapResponse({ as: 'global' }, (ctx) => cacheMapResponse(ctx))
++  .onAfterResponse({ as: 'global' }, (ctx) => cacheAfterResponse(ctx));
+diff --git a/apps/content-api/src/utils/response-cache.ts b/apps/content-api/src/utils/response-cache.ts
+new file mode 100644
+index 00000000..0219a55f
+--- /dev/null
++++ b/apps/content-api/src/utils/response-cache.ts
+@@ -0,0 +1,472 @@
++// 响应缓存（进程内·P0 过载修复）：缓存状态、清空入口与钩子实现。Elysia 注册在 plugins/response-cache.ts。
++//
++// 背景（已核实根因，~/.local/share/lingdao-cards/content-api-pool-rootcause-1117/REPORT.md 甲类）：
++// 站点 Worker 突发回源 → 热门 GET 列表接口把 Prisma 池（max 5）压满排队 → 超过 15s 站点放弃但服务端照做 →
++// 站点失败不缓存、重复回源放大 → 亚稳态卡死。本模块断的是「容量」这一环：公共只读目录数据命中缓存后
++// 几乎不占 DB 连接，同时用单飞把同一 key 的并发压成一次执行（突发时不再 N 份重复查询）。
++//
++// 机制要点（Elysia 1.4.28 实测结论，勿凭直觉改）：
++//   1. 命中：全局 `onBeforeHandle` 返回**已序列化 body 的 Response** → 跳过 handler、跳过 response 校验。
++//      ⚠️ 绝不能返回字符串/对象当 body：那会走 response 校验并被判 422。
++//   2. 存：全局 `mapResponse` 拿到的 `response` 是**response 校验之后**的树枝对象（信封），此处
++//      `JSON.stringify` 一次并落库，回一个带 `content-type` 的 Response（命中时直接用同一份字符串）。
++//   3. `set.headers`（含 handler 设的 `vary: Accept-Language`）会与这里返回的 Response 头合并，
++//      故缓存条目只需记 `vary`，其余请求级头（CORS 等）由各自钩子补。
++//   4. 写后失效：任何非 GET/HEAD 成功响应（2xx）→ 清空整个缓存（写很少，简单可靠）。清空发生在
++//      `mapResponse`（同步于响应映射）而非 `onAfterResponse`（经 setImmediate 异步），避免写返回与
++//      清空之间留下重放旧内容的时间窗。
++//   5. site-purge 发清站点缓存请求**之前**必须先清本缓存（见 modules/model-sync/site-purge.ts 接线），
++//      否则站点回源拿到的仍是旧缓存。
++//
++// 白名单原则（宁缺毋滥）：只缓存「输出与请求身份无关」的公开 GET；读 header/cookie/会话/staff 身份的路由
++// 一律不进（审计结论见报告 REPORT-api.md）。依赖「当前时间」的路由可进，代价是最多晚一个 TTL 生效。
++//
++// env：
++//   HIAPI_RESPONSE_CACHE_TTL_MS       默认 60000；`0` = 缓存整体关闭（紧急开关；旁路时不读不写、也不写 x-content-cache 头）
++//   HIAPI_RESPONSE_CACHE_MAX_ENTRIES  默认 2000（LRU 淘汰）
++//   HIAPI_RESPONSE_CACHE_MAX_BYTES    默认 64MB（LRU 淘汰）
++//   HIAPI_RESPONSE_CACHE_WAIT_MS      默认 12000（单飞等待上限，超时回 503 busy，防「领头请求卡住拖死等待者」）
++import { ElysiaCustomStatusResponse, type Context } from 'elysia';
++import { apiError } from '@hiapi/content-sdk';
++import { resolveLocale } from './accept-language';
++
++/** 缓存条目：序列化后的响应体 + 需重放的响应头 + 记账字段。 */
++interface CacheEntry {
++  body: string;
++  status: number;
++  contentType: string;
++  vary?: string;
++  bytes: number;
++  expiresAt: number;
++}
++
++/**
++ * 单飞结果（领头请求在 mapResponse/onAfterResponse 时 settle）。
++ * resolve 的 entry 是领头的最终响应：2xx 成功信封（同时落缓存），或 4xx/5xx 错误信封（不落缓存，
++ * 等待者原样应答——同一 URL 并发拿到同一类结果，404 不会被等待者折成 503）。
++ * reject 只用于拿不到可重放响应的情况（handler 抛错未经 mapResponse、响应是原生 Response 等），等待者回 503。
++ */
++type Flight = {
++  promise: Promise<CacheEntry>;
++  resolve: (entry: CacheEntry) => void;
++  reject: (err: unknown) => void;
++  request: Request;
++  /** 挂上来的等待者数（只用于失败日志）。 */
++  waiters: number;
++};
++
++/**
++ * 白名单：路径模式（Elysia 同款 `:param` 段语法）+ 是否需要把协商后的 Accept-Language 并入 key。
++ *
++ * `negotiatesHeader` = true 的路由在 handler 里 `resolveLocale(query.locale, accept-language)`：
++ * 输出随「协商结果」而非 header 字面值变化，故 key 用协商后的 locale（不同 header 协商到同一 locale
++ * 得到同一份缓存，正确且不碎片化）。
++ *
++ * 全部候选路由的逐条审计（读 header / 会话 / staff / 当前时间）见 REPORT-api.md 的「白名单审计表」。
++ */
++const WHITELIST: readonly { pattern: string; negotiatesHeader: boolean }[] = [
++  // ——— 站点回源主力（生产流量 Top）———
++  { pattern: '/announcement', negotiatesHeader: false }, // ?locale=；按当前时间筛生效窗口（最多晚一个 TTL）
++  // ⚠️ 字面量段必须排在参数段之前：/blog/slugs 不能被 /blog/:slug 吃掉（否则 key 维度用错）。
++  { pattern: '/blog/slugs', negotiatesHeader: false },
++  { pattern: '/showcases', negotiatesHeader: true },
++  { pattern: '/showcases/cards', negotiatesHeader: true },
++  { pattern: '/showcases/:slug', negotiatesHeader: true },
++  // ——— 模型目录 ———
++  { pattern: '/models', negotiatesHeader: false },
++  { pattern: '/models/page/:modelSlug', negotiatesHeader: false }, // ?locale=&route=
++  { pattern: '/models/_names', negotiatesHeader: false },
++  { pattern: '/models/_filters', negotiatesHeader: false },
++  { pattern: '/models/_redirects', negotiatesHeader: false },
++  { pattern: '/models/_retired', negotiatesHeader: false },
++  { pattern: '/pricing', negotiatesHeader: false },
++  // ——— 内容面 ———
++  { pattern: '/blog', negotiatesHeader: false },
++  { pattern: '/blog/:slug', negotiatesHeader: false },
++  { pattern: '/playgrounds/bundles', negotiatesHeader: false },
++  { pattern: '/playgrounds/models/:id', negotiatesHeader: false },
++  { pattern: '/promotions', negotiatesHeader: false }, // buildLiveWhere 含时间窗（最多晚一个 TTL）
++  { pattern: '/promotions/:slug', negotiatesHeader: false },
++  { pattern: '/faq', negotiatesHeader: true },
++  { pattern: '/faq/categories', negotiatesHeader: true },
++  { pattern: '/changelog', negotiatesHeader: true },
++  { pattern: '/changelog/categories', negotiatesHeader: true },
++  { pattern: '/changelog/feed', negotiatesHeader: true },
++  { pattern: '/changelog/:id', negotiatesHeader: true },
++  { pattern: '/api-doc', negotiatesHeader: false },
++  { pattern: '/locales/enabled', negotiatesHeader: false },
++];
++
++/** 编译成 { regex, negotiatesHeader }；`:param` 只匹配单段（故 /blog/:slug 不会误吃 /blog/x/translations/en/raw）。 */
++const ROUTES: readonly { regex: RegExp; negotiatesHeader: boolean }[] = WHITELIST.map((r) => {
++  const source = r.pattern
++    .split('/')
++    .map((seg) => (seg.startsWith(':') ? '[^/]+' : seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
++    .join('/');
++  return { regex: new RegExp(`^${source}$`), negotiatesHeader: r.negotiatesHeader };
++});
++
++function matchRoute(pathname: string): { negotiatesHeader: boolean } | null {
++  for (const route of ROUTES) if (route.regex.test(pathname)) return route;
++  return null;
++}
++
++/** env 数值读取：非法/负数按默认值（防误配成 "abc" 静默关掉缓存）。 */
++function envInt(name: string, fallback: number): number {
++  const raw = process.env[name];
++  if (raw === undefined || raw === '') return fallback;
++  const n = Number(raw);
++  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
++}
++
++function ttlMs(): number {
++  return envInt('HIAPI_RESPONSE_CACHE_TTL_MS', 60_000);
++}
++function maxEntries(): number {
++  return envInt('HIAPI_RESPONSE_CACHE_MAX_ENTRIES', 2_000);
++}
++function maxBytes(): number {
++  return envInt('HIAPI_RESPONSE_CACHE_MAX_BYTES', 64 * 1024 * 1024);
++}
++function waitMs(): number {
++  return envInt('HIAPI_RESPONSE_CACHE_WAIT_MS', 12_000);
++}
++
++// ———————————————————————— 缓存存储（手写 LRU：Map 插入序 + get 时搬到末尾）————————————————————————
++const cache = new Map<string, CacheEntry>();
++const flights = new Map<string, Flight>();
++/** 领头请求 → 它的 flight（mapResponse/onAfterResponse 用请求本身找回 key，不靠重算 URL 维度）。 */
++const flightOfRequest = new WeakMap<Request, { key: string; flight: Flight; generation: number }>();
++
++let hits = 0;
++let misses = 0;
++let coalesced = 0;
++let evictions = 0;
++let totalBytes = 0;
++
++/**
++ * 缓存世代（写-清竞态，审计风险点 5）：
++ * 「写前开始、写后才完成的 GET」若在清空之后落库，会把写前的旧数据写回缓存，导致「刚发布却又是旧内容」
++ * 直到下个 TTL。修法：清空时 generations++，GET 在开始（onBeforeHandle 领头处）记下当前世代，
++ * 落缓存时世代不一致就丢弃。flight 也按世代判定——跨代的 in-flight 结果不喂给清空后的等待者。
++ */
++let generation = 0;
++
++/** 清空本缓存（写请求成功、site-purge 前、测试复位）；同时推进世代，让在途的旧读结果不再落库。 */
++export function clearResponseCache(): void {
++  cache.clear();
++  // 在途 flight 也摘掉：清空之后到达的请求必须自己当领头去读新数据，不能挂到清空前开始的旧读上
++  // （否则旧读按世代被判废，后到者只能拿 503——purge 后站点立刻回源正好撞上，等于这次刷新白发）。
++  // 旧领头仍持有自己的 flight，完成后照常 settle 它原有的等待者（见 mapResponse）。
++  flights.clear();
++  totalBytes = 0;
++  generation++;
++}
++
++/** 缓存指标（测试 / 指标行）。`inflight` 由 plugins/inflight.ts 另计，不在此。 */
++export function responseCacheStats(): {
++  hits: number;
++  misses: number;
++  coalesced: number;
++  evictions: number;
++  entries: number;
++  bytes: number;
++  flights: number;
++  ttlMs: number;
++} {
++  return {
++    hits,
++    misses,
++    coalesced,
++    evictions,
++    entries: cache.size,
++    bytes: totalBytes,
++    flights: flights.size,
++    ttlMs: ttlMs(),
++  };
++}
++
++/** 测试复位（计数与内容都归零；不动 env）。 */
++export function __resetResponseCacheForTest(): void {
++  cache.clear();
++  flights.clear();
++  totalBytes = 0;
++  hits = 0;
++  misses = 0;
++  coalesced = 0;
++  evictions = 0;
++}
++
++/**
++ * 归一化 query：只按参数名排序（稳定排序，同名参数保留原顺序），重建稳定串。
++ * 同名参数不能按值排：Elysia 对标量参数取最后一个值，`?locale=en&locale=zh` 与 `?locale=zh&locale=en`
++ * 含义不同，按值排会把两者归成同一个 key 而串内容。
++ */
++function canonicalQuery(searchParams: URLSearchParams): string {
++  const pairs = [...searchParams.entries()].sort((a, b) => (a[0] === b[0] ? 0 : a[0] < b[0] ? -1 : 1));
++  return pairs.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
++}
++
++/** 缓存 key：method + 完整 path + 规范化 query（+ 协商 locale 维度）。 */
++function cacheKey(request: Request, route: { negotiatesHeader: boolean }): string {
++  const url = new URL(request.url);
++  const query = canonicalQuery(url.searchParams);
++  if (!route.negotiatesHeader) return `${request.method} ${url.pathname}?${query}`;
++  const acceptLanguage = request.headers.get('accept-language') ?? undefined;
++  const locale = resolveLocale(url.searchParams.get('locale') ?? undefined, acceptLanguage);
++  return `${request.method} ${url.pathname}?${query}|al=${locale}`;
++}
++
++function byteLength(s: string): number {
++  return Buffer.byteLength(s, 'utf8');
++}
++
++/** 取未过期条目；命中则搬到 LRU 末尾。 */
++function readEntry(key: string): CacheEntry | null {
++  const entry = cache.get(key);
++  if (entry === undefined) return null;
++  if (entry.expiresAt <= Date.now()) {
++    cache.delete(key);
++    totalBytes -= entry.bytes;
++    return null;
++  }
++  cache.delete(key);
++  cache.set(key, entry); // LRU：最近使用搬到末尾
++  return entry;
++}
++
++/** 写入 + 容量淘汰（条目数 / 总字节双上限，都按 LRU 从前端淘汰）。 */
++function writeEntry(key: string, entry: CacheEntry): void {
++  const existing = cache.get(key);
++  if (existing !== undefined) {
++    totalBytes -= existing.bytes;
++    cache.delete(key);
++  }
++  cache.set(key, entry);
++  totalBytes += entry.bytes;
++  const maxE = maxEntries();
++  const maxB = maxBytes();
++  while (cache.size > 0 && (cache.size > maxE || totalBytes > maxB)) {
++    const oldest = cache.keys().next();
++    if (oldest.done === true) break;
++    const victim = cache.get(oldest.value);
++    cache.delete(oldest.value);
++    if (victim !== undefined) totalBytes -= victim.bytes;
++    evictions++;
++  }
++}
++
++/** 构造命中响应：重放 content-type/vary，带 x-content-cache，遵循 set.headers 合并（CORS 由 onRequest 钩子补）。 */
++function hitResponse(entry: CacheEntry, marker: 'HIT' | 'COALESCED'): Response {
++  const headers: Record<string, string> = {
++    'content-type': entry.contentType,
++    'x-content-cache': marker,
++  };
++  if (entry.vary !== undefined) headers.vary = entry.vary;
++  return new Response(entry.body, { status: entry.status, headers });
++}
++
++/** 单飞等待者失败（等待超时 / 领头失败）的 503 busy：手写 Response 跳过路由 response 校验（同 inflight-limit）。 */
++function busyResponse(): Response {
++  return new Response(JSON.stringify(apiError(503, 'busy')), {
++    status: 503,
++    headers: { 'content-type': 'application/json;charset=utf-8', 'x-content-cache': 'COALESCED' },
++  });
++}
++
++/** 缓存关闭（TTL=0）时的旁路判定：所有钩子直接返回，不读不写不记账。 */
++function bypassed(): boolean {
++  return ttlMs() <= 0;
++}
++
++/** 只摘掉「仍是自己」的 flight：清空后同 key 可能已有新领头，不能误删别人的。 */
++function detachFlight(key: string, flight: Flight): void {
++  if (flights.get(key) === flight) flights.delete(key);
++  flightOfRequest.delete(flight.request);
++}
++
++/** 单飞领头请求拿不到可重放的响应：所有等待者一起回 503（不入缓存）。有等待者时记一行，便于追原因。 */
++function settleFlightError(leader: { key: string; flight: Flight }, err: unknown): void {
++  const { key, flight } = leader;
++  detachFlight(key, flight);
++  if (flight.waiters > 0) {
++    const reason = err instanceof Error ? err.message : String(err);
++    console.warn(`[response-cache] 单飞领头失败，${flight.waiters} 个等待者回 503 key=${key} reason=${reason}`);
++  }
++  flight.reject(err);
++  // 拒绝后没人 await 会触发 unhandledRejection：给个空 catch 兜底（等待方自己 await 的是同一 promise）。
++  flight.promise.catch(() => {});
++}
++
++/**
++ * 领头的响应不可缓存（4xx/5xx 或 code≠0）：能重放就让等待者原样应答（不落缓存，下一个请求照常回源），
++ * 否则等待者回 503。
++ *
++ * 错误路径（handler throw → envelope onError 的 `status(404, apiError(...))`）：Elysia 1.4.28 交给
++ * mapResponse 的是 ElysiaCustomStatusResponse { code, response }，此刻 set.status 仍是 500（实测）——
++ * 必须拆包取真实状态与信封，否则等待者拿到的是 500 + 包装对象。
++ */
++function settleFlightNonCacheable(leader: { key: string; flight: Flight }, response: unknown, status: number): void {
++  const wrapped = response instanceof ElysiaCustomStatusResponse;
++  const replayStatus = wrapped ? Number(response.code) : status;
++  const replayBody: unknown = wrapped ? response.response : response;
++  const replayable =
++    typeof replayBody === 'object' && replayBody !== null && !(replayBody instanceof Response) && Number.isFinite(replayStatus);
++  if (!replayable) {
++    settleFlightError(leader, new Error(`non-replayable response ${status}`));
++    return;
++  }
++  const body = JSON.stringify(replayBody);
++  detachFlight(leader.key, leader.flight);
++  leader.flight.resolve({
++    body,
++    status: replayStatus,
++    contentType: 'application/json;charset=utf-8',
++    bytes: byteLength(body),
++    expiresAt: 0,
++  });
++}
++
++/** Elysia 钩子的 `set`（状态码 / 响应头）。本模块只读写 status 与 headers。 */
++type HookSet = Context['set'];
++
++// ———————————————————————— 钩子实现（插件 plugins/response-cache.ts 只负责注册）————————————————————————
++
++/**
++ * onBeforeHandle：命中直接应答 / 单飞等待。非白名单、非 GET、旁路模式一律放行到 handler。
++ * 单飞等待者最多等 HIAPI_RESPONSE_CACHE_WAIT_MS（默认 12s），超时或领头失败都回 503 busy（不各自再起一轮查询）。
++ */
++export async function cacheBeforeHandle({ request, set }: { request: Request; set: HookSet }): Promise<Response | undefined> {
++  if (bypassed()) return;
++  if (request.method !== 'GET' && request.method !== 'HEAD') return;
++  const { pathname } = new URL(request.url);
++  const route = matchRoute(pathname);
++  if (route === null) return;
++
++  const key = cacheKey(request, route);
++  const cached = readEntry(key);
++  if (cached !== null) {
++    hits++;
++    // 传出去的 body 与缓存条目共用同一字符串（不可变），无需再 stringify。
++    return hitResponse(cached, 'HIT');
++  }
++
++  // 单飞：同 key 已有请求在执行 → 复用它的结果（不再打 DB）。
++  const existing = flights.get(key);
++  if (existing !== undefined) {
++    coalesced++;
++    existing.waiters++;
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    const timeout = new Promise<null>((resolve) => {
++      timer = setTimeout(() => resolve(null), waitMs());
++      timer.unref?.();
++    });
++    try {
++      const entry = await Promise.race([existing.promise, timeout]);
++      if (entry === null) {
++        // 等待超时：领头请求可能已卡在 DB 上——直接失败，别把等待者一起挂住（也避免它们各自起一轮）。
++        set.status = 503;
++        return busyResponse();
++      }
++      return hitResponse(entry, 'COALESCED');
++    } catch {
++      // 领头失败 → 本请求也失败（不入缓存）；走全局 onError 的信封化路径会丢「同因」，故直接回 503。
++      set.status = 503;
++      return busyResponse();
++    } finally {
++      if (timer !== undefined) clearTimeout(timer);
++    }
++  }
++
++  // 领头：登记 flight，等 mapResponse（成功）或 onAfterResponse（兜底失败）来 settle。
++  misses++;
++  let resolve!: (entry: CacheEntry) => void;
++  let reject!: (err: unknown) => void;
++  const promise = new Promise<CacheEntry>((res, rej) => {
++    resolve = res;
++    reject = rej;
++  });
++  promise.catch(() => {}); // 无等待者时也不产生 unhandledRejection
++  const flight: Flight = { promise, resolve, reject, request, waiters: 0 };
++  flights.set(key, flight);
++  flightOfRequest.set(request, { key, flight, generation });
++  return;
++}
++
++// 成功响应落缓存：只存「2xx + 信封 code===0」的 JSON 对象；顺带 settle 单飞。
++// 写后失效也在这里做（而非 onAfterResponse——后者经 setImmediate 异步触发，会给写返回与清空之间
++// 留下一个真实的重放窗口）。
++//
++// ⚠️ 每条路径都必须 **原样 return response（passthrough）**：Elysia 1.4.28 的错误/404 路径上，
++// 全局 mapResponse 返回 undefined 会被当成「替换结果」写回 `_r`，而 `_r` 不会还原成原响应
++// → 404 变 200 空体（实测：/playgrounds/branches/x 由 404 变 200 ""）。故一律 `return response`。
++export function cacheMapResponse({ request, set, response }: { request: Request; set: HookSet; response: unknown }): Response {
++  // 原样透传（绝不可返回 undefined：Elysia 1.4.28 错误路径上 undefined 会吞掉原响应）。
++  // Elysia context 把 response 标成 unknown，这里按契约断言（普通对象被原样返回即「不替换」语义）。
++  const keep = response as unknown as Response;
++  const method = request.method;
++  const status = typeof set.status === 'string' ? Number(set.status) : (set.status ?? 200);
++
++  // 写后失效第一优先：任何非 GET/HEAD 的 2xx（写很少，整体清空简单可靠）。
++  if (method !== 'GET' && method !== 'HEAD') {
++    if (status >= 200 && status < 300) clearResponseCache();
++    return keep;
++  }
++
++  const leader = flightOfRequest.get(request);
++  if (bypassed()) {
++    if (leader !== undefined) settleFlightError(leader, new Error('cache bypassed'));
++    return keep;
++  }
++  const { pathname } = new URL(request.url);
++  const route = matchRoute(pathname);
++  if (route === null) {
++    if (leader !== undefined) settleFlightError(leader, new Error('not whitelisted'));
++    return keep;
++  }
++
++  const isEnvelopeOk =
++    typeof response === 'object' &&
++    response !== null &&
++    !(response instanceof Response) &&
++    (response as { code?: unknown }).code === 0;
++  if (status < 200 || status >= 300 || !isEnvelopeOk) {
++    if (leader !== undefined) settleFlightNonCacheable(leader, response, status);
++    return keep;
++  }
++
++  const body = JSON.stringify(response);
++  const vary = typeof set.headers.vary === 'string' ? set.headers.vary : undefined;
++  const entry: CacheEntry = {
++    body,
++    status,
++    contentType: 'application/json;charset=utf-8',
++    ...(vary !== undefined ? { vary } : {}),
++    bytes: byteLength(body),
++    expiresAt: Date.now() + ttlMs(),
++  };
++  if (leader !== undefined) {
++    const key = leader.key;
++    detachFlight(key, leader.flight);
++    // 世代不一致 = 本次读在清空（写成功 / purge）之前开始、之后才完成 → 结果可能含旧数据，不落缓存。
++    // 等待者都是清空前挂上的（清空时 flights 已摘掉，之后到达的会自己当领头），它们本就开始于写之前，
++    // 拿这份结果与「直接打到 handler」等价，故照常应答而不是 503。
++    if (leader.generation === generation) writeEntry(key, entry);
++    leader.flight.resolve(entry);
++  }
++  set.headers['x-content-cache'] = 'MISS';
++  return new Response(body, {
++    status,
++    headers: { 'content-type': entry.contentType, ...(vary !== undefined ? { vary } : {}) },
++  });
++}
++
++/**
++ * onAfterResponse 兜底：领头请求没走到 mapResponse 的 settle（handler 抛错、被后续钩子短路等），
++ * 在这里把 flight 置失败，等待者一起回 503。不另挂全局 onError——全局 onError 只留 plugins/envelope.ts 一处。
++ * onAfterResponse 经 setImmediate 触发，比 onError 晚一个事件循环 tick，对等待者无实质影响。
++ */
++export function cacheAfterResponse({ request }: { request: Request }): void {
++  const leader = flightOfRequest.get(request);
++  if (leader !== undefined) settleFlightError(leader, new Error('leader finished without cacheable response'));
++}
+diff --git a/apps/content-api/tests/plugins/inflight-limit.test.ts b/apps/content-api/tests/plugins/inflight-limit.test.ts
+new file mode 100644
+index 00000000..9f3696ed
+--- /dev/null
++++ b/apps/content-api/tests/plugins/inflight-limit.test.ts
+@@ -0,0 +1,190 @@
++// inflight-limit 插件单测：准入上限计数语义（+1/-1 各一次），503 与健康检查豁免。
++// 关键行为都依赖 Elysia 1.4.28 的实测结论（见插件头注释），故这里逐条钉住。
++import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
++import { Elysia } from 'elysia';
++import { inflightLimit, inflightStats, __resetInflightForTest } from '../../src/plugins/inflight-limit';
++
++let slowMs = 0;
++
++function buildApp(max?: string) {
++  if (max !== undefined) process.env.HIAPI_MAX_INFLIGHT = max;
++  let release: (() => void) | null = null;
++  const app = new Elysia()
++    .use(inflightLimit)
++    .get('/work', async () => {
++      if (slowMs > 0) {
++        await new Promise<void>((resolve) => {
++          release = resolve;
++          setTimeout(resolve, slowMs);
++        });
++      }
++      return { code: 0, message: 'ok', data: { done: true } };
++    })
++    .get('/internal/health', () => ({ code: 0, message: 'ok', data: { status: 'ok' } }))
++    .get('/boom', () => {
++      throw new Error('kaboom');
++    });
++  return { app, getRelease: () => release };
++}
++
++// 快照 / 还原 HIAPI_MAX_INFLIGHT（不裸 delete：quality-guidelines §Testing Requirements 09-24 判例）。
++let savedMax: string | undefined;
++
++beforeEach(() => {
++  __resetInflightForTest();
++  slowMs = 0;
++  savedMax = process.env.HIAPI_MAX_INFLIGHT;
++  delete process.env.HIAPI_MAX_INFLIGHT; // 用例默认从「未设置」起步，afterEach 还原
++});
++
++afterEach(() => {
++  if (savedMax === undefined) delete process.env.HIAPI_MAX_INFLIGHT;
++  else process.env.HIAPI_MAX_INFLIGHT = savedMax;
++});
++
++describe('inflight-limit：计数', () => {
++  test('请求完成后 in-flight 归零（不泄漏）', async () => {
++    const { app } = buildApp();
++    const r = await app.handle(new Request('http://localhost/work'));
++    expect(r.status).toBe(200);
++    await Bun.sleep(10); // afterResponse 经 setImmediate 异步触发
++    expect(inflightStats().inflight).toBe(0);
++    expect(inflightStats().peak).toBe(1);
++  });
++
++  test('handler 抛错后 in-flight 仍归零（onError 路径也触发 afterResponse）', async () => {
++    const { app } = buildApp();
++    const r = await app.handle(new Request('http://localhost/boom'));
++    expect(r.status).toBe(500);
++    await Bun.sleep(10);
++    expect(inflightStats().inflight).toBe(0);
++  });
++
++  test('客户端中途断开（真实 HTTP 连接 abort）后 in-flight 仍归零', async () => {
++    let finished = 0;
++    const server = new Elysia()
++      .use(inflightLimit)
++      .get('/work', async () => {
++        await Bun.sleep(150);
++        finished++;
++        return { code: 0, message: 'ok', data: { done: true } };
++      })
++      .listen(0);
++    try {
++      const port = server.server!.port;
++      const ac = new AbortController();
++      const pending = fetch(`http://127.0.0.1:${port}/work`, { signal: ac.signal }).catch((e: unknown) => e);
++      await Bun.sleep(30);
++      expect(inflightStats().inflight).toBe(1);
++      ac.abort();
++      expect(String(await pending)).toContain('AbortError');
++      await Bun.sleep(300); // handler 照常跑完 → afterResponse 补触发
++      expect(finished).toBe(1);
++      expect(inflightStats().inflight).toBe(0);
++    } finally {
++      await server.stop(true);
++    }
++  });
++
++  test('并发 3 个慢请求 → peak=3，全部完成后归零', async () => {
++    slowMs = 1000;
++    const { app, getRelease } = buildApp();
++    const ps = Array.from({ length: 3 }, () => app.handle(new Request('http://localhost/work')));
++    await Bun.sleep(10);
++    expect(inflightStats().inflight).toBe(3);
++    expect(inflightStats().peak).toBe(3);
++    getRelease()?.();
++    const res = await Promise.all(ps);
++    expect(res.every((r) => r.status === 200)).toBe(true);
++    await Bun.sleep(10);
++    expect(inflightStats().inflight).toBe(0);
++  });
++});
++
++describe('inflight-limit：准入拒绝', () => {
++  test('超过上限 → 503 busy，且不重复计数/不漏减', async () => {
++    slowMs = 1000;
++    const { app, getRelease } = buildApp('1');
++    const p1 = app.handle(new Request('http://localhost/work')); // 占住唯一名额
++    await Bun.sleep(10);
++    expect(inflightStats().inflight).toBe(1);
++
++    const r2 = await app.handle(new Request('http://localhost/work'));
++    expect(r2.status).toBe(503);
++    expect(await r2.json()).toEqual({ code: 503, message: 'busy' });
++    expect(r2.headers.get('x-content-cache')).toBe('BYPASS');
++    expect(inflightStats().shed).toBe(1);
++    // 被拒的请求没 +1 → 完成时不减，计数仍为 1（不多也不少）
++    await Bun.sleep(10);
++    expect(inflightStats().inflight).toBe(1);
++
++    getRelease()?.();
++    await p1;
++    await Bun.sleep(10);
++    expect(inflightStats().inflight).toBe(0);
++  });
++
++  test('健康检查不受准入限制（即使已满）', async () => {
++    slowMs = 1000;
++    const { app, getRelease } = buildApp('1');
++    const p1 = app.handle(new Request('http://localhost/work'));
++    await Bun.sleep(10);
++    expect(inflightStats().inflight).toBe(1);
++
++    const h = await app.handle(new Request('http://localhost/internal/health'));
++    expect(h.status).toBe(200);
++    // 健康检查不计数、不占名额
++    expect(inflightStats().inflight).toBe(1);
++    expect(inflightStats().shed).toBe(0);
++
++    getRelease()?.();
++    await p1;
++    await Bun.sleep(10);
++    expect(inflightStats().inflight).toBe(0);
++  });
++
++  test('HIAPI_MAX_INFLIGHT 未设 → 默认 64', () => {
++    expect(inflightStats().max).toBe(64);
++  });
++
++  test('HIAPI_MAX_INFLIGHT 非法值 → 回落默认', () => {
++    process.env.HIAPI_MAX_INFLIGHT = 'x';
++    expect(inflightStats().max).toBe(64);
++  });
++
++  test('HIAPI_MAX_INFLIGHT=0 → 不限制（0 表示关闭闸门）', async () => {
++    const { app } = buildApp('0');
++    const ps = Array.from({ length: 20 }, () => app.handle(new Request('http://localhost/work')));
++    const res = await Promise.all(ps);
++    expect(res.every((r) => r.status === 200)).toBe(true);
++    expect(inflightStats().shed).toBe(0);
++  });
++});
++
++describe('inflight-limit：与缓存命中互不干扰（顺序即语义）', () => {
++  test('缓存命中不进入 in-flight 计数（命中在更早的 onBeforeHandle 短路）', async () => {
++    const { responseCache } = await import('../../src/plugins/response-cache');
++    const { __resetResponseCacheForTest } = await import('../../src/utils/response-cache');
++    // 测试进程默认关缓存（tests/support/clean-env.ts）——本用例要真实缓存语义，临时开启
++    const savedTtl = process.env.HIAPI_RESPONSE_CACHE_TTL_MS;
++    process.env.HIAPI_RESPONSE_CACHE_TTL_MS = '60000';
++    __resetResponseCacheForTest();
++    const app = new Elysia().use(responseCache).use(inflightLimit).get('/announcement', () => ({
++      code: 0,
++      message: 'ok',
++      data: { n: 1 },
++    }));
++    await app.handle(new Request('http://localhost/announcement')); // MISS：计数 1 次
++    await Bun.sleep(10);
++    expect(inflightStats().peak).toBe(1);
++
++    __resetInflightForTest();
++    const hit = await app.handle(new Request('http://localhost/announcement')); // HIT：不应计数
++    expect(hit.headers.get('x-content-cache')).toBe('HIT');
++    await Bun.sleep(10);
++    expect(inflightStats().peak).toBe(0); // 命中完全没进 inflightLimit
++    __resetResponseCacheForTest();
++    if (savedTtl === undefined) delete process.env.HIAPI_RESPONSE_CACHE_TTL_MS;
++    else process.env.HIAPI_RESPONSE_CACHE_TTL_MS = savedTtl;
++  });
++});
+diff --git a/apps/content-api/tests/plugins/metrics.test.ts b/apps/content-api/tests/plugins/metrics.test.ts
+new file mode 100644
+index 00000000..5456ad3b
+--- /dev/null
++++ b/apps/content-api/tests/plugins/metrics.test.ts
+@@ -0,0 +1,60 @@
++// metrics 插件单测：指标行格式（一行 JSON、字段齐全、池读不到时写明原因）。
++import { describe, test, expect } from 'bun:test';
++import { statsSnapshot, logStatsLine } from '../../src/plugins/metrics';
++
++describe('metrics：指标行', () => {
++  test('snapshot 字段齐全（ts/pool/inflight/cache）', () => {
++    const s = statsSnapshot();
++    expect(typeof s.ts).toBe('string');
++    expect(s.pool).toBeDefined();
++    expect(s.inflight).toMatchObject({
++      inflight: expect.any(Number),
++      peak: expect.any(Number),
++      shed: expect.any(Number),
++      max: expect.any(Number),
++    });
++    expect(s.cache).toMatchObject({
++      hits: expect.any(Number),
++      misses: expect.any(Number),
++      coalesced: expect.any(Number),
++      evictions: expect.any(Number),
++      entries: expect.any(Number),
++      bytes: expect.any(Number),
++      flights: expect.any(Number),
++      ttlMs: expect.any(Number),
++    });
++  });
++
++  test('pool 要么给出真实三项计数、要么写明读不到的原因（不许省略/静默）', () => {
++    const pool = statsSnapshot().pool as Record<string, unknown>;
++    // 不依赖进程状态：同进程跑全量时别的用例可能已连库。两种合法形态：
++    //   ① 已 connect → { total, idle, waiting } 三个数字；
++    //   ② 未 connect → { error: <原因字符串> }（区分「读不到」与「0 连接」）。
++    if ('error' in pool) {
++      expect(typeof pool.error).toBe('string');
++      expect((pool.error as string).length).toBeGreaterThan(0);
++    } else {
++      expect(typeof pool.total).toBe('number');
++      expect(typeof pool.idle).toBe('number');
++      expect(typeof pool.waiting).toBe('number');
++    }
++  });
++
++  test('logStatsLine 输出单行 [content-api] stats {json}', () => {
++    const lines: string[] = [];
++    const orig = console.info;
++    console.info = (msg: string) => {
++      lines.push(msg);
++    };
++    try {
++      logStatsLine();
++    } finally {
++      console.info = orig;
++    }
++    expect(lines.length).toBe(1);
++    expect(lines[0]!.startsWith('[content-api] stats ')).toBe(true);
++    expect(lines[0]!.includes('\n')).toBe(false);
++    const json = JSON.parse(lines[0]!.slice('[content-api] stats '.length));
++    expect(json.pool).toBeDefined();
++  });
++});
+diff --git a/apps/content-api/tests/plugins/response-cache.integration.test.ts b/apps/content-api/tests/plugins/response-cache.integration.test.ts
+new file mode 100644
+index 00000000..19559bc6
+--- /dev/null
++++ b/apps/content-api/tests/plugins/response-cache.integration.test.ts
+@@ -0,0 +1,299 @@
++// response-cache 集成测试：真实 app（src/index.ts）+ DB harness。
++// 单测（tests/plugins/response-cache.test.ts）已钉住 key/TTL/单飞/准入等语义；这里只验真实组装下必须成立的四件事：
++//   ① 鉴权在缓存之前（未带 client token 拿不到缓存内容）；
++//   ② 真实白名单路由 miss→hit，且命中不查库（DB 关掉后仍能命中）；
++//   ③ 真实写路由（POST /announcement）成功 → 缓存清空；
++//   ④ purgeSitePaths 发请求前先清本进程缓存；
++//   ⑤ 真实路由上同 key 并发只进一次 service（单飞）。
++// 只有一处写（POST /announcement，ULID 新行，不影响其它用例断言）→ 用文件级重置档（beforeAll resetAndSeed）。
++import { describe, test, expect, beforeAll, beforeEach, afterEach } from 'bun:test';
++import { app } from '../../src/index';
++import { resetAndSeed } from '../db-harness';
++import { json } from '../support/http';
++import { CLIENT_TEST_TOKEN } from '../support/client-token';
++import { staffCookie } from '../support/auth';
++import {
++  clearResponseCache,
++  responseCacheStats,
++  __resetResponseCacheForTest,
++} from '../../src/utils/response-cache';
++import {
++  __installSitePurgeTestDeps,
++  __resetSitePurgeForTest,
++  __flushSitePurgeForTest,
++  collectSitePurge,
++  purgeSitePaths,
++} from '../../src/modules/model-sync/site-purge';
++
++const AUTH = { authorization: `Bearer ${CLIENT_TEST_TOKEN}` };
++// 测试进程预置 TTL=0（tests/support/clean-env.ts），本文件要验证真实缓存语义 → 显式开启。
++// 本文件改动的全部 env 键：每用例前快照、后逐键还原（SITE_PURGE_TOKEN 无 HIAPI_ 前缀，clean-env 清不到，
++// 不还原会泄漏给同进程后续文件——quality-guidelines §Testing Requirements 09-24 判例）。
++const TOUCHED_ENV = [
++  'HIAPI_RESPONSE_CACHE_TTL_MS',
++  'SITE_PURGE_TOKEN',
++  'HIAPI_CONTENT_TO_SITE_BASE_URL',
++  'HIAPI_CF_ZONE_ID',
++  'HIAPI_CF_PURGE_TOKEN',
++] as const;
++let savedEnv: Record<string, string | undefined> = {};
++
++beforeAll(async () => {
++  await resetAndSeed();
++});
++
++beforeEach(() => {
++  savedEnv = Object.fromEntries(TOUCHED_ENV.map((k) => [k, process.env[k]]));
++  process.env.HIAPI_RESPONSE_CACHE_TTL_MS = '60000';
++  __resetResponseCacheForTest();
++});
++
++afterEach(() => {
++  clearResponseCache();
++  __resetSitePurgeForTest();
++  for (const k of TOUCHED_ENV) {
++    const v = savedEnv[k];
++    if (v === undefined) delete process.env[k];
++    else process.env[k] = v;
++  }
++});
++
++describe('集成：鉴权先于缓存', () => {
++  test('不带 client token → 401，且不返回缓存内容', async () => {
++    // 先带 token 建立缓存
++    const ok = await app.handle(json('GET', '/announcement?locale=en'));
++    expect(ok.status).toBe(200);
++    expect(ok.headers.get('x-content-cache')).toBe('MISS');
++    const okBody = (await ok.json()) as { code: number };
++    expect(okBody.code).toBe(0);
++
++    // 同 URL 不带 token
++    const res = await app.handle(new Request('http://localhost/announcement?locale=en'));
++    expect(res.status).toBe(401);
++    const body = (await res.json()) as { code: number; message: string };
++    expect(body.code).toBe(401);
++    expect(body.message).toBe('unauthorized');
++    expect(res.headers.get('x-content-cache')).toBeNull();
++  });
++
++  test('/internal 健康检查不受 client token 限制，也不进缓存', async () => {
++    const a = await app.handle(new Request('http://localhost/internal/model-sync/health'));
++    const b = await app.handle(new Request('http://localhost/internal/model-sync/health'));
++    expect(a.status).toBe(200);
++    expect(b.headers.get('x-content-cache')).toBeNull();
++  });
++});
++
++describe('集成：真实路由 miss → hit', () => {
++  const ROUTES = [
++    '/announcement?locale=en',
++    '/showcases?locale=en',
++    '/models?locale=en',
++    '/blog?locale=en',
++    '/faq?locale=en',
++    '/changelog?locale=en',
++    '/faq/categories?locale=en',
++    '/changelog/categories?locale=en',
++    '/api-doc?locale=en',
++    '/promotions?locale=en',
++    '/playgrounds/bundles?locale=en',
++    '/models/_filters?locale=en',
++    '/models/_names',
++    '/models/_redirects',
++    '/models/_retired',
++    '/pricing?locale=en',
++    '/locales/enabled',
++    '/blog/slugs?locale=en',
++  ];
++
++  for (const path of ROUTES) {
++    test(`${path}：第一次 MISS、第二次 HIT 且内容一致`, async () => {
++      const r1 = await app.handle(json('GET', path));
++      expect(r1.status).toBe(200);
++      expect(r1.headers.get('x-content-cache')).toBe('MISS');
++      const body1 = await r1.text();
++
++      const r2 = await app.handle(json('GET', path));
++      expect(r2.status).toBe(200);
++      expect(r2.headers.get('x-content-cache')).toBe('HIT');
++      expect(await r2.text()).toBe(body1);
++    });
++  }
++});
++
++describe('集成：命中不查库（容量来源）', () => {
++  test('命中不进 service（DB 查询入口调用次数不变）', async () => {
++    const { AnnouncementService } = await import('../../src/modules/announcement/service');
++    let calls = 0;
++    const orig = AnnouncementService.list.bind(AnnouncementService);
++    // 计数包装：命中原样返回，但能看出 handler 是否真的执行到 DB 层
++    (AnnouncementService as unknown as { list: typeof orig }).list = ((locale?: string) => {
++      calls++;
++      return orig(locale);
++    }) as typeof orig;
++    try {
++      const r1 = await app.handle(json('GET', '/announcement?locale=en'));
++      expect(r1.status).toBe(200);
++      expect(r1.headers.get('x-content-cache')).toBe('MISS');
++      expect(calls).toBe(1);
++
++      const stats1 = responseCacheStats();
++      const r2 = await app.handle(json('GET', '/announcement?locale=en'));
++      expect(r2.headers.get('x-content-cache')).toBe('HIT');
++      expect(calls).toBe(1); // 命中原样不触库
++
++      // 对照：另一个 locale 未缓存 → 必须再进 service
++      const r3 = await app.handle(json('GET', '/announcement?locale=ja'));
++      expect(r3.headers.get('x-content-cache')).toBe('MISS');
++      expect(calls).toBe(2);
++
++      const stats2 = responseCacheStats();
++      expect(stats2.hits).toBe(stats1.hits + 1);
++      expect(stats2.misses).toBe(stats1.misses + 1); // 只有未命中那次计 miss
++    } finally {
++      (AnnouncementService as unknown as { list: typeof orig }).list = orig;
++    }
++  });
++});
++
++describe('集成：真实路由单飞', () => {
++  test('同 key 并发 5 个 → service 只进 1 次，其余 COALESCED 且内容一致', async () => {
++    const { AnnouncementService } = await import('../../src/modules/announcement/service');
++    let calls = 0;
++    const orig = AnnouncementService.list.bind(AnnouncementService);
++    (AnnouncementService as unknown as { list: typeof orig }).list = (async (locale?: string) => {
++      calls++;
++      await new Promise((r) => setTimeout(r, 50)); // 拉长领头窗口，保证其余请求挂上 flight
++      return orig(locale);
++    }) as typeof orig;
++    try {
++      const results = await Promise.all(
++        Array.from({ length: 5 }, () => app.handle(json('GET', '/announcement?locale=en'))),
++      );
++      expect(calls).toBe(1);
++      const markers = results.map((r) => r.headers.get('x-content-cache')).sort();
++      expect(markers).toEqual(['COALESCED', 'COALESCED', 'COALESCED', 'COALESCED', 'MISS']);
++      const bodies = await Promise.all(results.map((r) => r.text()));
++      expect(new Set(bodies).size).toBe(1);
++      expect(responseCacheStats().flights).toBe(0);
++    } finally {
++      (AnnouncementService as unknown as { list: typeof orig }).list = orig;
++    }
++  });
++});
++
++describe('集成：写后失效（真实写路由）', () => {
++  test('POST /announcement 成功后缓存清空，再 GET 拿到新内容', async () => {
++    // 基线：先读一次建立缓存
++    const before = await app.handle(json('GET', '/announcement?locale=en'));
++    expect(before.status).toBe(200);
++    expect(responseCacheStats().entries).toBeGreaterThan(0);
++
++    const created = await app.handle(
++      json(
++        'POST',
++        '/announcement',
++        {
++          base: { enabled: true, level: 'info' },
++          sequence: 1,
++          translations: [{ locale: 'en', message: 'cache-invalidation-probe' }],
++        },
++        { ...AUTH, cookie: staffCookie() },
++      ),
++    );
++    expect(created.status).toBe(200);
++    expect(responseCacheStats().entries).toBe(0); // 写成功即清空
++
++    const after = await app.handle(json('GET', '/announcement?locale=en'));
++    expect(after.headers.get('x-content-cache')).toBe('MISS');
++    expect(await after.text()).toContain('cache-invalidation-probe');
++  });
++});
++
++describe('集成：site-purge 前先清缓存', () => {
++  let sent = 0;
++  beforeEach(() => {
++    sent = 0;
++    process.env.SITE_PURGE_TOKEN = 'purge-token';
++    process.env.HIAPI_CONTENT_TO_SITE_BASE_URL = 'https://site.test';
++    delete process.env.HIAPI_CF_ZONE_ID;
++    delete process.env.HIAPI_CF_PURGE_TOKEN;
++    __installSitePurgeTestDeps({
++      fetch: (async () => {
++        sent++;
++        return new Response('{"purged":true}', { status: 200 });
++      }) as unknown as typeof fetch,
++    });
++  });
++
++  test('collectSitePurge 不逐事件清：多个同步事件合并到 flush 时清一次（发 purge 之前）', async () => {
++    const entriesAtSend: number[] = [];
++    __installSitePurgeTestDeps({
++      fetch: (async () => {
++        sent++;
++        entriesAtSend.push(responseCacheStats().entries); // 发 purge 时本缓存必须已清空（站点收到 purge 立刻回源）
++        return new Response('{"purged":true}', { status: 200 });
++      }) as unknown as typeof fetch,
++      query: async () => new Map(),
++    });
++    await app.handle(json('GET', '/announcement?locale=en'));
++    collectSitePurge(['fam-1']);
++    collectSitePurge(['fam-2']);
++    expect(responseCacheStats().entries).toBeGreaterThan(0); // 收集时不清
++    await __flushSitePurgeForTest();
++    expect(sent).toBeGreaterThan(0);
++    expect(entriesAtSend.every((n) => n === 0)).toBe(true);
++    expect(responseCacheStats().entries).toBe(0);
++  });
++
++  test('purgeSitePaths 调用后缓存条目归零（站点回源不会拿到旧内容）', async () => {
++    await app.handle(json('GET', '/announcement?locale=en'));
++    expect(responseCacheStats().entries).toBeGreaterThan(0);
++
++    await purgeSitePaths(['/en', '/en/models']);
++    expect(sent).toBeGreaterThan(0);
++    expect(responseCacheStats().entries).toBe(0);
++  });
++
++  test('站点 purge 请求本身失败也照样清本缓存（不能因站点不可用而留旧内容）', async () => {
++    __installSitePurgeTestDeps({
++      fetch: (async () => {
++        throw new Error('site down');
++      }) as unknown as typeof fetch,
++    });
++    await app.handle(json('GET', '/announcement?locale=en'));
++    const entriesBefore = responseCacheStats().entries;
++    expect(entriesBefore).toBeGreaterThan(0);
++
++    await purgeSitePaths(['/en']);
++    expect(responseCacheStats().entries).toBe(0);
++  });
++});
++
++describe('集成：purge 通道不可用时也清本缓存', () => {
++  test('env 未配时 collectSitePurge 按 3s 窗口合并清本进程缓存', async () => {
++    delete process.env.SITE_PURGE_TOKEN;
++    delete process.env.HIAPI_CONTENT_TO_SITE_BASE_URL;
++    delete process.env.HIAPI_CF_ZONE_ID;
++    delete process.env.HIAPI_CF_PURGE_TOKEN;
++    await app.handle(json('GET', '/announcement?locale=en'));
++    collectSitePurge(['fam-1']);
++    collectSitePurge(['fam-2']);
++    expect(responseCacheStats().entries).toBeGreaterThan(0);
++    await Bun.sleep(3_200);
++    expect(responseCacheStats().entries).toBe(0);
++  }, 10_000);
++
++  test('env 未配（envConfig 返回 null）时 purgeSitePaths 仍清本进程缓存', async () => {
++    delete process.env.SITE_PURGE_TOKEN;
++    delete process.env.HIAPI_CONTENT_TO_SITE_BASE_URL;
++    delete process.env.HIAPI_CF_ZONE_ID;
++    delete process.env.HIAPI_CF_PURGE_TOKEN;
++
++    await app.handle(json('GET', '/announcement?locale=en'));
++    expect(responseCacheStats().entries).toBeGreaterThan(0);
++
++    await purgeSitePaths(['/en']);
++    expect(responseCacheStats().entries).toBe(0);
++  });
++});
+diff --git a/apps/content-api/tests/plugins/response-cache.test.ts b/apps/content-api/tests/plugins/response-cache.test.ts
+new file mode 100644
+index 00000000..1c0bf896
+--- /dev/null
++++ b/apps/content-api/tests/plugins/response-cache.test.ts
+@@ -0,0 +1,503 @@
++// response-cache 插件单测：不依赖 DB / 业务路由（挂临时 app，白名单 key 复用真实路径形态）。
++//
++// 覆盖（对齐任务卡验收 1）：
++//   miss→hit；不同 query/locale 不串；50 并发同 key → handler 只执行 1 次；TTL 到期重新执行；
++//   handler 失败不入缓存、等待者都失败；POST 成功后清空；TTL=0 完全旁路；
++//   未带 token（onRequest 鉴权失败）不返回缓存；Accept-Language 协商进 key。
++import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
++import { Elysia } from 'elysia';
++import { apiError } from '@hiapi/content-sdk';
++import { responseCache } from '../../src/plugins/response-cache';
++import { envelope } from '../../src/plugins/envelope';
++import { NotFoundError } from '../../src/utils/errors';
++import {
++  clearResponseCache,
++  responseCacheStats,
++  __resetResponseCacheForTest,
++} from '../../src/utils/response-cache';
++
++let handlerCalls = 0;
++let failNext = false;
++let slowMs = 0;
++
++/** 临时 app：/announcement（不协商头）、/showcases（协商 Accept-Language）、POST /write（写后清空）。 */
++function buildApp(opts: { withAuthGuard?: boolean; requireToken?: string } = {}) {
++  const app = new Elysia();
++  if (opts.withAuthGuard === true) {
++    app.onRequest(({ request, set }) => {
++      const expected = `Bearer ${opts.requireToken}`;
++      if (request.headers.get('authorization') !== expected) {
++        set.status = 401;
++        return apiError(401, 'unauthorized') as unknown as Response;
++      }
++      return undefined;
++    });
++  }
++  return app
++    .use(responseCache)
++    .get('/announcement', async ({ query }) => {
++      handlerCalls++;
++      if (slowMs > 0) await Bun.sleep(slowMs);
++      if (failNext) throw new Error('boom');
++      return { code: 0, message: 'ok', data: { locale: query.locale ?? 'en', n: handlerCalls } };
++    })
++    .get('/showcases', async ({ query, headers, set }) => {
++      handlerCalls++;
++      set.headers['vary'] = 'Accept-Language';
++      const al = headers['accept-language'] ?? 'en';
++      return { code: 0, message: 'ok', data: { locale: query.locale ?? al, n: handlerCalls } };
++    })
++    .post('/write', () => ({ code: 0, message: 'ok', data: { written: true } }));
++}
++
++let app: Elysia;
++let saved: Record<string, string | undefined> = {};
++const ENV_KEYS = [
++  'HIAPI_RESPONSE_CACHE_TTL_MS',
++  'HIAPI_RESPONSE_CACHE_MAX_ENTRIES',
++  'HIAPI_RESPONSE_CACHE_MAX_BYTES',
++  'HIAPI_RESPONSE_CACHE_WAIT_MS',
++];
++
++beforeEach(() => {
++  __resetResponseCacheForTest();
++  // 测试进程预置 TTL=0（tests/support/clean-env.ts：默认关缓存）——本文件显式开一个等效默认值，
++  // 断言「TTL 默认」的用例临时删 key 即可；文件结束原样恢复（不污染同进程后续文件）。
++  saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
++  process.env.HIAPI_RESPONSE_CACHE_TTL_MS = '60000';
++  delete process.env.HIAPI_RESPONSE_CACHE_MAX_ENTRIES;
++  delete process.env.HIAPI_RESPONSE_CACHE_MAX_BYTES;
++  handlerCalls = 0;
++  failNext = false;
++  slowMs = 0;
++  app = buildApp();
++});
++
++afterEach(() => {
++  for (const [k, v] of Object.entries(saved)) {
++    if (v === undefined) delete process.env[k];
++    else process.env[k] = v;
++  }
++  clearResponseCache();
++});
++
++describe('response-cache：基本命中', () => {
++  test('miss → hit：第二次不执行 handler，x-content-cache 依次为 MISS / HIT', async () => {
++    const r1 = await app.handle(new Request('http://localhost/announcement'));
++    expect(r1.status).toBe(200);
++    expect(r1.headers.get('x-content-cache')).toBe('MISS');
++    const b1 = await r1.json();
++    expect(handlerCalls).toBe(1);
++
++    const r2 = await app.handle(new Request('http://localhost/announcement'));
++    expect(r2.status).toBe(200);
++    expect(r2.headers.get('x-content-cache')).toBe('HIT');
++    expect(await r2.json()).toEqual(b1);
++    expect(handlerCalls).toBe(1); // 只执行一次
++  });
++
++  test('命中响应的 content-type 与 body 完整（可直接解析信封）', async () => {
++    await app.handle(new Request('http://localhost/announcement'));
++    const r = await app.handle(new Request('http://localhost/announcement'));
++    expect(r.headers.get('content-type')).toContain('application/json');
++    const body = (await r.json()) as { code: number; message: string; data: unknown };
++    expect(body.code).toBe(0);
++    expect(body.message).toBe('ok');
++  });
++
++  test('命中时保留 handler 设的 vary（Accept-Language 缓存正确性）', async () => {
++    await app.handle(new Request('http://localhost/showcases', { headers: { 'accept-language': 'ja' } }));
++    const r = await app.handle(new Request('http://localhost/showcases', { headers: { 'accept-language': 'ja' } }));
++    expect(r.headers.get('x-content-cache')).toBe('HIT');
++    expect(r.headers.get('vary')).toBe('Accept-Language');
++  });
++});
++
++describe('response-cache：key 维度', () => {
++  test('不同 query 不串（locale / page / size 各自独立）', async () => {
++    const a = await (await app.handle(new Request('http://localhost/announcement?locale=en'))).json();
++    const b = await (await app.handle(new Request('http://localhost/announcement?locale=ja'))).json();
++    expect(handlerCalls).toBe(2);
++    expect((a as { data: { locale: string } }).data.locale).toBe('en');
++    expect((b as { data: { locale: string } }).data.locale).toBe('ja');
++  });
++
++  test('query 顺序不影响 key（规范化排序）', async () => {
++    await app.handle(new Request('http://localhost/announcement?locale=ja&x=1'));
++    const r = await app.handle(new Request('http://localhost/announcement?x=1&locale=ja'));
++    expect(r.headers.get('x-content-cache')).toBe('HIT');
++    expect(handlerCalls).toBe(1);
++  });
++
++  test('不同 path 不串（/announcement vs /showcases）', async () => {
++    await app.handle(new Request('http://localhost/announcement'));
++    const r = await app.handle(new Request('http://localhost/showcases'));
++    expect(r.headers.get('x-content-cache')).toBe('MISS');
++    expect(handlerCalls).toBe(2);
++  });
++
++  test('协商 locale 进 key：header 不同但协商同一 locale 命中同一份；协商不同则分开', async () => {
++    // 第 1 次：header fr-CA → 协商 fr（resolveLocale 取基础语言）；query 无 locale
++    await app.handle(new Request('http://localhost/showcases', { headers: { 'accept-language': 'fr-CA,fr;q=0.9' } }));
++    expect(handlerCalls).toBe(1);
++    // fr-FR 也协商到 fr → 命中同一 key（不碎片化）
++    const r2 = await app.handle(new Request('http://localhost/showcases', { headers: { 'accept-language': 'fr-FR' } }));
++    expect(r2.headers.get('x-content-cache')).toBe('HIT');
++    expect(handlerCalls).toBe(1);
++    // de → 不同 key
++    const r3 = await app.handle(new Request('http://localhost/showcases', { headers: { 'accept-language': 'de' } }));
++    expect(r3.headers.get('x-content-cache')).toBe('MISS');
++    expect(handlerCalls).toBe(2);
++  });
++
++  test('不带 Accept-Language 与带 en 命中同一份（协商回落 en）', async () => {
++    await app.handle(new Request('http://localhost/showcases'));
++    const r = await app.handle(new Request('http://localhost/showcases', { headers: { 'accept-language': 'en' } }));
++    expect(r.headers.get('x-content-cache')).toBe('HIT');
++    expect(handlerCalls).toBe(1);
++  });
++});
++
++describe('response-cache：单飞', () => {
++  test('50 个并发同 key → handler 只执行 1 次，全部拿到同一份内容', async () => {
++    slowMs = 120; // 拉长窗口，确保并发确实重叠在 flight 内
++    const results = await Promise.all(
++      Array.from({ length: 50 }, () => app.handle(new Request('http://localhost/announcement'))),
++    );
++    expect(handlerCalls).toBe(1);
++    const bodies = await Promise.all(results.map((r) => r.text()));
++    expect(new Set(bodies).size).toBe(1);
++    // 1 个 MISS + 49 个 COALESCED（首个请求之外都走单飞）
++    const markers = results.map((r) => r.headers.get('x-content-cache'));
++    expect(markers.filter((m) => m === 'MISS').length).toBe(1);
++    expect(markers.filter((m) => m === 'COALESCED').length).toBe(49);
++    const stats = responseCacheStats();
++    expect(stats.coalesced).toBe(49);
++    expect(stats.hits).toBe(0);
++  });
++
++  test('并发之后再次请求 → HIT（领头结果已入缓存）', async () => {
++    slowMs = 50;
++    await Promise.all(Array.from({ length: 5 }, () => app.handle(new Request('http://localhost/announcement'))));
++    const r = await app.handle(new Request('http://localhost/announcement'));
++    expect(r.headers.get('x-content-cache')).toBe('HIT');
++  });
++
++  test('handler 失败 → 等待者全部失败、失败结果不入缓存（后续可重试）', async () => {
++    slowMs = 80;
++    failNext = true;
++    const results = await Promise.all(
++      Array.from({ length: 5 }, () => app.handle(new Request('http://localhost/announcement'))),
++    );
++    // 领头走全局 onError（envelope）→ 500；等待者拿 COALESCED 的 503（同一原因：领头失败）。
++    // 等待者必须马上失败，不能挂到 12s 等待上限（否则本用例超时）。
++    const statuses = results.map((r) => r.status);
++    expect(statuses.every((s) => s >= 500)).toBe(true);
++    expect(results.filter((r) => r.headers.get('x-content-cache') === 'COALESCED').length).toBe(4);
++    expect(responseCacheStats().entries).toBe(0);
++    expect(responseCacheStats().flights).toBe(0);
++
++    // 恢复后能正常服务（失败不入缓存）
++    failNext = false;
++    handlerCalls = 0;
++    const ok = await app.handle(new Request('http://localhost/announcement'));
++    expect(ok.status).toBe(200);
++    expect(ok.headers.get('x-content-cache')).toBe('MISS');
++    expect(handlerCalls).toBe(1);
++  });
++
++  test('领头 404（真实 envelope）→ 等待者原样拿 404 同一 body，不折成 503；不入缓存', async () => {
++    let calls = 0;
++    const a = new Elysia()
++      .use(envelope)
++      .use(responseCache)
++      .get('/blog/:slug', async () => {
++        calls++;
++        await Bun.sleep(60);
++        throw new NotFoundError('blog not found');
++      });
++    const results = await Promise.all(
++      Array.from({ length: 3 }, () => a.handle(new Request('http://localhost/blog/missing'))),
++    );
++    expect(calls).toBe(1);
++    expect(results.map((r) => r.status)).toEqual([404, 404, 404]);
++    expect(results.filter((r) => r.headers.get('x-content-cache') === 'COALESCED').length).toBe(2);
++    const bodies = await Promise.all(results.map((r) => r.text()));
++    expect(new Set(bodies).size).toBe(1);
++    expect(JSON.parse(bodies[0]!).code).toBe(404);
++    expect(responseCacheStats().entries).toBe(0);
++    expect(responseCacheStats().flights).toBe(0);
++    // 不入缓存：下一个请求照常回源
++    await a.handle(new Request('http://localhost/blog/missing'));
++    expect(calls).toBe(2);
++  });
++
++  test('等待者超过等待上限 → 503 busy（COALESCED），不各自再起一次查询', async () => {
++    process.env.HIAPI_RESPONSE_CACHE_WAIT_MS = '1';
++    slowMs = 80;
++    const results = await Promise.all(
++      Array.from({ length: 4 }, () => app.handle(new Request('http://localhost/announcement'))),
++    );
++    expect(handlerCalls).toBe(1);
++    const statuses = results.map((r) => r.status).sort();
++    expect(statuses).toEqual([200, 503, 503, 503]);
++    const waiters = results.filter((r) => r.status === 503);
++    expect(waiters.every((r) => r.headers.get('x-content-cache') === 'COALESCED')).toBe(true);
++    expect(JSON.parse(await waiters[0]!.text())).toEqual({ code: 503, message: 'busy' });
++    // 领头完成后照常落缓存
++    const hit = await app.handle(new Request('http://localhost/announcement'));
++    expect(hit.headers.get('x-content-cache')).toBe('HIT');
++  });
++
++  test('非 2xx 响应不入缓存（set.status=503 的 handler）', async () => {
++    const a = new Elysia()
++      .use(responseCache)
++      .get('/announcement', ({ set }) => {
++        handlerCalls++;
++        set.status = 503;
++        return { code: 503, message: 'busy' };
++      });
++    const r1 = await a.handle(new Request('http://localhost/announcement'));
++    expect(r1.status).toBe(503);
++    const r2 = await a.handle(new Request('http://localhost/announcement'));
++    expect(r2.status).toBe(503);
++    expect(handlerCalls).toBe(2); // 未命中缓存
++    expect(responseCacheStats().entries).toBe(0);
++  });
++
++  test('信封 code != 0 的 2xx 响应不入缓存', async () => {
++    const a = new Elysia()
++      .use(responseCache)
++      .get('/announcement', () => {
++        handlerCalls++;
++        return { code: 42, message: 'weird', data: {} };
++      });
++    await a.handle(new Request('http://localhost/announcement'));
++    await a.handle(new Request('http://localhost/announcement'));
++    expect(handlerCalls).toBe(2);
++  });
++});
++
++describe('response-cache：TTL 与旁路', () => {
++  test('TTL 到期后重新执行 handler', async () => {
++    process.env.HIAPI_RESPONSE_CACHE_TTL_MS = '40';
++    await app.handle(new Request('http://localhost/announcement'));
++    const hit = await app.handle(new Request('http://localhost/announcement'));
++    expect(hit.headers.get('x-content-cache')).toBe('HIT');
++    await Bun.sleep(60);
++    const after = await app.handle(new Request('http://localhost/announcement'));
++    expect(after.headers.get('x-content-cache')).toBe('MISS');
++    expect(handlerCalls).toBe(2);
++  });
++
++  test('TTL=0 完全旁路：每次都执行 handler，不写缓存', async () => {
++    process.env.HIAPI_RESPONSE_CACHE_TTL_MS = '0';
++    await app.handle(new Request('http://localhost/announcement'));
++    const r = await app.handle(new Request('http://localhost/announcement'));
++    expect(handlerCalls).toBe(2);
++    expect(r.headers.get('x-content-cache')).toBeNull(); // 旁路模式不加标记
++    const stats = responseCacheStats();
++    expect(stats.entries).toBe(0);
++    expect(stats.hits).toBe(0);
++    expect(stats.misses).toBe(0);
++  });
++
++  test('非白名单路径不缓存', async () => {
++    const a = new Elysia().use(responseCache).get('/not-whitelisted', () => {
++      handlerCalls++;
++      return { code: 0, message: 'ok', data: {} };
++    });
++    await a.handle(new Request('http://localhost/not-whitelisted'));
++    const r = await a.handle(new Request('http://localhost/not-whitelisted'));
++    expect(handlerCalls).toBe(2);
++    expect(r.headers.get('x-content-cache')).toBeNull();
++  });
++
++  test('路径段数不匹配不算白名单（/blog/x/y 不被 /blog/:slug 吃掉）', async () => {
++    const a = new Elysia().use(responseCache).get('/blog/:slug/:locale/raw', () => {
++      handlerCalls++;
++      return { code: 0, message: 'ok', data: {} };
++    });
++    await a.handle(new Request('http://localhost/blog/x/en/raw'));
++    const r = await a.handle(new Request('http://localhost/blog/x/en/raw'));
++    expect(handlerCalls).toBe(2);
++    expect(r.headers.get('x-content-cache')).toBeNull();
++  });
++
++  test('POST 不缓存（方法维度）', async () => {
++    const r = await app.handle(new Request('http://localhost/write', { method: 'POST' }));
++    expect(r.status).toBe(200);
++    const r2 = await app.handle(new Request('http://localhost/write', { method: 'POST' }));
++    expect(r2.headers.get('x-content-cache')).toBeNull();
++  });
++});
++
++describe('response-cache：写后失效', () => {
++  test('POST 成功（2xx）后整个缓存清空', async () => {
++    await app.handle(new Request('http://localhost/announcement'));
++    await app.handle(new Request('http://localhost/showcases'));
++    expect(responseCacheStats().entries).toBe(2);
++
++    const w = await app.handle(new Request('http://localhost/write', { method: 'POST' }));
++    expect(w.status).toBe(200);
++    expect(responseCacheStats().entries).toBe(0);
++
++    handlerCalls = 0;
++    const r = await app.handle(new Request('http://localhost/announcement'));
++    expect(r.headers.get('x-content-cache')).toBe('MISS');
++    expect(handlerCalls).toBe(1);
++  });
++
++  test('写请求失败（非 2xx）不清空', async () => {
++    await app.handle(new Request('http://localhost/announcement'));
++    expect(responseCacheStats().entries).toBe(1);
++    const a = new Elysia().use(responseCache).post('/write', ({ set }) => {
++      set.status = 400;
++      return { code: 400, message: 'bad' };
++    });
++    await a.handle(new Request('http://localhost/write', { method: 'POST' }));
++    // 注意：本 app 与上一步的 app 共享模块级缓存（同一模块单例），故条目仍在
++    expect(responseCacheStats().entries).toBe(1);
++  });
++});
++
++describe('response-cache：鉴权先于缓存命中', () => {
++  test('未带 token 的请求 → 401，且不返回缓存内容', async () => {
++    // 先带 token 建立缓存
++    const guarded = buildApp({ withAuthGuard: true, requireToken: 'secret' });
++    const okRes = await guarded.handle(
++      new Request('http://localhost/announcement', { headers: { authorization: 'Bearer secret' } }),
++    );
++    expect(okRes.status).toBe(200);
++    expect(await okRes.json()).toMatchObject({ data: { locale: 'en', n: 1 } });
++    expect(responseCacheStats().entries).toBe(1);
++
++    // 不带 token：clientAuthGuard（onRequest）先拒 → 不该拿到缓存
++    const denied = await guarded.handle(new Request('http://localhost/announcement'));
++    expect(denied.status).toBe(401);
++    const body = (await denied.json()) as { code: number; message: string };
++    expect(body.code).toBe(401);
++    expect(body.message).toBe('unauthorized');
++    expect(denied.headers.get('x-content-cache')).toBeNull();
++  });
++});
++
++describe('response-cache：容量与指标', () => {
++  test('条目数上限 → LRU 淘汰', async () => {
++    process.env.HIAPI_RESPONSE_CACHE_MAX_ENTRIES = '2';
++    for (const loc of ['en', 'ja', 'de']) {
++      await app.handle(new Request(`http://localhost/announcement?locale=${loc}`));
++    }
++    const stats = responseCacheStats();
++    expect(stats.entries).toBe(2);
++    expect(stats.evictions).toBeGreaterThanOrEqual(1);
++  });
++
++  test('LRU 语义：最近使用的留下，最旧的被淘汰', async () => {
++    process.env.HIAPI_RESPONSE_CACHE_MAX_ENTRIES = '2';
++    await app.handle(new Request('http://localhost/announcement?locale=en')); // 最旧
++    await app.handle(new Request('http://localhost/announcement?locale=ja'));
++    // 再访问 en 让它变最新 → 加入 de 时应淘汰 ja
++    await app.handle(new Request('http://localhost/announcement?locale=en'));
++    await app.handle(new Request('http://localhost/announcement?locale=de'));
++
++    handlerCalls = 0;
++    const en = await app.handle(new Request('http://localhost/announcement?locale=en'));
++    expect(en.headers.get('x-content-cache')).toBe('HIT');
++    const ja = await app.handle(new Request('http://localhost/announcement?locale=ja'));
++    expect(ja.headers.get('x-content-cache')).toBe('MISS');
++    expect(handlerCalls).toBe(1); // 只有 ja 打了 handler
++  });
++
++  test('字节上限 → 淘汰（单条超大也淘汰自己，不留空壳）', async () => {
++    process.env.HIAPI_RESPONSE_CACHE_MAX_BYTES = '50';
++    await app.handle(new Request('http://localhost/announcement'));
++    const stats = responseCacheStats();
++    expect(stats.entries).toBe(0); // 单条就超限 → 被淘汰
++  });
++
++  test('stats 记账：hits/misses/entries/bytes/ttlMs', async () => {
++    await app.handle(new Request('http://localhost/announcement'));
++    await app.handle(new Request('http://localhost/announcement'));
++    const s = responseCacheStats();
++    expect(s.misses).toBe(1);
++    expect(s.hits).toBe(1);
++    expect(s.entries).toBe(1);
++    expect(s.bytes).toBeGreaterThan(0);
++    expect(s.ttlMs).toBe(60_000);
++  });
++
++  test('env 非法值按默认（防止误配静默关掉缓存）', async () => {
++    process.env.HIAPI_RESPONSE_CACHE_TTL_MS = 'abc';
++    await app.handle(new Request('http://localhost/announcement'));
++    const r = await app.handle(new Request('http://localhost/announcement'));
++    expect(r.headers.get('x-content-cache')).toBe('HIT');
++    expect(responseCacheStats().ttlMs).toBe(60_000);
++  });
++});
++
++describe('response-cache：写-清竞态（世代）', () => {
++  test('写前开始、写后才完成的 GET 不把旧数据写回缓存', async () => {
++    slowMs = 120;
++    // ① 领头慢请求开始（记下旧世代）
++    const stale = app.handle(new Request('http://localhost/announcement'));
++    await Bun.sleep(10);
++    // ② 期间写成功 → 清空 + 世代 +1
++    await app.handle(new Request('http://localhost/write', { method: 'POST' }));
++    expect(responseCacheStats().entries).toBe(0);
++    // ③ 旧读完成：不得落库
++    await stale;
++    expect(responseCacheStats().entries).toBe(0);
++  });
++
++  test('写前挂上的等待者拿领头结果（200 COALESCED），旧结果不落缓存', async () => {
++    slowMs = 120;
++    const leader = app.handle(new Request('http://localhost/announcement'));
++    await Bun.sleep(5);
++    const waiter = app.handle(new Request('http://localhost/announcement'));
++    await Bun.sleep(5);
++    await app.handle(new Request('http://localhost/write', { method: 'POST' }));
++    expect((await leader).status).toBe(200);
++    const w = await waiter;
++    expect(w.status).toBe(200);
++    expect(w.headers.get('x-content-cache')).toBe('COALESCED');
++    expect(responseCacheStats().entries).toBe(0);
++  });
++
++  test('清空后到达的请求自己当领头读新数据，不挂到清空前的旧读上（不 503）', async () => {
++    slowMs = 120;
++    const before = handlerCalls;
++    const stale = app.handle(new Request('http://localhost/announcement'));
++    await Bun.sleep(10);
++    clearResponseCache(); // 模拟 site-purge / 写成功
++    const fresh = await app.handle(new Request('http://localhost/announcement'));
++    expect(fresh.status).toBe(200);
++    expect(fresh.headers.get('x-content-cache')).toBe('MISS');
++    expect(handlerCalls - before).toBe(2); // 新读真的打了 handler
++    expect(responseCacheStats().entries).toBe(1); // 新领头落了缓存
++    await stale;
++    // 旧领头晚完成：既不覆盖新条目，也不误删新领头的 flight
++    expect(responseCacheStats().entries).toBe(1);
++    expect(responseCacheStats().flights).toBe(0);
++    const hit = await app.handle(new Request('http://localhost/announcement'));
++    expect(hit.headers.get('x-content-cache')).toBe('HIT');
++    expect(((await hit.json()) as { data: { n: number } }).data.n).toBe(handlerCalls);
++  });
++});
++
++describe('response-cache：query 归一', () => {
++  test('同名参数顺序不同 = 不同 key（Elysia 标量取最后一个值，不能按值排序合并）', async () => {
++    const a = await app.handle(new Request('http://localhost/announcement?locale=en&locale=zh'));
++    const b = await app.handle(new Request('http://localhost/announcement?locale=zh&locale=en'));
++    expect(a.headers.get('x-content-cache')).toBe('MISS');
++    expect(b.headers.get('x-content-cache')).toBe('MISS');
++    const c = await app.handle(new Request('http://localhost/announcement?locale=zh&locale=en'));
++    expect(c.headers.get('x-content-cache')).toBe('HIT');
++  });
++
++  test('不同名参数顺序不同 = 同一 key', async () => {
++    await app.handle(new Request('http://localhost/announcement?locale=en&page=2'));
++    const b = await app.handle(new Request('http://localhost/announcement?page=2&locale=en'));
++    expect(b.headers.get('x-content-cache')).toBe('HIT');
++  });
++});
+diff --git a/apps/content-api/tests/support/clean-env.ts b/apps/content-api/tests/support/clean-env.ts
+index 955369d5..2542a070 100644
+--- a/apps/content-api/tests/support/clean-env.ts
++++ b/apps/content-api/tests/support/clean-env.ts
+@@ -25,3 +25,8 @@ for (const key of Object.keys(process.env)) {
+ if (removed > 0) {
+   console.info(`[tests] 宿主业务 env 已隔离（清理 ${removed} 项；见 tests/support/clean-env.ts）`);
+ }
++
++// 响应缓存默认关闭（2026-11-17）：既有用例普遍「写库/夹具 → 立刻 GET 断言新内容」，
++// 而缓存按设计只在 TTL 到期或 HTTP 写成功后失效——直写 DB 后读到的会是旧条目，导致大量假失败。
++// 需要缓存语义的用例自己在测试里设 HIAPI_RESPONSE_CACHE_TTL_MS（见 tests/plugins/*）。
++process.env.HIAPI_RESPONSE_CACHE_TTL_MS ??= "0";
+diff --git a/apps/site/src/lib/site-snapshot.ts b/apps/site/src/lib/site-snapshot.ts
+index 10fcbf66..952a5113 100644
+--- a/apps/site/src/lib/site-snapshot.ts
++++ b/apps/site/src/lib/site-snapshot.ts
+@@ -16,7 +16,22 @@
+ //
+ // 失败语义：401/503/网络错 → alova 抛错（构建期 = 构建失败；SSR = 页面 500 fail loud）；
+ // 信封 code!==0 → 本模块 throw（v3 收紧：业务空态 = code:0 + items:[] 合法缓存；异常信封不得归一空集
+-// 烘成「空目录」——部分分页失败同样整体拒绝驻留）；rejected promise **不驻留缓存**（清槽 rethrow，下次重试）。
++// 烘成「空目录」——部分分页失败同样整体拒绝驻留）。
++//
++// stale-on-error + 负缓存（2026-11-17，content-api 过载根因报告「环 5 放大」）：
++// 旧行为「rejected 不驻留、清槽重试」在 upstream 过载时会**放大回源**——每个请求都重新回源，全球各
++// isolate/colo 一起这样，回源量涨 3–7 倍，把 content-api 压在排队卡死状态（11-16/11-17 生产判例）。
++// 现每次回源成功另记一份 last-good 副本：L1 = 模块级 Map（与 TTL 槽分开，purge 不清）；L2 = edge 槽
++// 另写 `stale:<key>` 条目（信封 e = at + STALE_MAX_MS，新 isolate 也能拿到旧数据——跨 isolate 收敛的关键）。
++// 失败时：
++//   ① 有 ≤10 分钟的旧值（先 L1 再 L2 stale）→ 返回旧值，并在槽里装一个 15s「旧值驻留」窗口
++//      （窗口内同 key 直接拿旧值、不回源；窗口过后下一个请求再试一次回源，单飞语义不变）；
++//   ② 无可用旧值 → 负缓存 10s：装一个已完成的「失败槽」，窗口内同 key 直接抛同一错误、不回源；
++//   ③ 在途超时（SlotWaitTimeout）且有旧值 → 直接返回旧值、不再重拉（在途请求继续跑，成功了照常更新槽）；
++//      无旧值才保持原「清槽重拉一次」逻辑。
++// 内容影响：正常有界陈旧仍是 TTL 120s + HTML 180s；**只有 content-api 出错时**，edge 槽（模型卡/价格/活动等）
++// 最多显示 10 分钟前的数据（叠 HTML 180s ≈ 13min）；横切槽（公告/弹窗）与 edge:false 动态槽只有 L1 旧值，
++// 冷 isolate 下无旧值走原失败路径。超过 10 分钟仍出错就按原逻辑报错。规范见 ssr-runtime.md §9「失败路径」。
+ //
+ // 缓存层级不变量（catalog-ssr v3）：本模块是 content 通道唯一缓存层——client.ts 已显式 cacheFor:null
+ // （alova 3.5.5 默认 GET 300s 内存缓存在实例复用形态下会叠层）。
+@@ -25,7 +40,7 @@
+ import type { AnnouncementItem, PromotionSummary, PromotionDetail, FamilyNameGroup, ModelFamilyCard, ModelFilters, PricingFamilyView, ApiDocView, ShowcaseSummary, ShowcaseCard, ChangelogDetail, ChangelogCategoryRef, FaqSummary, FaqCategoryRef, BlogSummary, PlaygroundBundleEntry, ModelRedirectEntry } from "@hiapi/content-sdk";
+ import { siteClientFromBuildEnv, siteClientFromRuntime } from "./server-env";
+ import type { SiteClient } from "./client";
+-import { edgeCacheDelete, edgeCacheGet, edgeCachePut } from "./snapshot-edge-cache";
++import { edgeCacheDelete, edgeCacheGet, edgeCachePut, edgeStaleGet, edgeStalePut } from "./snapshot-edge-cache";
+ import { promoByFamily } from "./promotion-links";
+ import { buildPool } from "./home-featured";
+ import { buildPriceBySlug } from "./pricing-from";
+@@ -43,6 +58,15 @@ const CATALOG_TTL_MS = 120_000;
+ const SLOT_WAIT_MS = 30_000;
+ let slotWaitMs = SLOT_WAIT_MS;
+ 
++/** 旧数据最多用多久（回源失败时可返回的 last-good 年龄上限）。领航定「最长约 10 分钟」。 */
++const STALE_MAX_MS = 10 * 60_000;
++
++/** 回源失败但返回了旧值后，旧值的驻留窗口——窗口内同 key 不再回源（每 key 每 15s 最多试一次）。 */
++const STALE_RETRY_MS = 15_000;
++
++/** 回源失败且无旧值时的负缓存窗口——窗口内同 key 直接抛同一错误，不回源。 */
++const NEGATIVE_TTL_MS = 10_000;
++
+ /** 双源客户端：SSR 请求期用 runtime env；纯构建期（prerender 烘焙）回落构建进程 env。 */
+ function snapshotClient(locals?: App.Locals): SiteClient {
+   const runtimeEnv = locals?.runtime?.env;
+@@ -196,10 +220,141 @@ interface TtlSlot {
+   startedAt: number;
+   /** p 已 resolve/reject。在途槽超过 SLOT_WAIT_MS 仍未 settled = 视为卡死、换新槽。 */
+   settled: boolean;
++  /** 降级槽（旧值驻留窗口 / 负缓存窗口）：有真实回源结果时允许被顶替。 */
++  degraded?: boolean;
++  /** 发起时的 purge 世代：purge 之前发出的回源，成功后不得顶替 purge 之后装的降级槽（否则旧内容复活一整个 TTL）。 */
++  gen?: number;
+ }
+ 
++/** purge 世代：invalidateCatalogSnapshots 每次 +1。 */
++let slotGeneration = 0;
++
+ const listTtlSlots = new Map<string, TtlSlot>();
+ 
++// ——— stale-on-error 的 last-good 副本（2026-11-17）———
++
++/** 每个槽 key 最近一次成功取到的值；只在回源失败时消费。 */
++interface LastGood {
++  value: unknown;
++  /** 数据实际取得时刻（L2 命中按信封反推），用于卡 STALE_MAX_MS 上限。 */
++  at: number;
++}
++
++/** L1 旧值副本：与 TTL 槽分开存——`invalidateCatalogSnapshots` **不清**（故障期仍要有旧值可回）。 */
++const lastGood = new Map<string, LastGood>();
++
++/** L1 旧值副本条目数上限：一条可持有整份快照（cards/pricing 200KB 级、changelog/faq 更大），
++ *  Worker 内存 128MB。固定槽共 135 键，上限取 160 保证它们全留得住；动态槽（showcase-cards:*、
++ *  blog:{locale}:{model}）与之共用名额，超出先按 10 分钟老化清、再逐条丢最旧的——被丢的 edge 槽仍有
++ *  L2 stale 兜底，edge:false 的动态槽退化为原有失败路径（页面本就 fail-soft），不会误报错。 */
++const LAST_GOOD_CAP = 160;
++
++function recordLastGood(key: string, value: unknown, at: number): void {
++  const stamped = Number.isFinite(at) ? Math.min(at, Date.now()) : Date.now();
++  lastGood.set(key, { value, at: stamped });
++  if (lastGood.size <= LAST_GOOD_CAP) return;
++  const now = Date.now();
++  for (const [k, v] of lastGood) {
++    if (now - v.at > STALE_MAX_MS) lastGood.delete(k);
++  }
++  // 仍超限：逐条丢最旧的（按数据取得时刻，不按插入序——重读槽不会刷新插入序）
++  while (lastGood.size > LAST_GOOD_CAP) {
++    let oldestKey: string | undefined;
++    let oldestAt = Number.POSITIVE_INFINITY;
++    for (const [k, v] of lastGood) {
++      if (v.at < oldestAt) {
++        oldestAt = v.at;
++        oldestKey = k;
++      }
++    }
++    if (oldestKey === undefined) break;
++    lastGood.delete(oldestKey);
++  }
++}
++
++/** 同 key 的旧值告警去重（每个 15s 窗口只打一行，避免故障期刷屏）。 */
++const staleWarnAt = new Map<string, number>();
++
++function warnStaleOnce(key: string, err: unknown, ageMs: number): void {
++  const now = Date.now();
++  const previous = staleWarnAt.get(key);
++  if (previous !== undefined && now - previous < STALE_RETRY_MS) return;
++  staleWarnAt.set(key, now);
++  const reason = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
++  console.warn(`[site-snapshot] 回源失败，返回旧数据 key=${key} ageMs=${Math.max(0, Math.round(ageMs))} reason=${reason}`);
++}
++
++/**
++ * 找可用旧值：先 L1，再（edge 槽）L2 stale 条目；命中 L2 时回填 L1。
++ * 超过 STALE_MAX_MS 一律当没有——不返回过期数据。
++ */
++async function findStale<T>(
++  key: string,
++  origin: string | undefined,
++  useEdge: boolean,
++): Promise<LastGood & { value: T } | undefined> {
++  const now = Date.now();
++  const local = lastGood.get(key);
++  if (local && now - local.at <= STALE_MAX_MS) return local as LastGood & { value: T };
++  if (!useEdge) return undefined;
++  const hit = await edgeStaleGet<T>(origin, key);
++  if (!hit) return undefined;
++  // 信封 e = 写入时刻 + STALE_MAX_MS
++  const at = hit.expiresAt - STALE_MAX_MS;
++  if (!Number.isFinite(at) || now - at > STALE_MAX_MS) return undefined;
++  recordLastGood(key, hit.value, at);
++  return { value: hit.value, at };
++}
++
++/** 装一个已完成槽（旧值驻留窗口 / 负缓存窗口置入槽位用）。 */
++function completedSlot(value: unknown, ttlMs: number): TtlSlot {
++  const at = Date.now();
++  return { at, ttlMs, p: Promise.resolve(value), startedAt: at, settled: true, degraded: true };
++}
++
++/**
++ * 槽返回过的对象 → 其数据取得时刻（回源 / L2 反推 / 旧值）。派生池（pool:*）靠它继承来源年龄记旧值副本，
++ * 不按派生时刻重新计龄——否则 cards 的数据经派生池可以活过 10 分钟上限。
++ */
++const dataAt = new WeakMap<object, number>();
++/** 以旧值身份返回过的对象（及由它派生的对象）：派生槽只装降级窗口，不当新鲜数据驻留整个 TTL。 */
++const servedStale = new WeakSet<object>();
++
++const isObj = (v: unknown): v is object => typeof v === "object" && v !== null;
++
++/** 记数据取得时刻（已记过的不覆盖：派生值先由 deriveFrom 继承来源时刻）。 */
++function markDataAt(value: unknown, at: number): void {
++  if (isObj(value) && !dataAt.has(value)) dataAt.set(value, at);
++}
++
++function markStale(value: unknown, at: number): void {
++  if (!isObj(value)) return;
++  dataAt.set(value, Math.min(at, dataAt.get(value) ?? at));
++  servedStale.add(value);
++}
++
++/** 派生值继承来源的数据年龄与旧值身份。 */
++function deriveFrom<T>(source: unknown, derived: T): T {
++  if (isObj(source) && isObj(derived)) {
++    const at = dataAt.get(source);
++    if (at !== undefined) dataAt.set(derived, at);
++    if (servedStale.has(source)) servedStale.add(derived);
++  }
++  return derived;
++}
++
++/** 旧值驻留窗口：15s，但不越过旧值的 10 分钟绝对上限。 */
++function staleWindowMs(at: number): number {
++  return Math.max(1, Math.min(STALE_RETRY_MS, at + STALE_MAX_MS - Date.now()));
++}
++
++/** 返回旧值：打年龄标记 + 装驻留窗口（只在没有槽时装：并发失败方共用同一窗口，在途槽优先）。 */
++function serveStale<T>(key: string, stale: LastGood & { value: T }, slots: Map<string, TtlSlot>): T {
++  markStale(stale.value, stale.at);
++  if (!slots.get(key)) slots.set(key, completedSlot(stale.value, staleWindowMs(stale.at)));
++  return stale.value;
++}
++
+ /**
+  * L2 可枚举的固定槽键（purge 删除用）：只有「按 locale + 固定槽名」能完整枚举的源数据才进 L2；
+  * 动态槽（showcase-cards:{family}）与派生池（pool:*）只留 L1——否则新 isolate 收到 purge 时
+@@ -262,19 +417,41 @@ function acquireSlot<T>(
+   // 2026-10-27（site-ssr-latency）：L1（isolate Map）miss 后先查 L2（Workers Cache API，同 colo 跨 isolate）。
+   // 命中回填 L1 时 ttlMs 取 L2 剩余窗口（不延长数据新鲜度预算）；未命中回源并写 L2。
+   // 构建期无 origin / 无全局 caches → edgeGet 恒 undefined、edgePut no-op，行为同旧。
+-  const slot: TtlSlot = { at: now, ttlMs, p: Promise.resolve(), startedAt: now, settled: false };
++  const slot: TtlSlot = { at: now, ttlMs, p: Promise.resolve(), startedAt: now, settled: false, gen: slotGeneration };
+   const p = (async () => {
+     const origin = locals?.origin;
+     const cached = useEdge ? await edgeCacheGet<T>(origin, key) : undefined;
+     if (cached !== undefined) {
+       slot.at = Date.now();
+       slot.ttlMs = Math.max(1, cached.expiresAt - Date.now());
++      // L2 数据槽信封 e = 写入时刻 + 槽 TTL → 反推数据取得时刻，旧值年龄按它计（不按命中时刻）
++      recordLastGood(key, cached.value, cached.expiresAt - ttlMs);
++      markDataAt(cached.value, cached.expiresAt - ttlMs);
+       return cached.value;
+     }
+     const value = await load(snapshotClient(locals));
+     slot.at = Date.now();
++    // 派生值已继承来源的数据时刻；直接回源的值记此刻。旧值副本一律按数据时刻计龄。
++    markDataAt(value, slot.at);
++    const valueAt = isObj(value) ? (dataAt.get(value) ?? slot.at) : slot.at;
++    if (isObj(value) && servedStale.has(value)) {
++      // 派生自旧值（来源回源失败）：只装降级窗口，不当新鲜数据驻留一整个 TTL。
++      slot.ttlMs = staleWindowMs(valueAt);
++      slot.degraded = true;
++      recordLastGood(key, value, valueAt);
++      return value;
++    }
+     slot.ttlMs = ttlMs;
+-    if (useEdge) await edgeCachePut(origin, key, value, ttlMs, locals?.runtime?.ctx);
++    recordLastGood(key, value, valueAt);
++    if (useEdge) {
++      // purge 之前发出、之后才完成的回源不写 L2 数据条目：它读到的可能正是 purge 要清掉的旧内容，
++      // 写回会让 purge 刚删掉的 key 被旧内容重建一个 TTL（sites#277 评审）。L1 同理不顶替（见下方 then）。
++      if (slot.gen === slotGeneration) await edgeCachePut(origin, key, value, ttlMs, locals?.runtime?.ctx);
++      // 旧数据副本照写：stale 条目只在回源失败时读，且按设计不受 purge 影响（purge 后故障期仍要有旧值可回）；
++      // 它不会比已有的旧值副本更旧。只有可枚举的 edge 槽写（动态槽/派生池 purge 无从定位，只留 L1）；
++      // 写入交给 waitUntil，失败 fail-open。有效期 = STALE_MAX_MS，与数据槽 TTL 无关。
++      await edgeStalePut(origin, key, value, STALE_MAX_MS, locals?.runtime?.ctx);
++    }
+     return value;
+   })();
+   slot.p = p;
+@@ -282,10 +459,14 @@ function acquireSlot<T>(
+   p.then(
+     () => {
+       slot.settled = true;
++      // 真实回源成功后，顶替占位的降级槽（旧值窗口 / 负缓存）——否则降级槽会把新数据挡住一个窗口。
++      // purge 之前发出的回源不顶替（它读到的可能正是 purge 要清掉的旧内容）。
++      const current = slots.get(key);
++      if (current && current !== slot && current.degraded && slot.gen === slotGeneration) slots.set(key, slot);
+     },
+     () => {
+       slot.settled = true;
+-      if (slots.get(key) === slot) slots.delete(key); // 失败不驻留：下次重试（identity guard：过期槽在途旧请求失败不误删新槽）
++      if (slots.get(key) === slot) slots.delete(key); // 失败不驻留：交由 ttlListSlot 走旧值/负缓存兜底
+     },
+   );
+   return slot;
+@@ -302,6 +483,39 @@ function waitSlot<T>(slot: TtlSlot, key: string): Promise<T> {
+   return Promise.race([slot.p as Promise<T>, deadline]).finally(() => clearTimeout(timer));
+ }
+ 
++/** 回源失败的兜底：有旧值返回旧值（装 15s 旧值窗口），无旧值装 10s 负缓存并抛原错误。 */
++async function handleSlotFailure<T>(
++  key: string,
++  err: unknown,
++  locals: App.Locals | undefined,
++  opts: TtlSlotOptions | undefined,
++): Promise<T> {
++  const slots = opts?.slots ?? listTtlSlots;
++
++  // ① 有 ≤10 分钟旧值 → 返回旧值，并装 15s 旧值驻留窗口（窗口内同 key 不回源；
++  //    窗口过后下一个请求再试一次回源）。L1 优先，edge 槽再查 L2 stale（新 isolate 也能拿到）。
++  const stale = await findStale<T>(key, locals?.origin, opts?.edge !== false);
++  if (stale) {
++    warnStaleOnce(key, err, Date.now() - stale.at);
++    return serveStale(key, stale, slots);
++  }
++
++  // ② 无可用旧值 → 负缓存 10s：装一个已完成的 rejection 槽，窗口内同 key 直接抛同一错误、不回源。
++  //    rejected promise 必须先挂 catch，否则 unhandled rejection。
++  const now = Date.now();
++  const negative: TtlSlot = {
++    at: now,
++    ttlMs: NEGATIVE_TTL_MS,
++    p: Promise.reject(err),
++    startedAt: now,
++    settled: true,
++    degraded: true,
++  };
++  (negative.p as Promise<unknown>).catch(() => {});
++  if (!slots.get(key)) slots.set(key, negative);
++  throw err;
++}
++
+ function ttlListSlot<T>(
+   key: string,
+   ttlMs: number,
+@@ -311,14 +525,30 @@ function ttlListSlot<T>(
+ ): Promise<T> {
+   const slots = opts?.slots ?? listTtlSlots;
+   const slot = acquireSlot(key, ttlMs, load, locals, opts);
+-  if (slot.settled) return slot.p as Promise<T>; // 已完成槽原样返回（同窗口复用同一 promise）
+-  return waitSlot<T>(slot, key).catch((err: unknown) => {
+-    if (!(err instanceof SlotWaitTimeout)) throw err;
++  if (slot.settled) return slot.p as Promise<T>; // 已完成槽原样返回（同窗口复用同一 promise / 降级槽直接复用）
++  return waitSlot<T>(slot, key).catch(async (err: unknown) => {
++    if (slots.get(key) === slot) slots.delete(key); // 清槽（identity guard：过期槽在途旧请求失败不误删新槽）
++    if (!(err instanceof SlotWaitTimeout)) {
++      // 回源失败（load 抛错 / 信封异常 / client 15s 超时）→ 旧值 / 负缓存兜底
++      return handleSlotFailure<T>(key, err, locals, opts);
++    }
++    // 在途卡死：有旧值就直接返回旧值、**不再重拉**（故障期重拉等于给上游加码）；
++    // 在途请求继续跑，成功时照常更新 lastGood。
++    const stale = await findStale<T>(key, locals?.origin, opts?.edge !== false);
++    if (stale) {
++      warnStaleOnce(key, err, Date.now() - stale.at);
++      return serveStale(key, stale, slots);
++    }
++    // 无旧值：保持原「清槽重拉一次」逻辑——并发超时的调用方共用新槽（同 key 只多一次上游请求）；
++    // 新槽再超时/失败走负缓存（10s 内不再回源），不再无限等。
+     console.warn(`[site-snapshot] 在途请求超时，清槽重拉 key=${key} waitMs=${slotWaitMs}`);
+-    if (slots.get(key) === slot) slots.delete(key);
+-    // 重拉一次：并发超时的调用方会拿到同一个新槽（acquireSlot 共用在途槽）→ 同 key 只多一次上游请求。
+-    // 新槽再超时直接抛 SlotWaitTimeout → 页面既有失败路径（catch 兜底 / 500），不再无限等。
+-    return waitSlot<T>(acquireSlot(key, ttlMs, load, locals, opts), key);
++    const retry = acquireSlot(key, ttlMs, load, locals, opts);
++    try {
++      return await waitSlot<T>(retry, key);
++    } catch (retryErr) {
++      if (slots.get(key) === retry) slots.delete(key);
++      return handleSlotFailure<T>(key, retryErr, locals, opts);
++    }
+   });
+ }
+ 
+@@ -327,6 +557,7 @@ function ttlListSlot<T>(
+  *  动态槽/派生池本就只存 L1，无需删除。跨 colo 仍靠 TTL 兜底（与 HTML purge 单 colo 语义一致）。 */
+ export async function invalidateCatalogSnapshots(origin?: string): Promise<void> {
+   listTtlSlots.clear();
++  slotGeneration++;
+   if (!origin) return;
+   await Promise.all(FIXED_EDGE_SLOT_KEYS.map((key) => edgeCacheDelete(origin, key)));
+ }
+@@ -341,20 +572,26 @@ export function modelCardsSnapshot(locals: App.Locals | undefined, locale: strin
+  *  shuffle 取前 n，见 lib/home-featured）。由全量 cards 槽派生——零新增上游请求；TTL 与目录槽同窗。
+  *  池空 → 空数组（组件层走静态 fallback）；cards 失败 → 池槽不驻留（ttlListSlot 通用语义）。 */
+ export function featuredPoolSnapshot(locals: App.Locals | undefined, locale: string): Promise<ModelFamilyCard[]> {
+-  return ttlListSlot(`pool:featured:${locale}`, CATALOG_TTL_MS, async () =>
+-    buildPool(await modelCardsSnapshot(locals, locale), "featured", 30), locals, { edge: false });
++  return ttlListSlot(`pool:featured:${locale}`, CATALOG_TTL_MS, async () => {
++    const cards = await modelCardsSnapshot(locals, locale);
++    return deriveFrom(cards, buildPool(cards, "featured", 30));
++  }, locals, { edge: false });
+ }
+ 
+ /** cost 池（is_featured·min(12, 全量)；PricingSection 渲染层取 4）。 */
+ export function costPoolSnapshot(locals: App.Locals | undefined, locale: string): Promise<ModelFamilyCard[]> {
+-  return ttlListSlot(`pool:cost:${locale}`, CATALOG_TTL_MS, async () =>
+-    buildPool(await modelCardsSnapshot(locals, locale), "featured", 12), locals, { edge: false });
++  return ttlListSlot(`pool:cost:${locale}`, CATALOG_TTL_MS, async () => {
++    const cards = await modelCardsSnapshot(locals, locale);
++    return deriveFrom(cards, buildPool(cards, "featured", 12));
++  }, locals, { edge: false });
+ }
+ 
+ /** banner 池（isFeatured 且有 poster·min(15, 全量)；Hero 渲染层取 5）。 */
+ export function bannerPoolSnapshot(locals: App.Locals | undefined, locale: string): Promise<ModelFamilyCard[]> {
+-  return ttlListSlot(`pool:banner:${locale}`, CATALOG_TTL_MS, async () =>
+-    buildPool(await modelCardsSnapshot(locals, locale), "featured", 15, { requirePoster: true }), locals, { edge: false });
++  return ttlListSlot(`pool:banner:${locale}`, CATALOG_TTL_MS, async () => {
++    const cards = await modelCardsSnapshot(locals, locale);
++    return deriveFrom(cards, buildPool(cards, "featured", 15, { requirePoster: true }));
++  }, locals, { edge: false });
+ }
+ 
+ /** 搜索名册（GET /models/_names，无 locale 全站一份）——单次拉取（服务端一次返全量，无分页契约）；TTL 120s。 */
+@@ -641,12 +878,20 @@ export function searchIndexSnapshot(locals: App.Locals | undefined, locale: stri
+ }
+ 
+ // 测试钩子：清空全部快照缓存（bun test 每文件隔离用；生产零调用——invalidateCatalogSnapshots 是生产失效入口）。
++// 注：**清 lastGood**——生产语义恰好相反（purge 不清旧值副本），这里清是为了让测试文件之间互不串旧值。
+ export function __clearSnapshotCachesForTest(): void {
+   listTtlSlots.clear();
+   crossCutSlots.clear();
++  lastGood.clear();
++  staleWarnAt.clear();
+   slotWaitMs = SLOT_WAIT_MS;
+ }
+ 
++/** 测试钩子：L1 旧值副本当前的 key（生产零调用）。 */
++export function __lastGoodKeysForTest(): string[] {
++  return [...lastGood.keys()];
++}
++
+ /** 测试钩子：缩短在途等待上限（真实计时器；生产零调用）。 */
+ export function __setSlotWaitMsForTest(ms: number): void {
+   slotWaitMs = ms;
+diff --git a/apps/site/src/lib/snapshot-edge-cache.ts b/apps/site/src/lib/snapshot-edge-cache.ts
+index 79eca07b..11200042 100644
+--- a/apps/site/src/lib/snapshot-edge-cache.ts
++++ b/apps/site/src/lib/snapshot-edge-cache.ts
+@@ -9,6 +9,9 @@
+ // - key = `${origin}/__data/v1/<encodeURIComponent(slotKey)>`——origin 与 HTML 缓存层同源（避免跨 zone key），
+ //   `v1` 是缓存格式版本（envelope 结构变更时递增，旧条目自然不可达）。
+ // - 存的是 envelope `{ v: value, e: expiresAt(ms) }`：L2 命中时 L1 沿用**原始绝对期限**，不延长数据窗口。
++// - 另有**旧数据副本**命名空间 `/__data/v1/stale/<encodeURIComponent(slotKey)>`（2026-11-17 stale-on-error）：
++//   信封同构、有效期 = 最后一次成功回源 + 10 分钟，只在回源失败时消费。purge 不删这些条目（故障期仍要有
++//   旧值可回），过期由 Cache API 的 e / cache-control 兜底。
+ // - origin 由 middleware 注入（context.locals.origin）；构建期（prerender）无 origin → 全短路，行为同旧。
+ // - 读写失败一律 fail-open：缓存层永不 fail 响应，正确性由回源保证。
+ // - purge 由 `invalidateCatalogSnapshots(origin)` 删除本 isolate 已知的 L2 key；跨 isolate/colo 靠 TTL 兜底
+@@ -17,6 +20,9 @@
+ /** Cache API key 前缀（含格式版本；HTML 缓存只对 SSR 路由面生效，两者不重叠）。 */
+ const PREFIX = "/__data/v1/";
+ 
++/** 旧数据副本（stale-on-error）命名空间：与数据槽同源同 origin，键空间独立。 */
++const STALE_PREFIX = "/__data/v1/stale/";
++
+ /** workerd 的 ExecutionContext 子集（adapter 注入 locals.runtime.ctx；构建期/单测可缺省）。 */
+ export interface EdgeCacheCtx {
+ 	waitUntil?(promise: Promise<unknown>): void;
+@@ -35,23 +41,24 @@ function defaultCache(): Cache | null {
+ 	return globalThis.caches?.default ?? null;
+ }
+ 
+-function keyRequest(origin: string, key: string): Request {
+-	return new Request(`${origin}${PREFIX}${encodeURIComponent(key)}`, { method: "GET" });
++function keyRequest(origin: string, key: string, prefix = PREFIX): Request {
++	return new Request(`${origin}${prefix}${encodeURIComponent(key)}`, { method: "GET" });
+ }
+ 
+ /**
+- * 读 L2。origin 缺失 / 无 caches / 解析失败 / 已过期 → undefined（调用方回源）。
++ * 读 L2（通用实现）。origin 缺失 / 无 caches / 解析失败 / 已过期 → undefined（调用方回源）。
+  * Cache API 返回的 body 只能消费一次，这里直接 `json()`。
+  */
+-export async function edgeCacheGet<T>(
++async function edgeGet<T>(
+ 	origin: string | undefined,
+ 	key: string,
++	prefix: string,
+ ): Promise<{ value: T; expiresAt: number } | undefined> {
+ 	if (!origin) return undefined;
+ 	const cache = defaultCache();
+ 	if (!cache) return undefined;
+ 	try {
+-		const hit = await cache.match(keyRequest(origin, key));
++		const hit = await cache.match(keyRequest(origin, key, prefix));
+ 		if (!hit) return undefined;
+ 		const envelope = (await hit.json()) as Partial<CachedEnvelope<T>> | null;
+ 		// 形状校验：必须是对象、带 v、e 为有限数字且在将来（非法 envelope 一律当 miss）
+@@ -67,15 +74,16 @@ export async function edgeCacheGet<T>(
+ }
+ 
+ /**
+- * 写 L2。有 ctx.waitUntil 时交给它（不阻塞响应）；否则等写完（构建期/单测路径）。
++ * 写 L2（通用实现）。有 ctx.waitUntil 时交给它（不阻塞响应）；否则等写完（构建期/单测路径）。
+  * 任何失败都吞掉（fail-open）。
+  */
+-export async function edgeCachePut<T>(
++async function edgePut<T>(
+ 	origin: string | undefined,
+ 	key: string,
+ 	value: T,
+ 	ttlMs: number,
+-	ctx?: EdgeCacheCtx,
++	ctx: EdgeCacheCtx | undefined,
++	prefix: string,
+ ): Promise<void> {
+ 	if (!origin) return;
+ 	const cache = defaultCache();
+@@ -87,7 +95,7 @@ export async function edgeCachePut<T>(
+ 			const expiresAt = Date.now() + ttlMs;
+ 			const body = JSON.stringify({ v: value, e: expiresAt } satisfies CachedEnvelope<T>);
+ 			await cache.put(
+-				keyRequest(origin, key),
++				keyRequest(origin, key, prefix),
+ 				new Response(body, {
+ 					headers: {
+ 						"content-type": "application/json; charset=utf-8",
+@@ -111,6 +119,50 @@ export async function edgeCachePut<T>(
+ 	await write;
+ }
+ 
++/** 读 L2 数据槽（TTL 面）。 */
++export function edgeCacheGet<T>(
++	origin: string | undefined,
++	key: string,
++): Promise<{ value: T; expiresAt: number } | undefined> {
++	return edgeGet<T>(origin, key, PREFIX);
++}
++
++/**
++ * 写 L2 数据槽。有 ctx.waitUntil 时交给它（不阻塞响应）；否则等写完（构建期/单测路径）。
++ * 任何失败都吞掉（fail-open）。
++ */
++export function edgeCachePut<T>(
++	origin: string | undefined,
++	key: string,
++	value: T,
++	ttlMs: number,
++	ctx?: EdgeCacheCtx,
++): Promise<void> {
++	return edgePut(origin, key, value, ttlMs, ctx, PREFIX);
++}
++
++/**
++ * 读旧数据副本（stale-on-error）——只在回源失败时调用。
++ * key 与数据槽同形（slotKey），但落在独立命名空间；过期即 miss（不会返回超过 STALE_MAX_MS 的旧数据）。
++ */
++export function edgeStaleGet<T>(
++	origin: string | undefined,
++	key: string,
++): Promise<{ value: T; expiresAt: number } | undefined> {
++	return edgeGet<T>(origin, key, STALE_PREFIX);
++}
++
++/** 写旧数据副本。ttlMs 由调用方定（= STALE_MAX_MS）；失败 fail-open。 */
++export function edgeStalePut<T>(
++	origin: string | undefined,
++	key: string,
++	value: T,
++	ttlMs: number,
++	ctx?: EdgeCacheCtx,
++): Promise<void> {
++	return edgePut(origin, key, value, ttlMs, ctx, STALE_PREFIX);
++}
++
+ /** 删除 L2 单条（purge 用）。失败吞掉（fail-open）。 */
+ export async function edgeCacheDelete(origin: string | undefined, key: string): Promise<void> {
+ 	if (!origin) return;
+diff --git a/apps/site/tests/lib/site-snapshot.test.ts b/apps/site/tests/lib/site-snapshot.test.ts
+index f1cb7119..010432a1 100644
+--- a/apps/site/tests/lib/site-snapshot.test.ts
++++ b/apps/site/tests/lib/site-snapshot.test.ts
+@@ -28,6 +28,7 @@ import {
+   buildSearchIndex,
+   __clearSnapshotCachesForTest,
+   __setSlotWaitMsForTest,
++  __lastGoodKeysForTest,
+   apiDocSnapshot,
+ } from "../../src/lib/site-snapshot";
+ 
+@@ -170,13 +171,14 @@ test("announcement：locale 维分槽（en/zh 各自请求一次）", async () =
+   expect(zh[0]?.message).toBe("zh-msg");
+ });
+ 
+-test("announcement：失败清槽——502 抛错后再次调用重新请求", async () => {
++test("announcement：失败清槽——502 抛错后（负缓存窗口过后）再次调用重新请求", async () => {
+   failAll = true;
+   await expect(announcementSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/502|bad gateway/i);
+   failAll = false;
+   route("/announcement?locale=en", {
+     items: [{ id: "r", level: "info", message: "recovered", updatedAt: "2026-09-23T00:00:00Z" }],
+   });
++  virtualNow += 11_000; // 越过负缓存窗口（10s）
+   const items = await announcementSnapshot(NO_RUNTIME, "en");
+   expect(items.map((i) => i.message)).toEqual(["recovered"]);
+ });
+@@ -294,7 +296,7 @@ test("cards：fetchAll 剩余页并行拉取（page1 拿 total 后 page2..N 同
+ });
+ 
+ 
+-test("cards：中途页失败 → 整体拒绝且不驻留，下次调用整体重拉", async () => {
++test("cards：中途页失败 → 整体拒绝且不驻留，负缓存窗口过后整体重拉", async () => {
+   let page2Fails = true;
+   routeFn((url) => {
+     if (!url.includes("/models?locale=en")) return undefined;
+@@ -311,6 +313,7 @@ test("cards：中途页失败 → 整体拒绝且不驻留，下次调用整体
+   await expect(modelCardsSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/code=500/);
+   expect(requests.filter((u) => u.includes("/models?locale=en"))).toHaveLength(2); // 失败路径已发 page1+page2
+   page2Fails = false;
++  virtualNow += 11_000; // 越过负缓存窗口（10s）
+   requests = [];
+   const cards = await modelCardsSnapshot(NO_RUNTIME, "en"); // 槽已清 → 重拉
+   expect(cards).toHaveLength(501);
+@@ -529,6 +532,7 @@ test("cards：第二页 code:0 但缺 data → 整体拒绝（部分数据不当
+   });
+   await expect(modelCardsSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/形状异常/);
+   page2NoData = false;
++  virtualNow += 11_000; // 越过负缓存窗口
+   requests = [];
+   const cards = await modelCardsSnapshot(NO_RUNTIME, "en");
+   expect(cards).toHaveLength(501);
+@@ -606,6 +610,7 @@ test("池空：三池返回空数组（组件层走静态 fallback）；cards 
+   failAll = true;
+   await expect(bannerPoolSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/502|bad gateway/i);
+   failAll = false;
++  virtualNow += 11_000; // 越过负缓存窗口
+   expect(await bannerPoolSnapshot(NO_RUNTIME, "en")).toEqual([]); // 错误路径清槽后重建
+ });
+ 
+@@ -738,6 +743,7 @@ test("blogRelated：失败清槽后重试；成功空数组驻留；不回退全
+   });
+   await expect(blogRelatedSnapshot(NO_RUNTIME, "zh", "model-a")).rejects.toThrow(/信封异常/);
+   fail = false;
++  virtualNow += 11_000; // 越过负缓存窗口
+   requests = [];
+   const empty = await blogRelatedSnapshot(NO_RUNTIME, "zh", "model-a");
+   expect(empty).toEqual([]);
+@@ -806,6 +812,7 @@ test("blogRelated：行缺 publishedAt（旧 content-api 投影）→ tripwire f
+   await expect(blogRelatedSnapshot(NO_RUNTIME, "ko", "model-ko")).rejects.toThrow(/缺 publishedAt/);
+   // 拒绝整槽后必须清槽，否则下一次仍拿到 rejected promise。
+   legacy = false;
++  virtualNow += 11_000; // 越过负缓存窗口
+   const items = await blogRelatedSnapshot(NO_RUNTIME, "ko", "model-ko");
+   expect(items.map((x) => x.id)).toEqual(["NEW"]);
+ });
+@@ -911,7 +918,9 @@ test("modelCards：L2 边缘缓存命中——清 L1（模拟 isolate 更换）
+     const locals = { origin: "https://site.test" } as unknown as App.Locals;
+     await modelCardsSnapshot(locals, "en");
+     expect(requests).toHaveLength(1);
+-    expect(store.size).toBe(1); // 已写 L2
++    // 数据槽 + stale 旧值副本（2026-11-17 stale-on-error）各一条
++    expect([...store.keys()].some((k) => k.includes("/__data/v1/cards%3Aen"))).toBe(true);
++    expect([...store.keys()].some((k) => k.includes("/__data/v1/stale/cards%3Aen"))).toBe(true);
+ 
+     __clearSnapshotCachesForTest(); // 模拟 isolate 更换（L1 清空，L2 保留）
+     requests = [];
+@@ -994,10 +1003,11 @@ test("invalidateCatalogSnapshots(origin)：枚举删除固定源槽（不依赖
+     route("/models?locale=en", { total: 1, items: [{ slug: "a" }] });
+     const locals = { origin: "https://site.test" } as unknown as App.Locals;
+     await modelCardsSnapshot(locals, "en");
+-    expect(store.size).toBe(1);
++    expect(store.size).toBe(2); // 数据槽 + stale 旧值副本
+     __clearSnapshotCachesForTest(); // 模拟“收到 purge 的 isolate 从未读过这些槽”
+     await invalidateCatalogSnapshots("https://site.test");
+-    expect(store.size).toBe(0); // 按固定槽名枚举删除，不靠 knownKeys
++    // 数据槽被枚举删除；stale 副本按设计保留（故障期仍要有旧值可回，过期由信封 e 兜底）
++    expect([...store.keys()]).toEqual([`${"https://site.test"}/__data/v1/stale/cards%3Aen`]);
+   } finally {
+     (globalThis as { caches?: unknown }).caches = prevCaches;
+   }
+@@ -1059,7 +1069,8 @@ test("在途卡死：重拉仍不返回 → 抛错走失败路径，且槽不驻
+     return { items: [{ slug: "a" }], total: 1 };
+   });
+   await expect(modelCardsSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/等待在途请求超时/);
+-  // 下一次调用：卡死槽已超时，换新槽回源成功
++  // 下一次调用：卡死槽已超时，换新槽回源成功（先越过负缓存窗口）
++  virtualNow += 11_000;
+   await expect(modelCardsSnapshot(NO_RUNTIME, "en")).resolves.toHaveLength(1);
+   expect(calls).toBe(3);
+ });
+@@ -1078,3 +1089,337 @@ test("在途未超时：慢但会返回的请求不被误杀", async () => {
+   expect(b[0]?.slug).toBe("slow");
+   expect(calls).toBe(1);
+ });
++
++// ——— stale-on-error + 负缓存（2026-11-17：content-api 过载放大·环 5）———
++// 契约：回源成功记 last-good；失败时有 ≤10min 旧值就返回旧值并装 15s 窗口（窗口内不回源），
++// 无旧值则 10s 负缓存（窗口内直接抛、不调用 load）；超过 10min 的旧值不用；purge 不清 lastGood；
++// 恢复后返回新值；L2 stale 条目让新 isolate（L1 清空）也能拿到旧值。
++
++/** 安装内存版 Cache API（L2）；返回 store 供断言，调用方负责在 finally 里恢复。 */
++function installMemoryCaches(): { store: Map<string, string>; restore: () => void } {
++  const prevCaches = (globalThis as { caches?: unknown }).caches;
++  const store = new Map<string, string>();
++  (globalThis as { caches?: unknown }).caches = {
++    default: {
++      match: async (req: Request) => (store.has(req.url) ? new Response(store.get(req.url)!) : undefined),
++      put: async (req: Request, res: Response) => {
++        store.set(req.url, await res.text());
++      },
++      delete: async (req: Request) => store.delete(req.url),
++    },
++  };
++  return {
++    store,
++    restore: () => {
++      (globalThis as { caches?: unknown }).caches = prevCaches;
++    },
++  };
++}
++
++const EDGE_LOCALS = { origin: "https://site.test" } as unknown as App.Locals;
++
++/** cards 端点计数路由：前 okCalls 次成功（值为 version），之后 502。 */
++function routeCardsSequence(okCalls: number, version: () => string) {
++  let calls = 0;
++  routeFn((url) => {
++    if (!url.includes("/models?locale=en")) return undefined;
++    calls += 1;
++    if (calls > okCalls) return Promise.reject(new Error("upstream overloaded"));
++    return { items: [{ slug: version() }], total: 1 };
++  });
++  return () => calls;
++}
++
++test("stale：回源成功→失败返回旧值；15s 窗口内不再回源；窗口过后再试一次", async () => {
++  const calls = routeCardsSequence(1, () => "v1");
++  expect((await modelCardsSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["v1"]);
++  virtualNow += 121_000; // TTL 过期，下次必须回源
++  expect((await modelCardsSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["v1"]); // 回源失败 → 旧值
++  expect(calls()).toBe(2);
++  // 15s 窗口内：零回源
++  virtualNow += 5_000;
++  expect((await modelCardsSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["v1"]);
++  expect(calls()).toBe(2);
++  // 窗口过后：再试一次（仍失败，仍返回旧值）
++  virtualNow += 11_000;
++  expect((await modelCardsSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["v1"]);
++  expect(calls()).toBe(3);
++});
++
++test("stale：旧值超过 10 分钟 → 抛错（不返回过期数据）", async () => {
++  const calls = routeCardsSequence(1, () => "v1");
++  await modelCardsSnapshot(NO_RUNTIME, "en");
++  virtualNow += 10 * 60_000 + 1_000; // 超过 STALE_MAX_MS
++  await expect(modelCardsSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/overloaded|等待在途请求超时/);
++  expect(calls()).toBe(2);
++});
++
++test("负缓存：无旧值失败后 10s 内重复请求不调用 load、直接抛；10s 后再调", async () => {
++  let calls = 0;
++  routeFn((url) => {
++    if (!url.includes("/models?locale=en")) return undefined;
++    calls += 1;
++    return Promise.reject(new Error("upstream down"));
++  });
++  await expect(modelCardsSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/upstream down/);
++  expect(calls).toBe(1);
++  virtualNow += 5_000;
++  await expect(modelCardsSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/upstream down/);
++  expect(calls).toBe(1); // 负缓存窗口内零回源
++  virtualNow += 6_000;
++  await expect(modelCardsSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/upstream down/);
++  expect(calls).toBe(2);
++});
++
++test("在途超时且有旧值：直接返回旧值、不重拉", async () => {
++  __setSlotWaitMsForTest(30);
++  let calls = 0;
++  routeFn((url) => {
++    if (!url.includes("/models?locale=en")) return undefined;
++    calls += 1;
++    // 第 1 次成功（种下旧值）；之后一直卡死不返回
++    if (calls === 1) return { items: [{ slug: "v1" }], total: 1 };
++    return new Promise<undefined>(() => {});
++  });
++  await modelCardsSnapshot(NO_RUNTIME, "en");
++  expect(calls).toBe(1);
++  virtualNow += 121_000; // TTL 过期
++  const cards = await modelCardsSnapshot(NO_RUNTIME, "en");
++  expect(cards.map((c) => c.slug)).toEqual(["v1"]); // 在途超时 → 旧值，不重拉
++  expect(calls).toBe(2); // 只发了卡死那一次，没有重拉
++});
++
++test("L2 stale：L1 清空（模拟新 isolate）后失败，仍能从 stale 条目拿到旧值", async () => {
++  const mem = installMemoryCaches();
++  try {
++    const calls = routeCardsSequence(1, () => "v-edge");
++    await modelCardsSnapshot(EDGE_LOCALS, "en");
++    expect(calls()).toBe(1);
++    expect([...mem.store.keys()].some((k) => k.includes("/stale/cards%3Aen"))).toBe(true);
++    __clearSnapshotCachesForTest(); // 新 isolate：L1（含 lastGood）清空，L2 保留
++    requests = [];
++    virtualNow += 121_000; // L2 数据槽已过期（120s）
++    const cards = await modelCardsSnapshot(EDGE_LOCALS, "en"); // 数据槽 miss → 回源失败 → 读 L2 stale
++    expect(cards.map((c) => c.slug)).toEqual(["v-edge"]);
++  } finally {
++    mem.restore();
++  }
++});
++
++test("purge 不清 lastGood：invalidateCatalogSnapshots 之后回源失败仍返回旧值", async () => {
++  const calls = routeCardsSequence(1, () => "v-before-purge");
++  await modelCardsSnapshot(NO_RUNTIME, "en");
++  await invalidateCatalogSnapshots(); // 只清 TTL 槽，不动 lastGood
++  const cards = await modelCardsSnapshot(NO_RUNTIME, "en"); // 回源失败 → 旧值
++  expect(cards.map((c) => c.slug)).toEqual(["v-before-purge"]);
++  expect(calls()).toBe(2);
++});
++
++test("stale：失败后恢复——下一次成功回源返回新值，lastGood 更新", async () => {
++  let healthy = true;
++  let version = "v1";
++  let calls = 0;
++  routeFn((url) => {
++    if (!url.includes("/models?locale=en")) return undefined;
++    calls += 1;
++    if (!healthy) return Promise.reject(new Error("overloaded"));
++    return { items: [{ slug: version }], total: 1 };
++  });
++  await modelCardsSnapshot(NO_RUNTIME, "en");
++  healthy = false;
++  virtualNow += 121_000;
++  expect((await modelCardsSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["v1"]); // 旧值
++  // 恢复（越过 15s 旧值窗口）
++  healthy = true;
++  version = "v2";
++  virtualNow += 16_000;
++  expect((await modelCardsSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["v2"]);
++  // 新值已成为 lastGood：再次失败时返回 v2 而不是 v1
++  healthy = false;
++  virtualNow += 121_000;
++  expect((await modelCardsSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["v2"]);
++  expect(calls).toBe(4);
++});
++
++test("stale：横切槽（edge:false）只有 L1 旧值，同样生效", async () => {
++  let calls = 0;
++  routeFn((url) => {
++    if (!url.includes("/announcement?locale=en")) return undefined;
++    calls += 1;
++    if (calls === 1) {
++      return { items: [{ id: "a", level: "info", message: "old", updatedAt: "2026-11-17T00:00:00Z" }] };
++    }
++    return Promise.reject(new Error("overloaded"));
++  });
++  const first = await announcementSnapshot(NO_RUNTIME, "en");
++  expect(first.map((i) => i.message)).toEqual(["old"]);
++  virtualNow += 121_000;
++  const stale = await announcementSnapshot(NO_RUNTIME, "en");
++  expect(stale.map((i) => i.message)).toEqual(["old"]);
++  expect(calls).toBe(2);
++});
++
++test("stale：派生池（pool:*，edge:false）失败时由源槽旧值兜底（不额外回源）", async () => {
++  let calls = 0;
++  routeFn((url) => {
++    if (!url.includes("/models?locale=en")) return undefined;
++    calls += 1;
++    if (calls === 1) return { items: [{ slug: "f-0", isFeatured: true }], total: 1 };
++    return Promise.reject(new Error("overloaded"));
++  });
++  expect((await featuredPoolSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["f-0"]);
++  virtualNow += 121_000;
++  // cards 槽与 pool 槽同时过期；cards 回源失败 → cards 旧值 → pool 正常派生
++  expect((await featuredPoolSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["f-0"]);
++  expect(calls).toBe(2); // 只有 cards 那一次失败回源，池槽没额外打上游
++});
++
++test("负缓存槽先抛同一个错误实例（同 key 重复请求不新增回源）", async () => {
++  let calls = 0;
++  routeFn((url) => {
++    if (!url.includes("/models?locale=en")) return undefined;
++    calls += 1;
++    return Promise.reject(new Error("boom-once"));
++  });
++  const [a, b] = await Promise.allSettled([
++    modelCardsSnapshot(NO_RUNTIME, "en"),
++    modelCardsSnapshot(NO_RUNTIME, "en"),
++  ]);
++  expect(a.status).toBe("rejected");
++  expect(b.status).toBe("rejected");
++  expect(calls).toBe(1); // 并发共用同一在途槽
++  const c = await modelCardsSnapshot(NO_RUNTIME, "en").catch((e: Error) => e);
++  expect((c as Error).message).toContain("boom-once"); // 负缓存窗口内直接抛
++  expect(calls).toBe(1);
++});
++
++test("stale：派生池不把旧值重新计龄——源数据超过 10 分钟后池同样报错", async () => {
++  let calls = 0;
++  routeFn((url) => {
++    if (!url.includes("/models?locale=en")) return undefined;
++    calls += 1;
++    if (calls === 1) return { items: [{ slug: "f-0", isFeatured: true }], total: 1 };
++    return Promise.reject(new Error("overloaded"));
++  });
++  expect((await featuredPoolSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["f-0"]);
++  // t≈599s：cards 旧值仍在 10 分钟内 → 池派生出旧值（不得按此刻重新计龄、不得驻留整个 TTL）
++  virtualNow += 599_000;
++  expect((await featuredPoolSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["f-0"]);
++  // 越过源数据 10 分钟上限：池不能再拿自己「新记」的旧值兜底
++  virtualNow += 2_000;
++  await expect(featuredPoolSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/overloaded/);
++  virtualNow += 600_000; // 原缺陷下 t≈1170s 仍返回 t=0 的卡片
++  await expect(featuredPoolSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/overloaded|等待在途请求超时/);
++});
++
++test("stale：15s 旧值窗口不越过 10 分钟绝对上限", async () => {
++  const calls = routeCardsSequence(1, () => "v1");
++  await modelCardsSnapshot(NO_RUNTIME, "en");
++  virtualNow += 599_000; // 旧值还剩 1s 寿命
++  expect((await modelCardsSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["v1"]);
++  expect(calls()).toBe(2);
++  virtualNow += 5_000; // 原缺陷下这里仍命中 15s 窗口返回旧值（t=604s）
++  await expect(modelCardsSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/overloaded/);
++  expect(calls()).toBe(3); // 窗口按剩余寿命截短，过期后重新回源
++});
++
++test("stale：派生池由新鲜 cards 派生时按 cards 的数据时刻计龄（不按派生时刻）", async () => {
++  let calls = 0;
++  routeFn((url) => {
++    if (!url.includes("/models?locale=en")) return undefined;
++    calls += 1;
++    if (calls === 1) return { items: [{ slug: "v0", isFeatured: true }], total: 1 };
++    return Promise.reject(new Error("overloaded"));
++  });
++  await modelCardsSnapshot(NO_RUNTIME, "en"); // t=0 cards 数据
++  virtualNow += 119_000; // cards 槽仍新鲜：池由 t=0 的 cards 派生
++  expect((await featuredPoolSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["v0"]);
++  expect(calls).toBe(1);
++  virtualNow += 482_000; // t=601s：数据已超过 10 分钟（原缺陷下池按 t=119s 计龄，仍返回 v0）
++  await expect(featuredPoolSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/overloaded/);
++});
++
++test("purge 之前在途的回源成功后，不顶替 purge 之后装的降级槽（旧内容不复活）", async () => {
++  let calls = 0;
++  let releaseA!: () => void;
++  routeFn((url) => {
++    if (!url.includes("/models?locale=en")) return undefined;
++    calls += 1;
++    if (calls === 1) return new Promise((res) => { releaseA = () => res({ items: [{ slug: "old-before-purge" }], total: 1 }); });
++    if (calls === 2) return Promise.reject(new Error("blip"));
++    return { items: [{ slug: "new" }], total: 1 };
++  });
++  const a = modelCardsSnapshot(NO_RUNTIME, "en"); // A：purge 前发出、在途
++  await Bun.sleep(0);
++  await invalidateCatalogSnapshots();
++  await expect(modelCardsSnapshot(NO_RUNTIME, "en")).rejects.toThrow(/blip/); // B：purge 后失败 → 负缓存
++  releaseA();
++  expect((await a).map((c) => c.slug)).toEqual(["old-before-purge"]); // A 自己照常返回
++  // 负缓存窗口过后应回源拿新内容；原缺陷下 A 顶替降级槽，驻留整个 TTL 返回旧内容、不回源
++  virtualNow += 11_000;
++  expect((await modelCardsSnapshot(NO_RUNTIME, "en")).map((c) => c.slug)).toEqual(["new"]);
++  expect(calls).toBe(3);
++});
++
++test("purge 之前在途的回源完成后，不重建 purge 刚删掉的 L2 数据条目（stale 副本按设计照写）", async () => {
++  const mem = installMemoryCaches();
++  try {
++    let calls = 0;
++    let releaseA!: () => void;
++    routeFn((url) => {
++      if (!url.includes("/models?locale=en")) return undefined;
++      calls += 1;
++      if (calls === 1) return new Promise((res) => { releaseA = () => res({ items: [{ slug: "read-before-purge" }], total: 1 }); });
++      return { items: [{ slug: "after-purge" }], total: 1 };
++    });
++    const a = modelCardsSnapshot(EDGE_LOCALS, "en"); // purge 前发出、在途
++    await Bun.sleep(0);
++    await invalidateCatalogSnapshots("https://site.test");
++    releaseA();
++    expect((await a).map((c) => c.slug)).toEqual(["read-before-purge"]); // 发起方自己照常拿结果
++    await Bun.sleep(0);
++    const keys = [...mem.store.keys()];
++    expect(keys.some((k) => k.endsWith("/__data/v1/cards%3Aen"))).toBe(false); // 原缺陷：旧内容重建 120s
++    expect(keys.some((k) => k.includes("/__data/v1/stale/cards%3Aen"))).toBe(true);
++    // purge 后的下一个请求回源拿新内容
++    expect((await modelCardsSnapshot(EDGE_LOCALS, "en")).map((c) => c.slug)).toEqual(["after-purge"]);
++    expect(calls).toBe(2);
++  } finally {
++    mem.restore();
++  }
++});
++
++test("L1 旧值副本有界：超 160 键先清 10 分钟以上的，再按数据时刻丢最旧的；新键仍可作旧值返回", async () => {
++  let failing = false;
++  routeFn((url) => {
++    if (!url.includes("/showcases/cards?family=")) return undefined;
++    if (failing) return Promise.reject(new Error("overloaded"));
++    const fam = new URL(url, "http://x").searchParams.get("family");
++    return { items: [{ slug: `card-${fam}` }], total: 1 };
++  });
++  const baseline = __lastGoodKeysForTest().length;
++  // 第一阶段：150 个老键，之后时间推过 10 分钟，再写 20 个新键 → 老键全部按年龄清掉
++  for (let i = 0; i < 150; i++) await showcaseCardsSnapshot(NO_RUNTIME, `old-${i}`, "en");
++  virtualNow += 10 * 60_000 + 1_000;
++  for (let i = 0; i < 20; i++) {
++    virtualNow += 1;
++    await showcaseCardsSnapshot(NO_RUNTIME, `new-${i}`, "en");
++  }
++  let keys = __lastGoodKeysForTest();
++  expect(keys.length).toBeLessThanOrEqual(160);
++  expect(keys.filter((k) => k.includes(":old-")).length).toBe(0);
++  // 第二阶段：全在 10 分钟内，持续写到超限 → 逐条丢最旧，总数恒 ≤ 160
++  for (let i = 0; i < 200; i++) {
++    virtualNow += 1;
++    await showcaseCardsSnapshot(NO_RUNTIME, `fresh-${i}`, "en");
++    expect(__lastGoodKeysForTest().length).toBeLessThanOrEqual(160);
++  }
++  keys = __lastGoodKeysForTest();
++  expect(keys.some((k) => k.includes(":fresh-0:"))).toBe(false); // 最旧的被丢
++  expect(keys.some((k) => k.includes(":fresh-199:"))).toBe(true);
++  expect(baseline).toBe(0);
++  // 最新键在失败时仍能返回旧值
++  failing = true;
++  virtualNow += 121_000;
++  expect((await showcaseCardsSnapshot(NO_RUNTIME, "fresh-199", "en")).map((c) => c.slug)).toEqual(["card-fresh-199"]);
++});

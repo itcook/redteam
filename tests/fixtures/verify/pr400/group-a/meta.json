@@ -1,0 +1,9 @@
+{
+  "group": "a",
+  "h1": "122220fde58e0ab5da4cb466568d32db6b6f954b",
+  "h2": "54f4c944da97ccd775de51e3525e86e611b2cd83",
+  "h1_label": "分诊轮 head（第 1 轮评审对象）",
+  "h2_label": "修复提交（第 2 轮评审对象）",
+  "expected_source": "第 2 轮人工评审正文（CHANGES_REQUESTED）",
+  "scenario": "修复引入回归：两个阻塞按人工判决已修复，但严格化之后同请求回退会重选刚被拒绝的渠道（第 2 轮 🔴1，-count=50 复现 19 次失败）。"
+}

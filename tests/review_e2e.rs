@@ -25,7 +25,7 @@ fn scan_and_review_registry(scan: &str, review: &str) -> ProviderRegistry {
     reg
 }
 fn args_wt() -> ReviewArgs {
-    ReviewArgs { pack_only: false,
+    ReviewArgs { job_mode: false, pack_only: false,
         base: None, scope: "working-tree".into(),
         spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
@@ -50,7 +50,7 @@ async fn scan_anchors_real_suspicion_and_drops_fabricated() {
         {"file":"src/auth.rs","line_start":1,"line_end":1,"hint":"phantom sqli","category":"L1","confidence":0.95,"quote":"execute_raw_sql(evil)"}
     ],"needs":[{"path":"src/db.rs","reason":"write contract"}],"scanned_areas":[{"file":"src/auth.rs","ranges":["1-4"]}]}"#;
     let reg = scan_registry(&[("p/m", json)]);
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
     let changes = vec![FileChange { path: "src/auth.rs".into(), diff: "@@ -3,1 +3,1 @@\n+    db.write(token);".into() }];
 
     let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, root.path(), None, None, vec![]).await.unwrap();
@@ -79,7 +79,7 @@ async fn two_scanner_families_same_quote_yield_agreement_two() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"beta":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"settings":{"review":{"scanners":{"samples":2},"roles":{"scanner":{"models":[{"provider":"p","id":"alpha"},{"provider":"p","id":"beta"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"alpha"},{"id":"beta"}]}}}"#).unwrap();
     let reg = scan_registry(&[
         ("p/alpha", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"shared issue","confidence":0.9,"quote":"db.write(token);"}],"scanned_areas":[]}"#),
         ("p/beta", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"write without validation","confidence":0.7,"quote":"db.write(token);"}],"scanned_areas":[]}"#),
@@ -94,7 +94,7 @@ async fn two_scanner_families_same_quote_yield_agreement_two() {
     assert_eq!((m.agreement, m.suspicion.line_start, m.suspicion.confidence), (2, 2, 0.9));
     assert_eq!(m.families, vec!["alpha", "beta"]);
     assert_eq!(m.hints.len(), 2);
-    assert_eq!(m.cell_ids, vec!["scan[g1]@p/alpha#1", "scan[g1]@p/beta#1"]);
+    assert_eq!(m.cell_ids, vec!["scan[g1]@p/alpha#1", "scan[g1]@p/beta#2"]);
     assert_eq!(scan.stats.agreement_ge2, 1);
     assert_eq!(report.cells.len(), 2);
 }
@@ -106,13 +106,13 @@ async fn unreachable_scanner_cell_makes_scan_incomplete_exit_three() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"ghost":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"settings":{"review":{"scanners":{"samples":2},"roles":{"scanner":{"models":[{"provider":"p","id":"alpha"},{"provider":"p","id":"ghost"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"alpha"},{"id":"ghost"}]}}}"#).unwrap();
     let reg = scan_registry(&[("p/alpha", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"minor","confidence":0.3,"quote":"let x = 1;"}],"scanned_areas":[]}"#)]);
     let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
     let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
 
     assert_eq!((report.verdict, code), (Verdict::Incomplete, 3));
-    assert_eq!(report.run.coverage.failed.get(&Role::Scanner), Some(&vec!["scan[g1]@p/ghost#1".to_string()]));
+    assert_eq!(report.run.coverage.failed.get(&Role::Scanner), Some(&vec!["scan[g1]@p/ghost#2".to_string()]));
     assert_eq!(report.run.coverage.completed.get(&Role::Scanner), Some(&vec!["scan[g1]@p/alpha#1".to_string()]));
     assert!(report.run.failed_models.is_empty(), "scan 路径失败进 coverage，不走 failed_models");
     assert!(report.run.warnings.iter().any(|w| w.contains("scanner not in registry")), "{:?}", report.run.warnings);
@@ -132,7 +132,7 @@ fn incremental_from_background_is_rejected_before_spawning_job() {
     };
     git(&["init", "-q", "-b", "main"]);
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join("config.json"), r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+    std::fs::write(home.path().join("config.json"), r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
     let out = std::process::Command::new(bin)
         .current_dir(dir.path())
         .env("REDTEAM_HOME", home.path())
@@ -164,7 +164,7 @@ fn cli_entry_lets_incremental_through_to_the_pipeline() {
         .current_dir(dir.path()).args(["init", "-q", "-b", "main"]).output().unwrap();
     assert!(out.status.success());
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join("config.json"), r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+    std::fs::write(home.path().join("config.json"), r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
 
     let out = std::process::Command::new(bin)
         .current_dir(dir.path())
@@ -193,8 +193,8 @@ fn cli_entry_lets_incremental_through_to_the_pipeline() {
 async fn incremental_from_is_refused_by_preflight_guards() {
     use redteam::cli::run_review_dispatch;
     let dir = tempfile::tempdir().unwrap();
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
-    let args = ReviewArgs { base: Some("main".into()), scope: "branch".into(), incremental_from: Some("prior1".into()), ..args_wt() };
+    let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
+    let args = ReviewArgs { job_mode: false, base: Some("main".into()), scope: "branch".into(), incremental_from: Some("prior1".into()), ..args_wt() };
     let err = run_review_dispatch(&args, &ProviderRegistry::new(), &cfg, dir.path(), None).await.unwrap_err();
     assert!(err.to_string().contains("--incremental-from"), "报错要指出是哪个 flag: {err}");
     assert!(!dir.path().join(".redteam").join(redteam::db::DB_FILE).exists(), "拒跑不该建库");
@@ -223,10 +223,10 @@ async fn background_job_smoke_full_lifecycle_single_store() {
     std::fs::write(dir.path().join("src/a.rs"), "fn f() {\n    db.write(token);\n}\n").unwrap();
     git(dir.path(), &["add", "src/a.rs"]); // working-tree scope 读 staged 改动
 
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"alpha"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"alpha"}]}}}"#).unwrap();
     let reg = scan_registry(&[("p/alpha", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"unvalidated write","category":"L1","confidence":0.9,"quote":"db.write(token);"}],"scanned_areas":[{"file":"src/a.rs","ranges":["1-3"]}]}"#)]);
 
-    let args = ReviewArgs { pack_only: false,
+    let args = ReviewArgs { job_mode: false, pack_only: false,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None,
         background: true, format: "json".into(), resume: None, dismissed: None,
@@ -298,11 +298,17 @@ fn worker_panic_hook_lands_failed_and_seals() {
 
     // spawn 真二进制，设 REDTEAM_TEST_PANIC=1
     let bin = env!("CARGO_BIN_EXE_redteam");
+    // 配置根隔离：worker 起手会读 config（语言 / 角色），不能依赖开发者本机的 ~/.redteam。
+    let home = run_dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let cfg = r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"http://127.0.0.1:1","apiKeyEnv":"P_KEY","models":[{"id":"s"}]}}}"#;
+    std::fs::write(home.join("config.json"), cfg).unwrap();
     let status = std::process::Command::new(bin)
         .arg("worker")
         .arg("--job-id")
         .arg(job_id)
         .env("REDTEAM_TEST_PANIC", "1")
+        .env("REDTEAM_HOME", &home)
         .current_dir(run_dir)
         .status()
         .expect("spawn 真二进制失败");
@@ -367,7 +373,7 @@ async fn exit_code_three_on_incomplete_resume() {
     });
     store.write_args_raw(job_id, &fake_args.to_string()).unwrap();
 
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
     let (report, code) = run_resume(job_id, &ProviderRegistry::new(), &cfg, dir.path(), &store).await;
     assert_eq!(report.verdict, Verdict::Incomplete, "空 manifest → Incomplete");
     assert_eq!(code, 3, "Incomplete → exit 3");
@@ -444,7 +450,7 @@ fn result_md_three_states() {
             hard_constraint: false,
             quote: "db.write(token);".into(),
             cluster_id: None,
-            verify: None,
+            refute: None,
             previously_dismissed: false,
             origin: Origin::New, outside_window: false,
         }],
@@ -511,7 +517,7 @@ async fn dismissed_ledger_is_loaded_and_disclosed_in_scan_only() {
     assert!(add_out.status.success(), "dismiss add 应成功: {add_out:?}");
 
     // ② 同仓跑 scan 评审：root 下 `.redteam/proj.db` 已由上一步建出——zero-config 自动加载（无需 --dismissed）。
-    let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+    let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
     let reg = scan_registry(&[("p/m", r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"unvalidated write","confidence":0.9,"quote":"db.write(token);"}],"scanned_areas":[]}"#)]);
     let changes = vec![FileChange { path: file.into(), diff: "+    db.write(token);".into() }];
     let (report, code) = run_code_review(&args_wt(), &reg, &cfg, changes, dir.path(), None, None, vec![]).await.unwrap();
@@ -564,7 +570,7 @@ fn pack_only_writes_packs_and_reports_bytes() {
     std::fs::write(dir.path().join("src/b.rs"), "fn beta() { alpha_marker(); }\n").unwrap();
     git(dir.path(), &["add", "-A"]); // working-tree scope：staged 新文件即证据
 
-    let args = ReviewArgs {
+    let args = ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: Some("预算试跑".into()),
         block_threshold: None, conf_floor: None, background: false,
@@ -606,7 +612,7 @@ fn pack_only_empty_changes_reports_zero_cells() {
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
     git(&["init", "-q", "-b", "main"]);
-    let args = ReviewArgs {
+    let args = ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false,
@@ -653,7 +659,7 @@ fn pack_only_two_groups_cross_index_lists_other_group_only() {
         std::fs::write(p, body).unwrap();
     }
     git(dir.path(), &["add", "-A"]);
-    let args = ReviewArgs {
+    let args = ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false,
@@ -877,7 +883,7 @@ fn pack_only_slices_large_file_and_reports_shape() {
     std::fs::write(dir.path().join("src/big.rs"), &modified).unwrap();
     git(dir.path(), &["add", "-A"]);
 
-    let args = ReviewArgs {
+    let args = ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false,
@@ -901,7 +907,7 @@ fn pack_only_slices_large_file_and_reports_shape() {
     assert_eq!(summary["cells"][0]["pack"]["sliced"], 1);
 
     // full 档（对照臂，K10 / K14：配置切档，无 CLI 旗）
-    let cfg_full = Config::from_json(r#"{"review":{"pack":{"body":"full"}}}"#).unwrap();
+    let cfg_full = Config::from_json(r#"{"settings":{"review":{"pack":{"body":"full"}}},"providers":{}}"#).unwrap();
     let full = run_pack_only(&args, &cfg_full, dir.path()).unwrap();
     let f = &full.cells[0];
     assert_eq!((f.pack.body.as_str(), f.pack.full, f.pack.sliced, f.pack.outside_sites), ("full", 1, 0, 0), "{:?}", f.pack);
@@ -942,7 +948,7 @@ fn pack_only_injects_precedents_and_honors_no_dismissed() {
     .unwrap();
     drop(db);
 
-    let args = |no_dismissed: bool| ReviewArgs {
+    let args = |no_dismissed: bool| ReviewArgs { job_mode: false,
         pack_only: true,
         base: None, scope: "working-tree".into(), spec: vec![], focus: None,
         block_threshold: None, conf_floor: None, background: false,
@@ -1015,7 +1021,7 @@ async fn incremental_round_carries_prior_findings_into_the_merged_set() {
     git(dir.path(), &["commit", "-qm", "r1 target"]);
 
     let cfg = Config::from_json(
-        r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#,
+        r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#,
     )
     .unwrap();
     // r1：在 old.rs 上挖出**两条** finding——一条留着走携带，一条用来验假修复检测。
@@ -1023,7 +1029,7 @@ async fn incremental_round_carries_prior_findings_into_the_merged_set() {
     let rev1 = r#"{"findings":[{"severity":"high","title":"unvalidated write","body":"b","file":"src/old.rs","line_start":2,"line_end":2,"confidence":0.9,"recommendation":"r","quote":"db.write(token);"},{"severity":"high","title":"stray call","body":"b","file":"src/old.rs","line_start":3,"line_end":3,"confidence":0.9,"recommendation":"r","quote":"more();"}],"needs":[]}"#;
     let reg1 = scan_and_review_registry(scan1, rev1);
 
-    let args1 = ReviewArgs {
+    let args1 = ReviewArgs { job_mode: false,
         base: Some("main".into()), scope: "branch".into(), background: true,
         ..args_wt()
     };
@@ -1060,7 +1066,7 @@ async fn incremental_round_carries_prior_findings_into_the_merged_set() {
 
     // r2 的 scanner 在 new.rs 上什么都不报 → 新发为 0，合并集里只剩携带项
     let reg2 = scan_and_review_registry(r#"{"suspicions":[],"scanned_areas":[]}"#, r#"{"findings":[],"needs":[]}"#);
-    let args2 = ReviewArgs {
+    let args2 = ReviewArgs { job_mode: false,
         base: Some("main".into()), scope: "branch".into(),
         incremental_from: Some(job1.into()), ..args_wt()
     };

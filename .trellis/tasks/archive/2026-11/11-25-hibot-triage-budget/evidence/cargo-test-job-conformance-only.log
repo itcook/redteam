@@ -1,0 +1,33 @@
+   Compiling redteam v0.1.0 (/Users/weilai/hobby/.worktrees/redteam/hibot-triage-budget)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.76s
+     Running tests/job_conformance.rs (target/debug/deps/job_conformance-998042019814372b)
+
+running 25 tests
+test kind_mismatch_and_bad_manifest_are_reported_correctly ... ok
+test head_must_match_manifest_head_sha ... ok
+test backend_construction_failure_is_config_invalid_not_internal_panic ... ok
+test clean_fixture_is_ok_with_empty_findings_and_echoes_input ... ok
+test job_mode_without_refuter_skips_refute_and_discloses ... ok
+test job_mode_with_explicit_refuter_runs_refute ... ok
+test dismissed_is_audited_but_never_refuted ... ok
+test malformed_dismissed_csv_is_an_error ... ok
+test merge_base_must_be_a_full_sha ... ok
+test missing_blob_produces_valid_error_report ... ok
+test job_language_comes_from_config_not_env ... ok
+test quote_is_corrected_from_the_checkout_before_fingerprint ... ok
+test shallow_checkout_produces_valid_error_report ... ok
+test known_vuln_fixture_finds_quote_and_fingerprint_is_stable ... ok
+test review_uses_diff_patch_not_git_as_change_source ... ok
+test language_is_consistent_across_prompts_findings_and_status_reason ... ok
+test triage_and_verify_write_three_value_heartbeat ... ok
+test unrelated_histories_produce_valid_error_report ... ok
+test prior_report_only_adjusts_lens_and_budget ... ok
+test unverifiable_quote_is_dropped_and_makes_partial ... ok
+test triage_rejects_bad_pr_context_and_verify_is_a_stub ... ok
+test timeout_partial_report_keeps_run_facts_and_corrected_quote ... ok
+test budget_exhausted_during_prep_makes_no_backend_calls ... ok
+test heartbeat_state_file_reports_gate_snapshot_and_stops_after_exit ... ok
+test partial_fixture_uses_missing_provider_key_and_reports_partial ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.35s
+

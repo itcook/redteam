@@ -513,24 +513,24 @@ fn dump_to(dir: &Path, label: &str, text: &str) -> std::io::Result<std::path::Pa
     Ok(path)
 }
 
-/// verifier 输出解析（M21b 批 D，与 `templates/verifier.md` 的 output_contract 成对）：
+/// refuter 输出解析（M21b 批 D，与 `templates/refuter.md` 的 output_contract 成对）：
 /// `{"analysis": …, "verdict": "REFUTED"|"UPHELD", "reason": …}`。
 ///
 /// **存疑即 UPHELD**：解析不出 JSON、缺 `verdict`、verdict 值不认识——一律回 `Err`，由调用方按
 /// 「失败保守 upheld」处理（design §8.1）。只有模型明确写下 `REFUTED` 才驳回，因为误驳会静默删掉一条真缺陷。
-/// `analysis` 不进返回值：它是让模型先推理后表态的手段（字段序），不是要存的数据；`reason` 才落 `VerifyEntry.note`。
-pub fn parse_verify_output(raw: &str) -> Result<(crate::domain::VerifyVerdict, String), ProviderError> {
-    use crate::domain::VerifyVerdict;
+/// `analysis` 不进返回值：它是让模型先推理后表态的手段（字段序），不是要存的数据；`reason` 才落 `RefuteEntry.note`。
+pub fn parse_refute_output(raw: &str) -> Result<(crate::domain::RefuteVerdict, String), ProviderError> {
+    use crate::domain::RefuteVerdict;
     let v = extract_json_object(raw).ok_or_else(|| {
         ProviderError::Parse(format!("no JSON object in: {}", raw.chars().take(120).collect::<String>()))
     })?;
     let verdict = v.get("verdict").and_then(Value::as_str).map(str::trim).unwrap_or_default();
     let verdict = match verdict.to_ascii_uppercase().as_str() {
-        "REFUTED" => VerifyVerdict::Refuted,
-        "UPHELD" => VerifyVerdict::Upheld,
+        "REFUTED" => RefuteVerdict::Refuted,
+        "UPHELD" => RefuteVerdict::Upheld,
         other => {
             return Err(ProviderError::Parse(format!(
-                "verify output has no recognizable \"verdict\" (got {other:?})"
+                "refute output has no recognizable \"verdict\" (got {other:?})"
             )))
         }
     };
@@ -941,30 +941,30 @@ mod tests {
         assert!(parse_lens_output(without).unwrap().needs.is_empty());
     }
 
-    /// verifier 契约（批 D）：两个判决各自认得，reason 单行化后落 note。
+    /// refuter 契约（批 D）：两个判决各自认得，reason 单行化后落 note。
     #[test]
-    fn verify_output_parses_both_verdicts() {
-        use crate::domain::VerifyVerdict;
+    fn refute_output_parses_both_verdicts() {
+        use crate::domain::RefuteVerdict;
         let refuted = "{\"analysis\":\"走了三步\",\"verdict\":\"REFUTED\",\"reason\":\"调用方\\n已有守卫\"}";
-        let (v, note) = parse_verify_output(refuted).unwrap();
-        assert_eq!(v, VerifyVerdict::Refuted);
+        let (v, note) = parse_refute_output(refuted).unwrap();
+        assert_eq!(v, RefuteVerdict::Refuted);
         assert_eq!(note, "调用方 已有守卫", "reason 单行化（威胁模型 B：注入换行伪造条目）");
 
         let upheld = "```json\n{\"analysis\":\"快照不足以判定\",\"verdict\":\"UPHELD\",\"reason\":\"守卫在未展示的调用方\"}\n```";
-        assert_eq!(parse_verify_output(upheld).unwrap().0, VerifyVerdict::Upheld, "围栏照剥");
+        assert_eq!(parse_refute_output(upheld).unwrap().0, RefuteVerdict::Upheld, "围栏照剥");
     }
 
     /// 存疑即 UPHELD：解析不出的一律 Err，由调用方按「失败保守 upheld」处理——
     /// 绝不把「读不懂」默认成 REFUTED（那会静默删掉真缺陷）。
     #[test]
-    fn verify_output_refuses_to_guess_a_verdict() {
+    fn refute_output_refuses_to_guess_a_verdict() {
         for bad in [
             "not json at all",
             r#"{"analysis":"…"}"#,
             r#"{"verdict":"MAYBE","reason":"r"}"#,
             r#"{"verdict":"","reason":"r"}"#,
         ] {
-            assert!(parse_verify_output(bad).is_err(), "不得猜判决: {bad}");
+            assert!(parse_refute_output(bad).is_err(), "不得猜判决: {bad}");
         }
     }
 }

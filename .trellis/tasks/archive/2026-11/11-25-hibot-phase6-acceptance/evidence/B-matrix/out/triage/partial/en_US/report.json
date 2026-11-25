@@ -1,0 +1,134 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "J-matrix-triage",
+  "kind": "triage",
+  "status": "partial",
+  "status_reason": "triage axis `security` incomplete",
+  "input": {
+    "head_sha": "783dfe64edb79998ace4d15704db492b645d7f89",
+    "base_sha": "ecef50b364f4be5f62e94b515e38311712f3633f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "usage": {
+    "input_tokens": 50,
+    "output_tokens": 10,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 93
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 0,
+          "error": "structured-output parse failed: final JSON parse failed (finish_reason=stop; len=15 chars, no '{' found): not json at all",
+          "ok": false,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 20,
+            "output_tokens": 4
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 1,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 0,
+          "modules": [
+            {
+              "doc": "src/AGENTS.md",
+              "linters": [],
+              "module": "src",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "rows": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 10,
+            "output_tokens": 2
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 2,
+          "claims": 0,
+          "delivered": 0,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 0,
+          "ok": true,
+          "rows": 1,
+          "scope_creep": 0,
+          "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 20,
+            "output_tokens": 4
+          },
+          "verification_complete": true
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 120
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "p1": 10
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "status_code": "triage_axis_failed:security",
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

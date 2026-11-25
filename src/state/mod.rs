@@ -43,12 +43,12 @@ pub enum Phase {
     Fanout,     // 旧 finding 扇出（F-4 后不再打；旧作业 state 可读）
     Scan,       // 批 F-5：scanner 静态扇出（cell 并发执行中，progress.done 推进）
     Deep,       // M21b 批 C：深挖队列消费中
-    // M21b 批 C 占位、批 D 做了流式复核却没接上打点（全仓零产品写入，M21c 批 C 的状态机盘点查出来）。
-    // 现在打在**复核尾段**：深挖队列排空、就剩复核还在跑的那一段——`verify_tail_ms` 量的正是它。
-    // 复核与深挖重叠的部分仍算 Deep，这里标的是「深挖该收了，在等复核」。
-    Verify,
+    // 验真尾段（M21c 批 C）：深挖队列排空、就剩 refute 还在跑的那一段——`refute_tail_ms` 量的正是它。
+    // 验真与深挖重叠的部分仍算 Deep，这里标的是「深挖该收了，在等验真」。
+    // 写入点：`deep.rs` 尾段打点（`refute_phase_marked` 守卫，只打一次）。
+    // 0.8 术语分家：旧的 `Verify` 变体删除，legacy `Refute` 提升为唯一变体（serde 名不变）。
+    Refute,
     Finalizing, // 尾段：合并 / 报告（progress/last_active 静止）
-    Refute,     // 旧 verifier 子阶段（serde 仍可读；新作业打 Verify）
 }
 
 /// phase 时间线一格（2026-07-03 grill 定案：finalizing 黑盒可观测）。
@@ -168,7 +168,7 @@ pub struct CellInput {
 }
 
 /// partial 每 cell：单个 cell 的执行结果（db 同键覆盖：重试成功覆盖失败记录）。
-/// v4（D11-7 R14）：输出按角色分叉为 [`CellOutput`]（scanner 疑点 / reviewer findings / verifier 判决），一 cell 一条记录；
+/// v4（D11-7 R14）：输出按角色分叉为 [`CellOutput`]（scanner 疑点 / reviewer findings / refuter 判决），一 cell 一条记录；
 /// 角色只有一个真相源——`output` 的枚举 tag，[`CellRecord::role`] 与 `cells.role` 列都由它派生（不另存字段，评审裁定 2026-09-08）。
 /// 旧 v3 记录（`findings` 平铺、无 output）不再可读——由 `db::USER_VERSION` 守卫保证运行时读不到。
 /// 运行学字段（duration/tokens/attempts，2026-07-03 grill 定案）serde default——缺字段零值。
@@ -176,7 +176,7 @@ pub struct CellInput {
 pub struct CellRecord {
     pub cell: String,
     pub model: String,
-    /// 模型家族（agreement 计家族数、verifier 异族选择的口径，design §5 / §8.1）：取角色条目 `EffectiveModel.family`
+    /// 模型家族（agreement 计家族数、refuter 异族选择的口径，design §5 / §8.1）：取角色条目 `EffectiveModel.family`
     /// （批 A：`family` 缺省 model_id 首段小写），由调用方经 [`CellRecord::with_family`] 填；未知为空串。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub family: String,
@@ -217,6 +217,10 @@ pub struct CellRecord {
     /// 其中 **429 重试**（限流退避，不是探索深度）。旧记录 0。
     #[serde(default)]
     pub rl_retries: u32,
+    /// **quote 锚定丢弃**的 finding 条数（hibot 2.5）：`anchor_review_findings` 在解析阶段就丢掉的那些。
+    /// 以前只活在 `warn` 文本里，报告出口无法聚合——空结果会被误报成 `ok`。旧记录 0。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub dropped_quote: u32,
     /// 胜出 call 的 tool-loop 迭代数（计 FINALIZE、不计 turn 级重试；单发单收=1）。
     /// 0＝失败/未观测（旧记录、整链失败、resume 格）。
     #[serde(default)]
@@ -235,6 +239,10 @@ pub struct CellRecord {
     pub template_hash: Option<String>,
 }
 
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
 fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
@@ -244,7 +252,7 @@ impl CellRecord {
     pub fn ok(cell: impl Into<String>, model: impl Into<String>, output: crate::domain::CellOutput) -> Self {
         Self {
             cell: cell.into(), model: model.into(), family: String::new(), ok: true, output, warn: None,
-            duration_ms: 0, queue_wait_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0, repair_rounds: 0, two_stage_rounds: 0, rl_retries: 0,
+            duration_ms: 0, queue_wait_ms: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, attempts: 0, iterations: 0, repair_rounds: 0, two_stage_rounds: 0, rl_retries: 0, dropped_quote: 0,
             max_turn_output_tokens: 0, tool_use: Default::default(), template_hash: None,
         }
     }
@@ -492,8 +500,10 @@ mod tests {
         assert_eq!(serde_json::to_string(&Phase::Scan).unwrap(), "\"scan\"");
         assert_eq!(serde_json::from_str::<Phase>("\"scan\"").unwrap(), Phase::Scan);
         assert_eq!(serde_json::to_string(&Phase::Deep).unwrap(), "\"deep\"");
-        assert_eq!(serde_json::from_str::<Phase>("\"verify\"").unwrap(), Phase::Verify);
-        assert_eq!(serde_json::from_str::<Phase>("\"refute\"").unwrap(), Phase::Refute, "旧 refute 仍可读");
+        // 0.8 术语分家：只剩 `refute` 一个变体（旧的 `verify` 串已不可读，硬切无别名）。
+        assert_eq!(serde_json::to_string(&Phase::Refute).unwrap(), "\"refute\"");
+        assert_eq!(serde_json::from_str::<Phase>("\"refute\"").unwrap(), Phase::Refute);
+        assert!(serde_json::from_str::<Phase>("\"verify\"").is_err(), "旧作业 state 的 verify 串按设计反序列化失败");
     }
 
     #[test]
@@ -623,10 +633,10 @@ mod tests {
         let review = CellRecord::ok("bundle[a]@m", "agc/glm-5.3", CellOutput::review(vec![]));
         assert_eq!((review.role(), review.family.as_str()), (Role::Reviewer, ""), "未回填 family 为空串且不序列化");
         assert!(!serde_json::to_string(&review).unwrap().contains("family"));
-        let mut verify = CellRecord::failed("verify[f1]@kimi", "kimi", Role::Verifier, "timeout").with_family("kimi");
-        verify.template_hash = Some("deadbeef".into());
-        assert_eq!((verify.role(), verify.family.as_str(), verify.ok), (Role::Verifier, "kimi", false));
-        for rec in [scan, review, verify] {
+        let mut refute = CellRecord::failed("refute[f1]@kimi", "kimi", Role::Refuter, "timeout").with_family("kimi");
+        refute.template_hash = Some("deadbeef".into());
+        assert_eq!((refute.role(), refute.family.as_str(), refute.ok), (Role::Refuter, "kimi", false));
+        for rec in [scan, review, refute] {
             let j = serde_json::to_string(&rec).unwrap();
             let v: serde_json::Value = serde_json::from_str(&j).unwrap();
             assert!(v.get("role").is_none(), "顶层无 role 字段（唯一真相源是 output tag）: {j}");
@@ -802,16 +812,16 @@ mod tests {
         let store = JobStore::open(tmp.path()).unwrap();
         store.append_partial("j1", &CellRecord::ok("s", "deepseek-v4-flash", CellOutput::Scan(ScanOutput::default()))).unwrap();
         store.append_partial("j1", &CellRecord::ok("r", "glm-5.3", CellOutput::review(vec![]))).unwrap();
-        store.append_partial("j1", &CellRecord::failed("v", "kimi_k3", Role::Verifier, "x")).unwrap();
+        store.append_partial("j1", &CellRecord::failed("v", "kimi_k3", Role::Refuter, "x")).unwrap();
         let all = store.read_partial("j1");
         let by = |c: &str| all.iter().find(|r| r.cell == c).unwrap().clone();
         assert_eq!(by("s").role(), Role::Scanner);
         assert!(matches!(by("s").output, CellOutput::Scan(_)));
         assert_eq!(by("r").role(), Role::Reviewer);
-        assert_eq!(by("v").role(), Role::Verifier);
+        assert_eq!(by("v").role(), Role::Refuter);
         assert!(!by("v").ok);
         let db = store.db.lock().unwrap();
-        for (c, role) in [("s", "scanner"), ("r", "reviewer"), ("v", "verifier")] {
+        for (c, role) in [("s", "scanner"), ("r", "reviewer"), ("v", "refuter")] {
             assert_eq!(db.cell_role("j1", c).unwrap().as_deref(), Some(role), "cells.role 列 = 记录 role");
         }
     }

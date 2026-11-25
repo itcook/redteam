@@ -1,0 +1,78 @@
+{
+  "schema": "hibot.audit.report.verify/1",
+  "job_id": "pr400-group-a",
+  "kind": "verify",
+  "status": "ok",
+  "input": {
+    "head_sha": "54f4c944da97ccd775de51e3525e86e611b2cd83",
+    "base_sha": "122220fde58e0ab5da4cb466568d32db6b6f954b"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "verifications": [
+    {
+      "evidence": "修复把 ChannelAllowed 拆成带 strict 参数的 channelAllowed，并新增 PinnedChannelAllowed（strict=true）在比对存储指纹后才放行；service/llmconfig/execution.go 的 Fingerprint 计算后新增 strict 分支，指纹不等即返回 false，不再只看指纹可计算。middleware/distributor.go 的显式 channel id 路径（约 :65）与 affinity 首选渠道路径（约 :158）都改为调用 PinnedChannelAllowed，因此 affinity/pinned 的 fail-closed 语义恢复：不兼容时 pinned 返回 403、affinity 命中时返回 503 或清空 channel 回落到普通选择。同时 FilterCandidates 的 pinned 分支恢复了 allowed[c.Channel.Id] != c.CurrentFingerprint 校验，migration 侧改用新增的 VerifiedChannelIDs。非 strict 的 ChannelAllowed/AllowedChannelIDs 只服务于普通选择与请求内缓存，strict 校验在其之上叠加，未见改动行引入新的具体问题。",
+      "finding_fingerprint": "sha256:697a6db64a341b98e313f7e9eaf2bb1b15991a0b553ad40813886afce781c3a2",
+      "quote": "if strict && current != expected {",
+      "status": "resolved"
+    },
+    {
+      "evidence": "修复引入严格/宽松两条路径：execution.go 新增 VerifiedChannelIDs，经 allowedChannelIDs(..., strict=true) 在计算当前指纹后额外要求 current == fp（`if err != nil || (strict && current != fp) {` 即跳过）；migration.go 的 validateEffectiveMigrationChannels 已从 AllowedChannelIDs 改为调用 VerifiedChannelIDs，使迁移 forward switch 重新绑定到已验证（指纹一致）的渠道，并在无渠道时报错要求先 rebind-evidence。原先“门禁被同步放宽”的构造已消失，改为按调用点参数化；同时 distributor.go 的显式渠道/亲和路径改用 PinnedChannelAllowed 保持严格，未发现改动行引入的新问题。",
+      "finding_fingerprint": "sha256:7db89c45c86767f14a69cdc975e148b524102f6f2990c9525030aa5d08e0b508",
+      "quote": "ids, err := VerifiedChannelIDs(ctx, &RuntimeSnapshot{ModelName: b.Model.ModelName, Protocol: p, ChannelEvidence: evidence})",
+      "status": "resolved"
+    }
+  ],
+  "usage": {
+    "input_tokens": 13038,
+    "output_tokens": 3987,
+    "cached_input_tokens": 1024,
+    "wall_clock_ms": 12838
+  },
+  "extensions": {
+    "redteam": {
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 900
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 10
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "zh_CN"
+      },
+      "template_hashes": {
+        "fix_verify": "3a1cfc364de35f6b"
+      },
+      "verifier": "deepseek/deepseek-flash",
+      "verify": {
+        "calls": 2,
+        "counts": {
+          "inconclusive": 0,
+          "regressed": 0,
+          "resolved": 2,
+          "unresolved": 0
+        },
+        "duplicate_fingerprints": 0,
+        "latency_ms": {
+          "max": 12572,
+          "total": 22833
+        },
+        "model_failures": 0,
+        "quote_rejected": 0,
+        "rate_limit": {
+          "retries": 0,
+          "wait_ms": 0
+        },
+        "warnings": []
+      }
+    }
+  }
+}

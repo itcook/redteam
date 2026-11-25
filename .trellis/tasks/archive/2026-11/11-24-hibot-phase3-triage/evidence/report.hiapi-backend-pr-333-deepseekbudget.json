@@ -1,0 +1,230 @@
+{
+  "schema": "hibot.audit.report.triage/1",
+  "job_id": "eval-pr-333",
+  "kind": "triage",
+  "status": "ok",
+  "input": {
+    "head_sha": "fac9d4ffaaf8aa37c1d6f28274a56861cd8444f8",
+    "base_sha": "ef4a0cbb962b4057f59a08d2de0bb7baedf0c80f"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "fingerprint": "sha256:d2ece833ffcff51b0c6432e9d14424b4c50c412b2e3157c9df4b788bc757a64e",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_client.go",
+      "line_start": 349,
+      "line_end": 349,
+      "quote": "req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.LLMBaseURL+\"/chat/completions\", bytes.NewReader(raw))",
+      "title": "Security (surface 7): SSRF",
+      "body": "Reachability: env `FEISHU_FINANCE_AGENT_LLM_BASE_URL` -> `setting.GetFeishuFinanceAgentSetting()` at service/feishu_finance_agent_client.go:280 -> `cfg.LLMBaseURL` -> `http.NewRequestWithContext` at service/feishu_finance_agent_client.go:349\nNote: The outbound URL is built directly from the configured LLM base URL without scheme or host validation. If the setting/env value is attacker-influenced, the server can be made to POST to arbitrary internal hosts; line 353 also attaches the LLM API key to that request. The Feishu message text only controls the JSON body, not the URL.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    },
+    {
+      "fingerprint": "sha256:39be96c5dff3fa43848c505cca0e663cee81cde31de6a0ac5cec4ea99204045f",
+      "severity": "medium",
+      "confidence": 0.8,
+      "file": "service/feishu_finance_agent_ws.go",
+      "line_start": 101,
+      "line_end": 103,
+      "quote": "if domain := feishuFinanceAgentWSDomain(cfg.OpenAPIBase); domain != \"\" {\n\t\topts = append(opts, larkws.WithDomain(domain))\n\t}",
+      "title": "Security (surface 7): SSRF",
+      "body": "Reachability: env var FEISHU_FINANCE_AGENT_OPENAPI_BASE read at setting/feishu_finance_agent_setting.go:32 -> FeishuFinanceAgentSetting.OpenAPIBase -> StartFeishuFinanceAgentWS passes cfg into runFeishuFinanceAgentWSSession (service/feishu_finance_agent_ws.go:60) -> feishuFinanceAgentWSDomain (service/feishu_finance_agent_ws.go:111) only trims whitespace, a trailing '/' and '/open-apis' -> larkws.WithDomain(domain) at service/feishu_finance_agent_ws.go:102 -> larkws.NewClient(cfg.AppID, cfg.AppSecret, opts...) at service/feishu_finance_agent_ws.go:105 -> client.Start(context.Background()) at service/feishu_finance_agent_ws.go:106 opens the outbound WebSocket to that host\nNote: The outbound long-connection endpoint is taken verbatim from configuration with no allowlist forcing it to open.feishu.cn; any mechanism that lets an attacker influence FEISHU_FINANCE_AGENT_OPENAPI_BASE (env/config injection, tampered container env, a fake local smoke-test service left enabled) silently redirects the connection, and the same host receives the tenant authentication carrying FEISHU_FINANCE_AGENT_APP_SECRET. Note the value is deployment-controlled rather than supplied by an end user of the bot, so external reachability is indirect; the code path itself is unconditional whenever the env var is non-empty.",
+      "recommendation": "Fix the issue, or provide evidence that the path is not reachable.",
+      "refuted": false,
+      "source": {
+        "executor": "redteam",
+        "model": "deepseek/deepseek-flash",
+        "role": "scanner"
+      }
+    }
+  ],
+  "summary": {
+    "blockers_count": 0,
+    "convention_drift": "local",
+    "fit": "in-scope",
+    "intent_undelivered": 0,
+    "local_count": 2,
+    "risk": "high",
+    "routing": {
+      "focus": [
+        "ssrf@service/feishu_finance_agent_client.go",
+        "ssrf@service/feishu_finance_agent_ws.go"
+      ],
+      "specs": [
+        "AGENTS.md"
+      ],
+      "wall_clock_s": 1200
+    },
+    "scope_creep_count": 4,
+    "security_tier": 1,
+    "structural_count": 0
+  },
+  "usage": {
+    "input_tokens": 169547,
+    "output_tokens": 128874,
+    "cached_input_tokens": 91520,
+    "wall_clock_ms": 251703
+  },
+  "extensions": {
+    "redteam": {
+      "axes": [
+        {
+          "axis": "security",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 94062,
+          "ok": true,
+          "rows": 2,
+          "usage": {
+            "cached_input_tokens": 46848,
+            "input_tokens": 47360,
+            "output_tokens": 30728
+          }
+        },
+        {
+          "axis": "drift",
+          "cells": 3,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 229749,
+          "modules": [
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": ".",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "model",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "service",
+              "peers": [],
+              "source": "doc"
+            },
+            {
+              "doc": "AGENTS.md",
+              "linters": [],
+              "module": "setting",
+              "peers": [],
+              "source": "doc"
+            }
+          ],
+          "no_standard": [],
+          "ok": true,
+          "repair_notes": [
+            "triage-drift: first turn parse failed (finish=length, text_len=0, head=\"\"); repaired"
+          ],
+          "rows": 2,
+          "usage": {
+            "cached_input_tokens": 39552,
+            "input_tokens": 69568,
+            "output_tokens": 53712
+          }
+        },
+        {
+          "axis": "intent",
+          "cells": 4,
+          "claims": 20,
+          "delivered": 20,
+          "dropped": {
+            "below_threshold": 0,
+            "dropped_rows": [],
+            "dropped_total": 0,
+            "duplicate": 0,
+            "invalid": 0,
+            "invalid_claim_source": 0,
+            "no_reach": 0,
+            "off_patch": 0,
+            "overlap_unverified": 0,
+            "unanchored": 0
+          },
+          "elapsed_ms": 157053,
+          "notes": [
+            "The PR body is unusually long and contains a structured review-response table (items 1–6, F1–F6, S5+Q7, Q13, Q30) that reads as iterative feedback cycles; the body alone does not show who raised those items.",
+            "Verification statements (not counted as claims): 20 new/updated tests covering plan building, confirm flow, duplicate click, non-initiator/downgraded Root, cancel/expiry, stranger, SDK event and card callback conversion, in-flight re-click, crash recovery, not preempting fresh records, json_schema → json_object fallback, field-level command validation, injection warning, recovery re-auth, fencing version, parsing recovery, withdrawal current value; `go build ./...` and `go test ./service ./model ./router ./controller` reported passing.",
+            "Verification statement: author reports end-to-end smoke with a real Feishu app and real model (reported as `deepseek-v4.1-flash`) plus DB checks of promotion/commission/withdrawal/credits/logs — provided as observation only, not evidence in this phase.",
+            "New dependencies are introduced via `go.mod`/`go.sum` (+2/+30), consistent with the stated Feishu Go SDK long-connection approach.",
+            "Configuration surface stated in the body: `FEISHU_FINANCE_AGENT_APP_ID`, `FEISHU_FINANCE_AGENT_APP_SECRET`, `FEISHU_FINANCE_AGENT_LLM_BASE_URL`, `FEISHU_FINANCE_AGENT_LLM_API_KEY`, `FEISHU_FINANCE_AGENT_LLM_MODEL`, and optional test-only `FEISHU_FINANCE_AGENT_OPENAPI_BASE`.",
+            "Deployment prerequisites stated: Feishu console must subscribe the long connection to `im.message.receive_v1` and `card.action.trigger` and grant `im:message:send_as_bot`, `im:message.p2p_msg:readonly`, `im:message.group_at_msg:readonly`.",
+            "The body explicitly states the trust model (LLM plans are untrusted input gated by a human Root confirmation) \"needs Root-side acceptance\" — a policy decision for reviewers, not a code claim.",
+            "Author notes that multiple backend instances may run against the same Feishu app with events randomly distributed, relying on DB dedup and state claiming for exactly-once execution.",
+            "Author notes a local SQLite (glebarez v1.10) restart DDL issue claimed unrelated to this PR; production uses PostgreSQL.",
+            "No non-bot, non-author reviewer comments were supplied in this request, so maintainer overlap cannot be assessed.",
+            "This slice covers only build metadata (go.mod/go.sum), main.go wiring, the new model file and the migration list; service-layer claims (c1, c3, c4, c6, c7, c8, c9, c12, c15, c16, c17, c18) cannot be judged here and are intentionally omitted.",
+            "go.sum changes are transitive dependency churn pulled in by the new larksuite SDK (gogo/protobuf, goldmark, older golang.org/x/* go.mod lines) and are traceable to c2, not scope creep.",
+            "Line numbers cited for model/feishu_finance_agent.go are positions inside the newly added 308-line file; the other files use the post-image line numbers from the diff hunks.",
+            "This slice covers the service logic, card rendering, Feishu SDK client and LLM parser tests; model, setting, main and websocket files are outside this slice.",
+            "This slice covers the websocket glue, the settings loader and three test files; plan building, LLM parsing, model persistence and main.go wiring are in other slices, so their claims are omitted rather than judged."
+          ],
+          "ok": true,
+          "rows": 1,
+          "scope_creep": 4,
+          "usage": {
+            "cached_input_tokens": 5120,
+            "input_tokens": 52619,
+            "output_tokens": 44434
+          },
+          "verification_complete": true
+        }
+      ],
+      "blockers": [],
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 1200
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "deepseek": 4
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "en_US"
+      },
+      "template_hashes": {
+        "triage": "f8e848e16e926990"
+      }
+    }
+  }
+}

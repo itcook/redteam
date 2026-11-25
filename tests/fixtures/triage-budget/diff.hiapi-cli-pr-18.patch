@@ -1,0 +1,1462 @@
+diff --git a/.trellis/spec/backend/error-handling.md b/.trellis/spec/backend/error-handling.md
+index 18a6584..508c6a4 100644
+--- a/.trellis/spec/backend/error-handling.md
++++ b/.trellis/spec/backend/error-handling.md
+@@ -60,3 +60,18 @@ Questions to answer:
+   **不得**把 `found`（可能含整页业务数据）打到终端；原文只进 `debug`。
+ - message 自带状态码时调用 `with_status_in_message()`，避免 `summary()` 重复追加 `(HTTP xxx)`。
+ - 新增 `CliError` 字段时，手写字面量优先改为 `..err` 或构造器，避免漏字段编译失败。
++
++---
++
++## Draft mutation receipts and recovery
++
++- `draft update` and `draft revise` carry `expectedUpdatedAt`. An explicit
++  `--if-unmodified-since` is the user's reviewed version; otherwise fetch the version before writing.
++  A 409 must never trigger an automatic read-and-retry with a newer version.
++- `revise` requires a caller-supplied stable request ID. Retrying an uncertain result must preserve
++  the request ID, patch and target; do not generate a replacement key automatically.
++- A transport failure or HTTP 5xx after a mutation does not prove rollback. Replace the generic
++  unavailable hint with readback/replay instructions; retain the error status and nonzero exit code.
++- Successful mutation receipts retain all server fields and add environment/source/result IDs and
++  status. Missing draft identity/status or `affectsPublishedContent: false` is a contract error,
++  with readback guidance because the mutation may already have committed.
+diff --git a/.trellis/tasks/11-20-draft-revisions-cli/check.jsonl b/.trellis/tasks/11-20-draft-revisions-cli/check.jsonl
+new file mode 100644
+index 0000000..381f83c
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-cli/check.jsonl
+@@ -0,0 +1 @@
++{"file": ".trellis/spec/backend/error-handling.md", "reason": "CLI recovery invariants"}
+diff --git a/.trellis/tasks/11-20-draft-revisions-cli/design.md b/.trellis/tasks/11-20-draft-revisions-cli/design.md
+new file mode 100644
+index 0000000..c4bfe9e
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-cli/design.md
+@@ -0,0 +1,7 @@
++# cli child design
++
++Shared contract and rationale: [parent design](../11-20-draft-revisions/design.md).
++
++The CLI is an HTTP client; it must never synthesize formal target bindings or downgrade missing version/receipt contracts. Explicit timestamps represent the user's reviewed snapshot. Stable request IDs are supplied by callers.
++
++Dependency: sites migration/API must be deployed before CLI distribution. Rollback constraints are inherited from the parent implement.md and sites rollout.md.
+diff --git a/.trellis/tasks/11-20-draft-revisions-cli/implement.jsonl b/.trellis/tasks/11-20-draft-revisions-cli/implement.jsonl
+new file mode 100644
+index 0000000..9ede7c1
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-cli/implement.jsonl
+@@ -0,0 +1 @@
++{"file": ".trellis/tasks/11-20-draft-revisions/design.md", "reason": "Shared contract"}
+diff --git a/.trellis/tasks/11-20-draft-revisions-cli/implement.md b/.trellis/tasks/11-20-draft-revisions-cli/implement.md
+new file mode 100644
+index 0000000..3b5c226
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-cli/implement.md
+@@ -0,0 +1,25 @@
++# CLI implementation plan
++
++1. [x] Read shared contract and existing error/render conventions.
++2. [x] Implement update/revise arguments, requests, receipts and recovery.
++3. [x] Add parser/HTTP/binary regression coverage and run `scripts/check.sh` (230 passed).
++4. [x] Independent full-change review before PR #18.
++5. [x] Apply weil-ai feedback and rerun scripts/check.sh: fmt, clippy and 230 Linux tests passed; Windows-only tests were not run.
++6. [ ] Push the reviewed follow-up and request re-review from weil-ai.
++7. [ ] Wait for sites deployment, then execute docs/staging-integration-checklist.md §6.6 including blog/FAQ and two Showcases.
++
++## Commands
++```sh
++scripts/check.sh
++git diff --check
++```
++WSL root command:
++```sh
++setpriv --bounding-set=-dac_override,-dac_read_search env PATH=/usr/lib/rust-1.91/bin:/usr/local/bin:/usr/bin:/bin CARGO_TARGET_DIR=/var/tmp/hiapi-issue17-target RUST_TEST_THREADS=1 bash scripts/check.sh
++```
++
++## Gates
++No automatic conflict retry; stable operation IDs; malformed success receipt is nonzero with readback guidance. Package quality gate and reviewer approval precede distribution. API migration/deployment is a prerequisite, not implied by task status.
++
++## Rollback
++Revert CLI distribution without changing content. Never fall back to unversioned writes. API rollback after pending revisions exist is unsafe; follow parent implement.md. The parent [validation.md](../11-20-draft-revisions/validation.md) remains supporting historical evidence.
+diff --git a/.trellis/tasks/11-20-draft-revisions-cli/prd.md b/.trellis/tasks/11-20-draft-revisions-cli/prd.md
+new file mode 100644
+index 0000000..0080d23
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-cli/prd.md
+@@ -0,0 +1,15 @@
++# CLI deliverable for issue 17
++
++Parent: [11-20-draft-revisions](../11-20-draft-revisions/prd.md).
++PR: https://github.com/zimacode-network/hiapi-cli/pull/18
++
++## Scope
++Implement versioned draft update, explicit revise with stable request ID, truthful environment/source/result/status receipts, uncertain-write recovery, command help and staging instructions.
++API storage, target resolution and accept behavior belong to sibling sites deliverable.
++
++## Acceptance
++- Parser/HTTP/binary tests cover explicit and auto versions, no retry on conflicts, file/stdin patches, replay receipts and uncertain errors.
++- scripts/check.sh passes; receipts preserve server fields and expose local environment/context.
++- Document Showcase and both FAQ/blog acceptance, exact write-error scope and old-server behavior.
++- Reviewer feedback is resolved on the final PR head.
++- Distribution waits for deployed companion API/migration.
+diff --git a/.trellis/tasks/11-20-draft-revisions-cli/task.json b/.trellis/tasks/11-20-draft-revisions-cli/task.json
+new file mode 100644
+index 0000000..f58a3c6
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-cli/task.json
+@@ -0,0 +1,26 @@
++{
++  "id": "draft-revisions-cli",
++  "name": "draft-revisions-cli",
++  "title": "Issue 17 CLI implementation and review",
++  "description": "Own CLI revise/update version flags, receipts, help, command tests and deployment acceptance instructions; API is a separate prerequisite deliverable.",
++  "status": "in_progress",
++  "dev_type": null,
++  "scope": null,
++  "package": null,
++  "priority": "P2",
++  "creator": "codex",
++  "assignee": "codex",
++  "createdAt": "2026-11-20",
++  "completedAt": null,
++  "branch": "feat/draft-revisions",
++  "base_branch": "main",
++  "worktree_path": null,
++  "commit": null,
++  "pr_url": "https://github.com/zimacode-network/hiapi-cli/pull/18",
++  "subtasks": [],
++  "children": [],
++  "parent": "11-20-draft-revisions",
++  "relatedFiles": [],
++  "notes": "",
++  "meta": {}
++}
+\ No newline at end of file
+diff --git a/.trellis/tasks/11-20-draft-revisions-sites/check.jsonl b/.trellis/tasks/11-20-draft-revisions-sites/check.jsonl
+new file mode 100644
+index 0000000..0f6401c
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-sites/check.jsonl
+@@ -0,0 +1 @@
++{"file": ".trellis/tasks/11-20-draft-revisions-sites/prd.md", "reason": "Independent sites acceptance"}
+diff --git a/.trellis/tasks/11-20-draft-revisions-sites/design.md b/.trellis/tasks/11-20-draft-revisions-sites/design.md
+new file mode 100644
+index 0000000..a797f3b
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-sites/design.md
+@@ -0,0 +1,7 @@
++# sites child design
++
++Shared contract and rationale: [parent design](../11-20-draft-revisions/design.md).
++
++API owns trusted receipt storage, target binding and transaction-level version comparison. Implementation details are maintained in the linked sites task design.md; this child tracks its delivery, not a second copy of production code.
++
++Dependency: sites migration/API must be deployed before CLI distribution. Rollback constraints are inherited from the parent implement.md and sites rollout.md.
+diff --git a/.trellis/tasks/11-20-draft-revisions-sites/implement.jsonl b/.trellis/tasks/11-20-draft-revisions-sites/implement.jsonl
+new file mode 100644
+index 0000000..39b1d04
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-sites/implement.jsonl
+@@ -0,0 +1 @@
++{"file": ".trellis/tasks/11-20-draft-revisions/design.md", "reason": "Shared contract tracking"}
+diff --git a/.trellis/tasks/11-20-draft-revisions-sites/implement.md b/.trellis/tasks/11-20-draft-revisions-sites/implement.md
+new file mode 100644
+index 0000000..605e792
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-sites/implement.md
+@@ -0,0 +1,18 @@
++# Sites coordination-child execution
++
++1. [x] Delegate implementation to hiapi-sites task 11-20-draft-revisions (PR #328).
++2. [x] Verify additive migration, trusted target/replay metadata and original-entity acceptance.
++3. [x] Confirm sites local checks: 571 tests, affected typechecks/lint, fresh 73-migration replay.
++4. [ ] Close API review on final head and cross-check CLI replay/receipt compatibility.
++5. [ ] Deploy migration then API; only then distribute CLI and execute parent staging gate.
++
++## Commands (in hiapi-sites)
++```sh
++bun test apps/content-api/tests/modules/review/draft-revise.test.ts packages/content-sdk/tests/schema/ingest-update-modify.test.ts --timeout 30000
++bun run --filter @hiapi/content-api --filter @hiapi/content-sdk --filter @hiapi/manage typecheck
++git diff --check
++```
++The sites local implement.md contains the broader domain regression and lint commands. The CLI parent records cross-repository verification.
++
++## Review / rollback gates
++Fail closed on ambiguous old targets, stale formal versions and forbidden fields. Reviewer approval precedes deployment. Do not expose existing revision drafts to old create-only accept logic; preserve receipt tables, disable mutation or roll forward if reverting after new rows exist.
+diff --git a/.trellis/tasks/11-20-draft-revisions-sites/prd.md b/.trellis/tasks/11-20-draft-revisions-sites/prd.md
+new file mode 100644
+index 0000000..60f410b
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-sites/prd.md
+@@ -0,0 +1,17 @@
++# API/SDK deliverable for issue 17
++
++Parent: [11-20-draft-revisions](../11-20-draft-revisions/prd.md).
++PR: https://github.com/zimacode-network/hiapi-sites/pull/328
++Implementation record: https://github.com/zimacode-network/hiapi-sites/tree/feat/draft-revisions/.trellis/tasks/11-20-draft-revisions
++
++## Scope
++This coordination child tracks independently deliverable sites code: narrow Showcase copy editor, trusted target/version/replay metadata, additive migration, API/SDK contracts and transactional original-entity acceptance.
++Actual implementation and test commands live in the linked sites task. CLI behavior belongs to sibling CLI child.
++
++## Acceptance
++- Protected-field atomic rejection and version conflict tests pass.
++- Accepted blog, FAQ, changelog and model-info revise into pending; original accepted/formal content remains unchanged before accept.
++- Accept edits original entity/locale, preserves other locales/publication state and avoids generation.
++- Same request key replays without duplication; different data/target rejects; freshness checks only apply to new requests.
++- Fresh migrations, affected API/SDK regressions/typechecks/lint pass.
++- API/migration deploy precedes CLI distribution; staging integration remains a parent release gate.
+diff --git a/.trellis/tasks/11-20-draft-revisions-sites/task.json b/.trellis/tasks/11-20-draft-revisions-sites/task.json
+new file mode 100644
+index 0000000..7af6e68
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions-sites/task.json
+@@ -0,0 +1,28 @@
++{
++  "id": "draft-revisions-sites",
++  "name": "draft-revisions-sites",
++  "title": "Issue 17 content API implementation and review",
++  "description": "Track the independently verified hiapi-sites API/SDK/migration deliverable and its PR328; implementation record lives in hiapi-sites task 11-20-draft-revisions.",
++  "status": "in_progress",
++  "dev_type": null,
++  "scope": null,
++  "package": null,
++  "priority": "P2",
++  "creator": "codex",
++  "assignee": "codex",
++  "createdAt": "2026-11-20",
++  "completedAt": null,
++  "branch": null,
++  "base_branch": "dev",
++  "worktree_path": null,
++  "commit": null,
++  "pr_url": "https://github.com/zimacode-network/hiapi-sites/pull/328",
++  "subtasks": [],
++  "children": [],
++  "parent": "11-20-draft-revisions",
++  "relatedFiles": [],
++  "notes": "",
++  "meta": {
++    "implementationRecord": "https://github.com/zimacode-network/hiapi-sites/tree/feat/draft-revisions/.trellis/tasks/11-20-draft-revisions"
++  }
++}
+diff --git a/.trellis/tasks/11-20-draft-revisions/check.jsonl b/.trellis/tasks/11-20-draft-revisions/check.jsonl
+new file mode 100644
+index 0000000..1ccc5ec
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/check.jsonl
+@@ -0,0 +1,2 @@
++{"file": ".trellis/tasks/11-20-draft-revisions/design.md", "reason": "Cross-repository acceptance contract"}
++{"file": ".trellis/spec/backend/error-handling.md", "reason": "Final package quality review"}
+diff --git a/.trellis/tasks/11-20-draft-revisions/design.md b/.trellis/tasks/11-20-draft-revisions/design.md
+new file mode 100644
+index 0000000..6c7a158
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/design.md
+@@ -0,0 +1,30 @@
++# Design
++## Wire contract
++PATCH /admin/drafts/:id adds optional expectedUpdatedAt (ISO). CLI update reads info to supply it unless --if-unmodified-since provided.
++POST /admin/drafts/:id/revise body: data (merge patch), expectedUpdatedAt (required ISO), idempotencyKey (required opaque 1..128), targetEntityId (optional ULID for legacy ambiguity).
++CLI: content draft revise --id ID --data JSON|@FILE|- --request-id KEY [--if-unmodified-since ISO] [--target-entity-id ID].
++Revision source version defaults to info. Replay checked before freshness, stable request ID required.
++Server mutation result: {draft: IngestDraftDetail, derivedFrom?: string, affectsPublishedContent: false, reused?: boolean}.
++CLI adds environment, sourceDraftId, draftId and status.
++
++## Storage and acceptance
++Persist trusted target/baseline/patch metadata separately from caller source/data. Record new accepted draft -> entity associations. Resolve legacy target only unambiguously; explicit target must be validated.
++Lock target, compare baseline, update original locale in accept transaction. Do not reuse full-replacement CRUD deleting other locales.
++Apply intended changes against current formal baseline, avoiding unrelated stale-data overwrite. Identity/operational fields stay protected.
++Revision descendants preserve trusted metadata or reject unsafe derivation explicitly.
++Showcase has a separate narrow editor; no media clearing, agent dispatch or current-schema acceptance check.
++
++## Rollout
++Migration/API before CLI. PR review only; no production deploy. Staging end-to-end proof follows deployment.
++
++## Tradeoffs and compatibility
++- A distinct revise command makes accepted-to-pending intent explicit; update never silently overwrites accepted content.
++- Caller-owned request IDs survive timeout/restart. Server replay lookup precedes source freshness checks; its fingerprint contains data and targetEntityId, deliberately excluding expectedUpdatedAt. The timestamp protects new operations, while a replay returns the prior result even if the source version changed. Different patch/target with the same key conflicts.
++- The CLI keeps a small local nonblank/length request-ID check for immediate usage errors; the SDK/API remains authoritative and validates all HTTP clients independently.
++- CLI auto-fetch only guards concurrent changes after that read. --if-unmodified-since is required to protect a version reviewed earlier by a human.
++- Old APIs may reject expectedUpdatedAt or lack revise. If a partially upgraded API commits a write but returns a receipt without affectsPublishedContent=false, the new CLI exits 1 with readback guidance; it never retries without the version guard. Deploy API first.
++- Trusted revision metadata is separate from caller-owned source/data to prevent forged target bindings. Additional tables are additive; existing drafts need no destructive backfill. Legacy resolution is deliberately conservative.
++- Narrow per-locale writes preserve other translations; full CRUD replacement and ordinary create-only accept were rejected because they can delete locales or duplicate content.
++
++## Rollback shape
++CLI can revert independently, retaining all content. Once revision rows exist, old create-only API accept is unsafe even if no revision has yet been accepted: disable mutation or roll forward; retain receipts/mappings. After acceptance, corrections require a new reviewed revision, not destructive history rollback. See implement.md and the sites rollout record for release gates.
+diff --git a/.trellis/tasks/11-20-draft-revisions/implement.jsonl b/.trellis/tasks/11-20-draft-revisions/implement.jsonl
+new file mode 100644
+index 0000000..525b2e0
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/implement.jsonl
+@@ -0,0 +1,2 @@
++{"file": ".trellis/tasks/11-20-draft-revisions/design.md", "reason": "Shared API contract and safety invariants"}
++{"file": ".trellis/spec/backend/error-handling.md", "reason": "Existing package contracts"}
+diff --git a/.trellis/tasks/11-20-draft-revisions/implement.md b/.trellis/tasks/11-20-draft-revisions/implement.md
+new file mode 100644
+index 0000000..f14cd19
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/implement.md
+@@ -0,0 +1,44 @@
++# Issue 17 integration execution and review
++
++## Ordered plan
++1. [x] Explore existing update/accept paths and freeze wire semantics in design.md.
++2. [x] Implement API/SDK/migration through the sites child; validate independently.
++3. [x] Implement CLI through the CLI child; validate independently.
++4. [x] Exercise real cross-repository CLI/HTTP/PostgreSQL integration; inspect all affected contracts.
++5. [x] Submit linked PRs #18 and hiapi-sites#328. Review-driven changes remain on the same branches.
++6. [ ] Close reviewer feedback and obtain approval on the final heads.
++7. [ ] After approved deployment, execute staging Showcase, blog and FAQ acceptance in docs/staging-integration-checklist.md §6.6. Record evidence before treating issue #17 as fully accepted.
++
++## Verification commands
++Run from the CLI child worktree:
++```sh
++scripts/check.sh
++git diff --check
++```
++WSL root verification used (Linux-only; Windows tests do not execute):
++```sh
++setpriv --bounding-set=-dac_override,-dac_read_search env PATH=/usr/lib/rust-1.91/bin:/usr/local/bin:/usr/bin:/bin CARGO_TARGET_DIR=/var/tmp/hiapi-issue17-target RUST_TEST_THREADS=1 bash scripts/check.sh
++```
++From the sites child worktree (or an exact Linux mirror), with a local test database:
++```sh
++bun test apps/content-api/tests/modules/review apps/content-api/tests/modules/blog apps/content-api/tests/modules/faq apps/content-api/tests/modules/changelog apps/content-api/tests/modules/model/transcribe-info.test.ts apps/content-api/tests/modules/model/content-core.test.ts packages/content-sdk/tests/schema/ingest-update-modify.test.ts packages/content-sdk/tests/schema/ingest-blog.test.ts packages/content-sdk/tests/schema/ingest-batch5.test.ts packages/content-sdk/tests/schema/ingest-model.test.ts --timeout 30000
++bun run --filter @hiapi/content-api --filter @hiapi/content-sdk --filter @hiapi/manage typecheck
++git diff --check
++```
++Changed TypeScript files additionally pass ESLint with --max-warnings 0; exact package commands/evidence belong to the sites child implementation record.
++
++## Review gates and results
++- Contract gate: CLI/API version precondition and replay fingerprint agree; no automatic retry on 409.
++- Correctness gate: protected Showcase fields, old accepted records, target IDs, other locales, publication time and no regeneration are tested.
++- Independent implementation review: completed before PR submission; null model-body deletion and legacy target matching findings fixed.
++- Baseline results: CLI 230 tests; API 571 tests / 55 files / 2080 assertions; types/lint green. Local real CLI/HTTP/DB integration passed Showcase and FAQ. API blog integration verifies original-target updates and other locales.
++- Follow-up results: CLI full gate passed again (230 Linux tests); API replay/blog regression passed (13 tests, 97 assertions), changed test lint passed. Final independent review found no new code blockers.
++- PR review gate: weil-ai requested planning/tree/blog-documentation corrections; this follow-up supplies them. Later comments must be addressed before approval.
++- Remote CI is not evidence of code failure: sites run 44658696801 had zero steps due to account billing/spending limits.
++- Live staging remains pending; local evidence is not a deployed acceptance claim. validation.md is a supplementary historical result log; this implement.md is the authoritative execution plan.
++
++## Rollback points
++1. Before writes/new revision rows: revert CLI independently; API code can revert while retaining additive schema.
++2. Once a pending revision exists: NEVER roll API acceptance back to create-only logic; disable mutation endpoints or roll forward. Keep trusted receipts and mappings.
++3. After accept: no automatic destructive rollback. Correct via a new reviewed revision; retain original accepted history.
++4. Do not remove migration tables while revision drafts/associations exist. Separate operational recovery review is required before schema removal.
+diff --git a/.trellis/tasks/11-20-draft-revisions/prd.md b/.trellis/tasks/11-20-draft-revisions/prd.md
+new file mode 100644
+index 0000000..70b9c3e
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/prd.md
+@@ -0,0 +1,31 @@
++# Issue 17 cross-repository coordination
++
++## Goal
++Deliver Showcase copy editing and explicit pending revisions of accepted content described in https://github.com/zimacode-network/hiapi-cli/issues/17.
++This parent owns requirements, the shared API contract, delivery ordering and final integration review. Product implementation belongs to the children below.
++
++## Task map
++| Child | Owner and independent acceptance | Implementation record / PR |
++|---|---|---|
++| [11-20-draft-revisions-cli](../11-20-draft-revisions-cli/prd.md) | hiapi-cli: command parsing, version guards, receipts, recovery, help and CLI tests | https://github.com/zimacode-network/hiapi-cli/pull/18 |
++| [11-20-draft-revisions-sites](../11-20-draft-revisions-sites/prd.md) | hiapi-sites: API/SDK/migration, trusted revision target, protected fields and transactional accept | https://github.com/zimacode-network/hiapi-sites/pull/328; local implementation record in that repository at .trellis/tasks/11-20-draft-revisions |
++
++The authoritative parent/child task.json links live in this CLI repository. The sites child is a cross-repository coordination record, not a second implementation task; its local sites record links back to this tree. A CLI failure belongs to the CLI child; schema/target/acceptance failure belongs to the sites child; wire/rollout failure belongs to this parent.
++
++## Requirements
++- Pending Showcase changes only title/introduce while retaining all generation inputs, artifacts, media, schema hash and identity.
++- Explicit accepted-to-pending revisions retain the original accepted record and formal target association.
++- Accept updates the original blog/FAQ/changelog/model-info target and selected locale without duplicate entities or damage to other locales.
++- Detect stale writes; retry the same operation without duplicate revisions. No publication, visibility changes or generation during proposal/edit.
++- Preserve existing rejected updates and specialized overview source-proof workflows.
++- Exclude model switches, paid regeneration, production publishing and historical hash rewrites.
++
++## Cross-child acceptance
++- [x] CLI quality gate and API affected regression/type/lint checks pass.
++- [x] Local real CLI -> API -> PostgreSQL proves Showcase and FAQ behavior; API integration covers blog.
++- [x] Both review PRs exist and document backend-first rollout.
++- [ ] Review feedback is closed on both PRs.
++- [ ] After deployment, staging proves both named Showcase patches and blog AND FAQ derive -> formal content unchanged -> explicit accept updates the original target locale.
++
++## Dependency
++Deploy the sites migration/API before distributing the CLI. Task linkage does not imply runtime readiness: both child implement.md files make this dependency explicit.
+diff --git a/.trellis/tasks/11-20-draft-revisions/task.json b/.trellis/tasks/11-20-draft-revisions/task.json
+new file mode 100644
+index 0000000..5e177e6
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/task.json
+@@ -0,0 +1,29 @@
++{
++  "id": "draft-revisions",
++  "name": "draft-revisions",
++  "title": "Showcase copy and accepted content revisions",
++  "description": "Implement hiapi-cli issue 17 across CLI and content-api with version guards, idempotent pending revisions and original-entity acceptance.",
++  "status": "in_progress",
++  "dev_type": null,
++  "scope": null,
++  "package": null,
++  "priority": "P2",
++  "creator": "codex",
++  "assignee": "codex",
++  "createdAt": "2026-11-20",
++  "completedAt": null,
++  "branch": "feat/draft-revisions",
++  "base_branch": "main",
++  "worktree_path": null,
++  "commit": null,
++  "pr_url": "https://github.com/zimacode-network/hiapi-cli/pull/18",
++  "subtasks": [],
++  "children": [
++    "11-20-draft-revisions-cli",
++    "11-20-draft-revisions-sites"
++  ],
++  "parent": null,
++  "relatedFiles": [],
++  "notes": "",
++  "meta": {}
++}
+diff --git a/.trellis/tasks/11-20-draft-revisions/validation.md b/.trellis/tasks/11-20-draft-revisions/validation.md
+new file mode 100644
+index 0000000..dcbff90
+--- /dev/null
++++ b/.trellis/tasks/11-20-draft-revisions/validation.md
+@@ -0,0 +1,35 @@
++# CLI validation
++
++Validated on 2026-11-20 in WSL Ubuntu with Rust 1.91, target `x86_64-unknown-linux-gnu`.
++
++`scripts/check.sh` passed: installer encoding, fmt, clippy with `-D warnings`, and all 230 tests.
++Counts: 100 unit, 19 auth flow, 21 CLI binary, 51 content HTTP, 4 credentials,
++24 self-update, 11 update-hint tests. Windows-only tests do not execute on Linux.
++
++Command environment:
++
++```sh
++setpriv --bounding-set=-dac_override,-dac_read_search \
++  env PATH=/usr/lib/rust-1.91/bin:/usr/local/bin:/usr/bin:/bin \
++  CARGO_TARGET_DIR=/tmp/hiapi-issue17-target RUST_TEST_THREADS=1 \
++  bash scripts/check.sh
++```
++
++The WSL default user is root. Dropping DAC override capabilities makes existing read-only-directory
++tests exercise real permission denial. Serial test execution avoids an intermittent Linux ETXTBSY
++in the existing self-updater executable probe; the concurrency test still runs its own concurrent
++operations. Its wrong-platform fixture now chooses a target different from the actual host target
++(the previous hardcoded Linux value matched the WSL host and invalidated the test premise).
++
++After the final help-only wording change, fmt and the binary help regression passed again.
++`git diff --check` passed. No service deployment or staging writes were performed by the CLI implementation.
++
++New regressions cover version-fetch failure, explicit reviewed versions, no retry on 409,
++stable revision requests/replay receipts, JSON context preservation, file/stdin patches,
++5xx readback hints, and malformed mutation receipts.
++
++A real cross-repository local integration also passed: built Rust CLI -> Elysia HTTP -> fresh
++PostgreSQL. It covers Showcase patch/readback/protected-field atomic rejection and accepted FAQ
++revise/replay/accept, preserving the original accepted record, formal entity ID, publication time
++and other locale. No agent jobs were created. Staff introspection used project test fixtures.
++The database replayed all 73 migrations. This does not substitute for deployed staging validation.
+diff --git a/README.md b/README.md
+index 2e56e45..ab89094 100644
+--- a/README.md
++++ b/README.md
+@@ -14,7 +14,7 @@ hiapi [--env production|staging] [--output table|json] [--verbose]
+   content model-family info|list|count|update|enable|disable
+   content model-entity info|list|count|update
+   content model-route  info|list|count|update
+-  content draft        info|list|count|update|modify|accept|reject
++  content draft        info|list|count|update|revise|modify|accept|reject
+   agent job            info --id <job-id>
+ ```
+ 
+@@ -236,6 +236,17 @@ hiapi content draft update --id <draft-id> --data '{"brief":"新文案"}'
+ hiapi content draft update --id <draft-id> --data @patch.json   # @文件 或 - 读 stdin
+ hiapi content draft update --id <draft-id> --media '[]'        # media：null 清空、[] 等价无媒体（非空数组 422）
+ 
++# pending Showcase：仅编辑 title / introduce，保留原始 prompt、input、artifact、媒体和 schema hash
++hiapi content draft update --id <showcase-draft-id> --data '{"title":"雨后月台与暖灯"}' -e staging
++
++# accepted 内容：显式派生 pending 修订稿，原稿与正式内容保持不变
++# 支持 blog / faq / model-faq / changelog / model-info；不调用 agents、不产生图片生成费用
++hiapi content draft revise --id <accepted-id> --data @correction.json --request-id correction-20261120-1 -e staging --output json
++# 无法唯一定位历史稿的正式实体时，补 --target-entity-id <verified-entity-id>
++# 审核新稿后才显式 accept：更新原实体指定语言，不创建重复文章或 FAQ
++hiapi content draft info --id <new-draft-id> -e staging
++hiapi content draft accept --id <new-draft-id> -e staging
++
+ # 自然语言改写：异步生成新 pending 草稿（原草稿保留）
+ #   支持 model-info / model-api-params / model-faq / faq / changelog / blog；showcase 不支持
+ #   blog 是整篇重写，成本显著高于其它类型
+@@ -249,7 +260,34 @@ hiapi agent job info --id <job-id> --output json
+ ```
+ 
+ 输出：默认 table（列表为表格 + 分页脚注，详情为 key-value，批量为 dryRun/total/成功/失败摘要）；
+-`--output json` 原样输出 content-api 的 `data`，便于脚本。
++`--output json` 原样输出 content-api 的 `data`，便于脚本；`draft update/revise` 额外返回
++`environment`、`sourceDraftId`、`draftId`、`status`。完整 `draft`、`derivedFrom`、
++`affectsPublishedContent: false` 及 `reused`（修订重放）保留在回执中。
++
++`draft update/revise` 默认先读取 `updatedAt` 再提交版本条件，检测读取后发生的并发改动。
++若补丁来自早先审阅的版本，传 `--if-unmodified-since <当时的updatedAt>`，避免覆盖期间已变更的内容。
++409 冲突不会自动重试，先回读并核对差异。Showcase 编辑只校验展示文案，不改历史
++`inputSchemaHash`；旧 schema 导致的 accept 障碍仍按原规则处理。
++
++派生超时或断网后，使用同一环境的 `draft list --filters '{"parentDraftId":"<accepted-id>"}'`
++查找结果；重试需复用相同 `--request-id`、补丁和目标实体。服务端复用已创建修订稿，
++即使它已被编辑、接受或驳回也不会重复派生。新操作使用新 request ID。
++服务端先查原稿 ID 与 request ID 对应的回执，再检查版本；请求指纹只比较补丁与目标实体，
++不含 `expectedUpdatedAt`。因此重试时自动读取到不同时间戳仍可回读已有结果；首次派生仍须通过版本检查。
++`update` 超时则先用 `draft info` 回读内容和版本，不要盲目重复写入。
++
++修订入口只开放文案字段：blog 的 `title/subtitle/bodyHtml/summary/takeaways/keywords/heroStats/seo/readingTime`，
++FAQ 的 `question/answer`，changelog 的 `title/bodyHtml`，model-info 的 `brief`（family）或 `overview`（model）。
++分类、排序、关联、slug、封面及模型身份不属于这个修订入口。修订稿后续也只能在此范围内使用 `update`；
++正式内容版本变化后需重新审阅、派生，不能强行接受旧修订。
++
++`revise` 沿用原稿已有语言，不更换语言、不做翻译。已有专用 `overviewRefill` 流程管理的
++介绍继续使用原专用修订流程，本入口会明确拒绝，避免绕过其素材审核约束。
++
++部署顺序：先部署配套 content-api 的迁移和修订接口，再升级 CLI。旧服务端会拒绝新增的
++版本条件或 revise 端点；CLI 不会降级为无版本保护的写入。
++如果服务端完成写入却返回缺少有效草稿 ID、状态或 `affectsPublishedContent: false` 的回执，
++CLI 会以退出码 1 报契约错误，并提示回读。这不代表写入回滚；先确认同环境的草稿结果，再决定后续操作。
+ 
+ 错误：401 → 退出 3（检查 client token 或重新登录）、403 → 4（角色不足/账号禁用/不在名单，
+ `upstreamCode` 给出具体原因）、422 → 1（字段白名单/参数非法，消息含具体字段）、5xx → 5。
+@@ -271,12 +309,15 @@ hiapi agent job info --id <job-id> --output json
+ 
+ - 401：`运行 hiapi login 重新登录`
+ - 403：`身份有效但当前角色不允许该操作`
+-- 503：`身份/内容服务不可用，未做任何修改`
++- 503：读请求或写入前的身份服务失败可稍后重试；`draft update/revise/modify` 的写请求失败会给出回读提示，不能据此认定未写入。
++
++上述专用回读提示目前只覆盖 `draft update/revise/modify`。`draft accept/reject`（含批量）与
++model 写命令仍使用通用服务不可用提示；该提示不是服务端事务回滚的证明，执行结果应另行核实。
+ 
+ ## 输出格式
+ 
+ - `--output table`（默认）：面向人读的 key-value / 表格。
+-- `--output json`：直接输出服务端返回体，便于脚本处理。
++- `--output json`：保留服务端结果字段，便于脚本处理；`draft update/revise` 另补环境与原稿/结果稿 ID、状态。
+ - `--verbose`：把请求方法、路径、状态与耗时打到 stderr，stdout 仍只放结果。
+ 
+ ## 故障排查
+@@ -286,7 +327,7 @@ hiapi agent job info --id <job-id> --output json
+ | `无法连接服务端` | 检查网络、`HIAPI_BACKEND_URL`；staging 需用 `-e staging` |
+ | 401 / 退出码 3 | 凭证已失效或被撤销，重新 `hiapi login` |
+ | 403 / 退出码 4 | 账号被禁用或角色不足，联系管理员 |
+-| 503 / 退出码 5 | 身份服务不可用；CLI 未做任何修改，稍后重试 |
++| 503 / 退出码 5 | 读请求可稍后重试；`draft update/revise/modify` 按专用提示回读，revise 重试复用相同 request ID 和补丁；其他写命令需另行核实结果 |
+ | content 域 401（退出码 3） | 先 `hiapi login`；若服务端仍是旧版 content-api，还需配置 `HIAPI_CONTENT_TOKEN` |
+ | content 域 503 `staff auth unavailable` | 服务端 `HIAPI_STAFF_INTROSPECT_BASE_URL` / `STAFF_INTROSPECT_SERVICE_TOKEN` 未配或与 backend 不一致（运维问题，不是 CLI 凭证问题） |
+ | `device code 已过期` | 授权窗口（默认 10 分钟）已关闭，重新 `hiapi login` |
+diff --git a/docs/staging-integration-checklist.md b/docs/staging-integration-checklist.md
+index 807f24a..2119203 100644
+--- a/docs/staging-integration-checklist.md
++++ b/docs/staging-integration-checklist.md
+@@ -301,6 +301,69 @@ hiapi content draft modify --id <showcase-id> --prompt 'x'; echo "exit=$?"     #
+ | `modify --wait` | succeeded → exit 0；failed → exit 1；超时（默认 300s） → exit 5，job 仍可查 |
+ | `agent job info` | `queued|running|succeeded|failed`；404 输出「job 不存在」 |
+ 
++### 6.6 Showcase 文案与 accepted 修订（Issue #17，先部署配套 API）
++
++这是一份部署后验收步骤，不代表已经完成 staging 验证。所有命令固定 `-e staging`。
++
++**Showcase 与 FAQ**：先保存两份 Showcase 原值，以及 FAQ 对应正式实体的所有语言原值、实体 ID、
++发布时间和条目数量。正式实体通过 staging 管理后台或对应只读 API 查询；仅 `draft info` 不足以证明正式内容未改。
++
++```bash
++hiapi content draft info --id 01M7RTXMTT8R8EWNS5Q5Q404TM -e staging --output json
++hiapi content draft info --id 01M7RTXGZRFWQ77M85SN2VDREE -e staging --output json
++
++# 确认仍 pending 后，分别提交已审核的 introduce 或 title/introduce 补丁；替换为刚读到的 updatedAt
++hiapi content draft update --id 01M7RTXMTT8R8EWNS5Q5Q404TM --data @bottle-copy.json --if-unmodified-since <bottle-updatedAt> -e staging --output json
++hiapi content draft update --id 01M7RTXGZRFWQ77M85SN2VDREE --data @platform-copy.json --if-unmodified-since <platform-updatedAt> -e staging --output json
++hiapi content draft info --id 01M7RTXMTT8R8EWNS5Q5Q404TM -e staging --output json
++hiapi content draft info --id 01M7RTXGZRFWQ77M85SN2VDREE -e staging --output json
++
++hiapi content draft info --id 01M7RSYN4H4FHP9891TNPRVKAY -e staging --output json
++hiapi content draft revise --id 01M7RSYN4H4FHP9891TNPRVKAY --data @faq-correction.json --request-id issue17-faq-1 --if-unmodified-since <faq-updatedAt> -e staging --output json
++hiapi content draft list --filters '{"parentDraftId":"01M7RSYN4H4FHP9891TNPRVKAY"}' -e staging --output json
++hiapi content draft info --id <new-faq-draft-id> -e staging --output json
++# 先核对原 accepted 草稿与正式 FAQ 未变，明确审核新稿后才执行
++hiapi content draft accept --id <new-faq-draft-id> -e staging --output json
++```
++
++**Blog**：Issue 中的 `01M7M796Y9NKZSF4H4HQKKMG20`（接入指南）、
++`01M7M7967DSGN8BRMHYE2R77C9`（横向对比）、`01M7M78A73PDF9817C39K23BNT`（应用场景）
++都是 **production 草稿 ID**，仅作为内容问题参考，不可直接当 staging ID 使用。
++在 staging 准备已接受、已发布的等价隔离博客样本，分别覆盖摘要与正文修订；记录本环境的草稿和正式实体 ID。
++至少一个样本具有目标语言及另一语言译文，用于证明修订不会覆盖其它语言。准备数据也只在 staging 操作。
++
++先通过 staging 管理后台或对应只读 API 保存正式文章所有语言的内容、实体 ID、各语言 slug/publishedAt、
++封面、分类、模型关联及文章数量。补丁只修改需纠正的 `summary` / `bodyHtml` 等文案，不改变 slug 或归属。
++
++```bash
++# 每个隔离博客样本各执行一轮，下面所有 ID 均来自 staging；每轮使用独立 request-id
++hiapi content draft info --id <staging-accepted-blog-id> -e staging --output json
++hiapi content draft revise --id <staging-accepted-blog-id> --data @blog-correction.json --request-id issue17-blog-guide-1 --if-unmodified-since <blog-updatedAt> -e staging --output json
++hiapi content draft list --filters '{"parentDraftId":"<staging-accepted-blog-id>"}' -e staging --output json
++hiapi content draft info --id <new-blog-draft-id> -e staging --output json
++hiapi content draft info --id <staging-accepted-blog-id> -e staging --output json
++
++# 此时回读正式文章并与快照比较，应尚未变更；相同请求重放应返回同一新稿 ID
++hiapi content draft revise --id <staging-accepted-blog-id> --data @blog-correction.json --request-id issue17-blog-guide-1 --if-unmodified-since <blog-updatedAt> -e staging --output json
++
++# 明确审核修订后才接受；随后回读相同正式实体的所有语言及文章数量
++hiapi content draft accept --id <new-blog-draft-id> -e staging --output json
++hiapi content draft info --id <new-blog-draft-id> -e staging --output json
++hiapi content draft info --id <staging-accepted-blog-id> -e staging --output json
++```
++
++| 场景 | 期望 |
++|---|---|
++| 两份 Showcase 修改与回读 | ID 不变、仍 pending；仅允许文案与 updatedAt 变化；prompt/input/artifact/media/inputSchemaHash/familyRef/modelRef/routeKey/source 逐项不变 |
++| Showcase 使用旧版本或夹带禁止字段 | 旧版本 409；混入 prompt 或 media 为 422；回读无部分写入，不创建生成任务 |
++| FAQ / blog 派生修订 | 原 accepted 记录与正式内容快照不变；新 ID 为 pending；返回 sourceDraftId/derivedFrom 与正式目标关联；affectsPublishedContent=false |
++| FAQ / blog 同请求重放 | 同原稿、request ID、补丁与目标实体返回同一修订 ID，reused=true；同 key 换补丁为 409 |
++| FAQ / blog 接受修订 | accept 返回原正式实体 ID，数量不增加；仅目标语言预期文案变化；其它语言、slug、publishedAt、封面、分类、关联不变；原 accepted 草稿不变 |
++| 正式目标并发变化（另用隔离样本） | 派生后修改正式内容，再 accept 为 409；修订仍 pending，正式内容保留并发版本 |
++| 全流程副作用 | 不切换 family.enabled/route.visible，不重新生成图片；不改写 inputSchemaHash 绕过既有 Showcase 接受校验 |
++
++验收记录需保存每轮的原稿/新稿/正式实体 ID、环境、前后快照及退出码；未部署或缺少隔离博客样本时明确标为待验收。
++
+ ## 7. 需要浏览器参与的步骤
+ 
+ | 步骤 | 是否需要浏览器 | 说明 |
+diff --git a/src/cli.rs b/src/cli.rs
+index d06a2de..8f6b68b 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -262,17 +262,17 @@ pub enum DraftAction {
+     Info(IdArgs),
+     /// 审核队列列表（可选 --page / --size / --filters）
+     #[command(
+-        after_help = "filters 可用键: status（pending/accepted/rejected）、contentType、\n  familyId/entityId/routeId（ULID）、familyRef/entityRef/routeRef（slug / origin@key）\n模型关联键（content-api 2026-11 起）：familyId 会传递命中该族下 entity/route 草稿；\n  历史草稿只回填了 refText，请用 ref 键。\n示例:\n  hiapi content draft list --filters '{\"status\":\"pending\"}' --size 50 --output json\n  hiapi content draft list --filters '{\"entityRef\":\"gpt-image-2.6-flare-image-to-image\"}'"
++        after_help = "filters 可用键: status（pending/accepted/rejected）、contentType、parentDraftId、\n  familyId/entityId/routeId（ULID）、familyRef/entityRef/routeRef（slug / origin@key）\n模型关联键（content-api 2026-11 起）：familyId 会传递命中该族下 entity/route 草稿；\n  历史草稿只回填了 refText，请用 ref 键。\n示例:\n  hiapi content draft list --filters '{\"status\":\"pending\"}' --size 50 --output json\n  hiapi content draft list --filters '{\"entityRef\":\"gpt-image-2.6-flare-image-to-image\"}'"
+     )]
+     List(ListArgs),
+     /// 计数（可选 --conditions）
+     #[command(
+-        after_help = "条件键: status（pending/accepted/rejected）、contentType、\n  familyId/entityId/routeId（ULID）、familyRef/entityRef/routeRef（slug / origin@key）\n模型关联键（content-api 2026-11 起）：familyId 会传递命中该族下 entity/route 草稿；\n  历史草稿只回填了 refText，请用 ref 键。\n示例:\n  hiapi content draft count\n  hiapi content draft count --conditions '{\"status\":\"pending\"}' --output json\n  hiapi content draft count --conditions '{\"familyRef\":\"kling-4.0\"}'"
++        after_help = "条件键: status（pending/accepted/rejected）、contentType、parentDraftId、\n  familyId/entityId/routeId（ULID）、familyRef/entityRef/routeRef（slug / origin@key）\n模型关联键（content-api 2026-11 起）：familyId 会传递命中该族下 entity/route 草稿；\n  历史草稿只回填了 refText，请用 ref 键。\n示例:\n  hiapi content draft count\n  hiapi content draft count --conditions '{\"status\":\"pending\"}' --output json\n  hiapi content draft count --conditions '{\"familyRef\":\"kling-4.0\"}'"
+     )]
+     Count(CountArgs),
+     /// 接受草稿（--id 单条；--ids/--conditions 批量；admin）
+     #[command(
+-        after_help = "用法:\n  单条:     --id <draft-id>\n  批量预览: --conditions '{\"status\":\"pending\"}' --dry-run\n  批量执行: 去掉 --dry-run 并加 --yes\n  按 ID:    --ids id1,id2 --yes\n条件键: status、contentType；单批上限 200 条\n注意: accept 不可逆（会创建 model entity）；需 admin 角色"
++        after_help = "用法:\n  单条:     --id <draft-id>\n  批量预览: --conditions '{\"status\":\"pending\"}' --dry-run\n  批量执行: 去掉 --dry-run 并加 --yes\n  按 ID:    --ids id1,id2 --yes\n条件键: status、contentType；单批上限 200 条\n注意: accept 不可逆且会发布内容；修订稿更新原实体的指定语言；需 admin 角色"
+     )]
+     Accept(ReviewArgs),
+     /// 驳回草稿（--id 单条；--ids/--conditions 批量；admin）
+@@ -282,9 +282,14 @@ pub enum DraftAction {
+     Reject(ReviewArgs),
+     /// 修改草稿 content（--data / --media / --locale 至少一项）
+     #[command(
+-        after_help = "用法:\n  --data '<json>'   RFC 7386 深合并：null 删键、数组整体替换\n  --media '<json>'  null 清空；[] 等价无媒体（非空数组会被 422：accept 不收媒体）\n  --locale zh       首版仅 zh 可用（服务端拒绝其它值）\n三个参数至少要给一个；--data/--media 支持 @文件 与 - （stdin）\n\n行为:\n  pending  原地更新（status 不变）\n  rejected 派生一条新的 pending 草稿（原草稿保留，输出里带 derived from <id>）\n  accepted 不可改（409）\n\n服务端按 contentType 校验，字段不合法会 422；身份字段不可变:\n  modelId、granularity、modelName、familyRef、modelRef、routeKey、slug\n\n支持的类型与主要可写字段:\n  model-info        displayName、brief、overview\n  model-api-params  params\n  model-faq / faq   question、answer、categoryKey、sequence\n  changelog         title、bodyHtml、categoryKey、familyRefs、modelRefs\n  blog              title、subtitle、bodyHtml、summary、takeaways、keywords、heroStats、\n                    seo、readingTime、cover、categoryKey、tagKeys、authorName、\n                    familyRefs、modelRefs\n  showcase          不支持\n示例:\n  hiapi content draft update --id 01J... --data '{\"brief\":\"新文案\"}'\n  hiapi content draft update --id 01J... --data @patch.json --media '[]'\n  hiapi content draft update --id 01J... --data - --output json"
++        after_help = "用法:\n  --data '<json>'   RFC 7386 深合并：null 删键、数组整体替换\n  --media '<json>'  null 清空；[] 等价无媒体（非空数组会被 422：accept 不收媒体）\n  --locale zh       首版仅 zh 可用（服务端拒绝其它值）\n三个参数至少要给一个；--data/--media 支持 @文件 与 - （stdin）\n默认先读取 updatedAt 并检查并发版本；--if-unmodified-since 可指定已审阅版本\nShowcase 不接受 --media/--locale，只允许 --data 中 title、introduce\n\n行为:\n  pending  原地更新（status 不变）\n  rejected 派生一条新的 pending 草稿（原草稿保留，输出里带 derived from <id>）\n  accepted 不可原地改（409）；用 revise 派生待审修订稿\n\n服务端按 contentType 校验，字段不合法会 422；身份字段不可变:\n  modelId、granularity、modelName、familyRef、modelRef、routeKey、slug\n\n支持的类型与主要可写字段:\n  model-info        displayName、brief、overview\n  model-api-params  params\n  model-faq / faq   question、answer、categoryKey、sequence\n  changelog         title、bodyHtml、categoryKey、familyRefs、modelRefs\n  blog              title、subtitle、bodyHtml、summary、takeaways、keywords、heroStats、\n                    seo、readingTime、cover、categoryKey、tagKeys、authorName、\n                    familyRefs、modelRefs\n  showcase          仅 pending 的 title、introduce（媒体与原始生成参数不可变）\n示例:\n  hiapi content draft update --id 01J... --data '{\"brief\":\"新文案\"}'\n  hiapi content draft update --id 01J... --data @patch.json --media '[]'\n  hiapi content draft update --id 01J... --data - --output json"
+     )]
+     Update(DraftUpdateArgs),
++    /// 从 accepted 内容派生待审修订稿（原稿与正式内容保持不变）
++    #[command(
++        after_help = "支持 blog、faq/model-faq、changelog、model-info（沿用原稿已有语言，不做翻译）。\n专用 overviewRefill 管理的介绍须继续使用原专用修订流程。\n可写字段：blog 的标题/摘要/正文等文案；FAQ 的 question/answer；\n  changelog 的 title/bodyHtml；model-info 的 brief（family）或 overview（model）。\n分类、排序、关联、slug、封面等身份/运营字段不可改。\n--data 是确定性合并补丁，不调用 agents、不重新生成图片。\n新稿保持 pending；后续显式 accept 才更新原实体的指定语言，不重复创建内容。\n--request-id 为本次操作的稳定标识（1..128 字），超时重试必须复用同一值和补丁。\n默认读取原稿 updatedAt；可用 --if-unmodified-since 指定已审阅的版本。版本冲突返回 409。\n历史草稿无法唯一定位正式实体时，用 --target-entity-id 指定经核实的目标。\n示例:\n  hiapi content draft revise --id 01J... --data @patch.json --request-id faq-copy-1 -e staging --output json\n回读: hiapi content draft list --filters '{\"parentDraftId\":\"01J...\"}' -e staging"
++    )]
++    Revise(DraftReviseArgs),
+     /// 用自然语言指令让 agents 重写草稿（生成新 pending 草稿）
+     #[command(
+         after_help = "用法:\n  --prompt '<text>'  修改指令（1..4000 字；支持 @文件 与 - 读 stdin）\n  --wait             阻塞轮询到 job 结束（默认超时 300s，可用 --timeout 改）\n\n流程: POST /admin/drafts/{id}/modify 建 job（秒回）→ agents 生成 → 新草稿入库\n默认只打印 jobId 与 status 就退出，稍后用 `hiapi agent job info --id <jobId>` 查进度\n--wait 时退出码: succeeded=0；failed≠0；超时≠0（jobId 仍可继续查）\n\n支持的类型: model-info、model-api-params、model-faq、faq、changelog、blog\n  showcase 不支持（422）\n  blog 会整篇重写，成本显著高于其它类型\n\n新草稿以 pending 进入审核队列，**原草稿保留不变**；accepted 草稿不能再 modify（409）\n同一草稿同时只能有一个 queued/running 的 job（否则 409）\n示例:\n  hiapi content draft modify --id 01J... --prompt '把音频那段改成未验证'\n  hiapi content draft modify --id 01J... --prompt @instruction.md --wait\n  hiapi content draft modify --id 01J... --prompt - --wait --timeout 600"
+@@ -342,6 +347,33 @@ pub struct DraftUpdateArgs {
+     /// 语言（首版仅 zh）
+     #[arg(long, value_name = "LOCALE")]
+     pub locale: Option<String>,
++
++    /// 已审阅草稿的 updatedAt（RFC 3339；省略时先读取当前版本，冲突返回 409）
++    #[arg(long, value_name = "TIMESTAMP")]
++    pub if_unmodified_since: Option<String>,
++}
++
++#[derive(Debug, Args, Default)]
++pub struct DraftReviseArgs {
++    /// accepted 草稿 ID
++    #[arg(long, value_name = "ID", required = true)]
++    pub id: Option<String>,
++
++    /// 修订补丁（JSON 对象；@文件 或 - 读 stdin）
++    #[arg(long, value_name = "JSON|@FILE|-", required = true)]
++    pub data: Option<String>,
++
++    /// 本次派生的稳定标识，超时重试复用同一值（1..128 字）
++    #[arg(long, value_name = "KEY", required = true)]
++    pub request_id: Option<String>,
++
++    /// 已审阅原稿的 updatedAt（RFC 3339；省略时先读取当前版本）
++    #[arg(long, value_name = "TIMESTAMP")]
++    pub if_unmodified_since: Option<String>,
++
++    /// 历史稿对应的正式实体 ID（仅在无法唯一定位时使用；服务端校验关联）
++    #[arg(long, value_name = "ID")]
++    pub target_entity_id: Option<String>,
+ }
+ 
+ /// `draft modify`：建 job，可选阻塞等待。
+@@ -682,6 +714,73 @@ mod tests {
+         assert!(help.contains("displayName"), "help = {help}");
+         assert!(help.contains("showcase"), "help = {help}");
+         assert!(help.contains("derived from"), "help = {help}");
++        assert!(help.contains("--if-unmodified-since"), "help = {help}");
++        assert!(help.contains("title、introduce"), "help = {help}");
++    }
++
++    #[test]
++    fn draft_revise_parses_guard_and_legacy_target() {
++        let cli = Cli::try_parse_from([
++            "hiapi",
++            "content",
++            "draft",
++            "revise",
++            "--id",
++            "d1",
++            "--data",
++            "@patch.json",
++            "--request-id",
++            "correction-1",
++            "--if-unmodified-since",
++            "2026-11-20T00:00:00Z",
++            "--target-entity-id",
++            "entity1",
++            "-e",
++            "staging",
++        ])
++        .unwrap();
++        assert_eq!(cli.env, Env::Staging);
++        let Command::Content(args) = cli.command else {
++            panic!("expected content")
++        };
++        let ContentResource::Draft(args) = args.resource else {
++            panic!("expected draft")
++        };
++        let DraftAction::Revise(args) = args.action else {
++            panic!("expected revise")
++        };
++        assert_eq!(args.id.as_deref(), Some("d1"));
++        assert_eq!(args.data.as_deref(), Some("@patch.json"));
++        assert_eq!(args.request_id.as_deref(), Some("correction-1"));
++        assert_eq!(
++            args.if_unmodified_since.as_deref(),
++            Some("2026-11-20T00:00:00Z")
++        );
++        assert_eq!(args.target_entity_id.as_deref(), Some("entity1"));
++    }
++
++    #[test]
++    fn draft_revise_requires_stable_request_and_patch() {
++        for args in [
++            vec![
++                "hiapi", "content", "draft", "revise", "--id", "d1", "--data", "{}",
++            ],
++            vec![
++                "hiapi",
++                "content",
++                "draft",
++                "revise",
++                "--id",
++                "d1",
++                "--request-id",
++                "r1",
++            ],
++        ] {
++            assert_eq!(
++                Cli::try_parse_from(args).unwrap_err().kind(),
++                clap::error::ErrorKind::MissingRequiredArgument
++            );
++        }
+     }
+ 
+     #[test]
+diff --git a/src/commands/content.rs b/src/commands/content.rs
+index cd02664..524ea74 100644
+--- a/src/commands/content.rs
++++ b/src/commands/content.rs
+@@ -80,7 +80,13 @@ async fn run_draft(
+             .render(&draft::review(client, args, "reject").await?),
+         DraftAction::Update(args) => {
+             let value = draft::update(client, args).await?;
+-            render_draft_update(ctx.output, &value);
++            let receipt = draft_receipt(value, ctx.env.as_str(), args.id.as_deref())?;
++            render_draft_update(ctx.output, &receipt);
++        }
++        DraftAction::Revise(args) => {
++            let value = draft::revise(client, args).await?;
++            let receipt = draft_receipt(value, ctx.env.as_str(), args.id.as_deref())?;
++            render_draft_update(ctx.output, &receipt);
+         }
+         DraftAction::Modify(args) => {
+             let outcome = draft::modify(client, args).await?;
+@@ -121,7 +127,40 @@ fn render_draft_info(output: OutputFormat, value: &Value) {
+     output.render(&Value::Object(map));
+ }
+ 
+-/// table 只给人看摘要；json 直接输出服务端 data（`{draft, derivedFrom?}`）。
++fn draft_receipt(
++    mut value: Value,
++    environment: &str,
++    source_id: Option<&str>,
++) -> Result<Value, CliError> {
++    let draft = &value["draft"];
++    let id = draft
++        .get("id")
++        .and_then(Value::as_str)
++        .filter(|id| !id.is_empty());
++    let status = draft
++        .get("status")
++        .and_then(Value::as_str)
++        .filter(|status| matches!(*status, "pending" | "accepted" | "rejected"));
++    let (Some(id), Some(status), Some(source_id), Some(false)) = (
++        id,
++        status,
++        source_id,
++        value
++            .get("affectsPublishedContent")
++            .and_then(Value::as_bool),
++    ) else {
++        return Err(CliError::other("服务端草稿写入回执缺少有效 id/status 或 affectsPublishedContent=false")
++            .with_hint("写入可能已生效：先在同一环境用 draft info 或 parentDraftId 过滤回读，不要盲目重建修订稿"));
++    };
++    let (id, status) = (id.to_string(), status.to_string());
++    value["environment"] = Value::String(environment.to_string());
++    value["sourceDraftId"] = Value::String(source_id.to_string());
++    value["draftId"] = Value::String(id);
++    value["status"] = Value::String(status);
++    Ok(value)
++}
++
++/// table 给出环境和草稿摘要；json 保留完整服务端回执并补上操作上下文。
+ fn render_draft_update(output: OutputFormat, value: &Value) {
+     if output.is_json() {
+         output.emit_json(value);
+@@ -131,10 +170,19 @@ fn render_draft_update(output: OutputFormat, value: &Value) {
+         output.render(value);
+         return;
+     };
+-    let rows: Vec<(&str, String)> = ["id", "contentType", "locale", "status", "updatedAt"]
+-        .iter()
+-        .map(|key| (*key, field_text(draft, key)))
+-        .collect();
++    let mut rows = vec![
++        ("environment", field_text(value, "environment")),
++        ("sourceDraftId", field_text(value, "sourceDraftId")),
++        (
++            "affectsPublishedContent",
++            field_text(value, "affectsPublishedContent"),
++        ),
++    ];
++    rows.extend(
++        ["id", "contentType", "locale", "status", "updatedAt"]
++            .iter()
++            .map(|key| (*key, field_text(draft, key))),
++    );
+     output.emit_kv(&rows);
+     if let Some(derived) = value.get("derivedFrom").and_then(Value::as_str) {
+         println!("derived from {derived}");
+diff --git a/src/content/draft.rs b/src/content/draft.rs
+index 5075eeb..8a1a7df 100644
+--- a/src/content/draft.rs
++++ b/src/content/draft.rs
+@@ -4,7 +4,9 @@ use std::time::Duration;
+ 
+ use serde_json::{Map, Value, json};
+ 
+-use crate::cli::{CountArgs, DraftModifyArgs, DraftUpdateArgs, IdArgs, ListArgs, ReviewArgs};
++use crate::cli::{
++    CountArgs, DraftModifyArgs, DraftReviseArgs, DraftUpdateArgs, IdArgs, ListArgs, ReviewArgs,
++};
+ use crate::content::model::encode;
+ use crate::content::{
+     ContentClient, filters_to_query, json_to_query, parse_conditions_arg, parse_data_arg,
+@@ -75,22 +77,81 @@ pub async fn update(client: &ContentClient, args: &DraftUpdateArgs) -> Result<Va
+             "draft update 需要 --data / --media / --locale 至少一项",
+         ));
+     }
++    body.insert(
++        "expectedUpdatedAt".into(),
++        json!(expected_updated_at(client, id, args.if_unmodified_since.as_deref()).await?),
++    );
+     client
+         .patch(&format!("{PATH}/{}", encode(id)), &Value::Object(body))
+         .await
+         .map_err(|error| uncertain_write(error, UPDATE_UNKNOWN_HINT))
+ }
+ 
++pub async fn revise(client: &ContentClient, args: &DraftReviseArgs) -> Result<Value, CliError> {
++    let id = require_id(args.id.as_deref())?;
++    let data = parse_data_arg(
++        args.data
++            .as_deref()
++            .ok_or_else(|| CliError::usage("draft revise 需要 --data"))?,
++    )?;
++    let request_id = args
++        .request_id
++        .as_deref()
++        .ok_or_else(|| CliError::usage("draft revise 需要 --request-id"))?;
++    if request_id.trim().is_empty() || request_id.chars().count() > 128 {
++        return Err(CliError::usage("--request-id 必须为 1..128 字且不全为空白"));
++    }
++    let mut body = json!({
++        "data": data,
++        "idempotencyKey": request_id,
++        "expectedUpdatedAt": expected_updated_at(client, id, args.if_unmodified_since.as_deref()).await?,
++    });
++    if let Some(target) = args.target_entity_id.as_deref() {
++        body["targetEntityId"] = json!(target);
++    }
++    client
++        .post(&format!("{PATH}/{}/revise", encode(id)), Some(&body))
++        .await
++        .map_err(|error| uncertain_write(error, REVISE_UNKNOWN_HINT))
++}
++
++async fn expected_updated_at(
++    client: &ContentClient,
++    id: &str,
++    explicit: Option<&str>,
++) -> Result<String, CliError> {
++    if let Some(value) = explicit {
++        if chrono::DateTime::parse_from_rfc3339(value).is_err() {
++            return Err(CliError::usage(
++                "--if-unmodified-since 必须是带时区的 RFC 3339 时间，例如 2026-11-20T00:00:00.000Z",
++            ));
++        }
++        return Ok(value.to_string());
++    }
++    let current = client.get(&format!("{PATH}/{}", encode(id))).await?;
++    let version = current
++        .get("updatedAt")
++        .and_then(Value::as_str)
++        .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
++        .ok_or_else(|| {
++            CliError::other("draft info 未返回有效 updatedAt，未提交写请求")
++                .with_hint("确认 content-api 已部署草稿修订接口，再重新读取草稿")
++        })?;
++    Ok(version.to_string())
++}
++
+ /// 写请求超时/断网后的恢复路径（PATCH 可能已在服务端生效）。
+-const UPDATE_UNKNOWN_HINT: &str = "超时/断网不代表没写入：先 `hiapi content draft info --id <draft-id>` 看 status/updatedAt；\n目标稿是 rejected 时，再用 `hiapi content draft list --filters '{\"parentDraftId\":\"<draft-id>\"}'` 看是否已派生。\n同 payload 重试是幂等的（content-api 2026-11 起派生用确定性键）；update 没有 modify 那样的「同一草稿只允许一个进行中操作」保护（modify 重复会 409）";
++const UPDATE_UNKNOWN_HINT: &str = "超时/断网不代表没写入：在同一环境用 `hiapi content draft info --id <draft-id>` 回读 data/status/updatedAt；\n目标稿是 rejected 时，再用 `hiapi content draft list --filters '{\"parentDraftId\":\"<draft-id>\"}'` 看是否已派生。\n不要盲目重试 pending 更新；核对结果后再决定是否提交新补丁，显式 --if-unmodified-since 可保留原版本保护";
++
++const REVISE_UNKNOWN_HINT: &str = "派生结果不确定：在同一环境用 `hiapi content draft list --filters '{\"parentDraftId\":\"<draft-id>\"}'` 查修订稿，再用 draft info 回读；\n重试必须使用相同 --request-id、--data 和 --target-entity-id，已创建的修订稿会复用；不要换 request-id 重建";
+ 
+ /// 写请求超时/断网后的恢复路径（POST 可能已建出 job）。
+ const MODIFY_UNKNOWN_HINT: &str = "超时/断网不代表 job 没建：先 `hiapi content draft list --filters '{\"parentDraftId\":\"<draft-id>\"}'` 看是否已产出新草稿；\n同一草稿同时只允许一个 queued/running 的 job，重复提交会 409（可当作已提交的信号）";
+ 
+-/// 传输层失败（无 HTTP 状态）对写请求是「结果不确定」。
++/// 传输层失败或 5xx 不能证明事务未提交，写请求结果均需回读。
+ /// `unavailable` 的默认提示「未做任何修改」在这里是错的，换成恢复路径。
+ fn uncertain_write(error: CliError, recovery: &str) -> CliError {
+-    if error.kind == ErrorKind::Unavailable && error.status.is_none() {
++    if error.kind == ErrorKind::Unavailable && error.status.is_none_or(|status| status >= 500) {
+         error.with_hint(recovery)
+     } else {
+         error
+@@ -367,8 +428,13 @@ mod tests {
+         assert_eq!(error.exit_code(), 5);
+         assert_eq!(error.hint_text(), Some("恢复路径"));
+ 
+-        // 服务端明确回包（5xx）不算「不确定」，保留原有提示语义。
++        // 网关/服务端 5xx 也可能发生在提交之后，不得声称未写入。
+         let error = uncertain_write(CliError::unavailable("boom").with_status(503), "恢复路径");
++        assert_eq!(error.hint_text(), Some("恢复路径"));
++        let error = uncertain_write(
++            CliError::unavailable("limited").with_status(429),
++            "恢复路径",
++        );
+         assert_ne!(error.hint_text(), Some("恢复路径"));
+     }
+ 
+diff --git a/tests/cli_binary.rs b/tests/cli_binary.rs
+index 93f373f..4d18255 100644
+--- a/tests/cli_binary.rs
++++ b/tests/cli_binary.rs
+@@ -280,6 +280,13 @@ fn root_help_lists_agent_domain() {
+ fn draft_update_prints_summary_and_derived_from() {
+     let runtime = mock_runtime();
+     let server = runtime.block_on(MockServer::start());
++    server.route(
++        "GET",
++        "/admin/drafts/d1",
++        vec![ok_json(json!({
++            "id": "d1", "updatedAt": "2026-11-10T00:00:00Z"
++        }))],
++    );
+     server.route(
+         "PATCH",
+         "/admin/drafts/d1",
+@@ -288,7 +295,8 @@ fn draft_update_prints_summary_and_derived_from() {
+                 "id": "d2", "contentType": "model-info", "locale": "zh",
+                 "status": "pending", "updatedAt": "2026-11-10T00:00:00Z"
+             },
+-            "derivedFrom": "d1"
++            "derivedFrom": "d1",
++            "affectsPublishedContent": false
+         }))],
+     );
+ 
+@@ -316,6 +324,143 @@ fn draft_update_prints_summary_and_derived_from() {
+     assert_eq!(requests[0].body.as_ref().unwrap()["data"]["brief"], "x");
+ }
+ 
++#[test]
++fn draft_revise_stdin_outputs_environment_and_full_receipt() {
++    let runtime = mock_runtime();
++    let server = runtime.block_on(MockServer::start());
++    server.route(
++        "GET",
++        "/admin/drafts/d1",
++        vec![ok_json(json!({
++            "id": "d1", "status": "accepted", "updatedAt": "2026-11-20T00:00:00Z"
++        }))],
++    );
++    server.route("POST", "/admin/drafts/d1/revise", vec![ok_json(json!({
++        "draft": {"id": "d2", "status": "pending", "parentDraftId": "d1", "data": {"answer": "corrected"}},
++        "derivedFrom": "d1", "affectsPublishedContent": false, "reused": true,
++        "targetEntityId": "faq1"
++    }))]);
++    let temp = tempfile::tempdir().unwrap();
++    let output = content_command_with_stdin(
++        temp.path(),
++        &server,
++        &[
++            "content",
++            "draft",
++            "revise",
++            "--id",
++            "d1",
++            "--data",
++            "-",
++            "--request-id",
++            "fix-1",
++            "--output",
++            "json",
++        ],
++        r#"{"answer":"corrected"}"#,
++    );
++    assert_eq!(
++        output.status.code(),
++        Some(0),
++        "stderr = {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++    assert_eq!(receipt["environment"], "staging");
++    assert_eq!(receipt["sourceDraftId"], "d1");
++    assert_eq!(receipt["draftId"], "d2");
++    assert_eq!(receipt["status"], "pending");
++    assert_eq!(receipt["affectsPublishedContent"], false);
++    assert_eq!(receipt["reused"], true);
++    assert_eq!(receipt["targetEntityId"], "faq1", "服务端扩展字段必须保留");
++    assert_eq!(receipt["draft"]["data"]["answer"], "corrected");
++    let requests = server.requests("POST", "/admin/drafts/d1/revise");
++    assert_eq!(
++        requests[0].body.as_ref().unwrap()["data"]["answer"],
++        "corrected"
++    );
++    assert_eq!(server.request_count("POST", "/admin/drafts/d1/accept"), 0);
++}
++
++#[test]
++fn draft_mutation_rejects_incomplete_receipt_without_retry() {
++    let runtime = mock_runtime();
++    let server = runtime.block_on(MockServer::start());
++    server.route(
++        "PATCH",
++        "/admin/drafts/d1",
++        vec![
++            ok_json(json!({"draft": {"id": "d1", "status": "pending"}})),
++            ok_json(json!({"draft": {"id": "d1"}, "affectsPublishedContent": false})),
++        ],
++    );
++    let temp = tempfile::tempdir().unwrap();
++    for _ in 0..2 {
++        let output = content_command(
++            temp.path(),
++            &server,
++            &[
++                "content",
++                "draft",
++                "update",
++                "--id",
++                "d1",
++                "--data",
++                r#"{"title":"new"}"#,
++                "--if-unmodified-since",
++                "2026-11-20T00:00:00Z",
++                "--output",
++                "json",
++            ],
++        );
++        assert_eq!(output.status.code(), Some(1));
++        assert!(output.stdout.is_empty());
++        assert!(String::from_utf8_lossy(&output.stderr).contains("回读"));
++    }
++    assert_eq!(server.request_count("PATCH", "/admin/drafts/d1"), 2);
++    assert_eq!(server.request_count("GET", "/admin/drafts/d1"), 0);
++}
++
++#[test]
++fn draft_update_json_reports_source_and_target_drafts() {
++    let runtime = mock_runtime();
++    let server = runtime.block_on(MockServer::start());
++    server.route(
++        "PATCH",
++        "/admin/drafts/d1",
++        vec![ok_json(json!({
++            "draft": {"id": "d2", "status": "pending"}, "derivedFrom": "d1",
++            "affectsPublishedContent": false
++        }))],
++    );
++    let temp = tempfile::tempdir().unwrap();
++    let output = content_command(
++        temp.path(),
++        &server,
++        &[
++            "content",
++            "draft",
++            "update",
++            "--id",
++            "d1",
++            "--data",
++            r#"{"title":"new"}"#,
++            "--if-unmodified-since",
++            "2026-11-20T00:00:00Z",
++            "--output",
++            "json",
++        ],
++    );
++    assert_eq!(output.status.code(), Some(0));
++    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++    assert_eq!(receipt["environment"], "staging");
++    assert_eq!(receipt["sourceDraftId"], "d1");
++    assert_eq!(receipt["draftId"], "d2");
++    assert_eq!(receipt["status"], "pending");
++    assert_eq!(receipt["affectsPublishedContent"], false);
++    assert_eq!(receipt["derivedFrom"], "d1");
++}
++
+ #[test]
+ fn draft_modify_prints_job_hint_without_wait() {
+     let runtime = mock_runtime();
+@@ -406,6 +551,20 @@ fn draft_help_documents_new_commands() {
+         assert!(text.contains(key), "draft update help 缺少 {key}: {text}");
+     }
+ 
++    let revise = run(temp.path(), &["content", "draft", "revise", "--help"]);
++    assert!(revise.status.success());
++    let text = String::from_utf8_lossy(&revise.stdout);
++    for key in [
++        "--request-id",
++        "--if-unmodified-since",
++        "--target-entity-id",
++        "pending",
++        "accept",
++        "原实体",
++    ] {
++        assert!(text.contains(key), "draft revise help 缺少 {key}: {text}");
++    }
++
+     let modify = run(temp.path(), &["content", "draft", "modify", "--help"]);
+     assert!(modify.status.success());
+     let text = String::from_utf8_lossy(&modify.stdout);
+diff --git a/tests/content_cli.rs b/tests/content_cli.rs
+index 163f5db..e29357c 100644
+--- a/tests/content_cli.rs
++++ b/tests/content_cli.rs
+@@ -4,7 +4,8 @@ mod support;
+ 
+ use chrono::{Duration as ChronoDuration, Utc};
+ use hiapi::cli::{
+-    CountArgs, DraftModifyArgs, DraftUpdateArgs, IdArgs, ListArgs, ReviewArgs, UpdateArgs,
++    CountArgs, DraftModifyArgs, DraftReviseArgs, DraftUpdateArgs, IdArgs, ListArgs, ReviewArgs,
++    UpdateArgs,
+ };
+ use hiapi::commands::Context;
+ use std::process::Command;
+@@ -880,6 +881,7 @@ async fn count_binary_outputs_json_and_table_count() {
+ fn draft_update_args() -> DraftUpdateArgs {
+     DraftUpdateArgs {
+         id: Some("d1".into()),
++        if_unmodified_since: Some("2026-11-20T00:00:00.000Z".into()),
+         ..Default::default()
+     }
+ }
+@@ -910,6 +912,8 @@ async fn draft_update_patches_only_given_fields() {
+     assert_eq!(requests.len(), 1);
+     let body = requests[0].body.as_ref().unwrap();
+     assert_eq!(body["data"]["brief"], "新文案");
++    assert_eq!(body["expectedUpdatedAt"], "2026-11-20T00:00:00.000Z");
++    assert_eq!(server.request_count("GET", "/admin/drafts/d1"), 0);
+     assert!(
+         body["data"]["seo"].is_null(),
+         "null 是删键语义，必须原样透传"
+@@ -1024,6 +1028,241 @@ async fn draft_update_rejects_non_object_data_and_non_array_media() {
+     assert_eq!(server.request_count("PATCH", "/admin/drafts/d1"), 0);
+ }
+ 
++// ---------------------------------------------------------------------------
++// 乐观版本更新与显式派生修订
++// ---------------------------------------------------------------------------
++
++#[tokio::test]
++async fn draft_update_reads_version_and_preserves_conflict() {
++    let server = MockServer::start().await;
++    server.route(
++        "GET",
++        "/admin/drafts/d1",
++        vec![ok(json!({
++            "id": "d1", "updatedAt": "2026-11-20T01:02:03.456Z",
++            "data": {"title": "old", "input": {"prompt": "original"}}
++        }))],
++    );
++    server.route(
++        "PATCH",
++        "/admin/drafts/d1",
++        vec![Reply::status(
++            409,
++            json!({
++                "code": 409, "message": "draft version changed"
++            }),
++        )],
++    );
++    let args = DraftUpdateArgs {
++        id: Some("d1".into()),
++        data: Some(r#"{"title":"new"}"#.into()),
++        ..Default::default()
++    };
++    let error = draft::update(&client(&server), &args).await.unwrap_err();
++    assert_eq!(error.status, Some(409));
++    assert_eq!(error.exit_code(), 1);
++    let requests = server.requests("PATCH", "/admin/drafts/d1");
++    assert_eq!(requests.len(), 1, "冲突不得自动换版本重试");
++    assert_eq!(
++        requests[0].body,
++        Some(json!({
++            "data": {"title": "new"}, "expectedUpdatedAt": "2026-11-20T01:02:03.456Z"
++        }))
++    );
++}
++
++#[tokio::test]
++async fn draft_update_does_not_write_without_a_valid_version() {
++    let server = MockServer::start().await;
++    server.route(
++        "GET",
++        "/admin/drafts/d1",
++        vec![
++            ok(json!({"id": "d1"})),
++            ok(json!({"id": "d1", "updatedAt": "invalid"})),
++            Reply::status(404, json!({"code": 404, "message": "not found"})),
++        ],
++    );
++    let args = DraftUpdateArgs {
++        id: Some("d1".into()),
++        data: Some(r#"{"title":"new"}"#.into()),
++        ..Default::default()
++    };
++    for _ in 0..3 {
++        assert!(draft::update(&client(&server), &args).await.is_err());
++    }
++    let invalid = DraftUpdateArgs {
++        if_unmodified_since: Some("yesterday".into()),
++        ..args
++    };
++    assert_eq!(
++        draft::update(&client(&server), &invalid)
++            .await
++            .unwrap_err()
++            .exit_code(),
++        2
++    );
++    assert_eq!(server.request_count("GET", "/admin/drafts/d1"), 3);
++    assert_eq!(server.request_count("PATCH", "/admin/drafts/d1"), 0);
++}
++
++fn revise_args() -> DraftReviseArgs {
++    DraftReviseArgs {
++        id: Some("d1".into()),
++        data: Some(r#"{"answer":"corrected"}"#.into()),
++        request_id: Some("faq-correction-1".into()),
++        ..Default::default()
++    }
++}
++
++#[tokio::test]
++async fn draft_revise_sends_stable_request_and_returns_replay_receipt() {
++    let server = MockServer::start().await;
++    server.route(
++        "GET",
++        "/admin/drafts/d1",
++        vec![ok(json!({
++            "id": "d1", "status": "accepted", "updatedAt": "2026-11-20T00:00:00.000Z"
++        }))],
++    );
++    let result = json!({
++        "draft": {"id": "d2", "status": "pending", "parentDraftId": "d1"},
++        "derivedFrom": "d1", "affectsPublishedContent": false, "reused": true
++    });
++    server.route("POST", "/admin/drafts/d1/revise", vec![ok(result.clone())]);
++    let args = DraftReviseArgs {
++        target_entity_id: Some("entity1".into()),
++        ..revise_args()
++    };
++    for _ in 0..2 {
++        assert_eq!(
++            draft::revise(&client(&server), &args).await.unwrap(),
++            result
++        );
++    }
++    let requests = server.requests("POST", "/admin/drafts/d1/revise");
++    assert_eq!(requests.len(), 2);
++    assert_eq!(requests[0].body, requests[1].body);
++    assert_eq!(
++        requests[0].body,
++        Some(json!({
++            "data": {"answer": "corrected"}, "idempotencyKey": "faq-correction-1",
++            "expectedUpdatedAt": "2026-11-20T00:00:00.000Z", "targetEntityId": "entity1"
++        }))
++    );
++    assert_eq!(requests[0].header("x-hiapi-staff-token"), Some("staff-jwt"));
++    assert_eq!(server.request_count("POST", "/admin/drafts/d1/accept"), 0);
++    assert_eq!(server.request_count("POST", "/admin/drafts/d1/modify"), 0);
++}
++
++#[tokio::test]
++async fn draft_revise_reads_file_and_uses_explicit_version_without_get() {
++    let server = MockServer::start().await;
++    server.route(
++        "POST",
++        "/admin/drafts/d1/revise",
++        vec![Reply::status(
++            409,
++            json!({
++                "code": 409, "message": "request key reused with a different payload"
++            }),
++        )],
++    );
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("revision.json");
++    std::fs::write(&path, r#"{"title":"corrected","subtitle":null}"#).unwrap();
++    let args = DraftReviseArgs {
++        data: Some(format!("@{}", path.display())),
++        if_unmodified_since: Some("2026-11-20T08:00:00+08:00".into()),
++        ..revise_args()
++    };
++    let error = draft::revise(&client(&server), &args).await.unwrap_err();
++    assert_eq!(error.status, Some(409));
++    assert_eq!(server.request_count("GET", "/admin/drafts/d1"), 0);
++    let requests = server.requests("POST", "/admin/drafts/d1/revise");
++    assert_eq!(requests.len(), 1);
++    assert_eq!(
++        requests[0].body.as_ref().unwrap()["data"],
++        json!({"title": "corrected", "subtitle": null})
++    );
++    assert!(
++        requests[0]
++            .body
++            .as_ref()
++            .unwrap()
++            .get("targetEntityId")
++            .is_none()
++    );
++}
++
++#[tokio::test]
++async fn draft_revise_rejects_invalid_local_arguments_before_network() {
++    let server = MockServer::start().await;
++    let cases = [
++        DraftReviseArgs {
++            request_id: None,
++            ..revise_args()
++        },
++        DraftReviseArgs {
++            request_id: Some(" ".into()),
++            ..revise_args()
++        },
++        DraftReviseArgs {
++            request_id: Some("x".repeat(129)),
++            ..revise_args()
++        },
++        DraftReviseArgs {
++            data: None,
++            ..revise_args()
++        },
++        DraftReviseArgs {
++            data: Some("[]".into()),
++            ..revise_args()
++        },
++        DraftReviseArgs {
++            if_unmodified_since: Some("invalid".into()),
++            ..revise_args()
++        },
++    ];
++    for args in cases {
++        assert_eq!(
++            draft::revise(&client(&server), &args)
++                .await
++                .unwrap_err()
++                .exit_code(),
++            2
++        );
++    }
++    assert_eq!(server.request_count("GET", "/admin/drafts/d1"), 0);
++    assert_eq!(server.request_count("POST", "/admin/drafts/d1/revise"), 0);
++}
++
++#[tokio::test]
++async fn draft_revise_server_failure_has_replay_guidance_without_retry() {
++    let server = MockServer::start().await;
++    server.route(
++        "POST",
++        "/admin/drafts/d1/revise",
++        vec![Reply::status(
++            503,
++            json!({
++                "code": 503, "message": "upstream unavailable"
++            }),
++        )],
++    );
++    let args = DraftReviseArgs {
++        if_unmodified_since: Some("2026-11-20T00:00:00Z".into()),
++        ..revise_args()
++    };
++    let error = draft::revise(&client(&server), &args).await.unwrap_err();
++    assert_eq!(error.exit_code(), 5);
++    let hint = error.hint_text().unwrap();
++    assert!(hint.contains("--request-id"));
++    assert!(hint.contains("parentDraftId"));
++    assert!(!hint.contains("未做任何修改"));
++    assert_eq!(server.request_count("POST", "/admin/drafts/d1/revise"), 1);
++}
++
+ // ---------------------------------------------------------------------------
+ // draft modify + agent job
+ // ---------------------------------------------------------------------------
+diff --git a/tests/update_cli.rs b/tests/update_cli.rs
+index 8dfa68f..e06ab11 100644
+--- a/tests/update_cli.rs
++++ b/tests/update_cli.rs
+@@ -626,10 +626,15 @@ async fn self_check_rejects_wrong_version() {
+ #[tokio::test]
+ async fn self_check_rejects_wrong_target() {
+     let server = MockServer::start().await;
++    let wrong_target = if hiapi::version::TARGET == "x86_64-unknown-linux-gnu" {
++        "aarch64-apple-darwin"
++    } else {
++        "x86_64-unknown-linux-gnu"
++    };
+     serve_release(
+         &server,
+         "v9.9.9",
+-        &fake_binary_with_target("9.9.9", "x86_64-unknown-linux-gnu"),
++        &fake_binary_with_target("9.9.9", wrong_target),
+         false,
+     );
+ 

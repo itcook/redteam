@@ -1,0 +1,74 @@
+{
+  "schema": "hibot.audit.report.verify/1",
+  "job_id": "J-matrix-verify",
+  "kind": "verify",
+  "status": "ok",
+  "input": {
+    "head_sha": "6b37321b0242b10a454111f34c601d8a7bc9973a",
+    "base_sha": "ae7a910884d362c5935ca3a41cae9f6797005c79"
+  },
+  "executor": {
+    "name": "redteam",
+    "version": "0.1.0"
+  },
+  "findings": [],
+  "verifications": [
+    {
+      "evidence": "拼接仍在，注入面未消失",
+      "finding_fingerprint": "sha256:442c7691d933af2dec358689e3575e4673034ef318e5953cd7c54e7148b28014",
+      "quote": "return db.query('SELECT * FROM users WHERE id=' + id);",
+      "status": "unresolved"
+    }
+  ],
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 2,
+    "cached_input_tokens": 0,
+    "wall_clock_ms": 94
+  },
+  "extensions": {
+    "redteam": {
+      "budget": {
+        "truncated_items": 0,
+        "wall_clock_s": 120
+      },
+      "concurrency": {
+        "mode": "per-provider",
+        "provider_caps": {
+          "p1": 10
+        }
+      },
+      "language": {
+        "source": "config",
+        "value": "zh_CN"
+      },
+      "template_hashes": {
+        "fix_verify": "3a1cfc364de35f6b"
+      },
+      "verifier": "p1/v",
+      "verify": {
+        "calls": 1,
+        "counts": {
+          "inconclusive": 0,
+          "regressed": 0,
+          "resolved": 0,
+          "unresolved": 1
+        },
+        "duplicate_fingerprints": 0,
+        "latency_ms": {
+          "max": 0,
+          "total": 0
+        },
+        "model_failures": 0,
+        "quote_rejected": 0,
+        "rate_limit": {
+          "retries": 0,
+          "wait_ms": 0
+        },
+        "warnings": [
+          "symbol_blast_radius_skipped:unsupported_language:src/app.py"
+        ]
+      }
+    }
+  }
+}

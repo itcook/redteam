@@ -16,7 +16,7 @@ pub(crate) const BRIEF_REL_PATH: &str = ".redteam/brief.md";
 /// 路径遍历信用户（user-arg），但内容敏感度不信任（防 secret exfil）。
 /// M18 批 1·1-2：denylist 判据本身已抽到 `deny::is_denylisted_path`（与 second_pass.rs 的
 /// `is_needs_denylisted` 共用单一真相源、语义=两清单并集），本函数只剩薄委托。
-fn is_sensitive_spec_path(path: &str) -> bool {
+pub(crate) fn is_sensitive_spec_path(path: &str) -> bool {
     super::deny::is_denylisted_path(path)
 }
 
@@ -33,8 +33,8 @@ fn contains_pem_private_key(content: &str) -> bool {
 /// 实现收敛到 `prompt::neutralize_structure`（Task 4，dossier entries 同类风险共用一套）。
 fn neutralize_spec_delimiters(content: &str) -> String {
     // spec 与 brief 同在**稳定前缀**里，同样要与角色无关地中和：三张表标签集不同
-    // （`</diff>` / `</evidence>` / `</dossier>` 在 scan + reviewer 有、verifier 没有），
-    // 只中和 `</spec_docs>` 会让含 `</diff>` 的设计文档在 verifier 侧与另两侧字节不同、cache 前缀裂开。
+    // （`</diff>` / `</evidence>` / `</dossier>` 在 scan + reviewer 有、refuter 没有），
+    // 只中和 `</spec_docs>` 会让含 `</diff>` 的设计文档在 refuter 侧与另两侧字节不同、cache 前缀裂开。
     // B-1 只修了 brief 这一半，另一半在同一个 system 串里（2026-09-29 `/code-review` 指出）。
     crate::prompt::neutralize_for_stable_prefix(content)
 }
@@ -53,9 +53,30 @@ pub(crate) fn render_spec_section(spec_paths: &[String]) -> (String, usize, Vec<
 /// 带显式帽版本（dogfood 2026-07-16 #2）：小窗模型的 pack 预算可能低于 64K 固定帽，
 /// 调用方以 `SPEC_BUDGET_BYTES.min(pack 预算/2)` 夹紧，spec 不再吃穿小模型的整个输入窗。
 pub(crate) fn render_spec_section_capped(spec_paths: &[String], cap: usize) -> (String, usize, Vec<String>) {
+    let r = render_spec_section_reporting(spec_paths, cap);
+    (r.section, r.used, r.warnings)
+}
+
+/// spec 段渲染的完整报告：除 section/用量/警告外，还给出**实际接纳**与**明确拒收**的路径。
+///
+/// job 的 `prior_report.routing.specs` 必须按真实注入结果披露（不能另写一套预读规则）：
+/// - `accepted` = 真正进了 `<spec_docs>` 的文件；
+/// - `rejected` = 有明确拒收理由（敏感路径 / 非普通文件 / 读失败 / 非 UTF-8 / PEM）；
+/// - 预算耗尽后剩余的文件两者都不进（它们只是没被注入）。
+pub(crate) struct SpecRender {
+    pub section: String,
+    pub used: usize,
+    pub warnings: Vec<String>,
+    pub accepted: Vec<String>,
+    pub rejected: Vec<String>,
+}
+
+pub(crate) fn render_spec_section_reporting(spec_paths: &[String], cap: usize) -> SpecRender {
     let mut warnings = Vec::new();
+    let mut accepted: Vec<String> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
     if spec_paths.is_empty() {
-        return (String::new(), 0, warnings);
+        return SpecRender { section: String::new(), used: 0, warnings, accepted, rejected };
     }
     let mut body = String::new();
     let mut used = 0usize;
@@ -65,6 +86,7 @@ pub(crate) fn render_spec_section_capped(spec_paths: &[String], cap: usize) -> (
             let msg = format!("拒绝把疑似密钥/凭据文件注入评审上下文（防泄漏给外部模型）：{p}");
             eprintln!("redteam: {msg}");
             warnings.push(msg); // T46①：denylist 拒读入账 run.warnings（CI/bot 可见）
+            rejected.push(p.clone());
             continue;
         }
         if used >= cap {
@@ -79,10 +101,12 @@ pub(crate) fn render_spec_section_capped(spec_paths: &[String], cap: usize) -> (
         // 攻击需可写 spec 目录+赢竞态，窄；metadata 预检已挡常见预置 FIFO）。
         if !std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false) {
             eprintln!("redteam: --spec 非常规文件（或不存在），跳过：{p}");
+            rejected.push(p.clone());
             continue;
         }
         let Ok(file) = std::fs::File::open(p) else {
             eprintln!("redteam: --spec 文档读取失败，跳过：{p}");
+            rejected.push(p.clone());
             continue;
         };
         let mut buf = Vec::new();
@@ -90,6 +114,7 @@ pub(crate) fn render_spec_section_capped(spec_paths: &[String], cap: usize) -> (
             use std::io::Read;
             if file.take(cap as u64 + 1).read_to_end(&mut buf).is_err() {
                 eprintln!("redteam: --spec 文档读取失败，跳过：{p}");
+                rejected.push(p.clone());
                 continue;
             }
         }
@@ -107,6 +132,7 @@ pub(crate) fn render_spec_section_capped(spec_paths: &[String], cap: usize) -> (
                     String::from_utf8_lossy(&e.into_bytes()[..valid]).into_owned()
                 } else {
                     eprintln!("redteam: --spec 非 UTF-8 文本，跳过：{p}");
+                    rejected.push(p.clone());
                     continue;
                 }
             }
@@ -115,6 +141,7 @@ pub(crate) fn render_spec_section_capped(spec_paths: &[String], cap: usize) -> (
             let msg = format!("拒绝把疑似密钥/凭据文件注入评审上下文（防泄漏给外部模型）：{p}");
             eprintln!("redteam: {msg}");
             warnings.push(msg); // T46①：PEM 内容嗅探拒读同样入账 run.warnings
+            rejected.push(p.clone());
             continue;
         }
         let remaining = cap - used;
@@ -139,17 +166,18 @@ pub(crate) fn render_spec_section_capped(spec_paths: &[String], cap: usize) -> (
         );
         used += shell.len(); // 壳字节（标题/围栏/截断提示）纳入预算，section 真正有界。
         body.push_str(&shell);
+        accepted.push(p.clone());
     }
     if skipped_by_budget > 0 {
         body.push_str(&format!("（…{skipped_by_budget} 份 spec 文档因预算超限未纳入）\n"));
     }
     if body.is_empty() {
-        return (String::new(), 0, warnings);
+        return SpecRender { section: String::new(), used: 0, warnings, accepted, rejected };
     }
     let section = format!(
         "<spec_docs>\n关联设计/规格文档（供 [L0] 检查实现是否偏离设计意图；评审对象仍是代码、spec 仅作参照）：\n\n{body}</spec_docs>\n"
     );
-    (section, used, warnings)
+    SpecRender { section, used, warnings, accepted, rejected }
 }
 
 #[cfg(test)]
@@ -517,7 +545,7 @@ mod brief_tests {
     }
 
     /// `--spec` 与 brief 同在稳定前缀里，中和也要与角色无关：`</diff>` 在 scan + reviewer 表里有、
-    /// verifier 表里没有，只中和 `</spec_docs>` 会让含它的设计文档在 verifier 侧字节不同。
+    /// refuter 表里没有，只中和 `</spec_docs>` 会让含它的设计文档在 refuter 侧字节不同。
     #[test]
     fn spec_is_neutralized_role_independently_too() {
         let d = tempfile::tempdir().unwrap();

@@ -1,0 +1,7 @@
+{"file": ".doc/design/2026-11-25-redteam-config-v2-design.md", "reason": "v2 设计正文：全键映射表、语义、诊断码、待拍板问题、T-B 分层"}
+{"file": ".trellis/tasks/11-25-config-v2/hibot-delivery.md", "reason": "hibot 交付清单：渲染器对照表、样例、sha256、诊断码"}
+{"file": ".trellis/tasks/11-25-config-v2/config-v2.sample.json", "reason": "v2 样例（models[] 长度 1），T-B 作为 config check 夹具"}
+{"file": ".trellis/tasks/11-25-config-v2/config-v2.schema.json", "reason": "手写 draft-07 schema 草案；T-B 用 schemars 产物替换"}
+{"file": ".trellis/spec/backend/index.md", "reason": "backend 层编码规范索引"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "诊断码/错误文案约定（config check 输出契约）"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "测试与质量门禁（make verify / 生成物防漂移）"}

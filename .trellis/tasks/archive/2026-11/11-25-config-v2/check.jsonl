@@ -1,0 +1,5 @@
+{"file": ".doc/design/2026-11-25-redteam-config-v2-design.md", "reason": "对照 §2 迁移表与 §10 验收：全键覆盖、诊断码、测试点"}
+{"file": ".trellis/tasks/11-25-config-v2/hibot-delivery.md", "reason": "对照 §3/§4：渲染器路径与 config check 码"}
+{"file": ".trellis/tasks/11-25-config-v2/config-v2.sample.json", "reason": "config check --kind review|triage|verify 的夹具"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "make verify / 生成物防漂移 / 测试门禁"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "错误码与单行诊断格式"}

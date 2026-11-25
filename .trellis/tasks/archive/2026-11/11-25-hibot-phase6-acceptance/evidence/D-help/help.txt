@@ -1,0 +1,84 @@
+### redteam --help
+redteam：模型无关的对抗式代码评审器——风险路由 → 疑点扫描 → 深挖 → finding（可选验真）
+
+Usage: redteam <COMMAND>
+
+Commands:
+  review        发起对抗式评审：证据收集 → 疑点扫描 → 深挖 → finding 报告与 verdict（可选验真）。
+  config        配置契约：`schema`（从类型生成 JSON Schema）/ `check`（形状 + 语义校验）。
+  update        自更新（standalone 安装）：默认检查并升级到最新正式版。
+  triage        triage（外派）：读 job 目录，写 hibot `report.triage/1`。三轴（security / drift / intent）并发， 产出 `summary` + findings + `extensions.redteam.blockers`；轴失败 ⇒ `partial` + `triage_axis_failed:<axis>`。
+  verify        verify（外派）：读 job 目录，写 hibot `report.verify/1`。逐条核验 anchored finding 的修复， 四态 `resolved / unresolved / regressed / inconclusive`；出现 inconclusive ⇒ `partial` + `status_reason`。
+  status        查询作业状态：无 id 列本项目全部；有 id 打印该作业 JSON。
+  result        取回作业的评审结果（持久存储于 .redteam/proj.db）。
+  cancel        取消 running/pending 作业（发 SIGTERM）。
+  model         配置/查询 provider 与 model。
+  dismiss       驳回判例台账（.redteam/proj.db）：建卡/查卡/状态迁移/锚失效回收。
+  resolve       销案判例台账（.redteam/proj.db 独立表，不混 dismissed——已修复≠误报，不进豁免/预筛）： 建卡/查卡。增量轮（review --incremental-from）据此不再携带该 finding；quote 未随修复 消失的会注入下轮「顺带验证」防假修复。
+  init          幂等创建项目级 .redteam/ 骨架（.gitignore、rounds/、proj.db；配置在用户级 ~/.redteam/config.json，项目层无配置文件）。
+  test-command  打印生效的测试命令（ship 循环第 2 步用）。
+  risk          风险路由只读回放（零 provider / 零副作用）。
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+快速上手：
+  1. redteam init                                              # 项目内建 .redteam/ 骨架（状态与内容，无配置）
+  2. redteam model setup --provider X --model <id> --role scanner # 给至少一个模型配 scanner 角色（key 见 --key-store）
+  3. redteam review --base main                                # 评审当前分支相对 main 的改动
+  配置：~/.redteam/config.json + secrets.json（REDTEAM_HOME 可覆盖；用户级唯一，无项目层；严格 JSON、无注释）。
+  后台跑：review --background 得 job id → status <id> 看进度 → result <id> 取报告。
+
+### triage --help
+triage（外派）：读 job 目录，写 hibot `report.triage/1`。三轴（security / drift / intent）并发， 产出 `summary` + findings + `extensions.redteam.blockers`；轴失败 ⇒ `partial` + `triage_axis_failed:<axis>`。
+
+Usage: redteam triage --job-dir <JOB_DIR>
+
+Options:
+      --job-dir <JOB_DIR>  job 目录（必需）：manifest `hibot.audit.job.triage/1`。
+  -h, --help               Print help
+
+### verify --help
+verify（外派）：读 job 目录，写 hibot `report.verify/1`。逐条核验 anchored finding 的修复， 四态 `resolved / unresolved / regressed / inconclusive`；出现 inconclusive ⇒ `partial` + `status_reason`。
+
+Usage: redteam verify --job-dir <JOB_DIR>
+
+Options:
+      --job-dir <JOB_DIR>  job 目录（必需）：manifest `hibot.audit.job.verify/1`。
+  -h, --help               Print help
+
+### config --help
+配置契约：`schema`（从类型生成 JSON Schema）/ `check`（形状 + 语义校验）。
+
+Usage: redteam config <COMMAND>
+
+Commands:
+  schema  生成 executor config 的 JSON Schema（draft-07；`$id: urn:redteam:config/2`，`schemaVersion: 2`）。
+  check   校验 executor config：形状 + 未知键 + 密钥字段 + 语义（可选按 kind 查角色）。 诊断只走 stdout；退出码 0/1；WARN 不影响退出码。
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+### config schema --help
+生成 executor config 的 JSON Schema（draft-07；`$id: urn:redteam:config/2`，`schemaVersion: 2`）。
+
+Usage: redteam config schema [OPTIONS]
+
+Options:
+      --out <OUT>  写到文件（缺省打印到 stdout）。入库生成物是 dist/config.schema.json。
+  -h, --help       Print help
+
+### config check --help
+校验 executor config：形状 + 未知键 + 密钥字段 + 语义（可选按 kind 查角色）。 诊断只走 stdout；退出码 0/1；WARN 不影响退出码。
+
+Usage: redteam config check [OPTIONS] <INPUT>
+
+Arguments:
+  <INPUT>  文件路径，或直接给 JSON 文本（以 `{` 开头）。
+
+Options:
+      --kind <KIND>  按 kind 校验角色最小集：triage | review | verify。 [possible values: triage, review, verify]
+  -h, --help         Print help

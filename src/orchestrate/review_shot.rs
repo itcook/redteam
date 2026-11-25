@@ -282,8 +282,9 @@ fn finish_parse(
     let CellOutput::Review { findings, needs } = out else {
         return Err(ProviderError::Parse("review parse did not yield Review".into()));
     };
-    let (kept, dropped, dropped_unreadable) = anchor_review_findings(findings, ctx.root);
-    stats.dropped_quote = dropped + dropped_unreadable;
+    let (kept, dropped, _dropped_unreadable) = anchor_review_findings(findings, ctx.root);
+    // `dropped` 已包含「文件不可读」那一类；再加 `dropped_unreadable` 会重复计数（2.5 出口验收）。
+    stats.dropped_quote = dropped;
 
     let mut final_findings = Vec::new();
     for mut f in kept {

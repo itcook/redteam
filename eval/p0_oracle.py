@@ -177,7 +177,8 @@ def build_hobby(a):
                 skipped.append((jid, "head-uninferable"))
                 continue
         for f in r["findings"]:
-            if (f.get("verify") or {}).get("verdict") != "upheld":
+            # 0.8 术语分家：新报告写 refute，历史 results 行仍是 verify
+            if (f.get("refute") or f.get("verify") or {}).get("verdict") != "upheld":
                 continue
             key = (f["id"], head)
             if key in seen:
