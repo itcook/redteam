@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-25
+
 ### Added
 
 - 发布面：`scripts/release.sh`（构建 → 打包 + `SHA256SUMS` → GitHub Release → 可选 R2 镜像 → 下载回验），
