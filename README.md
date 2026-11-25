@@ -65,7 +65,8 @@ rename 迁移 → 已 resolve 的排除 → quote 锚得上就携带（行号重
 条目形状：`{ "provider": "<providers 键>", "id": "<models.id>", "reasoningEffort": "high" }`。
 provider 级通道写在 `providers.<name>`（`api` / `baseUrl` / `apiKeyEnv` / `maxConcurrency`）；
 模型固有属性（`id`/`family`/`contextWindow`/`maxOutputTokens`/…）写在 `providers.<name>.models[]`；
-`language` 在 `settings.language`。v2 是破坏性重排，旧 v1 配置会报错并逐字段给迁移提示。
+模型条目可选覆盖 `api`（有效 api = `models[].api ?? provider.api`，同一 provider 可混多种 api；
+`baseUrl` 仍在 provider 级）；`language` 在 `settings.language`。v2 是破坏性重排，旧 v1 配置会报错并逐字段给迁移提示。
 
 ## 快速开始
 

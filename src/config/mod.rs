@@ -172,6 +172,10 @@ pub struct ModelConfig {
     /// 人读显示名（`model list` / 报告用）；**不是**身份串。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// 该模型覆盖 provider 的通道 api（v2.0.1 可选；缺省 `provider.api`）。
+    /// `baseUrl` 仍在 provider 级——同一 provider 下需要不同端点请拆 provider。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ProviderApi>,
     /// 本地内联密钥（Q2 裁决；job 模式出现即 `secret_field`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -897,7 +901,7 @@ impl Config {
             id: id.to_string(),
             provider: provider.to_string(),
             role,
-            api: p.api,
+            api: m.api.unwrap_or(p.api),
             base_url: Some(p.base_url.clone()),
             context_window: m.context_window.unwrap_or(128_000),
             max_output_tokens: m.max_output_tokens,
@@ -1040,6 +1044,13 @@ impl Config {
                         message: format!("model id {:?} 在同一 provider 内重复", m.id),
                     });
                 }
+                if let Some(api) = m.api.filter(|a| !a.implemented()) {
+                    out.push(SemanticProblem {
+                        code: "api_not_implemented",
+                        pointer: format!("/providers/{}/models/{idx}/api", ptr_escape(pname)),
+                        message: format!("api {} 尚未实现（预留值）；当前可用：openai-completions / anthropic-messages", api.as_str()),
+                    });
+                }
                 seen.push(&m.id);
             }
         }
@@ -1162,7 +1173,7 @@ const ROLE_POOL: &[&str] = &["models"];
 const ROLE_REF: &[&str] = &["provider", "id", "reasoningEffort"];
 const PROVIDER: &[&str] = &["api", "baseUrl", "apiKey", "apiKeyEnv", "maxConcurrency", "models"];
 const MODEL: &[&str] = &[
-    "id", "displayName", "apiKey", "apiKeyEnv", "family", "contextWindow", "maxOutputTokens", "perTurnTimeoutSecs", "reasoning", "thinkingLevelMap",
+    "id", "displayName", "api", "apiKey", "apiKeyEnv", "family", "contextWindow", "maxOutputTokens", "perTurnTimeoutSecs", "reasoning", "thinkingLevelMap",
 ];
 const THINKING: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 /// review 已删键：`risk`（D11 无模式旋钮）；`verifiers` 已更名 `refuters`。
@@ -1192,8 +1203,11 @@ fn legacy_model_keys(errors: &mut Vec<String>, mpath: &str, mo: &serde_json::Map
     }
     if let Some(kind) = mo.get("kind") {
         let eff = kind.as_str().unwrap_or("<kind>");
+        let target = legacy_api_hint(kind.as_str().unwrap_or(""))
+            .map(|api| format!("{mpath}.api = {api:?}"))
+            .unwrap_or_else(|| format!("{mpath}.api = {eff:?}"));
         errors.push(format!(
-            "{mpath}.kind 已删除：v2 的 api 只在 provider 层（本模型有效 api = model.kind.or(provider.kind) = {eff:?}）；同一 provider 混多种 api 需拆 provider"
+            "{mpath}.kind 已改名为 api（模型条目可覆盖 provider）：{target}；同一 provider 可混多种 api，不必拆 provider"
         ));
     }
     if mo.contains_key("roles") {
@@ -1300,10 +1314,13 @@ fn legacy_model_field_issues(out: &mut Vec<ConfigIssue>, mpath: &str, mo: &serde
     }
     if let Some(kind) = mo.get("kind") {
         let eff = kind.as_str().unwrap_or("<kind>");
+        let target = legacy_api_hint(kind.as_str().unwrap_or(""))
+            .map(|api| format!("{mpath}.api = {api:?}"))
+            .unwrap_or_else(|| format!("{mpath}.api = {eff:?}"));
         push_legacy(
             out,
             format!("{mpath}/kind"),
-            format!("kind 已删除：api 只在 provider 层（本模型有效 api = model.kind.or(provider.kind) = {eff:?}）；同一 provider 混多种 api 需拆 provider"),
+            format!("kind 已改名为 api（模型条目可覆盖 provider）：{target}；同一 provider 可混多种 api，不必拆 provider"),
         );
     }
     if let Some(roles) = mo.get("roles") {
@@ -2242,6 +2259,104 @@ mod tests {
         }
     }
 
+    /// v2.0.1：条目级 api 覆盖 provider；未覆盖时与今天逐字节一致（`skip_serializing_if`）。
+    #[test]
+    fn model_api_overrides_provider_api() {
+        let text = r#"{
+          "settings": {},
+          "providers": {"p": {"api": "openai-completions", "baseUrl": "https://x", "models": [
+            {"id": "a"}, {"id": "b", "api": "anthropic-messages"}
+          ]}}
+        }"#;
+        let c = cfg(text);
+        let a = c.effective("p", "a", Role::Reviewer, None).unwrap();
+        let b = c.effective("p", "b", Role::Reviewer, None).unwrap();
+        assert_eq!(a.api, ProviderApi::OpenaiCompletions, "无覆盖 → 继承 provider");
+        assert_eq!(b.api, ProviderApi::AnthropicMessages, "条目覆盖生效");
+        assert_eq!(a.base_url, b.base_url, "baseUrl 仍是 provider 唯一来源");
+        // 不写 `api` 时序列化不出该键（旧配置/报告字节不变）。
+        let m: ModelConfig = serde_json::from_value(serde_json::json!({"id": "a"})).unwrap();
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(v.get("api").is_none(), "{v}");
+        let m2: ModelConfig = serde_json::from_value(serde_json::json!({"id": "b", "api": "anthropic-messages"})).unwrap();
+        assert_eq!(serde_json::to_value(&m2).unwrap()["api"], "anthropic-messages");
+    }
+
+    /// 有效值真的走到 backend 构造（用预留未实现的 `openai-responses` 作探针：只有条目级覆盖能触发它）。
+    #[test]
+    fn model_api_override_reaches_backend_construction() {
+        let mut c = Config::default();
+        c.providers.insert(
+            "p".into(),
+            ProviderConfig {
+                api: ProviderApi::OpenaiCompletions,
+                base_url: "https://x".into(),
+                api_key: None,
+                api_key_env: None,
+                max_concurrency: None,
+                models: vec![
+                    ModelConfig { id: "plain".into(), ..Default::default() },
+                    ModelConfig { id: "resp".into(), api: Some(ProviderApi::OpenaiResponses), ..Default::default() },
+                ],
+            },
+        );
+        let plain = c.effective("p", "plain", Role::Reviewer, None).unwrap();
+        assert!(crate::provider::backends::backend_from_config(&plain, "k".into()).is_ok(), "缺省 api 照常构造");
+        let resp = c.effective("p", "resp", Role::Reviewer, None).unwrap();
+        let err = crate::provider::backends::backend_from_config(&resp, "k".into()).err().expect("条目级 api 必须生效");
+        assert!(err.to_string().contains("openai-responses"), "{err}");
+    }
+
+    #[test]
+    fn model_level_kind_hint_points_to_model_api() {
+        let text = r#"{"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m","kind":"anthropic"}]}}}"#;
+        let err = Config::from_json(text).unwrap_err().to_string();
+        assert!(err.contains("kind 已改名为 api"), "{err}");
+        assert!(err.contains(".api = \"anthropic-messages\""), "必须指向条目级 api：{err}");
+        assert!(!err.contains("需拆 provider"), "不再要求混协议拆 provider：{err}");
+        // `config check` 的逐字段诊断同样指向 model.api。
+        let (_, issues) = check_text(text);
+        let hit = issues.iter().find(|i| i.pointer.ends_with("/models/0/kind")).expect("逐字段诊断");
+        assert!(hit.message.contains("model") || hit.message.contains(".api = "), "{hit:?}");
+    }
+
+    #[test]
+    fn model_api_not_implemented_is_semantic_problem() {
+        let mut c = Config::default();
+        c.providers.insert(
+            "p".into(),
+            ProviderConfig {
+                api: ProviderApi::OpenaiCompletions,
+                base_url: "https://x".into(),
+                api_key: None,
+                api_key_env: None,
+                max_concurrency: None,
+                models: vec![ModelConfig { id: "a".into(), api: Some(ProviderApi::OpenaiResponses), ..Default::default() }],
+            },
+        );
+        let probs = c.semantic_problems();
+        assert!(
+            probs.iter().any(|p| p.code == "api_not_implemented" && p.pointer == "/providers/p/models/0/api"),
+            "{probs:?}"
+        );
+        assert_eq!(c.effective("p", "a", Role::Reviewer, None).unwrap().api, ProviderApi::OpenaiResponses);
+        // 解析入口也会拒绝（聚合错误里点名该指针路径）。
+        let text = r#"{"settings":{},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"a","api":"openai-responses"}]}}}"#;
+        let err = Config::from_json(text).unwrap_err().to_string();
+        assert!(err.contains("openai-responses"), "{err}");
+    }
+
+    #[test]
+    fn job_mode_rejects_model_level_api_key() {
+        let text = r#"{"settings":{},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"a","apiKey":"sk-x"}]}}}"#;
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        let issues = strict_issues(&v);
+        assert!(
+            issues.iter().any(|i| i.code == "secret_field" && i.pointer == "/providers/p/models/0/apiKey"),
+            "{issues:?}"
+        );
+    }
+
     #[test]
     fn semantic_problems_have_pointers_and_codes() {
         let c: Config = serde_json::from_str(
@@ -2341,7 +2456,7 @@ mod tests {
             ),
             (
                 r#"{"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m","kind":"anthropic"}]}}}"#,
-                &["kind 已删除", "拆 provider"],
+                &["kind 已改名为 api", "models[0].api = \"anthropic-messages\""],
             ),
             (
                 r#"{"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m","roles":{"scanner":{}}}]}}}"#,
