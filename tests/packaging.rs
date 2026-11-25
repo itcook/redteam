@@ -189,3 +189,48 @@ fn launcher_errors_when_binary_missing() {
     assert!(String::from_utf8_lossy(&miss.stderr).contains("no binary for"),
         "missing binary → clear error: {}", String::from_utf8_lossy(&miss.stderr));
 }
+
+// CD 契约（U9）：R2 公开基址 = 前缀去掉历史 releases 段；前缀归一化对空值/斜杠宽容。
+#[test]
+fn release_script_prefix_and_public_base() {
+    let cases = [
+        ("", "executor/audit/redteam"),
+        ("   ", "executor/audit/redteam"),
+        ("/executor/audit/redteam/", "executor/audit/redteam"),
+        ("executor//audit///redteam", "executor/audit/redteam"),
+        ("/custom/prefix//", "custom/prefix"),
+    ];
+    for (input, want) in cases {
+        let out = Command::new("bash")
+            .args(["scripts/release.sh", "v0.1.0", "--print-config"])
+            .env("R2_PREFIX", input)
+            .env("REDTEAM_NO_DOTENV", "1")
+            .output()
+            .expect("run release.sh --print-config");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "R2_PREFIX={input:?}: {stderr}");
+        assert!(
+            stdout.contains(&format!("R2_PREFIX={want}\n")),
+            "R2_PREFIX={input:?} → {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("PUBLIC_BASE=https://release.hibot.sh/{want}\n")),
+            "R2_PREFIX={input:?} → {stdout}"
+        );
+    }
+}
+
+#[test]
+fn install_script_uses_cd_base_without_releases_segment() {
+    let install = read("dist/install.sh");
+    assert!(
+        install.contains("R2_DEFAULT_BASE=\"https://release.hibot.sh/executor/audit/redteam\""),
+        "install.sh 的 R2 默认基址必须跟 CD 公开基址一致"
+    );
+    assert!(
+        !install.contains("/releases/${VERSION}"),
+        "install.sh 的 R2 版本目录不再有 releases 段"
+    );
+    assert!(install.contains("RELEASE_BASE=\"${BASE_URL}/${VERSION}\""));
+}
