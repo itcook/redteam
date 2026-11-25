@@ -53,7 +53,7 @@ git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1    # 预发布
 `.github/workflows/release.yml` 分四段：
 
 1. **prepare**（ubuntu）：校验 tag 形态（`vX.Y.Z[-pre]`）、与 `Cargo.toml` 同源、指向 HEAD，判定 prerelease；
-2. **build**（`macos-14`，arm64）：`make verify` → `scripts/release.sh <tag> --prepare-only --skip-verify`，
+2. **build**（`macos-latest`，arm64）：`make verify` → `scripts/release.sh <tag> --prepare-only --skip-verify`，
    上传 tar.gz / SHA256SUMS / release-notes / install.sh / config.schema.json；
 3. **release**：`softprops/action-gh-release@v2` 发布（rc 标 prerelease）；
 4. **check_r2 → r2**：R2 四键齐全才镜像（缺失只告警、不阻塞），上传后按公开基址 HEAD 200 + sha 回验。
