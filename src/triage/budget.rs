@@ -32,7 +32,7 @@ pub const DRIFT_PER_PACK_KB_S: f64 = 1.0;
 /// ── 整轮预算包线 v2（2026-11-25 用户批准 B2）──
 ///
 /// `base + per_diff_kb×diff_kb + per_file×files + per_text_kb×text_kb`。
-/// `per_diff_kb` 与单 cell 的 [`PER_KB_S`] 同值；其余为经验系数。
+/// `per_diff_kb` 在 B1 档复用单 cell 的 [`PER_KB_S`]（6.0），B2 档上调到 7.5；其余为经验系数。
 /// 这是**包线**，不是耗时预测：跑得快照常提前结束，manifest 仍是硬上限。
 pub const TOTAL_BASE_S: f64 = 220.0;
 pub const TOTAL_PER_KB_S: f64 = 7.5;
@@ -100,9 +100,10 @@ pub fn total_estimate_s(diff_kb: f64, files: usize, text_kb: f64, manifest_cap_s
         + TOTAL_PER_KB_S * diff_kb
         + TOTAL_PER_FILE_S * files as f64
         + TOTAL_PER_TEXT_KB_S * text_kb;
-    let cap = manifest_cap_s as f64;
-    let floor = TOTAL_MIN_S.min(cap);
-    raw.max(floor).min(cap).ceil() as u64
+    // 先把浮点包线上取整成 u64，再与 manifest 取 min：不把 u64 manifest 转 f64，
+    // 避免 >2^53 时舍入导致结果超过硬上限。
+    let estimate = raw.max(TOTAL_MIN_S).ceil() as u64;
+    estimate.min(manifest_cap_s)
 }
 
 #[cfg(test)]
@@ -155,15 +156,16 @@ mod tests {
     #[test]
     fn total_estimate_matches_the_b2_calibration() {
         // B2 = 220 + 7.5×diff_kb + 7.5×files + 2.5×text_kb（2026-11-25 用户批准）。
-        // backend #333：130.3KB / 13 files / 6.9KB → 1312s；GLM-5.4 唯一 ok 轮实测 1050.1s（1.25×）。
-        assert_eq!(total_estimate_s(130.3, 13, 6.9, 1800), 1312);
-        // cli #18：78.9KB / 28 files / 1.95KB → 1027s。
-        assert_eq!(total_estimate_s(78.9, 28, 1.95, 1800), 1027);
-        // sites #235：253.1KB / 62 files / 4.24KB → 原始 2594s，被 manifest 截断。
-        assert_eq!(total_estimate_s(253.1, 62, 4.24, 1800), 1800);
-        // sites #277：147.7KB / 16 files / 8.63KB → 1470s；sites #328：90.6KB / 30 files / 3.29KB → 1133s。
-        assert_eq!(total_estimate_s(147.7, 16, 8.63, 1800), 1470);
-        assert_eq!(total_estimate_s(90.6, 30, 3.29, 1800), 1133);
+        // 输入是归档的历史 diff_patch / pr_context 的真实字节数（evidence/budget-candidates.md）。
+        // backend #333：1312.09… → 1313；GLM-5.4 唯一 ok 轮实测 1050.1s（1.25×）。
+        assert_eq!(total_estimate_s(kb(133444), 13, kb(7054), 1800), 1313);
+        // cli #18：1026.64… → 1027。
+        assert_eq!(total_estimate_s(kb(80796), 28, kb(1996), 1800), 1027);
+        // sites #235：2594.02… → 被 manifest 截断到 1800。
+        assert_eq!(total_estimate_s(kb(259197), 62, kb(4345), 1800), 1800);
+        // sites #277：1469.09… → 1470；sites #328：1132.57… → 1133。
+        assert_eq!(total_estimate_s(kb(151212), 16, kb(8840), 1800), 1470);
+        assert_eq!(total_estimate_s(kb(92751), 30, kb(3374), 1800), 1133);
     }
 
     #[test]
@@ -172,6 +174,7 @@ mod tests {
         assert_eq!(total_estimate_s(1.0, 1, 0.3, 1800), 900, "小 PR 取下限");
         assert_eq!(total_estimate_s(1.0, 1, 0.3, 600), 600, "manifest 小于下限时取 manifest");
         assert_eq!(total_estimate_s(10_000.0, 500, 100.0, 1800), 1800, "大 PR 等于 manifest");
-        assert!(total_estimate_s(130.3, 13, 6.9, 1200) <= 1200, "恒 ≤ manifest");
+        assert_eq!(total_estimate_s(0.0, 0, 0.0, u64::MAX), 900, "u64::MAX 不做 f64 截断");
+        assert_eq!(total_estimate_s(f64::MAX, 0, 0.0, u64::MAX), u64::MAX, "溢出饱和到 manifest");
     }
 }

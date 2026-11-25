@@ -79,15 +79,23 @@ fn patch_pairs(changes: &[FileChange]) -> Vec<(String, String)> {
 /// 整轮预算的规模口径：PR 文本（`title + body + linked issues` 的 title/body）与
 /// **非空 diff** 的字节/文件数；空 diff 文件不计（与 [`patch_pairs`] 一致）。
 pub fn total_estimate(pr: &PrContext, changes: &[FileChange], manifest_cap_s: u64) -> u64 {
-    let files = patch_pairs(changes);
-    let diff_kb = budget::kb(files.iter().map(|(_, d)| d.len()).sum());
+    let mut diff_bytes = 0usize;
+    let mut files = 0usize;
+    for c in changes {
+        // 空/纯空白 diff 不计（与 `patch_pairs` 同口径，但不克隆整份 diff）。
+        if c.diff.trim().is_empty() {
+            continue;
+        }
+        diff_bytes += c.diff.len();
+        files += 1;
+    }
     let text_bytes = pr.title.len()
         + pr.body.len()
         + pr.linked_issues
             .iter()
             .map(|i| i.title.len() + i.body.as_deref().unwrap_or("").len())
             .sum::<usize>();
-    budget::total_estimate_s(diff_kb, files.len(), budget::kb(text_bytes), manifest_cap_s)
+    budget::total_estimate_s(budget::kb(diff_bytes), files, budget::kb(text_bytes), manifest_cap_s)
 }
 
 /// 跑三轴（并发，只受 provider 门约束）。`progress` 在每轴完成时更新，取消后仍可取快照。
@@ -462,20 +470,39 @@ mod tests {
 
     #[test]
     fn total_estimate_counts_title_issues_and_non_empty_diffs() {
-        // text = title(1) + body(5) + issue title(1) + issue body(50KB)；空 diff 文件不计。
-        let issue_body = "i".repeat(50 * 1024);
+        let title = "题".repeat(2_000); // 6 KB（UTF-8 3B/字）
+        let issue_title = "议".repeat(2_000); // 6 KB
+        let issue_body = "i".repeat(50 * 1024); // 50 KB
         let json = format!(
-            r#"{{"schema":"hibot.audit.pr-context/1","title":"t","body":"hello","author":"a","labels":[],"comments":[],"linked_issues":[{{"number":1,"title":"i","state":"open","body":"{issue_body}"}}],"ci":{{"state":"success","failing":[]}},"changed_files":[{{"path":"a.rs"}}]}}"#
+            r#"{{"schema":"hibot.audit.pr-context/1","title":"{title}","body":"hello","author":"a","labels":[],"comments":[],"linked_issues":[{{"number":1,"title":"{issue_title}","state":"open","body":"{issue_body}"}}],"ci":{{"state":"success","failing":[]}},"changed_files":[{{"path":"a.rs"}}]}}"#
         );
         let pr = input::parse(&json).unwrap();
         let big = format!("diff --git a/a.rs b/a.rs\n{}", "x".repeat(100 * 1024));
         let changes = vec![
             FileChange { path: "a.rs".into(), diff: big.clone() },
-            FileChange { path: "b.bin".into(), diff: "  \n".into() },
+            FileChange { path: "b.bin".into(), diff: "\n".into() },
         ];
-        // 220 + 7.5×100.0KB + 7.5×1 file + 2.5×50.0KB ≈ 1103s；
-        // 漏掉 title/linked issue 或把空 diff 计入都会改变这个值。
-        assert_eq!(total_estimate(&pr, &changes, 1800), 1103);
+        let base = total_estimate(&pr, &changes, 1800);
+        assert!((900..1800).contains(&base), "避开下限/上限遮蔽: {base}");
+
+        // 每项单独去掉都会让包线下降 >10s（6KB 文本 ≈ 14.6s，50KB ≈ 125s）；
+        // 1 字节 title 做不到这种辨识力。
+        let mut no_title = pr.clone();
+        no_title.title.clear();
+        assert!(base - total_estimate(&no_title, &changes, 1800) >= 10, "title 计入");
+
+        let mut no_issue_title = pr.clone();
+        no_issue_title.linked_issues[0].title.clear();
+        assert!(base - total_estimate(&no_issue_title, &changes, 1800) >= 10, "linked issue title 计入");
+
+        let mut no_issue_body = pr.clone();
+        no_issue_body.linked_issues[0].body = None;
+        assert!(base - total_estimate(&no_issue_body, &changes, 1800) >= 100, "linked issue body 计入");
+
+        // 空/纯空白 diff 的文件不计。
+        let mut with_empty = changes.clone();
+        with_empty.push(FileChange { path: "c.bin".into(), diff: " \n".into() });
+        assert_eq!(total_estimate(&pr, &with_empty, 1800), base);
     }
 
     #[test]

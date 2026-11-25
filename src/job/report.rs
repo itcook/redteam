@@ -553,4 +553,45 @@ mod tests {
         assert_eq!(v.verifications.as_deref(), Some(&[][..]), "verify 报告必须带 verifications（空也可）");
         assert!(v.findings.is_empty(), "禁止伪造 findings");
     }
+
+    #[test]
+    fn triage_report_carries_estimate_s_on_ok_and_partial() {
+        let m = JobManifest::parse(r#"{
+          "schema":"hibot.audit.job.triage/1","job_id":"J3","kind":"triage",
+          "repo":{"id":1,"full_name":"o/r"},
+          "pr":{"number":7,"head_sha":"abcdef0","base_sha":"1234567"},
+          "executor":{"name":"redteam","version":"0.1.0"},
+          "limits":{"wall_clock_s":1800},
+          "paths":{"repo":"../repo","out":"out","config":"config/executor.redteam.json"},
+          "inputs":{}
+        }"#).unwrap();
+        let cfg = Config::default();
+        let lang = crate::config::Language::EnUs.output();
+        let outcome = |summary: Option<Value>, reasons: Vec<JobFailure>| crate::triage::TriageOutcome {
+            completed: reasons.is_empty(),
+            summary,
+            findings: Vec::new(),
+            blockers: Vec::new(),
+            axes: Vec::new(),
+            usage: (0, 0, 0),
+            reasons,
+            route_key: "p/m".into(),
+            estimate_s: 1313,
+        };
+
+        let ok = triage_report(&m, &lang, &cfg, &outcome(Some(json!({})), vec![]), "h");
+        assert_eq!(ok.status, JobStatus::Ok);
+        assert_eq!(ok.extensions["redteam"]["budget"]["estimate_s"], 1313);
+        assert_eq!(ok.extensions["redteam"]["budget"]["wall_clock_s"], 1800, "manifest 硬上限不变");
+
+        let partial = triage_report(
+            &m,
+            &lang,
+            &cfg,
+            &outcome(None, vec![JobFailure::new("wall_clock_exhausted", None)]),
+            "h",
+        );
+        assert_eq!(partial.status, JobStatus::Partial);
+        assert_eq!(partial.extensions["redteam"]["budget"]["estimate_s"], 1313, "partial 路径保留同一估算");
+    }
 }
