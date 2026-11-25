@@ -85,11 +85,24 @@ config v2 已合入：verify 模型取 `settings.verify.models[]`（轮转池，
   `settings.verify.models`，与 triage 版平行）。
 - `src/positioning/mod.rs`：`safe_read` 私有 → `pub(crate)`（仅可见性，复用越界/符号链接读守卫）。
 
-**遗留（followup，未改代码 —— 协调者要求收口后停止编码）**
+**补丁（协调者 2026-11-25 裁 (a)：补一个提交）**
 
-1. **作业级 error 的覆盖**：`findings` 可解析但作业级失败（检出缺对象 / 缺 verifier / registry 构造失败）时，
-   当前输出 `verifications: []`，而契约 §3.3 说「集合为空是唯一允许空数组的情形」。提议
-   `report::error_report_covering(...)`：findings 可解析时逐条给 `inconclusive`（证据句绑定错误码），
-   仅 findings 不可解析/集合为空才留空数组。已报告协调者，待裁定。
+| 提交 | 内容 |
+|---|---|
+| `f10f224` | `fix(verify)`：作业级 error 仍逐条覆盖输入指纹（契约 §3.3） |
+
+- `report::error_report_covering`：findings 已解析时逐条 `inconclusive`，证据句绑定真实
+  `status_code` 且随 `settings.language`；`status` 仍为 `error`（不改 partial）。
+- `run_verify`：findings/prior 解析前移到 repo / merge_base / 角色检查之前；findings 本身坏 →
+  空数组（唯一合法例外）。
+- 自证：删掉检出目录 → `input_path_invalid:paths.repo` + 逐条 `inconclusive`；缺 verifier 池 +
+  非空 findings → `missing_role:verifier` + 逐条 `inconclusive`；坏指纹 → `[]`；空输入 → `ok` + `[]`。
+- `make verify` exit 0；`cargo test` exit 0（lib 1162 + job_conformance 25 + verify_conformance 10 + 其余）；告警 0。
+
+**遗留（followup，不改代码）**
+
+1. ~~作业级 error 的覆盖~~ —— 已随 `f10f224` 修复（见上）。
 2. `missing_role` 诊断的 pointer 落在 `/providers`，对 `settings.verify.models` 这类池缺失不够直观
    （协调者记为 followup，不返工）。
+3. `install_panic_report_hook` 的 panic 路径仍用 `error_report`（空 `verifications`）：panic hook 里再解析
+   findings 有二次失败风险，本轮不动；若 hibot 严格要求 panic 报告也覆盖，再单独评估。
