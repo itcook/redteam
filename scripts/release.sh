@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # redteam 发布：构建 → 打包 + SHA256SUMS → tag → GitHub Release → 可选 R2 镜像 → 下载回验。
 #
-# 通道（计划 §10 / 7.0）：GitHub Release 是公开发布面（standalone 安装 / `redteam update` 默认源）；
-# R2 只是可选镜像。插件渠道（marketplace）由 `make build` + 单独提交二进制维护，不走本脚本。
+# 通道（计划 §10 / 7.0）：R2 镜像（https://release.hibot.sh/executor/audit/redteam）是 standalone 安装 /
+# `redteam update` 的默认源；GitHub Release 保留为发布备源。插件渠道（marketplace）由 `make build`
+# + 单独提交二进制维护，不走本脚本。
 #
 # 重活交给 CI：`.github/workflows/release.yml` 在 `push tag v*` 时调用本脚本的 `--prepare-only`
 # 产出交付资产，再发 GitHub Release、镜像 R2。本脚本的完整发布模式保留为本机兜底。

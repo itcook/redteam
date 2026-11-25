@@ -232,4 +232,8 @@ fn install_script_uses_cd_base_without_releases_segment() {
         "install.sh 的 R2 版本目录不再有 releases 段"
     );
     assert!(install.contains("RELEASE_BASE=\"${BASE_URL}/${VERSION}\""));
+    assert!(
+        install.contains("FROM=\"${REDTEAM_FROM:-r2}\""),
+        "install.sh 的默认下载源必须是 R2（唯一公开源）"
+    );
 }

@@ -3,7 +3,7 @@
 //! 分发通道（计划 §10 / 7.0）：standalone 安装（`dist/install.sh`）用本命令自更新；
 //! 插件渠道（`plugins/redteam/bin/`）默认拒写，见 `replace::is_plugin_path`。
 //!
-//! 默认下载源是 GitHub Releases（本仓公开）；R2 只是可选镜像。
+//! 默认下载源是 R2 镜像（本仓唯一公开源）；GitHub Release 保留为显式备源（`--from github`）。
 //! `--base-url` 同时是本地验收的入口（起一个静态目录按 R2 布局即可端到端演练）。
 
 pub mod asset;
@@ -16,8 +16,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 
-/// 默认下载源：github（本仓公开，匿名可下载）。
-pub const DEFAULT_FROM: &str = "github";
+/// 默认下载源：r2（唯一公开源；换域名/路径时在 `R2_BASE_URL` 做旧源兼容）。
+pub const DEFAULT_FROM: &str = "r2";
 /// 公开仓（与 `scripts/release.sh` 的 `REPO` 一致）。
 pub const GITHUB_REPO: &str = "itcook/redteam";
 /// GitHub 资产基址（`{base}/{tag}/{asset}`）。
@@ -254,6 +254,8 @@ mod tests {
         );
         assert_eq!(resolve_base_url("github", None).unwrap(), GITHUB_DOWNLOAD_BASE);
         assert_eq!(resolve_base_url("r2", None).unwrap(), R2_BASE_URL);
+        assert_eq!(DEFAULT_FROM, "r2");
+        assert_eq!(resolve_base_url(DEFAULT_FROM, None).unwrap(), R2_BASE_URL);
         assert!(resolve_base_url("ftp", None).is_err());
     }
 

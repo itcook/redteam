@@ -147,7 +147,7 @@ enum Cmd {
         /// 即使已是最新也重装。
         #[arg(long)]
         force: bool,
-        /// 下载源：github | r2（默认 github）。
+        /// 下载源：r2 | github（默认 r2；github 为发布备源）。
         #[arg(long, value_parser = ["github", "r2"])]
         from: Option<String>,
         /// 下载基址（覆盖默认；本地测试用）。

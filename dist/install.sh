@@ -1,7 +1,7 @@
 #!/bin/sh
 # redteam installer — macOS Apple Silicon (arm64)
 #
-#   curl -fsSL https://github.com/itcook/redteam/releases/latest/download/install.sh | sh
+#   curl -fsSL https://release.hibot.sh/executor/audit/redteam/install.sh | sh
 #   REDTEAM_VERSION=v0.1.0 curl -fsSL .../install.sh | sh
 #   curl -fsSL .../install.sh | REDTEAM_INSTALL_DIR=/usr/local/bin sh
 #
@@ -12,7 +12,7 @@
 #   REDTEAM_VERSION      版本号，`latest` = 最新**正式版**（预发布不参与）  默认 latest
 #   REDTEAM_INSTALL_DIR  安装目录                                          默认 ~/.local/bin
 #   REDTEAM_BASE_URL     下载基址（覆盖默认）
-#   REDTEAM_FROM         下载源：github | r2                                默认 github
+#   REDTEAM_FROM         下载源：r2 | github                                默认 r2
 #
 # 平台扩展位（7.7）：首期只有 macOS arm64。加平台 = 改下面 TARGET/REQUIRED_* 常量 + 发布产物矩阵，
 # 主逻辑不动（Linux/Windows 归 M20，含交叉构建与 install.ps1）。
@@ -28,7 +28,7 @@ GITHUB_DEFAULT_BASE="https://github.com/${REPO}/releases/download"
 VERSION="${REDTEAM_VERSION:-latest}"
 INSTALL_DIR="${REDTEAM_INSTALL_DIR:-$HOME/.local/bin}"
 BASE_URL="${REDTEAM_BASE_URL:-}"
-FROM="${REDTEAM_FROM:-github}"
+FROM="${REDTEAM_FROM:-r2}"
 
 err() {
     printf '错误: %s\n' "$*" >&2
@@ -55,7 +55,7 @@ redteam 安装脚本（macOS arm64）
   --version <vX.Y.Z>   指定版本（默认 latest）
   --dir <path>         安装目录（默认 ~/.local/bin）
   --base-url <url>     下载基址（覆盖默认）
-  --from <github|r2>   下载源（默认 github）
+  --from <r2|github>   下载源（默认 r2）
   -h, --help           显示本帮助
 
 环境变量: REDTEAM_VERSION / REDTEAM_INSTALL_DIR / REDTEAM_BASE_URL / REDTEAM_FROM

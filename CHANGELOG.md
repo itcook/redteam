@@ -13,7 +13,8 @@
   两段都做 HEAD 200 + 归档/schema SHA256 回验）；`scripts/release.sh --prepare-only` 是 CI 唯一打包入口。
   `scripts/release.sh vX` 默认只推 tag、交给 CI 发布，本机发布需 `--local-publish`（避免双发覆盖）。
   R2 前缀收敛为 `executor/audit/redteam`（去掉历史 `releases/` 段，公开基址
-  `https://release.hibot.sh/executor/audit/redteam`）。
+  `https://release.hibot.sh/executor/audit/redteam`）。安装与自更新默认走该 R2 基址
+  （`install.sh` / `redteam update` 的唯一公开源），GitHub Release 仅作备源（`--from github`）。
 - standalone 安装与自更新：`dist/install.sh`（`latest` 解析、SHA256 校验、原子安装、macOS arm64 守卫）与
   `redteam update`（`--check` / `--version` / `--force`，同目录锁 + 原子替换 + 替换后自检）。
 - 版本单一来源：`Cargo.toml` 为唯一真相，`make gen` 同步两个 `plugin.json` 与

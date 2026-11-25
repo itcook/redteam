@@ -14,7 +14,7 @@
 |---|---|
 | 仓库 | `itcook/redteam`（public；`gh auth status` 需对它有权限） |
 | 工具链 | `cargo`（含 `aarch64-apple-darwin` target）、`tar`、`shasum`、`curl`、`gh`、`aws`（仅 R2 镜像） |
-| R2（可选） | `.env` 或环境变量：`R2_STATIC_ENDPOINT` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET`，可选 `R2_PREFIX`（默认 `executor/audit/redteam`）/ `R2_BUCKET_DOMAIN`（默认 `release.hibot.sh`）。**`.env` 不入库**（`.gitignore` 已挡） |
+| R2（镜像；客户端默认源） | `.env` 或环境变量：`R2_STATIC_ENDPOINT` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET`，可选 `R2_PREFIX`（默认 `executor/audit/redteam`）/ `R2_BUCKET_DOMAIN`（默认 `release.hibot.sh`）。**`.env` 不入库**（`.gitignore` 已挡） |
 | CI 配置 | secrets 同左四键；vars：`R2_PREFIX` / `R2_BUCKET_DOMAIN`（不设则用默认值） |
 | 工作区 | 已跟踪文件干净；`make verify` 绿 |
 
@@ -136,23 +136,24 @@ cat dist/release/SHA256SUMS
 
 ```bash
 tmp=$(mktemp -d)
-HOME="$tmp" curl -fsSL https://github.com/itcook/redteam/releases/download/v0.1.0/install.sh | sh
+HOME="$tmp" curl -fsSL https://release.hibot.sh/executor/audit/redteam/install.sh | sh
 "$tmp/.local/bin/redteam" --version
 ```
 
 预期：`redteam 0.1.0`；`PATH` 不在时给出提示。
+验证 GitHub 备源：`REDTEAM_FROM=github curl -fsSL .../releases/download/v0.1.0/install.sh | sh`。
 
 ### 4.2 篡改拒绝
 
 ```bash
-# 本地造一个 R2 布局的目录，改一位哈希后用 --from r2 装
+# 本地造一个 R2 布局的目录，改一位哈希后装（默认源就是 r2）
 mkdir -p /tmp/fake/redteam/v0.1.0
 cp dist/release/redteam-0.1.0-aarch64-apple-darwin.tar.gz \
    dist/release/SHA256SUMS /tmp/fake/redteam/v0.1.0/
 sed -i '' 's/^./0/' /tmp/fake/redteam/v0.1.0/SHA256SUMS     # 破坏一位
 printf 'v0.1.0\n' > /tmp/fake/redteam/latest
 REDTEAM_INSTALL_DIR=$(mktemp -d) \
-REDTEAM_BASE_URL=file:///tmp/fake/redteam REDTEAM_FROM=r2 \
+REDTEAM_BASE_URL=file:///tmp/fake/redteam \
   sh dist/install.sh
 ```
 
@@ -175,7 +176,7 @@ REDTEAM_BASE_URL=file:///tmp/fake/redteam REDTEAM_FROM=r2 \
 本地演练（不起网络）：按 R2 布局准备一个目录 + `python3 -m http.server`，然后
 
 ```bash
-redteam update --from r2 --base-url http://127.0.0.1:PORT/executor/audit/redteam --check
+redteam update --base-url http://127.0.0.1:PORT/executor/audit/redteam --check   # 默认源已是 r2
 ```
 
 ## 5. R2 镜像（可选）
