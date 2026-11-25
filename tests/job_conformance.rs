@@ -158,30 +158,34 @@ fn fake_override<'a>(
 const QUOTE: &str = "return db.query('SELECT * FROM users WHERE id=' + id);";
 
 fn config_with(lang: Option<&str>, partial: bool) -> String {
-    let mut models = serde_json::json!({
-        "s": {"roles": {"scanner": {}}},
-        "r": {"roles": {"reviewer": {}}}
-    });
-    if partial {
-        models["scan2"] = serde_json::json!({"roles": {"scanner": {}}});
-    }
+    let mut scanner_pool = vec![serde_json::json!({"provider": "p1", "id": "s"})];
     let mut providers = serde_json::json!({
-        "p1": {"kind": "openai", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY", "models": models}
+        "p1": {"api": "openai-completions", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
+               "models": [{"id": "s"}, {"id": "r"}]}
     });
+    let mut scanners = serde_json::json!({});
     if partial {
+        scanner_pool.push(serde_json::json!({"provider": "p2", "id": "scan2"}));
         providers["p2"] = serde_json::json!({
-            "kind": "openai", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P2_KEY_NOT_SET",
-            "models": {"scan2": {}}
+            "api": "openai-completions", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P2_KEY_NOT_SET",
+            "models": [{"id": "scan2"}]
         });
-        // models 已挂在 p1 下；把 scan2 挪到 p2。
-        providers["p1"]["models"].as_object_mut().unwrap().remove("scan2");
-        providers["p2"]["models"] = serde_json::json!({"scan2": {"roles": {"scanner": {}}}});
+        // 两个 scanner 条目都要跑（v2 轮转）；samples = 池大小。
+        scanners = serde_json::json!({"samples": 2});
     }
-    let mut cfg = serde_json::json!({"providers": providers});
+    let mut settings = serde_json::json!({
+        "review": {
+            "scanners": scanners,
+            "roles": {
+                "scanner": {"models": scanner_pool},
+                "reviewer": {"models": [{"provider": "p1", "id": "r"}]}
+            }
+        }
+    });
     if let Some(l) = lang {
-        cfg["language"] = serde_json::json!(l);
+        settings["language"] = serde_json::json!(l);
     }
-    cfg.to_string()
+    serde_json::json!({"settings": settings, "providers": providers}).to_string()
 }
 
 #[tokio::test]
@@ -320,9 +324,11 @@ async fn partial_fixture_uses_missing_provider_key_and_reports_partial() {
     let server_body = scanner_json(quote, "src/app.js", 2);
     let server = TestServer::start(server_body);
     let config = format!(
-        r#"{{"language":"en_US","providers":{{
-          "p1":{{"kind":"openai","baseUrl":"http://127.0.0.1:1","apiKeyEnv":"P1_KEY","models":{{"s":{{"roles":{{"scanner":{{}}}}}},"r":{{"roles":{{"reviewer":{{}}}}}}}}}},
-          "p2":{{"kind":"openai","baseUrl":"http://127.0.0.1:{}","apiKeyEnv":"P2_KEY","models":{{"scan2":{{"roles":{{"scanner":{{}}}}}}}}}}
+        r#"{{"settings":{{"language":"en_US","review":{{"scanners":{{"samples":2}},"roles":{{
+          "scanner":{{"models":[{{"provider":"p1","id":"s"}},{{"provider":"p2","id":"scan2"}}]}},
+          "reviewer":{{"models":[{{"provider":"p1","id":"r"}}]}}}}}}}},"providers":{{
+          "p1":{{"api":"openai-completions","baseUrl":"http://127.0.0.1:1","apiKeyEnv":"P1_KEY","models":[{{"id":"s"}},{{"id":"r"}}]}},
+          "p2":{{"api":"openai-completions","baseUrl":"http://127.0.0.1:{}","apiKeyEnv":"P2_KEY","models":[{{"id":"scan2"}}]}}
         }}}}"#,
         server.port
     );
@@ -487,15 +493,15 @@ fn make_verify_job(findings: &[u8]) -> VerifyJob {
 
 #[tokio::test]
 async fn backend_construction_failure_is_config_invalid_not_internal_panic() {
-    // kind=google 的 backend 尚未支持：这是 executor config 的问题，不是内部错误。
+    // v1 形状里的 kind=google：v2 硬切在配置期拒绝（迁移提示点名 google）——是 config 问题，不是内部错误。
     let config = r#"{"language":"en_US","providers":{"p":{"kind":"google","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#;
     let fx = make_repo_and_job("review", config, true, false);
     let code = redteam::job::run::run_with(JobKind::Review, &fx.job, None).await;
     assert_eq!(code, 1);
     let r = read_report(&fx.job);
     assert_eq!(r["status"], "error");
-    assert_eq!(r["extensions"]["redteam"]["status_code"], "config_invalid", "{r}");
-    assert!(r["status_reason"].as_str().unwrap().to_lowercase().contains("google"), "{r}");
+    assert!(r["extensions"]["redteam"]["status_code"].as_str().unwrap().starts_with("config_invalid"), "{r}");
+    assert!(r["status_reason"].as_str().unwrap().contains("legacy") || r["status_reason"].as_str().unwrap().contains("已移入"), "{r}");
 }
 
 #[tokio::test]
@@ -712,8 +718,9 @@ async fn dismissed_is_audited_but_never_refuted() {
     // 复核开启且模型判 REFUTED：人的驳回仍优先——报告的 refuted 必须保持 false。
     let refute = Arc::new(FakeChatBackend::repeating(turn(r#"{"verdict":"REFUTED","reason":"safe"}"#)));
     let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
-    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
-    cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+    cfg["settings"]["review"]["refuters"] = serde_json::json!({"enabled": true});
+    cfg["settings"]["review"]["roles"]["refuter"] = serde_json::json!({"models": [{"provider": "p1", "id": "v"}]});
+    cfg["providers"]["p1"]["models"].as_array_mut().unwrap().push(serde_json::json!({"id": "v"}));
     let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
     let csv = format!("fingerprint,actor,reason,created_at\n{fp},alice,\"false positive, see #12\",2026-11-20T10:00:00Z\n");
     update_input(&fx.job, "dismissed", "input/dismissed.csv", csv.as_bytes());
@@ -766,7 +773,7 @@ async fn malformed_dismissed_csv_is_an_error() {
 #[tokio::test]
 async fn job_mode_without_refuter_skips_refute_and_discloses() {
     let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
-    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
+    cfg["settings"]["review"]["refuters"] = serde_json::json!({"enabled": true});
     let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
     let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
     let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
@@ -784,8 +791,9 @@ async fn job_mode_without_refuter_skips_refute_and_discloses() {
 #[tokio::test]
 async fn job_mode_with_explicit_refuter_runs_refute() {
     let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
-    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
-    cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+    cfg["settings"]["review"]["refuters"] = serde_json::json!({"enabled": true});
+    cfg["settings"]["review"]["roles"]["refuter"] = serde_json::json!({"models": [{"provider": "p1", "id": "v"}]});
+    cfg["providers"]["p1"]["models"].as_array_mut().unwrap().push(serde_json::json!({"id": "v"}));
     let scan = Arc::new(FakeChatBackend::repeating(turn(&scanner_json(QUOTE, "src/app.js", 2))));
     let review = Arc::new(FakeChatBackend::repeating(turn(&reviewer_json(QUOTE, "src/app.js", 2, "SQL injection"))));
     let refute = Arc::new(FakeChatBackend::repeating(turn(r#"{"verdict":"UPHELD","reason":"real SQL string concat"}"#)));
@@ -855,8 +863,9 @@ async fn language_is_consistent_across_prompts_findings_and_status_reason() {
 
         // 开启验真并显式声明 refuter（P2：job + enabled + 有 refuter → 真跑）。
         let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some(value), false)).unwrap();
-        cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
-        cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+        cfg["settings"]["review"]["refuters"] = serde_json::json!({"enabled": true});
+        cfg["settings"]["review"]["roles"]["refuter"] = serde_json::json!({"models": [{"provider": "p1", "id": "v"}]});
+        cfg["providers"]["p1"]["models"].as_array_mut().unwrap().push(serde_json::json!({"id": "v"}));
         let fx = make_repo_and_job("review", &cfg.to_string(), true, false);
         // 用「声明了但读不到的 spec」制造 partial，才能断言 status_reason 的语言。
         let prior = serde_json::json!({
@@ -947,8 +956,9 @@ async fn timeout_partial_report_keeps_run_facts_and_corrected_quote() {
             .with_delay(std::time::Duration::from_secs(5)),
     );
     let mut cfg: serde_json::Value = serde_json::from_str(&config_with(Some("en_US"), false)).unwrap();
-    cfg["review"] = serde_json::json!({"refuters": {"enabled": true}});
-    cfg["providers"]["p1"]["models"]["v"] = serde_json::json!({"roles": {"refuter": {}}});
+    cfg["settings"]["review"]["refuters"] = serde_json::json!({"enabled": true});
+    cfg["settings"]["review"]["roles"]["refuter"] = serde_json::json!({"models": [{"provider": "p1", "id": "v"}]});
+    cfg["providers"]["p1"]["models"].as_array_mut().unwrap().push(serde_json::json!({"id": "v"}));
     let fx = make_repo_and_job_with_body("review", &cfg.to_string(), body, false);
     // 预算 1s
     let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.job.join("job.json")).unwrap()).unwrap();

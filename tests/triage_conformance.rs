@@ -115,9 +115,16 @@ fn read_report(job: &Path) -> serde_json::Value {
 
 fn config() -> String {
     serde_json::json!({
-        "providers": {"p1": {"kind": "openai", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
-            "models": {"s": {"roles": {"scanner": {}}}, "r": {"roles": {"reviewer": {}}}}}},
-        "language": "en_US"
+        "settings": {
+            "language": "en_US",
+            "review": {"roles": {
+                "scanner": {"models": [{"provider": "p1", "id": "s"}]},
+                "reviewer": {"models": [{"provider": "p1", "id": "r"}]}
+            }},
+            "triage": {"models": [{"provider": "p1", "id": "r"}]}
+        },
+        "providers": {"p1": {"api": "openai-completions", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
+            "models": [{"id": "s"}, {"id": "r"}]}}
     })
     .to_string()
 }
@@ -450,3 +457,90 @@ async fn slow_cell_is_capped_by_its_share_of_the_job_budget() {
     assert!(err.contains("in_flight_ms="), "{err}");
 }
 
+
+/// v2 池归因：三个 triage 模型按轴轮转（claims/security→0、drift→1、intent→2），
+/// 报告 findings 的 `source.model` 必须是**实际产出轴**的模型，不能统一写池首条。
+#[tokio::test]
+async fn triage_rotates_models_per_axis_and_attributes_findings_to_the_producing_model() {
+    use std::sync::Mutex;
+
+    struct RecordingFake {
+        fake: Arc<TriageFake>,
+        model: String,
+        log: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    #[async_trait::async_trait]
+    impl ChatBackend for RecordingFake {
+        async fn turn(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> Result<AssistantTurn, ProviderError> {
+            let text = flatten(messages);
+            let axis = if text.contains("# Axis: security") {
+                "security"
+            } else if text.contains("# Axis: convention drift") {
+                "drift"
+            } else if text.contains("# Axis: intent claims") {
+                "claims"
+            } else if text.contains("# Axis: intent slice") {
+                "intent"
+            } else {
+                "unknown"
+            };
+            self.log.lock().unwrap().push((axis.to_string(), self.model.clone()));
+            self.fake.turn(messages, tools).await
+        }
+    }
+
+    let cfg = serde_json::json!({
+        "settings": {
+            "language": "en_US",
+            "triage": {"models": [
+                {"provider": "p1", "id": "m0"},
+                {"provider": "p1", "id": "m1"},
+                {"provider": "p1", "id": "m2"}
+            ]}
+        },
+        "providers": {"p1": {"api": "openai-completions", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
+            "models": [{"id": "m0"}, {"id": "m1"}, {"id": "m2"}]}}
+    })
+    .to_string();
+    let fx = make_job(&cfg, "Add an eval helper for the CLI", true);
+    let shared = good_fake();
+    let log: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let over: Box<redteam::cli::BackendOverride<'_>> = {
+        let shared = Arc::clone(&shared);
+        let log = Arc::clone(&log);
+        Box::new(move |em: &EffectiveModel| {
+            Some(Box::new(RecordingFake {
+                fake: Arc::clone(&shared),
+                model: em.name.clone(),
+                log: Arc::clone(&log),
+            }))
+        })
+    };
+    let code = redteam::job::run::run_with(JobKind::Triage, &fx.job, Some(over.as_ref())).await;
+    assert_eq!(code, 0, "{:?}", read_report(&fx.job));
+
+    let log = log.lock().unwrap().clone();
+    let model_of = |axis: &str| {
+        log.iter()
+            .find(|(a, _)| a == axis)
+            .map(|(_, m)| m.as_str())
+            .unwrap_or_else(|| panic!("axis {axis} 没有派发: {log:?}"))
+    };
+    assert_eq!(model_of("claims"), "p1/m0", "I0/claims 用池首条: {log:?}");
+    assert_eq!(model_of("security"), "p1/m0", "security → 池[0]: {log:?}");
+    assert_eq!(model_of("drift"), "p1/m1", "drift → 池[1]: {log:?}");
+    assert_eq!(model_of("intent"), "p1/m2", "intent → 池[2]: {log:?}");
+
+    let r = read_report(&fx.job);
+    let findings = r["findings"].as_array().unwrap();
+    assert!(!findings.is_empty());
+    for f in findings {
+        let model = f["source"]["model"].as_str().unwrap();
+        let title = f["title"].as_str().unwrap_or("");
+        if title.starts_with("Security") {
+            assert_eq!(model, "p1/m0", "安全 finding 归到安全轴模型: {f}");
+        } else if title.starts_with("Structural") {
+            assert_eq!(model, "p1/m1", "漂移 finding 归到漂移轴模型: {f}");
+        }
+    }
+}

@@ -160,7 +160,7 @@ awk 'NF { seen = 1 } seen' "$NOTES" >"$NOTES.trim" && mv "$NOTES.trim" "$NOTES"
     while read -r hash name; do
         [ -n "$name" ] && printf '| `%s` | `%s` |\n' "$name" "$hash"
     done <"$DIST/SHA256SUMS"
-    printf '\n配置 schema：`config.schema.json`（`$id: urn:redteam:config/1`，`schemaVersion: 1`）\n'
+    printf '\n配置 schema：`config.schema.json`（`$id: urn:redteam:config/2`，`schemaVersion: 2`）\n'
 } >>"$NOTES"
 
 printf '\n产物：\n'

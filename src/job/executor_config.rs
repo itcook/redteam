@@ -31,10 +31,15 @@ pub fn load(manifest: &JobManifest, job_dir: &Path) -> Result<Config, JobFailure
     }
 }
 
-/// 多条 issue 取**第一条**（附录 E：status_code 只保留主导一条）；密钥字段优先上报。
+/// 多条 issue 取**主导一条**（附录 E：status_code 只保留主导一条）：密钥 > v1 形状 > 第一条。
+/// v1 形状优先于 unknown_key——迁移提示比「language 是未知键」可操作得多。
 fn issue_to_failure(issues: &[ConfigIssue]) -> JobFailure {
     if let Some(i) = issues.iter().find(|i| i.code == "secret_field") {
         return JobFailure::new("config_contains_secret", Some(pointer_or_root(&i.pointer)));
+    }
+    if let Some(i) = issues.iter().find(|i| i.code == "legacy_shape") {
+        // 迁移提示要进 status_reason：只给一个 pointer 的话，运维不知道该怎么改。
+        return JobFailure::with_reason("config_invalid", Some(pointer_or_root(&i.pointer)), i.message.clone());
     }
     let i = &issues[0];
     JobFailure::new("config_invalid", Some(pointer_or_root(&i.pointer)))
@@ -71,9 +76,9 @@ mod tests {
 
     #[test]
     fn loads_valid_config() {
-        let (_d, job) = job_with_config(r#"{"language":"zh_CN","providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#);
+        let (_d, job) = job_with_config(r#"{"settings":{"language":"zh_CN","review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#);
         let cfg = load(&manifest(), &job).unwrap();
-        assert_eq!(cfg.language, Some(crate::config::Language::ZhCn));
+        assert_eq!(cfg.settings.language, Some(crate::config::Language::ZhCn));
     }
 
     #[test]
@@ -88,22 +93,22 @@ mod tests {
 
     #[test]
     fn unknown_key_is_rejected_not_warned() {
-        let (_d, job) = job_with_config(r#"{"language":"en_US","review":{"unknown":1},"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#);
+        let (_d, job) = job_with_config(r#"{"settings":{"language":"en_US","review":{"unknown":1,"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#);
         let e = load(&manifest(), &job).unwrap_err();
         assert_eq!(e.code, "config_invalid");
-        assert_eq!(e.detail.as_deref(), Some("/review/unknown"));
+        assert_eq!(e.detail.as_deref(), Some("/settings/review/unknown"));
     }
 
     #[test]
     fn secret_field_has_dedicated_code() {
-        let (_d, job) = job_with_config(r#"{"providers":{"p":{"kind":"openai","apiKey":"sk-x","models":{"m":{"roles":{"scanner":{}}}}}}}"#);
+        let (_d, job) = job_with_config(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","apiKey":"sk-x","baseUrl":"https://x","models":[{"id":"m"}]}}}"#);
         let e = load(&manifest(), &job).unwrap_err();
         assert_eq!(e.full_code(), "config_contains_secret:/providers/p/apiKey");
     }
 
     #[test]
     fn api_key_env_is_not_a_secret_field() {
-        let (_d, job) = job_with_config(r#"{"providers":{"p":{"kind":"openai","apiKeyEnv":"P_KEY","models":{"m":{"roles":{"scanner":{}}}}}}}"#);
+        let (_d, job) = job_with_config(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","apiKeyEnv":"P_KEY","baseUrl":"https://x","models":[{"id":"m"}]}}}"#);
         assert!(load(&manifest(), &job).is_ok());
     }
 }

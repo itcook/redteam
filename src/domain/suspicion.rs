@@ -95,8 +95,8 @@ impl CellOutput {
             Role::Scanner => CellOutput::Scan(ScanOutput::default()),
             Role::Reviewer => CellOutput::Review { findings: vec![], needs: vec![] },
             Role::Refuter => CellOutput::Refute { verdicts: vec![] },
-            Role::Verifier => unreachable!(
-                "Role::Verifier 不属于 review cell 管线（fix 验证的结果类型在 Phase 4 定义）"
+            Role::Verifier | Role::Triage => unreachable!(
+                "Role::Verifier / Role::Triage 不属于 review cell 管线（fix 验证 / triage 的结果类型另行定义）"
             ),
         }
     }
@@ -241,15 +241,17 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&CellOutput::empty(r)).unwrap()).unwrap();
             assert_eq!(v["role"], r.as_str());
         }
-        // 四个配置角色都在 `ALL` 里（fix 验证的串也要能配置/解析）。
-        assert_eq!(Role::ALL.len(), 4);
+        // 五个配置角色都在 `ALL` 里（fix 验证 / triage 的串也要能配置/解析）。
+        assert_eq!(Role::ALL.len(), 5);
         assert_eq!(Role::parse("verifier"), Some(Role::Verifier));
         assert_eq!(Role::Verifier.as_str(), "verifier");
+        assert_eq!(Role::parse("triage"), Some(Role::Triage));
+        assert_eq!(Role::Triage.as_str(), "triage");
     }
 
     /// fix 验证（`kind=verify`）不得冒充 review 的 cell 输出：它的结果类型在 Phase 4 才有。
     #[test]
-    #[should_panic(expected = "Role::Verifier 不属于 review cell 管线")]
+    #[should_panic(expected = "不属于 review cell 管线")]
     fn verifier_is_not_a_review_cell_role() {
         let _ = CellOutput::empty(Role::Verifier);
     }

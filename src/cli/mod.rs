@@ -296,7 +296,7 @@ fn stage0_risk(
         base,
         ledger.as_deref(),
         None,
-        cfg.review.reviewers.max_cells,
+        cfg.settings.review.reviewers.max_cells,
     );
     let meta = RiskMeta {
         hotspots: route.hotspots.len() as u32,
@@ -377,12 +377,12 @@ pub async fn run_code_review(
     let budget = budget.saturating_sub(repo_brief.len());
     // 分组 / 装包 / 跨组索引（plan_cells：与 --pack-only 同源）。门未过 → 单包。
     let CellPlan { bundles, dossiers, others, dossier_meta, stats, pack_stats, folded } =
-        plan_cells(selected, root, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
+        plan_cells(selected, root, budget, &cfg.settings.review.grouping, &cfg.settings.review.pack, &[], None);
     let input = ScanFanoutInput {
         lang: lang.clone(),
         target_label: &target_label, bundles: &bundles, dossiers: &dossiers, others: &others,
         user_focus: &focus, spec_docs: &spec_section, repo_brief: &repo_brief, root,
-        entries: &entries, samples: cfg.review.scanners.samples,
+        entries: &entries, samples: cfg.settings.review.scanners.samples,
         // 判例前移（M21c 批 B-1）：`ledger` 来自 `load_ledger(args.dismissed, args.no_dismissed, root)`,
         // 已过「完全关闭台账」那道旗——这一层不再自己开库。
         precedents: &ledger.cards,
@@ -446,7 +446,7 @@ pub async fn run_code_review(
                 root,
                 reviewers: &roles.reviewers,
                 budget_cells,
-                pack: &cfg.review.pack,
+                pack: &cfg.settings.review.pack,
                 spec_docs: &spec_section,
                 repo_brief: &repo_brief,
                 target_label: &target_label,
@@ -612,7 +612,7 @@ fn per_cell_backend_factory(cfg: &Config, job_mode: bool) -> Box<crate::orchestr
 
 /// `--tools` 旗覆盖 config `review.tools`（R2 二阶段档位）。
 fn resolve_tools(args: &ReviewArgs, cfg: &Config) -> crate::config::ToolsMode {
-    args.tools.as_deref().and_then(crate::config::ToolsMode::from_flag).unwrap_or(cfg.review.tools)
+    args.tools.as_deref().and_then(crate::config::ToolsMode::from_flag).unwrap_or(cfg.settings.review.tools)
 }
 
 #[allow(clippy::too_many_arguments)] // 报告 / 退出码 / 深挖结果 / 两处配置 / registry / 计时——各不同源，收拢 struct 是过度设计
@@ -625,8 +625,8 @@ pub(crate) fn verdict_thresholds(args: &ReviewArgs, cfg: &Config) -> (crate::dom
         .block_threshold
         .as_deref()
         .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
-        .unwrap_or(cfg.review.block_threshold);
-    (block, args.conf_floor.unwrap_or(cfg.review.conf_floor))
+        .unwrap_or(cfg.settings.review.block_threshold);
+    (block, args.conf_floor.unwrap_or(cfg.settings.review.conf_floor))
 }
 
 #[allow(clippy::too_many_arguments)] // 报告 / 退出码 / 深挖结果 / 旗标 / 配置 / registry / 变更集 / 计时各不同源
@@ -655,7 +655,7 @@ fn overlay_deep(
     let mut findings = deep.findings;
     // 确定性后滤（design §10.4，M21d 批 B-2）：标记锚点落在改动行 ±N 外的 finding。
     // **默认只观测**——`findingWindowEnforce` 才降级（把它们移出 findings、只留披露）〔批 B 裁定 2〕。
-    let window = cfg.review.pack.finding_window;
+    let window = cfg.settings.review.pack.finding_window;
     let outside = match bundles {
         Some(bs) => crate::positioning::mark_outside_window(&mut findings, bs, window),
         // 没有变更集就没有基准：重算只会把往轮的标记**全部复位**（`mark_outside_window` 每轮先清零），
@@ -670,7 +670,7 @@ fn overlay_deep(
     // resume 按当前工作树重建 diff，部分提交 / amend / rebase 之后往次的锚点就可能落到窗外
     // （2026-09-29 批 B dogfood 抓到）。这些往轮项 `origin` 是 `New`（`Carried` 只属 M13 增量轮），
     // 跳过 carried 那条防线接不住它们。
-    let enforce = cfg.review.pack.finding_window_enforce && outside > 0;
+    let enforce = cfg.settings.review.pack.finding_window_enforce && outside > 0;
     report.run.finding_window_enforced = enforce;
     let counted: Vec<crate::domain::Finding> =
         if enforce { findings.iter().filter(|f| !f.outside_window).cloned().collect() } else { findings.clone() };
@@ -1021,8 +1021,8 @@ pub(crate) fn scanned_coverage(bundles: &[Bundle], cells: &[ScanCellResult]) -> 
 ///
 /// **job 模式凭据只走 env**（P6）：`args.job_mode` 时 secrets 传空，`resolve_key_with` 只读 `apiKeyEnv` 指向的环境变量。
 ///
-/// **`roles.verifier`（fix 验证）不在这里注册**：它属 kind=verify 管线（Phase 4），review 既不用也不该
-/// 因它构造 backend；它的回退（缺省复用 reviewer）是选择策略（`RoleSets::fix_verifiers`），不是 review 的注册项。
+/// **`settings.verify` 池不在这里注册**：它属 kind=verify 管线（Phase 4），review 既不用也不该
+/// 因它构造 backend；v2 起 verify **不再回退 reviewer**（空池即 `missing_role:verifier`）。
 /// 测试/夹具接缝：按角色条目覆盖 backend 构造（返回 None 则走真实 `backend_from_config`）。
 /// 生产路径不传；集成测试用它注入确定性后端（计划 1.6），**不是**产品开关。
 pub type BackendOverride<'a> =
@@ -1032,89 +1032,123 @@ pub fn build_registry(args: &ReviewArgs, cfg: &Config) -> Result<ProviderRegistr
     build_registry_with(args, cfg, None)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistryMode {
+    Review,
+    Triage,
+}
+
 pub fn build_registry_with(
     args: &ReviewArgs,
     cfg: &Config,
     over: Option<&BackendOverride<'_>>,
 ) -> Result<ProviderRegistry, String> {
-    build_registry_inner(args, cfg, over, true)
+    build_registry_inner(args, cfg, over, RegistryMode::Review)
 }
 
-/// triage 专用：只用 `roles.reviewer`，因此**不因缺 scanner 而拒绝**（角色最小集在 `config check --kind triage`）。
+/// triage 专用：只用 `settings.triage.models`，因此**不因缺 scanner 而拒绝**（角色最小集在 `config check --kind triage`）。
 pub fn build_registry_for_triage(
     args: &ReviewArgs,
     cfg: &Config,
     over: Option<&BackendOverride<'_>>,
 ) -> Result<ProviderRegistry, String> {
-    build_registry_inner(args, cfg, over, false)
+    build_registry_inner(args, cfg, over, RegistryMode::Triage)
 }
 
+/// 构造 ProviderRegistry（前台 / worker / triage 共用）：按角色池注册 backend。
+/// 同一模型跨角色各占一份角色键（`reasoningEffort` 是角色属性，不能共用档位）。
 fn build_registry_inner(
     args: &ReviewArgs,
     cfg: &Config,
     over: Option<&BackendOverride<'_>>,
-    require_scanner: bool,
+    mode: RegistryMode,
 ) -> Result<ProviderRegistry, String> {
     let roles = cfg.active_roles();
-    if require_scanner && roles.scanners.is_empty() {
+    if mode == RegistryMode::Review && roles.scanners.is_empty() {
         return Err(NO_SCANNER_MSG.to_string());
     }
     let secrets = if args.job_mode { crate::config::secrets::Secrets::default() } else { crate::config::secrets::load_secrets() };
     let mut registry = ProviderRegistry::new();
     // reasoningEffort 无映射 warnings 按角色条目统一给——同一模型跨角色各有各的档位，不能只报先注册的那条。
-    for w in crate::provider::backends::role_reasoning_effort_warnings(&roles) {
+    let warnings = match mode {
+        RegistryMode::Review => crate::provider::backends::role_reasoning_effort_warnings(&roles),
+        RegistryMode::Triage => crate::provider::backends::reasoning_warnings_for(roles.triage.iter()),
+    };
+    for w in warnings {
         registry.push_warning(w);
     }
-    for em in &roles.scanners {
-        let key = cfg.resolve_key_with(&em.provider, &em.id, &secrets).unwrap_or_default();
+    let cap_of = |em: &crate::config::EffectiveModel| {
+        // usize → u32 饱和而非截断（误填 2^32 以上的值不会被截成 0 / 小数）。
+        em.max_concurrency.unwrap_or(u32::try_from(cfg.settings.review.max_concurrency).unwrap_or(u32::MAX))
+    };
+    #[allow(clippy::too_many_arguments)]
+    fn register(
+        registry: &mut ProviderRegistry,
+        cfg: &Config,
+        secrets: &crate::config::secrets::Secrets,
+        over: Option<&BackendOverride<'_>>,
+        em: &crate::config::EffectiveModel,
+        role: Role,
+        soft: bool,
+        cap: u32,
+        env_only: bool,
+    ) -> Result<(), String> {
+        // job 模式**只读 env**：不碰 config 内联槽 / secrets.json（即使 Config 是直接构造进来的）。
+        let key = if env_only {
+            cfg.resolve_key_env_only(&em.provider, &em.id)
+        } else {
+            cfg.resolve_key_with(&em.provider, &em.id, secrets)
+        }
+        .unwrap_or_default();
         let backend = match over.and_then(|f| f(em)) {
             Some(b) => b,
             None => match crate::provider::backends::backend_from_config(em, key) {
                 Ok(b) => b,
+                // 软的（refuter）造不出只是这一路没得用，不该让整条 review 命令拒跑。
+                Err(e) if soft => {
+                    registry.push_warning(format!("{} {} 不可用（{e}）——本轮将跳过它", role.as_str(), em.name));
+                    return Ok(());
+                }
                 Err(e) => return Err(format!("{e}")),
             },
         };
-        // 单轮超时（design §12.3）：模型 perTurnTimeoutSecs > REDTEAM_PER_TURN_SECS > `max_tokens_effective ÷ 20 TPS + 60s`。
         let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
-        // usize → u32 饱和而非截断（误填 2^32 以上的值不会被截成 0 / 小数）。
-        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
-        registry.insert_scan(crate::provider::registry::role_key(Role::Scanner, &em.name), &em.provider, cap, backend, per_turn, crate::provider::DEFAULT_RETRY_BUDGET);
+        registry.insert_scan(
+            crate::provider::registry::role_key(role, &em.name),
+            &em.provider,
+            cap,
+            backend,
+            per_turn,
+            crate::provider::DEFAULT_RETRY_BUDGET,
+        );
+        Ok(())
     }
-    // 0.8 护栏（R20）：旧配置里“验真角色”写作 `roles.verifier`，硬切后会静默变成 fix 验证角色。
-    // 这里把变义提示进 registry.warnings → 报告 run.warnings——后台 worker 的 stderr 是 /dev/null，
-    // 只靠 `Config::load` 的 eprintln 后台作业永远看不到。
-    if let Some(w) = cfg.verifier_role_guard_warning() {
-        if !registry.warnings().contains(&w) {
-            registry.push_warning(w);
-        }
-    }
-    // reviewer 与 refuter 各按角色键注册（同模型不同档位各占一份 backend，不互相覆盖）。批 D〔D17〕：
-    // refuter 必须在这里注册，否则 `pick_refuter` 选中一个纯 refuter 模型时 `registry.lease()` 直接
-    // Unavailable，每条复核都静默落成「保守 upheld」——看起来跑了、其实一次没验。
-    for (em, role) in roles
-        .reviewers
-        .iter()
-        .map(|m| (m, Role::Reviewer))
-        .chain(roles.refuters.iter().map(|m| (m, Role::Refuter)))
-    {
-        let key = cfg.resolve_key_with(&em.provider, &em.id, &secrets).unwrap_or_default();
-        let backend = match over.and_then(|f| f(em)) {
-            Some(b) => b,
-            None => match crate::provider::backends::backend_from_config(em, key) {
-                Ok(b) => b,
-            // reviewer 造不出 = 本轮的活干不了，硬 Err 照旧；**refuter 造不出只是这一路没得用**
-            // （复核缺省还关着），不该让整条 review 命令拒跑（收口评审 #8：
-            // 预置一个 kind=google 的 refuter 模型，整个 review 会以 "google not yet supported" 退出）。
-            Err(e) if role == Role::Refuter => {
-                registry.push_warning(format!("refuter {} 不可用（{e}）——本轮复核将跳过它", em.name));
-                continue;
+
+    match mode {
+        RegistryMode::Review => {
+            for em in &roles.scanners {
+                register(&mut registry, cfg, &secrets, over, em, Role::Scanner, false, cap_of(em), args.job_mode)?;
             }
-            Err(e) => return Err(format!("{e}")),
-            },
-        };
-        let per_turn = std::time::Duration::from_secs(em.per_turn_secs());
-        let cap = em.max_concurrency.unwrap_or(u32::try_from(cfg.review.max_concurrency).unwrap_or(u32::MAX));
-        registry.insert_scan(crate::provider::registry::role_key(role, &em.name), &em.provider, cap, backend, per_turn, crate::provider::DEFAULT_RETRY_BUDGET);
+            // reviewer 与 refuter 各按角色键注册（同模型不同档位各占一份 backend，不互相覆盖）。
+            // 批 D〔D17〕：refuter 必须在这里注册，否则 `pick_refuter` 选中一个纯 refuter 模型时
+            // `registry.lease()` 直接 Unavailable，每条复核都静默落成「保守 upheld」。
+            for (em, role) in roles
+                .reviewers
+                .iter()
+                .map(|m| (m, Role::Reviewer))
+                .chain(roles.refuters.iter().map(|m| (m, Role::Refuter)))
+            {
+                register(&mut registry, cfg, &secrets, over, em, role, role == Role::Refuter, cap_of(em), args.job_mode)?;
+            }
+        }
+        RegistryMode::Triage => {
+            if roles.triage.is_empty() {
+                return Err("no triage model configured: settings.triage.models 为空".to_string());
+            }
+            for em in &roles.triage {
+                register(&mut registry, cfg, &secrets, over, em, Role::Triage, false, cap_of(em), args.job_mode)?;
+            }
+        }
     }
     Ok(registry)
 }
@@ -1221,7 +1255,7 @@ pub fn run_pack_only(args: &ReviewArgs, cfg: &Config, cwd: &Path) -> anyhow::Res
     let selected = select_files(changes);
     let (risk, _route) = stage0_risk(&selected, cwd, args, cfg, head_sha.as_deref());
     let CellPlan { bundles, dossiers, others, stats, pack_stats, .. } =
-        plan_cells(selected, cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
+        plan_cells(selected, cwd, budget, &cfg.settings.review.grouping, &cfg.settings.review.pack, &[], None);
     let focus = args.focus.clone().unwrap_or_default();
 
     let job_id = gen_job_id(cwd);
@@ -2008,7 +2042,7 @@ pub async fn run_resume(
             spec_warnings.extend(brief_warnings);
             report.run.warnings.extend(spec_warnings);
             let CellPlan { bundles, .. } =
-                plan_cells(selected, cwd, budget, &cfg.review.grouping, &cfg.review.pack, &[], None);
+                plan_cells(selected, cwd, budget, &cfg.settings.review.grouping, &cfg.settings.review.pack, &[], None);
             // 「re-digging」只在真会重挖时披露（评审第 2 档 #7）：变更集为空时 run_deep 早退、另报「无法重跑」并计债。
             if reopened > 0 && !bundles.is_empty() {
                 report.run.warnings.push(format!(
@@ -2072,7 +2106,7 @@ pub async fn run_resume(
                     root: cwd,
                     reviewers: &roles.reviewers,
                     budget_cells,
-                    pack: &cfg.review.pack,
+                    pack: &cfg.settings.review.pack,
                     spec_docs: &spec_section,
                     repo_brief: &repo_brief,
                     target_label: &target_label,
@@ -2470,7 +2504,7 @@ mod job_tests {
         run(&["add", file]);
     }
     fn cfg() -> Config {
-        Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}}}}}}"#).unwrap()
+        Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"alpha"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"alpha"}]}}}"#).unwrap()
     }
 
     /// 配了 reviewer 的作业阶段时间线（design C2 §2.3〔D15〕）：Collecting → Scan（manifest）→ Deep（扫描全部返回时）→ Finalizing。
@@ -2480,7 +2514,7 @@ mod job_tests {
         git_staged(dir.path(), "a.rs", "fn main() {\n    let x = 1;\n}\n");
         let mut registry = scan_registry("p/alpha", r#"{"suspicions":[{"file":"a.rs","line_start":2,"line_end":2,"hint":"t","confidence":0.9,"quote":"let x = 1;"}],"scanned_areas":[]}"#);
         registry.insert_scan("p/r", "p", 8, Box::new(FakeChatBackend::repeating(scan_turn(r#"{"findings":[],"needs":[]}"#))), std::time::Duration::from_secs(5), 0);
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"alpha"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"alpha"},{"id":"r"}]}}}"#).unwrap();
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let store = Arc::new(crate::state::JobStore::open(&ws).unwrap());
@@ -3064,7 +3098,7 @@ mod resume_tests {
         };
         store.put_queue_item("j", &item).unwrap();
         store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"},{"id":"r"}]}}}"#).unwrap();
         let (reg, _backend) = recording_registry("p/m", "c.rs");
 
         let (report, _code) = run_resume("j", &reg, &cfg, ws, &store).await;
@@ -3113,7 +3147,7 @@ mod resume_tests {
     }
 
     fn deep_cfg() -> Config {
-        Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap()
+        Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"},{"id":"r"}]}}}"#).unwrap()
     }
 
     /// scanner `p/m` + reviewer `p/r`（每次都回同一份 finding JSON；`Arc` 句柄留给测试数调用次数）。
@@ -3568,10 +3602,9 @@ mod resume_tests {
     }
 
     fn rs_cfg(max_cells: u32) -> Config {
-        Config::from_json(
-            &r#"{"review":{"reviewers":{"maxCells":MAX}},"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#
-                .replace("MAX", &max_cells.to_string()),
-        )
+        Config::from_json(&format!(
+            r#"{{"settings":{{"review":{{"reviewers":{{"maxCells":{max_cells}}},"roles":{{"scanner":{{"models":[{{"provider":"p","id":"m"}}]}},"reviewer":{{"models":[{{"provider":"p","id":"r"}}]}}}}}}}},"providers":{{"p":{{"api":"openai-completions","baseUrl":"https://x","models":[{{"id":"m"}},{{"id":"r"}}]}}}}}}"#
+        ))
         .unwrap()
     }
 
@@ -4088,7 +4121,7 @@ mod resume_tests {
         store.append_partial("j", &done_scan("scan[g1]@p/alpha#1", "p/alpha", "c.rs").with_family("alpha")).unwrap();
         store.write_args_raw("j", &serde_json::to_string(&args()).unwrap()).unwrap();
         let (reg, backend) = recording_registry("p/beta", "c.rs");
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"beta":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"alpha"},{"provider":"p","id":"beta"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"alpha"},{"id":"beta"}]}}}"#).unwrap();
 
         let (report, _code) = run_resume("j", &reg, &cfg, ws, &store).await;
 
@@ -4184,10 +4217,10 @@ mod resolve_tests {
     /// 批 C followup：`review.grouping` 子表接到 `GroupingOpts`（缺省 4 / 200 / 10 与内置一致）。
     #[test]
     fn grouping_opts_read_review_grouping_config() {
-        let d = grouping_opts(&Config::default().review.grouping, 1000);
+        let d = grouping_opts(&Config::default().settings.review.grouping, 1000);
         assert_eq!((d.min_files, d.bundle_line_threshold, d.max_files_per_group, d.budget_bytes), (4, 200, 10, Some(1000)));
-        let c = Config::from_json(r#"{"review":{"grouping":{"minFiles":1,"bundleLineThreshold":0,"maxFilesPerGroup":2}}}"#).unwrap();
-        let o = grouping_opts(&c.review.grouping, 5);
+        let c = Config::from_json(r#"{"settings":{"review":{"grouping":{"minFiles":1,"bundleLineThreshold":0,"maxFilesPerGroup":2}}},"providers":{}}"#).unwrap();
+        let o = grouping_opts(&c.settings.review.grouping, 5);
         assert_eq!((o.min_files, o.bundle_line_threshold, o.max_files_per_group, o.budget_bytes), (1, 0, 2, Some(5)));
     }
 
@@ -4232,7 +4265,7 @@ mod code_review_tests {
     async fn scan_review_anchors_real_drops_fabricated_and_merges_families() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}},"m2":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"scanners":{"samples":2},"roles":{"scanner":{"models":[{"provider":"p","id":"m"},{"provider":"p","id":"m2"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"},{"id":"m2"}]}}}"#).unwrap();
         let reg = registry(&[
             ("p/m", &format!(r#"{{"suspicions":[{},{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8), susp("fab", "this is fabricated", 0.9))),
             ("p/m2", &format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("unvalidated", "db.write(token);", 0.6))),
@@ -4263,11 +4296,7 @@ mod code_review_tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
         let cfg = Config::from_json(
-            r#"{"review":{"refuters":{"enabled":true}},"providers":{"p":{"kind":"openai","models":{
-                "s":{"roles":{"scanner":{}}},
-                "r":{"roles":{"reviewer":{}}},
-                "v":{"roles":{"refuter":{}}}
-            }}}}"#,
+            r#"{"settings":{"review":{"refuters":{"enabled":true},"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]},"refuter":{"models":[{"provider":"p","id":"v"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"},{"id":"v"}]}}}"#,
         )
         .unwrap();
         let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
@@ -4298,7 +4327,7 @@ mod code_review_tests {
     async fn deep_review_emits_findings_and_approve() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#).unwrap();
         let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
         let rev_json = r#"{"findings":[{"severity":"low","title":"t","body":"b","file":"src/a.rs","line_start":2,"line_end":2,"confidence":0.4,"recommendation":"r","quote":"db.write(token);"}],"needs":[]}"#;
         let mut reg = ProviderRegistry::new();
@@ -4320,7 +4349,7 @@ mod code_review_tests {
     async fn deep_reviewer_failure_is_approve_exit_2() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#).unwrap();
         let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
         let mut reg = ProviderRegistry::new();
         let scan_turn = AssistantTurn { text: scan_json, tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None };
@@ -4354,7 +4383,7 @@ mod code_review_tests {
         }).unwrap();
         drop(db);
 
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#).unwrap();
         let turn = |t: String| AssistantTurn { text: t, tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None };
         let mk_reg = || {
             let mut reg = ProviderRegistry::new();
@@ -4443,7 +4472,7 @@ mod code_review_tests {
         .unwrap();
         drop(db);
 
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#).unwrap();
         let turn = |t: String| AssistantTurn { text: t, tool_calls: vec![], input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, finish_reason: None, reasoning_tokens: None };
         // scanner 报的正是判例所指那一行（quote 逐字相同 → 机械匹配命中）
         let scan = r#"{"suspicions":[{"file":"src/a.rs","line_start":1,"line_end":1,"hint":"签名可疑","confidence":0.8,"quote":"fn a() {"}],"scanned_areas":[]}"#;
@@ -4476,7 +4505,7 @@ mod code_review_tests {
     #[tokio::test]
     async fn scan_review_empty_changes_is_scan_only_with_warning() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
         let reg = registry(&[("p/m", r#"{"suspicions":[],"scanned_areas":[]}"#)]);
         let (report, code) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), None, None, vec![]).await.unwrap();
         assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0));
@@ -4490,7 +4519,7 @@ mod code_review_tests {
     #[tokio::test]
     async fn empty_changes_with_reviewer_stays_scan_only() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#).unwrap();
         let reg = registry(&[("p/s", r#"{"suspicions":[],"scanned_areas":[]}"#), ("p/r", r#"{"findings":[],"needs":[]}"#)]);
         let (report, code) = run_code_review(&args(), &reg, &cfg, vec![], dir.path(), None, None, vec![]).await.unwrap();
         assert_eq!((report.verdict, code), (Verdict::ScanOnly, 0), "warnings={:?}", report.run.warnings);
@@ -4513,7 +4542,7 @@ mod code_review_tests {
         }
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#).unwrap();
         let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
         let rev_json = r#"{"findings":[{"severity":"low","title":"t","body":"b","file":"src/a.rs","line_start":2,"line_end":2,"confidence":0.4,"recommendation":"r","quote":"db.write(token);"}],"needs":[]}"#;
         let mut reg = ProviderRegistry::new();
@@ -4671,7 +4700,7 @@ mod code_review_tests {
 
         // ② 打开 enforce：窗外那条移出 findings（verdict 谓词零改动，自然不含它）
         let mut cfg2 = Config::default();
-        cfg2.review.pack.finding_window_enforce = true;
+        cfg2.settings.review.pack.finding_window_enforce = true;
         let (rep2, _) = overlay_deep(blank(), 0, deep(), &args(), &cfg2, &reg, Some(&bundles), std::time::Instant::now());
         assert_eq!(rep2.run.findings_outside_window, 1);
         assert!(rep2.run.finding_window_enforced);
@@ -4732,7 +4761,7 @@ mod code_review_tests {
     #[tokio::test]
     async fn scan_review_errors_without_scanner_role() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"reviewer":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"reviewer":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
         let err = run_code_review(&args(), &ProviderRegistry::new(), &cfg, vec![], dir.path(), None, None, vec![]).await.unwrap_err();
         assert!(err.to_string().contains("scanner"), "{err}");
     }
@@ -4740,7 +4769,7 @@ mod code_review_tests {
     #[tokio::test]
     async fn scan_review_stamps_head_sha_and_test_command_into_runmeta() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
         let reg = registry(&[("p/m", r#"{"suspicions":[],"scanned_areas":[]}"#)]);
         // K1：无 --test-command 时按项目推断（Cargo.toml → cargo test）进 RunMeta。
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"\n").unwrap();
@@ -4828,11 +4857,7 @@ mod code_review_tests {
     #[test]
     fn scan_entry_spec_pinned_requires_a_reasoning_effort_mapping() {
         use crate::orchestrate::ScanEntrySpec;
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{
-            "deepseek-v4-flash":{"roles":{"scanner":{"reasoningEffort":"low"}}},
-            "grok-4":{"roles":{"scanner":{"reasoningEffort":"high"}}},
-            "gpt-5":{"roles":{"scanner":{"reasoningEffort":"minimal"}}},
-            "qwen3":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"deepseek-v4-flash","reasoningEffort":"low"},{"provider":"p","id":"grok-4","reasoningEffort":"high"},{"provider":"p","id":"gpt-5","reasoningEffort":"minimal"},{"provider":"p","id":"qwen3"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"deepseek-v4-flash"},{"id":"grok-4"},{"id":"gpt-5"},{"id":"qwen3"}]}}}"#).unwrap();
         let roles = cfg.active_roles();
         let pinned: std::collections::BTreeMap<String, bool> = roles.scanners.iter().map(|em| (em.id.clone(), ScanEntrySpec::from(em).reasoning_pinned)).collect();
         assert!(pinned["deepseek-v4-flash"]);
@@ -4899,7 +4924,7 @@ mod code_review_tests {
     }
 
     fn scanner_and_reviewer_cfg() -> Config {
-        Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#).unwrap()
+        Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#).unwrap()
     }
 
     /// 一个 H0 区（敏感路径 + 签名变更、含控制流 → 分数过门槛）+ 一条 scanner 疑点（新增的 `db.write(token);`）的改动。
@@ -4969,7 +4994,7 @@ mod code_review_tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f() {\n    db.write(token);\n}\n");
         let cfg = Config::from_json(
-            r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"ghost":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#,
+            r#"{"settings":{"review":{"scanners":{"samples":2},"roles":{"scanner":{"models":[{"provider":"p","id":"s"},{"provider":"p","id":"ghost"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"ghost"},{"id":"r"}]}}}"#,
         )
         .unwrap();
         let scan_json = format!(r#"{{"suspicions":[{}],"scanned_areas":[]}}"#, susp("write", "db.write(token);", 0.8));
@@ -4987,7 +5012,7 @@ mod code_review_tests {
         let w = &report.run.warnings;
         assert_eq!((report.verdict, code), (Verdict::Incomplete, 3), "{w:?}");
         assert_eq!(report.findings.len(), 1, "深挖照跑、findings 进报告: {w:?}");
-        assert_eq!(report.run.coverage.failed.get(&Role::Scanner), Some(&vec!["scan[g1]@p/ghost#1".to_string()]));
+        assert_eq!(report.run.coverage.failed.get(&Role::Scanner), Some(&vec!["scan[g1]@p/ghost#2".to_string()]));
         assert_eq!(report.run.coverage.completed.get(&Role::Reviewer).map(Vec::len), Some(1));
         assert!(w.iter().any(|x| x == "scan incomplete: 1 blocking finding(s) present — a complete review would reject"), "{w:?}");
         assert!(w.iter().any(|x| x.contains("verdict hard Incomplete")), "scan 段失败披露照旧: {w:?}");
@@ -5014,7 +5039,7 @@ mod code_review_tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/a.rs", "fn f1() {\n    tick();\n    pad();\n    tick();\n}\nfn f2() {\n    tick();\n}\n");
         let cfg = Config::from_json(
-            r#"{"providers":{"p":{"kind":"openai","models":{"alpha":{"roles":{"scanner":{}}},"beta":{"roles":{"scanner":{}}},"gamma":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#,
+            r#"{"settings":{"review":{"scanners":{"samples":3},"roles":{"scanner":{"models":[{"provider":"p","id":"alpha"},{"provider":"p","id":"beta"},{"provider":"p","id":"gamma"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"alpha"},{"id":"beta"},{"id":"gamma"},{"id":"r"}]}}}"#,
         )
         .unwrap();
         let at_line = |line: u32| format!(r#"{{"suspicions":[{{"file":"src/a.rs","line_start":{line},"line_end":{line},"hint":"h","confidence":0.5,"quote":"tick();"}}],"scanned_areas":[]}}"#);
@@ -5073,7 +5098,7 @@ mod spec_tests {
         std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
         let spec_path = root.join("design.md");
         std::fs::write(&spec_path, "DESIGN D8: fail-open").unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
         let (reg, backend) = recorder();
         let args = spec_test_args(vec![spec_path.to_string_lossy().to_string()]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
@@ -5093,7 +5118,7 @@ mod spec_tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "fn f() {\n    let x = 1;\n}\n").unwrap();
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#).unwrap();
         let (reg, backend) = recorder();
         let args = spec_test_args(vec![]);
         let changes = vec![FileChange { path: "src/a.rs".into(), diff: "+    let x = 1;".into() }];
@@ -5115,7 +5140,7 @@ mod tests {
     /// `build_registry` 的 job 分支正是用 `Secrets::default()` 调 `resolve_key_with`。
     #[test]
     fn job_mode_key_resolution_is_env_only() {
-        let cfg = Config::from_json(r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","apiKeyEnv":"JOB_TEST_UNSET_KEY","models":{"m":{"roles":{"scanner":{}}}}}}}"#).unwrap();
+        let cfg = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","apiKeyEnv":"JOB_TEST_UNSET_KEY","models":[{"id":"m"}]}}}"#).unwrap();
         let em = &cfg.active_roles().scanners[0];
         assert!(std::env::var("JOB_TEST_UNSET_KEY").is_err(), "前提：env 未注入");
         assert!(
@@ -5199,7 +5224,7 @@ mod tests {
             mk("scan[g1]@p/y#1", 0, "beta", true, vec![susp("a.rs", "h1b", "q1", Category::L1, 0.7)], 0, 100, 0),
             mk("scan[g2]@p/x#1", 1, "alpha", true, vec![susp("b.rs", "h2", "q2", Category::L3, 0.4)], 0, 0, 0),
         ];
-        let roles = Config::from_json(r#"{"providers":{"p":{"kind":"openai","models":{"x":{"roles":{"scanner":{}}},"y":{"roles":{"scanner":{}}}}}}}"#).unwrap().active_roles();
+        let roles = Config::from_json(r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"x"},{"provider":"p","id":"y"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"x"},{"id":"y"}]}}}"#).unwrap().active_roles();
         let base = |cells: Vec<ScanCellResult>, reused: Vec<String>| ScanFinish {
             groups: vec![], scanned_coverage: Some(0.5), grouping: None,
             risk: Some(crate::domain::RiskMeta { hotspots: 2, r: 1.25, tier: crate::risk::Tier::Mid, budget_cells: 12 }),
@@ -5308,20 +5333,25 @@ mod tests {
         // design §2.2 预算函数：min(768K 绝对帽, (min_ctx − 16K 输出预留)×3 − 24K 壳预留)。
         // 2026-07-28 提帽 256K→768K（1M 窗时代，锚 gpt-5.6 272K 计费悬崖之下）——
         // 128K 缺省档从「帽封顶 256K」翻为「窗口墙生效 312K」是本次显式入账的行为变化。
-        let mk = |models: &str| crate::config::Config::from_json(
-            &r#"{"providers":{"p":{"kind":"openai","models":{MODELS}}}}"#.replace("MODELS", models),
-        ).unwrap().active_roles();
-        let big = r#""big-ctx":{"contextWindow":1000000,"roles":{"scanner":{}}}"#;
-        let small = r#""small-ctx":{"contextWindow":40000,"roles":{"scanner":{}}}"#;
-        let unknown = r#""u":{"roles":{"scanner":{}}}"#;
+        let mk = |models: serde_json::Value, ids: &[&str]| {
+            let pool: Vec<serde_json::Value> = ids.iter().map(|id| serde_json::json!({"provider": "p", "id": id})).collect();
+            let cfg = serde_json::json!({
+                "settings": {"review": {"roles": {"scanner": {"models": pool}}}},
+                "providers": {"p": {"api": "openai-completions", "baseUrl": "https://x", "models": models}},
+            });
+            crate::config::Config::from_json(&cfg.to_string()).unwrap().active_roles()
+        };
+        let big = serde_json::json!([{"id": "big-ctx", "contextWindow": 1000000}]);
+        let small = serde_json::json!([{"id": "small-ctx", "contextWindow": 40000}]);
+        let unknown = serde_json::json!([{"id": "u"}]);
         // 未声明窗口的模型 → 保守缺省 128K → (128K−16K)*3−24K=312K < 768K → 窗口墙生效
-        assert_eq!(pack_budget_bytes(&mk(unknown)), 312_000);
+        assert_eq!(pack_budget_bytes(&mk(unknown, &["u"])), 312_000);
         // 大窗模型（1M）：窗口墙 ≈2.9M → 绝对帽 768K 封顶（≈256K tok 记账 <272K 悬崖）
-        assert_eq!(pack_budget_bytes(&mk(big)), 768_000);
+        assert_eq!(pack_budget_bytes(&mk(big, &["big-ctx"])), 768_000);
         // 小窗模型：(40_000−16_000)*3−24_000 = 48_000
-        assert_eq!(pack_budget_bytes(&mk(small)), 48_000);
+        assert_eq!(pack_budget_bytes(&mk(small, &["small-ctx"])), 48_000);
         // 多模型取最小窗（一份 pack 全模型安全）
-        assert_eq!(pack_budget_bytes(&mk(&format!("{big},{small}"))), 48_000);
+        assert_eq!(pack_budget_bytes(&mk(serde_json::json!([{"id":"big-ctx","contextWindow":1000000},{"id":"small-ctx","contextWindow":40000}]), &["big-ctx","small-ctx"])), 48_000);
         // 无 scanner → 缺省 128K 档
         assert_eq!(pack_budget_bytes(&crate::config::RoleSets::default()), 312_000);
     }

@@ -444,10 +444,10 @@ mod tests {
         EffectiveModel {
             name: name.into(), display_name: None, id: name.rsplit('/').next().unwrap().into(),
             provider: name.split('/').next().unwrap().into(),
-            role: crate::config::Role::Refuter, kind: crate::config::ProviderKind::Openai,
+            role: crate::config::Role::Refuter, api: crate::config::ProviderApi::OpenaiCompletions,
             base_url: None, context_window: 100_000, max_output_tokens: None,
             per_turn_timeout_secs: None, reasoning: false, reasoning_effort: None,
-            family: family.into(), max_concurrency: None,
+            thinking_level_map: None, family: family.into(), max_concurrency: None,
         }
     }
 
@@ -552,6 +552,7 @@ mod tests {
             reviewers: vec![model("p/r", "glm")],
             refuters: vec![model("p/v1", "kimi"), model("p/v2", "qwen")],
             verifiers: vec![],
+            ..Default::default()
         };
         let rev = model("p/r", "glm");
         let names: Vec<&str> = (0..4).map(|i| pick_refuter(&roles, &rev, i).unwrap().0.name.as_str()).collect();
@@ -569,6 +570,7 @@ mod tests {
             reviewers: vec![model("p/r", "glm")],
             refuters: vec![model("p/r", "glm")], // 现配置就是这个形状：一个模型兼两角色
             verifiers: vec![],
+            ..Default::default()
         };
         let (m, warn) = pick_refuter(&same, &model("p/r", "glm"), 0).unwrap();
         assert_eq!(m.name, "p/r");
@@ -579,6 +581,7 @@ mod tests {
             reviewers: vec![model("p/r", "glm")],
             refuters: vec![model("p/r2", "glm")], // 不同模型、同家族
             verifiers: vec![],
+            ..Default::default()
         };
         let (_, warn) = pick_refuter(&kin, &model("p/r", "glm"), 0).unwrap();
         assert!(warn.as_deref().is_some_and(|w| w.contains("同家族")), "同族也要说一声: {warn:?}");
@@ -592,6 +595,7 @@ mod tests {
             reviewers: vec![model("p/r", "glm"), model("p/r2", "kimi")],
             refuters: vec![],
             verifiers: vec![],
+            ..Default::default()
         };
         assert_eq!(pick_refuter(&roles, &model("p/r", "glm"), 0).unwrap().0.name, "p/r2", "异族 reviewer 优先");
 
@@ -600,6 +604,7 @@ mod tests {
             reviewers: vec![model("p/r", "glm")],
             refuters: vec![],
             verifiers: vec![],
+            ..Default::default()
         };
         assert_eq!(pick_refuter(&only_scanner_cross, &model("p/r", "glm"), 0).unwrap().0.name, "p/s", "没有异族 reviewer 就取 scanner 档");
     }
@@ -612,6 +617,7 @@ mod tests {
             reviewers: vec![model("p/r", "glm")],
             refuters: vec![],
             verifiers: vec![],
+            ..Default::default()
         };
         let (m, warn) = pick_refuter(&roles, &model("p/r", "glm"), 0).unwrap();
         assert_eq!(m.name, "p/r");

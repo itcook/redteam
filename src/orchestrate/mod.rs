@@ -95,8 +95,8 @@ impl From<&crate::config::EffectiveModel> for ScanEntrySpec {
     fn from(em: &crate::config::EffectiveModel) -> Self {
         // pinned = 配置了 reasoningEffort **且** 该 (kind, family, id) 真有参数映射并会发出（评审修 9：无映射家族不该触发零推理告警）。
         let pinned = em.reasoning_effort.is_some_and(|e| {
-            crate::provider::backends::reasoning_effort_params(em.kind, &em.family, &em.id, e)
-                .is_some_and(|v| !v.is_empty())
+            let plan = crate::provider::backends::reasoning_plan(em.api, &em.family, &em.id, e, em.thinking_level_map.as_ref());
+            !plan.params.is_empty()
         });
         ScanEntrySpec { route_key: em.name.clone(), family: em.family.clone(), reasoning_pinned: pinned }
     }
@@ -244,11 +244,22 @@ pub async fn run_scan_fanout(
         })
         .collect();
     let samples = input.samples.max(1);
-    let plan: Vec<(usize, &ScanEntrySpec, u32, String)> = (0..input.bundles.len())
-        .flat_map(|g| {
-            input.entries.iter().flat_map(move |e| (1..=samples).map(move |k| (g, e, k, scan_cell_id(g, &e.route_key, k))))
-        })
-        .collect();
+    // v2：scanner 池 = **轮转**（不是扇出）。按稳定的 `(group, sample)` 次序取池：
+    // `index = (group × samples + (sample−1)) % len`——与并发完成顺序无关，重试沿用已分配的格。
+    let n = input.entries.len().max(1);
+    let plan: Vec<(usize, &ScanEntrySpec, u32, String)> = if input.entries.is_empty() {
+        Vec::new()
+    } else {
+        (0..input.bundles.len())
+            .flat_map(|g| {
+                (1..=samples).map(move |k| {
+                    let idx = (g * samples as usize + (k as usize - 1)) % n;
+                    let e = &input.entries[idx];
+                    (g, e, k, scan_cell_id(g, &e.route_key, k))
+                })
+            })
+            .collect()
+    };
     let template_hash = crate::prompt::scan_template_hash();
     if let Some(s) = sink {
         s.on_roles(&[Role::Scanner]);
@@ -678,7 +689,7 @@ mod scan_tests {
         let sink = RecSink::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let fanout = async move {
-            let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&sink), Some(&tx)).await;
+            let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 2), Some(&sink), Some(&tx)).await;
             drop(tx);
             (res, sink, reg, b, entries, repo)
         };
@@ -710,12 +721,12 @@ mod scan_tests {
         assert!(needs[0].arrival.clone().unwrap_or_default().starts_with("needs:src/b.rs:3-9:"), "{keys:?}");
         // 解不出行锚的那条不入队（评审 #13）：入了也只是「无笔记地审文件开头」。
         assert!(!got.iter().any(|r| r.spec.file == "src/c.rs"), "{keys:?}");
-        assert_eq!(res.failed, vec!["scan[g1]@p/ghost#1"]);
+        assert_eq!(res.failed, vec!["scan[g1]@p/ghost#2"]);
         assert_eq!(sink.cells.lock().unwrap().len(), 2);
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None, Some(&tx)).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 2), None, Some(&tx)).await;
         assert_eq!(res.cells.iter().filter(|c| c.record.ok).count(), 1, "接收端已关：发送失败忽略");
         assert_eq!(res.cells[0].output.as_ref().map(|o| o.suspicions.len()), Some(1));
     }
@@ -821,9 +832,9 @@ mod scan_tests {
         let others = vec!["src/f1.rs (g2 +1/-0)".to_string(), "src/f0.rs (g1 +1/-0)".to_string()];
         let entries = vec![entry("p/a", "alpha", false), entry("q/b", "beta", false)];
         let sink = RecSink::new();
-        let res = run_scan_fanout(&reg, &input(&b, &dossiers, &others, repo.path(), &entries, 1), Some(&sink), None).await;
+        let res = run_scan_fanout(&reg, &input(&b, &dossiers, &others, repo.path(), &entries, 2), Some(&sink), None).await;
         let ids: Vec<&str> = res.cells.iter().map(|c| c.cell_id.as_str()).collect();
-        assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g1]@q/b#1", "scan[g2]@p/a#1", "scan[g2]@q/b#1"]);
+        assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g1]@q/b#2", "scan[g2]@p/a#1", "scan[g2]@q/b#2"]);
         assert!(res.cells.iter().all(|c| c.record.ok && c.record.role() == Role::Scanner), "{:?}", res.cells);
         assert_eq!(res.cells[1].family, "beta");
         assert_eq!(res.cells[2].group, 1);
@@ -883,6 +894,32 @@ mod scan_tests {
         assert!(res3.warnings.is_empty(), "门宽 ≥ 格数无排队告警: {:?}", res3.warnings);
     }
 
+    /// v2 轮转：两模型 × 多组，`samples=1` 时按 `(group, sample)` 稳定交替；计划格数/身份与 resume 反解一致。
+    #[tokio::test]
+    async fn scan_rotation_alternates_models_per_group_and_sample() {
+        let repo = repo();
+        let mut reg = ProviderRegistry::new();
+        let turn = turn(&scan_json(""), None, 300);
+        reg.insert_scan("p/a", "p", 8, Box::new(FakeChatBackend::repeating(turn.clone())), Duration::from_secs(5), 0);
+        reg.insert_scan("q/b", "q", 8, Box::new(FakeChatBackend::repeating(turn)), Duration::from_secs(5), 0);
+        let b = bundles(3);
+        let entries = vec![entry("p/a", "alpha", false), entry("q/b", "beta", false)];
+        // samples = 1：三组交替 a, b, a（不是 v1 的 3×2 扇出）
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None, None).await;
+        let plan: Vec<(usize, &str, u32)> = res.cells.iter().map(|c| (c.group, c.route_key.as_str(), c.sample)).collect();
+        assert_eq!(plan, vec![(0, "p/a", 1), (1, "q/b", 1), (2, "p/a", 1)], "稳定 (group, sample) 轮转");
+        assert_eq!(res.cells.len(), 3, "轮转不复制格");
+        // samples = 2：每组两个 sample 各取一个模型（a/#1, b/#2）
+        let res2 = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 2), None, None).await;
+        let plan2: Vec<(usize, &str, u32)> = res2.cells.iter().map(|c| (c.group, c.route_key.as_str(), c.sample)).collect();
+        assert_eq!(plan2, vec![(0, "p/a", 1), (0, "q/b", 2), (1, "p/a", 1), (1, "q/b", 2), (2, "p/a", 1), (2, "q/b", 2)]);
+        // 记录 / manifest 的 model 与分配一致；resume 反解出的 (group, route_key, sample) 同一份。
+        for c in &res2.cells {
+            assert_eq!(c.record.model, c.route_key, "记录 model 必须就是本格分配的模型");
+            assert_eq!(parse_scan_cell_id(&c.cell_id), Some((c.group, c.route_key.clone(), c.sample)), "{}", c.cell_id);
+        }
+    }
+
     /// prd AC2：失败格——未注册条目 Unavailable、Auth 带 usage → failed 列表 + warning + 烧掉的 usage 入账；成功格不受影响。
     #[tokio::test]
     async fn scan_fanout_failed_cells_recorded_with_burned_usage() {
@@ -893,8 +930,8 @@ mod scan_tests {
         let b = bundles(1);
         let entries = vec![entry("p/a", "alpha", false), entry("p/dead", "alpha", false), entry("ghost/x", "gamma", false)];
         let sink = RecSink::new();
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&sink), None).await;
-        assert_eq!(res.failed, vec!["scan[g1]@p/dead#1", "scan[g1]@ghost/x#1"]);
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 3), Some(&sink), None).await;
+        assert_eq!(res.failed, vec!["scan[g1]@p/dead#2", "scan[g1]@ghost/x#3"]);
         assert_eq!(res.warnings.len(), 2);
         assert!(res.warnings[0].contains("auth error") && res.warnings[1].contains("scanner not in registry"), "{:?}", res.warnings);
         let dead = &res.cells[1].record;

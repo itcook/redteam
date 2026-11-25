@@ -150,7 +150,7 @@ pub async fn run_with(
     };
     if deadline.saturating_duration_since(std::time::Instant::now()).is_zero() || early_signal {
         let sink = JobDirCellSink::with_heartbeat(out_dir.clone(), Arc::clone(&heartbeat));
-        let refute_skipped = (cfg.review.refuters.enabled && cfg.active_roles().refuters.is_empty())
+        let refute_skipped = (cfg.settings.review.refuters.enabled && cfg.active_roles().refuters.is_empty())
             .then_some("no_refuter");
         let base_extras = report::ReviewExtras { refute_skipped, ..Default::default() };
         let r = lifecycle::interrupted_report(&manifest, &lang, &cfg, &sink, None, &dismissed, &base_extras);
@@ -278,7 +278,7 @@ async fn run_review(
         extra_partial.push(JobFailure::new("routing_specs_unreadable", Some(prior.specs_unreadable.to_string())));
     }
     // P2：job 模式 + 验真开启 + 未声明 refuter → 跳过验真；报告必须显式披露。
-    let refute_skipped = (cfg.review.refuters.enabled && roles.refuters.is_empty()).then_some("no_refuter");
+    let refute_skipped = (cfg.settings.review.refuters.enabled && roles.refuters.is_empty()).then_some("no_refuter");
     // 正常与中断两条收口路径共享同一份运行事实（否则 SIGTERM 报告会丢 input_consistency / prior_routing）。
     let base_extras = report::ReviewExtras {
         input_consistency: Some(input_consistency.clone()),
@@ -430,10 +430,12 @@ async fn run_triage(
         Ok(h) => h,
         Err(e) => return report::error_report(manifest, lang, &e),
     };
-    let route_key = match crate::triage::triage_route(cfg) {
-        Some(m) => m.name,
-        None => return report::error_report(manifest, lang, &JobFailure::new("missing_role", Some("reviewer".into()))),
-    };
+    let routes = crate::triage::triage_routes(cfg);
+    if routes.is_empty() {
+        return report::error_report(manifest, lang, &JobFailure::new("missing_role", Some("triage".into())));
+    }
+    let route_keys: Vec<String> = routes.iter().map(|(_, k)| k.clone()).collect();
+    let route_names: Vec<String> = routes.iter().map(|(em, _)| em.name.clone()).collect();
     // backend 构造失败 = 配置问题（与 review 同一口径）。
     let registry = match crate::cli::build_registry_for_triage(&triage_args(&base), cfg, over) {
         Ok(r) => r,
@@ -453,7 +455,8 @@ async fn run_triage(
         lang,
         manifest_cap_s: manifest.limits.wall_clock_s,
         deadline,
-        route_key,
+        route_keys,
+        route_names,
     };
     let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::triage::Progress::default()));
     // Phase 5：三 kind 都走心跳；进入模型派发即 running（triage 的 manifest 没有 item 清单，不伪造 progress）。
@@ -708,7 +711,7 @@ mod tests {
     #[test]
     fn prior_routing_cannot_change_blocking_thresholds() {
         let cfg: Config = serde_json::from_str(
-            r#"{"review":{"blockThreshold":"low","confFloor":0.31},"providers":{}}"#,
+            r#"{"settings":{"review":{"blockThreshold":"low","confFloor":0.31}},"providers":{}}"#,
         )
         .unwrap();
         let base = "0".repeat(40);

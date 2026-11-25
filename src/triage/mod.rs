@@ -33,8 +33,11 @@ pub struct TriageRequest<'a> {
     pub manifest_cap_s: u64,
     /// 绝对截止时刻（manifest 墙钟）：I0 与波次预算都从这里扣除已用时间。
     pub deadline: std::time::Instant,
-    /// 三轴使用的模型（`roles.scanner` 的第一条；grill：不新增配置块）。
-    pub route_key: String,
+    /// 三轴使用的模型池（`settings.triage.models`，顺序即轮转序）。
+    /// 轴序 security → drift → intent 依次取池；I0/claims 与报告身份固定用第 1 条。
+    pub route_keys: Vec<String>,
+    /// 报告身份（`provider/id`），与 `route_keys` 等长等序：`source.model` / `f.models` 只认身份串。
+    pub route_names: Vec<String>,
 }
 
 /// 三轴已完成的结果（取消后从这里取已完成部分）。
@@ -58,6 +61,23 @@ pub struct TriageOutcome {
     pub reasons: Vec<JobFailure>,
     /// 合并到 findings 的 model 身份（报告 `source.model`）。
     pub route_key: String,
+}
+
+/// 轴 → 池下标（security=0 / drift=1 / intent=2），与并发完成顺序无关。
+pub(crate) fn axis_route<'a>(keys: &'a [String], axis: usize) -> &'a str {
+    &keys[axis % keys.len()]
+}
+
+impl TriageRequest<'_> {
+    fn route_for(&self, axis: usize) -> &str {
+        axis_route(&self.route_keys, axis)
+    }
+    fn route_identity(&self) -> &str {
+        &self.route_names[0]
+    }
+    fn identity_for(&self, axis: usize) -> &str {
+        &self.route_names[axis % self.route_names.len()]
+    }
 }
 
 fn changed_files(changes: &[FileChange]) -> BTreeSet<String> {
@@ -104,7 +124,7 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
     );
     let i0_budget = budget::scaled_i0_timeout(i0_text_kb, budget_factor).min(remaining.mul_f64(0.8));
     let i0_start = std::time::Instant::now();
-    let claims_run = lenses::run_intent_claims(registry, &req.route_key, req.lang, req.pr, i0_budget).await;
+    let claims_run = lenses::run_intent_claims(registry, req.route_for(0), req.lang, req.pr, i0_budget).await;
     let i0_elapsed = i0_start.elapsed().as_millis() as u64;
 
     // 规模决定分片数：min(4, ceil(total_kb/45), ceil(files/6))；drift 再受 modules 限制。
@@ -113,8 +133,9 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
     let modules: std::collections::BTreeSet<String> =
         files.iter().map(|(p, _)| standards::module_of(p)).collect();
     let n_drift = n_sec.min(modules.len().max(1));
-    let provider_cap = registry
-        .provider_of(&req.route_key)
+    // intent slices 只受 intent 轴所用 provider 的门约束（不是全池最大值）。
+    let intent_cap = registry
+        .provider_of(req.route_for(2))
         .and_then(|p| registry.cap_of(p))
         .unwrap_or(4) as usize;
 
@@ -125,13 +146,13 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
             async {
                 let r = lenses::run_intent_slices(
                     registry,
-                    &req.route_key,
+                    req.route_for(2),
                     req.lang,
                     req.pr,
                     &claims.claims,
                     &files,
                     n_sec,
-                    (provider_cap / 2).max(1),
+                    (intent_cap / 2).max(1),
                     req.deadline,
                     budget_factor,
                 )
@@ -155,14 +176,14 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
+                let r = lenses::run_security(registry, req.route_for(0), req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
                 progress.lock().unwrap().security = Some(r);
             },
             async {
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
+                let r = lenses::run_drift(registry, req.route_for(1), req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
                 progress.lock().unwrap().drift = Some(r);
             }
         );
@@ -185,14 +206,14 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
+                let r = lenses::run_security(registry, req.route_for(0), req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
                 progress.lock().unwrap().security = Some(r);
             },
             async {
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
+                let r = lenses::run_drift(registry, req.route_for(1), req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
                 progress.lock().unwrap().drift = Some(r);
             }
         );
@@ -350,8 +371,13 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
     }
 
     let mut findings = tallied.findings;
-    for f in &mut findings {
-        f.models = vec![req.route_key.clone()];
+    // 归因到实际产出轴：安全轴 → 池[0]，结构性漂移 → 池[1]（intent 不产 findings，只产 blockers/claims）。
+    // `tally::tally` 的 findings 顺序 = 全部安全 finding 后接结构性漂移 finding。
+    let sec_n = prepared.security.len();
+    let sec_route = req.identity_for(0).to_string();
+    let drift_route = req.identity_for(1).to_string();
+    for (i, f) in findings.iter_mut().enumerate() {
+        f.models = vec![if i < sec_n { sec_route.clone() } else { drift_route.clone() }];
     }
     let blockers = tallied.blockers;
     TriageOutcome {
@@ -362,7 +388,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
         axes,
         usage,
         reasons,
-        route_key: req.route_key.clone(),
+        route_key: req.route_identity().to_string(),
     }
 }
 
@@ -423,8 +449,15 @@ pub fn template_hash() -> String {
 
 /// 三轴使用的模型：`roles.reviewer` 的第一条（2026-11-24 用户调整：triage 用 reviewer 的思考档位，
 /// 不再用 scanner；确定性顺序 = 配置的 BTreeMap 顺序）。
-pub fn triage_route(cfg: &crate::config::Config) -> Option<crate::config::EffectiveModel> {
-    cfg.active_roles().reviewers.into_iter().next()
+/// triage 模型池 → 注册表 route key（`triage:<provider>/<id>`）；空池 → 空 vec（由调用方报 `missing_role:triage`）。
+pub fn triage_routes(cfg: &crate::config::Config) -> Vec<(crate::config::EffectiveModel, String)> {
+    cfg.triage_models()
+        .into_iter()
+        .map(|em| {
+            let key = crate::provider::registry::role_key(crate::config::Role::Triage, &em.name);
+            (em, key)
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -1,9 +1,11 @@
 {
-  "$id": "urn:redteam:config/1",
+  "$id": "urn:redteam:config/2",
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
   "definitions": {
     "GroupingCfg": {
-      "description": "`review.grouping`：ocr 双阈值门起步值（4 / 200 / 10，D3）；`semantic` 默认关（R8）。",
+      "additionalProperties": false,
+      "description": "`settings.review.grouping`：ocr 双阈值门起步值（4 / 200 / 10，D3）；`semantic` 默认关（R8）。",
       "properties": {
         "bundleLineThreshold": {
           "default": 200,
@@ -53,7 +55,8 @@
       ]
     },
     "ModelConfig": {
-      "description": "模型（`providers.<name>.models.<id>`）：固有属性只写一次；`roles` 键即该模型参与的角色。",
+      "additionalProperties": false,
+      "description": "模型（`providers.<name>.models[]`）：固有属性只写一次；角色由 `settings.*.models[]` 引用。",
       "properties": {
         "apiKeyEnv": {
           "description": "模型级 key env（覆盖 provider.apiKeyEnv）。",
@@ -72,29 +75,22 @@
           ]
         },
         "displayName": {
-          "description": "人读显示名（`model list` / 将来报告用）；**不是**身份串——身份串固定为 `provider/id`〔D12 定案 3〕。",
+          "description": "人读显示名（`model list` / 报告用）；**不是**身份串。",
           "type": [
             "string",
             "null"
           ]
         },
         "family": {
-          "description": "家族；缺省取 id 首段（deepseek / gemini / glm / kimi）。",
+          "description": "家族；缺省取 id 首段（deepseek / gemini / glm / kimi）。服务 agreement 归族与 reasoning 参数形状。",
           "type": [
             "string",
             "null"
           ]
         },
-        "kind": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ProviderKind"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "覆盖 provider.kind；两层都缺 → validate 报错。"
+        "id": {
+          "description": "模型 id（请求体里的 model；身份串 = `provider/id`）。",
+          "type": "string"
         },
         "maxOutputTokens": {
           "description": "输出上限（max_tokens，≥ 1）：> REDTEAM_MAX_TOKENS env > 32768 默认。",
@@ -119,26 +115,25 @@
           "description": "思考型模型（thinking token 计入输出额度——预算与截断判定参考）。",
           "type": "boolean"
         },
-        "roles": {
-          "additionalProperties": {
-            "$ref": "#/definitions/RoleAttrs"
-          },
-          "default": {},
-          "description": "角色 map：键必须显式枚举（P17：schema 也要拦住 `roles.gerbil` 这类拼写错误， 不能只靠运行期 serde 报错）。schemars 对 `BTreeMap<Role, _>` 只生成 `additionalProperties`，故手写键枚举（与 `MaxCells` 同理由）。",
-          "propertyNames": {
-            "enum": [
-              "scanner",
-              "reviewer",
-              "refuter",
-              "verifier"
-            ]
-          }
+        "thinkingLevelMap": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThinkingLevelMap"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "推理档位翻译表；缺省走内置 family 表。"
         }
       },
+      "required": [
+        "id"
+      ],
       "type": "object"
     },
     "PackBody": {
-      "description": "`review.pack.body`：scanner 组 pack 装包形态；缺省 `slice`〔D8〕，pack 侧实现在批 E。",
+      "description": "`settings.review.pack.body`：scanner 组 pack 装包形态；缺省 `slice`〔D8〕。",
       "enum": [
         "full",
         "slice"
@@ -146,6 +141,7 @@
       "type": "string"
     },
     "PackCfg": {
+      "additionalProperties": false,
       "properties": {
         "anchorWindow": {
           "default": 30,
@@ -163,14 +159,14 @@
         },
         "findingWindow": {
           "default": 30,
-          "description": "finding 判定半径（design §10.4，M21d 批 B-2）：锚点离最近改动行超过 N 行即「窗外」。 **与 `anchorWindow` 是两回事**——那个是装包的禁真空窗半径，调参方向相反（装包半径大一点更安全， 判定半径大一点更宽松），共用一个键会让调任一方都要跑两套回归〔批 B 开工裁定 1〕。 0 = 连观测都关。",
+          "description": "finding 判定半径；**与 `anchorWindow` 是两回事**；0 = 连观测都关。",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "findingWindowEnforce": {
           "default": false,
-          "description": "窗外 finding 是否**降级**（移出 findings、只进披露）。默认 false = 只观测不改产出 〔批 B 开工裁定 2：先拿真实分布再定阈值；直接丢 = 静默少报〕。",
+          "description": "窗外 finding 是否**降级**（移出 findings、只进披露）。默认 false = 只观测不改产出。",
           "type": "boolean"
         },
         "sliceMinBytes": {
@@ -183,9 +179,27 @@
       },
       "type": "object"
     },
+    "ProviderApi": {
+      "description": "通道 API（v2 三值，**不接受别名**）。`openai-responses` 仅预留：配置期即拒绝。",
+      "enum": [
+        "openai-completions",
+        "anthropic-messages",
+        "openai-responses"
+      ],
+      "type": "string"
+    },
     "ProviderConfig": {
-      "description": "`providers.<name>`：通道层。`maxConcurrency` = 该 provider 在途上限（缺省继承 `review.maxConcurrency`；在途锁批 F 接线）。",
+      "additionalProperties": false,
+      "description": "`providers.<name>`：通道层。`maxConcurrency` = 该 provider 在途上限（缺省继承 `settings.review.maxConcurrency`）。",
       "properties": {
+        "api": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderApi"
+            }
+          ],
+          "description": "通道 API（必填）。"
+        },
         "apiKeyEnv": {
           "type": [
             "string",
@@ -193,20 +207,8 @@
           ]
         },
         "baseUrl": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "kind": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ProviderKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "description": "端点（必填；不再按 api 猜默认）。",
+          "type": "string"
         },
         "maxConcurrency": {
           "format": "uint32",
@@ -217,27 +219,21 @@
           ]
         },
         "models": {
-          "additionalProperties": {
+          "default": [],
+          "items": {
             "$ref": "#/definitions/ModelConfig"
           },
-          "default": {},
-          "type": "object"
+          "type": "array"
         }
       },
+      "required": [
+        "api",
+        "baseUrl"
+      ],
       "type": "object"
     },
-    "ProviderKind": {
-      "description": "各变体的 `#[serde(alias = ...)]` 是别名的唯一真相源；`model::validate_setup` 的报错文案 手工抄了一份人读版本（serde alias 列表运行时不可反射）——改这里的别名记得同步改那边的文案。",
-      "enum": [
-        "anthropic",
-        "openai",
-        "openai-compatible",
-        "google"
-      ],
-      "type": "string"
-    },
     "ReasoningEffort": {
-      "description": "推理强度（角色属性：同一模型可在 scanner 位 low、reviewer 位 high）。backend 消费在批 F。 值原样透传给上游；`off` / `none` 不再建模——只有极少数模型支持关推理，需要时由模型默认行为决定。",
+      "description": "推理强度（角色属性：同一模型可在 scanner 位 low、reviewer 位 high）。backend 消费在 `provider::backends`。",
       "enum": [
         "minimal",
         "low",
@@ -250,7 +246,8 @@
       "type": "string"
     },
     "RefutersCfg": {
-      "description": "`review.refuters`：评审内 finding 验真（refute）开关。**缺省关**——批 D-4 的离线基线按预登记阈值裁定 （误驳 ≤ 5% ∧ 驳回 ≥ 30% 才默认开）：异族 deepseek-flash 驳回 31.2% / 误驳 12.0%、 同族 glm-5.3 驳回 18.8% / 误驳 8.0%，两臂的误驳都超门槛 → 默认关，要开显式写 `\"enabled\": true`。 （数字为收口修掉「角色尾未 render」后的重跑值；修前那版见 research 的对照表。） 数字与归因见 `.next/research/2026-09-21-redteam-verifier-offline-baseline-research.md`（历史文档，保留原名）。 缺省关 = `bool` 的 `Default`，故直接 derive：serde 缺省与 `Default` 只此一个来源，不会各说各话 （`refuters_enabled_defaults_off` 钉住两条路径同值）。",
+      "additionalProperties": false,
+      "description": "`settings.review.refuters`：评审内 finding 验真（refute）开关。**缺省关**。\n\n池空 + `enabled=true` 的分叉（Q6 裁决）： - 本地：保留自动异族回退（reviewer → scanner；无外族才同族 + warning）。 - job：跳过复核，报告 `extensions.redteam.refute_skipped = \"no_refuter\"`。",
       "properties": {
         "enabled": {
           "default": false,
@@ -260,6 +257,7 @@
       "type": "object"
     },
     "ReviewConfig": {
+      "additionalProperties": false,
       "properties": {
         "blockThreshold": {
           "allOf": [
@@ -289,7 +287,7 @@
         },
         "maxConcurrency": {
           "default": 10,
-          "description": "全局在途上限缺省（10，D13）；provider 级 `maxConcurrency` 缺省继承它。provider 在途门是唯一一道闸（design §12.3）： 无角色级 workers；> `MAX_CONCURRENCY_SANE` 只 warning（像是把 maxOutputTokens 填错了字段）。",
+          "description": "全局在途上限缺省（10，D13）；provider 级 `maxConcurrency` 缺省继承它。**唯一一道闸**（无角色级 workers）。",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
@@ -316,8 +314,7 @@
           ],
           "default": {
             "enabled": false
-          },
-          "description": "评审内 finding 验真开关（角色 `refuter`）。**缺省关**（数值依据见 `RefutersCfg`）。"
+          }
         },
         "reviewers": {
           "allOf": [
@@ -329,6 +326,25 @@
             "maxCells": "auto",
             "reenqueue": false
           }
+        },
+        "roles": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReviewRoles"
+            }
+          ],
+          "default": {
+            "refuter": {
+              "models": []
+            },
+            "reviewer": {
+              "models": []
+            },
+            "scanner": {
+              "models": []
+            }
+          },
+          "description": "评审三角色的模型池。"
         },
         "scanners": {
           "allOf": [
@@ -352,7 +368,45 @@
       },
       "type": "object"
     },
+    "ReviewRoles": {
+      "additionalProperties": false,
+      "description": "`settings.review.roles`：评审三角色的模型池。",
+      "properties": {
+        "refuter": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RolePool"
+            }
+          ],
+          "default": {
+            "models": []
+          }
+        },
+        "reviewer": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RolePool"
+            }
+          ],
+          "default": {
+            "models": []
+          }
+        },
+        "scanner": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RolePool"
+            }
+          ],
+          "default": {
+            "models": []
+          }
+        }
+      },
+      "type": "object"
+    },
     "ReviewersCfg": {
+      "additionalProperties": false,
       "properties": {
         "maxCells": {
           "allOf": [
@@ -369,9 +423,16 @@
       },
       "type": "object"
     },
-    "RoleAttrs": {
-      "description": "角色属性（`models.<id>.roles.<role>`）。将来的角色级旋钮只加在这里。",
+    "RoleModelRef": {
+      "additionalProperties": false,
+      "description": "角色池条目：`{provider, id, reasoningEffort?}`。",
       "properties": {
+        "id": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
         "reasoningEffort": {
           "anyOf": [
             {
@@ -383,17 +444,121 @@
           ]
         }
       },
+      "required": [
+        "id",
+        "provider"
+      ],
+      "type": "object"
+    },
+    "RolePool": {
+      "additionalProperties": false,
+      "description": "角色池（`settings.review.roles.<role>` / `settings.triage` / `settings.verify`）。",
+      "properties": {
+        "models": {
+          "default": [],
+          "description": "有序轮转池；长度 1 合法。空池 = 角色缺席。",
+          "items": {
+            "$ref": "#/definitions/RoleModelRef"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "ScannersCfg": {
-      "description": "角色节（design §12.1〔D13〕）：无角色级 `workers`——并发只看 provider `maxConcurrency`（唯一闸，§12.3）。",
+      "additionalProperties": false,
+      "description": "`settings.review.scanners`：同模型多 lens 采样并集（E3：方差对冲旋钮）。",
       "properties": {
         "samples": {
           "default": 1,
-          "description": "同模型多 lens 采样并集（E3：方差对冲旋钮）。",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Settings": {
+      "additionalProperties": false,
+      "description": "`settings`：怎么用（语言、管线旋钮、角色池）。",
+      "properties": {
+        "language": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Language"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "输出语言（`zh_CN` | `en_US`）；缺省：本地 locale / job `en_US`。"
+        },
+        "review": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReviewConfig"
+            }
+          ],
+          "default": {
+            "blockThreshold": "medium",
+            "confFloor": 0.5,
+            "grouping": {
+              "bundleLineThreshold": 200,
+              "maxFilesPerGroup": 10,
+              "minFiles": 4,
+              "semantic": false
+            },
+            "maxConcurrency": 10,
+            "pack": {
+              "anchorWindow": 30,
+              "body": "slice",
+              "findingWindow": 30,
+              "findingWindowEnforce": false,
+              "sliceMinBytes": 8192
+            },
+            "refuters": {
+              "enabled": false
+            },
+            "reviewers": {
+              "maxCells": "auto",
+              "reenqueue": false
+            },
+            "roles": {
+              "refuter": {
+                "models": []
+              },
+              "reviewer": {
+                "models": []
+              },
+              "scanner": {
+                "models": []
+              }
+            },
+            "scanners": {
+              "samples": 1
+            },
+            "tools": "two-stage"
+          }
+        },
+        "triage": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RolePool"
+            }
+          ],
+          "default": {
+            "models": []
+          }
+        },
+        "verify": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RolePool"
+            }
+          ],
+          "default": {
+            "models": []
+          }
         }
       },
       "type": "object"
@@ -407,8 +572,57 @@
       ],
       "type": "string"
     },
+    "ThinkingLevelMap": {
+      "additionalProperties": false,
+      "description": "`reasoningEffort` 的模型级翻译表（`models[].thinkingLevelMap`）：我方档位 → provider 实际强度值。 键缺失与 `null` 同义：省略该档位的整组推理参数（不保证上游默认推理关闭）；整键缺省 → 回退内置 family 表。",
+      "properties": {
+        "high": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "low": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "medium": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "minimal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ultra": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "xhigh": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ToolsMode": {
-      "description": "评审工具档位（design 2026-07-13 §2.4）：off / two-stage（默认）/ on。M21b 定工具分层前保留不动。",
+      "description": "评审工具档位（design 2026-07-13 §2.4）：off / two-stage（默认）/ on。",
       "enum": [
         "off",
         "two-stage",
@@ -418,17 +632,6 @@
     }
   },
   "properties": {
-    "language": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/Language"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "输出语言（P15 / 计划 1.4）：顶层键，`zh_CN` | `en_US`。 缺省（None）时：本地模式沿用 locale 探测，job 模式固定 `en_US` 且**不读 env**。"
-    },
     "providers": {
       "additionalProperties": {
         "$ref": "#/definitions/ProviderConfig"
@@ -436,44 +639,63 @@
       "default": {},
       "type": "object"
     },
-    "review": {
+    "settings": {
       "allOf": [
         {
-          "$ref": "#/definitions/ReviewConfig"
+          "$ref": "#/definitions/Settings"
         }
       ],
       "default": {
-        "blockThreshold": "medium",
-        "confFloor": 0.5,
-        "grouping": {
-          "bundleLineThreshold": 200,
-          "maxFilesPerGroup": 10,
-          "minFiles": 4,
-          "semantic": false
+        "review": {
+          "blockThreshold": "medium",
+          "confFloor": 0.5,
+          "grouping": {
+            "bundleLineThreshold": 200,
+            "maxFilesPerGroup": 10,
+            "minFiles": 4,
+            "semantic": false
+          },
+          "maxConcurrency": 10,
+          "pack": {
+            "anchorWindow": 30,
+            "body": "slice",
+            "findingWindow": 30,
+            "findingWindowEnforce": false,
+            "sliceMinBytes": 8192
+          },
+          "refuters": {
+            "enabled": false
+          },
+          "reviewers": {
+            "maxCells": "auto",
+            "reenqueue": false
+          },
+          "roles": {
+            "refuter": {
+              "models": []
+            },
+            "reviewer": {
+              "models": []
+            },
+            "scanner": {
+              "models": []
+            }
+          },
+          "scanners": {
+            "samples": 1
+          },
+          "tools": "two-stage"
         },
-        "maxConcurrency": 10,
-        "pack": {
-          "anchorWindow": 30,
-          "body": "slice",
-          "findingWindow": 30,
-          "findingWindowEnforce": false,
-          "sliceMinBytes": 8192
+        "triage": {
+          "models": []
         },
-        "refuters": {
-          "enabled": false
-        },
-        "reviewers": {
-          "maxCells": "auto",
-          "reenqueue": false
-        },
-        "scanners": {
-          "samples": 1
-        },
-        "tools": "two-stage"
+        "verify": {
+          "models": []
+        }
       }
     }
   },
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "title": "redteam executor config",
   "type": "object"
 }
