@@ -46,6 +46,7 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
+      sha: ${{ steps.meta.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,6 +91,7 @@ jobs:
             echo "tag=$tag"
             echo "version=$version"
             echo "prerelease=$prerelease"
+            echo "sha=$head_sha"
           } >>"$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------- 构建 + 打包
@@ -101,8 +103,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          # 构建与 prepare 验的是同一个 commit（tag 可移动，不能按 tag 重新解析）。
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
+          fetch-tags: true
+
+      - name: 校验 tag 仍指向该 commit
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          if [ "$head_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::checkout HEAD $head_sha 与 prepare 的 $EXPECTED_SHA 不一致"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::找不到 tag $TAG（fetch-tags 未生效？）"
+            exit 1
+          fi
+          tag_sha="$(git rev-parse "$TAG^{commit}")"
+          if [ "$tag_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::tag $TAG 在 prepare 后被移动：$tag_sha != $EXPECTED_SHA"
+            exit 1
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -152,6 +177,64 @@ jobs:
             dist/release/install.sh
             dist/release/config.schema.json
 
+      - name: 回验 GitHub Release 资产
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          asset="$(basename "$(ls dist/release/*.tar.gz)")"
+          sha256() { # file
+            if command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "$1" | awk '{print $1}'
+            else
+              sha256sum "$1" | awk '{print $1}'
+            fi
+          }
+          fail=0
+          check_url() {
+            local code attempt=1
+            while :; do
+              code="$(curl -s -o /dev/null -w '%{http_code}' -L -I "$1" || true)"
+              if [ "$code" = "200" ]; then
+                echo "  ok   $1"
+                return
+              fi
+              if [ "$attempt" -ge 3 ]; then
+                echo "  FAIL $1 (HTTP $code)"
+                fail=1
+                return
+              fi
+              attempt=$((attempt + 1))
+              sleep 3
+            done
+          }
+          check_asset() { # local_path url
+            local want tmp attempt=1
+            want="$(sha256 "$1")"
+            tmp="$(mktemp)"
+            while :; do
+              if curl -fsSL "$2" -o "$tmp" 2>/dev/null && [ "$(sha256 "$tmp")" = "$want" ]; then
+                echo "  ok   $2 (sha256 匹配)"
+                break
+              fi
+              if [ "$attempt" -ge 3 ]; then
+                echo "  FAIL $2（下载失败或 sha 不一致）"
+                fail=1
+                break
+              fi
+              attempt=$((attempt + 1))
+              sleep 3
+            done
+            rm -f "$tmp"
+          }
+          check_url "$base/$asset"
+          check_url "$base/SHA256SUMS"
+          check_url "$base/install.sh"
+          check_url "$base/config.schema.json"
+          check_asset "dist/release/$asset" "$base/$asset"
+          check_asset dist/release/config.schema.json "$base/config.schema.json"
+          [ "$fail" = 0 ] || { echo "::error::GitHub Release 回验失败"; exit 1; }
   # ---------------------------------------------------------------- R2 凭据检查
   check_r2:
     name: 检查 R2 凭据
@@ -223,31 +306,50 @@ jobs:
           }
 
           put() { # local_path remote_key content_type
-            aws s3 cp "$1" "s3://${R2_BUCKET}/${prefix}/$2" \
-              --endpoint-url "$R2_STATIC_ENDPOINT" \
-              --content-type "$3" --cache-control no-cache
+            # AWS CLI 只读 AWS_*；R2_* 是本仓的命名，必须显式映射。
+            AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+            AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+              aws s3 cp "$1" "s3://${R2_BUCKET}/${prefix}/$2" \
+                --endpoint-url "$R2_STATIC_ENDPOINT" \
+                --content-type "$3" --cache-control no-cache
           }
 
           fail=0
           check_url() {
-            code="$(curl -s -o /dev/null -w '%{http_code}' -L -I "$1" || true)"
-            if [ "$code" = "200" ]; then
-              echo "  ok   $1"
-            else
-              echo "  FAIL $1 (HTTP $code)"
-              fail=1
-            fi
+            local code attempt=1
+            while :; do
+              code="$(curl -s -o /dev/null -w '%{http_code}' -L -I "$1" || true)"
+              if [ "$code" = "200" ]; then
+                echo "  ok   $1"
+                return
+              fi
+              if [ "$attempt" -ge 3 ]; then
+                echo "  FAIL $1 (HTTP $code)"
+                fail=1
+                return
+              fi
+              attempt=$((attempt + 1))
+              sleep 3
+            done
           }
 
           check_asset() { # local_path url
+            local want tmp attempt=1
+            want="$(sha256 "$1")"
             tmp="$(mktemp)"
-            curl -fsSL "$2" -o "$tmp" 2>/dev/null || true
-            if [ "$(sha256 "$1")" = "$(sha256 "$tmp")" ]; then
-              echo "  ok   $2 (sha256 匹配)"
-            else
-              echo "  FAIL $2（远端与本地不一致）"
-              fail=1
-            fi
+            while :; do
+              if curl -fsSL "$2" -o "$tmp" 2>/dev/null && [ "$(sha256 "$tmp")" = "$want" ]; then
+                echo "  ok   $2 (sha256 匹配)"
+                break
+              fi
+              if [ "$attempt" -ge 3 ]; then
+                echo "  FAIL $2（下载失败或 sha 不一致）"
+                fail=1
+                break
+              fi
+              attempt=$((attempt + 1))
+              sleep 3
+            done
             rm -f "$tmp"
           }
 
@@ -270,9 +372,15 @@ jobs:
           check_url "${public_base}/v${version}/SHA256SUMS"
           check_url "${public_base}/install.sh"
           check_url "${public_base}/config.schema.json"
+          check_asset dist/release/config.schema.json "${public_base}/config.schema.json"
           if [ "$PRERELEASE" != "true" ]; then
             check_url "${public_base}/latest"
-            have_latest="$(curl -fsSL "${public_base}/latest" || true)"
+            have_latest=""
+            for attempt in 1 2 3; do
+              have_latest="$(curl -fsSL "${public_base}/latest" || true)"
+              if [ "$have_latest" = "v${version}" ]; then break; fi
+              sleep 3
+            done
             if [ "$have_latest" = "v${version}" ]; then
               echo "  ok   latest → v${version}"
             else
