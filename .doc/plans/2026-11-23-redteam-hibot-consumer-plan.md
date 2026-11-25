@@ -225,8 +225,9 @@
 | 1.8 | **错误路径的报告可写性**（hibot B5 已裁）：① **仅 manifest 不可解析** → 不写 `report.json`（runner 按无报告=error），**禁止伪造 job_id/SHA/零值 summary**；② triage 的 `summary` **只在 `status=ok` 时必需**，`partial` 可省、`error` 不写摘要；③ verify 的 `verifications` **仅当输入指纹集合为空时允许空数组**，其余必须逐条覆盖 | `src/job/report.rs` | 三 kind 各一条：manifest 损坏→无报告非零退出；triage error→有报告但无 summary；verify 空输入→有报告且 `verifications: []` |
 | 1.9 | **配置契约外化**（P17）：`config schema` + `config check <path|json> --kind`；生成物入库 `dist/config.schema.json`，`make verify` 零 diff；job 模式未知键与密钥类字段 → error。**生成 schema 的硬前提（hibot 要求，四条缺一不可）**：① 顶层 `language` 已入 `Config`（1.4）；② `review.verifiers{enabled}` 已在（**已具备**）；③ `roles` 枚举已含 `scanner`/`reviewer`/`refuter`/`verifier`（**依赖 0.8 改名**）；④ provider `kind` 为 kebab-case（**已具备**，`openai-compatible`）。**否则 hibot 示例会被判 error** | `src/config/`（derive + schema 生成）、`src/cli/`、`dist/config.schema.json`、`tests/packaging.rs`、**`Makefile`**（`verify` 加 `git diff --exit-code dist/`） | 四条前提齐备后才生成；合法样例通过；未知键/错枚举/错类型/密钥字段四类各报错；`--kind review` 缺 scanner 报错；**退出码二值 + WARN 不影响退出码 + 诊断只走 stdout**（hibot 三点要求）；**用 hibot 示例跑一遍并回报**（B1） |
 
----
+> **2026-11-25 修订（config v2，取代 1.9 的 v1 形状）**：`providers.*.kind` → `api`（三值 `openai-completions`/`anthropic-messages`/`openai-responses`，`google` 删除，`baseUrl` 必填）；`language` 移入 `settings.language`；角色从 `models[].roles` 移到 `settings.{review.roles,triage,verify}.models[]`（轮转池，长度 1 合法）；`apiKey` 仅限本地、job 模式出现即 `secret_field`；`review.*` 整节移入 `settings.review`。schema `$id: urn:redteam:config/2`、`schemaVersion: 2`（capabilities 同值，有相等断言）。硬切无别名，旧结构 `config check` 逐字段报迁移 Pointer。设计见 `.doc/design/2026-11-25-redteam-config-v2-design.md`。
 
+---
 ## 5. Phase 2 · review 端到端（解锁 hibot M2）
 
 **2.0 数据流（先写清再实现）**
