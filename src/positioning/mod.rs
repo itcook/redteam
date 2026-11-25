@@ -9,7 +9,7 @@ fn normalize_ws(s: &str) -> String {
 }
 
 /// 受 root 约束读取：拒绝绝对路径与 `..`；二进制/超大/不存在 → None。
-fn safe_read(root: &Path, rel: &str) -> Option<String> {
+pub(crate) fn safe_read(root: &Path, rel: &str) -> Option<String> {
     let p = Path::new(rel);
     if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
         return None;
