@@ -1,17 +1,17 @@
 pub mod probe;
 
-use crate::config::{Config, ProviderKind};
+use crate::config::{Config, ProviderApi};
 
 pub const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 pub const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 
-/// 有效 base URL：显式 baseUrl 优先，否则按 kind 取默认。
-pub fn effective_base(base_url: Option<&str>, kind: ProviderKind) -> String {
+/// 有效 base URL：显式 baseUrl 优先，否则按 api 取默认。
+pub fn effective_base(base_url: Option<&str>, kind: ProviderApi) -> String {
     if let Some(b) = base_url {
         return b.to_string();
     }
     match kind {
-        ProviderKind::Anthropic => ANTHROPIC_DEFAULT_BASE.to_string(),
+        ProviderApi::AnthropicMessages => ANTHROPIC_DEFAULT_BASE.to_string(),
         _ => OPENAI_DEFAULT_BASE.to_string(),
     }
 }
@@ -19,10 +19,10 @@ pub fn effective_base(base_url: Option<&str>, kind: ProviderKind) -> String {
 /// 端点探测（可注入）：`list_models` 带 key 查 `{base}/models`——
 /// 成功(2xx)即认证通过 + 端点正确，返回模型 id 列表；失败(401/404/连不上)→Err。
 /// 认证头随 `kind` 分派（Anthropic 用 `x-api-key`+`anthropic-version`，其余 bearer；
-/// 见 `probe::auth_headers`），故调用方须传入 provider 的 `ProviderKind`。
+/// 见 `probe::auth_headers`），故调用方须传入 provider 的 `ProviderApi`。
 #[async_trait::async_trait]
 pub trait Prober: Send + Sync {
-    async fn list_models(&self, base_url: &str, key: Option<&str>, kind: ProviderKind) -> anyhow::Result<Vec<String>>;
+    async fn list_models(&self, base_url: &str, key: Option<&str>, kind: ProviderApi) -> anyhow::Result<Vec<String>>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,7 +65,7 @@ pub async fn check_all(cfg: &Config, prober: &dyn Prober) -> Vec<Availability> {
         let key = cfg.resolve_key(&em.provider, &em.id);
         let key_present = key.is_some();
         let (reachable, model_listed) =
-            match prober.list_models(&effective_base(em.base_url.as_deref(), em.kind), key.as_deref(), em.kind).await {
+            match prober.list_models(&effective_base(em.base_url.as_deref(), em.api), key.as_deref(), em.api).await {
                 Ok(ids) => {
                     let listed = if ids.is_empty() {
                         None
@@ -92,24 +92,20 @@ pub fn check_exit_code(avs: &[Availability]) -> i32 {
     }
 }
 
-/// 推断 provider kind：显式 > 有 base_url(openai-compatible) > 按名推断 > 兜底 openai-compatible。
-/// 显式 kind 若非法（`ProviderKind::parse` 失败）视同未提供、落回后续推断——CLI 层
-/// （`model setup`）在调用本函数前已用 `validate_setup` 对显式输入把关，故此处到达
-/// 「非法显式值」分支时调用方本已提前拒绝；本函数独立单测时对此保守兜底、不 panic。
-pub fn derive_kind(provider: &str, explicit_kind: Option<&str>, base_url: Option<&str>) -> ProviderKind {
-    if let Some(k) = explicit_kind.and_then(ProviderKind::parse) {
+/// 推断 provider api（`model setup` 新建 provider 用）：显式 > 有 base_url(openai-completions) >
+/// 按名推断 > 兜底 openai-completions。v2 无别名；显式值由 `validate_setup` 先把关。
+pub fn derive_api(provider: &str, explicit_api: Option<&str>, base_url: Option<&str>) -> ProviderApi {
+    if let Some(k) = explicit_api.and_then(ProviderApi::parse) {
         return k;
     }
     if base_url.is_some() {
-        return ProviderKind::OpenaiCompatible;
+        return ProviderApi::OpenaiCompletions;
     }
     let p = provider.to_lowercase();
     if p.contains("claude") || p.contains("anthropic") {
-        ProviderKind::Anthropic
-    } else if p.contains("gpt") || p.contains("openai") {
-        ProviderKind::Openai
+        ProviderApi::AnthropicMessages
     } else {
-        ProviderKind::OpenaiCompatible
+        ProviderApi::OpenaiCompletions
     }
 }
 
@@ -126,17 +122,12 @@ pub fn derive_api_key_env(provider: &str) -> String {
     format!("{norm}_API_KEY")
 }
 
-/// `model setup` 写入前守卫：kind 必须是合法 ProviderKind（含别名），base_url 若提供必须是
-/// http(s) URI 且有 host。任一不合法返回 Err（调用方提示并拒绝写入），避免污染配置导致后续
-/// 整份 config 解析失败（如曾经的 kind="claude" → check 无输出）。
-pub fn validate_setup(kind: &str, base_url: Option<&str>) -> Result<(), String> {
-    if ProviderKind::parse(kind).is_none() {
-        // 别名文案与 `ProviderKind` 各变体的 `#[serde(alias = ...)]` 手动保持同步——
-        // serde 的 alias 列表运行时不可反射，无法程序化生成；改一处务必顺手改另一处
-        // （batch4 polish 评估：converge 成本高于价值，改留交叉引用注释）。
+/// `model setup` 写入前守卫：api 必须是 v2 三值之一（无别名），base_url 若提供必须是
+/// http(s) URI 且有 host。任一不合法返回 Err（调用方提示并拒绝写入）。
+pub fn validate_setup(api: &str, base_url: Option<&str>) -> Result<(), String> {
+    if ProviderApi::parse(api).is_none() {
         return Err(format!(
-            "非法 provider kind '{kind}'。合法值：anthropic(别名 claude) / openai(别名 gpt) / \
-             openai-compatible(别名 openai_compatible/compatible) / google(别名 gemini)"
+            "非法 provider api '{api}'。v2 只接受：openai-completions / anthropic-messages / openai-responses（最后一个仅预留）"
         ));
     }
     if let Some(b) = base_url {
@@ -159,10 +150,10 @@ pub fn render_model_list(cfg: &Config, avs: &[Availability], config_path: &str) 
             .map(|a| a.status_str())
             .unwrap_or("?");
         let display = em.display_name.as_deref().map(|d| format!("  ({d})")).unwrap_or_default();
-        lines.push(format!("[{}] {}/{}{display}  [{}]  {status}", em.role.as_str(), em.provider, em.id, em.kind.as_str()));
+        lines.push(format!("[{}] {}/{}{display}  [{}]  {status}", em.role.as_str(), em.provider, em.id, em.api.as_str()));
     }
     if lines.is_empty() {
-        lines.push("(no model has roles.scanner / reviewer / refuter / verifier — `redteam model setup --provider X --model <id> --role scanner …`)".into());
+        lines.push("(no model in any role pool — `redteam model setup --provider X --model <id> --role scanner …`)".into());
     }
     let mut out = lines.join("\n");
     out.push_str(&format!("\n\nconfig: {config_path}  (user-level only; REDTEAM_HOME overrides)"));
@@ -175,7 +166,7 @@ pub struct FakeProber {
 }
 #[async_trait::async_trait]
 impl Prober for FakeProber {
-    async fn list_models(&self, _base_url: &str, _key: Option<&str>, _kind: ProviderKind) -> anyhow::Result<Vec<String>> {
+    async fn list_models(&self, _base_url: &str, _key: Option<&str>, _kind: ProviderApi) -> anyhow::Result<Vec<String>> {
         match &self.models {
             Some(m) => Ok(m.clone()),
             None => Err(anyhow::anyhow!("simulated auth/connection failure")),
@@ -195,11 +186,10 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn check_all_authed_probe_truth_table() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("ALPHA_KEY", "k"); std::env::remove_var("BETA_KEY"); }
         let cfg = cfg_with(
-            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"displayName":"alpha","apiKeyEnv":"ALPHA_KEY","roles":{"scanner":{}}}}},
-                "beta_p":{"kind":"openai","apiKeyEnv":"BETA_KEY","models":{"b":{"displayName":"beta","roles":{"reviewer":{}}}}}}}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"alpha_p","id":"a"}]},"reviewer":{"models":[{"provider":"beta_p","id":"b"}]}}}},"providers":{"alpha_p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"a","displayName":"alpha","apiKeyEnv":"ALPHA_KEY"}]},"beta_p":{"api":"openai-completions","apiKeyEnv":"BETA_KEY","baseUrl":"https://x","models":[{"id":"b","displayName":"beta"}]}}}"#,
         );
         // 认证成功，/models 含 alpha 的 model "a"
         let ok = FakeProber { models: Some(vec!["a".into(), "z".into()]) };
@@ -212,7 +202,7 @@ mod tests {
 
         // 认证失败（401/连不上）→ 即便 key 在也不可用（修复 base 错配的假阳性）
         let cfg_a = cfg_with(
-            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"displayName":"alpha","apiKeyEnv":"ALPHA_KEY","roles":{"scanner":{}}}}}}}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"alpha_p","id":"a"}]}}}},"providers":{"alpha_p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"a","displayName":"alpha","apiKeyEnv":"ALPHA_KEY"}]}}}"#,
         );
         let fail = FakeProber { models: None };
         let avs2 = check_all(&cfg_a, &fail).await;
@@ -238,15 +228,15 @@ mod tests {
     }
 
     #[test]
-    fn derive_kind_rules() {
-        assert_eq!(derive_kind("anything", Some("anthropic"), None), ProviderKind::Anthropic); // 显式优先
-        assert_eq!(derive_kind("x", None, Some("http://h/v1")), ProviderKind::OpenaiCompatible); // base_url
-        assert_eq!(derive_kind("claude", None, None), ProviderKind::Anthropic); // 名推断
-        assert_eq!(derive_kind("gpt", None, None), ProviderKind::Openai);
-        assert_eq!(derive_kind("mystery", None, None), ProviderKind::OpenaiCompatible); // 兜底
-        // 显式别名按 ProviderKind::parse 规范化；非法显式值落回推断链（不 panic）
-        assert_eq!(derive_kind("anything", Some("claude"), None), ProviderKind::Anthropic);
-        assert_eq!(derive_kind("mystery", Some("bogus"), None), ProviderKind::OpenaiCompatible);
+    fn derive_api_rules() {
+        assert_eq!(derive_api("anything", Some("anthropic-messages"), None), ProviderApi::AnthropicMessages); // 显式优先
+        assert_eq!(derive_api("x", None, Some("http://h/v1")), ProviderApi::OpenaiCompletions); // base_url
+        assert_eq!(derive_api("claude", None, None), ProviderApi::AnthropicMessages); // 名推断
+        assert_eq!(derive_api("gpt", None, None), ProviderApi::OpenaiCompletions);
+        assert_eq!(derive_api("mystery", None, None), ProviderApi::OpenaiCompletions); // 兜底
+        // v2 无别名：非法显式值落回推断链（不 panic）
+        assert_eq!(derive_api("mystery", Some("bogus"), None), ProviderApi::OpenaiCompletions);
+        assert_eq!(derive_api("mystery", Some("claude"), None), ProviderApi::OpenaiCompletions, "别名不再接受");
     }
 
     #[test]
@@ -261,34 +251,34 @@ mod tests {
     }
 
     #[test]
-    fn validate_setup_guards_kind_and_url() {
-        // 合法 kind（含别名）
-        assert!(validate_setup("anthropic", None).is_ok());
-        assert!(validate_setup("claude", None).is_ok());
-        assert!(validate_setup("openai-compatible", Some("https://h/v1")).is_ok());
-        assert!(validate_setup("claude", Some("https://team.aigocode.com/v1")).is_ok());
-        // 非法 kind → 拒绝
-        assert!(validate_setup("foobar", None).is_err());
+    fn validate_setup_guards_api_and_url() {
+        // 合法 api（v2 三值，无别名）
+        assert!(validate_setup("anthropic-messages", None).is_ok());
+        assert!(validate_setup("openai-completions", Some("https://h/v1")).is_ok());
+        assert!(validate_setup("openai-responses", None).is_ok(), "预留值可声明（config check 再拒）");
+        // 旧词表 → 拒绝
+        for old in ["anthropic", "claude", "openai", "openai-compatible", "google", "foobar"] {
+            assert!(validate_setup(old, None).is_err(), "{old}");
+        }
         // 非法 base_url → 拒绝
-        assert!(validate_setup("openai", Some("not-a-url")).is_err());
-        assert!(validate_setup("openai", Some("ftp://h")).is_err()); // 非 http(s)
-        assert!(validate_setup("openai", Some("https://")).is_err()); // 无 host
+        assert!(validate_setup("openai-completions", Some("not-a-url")).is_err());
+        assert!(validate_setup("openai-completions", Some("ftp://h")).is_err()); // 非 http(s)
+        assert!(validate_setup("openai-completions", Some("https://")).is_err()); // 无 host
     }
 
     #[test]
-    fn effective_base_defaults_by_kind() {
-        assert_eq!(effective_base(None, ProviderKind::Anthropic), ANTHROPIC_DEFAULT_BASE);
-        assert_eq!(effective_base(None, ProviderKind::Openai), OPENAI_DEFAULT_BASE);
-        assert_eq!(effective_base(None, ProviderKind::OpenaiCompatible), OPENAI_DEFAULT_BASE);
-        assert_eq!(effective_base(Some("http://x/v1"), ProviderKind::OpenaiCompatible), "http://x/v1");
-        assert_eq!(effective_base(Some("https://gw/v1"), ProviderKind::Anthropic), "https://gw/v1", "显式 baseUrl 优先于 kind 默认");
+    fn effective_base_defaults_by_api() {
+        assert_eq!(effective_base(None, ProviderApi::AnthropicMessages), ANTHROPIC_DEFAULT_BASE);
+        assert_eq!(effective_base(None, ProviderApi::OpenaiCompletions), OPENAI_DEFAULT_BASE);
+        assert_eq!(effective_base(None, ProviderApi::OpenaiCompletions), OPENAI_DEFAULT_BASE);
+        assert_eq!(effective_base(Some("http://x/v1"), ProviderApi::OpenaiCompletions), "http://x/v1");
+        assert_eq!(effective_base(Some("https://gw/v1"), ProviderApi::AnthropicMessages), "https://gw/v1", "显式 baseUrl 优先于 api 默认");
     }
 
     #[test]
     fn render_model_list_one_line_per_provider_with_status() {
         let cfg = cfg_with(
-            r#"{"providers":{"alpha_p":{"kind":"openai","models":{"a":{"displayName":"alpha","roles":{"scanner":{}}}}},
-                "beta_p":{"kind":"anthropic","models":{"b":{"roles":{"reviewer":{}}}}}}}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"alpha_p","id":"a"}]},"reviewer":{"models":[{"provider":"beta_p","id":"b"}]}}}},"providers":{"alpha_p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"a","displayName":"alpha"}]},"beta_p":{"api":"anthropic-messages","baseUrl":"https://x","models":[{"id":"b"}]}}}"#,
         );
         let avs = vec![
             Availability { provider: "scanner:alpha_p/a".into(), key_present: true, reachable: true, model_listed: Some(true) },
@@ -296,8 +286,8 @@ mod tests {
         ];
         let out = render_model_list(&cfg, &avs, "/u/config.json");
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines.iter().any(|l| l.starts_with("[scanner] alpha_p/a  (alpha)  [openai]") && l.contains("available")), "{out}");
-        assert!(lines.iter().any(|l| l.starts_with("[reviewer] beta_p/b  [anthropic]") && l.contains("missing key")), "无 name 不重复打印 provider/id：{out}");
+        assert!(lines.iter().any(|l| l.starts_with("[scanner] alpha_p/a  (alpha)  [openai-completions]") && l.contains("available")), "{out}");
+        assert!(lines.iter().any(|l| l.starts_with("[reviewer] beta_p/b  [anthropic-messages]") && l.contains("missing key")), "无 name 不重复打印 provider/id：{out}");
         assert!(out.contains("/u/config.json"), "config 位置打印");
     }
 }

@@ -1981,10 +1981,10 @@ mod tests {
     fn fake_reviewer() -> crate::config::EffectiveModel {
         crate::config::EffectiveModel {
             name: "p/r".into(), display_name: None, id: "r".into(), provider: "p".into(),
-            role: crate::config::Role::Reviewer, kind: crate::config::ProviderKind::Openai,
+            role: crate::config::Role::Reviewer, api: crate::config::ProviderApi::OpenaiCompletions,
             base_url: None, context_window: 100_000, max_output_tokens: None,
             per_turn_timeout_secs: None, reasoning: false, reasoning_effort: None,
-            family: "r".into(), max_concurrency: None,
+            thinking_level_map: None, family: "r".into(), max_concurrency: None,
         }
     }
 
@@ -4516,7 +4516,7 @@ mod tests {
     }
 
     fn refute_roles() -> crate::config::RoleSets {
-        crate::config::RoleSets { scanners: vec![], reviewers: vec![fake_reviewer()], refuters: vec![fake_refuter()], verifiers: vec![] }
+        crate::config::RoleSets { scanners: vec![], reviewers: vec![fake_reviewer()], refuters: vec![fake_refuter()], ..Default::default() }
     }
 
     fn vin<'a>(

@@ -49,5 +49,17 @@ fn declares_the_config_schema_command() {
     let c = capabilities();
     let cs = &c["extensions"]["config_schema"];
     assert_eq!(cs["command"], "redteam config schema");
-    assert_eq!(cs["schemaVersion"], 1);
+    assert_eq!(cs["schemaVersion"], 2);
+}
+
+/// schema 产物与 capabilities 的版本必须同步（hibot 渲染 CI 的拒发比对点）。
+#[test]
+fn config_schema_version_matches_capabilities() {
+    let c = capabilities();
+    let cap = &c["extensions"]["config_schema"]["schemaVersion"];
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dist/config.schema.json");
+    let schema: Value = serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))).unwrap();
+    assert_eq!(schema["schemaVersion"], *cap, "dist/config.schema.json 与 capabilities 必须同版本");
+    assert_eq!(schema["schemaVersion"], 2, "v2 硬切");
+    assert_eq!(schema["$id"], "urn:redteam:config/2");
 }

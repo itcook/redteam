@@ -256,10 +256,7 @@ mod tests {
     #[test]
     fn pick_model_prefers_the_refuter_role_entry() {
         let cfg: Config = serde_json::from_str(
-            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
-                "s":{"roles":{"scanner":{}}},
-                "v":{"roles":{"refuter":{}}}
-            }}}}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"refuter":{"models":[{"provider":"p","id":"v"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"v"}]}}}"#,
         )
         .unwrap();
         assert_eq!(pick_model(&cfg, Some("p/v")).unwrap().1, "refuter");

@@ -33,8 +33,11 @@ pub struct TriageRequest<'a> {
     pub manifest_cap_s: u64,
     /// 绝对截止时刻（manifest 墙钟）：I0 与波次预算都从这里扣除已用时间。
     pub deadline: std::time::Instant,
-    /// 三轴使用的模型（`roles.scanner` 的第一条；grill：不新增配置块）。
-    pub route_key: String,
+    /// 三轴使用的模型池（`settings.triage.models`，顺序即轮转序）。
+    /// 轴序 security → drift → intent 依次取池；I0/claims 与报告身份固定用第 1 条。
+    pub route_keys: Vec<String>,
+    /// 报告身份（`provider/id`，池首条）：`source.model` / `f.models` 只认它，不认注册表 role key。
+    pub route_name: String,
 }
 
 /// 三轴已完成的结果（取消后从这里取已完成部分）。
@@ -58,6 +61,16 @@ pub struct TriageOutcome {
     pub reasons: Vec<JobFailure>,
     /// 合并到 findings 的 model 身份（报告 `source.model`）。
     pub route_key: String,
+}
+
+impl TriageRequest<'_> {
+    /// 轴 → 池下标（security=0 / drift=1 / intent=2），与并发完成顺序无关。
+    fn route_for(&self, axis: usize) -> &str {
+        &self.route_keys[axis % self.route_keys.len()]
+    }
+    fn route_identity(&self) -> &str {
+        &self.route_name
+    }
 }
 
 fn changed_files(changes: &[FileChange]) -> BTreeSet<String> {
@@ -104,7 +117,7 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
     );
     let i0_budget = budget::scaled_i0_timeout(i0_text_kb, budget_factor).min(remaining.mul_f64(0.8));
     let i0_start = std::time::Instant::now();
-    let claims_run = lenses::run_intent_claims(registry, &req.route_key, req.lang, req.pr, i0_budget).await;
+    let claims_run = lenses::run_intent_claims(registry, req.route_for(0), req.lang, req.pr, i0_budget).await;
     let i0_elapsed = i0_start.elapsed().as_millis() as u64;
 
     // 规模决定分片数：min(4, ceil(total_kb/45), ceil(files/6))；drift 再受 modules 限制。
@@ -113,9 +126,12 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
     let modules: std::collections::BTreeSet<String> =
         files.iter().map(|(p, _)| standards::module_of(p)).collect();
     let n_drift = n_sec.min(modules.len().max(1));
-    let provider_cap = registry
-        .provider_of(&req.route_key)
-        .and_then(|p| registry.cap_of(p))
+    let provider_cap = req
+        .route_keys
+        .iter()
+        .filter_map(|k| registry.provider_of(k))
+        .filter_map(|p| registry.cap_of(p))
+        .max()
         .unwrap_or(4) as usize;
 
     let claims = claims_run.rows.first().cloned().unwrap_or_default();
@@ -125,7 +141,7 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
             async {
                 let r = lenses::run_intent_slices(
                     registry,
-                    &req.route_key,
+                    req.route_for(2),
                     req.lang,
                     req.pr,
                     &claims.claims,
@@ -155,14 +171,14 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
+                let r = lenses::run_security(registry, req.route_for(0), req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
                 progress.lock().unwrap().security = Some(r);
             },
             async {
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
+                let r = lenses::run_drift(registry, req.route_for(1), req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
                 progress.lock().unwrap().drift = Some(r);
             }
         );
@@ -185,14 +201,14 @@ pub async fn run(registry: &ProviderRegistry, req: &TriageRequest<'_>, progress:
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_security(registry, &req.route_key, req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
+                let r = lenses::run_security(registry, req.route_for(0), req.lang, req.pr, &files, n_sec, req.deadline, budget_factor).await;
                 progress.lock().unwrap().security = Some(r);
             },
             async {
                 if files.is_empty() {
                     return;
                 }
-                let r = lenses::run_drift(registry, &req.route_key, req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
+                let r = lenses::run_drift(registry, req.route_for(1), req.lang, &map, req.repo, &files, n_drift, req.deadline, budget_factor).await;
                 progress.lock().unwrap().drift = Some(r);
             }
         );
@@ -351,7 +367,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
 
     let mut findings = tallied.findings;
     for f in &mut findings {
-        f.models = vec![req.route_key.clone()];
+        f.models = vec![req.route_identity().to_string()];
     }
     let blockers = tallied.blockers;
     TriageOutcome {
@@ -362,7 +378,7 @@ fn finalize(req: &TriageRequest<'_>, p: &Progress, completed: bool) -> TriageOut
         axes,
         usage,
         reasons,
-        route_key: req.route_key.clone(),
+        route_key: req.route_identity().to_string(),
     }
 }
 
@@ -423,8 +439,15 @@ pub fn template_hash() -> String {
 
 /// 三轴使用的模型：`roles.reviewer` 的第一条（2026-11-24 用户调整：triage 用 reviewer 的思考档位，
 /// 不再用 scanner；确定性顺序 = 配置的 BTreeMap 顺序）。
-pub fn triage_route(cfg: &crate::config::Config) -> Option<crate::config::EffectiveModel> {
-    cfg.active_roles().reviewers.into_iter().next()
+/// triage 模型池 → 注册表 route key（`triager:<provider>/<id>`）；空池 → 空 vec（由调用方报 `missing_role:triage`）。
+pub fn triage_routes(cfg: &crate::config::Config) -> Vec<(crate::config::EffectiveModel, String)> {
+    cfg.triage_models()
+        .into_iter()
+        .map(|em| {
+            let key = crate::provider::registry::role_key(crate::config::Role::Triager, &em.name);
+            (em, key)
+        })
+        .collect()
 }
 
 #[cfg(test)]

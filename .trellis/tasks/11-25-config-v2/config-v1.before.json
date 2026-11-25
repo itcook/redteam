@@ -1,0 +1,60 @@
+{
+  "providers": {
+    "deepseek": {
+      "kind": "openai-compatible",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKeyEnv": "HIBOT_LLM_DEEPSEEK_KEY",
+      "maxConcurrency": 20,
+      "models": {
+        "deepseek-chat": {
+          "displayName": "DeepSeek Chat",
+          "contextWindow": 128000,
+          "maxOutputTokens": 32768,
+          "perTurnTimeoutSecs": 600,
+          "reasoning": true,
+          "roles": {
+            "scanner": {
+              "reasoningEffort": "medium"
+            },
+            "reviewer": {
+              "reasoningEffort": "high"
+            },
+            "refuter": {
+              "reasoningEffort": "medium"
+            }
+          }
+        }
+      }
+    },
+    "glm": {
+      "kind": "openai-compatible",
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+      "apiKeyEnv": "HIBOT_LLM_GLM_KEY",
+      "maxConcurrency": 10,
+      "models": {
+        "glm-5": {
+          "contextWindow": 200000,
+          "reasoning": true,
+          "roles": {
+            "scanner": {
+              "reasoningEffort": "medium"
+            },
+            "reviewer": {
+              "reasoningEffort": "high"
+            }
+          }
+        }
+      }
+    }
+  },
+  "review": {
+    "blockThreshold": "medium",
+    "confFloor": 0.5,
+    "maxConcurrency": 10,
+    "tools": "two-stage",
+    "refuters": {
+      "enabled": true
+    }
+  },
+  "language": "en_US"
+}

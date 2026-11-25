@@ -77,24 +77,24 @@ fn check(text: &str, kind: Option<JobKind>) -> (Option<Config>, Vec<Diag>, Vec<D
     let mut errors: Vec<Diag> = issues.into_iter().map(issue_diag).collect();
     let mut warnings = Vec::new();
     if let Some(c) = &cfg {
-        // 角色最小集（P2）：review = scanner + reviewer；triage = reviewer（2026-11-24 起）；verify = verifier 或 reviewer。
-        let roles = c.active_roles();
+        // 角色最小集（v2）：review = scanner + reviewer；triage = settings.triage.models；
+        // verify = settings.verify.models（**不再回退 reviewer**）。通用 validate 不查三池齐全。
         match kind {
             Some(JobKind::Review) => {
-                if roles.scanners.is_empty() {
+                if c.settings.review.roles.scanner.models.is_empty() {
                     errors.push(missing_role("scanner"));
                 }
-                if roles.reviewers.is_empty() {
+                if c.settings.review.roles.reviewer.models.is_empty() {
                     errors.push(missing_role("reviewer"));
                 }
             }
             Some(JobKind::Triage) => {
-                if roles.reviewers.is_empty() {
-                    errors.push(missing_role("reviewer"));
+                if c.settings.triage.models.is_empty() {
+                    errors.push(missing_role("triage"));
                 }
             }
             Some(JobKind::Verify) => {
-                if roles.verifiers.is_empty() && roles.reviewers.is_empty() {
+                if c.settings.verify.models.is_empty() {
                     errors.push(missing_role("verifier"));
                 }
             }
@@ -109,23 +109,31 @@ fn check(text: &str, kind: Option<JobKind>) -> (Option<Config>, Vec<Diag>, Vec<D
                     message: format!("maxConcurrency = {cap} looks like a wrong field (maxOutputTokens?)"),
                 });
             }
-            for (id, m) in &p.models {
-                if m.roles.is_empty() {
+            for (idx, m) in p.models.iter().enumerate() {
+                if !c.model_is_used(pname, &m.id) {
                     warnings.push(Diag {
                         level: "WARN",
-                        pointer: format!("/providers/{}/models/{}", esc(pname), esc(id)),
-                        code: "no_roles".into(),
-                        message: "model declares no roles and will not participate".into(),
+                        pointer: format!("/providers/{}/models/{idx}", esc(pname)),
+                        code: "model_unused".into(),
+                        message: format!("model {:?} is not referenced by any role pool", m.id),
                     });
                 }
             }
         }
-        if c.review.max_concurrency > MAX_CONCURRENCY_SANE as usize {
+        if c.settings.review.refuters.enabled && c.settings.review.roles.refuter.models.is_empty() {
             warnings.push(Diag {
                 level: "WARN",
-                pointer: "/review/maxConcurrency".into(),
+                pointer: "/settings/review/refuters/enabled".into(),
+                code: "refuter_no_models".into(),
+                message: "refuters.enabled = true but roles.refuter.models is empty; job mode will skip refute".into(),
+            });
+        }
+        if c.settings.review.max_concurrency > MAX_CONCURRENCY_SANE as usize {
+            warnings.push(Diag {
+                level: "WARN",
+                pointer: "/settings/review/maxConcurrency".into(),
                 code: "max_concurrency_sane".into(),
-                message: format!("maxConcurrency = {} is the provider gate default; looks wrong", c.review.max_concurrency),
+                message: format!("maxConcurrency = {} is the provider gate default; looks wrong", c.settings.review.max_concurrency),
             });
         }
     }
@@ -161,31 +169,35 @@ mod tests {
         (code, format!("{} errors, {} warnings", errors.len(), warnings.len()))
     }
 
-    const OK: &str = r#"{"language":"en_US","providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}},"r":{"roles":{"reviewer":{}}}}}}}"#;
+    const OK: &str = r#"{"settings":{"language":"en_US","review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#;
 
     #[test]
     fn valid_config_passes_kind_review() {
         assert_eq!(run(OK, Some("review")).0, 0);
-        assert_eq!(run(OK, Some("triage")).0, 0);
-        assert_eq!(run(OK, Some("verify")).0, 0, "reviewer 是 verifier 的回退");
+        assert_eq!(run(OK, Some("triage")).0, 1, "v2 triage 池独立，缺则 missing_role:triage");
+        assert_eq!(run(OK, Some("verify")).0, 1, "v2 verify 不再回退 reviewer");
+        let full = r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]}}},"triage":{"models":[{"provider":"p","id":"r"}]},"verify":{"models":[{"provider":"p","id":"r"}]}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"}]}}}"#;
+        for k in ["review", "triage", "verify"] {
+            assert_eq!(run(full, Some(k)).0, 0, "{k}");
+        }
     }
 
     #[test]
     fn missing_roles_are_errors_per_kind() {
-        let no_scanner = r#"{"providers":{"p":{"kind":"openai","models":{"r":{"roles":{"reviewer":{}}}}}}}"#;
+        let no_scanner = r#"{"settings":{"review":{"roles":{"reviewer":{"models":[{"provider":"p","id":"r"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"r"}]}}}"#;
         assert_eq!(run(no_scanner, Some("review")).0, 1);
-        assert_eq!(run(no_scanner, Some("triage")).0, 0, "triage 只需 reviewer");
-        assert_eq!(run(no_scanner, Some("verify")).0, 0);
-        let no_reviewer = r#"{"providers":{"p":{"kind":"openai","models":{"s":{"roles":{"scanner":{}}}}}}}"#;
-        assert_eq!(run(no_reviewer, Some("triage")).0, 1, "triage 缺 reviewer");
-        assert_eq!(run(no_reviewer, Some("verify")).0, 1, "verifier 与 reviewer 都缺");
+        assert_eq!(run(no_scanner, Some("triage")).0, 1, "triage 池独立");
+        assert_eq!(run(no_scanner, Some("verify")).0, 1);
+        let no_reviewer = r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"}]}}}"#;
+        assert_eq!(run(no_reviewer, Some("triage")).0, 1, "triage 缺 triage 池");
+        assert_eq!(run(no_reviewer, Some("verify")).0, 1, "verifier 池缺");
     }
 
     #[test]
     fn unknown_and_secret_keys_are_errors_warns_do_not_fail() {
-        let bad = r#"{"providers":{"p":{"kind":"openai","apiKey":"sk-x","models":{"m":{"roles":{"scanner":{}}},"n":{}}}},"review":{"unknown":1}}"#;
+        let bad = r#"{"settings":{"review":{"unknown":1,"roles":{"scanner":{"models":[{"provider":"p","id":"m"}]}}}},"providers":{"p":{"api":"openai-completions","apiKey":"sk-x","baseUrl":"https://x","models":[{"id":"m"},{"id":"n"}]}}}"#;
         assert_eq!(run(bad, None).0, 1);
-        let warn_only = r#"{"providers":{"p":{"kind":"openai","maxConcurrency":999,"models":{"m":{}}}}}"#;
+        let warn_only = r#"{"settings":{"review":{}},"providers":{"p":{"api":"openai-completions","maxConcurrency":999,"baseUrl":"https://x","models":[{"id":"m"}]}}}"#;
         let (code, summary) = run(warn_only, None);
         assert_eq!(code, 0, "WARN 不影响退出码");
         assert!(summary.contains("warnings"), "{summary}");
@@ -193,20 +205,21 @@ mod tests {
 
     #[test]
     fn unknown_role_key_fails_strict_check() {
-        let bad = r#"{"providers":{"p":{"kind":"openai","models":{"m":{"roles":{"gerbil":{}}}}}}}"#;
+        let bad = r#"{"settings":{"review":{}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#;
         assert_eq!(run(bad, Some("review")).0, 1);
     }
 
     #[test]
     fn schema_identity_is_stable() {
         let v = crate::config::config_schema_json();
-        assert_eq!(v["$id"], "urn:redteam:config/1");
+        assert_eq!(v["$id"], "urn:redteam:config/2");
         assert_eq!(v["title"], "redteam executor config");
-        assert_eq!(v["schemaVersion"], 1);
-        assert!(v["properties"]["language"].is_object(), "language 必须进 schema");
-        assert!(v["properties"]["review"].is_object());
-        let roles = &v["definitions"]["ModelConfig"]["properties"]["roles"]["propertyNames"]["enum"];
-        assert_eq!(roles, &serde_json::json!(["scanner", "reviewer", "refuter", "verifier"]), "roles 键必须枚举");
+        assert_eq!(v["schemaVersion"], 2);
+        assert!(v["properties"]["settings"].is_object(), "settings 必须进 schema");
+        assert!(v["properties"]["providers"].is_object());
+        assert!(v["definitions"]["Settings"]["properties"]["language"].is_object(), "language 在 settings 下");
+        assert!(v["definitions"]["ReviewConfig"]["properties"]["roles"].is_object());
+        assert!(v["definitions"]["ProviderConfig"]["properties"]["api"].is_object());
         assert!(crate::config::render_config_schema().ends_with('\n'));
     }
 }

@@ -1,4 +1,4 @@
-use crate::config::ProviderKind;
+use crate::config::ProviderApi;
 use crate::model::Prober;
 use std::time::Duration;
 
@@ -25,10 +25,10 @@ impl HttpProber {
 /// （其 `/v1/models` 端点不认 bearer），其余（openai / openai-compatible / google 兜底）
 /// 沿用 `authorization: Bearer <key>`。`key=None` 时不产生任何头（未配置 key 的探测——
 /// 上游多半直接 401，这里如实不带头、把认证失败留给响应状态分类）。
-pub(crate) fn auth_headers(kind: ProviderKind, key: Option<&str>) -> Vec<(&'static str, String)> {
+pub(crate) fn auth_headers(kind: ProviderApi, key: Option<&str>) -> Vec<(&'static str, String)> {
     let Some(k) = key else { return vec![] };
     match kind {
-        ProviderKind::Anthropic => vec![
+        ProviderApi::AnthropicMessages => vec![
             ("x-api-key", k.to_string()),
             ("anthropic-version", "2023-06-01".to_string()),
         ],
@@ -40,10 +40,10 @@ pub(crate) fn auth_headers(kind: ProviderKind, key: Option<&str>) -> Vec<(&'stat
 /// `anthropic_messages_url` 的同款 /v1 规范手法——base 含不含 `/v1` 都能拼对，不重复
 /// `/v1/v1`）；其余 provider 沿用现有 `{base}/models`（openai 兼容生态无统一规范，
 /// base_url 由配置负责，见 `provider::mod` 对应注释）。
-fn models_url(base_url: &str, kind: ProviderKind) -> String {
+fn models_url(base_url: &str, kind: ProviderApi) -> String {
     let base = base_url.trim_end_matches('/');
     match kind {
-        ProviderKind::Anthropic => {
+        ProviderApi::AnthropicMessages => {
             if base.ends_with("/v1") {
                 format!("{base}/models")
             } else {
@@ -56,7 +56,7 @@ fn models_url(base_url: &str, kind: ProviderKind) -> String {
 
 #[async_trait::async_trait]
 impl Prober for HttpProber {
-    async fn list_models(&self, base_url: &str, key: Option<&str>, kind: ProviderKind) -> anyhow::Result<Vec<String>> {
+    async fn list_models(&self, base_url: &str, key: Option<&str>, kind: ProviderApi) -> anyhow::Result<Vec<String>> {
         let url = models_url(base_url, kind);
         let mut req = self.client.get(&url);
         for (name, value) in auth_headers(kind, key) {
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn auth_headers_anthropic_uses_x_api_key_and_version() {
-        let h = auth_headers(ProviderKind::Anthropic, Some("sk-ant-x"));
+        let h = auth_headers(ProviderApi::AnthropicMessages, Some("sk-ant-x"));
         assert_eq!(h, vec![
             ("x-api-key", "sk-ant-x".to_string()),
             ("anthropic-version", "2023-06-01".to_string()),
@@ -92,25 +92,25 @@ mod tests {
 
     #[test]
     fn auth_headers_non_anthropic_uses_bearer() {
-        for kind in [ProviderKind::Openai, ProviderKind::OpenaiCompatible, ProviderKind::Google] {
-            let h = auth_headers(kind, Some("sk-x"));
-            assert_eq!(h, vec![("authorization", "Bearer sk-x".to_string())], "kind={kind:?}");
+        for api in [ProviderApi::OpenaiCompletions, ProviderApi::OpenaiResponses] {
+            let h = auth_headers(api, Some("sk-x"));
+            assert_eq!(h, vec![("authorization", "Bearer sk-x".to_string())], "api={api:?}");
         }
     }
 
     #[test]
     fn auth_headers_no_key_is_empty() {
-        assert_eq!(auth_headers(ProviderKind::Anthropic, None), vec![]);
-        assert_eq!(auth_headers(ProviderKind::Openai, None), vec![]);
+        assert_eq!(auth_headers(ProviderApi::AnthropicMessages, None), vec![]);
+        assert_eq!(auth_headers(ProviderApi::OpenaiCompletions, None), vec![]);
     }
 
     #[test]
     fn models_url_normalizes_v1_for_anthropic_only() {
-        assert_eq!(models_url("https://api.anthropic.com", ProviderKind::Anthropic), "https://api.anthropic.com/v1/models");
-        assert_eq!(models_url("https://h/v1", ProviderKind::Anthropic), "https://h/v1/models");
-        assert_eq!(models_url("https://h/v1/", ProviderKind::Anthropic), "https://h/v1/models");
+        assert_eq!(models_url("https://api.anthropic.com", ProviderApi::AnthropicMessages), "https://api.anthropic.com/v1/models");
+        assert_eq!(models_url("https://h/v1", ProviderApi::AnthropicMessages), "https://h/v1/models");
+        assert_eq!(models_url("https://h/v1/", ProviderApi::AnthropicMessages), "https://h/v1/models");
         // 非 anthropic 不做 /v1 规范化（沿用现有 {base}/models）
-        assert_eq!(models_url("https://api.openai.com/v1", ProviderKind::Openai), "https://api.openai.com/v1/models");
-        assert_eq!(models_url("http://localhost:11434/v1", ProviderKind::OpenaiCompatible), "http://localhost:11434/v1/models");
+        assert_eq!(models_url("https://api.openai.com/v1", ProviderApi::OpenaiCompletions), "https://api.openai.com/v1/models");
+        assert_eq!(models_url("http://localhost:11434/v1", ProviderApi::OpenaiCompletions), "http://localhost:11434/v1/models");
     }
 }

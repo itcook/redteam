@@ -20,7 +20,7 @@
   "extensions": {
     "config_schema": {
       "command": "redteam config schema",
-      "schemaVersion": 1
+      "schemaVersion": 2
     }
   }
 }

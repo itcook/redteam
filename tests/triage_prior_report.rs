@@ -90,11 +90,19 @@ fn make_job(prior: Option<serde_json::Value>, slow: bool) -> Fixture {
     std::fs::write(
         job.join("config/executor.redteam.json"),
         serde_json::json!({
-            "providers": {"p1": {"kind": "openai", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
-                "models": {"s": {"roles": {"scanner": {}}}, "r": {"roles": {"reviewer": {}}}}}},
-            // 非默认阈值：prior_report 不得改这两个值。
-            "review": {"blockThreshold": "low", "confFloor": 0.31},
-            "language": "en_US"
+            "settings": {
+                "language": "en_US",
+                "review": {
+                    // 非默认阈值：prior_report 不得改这两个值。
+                    "blockThreshold": "low", "confFloor": 0.31,
+                    "roles": {
+                        "scanner": {"models": [{"provider": "p1", "id": "s"}]},
+                        "reviewer": {"models": [{"provider": "p1", "id": "r"}]}
+                    }
+                }
+            },
+            "providers": {"p1": {"api": "openai-completions", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
+                "models": [{"id": "s"}, {"id": "r"}]}}
         })
         .to_string(),
     )

@@ -383,24 +383,25 @@ enum ModelCmd {
         /// 请求体里的 model id（providers.<name>.models.<id>，如 deepseek-v4-flash）。
         #[arg(long)]
         model: String,
-        /// 角色，逗号分隔：scanner,reviewer,refuter,verifier（拥有该角色键的模型即活跃集，无候补）。
-        /// `refuter` = 评审内 finding 验真；`verifier` = 修复验证（独立管线，review 不使用；缺省回退 reviewer）。
+        /// 角色，逗号分隔：scanner,reviewer,refuter,verifier,triage（模型加入对应池；顺序即轮转序）。
+        /// `refuter` = 评审内 finding 验真；`verifier` = 修复验证（独立管线，**不回退 reviewer**）；
+        /// `triage` = hibot triage kind（独立池）。
         #[arg(long)]
         role: String,
         /// 人读显示名（model list / 报告用）；身份串固定为 provider/id，不可配置。
         #[arg(long)]
         display_name: Option<String>,
-        /// 协议类型：openai | anthropic（含 claude/gpt/gemini 等别名）。新建 provider 时写 provider 层（缺省按名 / base_url 推断）；
-        /// provider 已存在时写模型层，不动共享的 provider 层。
+        /// 通道 API（v2 三值，无别名）：openai-completions | anthropic-messages | openai-responses（预留）。
+        /// 新建 provider 时写 provider 层（缺省按名 / base_url 推断）；provider 已存在时覆盖 provider.api（v2 无模型级 api）。
         #[arg(long)]
-        kind: Option<String>,
-        /// API 端点 base URL（anthropic 网关须带 /v1）。
+        api: Option<String>,
+        /// API 端点 base URL（v2 必填；新建 provider 时缺省仅对已知供应商推断，其余必须显式给）。
         #[arg(long)]
         base_url: Option<String>,
         /// key 环境变量名：新建 provider 时写 provider 层（缺省 `<PROVIDER>_API_KEY`）；provider 已存在时写模型层。
         #[arg(long)]
         api_key_env: Option<String>,
-        /// 该 provider 同时在途请求上限（缺省继承 review.maxConcurrency）。
+        /// 该 provider 同时在途请求上限（缺省继承 settings.review.maxConcurrency）。
         #[arg(long)]
         max_concurrency: Option<u32>,
         /// API key（配合 --key-store 决定去处；不落 config.json）。
@@ -1003,20 +1004,20 @@ async fn main() {
                 }
                 redteam::model::check_exit_code(&avs)
             }
-            ModelCmd::Setup { provider, model, role, display_name, kind, base_url, api_key_env, max_concurrency, key, key_store, model_key, context_window, max_output_tokens, per_turn_timeout_secs, reasoning, reasoning_effort } => {
+            ModelCmd::Setup { provider, model, role, display_name, api, base_url, api_key_env, max_concurrency, key, key_store, model_key, context_window, max_output_tokens, per_turn_timeout_secs, reasoning, reasoning_effort } => {
                 let mut roles: Vec<redteam::config::Role> = Vec::new();
                 for r in role.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     match redteam::config::Role::parse(r) {
                         Some(x) if !roles.contains(&x) => roles.push(x),
                         Some(_) => {}
                         None => {
-                            eprintln!("error: --role 取 scanner | reviewer | refuter | verifier（逗号分隔，如 scanner,reviewer），收到 {r:?}");
+                            eprintln!("error: --role 取 scanner | reviewer | refuter | verifier | triage（逗号分隔，如 scanner,reviewer），收到 {r:?}");
                             std::process::exit(1);
                         }
                     }
                 }
                 if roles.is_empty() {
-                    eprintln!("error: --role 至少给一个角色：scanner | reviewer | refuter | verifier");
+                    eprintln!("error: --role 至少给一个角色：scanner | reviewer | refuter | verifier | triage");
                     std::process::exit(1);
                 }
                 let reasoning_effort = match reasoning_effort.as_deref() {
@@ -1035,11 +1036,11 @@ async fn main() {
                     eprintln!("error: --key-store secrets requires --key");
                     std::process::exit(1);
                 }
-                let kind_if_new = redteam::model::derive_kind(&provider, kind.as_deref(), base_url.as_deref());
-                // 写入前守卫：kind/base_url 不合法则提示并拒绝写入，不污染配置。kind 检查用原始 --kind 字符串
-                // （若显式给出，哪怕非法）——`derive_kind` 内非法显式值已落回推断链、不会原样带出来。
-                let kind_for_validate = kind.as_deref().unwrap_or_else(|| kind_if_new.as_str());
-                if let Err(e) = redteam::model::validate_setup(kind_for_validate, base_url.as_deref()) {
+                let api_if_new = redteam::model::derive_api(&provider, api.as_deref(), base_url.as_deref());
+                // 写入前守卫：api/base_url 不合法则提示并拒绝写入，不污染配置。api 检查用原始 --api 字符串
+                // （若显式给出，哪怕非法）——`derive_api` 内非法显式值已落回推断链、不会原样带出来。
+                let api_for_validate = api.as_deref().unwrap_or_else(|| api_if_new.as_str());
+                if let Err(e) = redteam::model::validate_setup(api_for_validate, base_url.as_deref()) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -1049,7 +1050,7 @@ async fn main() {
                 let env_configured = api_key_env.is_some()
                     || match existing.providers.get(&provider) {
                         None => true,
-                        Some(p) => p.api_key_env.is_some() || p.models.get(&model).is_some_and(|m| m.api_key_env.is_some()),
+                        Some(p) => p.api_key_env.is_some() || p.models.iter().any(|m| m.id == model && m.api_key_env.is_some()),
                     };
                 if key_store == "env" && key.is_some() && !env_configured {
                     eprintln!(
@@ -1057,14 +1058,13 @@ async fn main() {
                     );
                     std::process::exit(1);
                 }
-                // design v9 §12.1 形状：providers.<provider>.models.<id>.roles.<role>；三层只写显式给出的字段，
-                // 已存在的 provider 不被 --kind / --api-key-env 改写（这两项落模型层，评审 #3 / #5）；写前完整校验（#4）。
+                // v2 形状：provider.api/baseUrl + models[]，角色写 settings 池；三层只写显式给出的字段，写前完整校验（#4）。
                 let patch = redteam::config::SetupPatch {
                     provider: provider.clone(),
                     model_id: model.clone(),
                     roles: roles.clone(),
                     display_name: display_name.clone(),
-                    kind: kind.as_deref().and_then(redteam::config::ProviderKind::parse),
+                    api: api.as_deref().and_then(redteam::config::ProviderApi::parse),
                     base_url: base_url.clone(),
                     api_key_env: api_key_env.clone(),
                     max_concurrency,
@@ -1073,15 +1073,15 @@ async fn main() {
                     per_turn_timeout_secs,
                     reasoning,
                     reasoning_effort,
-                    kind_if_new,
+                    api_if_new,
                     api_key_env_if_new: Some(redteam::model::derive_api_key_env(&provider)),
                 };
                 let path = match redteam::config::write_setup(&patch) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("error: failed to write config: {e}");
-                        if e.to_string().contains("缺 kind") {
-                            eprintln!("提示：加 --kind openai|anthropic（provider 已存在时写入该模型层）");
+                        if e.to_string().contains("baseUrl") {
+                            eprintln!("提示：v2 的 baseUrl 必填，加 --base-url https://<host>[/v1]");
                         }
                         std::process::exit(1);
                     }
@@ -1092,7 +1092,7 @@ async fn main() {
                     eprintln!("error: provider missing from just-written config (unexpected)");
                     std::process::exit(1);
                 };
-                let env_name = pc.models.get(&model).and_then(|m| m.api_key_env.clone()).or_else(|| pc.api_key_env.clone());
+                let env_name = pc.models.iter().find(|m| m.id == model).and_then(|m| m.api_key_env.clone()).or_else(|| pc.api_key_env.clone());
                 // key 去处：env(默认，打印 export) / secrets(写 secrets.json；--model-key 写模型级)
                 match key_store.as_str() {
                     "secrets" => {
@@ -1109,13 +1109,13 @@ async fn main() {
                         (None, _) => println!("notice: providers.{provider} 未配置 apiKeyEnv；key 可放 secrets.json（--key-store secrets [--model-key]）或补 --api-key-env"),
                     },
                 }
-                let em = cfg.effective(&provider, &model, roles[0]);
-                let probe_kind = em.as_ref().map(|e| e.kind).unwrap_or_else(|| provider_probe_kind(pc));
+                let em = cfg.effective(&provider, &model, roles[0], reasoning_effort);
+                let probe_api = em.as_ref().map(|e| e.api).unwrap_or_else(|| provider_probe(pc));
                 let shown = display_name.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
                 println!(
-                    "configured {provider}/{model}{shown} roles=[{}] (kind={}, apiKeyEnv={}) → {}",
+                    "configured {provider}/{model}{shown} roles=[{}] (api={}, apiKeyEnv={}) → {}",
                     roles.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(","),
-                    probe_kind.as_str(),
+                    probe_api.as_str(),
                     env_name.as_deref().unwrap_or("-"),
                     path.display()
                 );
@@ -1127,7 +1127,7 @@ async fn main() {
                 let prober = redteam::model::probe::HttpProber::new();
                 let probe_key = cfg.resolve_key(&provider, &model);
                 let probe_result = prober
-                    .list_models(&redteam::model::effective_base(pc.base_url.as_deref(), probe_kind), probe_key.as_deref(), probe_kind)
+                    .list_models(&redteam::model::effective_base(Some(&pc.base_url), probe_api), probe_key.as_deref(), probe_api)
                     .await
                     .map_err(|e| e.to_string());
                 println!("{}", format_probe_outcome(&provider, &model, &probe_result));
@@ -1147,10 +1147,10 @@ async fn main() {
                             Some(p) => p,
                             None => { eprintln!("no such provider: {prov}"); std::process::exit(1); }
                         };
-                        let kind = provider_probe_kind(pc);
-                        let base = redteam::model::effective_base(pc.base_url.as_deref(), kind);
+                        let api = provider_probe(pc);
+                        let base = redteam::model::effective_base(Some(&pc.base_url), api);
                         let key = cfg.resolve_provider_key(&prov);
-                        match prober.list_models(&base, key.as_deref(), kind).await {
+                        match prober.list_models(&base, key.as_deref(), api).await {
                             Ok(models) => {
                                 for m in models { println!("{m}"); }
                                 0
@@ -1255,7 +1255,7 @@ fn run_risk(base: &str, head: Option<&str>, dismissed: Option<&str>, before: Opt
         _ => None,
     };
     let route = redteam::risk::replay_from_git(
-        &changes, &cwd, base, &head, ledger.as_deref(), before, cfg.review.reviewers.max_cells,
+        &changes, &cwd, base, &head, ledger.as_deref(), before, cfg.settings.review.reviewers.max_cells,
     );
     let out = serde_json::json!({
         "schema": "risk-v1",
@@ -1276,11 +1276,9 @@ fn run_risk(base: &str, head: Option<&str>, dismissed: Option<&str>, before: Opt
     }
 }
 
-/// provider 级探测（`model list --remote` / setup 后探测）用的协议：provider 层 kind > 任一模型的 kind > openai-compatible。
-fn provider_probe_kind(pc: &redteam::config::ProviderConfig) -> redteam::config::ProviderKind {
-    pc.kind
-        .or_else(|| pc.models.values().find_map(|m| m.kind))
-        .unwrap_or(redteam::config::ProviderKind::OpenaiCompatible)
+/// provider 级探测（`model list --remote` / setup 后探测）用的协议：v2 只有 provider 层 api。
+fn provider_probe(pc: &redteam::config::ProviderConfig) -> redteam::config::ProviderApi {
+    pc.api
 }
 
 /// T26：`model setup` 落盘后自动 probe 该 provider 的结果文案——纯函数，网络调用
@@ -1726,11 +1724,7 @@ mod tests {
     #[test]
     fn build_registry_registers_refuter_only_models() {
         let cfg: redteam::config::Config = serde_json::from_str(
-            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
-                "s":{"roles":{"scanner":{}}},
-                "r":{"roles":{"reviewer":{}}},
-                "v":{"roles":{"refuter":{}}}
-            }}}}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"reviewer":{"models":[{"provider":"p","id":"r"}]},"refuter":{"models":[{"provider":"p","id":"v"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"},{"id":"r"},{"id":"v"}]}}}"#,
         )
         .unwrap();
         let reg = redteam::cli::build_registry(&plain_review_args(), &cfg).unwrap();
@@ -1751,10 +1745,7 @@ mod tests {
     #[test]
     fn build_registry_skips_unusable_refuter_instead_of_failing_the_run() {
         let cfg: redteam::config::Config = serde_json::from_str(
-            r#"{"providers":{
-                "p":{"kind":"openai","baseUrl":"https://x","models":{"s":{"roles":{"scanner":{}}}}},
-                "g":{"kind":"google","baseUrl":"https://y","models":{"v":{"roles":{"refuter":{}}}}}
-            }}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"s"}]},"refuter":{"models":[{"provider":"g","id":"v"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"s"}]},"g":{"api":"openai-responses","baseUrl":"https://y","models":[{"id":"v"}]}}}"#,
         )
         .unwrap();
         let reg = redteam::cli::build_registry(&plain_review_args(), &cfg)
@@ -1770,47 +1761,22 @@ mod tests {
         );
     }
 
-    /// 0.8 护栏（R20）接线：旧配置的 `roles.verifier`（原“验真角色”）必须让后台作业也看得见。
-    /// worker 的 stderr 是 /dev/null，只有 registry.warnings → 报告 run.warnings 这条路。
+    /// v2 硬切：v1 的模型级 `roles`（含 `verifier`）必须报 `legacy_shape` 并指向 settings 池。
     #[test]
-    fn build_registry_surfaces_verifier_role_rename_guard() {
-        let stale: redteam::config::Config = serde_json::from_str(
-            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
-                "s":{"roles":{"scanner":{}}},
-                "m":{"roles":{"verifier":{}}}
-            }}}}"#,
+    fn v1_model_roles_are_rejected_with_a_migration_hint() {
+        let err = redteam::config::Config::from_json(
+            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{"m":{"roles":{"verifier":{}}}}}}}"#,
         )
-        .unwrap();
-        let reg = redteam::cli::build_registry(&plain_review_args(), &stale).unwrap();
-        assert!(
-            reg.warnings().iter().any(|w| w.contains("验真角色已更名为 refuter")),
-            "旧语义的 verifier 角色必须进报告 warnings: {:?}",
-            reg.warnings()
-        );
-        // 新语义（显式 refuter，或两者都有）不报这条。
-        let fresh: redteam::config::Config = serde_json::from_str(
-            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
-                "s":{"roles":{"scanner":{}}},
-                "m":{"roles":{"refuter":{},"verifier":{}}}
-            }}}}"#,
-        )
-        .unwrap();
-        let reg2 = redteam::cli::build_registry(&plain_review_args(), &fresh).unwrap();
-        assert!(
-            !reg2.warnings().iter().any(|w| w.contains("验真角色已更名")),
-            "新语义不该触发护栏: {:?}",
-            reg2.warnings()
-        );
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("roles 已删除"), "{err}");
+        assert!(err.contains("settings.review.roles") && err.contains("settings.verify.models"), "{err}");
     }
 
-    /// 同一模型兼任多角色：按角色键各注册一份 backend，档位互不覆盖。
-    /// dogfood 暴露的真问题：旧实现只留先注册的 scanner 档，reviewer / refuter 配 high 照样跑 medium。
     #[test]
     fn build_registry_keeps_role_scoped_reasoning_efforts() {
         let cfg: redteam::config::Config = serde_json::from_str(
-            r#"{"providers":{"p":{"kind":"openai","baseUrl":"https://x","models":{
-                "m":{"roles":{"scanner":{"reasoningEffort":"medium"},"reviewer":{"reasoningEffort":"high"},"refuter":{"reasoningEffort":"high"}}}
-            }}}}"#,
+            r#"{"settings":{"review":{"roles":{"scanner":{"models":[{"provider":"p","id":"m","reasoningEffort":"medium"}]},"reviewer":{"models":[{"provider":"p","id":"m","reasoningEffort":"high"}]},"refuter":{"models":[{"provider":"p","id":"m","reasoningEffort":"high"}]}}}},"providers":{"p":{"api":"openai-completions","baseUrl":"https://x","models":[{"id":"m"}]}}}"#,
         )
         .unwrap();
         let reg = redteam::cli::build_registry(&plain_review_args(), &cfg).unwrap();
@@ -1832,7 +1798,6 @@ mod tests {
 
         // 空配置：无 scanner 角色 → 角色集为空 → Err
         let cfg = Config::default();
-        let cwd = std::path::Path::new(".");
         let args = plain_review_args();
         let result = redteam::cli::build_registry(&args, &cfg);
         assert!(result.is_err(), "无 scanner 时 build_registry 应返回 Err");

@@ -115,9 +115,16 @@ fn read_report(job: &Path) -> serde_json::Value {
 
 fn config() -> String {
     serde_json::json!({
-        "providers": {"p1": {"kind": "openai", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
-            "models": {"s": {"roles": {"scanner": {}}}, "r": {"roles": {"reviewer": {}}}}}},
-        "language": "en_US"
+        "settings": {
+            "language": "en_US",
+            "review": {"roles": {
+                "scanner": {"models": [{"provider": "p1", "id": "s"}]},
+                "reviewer": {"models": [{"provider": "p1", "id": "r"}]}
+            }},
+            "triage": {"models": [{"provider": "p1", "id": "r"}]}
+        },
+        "providers": {"p1": {"api": "openai-completions", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "P1_KEY",
+            "models": [{"id": "s"}, {"id": "r"}]}}
     })
     .to_string()
 }

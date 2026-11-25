@@ -236,7 +236,7 @@ fn language_json(lang: &OutputLang) -> Value {
 fn concurrency_json(cfg: &Config) -> Value {
     let mut caps = serde_json::Map::new();
     for (name, p) in &cfg.providers {
-        let cap = p.max_concurrency.unwrap_or(cfg.review.max_concurrency as u32);
+        let cap = p.max_concurrency.unwrap_or(cfg.settings.review.max_concurrency as u32);
         caps.insert(name.clone(), json!(cap));
     }
     json!({ "mode": "per-provider", "provider_caps": Value::Object(caps) })

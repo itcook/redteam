@@ -95,8 +95,8 @@ impl From<&crate::config::EffectiveModel> for ScanEntrySpec {
     fn from(em: &crate::config::EffectiveModel) -> Self {
         // pinned = 配置了 reasoningEffort **且** 该 (kind, family, id) 真有参数映射并会发出（评审修 9：无映射家族不该触发零推理告警）。
         let pinned = em.reasoning_effort.is_some_and(|e| {
-            crate::provider::backends::reasoning_effort_params(em.kind, &em.family, &em.id, e)
-                .is_some_and(|v| !v.is_empty())
+            let plan = crate::provider::backends::reasoning_plan(em.api, &em.family, &em.id, e, em.thinking_level_map.as_ref());
+            !plan.params.is_empty()
         });
         ScanEntrySpec { route_key: em.name.clone(), family: em.family.clone(), reasoning_pinned: pinned }
     }
@@ -244,11 +244,22 @@ pub async fn run_scan_fanout(
         })
         .collect();
     let samples = input.samples.max(1);
-    let plan: Vec<(usize, &ScanEntrySpec, u32, String)> = (0..input.bundles.len())
-        .flat_map(|g| {
-            input.entries.iter().flat_map(move |e| (1..=samples).map(move |k| (g, e, k, scan_cell_id(g, &e.route_key, k))))
-        })
-        .collect();
+    // v2：scanner 池 = **轮转**（不是扇出）。按稳定的 `(group, sample)` 次序取池：
+    // `index = (group × samples + (sample−1)) % len`——与并发完成顺序无关，重试沿用已分配的格。
+    let n = input.entries.len().max(1);
+    let plan: Vec<(usize, &ScanEntrySpec, u32, String)> = if input.entries.is_empty() {
+        Vec::new()
+    } else {
+        (0..input.bundles.len())
+            .flat_map(|g| {
+                (1..=samples).map(move |k| {
+                    let idx = (g * samples as usize + (k as usize - 1)) % n;
+                    let e = &input.entries[idx];
+                    (g, e, k, scan_cell_id(g, &e.route_key, k))
+                })
+            })
+            .collect()
+    };
     let template_hash = crate::prompt::scan_template_hash();
     if let Some(s) = sink {
         s.on_roles(&[Role::Scanner]);
@@ -678,7 +689,7 @@ mod scan_tests {
         let sink = RecSink::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let fanout = async move {
-            let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&sink), Some(&tx)).await;
+            let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 2), Some(&sink), Some(&tx)).await;
             drop(tx);
             (res, sink, reg, b, entries, repo)
         };
@@ -710,12 +721,12 @@ mod scan_tests {
         assert!(needs[0].arrival.clone().unwrap_or_default().starts_with("needs:src/b.rs:3-9:"), "{keys:?}");
         // 解不出行锚的那条不入队（评审 #13）：入了也只是「无笔记地审文件开头」。
         assert!(!got.iter().any(|r| r.spec.file == "src/c.rs"), "{keys:?}");
-        assert_eq!(res.failed, vec!["scan[g1]@p/ghost#1"]);
+        assert_eq!(res.failed, vec!["scan[g1]@p/ghost#2"]);
         assert_eq!(sink.cells.lock().unwrap().len(), 2);
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), None, Some(&tx)).await;
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 2), None, Some(&tx)).await;
         assert_eq!(res.cells.iter().filter(|c| c.record.ok).count(), 1, "接收端已关：发送失败忽略");
         assert_eq!(res.cells[0].output.as_ref().map(|o| o.suspicions.len()), Some(1));
     }
@@ -821,9 +832,9 @@ mod scan_tests {
         let others = vec!["src/f1.rs (g2 +1/-0)".to_string(), "src/f0.rs (g1 +1/-0)".to_string()];
         let entries = vec![entry("p/a", "alpha", false), entry("q/b", "beta", false)];
         let sink = RecSink::new();
-        let res = run_scan_fanout(&reg, &input(&b, &dossiers, &others, repo.path(), &entries, 1), Some(&sink), None).await;
+        let res = run_scan_fanout(&reg, &input(&b, &dossiers, &others, repo.path(), &entries, 2), Some(&sink), None).await;
         let ids: Vec<&str> = res.cells.iter().map(|c| c.cell_id.as_str()).collect();
-        assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g1]@q/b#1", "scan[g2]@p/a#1", "scan[g2]@q/b#1"]);
+        assert_eq!(ids, vec!["scan[g1]@p/a#1", "scan[g1]@q/b#2", "scan[g2]@p/a#1", "scan[g2]@q/b#2"]);
         assert!(res.cells.iter().all(|c| c.record.ok && c.record.role() == Role::Scanner), "{:?}", res.cells);
         assert_eq!(res.cells[1].family, "beta");
         assert_eq!(res.cells[2].group, 1);
@@ -893,8 +904,8 @@ mod scan_tests {
         let b = bundles(1);
         let entries = vec![entry("p/a", "alpha", false), entry("p/dead", "alpha", false), entry("ghost/x", "gamma", false)];
         let sink = RecSink::new();
-        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 1), Some(&sink), None).await;
-        assert_eq!(res.failed, vec!["scan[g1]@p/dead#1", "scan[g1]@ghost/x#1"]);
+        let res = run_scan_fanout(&reg, &input(&b, &[], &[], repo.path(), &entries, 3), Some(&sink), None).await;
+        assert_eq!(res.failed, vec!["scan[g1]@p/dead#2", "scan[g1]@ghost/x#3"]);
         assert_eq!(res.warnings.len(), 2);
         assert!(res.warnings[0].contains("auth error") && res.warnings[1].contains("scanner not in registry"), "{:?}", res.warnings);
         let dead = &res.cells[1].record;
