@@ -1,0 +1,40 @@
+[
+  {
+    "fingerprint": "sha256:697a6db64a341b98e313f7e9eaf2bb1b15991a0b553ad40813886afce781c3a2",
+    "severity": "high",
+    "confidence": 0.9,
+    "file": "service/llmconfig/execution.go",
+    "line_start": 255,
+    "line_end": 255,
+    "quote": "\t_, err := CurrentChannelFingerprint(channel, snapshot.ModelName, snapshot.Protocol.ProtocolType, snapshot.Protocol.ProfileKey)",
+    "title": "affinity/pinned 准入被一并放宽",
+    "body": "ChannelAllowed 去掉指纹相等判断后，affinity 首选渠道与显式 channel id 两条 fail-closed 路径都会接受 stale 指纹渠道；middleware/distributor_affinity_test.go 的 three 个子用例（:31 native incompatible pinned by affinity 期望 503、:112 fallback 期望落到 902）会失败。",
+    "recommendation": "保持 pinned/affinity 的 fail-closed 语义（该路径继续比较指纹、只放宽普通选择与目录页），或确认放宽范围并同步更新用例与 PR 描述。",
+    "extensions": {
+      "redteam": {
+        "fixture": {
+          "provenance": "hiapi-backend#400 第 1 轮分诊 blockers#1（review 引用 service/llmconfig/execution.go:256）"
+        }
+      }
+    }
+  },
+  {
+    "fingerprint": "sha256:7db89c45c86767f14a69cdc975e148b524102f6f2990c9525030aa5d08e0b508",
+    "severity": "high",
+    "confidence": 0.9,
+    "file": "service/llmconfig/execution.go",
+    "line_start": 194,
+    "line_end": 194,
+    "quote": "\t\tif _, err := CurrentChannelFingerprint(&channel, snapshot.ModelName, snapshot.Protocol.ProtocolType, snapshot.Protocol.ProfileKey); err != nil {",
+    "title": "迁移 forward switch 门禁被同步放宽",
+    "body": "validateEffectiveMigrationChannels 复用 AllowedChannelIDs，SwitchMigrationSources 现在也接受 stale 指纹渠道；migration_evidence_pg_test.go:44-56 的回归断言被改成允许，与文档/PR 描述不一致。",
+    "recommendation": "迁移 forward switch 继续用严格集合（VerifiedChannelIDs），或明确写出范围变化并同步文档与用例。",
+    "extensions": {
+      "redteam": {
+        "fixture": {
+          "provenance": "hiapi-backend#400 第 1 轮分诊 blockers#2"
+        }
+      }
+    }
+  }
+]

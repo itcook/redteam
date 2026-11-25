@@ -1,0 +1,21 @@
+[
+  {
+    "fingerprint": "sha256:9ef71ed55f91ac702a4e28c96904802173681f9c721d53beb1151c353f38a93f",
+    "severity": "high",
+    "confidence": 0.9,
+    "file": "service/llmconfig/migration.go",
+    "line_start": 563,
+    "line_end": 563,
+    "quote": "\t\t\treturn invalid(fmt.Errorf(\"no verified channels remain for %s; refresh evidence first (rebind-evidence, then re-save the protocol being switched)\", p.ProtocolType))",
+    "title": "恢复指引未覆盖已切到 llm 的漂移协议",
+    "body": "新指引只对「待切换协议自身」有效；当另一个已经在 llm 来源上的协议也发生漂移时，validateEffectiveMigrationChannels 会校验它、RebindMigrationBaselineEvidence 跳过它，重存待切换协议不会刷新它的 readiness_evidence_json——按文档操作会陷入重复失败。",
+    "recommendation": "恢复指引改成按来源描述：仍走 legacy 的协议刷新 baseline，需要 native evidence 的漂移协议（包括已在 llm 来源的）逐个重新保存；不要无条件写成「两步缺一不可」。",
+    "extensions": {
+      "redteam": {
+        "fixture": {
+          "provenance": "hiapi-backend#400 第 3 轮 🟡Q2"
+        }
+      }
+    }
+  }
+]

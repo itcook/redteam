@@ -1,0 +1,9 @@
+{
+  "group": "c",
+  "h1": "a88eb64584d964cc000c440a830226c66328527a",
+  "h2": "7c036382badbd812be7673fc93fdd9d545d50ef7",
+  "h1_label": "第 3 轮复验对象 head",
+  "h2_label": "修复提交（第 4 轮复验对象）",
+  "expected_source": "第 4 轮人工复验正文（APPROVED）",
+  "scenario": "非代码类修复：只改错误文案 + 文档三处 + 测试，不动迁移状态机。"
+}

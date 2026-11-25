@@ -164,9 +164,10 @@ fn blast_radius(root: &Path, fixes: &[FileFix], own_path: &str, symbols: &[Strin
     if symbols.is_empty() {
         return String::new();
     }
+    // 测试文件不进 blast：它们不改运行时行为，排在生产调用点前面只会挤掉真正的证据。
     let mut ordered: Vec<&FileFix> = fixes
         .iter()
-        .filter(|f| f.path != own_path && f.kind != FixChange::Deleted)
+        .filter(|f| f.path != own_path && f.kind != FixChange::Deleted && !is_test_path(&f.path))
         .collect();
     ordered.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -199,28 +200,28 @@ fn blast_radius(root: &Path, fixes: &[FileFix], own_path: &str, symbols: &[Strin
         }
     }
 
-    // 2) 只给前 3 个引用文件读内容、算行号、拼快照；≤6 处引用 / ≤12KB，超了停（段尾写省略数）。
+    // 2) 只给前 3 个引用文件读内容；**文件间轮转**（先每个文件第 1 个命中 hunk，再第 2 个……），
+    //    避免一个文件的大快照把别的文件里真正的修复点挤掉。≤6 处引用 / ≤12KB，超了停。
     let mut out = String::new();
     let mut included = 0usize;
-    for c in cands.iter().take(BLAST_FILES_MAX) {
-        if included >= BLAST_REFS_MAX {
-            break;
-        }
-        let Some(content) = crate::positioning::safe_read(root, &c.path) else { continue };
-        let lines: Vec<&str> = content.lines().collect();
-        let mut header_done = false;
-        for (hs, he, syms) in &c.hunks {
+    let mut started: Vec<bool> = vec![false; cands.len().min(BLAST_FILES_MAX)];
+    let max_hunks = cands.iter().take(BLAST_FILES_MAX).map(|c| c.hunks.len()).max().unwrap_or(0);
+    'sections: for round in 0..max_hunks {
+        for (ci, c) in cands.iter().take(BLAST_FILES_MAX).enumerate() {
             if included >= BLAST_REFS_MAX {
-                break;
+                break 'sections;
             }
+            let Some((hs, he, syms)) = c.hunks.get(round) else { continue };
+            let Some(content) = crate::positioning::safe_read(root, &c.path) else { continue };
+            let lines: Vec<&str> = content.lines().collect();
             let take = (BLAST_REFS_MAX - included).min(syms.len());
             let mut section = String::new();
-            if !header_done {
+            if !started[ci] {
                 section.push_str(&format!("### {} (changed by the fix)\n", c.path));
-                header_done = true;
+                started[ci] = true;
             }
             for sym in syms.iter().take(take) {
-                match first_line_with(&lines, sym, *hs, *he) {
+                match line_in_hunk(&lines, sym, *hs, *he) {
                     Some(line) => section.push_str(&format!("- {sym} referenced at {}:{line}\n", c.path)),
                     None => section.push_str(&format!("- {sym} referenced in this hunk ({})\n", c.path)),
                 }
@@ -228,7 +229,7 @@ fn blast_radius(root: &Path, fixes: &[FileFix], own_path: &str, symbols: &[Strin
             section.push_str(&snapshot_window_with(&content, &c.path, *hs, *he, BLAST_RADIUS));
             section.push('\n');
             if out.len() + section.len() > BLAST_BYTE_CAP {
-                break;
+                break 'sections;
             }
             out.push_str(&section);
             included += take;
@@ -241,14 +242,24 @@ fn blast_radius(root: &Path, fixes: &[FileFix], own_path: &str, symbols: &[Strin
     out.trim_end().to_string()
 }
 
-/// 引用处行号：先在 hunk 的新文件范围内找，找不到再全文找（1-based）。
-fn first_line_with(lines: &[&str], sym: &str, hs: u32, he: u32) -> Option<u32> {
+/// 测试文件（Go/Rust/TS 的常见形态）：blast 只看生产代码。
+fn is_test_path(path: &str) -> bool {
+    const SUFFIXES: &[&str] = &["_test.go", "_test.rs", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx", "_spec.rb"];
+    const SEGMENTS: &[&str] = &["/tests/", "/test/", "/__tests__/", "/spec/"];
+    SUFFIXES.iter().any(|s| path.ends_with(s)) || SEGMENTS.iter().any(|s| path.contains(s))
+}
+
+/// 引用处行号：**只在 hunk 的新文件范围内**找（1-based）。
+///
+/// 不回退全文：那会把「符号在文件别处出现」当成引用位置，给出 hunk 外的假坐标——
+/// 段里要的是「这条引用在哪个 hunk」，不是「这个符号在文件里还出现过」。
+fn line_in_hunk(lines: &[&str], sym: &str, hs: u32, he: u32) -> Option<u32> {
     let lo = (hs as usize).saturating_sub(1);
     let hi = (he as usize).min(lines.len());
-    if let Some(i) = lines.get(lo..hi).and_then(|w| w.iter().position(|l| mentions(l, sym))) {
-        return Some((lo + i + 1) as u32);
-    }
-    lines.iter().position(|l| mentions(l, sym)).map(|i| (i + 1) as u32)
+    lines
+        .get(lo..hi)
+        .and_then(|w| w.iter().position(|l| mentions(l, sym)))
+        .map(|i| (lo + i + 1) as u32)
 }
 
 /// 标识符边界匹配（避免 `Pin` 命中 `Pinned`）。

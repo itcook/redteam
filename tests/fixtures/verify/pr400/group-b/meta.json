@@ -1,0 +1,9 @@
+{
+  "group": "b",
+  "h1": "54f4c944da97ccd775de51e3525e86e611b2cd83",
+  "h2": "a88eb64584d964cc000c440a830226c66328527a",
+  "h1_label": "第 2 轮评审对象 head",
+  "h2_label": "修复提交（第 3 轮复验对象）",
+  "expected_source": "第 3 轮人工复验正文（CHANGES_REQUESTED）",
+  "scenario": "部分修复：Q1/Q7 关闭、Q2 主路径修好，但 Q2 的「已切到 llm 的漂移协议」边界仍未覆盖。"
+}
