@@ -204,7 +204,6 @@ fn release_script_prefix_and_public_base() {
         let out = Command::new("bash")
             .args(["scripts/release.sh", "v0.1.0", "--print-config"])
             .env("R2_PREFIX", input)
-            .env("REDTEAM_NO_DOTENV", "1")
             .output()
             .expect("run release.sh --print-config");
         let stdout = String::from_utf8_lossy(&out.stdout);

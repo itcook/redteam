@@ -8,14 +8,15 @@
 # 产出交付资产，再发 GitHub Release、镜像 R2。本脚本的完整发布模式保留为本机兜底。
 #
 # 用法：
-#   scripts/release.sh v0.1.0                  # 完整发布（正式版）
+#   scripts/release.sh v0.1.0                  # 推 tag，由 CI 发布（默认；不本机发 Release/R2）
+#   scripts/release.sh v0.1.0 --local-publish  # 本机完成 Release + R2（先停掉同 tag 的 CI run）
 #   scripts/release.sh v0.1.0-rc.1             # 预发布（GitHub 标 prerelease，R2 不更新 latest）
 #   scripts/release.sh v0.1.0 --prepare-only   # 只产出发行产物（CI build 用），不碰 git/Release/R2
 #   scripts/release.sh v0.1.0 --dry-run        # 只做前置检查 + 构建 + 打包，不碰 git/Release/R2
 #   scripts/release.sh v0.1.0 --no-push        # 本地打 tag，不推、不建 Release、不上传 R2
-#   scripts/release.sh v0.1.0 --skip-r2        # 只发 GitHub Release
-#   scripts/release.sh v0.1.0 --skip-verify    # 调用方已跑过 make verify（CI build job）
-#   scripts/release.sh v0.1.0 --print-config   # 打印归一化后的 R2 前缀与公开基址后退出（调试）
+#   scripts/release.sh v0.1.0 --skip-r2        # 本机发布但只发 GitHub Release
+#   scripts/release.sh v0.1.0 --prepare-only --skip-verify  # CI 已跑过 make verify（仅限 prepare）
+#   scripts/release.sh v0.1.0 --print-config   # 只按环境变量打印 R2 前缀与公开基址（调试）
 #
 # 前置：
 #   - 工作区干净（已跟踪文件无改动；--dry-run 只警告）
@@ -54,23 +55,27 @@ normalize_r2_prefix() {
     printf '%s' "$prefix"
 }
 
-# .env 里的 R2 凭据（可选，不入库）；提前加载，上传与回验共用同一份配置。
-# REDTEAM_NO_DOTENV=1 供测试/CI 跳过它（避免本机 .env 干扰断言）。
-if [ -f .env ] && [ "${REDTEAM_NO_DOTENV:-0}" != "1" ]; then
-    set -a; . ./.env; set +a
-fi
+# R2 前缀/公开基址：先按环境变量解析；`.env` 只在真正发布阶段加载（见下）。
 R2_PREFIX="$(normalize_r2_prefix "${R2_PREFIX:-}")"
 R2_BUCKET_DOMAIN="${R2_BUCKET_DOMAIN:-$DEFAULT_R2_BUCKET_DOMAIN}"
 PUBLIC_BASE="https://${R2_BUCKET_DOMAIN}/${R2_PREFIX}"
 
+# 重新解析 R2 配置（`.env` 可能改了 R2_PREFIX / R2_BUCKET_DOMAIN）。
+resolve_r2_config() {
+    R2_PREFIX="$(normalize_r2_prefix "${R2_PREFIX:-}")"
+    R2_BUCKET_DOMAIN="${R2_BUCKET_DOMAIN:-$DEFAULT_R2_BUCKET_DOMAIN}"
+    PUBLIC_BASE="https://${R2_BUCKET_DOMAIN}/${R2_PREFIX}"
+}
+
 # ---------------------------------------------------------------- 参数
 TAG_ARG="${1:-}"
-[ -n "$TAG_ARG" ] || die "用法: scripts/release.sh vX.Y.Z[-pre] [--prepare-only] [--dry-run] [--no-push] [--skip-r2] [--skip-verify] [--print-config]"
+[ -n "$TAG_ARG" ] || die "用法: scripts/release.sh vX.Y.Z[-pre] [--prepare-only] [--dry-run] [--no-push] [--skip-r2] [--local-publish] [--skip-verify] [--print-config]"
 shift
 DRY_RUN=false
 NO_PUSH=false
 SKIP_R2=false
 PREPARE_ONLY=false
+LOCAL_PUBLISH=false
 SKIP_VERIFY=false
 PRINT_CONFIG=false
 for arg in "$@"; do
@@ -79,20 +84,24 @@ for arg in "$@"; do
         --no-push) NO_PUSH=true ;;
         --skip-r2) SKIP_R2=true ;;
         --prepare-only|--ci) PREPARE_ONLY=true ;;
+        --local-publish) LOCAL_PUBLISH=true ;;
         --skip-verify) SKIP_VERIFY=true ;;
         --print-config) PRINT_CONFIG=true ;;
         *) die "未知参数: $arg" ;;
     esac
 done
 
-# 调试/测试入口：只打印归一化结果，不做任何检查与写入。
+# 调试/测试入口：只按环境变量打印归一化结果，不读 .env、不做任何检查与写入。
 if [ "$PRINT_CONFIG" = true ]; then
     printf 'R2_PREFIX=%s\nPUBLIC_BASE=%s\n' "$R2_PREFIX" "$PUBLIC_BASE"
     exit 0
 fi
 
-if [ "$PREPARE_ONLY" = true ] && { [ "$NO_PUSH" = true ] || [ "$SKIP_R2" = true ]; }; then
-    die "--prepare-only 不发布，不能与 --no-push / --skip-r2 同用"
+if [ "$PREPARE_ONLY" = true ] && { [ "$DRY_RUN" = true ] || [ "$NO_PUSH" = true ] || [ "$SKIP_R2" = true ]; }; then
+    die "--prepare-only 不发布，不能与 --dry-run / --no-push / --skip-r2 同用"
+fi
+if [ "$SKIP_VERIFY" = true ] && [ "$PREPARE_ONLY" = false ]; then
+    die "--skip-verify 只能与 --prepare-only 同用（完整发布必须先过 make verify）"
 fi
 
 # ---------------------------------------------------------------- 版本校验
@@ -233,6 +242,12 @@ if [ "$DRY_RUN" = true ]; then
     exit 0
 fi
 
+# 真正发布阶段才读 .env（prepare/dry-run 不执行其中的任意 shell）。
+if [ -f .env ]; then
+    set -a; . ./.env; set +a
+    resolve_r2_config
+fi
+
 # ---------------------------------------------------------------- tag
 if git rev-parse -q --verify "refs/tags/$TAG_ARG" >/dev/null; then
     info "tag 已存在且指向 HEAD: $TAG_ARG"
@@ -248,6 +263,15 @@ fi
 
 info "推送 tag 到 origin"
 git push origin "refs/tags/$TAG_ARG"
+
+# CI 是本仓正式发布路径：tag 推上去后 workflow 会发 Release + 镜像 R2。
+# 本机再发一遍会与它覆盖同名资产（归档哈希不同 → 资产与 SHA256SUMS 可能交叉覆盖），
+# 所以默认到此为止；只有明确 --local-publish 才继续（调用方负责先停掉同 tag 的 run）。
+if [ -f .github/workflows/release.yml ] && [ "$LOCAL_PUBLISH" = false ]; then
+    info "tag 已推送；CI（.github/workflows/release.yml）将发布 GitHub Release 与 R2 镜像"
+    info "确认同 tag 的 Actions run 不会并发后，可加 --local-publish 在本机完成发布"
+    exit 0
+fi
 
 # ---------------------------------------------------------------- GitHub Release
 info "发布 GitHub Release"
